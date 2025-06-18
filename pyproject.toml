@@ -7,7 +7,7 @@ authors = [
     { name = "ZeusDB", email = "contact@zeusdb.com" }
 ]
 requires-python = ">=3.10"
-license = {file = 'LICENSE'}
+license = "Apache-2.0"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -15,7 +15,7 @@ classifiers = [
 dependencies = []
 
 [build-system]
-requires = ["maturin>=1.8,<2.0"]
+requires = ["maturin>=1.8.7,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
