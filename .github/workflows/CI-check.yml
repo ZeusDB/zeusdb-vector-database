@@ -1,0 +1,193 @@
+# This workflow checks the zeusdb package.
+# It DOES NOT publish to PyPI, but prepares the package for manual review.
+# This workflow runs manually (via workflow_dispatch).
+# This workflow is useful for verifying the package contents before publishing.
+name: Check Package (without publishing to PyPI)
+
+on:
+  workflow_dispatch: 
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04
+            target: x86
+          - runner: ubuntu-24.04
+            target: aarch64
+          - runner: ubuntu-24.04
+            target: armv7
+          - runner: ubuntu-24.04
+            target: s390x
+          - runner: ubuntu-24.04
+            target: ppc64le
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'  # Match the minimum required version in pyproject.toml
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          sccache: true  # Always use sccache for manual Dispatch
+          manylinux: auto
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.platform.target }}
+          path: dist
+
+  musllinux:
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04
+            target: x86
+          - runner: ubuntu-24.04
+            target: aarch64
+          - runner: ubuntu-24.04
+            target: armv7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'  # Match the minimum required version in pyproject.toml
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          sccache: true  # Always use sccache for manual Dispatch
+          manylinux: musllinux_1_2
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-musllinux-${{ matrix.platform.target }}
+          path: dist
+
+  windows:
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: windows-latest
+            target: x64
+          - runner: windows-latest
+            target: x86
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'  # Match the minimum required version in pyproject.toml
+          architecture: ${{ matrix.platform.target }}
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          sccache: true  # Always use sccache for manual Dispatch
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.platform.target }}
+          path: dist
+
+  macos:
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: macos-13
+            target: x86_64
+          - runner: macos-14
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'  # Match the minimum required version in pyproject.toml
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          sccache: true
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.platform.target }}
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  release:
+    name: Inspect Artifacts
+    runs-on: ubuntu-latest
+    needs: [linux, musllinux, windows, macos, sdist]
+    permissions:
+      # Use to sign the release artifacts
+      contents: write
+    steps:
+      - name: Download and merge all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Install inspection tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install wheel twine
+
+      - name: Inspect build artifacts
+        run: |
+          echo "=== Contents of dist/ directory ==="
+          ls -lah dist/
+          echo ""
+          echo "=== File types of artifacts ==="
+          file dist/* || true
+          echo ""
+
+      - name: Check package metadata with twine
+        run: |
+          echo "=== Checking package metadata with twine ==="
+          python -m twine check dist/*
+
+      - name: Package summary
+        run: |
+          echo "=== Package Build Summary ==="
+          echo "Total artifacts: $(ls dist/ | wc -l)"
+          echo "Wheels: $(ls dist/*.whl 2>/dev/null | wc -l)"
+          echo "Source distributions: $(ls dist/*.tar.gz 2>/dev/null | wc -l)"
+          echo ""
+          echo "Platform coverage:"
+          ls dist/*.whl 2>/dev/null | sed 's/.*-\([^-]*\)\.whl/\1/' | sort | uniq -c || echo "No wheels found"
+
+
+
