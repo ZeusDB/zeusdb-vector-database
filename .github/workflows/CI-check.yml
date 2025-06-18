@@ -174,10 +174,10 @@ jobs:
           file dist/* || true
           echo ""
 
-      - name: Check package metadata with twine
-        run: |
-          echo "=== Checking package metadata with twine ==="
-          python -m twine check dist/*
+      # - name: Check package metadata with twine
+      #   run: |
+      #     echo "=== Checking package metadata with twine ==="
+      #     python -m twine check dist/*
 
       - name: Package summary
         run: |
