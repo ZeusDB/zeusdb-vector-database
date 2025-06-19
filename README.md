@@ -123,7 +123,7 @@ query_vec = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
 # Query with no filter (all documents)
 print("\n--- Querying without filter (all documents) ---")
 results = index.query(vector=query_vec, filter=None, top_k=2)
-for doc_id, score in results_all:
+for doc_id, score in results:
     print(f"{doc_id} (score={score:.4f})")
 ```
 
