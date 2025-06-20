@@ -181,3 +181,8 @@ class VectorDatabase:
             return None
         return self.index.get_vector_metadata(id)
     
+    def remove_point(self, id: str) -> bool:
+        """Remove a point by ID."""
+        if self.index is None:
+            raise RuntimeError("No index created. Call create_index_hnsw() first.")
+        return self.index.remove_point(id)
