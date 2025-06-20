@@ -1,8 +1,19 @@
-from .create_index_hnsw import HNSWIndex, create_index_hnsw
+"""
+VectorDatabase - Python wrapper for Rust implementation
+"""
+# Import the Rust implementation directly
+from .zeusdb_vector_database import HNSWIndex
 
 class VectorDatabase:
+    """
+    VectorDatabase class - thin Python wrapper around Rust implementation.
+    All heavy computation is done in Rust for performance.
+    """
     def __init__(self):
-        self.index = None
+        """Initialize VectorDatabase"""
+        self.index: HNSWIndex | None = None
+        self.index_type: str | None = None  # Tracks index backend used
+        self._stats = {"total_vectors": 0, "total_queries": 0}
 
     def create_index_hnsw(
             self, 
@@ -27,7 +38,33 @@ class VectorDatabase:
 
         Returns:
             HNSWIndex: An initialized HNSWIndex object ready for vector insertion and similarity search.
+
+        Raises:
+            ValueError: If an unsupported distance metric is given.
+            RuntimeError: If index creation fails internally.
         """
-        return create_index_hnsw(dim, space, M, ef_construction, expected_size)
+        #if space not in {"cosine", "l2", "dot"}:
+        if space not in {"cosine"}:
+            raise ValueError(f"Unsupported space: {space}")
+        if M > 256:
+            raise ValueError("M (max_nb_connection) must be less than or equal to 256")
+        if dim <= 0:
+            raise ValueError("dim must be positive")
+        if ef_construction <= 0:
+            raise ValueError("ef_construction must be positive")
+        if expected_size <= 0:
+            raise ValueError("expected_size must be positive")
+
+        try:
+            index = HNSWIndex(dim, space, M, ef_construction, expected_size)
+            self.index = index
+            self.index_type = "hnsw"
+            return index
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to create HNSW index with dim={dim}, space={space}, "
+                f"M={M}, ef={ef_construction}, expected_size={expected_size}"
+            ) from e
+
 
 
