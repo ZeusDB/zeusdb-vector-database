@@ -23,6 +23,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.0.2]
+
+### Added
+<!-- Add new features here -->
+
+### Changed
+<!-- Add changed behavior here -->
+
+### Fixed
+- Fixed and clarified the code example in the README.
+
+### Removed
+<!-- Add removals/deprecations here -->
+
+---
+
 ## [0.0.1] - 2025-06-17
 
 ### Added
