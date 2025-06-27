@@ -32,6 +32,4 @@ print("New Results with metadata:", results2)
 meta2 = results2[0][2]
 # Check metadata
 print("Metadata:", meta2)
-
-
     
