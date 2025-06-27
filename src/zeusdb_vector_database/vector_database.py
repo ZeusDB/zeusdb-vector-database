@@ -1,33 +1,50 @@
-from .create_index_hnsw import HNSWIndex, create_index_hnsw
+"""
+vector_database.py
+
+Pure factory for creating vector indexes using Rust backend.
+Currently supports HNSW (Hierarchical Navigable Small World).
+"""
+from .zeusdb_vector_database import HNSWIndex
 
 class VectorDatabase:
+    """
+    Pure factory for creating vector indexes.
+    No state management - just creates and returns indexes.
+    """
+    
     def __init__(self):
-        self.index = None
+        """Initialize VectorDatabase factory."""
+        pass
 
     def create_index_hnsw(
-            self, 
-            dim: int = 1536, 
-            space: str = "cosine", 
-            M: int = 16, 
-            ef_construction: int = 200,
-            expected_size: int = 10000  # Default capacity
-            ) -> HNSWIndex:
+        self,
+        dim: int = 1536,
+        space: str = "cosine",
+        M: int = 16,
+        ef_construction: int = 200,
+        expected_size: int = 10000
+    ) -> HNSWIndex:
         """
-        Creates a new HNSW (Hierarchical Navigable Small World) index using the specified configuration.
-
-        This method initializes the index for approximate nearest neighbor search using the HNSW algorithm.
-        It supports configuration of vector dimension, distance metric, connectivity, and construction parameters.
+        Creates a new HNSW (Hierarchical Navigable Small World) index.
 
         Args:
-            dim (int): The number of dimensions for each vector in the index (default is 1536).
-            space (str): The distance metric to use for similarity, currently only 'cosine' is supported.
-            M (int): The number of bidirectional links each node maintains in the graph (higher = more accuracy).
-            ef_construction (int): Size of the dynamic candidate list during index construction (higher = better recall).
-            expected_size (int): Estimated number of vectors to store; used to preallocate internal data structures (default is 10,000).
+            dim: Vector dimension (default: 1536)
+            space: Distance metric, only 'cosine' supported (default: 'cosine')
+            M: Bidirectional links per node (default: 16, max: 256)
+            ef_construction: Construction candidate list size (default: 200)
+            expected_size: Expected number of vectors (default: 10000)
 
         Returns:
-            HNSWIndex: An initialized HNSWIndex object ready for vector insertion and similarity search.
+            HNSWIndex: Use this index directly for all operations
+
+        Example:
+            vdb = VectorDatabase()
+            index = vdb.create_index_hnsw(dim=1536, expected_size=10000)
+            index.add_point("doc1", vector, metadata)
+            results = index.query(query_vector, k=10)
         """
-        return create_index_hnsw(dim, space, M, ef_construction, expected_size)
-
-
+        try:
+            return HNSWIndex(dim, space, M, ef_construction, expected_size)
+        except Exception as e:
+            raise RuntimeError(f"Failed to create HNSW index: {e}") from e
+    

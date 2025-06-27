@@ -1,6 +1,6 @@
 [package]
 name = "zeusdb-vector-database"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 resolver = "2" # <-- Avoid compiling unnecessary features from dependencies.
 
@@ -10,7 +10,7 @@ name = "zeusdb_vector_database" # <-- This is the name of the compiled Python mo
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.25.0", features = ["extension-module"] }
+pyo3 = { version = "0.25.1", features = ["extension-module"] }
 hnsw_rs = "0.3.2"
 
 [profile.release]
