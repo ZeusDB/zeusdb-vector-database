@@ -47,18 +47,4 @@ class VectorDatabase:
             return HNSWIndex(dim, space, M, ef_construction, expected_size)
         except Exception as e:
             raise RuntimeError(f"Failed to create HNSW index: {e}") from e
-
-    @staticmethod
-    def info() -> str:
-        """Get information about available index types."""
-        return (
-            "VectorDatabase Factory\n"
-            "Available index types:\n"
-            "  - HNSW: Hierarchical Navigable Small World\n"
-            "Usage:\n"
-            "  vdb = VectorDatabase()\n"
-            "  index = vdb.create_index_hnsw(dim=1536)\n"
-            "  index.add_point('id', vector, metadata)\n"
-            "  results = index.query(query_vector, k=10)"
-        )
     
