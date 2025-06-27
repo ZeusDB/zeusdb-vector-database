@@ -1,6 +1,6 @@
 [project]
 name = "zeusdb-vector-database"
-version = "0.0.1"
+version = "0.0.2"
 description = "Blazing-fast vector DB with real-time similarity search and metadata filtering."
 readme = "README.md"
 authors = [
@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [build-system]
-requires = ["maturin>=1.8.7,<2.0"]
+requires = ["maturin>=1.9.0,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
@@ -30,7 +30,7 @@ include = ["LICENSE", "NOTICE", "README.md", "src/**"]
 
 [project.optional-dependencies]
 dev = [
-    "maturin >=1.8.7",
+    "maturin >=1.9.0",
     "pytest >=8.4.0",
 ]
 
