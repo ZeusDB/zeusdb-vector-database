@@ -1,11 +1,14 @@
-# ZeusDB Vector Database
+<p align="center" width="100%">
+  <img src="https://github.com/user-attachments/assets/ad21baec-6f4c-445c-b423-88a081ca2b97" alt="zeusdb-vector-database-logo-cropped" />
+  <h1 align="center">ZeusDB Vector Database</h1>
+</p>
 
 <!-- <h2 align="center">Fast, Rust-powered vector database for similarity search</h2> -->
 <!--**Fast, Rust-powered vector database for similarity search** -->
 
 <!-- badges: start -->
 
-<div align="left">
+<div align="center">
   <table>
     <tr>
       <td><strong>Meta</strong></td>
