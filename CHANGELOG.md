@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.0.3]
 
 ### Added
 <!-- Add new features here -->
@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.0.2]
+## [0.0.2] - 2025-06-27
 
 ### Added
 - `search_with_metadata` method on `HNSWIndex` for querying vectors with metadata in the results.
@@ -90,3 +90,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - CI workflow now explicitly installs and upgrades `pkginfo` alongside `twine` and `wheel` during artifact inspection. This prevents metadata validation errors (such as "Metadata is missing required fields: Name, Version") caused by outdated versions of `pkginfo`.
+
+---
+
+## [Unreleased]
+
+### Added
+<!-- Add new features here -->
+
+### Changed
+<!-- Add changed behavior here -->
+
+### Fixed
+<!-- Add bug fixes here -->
+
+### Removed
+<!-- Add removals/deprecations here -->
+
+---
