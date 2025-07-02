@@ -1,7 +1,7 @@
 """
 ZeusDB Vector Database Module
 """
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 from .vector_database import VectorDatabase # imports the VectorDatabase class from the vector_database.py file
 
