@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.0.3]
+## [0.0.3] - 2025-07-02
 
 ### Added
 - Integrated `numpy = "0.25.0"` crate to support NumPy interoperability for Python bindings in `zeusdb-vector` via PyO3.
@@ -21,15 +21,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added robust input parsing and validation for each format, with detailed error handling.
 - Enabled support for NumPy arrays (1D and 2D) in all input styles for seamless integration with Python scientific workflows.
 - Extended internal batch insertion logic to track successes and errors, improving diagnostics and debugging.
-
-### Changed
-<!-- Add changed behavior here -->
-
-### Fixed
-<!-- Add bug fixes here -->
-
-### Removed
-<!-- Add removals/deprecations here -->
 
 ---
 
