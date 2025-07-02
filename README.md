@@ -107,17 +107,16 @@ vdb = VectorDatabase()
 # Initialize and set up the database resources
 index = vdb.create_index_hnsw(dim = 8, space = "cosine", M = 16, ef_construction = 200, expected_size=5)
 
-# Upload vector records
-vectors = {
-    "doc_001": ([0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7], {"author": "Alice"}),
-    "doc_002": ([0.9, 0.1, 0.4, 0.2, 0.8, 0.5, 0.3, 0.9], {"author": "Bob"}),
-    "doc_003": ([0.11, 0.21, 0.31, 0.15, 0.41, 0.22, 0.61, 0.72], {"author": "Alice"}),
-    "doc_004": ([0.85, 0.15, 0.42, 0.27, 0.83, 0.52, 0.33, 0.95], {"author": "Bob"}),
-    "doc_005": ([0.12, 0.22, 0.33, 0.13, 0.45, 0.23, 0.65, 0.71], {"author": "Alice"}),
-}
+# Upload vector records using the unified `add()` method
+records = [
+    {"id": "doc_001", "values": [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7], "metadata": {"author": "Alice"}},
+    {"id": "doc_002", "values": [0.9, 0.1, 0.4, 0.2, 0.8, 0.5, 0.3, 0.9], "metadata": {"author": "Bob"}},
+    {"id": "doc_003", "values": [0.11, 0.21, 0.31, 0.15, 0.41, 0.22, 0.61, 0.72], "metadata": {"author": "Alice"}},
+    {"id": "doc_004", "values": [0.85, 0.15, 0.42, 0.27, 0.83, 0.52, 0.33, 0.95], "metadata": {"author": "Bob"}},
+    {"id": "doc_005", "values": [0.12, 0.22, 0.33, 0.13, 0.45, 0.23, 0.65, 0.71], "metadata": {"author": "Alice"}},
+]
 
-for doc_id, (vec, meta) in vectors.items():
-    index.add_point(doc_id, vec, metadata=meta)
+result = index.add(records)
 
 # Perform a similarity search and print the top 2 results
 # Query Vector
@@ -132,6 +131,67 @@ for doc_id, score in results:
 
 <br/>
 
+### ➕ Adding Vectors – Multiple Formats Supported
+
+ZeusDB supports three flexible input formats for inserting vector data using index.add(...). All formats accept optional metadata per record.
+
+#### ✅ Format 1 – Single Object
+
+```python
+index.add({
+    "id": "doc1",
+    "values": [0.1, 0.2],
+    "metadata": {"text": "hello"}
+})
+
+print(result.summary())     # ✅ 1 inserted, ❌ 0 errors
+print(result.is_success())  # True
+```
+
+#### ✅ Format 2 – List of Objects
+
+```python
+index.add([
+    {"id": "doc1", "values": [0.1, 0.2], "metadata": {"text": "hello"}},
+    {"id": "doc2", "values": [0.3, 0.4], "metadata": {"text": "world"}}
+])
+
+print(result.summary())       # ✅ 2 inserted, ❌ 0 errors
+print(result.vector_shape)    # (2, 2)
+print(result.errors)          # []
+```
+
+#### ✅ Format 3 – Separate Arrays
+
+```python
+index.add({
+    "ids": ["doc1", "doc2"],
+    "embeddings": [[0.1, 0.2], [0.3, 0.4]],
+    "metadatas": [{"text": "hello"}, {"text": "world"}]
+})
+print(result)  # BatchResult(inserted=2, errors=0, shape=(2, 2))
+```
+
+#### ✅ Format 4 – Using NumPy Arrays
+
+ZeusDB also supports NumPy arrays as input for seamless integration with scientific and ML workflows.
+
+```python
+import numpy as np
+
+data = [
+    {"id": "doc2", "values": np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32), "metadata": {"type": "blog"}},
+    {"id": "doc3", "values": np.array([0.5, 0.6, 0.7, 0.8], dtype=np.float32), "metadata": {"type": "news"}},
+]
+
+result = index.add(data)
+
+print(result.summary())   # ✅ 2 inserted, ❌ 0 errors
+```
+
+Each format is automatically parsed and validated internally, including support for NumPy arrays (np.ndarray). Errors and successes are returned in a structured BatchResult object for easy debugging and logging.
+
+<br/>
 
 ### 🧰 Additional functionality
 

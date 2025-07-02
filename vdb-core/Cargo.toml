@@ -1,6 +1,6 @@
 [package]
 name = "zeusdb-vector-database"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 resolver = "2" # <-- Avoid compiling unnecessary features from dependencies.
 
@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.25.1", features = ["extension-module"] }
 hnsw_rs = "0.3.2"
+numpy = "0.25.0"
 
 [profile.release]
 lto = true # <-- Enable Link-Time Optimization
