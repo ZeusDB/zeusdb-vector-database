@@ -41,6 +41,8 @@ ZeusDB leverages the HNSW (Hierarchical Navigable Small World) algorithm for spe
 
 🔥 High-performance Rust backend 
 
+📥 Supports multiple input formats using a single, easy-to-use Python method
+
 🗂️ Metadata-aware filtering at query time
 
 🐍 Simple and intuitive Python API
@@ -133,7 +135,7 @@ for doc_id, score in results:
 
 ### ➕ Adding Vectors – Multiple Formats Supported
 
-ZeusDB supports three flexible input formats for inserting vector data using index.add(...). All formats accept optional metadata per record.
+ZeusDB Vector Database supports multiple intuitive ways to insert data using index.add(...). All formats accept optional metadata per record.
 
 #### ✅ Format 1 – Single Object
 
