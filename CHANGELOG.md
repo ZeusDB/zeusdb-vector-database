@@ -10,7 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.0.3]
 
 ### Added
-<!-- Add new features here -->
+- Integrated `numpy = "0.25.0"` crate to support NumPy interoperability for Python bindings in `zeusdb-vector` via PyO3.
+- Registered `BatchResult` class in the Python bindings for `zeusdb_vector_database`, making it accessible from Python alongside `HNSWIndex`.
+- Internal test scripts for manual validation and experimentation. These are not integrated with `pytest` and are intended for ad hoc or exploratory testing.
+- Introduced `BatchResult` class with structured summary of vector insertion, including total inserted, error count, and shape.
+- Implemented a unified `add()` method in `HNSWIndex` supporting three common input formats:
+  - Single object: `{"id": ..., "values": ..., "metadata": ...}`
+  - List of objects: `[{"id": ..., "values": ...}, ...]`
+  - Separate arrays: `{"ids": [...], "embeddings": [...], "metadatas": [...]}`
+- Added robust input parsing and validation for each format, with detailed error handling.
+- Enabled support for NumPy arrays (1D and 2D) in all input styles for seamless integration with Python scientific workflows.
+- Extended internal batch insertion logic to track successes and errors, improving diagnostics and debugging.
 
 ### Changed
 <!-- Add changed behavior here -->
