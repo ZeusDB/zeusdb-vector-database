@@ -6,6 +6,9 @@ This product includes software developed by:
 - The Python Software Foundation (https://www.python.org/psf/)
 - The Rust Project Developers (https://www.rust-lang.org/)
 - The PyO3 Project (https://pyo3.rs/)
+- Jean-pierreBoth (https://crates.io/crates/hnsw_rs/)
+
+Third-party components may be licensed under their respective terms. See LICENSES/ for full license texts.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

@@ -526,68 +526,72 @@ impl HNSWIndex {
         Ok(result)
     }
 
-    /// Query the index for the k-nearest neighbors of a vector
-    #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None))]
+    // /// DEPRECIATED: This one returns a list of tuples (id, score)
+    // /// Query the index for the k-nearest neighbors of a vector
+    // #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None))]
+    // pub fn query(
+    //     &self,
+    //     vector: Vec<f32>,
+    //     filter: Option<HashMap<String, String>>,
+    //     top_k: usize,
+    //     ef_search: Option<usize>,
+    // ) -> PyResult<Vec<(String, f32)>> {
+    //     if vector.len() != self.dim {
+    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+    //             "Query vector dimension mismatch: expected {}, got {}",
+    //             self.dim, vector.len()
+    //         )));
+    //     }
+
+    //     // Get results from HNSW graph
+    //     let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
+    //     let results = self.hnsw.search(&vector, top_k, ef);
+
+    //     let mut filtered_results = Vec::new();
+
+    //     for neighbor in results {
+    //         let score = neighbor.distance;
+    //         let internal_id = neighbor.get_origin_id();
+            
+    //         if let Some(ext_id) = self.rev_map.get(&internal_id) {
+    //             // Apply filtering if provided
+    //             if let Some(ref filter_map) = filter {
+    //                 if let Some(meta) = self.vector_metadata.get(ext_id) {
+    //                     let mut matches = true;
+    //                     for (k, v) in filter_map {
+    //                         if meta.get(k) != Some(v) {
+    //                             matches = false;
+    //                             break;
+    //                         }
+    //                     }
+    //                     if !matches {
+    //                         continue;
+    //                     }
+    //                 } else {
+    //                     // No metadata, but filter required - skip
+    //                     continue;
+    //                 }
+    //             }
+    //             filtered_results.push((ext_id.clone(), score));
+    //         }
+    //     }
+
+    //     Ok(filtered_results)
+    // }
+
+
+    /// Search for the k-nearest neighbors of a vector
+    /// Returns actual Python dictionaries which most common for ML workflows
+    #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, return_vector=false))]
     pub fn query(
         &self,
+        py: Python<'_>,
         vector: Vec<f32>,
         filter: Option<HashMap<String, String>>,
         top_k: usize,
         ef_search: Option<usize>,
-    ) -> PyResult<Vec<(String, f32)>> {
-        if vector.len() != self.dim {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Query vector dimension mismatch: expected {}, got {}",
-                self.dim, vector.len()
-            )));
-        }
-
-        // Get results from HNSW graph
-        let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
-        let results = self.hnsw.search(&vector, top_k, ef);
-
-        let mut filtered_results = Vec::new();
-
-        for neighbor in results {
-            let score = neighbor.distance;
-            let internal_id = neighbor.get_origin_id();
-            
-            if let Some(ext_id) = self.rev_map.get(&internal_id) {
-                // Apply filtering if provided
-                if let Some(ref filter_map) = filter {
-                    if let Some(meta) = self.vector_metadata.get(ext_id) {
-                        let mut matches = true;
-                        for (k, v) in filter_map {
-                            if meta.get(k) != Some(v) {
-                                matches = false;
-                                break;
-                            }
-                        }
-                        if !matches {
-                            continue;
-                        }
-                    } else {
-                        // No metadata, but filter required - skip
-                        continue;
-                    }
-                }
-                filtered_results.push((ext_id.clone(), score));
-            }
-        }
-
-        Ok(filtered_results)
-    }
-
-    /// Search with metadata included in results
-    #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, include_metadata=false))]
-    pub fn search_with_metadata(
-        &self,
-        vector: Vec<f32>,
-        filter: Option<HashMap<String, String>>,
-        top_k: usize,
-        ef_search: Option<usize>,
-        include_metadata: bool,
-    ) -> PyResult<Vec<(String, f32, Option<HashMap<String, String>>)>> {
+        return_vector: bool,
+    ) -> PyResult<Vec<Py<PyDict>>> {
         if vector.len() != self.dim {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                 "Query vector dimension mismatch: expected {}, got {}",
@@ -598,43 +602,180 @@ impl HNSWIndex {
         let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
         let results = self.hnsw.search(&vector, top_k, ef);
 
-        let mut filtered_results = Vec::new();
+        let mut output = Vec::with_capacity(results.len());
 
         for neighbor in results {
             let score = neighbor.distance;
             let internal_id = neighbor.get_origin_id();
-            
+
             if let Some(ext_id) = self.rev_map.get(&internal_id) {
-                // Apply filtering if provided
+                // Apply optional metadata filter
                 if let Some(ref filter_map) = filter {
                     if let Some(meta) = self.vector_metadata.get(ext_id) {
-                        let mut matches = true;
-                        for (k, v) in filter_map {
-                            if meta.get(k) != Some(v) {
-                                matches = false;
-                                break;
-                            }
-                        }
+                        let matches = filter_map.iter().all(|(k, v)| meta.get(k) == Some(v));
                         if !matches {
                             continue;
                         }
                     } else {
-                        continue;
+                        continue; // no metadata to match against
                     }
                 }
 
-                let metadata = if include_metadata {
-                    self.vector_metadata.get(ext_id).cloned()
-                } else {
-                    None
-                };
+                let dict = PyDict::new(py);
+                dict.set_item("id", ext_id)?;
+                dict.set_item("score", score)?;
 
-                filtered_results.push((ext_id.clone(), score, metadata));
+                let metadata = self.vector_metadata.get(ext_id).cloned().unwrap_or_default();
+                dict.set_item("metadata", metadata)?;
+
+                if return_vector {
+                    if let Some(vec) = self.vectors.get(ext_id) {
+                        dict.set_item("vector", vec.clone())?;
+                    }
+                }
+
+                output.push(dict.into());
             }
         }
 
-        Ok(filtered_results)
+        Ok(output)
     }
+
+
+
+
+
+
+
+
+
+    // /// DEPRECIATED: This one returns a list of tuples (id, score)
+    // /// Search with metadata included in results
+    // #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, include_metadata=false))]
+    // pub fn search_with_metadata(
+    //     &self,
+    //     vector: Vec<f32>,
+    //     filter: Option<HashMap<String, String>>,
+    //     top_k: usize,
+    //     ef_search: Option<usize>,
+    //     include_metadata: bool,
+    // ) -> PyResult<Vec<(String, f32, Option<HashMap<String, String>>)>> {
+    //     if vector.len() != self.dim {
+    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+    //             "Query vector dimension mismatch: expected {}, got {}",
+    //             self.dim, vector.len()
+    //         )));
+    //     }
+
+    //     let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
+    //     let results = self.hnsw.search(&vector, top_k, ef);
+
+    //     let mut filtered_results = Vec::new();
+
+    //     for neighbor in results {
+    //         let score = neighbor.distance;
+    //         let internal_id = neighbor.get_origin_id();
+            
+    //         if let Some(ext_id) = self.rev_map.get(&internal_id) {
+    //             // Apply filtering if provided
+    //             if let Some(ref filter_map) = filter {
+    //                 if let Some(meta) = self.vector_metadata.get(ext_id) {
+    //                     let mut matches = true;
+    //                     for (k, v) in filter_map {
+    //                         if meta.get(k) != Some(v) {
+    //                             matches = false;
+    //                             break;
+    //                         }
+    //                     }
+    //                     if !matches {
+    //                         continue;
+    //                     }
+    //                 } else {
+    //                     continue;
+    //                 }
+    //             }
+
+    //             let metadata = if include_metadata {
+    //                 self.vector_metadata.get(ext_id).cloned()
+    //             } else {
+    //                 None
+    //             };
+
+    //             filtered_results.push((ext_id.clone(), score, metadata));
+    //         }
+    //     }
+
+    //     Ok(filtered_results)
+    // }
+
+
+    // /// DEPRECIATED: Use `query()` instead. Have made query the single do all function.
+    // /// Search with metadata included in results
+    // #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, include_metadata=true))]
+    // pub fn search_with_metadata(
+    //     &self,
+    //     py: Python<'_>,
+    //     vector: Vec<f32>,
+    //     filter: Option<HashMap<String, String>>,
+    //     top_k: usize,
+    //     ef_search: Option<usize>,
+    //     include_metadata: bool,
+    // ) -> PyResult<Vec<Py<PyDict>>> {
+    //     if vector.len() != self.dim {
+    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+    //             "Query vector dimension mismatch: expected {}, got {}",
+    //             self.dim, vector.len()
+    //         )));
+    //     }
+
+    //     let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
+    //     let results = self.hnsw.search(&vector, top_k, ef);
+
+    //     let mut output = Vec::with_capacity(results.len());
+
+    //     for neighbor in results {
+    //         let score = neighbor.distance;
+    //         let internal_id = neighbor.get_origin_id();
+
+    //         if let Some(ext_id) = self.rev_map.get(&internal_id) {
+    //             // Apply optional filtering
+    //             if let Some(ref filter_map) = filter {
+    //                 if let Some(meta) = self.vector_metadata.get(ext_id) {
+    //                     let matches = filter_map.iter().all(|(k, v)| meta.get(k) == Some(v));
+    //                     if !matches {
+    //                         continue;
+    //                     }
+    //                 } else {
+    //                     continue;
+    //                 }
+    //             }
+
+    //             let dict = PyDict::new(py);
+    //             dict.set_item("id", ext_id)?;
+    //             dict.set_item("score", score)?;
+
+    //             if include_metadata {
+    //                 let metadata = self.vector_metadata.get(ext_id).cloned().unwrap_or_default();
+    //                 dict.set_item("metadata", metadata)?;
+    //             } else {
+    //                 dict.set_item("metadata", PyDict::new(py))?;
+    //             }
+
+    //             output.push(dict.into());
+    //         }
+    //     }
+
+    //     Ok(output)
+    // }
+
+
+
+
+
+
+
+
+
 
     /// Get vector by ID
     pub fn get_vector(&self, id: String) -> Option<Vec<f32>> {

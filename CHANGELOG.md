@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.0.4] - 2025-07-03
+
+### Added
+- `return_vector: bool = False` parameter added to the `.query()` method.
+  - When set to `True`, the returned results include the full embedding vector for each match.
+  - Useful for downstream workflows such as LLM context injection, reranking, or embedding inspection.
+
+### Changed
+- `.query()` method now returns results as a list of Python dictionaries instead of tuples.
+  - Old format: `[("doc_1", 0.87), ("doc_2", 0.91)]`
+  - New format:
+    ```python
+    [
+      {"id": "doc_1", "score": 0.87, "metadata": {...}},
+      {"id": "doc_2", "score": 0.91, "metadata": {...}}
+    ]
+    ```
+  - This change improves compatibility with modern machine learning workflows, LLM frameworks, and JSON-based APIs.
+- Metadata filtering is still applied after ANN search and before result construction.
+- Added `LICENSES/` directory to store third-party license files
+- Included `hnsw_rs-Apache-2.0.txt` containing the full Apache License 2.0 text from the `hnsw_rs` crate (https://crates.io/crates/hnsw_rs)
+- Updated `NOTICE` file to include proper attribution for `hnsw_rs`
+
+### Removed
+- `.search_with_metadata()` method has been removed. All functionality has been consolidated into the enhanced `.query()` interface.
+
+---
+
 ## [0.0.3] - 2025-07-02
 
 ### Added
