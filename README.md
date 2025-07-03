@@ -56,12 +56,16 @@ ZeusDB leverages the HNSW (Hierarchical Navigable Small World) algorithm for spe
 
 | Metric | Description                          |
 |--------|--------------------------------------|
-| cosine | Cosine distance (1 - Cosine Similiarity) |
+| cosine | Cosine Distance (1 - Cosine Similiarity) |
 <!--
 | l2     | Euclidean distance                   |
 | dot    | Dot product                 |
 
 -->
+
+Scores vs Distances: 
+- Similarity Scores (higher = more similar)
+- Distances (lower = more similar)
 
 <br/>
 
@@ -125,10 +129,23 @@ result = index.add(records)
 query_vec = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
 
 # Query with no filter (all documents)
-print("\n--- Querying without filter (all documents) ---")
 results = index.query(vector=query_vec, filter=None, top_k=2)
-for doc_id, score in results:
-    print(f"{doc_id} (score={score:.4f})")
+print("\n--- Raw Results Format ---")
+print(results)
+
+print("\n--- Formatted Results ---")
+for i, res in enumerate(results, 1):
+    print(f"{i}. ID: {res['id']}, Score: {res['score']:.4f}, Metadata: {res['metadata']}")
+```
+
+*Results Output:*
+```
+--- Raw Results Format ---
+[{'id': 'doc_001', 'score': 0.0, 'metadata': {'author': 'Alice'}}, {'id': 'doc_003', 'score': 0.0009883458260446787, 'metadata': {'author': 'Alice'}}]
+
+--- Formatted Results ---
+1. ID: doc_001, Score: 0.0000, Metadata: {'author': 'Alice'}
+2. ID: doc_003, Score: 0.0010, Metadata: {'author': 'Alice'}
 ```
 
 <br/>
@@ -261,14 +278,15 @@ This pre-filters on the given metadata prior to conducting the similarity search
 ```python
 print("\n--- Querying with filter: author = 'Alice' ---")
 results = index.query(vector=query_vec, filter={"author": "Alice"}, top_k=5)
-for doc_id, score in results:
-    print(f"{doc_id} (score={score:.4f})")
+print(results)
 ```
 *Output*
 ```
-doc_001 (score=0.0000)
-doc_003 (score=0.0010)
-doc_005 (score=0.0011)
+[
+  {'id': 'doc_001', 'score': 0.0, 'metadata': {'author': 'Alice'}}, 
+  {'id': 'doc_003', 'score': 0.0009883458260446787, 'metadata': {'author': 'Alice'}}, 
+  {'id': 'doc_005', 'score': 0.0011433829786255956, 'metadata': {'author': 'Alice'}}
+]
 ```
 
 
