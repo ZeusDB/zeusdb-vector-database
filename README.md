@@ -283,7 +283,7 @@ This pre-filters on the given metadata prior to conducting the similarity search
 
 ```python
 print("\n--- Querying with filter: author = 'Alice' ---")
-results = index.query(vector=query_vec, filter={"author": "Alice"}, top_k=5)
+results = index.query(vector=query_vector, filter={"author": "Alice"}, top_k=5)
 print(results)
 ```
 *Output*
