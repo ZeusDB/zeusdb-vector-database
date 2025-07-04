@@ -86,22 +86,7 @@ pip install zeusdb-vector-database
 
 <br/>
 
-
-## ✨ Usage
-
-### 📘 `create_index_hnsw` Parameters
-
-| Parameter        | Type   | Default   | Description                                                                 |
-|------------------|--------|-----------|-----------------------------------------------------------------------------|
-| `dim`            | `int`  | `1536`    | Dimensionality of the vectors to be indexed. Each vector must have this length. The default dim=1536 is chosen to match the output dimensionality of OpenAI’s text-embedding-ada-002 model. |
-| `space`          | `str`  | `"cosine"`| Distance metric used for similarity search. Options include `"cosine"`. Additional metrics such as `"l2"`, and `"dot"` will be added in future versions. |
-| `M`              | `int`  | `16`      | Number of bi-directional connections created for each new node. Higher `M` improves recall but increases index size and build time. |
-| `ef_construction`| `int`  | `200`     | Size of the dynamic list used during index construction. Larger values increase indexing time and memory, but improve quality. |
-| `expected_size`  | `int`  | `10000`   | Estimated number of elements to be inserted. Used for preallocating internal data structures. Not a hard limit. |
-
-<br/>
-
-### 🔥 Quick Start Example 
+## 🔥 Quick Start Example 
 
 ```python
 # Import the vector database module
@@ -156,9 +141,59 @@ for i, res in enumerate(results, 1):
 
 <br/>
 
-### ➕ How to Add Data – Multiple Formats Supported
+## ✨ Usage
 
-ZeusDB Vector Database supports multiple intuitive ways to insert data using index.add(...). All formats accept optional metadata per record.
+ZeusDB makes it easy to work with high-dimensional vector data using a fast, memory-efficient HNSW index. Whether you're building semantic search, recommendation engines, or embedding-based clustering, the workflow is simple and intuitive:
+
+Three simple steps:
+
+  1. Create an index
+
+  2. Add data to the index
+
+  3. Conduct a similarity search
+
+Each step is covered below.
+
+### 1️⃣ Create an Index
+
+To get started, first initialize a VectorDatabase and create an HNSWIndex. You can configure the vector dimension, distance metric, and graph construction parameters.
+
+```python
+# Import the vector database module
+from zeusdb_vector_database import VectorDatabase
+
+# Instantiate the VectorDatabase class
+vdb = VectorDatabase()
+
+# Initialize and set up the database resources
+index = vdb.create_index_hnsw(
+  dim = 8, 
+  space = "cosine", 
+  M = 16, 
+  ef_construction = 200, 
+  expected_size=5
+  )
+```
+
+#### 📘 `create_index_hnsw()` Parameters
+
+| Parameter        | Type   | Default   | Description                                                                 |
+|------------------|--------|-----------|-----------------------------------------------------------------------------|
+| `dim`            | `int`  | `1536`    | Dimensionality of the vectors to be indexed. Each vector must have this length. The default dim=1536 is chosen to match the output dimensionality of OpenAI’s text-embedding-ada-002 model. |
+| `space`          | `str`  | `"cosine"`| Distance metric used for similarity search. Options include `"cosine"`. Additional metrics such as `"l2"`, and `"dot"` will be added in future versions. |
+| `M`              | `int`  | `16`      | Number of bi-directional connections created for each new node. Higher `M` improves recall but increases index size and build time. |
+| `ef_construction`| `int`  | `200`     | Size of the dynamic list used during index construction. Larger values increase indexing time and memory, but improve quality. |
+| `expected_size`  | `int`  | `10000`   | Estimated number of elements to be inserted. Used for preallocating internal data structures. Not a hard limit. |
+
+<br/>
+
+
+### 2️⃣ Add Data to the Index
+
+ZeusDB provides a flexible `.add(...)` method that supports multiple input formats for inserting vectors into the index. Whether you're adding a single record, a list of documents, or structured arrays, the API is designed to be both intuitive and robust. Each record can include optional metadata for filtering or downstream use.
+
+All formats return an AddResult containing total_inserted, total_errors, and detailed error messages for any invalid entries.
 
 #### ✅ Format 1 – Single Object
 
@@ -229,6 +264,88 @@ print(add_result)  # AddResult(inserted=2, errors=0, shape=(2, 2))
 
 Each format is automatically parsed and validated internally, including support for NumPy arrays (np.ndarray). Errors and successes are returned in a structured AddResult object for easy debugging and logging.
 
+#### 📘 `add()` Parameters
+
+The `add()` method inserts one or more vectors into the index. Multiple data formats are supported to accommodate different workflows, including native Python types and NumPy arrays.
+
+| Parameter | Type                                | Default | Description |
+|-----------|-------------------------------------|---------|-------------|
+| `data`    | `dict`, `list[dict]`, or `dict of arrays` | *required* | Input records to be added to the index. Supports multiple formats |
+
+**Returns:**  
+[`AddResult`](#) – an object with `total_inserted`, `total_errors`, `errors`, and `vector_shape`. Helpful for validation, logging, and debugging.
+
+<br/>
+
+### 3️⃣ Conduct a Similarity Search
+
+Query the index using a new vector and retrieve the top-k nearest neighbors. You can also filter by metadata or return the original stored vectors.
+
+#### 🔍 Basic Search (Returning Top 2 most similar)
+
+```python
+print("\n--- Query returning two most similar results ---")
+results = index.query(vector=query_vector, top_k=2)
+print(results)
+```
+
+*Output*
+```
+[
+  {'id': 'doc_37', 'score': 0.016932480037212372, 'metadata': {'index': '37', 'split': 'test'}}, 
+  {'id': 'doc_33', 'score': 0.019877362996339798, 'metadata': {'split': 'test', 'index': '33'}}
+]
+```
+
+#### 🔍 Query with metadata filter
+
+This filters on the given metadata after conducting the similarity search.
+
+```python
+print("\n--- Querying with filter: author = 'Alice' ---")
+results = index.query(vector=query_vector, filter={"author": "Alice"}, top_k=5)
+print(results)
+```
+
+*Output*
+```
+[
+  {'id': 'doc_001', 'score': 0.0, 'metadata': {'author': 'Alice'}}, 
+  {'id': 'doc_003', 'score': 0.0009883458260446787, 'metadata': {'author': 'Alice'}}, 
+  {'id': 'doc_005', 'score': 0.0011433829786255956, 'metadata': {'author': 'Alice'}}
+]
+```
+
+#### 🔍 Include Vector in Similarity Results
+
+You can optionally return the stored embedding vectors alongside metadata and similarity scores by setting `return_vector=True`. This is useful when you need access to the raw vectors for downstream tasks such as re-ranking, inspection, or hybrid scoring.
+
+```python
+print("\n--- Querying with filter and returning embedding vectors ---")
+results = index.query(vector=query_vector, filter={"split": "test"}, top_k=2, return_vector=True)
+print(results)
+```
+
+*Output*
+```
+[
+  {'id': 'doc_37', 'score': 0.016932480037212372, 'metadata': {'index': '37', 'split': 'test'}, 'vector': [0.36544516682624817, 0.11984539777040482, 0.7143614292144775, 0.8995016813278198]}, 
+  {'id': 'doc_33', 'score': 0.019877362996339798, 'metadata': {'split': 'test', 'index': '33'}, 'vector': [0.8367619514465332, 0.6394991874694824, 0.9291712641716003, 0.9777664542198181]}
+]
+```
+
+#### 📘 `query()` Parameters
+
+The `query()` method retrieves the top-k most similar vectors from the index given an input query vector. Results include the vector ID, similarity score, metadata, and (optionally) the stored vector itself.
+
+| Parameter         | Type                            | Default   | Description                                                                 |
+|------------------|----------------------------------|-----------|-----------------------------------------------------------------------------|
+| `vector`         | `List[float]` or `np.ndarray`    | *required* | The query vector to compare against the index. Must match the index dimension. |
+| `filter`         | `Dict[str, str] \| None`         | `None`    | Optional metadata filter. Only vectors with matching key-value metadata pairs will be considered in the search. |
+| `top_k`          | `int`                            | `10`      | Number of nearest neighbors to return. |
+| `ef_search`      | `int \| None`                    | `max(2 × top_k, 100)` | Search complexity parameter. Higher values improve accuracy at the cost of speed. |
+| `return_vector`  | `bool`                           | `False`   | If `True`, the result objects will include the original embedding vector. Useful for downstream processing like re-ranking or hybrid search. |
+
 <br/>
 
 ### 🧰 Additional functionality
@@ -290,45 +407,6 @@ print(index.list(number=5)) # Shows first 5 records
 
 <br/>
 
-
-#### Query with metadata filter (only Alice documents)
-This pre-filters on the given metadata prior to conducting the similarity search.
-
-```python
-print("\n--- Querying with filter: author = 'Alice' ---")
-results = index.query(vector=query_vector, filter={"author": "Alice"}, top_k=5)
-print(results)
-```
-*Output*
-```
-[
-  {'id': 'doc_001', 'score': 0.0, 'metadata': {'author': 'Alice'}}, 
-  {'id': 'doc_003', 'score': 0.0009883458260446787, 'metadata': {'author': 'Alice'}}, 
-  {'id': 'doc_005', 'score': 0.0011433829786255956, 'metadata': {'author': 'Alice'}}
-]
-```
-
-
-<br/>
-
-#### Include Vector in Similarity Results
-You can optionally return the stored embedding vectors alongside metadata and similarity scores by setting `return_vector=True`. This is useful when you need access to the raw vectors for downstream tasks such as re-ranking, inspection, or hybrid scoring.
-
-```python
-print("\n--- Querying with filter and returning embedding vectors ---")
-results = index.query(vector=query_vector, filter={"split": "test"}, top_k=2, return_vector=True)
-print(results)
-```
-*Output*
-```
-[
-  {'id': 'doc_37', 'score': 0.016932480037212372, 'metadata': {'index': '37', 'split': 'test'}, 'vector': [0.36544516682624817, 0.11984539777040482, 0.7143614292144775, 0.8995016813278198]}, 
-  {'id': 'doc_33', 'score': 0.019877362996339798, 'metadata': {'split': 'test', 'index': '33'}, 'vector': [0.8367619514465332, 0.6394991874694824, 0.9291712641716003, 0.9777664542198181]}
-]
-```
-
-
-<br/>
 
 ## 📄 License
 
