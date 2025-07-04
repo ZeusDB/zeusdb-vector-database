@@ -113,7 +113,7 @@ vdb = VectorDatabase()
 # Initialize and set up the database resources
 index = vdb.create_index_hnsw(dim = 8, space = "cosine", M = 16, ef_construction = 200, expected_size=5)
 
-# Upload vector records using the unified `add()` method
+# Vector embeddings with accompanying ID's and Metadata
 records = [
     {"id": "doc_001", "values": [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7], "metadata": {"author": "Alice"}},
     {"id": "doc_002", "values": [0.9, 0.1, 0.4, 0.2, 0.8, 0.5, 0.3, 0.9], "metadata": {"author": "Bob"}},
@@ -122,24 +122,30 @@ records = [
     {"id": "doc_005", "values": [0.12, 0.22, 0.33, 0.13, 0.45, 0.23, 0.65, 0.71], "metadata": {"author": "Alice"}},
 ]
 
-result = index.add(records)
+# Upload records using the `add()` method
+add_result = index.add(records)
+print("\n--- Add Results Summary ---")
+print(add_result.summary())
 
 # Perform a similarity search and print the top 2 results
 # Query Vector
-query_vec = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
+query_vector = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
 
 # Query with no filter (all documents)
-results = index.query(vector=query_vec, filter=None, top_k=2)
-print("\n--- Raw Results Format ---")
+results = index.query(vector=query_vector, filter=None, top_k=2)
+print("\n--- Query Results Output - Raw ---")
 print(results)
 
-print("\n--- Formatted Results ---")
+print("\n--- Query Results Output - Formatted ---")
 for i, res in enumerate(results, 1):
     print(f"{i}. ID: {res['id']}, Score: {res['score']:.4f}, Metadata: {res['metadata']}")
 ```
 
 *Results Output:*
 ```
+--- Add Results Summary ---
+✅ 5 inserted, ❌ 0 errors
+
 --- Raw Results Format ---
 [{'id': 'doc_001', 'score': 0.0, 'metadata': {'author': 'Alice'}}, {'id': 'doc_003', 'score': 0.0009883458260446787, 'metadata': {'author': 'Alice'}}]
 
@@ -150,45 +156,45 @@ for i, res in enumerate(results, 1):
 
 <br/>
 
-### ➕ Adding Vectors – Multiple Formats Supported
+### ➕ How to Add Data – Multiple Formats Supported
 
 ZeusDB Vector Database supports multiple intuitive ways to insert data using index.add(...). All formats accept optional metadata per record.
 
 #### ✅ Format 1 – Single Object
 
 ```python
-index.add({
+add_result = index.add({
     "id": "doc1",
     "values": [0.1, 0.2],
     "metadata": {"text": "hello"}
 })
 
-print(result.summary())     # ✅ 1 inserted, ❌ 0 errors
-print(result.is_success())  # True
+print(add_result.summary())     # ✅ 1 inserted, ❌ 0 errors
+print(add_result.is_success())  # True
 ```
 
 #### ✅ Format 2 – List of Objects
 
 ```python
-index.add([
+add_result = index.add([
     {"id": "doc1", "values": [0.1, 0.2], "metadata": {"text": "hello"}},
     {"id": "doc2", "values": [0.3, 0.4], "metadata": {"text": "world"}}
 ])
 
-print(result.summary())       # ✅ 2 inserted, ❌ 0 errors
-print(result.vector_shape)    # (2, 2)
-print(result.errors)          # []
+print(add_result.summary())       # ✅ 2 inserted, ❌ 0 errors
+print(add_result.vector_shape)    # (2, 2)
+print(add_result.errors)          # []
 ```
 
 #### ✅ Format 3 – Separate Arrays
 
 ```python
-index.add({
+add_result = index.add({
     "ids": ["doc1", "doc2"],
     "embeddings": [[0.1, 0.2], [0.3, 0.4]],
     "metadatas": [{"text": "hello"}, {"text": "world"}]
 })
-print(result)  # BatchResult(inserted=2, errors=0, shape=(2, 2))
+print(add_result)  # BatchResult(inserted=2, errors=0, shape=(2, 2))
 ```
 
 #### ✅ Format 4 – Using NumPy Arrays
