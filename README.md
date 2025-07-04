@@ -194,7 +194,7 @@ add_result = index.add({
     "embeddings": [[0.1, 0.2], [0.3, 0.4]],
     "metadatas": [{"text": "hello"}, {"text": "world"}]
 })
-print(add_result)  # BatchResult(inserted=2, errors=0, shape=(2, 2))
+print(add_result)  # AddResult(inserted=2, errors=0, shape=(2, 2))
 ```
 
 #### ✅ Format 4 – Using NumPy Arrays
@@ -214,7 +214,7 @@ result = index.add(data)
 print(result.summary())   # ✅ 2 inserted, ❌ 0 errors
 ```
 
-Each format is automatically parsed and validated internally, including support for NumPy arrays (np.ndarray). Errors and successes are returned in a structured BatchResult object for easy debugging and logging.
+Each format is automatically parsed and validated internally, including support for NumPy arrays (np.ndarray). Errors and successes are returned in a structured AddResult object for easy debugging and logging.
 
 <br/>
 
@@ -292,6 +292,25 @@ print(results)
   {'id': 'doc_001', 'score': 0.0, 'metadata': {'author': 'Alice'}}, 
   {'id': 'doc_003', 'score': 0.0009883458260446787, 'metadata': {'author': 'Alice'}}, 
   {'id': 'doc_005', 'score': 0.0011433829786255956, 'metadata': {'author': 'Alice'}}
+]
+```
+
+
+<br/>
+
+#### Include Vector in Similarity Results
+You can optionally return the stored embedding vectors alongside metadata and similarity scores by setting `return_vector=True`. This is useful when you need access to the raw vectors for downstream tasks such as re-ranking, inspection, or hybrid scoring.
+
+```python
+print("\n--- Querying with filter and returning embedding vectors ---")
+results = index.query(vector=query_vector, filter={"split": "test"}, top_k=2, return_vector=True)
+print(results)
+```
+*Output*
+```
+[
+  {'id': 'doc_37', 'score': 0.016932480037212372, 'metadata': {'index': '37', 'split': 'test'}, 'vector': [0.36544516682624817, 0.11984539777040482, 0.7143614292144775, 0.8995016813278198]}, 
+  {'id': 'doc_33', 'score': 0.019877362996339798, 'metadata': {'split': 'test', 'index': '33'}, 'vector': [0.8367619514465332, 0.6394991874694824, 0.9291712641716003, 0.9777664542198181]}
 ]
 ```
 
