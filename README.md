@@ -160,6 +160,8 @@ for i, res in enumerate(results, 1):
 
 ZeusDB Vector Database supports multiple intuitive ways to insert data using index.add(...). All formats accept optional metadata per record.
 
+Each format is automatically parsed and validated internally, including support for NumPy arrays (np.ndarray). Errors and successes are returned in a structured AddResult object for easy debugging and logging.
+
 #### ✅ Format 1 – Single Object
 
 ```python
@@ -214,7 +216,18 @@ result = index.add(data)
 print(result.summary())   # ✅ 2 inserted, ❌ 0 errors
 ```
 
-Each format is automatically parsed and validated internally, including support for NumPy arrays (np.ndarray). Errors and successes are returned in a structured AddResult object for easy debugging and logging.
+#### ✅ Format 5 – Separate Arrays with NumPy
+
+```python
+add_result = index.add({
+    "ids": ["doc1", "doc2"],
+    "embeddings": np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+    "metadatas": [{"text": "hello"}, {"text": "world"}]
+})
+print(add_result)  # AddResult(inserted=2, errors=0, shape=(2, 2))
+```
+
+This format is highly performant and leverages NumPy's internal memory layout for efficient transfer of data.
 
 <br/>
 
