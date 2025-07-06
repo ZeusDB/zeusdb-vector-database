@@ -16,7 +16,6 @@
         <a href="https://pypi.org/project/zeusdb-vector-database/"><img src="https://img.shields.io/pypi/v/zeusdb-vector-database?label=PyPI&color=blue"></a>&nbsp;
         <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%7C3.11%7C3.12%7C3.13-blue?logo=python&logoColor=ffdd54"></a>&nbsp;
         <a href="https://github.com/zeusdb/zeusdb-vector-database/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>&nbsp;
-        <a href="https://github.com/zeusdb/zeusdb-vector-database"><img src="https://img.shields.io/badge/Vector%20DB-blue.svg"></a>&nbsp;
         <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Powered%20by-Rust-black?logo=rust&logoColor=white" alt="Powered by Rust"></a>&nbsp;
       </td>
     </tr>
@@ -145,17 +144,17 @@ for i, res in enumerate(results, 1):
 
 ## ✨ Usage
 
-ZeusDB makes it easy to work with high-dimensional vector data using a fast, memory-efficient HNSW index. Whether you're building semantic search, recommendation engines, or embedding-based clustering, the workflow is simple and intuitive:
+**ZeusDB** makes it easy to work with high-dimensional vector data using a fast, memory-efficient HNSW index. Whether you're building semantic search, recommendation engines, or embedding-based clustering, the workflow is simple and intuitive.
 
-Three simple steps:
+**Three simple steps**
 
-  1. **Create an index**
-
-  2. **Add data to the index**
-
-  3. **Conduct a similarity search**
+1. **Create an index**  
+2. **Add data to the index**  
+3. **Conduct a similarity search**
 
 Each step is covered below.
+
+<br/>
 
 ### 1️⃣ Create an Index
 
