@@ -1,6 +1,3 @@
-
-![zeusdb-github-badge-rounded](https://github.com/user-attachments/assets/e140d900-1160-4eaa-85c0-2b3507a5f0f5)
-
 <p align="center" width="100%">
   <img src="https://github.com/user-attachments/assets/ad21baec-6f4c-445c-b423-88a081ca2b97" alt="zeusdb-vector-database-logo-cropped" />
   <h1 align="center">ZeusDB Vector Database</h1>
