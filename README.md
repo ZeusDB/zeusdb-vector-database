@@ -145,7 +145,7 @@ for i, res in enumerate(results, 1):
 
 ## ✨ Usage
 
-**ZeusDB** makes it easy to work with high-dimensional vector data using a fast, memory-efficient HNSW index. Whether you're building semantic search, recommendation engines, or embedding-based clustering, the workflow is simple and intuitive.
+ZeusDB Vector Database makes it easy to work with high-dimensional vector data using a fast, memory-efficient HNSW index. Whether you're building semantic search, recommendation engines, or embedding-based clustering, the workflow is simple and intuitive.
 
 **Three simple steps**
 
