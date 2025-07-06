@@ -24,7 +24,7 @@ result = index.add({
 })
 
 print("\n--- Shows Data Insertion Results ---")
-print(f"Batch result: {result}")
+print(f"Add result: {result}")
 
 # Show updated index info
 print("\n--- Shows Index Information ---")

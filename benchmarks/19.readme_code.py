@@ -16,21 +16,33 @@ records = [
     {"id": "doc_005", "values": [0.12, 0.22, 0.33, 0.13, 0.45, 0.23, 0.65, 0.71], "metadata": {"author": "Alice"}},
 ]
 
-result = index.add(records)
+# Upload records using the `add()` method
+add_result = index.add(records)
+print("\n--- Add Results Summary ---")
+print(add_result.summary())
 
 # Perform a similarity search and print the top 2 results
 # Query Vector
-query_vec = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
+query_vector = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
 
 # Query with no filter (all documents)
-results = index.query(vector=query_vec, filter=None, top_k=2)
-print("\n--- Raw Results Format ---")
+results = index.query(vector=query_vector, filter=None, top_k=2)
+print("\n--- Query Results Output - Raw ---")
 print(results)
 
-print("\n--- Formatted Results ---")
+print("\n--- Query Results Output - Formatted ---")
 for i, res in enumerate(results, 1):
     print(f"{i}. ID: {res['id']}, Score: {res['score']:.4f}, Metadata: {res['metadata']}")
 
 print("\n--- Querying with filter: author = 'Alice' ---")
-results2 = index.query(vector=query_vec, filter={"author": "Alice"}, top_k=5)
+results2 = index.query(vector=query_vector, filter={"author": "Alice"}, top_k=5)
 print(results2)
+
+
+
+
+
+
+
+
+
