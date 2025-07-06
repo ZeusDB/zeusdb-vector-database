@@ -30,8 +30,8 @@ result = index.add({
 })
 
 print("\n--- Shows Data Insertion Results ---")
-print(f"Batch result: {result}")
-# Output: BatchResult(inserted=1000, errors=0, shape=(1000, 384))
+print(f"Add result: {result}")
+# Output: AddResult(inserted=1000, errors=0, shape=(1000, 384))
 
 # Outputs the details of the HNSW index
 print("\n--- Shows Index Information ---")

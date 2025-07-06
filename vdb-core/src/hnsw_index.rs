@@ -7,7 +7,7 @@ use hnsw_rs::prelude::{Hnsw, DistCosine};
 // Structured results
 #[derive(Debug, Clone)]
 #[pyclass]
-pub struct BatchResult {
+pub struct AddResult {
     #[pyo3(get)]
     pub total_inserted: usize,
     #[pyo3(get)]
@@ -19,10 +19,10 @@ pub struct BatchResult {
 }
 
 #[pymethods]
-impl BatchResult {
+impl AddResult {
     fn __repr__(&self) -> String {
         format!(
-            "BatchResult(inserted={}, errors={}, shape={:?})",
+            "AddResult(inserted={}, errors={}, shape={:?})",
             self.total_inserted, self.total_errors, self.vector_shape
         )
     }
@@ -120,26 +120,8 @@ impl HNSWIndex {
         })
     }
 
-    /// Add vectors to the index. Accepts multiple formats:
-    /// 
-    /// Format 1 - Single object:
-    ///     index.add({"id": "doc1", "values": [0.1, 0.2], "metadata": {"text": "hello"}})
-    /// 
-    /// Format 2 - List of objects:
-    ///     index.add([
-    ///         {"id": "doc1", "values": [0.1, 0.2], "metadata": {"text": "hello"}},
-    ///         {"id": "doc2", "values": [0.3, 0.4], "metadata": {"text": "world"}}
-    ///     ])
-    /// 
-    /// Format 3 - Separate arrays:
-    ///     index.add({
-    ///         "ids": ["doc1", "doc2"],
-    ///         "embeddings": [[0.1, 0.2], [0.3, 0.4]],
-    ///         "metadatas": [{"text": "hello"}, {"text": "world"}]
-    ///     })    
-
     /// Unified add method supporting all input formats
-    pub fn add(&mut self, data: Bound<PyAny>) -> PyResult<BatchResult> {
+    pub fn add(&mut self, data: Bound<PyAny>) -> PyResult<AddResult> {
         let records = if let Ok(list) = data.downcast::<PyList>() {
             // Format 2: List of objects
             self.parse_list_format(&list)?
@@ -258,25 +240,6 @@ impl HNSWIndex {
 
     /// HELPER FUNCTION
     /// Extract vector from dict, supporting both "values" and "vector" keys
-    // fn extract_vector_from_dict(&self, dict: &Bound<PyDict>, context: &str) -> PyResult<Vec<f32>> {
-    //     let vector_item = dict.get_item("values")?
-    //         .or_else(|| dict.get_item("vector").ok().flatten())
-    //         .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-    //             format!("{}: missing required field 'values' or 'vector'", context)
-    //         ))?;
-
-    //     // Try NumPy array first, then fall back to Vec<f32>
-    //     if let Ok(array) = vector_item.downcast::<PyArray2<f32>>() {
-    //         let readonly = array.readonly();
-    //         let slice = readonly.as_slice()?;
-    //         Ok(slice.to_vec())
-    //     } else {
-    //         vector_item.extract::<Vec<f32>>()
-    //             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-    //                 format!("{}: invalid vector format: {}", context, e)
-    //             ))
-    //     }
-    // }
     fn extract_vector_from_dict(&self, dict: &Bound<PyDict>, context: &str) -> PyResult<Vec<f32>> {
         let vector_item = dict.get_item("values")?
             .or_else(|| dict.get_item("vector").ok().flatten())
@@ -350,9 +313,9 @@ impl HNSWIndex {
 
 
     /// Internal batch processing with validation and structured results
-    fn add_batch_internal(&mut self, records: Vec<(String, Vec<f32>, Option<HashMap<String, String>>)>) -> PyResult<BatchResult> {
+    fn add_batch_internal(&mut self, records: Vec<(String, Vec<f32>, Option<HashMap<String, String>>)>) -> PyResult<AddResult> {
         if records.is_empty() {
-            return Ok(BatchResult {
+            return Ok(AddResult {
                 total_inserted: 0,
                 total_errors: 0,
                 errors: vec![],
@@ -391,7 +354,7 @@ impl HNSWIndex {
             }
         }
 
-        Ok(BatchResult {
+        Ok(AddResult {
             total_inserted: success_count,
             total_errors: errors.len(),
             errors,
@@ -401,34 +364,6 @@ impl HNSWIndex {
 
 
     /// Internal add_point without external validation (already validated)
-    // fn add_point_internal(&mut self, id: String, vector: Vec<f32>, metadata: Option<HashMap<String, String>>) -> PyResult<()> {
-    //     // Check for duplicate ID
-    //     if self.vectors.contains_key(&id) {
-    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-    //             "Duplicate ID: '{}' already exists", id
-    //         )));
-    //     }
-
-    //     // Assign internal index
-    //     let internal_id = self.id_counter;
-    //     self.id_counter += 1;
-
-    //     // Store the vector and mappings
-    //     self.vectors.insert(id.clone(), vector.clone());
-    //     self.id_map.insert(id.clone(), internal_id);
-    //     self.rev_map.insert(internal_id, id.clone());
-
-    //     // Store metadata if provided
-    //     if let Some(meta) = metadata {
-    //         self.vector_metadata.insert(id.clone(), meta);
-    //     }
-
-    //     // Insert into HNSW using a reference to the stored vector
-    //     let stored_vec = self.vectors.get(&id).unwrap();
-    //     self.hnsw.insert((stored_vec.as_slice(), internal_id));
-
-    //     Ok(())
-    // }
     fn add_point_internal(&mut self, id: String, vector: Vec<f32>, metadata: Option<HashMap<String, String>>) -> PyResult<()> {
         // Check for duplicate ID first (cheapest operation)
         if self.vectors.contains_key(&id) {
@@ -459,125 +394,6 @@ impl HNSWIndex {
 
         Ok(())
     }
-
-
-
-
-
-    /// DEPRECATED: Use `add()` instead
-    /// Adds a vector to the index. Fails if the ID already exists.
-    pub fn add_point(&mut self, id: String, vector: Vec<f32>, metadata: Option<HashMap<String, String>>) -> PyResult<()> {
-        // Check vector dimension
-        if vector.len() != self.dim {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Vector dimension mismatch: expected {}, got {}",
-                self.dim, vector.len()
-            )));
-        }
-
-        // Check for duplicate ID
-        if self.vectors.contains_key(&id) {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Duplicate ID: '{}' already exists", id
-            )));
-        }
-
-        // Assign internal index
-        let internal_id = self.id_counter;
-        self.id_counter += 1;
-
-        // Store the vector and mappings
-        self.vectors.insert(id.clone(), vector.clone());
-        self.id_map.insert(id.clone(), internal_id);
-        self.rev_map.insert(internal_id, id.clone());
-
-        // Store metadata if provided
-        if let Some(meta) = metadata {
-            self.vector_metadata.insert(id.clone(), meta);
-        }
-
-        // Insert into HNSW using a reference to the stored vector
-        let stored_vec = self.vectors.get(&id).unwrap();
-        self.hnsw.insert((stored_vec.as_slice(), internal_id));
-
-        Ok(())
-    }
-
-    /// DEPRECATED: Use `add()` instead 
-    /// Add multiple vectors in batch for better performance
-    pub fn add_batch(&mut self, 
-        points: Vec<(String, Vec<f32>, Option<HashMap<String, String>>)>
-    ) -> PyResult<HashMap<String, Vec<String>>> {
-        let mut errors = Vec::new();
-        let mut success_count = 0;
-
-        for (id, vector, metadata) in points {
-            match self.add_point(id.clone(), vector, metadata) {
-                Ok(()) => success_count += 1,
-                Err(e) => errors.push(format!("ID '{}': {}", id, e)),
-            }
-        }
-
-        let mut result = HashMap::new();
-        result.insert("success_count".to_string(), vec![success_count.to_string()]);
-        result.insert("error_count".to_string(), vec![errors.len().to_string()]);
-        result.insert("errors".to_string(), errors);
-
-        Ok(result)
-    }
-
-    // /// DEPRECIATED: This one returns a list of tuples (id, score)
-    // /// Query the index for the k-nearest neighbors of a vector
-    // #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None))]
-    // pub fn query(
-    //     &self,
-    //     vector: Vec<f32>,
-    //     filter: Option<HashMap<String, String>>,
-    //     top_k: usize,
-    //     ef_search: Option<usize>,
-    // ) -> PyResult<Vec<(String, f32)>> {
-    //     if vector.len() != self.dim {
-    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-    //             "Query vector dimension mismatch: expected {}, got {}",
-    //             self.dim, vector.len()
-    //         )));
-    //     }
-
-    //     // Get results from HNSW graph
-    //     let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
-    //     let results = self.hnsw.search(&vector, top_k, ef);
-
-    //     let mut filtered_results = Vec::new();
-
-    //     for neighbor in results {
-    //         let score = neighbor.distance;
-    //         let internal_id = neighbor.get_origin_id();
-            
-    //         if let Some(ext_id) = self.rev_map.get(&internal_id) {
-    //             // Apply filtering if provided
-    //             if let Some(ref filter_map) = filter {
-    //                 if let Some(meta) = self.vector_metadata.get(ext_id) {
-    //                     let mut matches = true;
-    //                     for (k, v) in filter_map {
-    //                         if meta.get(k) != Some(v) {
-    //                             matches = false;
-    //                             break;
-    //                         }
-    //                     }
-    //                     if !matches {
-    //                         continue;
-    //                     }
-    //                 } else {
-    //                     // No metadata, but filter required - skip
-    //                     continue;
-    //                 }
-    //             }
-    //             filtered_results.push((ext_id.clone(), score));
-    //         }
-    //     }
-
-    //     Ok(filtered_results)
-    // }
 
 
     /// Search for the k-nearest neighbors of a vector
@@ -640,138 +456,6 @@ impl HNSWIndex {
 
         Ok(output)
     }
-
-
-
-
-
-
-
-
-
-    // /// DEPRECIATED: This one returns a list of tuples (id, score)
-    // /// Search with metadata included in results
-    // #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, include_metadata=false))]
-    // pub fn search_with_metadata(
-    //     &self,
-    //     vector: Vec<f32>,
-    //     filter: Option<HashMap<String, String>>,
-    //     top_k: usize,
-    //     ef_search: Option<usize>,
-    //     include_metadata: bool,
-    // ) -> PyResult<Vec<(String, f32, Option<HashMap<String, String>>)>> {
-    //     if vector.len() != self.dim {
-    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-    //             "Query vector dimension mismatch: expected {}, got {}",
-    //             self.dim, vector.len()
-    //         )));
-    //     }
-
-    //     let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
-    //     let results = self.hnsw.search(&vector, top_k, ef);
-
-    //     let mut filtered_results = Vec::new();
-
-    //     for neighbor in results {
-    //         let score = neighbor.distance;
-    //         let internal_id = neighbor.get_origin_id();
-            
-    //         if let Some(ext_id) = self.rev_map.get(&internal_id) {
-    //             // Apply filtering if provided
-    //             if let Some(ref filter_map) = filter {
-    //                 if let Some(meta) = self.vector_metadata.get(ext_id) {
-    //                     let mut matches = true;
-    //                     for (k, v) in filter_map {
-    //                         if meta.get(k) != Some(v) {
-    //                             matches = false;
-    //                             break;
-    //                         }
-    //                     }
-    //                     if !matches {
-    //                         continue;
-    //                     }
-    //                 } else {
-    //                     continue;
-    //                 }
-    //             }
-
-    //             let metadata = if include_metadata {
-    //                 self.vector_metadata.get(ext_id).cloned()
-    //             } else {
-    //                 None
-    //             };
-
-    //             filtered_results.push((ext_id.clone(), score, metadata));
-    //         }
-    //     }
-
-    //     Ok(filtered_results)
-    // }
-
-
-    // /// DEPRECIATED: Use `query()` instead. Have made query the single do all function.
-    // /// Search with metadata included in results
-    // #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, include_metadata=true))]
-    // pub fn search_with_metadata(
-    //     &self,
-    //     py: Python<'_>,
-    //     vector: Vec<f32>,
-    //     filter: Option<HashMap<String, String>>,
-    //     top_k: usize,
-    //     ef_search: Option<usize>,
-    //     include_metadata: bool,
-    // ) -> PyResult<Vec<Py<PyDict>>> {
-    //     if vector.len() != self.dim {
-    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-    //             "Query vector dimension mismatch: expected {}, got {}",
-    //             self.dim, vector.len()
-    //         )));
-    //     }
-
-    //     let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
-    //     let results = self.hnsw.search(&vector, top_k, ef);
-
-    //     let mut output = Vec::with_capacity(results.len());
-
-    //     for neighbor in results {
-    //         let score = neighbor.distance;
-    //         let internal_id = neighbor.get_origin_id();
-
-    //         if let Some(ext_id) = self.rev_map.get(&internal_id) {
-    //             // Apply optional filtering
-    //             if let Some(ref filter_map) = filter {
-    //                 if let Some(meta) = self.vector_metadata.get(ext_id) {
-    //                     let matches = filter_map.iter().all(|(k, v)| meta.get(k) == Some(v));
-    //                     if !matches {
-    //                         continue;
-    //                     }
-    //                 } else {
-    //                     continue;
-    //                 }
-    //             }
-
-    //             let dict = PyDict::new(py);
-    //             dict.set_item("id", ext_id)?;
-    //             dict.set_item("score", score)?;
-
-    //             if include_metadata {
-    //                 let metadata = self.vector_metadata.get(ext_id).cloned().unwrap_or_default();
-    //                 dict.set_item("metadata", metadata)?;
-    //             } else {
-    //                 dict.set_item("metadata", PyDict::new(py))?;
-    //             }
-
-    //             output.push(dict.into());
-    //         }
-    //     }
-
-    //     Ok(output)
-    // }
-
-
-
-
-
 
 
 

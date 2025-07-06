@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.0.5] - 2025-07-06
+
+### Changed
+- Renamed BatchResult → AddResult to improve semantic clarity in both Rust and Python layers.
+- Updated unit tests for `create_index` and `similarity_search` methods to improve clarity and maintain edge case coverage.
+- Refactored test structure for better readability and maintainability.
+- Expanded the README with clearer descriptions of the core 3-step workflow.
+- Improved formatting and language for better readability and developer onboarding.
+
+---
+
 ## [0.0.4] - 2025-07-03
 
 ### Added
