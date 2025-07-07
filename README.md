@@ -193,7 +193,7 @@ index = vdb.create_index_hnsw(
 
 ### 2️⃣ Add Data to the Index
 
-ZeusDB provides a flexible `.add(...)` method that supports multiple input formats for inserting vectors into the index. Whether you're adding a single record, a list of documents, or structured arrays, the API is designed to be both intuitive and robust. Each record can include optional metadata for filtering or downstream use.
+ZeusDB provides a flexible `.add(...)` method that supports multiple input formats for inserting or updating vectors in the index. Whether you're adding a single record, a list of documents, or structured arrays, the API is designed to be both intuitive and robust. Each record can include optional metadata for filtering or downstream use.
 
 All formats return an AddResult containing total_inserted, total_errors, and detailed error messages for any invalid entries.
 
@@ -264,7 +264,7 @@ add_result = index.add({
 print(add_result)  # AddResult(inserted=2, errors=0, shape=(2, 2))
 ```
 
-Each format is automatically parsed and validated internally, including support for NumPy arrays (np.ndarray). Errors and successes are returned in a structured AddResult object for easy debugging and logging.
+Each format is parsed and validated automatically. Invalid records are skipped, and detailed error messages are returned to help with debugging and retry workflows.
 
 #### 📘 `add()` Parameters
 
@@ -272,10 +272,16 @@ The `add()` method inserts one or more vectors into the index. Multiple data for
 
 | Parameter | Type                                | Default | Description |
 |-----------|-------------------------------------|---------|-------------|
-| `data`    | `dict`, `list[dict]`, or `dict of arrays` | *required* | Input records to be added to the index. Supports multiple formats |
+| `data`    | `dict`, `list[dict]`, or `dict of arrays` | *required* | Input records to upsert into the index. Supports multiple formats |
 
 **Returns:**  
-`AddResult` – an object with `total_inserted`, `total_errors`, `errors`, and `vector_shape`. Helpful for validation, logging, and debugging.
+`AddResult` includes: – 
+- `total_success`: number of vectors successfully inserted or updated
+- `total_errors`: number of failed records
+- `errors`: list of error messages
+- `vector_shape`: the shape of the processed vector batch
+
+Helpful for validation, logging, and debugging.
 
 <br/>
 
@@ -352,7 +358,9 @@ The `query()` method retrieves the top-k most similar vectors from the index giv
 
 ### 🧰 Additional functionality
 
-#### Check the details of your HNSW index 
+ZeusDB Vector Database includes a suite of utility functions to help you inspect, manage, and maintain your index. You can view index configuration, attach custom metadata, list stored records, and remove vectors by ID. These tools make it easy to monitor and evolve your index over time,  whether you are experimenting locally or deploying in production.
+
+#### ☑️ Check the details of your HNSW index 
 
 ```python
 print(index.info()) 
@@ -365,7 +373,7 @@ HNSWIndex(dim=8, space=cosine, M=16, ef_construction=200, expected_size=5, vecto
 <br/>
 
 
-#### Add index level metadata
+#### ☑️ Add index level metadata
 
 ```python
 index.add_metadata({
@@ -396,7 +404,7 @@ John Smith
 <br/>
 
 
-#### List records in the index
+#### ☑️ List records in the index
 
 ```python
 print("\n--- Index Shows first 5 records ---")
@@ -409,6 +417,61 @@ print(index.list(number=5)) # Shows first 5 records
 
 <br/>
 
+#### ☑️ Remove Records 
+
+ZeusDB allows you to remove a vector and its associated metadata from the index using the .remove_point(id) method. This performs a <u>logical deletion</u>, meaning:
+- The vector is deleted from internal storage.
+- The metadata is removed.
+- The vector ID is no longer accessible via .contains(), .get_vector(), or .query().
+
+```python
+# Remove the point using its ID
+index.remove_point("doc1")  # "doc1" is the unique vector ID
+
+print("\n--- Check Removal ---")
+exists = index.contains("doc1")
+print(f"Point 'doc1' {'found' if exists else 'not found'} in index")
+```
+*Output*
+```
+--- Check Removal ---
+Point 'doc1' not found in index
+```
+
+**⚠️ Please Note:** Due to the nature of HNSW, the underlying graph node remains in memory, even after removing a point. This is common for HNSW implementations. To fully remove stale graph entries, consider rebuilding the index.
+
+<br/>
+
+#### ☑️ Retrieve records by ID
+
+Use `get_records()` to fetch one or more records by ID, with optional vector inclusion.
+
+```python
+# Single record
+print("\n--- Get Single Record ---")
+rec = index.get_records("doc1")
+print(rec)
+
+# Multiple records
+print("\n--- Get Multiple Records ---")
+batch = index.get_records(["doc1", "doc3"])
+print(batch)
+
+# Metadata only
+print("\n--- Get Metadata only ---")
+meta_only = index.get_records(["doc1", "doc2"], return_vector=False)
+print(meta_only)
+
+# Missing ID silently ignored
+print("\n--- Partial only ---")
+partial = index.get_records(["doc1", "missing_id"])
+print(partial)
+```
+
+⚠️ `get_records()` only returns results for IDs that exist in the index. Missing IDs are silently skipped.
+
+
+<br/>
 
 ## 📄 License
 

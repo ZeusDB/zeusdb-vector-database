@@ -330,20 +330,7 @@ impl HNSWIndex {
         self.rev_map.reserve(capacity);
         self.vector_metadata.reserve(capacity);
 
-        // Validate vector dimensions early
-        let expected_dim = self.dim;
-        for (i, (id, vector, _)) in records.iter().enumerate() {
-            if vector.len() != expected_dim {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!(
-                        "Inconsistent vector dimensions at index {}: expected {}, got {} (id: '{}')",
-                        i, expected_dim, vector.len(), id
-                    )
-                ));
-            }
-        }
-
-        // Process records
+        // Process records - each handles its own validation
         let mut errors = Vec::with_capacity(records.len());
         let mut success_count = 0;
 
@@ -358,42 +345,46 @@ impl HNSWIndex {
             total_inserted: success_count,
             total_errors: errors.len(),
             errors,
-            vector_shape: Some((records.len(), expected_dim)),
+            vector_shape: Some((records.len(), self.dim)),
         })
     }
 
 
-    /// Internal add_point without external validation (already validated)
+    /// Adds or updates a vector in the index.
+    /// If the ID already exists, the vector and metadata are overwritten.
+    /// Stale graph nodes are left in place but excluded from all queries.
     fn add_point_internal(&mut self, id: String, vector: Vec<f32>, metadata: Option<HashMap<String, String>>) -> PyResult<()> {
-        // Check for duplicate ID first (cheapest operation)
-        if self.vectors.contains_key(&id) {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Duplicate ID: '{}' already exists", id
-            )));
+        if vector.len() != self.dim {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Vector dimension mismatch: expected {}, got {} (id: '{}')", self.dim, vector.len(), id)
+            ));
         }
 
-        // Assign internal index
+        // Logical overwrite: remove any previous data
+        if let Some(internal_id) = self.id_map.remove(&id) {
+            self.rev_map.remove(&internal_id);
+        }
+        self.vectors.remove(&id);
+        self.vector_metadata.remove(&id);
+
         let internal_id = self.id_counter;
         self.id_counter += 1;
 
-        // Store vector first to get stable memory location
         self.vectors.insert(id.clone(), vector);
-    
-        // Get stable reference to stored vector for HNSW
         let stored_vec = self.vectors.get(&id).unwrap();
         self.hnsw.insert((stored_vec.as_slice(), internal_id));
-    
-        // Store ID mappings (reduced cloning)
+
         self.id_map.insert(id.clone(), internal_id);
         self.rev_map.insert(internal_id, id.clone());
-    
-        // Store metadata with final move (no clone needed)
+
         if let Some(meta) = metadata {
             self.vector_metadata.insert(id, meta);
         }
 
         Ok(())
     }
+
+
 
 
     /// Search for the k-nearest neighbors of a vector
@@ -459,17 +450,72 @@ impl HNSWIndex {
 
 
 
+    /// Get one or more records by ID(s).
+    /// Accepts a single ID or a list of IDs, and optionally returns vectors.
+    ///
+    /// Parameters:
+    /// - `input`: `str` or `List[str]`
+    /// - `return_vector`: if `True`, include the embedding vector in each result
+    ///
+    /// Returns:
+    /// - List of dictionaries with fields: `id`, `metadata`, and optionally `vector`
+    #[pyo3(signature = (input, return_vector = true))]
+    pub fn get_records(&self, py: Python<'_>, input: &Bound<PyAny>, return_vector: bool) -> PyResult<Vec<Py<PyDict>>> {
+        let ids: Vec<String> = if let Ok(id_str) = input.extract::<String>() {
+            vec![id_str]
+        } else if let Ok(id_list) = input.extract::<Vec<String>>() {
+            id_list
+        } else {
+            return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                "Expected a string or a list of strings for ID(s)"
+            ));
+        };
 
+        let mut records = Vec::with_capacity(ids.len());
 
-    /// Get vector by ID
-    pub fn get_vector(&self, id: String) -> Option<Vec<f32>> {
-        self.vectors.get(&id).cloned()
+        for id in ids {
+            if let Some(vector) = self.vectors.get(&id) {
+                let metadata = self.vector_metadata.get(&id).cloned().unwrap_or_default();
+
+                let dict = PyDict::new(py);
+                dict.set_item("id", id)?;
+                dict.set_item("metadata", metadata)?;
+
+                if return_vector {
+                    dict.set_item("vector", vector.clone())?;
+                }
+
+                records.push(dict.into());
+            }
+        }
+
+        Ok(records)
     }
 
-    /// Get metadata by ID
-    pub fn get_vector_metadata(&self, id: String) -> Option<HashMap<String, String>> {
-        self.vector_metadata.get(&id).cloned()
-    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     /// Get comprehensive statistics
     pub fn get_stats(&self) -> HashMap<String, String> {
@@ -533,13 +579,24 @@ impl HNSWIndex {
     }
 
     /// Remove vector by ID
+    /// Removes the vector and its metadata from all accessible mappings.
+    /// The point will no longer appear in queries, contains() checks, or be
+    /// retrievable by ID. 
+    /// 
+    /// Note: Due to HNSW algorithm limitations, the underlying graph structure
+    /// retains stale nodes internally, but these are completely inaccessible
+    /// to users and do not affect query results or performance.
+    /// 
+    /// Returns:
+    ///   - `Ok(true)` if the vector was found and removed
+    ///   - `Ok(false)` if the vector ID was not found
     pub fn remove_point(&mut self, id: String) -> PyResult<bool> {
         if let Some(internal_id) = self.id_map.remove(&id) {
             self.vectors.remove(&id);
             self.vector_metadata.remove(&id);
             self.rev_map.remove(&internal_id);
             // Note: HNSW doesn't support removal, so the graph still contains the point
-            // but it won't be accessible via our mappings
+            // but it won't be accessible via the mappings
             Ok(true)
         } else {
             Ok(false)
