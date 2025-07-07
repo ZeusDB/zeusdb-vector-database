@@ -450,17 +450,72 @@ impl HNSWIndex {
 
 
 
+    /// Get one or more records by ID(s).
+    /// Accepts a single ID or a list of IDs, and optionally returns vectors.
+    ///
+    /// Parameters:
+    /// - `input`: `str` or `List[str]`
+    /// - `return_vector`: if `True`, include the embedding vector in each result
+    ///
+    /// Returns:
+    /// - List of dictionaries with fields: `id`, `metadata`, and optionally `vector`
+    #[pyo3(signature = (input, return_vector = true))]
+    pub fn get_records(&self, py: Python<'_>, input: &Bound<PyAny>, return_vector: bool) -> PyResult<Vec<Py<PyDict>>> {
+        let ids: Vec<String> = if let Ok(id_str) = input.extract::<String>() {
+            vec![id_str]
+        } else if let Ok(id_list) = input.extract::<Vec<String>>() {
+            id_list
+        } else {
+            return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                "Expected a string or a list of strings for ID(s)"
+            ));
+        };
 
+        let mut records = Vec::with_capacity(ids.len());
 
-    /// Get vector by ID
-    pub fn get_vector(&self, id: String) -> Option<Vec<f32>> {
-        self.vectors.get(&id).cloned()
+        for id in ids {
+            if let Some(vector) = self.vectors.get(&id) {
+                let metadata = self.vector_metadata.get(&id).cloned().unwrap_or_default();
+
+                let dict = PyDict::new(py);
+                dict.set_item("id", id)?;
+                dict.set_item("metadata", metadata)?;
+
+                if return_vector {
+                    dict.set_item("vector", vector.clone())?;
+                }
+
+                records.push(dict.into());
+            }
+        }
+
+        Ok(records)
     }
 
-    /// Get metadata by ID
-    pub fn get_vector_metadata(&self, id: String) -> Option<HashMap<String, String>> {
-        self.vector_metadata.get(&id).cloned()
-    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     /// Get comprehensive statistics
     pub fn get_stats(&self) -> HashMap<String, String> {
@@ -524,13 +579,24 @@ impl HNSWIndex {
     }
 
     /// Remove vector by ID
+    /// Removes the vector and its metadata from all accessible mappings.
+    /// The point will no longer appear in queries, contains() checks, or be
+    /// retrievable by ID. 
+    /// 
+    /// Note: Due to HNSW algorithm limitations, the underlying graph structure
+    /// retains stale nodes internally, but these are completely inaccessible
+    /// to users and do not affect query results or performance.
+    /// 
+    /// Returns:
+    ///   - `Ok(true)` if the vector was found and removed
+    ///   - `Ok(false)` if the vector ID was not found
     pub fn remove_point(&mut self, id: String) -> PyResult<bool> {
         if let Some(internal_id) = self.id_map.remove(&id) {
             self.vectors.remove(&id);
             self.vector_metadata.remove(&id);
             self.rev_map.remove(&internal_id);
             // Note: HNSW doesn't support removal, so the graph still contains the point
-            // but it won't be accessible via our mappings
+            // but it won't be accessible via the mappings
             Ok(true)
         } else {
             Ok(false)
