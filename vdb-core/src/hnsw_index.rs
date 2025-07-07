@@ -330,20 +330,7 @@ impl HNSWIndex {
         self.rev_map.reserve(capacity);
         self.vector_metadata.reserve(capacity);
 
-        // Validate vector dimensions early
-        let expected_dim = self.dim;
-        for (i, (id, vector, _)) in records.iter().enumerate() {
-            if vector.len() != expected_dim {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!(
-                        "Inconsistent vector dimensions at index {}: expected {}, got {} (id: '{}')",
-                        i, expected_dim, vector.len(), id
-                    )
-                ));
-            }
-        }
-
-        // Process records
+        // Process records - each handles its own validation
         let mut errors = Vec::with_capacity(records.len());
         let mut success_count = 0;
 
@@ -358,42 +345,9 @@ impl HNSWIndex {
             total_inserted: success_count,
             total_errors: errors.len(),
             errors,
-            vector_shape: Some((records.len(), expected_dim)),
+            vector_shape: Some((records.len(), self.dim)),
         })
     }
-
-
-    // /// Internal add_point without external validation (already validated)
-    // fn add_point_internal(&mut self, id: String, vector: Vec<f32>, metadata: Option<HashMap<String, String>>) -> PyResult<()> {
-    //     // Check for duplicate ID first (cheapest operation)
-    //     if self.vectors.contains_key(&id) {
-    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-    //             "Duplicate ID: '{}' already exists", id
-    //         )));
-    //     }
-
-    //     // Assign internal index
-    //     let internal_id = self.id_counter;
-    //     self.id_counter += 1;
-
-    //     // Store vector first to get stable memory location
-    //     self.vectors.insert(id.clone(), vector);
-    
-    //     // Get stable reference to stored vector for HNSW
-    //     let stored_vec = self.vectors.get(&id).unwrap();
-    //     self.hnsw.insert((stored_vec.as_slice(), internal_id));
-    
-    //     // Store ID mappings (reduced cloning)
-    //     self.id_map.insert(id.clone(), internal_id);
-    //     self.rev_map.insert(internal_id, id.clone());
-    
-    //     // Store metadata with final move (no clone needed)
-    //     if let Some(meta) = metadata {
-    //         self.vector_metadata.insert(id, meta);
-    //     }
-
-    //     Ok(())
-    // }
 
 
     /// Adds or updates a vector in the index.
