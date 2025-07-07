@@ -358,6 +358,8 @@ The `query()` method retrieves the top-k most similar vectors from the index giv
 
 ### 🧰 Additional functionality
 
+ZeusDB Vector Database includes a suite of utility functions to help you inspect, manage, and maintain your index. You can view index configuration, attach custom metadata, list stored records, and remove vectors by ID. These tools make it easy to monitor and evolve your index over time,  whether you are experimenting locally or deploying in production.
+
 #### ☑️ Check the details of your HNSW index 
 
 ```python
@@ -402,7 +404,7 @@ John Smith
 <br/>
 
 
-#### List records in the index
+#### ☑️ List records in the index
 
 ```python
 print("\n--- Index Shows first 5 records ---")
@@ -417,12 +419,10 @@ print(index.list(number=5)) # Shows first 5 records
 
 #### ☑️ Remove Records 
 
-ZeusDB allows you to remove a vector and its associated metadata from the index using the .remove_point(id) method. This performs a logical deletion, meaning:
+ZeusDB allows you to remove a vector and its associated metadata from the index using the .remove_point(id) method. This performs a <u>logical deletion</u>, meaning:
 - The vector is deleted from internal storage.
 - The metadata is removed.
 - The vector ID is no longer accessible via .contains(), .get_vector(), or .query().
-
-⚠️ However, the underlying HNSW graph still retains the original node, which is standard behavior for HNSW-based indexes.
 
 ```python
 # Remove the point using its ID
@@ -438,7 +438,7 @@ print(f"Point 'doc1' {'found' if exists else 'not found'} in index")
 Point 'doc1' not found in index
 ```
 
-Due to the nature of HNSW, the underlying graph node remains in memory, even after removing a point. This is common for HNSW implementations. To fully remove stale graph entries, consider rebuilding the index from data periodically.
+**⚠️ Please Note:** Due to the nature of HNSW, the underlying graph node remains in memory, even after removing a point. This is common for HNSW implementations. To fully remove stale graph entries, consider rebuilding the index from data periodically.
 
 <br/>
 
