@@ -7,19 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.0.6] - 2025
+## [0.0.6] - 2025-07-07
 
 ### Added
-<!-- Add new features here -->
+- `get_records()` method for retrieving one or more indexed records by ID.
+ - Accepts either a single string ("doc1") or a list of strings (["doc1", "doc2"]).
+ - Optional return_vector parameter (default: True) controls whether embedding vectors are included in the output.
+ - Returns a list of Python dictionaries matching the query() response format
+ - Missing IDs are silently skipped for graceful partial batch access.
+ - Supports efficient batch usage with preallocation and avoids unnecessary `.clone()` calls.
+ - Exposed with PyO3 signature binding for clean Python defaults.
 
 ### Changed
-<!-- Add changed behavior here -->
-
-### Fixed
-<!-- Add bug fixes here -->
+- `add()` now always performs an upsert by default: existing vectors with the same ID are overwritten.
+- Removed distinction between "insert" and "overwrite" modes — no `overwrite` flag is needed.
+- `AddResult` still reports all errors; successful overwrites are counted as successful additions.
+- Old HNSW graph entries are logically removed by clearing internal ID mappings (`rev_map`, `id_map`) — queries will not return outdated vectors.
+- `add()` now fully supports partial success: invalid records (e.g. bad vector shape) no longer abort the entire batch.
+- `AddResult.vector_shape` now reflects total attempted records, even if some fail.
+- Error messages now clearly indicate the failed record by ID and reason, improving debugging and retry workflows.
 
 ### Removed
-<!-- Add removals/deprecations here -->
+- Removed early vector dimension validation in `add_batch_internal()` in favor of per-record validation inside `add_point_internal()`.
 
 ---
 
