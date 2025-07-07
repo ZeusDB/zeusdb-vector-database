@@ -438,7 +438,38 @@ print(f"Point 'doc1' {'found' if exists else 'not found'} in index")
 Point 'doc1' not found in index
 ```
 
-**⚠️ Please Note:** Due to the nature of HNSW, the underlying graph node remains in memory, even after removing a point. This is common for HNSW implementations. To fully remove stale graph entries, consider rebuilding the index from data periodically.
+**⚠️ Please Note:** Due to the nature of HNSW, the underlying graph node remains in memory, even after removing a point. This is common for HNSW implementations. To fully remove stale graph entries, consider rebuilding the index.
+
+<br/>
+
+#### ☑️ Retrieve records by ID
+
+Use `get_records()` to fetch one or more records by ID, with optional vector inclusion.
+
+```python
+# Single record
+print("\n--- Get Single Record ---")
+rec = index.get_records("doc1")
+print(rec)
+
+# Multiple records
+print("\n--- Get Multiple Records ---")
+batch = index.get_records(["doc1", "doc3"])
+print(batch)
+
+# Metadata only
+print("\n--- Get Metadata only ---")
+meta_only = index.get_records(["doc1", "doc2"], return_vector=False)
+print(meta_only)
+
+# Missing ID silently ignored
+print("\n--- Partial only ---")
+partial = index.get_records(["doc1", "missing_id"])
+print(partial)
+```
+
+⚠️ `get_records()` only returns results for IDs that exist in the index. Missing IDs are silently skipped.
+
 
 <br/>
 
