@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.0.7] - 2025-07-08
+
+### Added
+- Support for multiple distance metrics in HNSW index creation:
+  - `"cosine"` (default): cosine distance
+  - `"L2"`: Euclidean distance
+  - `"L1"`: Manhattan distance
+- Metric selection is now configurable via the `space` argument in `VectorDatabase.create_index_hnsw()`
+- Internal Rust implementation uses an enum-based dispatch for safe and performant metric switching
+- Comprehensive test coverage added for all three metrics using shared query and add APIs
+
+### Changed
+- Distance metric names (`space` parameter) are now case-insensitive:
+  - Accepts "L1", "l1", "L2", "l2", "Cosine", "cosine", etc.
+- Internally stores normalized lowercase form (e.g., "l1") for consistency
+- Error messages preserve original user input for clarity
+
+---
+
 ## [0.0.6] - 2025-07-07
 
 ### Added

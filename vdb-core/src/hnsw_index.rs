@@ -2,7 +2,15 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use std::collections::HashMap;
-use hnsw_rs::prelude::{Hnsw, DistCosine};
+use hnsw_rs::prelude::{Hnsw, DistCosine, DistL2, DistL1};
+
+// Define the distance type enum to handle different distance metrics
+enum DistanceType {
+    Cosine(Hnsw<'static, f32, DistCosine>),
+    L2(Hnsw<'static, f32, DistL2>),
+    L1(Hnsw<'static, f32, DistL1>),
+}
+
 
 // Structured results
 #[derive(Debug, Clone)]
@@ -51,7 +59,7 @@ pub struct HNSWIndex {
     vectors: HashMap<String, Vec<f32>>,
     vector_metadata: HashMap<String, HashMap<String, String>>,
 
-    hnsw: Hnsw<'static, f32, DistCosine>,  // Actual graph
+    hnsw: DistanceType,
     id_map: HashMap<String, usize>,     // Maps external ID → usize
     rev_map: HashMap<usize, String>,    // Maps usize → external ID
     id_counter: usize,
@@ -88,25 +96,29 @@ impl HNSWIndex {
                 "M must be less than or equal to 256"
             ));
         }
-        if space != "cosine" {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("Unsupported space: {}. Only 'cosine' is supported", space)
-            ));
-        }
 
-        // Calculate max_layer as log2(expected_size).ceil()
+
+        // Normalize space to lowercase for case-insensitive matching
+        let space_normalized = space.to_lowercase();
+        // Choose the distance metric dynamically
         let max_layer = (expected_size as f32).log2().ceil() as usize;
-        let hnsw = Hnsw::<f32, DistCosine>::new(
-            m,                // M
-            expected_size,    // expected number of vectors
-            max_layer,        // number of layers
-            ef_construction,  // ef
-            DistCosine {}
-        );
+
+        let hnsw = match space_normalized.as_str() {
+            "cosine" => DistanceType::Cosine(Hnsw::new(m, expected_size, max_layer, ef_construction, DistCosine {})),
+            "l2"     => DistanceType::L2(Hnsw::new(m, expected_size, max_layer, ef_construction, DistL2 {})),
+            "l1"     => DistanceType::L1(Hnsw::new(m, expected_size, max_layer, ef_construction, DistL1 {})),
+            _ => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Unsupported space: '{}'. Must be 'cosine', 'l2', or 'l1' (case-insensitive)", space)
+                ));
+            }
+        };
+
+
         
         Ok(HNSWIndex {
             dim,
-            space,
+            space: space_normalized,
             m,
             ef_construction,
             expected_size,
@@ -372,7 +384,13 @@ impl HNSWIndex {
 
         self.vectors.insert(id.clone(), vector);
         let stored_vec = self.vectors.get(&id).unwrap();
-        self.hnsw.insert((stored_vec.as_slice(), internal_id));
+
+        // Dispatch to the correct HNSW variant
+        match &mut self.hnsw {
+            DistanceType::Cosine(hnsw) => hnsw.insert((stored_vec.as_slice(), internal_id)),
+            DistanceType::L2(hnsw) => hnsw.insert((stored_vec.as_slice(), internal_id)),
+            DistanceType::L1(hnsw) => hnsw.insert((stored_vec.as_slice(), internal_id)),
+        };
 
         self.id_map.insert(id.clone(), internal_id);
         self.rev_map.insert(internal_id, id.clone());
@@ -407,7 +425,12 @@ impl HNSWIndex {
         }
 
         let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
-        let results = self.hnsw.search(&vector, top_k, ef);
+
+        let results = match &self.hnsw {
+            DistanceType::Cosine(hnsw) => hnsw.search(&vector, top_k, ef),
+            DistanceType::L2(hnsw) => hnsw.search(&vector, top_k, ef),
+            DistanceType::L1(hnsw) => hnsw.search(&vector, top_k, ef),
+        };
 
         let mut output = Vec::with_capacity(results.len());
 

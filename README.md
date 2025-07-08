@@ -27,7 +27,7 @@
 
 <br/>
 
-## What is ZeusDB Vector Database?
+## ℹ️ What is ZeusDB Vector Database?
 
 ZeusDB Vector Database is a high-performance, Rust-powered vector database designed for blazing-fast similarity search across high-dimensional data. It enables efficient approximate nearest neighbor (ANN) search, ideal for use cases like document retrieval, semantic search, recommendation systems, and AI-powered assistants. 
 
@@ -35,11 +35,11 @@ ZeusDB leverages the HNSW (Hierarchical Navigable Small World) algorithm for spe
 
 <br/>
 
-## Features
+## ⭐ Features
 
 🔍 Approximate Nearest Neighbor (ANN) search with HNSW
 
-<!-- 🧠 Supports multiple distance metrics: `cosine`, `l2`, `dot` -->
+📋 Supports multiple distance metrics: `cosine`, `L1`, `L2` 
 
 🔥 High-performance Rust backend 
 
@@ -56,18 +56,25 @@ ZeusDB leverages the HNSW (Hierarchical Navigable Small World) algorithm for spe
 
 ## ✅ Supported Distance Metrics
 
-| Metric | Description                          |
-|--------|--------------------------------------|
-| cosine | Cosine Distance (1 - Cosine Similiarity) |
-<!--
-| l2     | Euclidean distance                   |
-| dot    | Dot product                 |
+ZeusDB Vector Database supports the following metrics for vector similarity search. All metric names are case-insensitive, so "cosine", "COSINE", and "Cosine" are treated identically.
 
--->
+| Metric | Description                          | Accepted Values (case-insensitive)  |
+|--------|--------------------------------------|--------|
+| cosine | Cosine Distance (1 - Cosine Similiarity) | "cosine", "COSINE", "Cosine" |
+| l1     | Manhattan distance                   | "l1", "L1" |
+| l2     | Euclidean distance                 | "l2", "L2" |
 
-Scores vs Distances: 
-- Similarity Scores (higher = more similar)
-- Distances (lower = more similar)
+
+### 📏 Scores vs Distances 
+
+All distance metrics in ZeusDB Vector Database return distance values, not similarity scores:
+
+ - Lower values = more similar
+ - A score of 0.0 means a perfect match
+
+This applies to all distance types, including cosine.
+
+
 
 <br/>
 
@@ -98,7 +105,7 @@ from zeusdb_vector_database import VectorDatabase
 vdb = VectorDatabase()
 
 # Initialize and set up the database resources
-index = vdb.create_index_hnsw(dim = 8, space = "cosine", M = 16, ef_construction = 200, expected_size=5)
+index = vdb.create_index_hnsw(dim = 8)
 
 # Vector embeddings with accompanying ID's and Metadata
 records = [
