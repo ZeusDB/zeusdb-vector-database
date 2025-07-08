@@ -27,7 +27,7 @@
 
 <br/>
 
-## What is ZeusDB Vector Database?
+## ℹ️ What is ZeusDB Vector Database?
 
 ZeusDB Vector Database is a high-performance, Rust-powered vector database designed for blazing-fast similarity search across high-dimensional data. It enables efficient approximate nearest neighbor (ANN) search, ideal for use cases like document retrieval, semantic search, recommendation systems, and AI-powered assistants. 
 
@@ -35,11 +35,11 @@ ZeusDB leverages the HNSW (Hierarchical Navigable Small World) algorithm for spe
 
 <br/>
 
-## Features
+## ⭐ Features
 
 🔍 Approximate Nearest Neighbor (ANN) search with HNSW
 
-<!-- 🧠 Supports multiple distance metrics: `cosine`, `l2`, `dot` -->
+📋 Supports multiple distance metrics: `cosine`, `L1`, `L2` 
 
 🔥 High-performance Rust backend 
 
@@ -67,7 +67,7 @@ ZeusDB Vector Database supports the following metrics for vector similarity sear
 
 ### 📏 Scores vs Distances 
 
-All distance metrics in ZeusDB return distance values, not similarity scores:
+All distance metrics in ZeusDB Vector Database return distance values, not similarity scores:
 
  - Lower values = more similar
  - A score of 0.0 means a perfect match
