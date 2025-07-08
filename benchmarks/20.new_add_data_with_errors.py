@@ -40,5 +40,5 @@ for err in add_result_2.errors:
 
 # Verify the overwrite worked
 print("\n--- Verify Overwrite ---")
-doc_002_metadata = index.get_vector_metadata("doc_002")
+doc_002_metadata = index.get_records(["doc_002"], return_vector=False)[0]["metadata"]
 print(f"doc_002 author after overwrite: {doc_002_metadata.get('author')}")  # Should be "Mallory"
