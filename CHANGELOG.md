@@ -10,13 +10,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.0.8] - 2025-
 
 ### Added
-<!-- Add new features here -->
+- **Metadata filtering** support for HNSW vector indexes
+  - Filters can be applied during `query()` using Python dictionaries
+  - Supported operators:
+    - Basic equality: `"field": value`
+    - Comparison: `{"gt": val}`, `{"gte": val}`, `{"lt": val}`, `{"lte": val}`
+    - String ops: `{"contains": "x"}`, `{"startswith": "x"}`, `{"endswith": "x"}`
+    - Array ops: `{"in": [a, b, c]}`
+  - Filters can be combined across fields using AND logic
+  - Supports `None` for null value matching
+- **serde** and **serde_json** dependencies:
+  - Enables typed serialization and deserialization of metadata
+  - Powers the new metadata filtering and storage system using `serde_json::Value`
+- Comprehensive test suite for metadata filtering:
+  - Covers string, numeric, boolean, array, and null filters
+  - Includes multi-condition queries and invalid filter error handling
+  - Validates type fidelity in round-trip metadata storage and retrieval
 
 ### Changed
-<!-- Add changed behavior here -->
+- Vector metadata is now stored as `HashMap<String, Value>` for flexible typing
 
 ### Fixed
-<!-- Add bug fixes here -->
+- Improved type extraction and conversion between Python and Rust for metadata fields
 
 ### Removed
 <!-- Add removals/deprecations here -->
