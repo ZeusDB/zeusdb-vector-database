@@ -484,7 +484,7 @@ print(partial)
 
 ZeusDB supports rich metadata with full type fidelity. This means your metadata preserves the original Python data types (integers stay integers, floats stay floats, etc.) and enables powerful filtering capabilities.
 
-### Supported Types
+### 📘 Supported Types
 
 The following Python types are supported for metadata and preserved during filtering and retrieval.
 
@@ -498,8 +498,9 @@ The following Python types are supported for metadata and preserved during filte
 | **Array** | `["ai", "science"]` | `Value::Array` | Tags, categories, lists |
 | **Nested Object** | `{"key": "value"}` | `Value::Object` | Structured data |
 
+<br/>
 
-### Filter Operators Reference
+### 📘 Filter Operators Reference
 
 These operators can be used in metadata filters:
 
@@ -516,11 +517,11 @@ These operators can be used in metadata filters:
 | `in` | `{"in": [values]}` | `{"lang": {"in": ["en", "es"]}}` | Value is in the provided array |
 
 
-### Practical Filter Examples
+### 💡 Practical Filter Examples
 
 Below are common real-world examples of how to apply metadata filters using ZeusDB's metadata filtering:
 
-#### Find high-quality recent documents
+#### 🟪 Find high-quality recent documents
 ```python
 filter = {
     "published": True,
@@ -531,25 +532,25 @@ filter = {
 results = index.query(vector=query_embedding, filter=filter, top_k=5)
 ```
 
-#### Find documents by specific authors
+#### 🟪 Find documents by specific authors
 ```python
 filter = {"author": {"in": ["Alice", "Bob", "Charlie"]}}
 results = index.query(vector=query_embedding, filter=filter, top_k=5)
 ```
 
-#### Find AI-related content
+#### 🟪 Find AI-related content
 ```python
 filter = {"tags": {"contains": "ai"}}
 results = index.query(vector=query_embedding, filter=filter, top_k=5)
 ```
 
-#### Find documents in price range
+#### 🟪 Find documents in price range
 ```python
 filter = {"price": {"gte": 20.0, "lte": 40.0}}
 results = index.query(vector=query_embedding, filter=filter, top_k=5)
 ```
 
-#### Find documents with specific file types
+#### 🟪 Find documents with specific file types
 ```python
 filter = {"filename": {"endswith": ".pdf"}}
 results = index.query(vector=query_embedding, filter=filter, top_k=5)
