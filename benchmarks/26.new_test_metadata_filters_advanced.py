@@ -98,211 +98,176 @@ records = [
             "page_count": 300,
             "language": "en"
         }
+    },
+    {
+        "id": "doc_007", 
+        "values": [0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85],
+        "metadata": {
+            "author": "Frank",
+            "year": 2025,
+            "rating": 4.9,
+            "published": True,
+            "tags": ["whitepaper", "pdf", "ai"],
+            "price": 34.99,
+            "page_count": 180,
+            "language": "en",
+            "filename": "deep_learning_research.pdf"
+        }
     }
 ]
 
-# Upload records using the `add()` method
+# Upload records
 add_result = index.add(records)
 print("\n--- Add Results Summary ---")
 print(add_result.summary())
 
-# Query Vector
+# Query vector
 query_vector = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
 
 print("\n" + "=" * 60)
 print("BASIC FILTERING TESTS")
 print("=" * 60)
 
-# Test 1: No filter (baseline)
-print("\n1. NO FILTER (All documents)")
+# Test 1–3
+print("\n1. NO FILTER")
 results = index.query(vector=query_vector, filter=None, top_k=10)
 print(f"Found {len(results)} results")
 for i, res in enumerate(results, 1):
     print(f"  {i}. ID: {res['id']}, Score: {res['score']:.4f}, Author: {res['metadata']['author']}")
 
-# Test 2: Simple string equality
-print("\n2. STRING EQUALITY: author = 'Alice'")
+print("\n2. author = 'Alice'")
 results = index.query(vector=query_vector, filter={"author": "Alice"}, top_k=5)
 print(f"Found {len(results)} results")
 for res in results:
     print(f"  ID: {res['id']}, Author: {res['metadata']['author']}")
 
-# Test 3: Boolean filter
-print("\n3. BOOLEAN FILTER: published = True")
+print("\n3. published = True")
 results = index.query(vector=query_vector, filter={"published": True}, top_k=10)
 print(f"Found {len(results)} results")
 for res in results:
-    print(f"  ID: {res['id']}, Published: {res['metadata']['published']}, Author: {res['metadata']['author']}")
+    print(f"  ID: {res['id']}, Published: {res['metadata']['published']}")
 
 print("\n" + "=" * 60)
 print("NUMERIC FILTERING TESTS")
 print("=" * 60)
 
-# Test 4: Numeric greater than
-print("\n4. NUMERIC GT: rating > 4.0")
+# Test 4–7
+print("\n4. rating > 4.0")
 results = index.query(vector=query_vector, filter={"rating": {"gt": 4.0}}, top_k=10)
-print(f"Found {len(results)} results")
 for res in results:
-    print(f"  ID: {res['id']}, Rating: {res['metadata']['rating']}, Author: {res['metadata']['author']}")
+    print(f"  {res['id']} → {res['metadata']['rating']}")
 
-# Test 5: Numeric greater than or equal
-print("\n5. NUMERIC GTE: year >= 2024")
+print("\n5. year >= 2024")
 results = index.query(vector=query_vector, filter={"year": {"gte": 2024}}, top_k=10)
-print(f"Found {len(results)} results")
 for res in results:
-    print(f"  ID: {res['id']}, Year: {res['metadata']['year']}, Author: {res['metadata']['author']}")
+    print(f"  {res['id']} → {res['metadata']['year']}")
 
-# Test 6: Numeric less than
-print("\n6. NUMERIC LT: price < 30.0")
+print("\n6. price < 30.0")
 results = index.query(vector=query_vector, filter={"price": {"lt": 30.0}}, top_k=10)
-print(f"Found {len(results)} results")
 for res in results:
-    price = res['metadata']['price']
-    print(f"  ID: {res['id']}, Price: {price}, Author: {res['metadata']['author']}")
+    print(f"  {res['id']} → {res['metadata']['price']}")
 
-# Test 7: Numeric range (combined conditions)
-print("\n7. NUMERIC RANGE: 100 <= page_count <= 200")
+print("\n7. 100 <= page_count <= 200")
 results = index.query(vector=query_vector, filter={"page_count": {"gte": 100, "lte": 200}}, top_k=10)
-print(f"Found {len(results)} results")
 for res in results:
-    print(f"  ID: {res['id']}, Pages: {res['metadata']['page_count']}, Author: {res['metadata']['author']}")
+    print(f"  {res['id']} → {res['metadata']['page_count']}")
 
 print("\n" + "=" * 60)
-print("STRING OPERATION TESTS")
+print("STRING AND ARRAY TESTS")
 print("=" * 60)
 
-# Test 8: String contains
-print("\n8. STRING CONTAINS: author contains 'A'")
+# Test 8–11
+print("\n8. author contains 'A'")
 results = index.query(vector=query_vector, filter={"author": {"contains": "A"}}, top_k=10)
-print(f"Found {len(results)} results")
 for res in results:
-    print(f"  ID: {res['id']}, Author: {res['metadata']['author']}")
+    print(f"  {res['id']} → {res['metadata']['author']}")
 
-# Test 9: String starts with
-print("\n9. STRING STARTS WITH: author starts with 'A'")
+print("\n9. author startswith 'A'")
 results = index.query(vector=query_vector, filter={"author": {"startswith": "A"}}, top_k=10)
-print(f"Found {len(results)} results")
 for res in results:
-    print(f"  ID: {res['id']}, Author: {res['metadata']['author']}")
+    print(f"  {res['id']} → {res['metadata']['author']}")
 
-print("\n" + "=" * 60)
-print("ARRAY OPERATION TESTS")
-print("=" * 60)
-
-# Test 10: Array contains
-print("\n10. ARRAY CONTAINS: tags contains 'ai'")
+print("\n10. tags contains 'ai'")
 results = index.query(vector=query_vector, filter={"tags": {"contains": "ai"}}, top_k=10)
-print(f"Found {len(results)} results")
 for res in results:
-    print(f"  ID: {res['id']}, Tags: {res['metadata']['tags']}, Author: {res['metadata']['author']}")
+    print(f"  {res['id']} → {res['metadata']['tags']}")
 
-# Test 11: Value in array
-print("\n11. VALUE IN ARRAY: language in ['en', 'es']")
+print("\n11. language in ['en', 'es']")
 results = index.query(vector=query_vector, filter={"language": {"in": ["en", "es"]}}, top_k=10)
-print(f"Found {len(results)} results")
 for res in results:
-    print(f"  ID: {res['id']}, Language: {res['metadata']['language']}, Author: {res['metadata']['author']}")
+    print(f"  {res['id']} → {res['metadata']['language']}")
 
 print("\n" + "=" * 60)
-print("COMPLEX MULTI-CONDITION TESTS")
+print("COMPLEX CONDITIONS")
 print("=" * 60)
 
-# Test 12: Multiple conditions (AND logic)
-print("\n12. MULTIPLE CONDITIONS: published=True AND rating>=4.0 AND year>=2024")
+# Test 12–14
+print("\n12. published=True AND rating>=4.0 AND year>=2024")
 results = index.query(
-    vector=query_vector, 
-    filter={
-        "published": True,
-        "rating": {"gte": 4.0},
-        "year": {"gte": 2024}
-    }, 
+    vector=query_vector,
+    filter={"published": True, "rating": {"gte": 4.0}, "year": {"gte": 2024}},
     top_k=10
 )
-print(f"Found {len(results)} results")
 for res in results:
     meta = res['metadata']
-    print(f"  ID: {res['id']}, Author: {meta['author']}, Rating: {meta['rating']}, Year: {meta['year']}, Published: {meta['published']}")
+    print(f"  {res['id']} → Rating: {meta['rating']}, Year: {meta['year']}")
 
-# Test 13: Complex filter with arrays and strings
-print("\n13. COMPLEX FILTER: tags contains 'ai' AND language='en' AND price>25")
+print("\n13. tags contains 'ai' AND language='en' AND price>25")
 results = index.query(
-    vector=query_vector, 
-    filter={
-        "tags": {"contains": "ai"},
-        "language": "en",
-        "price": {"gt": 25.0}
-    }, 
+    vector=query_vector,
+    filter={"tags": {"contains": "ai"}, "language": "en", "price": {"gt": 25.0}},
     top_k=10
 )
-print(f"Found {len(results)} results")
 for res in results:
     meta = res['metadata']
-    print(f"  ID: {res['id']}, Author: {meta['author']}, Tags: {meta['tags']}, Price: {meta['price']}")
+    print(f"  {res['id']} → Price: {meta['price']}, Tags: {meta['tags']}")
 
-# Test 14: Filter with no results
-print("\n14. FILTER WITH NO RESULTS: author='NonExistent'")
+print("\n14. author = 'NonExistent'")
 results = index.query(vector=query_vector, filter={"author": "NonExistent"}, top_k=10)
 print(f"Found {len(results)} results")
 
-print("\n" + "=" * 60)
-print("METADATA TYPE VERIFICATION")
-print("=" * 60)
-
-# Test 15: Verify metadata types are preserved
 print("\n15. METADATA TYPE VERIFICATION")
 retrieved = index.get_records("doc_001", return_vector=False)
 if retrieved:
-    meta = retrieved[0]['metadata']
-    print(f"Document: {retrieved[0]['id']}")
-    print("Metadata types:")
-    for key, value in meta.items():
-        print(f"  {key}: {value} ({type(value).__name__})")
+    for k, v in retrieved[0]['metadata'].items():
+        print(f"  {k}: {v} ({type(v).__name__})")
 
-print("\n" + "=" * 60)
-print("EDGE CASE TESTS")
-print("=" * 60)
-
-# Test 16: Filter on null values
-print("\n16. NULL VALUE FILTER: price is None")
-# Note: This test depends on whether your implementation supports null equality
+print("\n16. NULL VALUE: price is None")
 try:
     results = index.query(vector=query_vector, filter={"price": None}, top_k=10)
-    print(f"Found {len(results)} results")
     for res in results:
-        print(f"  ID: {res['id']}, Price: {res['metadata']['price']}, Author: {res['metadata']['author']}")
+        print(f"  {res['id']} → {res['metadata']['price']}")
 except Exception as e:
-    print(f"Error with null filter: {e}")
+    print("Error:", e)
 
-# Test 17: Invalid filter operation
-print("\n17. INVALID FILTER OPERATION TEST")
+print("\n17. INVALID FILTER OPERATION")
 try:
-    results = index.query(vector=query_vector, filter={"rating": {"invalid_op": 4.0}}, top_k=10)
-    print(f"Unexpected success: Found {len(results)} results")
+    index.query(vector=query_vector, filter={"rating": {"invalid_op": 4.0}}, top_k=10)
 except Exception as e:
-    print(f"Expected error caught: {e}")
+    print("Expected error:", e)
 
-print("\n" + "=" * 60)
-print("PERFORMANCE TEST")
-print("=" * 60)
-
-# Test 18: Performance with complex filter
-print("\n18. PERFORMANCE TEST: Complex filter on all documents")
-
-start_time = time.time()
+print("\n18. PERFORMANCE TEST")
+start = time.time()
 results = index.query(
-    vector=query_vector, 
-    filter={
-        "year": {"gte": 2022, "lte": 2025},
-        "rating": {"gte": 3.0},
-        "published": True
-    }, 
+    vector=query_vector,
+    filter={"year": {"gte": 2022, "lte": 2025}, "rating": {"gte": 3.0}, "published": True},
     top_k=10
 )
-end_time = time.time()
-print(f"Found {len(results)} results in {(end_time - start_time)*1000:.2f}ms")
+elapsed = (time.time() - start) * 1000
+print(f"Found {len(results)} results in {elapsed:.2f}ms")
+
+print("\n19. AUTHOR IN ['Alice', 'Bob', 'Charlie']")
+results = index.query(vector=query_vector, filter={"author": {"in": ["Alice", "Bob", "Charlie"]}}, top_k=10)
+for res in results:
+    print(f"  {res['id']} → {res['metadata']['author']}")
+
+print("\n20. FILENAME ENDSWITH '.pdf'")
+results = index.query(vector=query_vector, filter={"filename": {"endswith": ".pdf"}}, top_k=10)
+for res in results:
+    print(f"  {res['id']} → {res['metadata']['filename']}")
 
 print("\n" + "=" * 60)
-print("TESTING COMPLETE!")
+print("TESTING COMPLETE")
 print("=" * 60)
 print("✅ Rich metadata system successfully tested")
 print(f"📊 Total documents indexed: {len(index.get_stats()['total_vectors'])}")
