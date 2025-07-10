@@ -3,6 +3,7 @@ use pyo3::types::{PyDict, PyList};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use std::collections::HashMap;
 use hnsw_rs::prelude::{Hnsw, DistCosine, DistL2, DistL1};
+use serde_json::Value;
 
 // Define the distance type enum to handle different distance metrics
 enum DistanceType {
@@ -10,7 +11,6 @@ enum DistanceType {
     L2(Hnsw<'static, f32, DistL2>),
     L1(Hnsw<'static, f32, DistL1>),
 }
-
 
 // Structured results
 #[derive(Debug, Clone)]
@@ -57,7 +57,7 @@ pub struct HNSWIndex {
 
     // Vector store
     vectors: HashMap<String, Vec<f32>>,
-    vector_metadata: HashMap<String, HashMap<String, String>>,
+    vector_metadata: HashMap<String, HashMap<String, Value>>,
 
     hnsw: DistanceType,
     id_map: HashMap<String, usize>,     // Maps external ID → usize
@@ -97,7 +97,6 @@ impl HNSWIndex {
             ));
         }
 
-
         // Normalize space to lowercase for case-insensitive matching
         let space_normalized = space.to_lowercase();
         // Choose the distance metric dynamically
@@ -113,8 +112,6 @@ impl HNSWIndex {
                 ));
             }
         };
-
-
         
         Ok(HNSWIndex {
             dim,
@@ -154,9 +151,210 @@ impl HNSWIndex {
         self.add_batch_internal(records)
     }
 
+    /// Search for the k-nearest neighbors of a vector
+    /// Returns actual Python dictionaries which most common for ML workflows
+    #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, return_vector=false))]
+    pub fn query(
+        &self,
+        py: Python<'_>,
+        vector: Vec<f32>,
+        filter: Option<&Bound<PyDict>>,
+        top_k: usize,
+        ef_search: Option<usize>,
+        return_vector: bool,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        if vector.len() != self.dim {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Query vector dimension mismatch: expected {}, got {}",
+                self.dim, vector.len()
+            )));
+        }
+
+        let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
+
+        let results = match &self.hnsw {
+            DistanceType::Cosine(hnsw) => hnsw.search(&vector, top_k, ef),
+            DistanceType::L2(hnsw) => hnsw.search(&vector, top_k, ef),
+            DistanceType::L1(hnsw) => hnsw.search(&vector, top_k, ef),
+        };
+
+        let mut output = Vec::with_capacity(results.len());
+
+        for neighbor in results {
+            let score = neighbor.distance;
+            let internal_id = neighbor.get_origin_id();
+
+            if let Some(ext_id) = self.rev_map.get(&internal_id) {
+                // Apply metadata filter if provided
+                if let Some(filter_dict) = filter {
+                    let filter_conditions = self.python_dict_to_value_map(filter_dict)?;
+                    if let Some(meta) = self.vector_metadata.get(ext_id) {
+                        if !self.matches_filter(meta, &filter_conditions)? {
+                            continue;
+                        }
+                    } else {
+                        continue; // no metadata to match against
+                    }
+                }
+
+                let dict = PyDict::new(py);
+                dict.set_item("id", ext_id)?;
+                dict.set_item("score", score)?;
+
+                let metadata = self.vector_metadata.get(ext_id).cloned().unwrap_or_default();
+                dict.set_item("metadata", self.value_map_to_python(&metadata, py)?)?;
+
+                if return_vector {
+                    if let Some(vec) = self.vectors.get(ext_id) {
+                        dict.set_item("vector", vec.clone())?;
+                    }
+                }
+
+                output.push(dict.into());
+            }
+        }
+
+        Ok(output)
+    }
+
+
+    /// Get one or more records by ID(s).
+    /// Accepts a single ID or a list of IDs, and optionally returns vectors.
+    ///
+    /// Parameters:
+    /// - `input`: `str` or `List[str]`
+    /// - `return_vector`: if `True`, include the embedding vector in each result
+    ///
+    /// Returns:
+    /// - List of dictionaries with fields: `id`, `metadata`, and optionally `vector`
+    #[pyo3(signature = (input, return_vector = true))]
+    pub fn get_records(&self, py: Python<'_>, input: &Bound<PyAny>, return_vector: bool) -> PyResult<Vec<Py<PyDict>>> {
+        let ids: Vec<String> = if let Ok(id_str) = input.extract::<String>() {
+            vec![id_str]
+        } else if let Ok(id_list) = input.extract::<Vec<String>>() {
+            id_list
+        } else {
+            return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                "Expected a string or a list of strings for ID(s)"
+            ));
+        };
+
+        let mut records = Vec::with_capacity(ids.len());
+
+        for id in ids {
+            if let Some(vector) = self.vectors.get(&id) {
+                let metadata = self.vector_metadata.get(&id).cloned().unwrap_or_default();
+
+                let dict = PyDict::new(py);
+                dict.set_item("id", id)?;
+                dict.set_item("metadata", self.value_map_to_python(&metadata, py)?)?;
+
+                if return_vector {
+                    dict.set_item("vector", vector.clone())?;
+                }
+
+                records.push(dict.into());
+            }
+        }
+
+        Ok(records)
+    }
+
+
+    /// Get comprehensive statistics
+    pub fn get_stats(&self) -> HashMap<String, String> {
+        let mut stats = HashMap::new();
+        stats.insert("total_vectors".to_string(), self.vectors.len().to_string());
+        stats.insert("dimension".to_string(), self.dim.to_string());
+        stats.insert("space".to_string(), self.space.clone());
+        stats.insert("M".to_string(), self.m.to_string());
+        stats.insert("ef_construction".to_string(), self.ef_construction.to_string());
+        stats.insert("expected_size".to_string(), self.expected_size.to_string());
+        stats.insert("index_type".to_string(), "HNSW".to_string());
+        stats
+    }
+
+    /// List the first `number` records in the index (ID and metadata).
+    #[pyo3(signature = (number=10))]
+    pub fn list(&self, py: Python<'_>, number: usize) -> PyResult<Vec<(String, PyObject)>> {
+        let mut results = Vec::new();
+        for (id, _vec) in self.vectors.iter().take(number) {
+            let metadata = self.vector_metadata.get(id).cloned().unwrap_or_default();
+            let py_metadata = self.value_map_to_python(&metadata, py)?;
+            results.push((id.clone(), py_metadata));
+        }
+        Ok(results)
+    }
+    
+    /// Add multiple key-value pairs to index-level metadata
+    pub fn add_metadata(&mut self, metadata: HashMap<String, String>) {
+        for (key, value) in metadata {
+            self.metadata.insert(key, value);
+        }
+    }
+
+    /// Get a single index-level metadata value
+    pub fn get_metadata(&self, key: String) -> Option<String> {
+        self.metadata.get(&key).cloned()
+    }
+
+    /// Get all index-level metadata
+    pub fn get_all_metadata(&self) -> HashMap<String, String> {
+        self.metadata.clone()
+    }
+
+    /// Returns basic info about the index
+    pub fn info(&self) -> String {
+        format!(
+            "HNSWIndex(dim={}, space={}, M={}, ef_construction={}, expected_size={}, vectors={})",
+            self.dim,
+            self.space,
+            self.m,
+            self.ef_construction,
+            self.expected_size,
+            self.vectors.len()
+        )
+    }
+
+    /// Check if vector ID exists
+    pub fn contains(&self, id: String) -> bool {
+        self.vectors.contains_key(&id)
+    }
+
+    /// Remove vector by ID
+    /// Removes the vector and its metadata from all accessible mappings.
+    /// The point will no longer appear in queries, contains() checks, or be
+    /// retrievable by ID. 
+    /// 
+    /// Note: Due to HNSW algorithm limitations, the underlying graph structure
+    /// retains stale nodes internally, but these are completely inaccessible
+    /// to users and do not affect query results or performance.
+    /// 
+    /// Returns:
+    ///   - `Ok(true)` if the vector was found and removed
+    ///   - `Ok(false)` if the vector ID was not found
+    pub fn remove_point(&mut self, id: String) -> PyResult<bool> {
+        if let Some(internal_id) = self.id_map.remove(&id) {
+            self.vectors.remove(&id);
+            self.vector_metadata.remove(&id);
+            self.rev_map.remove(&internal_id);
+            // Note: HNSW doesn't support removal, so the graph still contains the point
+            // but it won't be accessible via the mappings
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+
+// Separate impl block for private helper methods (NO #[pymethods])
+impl HNSWIndex {
+    // Additional  Internal logic, private to Rust methods 
+
     /// INPUT DATA FORMAT 1
     /// Parse single object format: {"id": "doc1", "values": [0.1, 0.2], "metadata": {...}}
-    fn parse_single_object(&self, dict: &Bound<PyDict>) -> PyResult<Vec<(String, Vec<f32>, Option<HashMap<String, String>>)>> {
+    fn parse_single_object(&self, dict: &Bound<PyDict>) -> PyResult<Vec<(String, Vec<f32>, Option<HashMap<String, Value>>)>> {
         // Extract ID
         let id = dict.get_item("id")?
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing required field 'id'"))?
@@ -165,17 +363,19 @@ impl HNSWIndex {
         // Extract vector - support both "values" and "vector" keys
         let vector = self.extract_vector_from_dict(dict, "object")?;
 
-        // Extract metadata
-        let metadata = dict.get_item("metadata")?
-            .map(|m| m.extract::<HashMap<String, String>>())
-            .transpose()?;
+        // Extract metadata as Value to preserve Python types automatically
+        let metadata = if let Some(meta_item) = dict.get_item("metadata")? {
+            Some(self.python_dict_to_value_map(meta_item.downcast::<PyDict>()?)?)
+        } else {
+            None
+        };
 
         Ok(vec![(id, vector, metadata)])
     }
 
     /// INPUT DATA FORMAT 2
     /// Parse list format: [{"id": "doc1", "values": [...]}, ...]
-    fn parse_list_format(&self, list: &Bound<PyList>) -> PyResult<Vec<(String, Vec<f32>, Option<HashMap<String, String>>)>> {
+    fn parse_list_format(&self, list: &Bound<PyList>) -> PyResult<Vec<(String, Vec<f32>, Option<HashMap<String, Value>>)>> {
         let mut records = Vec::with_capacity(list.len());
         
         for (i, item) in list.iter().enumerate() {
@@ -195,12 +395,14 @@ impl HNSWIndex {
             let vector = self.extract_vector_from_dict(dict, &format!("item {}", i))?;
 
             // Extract metadata
-            let metadata = dict.get_item("metadata")?
-                .map(|m| m.extract::<HashMap<String, String>>())
-                .transpose()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Item {}: invalid metadata: {}", i, e)
-                ))?;
+            let metadata = if let Some(meta_item) = dict.get_item("metadata")? {
+                Some(self.python_dict_to_value_map(meta_item.downcast::<PyDict>()
+                    .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("Item {}: metadata must be a dictionary", i)
+                    ))?)?)
+            } else {
+                None
+            };
 
             records.push((id, vector, metadata));
         }
@@ -210,7 +412,7 @@ impl HNSWIndex {
 
     /// INPUT DATA FORMAT 3
     /// Parse separate arrays format: {"ids": [...], "embeddings": [...], "metadatas": [...]}
-    fn parse_separate_arrays(&self, dict: &Bound<PyDict>) -> PyResult<Vec<(String, Vec<f32>, Option<HashMap<String, String>>)>> {
+    fn parse_separate_arrays(&self, dict: &Bound<PyDict>) -> PyResult<Vec<(String, Vec<f32>, Option<HashMap<String, Value>>)>> {
         // Extract IDs
         let ids = dict.get_item("ids")?
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing required field 'ids'"))?
@@ -228,7 +430,24 @@ impl HNSWIndex {
 
         // Extract metadatas (optional)
         let metadatas = if let Some(meta_item) = dict.get_item("metadatas")? {
-            let metas = meta_item.extract::<Vec<Option<HashMap<String, String>>>>()?;
+            let meta_list = meta_item.downcast::<PyList>()
+                .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "Field 'metadatas' must be a list"
+                ))?;
+
+            let mut metas = Vec::with_capacity(meta_list.len());
+            for (i, meta_item) in meta_list.iter().enumerate() {
+                if meta_item.is_none() {
+                    metas.push(None);
+                } else {
+                    let meta_dict = meta_item.downcast::<PyDict>()
+                        .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                            format!("metadatas[{}] must be a dictionary or None", i)
+                        ))?;
+                    metas.push(Some(self.python_dict_to_value_map(&meta_dict)?));
+                }
+            }
+
             if metas.len() != ids.len() {
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                     format!("Length mismatch: {} ids vs {} metadatas", ids.len(), metas.len())
@@ -325,7 +544,7 @@ impl HNSWIndex {
 
 
     /// Internal batch processing with validation and structured results
-    fn add_batch_internal(&mut self, records: Vec<(String, Vec<f32>, Option<HashMap<String, String>>)>) -> PyResult<AddResult> {
+    fn add_batch_internal(&mut self, records: Vec<(String, Vec<f32>, Option<HashMap<String, Value>>)>) -> PyResult<AddResult> {
         if records.is_empty() {
             return Ok(AddResult {
                 total_inserted: 0,
@@ -365,7 +584,7 @@ impl HNSWIndex {
     /// Adds or updates a vector in the index.
     /// If the ID already exists, the vector and metadata are overwritten.
     /// Stale graph nodes are left in place but excluded from all queries.
-    fn add_point_internal(&mut self, id: String, vector: Vec<f32>, metadata: Option<HashMap<String, String>>) -> PyResult<()> {
+    fn add_point_internal(&mut self, id: String, vector: Vec<f32>, metadata: Option<HashMap<String, Value>>) -> PyResult<()> {
         if vector.len() != self.dim {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("Vector dimension mismatch: expected {}, got {} (id: '{}')", self.dim, vector.len(), id)
@@ -402,227 +621,213 @@ impl HNSWIndex {
         Ok(())
     }
 
-
-
-
-    /// Search for the k-nearest neighbors of a vector
-    /// Returns actual Python dictionaries which most common for ML workflows
-    #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, return_vector=false))]
-    pub fn query(
-        &self,
-        py: Python<'_>,
-        vector: Vec<f32>,
-        filter: Option<HashMap<String, String>>,
-        top_k: usize,
-        ef_search: Option<usize>,
-        return_vector: bool,
-    ) -> PyResult<Vec<Py<PyDict>>> {
-        if vector.len() != self.dim {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Query vector dimension mismatch: expected {}, got {}",
-                self.dim, vector.len()
-            )));
-        }
-
-        let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
-
-        let results = match &self.hnsw {
-            DistanceType::Cosine(hnsw) => hnsw.search(&vector, top_k, ef),
-            DistanceType::L2(hnsw) => hnsw.search(&vector, top_k, ef),
-            DistanceType::L1(hnsw) => hnsw.search(&vector, top_k, ef),
-        };
-
-        let mut output = Vec::with_capacity(results.len());
-
-        for neighbor in results {
-            let score = neighbor.distance;
-            let internal_id = neighbor.get_origin_id();
-
-            if let Some(ext_id) = self.rev_map.get(&internal_id) {
-                // Apply optional metadata filter
-                if let Some(ref filter_map) = filter {
-                    if let Some(meta) = self.vector_metadata.get(ext_id) {
-                        let matches = filter_map.iter().all(|(k, v)| meta.get(k) == Some(v));
-                        if !matches {
-                            continue;
-                        }
-                    } else {
-                        continue; // no metadata to match against
-                    }
-                }
-
-                let dict = PyDict::new(py);
-                dict.set_item("id", ext_id)?;
-                dict.set_item("score", score)?;
-
-                let metadata = self.vector_metadata.get(ext_id).cloned().unwrap_or_default();
-                dict.set_item("metadata", metadata)?;
-
-                if return_vector {
-                    if let Some(vec) = self.vectors.get(ext_id) {
-                        dict.set_item("vector", vec.clone())?;
-                    }
-                }
-
-                output.push(dict.into());
-            }
-        }
-
-        Ok(output)
-    }
-
-
-
-    /// Get one or more records by ID(s).
-    /// Accepts a single ID or a list of IDs, and optionally returns vectors.
-    ///
-    /// Parameters:
-    /// - `input`: `str` or `List[str]`
-    /// - `return_vector`: if `True`, include the embedding vector in each result
-    ///
-    /// Returns:
-    /// - List of dictionaries with fields: `id`, `metadata`, and optionally `vector`
-    #[pyo3(signature = (input, return_vector = true))]
-    pub fn get_records(&self, py: Python<'_>, input: &Bound<PyAny>, return_vector: bool) -> PyResult<Vec<Py<PyDict>>> {
-        let ids: Vec<String> = if let Ok(id_str) = input.extract::<String>() {
-            vec![id_str]
-        } else if let Ok(id_list) = input.extract::<Vec<String>>() {
-            id_list
-        } else {
-            return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                "Expected a string or a list of strings for ID(s)"
-            ));
-        };
-
-        let mut records = Vec::with_capacity(ids.len());
-
-        for id in ids {
-            if let Some(vector) = self.vectors.get(&id) {
-                let metadata = self.vector_metadata.get(&id).cloned().unwrap_or_default();
-
-                let dict = PyDict::new(py);
-                dict.set_item("id", id)?;
-                dict.set_item("metadata", metadata)?;
-
-                if return_vector {
-                    dict.set_item("vector", vector.clone())?;
-                }
-
-                records.push(dict.into());
-            }
-        }
-
-        Ok(records)
-    }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    /// Get comprehensive statistics
-    pub fn get_stats(&self) -> HashMap<String, String> {
-        let mut stats = HashMap::new();
-        stats.insert("total_vectors".to_string(), self.vectors.len().to_string());
-        stats.insert("dimension".to_string(), self.dim.to_string());
-        stats.insert("space".to_string(), self.space.clone());
-        stats.insert("M".to_string(), self.m.to_string());
-        stats.insert("ef_construction".to_string(), self.ef_construction.to_string());
-        stats.insert("expected_size".to_string(), self.expected_size.to_string());
-        stats.insert("index_type".to_string(), "HNSW".to_string());
-        stats
-    }
-
-    /// List the first `number` records in the index (ID and metadata).
-    #[pyo3(signature = (number=10))]
-    pub fn list(&self, number: usize) -> Vec<(String, Option<HashMap<String, String>>)> {
-        self.vectors
-            .iter()
-            .take(number)
-            .map(|(id, _vec)| {
-                let meta = self.vector_metadata.get(id).cloned();
-                (id.clone(), meta)
-            })
-            .collect()
-    }
     
-    /// Add multiple key-value pairs to index-level metadata
-    pub fn add_metadata(&mut self, metadata: HashMap<String, String>) {
-        for (key, value) in metadata {
-            self.metadata.insert(key, value);
+    /// HELPER FUNCTION
+    /// Convert Python dict to HashMap<String, Value> for metadata storage
+    fn python_dict_to_value_map(&self, py_dict: &Bound<PyDict>) -> PyResult<HashMap<String, Value>> {
+        let mut map = HashMap::new();
+        
+        for (key, value) in py_dict.iter() {
+            let string_key = key.extract::<String>()?;
+            let json_value = self.python_object_to_value(&value)?;
+            map.insert(string_key, json_value);
         }
+        
+        Ok(map)
     }
 
-    /// Get a single index-level metadata value
-    pub fn get_metadata(&self, key: String) -> Option<String> {
-        self.metadata.get(&key).cloned()
-    }
-
-    /// Get all index-level metadata
-    pub fn get_all_metadata(&self) -> HashMap<String, String> {
-        self.metadata.clone()
-    }
-
-    /// Returns basic info about the index
-    pub fn info(&self) -> String {
-        format!(
-            "HNSWIndex(dim={}, space={}, M={}, ef_construction={}, expected_size={}, vectors={})",
-            self.dim,
-            self.space,
-            self.m,
-            self.ef_construction,
-            self.expected_size,
-            self.vectors.len()
-        )
-    }
-
-    /// Check if vector ID exists
-    pub fn contains(&self, id: String) -> bool {
-        self.vectors.contains_key(&id)
-    }
-
-    /// Remove vector by ID
-    /// Removes the vector and its metadata from all accessible mappings.
-    /// The point will no longer appear in queries, contains() checks, or be
-    /// retrievable by ID. 
-    /// 
-    /// Note: Due to HNSW algorithm limitations, the underlying graph structure
-    /// retains stale nodes internally, but these are completely inaccessible
-    /// to users and do not affect query results or performance.
-    /// 
-    /// Returns:
-    ///   - `Ok(true)` if the vector was found and removed
-    ///   - `Ok(false)` if the vector ID was not found
-    pub fn remove_point(&mut self, id: String) -> PyResult<bool> {
-        if let Some(internal_id) = self.id_map.remove(&id) {
-            self.vectors.remove(&id);
-            self.vector_metadata.remove(&id);
-            self.rev_map.remove(&internal_id);
-            // Note: HNSW doesn't support removal, so the graph still contains the point
-            // but it won't be accessible via the mappings
-            Ok(true)
+    /// HELPER FUNCTION  
+    /// Convert Python object to serde_json::Value
+    fn python_object_to_value(&self, py_obj: &Bound<PyAny>) -> PyResult<Value> {
+        if py_obj.is_none() {
+            Ok(Value::Null)
+        } else if let Ok(b) = py_obj.extract::<bool>() {
+            Ok(Value::Bool(b))
+        } else if let Ok(i) = py_obj.extract::<i64>() {
+            Ok(Value::Number(serde_json::Number::from(i)))
+        } else if let Ok(f) = py_obj.extract::<f64>() {
+            if let Some(num) = serde_json::Number::from_f64(f) {
+                Ok(Value::Number(num))
+            } else {
+                Ok(Value::String(f.to_string()))
+            }
+        } else if let Ok(s) = py_obj.extract::<String>() {
+            Ok(Value::String(s))
+        } else if let Ok(py_list) = py_obj.downcast::<PyList>() {
+            let mut vec = Vec::new();
+            for item in py_list.iter() {
+                vec.push(self.python_object_to_value(&item)?);
+            }
+            Ok(Value::Array(vec))
+        } else if let Ok(py_dict) = py_obj.downcast::<PyDict>() {
+            let mut map = serde_json::Map::new();
+            for (key, value) in py_dict.iter() {
+                let string_key = key.extract::<String>()?;
+                let json_value = self.python_object_to_value(&value)?;
+                map.insert(string_key, json_value);
+            }
+            Ok(Value::Object(map))
         } else {
-            Ok(false)
+            // Fallback: convert to string representation
+            Ok(Value::String(py_obj.to_string()))
         }
     }
-} 
+
+    /// Filter Support Helpers
+    // Simple but powerful filter matching using Value
+    fn matches_filter(&self, metadata: &HashMap<String, Value>, filter: &HashMap<String, Value>) -> PyResult<bool> {
+        for (field, condition) in filter {
+            if !self.field_matches(metadata, field, condition)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn field_matches(&self, metadata: &HashMap<String, Value>, field: &str, condition: &Value) -> PyResult<bool> {
+        let field_value = match metadata.get(field) {
+            Some(value) => value,
+            None => return Ok(false),
+        };
+
+        match condition {
+            // Direct equality for simple values
+            Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => {
+                Ok(field_value == condition)
+            },
+            
+            // Complex conditions: {"gt": 5, "lt": 10}
+            Value::Object(ops) => {
+                self.evaluate_value_conditions(field_value, ops)
+            },
+            
+            _ => Ok(false),
+        }
+    }
+
+    fn evaluate_value_conditions(&self, field_value: &Value, operations: &serde_json::Map<String, Value>) -> PyResult<bool> {
+        for (op, target_value) in operations {
+            let matches = match op.as_str() {
+                "eq" => field_value == target_value,
+                "ne" => field_value != target_value,
+                
+                // Numeric comparisons - serde_json handles the conversion
+                "gt" => self.compare_values(field_value, target_value, |a, b| a > b)?,
+                "gte" => self.compare_values(field_value, target_value, |a, b| a >= b)?,
+                "lt" => self.compare_values(field_value, target_value, |a, b| a < b)?,
+                "lte" => self.compare_values(field_value, target_value, |a, b| a <= b)?,
+                
+                // String operations
+                "contains" => self.value_contains(field_value, target_value)?,
+                "startswith" => self.value_starts_with(field_value, target_value)?,
+                "endswith" => self.value_ends_with(field_value, target_value)?,
+                
+                // Array operations
+                "in" => self.value_in_array(field_value, target_value)?,
+                
+                _ => {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("Unknown filter operation: {}", op)
+                    ));
+                }
+            };
+            
+            if !matches {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    // Helper methods for Value comparisons
+    fn compare_values<F>(&self, a: &Value, b: &Value, op: F) -> PyResult<bool>
+    where
+        F: Fn(f64, f64) -> bool,
+    {
+        match (a, b) {
+            (Value::Number(n1), Value::Number(n2)) => {
+                let f1 = n1.as_f64().unwrap_or(0.0);
+                let f2 = n2.as_f64().unwrap_or(0.0);
+                Ok(op(f1, f2))
+            },
+            _ => Ok(false),
+        }
+    }
+
+    fn value_contains(&self, field: &Value, target: &Value) -> PyResult<bool> {
+        match (field, target) {
+            (Value::String(s1), Value::String(s2)) => Ok(s1.contains(s2)),
+            (Value::Array(arr), val) => Ok(arr.contains(val)),
+            _ => Ok(false),
+        }
+    }
+
+    fn value_starts_with(&self, field: &Value, target: &Value) -> PyResult<bool> {
+        match (field, target) {
+            (Value::String(s1), Value::String(s2)) => Ok(s1.starts_with(s2)),
+            _ => Ok(false),
+        }
+    }
+
+    fn value_ends_with(&self, field: &Value, target: &Value) -> PyResult<bool> {
+        match (field, target) {
+            (Value::String(s1), Value::String(s2)) => Ok(s1.ends_with(s2)),
+            _ => Ok(false),
+        }
+    }
+
+    fn value_in_array(&self, field: &Value, target: &Value) -> PyResult<bool> {
+        match target {
+            Value::Array(arr) => Ok(arr.contains(field)),
+            _ => Ok(false),
+        }
+    }
+
+    // Convert Value HashMap back to Python objects
+    fn value_map_to_python(&self, value_map: &HashMap<String, Value>, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = PyDict::new(py);
+        
+        for (key, value) in value_map {
+            let py_value = self.value_to_python_object(value, py)?;
+            dict.set_item(key, py_value)?;
+        }
+        
+        //Ok(dict.into())
+        Ok(dict.into_pyobject(py)?.to_owned().unbind().into_any())
+    }
+
+    // Convert individual Value to Python object
+    fn value_to_python_object(&self, value: &Value, py: Python<'_>) -> PyResult<PyObject> {
+        let py_obj = match value {
+            Value::Null => py.None(),
+            Value::Bool(b) => b.into_pyobject(py)?.to_owned().unbind().into_any(),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    i.into_pyobject(py)?.to_owned().unbind().into_any()
+                } else if let Some(f) = n.as_f64() {
+                    f.into_pyobject(py)?.to_owned().unbind().into_any()
+                } else {
+                    n.to_string().into_pyobject(py)?.to_owned().unbind().into_any()
+                }
+            },
+            Value::String(s) => s.clone().into_pyobject(py)?.unbind().into_any(),
+            Value::Array(arr) => {
+                let py_list = PyList::empty(py);
+                for item in arr {
+                    py_list.append(self.value_to_python_object(item, py)?)?;
+                }
+                py_list.unbind().into_any() 
+            },
+            Value::Object(obj) => {
+                let py_dict = PyDict::new(py);
+                for (k, v) in obj {
+                    py_dict.set_item(k, self.value_to_python_object(v, py)?)?;
+                }
+                py_dict.unbind().into_any()
+            }
+        };
+        
+        Ok(py_obj)
+    }
+
+}
