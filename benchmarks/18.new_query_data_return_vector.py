@@ -32,7 +32,7 @@ print(index.info())
 
 # Query with top_k=2 and return_vector=True
 query_vector = np.random.rand(4).tolist()
-results = index.query(query_vector, top_k=2, return_vector=True)
+results = index.search(query_vector, top_k=2, return_vector=True)
 
 print("\n--- Top 2 Results (with vectors) - raw ---")
 print(results)

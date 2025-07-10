@@ -35,9 +35,9 @@ print(index.info())
 
 
 
-# Query
+# Search for the top K nearest neighbors
 query_vector = np.random.rand(384).tolist()
-results = index.query(query_vector, top_k=5)
+results = index.search(query_vector, top_k=5)
 print("\n--- Top K results ---")
 print(results)
 

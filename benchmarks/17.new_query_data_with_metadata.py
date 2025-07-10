@@ -39,7 +39,7 @@ print(index.info())
 
 # Query all records
 query_vector = np.random.rand(384).tolist()
-all_results = index.query(query_vector, top_k=10)
+all_results = index.search(query_vector, top_k=10)
 print("\n--- Top 10 results (raw no filter) ---")
 print(all_results)
 print(type(all_results))
@@ -48,7 +48,7 @@ for i, result in enumerate(all_results):
     print(f"{i+1}. ID: {result['id']}, Score: {result['score']:.4f}, Batch: {result['metadata']['batch']}")
 
 # Query only "large" batch records
-large_results = index.query(query_vector, filter={"batch": "large"}, top_k=5)
+large_results = index.search(query_vector, filter={"batch": "large"}, top_k=5)
 print("\n--- Top 5 'large' batch results - raw ---")
 print(large_results)
 print("\n--- Top 5 'large' batch results ---")
@@ -56,7 +56,7 @@ for i, result in enumerate(large_results):
     print(f"{i+1}. ID: {result['id']}, Score: {result['score']:.4f}, Batch: {result['metadata']['batch']}")
 
 # Query only "small" batch records  
-small_results = index.query(query_vector, filter={"batch": "small"}, top_k=5)
+small_results = index.search(query_vector, filter={"batch": "small"}, top_k=5)
 print("\n--- Top 5 'small' batch results ---")
 for i, result in enumerate(small_results):
     print(f"{i+1}. ID: {result['id']}, Score: {result['score']:.4f}, Batch: {result['metadata']['batch']}")

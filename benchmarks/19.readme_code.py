@@ -27,7 +27,7 @@ print(add_result.summary())
 query_vector = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
 
 # Query with no filter (all documents)
-results = index.query(vector=query_vector, filter=None, top_k=2)
+results = index.search(vector=query_vector, filter=None, top_k=2)
 print("\n--- Query Results Output - Raw ---")
 print(results)
 
@@ -36,7 +36,7 @@ for i, res in enumerate(results, 1):
     print(f"{i}. ID: {res['id']}, Score: {res['score']:.4f}, Metadata: {res['metadata']}")
 
 print("\n--- Querying with filter: author = 'Alice' ---")
-results2 = index.query(vector=query_vector, filter={"author": "Alice"}, top_k=5)
+results2 = index.search(vector=query_vector, filter={"author": "Alice"}, top_k=5)
 print(results2)
 
 

@@ -126,7 +126,7 @@ print(add_result.summary())
 query_vector = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
 
 # Query with no filter (all documents)
-results = index.query(vector=query_vector, filter=None, top_k=2)
+results = index.search(vector=query_vector, filter=None, top_k=2)
 print("\n--- Query Results Output - Raw ---")
 print(results)
 
@@ -300,7 +300,7 @@ Query the index using a new vector and retrieve the top-k nearest neighbors. You
 
 ```python
 print("\n--- Query returning two most similar results ---")
-results = index.query(vector=query_vector, top_k=2)
+results = index.search(vector=query_vector, top_k=2)
 print(results)
 ```
 
@@ -318,7 +318,7 @@ This filters on the given metadata after conducting the similarity search.
 
 ```python
 print("\n--- Querying with filter: author = 'Alice' ---")
-results = index.query(vector=query_vector, filter={"author": "Alice"}, top_k=5)
+results = index.search(vector=query_vector, filter={"author": "Alice"}, top_k=5)
 print(results)
 ```
 
@@ -337,7 +337,7 @@ You can optionally return the stored embedding vectors alongside metadata and si
 
 ```python
 print("\n--- Querying with filter and returning embedding vectors ---")
-results = index.query(vector=query_vector, filter={"split": "test"}, top_k=2, return_vector=True)
+results = index.search(vector=query_vector, filter={"split": "test"}, top_k=2, return_vector=True)
 print(results)
 ```
 
@@ -429,7 +429,7 @@ print(index.list(number=5)) # Shows first 5 records
 ZeusDB allows you to remove a vector and its associated metadata from the index using the .remove_point(id) method. This performs a <u>logical deletion</u>, meaning:
 - The vector is deleted from internal storage.
 - The metadata is removed.
-- The vector ID is no longer accessible via .contains(), .get_vector(), or .query().
+- The vector ID is no longer accessible via .contains(), .get_vector(), or .search().
 
 ```python
 # Remove the point using its ID
@@ -530,31 +530,31 @@ filter = {
     "year": {"gte": 2024}
 }
 
-results = index.query(vector=query_embedding, filter=filter, top_k=5)
+results = index.search(vector=query_embedding, filter=filter, top_k=5)
 ```
 
 #### ✔️ Find documents by specific authors
 ```python
 filter = {"author": {"in": ["Alice", "Bob", "Charlie"]}}
-results = index.query(vector=query_embedding, filter=filter, top_k=5)
+results = index.search(vector=query_embedding, filter=filter, top_k=5)
 ```
 
 #### ✔️ Find AI-related content
 ```python
 filter = {"tags": {"contains": "ai"}}
-results = index.query(vector=query_embedding, filter=filter, top_k=5)
+results = index.search(vector=query_embedding, filter=filter, top_k=5)
 ```
 
 #### ✔️ Find documents in price range
 ```python
 filter = {"price": {"gte": 20.0, "lte": 40.0}}
-results = index.query(vector=query_embedding, filter=filter, top_k=5)
+results = index.search(vector=query_embedding, filter=filter, top_k=5)
 ```
 
 #### ✔️ Find documents with specific file types
 ```python
 filter = {"filename": {"endswith": ".pdf"}}
-results = index.query(vector=query_embedding, filter=filter, top_k=5)
+results = index.search(vector=query_embedding, filter=filter, top_k=5)
 ```
 
 

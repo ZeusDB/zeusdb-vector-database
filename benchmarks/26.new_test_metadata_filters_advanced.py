@@ -130,19 +130,19 @@ print("=" * 60)
 
 # Test 1–3
 print("\n1. NO FILTER")
-results = index.query(vector=query_vector, filter=None, top_k=10)
+results = index.search(vector=query_vector, filter=None, top_k=10)
 print(f"Found {len(results)} results")
 for i, res in enumerate(results, 1):
     print(f"  {i}. ID: {res['id']}, Score: {res['score']:.4f}, Author: {res['metadata']['author']}")
 
 print("\n2. author = 'Alice'")
-results = index.query(vector=query_vector, filter={"author": "Alice"}, top_k=5)
+results = index.search(vector=query_vector, filter={"author": "Alice"}, top_k=5)
 print(f"Found {len(results)} results")
 for res in results:
     print(f"  ID: {res['id']}, Author: {res['metadata']['author']}")
 
 print("\n3. published = True")
-results = index.query(vector=query_vector, filter={"published": True}, top_k=10)
+results = index.search(vector=query_vector, filter={"published": True}, top_k=10)
 print(f"Found {len(results)} results")
 for res in results:
     print(f"  ID: {res['id']}, Published: {res['metadata']['published']}")
@@ -153,22 +153,22 @@ print("=" * 60)
 
 # Test 4–7
 print("\n4. rating > 4.0")
-results = index.query(vector=query_vector, filter={"rating": {"gt": 4.0}}, top_k=10)
+results = index.search(vector=query_vector, filter={"rating": {"gt": 4.0}}, top_k=10)
 for res in results:
     print(f"  {res['id']} → {res['metadata']['rating']}")
 
 print("\n5. year >= 2024")
-results = index.query(vector=query_vector, filter={"year": {"gte": 2024}}, top_k=10)
+results = index.search(vector=query_vector, filter={"year": {"gte": 2024}}, top_k=10)
 for res in results:
     print(f"  {res['id']} → {res['metadata']['year']}")
 
 print("\n6. price < 30.0")
-results = index.query(vector=query_vector, filter={"price": {"lt": 30.0}}, top_k=10)
+results = index.search(vector=query_vector, filter={"price": {"lt": 30.0}}, top_k=10)
 for res in results:
     print(f"  {res['id']} → {res['metadata']['price']}")
 
 print("\n7. 100 <= page_count <= 200")
-results = index.query(vector=query_vector, filter={"page_count": {"gte": 100, "lte": 200}}, top_k=10)
+results = index.search(vector=query_vector, filter={"page_count": {"gte": 100, "lte": 200}}, top_k=10)
 for res in results:
     print(f"  {res['id']} → {res['metadata']['page_count']}")
 
@@ -178,22 +178,22 @@ print("=" * 60)
 
 # Test 8–11
 print("\n8. author contains 'A'")
-results = index.query(vector=query_vector, filter={"author": {"contains": "A"}}, top_k=10)
+results = index.search(vector=query_vector, filter={"author": {"contains": "A"}}, top_k=10)
 for res in results:
     print(f"  {res['id']} → {res['metadata']['author']}")
 
 print("\n9. author startswith 'A'")
-results = index.query(vector=query_vector, filter={"author": {"startswith": "A"}}, top_k=10)
+results = index.search(vector=query_vector, filter={"author": {"startswith": "A"}}, top_k=10)
 for res in results:
     print(f"  {res['id']} → {res['metadata']['author']}")
 
 print("\n10. tags contains 'ai'")
-results = index.query(vector=query_vector, filter={"tags": {"contains": "ai"}}, top_k=10)
+results = index.search(vector=query_vector, filter={"tags": {"contains": "ai"}}, top_k=10)
 for res in results:
     print(f"  {res['id']} → {res['metadata']['tags']}")
 
 print("\n11. language in ['en', 'es']")
-results = index.query(vector=query_vector, filter={"language": {"in": ["en", "es"]}}, top_k=10)
+results = index.search(vector=query_vector, filter={"language": {"in": ["en", "es"]}}, top_k=10)
 for res in results:
     print(f"  {res['id']} → {res['metadata']['language']}")
 
@@ -203,7 +203,7 @@ print("=" * 60)
 
 # Test 12–14
 print("\n12. published=True AND rating>=4.0 AND year>=2024")
-results = index.query(
+results = index.search(
     vector=query_vector,
     filter={"published": True, "rating": {"gte": 4.0}, "year": {"gte": 2024}},
     top_k=10
@@ -213,7 +213,7 @@ for res in results:
     print(f"  {res['id']} → Rating: {meta['rating']}, Year: {meta['year']}")
 
 print("\n13. tags contains 'ai' AND language='en' AND price>25")
-results = index.query(
+results = index.search(
     vector=query_vector,
     filter={"tags": {"contains": "ai"}, "language": "en", "price": {"gt": 25.0}},
     top_k=10
@@ -223,7 +223,7 @@ for res in results:
     print(f"  {res['id']} → Price: {meta['price']}, Tags: {meta['tags']}")
 
 print("\n14. author = 'NonExistent'")
-results = index.query(vector=query_vector, filter={"author": "NonExistent"}, top_k=10)
+results = index.search(vector=query_vector, filter={"author": "NonExistent"}, top_k=10)
 print(f"Found {len(results)} results")
 
 print("\n15. METADATA TYPE VERIFICATION")
@@ -234,7 +234,7 @@ if retrieved:
 
 print("\n16. NULL VALUE: price is None")
 try:
-    results = index.query(vector=query_vector, filter={"price": None}, top_k=10)
+    results = index.search(vector=query_vector, filter={"price": None}, top_k=10)
     for res in results:
         print(f"  {res['id']} → {res['metadata']['price']}")
 except Exception as e:
@@ -242,13 +242,13 @@ except Exception as e:
 
 print("\n17. INVALID FILTER OPERATION")
 try:
-    index.query(vector=query_vector, filter={"rating": {"invalid_op": 4.0}}, top_k=10)
+    index.search(vector=query_vector, filter={"rating": {"invalid_op": 4.0}}, top_k=10)
 except Exception as e:
     print("Expected error:", e)
 
 print("\n18. PERFORMANCE TEST")
 start = time.time()
-results = index.query(
+results = index.search(
     vector=query_vector,
     filter={"year": {"gte": 2022, "lte": 2025}, "rating": {"gte": 3.0}, "published": True},
     top_k=10
@@ -257,12 +257,12 @@ elapsed = (time.time() - start) * 1000
 print(f"Found {len(results)} results in {elapsed:.2f}ms")
 
 print("\n19. AUTHOR IN ['Alice', 'Bob', 'Charlie']")
-results = index.query(vector=query_vector, filter={"author": {"in": ["Alice", "Bob", "Charlie"]}}, top_k=10)
+results = index.search(vector=query_vector, filter={"author": {"in": ["Alice", "Bob", "Charlie"]}}, top_k=10)
 for res in results:
     print(f"  {res['id']} → {res['metadata']['author']}")
 
 print("\n20. FILENAME ENDSWITH '.pdf'")
-results = index.query(vector=query_vector, filter={"filename": {"endswith": ".pdf"}}, top_k=10)
+results = index.search(vector=query_vector, filter={"filename": {"endswith": ".pdf"}}, top_k=10)
 for res in results:
     print(f"  {res['id']} → {res['metadata']['filename']}")
 

@@ -41,7 +41,7 @@ class VectorDatabase:
             vdb = VectorDatabase()
             index = vdb.create_index_hnsw(dim=1536, expected_size=10000)
             index.add_point("doc1", vector, metadata)
-            results = index.query(query_vector, k=10)
+            results = index.search(query_vector, top_k=10)
         """
         try:
             return HNSWIndex(dim, space, M, ef_construction, expected_size)
