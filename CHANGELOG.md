@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.0.8] - 2025-
+## [0.0.8] - 2025-07-10
 
 ### Added
 - **Metadata filtering** support for HNSW vector indexes
@@ -32,9 +32,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Improved type extraction and conversion between Python and Rust for metadata fields
-
-### Removed
-<!-- Add removals/deprecations here -->
 
 ---
 
