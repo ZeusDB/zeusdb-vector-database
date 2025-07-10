@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.0.9] - 2025-07-10
+
+### Added
+- `search()` is a more accurate and industry-standard term for vector similarity retrieval.
+
+### Changed
+- ⚠️ Breaking Changes - Renamed `HNSWIndex.query()` → `HNSWIndex.search()` to better reflect its role as a k-nearest neighbor (KNN) similarity search method.
+- Updated all internal references, tests, and examples to reflect the new `.search()` method name.
+
+### Removed
+- All usages of `.query()` must be replaced with `.search()`.
+
+---
+
 ## [0.0.8] - 2025-07-10
 
 ### Added

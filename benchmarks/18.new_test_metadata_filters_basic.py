@@ -23,30 +23,30 @@ print(result.summary())
 query = [0.1, 0.2, 0.3, 0.4]
 
 print("\n--- No Filter ---")
-res_all = index.query(vector=query, filter=None, top_k=10)
+res_all = index.search(vector=query, filter=None, top_k=10)
 for r in res_all:
     print(f"{r['id']} → {r['metadata']}")
 
 print("\n--- Filter: author = 'Alice' ---")
-res_alice = index.query(vector=query, filter={"author": "Alice"}, top_k=10)
+res_alice = index.search(vector=query, filter={"author": "Alice"}, top_k=10)
 for r in res_alice:
     print(f"{r['id']} → {r['metadata']}")
 
 print("\n--- Filter: author != 'Bob' ---")
-res_not_bob = index.query(vector=query, filter={"author": {"ne": "Bob"}}, top_k=10)
+res_not_bob = index.search(vector=query, filter={"author": {"ne": "Bob"}}, top_k=10)
 for r in res_not_bob:
     print(f"{r['id']} → {r['metadata']}")
 
 print("\n--- Filter: score > 90 ---")
-res_score = index.query(vector=query, filter={"score": {"gt": 90}}, top_k=10)
+res_score = index.search(vector=query, filter={"score": {"gt": 90}}, top_k=10)
 for r in res_score:
     print(f"{r['id']} → {r['metadata']}")
 
 print("\n--- Filter: tags contains 'ai' ---")
-res_tags = index.query(vector=query, filter={"tags": {"contains": "ai"}}, top_k=10)
+res_tags = index.search(vector=query, filter={"tags": {"contains": "ai"}}, top_k=10)
 for r in res_tags:
     print(f"{r['id']} → {r['metadata']}")
 
 print("\n--- Filter: author = 'DoesNotExist' ---")
-res_none = index.query(vector=query, filter={"author": "DoesNotExist"}, top_k=10)
+res_none = index.search(vector=query, filter={"author": "DoesNotExist"}, top_k=10)
 print(f"Returned {len(res_none)} results (expected: 0)")

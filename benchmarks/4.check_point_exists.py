@@ -16,9 +16,9 @@ result = index.add({
 # Verify that the point was added
 print("\n--- Check 1 ---")
 if index.contains("doc1"):
-    print("✓ Point 'to_remove' exists in the index")
+    print("✓ Point 'doc1' exists in the index")
 else:
-    print("✗ Point 'to_remove' not found in the index")
+    print("✗ Point 'doc1' not found in the index")
 
 print("\n--- Check 2 ---")
 exists = index.contains("doc1")

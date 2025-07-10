@@ -20,12 +20,12 @@ add_result_cos = index_cos.add(records)
 print("--- Add Results Summary ---")
 print(add_result_cos.summary())
 
-results_cos = index_cos.query(vector=query_vector, filter=None, top_k=2)
+results_cos = index_cos.search(vector=query_vector, filter=None, top_k=2)
 print("\n--- Top 2 Neighbors (No Filter) ---")
 for i, res in enumerate(results_cos, 1):
     print(f"{i}. ID: {res['id']}, Score: {res['score']:.4f}, Metadata: {res['metadata']}")
 
-results_cos_filtered = index_cos.query(vector=query_vector, filter={"author": "Alice"}, top_k=5)
+results_cos_filtered = index_cos.search(vector=query_vector, filter={"author": "Alice"}, top_k=5)
 print("\n--- Top 5 Neighbors (Filter: author = 'Alice') ---")
 for i, res in enumerate(results_cos_filtered, 1):
     print(f"{i}. ID: {res['id']}, Score: {res['score']:.4f}, Metadata: {res['metadata']}")
@@ -40,12 +40,12 @@ add_result_l2 = index_l2.add(records)
 print("--- Add Results Summary ---")
 print(add_result_l2.summary())
 
-results_l2 = index_l2.query(vector=query_vector, filter=None, top_k=2)
+results_l2 = index_l2.search(vector=query_vector, filter=None, top_k=2)
 print("\n--- Top 2 Neighbors (No Filter) ---")
 for i, res in enumerate(results_l2, 1):
     print(f"{i}. ID: {res['id']}, Score: {res['score']:.4f}, Metadata: {res['metadata']}")
 
-results_l2_filtered = index_l2.query(vector=query_vector, filter={"author": "Alice"}, top_k=5)
+results_l2_filtered = index_l2.search(vector=query_vector, filter={"author": "Alice"}, top_k=5)
 print("\n--- Top 5 Neighbors (Filter: author = 'Alice') ---")
 for i, res in enumerate(results_l2_filtered, 1):
     print(f"{i}. ID: {res['id']}, Score: {res['score']:.4f}, Metadata: {res['metadata']}")
@@ -60,12 +60,12 @@ add_result_l1 = index_l1.add(records)
 print("--- Add Results Summary ---")
 print(add_result_l1.summary())
 
-results_l1 = index_l1.query(vector=query_vector, filter=None, top_k=2)
+results_l1 = index_l1.search(vector=query_vector, filter=None, top_k=2)
 print("\n--- Top 2 Neighbors (No Filter) ---")
 for i, res in enumerate(results_l1, 1):
     print(f"{i}. ID: {res['id']}, Score: {res['score']:.4f}, Metadata: {res['metadata']}")
 
-results_l1_filtered = index_l1.query(vector=query_vector, filter={"author": "Alice"}, top_k=5)
+results_l1_filtered = index_l1.search(vector=query_vector, filter={"author": "Alice"}, top_k=5)
 print("\n--- Top 5 Neighbors (Filter: author = 'Alice') ---")
 for i, res in enumerate(results_l1_filtered, 1):
     print(f"{i}. ID: {res['id']}, Score: {res['score']:.4f}, Metadata: {res['metadata']}")

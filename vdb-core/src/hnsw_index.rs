@@ -154,7 +154,7 @@ impl HNSWIndex {
     /// Search for the k-nearest neighbors of a vector
     /// Returns actual Python dictionaries which most common for ML workflows
     #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, return_vector=false))]
-    pub fn query(
+    pub fn search(
         &self,
         py: Python<'_>,
         vector: Vec<f32>,
@@ -165,7 +165,7 @@ impl HNSWIndex {
     ) -> PyResult<Vec<Py<PyDict>>> {
         if vector.len() != self.dim {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Query vector dimension mismatch: expected {}, got {}",
+                "Search vector dimension mismatch: expected {}, got {}",
                 self.dim, vector.len()
             )));
         }
@@ -328,7 +328,7 @@ impl HNSWIndex {
     /// 
     /// Note: Due to HNSW algorithm limitations, the underlying graph structure
     /// retains stale nodes internally, but these are completely inaccessible
-    /// to users and do not affect query results or performance.
+    /// to users and do not affect search results or performance.
     /// 
     /// Returns:
     ///   - `Ok(true)` if the vector was found and removed
