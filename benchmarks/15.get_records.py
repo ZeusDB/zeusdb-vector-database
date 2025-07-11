@@ -5,7 +5,7 @@ from zeusdb_vector_database import VectorDatabase
 vdb = VectorDatabase()
 
 # Initialize and set up the database resources
-index = vdb.create_index_hnsw(dim = 2, space = "cosine", M = 16, ef_construction = 200, expected_size=5)
+index = vdb.create(index_type="hnsw", dim=2, space="cosine", m=16, ef_construction=200, expected_size=5)
 
 # Upload vector records using the unified `add()` method
 index.add([

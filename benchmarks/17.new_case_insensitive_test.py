@@ -8,7 +8,9 @@ for metric in metrics:
     print(f"\n--- Creating index with space = '{metric}' ---")
     try:
         vdb = VectorDatabase()
-        index = vdb.create_index_hnsw(dim=4, space=metric, M=8, ef_construction=100, expected_size=10)
+        index = vdb.create(index_type="hnsw", dim=4, space=metric, m=8, ef_construction=100, expected_size=10)
         print(f"✔️  Successfully created index with space = '{metric}'")
     except Exception as e:
         print(f"❌ Failed to create index with space = '{metric}': {e}")
+
+

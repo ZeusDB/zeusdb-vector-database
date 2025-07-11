@@ -9,7 +9,7 @@ from zeusdb_vector_database import VectorDatabase
 vdb = VectorDatabase()
 
 # Create index with large capacity
-index = vdb.create_index_hnsw(dim=8, expected_size=100000)
+index = vdb.create(index_type="hnsw", dim=8, expected_size=100000)
 
 # Insert 10,000 random records
 data = [{"id": f"doc_{i}", "values": [random.random() for _ in range(8)]} for i in range(10000)]

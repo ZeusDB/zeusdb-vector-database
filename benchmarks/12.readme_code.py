@@ -6,7 +6,7 @@ vdb = VectorDatabase()
 
 # Initialize and set up the database resources
 #index = vdb.create_index_hnsw(dim = 8, space = "cosine", M = 16, ef_construction = 200, expected_size=5)
-index = vdb.create_index_hnsw(dim = 8)
+index = vdb.create(index_type="hnsw", dim=8)
 
 # Upload vector records using the unified `add()` method
 records = [

@@ -1,10 +1,11 @@
+# Import the vector database module
 from zeusdb_vector_database import VectorDatabase
 
 # Instantiate the VectorDatabase class
 vdb = VectorDatabase()
 
 # Create an HNSW index with specified dimension and expected size
-index = vdb.create_index_hnsw(dim=2, expected_size=5)
+index = vdb.create(index_type="hnsw", dim=2, expected_size=5)
 
 # Add a point to the index - Blank metadata
 result = index.add({

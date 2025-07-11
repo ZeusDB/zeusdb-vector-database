@@ -1,11 +1,13 @@
 import numpy as np
+
+# Import the vector database module
 from zeusdb_vector_database import VectorDatabase
 
 # Instantiate the VectorDatabase class
 vdb = VectorDatabase()
 
 # Create index with dim=4
-index = vdb.create_index_hnsw(dim=4, expected_size=100)
+index = vdb.create(index_type="hnsw", dim=4, expected_size=100)
 
 # Show index info
 print("\n--- Shows Initial Index Information ---")

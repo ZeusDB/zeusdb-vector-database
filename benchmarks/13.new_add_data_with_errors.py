@@ -5,7 +5,7 @@ from zeusdb_vector_database import VectorDatabase
 vdb = VectorDatabase()
 
 # Step 1: Set up index with dim=8
-index = vdb.create_index_hnsw(dim=8, space="cosine", M=16, ef_construction=200, expected_size=5)
+index = vdb.create(index_type="hnsw", dim=8, space="cosine", m=16, ef_construction=200, expected_size=5)
 
 # Step 2: Add initial valid records
 records = [

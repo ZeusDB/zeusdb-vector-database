@@ -7,7 +7,7 @@ from zeusdb_vector_database import VectorDatabase
 vdb = VectorDatabase()
 
 # Initialize and set up the database resources
-index = vdb.create_index_hnsw(dim=8)
+index = vdb.create(index_type="hnsw", dim=8)
 
 print("=" * 60)
 print("ZEUSDB RICH METADATA FILTER TESTING")

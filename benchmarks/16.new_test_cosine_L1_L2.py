@@ -14,7 +14,7 @@ query_vector = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
 print("\n==================== Testing space = 'cosine' ====================\n")
 
 vdb_cos = VectorDatabase()
-index_cos = vdb_cos.create_index_hnsw(dim=8, space="cosine", M=16, ef_construction=200, expected_size=5)
+index_cos = vdb_cos.create(index_type="hnsw", dim=8, space="cosine", m=16, ef_construction=200, expected_size=5)
 
 add_result_cos = index_cos.add(records)
 print("--- Add Results Summary ---")
@@ -34,7 +34,8 @@ for i, res in enumerate(results_cos_filtered, 1):
 print("\n==================== Testing space = 'L2' ====================\n")
 
 vdb_l2 = VectorDatabase()
-index_l2 = vdb_l2.create_index_hnsw(dim=8, space="L2", M=16, ef_construction=200, expected_size=5)
+index_l2 = vdb_l2.create(index_type="hnsw", dim=8, space="L2", m=16, ef_construction=200, expected_size=5)
+
 
 add_result_l2 = index_l2.add(records)
 print("--- Add Results Summary ---")
@@ -54,7 +55,7 @@ for i, res in enumerate(results_l2_filtered, 1):
 print("\n==================== Testing space = 'L1' ====================\n")
 
 vdb_l1 = VectorDatabase()
-index_l1 = vdb_l1.create_index_hnsw(dim=8, space="L1", M=16, ef_construction=200, expected_size=5)
+index_l1 = vdb_l1.create(index_type="hnsw", dim=8, space="L1", m=16, ef_construction=200, expected_size=5)
 
 add_result_l1 = index_l1.add(records)
 print("--- Add Results Summary ---")
