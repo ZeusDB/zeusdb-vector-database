@@ -93,7 +93,7 @@ impl HNSWIndex {
         }
         if m > 256 {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "M must be less than or equal to 256"
+                "m must be less than or equal to 256"
             ));
         }
 
@@ -267,7 +267,7 @@ impl HNSWIndex {
         stats.insert("total_vectors".to_string(), self.vectors.len().to_string());
         stats.insert("dimension".to_string(), self.dim.to_string());
         stats.insert("space".to_string(), self.space.clone());
-        stats.insert("M".to_string(), self.m.to_string());
+        stats.insert("m".to_string(), self.m.to_string());
         stats.insert("ef_construction".to_string(), self.ef_construction.to_string());
         stats.insert("expected_size".to_string(), self.expected_size.to_string());
         stats.insert("index_type".to_string(), "HNSW".to_string());
@@ -306,7 +306,7 @@ impl HNSWIndex {
     /// Returns basic info about the index
     pub fn info(&self) -> String {
         format!(
-            "HNSWIndex(dim={}, space={}, M={}, ef_construction={}, expected_size={}, vectors={})",
+            "HNSWIndex(dim={}, space={}, m={}, ef_construction={}, expected_size={}, vectors={})",
             self.dim,
             self.space,
             self.m,
