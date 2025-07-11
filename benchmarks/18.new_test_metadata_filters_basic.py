@@ -4,7 +4,7 @@ print("\n=== ZeusDB Metadata Filter Test ===")
 
 # Create the index
 vdb = VectorDatabase()
-index = vdb.create_index_hnsw(dim=4, space="cosine", expected_size=10)
+index = vdb.create(index_type="hnsw", dim=4, space="cosine", expected_size=10)
 
 # Add records with metadata of varying structure
 records = [
