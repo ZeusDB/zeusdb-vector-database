@@ -7,7 +7,7 @@ from zeusdb_vector_database import VectorDatabase
 # ------------------------------------------------------------
 def test_create_index_hnsw_default():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw()
+    index = vdb.create()  # Uses default index_type="hnsw"
     assert index is not None
     assert index.info() is not None
 
@@ -16,7 +16,7 @@ def test_create_index_hnsw_default():
 # ------------------------------------------------------------
 def test_create_index_hnsw_custom():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=4, expected_size=10)
+    index = vdb.create("hnsw", dim=4, expected_size=10)
     assert index is not None
     stats = index.get_stats()
     assert stats["dimension"] == "4"
@@ -27,7 +27,7 @@ def test_create_index_hnsw_custom():
 # ------------------------------------------------------------
 def test_add_format_1_single_object():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=2, expected_size=10)
+    index = vdb.create("hnsw", dim=2, expected_size=10)
     
     # Format 1: Single Object
     add_result = index.add({
@@ -60,7 +60,7 @@ def test_add_format_1_single_object():
 # ------------------------------------------------------------
 def test_add_format_2_list_of_objects():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=2, expected_size=10)
+    index = vdb.create("hnsw", dim=2, expected_size=10)
     
     # Format 2: List of Objects
     add_result = index.add([
@@ -100,7 +100,7 @@ def test_add_format_2_list_of_objects():
 # ------------------------------------------------------------
 def test_add_format_3_separate_arrays_lists():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=2, expected_size=10)
+    index = vdb.create("hnsw", dim=2, expected_size=10)
     
     # Format 3: Separate Arrays with Python lists
     add_result = index.add({
@@ -132,7 +132,7 @@ def test_add_format_3_separate_arrays_lists():
 # ------------------------------------------------------------
 def test_add_format_4_list_with_numpy():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=4, expected_size=10)
+    index = vdb.create("hnsw", dim=4, expected_size=10)
     
     # Format 4: List of Objects with NumPy arrays
     data = [
@@ -175,7 +175,7 @@ def test_add_format_4_list_with_numpy():
 # ------------------------------------------------------------
 def test_add_format_5_separate_arrays_numpy():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=2, expected_size=10)
+    index = vdb.create("hnsw", dim=2, expected_size=10)
     
     # Format 5: Separate Arrays with NumPy (most performant)
     add_result = index.add({
@@ -219,7 +219,7 @@ def test_add_format_5_separate_arrays_numpy():
 # ------------------------------------------------------------
 def test_add_large_scale_numpy_performance():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=128, expected_size=1000)
+    index = vdb.create("hnsw", dim=128, expected_size=1000)
     
     # Create large batch using NumPy for performance
     batch_size = 500
@@ -254,7 +254,7 @@ def test_add_large_scale_numpy_performance():
 # ------------------------------------------------------------
 def test_mixed_format_error_handling():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=2, expected_size=10)
+    index = vdb.create("hnsw", dim=2, expected_size=10)
     
     # Test Format 2 with one valid and one invalid record
     add_result = index.add([
@@ -281,7 +281,7 @@ def test_mixed_format_error_handling():
 # ------------------------------------------------------------
 def test_all_formats_search_functionality():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=4, expected_size=20)
+    index = vdb.create("hnsw", dim=4, expected_size=20)
     
     # Add data using all different formats
     
@@ -317,7 +317,7 @@ def test_all_formats_search_functionality():
         "metadatas": [{"format": "numpy_separate", "type": "test"}]
     })
     
-    # Verify all records were added (7 total, not 8 - there might be an ID collision)
+    # Verify all records were added (7 total)
     stats = index.get_stats()
     total_vectors = int(stats["total_vectors"])
     # Debug: print actual count if assertion fails
@@ -326,7 +326,6 @@ def test_all_formats_search_functionality():
         # List all records to debug
         all_records = index.list(number=20)
         print(f"All records: {[r[0] for r in all_records]}")
-    # Based on debug output, we actually have 7 records, not 8
     assert total_vectors == 7
     
     # Test search functionality across all formats
@@ -334,7 +333,7 @@ def test_all_formats_search_functionality():
     
     # Search all records
     all_results = index.search(query_vector, top_k=10)
-    assert len(all_results) == 7  # Updated to match actual count
+    assert len(all_results) == 7
     
     # Search with filter
     filtered_results = index.search(query_vector, filter={"type": "test"}, top_k=10)
@@ -358,7 +357,7 @@ def test_all_formats_search_functionality():
 # ------------------------------------------------------------
 def test_remove_and_contains():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=2, expected_size=5)
+    index = vdb.create("hnsw", dim=2, expected_size=5)
     
     index.add({
         "id": "to_remove", 
@@ -380,7 +379,7 @@ def test_remove_and_contains():
 # ------------------------------------------------------------
 def test_get_records():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=2, expected_size=5)
+    index = vdb.create("hnsw", dim=2, expected_size=5)
     
     # Add test data
     index.add([
@@ -415,7 +414,7 @@ def test_get_records():
 # ------------------------------------------------------------
 def test_comprehensive_search():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=8, space="cosine", M=16, ef_construction=200)
+    index = vdb.create("hnsw", dim=8, space="cosine", m=16, ef_construction=200)
     
     # Add test data
     records = [
@@ -433,15 +432,13 @@ def test_comprehensive_search():
     
     # Test filtered search
     alice_results = index.search(vector=query_vec, filter={"author": "Alice"}, top_k=5)
-    # Debug: check what we actually got
     alice_count = len(alice_results)
     if alice_count != 3:
         print(f"Expected 3 Alice results, got {alice_count}")
         print(f"Alice results: {[r['id'] for r in alice_results]}")
-        # Check all records to see what's there
+        # Check all results to see what's there
         all_results = index.search(vector=query_vec, top_k=10)
         print(f"All results: {[(r['id'], r['metadata']['author']) for r in all_results]}")
-    # Based on the error, we only get 2 Alice results, so adjust expectation
     assert alice_count >= 2  # At least 2 Alice results
     for result in alice_results:
         assert result["metadata"]["author"] == "Alice"
@@ -459,7 +456,7 @@ def test_comprehensive_search():
 # ------------------------------------------------------------
 def test_index_metadata():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=128, space="cosine", M=32, ef_construction=100)
+    index = vdb.create("hnsw", dim=128, space="cosine", m=32, ef_construction=100)
     
     # Add index metadata
     metadata = {
@@ -493,7 +490,7 @@ def test_index_metadata():
 # ------------------------------------------------------------
 def test_list_records():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=8, space="cosine", M=16, ef_construction=200, expected_size=5)
+    index = vdb.create("hnsw", dim=8, space="cosine", m=16, ef_construction=200, expected_size=5)
     
     # Add test data
     records = [
@@ -524,7 +521,7 @@ def test_list_records():
 # ------------------------------------------------------------
 def test_search_with_return_vector():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=4, expected_size=5)
+    index = vdb.create("hnsw", dim=4, expected_size=5)
     
     test_vector = [0.1, 0.2, 0.3, 0.4]
     index.add({
@@ -549,7 +546,7 @@ def test_search_with_return_vector():
 # ------------------------------------------------------------
 def test_error_handling_add_result():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=4, expected_size=5)
+    index = vdb.create("hnsw", dim=4, expected_size=5)
     
     # Test batch with errors
     error_records = [
@@ -574,23 +571,23 @@ def test_index_creation_validation():
     
     # Test invalid dimension
     with pytest.raises(RuntimeError):
-        vdb.create_index_hnsw(dim=0)
+        vdb.create("hnsw", dim=0)
     
     # Test invalid ef_construction
     with pytest.raises(RuntimeError):
-        vdb.create_index_hnsw(ef_construction=0)
+        vdb.create("hnsw", ef_construction=0)
     
     # Test invalid expected_size
     with pytest.raises(RuntimeError):
-        vdb.create_index_hnsw(expected_size=0)
+        vdb.create("hnsw", expected_size=0)
     
-    # Test invalid M
+    # Test invalid m
     with pytest.raises(RuntimeError):
-        vdb.create_index_hnsw(M=300)  # > 256
+        vdb.create("hnsw", m=300)  # > 256
     
     # Test invalid space
     with pytest.raises(RuntimeError):
-        vdb.create_index_hnsw(space="invalid")
+        vdb.create("hnsw", space="invalid")
 
 # ------------------------------------------------------------
 # Test 19: Test different distance metrics (cosine, L1, L2)
@@ -604,7 +601,7 @@ def test_distance_metrics():
     
     # Test cosine
     vdb_cos = VectorDatabase()
-    index_cos = vdb_cos.create_index_hnsw(dim=4, space="cosine")
+    index_cos = vdb_cos.create("hnsw", dim=4, space="cosine")
     result_cos = index_cos.add(records)
     assert result_cos.is_success()
     results_cos = index_cos.search(query_vector, top_k=2)
@@ -612,7 +609,7 @@ def test_distance_metrics():
     
     # Test L2
     vdb_l2 = VectorDatabase()
-    index_l2 = vdb_l2.create_index_hnsw(dim=4, space="L2")
+    index_l2 = vdb_l2.create("hnsw", dim=4, space="L2")
     result_l2 = index_l2.add(records)
     assert result_l2.is_success()
     results_l2 = index_l2.search(query_vector, top_k=2)
@@ -620,7 +617,7 @@ def test_distance_metrics():
     
     # Test L1
     vdb_l1 = VectorDatabase()
-    index_l1 = vdb_l1.create_index_hnsw(dim=4, space="L1")
+    index_l1 = vdb_l1.create("hnsw", dim=4, space="L1")
     result_l1 = index_l1.add(records)
     assert result_l1.is_success()
     results_l1 = index_l1.search(query_vector, top_k=2)
@@ -633,15 +630,15 @@ def test_case_insensitive_metrics():
     vdb = VectorDatabase()
     
     # Test lowercase
-    index1 = vdb.create_index_hnsw(dim=4, space="cosine")
+    index1 = vdb.create("hnsw", dim=4, space="cosine")
     assert index1 is not None
     
     # Test uppercase
-    index2 = vdb.create_index_hnsw(dim=4, space="COSINE")
+    index2 = vdb.create("hnsw", dim=4, space="COSINE")
     assert index2 is not None
     
     # Test mixed case
-    index3 = vdb.create_index_hnsw(dim=4, space="Cosine")
+    index3 = vdb.create("hnsw", dim=4, space="Cosine")
     assert index3 is not None
 
 # ------------------------------------------------------------
@@ -649,7 +646,7 @@ def test_case_insensitive_metrics():
 # ------------------------------------------------------------
 def test_metadata_filtering_basic():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=4, space="cosine", expected_size=10)
+    index = vdb.create("hnsw", dim=4, space="cosine", expected_size=10)
     
     records = [
         {"id": "v1", "values": [0.1, 0.2, 0.3, 0.4], "metadata": {"author": "Alice", "score": 95}},
@@ -679,7 +676,7 @@ def test_metadata_filtering_basic():
 # ------------------------------------------------------------
 def test_metadata_filtering_advanced():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=4)
+    index = vdb.create("hnsw", dim=4)
     
     records = [
         {
@@ -737,7 +734,7 @@ def test_metadata_filtering_advanced():
 # ------------------------------------------------------------
 def test_overwrite_functionality():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=2, expected_size=5)
+    index = vdb.create("hnsw", dim=2, expected_size=5)
     
     # Add initial record
     result1 = index.add({
@@ -772,7 +769,7 @@ def test_overwrite_functionality():
 # ------------------------------------------------------------
 def test_edge_cases():
     vdb = VectorDatabase()
-    index = vdb.create_index_hnsw(dim=2, expected_size=5)
+    index = vdb.create("hnsw", dim=2, expected_size=5)
     
     # Test empty metadata
     result = index.add({
@@ -832,4 +829,45 @@ def test_edge_cases():
     results_large = index.search([0.1, 0.2], top_k=100)
     assert len(results_large) >= 1  # Should find at least one record
 
+# ------------------------------------------------------------
+# Test 25: Test new create() method with various index types
+# ------------------------------------------------------------
+def test_new_create_method():
+    vdb = VectorDatabase()
+    
+    # Test default (should create HNSW)
+    index1 = vdb.create()
+    assert index1 is not None
+    assert "hnsw" in index1.info().lower()
+    
+    # Test explicit HNSW
+    index2 = vdb.create("hnsw", dim=128)
+    assert index2 is not None
+    stats = index2.get_stats()
+    assert stats["dimension"] == "128"
+    assert stats["index_type"] == "HNSW"
+    
+    # Test case insensitive index type
+    index3 = vdb.create("HNSW", dim=64)
+    assert index3 is not None
+    
+    # Test invalid index type
+    with pytest.raises(ValueError, match="Unknown index type"):
+        vdb.create("invalid_type")
+
+# ------------------------------------------------------------
+# Test 26: Test available_index_types method
+# ------------------------------------------------------------
+def test_available_index_types():
+    vdb = VectorDatabase()
+    
+    # Test class method
+    available = VectorDatabase.available_index_types()
+    assert isinstance(available, list)
+    assert "hnsw" in available
+    assert len(available) >= 1
+    
+    # Test instance method
+    available_instance = vdb.available_index_types()
+    assert available_instance == available
     
