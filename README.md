@@ -156,9 +156,9 @@ ZeusDB Vector Database makes it easy to work with high-dimensional vector data u
 
 **Three simple steps**
 
-1. **Create an index**  
-2. **Add data to the index**  
-3. **Conduct a similarity search**
+**1. Create an index** using `.create()`
+**2. Add data to the index** using `.add(...)`
+**3. Conduct a similarity search** using `.search(...)`
 
 Each step is covered below.
 
