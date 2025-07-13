@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.0] - 2025-07-13
+
+### Added
+- **Generic `create()` method** for extensible vector index creation
+  - Registry-based architecture supporting multiple index types
+  - Case-insensitive index type matching: `create("HNSW")` or `create("hnsw")`
+  - Comprehensive parameter defaults with Rust backend validation
+  - Self-updating error messages showing all available index types
+  - Supports case-insensitive index types (e.g. "HNSW" and "hnsw")
+- **`available_index_types()`** class method for programmatic type discovery
+- Future-ready architecture for IVF, LSH, Annoy, and Flat index types
+
+### Changed
+- ⚠️ **Breaking Change**: Replaced index-specific factory methods with generic `create()`
+  - Migration: `VectorDatabase().create_index_hnsw(dim=768)` → `VectorDatabase().create("hnsw", dim=768)`
+  - All HNSW parameters now default to best-practice values; dim is the only commonly customized field. Most of the settings like `m`, `ef_construction`, `expected_size`, and `space` already have good defaults, so users typically don't change them. The only one they usually set themselves is `dim`, since it must match the shape of their data.
+  - Improved error messages with dynamic type listing
+
+### Fixed
+- Updated all internal testing files to use the new .create()` API
+
+### Removed
+- Index-specific factory methods (replaced by unified `create()` interface)
+
+---
+
 ## [0.0.9] - 2025-07-10
 
 ### Added

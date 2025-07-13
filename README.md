@@ -105,7 +105,7 @@ from zeusdb_vector_database import VectorDatabase
 vdb = VectorDatabase()
 
 # Initialize and set up the database resources
-index = vdb.create_index_hnsw(dim = 8)
+index = vdb.create(index_type="hnsw", dim=8)
 
 # Vector embeddings with accompanying ID's and Metadata
 records = [
@@ -156,11 +156,11 @@ ZeusDB Vector Database makes it easy to work with high-dimensional vector data u
 
 **Three simple steps**
 
-1. **Create an index**  
-2. **Add data to the index**  
-3. **Conduct a similarity search**
+1. **Create an index** using `.create()`
+2. **Add data** using `.add(...)`
+3. **Conduct a similarity search** using `.search(...)`
 
-Each step is covered below.
+Each step is covered below. 
 
 <br/>
 
@@ -176,22 +176,24 @@ from zeusdb_vector_database import VectorDatabase
 vdb = VectorDatabase()
 
 # Initialize and set up the database resources
-index = vdb.create_index_hnsw(
+index = vdb.create(
+  index_type = "hnsw",
   dim = 8, 
   space = "cosine", 
-  M = 16, 
+  m = 16, 
   ef_construction = 200, 
-  expected_size=5
+  expected_size = 5
   )
 ```
 
-#### 📘 `create_index_hnsw()` Parameters
+#### 📘 `create()` Parameters
 
 | Parameter        | Type   | Default   | Description                                                                 |
 |------------------|--------|-----------|-----------------------------------------------------------------------------|
+| `index_type`     | `str`  | `"hnsw"`  | The type of vector index to create. Currently supports `"hnsw"`. Future options include `"ivf"`, `"flat"`, etc. Case-insensitive. |
 | `dim`            | `int`  | `1536`    | Dimensionality of the vectors to be indexed. Each vector must have this length. The default dim=1536 is chosen to match the output dimensionality of OpenAI’s text-embedding-ada-002 model. |
 | `space`          | `str`  | `"cosine"`| Distance metric used for similarity search. Options include `"cosine"`. Additional metrics such as `"l2"`, and `"dot"` will be added in future versions. |
-| `M`              | `int`  | `16`      | Number of bi-directional connections created for each new node. Higher `M` improves recall but increases index size and build time. |
+| `m`              | `int`  | `16`      | Number of bi-directional connections created for each new node. Higher `m` improves recall but increases index size and build time. |
 | `ef_construction`| `int`  | `200`     | Size of the dynamic list used during index construction. Larger values increase indexing time and memory, but improve quality. |
 | `expected_size`  | `int`  | `10000`   | Estimated number of elements to be inserted. Used for preallocating internal data structures. Not a hard limit. |
 
@@ -374,7 +376,7 @@ print(index.info())
 ```
 *Output*
 ```
-HNSWIndex(dim=8, space=cosine, M=16, ef_construction=200, expected_size=5, vectors=5)
+HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=5, vectors=5)
 ```
 
 <br/>

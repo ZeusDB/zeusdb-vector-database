@@ -1,8 +1,11 @@
+# Import the vector database module
 from zeusdb_vector_database import VectorDatabase
 
-# Step 1: Create the index
+# Instantiate the VectorDatabase class
 vdb = VectorDatabase()
-index = vdb.create_index_hnsw(dim=8, space="cosine", M=16, ef_construction=200, expected_size=5)
+
+# Step 1: Create the index
+index = vdb.create(index_type="hnsw", dim=8, space="cosine", m=16, ef_construction=200, expected_size=5)
 
 # Step 2: Add data points
 records = [
