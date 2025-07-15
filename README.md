@@ -49,7 +49,9 @@ ZeusDB leverages the HNSW (Hierarchical Navigable Small World) algorithm for spe
 
 🐍 Simple and intuitive Python API
 
+⚡ Smart multi-threaded inserts that automatically speed up large batch uploads
 
+🚀 Fast, concurrent searches so you can run multiple queries at the same time
 
 
 <br/>

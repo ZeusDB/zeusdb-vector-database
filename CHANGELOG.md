@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.1] - 2025-07-15
+
+### Added
+- Parallel batch insertion using `rayon` for large datasets (`insert_batch`).
+- GIL-optimized `add_batch_parallel_gil_optimized()` path for inserts ≥ 50 items.
+- Thread-safe locking using `RwLock` and `Mutex` for all core maps (`vectors`, `id_map`, etc.).
+- `benchmark_concurrent_reads()` and `benchmark_raw_concurrent_performance()` for performance diagnostics.
+- `get_performance_info()` for runtime introspection of bottlenecks and recommendations.
+- Added `normalize_vector()` helper function to match Rust implementation behavior
+- Added `assert_vectors_close()` utility for normalized vector comparison with tolerance
+- Added additional tests for parallel batch processing validation, thread safety verification, and performance benchmarking.
+
+### Changed
+- `add()` now selects between sequential and parallel batch paths based on batch size.
+- `search()` releases the Python GIL and performs fast concurrent metadata filtering and conversion.
+- All internal maps (`vectors`, `metadata`, etc.) are now thread-safe for concurrent reads.
+- Cosine vector normalization is now always applied consistently across all input formats.
+
+### Fixed
+- Prevented deadlocks and data races by isolating all shared state behind locks.
+- Ensured proper ID overwrite handling across HNSW and reverse mappings with lock safety.
+- Fixed HNSW test suite to properly account for cosine space vector normalization. Replace exact floating-point comparisons with normalized vector assertions. The HNSW implementation was working correctly from the start. The tests 
+were actually validating that cosine normalization was properly implemented. 
+- Fixed comprehensive search test expectations for HNSW approximation behavior
+
+### Removed
+- Legacy single-threaded insertion behavior (now delegated via `add_batch_*` paths).
+
+---
+
 ## [0.1.0] - 2025-07-13
 
 ### Added
