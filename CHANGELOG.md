@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.2] - 2025-07-17
+
+### Added
+- **Intelligent Batch Search**: Automatic batch processing for multiple query vectors
+  - Transparent optimization: users get performance gains without API changes
+  - Smart strategy selection: sequential processing for ≤5 queries, parallel for 6+ queries
+  - Multiple input format support:
+    - `List[List[f32]]` - Native Python lists of vectors
+    - `NumPy 2D arrays (N, dims)` - Automatic batch detection
+    - `NumPy 1D arrays (dims,)` - Single vector fallback
+    - `List[f32]` - Traditional single vector (unchanged)
+- Added comprehensive batch search test suite
+
+### Changed
+- Optimized GIL release patterns for better concurrent performance
+- Reduced lock contention through intelligent batching strategies
+
+### Fixed
+<!-- Add bug fixes here -->
+
+### Removed
+<!-- Add removals/deprecations here -->
+
+---
+
 ## [0.1.1] - 2025-07-15
 
 ### Added

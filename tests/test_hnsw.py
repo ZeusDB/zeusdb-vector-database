@@ -882,3 +882,282 @@ def test_available_index_types():
     available_instance = vdb.available_index_types()
     assert available_instance == available
     
+# ------------------------------------------------------------
+# Test 27: Batch Search with List of Vectors
+# ------------------------------------------------------------
+def test_batch_search_list_vectors():
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=4, space="cosine", expected_size=20)
+    
+    # Add test data
+    records = [
+        {"id": "doc1", "values": [0.1, 0.2, 0.3, 0.4], "metadata": {"category": "A", "priority": 1}},
+        {"id": "doc2", "values": [0.5, 0.6, 0.7, 0.8], "metadata": {"category": "B", "priority": 2}},
+        {"id": "doc3", "values": [0.2, 0.3, 0.4, 0.5], "metadata": {"category": "A", "priority": 3}},
+        {"id": "doc4", "values": [0.8, 0.7, 0.6, 0.5], "metadata": {"category": "B", "priority": 1}},
+        {"id": "doc5", "values": [0.1, 0.1, 0.2, 0.2], "metadata": {"category": "C", "priority": 2}},
+        {"id": "doc6", "values": [0.9, 0.8, 0.7, 0.6], "metadata": {"category": "C", "priority": 3}},
+    ]
+    
+    result = index.add(records)
+    assert result.is_success()
+    assert result.total_inserted == 6
+    
+    # Test batch search with list of vectors
+    query_vectors = [
+        [0.1, 0.2, 0.3, 0.4],  # Similar to doc1
+        [0.5, 0.6, 0.7, 0.8],  # Similar to doc2
+        [0.9, 0.8, 0.7, 0.6],  # Similar to doc6
+    ]
+    
+    batch_results = index.search(query_vectors, top_k=3)
+    
+    # Verify batch results structure
+    assert isinstance(batch_results, list)
+    assert len(batch_results) == 3  # One result set per query
+    
+    # Verify each query result
+    for i, query_results in enumerate(batch_results):
+        assert isinstance(query_results, list)
+        assert len(query_results) <= 3  # top_k=3
+        assert len(query_results) >= 1  # Should find at least one result
+        
+        # Verify result structure
+        for result in query_results:
+            assert "id" in result
+            assert "score" in result
+            assert "metadata" in result
+            assert isinstance(result["score"], float)
+            assert result["score"] >= 0.0  # Distance should be non-negative
+    
+    # Test batch search with return_vector=True
+    batch_results_with_vectors = index.search(query_vectors, top_k=2, return_vector=True)
+    assert len(batch_results_with_vectors) == 3
+    
+    for query_results in batch_results_with_vectors:
+        for result in query_results:
+            assert "vector" in result
+            assert len(result["vector"]) == 4  # Dimension should match
+            vector = result["vector"]
+            assert isinstance(vector, list)
+            assert all(isinstance(v, float) for v in vector)
+
+# ------------------------------------------------------------
+# Test 28: Batch Search with 2D NumPy Array
+# ------------------------------------------------------------
+def test_batch_search_numpy_array():
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=8, space="cosine", expected_size=50)
+    
+    # Add test data using NumPy for efficiency
+    np.random.seed(42)  # For reproducible results
+    num_docs = 30
+    
+    # Create document vectors
+    doc_vectors = np.random.rand(num_docs, 8).astype(np.float32)
+    doc_ids = [f"doc_{i:03d}" for i in range(num_docs)]
+    doc_metadatas = [{"type": "document", "index": i, "batch": i % 3} for i in range(num_docs)]
+    
+    # Add documents using NumPy format
+    add_result = index.add({
+        "ids": doc_ids,
+        "embeddings": doc_vectors,
+        "metadatas": doc_metadatas
+    })
+    
+    assert add_result.is_success()
+    assert add_result.total_inserted == num_docs
+    
+    # Create query vectors using NumPy 2D array
+    num_queries = 5
+    query_vectors = np.random.rand(num_queries, 8).astype(np.float32)
+    
+    # Test batch search with NumPy 2D array
+    batch_results = index.search(query_vectors, top_k=5)
+    
+    # Verify batch results structure
+    assert isinstance(batch_results, list)
+    assert len(batch_results) == num_queries
+    
+    # Verify each query result
+    for i, query_results in enumerate(batch_results):
+        assert isinstance(query_results, list)
+        assert len(query_results) <= 5  # top_k=5
+        assert len(query_results) >= 1  # Should find at least one result
+        
+        # Verify results are sorted by score (ascending for cosine distance)
+        scores = [r["score"] for r in query_results]
+        assert scores == sorted(scores), f"Query {i} results not sorted by score"
+        
+        # Verify result structure
+        for result in query_results:
+            assert "id" in result
+            assert "score" in result
+            assert "metadata" in result
+            assert result["id"] in doc_ids
+            assert result["metadata"]["type"] == "document"
+            assert isinstance(result["metadata"]["index"], int)
+            assert isinstance(result["metadata"]["batch"], int)
+    
+    # Test with different ef_search parameter
+    batch_results_high_ef = index.search(query_vectors, top_k=3, ef_search=200)
+    assert len(batch_results_high_ef) == num_queries
+    
+    for query_results in batch_results_high_ef:
+        assert len(query_results) <= 3  # top_k=3
+        assert len(query_results) >= 1
+    
+    # Test error handling: wrong NumPy array shape
+    wrong_shape_queries = np.random.rand(3, 4).astype(np.float32)  # Wrong dimension
+    
+    with pytest.raises(ValueError, match="dimension mismatch"):
+        index.search(wrong_shape_queries, top_k=3)
+
+# ------------------------------------------------------------
+# Test 29: Batch Search with Metadata Filter
+# ------------------------------------------------------------
+def test_batch_search_with_metadata_filter():
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=6, space="cosine", expected_size=40)
+    
+    # Add diverse test data with rich metadata
+    records = [
+        {"id": "article_001", "values": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6], 
+         "metadata": {"type": "article", "author": "Alice", "year": 2024, "published": True, "score": 8.5}},
+        {"id": "article_002", "values": [0.2, 0.3, 0.4, 0.5, 0.6, 0.7], 
+         "metadata": {"type": "article", "author": "Bob", "year": 2023, "published": True, "score": 7.2}},
+        {"id": "article_003", "values": [0.3, 0.4, 0.5, 0.6, 0.7, 0.8], 
+         "metadata": {"type": "article", "author": "Alice", "year": 2024, "published": False, "score": 9.1}},
+        {"id": "blog_001", "values": [0.4, 0.5, 0.6, 0.7, 0.8, 0.9], 
+         "metadata": {"type": "blog", "author": "Charlie", "year": 2024, "published": True, "score": 6.8}},
+        {"id": "blog_002", "values": [0.5, 0.6, 0.7, 0.8, 0.9, 1.0], 
+         "metadata": {"type": "blog", "author": "Alice", "year": 2023, "published": True, "score": 8.0}},
+        {"id": "news_001", "values": [0.6, 0.7, 0.8, 0.9, 1.0, 0.1], 
+         "metadata": {"type": "news", "author": "David", "year": 2024, "published": True, "score": 5.5}},
+        {"id": "news_002", "values": [0.7, 0.8, 0.9, 1.0, 0.1, 0.2], 
+         "metadata": {"type": "news", "author": "Bob", "year": 2024, "published": False, "score": 7.8}},
+        {"id": "draft_001", "values": [0.8, 0.9, 1.0, 0.1, 0.2, 0.3], 
+         "metadata": {"type": "article", "author": "Alice", "year": 2024, "published": False, "score": 9.5}},
+    ]
+    
+    result = index.add(records)
+    assert result.is_success()
+    assert result.total_inserted == 8
+    
+    # Create batch queries
+    query_vectors = [
+        [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],  # Similar to article_001
+        [0.4, 0.5, 0.6, 0.7, 0.8, 0.9],  # Similar to blog_001
+        [0.7, 0.8, 0.9, 1.0, 0.1, 0.2],  # Similar to news_002
+    ]
+    
+    # Test 1: Filter by type
+    article_results = index.search(
+        query_vectors, 
+        filter={"type": "article"}, 
+        top_k=5
+    )
+    
+    assert len(article_results) == 3  # Three queries
+    for query_results in article_results:
+        assert len(query_results) >= 1  # Should find at least one article
+        for result in query_results:
+            assert result["metadata"]["type"] == "article"
+    
+    # Test 2: Filter by author
+    alice_results = index.search(
+        query_vectors, 
+        filter={"author": "Alice"}, 
+        top_k=5
+    )
+    
+    assert len(alice_results) == 3  # Three queries
+    for query_results in alice_results:
+        assert len(query_results) >= 1  # Should find at least one Alice document
+        for result in query_results:
+            assert result["metadata"]["author"] == "Alice"
+    
+    # Test 3: Filter by multiple conditions
+    published_alice_2024 = index.search(
+        query_vectors,
+        filter={"author": "Alice", "year": 2024, "published": True},
+        top_k=5
+    )
+    
+    assert len(published_alice_2024) == 3  # Three queries
+    for query_results in published_alice_2024:
+        # May not find results for all queries due to strict filter
+        for result in query_results:
+            assert result["metadata"]["author"] == "Alice"
+            assert result["metadata"]["year"] == 2024
+            assert result["metadata"]["published"] is True
+    
+    # Test 4: Filter with numeric conditions
+    high_score_results = index.search(
+        query_vectors,
+        filter={"score": {"gte": 8.0}},
+        top_k=5
+    )
+    
+    assert len(high_score_results) == 3  # Three queries
+    for query_results in high_score_results:
+        for result in query_results:
+            assert result["metadata"]["score"] >= 8.0
+    
+    # Test 5: Filter with range conditions
+    recent_high_quality = index.search(
+        query_vectors,
+        filter={"year": {"gte": 2024}, "score": {"gt": 7.0}, "published": True},
+        top_k=3
+    )
+    
+    assert len(recent_high_quality) == 3  # Three queries
+    for query_results in recent_high_quality:
+        for result in query_results:
+            assert result["metadata"]["year"] >= 2024
+            assert result["metadata"]["score"] > 7.0
+            assert result["metadata"]["published"] is True
+    
+    # Test 6: Empty filter results (should still return structure)
+    impossible_filter = index.search(
+        query_vectors,
+        filter={"type": "nonexistent"},
+        top_k=5
+    )
+    
+    assert len(impossible_filter) == 3  # Three queries
+    for query_results in impossible_filter:
+        assert len(query_results) == 0  # No results should match
+    
+    # Test 7: Batch search with filter and return_vector=True
+    filtered_with_vectors = index.search(
+        query_vectors,
+        filter={"type": "article"},
+        top_k=2,
+        return_vector=True
+    )
+    
+    assert len(filtered_with_vectors) == 3  # Three queries
+    for query_results in filtered_with_vectors:
+        for result in query_results:
+            assert "vector" in result
+            assert len(result["vector"]) == 6  # Dimension should match
+            assert result["metadata"]["type"] == "article"
+    
+    # Test 8: Compare filtered vs unfiltered results
+    unfiltered_results = index.search(query_vectors, top_k=8)
+    filtered_results = index.search(query_vectors, filter={"published": True}, top_k=8)
+    
+    assert len(unfiltered_results) == 3
+    assert len(filtered_results) == 3
+    
+    # Filtered results should be a subset (or equal) for each query
+    for i in range(3):
+        unfiltered_count = len(unfiltered_results[i])
+        filtered_count = len(filtered_results[i])
+        assert filtered_count <= unfiltered_count
+        
+        # All filtered results should have published=True
+        for result in filtered_results[i]:
+            assert result["metadata"]["published"] is True
+            

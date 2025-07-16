@@ -183,98 +183,212 @@ impl HNSWIndex {
         }
     }
 
-    /// GIL-optimized search with HNSW locking
+    // /// GIL-optimized search with HNSW locking
+    // #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, return_vector=false))]
+    // pub fn search(
+    //     &self,
+    //     py: Python<'_>,
+    //     vector: Vec<f32>,
+    //     filter: Option<&Bound<PyDict>>,
+    //     top_k: usize,
+    //     ef_search: Option<usize>,
+    //     return_vector: bool,
+    // ) -> PyResult<Vec<Py<PyDict>>> {
+    //     if vector.len() != self.dim {
+    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+    //             "Search vector dimension mismatch: expected {}, got {}",
+    //             self.dim, vector.len()
+    //         )));
+    //     }
+
+    //     // Parse filter while still have GIL
+    //     let filter_conditions = if let Some(filter_dict) = filter {
+    //         Some(self.python_dict_to_value_map(filter_dict)?)
+    //     } else {
+    //         None
+    //     };
+
+    //     let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
+
+    //     // Release GIL but use locking for HNSW
+    //     let search_results = py.allow_threads(|| {
+    //         // Step 1: HNSW search (needs exclusive access, but brief)
+    //         let hnsw_results = {
+    //             let hnsw_guard = self.hnsw.lock().unwrap();
+    //             hnsw_guard.search(&vector, top_k, ef)
+    //         }; // HNSW lock released here - This is critical for performance!
+            
+    //         // Step 2: Data lookup with RwLock (concurrent reads possible)
+    //         let vectors = self.vectors.read().unwrap();
+    //         let vector_metadata = self.vector_metadata.read().unwrap();
+    //         let rev_map = self.rev_map.read().unwrap();
+            
+    //         let mut results = Vec::with_capacity(hnsw_results.len());
+
+    //         let has_filter = filter_conditions.is_some();
+            
+    //         for neighbor in hnsw_results {
+    //             let score = neighbor.distance;
+    //             let internal_id = neighbor.get_origin_id();
+                
+    //             if let Some(ext_id) = rev_map.get(&internal_id) {
+    //                 if has_filter {
+    //                     if let Some(meta) = vector_metadata.get(ext_id) {
+    //                         let filter_conds = filter_conditions.as_ref().unwrap(); // Safe unwrap
+    //                         if !self.matches_filter(meta, filter_conds).unwrap_or(false) {
+    //                             continue;
+    //                         }
+    //                     } else {
+    //                         continue;
+    //                     }
+    //                 }
+                    
+    //                 // Collect data for Python object creation
+    //                 let metadata = vector_metadata.get(ext_id).cloned().unwrap_or_default();
+    //                 let vector_data = if return_vector {
+    //                     vectors.get(ext_id).cloned()
+    //                 } else {
+    //                     None
+    //                 };
+                    
+    //                 results.push((ext_id.clone(), score, metadata, vector_data));
+    //             }
+    //         }
+            
+    //         results
+    //     }); // GIL is reacquired here
+        
+    //     // Step 3: Convert to Python objects (needs GIL)
+    //     let mut output = Vec::with_capacity(search_results.len());
+    //     for (id, score, metadata, vector_data) in search_results {
+    //         let dict = PyDict::new(py);
+    //         dict.set_item("id", id)?;
+    //         dict.set_item("score", score)?;
+    //         dict.set_item("metadata", self.value_map_to_python(&metadata, py)?)?;
+            
+    //         if let Some(vec) = vector_data {
+    //             dict.set_item("vector", vec)?;
+    //         }
+            
+    //         output.push(dict.into());
+    //     }
+
+    //     Ok(output)
+    // }
+
+    // SEARCH METHOD
+    /// Enhanced search method with automatic batch detection and optimization
     #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, return_vector=false))]
     pub fn search(
         &self,
         py: Python<'_>,
-        vector: Vec<f32>,
+        vector: Bound<PyAny>,
         filter: Option<&Bound<PyDict>>,
         top_k: usize,
         ef_search: Option<usize>,
         return_vector: bool,
-    ) -> PyResult<Vec<Py<PyDict>>> {
-        if vector.len() != self.dim {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Search vector dimension mismatch: expected {}, got {}",
-                self.dim, vector.len()
-            )));
-        }
-
-        // Parse filter while still have GIL
-        let filter_conditions = if let Some(filter_dict) = filter {
-            Some(self.python_dict_to_value_map(filter_dict)?)
-        } else {
-            None
-        };
-
+    ) -> PyResult<PyObject> {
         let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
+        let filter_conditions = filter.map(|f| self.python_dict_to_value_map(f)).transpose()?;
 
-        // Release GIL but use locking for HNSW
-        let search_results = py.allow_threads(|| {
-            // Step 1: HNSW search (needs exclusive access, but brief)
-            let hnsw_results = {
-                let hnsw_guard = self.hnsw.lock().unwrap();
-                hnsw_guard.search(&vector, top_k, ef)
-            }; // HNSW lock released here - This is critical for performance!
-            
-            // Step 2: Data lookup with RwLock (concurrent reads possible)
-            let vectors = self.vectors.read().unwrap();
-            let vector_metadata = self.vector_metadata.read().unwrap();
-            let rev_map = self.rev_map.read().unwrap();
-            
-            let mut results = Vec::with_capacity(hnsw_results.len());
+        // Detect batch vs single query with comprehensive input support
+        if let Ok(list_vec) = vector.extract::<Vec<Vec<f32>>>() {
+            // Format: List of vectors [[0.1, 0.2], [0.3, 0.4]]
+            let results = self.batch_search_internal(&list_vec, filter_conditions.as_ref(), top_k, ef, return_vector, py)?;
+            Ok(PyList::new(py, results)?.into())
+        } else if let Ok(np_array) = vector.downcast::<PyArray2<f32>>() {
+            // Format: NumPy 2D array (N, dims)
+            let readonly = np_array.readonly();
+            let shape = readonly.shape();
 
-            let has_filter = filter_conditions.is_some();
-            
-            for neighbor in hnsw_results {
-                let score = neighbor.distance;
-                let internal_id = neighbor.get_origin_id();
-                
-                if let Some(ext_id) = rev_map.get(&internal_id) {
-                    if has_filter {
-                        if let Some(meta) = vector_metadata.get(ext_id) {
-                            let filter_conds = filter_conditions.as_ref().unwrap(); // Safe unwrap
-                            if !self.matches_filter(meta, filter_conds).unwrap_or(false) {
+            if shape.len() != 2 || shape[1] != self.dim {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "NumPy array must have shape (N, {}), got {:?}", self.dim, shape
+                )));
+            }
+
+            let flat = readonly.as_slice()?;
+            let batch: Vec<Vec<f32>> = flat.chunks(self.dim).map(|chunk| chunk.to_vec()).collect();
+            let results = self.batch_search_internal(&batch, filter_conditions.as_ref(), top_k, ef, return_vector, py)?;
+            Ok(PyList::new(py, results)?.into())
+        } else {
+            // Single vector path - enhanced with NumPy 1D support
+            let single_vec = if let Ok(array1d) = vector.downcast::<PyArray1<f32>>() {
+                array1d.readonly().as_slice()?.to_vec()
+            } else {
+                vector.extract::<Vec<f32>>()?
+            };
+
+            if single_vec.len() != self.dim {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Search vector dimension mismatch: expected {}, got {}",
+                    self.dim, single_vec.len()
+                )));
+            }
+
+            let search_results = py.allow_threads(|| {
+                let hnsw_results = {
+                    let hnsw_guard = self.hnsw.lock().unwrap();
+                    hnsw_guard.search(&single_vec, top_k, ef)
+                };
+
+                let vectors = self.vectors.read().unwrap();
+                let vector_metadata = self.vector_metadata.read().unwrap();
+                let rev_map = self.rev_map.read().unwrap();
+
+                let mut results = Vec::with_capacity(hnsw_results.len());
+                let has_filter = filter_conditions.is_some();
+
+                for neighbor in hnsw_results {
+                    let score = neighbor.distance;
+                    let internal_id = neighbor.get_origin_id();
+
+                    if let Some(ext_id) = rev_map.get(&internal_id) {
+                        if has_filter {
+                            if let Some(meta) = vector_metadata.get(ext_id) {
+                                let filter_conds = filter_conditions.as_ref().unwrap();
+                                if !self.matches_filter(meta, filter_conds).unwrap_or(false) {
+                                    continue;
+                                }
+                            } else {
                                 continue;
                             }
-                        } else {
-                            continue;
                         }
-                    }
-                    
-                    // Collect data for Python object creation
-                    let metadata = vector_metadata.get(ext_id).cloned().unwrap_or_default();
-                    let vector_data = if return_vector {
-                        vectors.get(ext_id).cloned()
-                    } else {
-                        None
-                    };
-                    
-                    results.push((ext_id.clone(), score, metadata, vector_data));
-                }
-            }
-            
-            results
-        }); // GIL is reacquired here
-        
-        // Step 3: Convert to Python objects (needs GIL)
-        let mut output = Vec::with_capacity(search_results.len());
-        for (id, score, metadata, vector_data) in search_results {
-            let dict = PyDict::new(py);
-            dict.set_item("id", id)?;
-            dict.set_item("score", score)?;
-            dict.set_item("metadata", self.value_map_to_python(&metadata, py)?)?;
-            
-            if let Some(vec) = vector_data {
-                dict.set_item("vector", vec)?;
-            }
-            
-            output.push(dict.into());
-        }
 
-        Ok(output)
+                        let metadata = vector_metadata.get(ext_id).cloned().unwrap_or_default();
+                        let vector_data = if return_vector {
+                            vectors.get(ext_id).cloned()
+                        } else {
+                            None
+                        };
+
+                        results.push((ext_id.clone(), score, metadata, vector_data));
+                    }
+                }
+
+                results
+            });
+
+            // let mut output = Vec::with_capacity(search_results.len());
+            let mut output: Vec<Py<PyDict>> = Vec::with_capacity(search_results.len());
+            for (id, score, metadata, vector_data) in search_results {
+                let dict = PyDict::new(py);
+                dict.set_item("id", id)?;
+                dict.set_item("score", score)?;
+                dict.set_item("metadata", self.value_map_to_python(&metadata, py)?)?;
+                if let Some(vec) = vector_data {
+                    dict.set_item("vector", vec)?;
+                }
+                output.push(dict.into());
+            }
+
+            Ok(PyList::new(py, output)?.into())
+        }
     }
+
+
+
+
 
     /// Thread-safe get_records implementation
     #[pyo3(signature = (input, return_vector = true))]
@@ -438,15 +552,12 @@ impl HNSWIndex {
             .collect();
         
         let mut results = HashMap::new();
-        
-        // Sequential benchmark
+
+        // Sequential benchmark (using raw search for cleaner performance measurement)
         let start = Instant::now();
-        Python::with_gil(|py| {
-            for query in &queries {
-                let _ = self.search(py, query.clone(), None, 10, None, false)?;
-            }
-            Ok::<(), PyErr>(())
-        })?;
+        for query in &queries {
+            let _ = self.raw_search_no_gil(query);
+        }
         let sequential_time = start.elapsed().as_secs_f64();
         results.insert("sequential_time".to_string(), sequential_time);
         results.insert("sequential_qps".to_string(), queries.len() as f64 / sequential_time);
@@ -1125,4 +1236,204 @@ impl HNSWIndex {
         
         Ok(py_obj)
     }
+
+    /// Internal batch search method for multiple query vectors (not exposed to Python)
+    /// Automatically chooses optimal strategy based on batch size
+    fn batch_search_internal(
+        &self,
+        vectors: &[Vec<f32>],
+        filter_conditions: Option<&HashMap<String, Value>>,
+        top_k: usize,
+        ef: usize,
+        return_vector: bool,
+        py: Python<'_>,
+    ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
+        // Validate all vectors have correct dimension
+        for (i, vector) in vectors.iter().enumerate() {
+            if vector.len() != self.dim {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Vector {}: dimension mismatch: expected {}, got {}", 
+                           i, self.dim, vector.len())));
+            }
+        }
+
+        // Choose strategy based on batch size
+        if vectors.len() <= 5 {
+            self.batch_search_sequential(vectors, filter_conditions, top_k, ef, return_vector, py)
+        } else {
+            self.batch_search_parallel(vectors, filter_conditions, top_k, ef, return_vector, py)
+        }
+    }
+
+    /// Sequential batch processing (for small batches - single HNSW lock)
+    /// Most efficient for 2-5 queries due to reduced lock overhead
+    fn batch_search_sequential(
+        &self,
+        vectors: &[Vec<f32>],
+        filter_conditions: Option<&HashMap<String, Value>>,
+        top_k: usize,
+        ef: usize,
+        return_vector: bool,
+        py: Python<'_>,
+    ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
+        let rust_results = py.allow_threads(|| {
+            // Single HNSW lock for entire batch (most efficient for small batches)
+            let hnsw_guard = self.hnsw.lock().unwrap();
+            let vector_store = self.vectors.read().unwrap();
+            let metadata_store = self.vector_metadata.read().unwrap();
+            let rev_map = self.rev_map.read().unwrap();
+            
+            let mut all_results = Vec::with_capacity(vectors.len());
+
+            for vector in vectors {
+                let neighbors = hnsw_guard.search(vector, top_k, ef);
+                let mut query_results = Vec::with_capacity(neighbors.len());
+
+                for neighbor in neighbors {
+                    let internal_id = neighbor.get_origin_id();
+
+                    if let Some(ext_id) = rev_map.get(&internal_id) {
+                        // Apply filter if specified
+                        if let Some(filter_conds) = filter_conditions {
+                            if let Some(meta) = metadata_store.get(ext_id) {
+                                if !self.matches_filter(meta, filter_conds).unwrap_or(false) {
+                                    continue;
+                                }
+                            } else {
+                                continue;
+                            }
+                        }
+
+                        let metadata = metadata_store.get(ext_id).cloned().unwrap_or_default();
+                        let vector_data = if return_vector {
+                            vector_store.get(ext_id).cloned()
+                        } else {
+                            None
+                        };
+
+                        query_results.push((ext_id.clone(), neighbor.distance, metadata, vector_data));
+                    }
+                }
+
+                all_results.push(query_results);
+            }
+            
+            all_results
+        });
+
+        // Convert to Python objects (needs GIL)
+        let mut output = Vec::with_capacity(rust_results.len());
+        for batch_result in rust_results {
+            let mut py_batch = Vec::with_capacity(batch_result.len());
+
+            for (id, score, metadata, vector_data) in batch_result {
+                let dict = PyDict::new(py);
+                dict.set_item("id", id)?;
+                dict.set_item("score", score)?;
+                dict.set_item("metadata", self.value_map_to_python(&metadata, py)?)?;
+
+                if let Some(vec) = vector_data {
+                    dict.set_item("vector", vec)?;
+                }
+
+                py_batch.push(dict.into());
+            }
+            
+            output.push(py_batch);
+        }
+
+        Ok(output)
+    }
+
+    /// Parallel batch processing (for larger batches - brief individual locks)
+    /// Scales with CPU cores for 6+ queries
+    fn batch_search_parallel(
+        &self,
+        vectors: &[Vec<f32>],
+        filter_conditions: Option<&HashMap<String, Value>>,
+        top_k: usize,
+        ef: usize,
+        return_vector: bool,
+        py: Python<'_>,
+    ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
+        let rust_results = py.allow_threads(|| {
+            // Parallel processing with brief individual HNSW locks
+            let results: Vec<Vec<(String, f32, HashMap<String, Value>, Option<Vec<f32>>)>> = vectors
+                .par_iter()
+                .map(|vector| {
+                    // Brief HNSW search (individual lock per query)
+                    let neighbors = {
+                        let hnsw_guard = self.hnsw.lock().unwrap();
+                        hnsw_guard.search(vector, top_k, ef)
+                    }; // Lock released immediately after search
+
+                    // Concurrent data lookup (RwLock allows parallel reads)
+                    let vector_store = self.vectors.read().unwrap();
+                    let metadata_store = self.vector_metadata.read().unwrap();
+                    let rev_map = self.rev_map.read().unwrap();
+
+                    let mut query_results = Vec::with_capacity(neighbors.len());
+
+                    for neighbor in neighbors {
+                        let internal_id = neighbor.get_origin_id();
+
+                        if let Some(ext_id) = rev_map.get(&internal_id) {
+                            // Apply filter if specified
+                            if let Some(filter_conds) = filter_conditions {
+                                if let Some(meta) = metadata_store.get(ext_id) {
+                                    if !self.matches_filter(meta, filter_conds).unwrap_or(false) {
+                                        continue;
+                                    }
+                                } else {
+                                    continue;
+                                }
+                            }
+
+                            let metadata = metadata_store.get(ext_id).cloned().unwrap_or_default();
+                            let vector_data = if return_vector {
+                                vector_store.get(ext_id).cloned()
+                            } else {
+                                None
+                            };
+
+                            query_results.push((ext_id.clone(), neighbor.distance, metadata, vector_data));
+                        }
+                    }
+
+                    query_results
+                })
+                .collect();
+                
+            results
+        });
+
+        // Convert to Python objects (needs GIL)
+        let mut output = Vec::with_capacity(rust_results.len());
+        for batch_result in rust_results {
+            let mut py_batch = Vec::with_capacity(batch_result.len());
+
+            for (id, score, metadata, vector_data) in batch_result {
+                let dict = PyDict::new(py);
+                dict.set_item("id", id)?;
+                dict.set_item("score", score)?;
+                dict.set_item("metadata", self.value_map_to_python(&metadata, py)?)?;
+
+                if let Some(vec) = vector_data {
+                    dict.set_item("vector", vec)?;
+                }
+
+                py_batch.push(dict.into());
+            }
+
+            output.push(py_batch);
+        }
+
+        Ok(output)
+    }
+
+
+
+
+
+
 }
