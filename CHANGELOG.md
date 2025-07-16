@@ -24,12 +24,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optimized GIL release patterns for better concurrent performance
 - Reduced lock contention through intelligent batching strategies
 
-### Fixed
-<!-- Add bug fixes here -->
-
-### Removed
-<!-- Add removals/deprecations here -->
-
 ---
 
 ## [0.1.1] - 2025-07-15
