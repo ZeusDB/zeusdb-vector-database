@@ -392,7 +392,7 @@ results = index.search(vector=query_vector, top_k=3)
 print(results)
 ```
 
-#### 🔍 Search Example 6 - Batch Search with with metadata filter
+#### 🔍 Search Example 6 - Batch Search with metadata filter
 
 Performs similarity search on multiple query vectors with metadata filtering, returning filtered results for each query.
 
