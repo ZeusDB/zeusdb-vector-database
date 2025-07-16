@@ -188,7 +188,9 @@ index = vdb.create(
   )
 ```
 
-#### 📘 `create()` Parameters
+<br/>
+
+#### 📘 Parameters - `create()`
 
 | Parameter        | Type   | Default   | Description                                                                 |
 |------------------|--------|-----------|-----------------------------------------------------------------------------|
@@ -277,7 +279,9 @@ print(add_result)  # AddResult(inserted=2, errors=0, shape=(2, 2))
 
 Each format is parsed and validated automatically. Invalid records are skipped, and detailed error messages are returned to help with debugging and retry workflows.
 
-#### 📘 `add()` Parameters
+<br/>
+
+#### 📘 Parameters - `add()`
 
 The `add()` method inserts one or more vectors into the index. Multiple data formats are supported to accommodate different workflows, including native Python types and NumPy arrays.
 
@@ -303,7 +307,6 @@ Query the index using a new vector and retrieve the top-k nearest neighbors. You
 #### 🔍 Basic Search (Returning Top 2 most similar)
 
 ```python
-print("\n--- Query returning two most similar results ---")
 results = index.search(vector=query_vector, top_k=2)
 print(results)
 ```
@@ -321,7 +324,6 @@ print(results)
 This filters on the given metadata after conducting the similarity search.
 
 ```python
-print("\n--- Querying with filter: author = 'Alice' ---")
 results = index.search(vector=query_vector, filter={"author": "Alice"}, top_k=5)
 print(results)
 ```
@@ -340,7 +342,6 @@ print(results)
 You can optionally return the stored embedding vectors alongside metadata and similarity scores by setting `return_vector=True`. This is useful when you need access to the raw vectors for downstream tasks such as re-ranking, inspection, or hybrid scoring.
 
 ```python
-print("\n--- Querying with filter and returning embedding vectors ---")
 results = index.search(vector=query_vector, filter={"split": "test"}, top_k=2, return_vector=True)
 print(results)
 ```
@@ -353,9 +354,9 @@ print(results)
 ]
 ```
 
-#### 📘 `query()` Parameters
+#### 📘 Parameters - `search()` 
 
-The `query()` method retrieves the top-k most similar vectors from the index given an input query vector. Results include the vector ID, similarity score, metadata, and (optionally) the stored vector itself.
+The `search()` method retrieves the top-k most similar vectors from the index given an input query vector. Results include the vector ID, similarity score, metadata, and (optionally) the stored vector itself.
 
 | Parameter         | Type                            | Default   | Description                                                                 |
 |------------------|----------------------------------|-----------|-----------------------------------------------------------------------------|
