@@ -304,7 +304,7 @@ Helpful for validation, logging, and debugging.
 
 Query the index using a new vector and retrieve the top-k nearest neighbors. You can also filter by metadata or return the original stored vectors.
 
-#### 🔍 Basic Search (Returning Top 2 most similar)
+#### 🔍 Search Example 1 - Basic (Returning Top 2 most similar)
 
 ```python
 results = index.search(vector=query_vector, top_k=2)
@@ -319,11 +319,12 @@ print(results)
 ]
 ```
 
-#### 🔍 Query with metadata filter
+#### 🔍 Search Example 2 - Query with metadata filter
 
 This filters on the given metadata after conducting the similarity search.
 
 ```python
+query_vector = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
 results = index.search(vector=query_vector, filter={"author": "Alice"}, top_k=5)
 print(results)
 ```
@@ -337,7 +338,7 @@ print(results)
 ]
 ```
 
-#### 🔍 Include Vector in Similarity Results
+#### 🔍 Search Example 3 - Search results include vectors
 
 You can optionally return the stored embedding vectors alongside metadata and similarity scores by setting `return_vector=True`. This is useful when you need access to the raw vectors for downstream tasks such as re-ranking, inspection, or hybrid scoring.
 
@@ -354,13 +355,66 @@ print(results)
 ]
 ```
 
+#### 🔍 Search Example 4 - Batch Search with a list of vectors
+
+Perform a similarity search on multiple query vectors simultaneously, returning results for each query.
+
+```python
+query_vector =
+[
+    [0.1, 0.2, 0.3],
+    [0.4, 0.5, 0.6]
+]
+results = index.search(vector=query_vector, top_k=3)
+print(results)
+```
+
+*Output*
+```
+[
+[{'id': 'a', 'score': 4.999447078546382e-09, 'metadata': {'category': 'A'}}, {'id': 'b', 'score': 0.02536815218627453, 'metadata': {'category': 'B'}}, {'id': 'c', 'score': 0.04058804363012314, 'metadata': {'category': 'A'}}],
+[{'id': 'b', 'score': 4.591760305316939e-09, 'metadata': {'category': 'B'}}, {'id': 'c', 'score': 0.0018091063247993588, 'metadata': {'category': 'A'}}, {'id': 'a', 'score': 0.025368161499500275, 'metadata': {'category': 'A'}}]
+]
+```
+
+#### 🔍 Search Example 5 - Batch Search with NumPy Array
+
+Perform a similarity search on multiple query vectors from a NumPy array, returning results for each query.
+
+```python
+query_vector = np.array(
+[
+    [0.1, 0.2, 0.3],
+    [0.7, 0.8, 0.9]
+], dtype=np.float32)
+
+results = index.search(vector=query_vector, top_k=3)
+print(results)
+```
+
+#### 🔍 Search Example 6 - Batch Search with with metadata filter
+
+Performs similarity search on multiple query vectors with metadata filtering, returning filtered results for each query.
+
+```python
+results = index.search(
+    [[0.1, 0.2, 0.3], [0.7, 0.8, 0.9]],
+    filter={"category": "A"},
+    top_k=3
+)
+print(results)
+```
+
+
+<br/>
+
 #### 📘 Parameters - `search()` 
 
 The `search()` method retrieves the top-k most similar vectors from the index given an input query vector. Results include the vector ID, similarity score, metadata, and (optionally) the stored vector itself.
 
 | Parameter         | Type                            | Default   | Description                                                                 |
 |------------------|----------------------------------|-----------|-----------------------------------------------------------------------------|
-| `vector`         | `List[float]` or `np.ndarray`    | *required* | The query vector to compare against the index. Must match the index dimension. |
+| `vector`         | `List[float]` or `List[List[float]]` or `np.ndarray`  | *required* | The query vector (single: `List[float]`) or batch of query vectors (`List[List[float]]` or 2D `np.ndarray`) to compare against the index. Must match the index dimension. |
 | `filter`         | `Dict[str, str] \| None`         | `None`    | Optional metadata filter. Only vectors with matching key-value metadata pairs will be considered in the search. |
 | `top_k`          | `int`                            | `10`      | Number of nearest neighbors to return. |
 | `ef_search`      | `int \| None`                    | `max(2 × top_k, 100)` | Search complexity parameter. Higher values improve accuracy at the cost of speed. |
