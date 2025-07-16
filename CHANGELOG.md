@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.1.2] - 2025-
+## [0.1.2] - 2025-07-17
 
 ### Added
 - **Intelligent Batch Search**: Automatic batch processing for multiple query vectors
