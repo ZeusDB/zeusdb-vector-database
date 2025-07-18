@@ -1,5 +1,6 @@
 // lib.rs
 mod hnsw_index;
+mod pq;
 
 use pyo3::prelude::*;
 
