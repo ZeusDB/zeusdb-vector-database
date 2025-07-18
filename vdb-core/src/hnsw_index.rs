@@ -2,52 +2,319 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use std::collections::HashMap;
-use std::sync::{Mutex, RwLock};
-use hnsw_rs::prelude::{Hnsw, DistCosine, DistL2, DistL1};
+use std::sync::{Mutex, RwLock, Arc};
+use hnsw_rs::prelude::{Hnsw, DistCosine, DistL2, DistL1, Distance};
 use serde_json::Value;
 use rayon::prelude::*;
 
+// Import PQ module
+use crate::pq::PQ;
+
+// Quantization configuration structure
+#[derive(Debug, Clone)]
+pub struct QuantizationConfig {
+    pub subvectors: usize,
+    pub bits: usize,
+    pub training_size: usize,
+    pub max_training_vectors: Option<usize>,
+}
+
+/// Custom distance function for Product Quantization using ADC
+#[derive(Clone)]
+pub struct DistPQ {
+    /// Reference to the PQ instance for accessing centroids
+    pq: Arc<PQ>,
+    /// Pre-computed ADC lookup table for the current query
+    /// Thread-safe storage since multiple threads may search simultaneously
+    lut: Arc<RwLock<Option<Vec<Vec<f32>>>>>,
+}
+
+impl DistPQ {
+    pub fn new(pq: Arc<PQ>) -> Self {
+        DistPQ {
+            pq,
+            lut: Arc::new(RwLock::new(None)),
+        }
+    }
+    
+    pub fn set_query_lut(&self, query: &[f32]) -> Result<(), String> {
+        if !self.pq.is_trained() {
+            return Err("PQ must be trained before ADC computation".to_string());
+        }
+        
+        let lut = self.pq.compute_adc_lut(query)?;
+        {
+            let mut lut_guard = self.lut.write().unwrap();
+            *lut_guard = Some(lut);
+        }
+        Ok(())
+    }
+    
+    pub fn clear_lut(&self) {
+        let mut lut_guard = self.lut.write().unwrap();
+        *lut_guard = None;
+    }
+}
+
+
+
+impl Distance<Vec<u8>> for DistPQ {
+    /// Compute distance between query (via LUT) and stored PQ codes
+    /// The first parameter `_a` is ignored since we use the pre-computed LUT
+    /// The second parameter `b` contains the PQ codes for the stored vector
+    fn eval(&self, _a: &[Vec<u8>], b: &[Vec<u8>]) -> f32 {
+        let lut_guard = self.lut.read().unwrap();
+        match lut_guard.as_ref() {
+            Some(lut) => {
+                // Use the first vector in the batch for distance computation
+                if let Some(codes) = b.first() {
+                    self.pq.adc_distance(codes, lut).unwrap_or(f32::INFINITY)
+                } else {
+                    f32::INFINITY
+                }
+            }
+            None => {
+                // Fallback: this shouldn't happen in normal operation
+                f32::INFINITY
+            }
+        }
+    }
+}
+
+
+
+
+// Enhanced DistanceType enum to support PQ variants
 enum DistanceType {
+    // Raw vector variants
     Cosine(Hnsw<'static, f32, DistCosine>),
     L2(Hnsw<'static, f32, DistL2>),
     L1(Hnsw<'static, f32, DistL1>),
+    
+    // PQ variants
+    CosinePQ(Hnsw<'static, Vec<u8>, DistPQ>),
+    L2PQ(Hnsw<'static, Vec<u8>, DistPQ>),
+    L1PQ(Hnsw<'static, Vec<u8>, DistPQ>),
 }
 
 impl DistanceType {
+    fn new_raw(
+        space: &str,
+        m: usize,
+        expected_size: usize,
+        max_layer: usize,
+        ef_construction: usize,
+    ) -> Self {
+        match space {
+            "cosine" => DistanceType::Cosine(Hnsw::new(m, expected_size, max_layer, ef_construction, DistCosine {})),
+            "l2" => DistanceType::L2(Hnsw::new(m, expected_size, max_layer, ef_construction, DistL2 {})),
+            "l1" => DistanceType::L1(Hnsw::new(m, expected_size, max_layer, ef_construction, DistL1 {})),
+            _ => panic!("Unsupported space: {}", space),
+        }
+    }
+    
+
+    fn new_pq(
+        space: &str,
+        m: usize,
+        expected_size: usize,
+        max_layer: usize,
+        ef_construction: usize,
+        pq: Arc<PQ>,
+    ) -> Self {
+        match space {
+            "cosine" => {
+                let dist_pq = DistPQ::new(pq);
+                DistanceType::CosinePQ(Hnsw::new(m, expected_size, max_layer, ef_construction, dist_pq))
+            }
+            "l2" => {
+                let dist_pq = DistPQ::new(pq);
+                DistanceType::L2PQ(Hnsw::new(m, expected_size, max_layer, ef_construction, dist_pq))
+            }
+            "l1" => {
+                let dist_pq = DistPQ::new(pq);
+                DistanceType::L1PQ(Hnsw::new(m, expected_size, max_layer, ef_construction, dist_pq))
+            }
+            _ => panic!("Unsupported space: {}", space),
+        }
+    }
+
+
+    
+    fn set_query_lut(&self, query: &[f32]) -> Result<(), String> {
+        match self {
+            DistanceType::CosinePQ(hnsw) => hnsw.get_distance().set_query_lut(query),
+            DistanceType::L2PQ(hnsw) => hnsw.get_distance().set_query_lut(query),
+            DistanceType::L1PQ(hnsw) => hnsw.get_distance().set_query_lut(query),
+            _ => Ok(()), // No-op for raw variants
+        }
+    }
+    
+    fn clear_lut(&self) {
+        match self {
+            DistanceType::CosinePQ(hnsw) => hnsw.get_distance().clear_lut(),
+            DistanceType::L2PQ(hnsw) => hnsw.get_distance().clear_lut(),
+            DistanceType::L1PQ(hnsw) => hnsw.get_distance().clear_lut(),
+            _ => {}, // No-op for raw variants
+        }
+    }
+    
+    fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<hnsw_rs::prelude::Neighbour>, String> {
+        match self {
+            // Raw vector search
+            DistanceType::Cosine(hnsw) => Ok(hnsw.search(query, k, ef)),
+            DistanceType::L2(hnsw) => Ok(hnsw.search(query, k, ef)),
+            DistanceType::L1(hnsw) => Ok(hnsw.search(query, k, ef)),
+            
+            // PQ-based search with ADC
+            DistanceType::CosinePQ(hnsw) | 
+            DistanceType::L2PQ(hnsw) | 
+            DistanceType::L1PQ(hnsw) => {
+                // Set the query LUT for ADC computation
+                self.set_query_lut(query)?;
+                
+                // Create dummy query vector for HNSW traversal
+                // The actual distance is computed via ADC using the stored LUT
+                let dummy_query = vec![vec![0u8; self.get_code_size()]];
+                
+                // Perform search
+                let results = hnsw.search(&dummy_query, k, ef);
+                
+                // Clear LUT after search for memory efficiency
+                self.clear_lut();
+                
+                Ok(results)
+            }
+        }
+    }
+    
+    fn get_code_size(&self) -> usize {
+        match self {
+            DistanceType::CosinePQ(hnsw) => hnsw.get_distance().pq.subvectors,
+            DistanceType::L2PQ(hnsw) => hnsw.get_distance().pq.subvectors,
+            DistanceType::L1PQ(hnsw) => hnsw.get_distance().pq.subvectors,
+            _ => 0,
+        }
+    }
+    
+    fn is_quantized(&self) -> bool {
+        matches!(self, 
+            DistanceType::CosinePQ(_) | 
+            DistanceType::L2PQ(_) | 
+            DistanceType::L1PQ(_)
+        )
+    }
+    
+    fn insert(&mut self, vector: &[f32], id: usize) {
+        match self {
+            DistanceType::Cosine(hnsw) => hnsw.insert((vector, id)),
+            DistanceType::L2(hnsw) => hnsw.insert((vector, id)),
+            DistanceType::L1(hnsw) => hnsw.insert((vector, id)),
+            _ => panic!("Cannot insert raw vectors into PQ index"),
+        }
+    }
+    
+    /// Insert PQ codes into the index
+    #[allow(dead_code)]
+    fn insert_pq_codes(&mut self, codes: &[u8], id: usize) {
+        match self {
+            DistanceType::CosinePQ(hnsw) => {
+                let wrapped_codes = vec![codes.to_vec()];
+                hnsw.insert((&wrapped_codes, id));
+            },
+            DistanceType::L2PQ(hnsw) => {
+                let wrapped_codes = vec![codes.to_vec()];
+                hnsw.insert((&wrapped_codes, id));
+            },
+            DistanceType::L1PQ(hnsw) => {
+                let wrapped_codes = vec![codes.to_vec()];
+                hnsw.insert((&wrapped_codes, id));
+            },
+            _ => panic!("Cannot insert PQ codes into raw index"),
+        }
+    }
+
+
+
+    
+    #[allow(dead_code)]
     fn insert_batch(&mut self, data: &[(&Vec<f32>, usize)]) {
-        // Use parallel_insert for large batches (1000 * num_threads or more)
         let num_threads = rayon::current_num_threads();
         let threshold = 1000 * num_threads;
 
         if data.len() >= threshold {
-            // Use parallel insertion for large batches
             match self {
                 DistanceType::Cosine(hnsw) => hnsw.parallel_insert(data),
                 DistanceType::L2(hnsw) => hnsw.parallel_insert(data),
                 DistanceType::L1(hnsw) => hnsw.parallel_insert(data),
+                _ => panic!("Cannot batch insert raw vectors into PQ index"),
             }
         } else {
-            // Use sequential insertion for small batches (avoid threading overhead)
             for (vector, id) in data {
-                match self {
-                    DistanceType::Cosine(hnsw) => hnsw.insert((vector.as_slice(), *id)),
-                    DistanceType::L2(hnsw) => hnsw.insert((vector.as_slice(), *id)),
-                    DistanceType::L1(hnsw) => hnsw.insert((vector.as_slice(), *id)),
-                }
+                self.insert(vector.as_slice(), *id);
             }
+        }
+    }
+    
+    // fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize)]) -> Result<(), String> {
+    //     let num_threads = rayon::current_num_threads();
+    //     let threshold = 1000 * num_threads;
+
+    //     match self {
+    //         DistanceType::CosinePQ(hnsw) |
+    //         DistanceType::L2PQ(hnsw) |
+    //         DistanceType::L1PQ(hnsw) => {
+    //             if data.len() >= threshold {
+    //                 hnsw.parallel_insert(data);
+    //             } else {
+    //                 for (codes, id) in data {
+    //                     hnsw.insert((codes.as_slice(), *id));
+    //                 }
+    //             }
+    //             Ok(())
+    //         }
+    //         _ => Err("Cannot insert PQ codes into raw HNSW index".to_string()),
+    //     }
+    // }
+
+
+    fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize)]) -> Result<(), String> {
+        let num_threads = rayon::current_num_threads();
+        let threshold = 1000 * num_threads;
+
+        match self {
+            DistanceType::CosinePQ(hnsw) |
+            DistanceType::L2PQ(hnsw) |
+            DistanceType::L1PQ(hnsw) => {
+                // Convert data format to match expected Vec<Vec<u8>>
+                let converted_data: Vec<(Vec<Vec<u8>>, usize)> = data.iter()
+                    .map(|(codes, id)| (vec![(*codes).clone()], *id))
+                    .collect();
+            
+                let ref_data: Vec<(&Vec<Vec<u8>>, usize)> = converted_data.iter()
+                    .map(|(codes, id)| (codes, *id))
+                    .collect();
+
+                if data.len() >= threshold {
+                    hnsw.parallel_insert(&ref_data);
+                } else {
+                    for (codes, id) in &ref_data {
+                        hnsw.insert((codes.as_slice(), *id));
+                    }
+                }
+                Ok(())
+            }
+            _ => Err("Cannot insert PQ codes into raw HNSW index".to_string()),
         }
     }
 
-    /// Search method that handles different distance types
-    /// and returns a vector of Neighbour results.
-    fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<hnsw_rs::prelude::Neighbour> {
-        match self {
-            DistanceType::Cosine(hnsw) => hnsw.search(query, k, ef),
-            DistanceType::L2(hnsw) => hnsw.search(query, k, ef),
-            DistanceType::L1(hnsw) => hnsw.search(query, k, ef),
-        }
-    }
+
 }
+
+
+
+
+
 
 #[derive(Debug, Clone)]
 #[pyclass]
@@ -80,7 +347,6 @@ impl AddResult {
     }
 }
 
-// Add RwLock/Mutex declarations in struct
 #[pyclass]
 pub struct HNSWIndex {
     dim: usize,
@@ -88,6 +354,11 @@ pub struct HNSWIndex {
     m: usize,
     ef_construction: usize,
     expected_size: usize,
+
+    // Quantization configuration and PQ instance
+    quantization_config: Option<QuantizationConfig>,
+    pq: Option<Arc<PQ>>,
+    pq_codes: RwLock<HashMap<String, Vec<u8>>>, // PQ codes storage
 
     // Index-level metadata (simple, infrequently accessed)
     metadata: Mutex<HashMap<String, String>>,
@@ -100,10 +371,13 @@ pub struct HNSWIndex {
     
     // Mutex for write-only fields
     id_counter: Mutex<usize>,
+    vector_count: Mutex<usize>, // Track total vectors for training trigger
     
     // Mutex for HNSW (not thread-safe for concurrent reads)
     hnsw: Mutex<DistanceType>,
 }
+
+
 
 #[pymethods]
 impl HNSWIndex {
@@ -114,6 +388,7 @@ impl HNSWIndex {
         m: usize,
         ef_construction: usize,
         expected_size: usize,
+        quantization_config: Option<&Bound<PyDict>>,
     ) -> PyResult<Self> {
         // Validation of parameters
         if dim == 0 {
@@ -130,18 +405,76 @@ impl HNSWIndex {
         }
 
         let space_normalized = space.to_lowercase();
-        let max_layer = (expected_size as f32).log2().ceil() as usize;
-
-        let hnsw = match space_normalized.as_str() {
-            "cosine" => DistanceType::Cosine(Hnsw::new(m, expected_size, max_layer, ef_construction, DistCosine {})),
-            "l2" => DistanceType::L2(Hnsw::new(m, expected_size, max_layer, ef_construction, DistL2 {})),
-            "l1" => DistanceType::L1(Hnsw::new(m, expected_size, max_layer, ef_construction, DistL1 {})),
-            _ => {
+        
+        // Extract quantization configuration
+        let (quantization_params, pq_instance) = if let Some(config) = quantization_config {
+            let qtype = config.get_item("type")?
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'type' in quantization_config"))?
+                .extract::<String>()?;
+            
+            if qtype != "pq" {
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Unsupported space: '{}'. Must be 'cosine', 'l2', or 'l1'", space),
+                    format!("Unsupported quantization type: '{}'. Only 'pq' is currently supported.", qtype)
                 ));
             }
+            
+            // Extract PQ parameters
+            let subvectors = config.get_item("subvectors")?
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'subvectors' in quantization_config"))?
+                .extract::<usize>()?;
+            
+            let bits = config.get_item("bits")?
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'bits' in quantization_config"))?
+                .extract::<usize>()?;
+            
+            let training_size = config.get_item("training_size")?
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'training_size' in quantization_config"))?
+                .extract::<usize>()?;
+            
+            let max_training_vectors = config.get_item("max_training_vectors")?
+                .map(|v| v.extract::<usize>())
+                .transpose()?;
+            
+            // Validate PQ parameters
+            if dim % subvectors != 0 {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("subvectors ({}) must divide dimension ({}) evenly", subvectors, dim)
+                ));
+            }
+            
+            if bits < 1 || bits > 8 {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("bits must be between 1 and 8, got {}", bits)
+                ));
+            }
+            
+            if training_size < 1000 {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("training_size must be at least 1000, got {}", training_size)
+                ));
+            }
+            
+            let config = QuantizationConfig {
+                subvectors,
+                bits,
+                training_size,
+                max_training_vectors,
+            };
+            
+            // Create PQ instance
+            let pq = Arc::new(PQ::new(dim, subvectors, bits, training_size, max_training_vectors));
+            
+            (Some(config), Some(pq))
+        } else {
+            (None, None)
         };
+
+        let max_layer = (expected_size as f32).log2().ceil() as usize;
+
+
+        // Create initial raw HNSW index (will be rebuilt as PQ after training)
+        let hnsw = DistanceType::new_raw(&space_normalized, m, expected_size, max_layer, ef_construction);
+
 
         // Initialize all fields with proper thread-safe wrappers
         Ok(HNSWIndex {
@@ -150,134 +483,201 @@ impl HNSWIndex {
             m,
             ef_construction,
             expected_size,
+            quantization_config: quantization_params,
+            pq: pq_instance,
+            pq_codes: RwLock::new(HashMap::new()),
             metadata: Mutex::new(HashMap::new()),
             vectors: RwLock::new(HashMap::new()),
             vector_metadata: RwLock::new(HashMap::new()),
             id_map: RwLock::new(HashMap::new()),
             rev_map: RwLock::new(HashMap::new()),
             id_counter: Mutex::new(0),
+            vector_count: Mutex::new(0),
             hnsw: Mutex::new(hnsw),
         })
     }
 
-    /// Unified add method with automatic parallel processing
-    pub fn add(&mut self, data: Bound<PyAny>) -> PyResult<AddResult> {
-        let records = if let Ok(list) = data.downcast::<PyList>() {
-            self.parse_list_format(&list)?
-        } else if let Ok(dict) = data.downcast::<PyDict>() {
-            if dict.contains("ids")? {
-                self.parse_separate_arrays(&dict)?
+    /// Get quantization configuration and status
+    pub fn get_quantization_info(&self) -> Option<PyObject> {
+        Python::with_gil(|py| {
+            if let Some(config) = &self.quantization_config {
+                let dict = PyDict::new(py);
+                dict.set_item("type", "pq").ok()?;
+                dict.set_item("subvectors", config.subvectors).ok()?;
+                dict.set_item("bits", config.bits).ok()?;
+                dict.set_item("training_size", config.training_size).ok()?;
+                
+                if let Some(max_training) = config.max_training_vectors {
+                    dict.set_item("max_training_vectors", max_training).ok()?;
+                }
+                
+                if let Some(pq) = &self.pq {
+                    dict.set_item("is_trained", pq.is_trained()).ok()?;
+                    
+                    // Use enhanced PQ methods
+                    let (memory_mb, total_centroids) = pq.get_memory_stats();
+                    dict.set_item("memory_mb", memory_mb).ok()?;
+                    dict.set_item("total_centroids", total_centroids).ok()?;
+                    
+                    // Calculate compression ratio using cached values
+                    let original_bytes = pq.dim * 4; // f32
+                    let compressed_bytes = pq.subvectors; // u8 per subvector
+                    let compression_ratio = original_bytes as f64 / compressed_bytes as f64;
+                    dict.set_item("compression_ratio", compression_ratio).ok()?;
+                }
+                
+                Some(dict.into())
             } else {
-                self.parse_single_object(&dict)?
+                None
             }
-        } else {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Invalid format: expected dict, list, or object with 'id' field",
-            ));
+        })
+    }
+
+    /// Check if quantization is enabled
+    pub fn has_quantization(&self) -> bool {
+        self.quantization_config.is_some()
+    }
+
+    /// Get current vector count (for monitoring training trigger)
+    pub fn get_vector_count(&self) -> usize {
+        *self.vector_count.lock().unwrap()
+    }
+
+    /// Get next available internal ID
+    fn get_next_id(&self) -> usize {
+        let mut counter = self.id_counter.lock().unwrap();
+        *counter += 1;
+        *counter
+    }
+
+    /// Rebuild the HNSW index to use PQ codes after training is complete
+    pub fn rebuild_with_quantization(&mut self) -> PyResult<bool> {
+        let pq = match &self.pq {
+            Some(pq) if pq.is_trained() => pq.clone(),
+            _ => return Ok(false),
         };
 
-        if records.len() >= 50 {
-            self.add_batch_parallel_gil_optimized(records)
+        // Get all current vectors for quantization
+        let vectors = self.vectors.read().unwrap();
+        if vectors.is_empty() {
+            return Ok(false);
+        }
+
+        // Quantize all existing vectors
+        let vector_refs: Vec<&[f32]> = vectors.values().map(|v| v.as_slice()).collect();
+        let quantized_codes = pq.quantize_batch(&vector_refs)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to quantize vectors: {}", e)
+            ))?;
+
+        // Create new PQ-based HNSW index
+        let max_layer = (self.expected_size as f32).log2().ceil() as usize;
+        let new_hnsw = DistanceType::new_pq(
+            &self.space, 
+            self.m, 
+            self.expected_size, 
+            max_layer, 
+            self.ef_construction, 
+            pq.clone()
+        );
+
+        // Store quantized codes
+        {
+            let mut pq_codes = self.pq_codes.write().unwrap();
+            pq_codes.clear(); // Clear any existing codes
+            
+            for (i, (id, _)) in vectors.iter().enumerate() {
+                if i < quantized_codes.len() {
+                    pq_codes.insert(id.clone(), quantized_codes[i].clone());
+                }
+            }
+        }
+
+        // Replace the HNSW index
+        {
+            let mut hnsw_guard = self.hnsw.lock().unwrap();
+            *hnsw_guard = new_hnsw;
+        }
+
+        // Insert quantized vectors into new index
+        let pq_codes = self.pq_codes.read().unwrap();
+        let id_map = self.id_map.read().unwrap();
+        let mut batch_data = Vec::new();
+        
+        for (id, codes) in pq_codes.iter() {
+            if let Some(&internal_id) = id_map.get(id) {
+                batch_data.push((codes, internal_id));
+            }
+        }
+
+        if !batch_data.is_empty() {
+            let mut hnsw_guard = self.hnsw.lock().unwrap();
+            hnsw_guard.insert_batch_pq(&batch_data)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Failed to insert quantized vectors: {}", e)
+                ))?;
+        }
+
+        Ok(true)
+    }
+
+
+    /// Check if the index is using quantized search
+    pub fn is_quantized(&self) -> bool {
+        if let Some(pq) = &self.pq {
+            if pq.is_trained() {
+                let hnsw_guard = self.hnsw.lock().unwrap();
+                return hnsw_guard.is_quantized();
+            }
+        }
+        false
+    }
+
+    /// Check if quantization can be used (PQ is trained)
+    pub fn can_use_quantization(&self) -> bool {
+        if let Some(pq) = &self.pq {
+            pq.is_trained()
         } else {
-            self.add_batch_sequential(records)
+            false
         }
     }
 
-    // /// GIL-optimized search with HNSW locking
-    // #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, return_vector=false))]
-    // pub fn search(
-    //     &self,
-    //     py: Python<'_>,
-    //     vector: Vec<f32>,
-    //     filter: Option<&Bound<PyDict>>,
-    //     top_k: usize,
-    //     ef_search: Option<usize>,
-    //     return_vector: bool,
-    // ) -> PyResult<Vec<Py<PyDict>>> {
-    //     if vector.len() != self.dim {
-    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-    //             "Search vector dimension mismatch: expected {}, got {}",
-    //             self.dim, vector.len()
-    //         )));
-    //     }
 
-    //     // Parse filter while still have GIL
-    //     let filter_conditions = if let Some(filter_dict) = filter {
-    //         Some(self.python_dict_to_value_map(filter_dict)?)
-    //     } else {
-    //         None
-    //     };
 
-    //     let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
-
-    //     // Release GIL but use locking for HNSW
-    //     let search_results = py.allow_threads(|| {
-    //         // Step 1: HNSW search (needs exclusive access, but brief)
-    //         let hnsw_results = {
-    //             let hnsw_guard = self.hnsw.lock().unwrap();
-    //             hnsw_guard.search(&vector, top_k, ef)
-    //         }; // HNSW lock released here - This is critical for performance!
-            
-    //         // Step 2: Data lookup with RwLock (concurrent reads possible)
-    //         let vectors = self.vectors.read().unwrap();
-    //         let vector_metadata = self.vector_metadata.read().unwrap();
-    //         let rev_map = self.rev_map.read().unwrap();
-            
-    //         let mut results = Vec::with_capacity(hnsw_results.len());
-
-    //         let has_filter = filter_conditions.is_some();
-            
-    //         for neighbor in hnsw_results {
-    //             let score = neighbor.distance;
-    //             let internal_id = neighbor.get_origin_id();
-                
-    //             if let Some(ext_id) = rev_map.get(&internal_id) {
-    //                 if has_filter {
-    //                     if let Some(meta) = vector_metadata.get(ext_id) {
-    //                         let filter_conds = filter_conditions.as_ref().unwrap(); // Safe unwrap
-    //                         if !self.matches_filter(meta, filter_conds).unwrap_or(false) {
-    //                             continue;
-    //                         }
-    //                     } else {
-    //                         continue;
-    //                     }
-    //                 }
-                    
-    //                 // Collect data for Python object creation
-    //                 let metadata = vector_metadata.get(ext_id).cloned().unwrap_or_default();
-    //                 let vector_data = if return_vector {
-    //                     vectors.get(ext_id).cloned()
-    //                 } else {
-    //                     None
-    //                 };
-                    
-    //                 results.push((ext_id.clone(), score, metadata, vector_data));
-    //             }
-    //         }
-            
-    //         results
-    //     }); // GIL is reacquired here
+    /// Add vectors to the index (placeholder for step 4)
+    pub fn add(&mut self, data: Bound<PyAny>) -> PyResult<AddResult> {
+        // Basic data type checking
+        if data.is_none() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Data cannot be None"
+            ));
+        }
         
-    //     // Step 3: Convert to Python objects (needs GIL)
-    //     let mut output = Vec::with_capacity(search_results.len());
-    //     for (id, score, metadata, vector_data) in search_results {
-    //         let dict = PyDict::new(py);
-    //         dict.set_item("id", id)?;
-    //         dict.set_item("score", score)?;
-    //         dict.set_item("metadata", self.value_map_to_python(&metadata, py)?)?;
-            
-    //         if let Some(vec) = vector_data {
-    //             dict.set_item("vector", vec)?;
-    //         }
-            
-    //         output.push(dict.into());
-    //     }
+        // Check if we should trigger training
+        if let Some(config) = &self.quantization_config {
+            if let Some(pq) = &self.pq {
+                let current_count = self.get_vector_count();
+                if current_count >= config.training_size && !pq.is_trained() {
+                    println!("Training threshold reached: {} >= {}", current_count, config.training_size);
+                    // TODO: Implement training logic in step 4
+                }
+            }
+        }
+        
+        // TODO: Implement full add logic in step 4
+        // For now, return placeholder
+        Ok(AddResult {
+            total_inserted: 0,
+            total_errors: 1,
+            errors: vec!["Add method implementation coming in step 4".to_string()],
+            vector_shape: Some((0, self.dim)),
+        })
+    }
 
-    //     Ok(output)
-    // }
 
-    // SEARCH METHOD
-    /// Enhanced search method with automatic batch detection and optimization
+
+
+    /// Enhanced search method with automatic ADC usage
     #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, return_vector=false))]
     pub fn search(
         &self,
@@ -326,13 +726,37 @@ impl HNSWIndex {
                 )));
             }
 
+            
             let search_results = py.allow_threads(|| {
+                // Check if we should use quantized search
+                let use_quantized = self.is_quantized();
+
                 let hnsw_results = {
                     let hnsw_guard = self.hnsw.lock().unwrap();
-                    hnsw_guard.search(&single_vec, top_k, ef)
+
+                    if use_quantized {
+                        // Use ADC search for quantized index
+                        hnsw_guard.search(&single_vec, top_k, ef)
+                            .unwrap_or_else(|e| {
+                                eprintln!("ADC search error: {}", e);
+                                Vec::new()
+                            })
+                    } else {
+                        // Use raw vector search
+                        match hnsw_guard.search(&single_vec, top_k, ef) {
+                            Ok(results) => results,
+                            Err(e) => {
+                                eprintln!("Raw search error: {}", e);
+                                Vec::new()
+                            }
+                        }
+                    }
                 };
 
+
+                // Process results with enhanced vector retrieval
                 let vectors = self.vectors.read().unwrap();
+                let pq_codes = self.pq_codes.read().unwrap();
                 let vector_metadata = self.vector_metadata.read().unwrap();
                 let rev_map = self.rev_map.read().unwrap();
 
@@ -357,7 +781,15 @@ impl HNSWIndex {
 
                         let metadata = vector_metadata.get(ext_id).cloned().unwrap_or_default();
                         let vector_data = if return_vector {
+                            // Try raw vector first, then PQ reconstruction
                             vectors.get(ext_id).cloned()
+                                .or_else(|| {
+                                    if let (Some(pq), Some(codes)) = (&self.pq, pq_codes.get(ext_id)) {
+                                        pq.reconstruct(codes).ok()
+                                    } else {
+                                        None
+                                    }
+                                })
                         } else {
                             None
                         };
@@ -369,7 +801,7 @@ impl HNSWIndex {
                 results
             });
 
-            // let mut output = Vec::with_capacity(search_results.len());
+            // Convert to Python objects
             let mut output: Vec<Py<PyDict>> = Vec::with_capacity(search_results.len());
             for (id, score, metadata, vector_data) in search_results {
                 let dict = PyDict::new(py);
@@ -388,9 +820,7 @@ impl HNSWIndex {
 
 
 
-
-
-    /// Thread-safe get_records implementation
+    /// Get records by ID(s) with PQ reconstruction support
     #[pyo3(signature = (input, return_vector = true))]
     pub fn get_records(&self, py: Python<'_>, input: &Bound<PyAny>, return_vector: bool) -> PyResult<Vec<Py<PyDict>>> {
         let ids: Vec<String> = if let Ok(id_str) = input.extract::<String>() {
@@ -407,6 +837,7 @@ impl HNSWIndex {
         
         // Use read locks for concurrent access
         let vectors = self.vectors.read().unwrap();
+        let pq_codes = self.pq_codes.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
 
         for id in ids {
@@ -414,11 +845,20 @@ impl HNSWIndex {
                 let metadata = vector_metadata.get(&id).cloned().unwrap_or_default();
 
                 let dict = PyDict::new(py);
-                dict.set_item("id", id)?;
+                dict.set_item("id", id.clone())?;
                 dict.set_item("metadata", self.value_map_to_python(&metadata, py)?)?;
 
                 if return_vector {
-                    dict.set_item("vector", vector.clone())?;
+                    // Try raw vector first, then PQ reconstruction
+                    let vector_data = if !vector.is_empty() {
+                        vector.clone()
+                    } else if let (Some(pq), Some(codes)) = (&self.pq, pq_codes.get(&id)) {
+                        pq.reconstruct(codes).unwrap_or_else(|_| vector.clone())
+                    } else {
+                        vector.clone()
+                    };
+                    
+                    dict.set_item("vector", vector_data)?;
                 }
 
                 records.push(dict.into());
@@ -428,25 +868,66 @@ impl HNSWIndex {
         Ok(records)
     }
 
-    /// Thread-safe statistics implementation
+
+
+
+
+
+
+    /// Get comprehensive statistics with quantization info
     pub fn get_stats(&self) -> HashMap<String, String> {
         let mut stats = HashMap::new();
         
         let vectors = self.vectors.read().unwrap();
-        stats.insert("total_vectors".to_string(), vectors.len().to_string());
+        let pq_codes = self.pq_codes.read().unwrap();
         
+        stats.insert("total_vectors".to_string(), vectors.len().to_string());
         stats.insert("dimension".to_string(), self.dim.to_string());
         stats.insert("space".to_string(), self.space.clone());
         stats.insert("m".to_string(), self.m.to_string());
         stats.insert("ef_construction".to_string(), self.ef_construction.to_string());
         stats.insert("expected_size".to_string(), self.expected_size.to_string());
         stats.insert("index_type".to_string(), "HNSW".to_string());
+        
+        // Add quantization info
+        if let Some(config) = &self.quantization_config {
+            stats.insert("quantization_type".to_string(), "pq".to_string());
+            stats.insert("quantization_subvectors".to_string(), config.subvectors.to_string());
+            stats.insert("quantization_bits".to_string(), config.bits.to_string());
+            stats.insert("quantization_training_size".to_string(), config.training_size.to_string());
+            
+            if let Some(max_training) = config.max_training_vectors {
+                stats.insert("quantization_max_training_vectors".to_string(), max_training.to_string());
+            }
+            
+            if let Some(pq) = &self.pq {
+                stats.insert("quantization_trained".to_string(), pq.is_trained().to_string());
+                let (memory_mb, _) = pq.get_memory_stats();
+                stats.insert("quantization_memory_mb".to_string(), format!("{:.2}", memory_mb));
+                
+                // Use cached values for efficiency
+                let compression_ratio = (pq.dim * 4) as f64 / pq.subvectors as f64;
+                stats.insert("quantization_compression_ratio".to_string(), format!("{:.1}x", compression_ratio));
+                
+                // Add quantization status
+                stats.insert("quantization_active".to_string(), self.is_quantized().to_string());
+                
+                // Add storage info
+                stats.insert("quantized_vectors".to_string(), pq_codes.len().to_string());
+            }
+        } else {
+            stats.insert("quantization_type".to_string(), "none".to_string());
+        }
+        
         stats.insert("thread_safety".to_string(), "RwLock+Mutex".to_string());
         
         stats
     }
 
-    /// List the first number of records in the index (ID and metadata).
+
+
+
+    /// List the first number of records in the index (ID and metadata)
     #[pyo3(signature = (number=10))]
     pub fn list(&self, py: Python<'_>, number: usize) -> PyResult<Vec<(String, PyObject)>> {
         let vectors = self.vectors.read().unwrap();
@@ -461,13 +942,13 @@ impl HNSWIndex {
         Ok(results)
     }
 
-    /// Thread-safe contains check implementation
+    /// Check if vector exists
     pub fn contains(&self, id: String) -> bool {
         let vectors = self.vectors.read().unwrap();
         vectors.contains_key(&id)
     }
 
-    /// Thread-safe metadata operations
+    /// Add index-level metadata
     pub fn add_metadata(&mut self, metadata: HashMap<String, String>) {
         let mut meta_lock = self.metadata.lock().unwrap();
         for (key, value) in metadata {
@@ -475,42 +956,48 @@ impl HNSWIndex {
         }
     }
 
+    /// Get index-level metadata value
     pub fn get_metadata(&self, key: String) -> Option<String> {
         let meta_lock = self.metadata.lock().unwrap();
         meta_lock.get(&key).cloned()
     }
 
+    /// Get all index-level metadata
     pub fn get_all_metadata(&self) -> HashMap<String, String> {
         let meta_lock = self.metadata.lock().unwrap();
         meta_lock.clone()
     }
 
-    /// Returns basic info about the index
+    /// Get a human-readable info string
     pub fn info(&self) -> String {
         let vectors = self.vectors.read().unwrap();
-        format!(
-            "HNSWIndex(dim={}, space={}, m={}, ef_construction={}, expected_size={}, vectors={})",
-            self.dim,
-            self.space,
-            self.m,
-            self.ef_construction,
-            self.expected_size,
-            vectors.len()
-        )
+        let base_info = format!(
+            "HNSWIndex(dim={}, space={}, m={}, ef_construction={}, expected_size={}, vectors={}",
+            self.dim, self.space, self.m, self.ef_construction, self.expected_size, vectors.len()
+        );
+        
+        if let Some(config) = &self.quantization_config {
+            let trained_status = self.pq.as_ref()
+                .map(|pq| if pq.is_trained() { "trained" } else { "untrained" })
+                .unwrap_or("unknown");
+
+            let active_status = if self.is_quantized() { "active" } else { "inactive" };
+            
+            // Use cached compression ratio calculation
+            let compression_info = self.pq.as_ref()
+                .map(|pq| format!("{}x", (pq.dim * 4) / pq.subvectors))
+                .unwrap_or_else(|| "unknown".to_string());
+            
+            format!(
+                "{}, quantization=pq(subvectors={}, bits={}, {}, {}, compression={}))",
+                base_info, config.subvectors, config.bits, trained_status, active_status, compression_info
+            )
+        } else {
+            format!("{}, quantization=none)", base_info)
+        }
     }
 
     /// Remove vector by ID
-    /// Removes the vector and its metadata from all accessible mappings.
-    /// The point will no longer appear in queries, contains() checks, or be
-    /// retrievable by ID. 
-    /// 
-    /// Note: Due to HNSW algorithm limitations, the underlying graph structure
-    /// retains stale nodes internally, but these are completely inaccessible
-    /// to users and do not affect search results or performance.
-    /// 
-    /// Returns:
-    ///   - `Ok(true)` if the vector was found and removed
-    ///   - `Ok(false)` if the vector ID was not found
     pub fn remove_point(&mut self, id: String) -> PyResult<bool> {
         let mut vectors = self.vectors.write().unwrap();
         let mut vector_metadata = self.vector_metadata.write().unwrap();
@@ -539,10 +1026,22 @@ impl HNSWIndex {
         info.insert("benefits".to_string(), "gil_release_concurrent_metadata_processing_parallel_insert".to_string());
         info.insert("limitation".to_string(), "parallel_insert_threshold_1000x_threads".to_string());
         info.insert("recommendation".to_string(), "excellent_for_large_batch_workloads".to_string());
+        
+        // Add quantization performance info
+        if let Some(config) = &self.quantization_config {
+            let original_bytes = self.dim * 4; // f32
+            let compressed_bytes = config.subvectors; // u8 per subvector
+            let compression_ratio = original_bytes as f64 / compressed_bytes as f64;
+            
+            info.insert("quantization_compression".to_string(), format!("{:.1}x", compression_ratio));
+            info.insert("quantization_memory_savings".to_string(), format!("{:.1}%", (1.0 - 1.0/compression_ratio) * 100.0));
+            info.insert("quantization_accuracy_impact".to_string(), "slight_recall_reduction".to_string());
+        }
+        
         info
     }
 
-    /// Concurrent benchmark
+    /// Concurrent benchmark for search performance
     #[pyo3(signature = (query_count, max_threads=None))]
     pub fn benchmark_concurrent_reads(&self, query_count: usize, max_threads: Option<usize>) -> PyResult<HashMap<String, f64>> {
         use std::time::Instant;
@@ -553,7 +1052,7 @@ impl HNSWIndex {
         
         let mut results = HashMap::new();
 
-        // Sequential benchmark (using raw search for cleaner performance measurement)
+        // Sequential benchmark
         let start = Instant::now();
         for query in &queries {
             let _ = self.raw_search_no_gil(query);
@@ -563,8 +1062,6 @@ impl HNSWIndex {
         results.insert("sequential_qps".to_string(), queries.len() as f64 / sequential_time);
         
         // Parallel benchmark
-        // Use full CPU by default, but allow limiting
-        // Parallel benchmark (no GIL - pure Rust performance)
         let available_threads = rayon::current_num_threads();
         let num_threads = max_threads.unwrap_or(available_threads).min(available_threads);
 
@@ -572,7 +1069,7 @@ impl HNSWIndex {
         let _: Vec<_> = queries
             .par_iter()
             .map(|query| {
-                self.raw_search_no_gil(query)  // No GIL needed!
+                self.raw_search_no_gil(query)
             })
             .collect();
 
@@ -585,7 +1082,7 @@ impl HNSWIndex {
         Ok(results)
     }
 
-    /// No-GIL benchmark for raw performance measurement
+    /// Raw performance benchmark
     #[pyo3(signature = (query_count, max_threads=None))]
     pub fn benchmark_raw_concurrent_performance(&self, query_count: usize, max_threads: Option<usize>) -> HashMap<String, f64> {
         use std::time::Instant;
@@ -596,15 +1093,14 @@ impl HNSWIndex {
         
         let mut results = HashMap::new();
         
-        // Sequential benchmark (no GIL)
+        // Sequential benchmark
         let start = Instant::now();
         for query in &queries {
             let _ = self.raw_search_no_gil(query);
         }
         let sequential_time = start.elapsed().as_secs_f64();
         
-        // Parallel benchmark (no GIL, but still serialized by HNSW mutex)
-        // Use full CPU by default
+        // Parallel benchmark
         let available_threads = rayon::current_num_threads();
         let num_threads = max_threads.unwrap_or(available_threads).min(available_threads);
         let chunk_size = (queries.len() + num_threads - 1) / num_threads;
@@ -642,7 +1138,8 @@ impl HNSWIndex {
         // HNSW search with locking
         let hnsw_results = {
             let hnsw_guard = self.hnsw.lock().unwrap();
-            hnsw_guard.search(query, 10, 100)
+            //hnsw_guard.search(query, 10, 100)
+            hnsw_guard.search(query, 10, 100).unwrap_or_else(|_| Vec::new())
         }; // Lock released immediately
         
         // Concurrent read access to ID mapping
@@ -657,400 +1154,7 @@ impl HNSWIndex {
             .collect()
     }
 
-    /// Sequential batch processing (clean and borrow-safe with .clone())
-    fn add_batch_sequential(
-        &mut self,
-        records: Vec<(String, Vec<f32>, Option<HashMap<String, Value>>)>
-    ) -> PyResult<AddResult> {
-        if records.is_empty() {
-            return Ok(AddResult {
-                total_inserted: 0,
-                total_errors: 0,
-                errors: vec![],
-                vector_shape: Some((0, self.dim)),
-            });
-        }
-
-        let mut valid_records = Vec::new();
-        let mut errors = Vec::new();
-
-        // Step 1: Validation + normalization
-        for (id, mut vector, metadata) in records {
-            if vector.len() != self.dim {
-                errors.push(format!(
-                    "ID '{}': Vector dimension mismatch: expected {}, got {}",
-                    id, self.dim, vector.len()
-                ));
-                continue;
-            }
-
-            if self.space == "cosine" {
-                let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
-                if norm > 0.0 {
-                    for x in vector.iter_mut() {
-                        *x /= norm;
-                    }
-                }
-            }
-
-            valid_records.push((id, vector, metadata));
-        }
-
-        if valid_records.is_empty() {
-            return Ok(AddResult {
-                total_inserted: 0,
-                total_errors: errors.len(),
-                errors,
-                vector_shape: Some((0, self.dim)),
-            });
-        }
-
-        // Step 2: Acquire all locks
-        let mut vectors = self.vectors.write().unwrap();
-        let mut vector_metadata = self.vector_metadata.write().unwrap();
-        let mut id_map = self.id_map.write().unwrap();
-        let mut rev_map = self.rev_map.write().unwrap();
-        let mut id_counter = self.id_counter.lock().unwrap();
-
-        vectors.reserve(valid_records.len());
-        vector_metadata.reserve(valid_records.len());
-        id_map.reserve(valid_records.len());
-        rev_map.reserve(valid_records.len());
-
-        let mut id_pairs = Vec::with_capacity(valid_records.len());
-
-        // Step 3: Insert into maps + prepare HNSW data
-        for (id, vector, metadata) in valid_records {
-            if let Some(old_id) = id_map.remove(&id) {
-                rev_map.remove(&old_id);
-                vectors.remove(&id);
-                vector_metadata.remove(&id); // Remove old metadata
-            }
-
-            let internal_id = *id_counter;
-            *id_counter += 1;
-
-            vectors.insert(id.clone(), vector);  // Move vector into HashMap
-            id_map.insert(id.clone(), internal_id);
-            rev_map.insert(internal_id, id.clone());
-
-            if let Some(meta) = metadata {
-                vector_metadata.insert(id.clone(), meta);
-            }
-
-            // Store the ID and internal_id for later reference collection
-            id_pairs.push((id, internal_id));
-
-        }
-
-        // Step 4: Collect references (all immutable operations)
-        let mut hnsw_data: Vec<(&Vec<f32>, usize)> = Vec::with_capacity(id_pairs.len());
-
-        for (id, internal_id) in id_pairs {
-            let vector_ref = vectors.get(&id).unwrap(); // Safe: just inserted
-            hnsw_data.push((vector_ref, internal_id));
-        }
-
-        // Step 5: Insert into HNSW
-        if !hnsw_data.is_empty() {
-            let mut hnsw_guard = self.hnsw.lock().unwrap();
-            hnsw_guard.insert_batch(&hnsw_data);
-        }
-
-        Ok(AddResult {
-            total_inserted: hnsw_data.len(),
-            total_errors: errors.len(),
-            errors,
-            vector_shape: Some((hnsw_data.len(), self.dim)),
-        })
-    }
-    
-
-    /// GIL-optimized parallel processing (with proper locking)
-    fn add_batch_parallel_gil_optimized(
-        &mut self, 
-        records: Vec<(String, Vec<f32>, Option<HashMap<String, Value>>)>
-    ) -> PyResult<AddResult> {
-        if records.is_empty() {
-            return Ok(AddResult {
-                total_inserted: 0,
-                total_errors: 0,
-                errors: vec![],
-                vector_shape: Some((0, self.dim)),
-            });
-        }
-
-        // Release GIL for compute-intensive processing
-        let processing_result = Python::with_gil(|py| {
-            py.allow_threads(|| -> Result<(usize, Vec<String>), PyErr> {
-                // Parallel validation with sequential normalization per vector
-                let validation_results: Vec<Result<(String, Vec<f32>, Option<HashMap<String, Value>>), String>> = records
-                    .into_par_iter()
-                    .map(|(id, mut vector, metadata)| {
-                        if vector.len() != self.dim {
-                            return Err(format!("ID '{}': Vector dimension mismatch: expected {}, got {}", 
-                                             id, self.dim, vector.len()));
-                        }
-                        
-                        // Sequential normalization per vector
-                        if self.space == "cosine" {
-                            let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
-                            if norm > 0.0 {
-                                for x in vector.iter_mut() {
-                                    *x /= norm;
-                                }
-                            }
-                        }
-
-                        Ok((id, vector, metadata))
-                    })
-                    .collect();
-
-                // Separate valid/invalid records
-                let mut valid_records = Vec::new();
-                let mut errors = Vec::new();
-                
-                for result in validation_results {
-                    match result {
-                        Ok(record) => valid_records.push(record),
-                        Err(e) => errors.push(e),
-                    }
-                }
-
-                if valid_records.is_empty() {
-                    return Ok((0, errors));
-                }
-
-                // Sequential data structure updates
-                let mut vectors = self.vectors.write().unwrap();
-                let mut vector_metadata = self.vector_metadata.write().unwrap();
-                let mut id_map = self.id_map.write().unwrap();
-                let mut rev_map = self.rev_map.write().unwrap();
-                let mut id_counter = self.id_counter.lock().unwrap();
-
-                let capacity = valid_records.len();
-                vectors.reserve(capacity);
-                vector_metadata.reserve(capacity);
-                id_map.reserve(capacity);
-                rev_map.reserve(capacity);
-
-                // Prepare ID pairs for HNSW insertion
-                let mut id_pairs = Vec::with_capacity(valid_records.len());
-
-                // Insert into maps and collect IDs
-                for (id, vector, metadata) in valid_records {
-                    if let Some(old_id) = id_map.remove(&id) {
-                        rev_map.remove(&old_id);
-                        vectors.remove(&id);
-                        vector_metadata.remove(&id);
-                    }
-
-                    let internal_id = *id_counter;
-                    *id_counter += 1;
-
-                    vectors.insert(id.clone(), vector);  // Move vector into HashMap
-                    id_map.insert(id.clone(), internal_id);
-                    rev_map.insert(internal_id, id.clone());
-
-                    if let Some(meta) = metadata {
-                        vector_metadata.insert(id.clone(), meta);
-                    }
-
-                    // Store the ID and internal_id for later reference collection
-                    id_pairs.push((id, internal_id));
-                }
-
-                // Step 4: Collect references (all immutable operations)
-                let mut hnsw_data: Vec<(&Vec<f32>, usize)> = Vec::with_capacity(id_pairs.len());
-                for (id, internal_id) in id_pairs {
-                    let vector_ref = vectors.get(&id).unwrap(); // Safe: just inserted
-                    hnsw_data.push((vector_ref, internal_id));
-                }
-
-                // Step 5: Insert into HNSW
-                if !hnsw_data.is_empty() {
-                    let mut hnsw_guard = self.hnsw.lock().unwrap();
-                    hnsw_guard.insert_batch(&hnsw_data);
-                }
-
-                Ok((hnsw_data.len(), errors))
-            })
-        })?;
-
-        let (inserted_count, errors) = processing_result;
-
-        Ok(AddResult {
-            total_inserted: inserted_count,
-            total_errors: errors.len(),
-            errors,
-            vector_shape: Some((inserted_count, self.dim)),
-        })
-    }
-
-    /// Thread-safe helper methods implementation
-    fn parse_single_object(&self, dict: &Bound<PyDict>) -> PyResult<Vec<(String, Vec<f32>, Option<HashMap<String, Value>>)>> {
-        let id = dict.get_item("id")?
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing required field 'id'"))?
-            .extract::<String>()?;
-
-        let vector = self.extract_vector_from_dict(dict, "object")?;
-
-        let metadata = if let Some(meta_item) = dict.get_item("metadata")? {
-            Some(self.python_dict_to_value_map(meta_item.downcast::<PyDict>()?)?)
-        } else {
-            None
-        };
-
-        Ok(vec![(id, vector, metadata)])
-    }
-
-    fn parse_list_format(&self, list: &Bound<PyList>) -> PyResult<Vec<(String, Vec<f32>, Option<HashMap<String, Value>>)>> {
-        let mut records = Vec::with_capacity(list.len());
-        
-        for (i, item) in list.iter().enumerate() {
-            let dict = item.downcast::<PyDict>()
-                .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Item {}: expected dict object", i)
-                ))?;
-
-            let id = dict.get_item("id")?
-                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Item {}: missing required field 'id'", i)
-                ))?
-                .extract::<String>()?;
-
-            let vector = self.extract_vector_from_dict(dict, &format!("item {}", i))?;
-
-            let metadata = if let Some(meta_item) = dict.get_item("metadata")? {
-                Some(self.python_dict_to_value_map(meta_item.downcast::<PyDict>()
-                    .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        format!("Item {}: metadata must be a dictionary", i)
-                    ))?)?)
-            } else {
-                None
-            };
-
-            records.push((id, vector, metadata));
-        }
-
-        Ok(records)
-    }
-
-    fn parse_separate_arrays(&self, dict: &Bound<PyDict>) -> PyResult<Vec<(String, Vec<f32>, Option<HashMap<String, Value>>)>> {
-        let ids = dict.get_item("ids")?
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing required field 'ids'"))?
-            .extract::<Vec<String>>()?;
-
-        let vectors = self.extract_vectors_from_separate_arrays(dict)?;
-
-        if vectors.len() != ids.len() {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("Length mismatch: {} ids vs {} vectors", ids.len(), vectors.len())
-            ));
-        }
-
-        let metadatas = if let Some(meta_item) = dict.get_item("metadatas")? {
-            let meta_list = meta_item.downcast::<PyList>()
-                .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "Field 'metadatas' must be a list"
-                ))?;
-
-            let mut metas = Vec::with_capacity(meta_list.len());
-            for (i, meta_item) in meta_list.iter().enumerate() {
-                if meta_item.is_none() {
-                    metas.push(None);
-                } else {
-                    let meta_dict = meta_item.downcast::<PyDict>()
-                        .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                            format!("metadatas[{}] must be a dictionary or None", i)
-                        ))?;
-                    metas.push(Some(self.python_dict_to_value_map(&meta_dict)?));
-                }
-            }
-
-            if metas.len() != ids.len() {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Length mismatch: {} ids vs {} metadatas", ids.len(), metas.len())
-                ));
-            }
-            metas
-        } else {
-            vec![None; ids.len()]
-        };
-
-        let records = ids.into_iter()
-            .zip(vectors.into_iter())
-            .zip(metadatas.into_iter())
-            .map(|((id, vector), metadata)| (id, vector, metadata))
-            .collect();
-
-        Ok(records)
-    }
-
-    fn extract_vector_from_dict(&self, dict: &Bound<PyDict>, context: &str) -> PyResult<Vec<f32>> {
-        let vector_item = dict.get_item("values")?
-            .or_else(|| dict.get_item("vector").ok().flatten())
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("{}: missing required field 'values' or 'vector'", context)
-            ))?;
-
-        if let Ok(array1d) = vector_item.downcast::<PyArray1<f32>>() {
-            Ok(array1d.readonly().as_slice()?.to_vec())
-        } else if let Ok(array2d) = vector_item.downcast::<PyArray2<f32>>() {
-            let readonly = array2d.readonly();
-            let shape = readonly.shape();
-
-            if (shape[0] == 1 && shape[1] > 0) || (shape[1] == 1 && shape[0] > 0) {
-                Ok(readonly.as_slice()?.to_vec())
-            } else {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("{}: expected single vector (1×N or N×1), got shape {:?}", context, shape)
-                ));
-            }
-        } else {
-            vector_item.extract::<Vec<f32>>()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("{}: invalid vector format: {}", context, e)
-                ))
-        }
-    }
-
-    fn extract_vectors_from_separate_arrays(&self, dict: &Bound<PyDict>) -> PyResult<Vec<Vec<f32>>> {
-        let vectors_item = dict.get_item("embeddings")?
-            .or_else(|| dict.get_item("values").ok().flatten())
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Missing required field 'embeddings' or 'values'"
-            ))?;
-
-        if let Ok(array) = vectors_item.downcast::<PyArray2<f32>>() {
-            let readonly = array.readonly();
-            let shape = readonly.shape();
-            
-            if shape.len() != 2 {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("NumPy array must be 2D, got {}D", shape.len())
-                ));
-            }
-
-            let slice = readonly.as_slice()?;
-            let (rows, cols) = (shape[0], shape[1]);
-            
-            let mut vectors = Vec::with_capacity(rows);
-            for i in 0..rows {
-                let start = i * cols;
-                let end = start + cols;
-                vectors.push(slice[start..end].to_vec());
-            }
-            
-            Ok(vectors)
-        } else {
-            vectors_item.extract::<Vec<Vec<f32>>>()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Invalid vectors format: {}", e)
-                ))
-        }
-    }
-
+    // Helper methods for data conversion and filtering
     fn python_dict_to_value_map(&self, py_dict: &Bound<PyDict>) -> PyResult<HashMap<String, Value>> {
         let mut map = HashMap::new();
         
@@ -1237,8 +1341,7 @@ impl HNSWIndex {
         Ok(py_obj)
     }
 
-    /// Internal batch search method for multiple query vectors (not exposed to Python)
-    /// Automatically chooses optimal strategy based on batch size
+    /// Internal batch search method for multiple query vectors
     fn batch_search_internal(
         &self,
         vectors: &[Vec<f32>],
@@ -1265,8 +1368,7 @@ impl HNSWIndex {
         }
     }
 
-    /// Sequential batch processing (for small batches - single HNSW lock)
-    /// Most efficient for 2-5 queries due to reduced lock overhead
+    /// Sequential batch processing (for small batches)
     fn batch_search_sequential(
         &self,
         vectors: &[Vec<f32>],
@@ -1277,7 +1379,6 @@ impl HNSWIndex {
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
         let rust_results = py.allow_threads(|| {
-            // Single HNSW lock for entire batch (most efficient for small batches)
             let hnsw_guard = self.hnsw.lock().unwrap();
             let vector_store = self.vectors.read().unwrap();
             let metadata_store = self.vector_metadata.read().unwrap();
@@ -1286,7 +1387,7 @@ impl HNSWIndex {
             let mut all_results = Vec::with_capacity(vectors.len());
 
             for vector in vectors {
-                let neighbors = hnsw_guard.search(vector, top_k, ef);
+                let neighbors = hnsw_guard.search(vector, top_k, ef).unwrap_or_else(|_| Vec::new());
                 let mut query_results = Vec::with_capacity(neighbors.len());
 
                 for neighbor in neighbors {
@@ -1321,7 +1422,7 @@ impl HNSWIndex {
             all_results
         });
 
-        // Convert to Python objects (needs GIL)
+        // Convert to Python objects
         let mut output = Vec::with_capacity(rust_results.len());
         for batch_result in rust_results {
             let mut py_batch = Vec::with_capacity(batch_result.len());
@@ -1345,8 +1446,7 @@ impl HNSWIndex {
         Ok(output)
     }
 
-    /// Parallel batch processing (for larger batches - brief individual locks)
-    /// Scales with CPU cores for 6+ queries
+    /// Parallel batch processing (for larger batches)
     fn batch_search_parallel(
         &self,
         vectors: &[Vec<f32>],
@@ -1357,17 +1457,16 @@ impl HNSWIndex {
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
         let rust_results = py.allow_threads(|| {
-            // Parallel processing with brief individual HNSW locks
             let results: Vec<Vec<(String, f32, HashMap<String, Value>, Option<Vec<f32>>)>> = vectors
                 .par_iter()
                 .map(|vector| {
                     // Brief HNSW search (individual lock per query)
                     let neighbors = {
                         let hnsw_guard = self.hnsw.lock().unwrap();
-                        hnsw_guard.search(vector, top_k, ef)
-                    }; // Lock released immediately after search
+                        hnsw_guard.search(vector, top_k, ef).unwrap_or_else(|_| Vec::new())
+                    };
 
-                    // Concurrent data lookup (RwLock allows parallel reads)
+                    // Concurrent data lookup
                     let vector_store = self.vectors.read().unwrap();
                     let metadata_store = self.vector_metadata.read().unwrap();
                     let rev_map = self.rev_map.read().unwrap();
@@ -1407,7 +1506,7 @@ impl HNSWIndex {
             results
         });
 
-        // Convert to Python objects (needs GIL)
+        // Convert to Python objects
         let mut output = Vec::with_capacity(rust_results.len());
         for batch_result in rust_results {
             let mut py_batch = Vec::with_capacity(batch_result.len());
@@ -1430,10 +1529,4 @@ impl HNSWIndex {
 
         Ok(output)
     }
-
-
-
-
-
-
 }
