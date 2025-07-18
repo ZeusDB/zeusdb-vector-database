@@ -195,7 +195,7 @@ class VectorDatabase:
         
         validated_config['training_size'] = training_size
         
-        # Validate max training vectors (optional)
+        # Validate max training vectors if provided
         max_training_vectors = validated_config.get('max_training_vectors')
         if max_training_vectors is not None:
             if not isinstance(max_training_vectors, int) or max_training_vectors < training_size:
@@ -264,7 +264,7 @@ class VectorDatabase:
         compressed_bytes_per_vector = subvectors  # 1 byte per subvector code
         compression_ratio = original_bytes_per_vector / compressed_bytes_per_vector
         
-        # Add memory info to config for user reference (marked as internal)
+        # Add memory info to config for user reference (internal)
         memory_info: MemoryInfo = {
             'centroid_storage_mb': round(centroid_memory_mb, 2),
             'compression_ratio': round(compression_ratio, 1),
