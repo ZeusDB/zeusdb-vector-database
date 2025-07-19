@@ -215,7 +215,7 @@ impl DistanceType {
     }
     
     /// Insert PQ codes into the index
-    #[allow(dead_code)]
+    //#[allow(dead_code)]
     fn insert_pq_codes(&mut self, codes: &[u8], id: usize) {
         match self {
             DistanceType::CosinePQ(hnsw) => {
@@ -237,7 +237,7 @@ impl DistanceType {
 
 
     
-    #[allow(dead_code)]
+    //#[allow(dead_code)]
     fn insert_batch(&mut self, data: &[(&Vec<f32>, usize)]) {
         let num_threads = rayon::current_num_threads();
         let threshold = 1000 * num_threads;
@@ -694,6 +694,23 @@ impl HNSWIndex {
         // Detect batch vs single query with comprehensive input support
         if let Ok(list_vec) = vector.extract::<Vec<Vec<f32>>>() {
             // Format: List of vectors [[0.1, 0.2], [0.3, 0.4]]
+
+            // Validation for empty batch or empty vectors in batch
+            if list_vec.is_empty() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "Batch cannot be empty"
+                ));
+            }
+
+            // Check for empty vectors within the batch
+            for (i, vec) in list_vec.iter().enumerate() {
+                if vec.is_empty() {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("Vector {} in batch cannot be empty", i)
+                    ));
+                }
+            }
+
             let results = self.batch_search_internal(&list_vec, filter_conditions.as_ref(), top_k, ef, return_vector, py)?;
             Ok(PyList::new(py, results)?.into())
         } else if let Ok(np_array) = vector.downcast::<PyArray2<f32>>() {
@@ -718,6 +735,13 @@ impl HNSWIndex {
             } else {
                 vector.extract::<Vec<f32>>()?
             };
+
+            // Validate vector is not empty
+            if single_vec.is_empty() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "Search vector cannot be empty"
+                ));
+            }
 
             if single_vec.len() != self.dim {
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
