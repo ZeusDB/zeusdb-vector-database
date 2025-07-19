@@ -124,16 +124,29 @@ class VectorDatabase:
         
         constructor = self._index_constructors[index_type]
         
+        # try:
+        #     # Pass quantization_config as a separate parameter if provided
+        #     if quantization_config is not None:
+        #         # Clean quantization_config before passing to Rust (remove internal keys)
+        #         clean_config = {k: v for k, v in quantization_config.items() if not k.startswith('_')}
+        #         return constructor(quantization_config=clean_config, **kwargs)
+        #     else:
+        #         return constructor(**kwargs)
+        # except Exception as e:
+        #     raise RuntimeError(f"Failed to create {index_type.upper()} index: {e}") from e
+
         try:
-            # Pass quantization_config as a separate parameter if provided
+            # Always pass quantization_config parameter
+            clean_config = None
             if quantization_config is not None:
                 # Clean quantization_config before passing to Rust (remove internal keys)
                 clean_config = {k: v for k, v in quantization_config.items() if not k.startswith('_')}
-                return constructor(quantization_config=clean_config, **kwargs)
-            else:
-                return constructor(**kwargs)
+            
+            return constructor(quantization_config=clean_config, **kwargs)
         except Exception as e:
             raise RuntimeError(f"Failed to create {index_type.upper()} index: {e}") from e
+
+
 
     def _validate_quantization_config(self, config: Dict[str, Any], dim: int) -> Dict[str, Any]:
         """
