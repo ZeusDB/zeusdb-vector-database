@@ -10,6 +10,9 @@ use rayon::prelude::*;
 // Import PQ module
 use crate::pq::PQ;
 
+// Part of the rust library so no need to specify in cargo.toml
+use std::sync::atomic::{AtomicBool, Ordering};
+
 // Quantization configuration structure
 #[derive(Debug, Clone)]
 pub struct QuantizationConfig {
@@ -215,7 +218,6 @@ impl DistanceType {
     }
     
     /// Insert PQ codes into the index
-    //#[allow(dead_code)]
     fn insert_pq_codes(&mut self, codes: &[u8], id: usize) {
         match self {
             DistanceType::CosinePQ(hnsw) => {
@@ -234,10 +236,7 @@ impl DistanceType {
         }
     }
 
-
-
-    
-    //#[allow(dead_code)]
+    #[allow(dead_code)]
     fn insert_batch(&mut self, data: &[(&Vec<f32>, usize)]) {
         let num_threads = rayon::current_num_threads();
         let threshold = 1000 * num_threads;
@@ -256,27 +255,6 @@ impl DistanceType {
         }
     }
     
-    // fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize)]) -> Result<(), String> {
-    //     let num_threads = rayon::current_num_threads();
-    //     let threshold = 1000 * num_threads;
-
-    //     match self {
-    //         DistanceType::CosinePQ(hnsw) |
-    //         DistanceType::L2PQ(hnsw) |
-    //         DistanceType::L1PQ(hnsw) => {
-    //             if data.len() >= threshold {
-    //                 hnsw.parallel_insert(data);
-    //             } else {
-    //                 for (codes, id) in data {
-    //                     hnsw.insert((codes.as_slice(), *id));
-    //                 }
-    //             }
-    //             Ok(())
-    //         }
-    //         _ => Err("Cannot insert PQ codes into raw HNSW index".to_string()),
-    //     }
-    // }
-
 
     fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize)]) -> Result<(), String> {
         let num_threads = rayon::current_num_threads();
@@ -375,6 +353,11 @@ pub struct HNSWIndex {
     
     // Mutex for HNSW (not thread-safe for concurrent reads)
     hnsw: Mutex<DistanceType>,
+
+    // ID-based training collection
+    training_ids: RwLock<Vec<String>>,          // Just IDs, not vectors
+    training_threshold_reached: AtomicBool,     // Atomic flag for safety
+
 }
 
 
@@ -382,6 +365,7 @@ pub struct HNSWIndex {
 #[pymethods]
 impl HNSWIndex {
     #[new]
+    #[pyo3(signature = (dim, space, m, ef_construction, expected_size, quantization_config = None))]
     fn new(
         dim: usize,
         space: String,
@@ -494,6 +478,8 @@ impl HNSWIndex {
             id_counter: Mutex::new(0),
             vector_count: Mutex::new(0),
             hnsw: Mutex::new(hnsw),
+            training_ids: RwLock::new(Vec::new()),
+            training_threshold_reached: AtomicBool::new(false),
         })
     }
 
@@ -644,35 +630,122 @@ impl HNSWIndex {
 
 
 
-    /// Add vectors to the index (placeholder for step 4)
-    pub fn add(&mut self, data: Bound<PyAny>) -> PyResult<AddResult> {
+    /// Add vectors to the index
+    #[pyo3(signature = (data, overwrite = true))]
+    pub fn add(&mut self, data: Bound<PyAny>, overwrite: bool) -> PyResult<AddResult> {
+        // Input validation
         // Basic data type checking
         if data.is_none() {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "Data cannot be None"
             ));
         }
-        
-        // Check if we should trigger training
-        if let Some(config) = &self.quantization_config {
-            if let Some(pq) = &self.pq {
-                let current_count = self.get_vector_count();
-                if current_count >= config.training_size && !pq.is_trained() {
-                    println!("Training threshold reached: {} >= {}", current_count, config.training_size);
-                    // TODO: Implement training logic in step 4
+
+        // Comprehensive input parsing
+        let parsed_data = self.parse_input_data(&data)?;
+        if parsed_data.is_empty() {
+            return Ok(AddResult {
+                total_inserted: 0,
+                total_errors: 0,
+                errors: vec![],
+                vector_shape: Some((0, self.dim)),
+            });
+        }
+
+        let mut total_inserted = 0;
+        let mut total_errors = 0;
+        let mut errors = Vec::new();
+        let vector_shape = Some((parsed_data.len(), self.dim));
+
+        // Process each vector using clean 3-path architecture
+        for (id, vector, metadata) in parsed_data {
+            // Clone the ID before moving it to add_single_vector
+            let id_for_error = id.clone(); // Keep a copy for error messages
+
+            match self.add_single_vector(id, vector, metadata, overwrite) {
+                Ok(()) => {
+                    total_inserted += 1;
+
+                    // Update vector count
+                    {
+                        let mut count = self.vector_count.lock().unwrap();
+                        *count += 1;
+                    }
+
+                    // Check training trigger (graceful failure handling)
+                    if let Err(training_error) = self.maybe_trigger_training() {
+                        errors.push(format!("Training failed: {}", training_error));
+                        eprintln!("Warning: PQ training failed: {}", training_error);
+                        // Continue with raw storage
+                    }
+                }
+                Err(e) => {
+                    total_errors += 1;
+                    errors.push(format!("Vector {}: {}", id_for_error, e));
                 }
             }
         }
-        
-        // TODO: Implement full add logic in step 4
-        // For now, return placeholder
+
         Ok(AddResult {
-            total_inserted: 0,
-            total_errors: 1,
-            errors: vec!["Add method implementation coming in step 4".to_string()],
-            vector_shape: Some((0, self.dim)),
+            total_inserted,
+            total_errors,
+            errors,
+            vector_shape,
         })
     }
+
+
+    /// ENHANCED STATISTICS with training progress
+    pub fn get_training_progress(&self) -> f32 {
+        if let Some(config) = &self.quantization_config {
+            if self.training_threshold_reached.load(Ordering::Acquire) {
+                100.0
+            } else {
+                let training_ids = self.training_ids.read().unwrap();
+                (training_ids.len() as f32 / config.training_size as f32 * 100.0).min(100.0)
+            }
+        } else {
+            0.0
+        }
+    }
+
+    /// Get number of training vectors still needed
+    pub fn training_vectors_needed(&self) -> usize {
+        if let Some(config) = &self.quantization_config {
+            if self.training_threshold_reached.load(Ordering::Acquire) {
+                0
+            } else {
+                let training_ids = self.training_ids.read().unwrap();
+                config.training_size.saturating_sub(training_ids.len())
+            }
+        } else {
+            0
+        }
+    }
+
+    /// Check if training is ready to be triggered
+    pub fn is_training_ready(&self) -> bool {
+        self.training_threshold_reached.load(Ordering::Acquire)
+    }
+
+    /// Get current storage mode description
+    pub fn get_storage_mode(&self) -> String {
+        if !self.has_quantization() {
+            "raw_only".to_string()
+        } else if !self.can_use_quantization() {
+            if self.training_threshold_reached.load(Ordering::Acquire) {
+                "raw_ready_for_training".to_string()
+            } else {
+                "raw_collecting_for_training".to_string()
+            }
+        } else if self.is_quantized() {
+            "quantized_active".to_string()
+        } else {
+            "raw_trained_not_rebuilt".to_string()
+        }
+    }
+
+    
 
 
 
@@ -895,59 +968,58 @@ impl HNSWIndex {
 
 
 
-
-
-
-    /// Get comprehensive statistics with quantization info
+    /// Enhanced get_stats with training info
     pub fn get_stats(&self) -> HashMap<String, String> {
         let mut stats = HashMap::new();
-        
+
         let vectors = self.vectors.read().unwrap();
         let pq_codes = self.pq_codes.read().unwrap();
-        
-        stats.insert("total_vectors".to_string(), vectors.len().to_string());
+        let vector_count = *self.vector_count.lock().unwrap();
+        let training_ids = self.training_ids.read().unwrap();
+
+        // Basic stats
+        stats.insert("total_vectors".to_string(), vector_count.to_string());
         stats.insert("dimension".to_string(), self.dim.to_string());
         stats.insert("space".to_string(), self.space.clone());
-        stats.insert("m".to_string(), self.m.to_string());
-        stats.insert("ef_construction".to_string(), self.ef_construction.to_string());
-        stats.insert("expected_size".to_string(), self.expected_size.to_string());
         stats.insert("index_type".to_string(), "HNSW".to_string());
-        
-        // Add quantization info
+
+        // Storage breakdown
+        stats.insert("raw_vectors_stored".to_string(), vectors.len().to_string());
+        stats.insert("quantized_codes_stored".to_string(), pq_codes.len().to_string());
+
+        // Training info
         if let Some(config) = &self.quantization_config {
             stats.insert("quantization_type".to_string(), "pq".to_string());
-            stats.insert("quantization_subvectors".to_string(), config.subvectors.to_string());
-            stats.insert("quantization_bits".to_string(), config.bits.to_string());
             stats.insert("quantization_training_size".to_string(), config.training_size.to_string());
+
+            let collected_count = training_ids.len();
+            let progress = self.get_training_progress();
+            stats.insert("training_progress".to_string(), 
+                format!("{}/{} ({:.1}%)", collected_count, config.training_size, progress));
             
-            if let Some(max_training) = config.max_training_vectors {
-                stats.insert("quantization_max_training_vectors".to_string(), max_training.to_string());
-            }
+            let vectors_needed = self.training_vectors_needed();
+            stats.insert("training_vectors_needed".to_string(), vectors_needed.to_string());
+            stats.insert("training_threshold_reached".to_string(), 
+                self.training_threshold_reached.load(Ordering::Acquire).to_string());
             
             if let Some(pq) = &self.pq {
-                stats.insert("quantization_trained".to_string(), pq.is_trained().to_string());
-                let (memory_mb, _) = pq.get_memory_stats();
-                stats.insert("quantization_memory_mb".to_string(), format!("{:.2}", memory_mb));
-                
-                // Use cached values for efficiency
-                let compression_ratio = (pq.dim * 4) as f64 / pq.subvectors as f64;
-                stats.insert("quantization_compression_ratio".to_string(), format!("{:.1}x", compression_ratio));
-                
-                // Add quantization status
+                let is_trained = pq.is_trained();
+                stats.insert("quantization_trained".to_string(), is_trained.to_string());
                 stats.insert("quantization_active".to_string(), self.is_quantized().to_string());
-                
-                // Add storage info
-                stats.insert("quantized_vectors".to_string(), pq_codes.len().to_string());
+
+                if is_trained {
+                    let compression_ratio = (pq.dim * 4) as f64 / pq.subvectors as f64;
+                    stats.insert("quantization_compression_ratio".to_string(), format!("{:.1}x", compression_ratio));
+                }
             }
         } else {
             stats.insert("quantization_type".to_string(), "none".to_string());
         }
-        
-        stats.insert("thread_safety".to_string(), "RwLock+Mutex".to_string());
-        
+
+        stats.insert("storage_mode".to_string(), self.get_storage_mode());
+
         stats
     }
-
 
 
 
@@ -1156,7 +1228,280 @@ impl HNSWIndex {
     }
 }
 
+
+
+
+
+
+
+
+// INTERNAL METHODS, HELPERS AND IMPLEMENTATIONS
 impl HNSWIndex {
+
+    // 1. CORE VECTOR OPERATIONS (6 methods)
+    /// 3-PATH ARCHITECTURE - Main router
+    fn add_single_vector(
+        &mut self,
+        id: String,
+        vector: Vec<f32>,
+        metadata: HashMap<String, Value>,
+        overwrite: bool
+    ) -> PyResult<()> {
+        // Duplicate check (unless overwrite)
+        if !overwrite {
+            let id_map = self.id_map.read().unwrap();
+            if id_map.contains_key(&id) {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Vector with ID '{}' already exists", id)
+                ));
+            }
+        }
+
+        // Clean 3-Path Architecture
+        if !self.has_quantization() {
+            // Path A: Raw storage (no quantization config)
+            self.add_raw_vector(id, vector, metadata)
+        } else if !self.is_quantized() {
+            // Path B: Raw storage + ID collection for training
+            self.add_with_id_collection(id, vector, metadata)
+        } else {
+            // Path C: Quantized storage (PQ trained and active)
+            self.add_quantized_vector(id, vector, metadata)
+        }
+    }
+
+    /// Path A: Raw storage (no quantization)
+    fn add_raw_vector(
+        &mut self,
+        id: String,
+        vector: Vec<f32>,
+        metadata: HashMap<String, Value>
+    ) -> PyResult<()> {
+        let internal_id = self.get_next_id();
+
+        // Store metadata
+        {
+            let mut vector_metadata = self.vector_metadata.write().unwrap();
+            vector_metadata.insert(id.clone(), metadata);
+        }
+
+        // Update ID mappings
+        {
+            let mut id_map = self.id_map.write().unwrap();
+            let mut rev_map = self.rev_map.write().unwrap();
+
+            id_map.insert(id.clone(), internal_id);
+            rev_map.insert(internal_id, id.clone());
+        }
+
+        // Store in vectors HashMap
+        {
+            let mut vectors = self.vectors.write().unwrap();
+            vectors.insert(id, vector.clone());
+        }
+
+        // Insert into HNSW index
+        {
+            let mut hnsw_guard = self.hnsw.lock().unwrap();
+            hnsw_guard.insert(&vector, internal_id);
+        }
+
+        Ok(())
+
+    }
+
+    /// Path B: ID collection for consistent training
+    fn add_with_id_collection(
+        &mut self,
+        id: String,
+        vector: Vec<f32>,
+        metadata: HashMap<String, Value>
+    ) -> PyResult<()> {
+        // 1. Store vector normally (single storage)
+        self.add_raw_vector(id.clone(), vector, metadata)?;
+
+        // 2. Collect ID for training (minimal memory overhead)
+        if let Some(config) = &self.quantization_config {
+            if !self.training_threshold_reached.load(Ordering::Acquire) {
+                let mut training_ids = self.training_ids.write().unwrap();
+
+                if training_ids.len() < config.training_size {
+                    training_ids.push(id);
+
+                    // Check if we've reached the threshold
+                    if training_ids.len() >= config.training_size {
+                        self.training_threshold_reached.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Path C: Quantized storage (trained and active)
+    fn add_quantized_vector(
+        &mut self,
+        id: String,
+        vector: Vec<f32>,
+        metadata: HashMap<String, Value>
+    ) -> PyResult<()> {
+        let internal_id = self.get_next_id();
+
+        // Store metadata
+        {
+            let mut vector_metadata = self.vector_metadata.write().unwrap();
+            vector_metadata.insert(id.clone(), metadata);
+        }
+
+        // Update ID mappings
+        {
+            let mut id_map = self.id_map.write().unwrap();
+            let mut rev_map = self.rev_map.write().unwrap();
+
+            id_map.insert(id.clone(), internal_id);
+            rev_map.insert(internal_id, id.clone());
+        }
+
+        // Quantize the vector
+        let pq = self.pq.as_ref().unwrap();
+        let codes = pq.quantize(&vector).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to quantize vector: {}", e)
+            )
+        })?;
+
+        // Store quantized codes
+        {
+            let mut pq_codes = self.pq_codes.write().unwrap();
+            pq_codes.insert(id.clone(), codes.clone());
+        }
+
+        // Store raw vector for exact reconstruction (persistence-ready)
+        {
+            let mut vectors = self.vectors.write().unwrap();
+            vectors.insert(id, vector.clone());
+        }
+
+        // Insert codes into quantized HNSW
+        {
+            let mut hnsw_guard = self.hnsw.lock().unwrap();
+            hnsw_guard.insert_pq_codes(&codes, internal_id);
+        }
+
+        Ok(())
+    }
+
+    /// TRAINING TRIGGER: Uses threshold flag for race condition safety
+    fn maybe_trigger_training(&mut self) -> Result<(), String> {
+        // Check atomic flag first (fast path)
+        if !self.training_threshold_reached.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        // Only proceed if we have quantization config and aren't already trained
+        if let Some(_config) = &self.quantization_config {
+            if let Some(pq) = &self.pq {
+                if !pq.is_trained() {
+                    println!("Training threshold reached. Starting PQ training...");
+                    return self.train_quantization_from_ids();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// TRAINING EXECUTION: Uses collected IDs for deterministic training set
+    fn train_quantization_from_ids(&mut self) -> Result<(), String> {
+        // let pq = self.pq.as_ref()
+        //     .ok_or("PQ instance not available")?;
+        let pq = self.pq.as_ref().ok_or("PQ not available")?.clone();
+
+        // let config = self.quantization_config.as_ref()
+        //     .ok_or("Quantization config not available")?;
+        let config = self.quantization_config.as_ref().ok_or("Config not available")?.clone();
+        
+
+        // Get consistent training set using collected IDs
+        let training_vectors = {
+            let training_ids = self.training_ids.read().unwrap();
+            let vectors = self.vectors.read().unwrap();
+
+            let mut training_data = Vec::new();
+            let mut missing_vectors = 0;
+
+            for id in training_ids.iter() {
+                if let Some(vector) = vectors.get(id) {
+                    training_data.push(vector.clone());
+                } else {
+                    missing_vectors += 1;
+                }
+            }
+
+            if missing_vectors > 0 {
+                eprintln!("Warning: {} training vectors were removed before training", missing_vectors);
+            }
+
+            training_data
+        };
+
+        if training_vectors.len() < config.training_size {
+            return Err(format!("Insufficient vectors for training: need {}, have {} (some may have been removed)",
+                config.training_size, training_vectors.len()));
+        }
+
+        // Respect max_training_vectors limit
+        let final_training_set = if let Some(max_training) = config.max_training_vectors {
+            if training_vectors.len() > max_training {
+                // Take first max_training vectors (deterministic)
+                training_vectors.into_iter().take(max_training).collect()
+            } else {
+                training_vectors
+            }
+        } else {
+            training_vectors
+        };
+
+        println!("Training PQ with {} vectors (from {} collected IDs)...",
+            final_training_set.len(),
+            self.training_ids.read().unwrap().len());
+
+        // Train the PQ model
+        pq.train(&final_training_set)?;
+
+        println!("PQ training completed successfully!");
+
+        // Clear training IDs (no longer needed)
+        {
+            let mut training_ids = self.training_ids.write().unwrap();
+            training_ids.clear();
+        }
+
+        // Rebuild index with quantization
+        println!("Rebuilding index with quantization...");
+        let rebuild_success = self.rebuild_with_quantization()
+            .map_err(|e| format!("Failed to rebuild with quantization: {}", e))?;
+
+        if rebuild_success {
+            println!("Index successfully rebuilt with quantization!");
+
+            // Calculate compression info
+            let compression_ratio = (self.dim * 4) / pq.subvectors;
+            let memory_savings = (1.0 - (pq.subvectors as f64) / (self.dim * 4) as f64) * 100.0;
+
+            println!("Compression: {}x, Memory saved: {:.1}%", 
+                compression_ratio, memory_savings);
+        } else {
+            return Err("Index rebuild returned false".to_string());
+        }
+
+        Ok(())
+    }
+
+
+
+    // 2. SEARCH OPERATIONS (1 method)
     /// Raw search without Python objects (for benchmarking)
     fn raw_search_no_gil(&self, query: &[f32]) -> Vec<(String, f32)> {
         // HNSW search with locking
@@ -1178,6 +1523,342 @@ impl HNSWIndex {
             .collect()
     }
 
+
+
+    // 3. INPUT PARSING METHODS (6 methods)
+    /// Parse input data into (id, vector, metadata) tuples
+    fn parse_input_data(&self, data: &Bound<PyAny>) -> PyResult<Vec<(String, Vec<f32>, HashMap<String, Value>)>> {
+        let mut parsed_vectors = Vec::new();
+
+        if let Ok(dict) = data.downcast::<PyDict>() {
+            self.parse_dict_input(dict, &mut parsed_vectors)?;
+        } else if let Ok(list) = data.downcast::<PyList>() {
+            self.parse_list_input(list, &mut parsed_vectors)?;
+        } else if let Ok(np_array) = data.downcast::<PyArray2<f32>>() {
+            self.parse_numpy_input(np_array, &mut parsed_vectors)?;
+        } else {
+            let vector = self.extract_single_vector(data)?;
+            let id = self.generate_id();
+            parsed_vectors.push((id, vector, HashMap::new()));
+        }
+
+        Ok(parsed_vectors)
+    }
+
+    // /// Parse dictionary input format
+    // fn parse_dict_input(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
+    //     // Two-step approach avoids temporary value issues
+    //     let vectors_item = dict.get_item("vectors")?
+    //         .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'vectors' key in input dictionary"))?;
+    //     let vectors = vectors_item.downcast::<PyList>()?;
+
+    //     // Try 1 DIDNT WORK
+    //     // let ids = dict.get_item("ids").map(|item| item.downcast::<PyList>()).transpose()?;
+    //     // let metadata = dict.get_item("metadata").map(|item| item.downcast::<PyList>()).transpose()?;
+
+    //     // Try 2 - Didnt work
+    //     // let ids = dict.get_item("ids")?
+    //     //     .map(|item| item.downcast::<PyList>())
+    //     //     .transpose()?;
+
+    //     // let metadata = dict.get_item("metadata")?
+    //     //     .map(|item| item.downcast::<PyList>())
+    //     //     .transpose()?;
+
+    //     // Try 3 - Didn't work
+    //     // // Store the intermediate Bound values
+    //     // let ids_item = dict.get_item("ids")?;
+    //     // let ids = if let Some(item) = ids_item {
+    //     //     Some(item.downcast::<PyList>()?)
+    //     // } else {
+    //     //     None
+    //     // };
+
+    //     // let metadata_item = dict.get_item("metadata")?;
+    //     // let metadata = if let Some(item) = metadata_item {
+    //     //     Some(item.downcast::<PyList>()?)
+    //     // } else {
+    //     //     None
+    //     // };
+
+
+    //     for (i, vector_item) in vectors.iter().enumerate() {
+    //         let vector = self.extract_single_vector(&vector_item)?;
+
+    //         let id = if let Some(id_list) = &ids {
+    //             if i < id_list.len() {
+    //                 id_list.get_item(i)?.extract::<String>()?
+    //             } else {
+    //                 self.generate_id()
+    //             }
+    //         } else {
+    //             self.generate_id()
+    //         };
+
+    //         let meta = if let Some(meta_list) = &metadata {
+    //             if i < meta_list.len() {
+    //                 // Simplified metadata handling for now
+    //                 HashMap::new()
+    //             } else {
+    //                 HashMap::new()
+    //             }
+    //         } else {
+    //             HashMap::new()
+    //         };
+
+    //         parsed_vectors.push((id, vector, meta));
+    //     }
+
+    //     Ok(())
+    // }
+
+
+    /// Parse dictionary input format
+    fn parse_dict_input(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
+        // Two-step approach for required field (works because vectors_item is stored)
+        let vectors_item = dict.get_item("vectors")?
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'vectors' key in input dictionary"))?;
+        let vectors = vectors_item.downcast::<PyList>()?;
+
+        for (i, vector_item) in vectors.iter().enumerate() {
+            let vector = self.extract_single_vector(&vector_item)?;
+
+            // ON-DEMAND PROCESSING: No storing of PyList references
+            let id = match dict.get_item("ids")? {
+                Some(item) => {
+                    let ids_list = item.downcast::<PyList>()?;
+                    if i < ids_list.len() {
+                        ids_list.get_item(i)?.extract::<String>()?
+                    } else {
+                        self.generate_id()
+                    }
+                }
+                None => self.generate_id(),
+            };
+
+            // OPTION 1: Simplified metadata handling
+            // // ON-DEMAND PROCESSING: metadata
+            // let meta = match dict.get_item("metadata")? {
+            //     Some(item) => {
+            //         let metadata_list = item.downcast::<PyList>()?;
+            //         if i < metadata_list.len() {
+            //             // For now, simplified metadata handling
+            //             // TODO: Implement proper metadata conversion from Python objects
+            //             HashMap::new()
+            //         } else {
+            //             HashMap::new()
+            //         }
+            //     }
+            //     None => HashMap::new(),
+            // };
+
+            // Option 2 - Better metadata handling with conversion
+            // // ON-DEMAND PROCESSING: metadata with proper metadata conversion from Python objects
+            // let meta = match dict.get_item("metadata")? {
+            //     Some(item) => {
+            //         let metadata_list = item.downcast::<PyList>()?;
+            //         if i < metadata_list.len() {
+            //             // Future: Convert Python object to HashMap<String, Value>
+            //             let metadata_item = metadata_list.get_item(i)?;
+
+            //             // Convert Python object to HashMap<String, Value>
+            //             if let Ok(py_dict) = metadata_item.downcast::<PyDict>() {
+            //                 self.python_dict_to_value_map(py_dict)?
+            //             } else {
+            //                 // If it's not a dict, create a single-entry map
+            //                 let mut map = HashMap::new();
+            //                 map.insert("value".to_string(), self.python_object_to_value(&metadata_item)?);
+            //                 map
+            //             }
+            //         } else {
+            //             HashMap::new()
+            //         }
+            //     }
+            //     None => HashMap::new(),
+            // };
+
+
+            // Option 3 - Enhanced metadata handling
+            // ON-DEMAND PROCESSING: metadata with comprehensive handling
+            let meta = match dict.get_item("metadata")? {
+                Some(item) => {
+                    let metadata_list = item.downcast::<PyList>()?;
+                    if i < metadata_list.len() {
+                        let metadata_item = metadata_list.get_item(i)?;
+
+                        // ENHANCED: Handle various metadata formats
+                        if let Ok(py_dict) = metadata_item.downcast::<PyDict>() {
+                            // Direct dict conversion
+                            self.python_dict_to_value_map(py_dict)?
+                        } else if metadata_item.is_none() {
+                            // Handle None values
+                            HashMap::new()
+                        } else {
+                            // Convert any other object to a single-entry map
+                            let mut map = HashMap::new();
+                            let value = self.python_object_to_value(&metadata_item)?;
+
+                            // Use a more descriptive key based on type
+                            let key = if value.is_string() {
+                                "text"
+                            } else if value.is_number() {
+                                "number"
+                            } else if value.is_boolean() {
+                                "flag"
+                            } else if value.is_array() {
+                                "list"
+                            } else {
+                                "value"
+                            };
+
+                            map.insert(key.to_string(), value);
+                            map
+                        }
+                    } else {
+                        HashMap::new()
+                    }
+                }
+                None => HashMap::new(),
+            };        
+
+            parsed_vectors.push((id, vector, meta));
+        }
+
+        Ok(())
+    }
+
+
+
+    // /// Parse list input format
+    // fn parse_list_input(&self, list: &Bound<PyList>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
+    //     for item in list.iter() {
+    //         if let Ok(item_dict) = item.downcast::<PyDict>() {
+    //             let vector = item_dict.get_item("vector")
+    //                 .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'vector' key in item"))?;
+    //             let vector_data = self.extract_single_vector(&vector)?;
+
+    //             let id = item_dict.get_item("id")
+    //                 .map(|v| v.extract::<String>())
+    //                 .transpose()?
+    //                 .unwrap_or_else(|| self.generate_id());
+
+    //             let metadata = HashMap::new(); // Simplified for now
+
+    //             parsed_vectors.push((id, vector_data, metadata));
+    //         } else {
+    //             let vector = self.extract_single_vector(&item)?;
+    //             let id = self.generate_id();
+    //             parsed_vectors.push((id, vector, HashMap::new()));
+    //         }
+    //     }
+
+    //     Ok(())
+    // }
+
+
+    /// Parse list input format
+    fn parse_list_input(&self, list: &Bound<PyList>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
+        for item in list.iter() {
+            if let Ok(item_dict) = item.downcast::<PyDict>() {
+                // 🔧 FIX: Extract Option first, then use ok_or_else
+                let vector = item_dict.get_item("vector")?
+                    .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'vector' key in item"))?;
+                let vector_data = self.extract_single_vector(&vector)?;
+
+                // 🔧 FIX: Extract Option first, then map
+                let id = item_dict.get_item("id")?
+                    .map(|v| v.extract::<String>())
+                    .transpose()?
+                    .unwrap_or_else(|| self.generate_id());
+
+                let metadata = HashMap::new(); // Simplified for now
+
+                parsed_vectors.push((id, vector_data, metadata));
+            } else {
+                let vector = self.extract_single_vector(&item)?;
+                let id = self.generate_id();
+                parsed_vectors.push((id, vector, HashMap::new()));
+            }
+        }
+
+        Ok(())
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    /// Parse NumPy 2D array input
+    fn parse_numpy_input(&self, np_array: &Bound<PyArray2<f32>>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
+        let readonly = np_array.readonly();
+        let shape = readonly.shape();
+
+        if shape.len() != 2 || shape[1] != self.dim {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "NumPy array must have shape (N, {}), got {:?}", self.dim, shape
+            )));
+        }
+
+        let flat = readonly.as_slice()?;
+        let num_vectors = shape[0];
+
+        for i in 0..num_vectors {
+            let start_idx = i * self.dim;
+            let end_idx = start_idx + self.dim;
+            let vector = flat[start_idx..end_idx].to_vec();
+            let id = self.generate_id();
+            parsed_vectors.push((id, vector, HashMap::new()));
+        }
+
+        Ok(())
+    }
+
+    /// Extract a single vector from various Python types
+    fn extract_single_vector(&self, data: &Bound<PyAny>) -> PyResult<Vec<f32>> {
+        let vector = if let Ok(array1d) = data.downcast::<PyArray1<f32>>() {
+            array1d.readonly().as_slice()?.to_vec()
+        } else if let Ok(list) = data.downcast::<PyList>() {
+            list.iter().map(|item| item.extract::<f32>()).collect::<PyResult<Vec<f32>>>()?
+        } else {
+            data.extract::<Vec<f32>>()?
+        };
+
+        if vector.len() != self.dim {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Vector dimension mismatch: expected {}, got {}", self.dim, vector.len()
+            )));
+        }
+
+        if vector.is_empty() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Vector cannot be empty"
+            ));
+        }
+
+        Ok(vector)
+    }
+
+    /// Generate a unique ID for a vector
+    fn generate_id(&self) -> String {
+        let id = self.get_next_id();
+        format!("vec_{}", id)
+    }
+
+
+
+    // 4. DATA CONVERSION & FILTERING (12 methods)
     // Helper methods for data conversion and filtering
     fn python_dict_to_value_map(&self, py_dict: &Bound<PyDict>) -> PyResult<HashMap<String, Value>> {
         let mut map = HashMap::new();
@@ -1365,6 +2046,9 @@ impl HNSWIndex {
         Ok(py_obj)
     }
 
+
+
+    // 5. BATCH SEARCH METHODS (3 methods)
     /// Internal batch search method for multiple query vectors
     fn batch_search_internal(
         &self,
@@ -1553,4 +2237,7 @@ impl HNSWIndex {
 
         Ok(output)
     }
+
+
+
 }
