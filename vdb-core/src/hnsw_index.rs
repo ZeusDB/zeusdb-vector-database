@@ -993,6 +993,7 @@ impl HNSWIndex {
         // Basic stats
         stats.insert("total_vectors".to_string(), vector_count.to_string());
         stats.insert("dimension".to_string(), self.dim.to_string());
+        stats.insert("expected_size".to_string(), self.expected_size.to_string());
         stats.insert("space".to_string(), self.space.clone());
         stats.insert("index_type".to_string(), "HNSW".to_string());
 
