@@ -802,26 +802,37 @@ impl HNSWIndex {
             let results = self.batch_search_internal(&batch, filter_conditions.as_ref(), top_k, ef, return_vector, py)?;
             Ok(PyList::new(py, results)?.into())
         } else {
-            // Single vector path - enhanced with NumPy 1D support
-            let single_vec = if let Ok(array1d) = vector.downcast::<PyArray1<f32>>() {
+            // // Single vector path - enhanced with NumPy 1D support
+            // let single_vec = if let Ok(array1d) = vector.downcast::<PyArray1<f32>>() {
+            //     array1d.readonly().as_slice()?.to_vec()
+            // } else {
+            //     vector.extract::<Vec<f32>>()?
+            // };
+
+            // // Validate vector is not empty
+            // if single_vec.is_empty() {
+            //     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            //         "Search vector cannot be empty"
+            //     ));
+            // }
+
+            // if single_vec.len() != self.dim {
+            //     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            //         "Search vector dimension mismatch: expected {}, got {}",
+            //         self.dim, single_vec.len()
+            //     )));
+            // }
+
+            // For single vector search:
+            let query_vector = if let Ok(array1d) = vector.downcast::<PyArray1<f32>>() {
                 array1d.readonly().as_slice()?.to_vec()
             } else {
                 vector.extract::<Vec<f32>>()?
             };
 
-            // Validate vector is not empty
-            if single_vec.is_empty() {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "Search vector cannot be empty"
-                ));
-            }
+            // PROCESS HERE using extract_single_vector logic
+            let processed_query = self.validate_and_process_query_vector(query_vector)?;
 
-            if single_vec.len() != self.dim {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Search vector dimension mismatch: expected {}, got {}",
-                    self.dim, single_vec.len()
-                )));
-            }
 
             
             let search_results = py.allow_threads(|| {
@@ -833,14 +844,16 @@ impl HNSWIndex {
 
                     if use_quantized {
                         // Use ADC search for quantized index
-                        hnsw_guard.search(&single_vec, top_k, ef)
+                        //hnsw_guard.search(&single_vec, top_k, ef)
+                        hnsw_guard.search(&processed_query, top_k, ef)
                             .unwrap_or_else(|e| {
                                 eprintln!("ADC search error: {}", e);
                                 Vec::new()
                             })
                     } else {
                         // Use raw vector search
-                        match hnsw_guard.search(&single_vec, top_k, ef) {
+                        //match hnsw_guard.search(&single_vec, top_k, ef) {
+                        match hnsw_guard.search(&processed_query, top_k, ef) {
                             Ok(results) => results,
                             Err(e) => {
                                 eprintln!("Raw search error: {}", e);
@@ -1238,6 +1251,53 @@ impl HNSWIndex {
 // INTERNAL METHODS, HELPERS AND IMPLEMENTATIONS
 impl HNSWIndex {
 
+    /// Pure function for vector normalization
+    fn normalize_vector(&self, vector: Vec<f32>) -> Vec<f32> {
+        let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            vector.iter().map(|x| x / norm).collect()
+        } else {
+            vector  // Return unchanged for zero vectors
+        }
+    }
+
+    /// Process vector according to distance space
+    fn process_vector_for_space(&self, vector: Vec<f32>) -> Vec<f32> {
+        match self.space.to_lowercase().as_str() {
+            "cosine" => self.normalize_vector(vector),
+            // Future extensions:
+            // "l2" => self.preprocess_l2(vector),
+            // "l1" => self.preprocess_l1(vector),
+            _ => vector
+        }
+    }
+
+    /// Helper for query processing (mirrors extract_single_vector validation)
+    fn validate_and_process_query_vector(&self, vector: Vec<f32>) -> PyResult<Vec<f32>> {
+        // Same validation as extract_single_vector
+        if vector.is_empty() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Search vector cannot be empty"
+            ));
+        }
+        if vector.len() != self.dim {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Search vector dimension mismatch: expected {}, got {}", self.dim, vector.len()
+            )));
+        }
+        for (i, &val) in vector.iter().enumerate() {
+            if !val.is_finite() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Search vector contains invalid value at index {}: {}", i, val
+                )));
+            }
+        }
+
+        // Apply same processing as storage vectors
+        Ok(self.process_vector_for_space(vector))
+    }
+
+
     // 1. CORE VECTOR OPERATIONS (6 methods)
     /// 3-PATH ARCHITECTURE - Main router
     fn add_single_vector(
@@ -1274,7 +1334,7 @@ impl HNSWIndex {
     fn add_raw_vector(
         &mut self,
         id: String,
-        vector: Vec<f32>,
+        vector: Vec<f32>, // Already processed by extract_single_vector
         metadata: HashMap<String, Value>
     ) -> PyResult<()> {
         let internal_id = self.get_next_id();
@@ -1294,16 +1354,16 @@ impl HNSWIndex {
             rev_map.insert(internal_id, id.clone());
         }
 
-        // Store in vectors HashMap
+        // Store processed vector directly (no additional processing)
         {
             let mut vectors = self.vectors.write().unwrap();
-            vectors.insert(id, vector.clone());
+            vectors.insert(id, vector.clone()); // Already normalized
         }
 
-        // Insert into HNSW index
+        // Insert processed vector into HNSW
         {
             let mut hnsw_guard = self.hnsw.lock().unwrap();
-            hnsw_guard.insert(&vector, internal_id);
+            hnsw_guard.insert(&vector, internal_id); // Already normalized
         }
 
         Ok(())
@@ -1314,7 +1374,7 @@ impl HNSWIndex {
     fn add_with_id_collection(
         &mut self,
         id: String,
-        vector: Vec<f32>,
+        vector: Vec<f32>,  // Already processed
         metadata: HashMap<String, Value>
     ) -> PyResult<()> {
         // 1. Store vector normally (single storage)
@@ -1343,7 +1403,7 @@ impl HNSWIndex {
     fn add_quantized_vector(
         &mut self,
         id: String,
-        vector: Vec<f32>,
+        vector: Vec<f32>,  // Already processed
         metadata: HashMap<String, Value>
     ) -> PyResult<()> {
         let internal_id = self.get_next_id();
@@ -2260,9 +2320,15 @@ impl HNSWIndex {
         for i in 0..num_vectors {
             let start_idx = i * self.dim;
             let end_idx = start_idx + self.dim;
-            let vector = flat[start_idx..end_idx].to_vec();
+
+            //let vector = flat[start_idx..end_idx].to_vec();
+            let raw_vector = flat[start_idx..end_idx].to_vec();
+            // ADD PROCESSING - only place besides extract_single_vector
+            let processed_vector = self.process_vector_for_space(raw_vector);
+
             let id = self.generate_id();
-            parsed_vectors.push((id, vector, HashMap::new()));
+            //parsed_vectors.push((id, vector, HashMap::new()));
+            parsed_vectors.push((id, processed_vector, HashMap::new()));
         }
 
         Ok(())
@@ -2303,7 +2369,9 @@ impl HNSWIndex {
             }
         }
 
-        Ok(vector)
+        //Ok(vector)
+        // ✅ Apply space-specific processing
+        Ok(self.process_vector_for_space(vector))
     }
 
     /// Generate a unique ID for a vector
@@ -2580,7 +2648,12 @@ impl HNSWIndex {
             let mut all_results = Vec::with_capacity(vectors.len());
 
             for vector in vectors {
-                let neighbors = hnsw_guard.search(vector, top_k, ef).unwrap_or_else(|_| Vec::new());
+                // FIX: Process each query vector for space
+                let processed_query = self.process_vector_for_space(vector.clone());
+
+                //let neighbors = hnsw_guard.search(vector, top_k, ef).unwrap_or_else(|_| Vec::new());
+                let neighbors = hnsw_guard.search(&processed_query, top_k, ef).unwrap_or_else(|_| Vec::new());
+
                 let mut query_results = Vec::with_capacity(neighbors.len());
 
                 for neighbor in neighbors {
@@ -2653,10 +2726,14 @@ impl HNSWIndex {
             let results: Vec<Vec<(String, f32, HashMap<String, Value>, Option<Vec<f32>>)>> = vectors
                 .par_iter()
                 .map(|vector| {
+                    // FIX: Process each query vector for space
+                    let processed_query = self.process_vector_for_space(vector.clone());
+
                     // Brief HNSW search (individual lock per query)
                     let neighbors = {
                         let hnsw_guard = self.hnsw.lock().unwrap();
-                        hnsw_guard.search(vector, top_k, ef).unwrap_or_else(|_| Vec::new())
+                        //hnsw_guard.search(vector, top_k, ef).unwrap_or_else(|_| Vec::new())
+                        hnsw_guard.search(&processed_query, top_k, ef).unwrap_or_else(|_| Vec::new())
                     };
 
                     // Concurrent data lookup
