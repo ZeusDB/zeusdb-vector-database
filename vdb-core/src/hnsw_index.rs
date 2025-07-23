@@ -112,7 +112,8 @@ impl DistanceType {
             "cosine" => DistanceType::Cosine(Hnsw::new(m, expected_size, max_layer, ef_construction, DistCosine {})),
             "l2" => DistanceType::L2(Hnsw::new(m, expected_size, max_layer, ef_construction, DistL2 {})),
             "l1" => DistanceType::L1(Hnsw::new(m, expected_size, max_layer, ef_construction, DistL1 {})),
-            _ => panic!("Unsupported space: {}", space),
+            // _ => panic!("Unsupported space: {}", space),
+            _ => panic!("INTERNAL ERROR: Invalid space '{}' passed to new_raw. This should have been validated in the constructor!", space),
         }
     }
     
@@ -138,7 +139,8 @@ impl DistanceType {
                 let dist_pq = DistPQ::new(pq);
                 DistanceType::L1PQ(Hnsw::new(m, expected_size, max_layer, ef_construction, dist_pq))
             }
-            _ => panic!("Unsupported space: {}", space),
+            //_ => panic!("Unsupported space: {}", space),
+            _ => panic!("INTERNAL ERROR: Invalid space '{}' passed to new_pq. This should have been validated in the constructor!", space),
         }
     }
 
@@ -388,7 +390,15 @@ impl HNSWIndex {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("m must be less than or equal to 256"));
         }
 
+        // Early space validation with user-friendly error
         let space_normalized = space.to_lowercase();
+        match space_normalized.as_str() {
+            "cosine" | "l2" | "l1" => {}, // Valid spaces - continue
+            _ => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Unsupported space: '{}'. Supported spaces: 'cosine', 'l2', 'l1'", space)
+            )),
+        }
+
         
         // Extract quantization configuration
         let (quantization_params, pq_instance) = if let Some(config) = quantization_config {
