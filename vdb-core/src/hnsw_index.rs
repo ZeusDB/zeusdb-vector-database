@@ -2149,29 +2149,49 @@ impl HNSWIndex {
     fn parse_batch_format(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
         // Process each key path immediately without storing references
 
+        // // Try "vectors" key
+        // if let Some(vectors_item) = dict.get_item("vectors")? {
+        //     if let Ok(list) = vectors_item.downcast::<PyList>() {
+        //         return self.process_vector_list(list, dict, parsed_vectors);
+        //     } else if let Ok(np_array) = vectors_item.downcast::<PyArray2<f32>>() {
+        //         return self.parse_numpy_input(np_array, parsed_vectors);
+        //     } else {
+        //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+        //             "vectors field must be a list or NumPy array"
+        //         ));
+        //     }
+        // }
+
         // Try "vectors" key
         if let Some(vectors_item) = dict.get_item("vectors")? {
             if let Ok(list) = vectors_item.downcast::<PyList>() {
                 return self.process_vector_list(list, dict, parsed_vectors);
             } else if let Ok(np_array) = vectors_item.downcast::<PyArray2<f32>>() {
-                return self.parse_numpy_input(np_array, parsed_vectors);
-            } else {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "vectors field must be a list or NumPy array"
-                ));
+                // FIX: Handle NumPy with IDs and metadata
+                return self.parse_numpy_with_context(np_array, dict, parsed_vectors);
             }
         }
 
-        // Try "embeddings" key
+        // // Try "embeddings" key
+        // if let Some(embeddings_item) = dict.get_item("embeddings")? {
+        //     if let Ok(list) = embeddings_item.downcast::<PyList>() {
+        //         return self.process_vector_list(list, dict, parsed_vectors);
+        //     } else if let Ok(np_array) = embeddings_item.downcast::<PyArray2<f32>>() {
+        //         return self.parse_numpy_input(np_array, parsed_vectors);
+        //     } else {
+        //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+        //             "embeddings field must be a list or NumPy array"
+        //         ));
+        //     }
+        // }
+
+        // Try "embeddings" key  
         if let Some(embeddings_item) = dict.get_item("embeddings")? {
             if let Ok(list) = embeddings_item.downcast::<PyList>() {
                 return self.process_vector_list(list, dict, parsed_vectors);
             } else if let Ok(np_array) = embeddings_item.downcast::<PyArray2<f32>>() {
-                return self.parse_numpy_input(np_array, parsed_vectors);
-            } else {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "embeddings field must be a list or NumPy array"
-                ));
+                // FIX: Handle NumPy with IDs and metadata
+                return self.parse_numpy_with_context(np_array, dict, parsed_vectors);
             }
         }
 
@@ -2250,6 +2270,118 @@ impl HNSWIndex {
     }
 
 
+    /// Parse NumPy array with context (IDs and metadata from dict)
+    fn parse_numpy_with_context(
+        &self,
+        np_array: &Bound<PyArray2<f32>>, 
+        dict: &Bound<PyDict>,
+        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>
+    ) -> PyResult<()> {
+        let readonly = np_array.readonly();
+        let shape = readonly.shape();
+
+        println!("🔍 DEBUG: parse_numpy_with_context - shape: {:?}", shape);
+
+        if shape.len() != 2 || shape[1] != self.dim {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "NumPy array must have shape (N, {}), got {:?}", self.dim, shape
+            )));
+        }
+
+        let flat = readonly.as_slice()?;
+        let num_vectors = shape[0];
+
+        // Extract IDs array
+        let ids_list = dict.get_item("ids")?
+            //.and_then(|item| item.downcast::<PyList>().ok());
+            .and_then(|item| item.downcast::<PyList>().ok().map(|list| list.clone()));
+        
+
+        // Extract metadata array
+        let metadatas_list = dict.get_item("metadatas")?
+            .or_else(|| dict.get_item("metadata").ok().flatten())
+            //.and_then(|item| item.downcast::<PyList>().ok());
+            .and_then(|item| item.downcast::<PyList>().ok().map(|list| list.clone()));
+
+        println!("🔍 DEBUG: Found IDs list: {}", ids_list.is_some());
+        println!("🔍 DEBUG: Found metadata list: {}", metadatas_list.is_some());
+
+        for i in 0..num_vectors {
+            let start_idx = i * self.dim;
+            let end_idx = start_idx + self.dim;
+            let raw_vector = flat[start_idx..end_idx].to_vec();
+            let processed_vector = self.process_vector_for_space(raw_vector);
+
+            // Get ID from provided IDs or generate
+            let id = if let Some(ids) = &ids_list {
+                if i < ids.len() {
+                    ids.get_item(i)?
+                        .extract::<String>()
+                        .unwrap_or_else(|_| self.generate_id())
+                } else {
+                    self.generate_id()
+                }
+            } else {
+                self.generate_id()
+            };
+
+            // Get metadata from provided metadata or use empty
+            let metadata = if let Some(metas) = &metadatas_list {
+                if i < metas.len() {
+                    let meta_item = metas.get_item(i)?;
+                    if let Ok(meta_dict) = meta_item.downcast::<PyDict>() {
+                        self.python_dict_to_value_map(meta_dict)?
+                    } else {
+                        HashMap::new()
+                    }
+                } else {
+                    HashMap::new()
+                }
+            } else {
+                HashMap::new()
+            };
+
+            println!("🔍 DEBUG: Vector {}: ID='{}', metadata keys: {:?}",
+                i, id, metadata.keys().collect::<Vec<_>>());
+
+            parsed_vectors.push((id, processed_vector, metadata));
+        }
+
+        println!("🔍 DEBUG: parse_numpy_with_context completed. Total parsed: {}", num_vectors);
+        Ok(())
+    }
+
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -2314,12 +2446,51 @@ impl HNSWIndex {
         Ok(())
     }
 
+    // /// Parse NumPy 2D array input with enhanced ID support
+    // fn parse_numpy_input(&self, np_array: &Bound<PyArray2<f32>>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
+    //     let readonly = np_array.readonly();
+    //     let shape = readonly.shape();
+
+    //     if shape.len() != 2 || shape[1] != self.dim {
+    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+    //             "NumPy array must have shape (N, {}), got {:?}", self.dim, shape
+    //         )));
+    //     }
+
+    //     let flat = readonly.as_slice()?;
+    //     let num_vectors = shape[0];
+
+    //     for i in 0..num_vectors {
+    //         let start_idx = i * self.dim;
+    //         let end_idx = start_idx + self.dim;
+
+    //         //let vector = flat[start_idx..end_idx].to_vec();
+    //         let raw_vector = flat[start_idx..end_idx].to_vec();
+    //         // ADD PROCESSING - only place besides extract_single_vector
+    //         let processed_vector = self.process_vector_for_space(raw_vector);
+
+    //         let id = self.generate_id();
+    //         //parsed_vectors.push((id, vector, HashMap::new()));
+    //         parsed_vectors.push((id, processed_vector, HashMap::new()));
+    //     }
+
+    //     Ok(())
+    // }
+
+
+
+
     /// Parse NumPy 2D array input with enhanced ID support
     fn parse_numpy_input(&self, np_array: &Bound<PyArray2<f32>>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
         let readonly = np_array.readonly();
         let shape = readonly.shape();
 
+        // 🔍 DEBUG: Add detailed logging
+        println!("🔍 DEBUG: NumPy array shape: {:?}", shape);
+        println!("🔍 DEBUG: Expected dim: {}", self.dim);
+
         if shape.len() != 2 || shape[1] != self.dim {
+            println!("❌ DEBUG: Shape validation failed!");
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                 "NumPy array must have shape (N, {}), got {:?}", self.dim, shape
             )));
@@ -2328,22 +2499,45 @@ impl HNSWIndex {
         let flat = readonly.as_slice()?;
         let num_vectors = shape[0];
 
+        println!("🔍 DEBUG: Processing {} vectors from NumPy array", num_vectors);
+        println!("🔍 DEBUG: Flat array length: {}", flat.len());
+
         for i in 0..num_vectors {
             let start_idx = i * self.dim;
             let end_idx = start_idx + self.dim;
 
-            //let vector = flat[start_idx..end_idx].to_vec();
+            println!("🔍 DEBUG: Vector {}: indices {}..{}", i, start_idx, end_idx);
+
             let raw_vector = flat[start_idx..end_idx].to_vec();
+            println!("🔍 DEBUG: Raw vector {}: {:?}", i, &raw_vector[..std::cmp::min(4, raw_vector.len())]);
+        
             // ADD PROCESSING - only place besides extract_single_vector
             let processed_vector = self.process_vector_for_space(raw_vector);
+            println!("🔍 DEBUG: Processed vector {}: {:?}", i, &processed_vector[..std::cmp::min(4, processed_vector.len())]);
 
             let id = self.generate_id();
-            //parsed_vectors.push((id, vector, HashMap::new()));
-            parsed_vectors.push((id, processed_vector, HashMap::new()));
+            println!("🔍 DEBUG: Generated ID for vector {}: {}", i, id);
+        
+            parsed_vectors.push((id.clone(), processed_vector, HashMap::new()));
+            println!("🔍 DEBUG: Added vector {} with ID {} to parsed_vectors", i, id);
         }
 
+        println!("🔍 DEBUG: parse_numpy_input completed. Total parsed: {}", parsed_vectors.len());
         Ok(())
     }
+
+        
+
+
+
+
+
+
+
+
+
+
+
 
     /// Extract a single vector from various Python types (enhanced)
     fn extract_single_vector(&self, data: &Bound<PyAny>) -> PyResult<Vec<f32>> {
