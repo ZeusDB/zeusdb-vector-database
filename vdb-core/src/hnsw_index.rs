@@ -1093,6 +1093,10 @@ impl HNSWIndex {
         stats.insert("space".to_string(), self.space.clone());
         stats.insert("index_type".to_string(), "HNSW".to_string());
 
+        stats.insert("m".to_string(), self.m.to_string());
+        stats.insert("ef_construction".to_string(), self.ef_construction.to_string());
+        stats.insert("thread_safety".to_string(), "RwLock+Mutex".to_string());
+
         // Storage breakdown
         stats.insert("raw_vectors_stored".to_string(), vectors.len().to_string());
         stats.insert("quantized_codes_stored".to_string(), pq_codes.len().to_string());
