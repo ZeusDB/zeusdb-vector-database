@@ -640,20 +640,95 @@ impl HNSWIndex {
 
 
 
-    /// Add vectors to the index
+    // /// Add vectors to the index
+    // #[pyo3(signature = (data, overwrite = true))]
+    // pub fn add(&mut self, data: Bound<PyAny>, overwrite: bool) -> PyResult<AddResult> {
+    //     // Input validation
+    //     // Basic data type checking
+    //     if data.is_none() {
+    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+    //             "Data cannot be None"
+    //         ));
+    //     }
+
+    //     // Comprehensive input parsing
+    //     let parsed_data = self.parse_input_data(&data)?;
+    //     if parsed_data.is_empty() {
+    //         return Ok(AddResult {
+    //             total_inserted: 0,
+    //             total_errors: 0,
+    //             errors: vec![],
+    //             vector_shape: Some((0, self.dim)),
+    //         });
+    //     }
+
+    //     let mut total_inserted = 0;
+    //     let mut total_errors = 0;
+    //     let mut errors = Vec::new();
+    //     let vector_shape = Some((parsed_data.len(), self.dim));
+
+    //     // Process each vector using clean 3-path architecture
+    //     for (id, vector, metadata) in parsed_data {
+    //         // Clone the ID before moving it to add_single_vector
+    //         let id_for_error = id.clone(); // Keep a copy for error messages
+
+    //         match self.add_single_vector(id, vector, metadata, overwrite) {
+    //             Ok(()) => {
+    //                 total_inserted += 1;
+
+    //                 // Update vector count
+    //                 {
+    //                     let mut count = self.vector_count.lock().unwrap();
+    //                     *count += 1;
+    //                 }
+
+    //                 // Check training trigger (graceful failure handling)
+    //                 if let Err(training_error) = self.maybe_trigger_training() {
+    //                     errors.push(format!("Training failed: {}", training_error));
+    //                     eprintln!("Warning: PQ training failed: {}", training_error);
+    //                     // Continue with raw storage
+    //                 }
+    //             }
+    //             Err(e) => {
+    //                 total_errors += 1;
+    //                 errors.push(format!("Vector {}: {}", id_for_error, e));
+    //             }
+    //         }
+    //     }
+
+    //     Ok(AddResult {
+    //         total_inserted,
+    //         total_errors,
+    //         errors,
+    //         vector_shape,
+    //     })
+    // }
+
+
+    /// Add vectors to the index with graceful error collection
     #[pyo3(signature = (data, overwrite = true))]
     pub fn add(&mut self, data: Bound<PyAny>, overwrite: bool) -> PyResult<AddResult> {
         // Input validation
-        // Basic data type checking
         if data.is_none() {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "Data cannot be None"
             ));
         }
 
-        // Comprehensive input parsing
-        let parsed_data = self.parse_input_data(&data)?;
-        if parsed_data.is_empty() {
+        // Use error-collecting parsing
+        let (parsed_data, parse_errors) = self.parse_input_data(&data);
+
+        let mut total_inserted = 0;
+        let mut total_errors = 0;
+        let mut errors = Vec::new();
+
+        // Add parse errors to the collection
+        for parse_error in parse_errors {
+            errors.push(parse_error);
+            total_errors += 1;
+        }
+
+        if parsed_data.is_empty() && errors.is_empty() {
             return Ok(AddResult {
                 total_inserted: 0,
                 total_errors: 0,
@@ -662,15 +737,12 @@ impl HNSWIndex {
             });
         }
 
-        let mut total_inserted = 0;
-        let mut total_errors = 0;
-        let mut errors = Vec::new();
-        let vector_shape = Some((parsed_data.len(), self.dim));
+        let total_input_count = parsed_data.len() + total_errors;
+        let vector_shape = Some((total_input_count, self.dim));
 
-        // Process each vector using clean 3-path architecture
+        // Process successfully parsed vectors
         for (id, vector, metadata) in parsed_data {
-            // Clone the ID before moving it to add_single_vector
-            let id_for_error = id.clone(); // Keep a copy for error messages
+            let id_for_error = id.clone();
 
             match self.add_single_vector(id, vector, metadata, overwrite) {
                 Ok(()) => {
@@ -686,7 +758,6 @@ impl HNSWIndex {
                     if let Err(training_error) = self.maybe_trigger_training() {
                         errors.push(format!("Training failed: {}", training_error));
                         eprintln!("Warning: PQ training failed: {}", training_error);
-                        // Continue with raw storage
                     }
                 }
                 Err(e) => {
@@ -703,6 +774,10 @@ impl HNSWIndex {
             vector_shape,
         })
     }
+
+
+
+
 
 
     /// ENHANCED STATISTICS with training progress
@@ -1966,24 +2041,59 @@ impl HNSWIndex {
 
     // 3. INPUT PARSING METHODS (8 methods - enhanced for full format support)
 
-    /// Parse input data into (id, vector, metadata) tuples
-    fn parse_input_data(&self, data: &Bound<PyAny>) -> PyResult<Vec<(String, Vec<f32>, HashMap<String, Value>)>> {
+    // /// Parse input data into (id, vector, metadata) tuples
+    // fn parse_input_data(&self, data: &Bound<PyAny>) -> PyResult<Vec<(String, Vec<f32>, HashMap<String, Value>)>> {
+    //     let mut parsed_vectors = Vec::new();
+
+    //     if let Ok(dict) = data.downcast::<PyDict>() {
+    //         self.parse_dict_input(dict, &mut parsed_vectors)?;
+    //     } else if let Ok(list) = data.downcast::<PyList>() {
+    //         self.parse_list_input(list, &mut parsed_vectors)?;
+    //     } else if let Ok(np_array) = data.downcast::<PyArray2<f32>>() {
+    //         self.parse_numpy_input(np_array, &mut parsed_vectors)?;
+    //     } else {
+    //         let vector = self.extract_single_vector(data)?;
+    //         let id = self.generate_id();
+    //         parsed_vectors.push((id, vector, HashMap::new()));
+    //     }
+
+    //     Ok(parsed_vectors)
+    // }
+
+    /// Parse input data into (id, vector, metadata) tuples with error collection
+    fn parse_input_data(&self, data: &Bound<PyAny>) -> (Vec<(String, Vec<f32>, HashMap<String, Value>)>, Vec<String>) {
         let mut parsed_vectors = Vec::new();
+        let mut errors = Vec::new();
 
         if let Ok(dict) = data.downcast::<PyDict>() {
-            self.parse_dict_input(dict, &mut parsed_vectors)?;
+            self.parse_dict_input_safe(dict, &mut parsed_vectors, &mut errors);
         } else if let Ok(list) = data.downcast::<PyList>() {
-            self.parse_list_input(list, &mut parsed_vectors)?;
+            self.parse_list_input_safe(list, &mut parsed_vectors, &mut errors);
         } else if let Ok(np_array) = data.downcast::<PyArray2<f32>>() {
-            self.parse_numpy_input(np_array, &mut parsed_vectors)?;
+            if let Err(e) = self.parse_numpy_input_safe(np_array, &mut parsed_vectors) {
+                errors.push(format!("NumPy parsing error: {}", e));
+            }
         } else {
-            let vector = self.extract_single_vector(data)?;
-            let id = self.generate_id();
-            parsed_vectors.push((id, vector, HashMap::new()));
+            // Single vector
+            match self.extract_single_vector_safe(data) {
+                Ok(vector) => {
+                    let id = self.generate_id();
+                    parsed_vectors.push((id, vector, HashMap::new()));
+                }
+                Err(e) => {
+                    errors.push(format!("Single vector error: {}", e));
+                }
+            }
         }
 
-        Ok(parsed_vectors)
+        (parsed_vectors, errors)
     }
+
+
+
+
+
+
 
     /// Parse dictionary input format with comprehensive support
     fn parse_dict_input(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
@@ -1997,6 +2107,70 @@ impl HNSWIndex {
         // FORMAT 3 & 5: Batch format {"vectors/embeddings": [...], "ids": [...], "metadatas": [...]}
         return self.parse_batch_format(dict, parsed_vectors);
     }
+
+    /// Safe dictionary parsing that collects errors
+    fn parse_dict_input_safe(
+        &self, 
+        dict: &Bound<PyDict>, 
+        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+        errors: &mut Vec<String>
+    ) {
+        // Check for single object format
+        if dict.contains("id").unwrap_or(false) && 
+            (dict.contains("values").unwrap_or(false) || dict.contains("vector").unwrap_or(false)) {
+
+                // Single object format
+                let vector_result = if let Ok(Some(values_item)) = dict.get_item("values") {
+                    self.extract_single_vector_safe(&values_item)
+                } else if let Ok(Some(vector_item)) = dict.get_item("vector") {
+                    self.extract_single_vector_safe(&vector_item)
+                } else {
+                    Err("Missing 'vector' or 'values' key".to_string())
+                };
+
+                match vector_result {
+                    Ok(vector) => {
+                        let id = match dict.get_item("id") {
+                            Ok(Some(id_item)) => id_item.extract::<String>().unwrap_or_else(|_| self.generate_id()),
+                            _ => self.generate_id(),
+                        };
+
+                        let metadata = match dict.get_item("metadata") {
+                            Ok(Some(meta_item)) => {
+                                if let Ok(meta_dict) = meta_item.downcast::<PyDict>() {
+                                    self.python_dict_to_value_map(meta_dict).unwrap_or_default()
+                                } else {
+                                    HashMap::new()
+                                }
+                            }
+                            _ => HashMap::new(),
+                        };
+
+                        parsed_vectors.push((id, vector, metadata));
+                    }
+                    Err(e) => {
+                        let id = dict.get_item("id")
+                            .ok()
+                            .flatten()
+                            .and_then(|id_item| id_item.extract::<String>().ok())
+                            .unwrap_or_else(|| "single_object".to_string());
+
+                        errors.push(format!("Vector {}: {}", id, e));
+                    }
+                }
+            } else {
+                // Batch format - try the existing parse_batch_format
+                if let Err(e) = self.parse_batch_format(dict, parsed_vectors) {
+                    errors.push(format!("Batch parsing error: {}", e));
+                }
+            }
+        }
+                        
+
+
+
+
+
 
     /// Handle Format 1: Single object
     fn parse_single_object_format(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
@@ -2355,38 +2529,6 @@ impl HNSWIndex {
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     /// Parse list input format with backward compatibility and enhanced metadata support
     fn parse_list_input(&self, list: &Bound<PyList>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
         for item in list.iter() {
@@ -2445,6 +2587,116 @@ impl HNSWIndex {
         }
         Ok(())
     }
+
+
+    /// Safe list parsing that collects errors instead of failing immediately
+    fn parse_list_input_safe(
+        &self, 
+        list: &Bound<PyList>, 
+        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+        errors: &mut Vec<String>
+    ) {
+        for (item_index, item) in list.iter().enumerate() {
+            if let Ok(item_dict) = item.downcast::<PyDict>() {
+                // Extract vector safely
+                let vector_result = if let Ok(Some(vector_item)) = item_dict.get_item("vector") {
+                    self.extract_single_vector_safe(&vector_item)
+                } else if let Ok(Some(values_item)) = item_dict.get_item("values") {
+                    self.extract_single_vector_safe(&values_item)
+                } else {
+                    Err("Missing 'vector' or 'values' key in item".to_string())
+                };
+
+                match vector_result {
+                    Ok(vector) => {
+                        // Extract ID
+                        let id = match item_dict.get_item("id") {
+                            Ok(Some(id_item)) => {
+                                id_item.extract::<String>().unwrap_or_else(|_| self.generate_id())
+                            }
+                            _ => self.generate_id(),
+                        };
+
+                        // Extract metadata
+                        let metadata = match item_dict.get_item("metadata") {
+                            Ok(Some(meta_item)) => {
+                                if let Ok(meta_dict) = meta_item.downcast::<PyDict>() {
+                                    self.python_dict_to_value_map(meta_dict).unwrap_or_default()
+                                } else {
+                                    // Handle non-dict metadata
+                                    let mut map = HashMap::new();
+                                    if let Ok(value) = self.python_object_to_value(&meta_item) {
+                                        let key = if value.is_string() { "text" } else { "value" };
+                                        map.insert(key.to_string(), value);
+                                    }
+                                    map
+                                }
+                            }
+                            _ => HashMap::new(),
+                        };
+
+                        parsed_vectors.push((id, vector, metadata));
+                    }
+                    Err(e) => {
+                        // Collect error with item index and ID for context
+                        let id = item_dict.get_item("id")
+                            .ok()
+                            .flatten()
+                            .and_then(|id_item| id_item.extract::<String>().ok())
+                            .unwrap_or_else(|| format!("item_{}", item_index));
+
+                        errors.push(format!("Vector {}: {}", id, e));
+                    }
+                }
+            } else {
+                // Direct vector item
+                match self.extract_single_vector_safe(&item) {
+                    Ok(vector) => {
+                        let id = self.generate_id();
+                        parsed_vectors.push((id, vector, HashMap::new()));
+                    }
+                    Err(e) => {
+                        errors.push(format!("Item {}: {}", item_index, e));
+                    }
+                }
+            }
+        }
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     // /// Parse NumPy 2D array input with enhanced ID support
     // fn parse_numpy_input(&self, np_array: &Bound<PyArray2<f32>>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
@@ -2526,17 +2778,31 @@ impl HNSWIndex {
         Ok(())
     }
 
-        
 
+    /// Safe NumPy parsing for error collection
+    fn parse_numpy_input_safe(&self, np_array: &Bound<PyArray2<f32>>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> Result<(), String> {
+        // This is the same as your current parse_numpy_input but returns Result<(), String>
+        let readonly = np_array.readonly();
+        let shape = readonly.shape();
 
+        if shape.len() != 2 || shape[1] != self.dim {
+            return Err(format!("NumPy array must have shape (N, {}), got {:?}", self.dim, shape));
+        }
 
+        let flat = readonly.as_slice().map_err(|e| format!("NumPy access error: {}", e))?;
+        let num_vectors = shape[0];
 
+        for i in 0..num_vectors {
+            let start_idx = i * self.dim;
+            let end_idx = start_idx + self.dim;
+            let raw_vector = flat[start_idx..end_idx].to_vec();
+            let processed_vector = self.process_vector_for_space(raw_vector);
+            let id = self.generate_id();
+            parsed_vectors.push((id, processed_vector, HashMap::new()));
+        }
 
-
-
-
-
-
+        Ok(())
+    }
 
 
     /// Extract a single vector from various Python types (enhanced)
@@ -2583,6 +2849,40 @@ impl HNSWIndex {
     fn generate_id(&self) -> String {
         let id = self.get_next_id();
         format!("vec_{}", id)
+    }
+
+
+
+    /// Safe version of extract_single_vector that returns String errors instead of PyErr
+    fn extract_single_vector_safe(&self, data: &Bound<PyAny>) -> Result<Vec<f32>, String> {
+        let vector = if let Ok(array1d) = data.downcast::<PyArray1<f32>>() {
+            array1d.readonly().as_slice()
+                .map_err(|e| format!("NumPy access error: {}", e))?
+                .to_vec()
+        } else if let Ok(list) = data.downcast::<PyList>() {
+            list.iter()
+                .map(|item| item.extract::<f32>()
+                    .map_err(|e| format!("List item error: {}", e)))
+                .collect::<Result<Vec<f32>, String>>()?
+        } else {
+            data.extract::<Vec<f32>>()
+                .map_err(|e| format!("Vector extraction error: {}", e))?
+        };
+
+        // Same validation as extract_single_vector, but with String errors
+        if vector.is_empty() {
+            return Err("Vector cannot be empty".to_string());
+        }
+        if vector.len() != self.dim {
+            return Err(format!("Vector dimension mismatch: expected {}, got {}", self.dim, vector.len()));
+        }
+        for (i, &val) in vector.iter().enumerate() {
+            if !val.is_finite() {
+                return Err(format!("Vector contains invalid value at index {}: {}", i, val));
+            }
+        }
+
+        Ok(self.process_vector_for_space(vector))
     }
                     
 
