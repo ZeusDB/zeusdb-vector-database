@@ -13,6 +13,17 @@ use crate::pq::PQ;
 // Part of the rust library so no need to specify in cargo.toml
 use std::sync::atomic::{AtomicBool, Ordering};
 
+// DEBUG LOGGER
+// To enable: set ZEUSDB_DEBUG=1 (or any value) in your environment before running your program.
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if std::env::var("ZEUSDB_DEBUG").is_ok() {
+            println!($($arg)*);
+        }
+    };
+}
+
+
 // Quantization configuration structure
 #[derive(Debug, Clone)]
 pub struct QuantizationConfig {
@@ -2454,7 +2465,8 @@ impl HNSWIndex {
         let readonly = np_array.readonly();
         let shape = readonly.shape();
 
-        println!("🔍 DEBUG: parse_numpy_with_context - shape: {:?}", shape);
+        //println!("🔍 DEBUG: parse_numpy_with_context - shape: {:?}", shape);
+        debug_log!("🔍 DEBUG: parse_numpy_with_context - shape: {:?}", shape);
 
         if shape.len() != 2 || shape[1] != self.dim {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
@@ -2477,8 +2489,10 @@ impl HNSWIndex {
             //.and_then(|item| item.downcast::<PyList>().ok());
             .and_then(|item| item.downcast::<PyList>().ok().map(|list| list.clone()));
 
-        println!("🔍 DEBUG: Found IDs list: {}", ids_list.is_some());
-        println!("🔍 DEBUG: Found metadata list: {}", metadatas_list.is_some());
+        // println!("🔍 DEBUG: Found IDs list: {}", ids_list.is_some());
+        // println!("🔍 DEBUG: Found metadata list: {}", metadatas_list.is_some());
+        debug_log!("🔍 DEBUG: Found IDs list: {}", ids_list.is_some());
+        debug_log!("🔍 DEBUG: Found metadata list: {}", metadatas_list.is_some());
 
         for i in 0..num_vectors {
             let start_idx = i * self.dim;
@@ -2515,13 +2529,15 @@ impl HNSWIndex {
                 HashMap::new()
             };
 
-            println!("🔍 DEBUG: Vector {}: ID='{}', metadata keys: {:?}",
+            //println!("🔍 DEBUG: Vector {}: ID='{}', metadata keys: {:?}",
+            debug_log!("🔍 DEBUG: Vector {}: ID='{}', metadata keys: {:?}",
                 i, id, metadata.keys().collect::<Vec<_>>());
 
             parsed_vectors.push((id, processed_vector, metadata));
         }
 
-        println!("🔍 DEBUG: parse_numpy_with_context completed. Total parsed: {}", num_vectors);
+        //println!("🔍 DEBUG: parse_numpy_with_context completed. Total parsed: {}", num_vectors);
+        debug_log!("🔍 DEBUG: parse_numpy_with_context completed. Total parsed: {}", num_vectors);
         Ok(())
     }
 
@@ -2738,8 +2754,10 @@ impl HNSWIndex {
         let shape = readonly.shape();
 
         // 🔍 DEBUG: Add detailed logging
-        println!("🔍 DEBUG: NumPy array shape: {:?}", shape);
-        println!("🔍 DEBUG: Expected dim: {}", self.dim);
+        //println!("🔍 DEBUG: NumPy array shape: {:?}", shape);
+        //println!("🔍 DEBUG: Expected dim: {}", self.dim);
+        debug_log!("🔍 DEBUG: NumPy array shape: {:?}", shape);
+        debug_log!("🔍 DEBUG: Expected dim: {}", self.dim);
 
         if shape.len() != 2 || shape[1] != self.dim {
             println!("❌ DEBUG: Shape validation failed!");
@@ -2751,30 +2769,38 @@ impl HNSWIndex {
         let flat = readonly.as_slice()?;
         let num_vectors = shape[0];
 
-        println!("🔍 DEBUG: Processing {} vectors from NumPy array", num_vectors);
-        println!("🔍 DEBUG: Flat array length: {}", flat.len());
+        //println!("🔍 DEBUG: Processing {} vectors from NumPy array", num_vectors);
+        //println!("🔍 DEBUG: Flat array length: {}", flat.len());
+        debug_log!("🔍 DEBUG: Processing {} vectors from NumPy array", num_vectors);
+        debug_log!("🔍 DEBUG: Flat array length: {}", flat.len());
 
         for i in 0..num_vectors {
             let start_idx = i * self.dim;
             let end_idx = start_idx + self.dim;
 
-            println!("🔍 DEBUG: Vector {}: indices {}..{}", i, start_idx, end_idx);
+            //println!("🔍 DEBUG: Vector {}: indices {}..{}", i, start_idx, end_idx);
+            debug_log!("🔍 DEBUG: Vector {}: indices {}..{}", i, start_idx, end_idx);
 
             let raw_vector = flat[start_idx..end_idx].to_vec();
-            println!("🔍 DEBUG: Raw vector {}: {:?}", i, &raw_vector[..std::cmp::min(4, raw_vector.len())]);
+            //println!("🔍 DEBUG: Raw vector {}: {:?}", i, &raw_vector[..std::cmp::min(4, raw_vector.len())]);
+            debug_log!("🔍 DEBUG: Raw vector {}: {:?}", i, &raw_vector[..std::cmp::min(4, raw_vector.len())]);
         
             // ADD PROCESSING - only place besides extract_single_vector
             let processed_vector = self.process_vector_for_space(raw_vector);
-            println!("🔍 DEBUG: Processed vector {}: {:?}", i, &processed_vector[..std::cmp::min(4, processed_vector.len())]);
+            //println!("🔍 DEBUG: Processed vector {}: {:?}", i, &processed_vector[..std::cmp::min(4, processed_vector.len())]);
+            debug_log!("🔍 DEBUG: Processed vector {}: {:?}", i, &processed_vector[..std::cmp::min(4, processed_vector.len())]);
 
             let id = self.generate_id();
-            println!("🔍 DEBUG: Generated ID for vector {}: {}", i, id);
+            //println!("🔍 DEBUG: Generated ID for vector {}: {}", i, id);
+            debug_log!("🔍 DEBUG: Generated ID for vector {}: {}", i, id);
         
             parsed_vectors.push((id.clone(), processed_vector, HashMap::new()));
-            println!("🔍 DEBUG: Added vector {} with ID {} to parsed_vectors", i, id);
+            //println!("🔍 DEBUG: Added vector {} with ID {} to parsed_vectors", i, id);
+            debug_log!("🔍 DEBUG: Added vector {} with ID {} to parsed_vectors", i, id);
         }
 
-        println!("🔍 DEBUG: parse_numpy_input completed. Total parsed: {}", parsed_vectors.len());
+        //println!("🔍 DEBUG: parse_numpy_input completed. Total parsed: {}", parsed_vectors.len());
+        debug_log!("🔍 DEBUG: parse_numpy_input completed. Total parsed: {}", parsed_vectors.len());
         Ok(())
     }
 
