@@ -97,7 +97,6 @@ impl Distance<Vec<u8>> for DistPQ {
 
 
 
-
 // Enhanced DistanceType enum to support PQ variants
 enum DistanceType {
     // Raw vector variants
@@ -301,9 +300,6 @@ impl DistanceType {
 
 
 }
-
-
-
 
 
 
@@ -650,72 +646,6 @@ impl HNSWIndex {
     }
 
 
-
-    // /// Add vectors to the index
-    // #[pyo3(signature = (data, overwrite = true))]
-    // pub fn add(&mut self, data: Bound<PyAny>, overwrite: bool) -> PyResult<AddResult> {
-    //     // Input validation
-    //     // Basic data type checking
-    //     if data.is_none() {
-    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-    //             "Data cannot be None"
-    //         ));
-    //     }
-
-    //     // Comprehensive input parsing
-    //     let parsed_data = self.parse_input_data(&data)?;
-    //     if parsed_data.is_empty() {
-    //         return Ok(AddResult {
-    //             total_inserted: 0,
-    //             total_errors: 0,
-    //             errors: vec![],
-    //             vector_shape: Some((0, self.dim)),
-    //         });
-    //     }
-
-    //     let mut total_inserted = 0;
-    //     let mut total_errors = 0;
-    //     let mut errors = Vec::new();
-    //     let vector_shape = Some((parsed_data.len(), self.dim));
-
-    //     // Process each vector using clean 3-path architecture
-    //     for (id, vector, metadata) in parsed_data {
-    //         // Clone the ID before moving it to add_single_vector
-    //         let id_for_error = id.clone(); // Keep a copy for error messages
-
-    //         match self.add_single_vector(id, vector, metadata, overwrite) {
-    //             Ok(()) => {
-    //                 total_inserted += 1;
-
-    //                 // Update vector count
-    //                 {
-    //                     let mut count = self.vector_count.lock().unwrap();
-    //                     *count += 1;
-    //                 }
-
-    //                 // Check training trigger (graceful failure handling)
-    //                 if let Err(training_error) = self.maybe_trigger_training() {
-    //                     errors.push(format!("Training failed: {}", training_error));
-    //                     eprintln!("Warning: PQ training failed: {}", training_error);
-    //                     // Continue with raw storage
-    //                 }
-    //             }
-    //             Err(e) => {
-    //                 total_errors += 1;
-    //                 errors.push(format!("Vector {}: {}", id_for_error, e));
-    //             }
-    //         }
-    //     }
-
-    //     Ok(AddResult {
-    //         total_inserted,
-    //         total_errors,
-    //         errors,
-    //         vector_shape,
-    //     })
-    // }
-
-
     /// Add vectors to the index with graceful error collection
     #[pyo3(signature = (data, overwrite = true))]
     pub fn add(&mut self, data: Bound<PyAny>, overwrite: bool) -> PyResult<AddResult> {
@@ -790,7 +720,6 @@ impl HNSWIndex {
 
 
 
-
     /// ENHANCED STATISTICS with training progress
     pub fn get_training_progress(&self) -> f32 {
         if let Some(config) = &self.quantization_config {
@@ -841,8 +770,6 @@ impl HNSWIndex {
         }
     }
 
-    
-
 
 
 
@@ -857,7 +784,14 @@ impl HNSWIndex {
         ef_search: Option<usize>,
         return_vector: bool,
     ) -> PyResult<PyObject> {
-        let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
+        //let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
+        let ef = ef_search.unwrap_or_else(|| {
+            match self.space.to_lowercase().as_str() {
+                "l1" | "l2" => std::cmp::max(2 * top_k, 150),
+                _ => std::cmp::max(2 * top_k, 100),
+            }
+        });
+
         let filter_conditions = filter.map(|f| self.python_dict_to_value_map(f)).transpose()?;
 
         // Detect batch vs single query with comprehensive input support
@@ -899,25 +833,6 @@ impl HNSWIndex {
             Ok(PyList::new(py, results)?.into())
         } else {
             // // Single vector path - enhanced with NumPy 1D support
-            // let single_vec = if let Ok(array1d) = vector.downcast::<PyArray1<f32>>() {
-            //     array1d.readonly().as_slice()?.to_vec()
-            // } else {
-            //     vector.extract::<Vec<f32>>()?
-            // };
-
-            // // Validate vector is not empty
-            // if single_vec.is_empty() {
-            //     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            //         "Search vector cannot be empty"
-            //     ));
-            // }
-
-            // if single_vec.len() != self.dim {
-            //     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            //         "Search vector dimension mismatch: expected {}, got {}",
-            //         self.dim, single_vec.len()
-            //     )));
-            // }
 
             // For single vector search:
             let query_vector = if let Ok(array1d) = vector.downcast::<PyArray1<f32>>() {
@@ -1347,8 +1262,6 @@ impl HNSWIndex {
 
 
 
-
-
 // INTERNAL METHODS, HELPERS AND IMPLEMENTATIONS
 impl HNSWIndex {
 
@@ -1688,393 +1601,6 @@ impl HNSWIndex {
 
 
 
-
-
-
-
-
-
-    // /// START of INPUT PARSING METHODS - VERSION 1
-
-    // // 3. INPUT PARSING METHODS (6 methods)
-    // /// Parse input data into (id, vector, metadata) tuples
-    // fn parse_input_data(&self, data: &Bound<PyAny>) -> PyResult<Vec<(String, Vec<f32>, HashMap<String, Value>)>> {
-    //     let mut parsed_vectors = Vec::new();
-
-    //     if let Ok(dict) = data.downcast::<PyDict>() {
-    //         self.parse_dict_input(dict, &mut parsed_vectors)?;
-    //     } else if let Ok(list) = data.downcast::<PyList>() {
-    //         self.parse_list_input(list, &mut parsed_vectors)?;
-    //     } else if let Ok(np_array) = data.downcast::<PyArray2<f32>>() {
-    //         self.parse_numpy_input(np_array, &mut parsed_vectors)?;
-    //     } else {
-    //         let vector = self.extract_single_vector(data)?;
-    //         let id = self.generate_id();
-    //         parsed_vectors.push((id, vector, HashMap::new()));
-    //     }
-
-    //     Ok(parsed_vectors)
-    // }
-
-    // // /// Parse dictionary input format
-    // // fn parse_dict_input(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
-    // //     // Two-step approach avoids temporary value issues
-    // //     let vectors_item = dict.get_item("vectors")?
-    // //         .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'vectors' key in input dictionary"))?;
-    // //     let vectors = vectors_item.downcast::<PyList>()?;
-
-    // //     // Try 1 DIDNT WORK
-    // //     // let ids = dict.get_item("ids").map(|item| item.downcast::<PyList>()).transpose()?;
-    // //     // let metadata = dict.get_item("metadata").map(|item| item.downcast::<PyList>()).transpose()?;
-
-    // //     // Try 2 - Didnt work
-    // //     // let ids = dict.get_item("ids")?
-    // //     //     .map(|item| item.downcast::<PyList>())
-    // //     //     .transpose()?;
-
-    // //     // let metadata = dict.get_item("metadata")?
-    // //     //     .map(|item| item.downcast::<PyList>())
-    // //     //     .transpose()?;
-
-    // //     // Try 3 - Didn't work
-    // //     // // Store the intermediate Bound values
-    // //     // let ids_item = dict.get_item("ids")?;
-    // //     // let ids = if let Some(item) = ids_item {
-    // //     //     Some(item.downcast::<PyList>()?)
-    // //     // } else {
-    // //     //     None
-    // //     // };
-
-    // //     // let metadata_item = dict.get_item("metadata")?;
-    // //     // let metadata = if let Some(item) = metadata_item {
-    // //     //     Some(item.downcast::<PyList>()?)
-    // //     // } else {
-    // //     //     None
-    // //     // };
-
-
-    // //     for (i, vector_item) in vectors.iter().enumerate() {
-    // //         let vector = self.extract_single_vector(&vector_item)?;
-
-    // //         let id = if let Some(id_list) = &ids {
-    // //             if i < id_list.len() {
-    // //                 id_list.get_item(i)?.extract::<String>()?
-    // //             } else {
-    // //                 self.generate_id()
-    // //             }
-    // //         } else {
-    // //             self.generate_id()
-    // //         };
-
-    // //         let meta = if let Some(meta_list) = &metadata {
-    // //             if i < meta_list.len() {
-    // //                 // Simplified metadata handling for now
-    // //                 HashMap::new()
-    // //             } else {
-    // //                 HashMap::new()
-    // //             }
-    // //         } else {
-    // //             HashMap::new()
-    // //         };
-
-    // //         parsed_vectors.push((id, vector, meta));
-    // //     }
-
-    // //     Ok(())
-    // // }
-
-
-    // /// Parse dictionary input format
-    // fn parse_dict_input(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
-    //     // Two-step approach for required field (works because vectors_item is stored)
-    //     let vectors_item = dict.get_item("vectors")?
-    //         .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'vectors' key in input dictionary"))?;
-    //     let vectors = vectors_item.downcast::<PyList>()?;
-
-    //     for (i, vector_item) in vectors.iter().enumerate() {
-    //         let vector = self.extract_single_vector(&vector_item)?;
-
-    //         // ON-DEMAND PROCESSING: No storing of PyList references
-    //         let id = match dict.get_item("ids")? {
-    //             Some(item) => {
-    //                 let ids_list = item.downcast::<PyList>()?;
-    //                 if i < ids_list.len() {
-    //                     ids_list.get_item(i)?.extract::<String>()?
-    //                 } else {
-    //                     self.generate_id()
-    //                 }
-    //             }
-    //             None => self.generate_id(),
-    //         };
-
-    //         // OPTION 1: Simplified metadata handling
-    //         // // ON-DEMAND PROCESSING: metadata
-    //         // let meta = match dict.get_item("metadata")? {
-    //         //     Some(item) => {
-    //         //         let metadata_list = item.downcast::<PyList>()?;
-    //         //         if i < metadata_list.len() {
-    //         //             // For now, simplified metadata handling
-    //         //             // TODO: Implement proper metadata conversion from Python objects
-    //         //             HashMap::new()
-    //         //         } else {
-    //         //             HashMap::new()
-    //         //         }
-    //         //     }
-    //         //     None => HashMap::new(),
-    //         // };
-
-    //         // Option 2 - Better metadata handling with conversion
-    //         // // ON-DEMAND PROCESSING: metadata with proper metadata conversion from Python objects
-    //         // let meta = match dict.get_item("metadata")? {
-    //         //     Some(item) => {
-    //         //         let metadata_list = item.downcast::<PyList>()?;
-    //         //         if i < metadata_list.len() {
-    //         //             // Future: Convert Python object to HashMap<String, Value>
-    //         //             let metadata_item = metadata_list.get_item(i)?;
-
-    //         //             // Convert Python object to HashMap<String, Value>
-    //         //             if let Ok(py_dict) = metadata_item.downcast::<PyDict>() {
-    //         //                 self.python_dict_to_value_map(py_dict)?
-    //         //             } else {
-    //         //                 // If it's not a dict, create a single-entry map
-    //         //                 let mut map = HashMap::new();
-    //         //                 map.insert("value".to_string(), self.python_object_to_value(&metadata_item)?);
-    //         //                 map
-    //         //             }
-    //         //         } else {
-    //         //             HashMap::new()
-    //         //         }
-    //         //     }
-    //         //     None => HashMap::new(),
-    //         // };
-
-
-    //         // Option 3 - Enhanced metadata handling
-    //         // ON-DEMAND PROCESSING: metadata with comprehensive handling
-    //         let meta = match dict.get_item("metadata")? {
-    //             Some(item) => {
-    //                 let metadata_list = item.downcast::<PyList>()?;
-    //                 if i < metadata_list.len() {
-    //                     let metadata_item = metadata_list.get_item(i)?;
-
-    //                     // ENHANCED: Handle various metadata formats
-    //                     if let Ok(py_dict) = metadata_item.downcast::<PyDict>() {
-    //                         // Direct dict conversion
-    //                         self.python_dict_to_value_map(py_dict)?
-    //                     } else if metadata_item.is_none() {
-    //                         // Handle None values
-    //                         HashMap::new()
-    //                     } else {
-    //                         // Convert any other object to a single-entry map
-    //                         let mut map = HashMap::new();
-    //                         let value = self.python_object_to_value(&metadata_item)?;
-
-    //                         // Use a more descriptive key based on type
-    //                         let key = if value.is_string() {
-    //                             "text"
-    //                         } else if value.is_number() {
-    //                             "number"
-    //                         } else if value.is_boolean() {
-    //                             "flag"
-    //                         } else if value.is_array() {
-    //                             "list"
-    //                         } else {
-    //                             "value"
-    //                         };
-
-    //                         map.insert(key.to_string(), value);
-    //                         map
-    //                     }
-    //                 } else {
-    //                     HashMap::new()
-    //                 }
-    //             }
-    //             None => HashMap::new(),
-    //         };        
-
-    //         parsed_vectors.push((id, vector, meta));
-    //     }
-
-    //     Ok(())
-    // }
-
-
-
-    // // /// Parse list input format - Version 1
-    // // fn parse_list_input(&self, list: &Bound<PyList>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
-    // //     for item in list.iter() {
-    // //         if let Ok(item_dict) = item.downcast::<PyDict>() {
-    // //             let vector = item_dict.get_item("vector")
-    // //                 .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'vector' key in item"))?;
-    // //             let vector_data = self.extract_single_vector(&vector)?;
-
-    // //             let id = item_dict.get_item("id")
-    // //                 .map(|v| v.extract::<String>())
-    // //                 .transpose()?
-    // //                 .unwrap_or_else(|| self.generate_id());
-
-    // //             let metadata = HashMap::new(); // Simplified for now
-
-    // //             parsed_vectors.push((id, vector_data, metadata));
-    // //         } else {
-    // //             let vector = self.extract_single_vector(&item)?;
-    // //             let id = self.generate_id();
-    // //             parsed_vectors.push((id, vector, HashMap::new()));
-    // //         }
-    // //     }
-
-    // //     Ok(())
-    // // }
-
-
-    // // /// Parse list input format - Version 2
-    // // fn parse_list_input(&self, list: &Bound<PyList>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
-    // //     for item in list.iter() {
-    // //         if let Ok(item_dict) = item.downcast::<PyDict>() {
-    // //             // 🔧 FIX: Extract Option first, then use ok_or_else
-    // //             let vector = item_dict.get_item("vector")?
-    // //                 .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'vector' key in item"))?;
-    // //             let vector_data = self.extract_single_vector(&vector)?;
-
-    // //             // 🔧 FIX: Extract Option first, then map
-    // //             let id = item_dict.get_item("id")?
-    // //                 .map(|v| v.extract::<String>())
-    // //                 .transpose()?
-    // //                 .unwrap_or_else(|| self.generate_id());
-
-    // //             let metadata = HashMap::new(); // Simplified for now
-
-    // //             parsed_vectors.push((id, vector_data, metadata));
-    // //         } else {
-    // //             let vector = self.extract_single_vector(&item)?;
-    // //             let id = self.generate_id();
-    // //             parsed_vectors.push((id, vector, HashMap::new()));
-    // //         }
-    // //     }
-
-    // //     Ok(())
-    // // }
-
-
-    // /// Parse list input format with backward compatibility - Version 3
-    // fn parse_list_input(&self, list: &Bound<PyList>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
-    //     for item in list.iter() {
-    //         if let Ok(item_dict) = item.downcast::<PyDict>() {
-    //             // Support both "vector" and "values" keys for backward compatibility
-    //             let vector = if let Some(vector_item) = item_dict.get_item("vector")? {
-    //                 self.extract_single_vector(&vector_item)?
-    //             } else if let Some(values_item) = item_dict.get_item("values")? {
-    //                 self.extract_single_vector(&values_item)?
-    //             } else {
-    //                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-    //                     "Missing 'vector' or 'values' key in item"
-    //                 ));
-    //             };
-
-    //             let id = item_dict.get_item("id")?
-    //                 .map(|v| v.extract::<String>())
-    //                 .transpose()?
-    //                 .unwrap_or_else(|| self.generate_id());
-
-    //             let metadata = HashMap::new();
-    //             parsed_vectors.push((id, vector, metadata));
-    //         } else {
-    //             let vector = self.extract_single_vector(&item)?;
-    //             let id = self.generate_id();
-    //             parsed_vectors.push((id, vector, HashMap::new()));
-    //         }
-    //     }
-    //     Ok(())
-    // }
-
-      
-
-    // /// Parse NumPy 2D array input
-    // fn parse_numpy_input(&self, np_array: &Bound<PyArray2<f32>>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
-    //     let readonly = np_array.readonly();
-    //     let shape = readonly.shape();
-
-    //     if shape.len() != 2 || shape[1] != self.dim {
-    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-    //             "NumPy array must have shape (N, {}), got {:?}", self.dim, shape
-    //         )));
-    //     }
-
-    //     let flat = readonly.as_slice()?;
-    //     let num_vectors = shape[0];
-
-    //     for i in 0..num_vectors {
-    //         let start_idx = i * self.dim;
-    //         let end_idx = start_idx + self.dim;
-    //         let vector = flat[start_idx..end_idx].to_vec();
-    //         let id = self.generate_id();
-    //         parsed_vectors.push((id, vector, HashMap::new()));
-    //     }
-
-    //     Ok(())
-    // }
-
-    // /// Extract a single vector from various Python types
-    // fn extract_single_vector(&self, data: &Bound<PyAny>) -> PyResult<Vec<f32>> {
-    //     let vector = if let Ok(array1d) = data.downcast::<PyArray1<f32>>() {
-    //         array1d.readonly().as_slice()?.to_vec()
-    //     } else if let Ok(list) = data.downcast::<PyList>() {
-    //         list.iter().map(|item| item.extract::<f32>()).collect::<PyResult<Vec<f32>>>()?
-    //     } else {
-    //         data.extract::<Vec<f32>>()?
-    //     };
-
-    //     if vector.len() != self.dim {
-    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-    //             "Vector dimension mismatch: expected {}, got {}", self.dim, vector.len()
-    //         )));
-    //     }
-
-    //     if vector.is_empty() {
-    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-    //             "Vector cannot be empty"
-    //         ));
-    //     }
-
-    //     Ok(vector)
-    // }
-
-    // /// Generate a unique ID for a vector
-    // fn generate_id(&self) -> String {
-    //     let id = self.get_next_id();
-    //     format!("vec_{}", id)
-    // }
-
-    // /// END of INPUT PARSING METHODS - VERSION 1
-
-
-
-
-
-
-
-
-    // 3. INPUT PARSING METHODS (8 methods - enhanced for full format support)
-
-    // /// Parse input data into (id, vector, metadata) tuples
-    // fn parse_input_data(&self, data: &Bound<PyAny>) -> PyResult<Vec<(String, Vec<f32>, HashMap<String, Value>)>> {
-    //     let mut parsed_vectors = Vec::new();
-
-    //     if let Ok(dict) = data.downcast::<PyDict>() {
-    //         self.parse_dict_input(dict, &mut parsed_vectors)?;
-    //     } else if let Ok(list) = data.downcast::<PyList>() {
-    //         self.parse_list_input(list, &mut parsed_vectors)?;
-    //     } else if let Ok(np_array) = data.downcast::<PyArray2<f32>>() {
-    //         self.parse_numpy_input(np_array, &mut parsed_vectors)?;
-    //     } else {
-    //         let vector = self.extract_single_vector(data)?;
-    //         let id = self.generate_id();
-    //         parsed_vectors.push((id, vector, HashMap::new()));
-    //     }
-
-    //     Ok(parsed_vectors)
-    // }
-
     /// Parse input data into (id, vector, metadata) tuples with error collection
     fn parse_input_data(&self, data: &Bound<PyAny>) -> (Vec<(String, Vec<f32>, HashMap<String, Value>)>, Vec<String>) {
         let mut parsed_vectors = Vec::new();
@@ -2106,11 +1632,9 @@ impl HNSWIndex {
 
 
 
-
-
-
-
     /// Parse dictionary input format with comprehensive support
+    /// Fast-fail validation mode for strict data processing and debugging scenarios
+    #[allow(dead_code)]
     fn parse_dict_input(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
         // Detect single object format vs batch format
         if dict.contains("id")? && (dict.contains("values")? || dict.contains("vector")?) {
@@ -2183,10 +1707,6 @@ impl HNSWIndex {
                         
 
 
-
-
-
-
     /// Handle Format 1: Single object
     fn parse_single_object_format(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
         // Extract vector (support both "values" and "vector" keys)
@@ -2239,117 +1759,11 @@ impl HNSWIndex {
         Ok(())
     }
 
-    // /// Handle Format 3 & 5: Batch format
-    // fn parse_batch_format(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
-    //     // Support multiple vector key names and NumPy arrays
-    //     let vectors = if let Some(vectors_item) = dict.get_item("vectors")? {
-    //         // Standard format: "vectors"
-    //         if let Ok(list) = vectors_item.downcast::<PyList>() {
-    //             list
-    //         } else if let Ok(np_array) = vectors_item.downcast::<PyArray2<f32>>() {
-    //             // Handle NumPy array in vectors field
-    //             return self.parse_numpy_input(np_array, parsed_vectors);
-    //         } else {
-    //             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-    //                 "vectors field must be a list or NumPy array"
-    //             ));
-    //         }
-    //     } else if let Some(embeddings_item) = dict.get_item("embeddings")? {
-    //         // Alternative format: "embeddings"
-    //         if let Ok(list) = embeddings_item.downcast::<PyList>() {
-    //             list
-    //         } else if let Ok(np_array) = embeddings_item.downcast::<PyArray2<f32>>() {
-    //             // Handle NumPy array in embeddings field
-    //             return self.parse_numpy_input(np_array, parsed_vectors);
-    //         } else {
-    //             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-    //                 "embeddings field must be a list or NumPy array"
-    //             ));
-    //         }
-    //     } else if let Some(values_item) = dict.get_item("values")? {
-    //         // Legacy format: "values"
-    //         if let Ok(list) = values_item.downcast::<PyList>() {
-    //             list
-    //         } else {
-    //             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-    //                 "values field must be a list in batch format"
-    //             ));
-    //         }
-    //     } else {
-    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-    //             "Missing vector data. Expected one of: 'vectors', 'embeddings', or 'values' key"
-    //         ));
-    //     };
-
-    //     // Process each vector in the batch
-    //     for (i, vector_item) in vectors.iter().enumerate() {
-    //         let vector = self.extract_single_vector(&vector_item)?;
-
-    //         // Extract ID from "ids" array
-    //         let id = match dict.get_item("ids")? {
-    //             Some(item) => {
-    //                 let ids_list = item.downcast::<PyList>()?;
-    //                 if i < ids_list.len() {
-    //                     ids_list.get_item(i)?.extract::<String>()?
-    //                 } else {
-    //                     self.generate_id()
-    //                 }
-    //             }
-    //             None => self.generate_id(),
-    //         };
-
-    //         // Extract metadata from "metadatas" or "metadata" arrays
-    //         let meta = match dict.get_item("metadatas")?.or_else(|| dict.get_item("metadata").ok().flatten()) {
-    //             Some(item) => {
-    //                 if let Ok(meta_list) = item.downcast::<PyList>() {
-    //                     if i < meta_list.len() {
-    //                         let metadata_item = meta_list.get_item(i)?;
-    //                         if let Ok(meta_dict) = metadata_item.downcast::<PyDict>() {
-    //                             self.python_dict_to_value_map(meta_dict)?
-    //                         } else if metadata_item.is_none() {
-    //                             HashMap::new()
-    //                         } else {
-    //                             let mut map = HashMap::new();
-    //                             let value = self.python_object_to_value(&metadata_item)?;
-    //                             let key = if value.is_string() { "text" } else { "value" };
-    //                             map.insert(key.to_string(), value);
-    //                             map
-    //                         }
-    //                     } else {
-    //                         HashMap::new()
-    //                     }
-    //                 } else {
-    //                     HashMap::new()
-    //                 }
-    //             }
-    //             None => HashMap::new(),
-    //         };
-
-    //         parsed_vectors.push((id, vector, meta));
-    //     }
-
-    //     Ok(())
-    // }
-
-
 
 
     /// Handle Format 3 & 5: Batch format - WORKING SOLUTION
     fn parse_batch_format(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
         // Process each key path immediately without storing references
-
-        // // Try "vectors" key
-        // if let Some(vectors_item) = dict.get_item("vectors")? {
-        //     if let Ok(list) = vectors_item.downcast::<PyList>() {
-        //         return self.process_vector_list(list, dict, parsed_vectors);
-        //     } else if let Ok(np_array) = vectors_item.downcast::<PyArray2<f32>>() {
-        //         return self.parse_numpy_input(np_array, parsed_vectors);
-        //     } else {
-        //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-        //             "vectors field must be a list or NumPy array"
-        //         ));
-        //     }
-        // }
 
         // Try "vectors" key
         if let Some(vectors_item) = dict.get_item("vectors")? {
@@ -2360,19 +1774,6 @@ impl HNSWIndex {
                 return self.parse_numpy_with_context(np_array, dict, parsed_vectors);
             }
         }
-
-        // // Try "embeddings" key
-        // if let Some(embeddings_item) = dict.get_item("embeddings")? {
-        //     if let Ok(list) = embeddings_item.downcast::<PyList>() {
-        //         return self.process_vector_list(list, dict, parsed_vectors);
-        //     } else if let Ok(np_array) = embeddings_item.downcast::<PyArray2<f32>>() {
-        //         return self.parse_numpy_input(np_array, parsed_vectors);
-        //     } else {
-        //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-        //             "embeddings field must be a list or NumPy array"
-        //         ));
-        //     }
-        // }
 
         // Try "embeddings" key  
         if let Some(embeddings_item) = dict.get_item("embeddings")? {
@@ -2545,11 +1946,11 @@ impl HNSWIndex {
         Ok(())
     }
 
-        
-
 
 
     /// Parse list input format with backward compatibility and enhanced metadata support
+    /// All-or-nothing list processing for research environments where data quality is critical
+    #[allow(dead_code)]
     fn parse_list_input(&self, list: &Bound<PyList>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
         for item in list.iter() {
             if let Ok(item_dict) = item.downcast::<PyDict>() {
@@ -2686,73 +2087,9 @@ impl HNSWIndex {
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    // /// Parse NumPy 2D array input with enhanced ID support
-    // fn parse_numpy_input(&self, np_array: &Bound<PyArray2<f32>>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
-    //     let readonly = np_array.readonly();
-    //     let shape = readonly.shape();
-
-    //     if shape.len() != 2 || shape[1] != self.dim {
-    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-    //             "NumPy array must have shape (N, {}), got {:?}", self.dim, shape
-    //         )));
-    //     }
-
-    //     let flat = readonly.as_slice()?;
-    //     let num_vectors = shape[0];
-
-    //     for i in 0..num_vectors {
-    //         let start_idx = i * self.dim;
-    //         let end_idx = start_idx + self.dim;
-
-    //         //let vector = flat[start_idx..end_idx].to_vec();
-    //         let raw_vector = flat[start_idx..end_idx].to_vec();
-    //         // ADD PROCESSING - only place besides extract_single_vector
-    //         let processed_vector = self.process_vector_for_space(raw_vector);
-
-    //         let id = self.generate_id();
-    //         //parsed_vectors.push((id, vector, HashMap::new()));
-    //         parsed_vectors.push((id, processed_vector, HashMap::new()));
-    //     }
-
-    //     Ok(())
-    // }
-
-
-
-
     /// Parse NumPy 2D array input with enhanced ID support
+    /// Performance-optimized NumPy parsing that fails fast on first validation error
+    #[allow(dead_code)]
     fn parse_numpy_input(&self, np_array: &Bound<PyArray2<f32>>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
         let readonly = np_array.readonly();
         let shape = readonly.shape();
@@ -2914,34 +2251,6 @@ impl HNSWIndex {
 
         Ok(self.process_vector_for_space(vector))
     }
-                    
-
-            
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -3334,7 +2643,6 @@ impl HNSWIndex {
 
         Ok(output)
     }
-
 
 
 }

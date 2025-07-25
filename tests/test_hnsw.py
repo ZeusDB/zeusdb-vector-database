@@ -625,7 +625,8 @@ def test_distance_metrics():
     index_l2 = vdb_l2.create("hnsw", dim=4, space="L2")
     result_l2 = index_l2.add(records)
     assert result_l2.is_success()
-    results_l2 = index_l2.search(query_vector, top_k=2)
+    #results_l2 = index_l2.search(query_vector, top_k=2)
+    results_l2 = index_l2.search(query_vector, top_k=2, ef_search=150)
     assert len(results_l2) == 2
     
     # Test L1
@@ -633,7 +634,8 @@ def test_distance_metrics():
     index_l1 = vdb_l1.create("hnsw", dim=4, space="L1")
     result_l1 = index_l1.add(records)
     assert result_l1.is_success()
-    results_l1 = index_l1.search(query_vector, top_k=2)
+    #results_l1 = index_l1.search(query_vector, top_k=2)
+    results_l1 = index_l1.search(query_vector, top_k=2, ef_search=150)
     assert len(results_l1) == 2
 
 # ------------------------------------------------------------
