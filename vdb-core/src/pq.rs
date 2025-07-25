@@ -306,6 +306,8 @@ impl PQ {
     }
     
     /// Get training statistics and information
+    /// Comprehensive training info method - kept for debugging, testing, and future API consistency
+    #[allow(dead_code)]
     pub fn get_training_info(&self) -> std::collections::HashMap<String, String> {
         let mut info = std::collections::HashMap::new();
         
