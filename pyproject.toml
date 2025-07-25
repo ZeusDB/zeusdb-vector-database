@@ -1,6 +1,6 @@
 [project]
 name = "zeusdb-vector-database"
-version = "0.1.3"
+version = "0.2.0"
 description = "Blazing-fast vector DB with real-time similarity search and metadata filtering."
 readme = "README.md"
 authors = [
