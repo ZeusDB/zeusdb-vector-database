@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.1.3] - 2025-
+## [0.2.0] - 2025-07-25
 
 ### Added
 - Product Quantization (PQ) Support
@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Path A: Raw storage (no quantization)
     - Path B: Raw storage + ID collection (pre-training)
     - Path C: Quantized storage (post-training)
+
+- Quantized Search API
+  - Unified search interface supports both raw and quantized vectors transparently.
+- Automatic fallback to raw search if quantization is not yet trained.
+- Quantization-aware batch addition for efficient ingestion at scale.
+- Detailed quantization diagnostics via get_quantization_info() (e.g., codebook stats, compression ratio, memory footprint).
+- Debug logging macro (ZEUSDB_DEBUG) for controlled diagnostic output in Rust backend.
+- Thread safety diagnostics in get_stats() (e.g., "thread_safety": "RwLock+Mutex").
+- Improved test coverage for quantized and raw modes, including edge cases and error handling.
 
 - Asymmetric Distance Computation (ADC) for fast quantized search
 - Memory-efficient k-means clustering for codebook generation
@@ -83,6 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  - Enhanced memory usage reporting with compression analysis
  - Detailed timing information for performance optimization
 
+- Default search parameters tuned for quantized and L1/L2 spaces (e.g., higher default ef_search for L1/L2).
+- Improved error messages for quantization-related failures and configuration issues.
+- Consistent handling of vector normalization (cosine) vs. raw (L1/L2) in all input/output paths.
+
 ### Fixed
 - Memory Management
  - Fixed temporary value lifetime issues in PyO3 integration
@@ -108,8 +121,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  - Fixed panic conditions in edge cases
  - Better handling of invalid input combinations
 
+- Fixed rare edge case where quantization training could stall with duplicate vectors.
+- Resolved non-deterministic search results in small datasets with L1/L2 metrics by tuning search parameters.
+- Fixed debug output leaking to production logs (now controlled by environment variable).
+
 ### Removed
-<!-- Add removals/deprecations here -->
+- Removed legacy single-path storage logic (now fully 3-path).
+- Deprecated or removed any old quantization/test hooks that are no longer needed.
 
 ---
 
