@@ -208,6 +208,7 @@ index = vdb.create(
 | `m`              | `int`  | `16`      | Number of bi-directional connections created for each new node. Higher `m` improves recall but increases index size and build time. |
 | `ef_construction`| `int`  | `200`     | Size of the dynamic list used during index construction. Larger values increase indexing time and memory, but improve quality. |
 | `expected_size`  | `int`  | `10000`   | Estimated number of elements to be inserted. Used for preallocating internal data structures. Not a hard limit. |
+| `quantization_config` | `dict` | `None` | Product Quantization configuration for memory-efficient vector compression. |
 
 <br/>
 
