@@ -37,22 +37,30 @@ ZeusDB leverages the HNSW (Hierarchical Navigable Small World) algorithm for spe
 
 ## ⭐ Features
 
-🔍 Approximate Nearest Neighbor (ANN) search with HNSW
+🐍 User-friendly Python API for adding vectors and running similarity searches
 
+🔥 High-performance Rust backend optimized for speed and concurrency
+
+🔍 Approximate Nearest Neighbor (ANN) search using HNSW for fast, accurate results
+
+📦 Product Quantization (PQ) for compact storage, faster distance computations, and scalability for Big Data
+
+📥 Flexible input formats, including native Python types and zero-copy NumPy arrays
+
+🗂️ Metadata-aware filtering for precise and contextual querying
+
+
+
+
+<!-- 
 📋 Supports multiple distance metrics: `cosine`, `L1`, `L2` 
 
-🔥 High-performance Rust backend 
-
 📥 Supports multiple input formats using a single, easy-to-use Python method
-
-🗂️ Metadata-aware filtering at query time
-
-🐍 Simple and intuitive Python API
 
 ⚡ Smart multi-threaded inserts that automatically speed up large batch uploads
 
 🚀 Fast, concurrent searches so you can run multiple queries at the same time
-
+-->
 
 <br/>
 
