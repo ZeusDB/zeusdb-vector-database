@@ -7,6 +7,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.0] - 2025-07-25
+
+### Added
+- Product Quantization (PQ) Support
+  - Quantized vector storage with configurable compression ratios (4x-256x)
+  - Automatic training pipeline with intelligent threshold detection
+  - 3-path storage architecture for optimal memory usage:
+    - Path A: Raw storage (no quantization)
+    - Path B: Raw storage + ID collection (pre-training)
+    - Path C: Quantized storage (post-training)
+
+- Quantized Search API
+  - Unified search interface supports both raw and quantized vectors transparently.
+- Automatic fallback to raw search if quantization is not yet trained.
+- Quantization-aware batch addition for efficient ingestion at scale.
+- Detailed quantization diagnostics via get_quantization_info() (e.g., codebook stats, compression ratio, memory footprint).
+- Debug logging macro (ZEUSDB_DEBUG) for controlled diagnostic output in Rust backend.
+- Thread safety diagnostics in get_stats() (e.g., "thread_safety": "RwLock+Mutex").
+- Improved test coverage for quantized and raw modes, including edge cases and error handling.
+
+- Asymmetric Distance Computation (ADC) for fast quantized search
+- Memory-efficient k-means clustering for codebook generation
+- Configurable quantization parameters:
+  - `subvectors`: Number of vector subspaces (divisor of dimension)
+  - `bits`: Bits per quantized code (1-8)
+  - `training_size`: Vectors needed for training (minimum 1000)
+  - `max_training_vectors`: Maximum vectors used for training
+
+- Enhanced Vector Database API
+- Quantization configuration support in create() method
+- Training progress monitoring with get_training_progress()
+- Storage mode detection with get_storage_mode()
+- Quantization status methods:
+  - `has_quantization()`: Check if quantization is configured
+  - `can_use_quantization()`: Check if PQ model is trained
+  - `is_quantized()`: Check if index is using quantized storage
+- Quantization info retrieval with `get_quantization_info()`
+- Training readiness check with `is_training_ready()`
+- Training vectors needed with `training_vectors_needed()`
+
+- Performance Monitoring
+  - Compression ratio calculation and reporting
+  - Memory usage estimation for raw vs compressed storage
+  - Training time measurement and optimization
+  - Search performance metrics for quantized vs raw modes
+  - Detailed statistics in 'get_stats()' method
+
+- Input Handling
+ - Enhanced dictionary input parsing with comprehensive error handling
+ - Flexible metadata support for various Python object types
+ - Automatic type detection and conversion for metadata
+ - Graceful handling of None values and edge cases
+ - Comprehensive input validation with descriptive error messages
+
+- Performance Optimizations
+ - Batch processing for large-scale vector additions
+ - Optimized memory allocation during training and storage
+ - Efficient vector reconstruction from quantized codes
+ - Fast ADC search implementation with SIMD optimizations
+ - Automatic performance scaling post-training (up to 8x faster additions)
+
+### Changed
+- Vector Addition Behavior
+ - Automatic training trigger when threshold is reached during vector addition
+ - Dynamic storage mode switching from raw to quantized seamlessly
+ - Enhanced error reporting with detailed failure information in AddResult
+ - Improved batch processing with better memory management
+
+- Search Performance
+ - Adaptive search strategy based on storage mode (raw vs quantized)
+ - Optimized distance calculations for quantized vectors
+ - Enhanced result quality with proper score normalization
+
+- Index Architecture
+ - 3-path storage system replaces simple raw storage
+ - Intelligent memory management with automatic cleanup
+ - Robust state transitions between storage modes
+ - Enhanced concurrency handling with proper lock management
+
+- Statistics and Monitoring
+ - Extended statistics including quantization metrics
+ - Real-time progress tracking during training operations
+ - Enhanced memory usage reporting with compression analysis
+ - Detailed timing information for performance optimization
+
+- Default search parameters tuned for quantized and L1/L2 spaces (e.g., higher default ef_search for L1/L2).
+- Improved error messages for quantization-related failures and configuration issues.
+- Consistent handling of vector normalization (cosine) vs. raw (L1/L2) in all input/output paths.
+
+### Fixed
+- Memory Management
+ - Fixed temporary value lifetime issues in PyO3 integration
+ - Resolved borrow checker conflicts in quantization pipeline
+ - Corrected memory leaks during large-scale operations
+ - Fixed reference counting for Python object handling
+
+- Vector Processing
+ - Fixed input format parsing for edge cases and invalid data
+ - Resolved metadata conversion issues for complex Python objects
+ - Corrected vector dimension validation with proper error messages
+ - Fixed batch processing memory allocation issues
+
+- Performance Issues
+ - Optimized training memory usage to prevent out-of-memory errors
+ - Fixed search performance degradation in large indexes
+ - Resolved training stability issues with improved k-means initialization
+ - Corrected distance calculation accuracy in quantized mode
+
+- Error Handling
+ - Enhanced validation for quantization configuration parameters
+ - Improved error propagation from Rust to Python
+ - Fixed panic conditions in edge cases
+ - Better handling of invalid input combinations
+
+- Fixed rare edge case where quantization training could stall with duplicate vectors.
+- Resolved non-deterministic search results in small datasets with L1/L2 metrics by tuning search parameters.
+- Fixed debug output leaking to production logs (now controlled by environment variable).
+
+### Removed
+- Removed legacy single-path storage logic (now fully 3-path).
+- Deprecated or removed any old quantization/test hooks that are no longer needed.
+
+---
+
 ## [0.1.2] - 2025-07-17
 
 ### Added
