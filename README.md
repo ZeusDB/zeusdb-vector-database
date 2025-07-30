@@ -575,6 +575,7 @@ To enable PQ, pass a `quantization_config` dictionary to the `.create()` index m
 | `bits` | `int` | Bits per quantized code (controls centroids per subvector) | 1-8 | `8` |
 | `training_size` | `int` | Minimum vectors needed for stable k-means clustering | ≥ 1000 | 1000 |
 | `max_training_vectors` | `int` | Maximum vectors used during training (optional limit) | ≥ training_size | `None` |
+| `storage_mode` | `str` | Storage strategy: "quantized_only" (memory optimized) or "quantized_with_raw" (keep raw vectors for exact reconstruction) | "quantized_only", "quantized_with_raw" | `"quantized_only"` |
 
 
 <br/>
