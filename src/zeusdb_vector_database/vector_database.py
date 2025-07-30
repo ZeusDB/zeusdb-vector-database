@@ -56,7 +56,8 @@ class VectorDatabase:
                     'subvectors': 8,           # Number of subvectors (must divide dim evenly, default: 8)
                     'bits': 8,                 # Bits per subvector (1-8, controls centroids, default: 8)
                     'training_size': None,     # Auto-calculated based on subvectors & bits (or specify manually)
-                    'max_training_vectors': None  # Optional limit on training vectors used
+                    'max_training_vectors': None,  # Optional limit on training vectors used
+                    'storage_mode': 'quantized_only' # Storage mode for quantized vectors (or 'quantized_with_raw')  
                 }
 
             Note: Quantization reduces memory usage (typically 4-32x compression) but may 
@@ -88,7 +89,8 @@ class VectorDatabase:
                 'type': 'pq',
                 'subvectors': 16,         # More subvectors = better compression
                 'bits': 6,                # Fewer bits = less memory per centroid
-                'training_size': 75000    # Override auto-calculation
+                'training_size': 75000,    # Override auto-calculation
+                'storage_mode': 'quantized_only'  # Only store quantized vectors
             }
             index = vdb.create(
                 index_type="hnsw",
@@ -172,7 +174,7 @@ class VectorDatabase:
         if dim % subvectors != 0:
             raise ValueError(
                 f"subvectors ({subvectors}) must divide dimension ({dim}) evenly. "
-                f"Consider using subvectors: {self._suggest_subvector_divisors(dim)}"
+                f"Consider using subvectors: {', '.join(map(str, self._suggest_subvector_divisors(dim)))}"
             )
         
         if subvectors > dim:
@@ -206,9 +208,38 @@ class VectorDatabase:
                 )
             validated_config['max_training_vectors'] = max_training_vectors
         
+        # Validate storage mode
+        storage_mode = str(validated_config.get('storage_mode', 'quantized_only')).lower()
+        valid_modes = {'quantized_only', 'quantized_with_raw'}
+        if storage_mode not in valid_modes:
+            raise ValueError(
+                f"Invalid storage_mode: '{storage_mode}'. Supported modes: {', '.join(sorted(valid_modes))}"
+            )
+        
+        validated_config['storage_mode'] = storage_mode
+
         # Calculate and warn about memory usage
         self._check_memory_usage(validated_config, dim)
+
+        # Add helpful warnings about storage mode
+        if storage_mode == 'quantized_with_raw':
+            import warnings
+            compression_ratio = validated_config.get('__memory_info__', {}).get('compression_ratio', 1.0)
+            warnings.warn(
+                f"storage_mode='quantized_with_raw' will use ~{compression_ratio:.1f}x more memory "
+                f"than 'quantized_only' but enables exact vector reconstruction.",
+                UserWarning,
+                stacklevel=2
+            )
         
+        # Final safety check: ensure all expected keys are present
+        # This is a final defensive programming - all the keys should already be set above, but added just in case
+        validated_config.setdefault('type', 'pq')
+        validated_config.setdefault('subvectors', 8)
+        validated_config.setdefault('bits', 8)
+        validated_config.setdefault('max_training_vectors', None)
+        validated_config.setdefault('storage_mode', 'quantized_only')
+
         return validated_config
 
     def _calculate_smart_training_size(self, subvectors: int, bits: int) -> int:
@@ -236,13 +267,14 @@ class VectorDatabase:
         
         return min(max(statistical_minimum, reasonable_minimum), reasonable_maximum)
 
-    def _suggest_subvector_divisors(self, dim: int) -> str:
-        """Suggest valid subvector counts that divide the dimension evenly."""
-        divisors = []
-        for i in range(1, min(33, dim + 1)):  # Common subvector counts up to 32
-            if dim % i == 0:
-                divisors.append(str(i))
-        return ', '.join(divisors[:8])  # Show first 8 suggestions
+    
+    def _suggest_subvector_divisors(self, dim: int) -> list[int]:
+        """Return valid subvector counts that divide the dimension evenly (up to 32)."""
+        return [i for i in range(1, min(33, dim + 1)) if dim % i == 0]
+    
+
+
+
 
     def _check_memory_usage(self, config: Dict[str, Any], dim: int) -> None:
         """
