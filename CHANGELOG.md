@@ -10,13 +10,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.1] - 2025-
 
 ### Added
-<!-- Add new features here -->
+- Storage mode configuration for product quantization: New storage_mode parameter in quantization config allows users to choose between:
+  - '"quantized_only"' (default): Maximum memory efficiency by discarding raw vectors after quantization
+  - '"quantized_with_raw"': Keep both quantized codes and raw vectors for exact reconstruction
+- Case-insensitive storage mode validation: Accepts variations like "Quantized_Only", "QUANTIZED_WITH_RAW"
+- Automatic memory usage warnings: Users are warned when `quantized_with_raw` mode will use significantly more memory
+- Enhanced subvector divisor suggestions: `_suggest_subvector_divisors()` now returns `list[int]` for programmatic use
+- StorageMode enum: Rust backend support for `quantized_only` and `quantized_with_raw` storage modes with JSON serialization
+- Storage mode parsing: Complete quantization config parsing in HNSWIndex constructor with proper error handling
+- Intelligent vector retrieval: `get_records()` method now prioritizes raw vectors over PQ reconstruction when available
+- Enhanced statistics: `get_stats()` now reports storage mode, memory usage breakdown, and storage strategy information
+- Memory usage tracking: Real-time memory usage calculations for both raw vectors and quantized codes
 
 ### Changed
-<!-- Add changed behavior here -->
+- Quantization config validation: Now includes comprehensive validation and normalization of all parameters
+- Error messages: Improved clarity for storage mode validation with sorted mode suggestions
+- Defensive programming: Added final safety checks to ensure complete configuration before passing to Rust backend
+- QuantizationConfig struct: Now includes `storage_mode` field with backward-compatible defaults
+- add_quantized_vector logic: Respects storage mode configuration to conditionally store raw vectors
+- get_stats output: Enhanced with storage strategy descriptions ("memory_optimized" vs "quality_optimized")
+- Vector storage behavior: `quantized_only` mode stops storing raw vectors after PQ training for maximum memory efficiency
 
 ### Fixed
-<!-- Add bug fixes here -->
+- Configuration completeness: All quantization parameters now have guaranteed defaults to prevent missing key errors
+- None value handling: Python config cleaning now properly removes `None` values before passing to Rust backend
+- Constructor parameter validation: Improved error handling for missing or invalid quantization parameters
+- Memory statistics accuracy: Corrected memory usage calculations based on actual storage mode behavior
 
 ### Removed
 <!-- Add removals/deprecations here -->
