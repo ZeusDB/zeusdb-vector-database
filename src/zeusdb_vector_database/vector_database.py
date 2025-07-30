@@ -128,11 +128,12 @@ class VectorDatabase:
         
         try:
             # Always pass quantization_config parameter
-            clean_config = None
             if quantization_config is not None:
-                # Clean quantization_config before passing to Rust (remove internal keys)
-                clean_config = {k: v for k, v in quantization_config.items() if not k.startswith('_')}
-            
+                # Remove keys with None values and internal keys
+                clean_config = {k: v for k, v in quantization_config.items() if not k.startswith('_') and v is not None}
+            else:
+                clean_config = None
+
             return constructor(quantization_config=clean_config, **kwargs)
         except Exception as e:
             raise RuntimeError(f"Failed to create {index_type.upper()} index: {e}") from e

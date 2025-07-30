@@ -6,6 +6,7 @@ use std::sync::{Mutex, RwLock, Arc};
 use hnsw_rs::prelude::{Hnsw, DistCosine, DistL2, DistL1, Distance};
 use serde_json::Value;
 use rayon::prelude::*;
+use serde::{Serialize, Deserialize};
 
 // Import PQ module
 use crate::pq::PQ;
@@ -24,14 +25,53 @@ macro_rules! debug_log {
 }
 
 
-// Quantization configuration structure
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StorageMode {
+    #[serde(rename = "quantized_only")]
+    QuantizedOnly,
+
+    #[serde(rename = "quantized_with_raw")]
+    QuantizedWithRaw,
+}
+
+impl StorageMode {
+    pub fn from_string(s: &str) -> Result<Self, String> {
+        match s {
+            "quantized_only" => Ok(StorageMode::QuantizedOnly),
+            "quantized_with_raw" => Ok(StorageMode::QuantizedWithRaw),
+            _ => Err(format!(
+                "Invalid storage_mode: '{}'. Supported: quantized_only, quantized_with_raw",
+                s
+            ))
+        }
+    }
+
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            StorageMode::QuantizedOnly => "quantized_only",
+            StorageMode::QuantizedWithRaw => "quantized_with_raw",
+        }
+    }
+}
+
+impl Default for StorageMode {
+    fn default() -> Self {
+        StorageMode::QuantizedOnly
+    }
+}
+
+
+// Updated QuantizationConfig structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuantizationConfig {
     pub subvectors: usize,
     pub bits: usize,
     pub training_size: usize,
     pub max_training_vectors: Option<usize>,
+    pub storage_mode: StorageMode,
 }
+
+
 
 /// Custom distance function for Product Quantization using ADC
 #[derive(Clone)]
@@ -435,6 +475,16 @@ impl HNSWIndex {
             let max_training_vectors = config.get_item("max_training_vectors")?
                 .map(|v| v.extract::<usize>())
                 .transpose()?;
+
+            // Extract storage_mode
+            let storage_mode_str = config.get_item("storage_mode")?
+                .map(|v| v.extract::<String>())
+                .transpose()?
+                .unwrap_or_else(|| "quantized_only".to_string());
+
+            let storage_mode = StorageMode::from_string(&storage_mode_str)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))?;
+
             
             // Validate PQ parameters
             if dim % subvectors != 0 {
@@ -460,6 +510,7 @@ impl HNSWIndex {
                 bits,
                 training_size,
                 max_training_vectors,
+                storage_mode,
             };
             
             // Create PQ instance
@@ -941,7 +992,57 @@ impl HNSWIndex {
 
 
 
-    /// Get records by ID(s) with PQ reconstruction support
+    // /// Get records by ID(s) with PQ reconstruction support
+    // #[pyo3(signature = (input, return_vector = true))]
+    // pub fn get_records(&self, py: Python<'_>, input: &Bound<PyAny>, return_vector: bool) -> PyResult<Vec<Py<PyDict>>> {
+    //     let ids: Vec<String> = if let Ok(id_str) = input.extract::<String>() {
+    //         vec![id_str]
+    //     } else if let Ok(id_list) = input.extract::<Vec<String>>() {
+    //         id_list
+    //     } else {
+    //         return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+    //             "Expected a string or a list of strings for ID(s)",
+    //         ));
+    //     };
+
+    //     let mut records = Vec::with_capacity(ids.len());
+        
+    //     // Use read locks for concurrent access
+    //     let vectors = self.vectors.read().unwrap();
+    //     let pq_codes = self.pq_codes.read().unwrap();
+    //     let vector_metadata = self.vector_metadata.read().unwrap();
+
+    //     for id in ids {
+    //         if let Some(vector) = vectors.get(&id) {
+    //             let metadata = vector_metadata.get(&id).cloned().unwrap_or_default();
+
+    //             let dict = PyDict::new(py);
+    //             dict.set_item("id", id.clone())?;
+    //             dict.set_item("metadata", self.value_map_to_python(&metadata, py)?)?;
+
+    //             if return_vector {
+    //                 // Try raw vector first, then PQ reconstruction
+    //                 let vector_data = if !vector.is_empty() {
+    //                     vector.clone()
+    //                 } else if let (Some(pq), Some(codes)) = (&self.pq, pq_codes.get(&id)) {
+    //                     pq.reconstruct(codes).unwrap_or_else(|_| vector.clone())
+    //                 } else {
+    //                     vector.clone()
+    //                 };
+                    
+    //                 dict.set_item("vector", vector_data)?;
+    //             }
+
+    //             records.push(dict.into());
+    //         }
+    //     }
+
+    //     Ok(records)
+    // }
+
+
+
+    /// Get records by ID(s) with PQ reconstruction support and storage mode awareness
     #[pyo3(signature = (input, return_vector = true))]
     pub fn get_records(&self, py: Python<'_>, input: &Bound<PyAny>, return_vector: bool) -> PyResult<Vec<Py<PyDict>>> {
         let ids: Vec<String> = if let Ok(id_str) = input.extract::<String>() {
@@ -955,14 +1056,17 @@ impl HNSWIndex {
         };
 
         let mut records = Vec::with_capacity(ids.len());
-        
+
         // Use read locks for concurrent access
         let vectors = self.vectors.read().unwrap();
         let pq_codes = self.pq_codes.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
 
         for id in ids {
-            if let Some(vector) = vectors.get(&id) {
+            // Check if this ID exists in either storage
+            let exists = vectors.contains_key(&id) || pq_codes.contains_key(&id);
+
+            if exists {
                 let metadata = vector_metadata.get(&id).cloned().unwrap_or_default();
 
                 let dict = PyDict::new(py);
@@ -970,16 +1074,27 @@ impl HNSWIndex {
                 dict.set_item("metadata", self.value_map_to_python(&metadata, py)?)?;
 
                 if return_vector {
-                    // Try raw vector first, then PQ reconstruction
-                    let vector_data = if !vector.is_empty() {
-                        vector.clone()
+                    // Priority: raw vector > PQ reconstruction
+                    let vector_data = if let Some(raw_vector) = vectors.get(&id) {
+                        // Case 1: Raw vector available (QuantizedWithRaw mode or non-quantized)
+                        Some(raw_vector.clone())
                     } else if let (Some(pq), Some(codes)) = (&self.pq, pq_codes.get(&id)) {
-                        pq.reconstruct(codes).unwrap_or_else(|_| vector.clone())
+                        // Case 2: Only quantized codes available (QuantizedOnly mode)
+                        match pq.reconstruct(codes) {
+                            Ok(reconstructed) => Some(reconstructed),
+                            Err(e) => {
+                                eprintln!("Warning: Failed to reconstruct vector for ID {}: {}", id, e);
+                                None
+                            }
+                        }
                     } else {
-                        vector.clone()
+                        // Case 3: No vector data available
+                        None
                     };
-                    
-                    dict.set_item("vector", vector_data)?;
+
+                    if let Some(vec) = vector_data {
+                        dict.set_item("vector", vec)?;
+                    }
                 }
 
                 records.push(dict.into());
@@ -992,7 +1107,75 @@ impl HNSWIndex {
 
 
 
-    /// Enhanced get_stats with training info
+
+
+
+
+
+
+
+
+    // /// Enhanced get_stats with training info
+    // pub fn get_stats(&self) -> HashMap<String, String> {
+    //     let mut stats = HashMap::new();
+
+    //     let vectors = self.vectors.read().unwrap();
+    //     let pq_codes = self.pq_codes.read().unwrap();
+    //     let vector_count = *self.vector_count.lock().unwrap();
+    //     let training_ids = self.training_ids.read().unwrap();
+
+    //     // Basic stats
+    //     stats.insert("total_vectors".to_string(), vector_count.to_string());
+    //     stats.insert("dimension".to_string(), self.dim.to_string());
+    //     stats.insert("expected_size".to_string(), self.expected_size.to_string());
+    //     stats.insert("space".to_string(), self.space.clone());
+    //     stats.insert("index_type".to_string(), "HNSW".to_string());
+
+    //     stats.insert("m".to_string(), self.m.to_string());
+    //     stats.insert("ef_construction".to_string(), self.ef_construction.to_string());
+    //     stats.insert("thread_safety".to_string(), "RwLock+Mutex".to_string());
+
+    //     // Storage breakdown
+    //     stats.insert("raw_vectors_stored".to_string(), vectors.len().to_string());
+    //     stats.insert("quantized_codes_stored".to_string(), pq_codes.len().to_string());
+
+    //     // Training info
+    //     if let Some(config) = &self.quantization_config {
+    //         stats.insert("quantization_type".to_string(), "pq".to_string());
+    //         stats.insert("quantization_training_size".to_string(), config.training_size.to_string());
+
+    //         let collected_count = training_ids.len();
+    //         let progress = self.get_training_progress();
+    //         stats.insert("training_progress".to_string(), 
+    //             format!("{}/{} ({:.1}%)", collected_count, config.training_size, progress));
+            
+    //         let vectors_needed = self.training_vectors_needed();
+    //         stats.insert("training_vectors_needed".to_string(), vectors_needed.to_string());
+    //         stats.insert("training_threshold_reached".to_string(), 
+    //             self.training_threshold_reached.load(Ordering::Acquire).to_string());
+            
+    //         if let Some(pq) = &self.pq {
+    //             let is_trained = pq.is_trained();
+    //             stats.insert("quantization_trained".to_string(), is_trained.to_string());
+    //             stats.insert("quantization_active".to_string(), self.is_quantized().to_string());
+
+    //             if is_trained {
+    //                 let compression_ratio = (pq.dim * 4) as f64 / pq.subvectors as f64;
+    //                 stats.insert("quantization_compression_ratio".to_string(), format!("{:.1}x", compression_ratio));
+    //             }
+    //         }
+    //     } else {
+    //         stats.insert("quantization_type".to_string(), "none".to_string());
+    //     }
+
+    //     stats.insert("storage_mode".to_string(), self.get_storage_mode());
+
+    //     stats
+    // }
+
+
+
+    /// Enhanced get_stats with storage mode information
     pub fn get_stats(&self) -> HashMap<String, String> {
         let mut stats = HashMap::new();
 
@@ -1021,16 +1204,37 @@ impl HNSWIndex {
             stats.insert("quantization_type".to_string(), "pq".to_string());
             stats.insert("quantization_training_size".to_string(), config.training_size.to_string());
 
+            // Storage mode information
+            stats.insert("storage_mode".to_string(), config.storage_mode.to_string().to_string());
+
+            // Calculate actual memory usage based on storage mode
+            let raw_memory_mb = (vectors.len() * self.dim * 4) as f64 / (1024.0 * 1024.0);
+            let quantized_memory_mb = (pq_codes.len() * config.subvectors) as f64 / (1024.0 * 1024.0);
+
+            stats.insert("raw_vectors_memory_mb".to_string(), format!("{:.2}", raw_memory_mb));
+            stats.insert("quantized_codes_memory_mb".to_string(), format!("{:.2}", quantized_memory_mb));
+
+            match config.storage_mode {
+                StorageMode::QuantizedOnly => {
+                    stats.insert("storage_strategy".to_string(), "memory_optimized".to_string());
+                    stats.insert("memory_savings".to_string(), "maximum".to_string());
+                }
+                StorageMode::QuantizedWithRaw => {
+                    stats.insert("storage_strategy".to_string(), "quality_optimized".to_string());
+                    stats.insert("memory_savings".to_string(), "raw_vectors_kept".to_string());
+                }
+            }
+
             let collected_count = training_ids.len();
             let progress = self.get_training_progress();
-            stats.insert("training_progress".to_string(), 
+            stats.insert("training_progress".to_string(),
                 format!("{}/{} ({:.1}%)", collected_count, config.training_size, progress));
             
             let vectors_needed = self.training_vectors_needed();
             stats.insert("training_vectors_needed".to_string(), vectors_needed.to_string());
-            stats.insert("training_threshold_reached".to_string(), 
+            stats.insert("training_threshold_reached".to_string(),
                 self.training_threshold_reached.load(Ordering::Acquire).to_string());
-            
+
             if let Some(pq) = &self.pq {
                 let is_trained = pq.is_trained();
                 stats.insert("quantization_trained".to_string(), is_trained.to_string());
@@ -1043,12 +1247,68 @@ impl HNSWIndex {
             }
         } else {
             stats.insert("quantization_type".to_string(), "none".to_string());
+            stats.insert("storage_mode".to_string(), "raw_only".to_string());
         }
 
-        stats.insert("storage_mode".to_string(), self.get_storage_mode());
+        stats.insert("storage_mode_description".to_string(), self.get_storage_mode());
 
         stats
     }
+            
+
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1413,7 +1673,61 @@ impl HNSWIndex {
         Ok(())
     }
 
-    /// Path C: Quantized storage (trained and active)
+    // /// Path C: Quantized storage (trained and active)
+    // fn add_quantized_vector(
+    //     &mut self,
+    //     id: String,
+    //     vector: Vec<f32>,  // Already processed
+    //     metadata: HashMap<String, Value>
+    // ) -> PyResult<()> {
+    //     let internal_id = self.get_next_id();
+
+    //     // Store metadata
+    //     {
+    //         let mut vector_metadata = self.vector_metadata.write().unwrap();
+    //         vector_metadata.insert(id.clone(), metadata);
+    //     }
+
+    //     // Update ID mappings
+    //     {
+    //         let mut id_map = self.id_map.write().unwrap();
+    //         let mut rev_map = self.rev_map.write().unwrap();
+
+    //         id_map.insert(id.clone(), internal_id);
+    //         rev_map.insert(internal_id, id.clone());
+    //     }
+
+    //     // Quantize the vector
+    //     let pq = self.pq.as_ref().unwrap();
+    //     let codes = pq.quantize(&vector).map_err(|e| {
+    //         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+    //             format!("Failed to quantize vector: {}", e)
+    //         )
+    //     })?;
+
+    //     // Store quantized codes
+    //     {
+    //         let mut pq_codes = self.pq_codes.write().unwrap();
+    //         pq_codes.insert(id.clone(), codes.clone());
+    //     }
+
+    //     // Store raw vector for exact reconstruction (persistence-ready)
+    //     {
+    //         let mut vectors = self.vectors.write().unwrap();
+    //         vectors.insert(id, vector.clone());
+    //     }
+
+    //     // Insert codes into quantized HNSW
+    //     {
+    //         let mut hnsw_guard = self.hnsw.lock().unwrap();
+    //         hnsw_guard.insert_pq_codes(&codes, internal_id);
+    //     }
+
+    //     Ok(())
+    // }
+
+
+    /// Path C: Quantized storage with configurable raw vector retention
     fn add_quantized_vector(
         &mut self,
         id: String,
@@ -1445,16 +1759,19 @@ impl HNSWIndex {
             )
         })?;
 
-        // Store quantized codes
+        // Store quantized codes (always)
         {
             let mut pq_codes = self.pq_codes.write().unwrap();
             pq_codes.insert(id.clone(), codes.clone());
         }
 
-        // Store raw vector for exact reconstruction (persistence-ready)
-        {
-            let mut vectors = self.vectors.write().unwrap();
-            vectors.insert(id, vector.clone());
+        // Store raw vector only if configured to keep them
+        if let Some(config) = &self.quantization_config {
+            if config.storage_mode == StorageMode::QuantizedWithRaw {
+                let mut vectors = self.vectors.write().unwrap();
+                vectors.insert(id.clone(), vector.clone());
+            }
+            // If QuantizedOnly mode, we don't store raw vectors (saves memory)
         }
 
         // Insert codes into quantized HNSW
@@ -1465,6 +1782,41 @@ impl HNSWIndex {
 
         Ok(())
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     /// TRAINING TRIGGER: Uses threshold flag for race condition safety
     fn maybe_trigger_training(&mut self) -> Result<(), String> {
