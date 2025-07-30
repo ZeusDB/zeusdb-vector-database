@@ -575,12 +575,13 @@ To enable PQ, pass a `quantization_config` dictionary to the `.create()` index m
 | `bits` | `int` | Bits per quantized code (controls centroids per subvector) | 1-8 | `8` |
 | `training_size` | `int` | Minimum vectors needed for stable k-means clustering | ≥ 1000 | 1000 |
 | `max_training_vectors` | `int` | Maximum vectors used during training (optional limit) | ≥ training_size | `None` |
+| `storage_mode` | `str` | Storage strategy: "quantized_only" (memory optimized) or "quantized_with_raw" (keep raw vectors for exact reconstruction) | "quantized_only", "quantized_with_raw" | `"quantized_only"` |
 
 
 <br/>
 
 
-### 🔧 Usage Example
+### 🔧 Usage Example 1
 
 ```python
 from zeusdb_vector_database import VectorDatabase
@@ -647,6 +648,36 @@ Results
 {'id': 'doc_7822', 'score': 0.5151920914649963, 'metadata': {'category': 'tech', 'year': 2026}}, 
 ]
 ```
+<br />
+
+### 🔧 Usage Example 2 - with explicit storage mode
+
+```python
+from zeusdb_vector_database import VectorDatabase
+import numpy as np
+
+# Create index with product quantization
+vdb = VectorDatabase()
+
+# Configure quantization for memory efficiency
+quantization_config = {
+    'type': 'pq',                  # `pq` for Product Quantization
+    'subvectors': 8,               # Divide 1536-dim vectors into 8 subvectors of 192 dims each
+    'bits': 8,                     # 256 centroids per subvector (2^8)
+    'training_size': 10000,        # Train when 10k vectors are collected
+    'max_training_vectors': 50000,  # Use max 50k vectors for training
+    'storage_mode': 'quantized_only'  # Explicitly set storage mode to only keep quantized values
+}
+
+# Create index with quantization
+# This will automatically handle training when enough vectors are added
+index = vdb.create(
+    index_type="hnsw",
+    dim=3072,                                  # OpenAI `text-embedding-3-large` dimension
+    quantization_config=quantization_config    # Add the compression configuration
+)
+
+```
 
 <br />
 
@@ -658,7 +689,8 @@ quantization_config = {
     'type': 'pq',
     'subvectors': 8,      # Balanced: moderate compression, good accuracy
     'bits': 8,            # 256 centroids per subvector (high precision)
-    'training_size': 10000  # Or higher for large datasets
+    'training_size': 10000,  # Or higher for large datasets
+    'storage_mode': 'quantized_only'  # Default, memory efficient
 }
 # Achieves ~16x–32x compression with strong recall for most applications
 ```
@@ -670,7 +702,8 @@ quantization_config = {
     'type': 'pq',
     'subvectors': 16,      # More subvectors = better compression
     'bits': 6,             # Fewer bits = less memory per centroid
-    'training_size': 20000
+    'training_size': 20000,
+    'storage_mode': 'quantized_only'
 }
 # Achieves ~32x compression ratio
 ```
@@ -682,6 +715,7 @@ quantization_config = {
     'subvectors': 4,       # Fewer subvectors = better accuracy
     'bits': 8,             # More bits = more precise quantization
     'training_size': 50000 # More training data = better centroids
+    'storage_mode': 'quantized_with_raw'  # Keep raw vectors for exact recall
 }
 # Achieves ~4x compression ratio with minimal accuracy loss
 ```
@@ -694,6 +728,10 @@ quantization_config = {
 - Accuracy Impact: Typically 1-5% recall reduction with proper tuning
 
 Quantization is ideal for production deployments with large vector datasets (100k+ vectors) where memory efficiency is critical.
+
+`"quantized_only"` is recommended for most use cases and maximizes memory savings.
+
+`"quantized_with_raw"` keeps both quantized and raw vectors for exact reconstruction, but uses more memory.
 
 
 <br/>

@@ -1787,3 +1787,287 @@ def test_pq_auto_calculated_training_size():
         centroids_per_subvector = 2 ** config['bits']
         expected_min = centroids_per_subvector * 20  # 20 samples per centroid minimum
         assert training_size >= expected_min
+
+# ------------------------------------------------------------
+# Test 42: Storage Mode Configuration and Behavior
+# ------------------------------------------------------------
+def test_storage_mode_configuration():
+    """Test both storage modes and their memory/quality tradeoffs"""
+    vdb = VectorDatabase()
+    
+    # Test 1: quantized_only mode (default)
+    quantization_config_only = {
+        'type': 'pq',
+        'subvectors': 8,
+        'bits': 8,
+        'training_size': 1000,
+        'storage_mode': 'quantized_only'  # Explicit default
+    }
+    
+    with pytest.warns(UserWarning, match="Very high compression ratio.*128.0x.*may significantly impact recall quality"):
+        index_only = vdb.create(
+            "hnsw",
+            dim=256,
+            quantization_config=quantization_config_only,
+            expected_size=1500
+        )
+    
+    # Test 2: quantized_with_raw mode
+    quantization_config_with_raw = {
+        'type': 'pq',
+        'subvectors': 8,
+        'bits': 8,
+        'training_size': 1000,
+        'storage_mode': 'quantized_with_raw'  # Keep both
+    }
+    
+    # Should warn about both compression AND storage mode
+    with pytest.warns(UserWarning) as warning_info:
+        index_with_raw = vdb.create(
+            "hnsw",
+            dim=256,
+            quantization_config=quantization_config_with_raw,
+            expected_size=1500
+        )
+    
+    # Verify we got both warnings
+    warning_messages = [str(w.message) for w in warning_info.list]
+    assert any("Very high compression ratio" in msg for msg in warning_messages)
+    assert any("storage_mode='quantized_with_raw' will use ~128.0x more memory" in msg for msg in warning_messages)
+    
+    # Add identical training data to both indexes
+    training_data = []
+    for i in range(1200):  # More than training_size
+        training_data.append({
+            "id": f"doc_{i}",
+            "vector": np.random.rand(256).astype(np.float32).tolist(),
+            "metadata": {"category": "A" if i % 2 == 0 else "B", "index": i}
+        })
+    
+    result1 = index_only.add(training_data)
+    result2 = index_with_raw.add(training_data)
+    
+    assert result1.is_success() and result2.is_success()
+    assert index_only.is_quantized() and index_with_raw.is_quantized()
+    
+    # Test storage behavior differences
+    stats1 = index_only.get_stats()
+    stats2 = index_with_raw.get_stats()
+    
+    # Both should have same quantized codes
+    assert stats1["quantized_codes_stored"] == stats2["quantized_codes_stored"] == "1200"
+    
+    # Different raw vector storage behavior
+    raw_stored_only = int(stats1["raw_vectors_stored"])
+    raw_stored_with_raw = int(stats2["raw_vectors_stored"])
+    
+    # quantized_only: should only store vectors up to training (1000)
+    assert raw_stored_only == 1000
+    
+    # quantized_with_raw: should store ALL vectors (1200)
+    assert raw_stored_with_raw == 1200
+    
+    # Test storage mode reporting
+    assert stats1["storage_mode"] == "quantized_only"
+    assert stats2["storage_mode"] == "quantized_with_raw"
+    
+    # Test memory usage reporting
+    assert "raw_vectors_memory_mb" in stats1 and "raw_vectors_memory_mb" in stats2
+    raw_memory_only = float(stats1["raw_vectors_memory_mb"])
+    raw_memory_with_raw = float(stats2["raw_vectors_memory_mb"])
+    assert raw_memory_with_raw > raw_memory_only  # quantized_with_raw uses more memory
+    
+    # Test vector retrieval behavior
+    # Both should be able to retrieve vectors (different mechanisms)
+    test_id = "doc_1100"  # Added after training
+    
+    records1 = index_only.get_records([test_id], return_vector=True)
+    records2 = index_with_raw.get_records([test_id], return_vector=True)
+    
+    assert len(records1) == 1 and len(records2) == 1
+    assert "vector" in records1[0] and "vector" in records2[0]
+    assert len(records1[0]["vector"]) == len(records2[0]["vector"]) == 256
+    
+    # quantized_with_raw should have exact vector, quantized_only should have reconstructed
+    # (We can't easily test for exactness due to floating point precision, but both should work)
+    
+    # Test search functionality works identically
+    query_vector = np.random.rand(256).astype(np.float32).tolist()
+    
+    search1 = index_only.search(query_vector, top_k=5)
+    search2 = index_with_raw.search(query_vector, top_k=5)
+    
+    assert len(search1) == len(search2) == 5
+    
+    # Test filtered search
+    filtered1 = index_only.search(query_vector, filter={"category": "A"}, top_k=3)
+    filtered2 = index_with_raw.search(query_vector, filter={"category": "A"}, top_k=3)
+    
+    assert len(filtered1) >= 1 and len(filtered2) >= 1
+    for result in filtered1 + filtered2:
+        assert result["metadata"]["category"] == "A"
+
+
+# ------------------------------------------------------------
+# Test 43: Storage Mode Error Handling and Edge Cases
+# ------------------------------------------------------------
+def test_storage_mode_error_handling():
+    """Test storage mode validation and edge cases"""
+    vdb = VectorDatabase()
+    
+    # Test 1: Invalid storage mode
+    with pytest.raises(ValueError, match="Invalid storage_mode.*Supported modes: quantized_only, quantized_with_raw"):
+        invalid_config = {
+            'type': 'pq',
+            'subvectors': 8,
+            'bits': 8,
+            'training_size': 1000,
+            'storage_mode': 'invalid_mode'
+        }
+        vdb.create("hnsw", dim=256, quantization_config=invalid_config)
+    
+    # Test 2: Case insensitive storage mode (should work)
+    case_variants = ['QUANTIZED_ONLY', 'Quantized_With_Raw', 'quantized_ONLY']
+    
+    for variant in case_variants:
+        try:
+            config = {
+                'type': 'pq',
+                'subvectors': 8,
+                'bits': 8,
+                'training_size': 1000,
+                'storage_mode': variant
+            }
+            
+            with pytest.warns(UserWarning):  # Expect compression warning
+                index = vdb.create("hnsw", dim=256, quantization_config=config)
+            
+            assert index is not None
+            # Storage mode should be normalized to lowercase
+            quant_info = index.get_quantization_info()
+            assert quant_info is not None
+            
+        except Exception as e:
+            pytest.fail(f"Case insensitive storage mode '{variant}' should work, but got: {e}")
+    
+    # Test 3: Default storage mode behavior (no storage_mode specified)
+    default_config = {
+        'type': 'pq',
+        'subvectors': 4,
+        'bits': 8,
+        'training_size': 1000
+        # No storage_mode specified - should default to quantized_only
+    }
+    
+    with pytest.warns(UserWarning, match="Very high compression ratio.*128.0x"):
+        default_index = vdb.create("hnsw", dim=128, quantization_config=default_config)
+    
+    # Add training data
+    training_data = []
+    for i in range(1200):
+        training_data.append({
+            "id": f"default_doc_{i}",
+            "vector": np.random.rand(128).astype(np.float32).tolist(),
+            "metadata": {"type": "default_test"}
+        })
+    
+    result = default_index.add(training_data)
+    assert result.is_success()
+    
+    # Should behave like quantized_only (default)
+    stats = default_index.get_stats()
+    assert stats["storage_mode"] == "quantized_only"
+    assert int(stats["raw_vectors_stored"]) == 1000  # Only training vectors stored
+    assert int(stats["quantized_codes_stored"]) == 1200  # All vectors quantized
+    
+    # Test 4: Storage mode with backward compatibility (no quantization)
+    no_quant_index = vdb.create("hnsw", dim=64)  # No quantization config
+    
+    no_quant_stats = no_quant_index.get_stats()
+    assert no_quant_stats["quantization_type"] == "none"
+    assert no_quant_stats["storage_mode"] == "raw_only"
+    
+    # Add some data
+    no_quant_data = [
+        {"id": "raw_1", "vector": np.random.rand(64).tolist(), "metadata": {"type": "raw"}},
+        {"id": "raw_2", "vector": np.random.rand(64).tolist(), "metadata": {"type": "raw"}},
+    ]
+    
+    result = no_quant_index.add(no_quant_data)
+    assert result.is_success()
+    
+    # Should store everything as raw vectors
+    updated_stats = no_quant_index.get_stats()
+    assert int(updated_stats["raw_vectors_stored"]) == 2
+    assert int(updated_stats["quantized_codes_stored"]) == 0
+    
+    # Search should still work
+    query = np.random.rand(64).tolist()
+    search_results = no_quant_index.search(query, top_k=2)
+    assert len(search_results) == 2
+    
+    # Test 5: Storage mode transitions during lifecycle
+    transition_config = {
+        'type': 'pq',
+        'subvectors': 8,
+        'bits': 8,
+        'training_size': 1000,
+        'storage_mode': 'quantized_with_raw'
+    }
+    
+    with pytest.warns(UserWarning):
+        transition_index = vdb.create("hnsw", dim=192, quantization_config=transition_config)
+    
+    # Before training: should be in collecting mode
+    assert transition_index.get_storage_mode() == "raw_collecting_for_training"
+    assert not transition_index.is_quantized()
+    
+    # Add training data
+    pre_training_data = []
+    for i in range(500):  # Less than training_size
+        pre_training_data.append({
+            "id": f"pre_{i}",
+            "vector": np.random.rand(192).tolist(),
+            "metadata": {"phase": "pre_training"}
+        })
+    
+    result = transition_index.add(pre_training_data)
+    assert result.is_success()
+    
+    # Still collecting
+    assert not transition_index.is_training_ready()
+    assert transition_index.get_storage_mode() == "raw_collecting_for_training"
+    
+    # Complete training
+    post_training_data = []
+    for i in range(500, 1000):
+        post_training_data.append({
+            "id": f"post_{i}",
+            "vector": np.random.rand(192).tolist(),
+            "metadata": {"phase": "complete_training"}
+        })
+    
+    result = transition_index.add(post_training_data)
+    assert result.is_success()
+    
+    # Should now be quantized and active
+    assert transition_index.is_quantized()
+    assert transition_index.get_storage_mode() == "quantized_active"
+    
+    # Add post-training data to test storage mode behavior
+    final_data = []
+    for i in range(1000, 1100):
+        final_data.append({
+            "id": f"final_{i}",
+            "vector": np.random.rand(192).tolist(),
+            "metadata": {"phase": "post_training"}
+        })
+    
+    result = transition_index.add(final_data)
+    assert result.is_success()
+    
+    # Verify quantized_with_raw behavior: should store all vectors
+    final_stats = transition_index.get_stats()
+    assert int(final_stats["raw_vectors_stored"]) == 1100  # All vectors stored
+    assert int(final_stats["quantized_codes_stored"]) == 1100  # All vectors quantized
+    assert final_stats["storage_mode"] == "quantized_with_raw"

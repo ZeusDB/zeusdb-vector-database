@@ -1,6 +1,6 @@
 [package]
 name = "zeusdb-vector-database"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 resolver = "2" # <-- Avoid compiling unnecessary features from dependencies.
 
@@ -17,6 +17,7 @@ serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 rayon = "1.10"
 rand = "0.9.1"
+bincode = "2.0.1"
 
 [profile.release]
 lto = true # <-- Enable Link-Time Optimization
