@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.2.1] - 2025-
+## [0.2.1] - 2025-07-30
 
 ### Added
 - Storage mode configuration for product quantization: New storage_mode parameter in quantization config allows users to choose between:
@@ -36,9 +36,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - None value handling: Python config cleaning now properly removes `None` values before passing to Rust backend
 - Constructor parameter validation: Improved error handling for missing or invalid quantization parameters
 - Memory statistics accuracy: Corrected memory usage calculations based on actual storage mode behavior
-
-### Removed
-<!-- Add removals/deprecations here -->
 
 ---
 
