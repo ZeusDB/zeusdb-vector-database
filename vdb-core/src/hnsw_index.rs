@@ -9,9 +9,22 @@ use serde_json::Value;
 use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
 use chrono::Utc;
+use std::path::Path;
+use hnsw_rs::api::AnnT;  // This provides the file_dump method
 
 // Import PQ module
 use crate::pq::PQ;
+
+// ============================================================================
+// VERSION COUNTER - MANUALLY INCREMENT TO TEST BUILD UPDATES
+// ============================================================================
+
+// 🔢 MANUAL VERSION COUNTER - Change this number after each code change
+const CODE_VERSION_COUNTER: u32 = 1002;  // ← INCREMENT THIS MANUALLY
+const CODE_VERSION_DESCRIPTION: &str = "change max_layers to 16";
+
+// ============================================================================
+
 
 // DEBUG LOGGER
 // To enable: set ZEUSDB_DEBUG=1 (or any value) in your environment before running your program.
@@ -523,7 +536,12 @@ impl HNSWIndex {
             (None, None)
         };
 
-        let max_layer = (expected_size as f32).log2().ceil() as usize;
+        //let max_layer = (expected_size as f32).log2().ceil() as usize;
+        // let calculated_max_layer = (expected_size as f32).log2().ceil() as usize;
+        // let max_layer = std::cmp::min(calculated_max_layer, 16); // Cap at 16
+        // println!("DEBUG: calculated_max_layer={}, using max_layer={}", calculated_max_layer, max_layer);
+        let max_layer = 16; // Always use NB_LAYER_MAX for hnsw-rs compatibility
+        println!("DEBUG: Using max_layer={} for hnsw-rs dump compatibility", max_layer);
 
 
         // Create initial raw HNSW index (will be rebuilt as PQ after training)
@@ -628,7 +646,13 @@ impl HNSWIndex {
             ))?;
 
         // Create new PQ-based HNSW index
-        let max_layer = (self.expected_size as f32).log2().ceil() as usize;
+        //let max_layer = (self.expected_size as f32).log2().ceil() as usize;
+        // let calculated_max_layer = (self.expected_size as f32).log2().ceil() as usize;
+        // let max_layer = std::cmp::min(calculated_max_layer, 16); // Cap at 16
+        // println!("DEBUG rebuild_with_quantization: calculated_max_layer={}, using max_layer={}", calculated_max_layer, max_layer);
+        let max_layer = 16; // Always use NB_LAYER_MAX for consistency
+        println!("DEBUG rebuild_with_quantization: using max_layer={}", max_layer);
+
         let new_hnsw = DistanceType::new_pq(
             &self.space, 
             self.m, 
@@ -1001,40 +1025,25 @@ impl HNSWIndex {
 
 
 
-    /// Save the index to a .zdb directory structure
-    pub fn save(&self, path: &str) -> PyResult<()> {
-        crate::persistence::save_index(self, path)
-    }
-
-    // /// Test method to verify PyO3 binding works
-    // pub fn test_save_binding(&self) -> String {
-    //     "PyO3 binding works!".to_string()
-    // }
-
     // /// Save the index to a .zdb directory structure
     // pub fn save(&self, path: &str) -> PyResult<()> {
-    //     // Try simple version first to test if the issue is with persistence module
-    //     // crate::persistence::save_index(self, path)
-
-    //     // Simple test version
-    //     std::fs::create_dir_all(path).map_err(|e| {
-    //         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-    //             format!("Failed to create directory {}: {}", path, e)
-    //         )
-    //     })?;
-
-    //     // Write a simple test file
-    //     std::fs::write(
-    //         format!("{}/test.txt", path), 
-    //         "Save method works!"
-    //     ).map_err(|e| {
-    //         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-    //             format!("Failed to write test file: {}", e)
-    //         )
-    //     })?;
-
-    //     Ok(())
+    //     crate::persistence::save_index(self, path)
     // }
+
+    /// Enhanced Save method to include HNSW Graph
+    pub fn save(&self, path: &str) -> PyResult<()> {
+
+        let path_buf = Path::new(path);
+
+        // Phase 1: Save all ZeusDB components (already tested to work)
+        crate::persistence::save_index(self, path)?;
+
+        // Phase 2: Save HNSW graph using hnsw-rs native dump
+        self.save_hnsw_graph(path_buf)?;
+
+        println!("✅ Phase 2 enhanced save completed successfully!");
+        Ok(())
+    }
 
 
 
@@ -1401,10 +1410,21 @@ impl HNSWIndex {
 
     
     
-    /// Simple test method
-    pub fn debug_test(&self) -> String {
-        "debug works".to_string()
+    // /// Simple test method
+    // pub fn debug_test(&self) -> String {
+    //     "debug works".to_string()
+    // }
+
+    /// Get current code version counter to verify build updates
+    pub fn get_code_version(&self) -> String {
+        format!("Version: {}, Description: {}", CODE_VERSION_COUNTER, CODE_VERSION_DESCRIPTION)
     }
+
+    /// Get just the version number for quick checking
+    pub fn get_version_number(&self) -> u32 {
+        CODE_VERSION_COUNTER
+    }
+
 }
 
 
@@ -1620,34 +1640,6 @@ impl HNSWIndex {
 
         Ok(())
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -2841,6 +2833,62 @@ impl HNSWIndex {
     pub fn load(path: &str) -> PyResult<Self> {
         crate::persistence::load_index(path)
     }
+
+    /// Save HNSW graph using hnsw-rs native file_dump
+    fn save_hnsw_graph(&self, path: &Path) -> PyResult<()> {
+        println!("📊 Saving HNSW graph structure...");
+
+        let hnsw_guard = self.hnsw.lock().unwrap();
+
+        let dump_result = match &*hnsw_guard {
+            DistanceType::Cosine(hnsw) => {
+                println!("   Using Cosine distance HNSW");
+                hnsw.file_dump(path, "hnsw_index")
+            },
+            DistanceType::L2(hnsw) => {
+                println!("   Using L2 distance HNSW");
+                hnsw.file_dump(path, "hnsw_index")
+            },
+            DistanceType::L1(hnsw) => {
+                println!("   Using L1 distance HNSW");
+                hnsw.file_dump(path, "hnsw_index")
+            },
+            DistanceType::CosinePQ(hnsw) => {
+                println!("   Using Cosine-PQ distance HNSW");
+                hnsw.file_dump(path, "hnsw_index")
+            },
+            DistanceType::L2PQ(hnsw) => {
+                println!("   Using L2-PQ distance HNSW");
+                hnsw.file_dump(path, "hnsw_index")
+            },
+            DistanceType::L1PQ(hnsw) => {
+                println!("   Using L1-PQ distance HNSW");
+                hnsw.file_dump(path, "hnsw_index")
+            },
+        };
+
+        match dump_result {
+            Ok(basename) => {
+                println!("✅ HNSW graph saved successfully!");
+                println!("   Files created:");
+                println!("     - {}.hnsw.graph (graph structure)", basename);
+                println!("     - {}.hnsw.data (ignored - we use our own data)", basename);
+                Ok(())
+            }
+            Err(e) => {
+                println!("❌ HNSW graph dump failed: {}", e);
+                Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("HNSW graph dump failed: {}", e)
+                ))
+            }
+        }
+    }
+
+
+
+
+
+
 
     // ============================================================================
     // PERSISTENCE GETTERS - For accessing private fields from persistence module
