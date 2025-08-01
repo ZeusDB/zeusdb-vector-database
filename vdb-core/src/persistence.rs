@@ -426,6 +426,16 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
     } else {
         files_excluded.push("vectors.bin".to_string());
     }
+
+    // Phase 2: Add HNSW graph files
+    files_included.push("hnsw_index.hnsw.graph".to_string());
+
+    // We deliberately exclude hnsw_index.hnsw.data since we manage our own data
+    files_excluded.push("hnsw_index.hnsw.data".to_string());
+
+    println!("📋 Graph files in manifest:");
+    println!("   ✅ Included: hnsw_index.hnsw.graph");
+    println!("   ❌ Excluded: hnsw_index.hnsw.data (we use our own data files)");
     
     // Calculate compression info for quantized indexes
     let compression_info = if index.has_quantization() && index.can_use_quantization() && !pq_codes.is_empty() {
