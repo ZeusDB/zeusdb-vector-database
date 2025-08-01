@@ -18,6 +18,7 @@ serde = { version = "1.0", features = ["derive"] }
 rayon = "1.10"
 rand = "0.9.1"
 bincode = "2.0.1"
+chrono = { version = "0.4.41", features = ["serde"] } # <-- For timestamps
 
 [profile.release]
 lto = true # <-- Enable Link-Time Optimization
