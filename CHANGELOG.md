@@ -10,13 +10,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.2] - 2025-08
 
 ### Added
-<!-- Add new features here -->
+- `save()` method to `HNSWIndex` for persisting index state to disk via Python and Rust.
+- New `persistence.rs` module implementing index save/load logic, including manifest and file structure generation.
+- PyO3 bindings for persistence-related methods, exposing them to Python.
+- Internal unit tests for the `save` function to ensure correct file output and manifest validation.
+- HNSW graph structure persistence via native hnsw-rs file_dump() integration
+- Enhanced save workflow with Phase 2 graph serialization support
+- Comprehensive Phase 2 integration test suite for full persistence validation
 
 ### Changed
-<!-- Add changed behavior here -->
+- Refactored `hnsw_index.rs` to integrate persistence logic and support serialization.
+- Updated `lib.rs` to register the persistence module and ensure all new methods are exposed to Python.
+- Enhanced error handling and docstrings for persistence operations.
+- Modified HNSW initialization to use fixed max_layer=16 for hnsw-rs dump compatibility
+- Updated manifest generation to include HNSW graph files (.hnsw.graph) and exclude data files (.hnsw.data)
+- Enhanced save_manifest() with graph file tracking and size calculation
 
 ### Fixed
-<!-- Add bug fixes here -->
+- Improved reliability of index serialization and file output.
+- Addressed edge cases in directory creation and file writing during persistence.
+- Resolved critical "nb_layer != NB_MAX_LAYER" error preventing HNSW graph dumps
+- Fixed layer count compatibility issue between ZeusDB and hnsw-rs library requirements
+- Enabled successful HNSW graph structure serialization for graph files
 
 ### Removed
 <!-- Add removals/deprecations here -->
