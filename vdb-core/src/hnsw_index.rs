@@ -3,16 +3,15 @@ use pyo3::types::{PyDict, PyList};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use std::collections::HashMap;
 use std::sync::{Mutex, RwLock, Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
 use hnsw_rs::prelude::{Hnsw, DistCosine, DistL2, DistL1, Distance};
 use serde_json::Value;
 use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
+use chrono::Utc;
 
 // Import PQ module
 use crate::pq::PQ;
-
-// Part of the rust library so no need to specify in cargo.toml
-use std::sync::atomic::{AtomicBool, Ordering};
 
 // DEBUG LOGGER
 // To enable: set ZEUSDB_DEBUG=1 (or any value) in your environment before running your program.
@@ -407,6 +406,9 @@ pub struct HNSWIndex {
     training_ids: RwLock<Vec<String>>,          // Just IDs, not vectors
     training_threshold_reached: AtomicBool,     // Atomic flag for safety
 
+    // Timestamp when the index was created
+    created_at: String,
+
 }
 
 
@@ -548,6 +550,7 @@ impl HNSWIndex {
             hnsw: Mutex::new(hnsw),
             training_ids: RwLock::new(Vec::new()),
             training_threshold_reached: AtomicBool::new(false),
+            created_at: Utc::now().to_rfc3339(),
         })
     }
 
@@ -992,53 +995,54 @@ impl HNSWIndex {
 
 
 
-    // /// Get records by ID(s) with PQ reconstruction support
-    // #[pyo3(signature = (input, return_vector = true))]
-    // pub fn get_records(&self, py: Python<'_>, input: &Bound<PyAny>, return_vector: bool) -> PyResult<Vec<Py<PyDict>>> {
-    //     let ids: Vec<String> = if let Ok(id_str) = input.extract::<String>() {
-    //         vec![id_str]
-    //     } else if let Ok(id_list) = input.extract::<Vec<String>>() {
-    //         id_list
-    //     } else {
-    //         return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-    //             "Expected a string or a list of strings for ID(s)",
-    //         ));
-    //     };
 
-    //     let mut records = Vec::with_capacity(ids.len());
-        
-    //     // Use read locks for concurrent access
-    //     let vectors = self.vectors.read().unwrap();
-    //     let pq_codes = self.pq_codes.read().unwrap();
-    //     let vector_metadata = self.vector_metadata.read().unwrap();
 
-    //     for id in ids {
-    //         if let Some(vector) = vectors.get(&id) {
-    //             let metadata = vector_metadata.get(&id).cloned().unwrap_or_default();
 
-    //             let dict = PyDict::new(py);
-    //             dict.set_item("id", id.clone())?;
-    //             dict.set_item("metadata", self.value_map_to_python(&metadata, py)?)?;
 
-    //             if return_vector {
-    //                 // Try raw vector first, then PQ reconstruction
-    //                 let vector_data = if !vector.is_empty() {
-    //                     vector.clone()
-    //                 } else if let (Some(pq), Some(codes)) = (&self.pq, pq_codes.get(&id)) {
-    //                     pq.reconstruct(codes).unwrap_or_else(|_| vector.clone())
-    //                 } else {
-    //                     vector.clone()
-    //                 };
-                    
-    //                 dict.set_item("vector", vector_data)?;
-    //             }
 
-    //             records.push(dict.into());
-    //         }
-    //     }
 
-    //     Ok(records)
+    /// Save the index to a .zdb directory structure
+    pub fn save(&self, path: &str) -> PyResult<()> {
+        crate::persistence::save_index(self, path)
+    }
+
+    // /// Test method to verify PyO3 binding works
+    // pub fn test_save_binding(&self) -> String {
+    //     "PyO3 binding works!".to_string()
     // }
+
+    // /// Save the index to a .zdb directory structure
+    // pub fn save(&self, path: &str) -> PyResult<()> {
+    //     // Try simple version first to test if the issue is with persistence module
+    //     // crate::persistence::save_index(self, path)
+
+    //     // Simple test version
+    //     std::fs::create_dir_all(path).map_err(|e| {
+    //         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+    //             format!("Failed to create directory {}: {}", path, e)
+    //         )
+    //     })?;
+
+    //     // Write a simple test file
+    //     std::fs::write(
+    //         format!("{}/test.txt", path), 
+    //         "Save method works!"
+    //     ).map_err(|e| {
+    //         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+    //             format!("Failed to write test file: {}", e)
+    //         )
+    //     })?;
+
+    //     Ok(())
+    // }
+
+
+
+
+
+
+
+
 
 
 
@@ -1104,74 +1108,6 @@ impl HNSWIndex {
         Ok(records)
     }
 
-
-
-
-
-
-
-
-
-
-
-
-    // /// Enhanced get_stats with training info
-    // pub fn get_stats(&self) -> HashMap<String, String> {
-    //     let mut stats = HashMap::new();
-
-    //     let vectors = self.vectors.read().unwrap();
-    //     let pq_codes = self.pq_codes.read().unwrap();
-    //     let vector_count = *self.vector_count.lock().unwrap();
-    //     let training_ids = self.training_ids.read().unwrap();
-
-    //     // Basic stats
-    //     stats.insert("total_vectors".to_string(), vector_count.to_string());
-    //     stats.insert("dimension".to_string(), self.dim.to_string());
-    //     stats.insert("expected_size".to_string(), self.expected_size.to_string());
-    //     stats.insert("space".to_string(), self.space.clone());
-    //     stats.insert("index_type".to_string(), "HNSW".to_string());
-
-    //     stats.insert("m".to_string(), self.m.to_string());
-    //     stats.insert("ef_construction".to_string(), self.ef_construction.to_string());
-    //     stats.insert("thread_safety".to_string(), "RwLock+Mutex".to_string());
-
-    //     // Storage breakdown
-    //     stats.insert("raw_vectors_stored".to_string(), vectors.len().to_string());
-    //     stats.insert("quantized_codes_stored".to_string(), pq_codes.len().to_string());
-
-    //     // Training info
-    //     if let Some(config) = &self.quantization_config {
-    //         stats.insert("quantization_type".to_string(), "pq".to_string());
-    //         stats.insert("quantization_training_size".to_string(), config.training_size.to_string());
-
-    //         let collected_count = training_ids.len();
-    //         let progress = self.get_training_progress();
-    //         stats.insert("training_progress".to_string(), 
-    //             format!("{}/{} ({:.1}%)", collected_count, config.training_size, progress));
-            
-    //         let vectors_needed = self.training_vectors_needed();
-    //         stats.insert("training_vectors_needed".to_string(), vectors_needed.to_string());
-    //         stats.insert("training_threshold_reached".to_string(), 
-    //             self.training_threshold_reached.load(Ordering::Acquire).to_string());
-            
-    //         if let Some(pq) = &self.pq {
-    //             let is_trained = pq.is_trained();
-    //             stats.insert("quantization_trained".to_string(), is_trained.to_string());
-    //             stats.insert("quantization_active".to_string(), self.is_quantized().to_string());
-
-    //             if is_trained {
-    //                 let compression_ratio = (pq.dim * 4) as f64 / pq.subvectors as f64;
-    //                 stats.insert("quantization_compression_ratio".to_string(), format!("{:.1}x", compression_ratio));
-    //             }
-    //         }
-    //     } else {
-    //         stats.insert("quantization_type".to_string(), "none".to_string());
-    //     }
-
-    //     stats.insert("storage_mode".to_string(), self.get_storage_mode());
-
-    //     stats
-    // }
 
 
 
@@ -1255,59 +1191,6 @@ impl HNSWIndex {
         stats
     }
             
-
-        
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -1515,6 +1398,13 @@ impl HNSWIndex {
         
         results
     }
+
+    
+    
+    /// Simple test method
+    pub fn debug_test(&self) -> String {
+        "debug works".to_string()
+    }
 }
 
 
@@ -1673,58 +1563,6 @@ impl HNSWIndex {
         Ok(())
     }
 
-    // /// Path C: Quantized storage (trained and active)
-    // fn add_quantized_vector(
-    //     &mut self,
-    //     id: String,
-    //     vector: Vec<f32>,  // Already processed
-    //     metadata: HashMap<String, Value>
-    // ) -> PyResult<()> {
-    //     let internal_id = self.get_next_id();
-
-    //     // Store metadata
-    //     {
-    //         let mut vector_metadata = self.vector_metadata.write().unwrap();
-    //         vector_metadata.insert(id.clone(), metadata);
-    //     }
-
-    //     // Update ID mappings
-    //     {
-    //         let mut id_map = self.id_map.write().unwrap();
-    //         let mut rev_map = self.rev_map.write().unwrap();
-
-    //         id_map.insert(id.clone(), internal_id);
-    //         rev_map.insert(internal_id, id.clone());
-    //     }
-
-    //     // Quantize the vector
-    //     let pq = self.pq.as_ref().unwrap();
-    //     let codes = pq.quantize(&vector).map_err(|e| {
-    //         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-    //             format!("Failed to quantize vector: {}", e)
-    //         )
-    //     })?;
-
-    //     // Store quantized codes
-    //     {
-    //         let mut pq_codes = self.pq_codes.write().unwrap();
-    //         pq_codes.insert(id.clone(), codes.clone());
-    //     }
-
-    //     // Store raw vector for exact reconstruction (persistence-ready)
-    //     {
-    //         let mut vectors = self.vectors.write().unwrap();
-    //         vectors.insert(id, vector.clone());
-    //     }
-
-    //     // Insert codes into quantized HNSW
-    //     {
-    //         let mut hnsw_guard = self.hnsw.lock().unwrap();
-    //         hnsw_guard.insert_pq_codes(&codes, internal_id);
-    //     }
-
-    //     Ok(())
-    // }
 
 
     /// Path C: Quantized storage with configurable raw vector retention
@@ -2995,6 +2833,97 @@ impl HNSWIndex {
 
         Ok(output)
     }
+
+
+    // 6. PERSISTENCE INTEGRATION METHODS (2 methods)
+
+    /// Load an index from a .zdb directory structure (Phase 2)
+    pub fn load(path: &str) -> PyResult<Self> {
+        crate::persistence::load_index(path)
+    }
+
+    // ============================================================================
+    // PERSISTENCE GETTERS - For accessing private fields from persistence module
+    // ============================================================================
+
+    /// Get the vector dimension
+    pub fn get_dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Get the distance space (cosine, l2, l1)
+    pub fn get_space(&self) -> &str {
+        &self.space
+    }
+
+    /// Get the maximum number of bidirectional links per node
+    pub fn get_m(&self) -> usize {
+        self.m
+    }
+
+    /// Get the construction parameter ef_construction
+    pub fn get_ef_construction(&self) -> usize {
+        self.ef_construction
+    }
+
+    /// Get the expected size parameter
+    pub fn get_expected_size(&self) -> usize {
+        self.expected_size
+    }
+
+    /// Get the current ID counter value (thread-safe)
+    pub fn get_id_counter(&self) -> usize {
+        *self.id_counter.lock().unwrap()
+    }
+
+    /// Get read access to the vectors HashMap (thread-safe)
+    pub fn get_vectors(&self) -> std::sync::RwLockReadGuard<HashMap<String, Vec<f32>>> {
+        self.vectors.read().unwrap()
+    }
+
+    /// Get read access to the PQ codes HashMap (thread-safe)
+    pub fn get_pq_codes(&self) -> std::sync::RwLockReadGuard<HashMap<String, Vec<u8>>> {
+        self.pq_codes.read().unwrap()
+    }
+
+    /// Get read access to the vector metadata HashMap (thread-safe)
+    pub fn get_vector_metadata(&self) -> std::sync::RwLockReadGuard<HashMap<String, HashMap<String, Value>>> {
+        self.vector_metadata.read().unwrap()
+    }
+
+    /// Get read access to the ID map (external ID -> internal ID)
+    pub fn get_id_map(&self) -> std::sync::RwLockReadGuard<HashMap<String, usize>> {
+        self.id_map.read().unwrap()
+    }
+
+    /// Get read access to the reverse ID map (internal ID -> external ID)
+    pub fn get_rev_map(&self) -> std::sync::RwLockReadGuard<HashMap<usize, String>> {
+        self.rev_map.read().unwrap()
+    }
+
+    /// Get reference to the quantization configuration
+    pub fn get_quantization_config(&self) -> Option<&QuantizationConfig> {
+        self.quantization_config.as_ref()
+    }
+
+    /// Get reference to the PQ instance
+    pub fn get_pq(&self) -> Option<&Arc<crate::pq::PQ>> {
+        self.pq.as_ref()
+    }
+
+    /// Helper to get quantization subvectors count
+    pub fn get_quantization_subvectors(&self) -> usize {
+        self.quantization_config
+            .as_ref()
+            .map(|config| config.subvectors)
+            .unwrap_or(1)
+    }
+
+    /// Get the index creation timestamp
+    pub fn get_created_at(&self) -> &str {
+        &self.created_at
+    }
+
 
 
 }
