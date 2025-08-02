@@ -9,5 +9,9 @@ use pyo3::prelude::*;
 fn zeusdb_vector_database(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<hnsw_index::HNSWIndex>()?;
     m.add_class::<hnsw_index::AddResult>()?;
+
+    // Add the load_index function directly
+    m.add_function(wrap_pyfunction!(persistence::load_index, m)?)?;
+    
     Ok(())
 }
