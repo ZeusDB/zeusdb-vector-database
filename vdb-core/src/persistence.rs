@@ -109,6 +109,159 @@ pub struct IdMappings {
     pub rev_map: HashMap<usize, String>,
 }
 
+
+// ============================================================================
+// INDIVIDUAL COMPONENT LOADERS (Phase 2)
+// ============================================================================
+
+/// Load index configuration from config.json
+fn load_config(path: &Path) -> PyResult<IndexConfig> {
+    println!("⚙️  Loading config.json...");
+    
+    let config_path = path.join("config.json");
+    let config_data = fs::read_to_string(&config_path).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
+            format!("Failed to read config.json: {}", e)
+        )
+    })?;
+    
+    let config: IndexConfig = serde_json::from_str(&config_data).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("Failed to parse config.json: {}", e)
+        )
+    })?;
+    
+    println!("✅ config.json loaded");
+    Ok(config)
+}
+
+/// Load ID mappings from mappings.bin
+fn load_mappings(path: &Path) -> PyResult<IdMappings> {
+    println!("🗂️  Loading mappings.bin...");
+    
+    let mappings_path = path.join("mappings.bin");
+    let mappings_data = fs::read(&mappings_path).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
+            format!("Failed to read mappings.bin: {}", e)
+        )
+    })?;
+    
+    let (mappings, _): (IdMappings, usize) = bincode::decode_from_slice(&mappings_data, bincode::config::standard())
+        .map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to deserialize mappings.bin: {}", e)
+            )
+        })?;
+    
+    println!("✅ mappings.bin loaded");
+    Ok(mappings)
+}
+
+/// Load vector metadata from metadata.json
+fn load_metadata(path: &Path) -> PyResult<HashMap<String, HashMap<String, Value>>> {
+    println!("📋 Loading metadata.json...");
+    
+    let metadata_path = path.join("metadata.json");
+    let metadata_data = fs::read_to_string(&metadata_path).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
+            format!("Failed to read metadata.json: {}", e)
+        )
+    })?;
+    
+    let metadata: HashMap<String, HashMap<String, Value>> = serde_json::from_str(&metadata_data).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("Failed to parse metadata.json: {}", e)
+        )
+    })?;
+    
+    println!("✅ metadata.json loaded");
+    Ok(metadata)
+}
+
+/// Load raw vectors from vectors.bin
+fn load_vectors(path: &Path) -> PyResult<HashMap<String, Vec<f32>>> {
+    println!("📊 Loading vectors.bin...");
+    
+    let vectors_path = path.join("vectors.bin");
+    
+    // Check if vectors.bin exists (might not exist in quantized_only mode)
+    if !vectors_path.exists() {
+        println!("ℹ️  vectors.bin not found (quantized_only storage mode)");
+        return Ok(HashMap::new());
+    }
+    
+    let vectors_data = fs::read(&vectors_path).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
+            format!("Failed to read vectors.bin: {}", e)
+        )
+    })?;
+    
+    let (vectors, _): (HashMap<String, Vec<f32>>, usize) = bincode::decode_from_slice(&vectors_data, bincode::config::standard())
+        .map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to deserialize vectors.bin: {}", e)
+            )
+        })?;
+    
+    println!("✅ vectors.bin loaded");
+    Ok(vectors)
+}
+
+/// Load manifest for validation and metadata
+fn load_manifest(path: &Path) -> PyResult<IndexManifest> {
+    println!("📝 Loading manifest.json...");
+    
+    let manifest_path = path.join("manifest.json");
+    let manifest_data = fs::read_to_string(&manifest_path).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
+            format!("Failed to read manifest.json: {}", e)
+        )
+    })?;
+    
+    let manifest: IndexManifest = serde_json::from_str(&manifest_data).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("Failed to parse manifest.json: {}", e)
+        )
+    })?;
+    
+    println!("✅ manifest.json loaded");
+    Ok(manifest)
+}
+
+/// Load quantization configuration and components (for later implementation)
+fn load_quantization(path: &Path) -> PyResult<Option<QuantizationPersistence>> {
+    println!("🔧 Loading quantization components...");
+    
+    let quant_path = path.join("quantization.json");
+    if !quant_path.exists() {
+        println!("ℹ️  No quantization.json found (non-quantized index)");
+        return Ok(None);
+    }
+    
+    let quant_data = fs::read_to_string(&quant_path).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
+            format!("Failed to read quantization.json: {}", e)
+        )
+    })?;
+    
+    let quant_config: QuantizationPersistence = serde_json::from_str(&quant_data).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("Failed to parse quantization.json: {}", e)
+        )
+    })?;
+    
+    println!("✅ quantization.json loaded");
+    
+    // TODO: Load PQ centroids and codes if they exist
+    // This will be implemented when we handle quantization reconstruction
+    
+    Ok(Some(quant_config))
+}
+
+
+
+
+
 // ============================================================================
 // MAIN PERSISTENCE INTERFACE
 // ============================================================================
@@ -150,13 +303,85 @@ pub fn save_index(index: &HNSWIndex, path: &str) -> PyResult<()> {
     Ok(())
 }
 
+
+
+// ============================================================================
+// LOAD INTERFACE
+// ============================================================================
+
+// /// Load an HNSWIndex from a directory structure (Phase 2 implementation)
+// pub fn load_index(_path: &str) -> PyResult<HNSWIndex> {
+//     // TODO: Implement in Phase 2
+//     Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+//         "Index loading not yet implemented - coming in Phase 2!"
+//     ))
+// }
+
 /// Load an HNSWIndex from a directory structure (Phase 2 implementation)
-pub fn load_index(_path: &str) -> PyResult<HNSWIndex> {
-    // TODO: Implement in Phase 2
+#[pyfunction]
+pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
+    println!("🚀 Starting Phase 2 enhanced load from: {}", path);
+    
+    let path_buf = Path::new(path);
+    
+    // Validate directory exists
+    if !path_buf.exists() {
+        return Err(PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
+            format!("Index directory not found: {}", path)
+        ));
+    }
+    
+    // Phase 1: Load all ZeusDB components using our helper functions
+    println!("📋 Phase 1: Loading ZeusDB components...");
+    
+    let manifest = load_manifest(path_buf)?;
+    println!("✅ Manifest loaded: {} vectors, format v{}", 
+             manifest.total_vectors, manifest.format_version);
+    
+    let config = load_config(path_buf)?;
+    println!("✅ Config loaded: dim={}, space={}", config.dim, config.space);
+    
+    let mappings = load_mappings(path_buf)?;
+    println!("✅ Mappings loaded: {} ID mappings", mappings.id_map.len());
+    
+    let metadata = load_metadata(path_buf)?;
+    println!("✅ Metadata loaded: {} records", metadata.len());
+    
+    let vectors = load_vectors(path_buf)?;
+    println!("✅ Vectors loaded: {} vectors", vectors.len());
+    
+    // Check for quantization
+    let quantization = load_quantization(path_buf)?;
+    if let Some(ref quant) = quantization {
+        println!("✅ Quantization loaded: {} subvectors, trained={}", 
+                 quant.subvectors, quant.is_trained);
+    } else {
+        println!("ℹ️  No quantization found (raw vectors only)");
+    }
+
+    // Validation
+
+    if mappings.id_map.len() != metadata.len() {
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("Data consistency error: {} mappings vs {} metadata records", 
+                   mappings.id_map.len(), metadata.len())
+        ));
+    }
+    
+    println!("✅ All components loaded and validated successfully!");
+    
+    // TODO: Phase 2 - Load and reconstruct HNSW graph
+    println!("⚠️  Phase 2 load: Component loading complete!");
+    println!("   Next: Add HNSW graph loading and index reconstruction");
+    
     Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-        "Index loading not yet implemented - coming in Phase 2!"
+        "Basic component loading working! Next: add graph loading and reconstruction."
     ))
 }
+
+
+
+
 
 // ============================================================================
 // INDIVIDUAL COMPONENT SAVERS
