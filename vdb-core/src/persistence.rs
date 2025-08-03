@@ -28,6 +28,10 @@ use serde_json::Value;
 
 use crate::hnsw_index::{HNSWIndex, StorageMode};
 
+use hnsw_rs::hnswio::{HnswIo, ReloadOptions};
+use hnsw_rs::hnsw::{Hnsw, NoData};
+use anndists::dist::NoDist;
+
 // ============================================================================
 // PERSISTENCE DATA STRUCTURES
 // ============================================================================
@@ -370,13 +374,50 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
     
     println!("✅ All components loaded and validated successfully!");
     
-    // TODO: Phase 2 - Load and reconstruct HNSW graph
-    println!("⚠️  Phase 2 load: Component loading complete!");
-    println!("   Next: Add HNSW graph loading and index reconstruction");
+    // // TODO: Phase 2 - Load and reconstruct HNSW graph
+    // println!("⚠️  Phase 2 load: Component loading complete!");
+    // println!("   Next: Add HNSW graph loading and index reconstruction");
     
+    // Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+    //     "Basic component loading working! Next: add graph loading and reconstruction."
+    // ))
+
+    // Phase 2: Load HNSW graph structure
+    println!("📊 Phase 2: Loading HNSW graph structure...");
+
+    let graph_path = path_buf.join("hnsw_index");
+    if !graph_path.with_extension("hnsw.graph").exists() {
+        return Err(PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
+            "HNSW graph file not found. Index may be corrupted or from an older version."
+        ));
+    }
+
+    // Load the graph structure using hnsw-rs NoData pattern
+    let mut hnsw_io = HnswIo::new(path_buf, "hnsw_index");
+    let options = ReloadOptions::default();
+    hnsw_io.set_options(options);
+
+    let graph_hnsw: Hnsw<NoData, NoDist> = hnsw_io.load_hnsw().map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("Failed to load HNSW graph: {}", e)
+        )
+    })?;
+
+    println!("✅ HNSW graph loaded: {} points", graph_hnsw.get_nb_point());
+
+    // Phase 3: Reconstruct full ZeusDB index
+    println!("🔧 Phase 3: Reconstructing ZeusDB index...");
+
+    // TODO: Create new HNSWIndex and populate it with our data + loaded graph
+    // This is where we'll integrate the loaded graph with our ZeusDB data structures
+
+    println!("⚠️  Phase 2 complete! Phase 3 reconstruction coming next...");
+
     Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-        "Basic component loading working! Next: add graph loading and reconstruction."
+        "HNSW graph loading working! Next: implement index reconstruction."
     ))
+
+
 }
 
 
