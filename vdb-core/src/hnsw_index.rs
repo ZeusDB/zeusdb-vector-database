@@ -20,8 +20,8 @@ use crate::pq::PQ;
 // ============================================================================
 
 // 🔢 MANUAL VERSION COUNTER - Change this number after each code change
-const CODE_VERSION_COUNTER: u32 = 1003;  // ← INCREMENT THIS MANUALLY
-const CODE_VERSION_DESCRIPTION: &str = "Update the load_index() placeholder in persistence.rs";
+const CODE_VERSION_COUNTER: u32 = 1004;  // ← INCREMENT THIS MANUALLY
+const CODE_VERSION_DESCRIPTION: &str = "Update the Load HNSW graph structure in persistence.rs";
 
 // ============================================================================
 
