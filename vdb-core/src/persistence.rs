@@ -24,20 +24,11 @@ use std::fs;
 use std::path::Path;
 use chrono::Utc;
 use serde_json::Value;
-
-//use crate::hnsw_index::{HNSWIndex, StorageMode};
-
-// use hnsw_rs::hnswio::{HnswIo, ReloadOptions};
-// use hnsw_rs::hnsw::{Hnsw, NoData};
-// use anndists::dist::NoDist;
-
 use pyo3::types::{PyDict, PyList};
-
 use std::sync::Arc;
 use crate::hnsw_index::{HNSWIndex, StorageMode, QuantizationConfig};
 use crate::pq::PQ;
 
-//use std::sync::atomic::Ordering;
 
 // ============================================================================
 // PERSISTENCE DATA STRUCTURES
@@ -276,8 +267,6 @@ fn load_quantization(path: &Path) -> PyResult<Option<QuantizationPersistence>> {
 
 
 
-
-
 // ============================================================================
 // MAIN PERSISTENCE INTERFACE
 // ============================================================================
@@ -321,48 +310,9 @@ pub fn save_index(index: &HNSWIndex, path: &str) -> PyResult<()> {
 
 
 
-
-
-
 // ============================================================================
 // RECONSTRUCTION FUNCTIONS
 // ============================================================================
-
-// /// Reconstruct a working HNSWIndex from loaded components
-// fn reconstruct_index(
-//     config: IndexConfig,
-//     _mappings: IdMappings,
-//     metadata: HashMap<String, HashMap<String, Value>>,
-//     vectors: HashMap<String, Vec<f32>>,
-//     quantization: Option<QuantizationPersistence>,
-//     _graph_hnsw: Hnsw<NoData, NoDist>, // We acknowledge the graph but don't use it
-// ) -> PyResult<HNSWIndex> {
-//     println!("🔧 Reconstructing HNSWIndex using industry standard approach...");
-//     println!("   Creating new index and rebuilding graph from data");
-    
-//     // Step 1: Create a new empty HNSWIndex with the loaded configuration
-//     println!("📊 Creating new HNSWIndex: dim={}, space={}, m={}", 
-//              config.dim, config.space, config.m);
-    
-//     // Handle quantization config if present
-//     let quant_config_dict = if let Some(ref quant) = quantization {
-//         Some(create_quantization_dict(quant)?)
-//     } else {
-//         None
-//     };
-    
-//     // Create the new index using the correct constructor
-//     let mut new_index = create_hnsw_index_from_config(&config, quant_config_dict)?;
-    
-//     // Step 2: Rebuild all internal state from loaded data
-//     println!("📝 Populating index with {} vectors", vectors.len());
-//     populate_index_data(&mut new_index, metadata, vectors)?;
-    
-//     println!("✅ Index reconstruction completed successfully!");
-//     println!("   Graph will be rebuilt automatically as vectors are accessed");
-    
-//     Ok(new_index)
-// }
 
 /// Reconstruct HNSWIndex using Simple Reconstruction 
 fn reconstruct_index_simple(
@@ -386,22 +336,16 @@ fn reconstruct_index_simple(
     println!("📝 Restoring data fields...");
     
     // Step 2: Restore all data fields directly (but not the graph)
-    //restore_data_fields(&mut index, mappings, metadata, vectors, &config, quantization)?;
     restore_data_fields(&mut index, mappings, metadata.clone(), vectors.clone(), &config, quantization)?;
     
     println!("🔄 Rebuilding HNSW graph from vectors...");
     
     // Step 3: Rebuild the graph by re-adding all vectors
-    //rebuild_graph_from_data(&mut index)?;
     rebuild_graph_from_data(&mut index, vectors, metadata)?;
     
     println!("✅ Reconstruction completed!");
     Ok(index)
 }
-
-
-
-
 
 
 
@@ -415,9 +359,6 @@ fn restore_data_fields(
     config: &IndexConfig,
     quantization: Option<QuantizationPersistence>,
 ) -> PyResult<()> {
-    // Restore data collections using setter methods
-    // index.set_vectors(vectors);
-    // index.set_vector_metadata(metadata);
     index.set_id_mappings(mappings.id_map, mappings.rev_map);
 
     // The add() method will properly:
@@ -437,76 +378,6 @@ fn restore_data_fields(
     println!("✅ All data fields restored successfully");
     Ok(())
 }
-
-
-
-
-
-
-
-// /// Restore quantization state (simplified for reconstruction)
-// fn restore_quantization_state_simple(
-//     index: &mut HNSWIndex,
-//     quant_data: QuantizationPersistence,
-// ) -> PyResult<()> {
-//     println!("🔧 Restoring quantization state...");
-    
-//     // Convert QuantizationPersistence back to QuantizationConfig
-//     let storage_mode = StorageMode::from_string(&quant_data.storage_mode)
-//         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-    
-//     let quant_config = QuantizationConfig {
-//         subvectors: quant_data.subvectors,
-//         bits: quant_data.bits,
-//         training_size: quant_data.training_size,
-//         max_training_vectors: quant_data.max_training_vectors,
-//         storage_mode,
-//     };
-    
-//     // Set quantization config
-//     index.set_quantization_config(Some(quant_config));
-
-
-//     // RESTORE TRAINING STATE
-//     index.set_training_ids(quant_data.training_ids.clone());
-//     index.set_training_threshold_reached(quant_data.training_threshold_reached);
-
-
-
-    
-//     // If quantization was trained, we'll need to restore the PQ instance
-//     if quant_data.is_trained {
-//         // Create a new PQ instance (it will be retrained during graph rebuild)
-//         let pq = Arc::new(PQ::new(
-//             index.get_dim(),
-//             quant_data.subvectors,
-//             quant_data.bits,
-//             quant_data.training_size,
-//             quant_data.max_training_vectors,
-//         ));
-
-//         pq.set_trained(true); // Mark as trained!
-
-
-//         index.set_pq(Some(pq));
-        
-//         // Set training threshold reached since it was trained before
-//         // index.set_training_threshold_reached(true);
-        
-//         //println!("✅ Quantization state restored (will retrain during rebuild)");
-
-//         println!("✅ Quantization state restored (trained, {} training IDs)", 
-//             quant_data.training_ids.len());
-//     } else {
-//         println!("✅ Quantization state restored (untrained, {} training IDs)", 
-//             quant_data.training_ids.len());
-
-//     }
-    
-//     Ok(())
-// }
-
-
 
 
 
@@ -574,80 +445,6 @@ fn restore_quantization_state_simple(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// /// Rebuild the HNSW graph by re-inserting all vectors using existing add logic
-// fn rebuild_graph_from_data(index: &mut HNSWIndex) -> PyResult<()> {
-//     // let vectors = index.vectors.read().unwrap();
-//     // let metadata = index.vector_metadata.read().unwrap();
-//     let vectors = index.get_vectors();
-//     let metadata = index.get_vector_metadata();
-    
-//     if vectors.is_empty() {
-//         println!("ℹ️  No vectors to rebuild (quantized_only mode or empty index)");
-//         return Ok(());
-//     }
-    
-//     println!("🔄 Rebuilding graph with {} vectors...", vectors.len());
-    
-//     // Prepare batch data for efficient insertion
-//     let mut batch_vectors = Vec::new();
-//     let mut batch_ids = Vec::new();
-//     let mut batch_metadatas = Vec::new();
-    
-//     // Collect all data maintaining ID consistency
-//     for (ext_id, vector) in vectors.iter() {
-//         if let Some(meta) = metadata.get(ext_id) {
-//             batch_vectors.push(vector.clone());
-//             batch_ids.push(ext_id.clone());
-//             batch_metadatas.push(meta.clone());
-//         }
-//     }
-    
-//     println!("📦 Prepared {} vectors for batch insertion", batch_vectors.len());
-    
-//     // Release the read locks before calling add
-//     drop(vectors);
-//     drop(metadata);
-    
-//     // Use the existing add() method to rebuild the graph
-//     Python::with_gil(|py| {
-//         rebuild_using_add_method(index, batch_vectors, batch_ids, batch_metadatas, py)
-//     })
-// }
-
-
-
 /// Rebuild the HNSW graph by re-inserting all vectors using existing add logic
 fn rebuild_graph_from_data(
     index: &mut HNSWIndex,
@@ -677,10 +474,8 @@ fn rebuild_graph_from_data(
 
     println!("📦 Prepared {} vectors for batch insertion", batch_vectors.len());
 
-
     // SET FLAG: Prevent training ID collection during rebuild
     index.rebuilding_from_persistence.store(true, std::sync::atomic::Ordering::Release);
-
 
     // Use the existing add() method to rebuild the graph
     Python::with_gil(|py| {
@@ -690,30 +485,9 @@ fn rebuild_graph_from_data(
     // 🔥 CLEAR FLAG: Resume normal operation
     index.rebuilding_from_persistence.store(false, std::sync::atomic::Ordering::Release);
 
-
     Ok(())
 
-
-
-
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -751,8 +525,6 @@ fn rebuild_using_add_method(
     println!("🔄 Calling add() method to rebuild graph...");
     
     // Call the existing add method - this rebuilds the graph automatically
-    //let result = index.add(batch_dict.as_any(), true)?; // overwrite=true
-    //let result = index.add(batch_dict, true)?; // overwrite=true
     let result = index.add(batch_dict.into_any(), true)?; // overwrite=true
     
     println!("✅ Graph rebuild completed: {}", result.summary());
@@ -805,382 +577,9 @@ fn convert_json_value_to_python(value: &Value, py: Python<'_>) -> PyResult<pyo3:
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// fn create_hnsw_index_from_config(
-//     config: &IndexConfig,
-//     quant_config: Option<pyo3::Py<pyo3::types::PyDict>>,
-// ) -> PyResult<HNSWIndex> {
-//     Python::with_gil(|py| {
-//         let quant_dict_bound = quant_config.map(|config_obj| config_obj.bind(py));
-//         //let quant_dict_ref = quant_dict_bound.as_ref();
-//         let quant_dict_ref = quant_dict_bound.as_ref().map(|v| &**v);
-
-//         HNSWIndex::new(
-//             config.dim,
-//             config.space.clone(),
-//             config.m,
-//             config.ef_construction,
-//             config.expected_size,
-//             quant_dict_ref, // <-- Option<&Bound<PyDict>>
-//         )
-//     })
-// }
-
-
-// fn create_hnsw_index_from_config(
-//     config: &IndexConfig,
-//     quant_config: Option<pyo3::Py<pyo3::types::PyDict>>,
-// ) -> PyResult<HNSWIndex> {
-//     use pyo3::Python;
-    
-//     // Convert Python quantization config to Rust QuantizationConfig if present
-//     let rust_quant_config = if let Some(py_dict) = quant_config {
-//         Python::with_gil(|py| {
-//             let bound_dict = py_dict.bind(py);
-            
-//             let subvectors = bound_dict.get_item("subvectors")?
-//                 .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'subvectors'"))?
-//                 .extract::<usize>()?;
-            
-//             let bits = bound_dict.get_item("bits")?
-//                 .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'bits'"))?
-//                 .extract::<usize>()?;
-            
-//             let training_size = bound_dict.get_item("training_size")?
-//                 .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'training_size'"))?
-//                 .extract::<usize>()?;
-            
-//             let max_training_vectors = bound_dict.get_item("max_training_vectors")?
-//                 .map(|v| v.extract::<usize>())
-//                 .transpose()?;
-            
-//             let storage_mode_str = bound_dict.get_item("storage_mode")?
-//                 .map(|v| v.extract::<String>())
-//                 .transpose()?
-//                 .unwrap_or_else(|| "quantized_only".to_string());
-            
-//             let storage_mode = StorageMode::from_string(&storage_mode_str)
-//                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))?;
-            
-//             Ok(Some(QuantizationConfig {
-//                 subvectors,
-//                 bits,
-//                 training_size,
-//                 max_training_vectors,
-//                 storage_mode,
-//             }))
-//         })?
-//     } else {
-//         None
-//     };
-    
-//     // Use the public Rust constructor
-//     HNSWIndex::new_from_config(
-//         config.dim,
-//         config.space.clone(),
-//         config.m,
-//         config.ef_construction,
-//         config.expected_size,
-//         rust_quant_config.as_ref(),
-//     )
-// }
-
-
-// /// Create HNSWIndex with configuration - Using Python API from Rust 
-// fn create_hnsw_index_from_config(
-//     config: &IndexConfig,
-//     quant_config: Option<pyo3::Py<pyo3::types::PyDict>>,
-// ) -> PyResult<HNSWIndex> {
-//     Python::with_gil(|py| {
-//         let hnsw_type = py.get_type::<HNSWIndex>();
-//         let args = (
-//             config.dim,
-//             config.space.clone(),
-//             config.m,
-//             config.ef_construction,
-//             config.expected_size,
-//             quant_config.as_ref(), // Option<&Py<PyDict>>
-//         );
-//         let instance = hnsw_type.call1(args)?;
-//         instance.extract()
-//     })
-// }
-
-
-
-
-
-
-
-
-// /// Create quantization dictionary for HNSWIndex constructor
-// fn create_quantization_dict(quant: &QuantizationPersistence) -> PyResult<pyo3::Py<pyo3::types::PyDict>> {
-//     use pyo3::{Python, types::PyDict};
-    
-//     Python::with_gil(|py| {
-//         let dict = PyDict::new(py);
-//         dict.set_item("type", "pq")?;
-//         dict.set_item("subvectors", quant.subvectors)?;
-//         dict.set_item("bits", quant.bits)?;
-//         dict.set_item("training_size", quant.training_size)?;
-//         dict.set_item("storage_mode", &quant.storage_mode)?;
-        
-//         if let Some(max_training) = quant.max_training_vectors {
-//             dict.set_item("max_training_vectors", max_training)?;
-//         }
-        
-//         Ok(dict.unbind())  // This returns Py<PyDict>
-//     })
-// }
-
-
-
-
-
-
-
-
-// /// Populate the index with loaded data using batch insertion
-// fn populate_index_data(
-//     index: &mut HNSWIndex,
-//     metadata: HashMap<String, HashMap<String, Value>>,
-//     vectors: HashMap<String, Vec<f32>>,
-// ) -> PyResult<()> {
-//     use pyo3::{Python, types::{PyDict, PyList}};
-    
-//     // Prepare batch data for efficient insertion
-//     let mut batch_vectors = Vec::new();
-//     let mut batch_ids = Vec::new();
-//     let mut batch_metadatas = Vec::new();
-    
-//     // Collect all data in original ID order to maintain consistency
-//     for (ext_id, vector) in vectors {
-//         if let Some(meta) = metadata.get(&ext_id) {
-//             batch_vectors.push(vector);
-//             batch_ids.push(ext_id);
-//             batch_metadatas.push(meta.clone());
-//         }
-//     }
-    
-//     if batch_vectors.is_empty() {
-//         println!("ℹ️  No vectors to populate (quantized_only mode)");
-//         return Ok(());
-//     }
-    
-//     println!("🔄 Adding {} vectors to index (rebuilding graph)...", batch_vectors.len());
-    
-//     // Use the standard add() method with batch data
-//     Python::with_gil(|py| {
-//         let vectors_list = PyList::new(py, &batch_vectors)?;
-//         let ids_list = PyList::new(py, &batch_ids)?;
-        
-//         // Convert metadata to Python objects
-//         let metadatas_vec: PyResult<Vec<_>> = batch_metadatas.iter().map(|m| {
-//             let dict = PyDict::new(py);
-//             for (k, v) in m {
-//                 dict.set_item(k, convert_json_value_to_python(v, py)?)?;
-//             }
-//             Ok(dict)
-//         }).collect();
-//         let metadatas_list = PyList::new(py, &metadatas_vec?)?;
-        
-//         let batch_dict = PyDict::new(py);
-//         batch_dict.set_item("vectors", vectors_list)?;
-//         batch_dict.set_item("ids", ids_list)?;
-//         batch_dict.set_item("metadatas", metadatas_list)?;
-        
-//         // Call add method - need to bind the dictionary properly
-//         let bound_dict = batch_dict.as_any().downcast::<pyo3::types::PyAny>()?;
-//         let result = index.add(bound_dict.clone(), true)?; // overwrite=true
-        
-//         println!("✅ Batch insertion completed: {}", result.summary());
-//         Ok(())
-//     })
-// }
-
-
-// /// Convert JSON Value to Python object
-// fn convert_json_value_to_python(value: &Value, py: Python<'_>) -> PyResult<pyo3::Py<pyo3::PyAny>> {
-    
-//     match value {
-//         Value::Null => Ok(py.None()),
-//         Value::Bool(b) => {
-//             let bound = b.into_pyobject(py)?;
-//             Ok(bound.to_owned().into())
-//         },
-//         Value::Number(n) => {
-//             if let Some(i) = n.as_i64() {
-//                 //Ok(i.into_py(py))
-//                 Ok(i.into_pyobject(py)?.unbind().into())
-//             } else if let Some(f) = n.as_f64() {
-//                 //Ok(f.into_py(py))
-//                 Ok(f.into_pyobject(py)?.unbind().into())
-//             } else {
-//                 //Ok(n.to_string().into_py(py))
-//                 Ok(n.to_string().into_pyobject(py)?.unbind().into())
-//             }
-//         },
-//         Value::String(s) => Ok(s.clone().into_pyobject(py)?.unbind().into()),
-//         Value::Array(arr) => {
-//             let py_list = PyList::empty(py);
-//             for item in arr {
-//                 py_list.append(convert_json_value_to_python(item, py)?)?;
-//             }
-//             Ok(py_list.into_pyobject(py)?.unbind().into())
-//         },
-//         Value::Object(obj) => {
-//             let py_dict = PyDict::new(py);
-//             for (k, v) in obj {
-//                 py_dict.set_item(k, convert_json_value_to_python(v, py)?)?;
-//             }
-//             Ok(py_dict.into_pyobject(py)?.unbind().into())
-//         }
-//     }
-// }
-
-
-
-
 // ============================================================================
 // LOAD INTERFACE
 // ============================================================================
-
-// /// Load an HNSWIndex from a directory structure (Phase 2 implementation)
-// pub fn load_index(_path: &str) -> PyResult<HNSWIndex> {
-//     // TODO: Implement in Phase 2
-//     Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-//         "Index loading not yet implemented - coming in Phase 2!"
-//     ))
-// }
-
-// /// Load an HNSWIndex from a directory structure (Phase 2 implementation)
-// #[pyfunction]
-// pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
-//     println!("🚀 Starting complete index load from: {}", path);
-    
-//     let path_buf = Path::new(path);
-    
-//     // Validate directory exists
-//     if !path_buf.exists() {
-//         return Err(PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
-//             format!("Index directory not found: {}", path)
-//         ));
-//     }
-    
-//     // Phase 1: Load all ZeusDB components using our helper functions
-//     println!("📋 Phase 1: Loading ZeusDB components...");
-    
-//     let manifest = load_manifest(path_buf)?;
-//     println!("✅ Manifest loaded: {} vectors, format v{}", 
-//              manifest.total_vectors, manifest.format_version);
-    
-//     let config = load_config(path_buf)?;
-//     println!("✅ Config loaded: dim={}, space={}", config.dim, config.space);
-    
-//     let mappings = load_mappings(path_buf)?;
-//     println!("✅ Mappings loaded: {} ID mappings", mappings.id_map.len());
-    
-//     let metadata = load_metadata(path_buf)?;
-//     println!("✅ Metadata loaded: {} records", metadata.len());
-    
-//     let vectors = load_vectors(path_buf)?;
-//     println!("✅ Vectors loaded: {} vectors", vectors.len());
-    
-//     // Check for quantization
-//     let quantization = load_quantization(path_buf)?;
-//     if let Some(ref quant) = quantization {
-//         println!("✅ Quantization loaded: {} subvectors, trained={}", 
-//                  quant.subvectors, quant.is_trained);
-//     } else {
-//         println!("ℹ️  No quantization found (raw vectors only)");
-//     }
-
-//     // Validation
-//     if mappings.id_map.len() != metadata.len() {
-//         return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-//             format!("Data consistency error: {} mappings vs {} metadata records", 
-//                    mappings.id_map.len(), metadata.len())
-//         ));
-//     }
-    
-//     println!("✅ All components loaded and validated successfully!");
-    
-//     // // TODO: Phase 2 - Load and reconstruct HNSW graph
-//     // println!("⚠️  Phase 2 load: Component loading complete!");
-//     // println!("   Next: Add HNSW graph loading and index reconstruction");
-    
-//     // Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-//     //     "Basic component loading working! Next: add graph loading and reconstruction."
-//     // ))
-
-//     // Phase 2: Load HNSW graph structure
-//     println!("📊 Phase 2: Loading HNSW graph structure...");
-
-//     let graph_path = path_buf.join("hnsw_index");
-//     if !graph_path.with_extension("hnsw.graph").exists() {
-//         return Err(PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
-//             "HNSW graph file not found. Index may be corrupted or from an older version."
-//         ));
-//     }
-
-//     // Load the graph structure using hnsw-rs NoData pattern
-//     let mut hnsw_io = HnswIo::new(path_buf, "hnsw_index");
-//     let options = ReloadOptions::default();
-//     hnsw_io.set_options(options);
-
-//     let graph_hnsw: Hnsw<NoData, NoDist> = hnsw_io.load_hnsw().map_err(|e| {
-//         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-//             format!("Failed to load HNSW graph: {}", e)
-//         )
-//     })?;
-
-//     println!("✅ HNSW graph loaded: {} points", graph_hnsw.get_nb_point());
-
-//     // Phase 3: Reconstruct full ZeusDB index
-//     println!("🔧 Phase 3: Reconstructing ZeusDB index...");
-
-//     let reconstructed_index = reconstruct_index(
-//         config,
-//         mappings,
-//         metadata,
-//         vectors,
-//         quantization,
-//         graph_hnsw,
-//     )?;
-
-//     println!("✅ Complete index loading finished successfully!");
-//     Ok(reconstructed_index)
-
-// }
-
-
-
-
 
 /// Load an HNSWIndex from a directory structure (Approach B: Simple Reconstruction)
 #[pyfunction]
@@ -1236,15 +635,6 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
     println!("✅ Index reconstruction with graph rebuild completed successfully!");
     Ok(restored_index)
 }
-
-
-
-
-
-
-
-
-
 
 
 
@@ -1527,15 +917,6 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
     }
 
     // Phase 2: Add HNSW graph files
-    // files_included.push("hnsw_index.hnsw.graph".to_string());
-
-    // // We deliberately exclude hnsw_index.hnsw.data since we manage our own data
-    // files_excluded.push("hnsw_index.hnsw.data".to_string());
-
-    // println!("📋 Graph files in manifest:");
-    // println!("   ✅ Included: hnsw_index.hnsw.graph");
-    // println!("   ❌ Excluded: hnsw_index.hnsw.data (we use our own data files)");
-
     // REPLACE WITH THIS CONDITIONAL LOGIC:
     let vector_count = index.get_vector_count();
     if vector_count > 0 {
@@ -1549,7 +930,6 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         files_excluded.push("hnsw_index.hnsw.data".to_string());
         println!("ℹ️  No graph files (empty index)");
     }
-
 
     
     // Calculate compression info for quantized indexes
