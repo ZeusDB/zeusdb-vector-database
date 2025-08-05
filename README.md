@@ -29,7 +29,7 @@
 ### 📚 Table of Contents
 
 - [ℹ️ What is ZeusDB Vector Database?](#ℹ️-what-is-zeusdb-vector-database)
-- [📦 Installation](#📦-installation) 
+- [📦 Installation](#📦-installation)
 - [🔥 Quick Start Example](#🔥-quick-start-example)  
 - [✨ Usage](#✨-usage) 
   - [1️⃣ Create an Index](#1️⃣-create-an-index)  
@@ -39,7 +39,7 @@
 - [💾 Persistence](#💾-persistence)  
   - [💾 Saving an Index - .save()](#💾-saving-an-index---save) 
   - [📂 Loading an Index - .load()](#📂-loading-an-index---load)
-- [🏷️ Metadata Filtering](#🏷️-metadata-filtering)
+- [🏷️ Metadata Filtering](#%F0%9F%8F%B7-%metadata-filtering)
 
 
 
