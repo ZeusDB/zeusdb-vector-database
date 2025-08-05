@@ -41,7 +41,19 @@
   - [📂 Loading an Index - .load()](#📂-loading-an-index---load)
 - [🏷️ Metadata Filtering](#metadata-filtering)
 
-
+### 📚 Table of Contents
+- [ℹ️ What is ZeusDB Vector Database?](#what-is-zeusdb-vector-database)
+- [📦 Installation](#installation)
+- [🔥 Quick Start Example](#quick-start-example)
+- [✨ Usage](#usage)
+  - [1️⃣ Create an Index](#create-an-index)
+  - [2️⃣ Add Data to the Index](#add-data-to-the-index)
+  - [3️⃣ Conduct a Similarity Search](#conduct-a-similarity-search)
+- [🗜️ Product Quantization](#product-quantization)
+- [💾 Persistence](#persistence)
+  - [💾 Saving an Index - .save()](#saving-an-index---save)
+  - [📂 Loading an Index - .load()](#loading-an-index---load)
+- [🏷️ Metadata Filtering](#metadata-filtering)
 
 <br />
 
