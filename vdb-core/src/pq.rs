@@ -54,6 +54,12 @@ impl PQ {
     pub fn is_trained(&self) -> bool {
         *self.is_trained.read().unwrap()
     }
+
+    /// Set the training state (for persistence restoration)
+    pub fn set_trained(&self, value: bool) {
+        let mut trained = self.is_trained.write().unwrap();
+        *trained = value;
+    }
     
     /// Train the PQ codebook using k-means clustering
     pub fn train(&self, vectors: &[Vec<f32>]) -> Result<(), String> {
