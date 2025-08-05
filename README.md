@@ -26,7 +26,7 @@
 <!-- badges: end -->
 
 
-## 📚 Table of Contents
+### 📚 Table of Contents
 
 - [ℹ️ What is ZeusDB Vector Database?](#what-is-zeusdb-vector-database)  
 - [📦 Installation](#installation)  
