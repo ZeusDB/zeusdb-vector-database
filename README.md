@@ -28,7 +28,7 @@
 
 ### 📚 Table of Contents
 
-- [ℹ️ What is ZeusDB Vector Database?](#what-is-zeusdb-vector-database)  
+- [ℹ️ What is ZeusDB Vector Database?](#ℹ️-what-is-zeusdb-vector-database)
 - [📦 Installation](#installation)  
 - [🔥 Quick Start Example](#quick-start-example)  
 - [✨ Usage](#usage)  
