@@ -810,15 +810,15 @@ quantization_config = {
     'type': 'pq',
     'subvectors': 8,
     'bits': 8,
-    'training_size': 500,
+    'training_size': 1000,
     'storage_mode': 'quantized_only'
 }
 
 vdb = VectorDatabase()
-index = vdb.create("hnsw", dim=256, quantization_config=quantization_config)
+index = vdb.create("hnsw", dim=1536, quantization_config=quantization_config)
 
 # Add enough vectors to trigger PQ training
-vectors = np.random.random((2000, 256)).astype(np.float32)
+vectors = np.random.random((2000, 1536)).astype(np.float32)
 data = {
     'vectors': vectors.tolist(),
     'ids': [f'vec_{i}' for i in range(2000)]
