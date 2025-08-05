@@ -20,8 +20,8 @@ use crate::pq::PQ;
 // ============================================================================
 
 // 🔢 MANUAL VERSION COUNTER - Change this number after each code change
-const CODE_VERSION_COUNTER: u32 = 1004;  // ← INCREMENT THIS MANUALLY
-const CODE_VERSION_DESCRIPTION: &str = "Update the Load HNSW graph structure in persistence.rs";
+const CODE_VERSION_COUNTER: u32 = 1017;  // ← INCREMENT THIS MANUALLY
+const CODE_VERSION_DESCRIPTION: &str = "Added new get_training_progress";
 
 // ============================================================================
 
@@ -422,6 +422,9 @@ pub struct HNSWIndex {
     // Timestamp when the index was created
     created_at: String,
 
+    // NEW: Flag to prevent training ID collection during persistence rebuild
+    pub rebuilding_from_persistence: AtomicBool,
+
 }
 
 
@@ -569,6 +572,7 @@ impl HNSWIndex {
             training_ids: RwLock::new(Vec::new()),
             training_threshold_reached: AtomicBool::new(false),
             created_at: Utc::now().to_rfc3339(),
+            rebuilding_from_persistence: AtomicBool::new(false),
         })
     }
 
@@ -616,6 +620,11 @@ impl HNSWIndex {
     /// Get current vector count (for monitoring training trigger)
     pub fn get_vector_count(&self) -> usize {
         *self.vector_count.lock().unwrap()
+    }
+
+    /// Get the distance space configuration
+    pub fn get_space(&self) -> String {
+        self.space.clone()
     }
 
     /// Get next available internal ID
@@ -764,14 +773,23 @@ impl HNSWIndex {
             let id_for_error = id.clone();
 
             match self.add_single_vector(id, vector, metadata, overwrite) {
-                Ok(()) => {
-                    total_inserted += 1;
+                // Ok(()) => {
+                //     total_inserted += 1;
 
-                    // Update vector count
-                    {
+                //     // Update vector count
+                //     {
+                //         let mut count = self.vector_count.lock().unwrap();
+                //         *count += 1;
+                //     }
+
+                Ok(inserted_new) => {
+                    total_inserted += 1;
+                    if inserted_new {
                         let mut count = self.vector_count.lock().unwrap();
                         *count += 1;
                     }
+
+
 
                     // Check training trigger (graceful failure handling)
                     if let Err(training_error) = self.maybe_trigger_training() {
@@ -798,19 +816,54 @@ impl HNSWIndex {
 
 
 
-    /// ENHANCED STATISTICS with training progress
+    // /// ENHANCED STATISTICS with training progress
+    // pub fn get_training_progress(&self) -> f32 {
+    //     if let Some(config) = &self.quantization_config {
+    //         if self.training_threshold_reached.load(Ordering::Acquire) {
+    //             100.0
+    //         } else {
+    //             let training_ids = self.training_ids.read().unwrap();
+    //             (training_ids.len() as f32 / config.training_size as f32 * 100.0).min(100.0)
+    //         }
+    //     } else {
+    //         0.0
+    //     }
+    // }
+
+
+    // /// ENHANCED STATISTICS with training progress
+    // pub fn get_training_progress(&self) -> f32 {
+    //     if let Some(config) = &self.quantization_config {
+    //         let training_ids = self.training_ids.read().unwrap();
+    //         (training_ids.len() as f32 / config.training_size as f32 * 100.0).min(100.0)
+    //     } else {
+    //         0.0
+    //     }
+    // }
+
+
+
     pub fn get_training_progress(&self) -> f32 {
         if let Some(config) = &self.quantization_config {
-            if self.training_threshold_reached.load(Ordering::Acquire) {
-                100.0
-            } else {
-                let training_ids = self.training_ids.read().unwrap();
-                (training_ids.len() as f32 / config.training_size as f32 * 100.0).min(100.0)
+            // If PQ is trained, always return 100%
+            if let Some(pq) = &self.pq {
+                if pq.is_trained() {
+                    return 100.0;
+                }
             }
+            let training_ids = self.training_ids.read().unwrap();
+            (training_ids.len() as f32 / config.training_size as f32 * 100.0).min(100.0)
         } else {
             0.0
         }
     }
+
+
+
+
+
+
+
 
     /// Get number of training vectors still needed
     pub fn training_vectors_needed(&self) -> usize {
@@ -1484,35 +1537,100 @@ impl HNSWIndex {
 
     // 1. CORE VECTOR OPERATIONS (6 methods)
     /// 3-PATH ARCHITECTURE - Main router
+    // fn add_single_vector(
+    //     &mut self,
+    //     id: String,
+    //     vector: Vec<f32>,
+    //     metadata: HashMap<String, Value>,
+    //     overwrite: bool
+    // ) -> PyResult<()> {
+    //     // Duplicate check (unless overwrite)
+    //     if !overwrite {
+    //         let id_map = self.id_map.read().unwrap();
+    //         if id_map.contains_key(&id) {
+    //             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+    //                 format!("Vector with ID '{}' already exists", id)
+    //             ));
+    //         }
+    //     }
+
+    //     // Clean 3-Path Architecture
+    //     if !self.has_quantization() {
+    //         // Path A: Raw storage (no quantization config)
+    //         self.add_raw_vector(id, vector, metadata)
+    //     } else if !self.is_quantized() {
+    //         // Path B: Raw storage + ID collection for training
+    //         self.add_with_id_collection(id, vector, metadata)
+    //     } else {
+    //         // Path C: Quantized storage (PQ trained and active)
+    //         self.add_quantized_vector(id, vector, metadata)
+    //     }
+    // }
+
+
     fn add_single_vector(
         &mut self,
         id: String,
         vector: Vec<f32>,
         metadata: HashMap<String, Value>,
         overwrite: bool
-    ) -> PyResult<()> {
-        // Duplicate check (unless overwrite)
-        if !overwrite {
+    ) -> PyResult<bool> {
+        // Check if this is a new vector or an overwrite
+        let is_new = {
             let id_map = self.id_map.read().unwrap();
-            if id_map.contains_key(&id) {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Vector with ID '{}' already exists", id)
-                ));
-            }
+            !id_map.contains_key(&id)
+        };
+
+        if !overwrite && !is_new {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Vector with ID '{}' already exists", id)
+            ));
         }
 
         // Clean 3-Path Architecture
         if !self.has_quantization() {
             // Path A: Raw storage (no quantization config)
-            self.add_raw_vector(id, vector, metadata)
+            self.add_raw_vector(id, vector, metadata)?;
         } else if !self.is_quantized() {
             // Path B: Raw storage + ID collection for training
-            self.add_with_id_collection(id, vector, metadata)
+            self.add_with_id_collection(id, vector, metadata)?;
         } else {
             // Path C: Quantized storage (PQ trained and active)
-            self.add_quantized_vector(id, vector, metadata)
+            self.add_quantized_vector(id, vector, metadata)?;
         }
+
+        Ok(is_new)
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     /// Path A: Raw storage (no quantization)
     fn add_raw_vector(
@@ -1562,7 +1680,13 @@ impl HNSWIndex {
         metadata: HashMap<String, Value>
     ) -> PyResult<()> {
         // 1. Store vector normally (single storage)
-        self.add_raw_vector(id.clone(), vector, metadata)?;
+        //self.add_raw_vector(id.clone(), vector, metadata)?;
+        let is_new = self.add_raw_vector(id.clone(), vector, metadata)?;
+
+        // SKIP TRAINING ID COLLECTION DURING PERSISTENCE REBUILD
+        if self.rebuilding_from_persistence.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(is_new); // Don't collect training IDs during rebuild
+        }
 
         // 2. Collect ID for training (minimal memory overhead)
         if let Some(config) = &self.quantization_config {
@@ -1580,7 +1704,7 @@ impl HNSWIndex {
             }
         }
 
-        Ok(())
+        Ok(is_new)
     }
 
 
@@ -1682,6 +1806,15 @@ impl HNSWIndex {
         // Get consistent training set using collected IDs
         let training_vectors = {
             let training_ids = self.training_ids.read().unwrap();
+
+            // ADD EARLY CHECK:
+            if training_ids.is_empty() {
+                // Reset threshold to prevent repeated attempts
+                self.training_threshold_reached.store(false, Ordering::Release);
+                return Err("No training IDs available for training".to_string());
+            }
+
+
             let vectors = self.vectors.read().unwrap();
 
             let mut training_data = Vec::new();
@@ -2838,6 +2971,13 @@ impl HNSWIndex {
     fn save_hnsw_graph(&self, path: &Path) -> PyResult<()> {
         println!("📊 Saving HNSW graph structure...");
 
+        // EMPTY INDEX CHECK:
+        let vector_count = self.get_vector_count();
+        if vector_count == 0 {
+            println!("  Index is empty - skipping HNSW graph dump");
+            return Ok(());
+        }
+
         let hnsw_guard = self.hnsw.lock().unwrap();
 
         let dump_result = match &*hnsw_guard {
@@ -2886,6 +3026,95 @@ impl HNSWIndex {
 
 
 
+    // ============================================================================
+    // PERSISTENCE Minimal Empty Constructor and SETTERS
+    // ============================================================================
+    /// Minimal constructor for persistence loading - creates empty index with config
+    /// No validation needed since config comes from trusted saved state
+    pub fn new_empty(
+        dim: usize,
+        space: String,
+        m: usize,
+        ef_construction: usize,
+        expected_size: usize,
+    ) -> Self {
+        let space_normalized = space.to_lowercase();
+        let max_layer = 16; // Always use NB_LAYER_MAX for consistency
+        let hnsw = DistanceType::new_raw(&space_normalized, m, expected_size, max_layer, ef_construction);
+
+        HNSWIndex {
+            dim,
+            space: space_normalized,
+            m,
+            ef_construction,
+            expected_size,
+            quantization_config: None,
+            pq: None,
+            pq_codes: RwLock::new(HashMap::new()),
+            metadata: Mutex::new(HashMap::new()),
+            vectors: RwLock::new(HashMap::new()),
+            vector_metadata: RwLock::new(HashMap::new()),
+            id_map: RwLock::new(HashMap::new()),
+            rev_map: RwLock::new(HashMap::new()),
+            id_counter: Mutex::new(0),
+            vector_count: Mutex::new(0),
+            hnsw: Mutex::new(hnsw),
+            training_ids: RwLock::new(Vec::new()),
+            training_threshold_reached: AtomicBool::new(false),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            rebuilding_from_persistence: AtomicBool::new(false),
+        }
+    }
+
+    /// Set vectors (for persistence loading only)
+    pub(crate) fn set_vectors(&mut self, vectors: HashMap<String, Vec<f32>>) {
+        *self.vectors.write().unwrap() = vectors;
+    }
+
+    /// Set vector metadata (for persistence loading only)
+    pub(crate) fn set_vector_metadata(&mut self, metadata: HashMap<String, HashMap<String, serde_json::Value>>) {
+        *self.vector_metadata.write().unwrap() = metadata;
+    }
+
+    /// Set ID mappings (for persistence loading only)
+    pub(crate) fn set_id_mappings(&mut self, id_map: HashMap<String, usize>, rev_map: HashMap<usize, String>) {
+        *self.id_map.write().unwrap() = id_map;
+        *self.rev_map.write().unwrap() = rev_map;
+    }
+
+    /// Set counters (for persistence loading only)
+    pub(crate) fn set_counters(&mut self, id_counter: usize, vector_count: usize) {
+        *self.id_counter.lock().unwrap() = id_counter;
+        *self.vector_count.lock().unwrap() = vector_count;
+    }
+
+    /// Set quantization config (for persistence loading only)
+    pub(crate) fn set_quantization_config(&mut self, config: Option<QuantizationConfig>) {
+        self.quantization_config = config;
+    }
+
+    /// Set PQ instance (for persistence loading only)
+    pub(crate) fn set_pq(&mut self, pq: Option<Arc<crate::pq::PQ>>) {
+        self.pq = pq;
+    }
+
+    /// Set training threshold reached flag (for persistence loading only)
+    pub(crate) fn set_training_threshold_reached(&mut self, value: bool) {
+        self.training_threshold_reached.store(value, std::sync::atomic::Ordering::Release);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -2899,8 +3128,13 @@ impl HNSWIndex {
         self.dim
     }
 
-    /// Get the distance space (cosine, l2, l1)
-    pub fn get_space(&self) -> &str {
+    // /// Get the distance space (cosine, l2, l1)
+    // pub fn get_space(&self) -> &str {
+    //     &self.space
+    // }
+
+    /// Get the distance space (cosine, l2, l1) - changed to a more idiomatic getter
+    pub fn space(&self) -> &str {  // Changed from get_space to space
         &self.space
     }
 
@@ -2972,6 +3206,22 @@ impl HNSWIndex {
         &self.created_at
     }
 
+
+    /// Get read access to training IDs (for persistence)
+    pub fn get_training_ids(&self) -> std::sync::RwLockReadGuard<Vec<String>> {
+        self.training_ids.read().unwrap()
+    }
+
+    /// Get training threshold reached flag (for persistence)
+    pub fn get_training_threshold_reached(&self) -> bool {
+        self.training_threshold_reached.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+
+    /// Set training IDs (for persistence loading only)
+    pub(crate) fn set_training_ids(&mut self, ids: Vec<String>) {
+        *self.training_ids.write().unwrap() = ids;
+    }
 
 
 }
