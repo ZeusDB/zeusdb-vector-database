@@ -39,7 +39,7 @@
 - [💾 Persistence](#persistence)  
   - [💾 Saving an Index - .save()](#saving-an-index---save)  
   - [📂 Loading an Index - .load()](#loading-an-index---load)  
-- [🏷️ Metadata Filtering](#metadata-filtering)
+- [Metadata Filtering](#metadata-filtering)
 
 
 
