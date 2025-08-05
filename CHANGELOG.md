@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] - 2025-08-06
+
+### Added
+- `save()` method to `HNSWIndex` for persisting index state to disk via Python and Rust.
+- New `persistence.rs` module implementing index save/load logic, including manifest and file structure generation.
+- PyO3 bindings for persistence-related methods, exposing them to Python.
+- Internal unit tests for the `save` function to ensure correct file output and manifest validation.
+- HNSW graph structure persistence via native hnsw-rs file_dump() integration
+- Enhanced save workflow with Phase 2 graph serialization support
+- Comprehensive Phase 2 integration test suite for full persistence validation
+- Complete component loading infrastructure with helper functions for all ZeusDB file types
+- load() method to VectorDatabase class for loading saved indexes from disk
+- Comprehensive component validation and data consistency checking in load workflow
+- Python API integration for load_index function with proper PyO3 bindings
+- End-to-end test suite for component loading validation and error handling
+- Complete HNSW graph loading functionality using NoData pattern from hnsw-rs
+- anndists dependency for NoDist distance type compatibility
+- Phase 2 graph structure loading with validation and error handling
+- Full persistence roundtrip capability: save and load HNSW graph structures
+- Empty index handling with conditional graph file creation for zero-vector scenarios
+- Training state preservation with ID collection tracking during persistence
+- Storage mode awareness in persistence (quantized_only vs quantized_with_raw handling)
+- PQ centroids and codes serialization for complete quantization state preservation
+- Compression statistics and memory usage reporting in manifest files
+- Directory size calculation and file inventory tracking in manifest generation
+- rebuilding_from_persistence flag to prevent training ID contamination during reconstruction
+- Smart reconstruction approach using existing add() logic instead of complex graph deserialization
+- Thread-safe data access patterns during save operations with proper lock management
+
+### Changed
+- Refactored `hnsw_index.rs` to integrate persistence logic and support serialization.
+- Updated `lib.rs` to register the persistence module and ensure all new methods are exposed to Python.
+- Enhanced error handling and docstrings for persistence operations.
+- Modified HNSW initialization to use fixed max_layer=16 for hnsw-rs dump compatibility
+- Updated manifest generation to include HNSW graph files (.hnsw.graph) and exclude data files (.hnsw.data)
+- Enhanced save_manifest() with graph file tracking and size calculation
+- Replaced placeholder load_index() with complete component loading implementation
+- Enhanced lib.rs module exports to include load_index function for Python access
+- Updated persistence.rs with comprehensive file loading and validation infrastructure
+- Extended persistence.rs with complete HNSW graph loading using HnswIo and ReloadOptions
+- Updated test suite to recognize and validate HNSW graph loading success
+- Enhanced quantization config validation to include training state and storage mode persistence
+- Modified PQ implementation to support set_trained() for persistence restoration
+- Updated index reconstruction to use "Simple Reconstruction" pattern for reliability
+- Refactored training threshold calculation to be self-healing during load operations
+- Enhanced error collection and reporting throughout persistence workflow
+
+### Fixed
+- Improved reliability of index serialization and file output.
+- Addressed edge cases in directory creation and file writing during persistence.
+- Resolved critical "nb_layer != NB_MAX_LAYER" error preventing HNSW graph dumps
+- Fixed layer count compatibility issue between ZeusDB and hnsw-rs library requirements
+- Enabled successful HNSW graph structure serialization for graph files
+- Resolved Python binding compilation error for load_index function export
+- Fixed missing #[pyfunction] annotation preventing Python module integration
+- Established proper API consistency between save and load methods
+- Resolved anndists dependency issues for NoDist import compatibility
+- Fixed HNSW graph loading import paths for hnsw-rs v0.3.0+ compatibility
+- Resolved training ID loss during graph reconstruction by adding persistence rebuild flag
+- Fixed PQ training state restoration ensuring loaded instances are properly marked as trained
+- Corrected training progress calculation inconsistencies between save/load cycles
+- Addressed quantization state contamination during index reconstruction
+- Resolved thread safety issues in concurrent data access during persistence operations
+- Fixed storage mode detection and raw vector preservation based on configuration
+- Prevented training ID re-collection during persistence rebuild operations
+
+### Removed
+<!-- Add removals/deprecations here -->
+
+---
+
 ## [0.2.1] - 2025-07-30
 
 ### Added

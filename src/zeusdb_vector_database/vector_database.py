@@ -139,6 +139,24 @@ class VectorDatabase:
             raise RuntimeError(f"Failed to create {index_type.upper()} index: {e}") from e
 
 
+    def load(self, path: str) -> Any:
+        """
+        Load a previously saved ZeusDB index from disk.
+    
+        Args:
+            path: Path to the .zdb directory containing the saved index
+        
+        Returns:
+            HNSWIndex: The loaded index ready for use
+        
+        Example:
+            >>> vdb = VectorDatabase()
+            >>> loaded_index = vdb.load("my_index.zdb")
+            >>> results = loaded_index.search(query_vector, top_k=5)
+        """
+        from .zeusdb_vector_database import load_index  # Direct function import
+        return load_index(path)
+
 
     def _validate_quantization_config(self, config: Dict[str, Any], dim: int) -> Dict[str, Any]:
         """
