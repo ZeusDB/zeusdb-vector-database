@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.2.2] - 2025-08
+## [0.3.0] - 2025-08-06
 
 ### Added
 - `save()` method to `HNSWIndex` for persisting index state to disk via Python and Rust.
@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - anndists dependency for NoDist distance type compatibility
 - Phase 2 graph structure loading with validation and error handling
 - Full persistence roundtrip capability: save and load HNSW graph structures
+- Empty index handling with conditional graph file creation for zero-vector scenarios
+- Training state preservation with ID collection tracking during persistence
+- Storage mode awareness in persistence (quantized_only vs quantized_with_raw handling)
+- PQ centroids and codes serialization for complete quantization state preservation
+- Compression statistics and memory usage reporting in manifest files
+- Directory size calculation and file inventory tracking in manifest generation
+- rebuilding_from_persistence flag to prevent training ID contamination during reconstruction
+- Smart reconstruction approach using existing add() logic instead of complex graph deserialization
+- Thread-safe data access patterns during save operations with proper lock management
 
 ### Changed
 - Refactored `hnsw_index.rs` to integrate persistence logic and support serialization.
@@ -39,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated persistence.rs with comprehensive file loading and validation infrastructure
 - Extended persistence.rs with complete HNSW graph loading using HnswIo and ReloadOptions
 - Updated test suite to recognize and validate HNSW graph loading success
+- Enhanced quantization config validation to include training state and storage mode persistence
+- Modified PQ implementation to support set_trained() for persistence restoration
+- Updated index reconstruction to use "Simple Reconstruction" pattern for reliability
+- Refactored training threshold calculation to be self-healing during load operations
+- Enhanced error collection and reporting throughout persistence workflow
 
 ### Fixed
 - Improved reliability of index serialization and file output.
@@ -51,6 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Established proper API consistency between save and load methods
 - Resolved anndists dependency issues for NoDist import compatibility
 - Fixed HNSW graph loading import paths for hnsw-rs v0.3.0+ compatibility
+- Resolved training ID loss during graph reconstruction by adding persistence rebuild flag
+- Fixed PQ training state restoration ensuring loaded instances are properly marked as trained
+- Corrected training progress calculation inconsistencies between save/load cycles
+- Addressed quantization state contamination during index reconstruction
+- Resolved thread safety issues in concurrent data access during persistence operations
+- Fixed storage mode detection and raw vector preservation based on configuration
+- Prevented training ID re-collection during persistence rebuild operations
 
 ### Removed
 <!-- Add removals/deprecations here -->
