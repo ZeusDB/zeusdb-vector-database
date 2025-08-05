@@ -25,45 +25,6 @@
 
 <!-- badges: end -->
 
-
-### 📚 Table of Contents
-
-- [ℹ️ What is ZeusDB Vector Database?](#ℹ️-what-is-zeusdb-vector-database)
-- [📦 Installation](#📦-installation)
-- [🔥 Quick Start Example](#🔥-quick-start-example)  
-- [✨ Usage](#✨-usage) 
-  - [1️⃣ Create an Index](#1️⃣-create-an-index)  
-  - [2️⃣ Add Data to the Index](#2️⃣-add-data-to-the-index)  
-  - [3️⃣ Conduct a Similarity Search](#3️⃣-conduct-a-similarity-search)  
-- [🗜️ Product Quantization](#🗜️-product-quantization)  
-- [💾 Persistence](#💾-persistence)  
-  - [💾 Saving an Index - .save()](#💾-saving-an-index---save) 
-  - [📂 Loading an Index - .load()](#📂-loading-an-index---load)
-- [🏷️ Metadata Filtering](#metadata-filtering)
-
-<div>
-  <ul>
-    <li><a href="#what-is-zeusdb-vector-database">ℹ️ What is ZeusDB Vector Database?</a></li>
-    <li><a href="#installation">📦 Installation</a></li>
-    <li><a href="#quick-start-example">🔥 Quick Start Example</a></li>
-    <li>✨ Usage
-      <ul>
-        <li><a href="#1-create-an-index">1️⃣ Create an Index</a></li>
-        <li><a href="#2-add-data-to-the-index">2️⃣ Add Data to the Index</a></li>
-        <li><a href="#3-conduct-a-similarity-search">3️⃣ Conduct a Similarity Search</a></li>
-      </ul>
-    </li>
-    <li><a href="#product-quantization">🗜️ Product Quantization</a></li>
-    <li>💾 Persistence
-      <ul>
-        <li><a href="#saving-an-index---save">💾 Saving an Index - .save()</a></li>
-        <li><a href="#loading-an-index---load">📂 Loading an Index - .load()</a></li>
-      </ul>
-    </li>
-    <li><a href="#metadata-filtering">🏷️ Metadata Filtering</a></li>
-  </ul>
-</div>
-
 <br />
 
 ## ℹ️ What is ZeusDB Vector Database?
