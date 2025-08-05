@@ -792,9 +792,10 @@ print(f"Loaded index with {loaded_index.get_vector_count()} vectors")
 print(f"Index configuration: {loaded_index.info()}")
 
 # Test search on loaded index
-query_vector = np.random.random(128).tolist()
+query_vector = np.random.random(1536).tolist()
 results = loaded_index.search(query_vector, top_k=3)
 print(f"Search returned {len(results)} results")
+print(results)
 ```
 
 <br />
