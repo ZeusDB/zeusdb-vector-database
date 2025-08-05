@@ -761,21 +761,19 @@ import numpy as np
 
 # Create and populate an index
 vdb = VectorDatabase()
-index = vdb.create("hnsw", dim=128, space="cosine")
+index = vdb.create("hnsw", dim=1536, space="cosine")
 
 # Add some vectors
-vectors = np.random.random((1000, 128)).astype(np.float32)
+vectors = np.random.random((1000, 1536)).astype(np.float32)
 data = {
     'vectors': vectors.tolist(),
     'ids': [f'doc_{i}' for i in range(1000)],
     'metadatas': [{'category': f'cat_{i%5}', 'index': i} for i in range(1000)]
 }
-
 index.add(data)
 
 # Save the complete index to disk
 index.save("my_index.zdb")
-print("✅ Index saved successfully!")
 ```
 
 <br />
@@ -845,7 +843,7 @@ print(f"Compression info: {loaded_index.get_quantization_info()}")
 The .save() method creates a structured directory containing all index components:
 
 ```
-index.zdb/
+my_index.zdb/
 ├── manifest.json           # Index metadata and file inventory
 ├── config.json             # HNSW configuration parameters
 ├── mappings.bin            # ID mappings (binary format)
