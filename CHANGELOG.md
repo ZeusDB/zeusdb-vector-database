@@ -7,20 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.3.1] - 2025-
+## [0.4.0] - 2025-08-13
 
 ### Added
-<!-- Add new features here -->
+- Enterprise-grade structured logging with Python+Rust coordination
+- Smart environment detection (production/development/testing/jupyter/CI)
+- Automatic logging configuration with graceful fallbacks
+- JSON and human-readable log formats with configurable targets (console/file)
+- File logging with daily rotation and intelligent path handling
+- Performance timing instrumentation on all hot paths (add, search, training)
+- Comprehensive error context logging with field standardization
+- Cross-platform logging support (Windows, macOS, Linux)
+- Environment variable configuration for all logging aspects
+- Production-ready observability for operations teams
 
 ### Changed
-<!-- Add changed behavior here -->
+- Replaced debug println! statements with structured tracing throughout codebase
+- Enhanced error handling with rich logging context instead of panic conditions
+- Improved vector addition pipeline with detailed operation tracking
+- Updated quantization training process with progress logging and timing metrics
+- Modernized persistence operations with comprehensive save/load logging
 
 ### Fixed
-<!-- Add bug fixes here -->
-
-### Removed
-<!-- Add removals/deprecations here -->
-
+- Eliminated potential panic conditions in distance space validation
+- Improved error propagation with proper logging context
+- Enhanced thread safety in concurrent logging scenarios
+- Resolved cross-platform path handling inconsistencies
+ 
 ---
 
 ## [0.3.0] - 2025-08-06
