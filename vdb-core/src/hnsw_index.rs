@@ -11,6 +11,10 @@ use serde::{Serialize, Deserialize};
 use chrono::Utc;
 use std::path::Path;
 use hnsw_rs::api::AnnT;  // This provides the file_dump method
+use std::time::Instant;
+
+// ✅ ENTERPRISE: Structured logging imports
+use tracing::{debug, info, warn, error, trace, instrument};
 
 // Import PQ module
 use crate::pq::PQ;
@@ -20,22 +24,10 @@ use crate::pq::PQ;
 // ============================================================================
 
 // 🔢 MANUAL VERSION COUNTER - Change this number after each code change
-const CODE_VERSION_COUNTER: u32 = 1017;  // ← INCREMENT THIS MANUALLY
-const CODE_VERSION_DESCRIPTION: &str = "Added new get_training_progress";
+const CODE_VERSION_COUNTER: u32 = 1026;  // ← INCREMENT THIS MANUALLY
+const CODE_VERSION_DESCRIPTION: &str = "Test of full logging capability";
 
 // ============================================================================
-
-
-// DEBUG LOGGER
-// To enable: set ZEUSDB_DEBUG=1 (or any value) in your environment before running your program.
-macro_rules! debug_log {
-    ($($arg:tt)*) => {
-        if std::env::var("ZEUSDB_DEBUG").is_ok() {
-            println!($($arg)*);
-        }
-    };
-}
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageMode {
@@ -72,7 +64,6 @@ impl Default for StorageMode {
     }
 }
 
-
 // Updated QuantizationConfig structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuantizationConfig {
@@ -82,8 +73,6 @@ pub struct QuantizationConfig {
     pub max_training_vectors: Option<usize>,
     pub storage_mode: StorageMode,
 }
-
-
 
 /// Custom distance function for Product Quantization using ADC
 #[derive(Clone)]
@@ -122,32 +111,30 @@ impl DistPQ {
     }
 }
 
-
-
-impl Distance<Vec<u8>> for DistPQ {
+impl Distance<u8> for DistPQ {
     /// Compute distance between query (via LUT) and stored PQ codes
     /// The first parameter `_a` is ignored since we use the pre-computed LUT
-    /// The second parameter `b` contains the PQ codes for the stored vector
-    fn eval(&self, _a: &[Vec<u8>], b: &[Vec<u8>]) -> f32 {
+    /// The second parameter `b` contains the PQ codes for the stored vector (one u8 per subvector)
+    fn eval(&self, _a: &[u8], b: &[u8]) -> f32 {
         let lut_guard = self.lut.read().unwrap();
-        match lut_guard.as_ref() {
-            Some(lut) => {
-                // Use the first vector in the batch for distance computation
-                if let Some(codes) = b.first() {
-                    self.pq.adc_distance(codes, lut).unwrap_or(f32::INFINITY)
-                } else {
-                    f32::INFINITY
-                }
-            }
-            None => {
-                // Fallback: this shouldn't happen in normal operation
-                f32::INFINITY
-            }
+        let lut = match lut_guard.as_ref() {
+            Some(l) => l,
+            None => return f32::INFINITY,
+        };
+        
+        // b.len() should equal pq.subvectors
+        let mut sum = 0.0f32;
+        for (sv, &code) in b.iter().enumerate() {
+            // lut[sv][code]
+            let distance_component = lut.get(sv)
+                .and_then(|row| row.get(code as usize))
+                .copied()
+                .unwrap_or(f32::INFINITY);
+            sum += distance_component;
         }
+        sum
     }
 }
-
-
 
 // Enhanced DistanceType enum to support PQ variants
 enum DistanceType {
@@ -156,10 +143,10 @@ enum DistanceType {
     L2(Hnsw<'static, f32, DistL2>),
     L1(Hnsw<'static, f32, DistL1>),
     
-    // PQ variants
-    CosinePQ(Hnsw<'static, Vec<u8>, DistPQ>),
-    L2PQ(Hnsw<'static, Vec<u8>, DistPQ>),
-    L1PQ(Hnsw<'static, Vec<u8>, DistPQ>),
+    // PQ variants - corrected to use u8 element type
+    CosinePQ(Hnsw<'static, u8, DistPQ>),
+    L2PQ(Hnsw<'static, u8, DistPQ>),
+    L1PQ(Hnsw<'static, u8, DistPQ>),
 }
 
 impl DistanceType {
@@ -170,16 +157,42 @@ impl DistanceType {
         max_layer: usize,
         ef_construction: usize,
     ) -> Self {
+        info!(
+            operation = "hnsw_creation",
+            space = space,
+            m = m,
+            expected_size = expected_size,
+            max_layer = max_layer,
+            ef_construction = ef_construction,
+            variant = "raw",
+            "Creating raw HNSW index"
+        );
+
         match space {
             "cosine" => DistanceType::Cosine(Hnsw::new(m, expected_size, max_layer, ef_construction, DistCosine {})),
             "l2" => DistanceType::L2(Hnsw::new(m, expected_size, max_layer, ef_construction, DistL2 {})),
             "l1" => DistanceType::L1(Hnsw::new(m, expected_size, max_layer, ef_construction, DistL1 {})),
-            // _ => panic!("Unsupported space: {}", space),
-            _ => panic!("INTERNAL ERROR: Invalid space '{}' passed to new_raw. This should have been validated in the constructor!", space),
+            _ => {
+                // ✅ ENTERPRISE: Replace panic with graceful error
+                error!(
+                    operation = "hnsw_creation",
+                    space = space,
+                    error = "invalid_space",
+                    "Invalid distance space provided"
+                );
+                // This is a programming error that should be caught earlier
+                // For now, default to cosine to prevent panic
+                warn!(
+                    operation = "hnsw_creation",
+                    space = space,
+                    fallback = "cosine",
+                    "Defaulting to cosine distance due to invalid space"
+                );
+                DistanceType::Cosine(Hnsw::new(m, expected_size, max_layer, ef_construction, DistCosine {}))
+            }
         }
     }
     
-
     fn new_pq(
         space: &str,
         m: usize,
@@ -188,6 +201,19 @@ impl DistanceType {
         ef_construction: usize,
         pq: Arc<PQ>,
     ) -> Self {
+        info!(
+            operation = "hnsw_creation",
+            space = space,
+            m = m,
+            expected_size = expected_size,
+            max_layer = max_layer,
+            ef_construction = ef_construction,
+            variant = "quantized",
+            subvectors = pq.subvectors,
+            bits = pq.bits,
+            "Creating PQ-enabled HNSW index"
+        );
+
         match space {
             "cosine" => {
                 let dist_pq = DistPQ::new(pq);
@@ -201,12 +227,25 @@ impl DistanceType {
                 let dist_pq = DistPQ::new(pq);
                 DistanceType::L1PQ(Hnsw::new(m, expected_size, max_layer, ef_construction, dist_pq))
             }
-            //_ => panic!("Unsupported space: {}", space),
-            _ => panic!("INTERNAL ERROR: Invalid space '{}' passed to new_pq. This should have been validated in the constructor!", space),
+            _ => {
+                // ✅ ENTERPRISE: Replace panic with graceful error
+                error!(
+                    operation = "hnsw_creation",
+                    space = space,
+                    error = "invalid_space",
+                    "Invalid distance space provided for PQ"
+                );
+                warn!(
+                    operation = "hnsw_creation",
+                    space = space,
+                    fallback = "cosine",
+                    "Defaulting to cosine distance due to invalid space"
+                );
+                let dist_pq = DistPQ::new(pq);
+                DistanceType::CosinePQ(Hnsw::new(m, expected_size, max_layer, ef_construction, dist_pq))
+            }
         }
     }
-
-
     
     fn set_query_lut(&self, query: &[f32]) -> Result<(), String> {
         match self {
@@ -240,9 +279,8 @@ impl DistanceType {
                 // Set the query LUT for ADC computation
                 self.set_query_lut(query)?;
                 
-                // Create dummy query vector for HNSW traversal
-                // The actual distance is computed via ADC using the stored LUT
-                let dummy_query = vec![vec![0u8; self.get_code_size()]];
+                // Create dummy query vector for HNSW traversal (flat u8 codes)
+                let dummy_query = vec![0u8; self.get_code_size()];
                 
                 // Perform search
                 let results = hnsw.search(&dummy_query, k, ef);
@@ -277,7 +315,15 @@ impl DistanceType {
             DistanceType::Cosine(hnsw) => hnsw.insert((vector, id)),
             DistanceType::L2(hnsw) => hnsw.insert((vector, id)),
             DistanceType::L1(hnsw) => hnsw.insert((vector, id)),
-            _ => panic!("Cannot insert raw vectors into PQ index"),
+            _ => {
+                // ✅ ENTERPRISE: Replace panic with graceful error logging
+                error!(
+                    operation = "vector_insert",
+                    error = "invalid_operation",
+                    reason = "cannot_insert_raw_vectors_into_pq_index",
+                    "Cannot insert raw vectors into PQ index"
+                );
+            }
         }
     }
     
@@ -285,18 +331,23 @@ impl DistanceType {
     fn insert_pq_codes(&mut self, codes: &[u8], id: usize) {
         match self {
             DistanceType::CosinePQ(hnsw) => {
-                let wrapped_codes = vec![codes.to_vec()];
-                hnsw.insert((&wrapped_codes, id));
+                hnsw.insert((codes, id));
             },
             DistanceType::L2PQ(hnsw) => {
-                let wrapped_codes = vec![codes.to_vec()];
-                hnsw.insert((&wrapped_codes, id));
+                hnsw.insert((codes, id));
             },
             DistanceType::L1PQ(hnsw) => {
-                let wrapped_codes = vec![codes.to_vec()];
-                hnsw.insert((&wrapped_codes, id));
+                hnsw.insert((codes, id));
             },
-            _ => panic!("Cannot insert PQ codes into raw index"),
+            _ => {
+                // ✅ ENTERPRISE: Replace panic with graceful error logging
+                error!(
+                    operation = "pq_codes_insert",
+                    error = "invalid_operation",
+                    reason = "cannot_insert_pq_codes_into_raw_index",
+                    "Cannot insert PQ codes into raw index"
+                );
+            }
         }
     }
 
@@ -305,12 +356,29 @@ impl DistanceType {
         let num_threads = rayon::current_num_threads();
         let threshold = 1000 * num_threads;
 
+        debug!(
+            operation = "batch_insert",
+            batch_size = data.len(),
+            num_threads = num_threads,
+            threshold = threshold,
+            parallel = data.len() >= threshold,
+            "Starting batch insertion"
+        );
+
         if data.len() >= threshold {
             match self {
                 DistanceType::Cosine(hnsw) => hnsw.parallel_insert(data),
                 DistanceType::L2(hnsw) => hnsw.parallel_insert(data),
                 DistanceType::L1(hnsw) => hnsw.parallel_insert(data),
-                _ => panic!("Cannot batch insert raw vectors into PQ index"),
+                _ => {
+                    // ✅ ENTERPRISE: Replace panic with graceful error
+                    error!(
+                        operation = "batch_insert",
+                        error = "invalid_operation",
+                        reason = "cannot_batch_insert_raw_vectors_into_pq_index",
+                        "Cannot batch insert raw vectors into PQ index"
+                    );
+                }
             }
         } else {
             for (vector, id) in data {
@@ -319,41 +387,37 @@ impl DistanceType {
         }
     }
     
-
     fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize)]) -> Result<(), String> {
         let num_threads = rayon::current_num_threads();
         let threshold = 1000 * num_threads;
+
+        debug!(
+            operation = "batch_insert_pq",
+            batch_size = data.len(),
+            num_threads = num_threads,
+            threshold = threshold,
+            parallel = data.len() >= threshold,
+            "Starting PQ batch insertion"
+        );
 
         match self {
             DistanceType::CosinePQ(hnsw) |
             DistanceType::L2PQ(hnsw) |
             DistanceType::L1PQ(hnsw) => {
-                // Convert data format to match expected Vec<Vec<u8>>
-                let converted_data: Vec<(Vec<Vec<u8>>, usize)> = data.iter()
-                    .map(|(codes, id)| (vec![(*codes).clone()], *id))
-                    .collect();
-            
-                let ref_data: Vec<(&Vec<Vec<u8>>, usize)> = converted_data.iter()
-                    .map(|(codes, id)| (codes, *id))
-                    .collect();
-
                 if data.len() >= threshold {
-                    hnsw.parallel_insert(&ref_data);
+                    hnsw.parallel_insert(data);
                 } else {
-                    for (codes, id) in &ref_data {
+                    for (codes, id) in data {
                         hnsw.insert((codes.as_slice(), *id));
                     }
                 }
+
                 Ok(())
             }
             _ => Err("Cannot insert PQ codes into raw HNSW index".to_string()),
         }
     }
-
-
 }
-
-
 
 #[derive(Debug, Clone)]
 #[pyclass]
@@ -424,15 +488,20 @@ pub struct HNSWIndex {
 
     // NEW: Flag to prevent training ID collection during persistence rebuild
     pub rebuilding_from_persistence: AtomicBool,
-
 }
-
-
 
 #[pymethods]
 impl HNSWIndex {
     #[new]
     #[pyo3(signature = (dim, space, m, ef_construction, expected_size, quantization_config = None))]
+    #[instrument(level = "info", skip(quantization_config), fields(
+        dim = dim,
+        space = %space,
+        m = m,
+        ef_construction = ef_construction,
+        expected_size = expected_size,
+        has_quantization = quantization_config.is_some()
+    ))]
     fn new(
         dim: usize,
         space: String,
@@ -441,29 +510,39 @@ impl HNSWIndex {
         expected_size: usize,
         quantization_config: Option<&Bound<PyDict>>,
     ) -> PyResult<Self> {
+        let start_time = Instant::now();
+
         // Validation of parameters
         if dim == 0 {
+            error!(operation = "validation", field = "dim", value = dim, "Invalid dimension");
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("dim must be positive"));
         }
         if ef_construction == 0 {
+            error!(operation = "validation", field = "ef_construction", value = ef_construction, "Invalid ef_construction");
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("ef_construction must be positive"));
         }
         if expected_size == 0 {
+            error!(operation = "validation", field = "expected_size", value = expected_size, "Invalid expected_size");
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("expected_size must be positive"));
         }
         if m > 256 {
+            error!(operation = "validation", field = "m", value = m, max_allowed = 256, "m exceeds maximum");
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("m must be less than or equal to 256"));
         }
 
         // Early space validation with user-friendly error
         let space_normalized = space.to_lowercase();
         match space_normalized.as_str() {
-            "cosine" | "l2" | "l1" => {}, // Valid spaces - continue
-            _ => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("Unsupported space: '{}'. Supported spaces: 'cosine', 'l2', 'l1'", space)
-            )),
+            "cosine" | "l2" | "l1" => {
+                debug!(operation = "validation", space = %space_normalized, "Distance space validated");
+            }, 
+            _ => {
+                error!(operation = "validation", field = "space", value = %space, "Unsupported distance space");
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Unsupported space: '{}'. Supported spaces: 'cosine', 'l2', 'l1'", space)
+                ));
+            }
         }
-
         
         // Extract quantization configuration
         let (quantization_params, pq_instance) = if let Some(config) = quantization_config {
@@ -472,6 +551,7 @@ impl HNSWIndex {
                 .extract::<String>()?;
             
             if qtype != "pq" {
+                error!(operation = "validation", field = "quantization_type", value = %qtype, "Unsupported quantization type");
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                     format!("Unsupported quantization type: '{}'. Only 'pq' is currently supported.", qtype)
                 ));
@@ -503,21 +583,29 @@ impl HNSWIndex {
             let storage_mode = StorageMode::from_string(&storage_mode_str)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))?;
 
-            
             // Validate PQ parameters
             if dim % subvectors != 0 {
+                error!(
+                    operation = "validation",
+                    field = "subvectors",
+                    dim = dim,
+                    subvectors = subvectors,
+                    "Subvectors must divide dimension evenly"
+                );
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                     format!("subvectors ({}) must divide dimension ({}) evenly", subvectors, dim)
                 ));
             }
             
             if bits < 1 || bits > 8 {
+                error!(operation = "validation", field = "bits", value = bits, min = 1, max = 8, "Bits out of range");
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                     format!("bits must be between 1 and 8, got {}", bits)
                 ));
             }
             
             if training_size < 1000 {
+                error!(operation = "validation", field = "training_size", value = training_size, min = 1000, "Training size too small");
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                     format!("training_size must be at least 1000, got {}", training_size)
                 ));
@@ -531,6 +619,17 @@ impl HNSWIndex {
                 storage_mode,
             };
             
+            debug!(
+                operation = "pq_configuration",
+                subvectors = subvectors,
+                bits = bits,
+                training_size = training_size,
+                storage_mode = %storage_mode_str,
+                sub_dim = dim / subvectors,
+                num_centroids = 1 << bits,
+                "Product Quantization configured"
+            );
+            
             // Create PQ instance
             let pq = Arc::new(PQ::new(dim, subvectors, bits, training_size, max_training_vectors));
             
@@ -539,17 +638,24 @@ impl HNSWIndex {
             (None, None)
         };
 
-        //let max_layer = (expected_size as f32).log2().ceil() as usize;
-        // let calculated_max_layer = (expected_size as f32).log2().ceil() as usize;
-        // let max_layer = std::cmp::min(calculated_max_layer, 16); // Cap at 16
-        // println!("DEBUG: calculated_max_layer={}, using max_layer={}", calculated_max_layer, max_layer);
         let max_layer = 16; // Always use NB_LAYER_MAX for hnsw-rs compatibility
-        println!("DEBUG: Using max_layer={} for hnsw-rs dump compatibility", max_layer);
-
+        trace!(operation = "hnsw_config", max_layer = max_layer, reason = "hnsw-rs compatibility", "Using fixed max_layer");
 
         // Create initial raw HNSW index (will be rebuilt as PQ after training)
         let hnsw = DistanceType::new_raw(&space_normalized, m, expected_size, max_layer, ef_construction);
 
+        let duration_ms = start_time.elapsed().as_millis();
+        info!(
+            operation = "index_creation_complete",
+            dim = dim,
+            space = %space_normalized,
+            m = m,
+            ef_construction = ef_construction,
+            expected_size = expected_size,
+            has_quantization = quantization_params.is_some(),
+            duration_ms = duration_ms,
+            "HNSW index created successfully"
+        );
 
         // Initialize all fields with proper thread-safe wrappers
         Ok(HNSWIndex {
@@ -635,32 +741,43 @@ impl HNSWIndex {
     }
 
     /// Rebuild the HNSW index to use PQ codes after training is complete
+    #[instrument(level = "info", skip(self), fields(
+        vector_count = self.get_vector_count(),
+        has_quantization = self.has_quantization()
+    ), err)]
     pub fn rebuild_with_quantization(&mut self) -> PyResult<bool> {
+        let start_time = Instant::now();
+
         let pq = match &self.pq {
             Some(pq) if pq.is_trained() => pq.clone(),
-            _ => return Ok(false),
+            _ => {
+                warn!(operation = "rebuild_quantization", reason = "pq_not_trained", "Cannot rebuild: PQ not trained");
+                return Ok(false);
+            }
         };
 
         // Get all current vectors for quantization
         let vectors = self.vectors.read().unwrap();
         if vectors.is_empty() {
+            warn!(operation = "rebuild_quantization", reason = "no_vectors", "Cannot rebuild: no vectors available");
             return Ok(false);
         }
+
+        info!(operation = "quantization_rebuild_start", vector_count = vectors.len(), "Starting quantization rebuild");
 
         // Quantize all existing vectors
         let vector_refs: Vec<&[f32]> = vectors.values().map(|v| v.as_slice()).collect();
         let quantized_codes = pq.quantize_batch(&vector_refs)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("Failed to quantize vectors: {}", e)
-            ))?;
+            .map_err(|e| {
+                error!(operation = "quantization_rebuild", error = %e, "Failed to quantize vectors");
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Failed to quantize vectors: {}", e)
+                )
+            })?;
 
         // Create new PQ-based HNSW index
-        //let max_layer = (self.expected_size as f32).log2().ceil() as usize;
-        // let calculated_max_layer = (self.expected_size as f32).log2().ceil() as usize;
-        // let max_layer = std::cmp::min(calculated_max_layer, 16); // Cap at 16
-        // println!("DEBUG rebuild_with_quantization: calculated_max_layer={}, using max_layer={}", calculated_max_layer, max_layer);
         let max_layer = 16; // Always use NB_LAYER_MAX for consistency
-        println!("DEBUG rebuild_with_quantization: using max_layer={}", max_layer);
+        trace!(operation = "rebuild_quantization", max_layer = max_layer, "Creating new PQ HNSW index");
 
         let new_hnsw = DistanceType::new_pq(
             &self.space, 
@@ -681,6 +798,7 @@ impl HNSWIndex {
                     pq_codes.insert(id.clone(), quantized_codes[i].clone());
                 }
             }
+            debug!(operation = "quantization_rebuild", codes_stored = pq_codes.len(), "Quantized codes stored");
         }
 
         // Replace the HNSW index
@@ -692,7 +810,7 @@ impl HNSWIndex {
         // Insert quantized vectors into new index
         let pq_codes = self.pq_codes.read().unwrap();
         let id_map = self.id_map.read().unwrap();
-        let mut batch_data = Vec::new();
+        let mut batch_data: Vec<(&Vec<u8>, usize)> = Vec::new();
         
         for (id, codes) in pq_codes.iter() {
             if let Some(&internal_id) = id_map.get(id) {
@@ -703,14 +821,28 @@ impl HNSWIndex {
         if !batch_data.is_empty() {
             let mut hnsw_guard = self.hnsw.lock().unwrap();
             hnsw_guard.insert_batch_pq(&batch_data)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    format!("Failed to insert quantized vectors: {}", e)
-                ))?;
+                .map_err(|e| {
+                    error!(operation = "quantization_rebuild", error = %e, "Failed to insert quantized vectors");
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        format!("Failed to insert quantized vectors: {}", e)
+                    )
+                })?;
         }
+
+        // ✅ ENTERPRISE: Add duration timing with fixed compression ratio calculation
+        let duration_ms = start_time.elapsed().as_millis();
+        let compression_ratio = (pq.dim as f64 * 4.0) / pq.subvectors as f64;
+        info!(
+            operation = "quantization_rebuild_complete",
+            vector_count = vectors.len(),
+            codes_inserted = batch_data.len(),
+            compression_ratio = compression_ratio,
+            duration_ms = duration_ms,
+            "Quantization rebuild completed successfully"
+        );
 
         Ok(true)
     }
-
 
     /// Check if the index is using quantized search
     pub fn is_quantized(&self) -> bool {
@@ -732,12 +864,18 @@ impl HNSWIndex {
         }
     }
 
-
     /// Add vectors to the index with graceful error collection
     #[pyo3(signature = (data, overwrite = true))]
+    #[instrument(level = "info", skip(self, data), fields(
+        overwrite = overwrite,
+        has_quantization = self.has_quantization()
+    ), err)]
     pub fn add(&mut self, data: Bound<PyAny>, overwrite: bool) -> PyResult<AddResult> {
+        let start_time = Instant::now();
+
         // Input validation
         if data.is_none() {
+            error!(operation = "add_vectors", error = "data_is_none", "Data cannot be None");
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "Data cannot be None"
             ));
@@ -757,6 +895,7 @@ impl HNSWIndex {
         }
 
         if parsed_data.is_empty() && errors.is_empty() {
+            trace!(operation = "add_vectors", result = "empty_input", "No vectors to process");
             return Ok(AddResult {
                 total_inserted: 0,
                 total_errors: 0,
@@ -768,20 +907,18 @@ impl HNSWIndex {
         let total_input_count = parsed_data.len() + total_errors;
         let vector_shape = Some((total_input_count, self.dim));
 
+        debug!(
+            operation = "add_vectors_start",
+            total_vectors = parsed_data.len(),
+            parse_errors = total_errors,
+            "Starting vector addition"
+        );
+
         // Process successfully parsed vectors
         for (id, vector, metadata) in parsed_data {
             let id_for_error = id.clone();
 
             match self.add_single_vector(id, vector, metadata, overwrite) {
-                // Ok(()) => {
-                //     total_inserted += 1;
-
-                //     // Update vector count
-                //     {
-                //         let mut count = self.vector_count.lock().unwrap();
-                //         *count += 1;
-                //     }
-
                 Ok(inserted_new) => {
                     total_inserted += 1;
                     if inserted_new {
@@ -789,20 +926,44 @@ impl HNSWIndex {
                         *count += 1;
                     }
 
-
-
                     // Check training trigger (graceful failure handling)
                     if let Err(training_error) = self.maybe_trigger_training() {
+                        warn!(
+                            operation = "training_trigger",
+                            error = %training_error,
+                            vector_id = %id_for_error,
+                            "Training trigger failed"
+                        );
                         errors.push(format!("Training failed: {}", training_error));
-                        eprintln!("Warning: PQ training failed: {}", training_error);
                     }
                 }
                 Err(e) => {
                     total_errors += 1;
                     errors.push(format!("Vector {}: {}", id_for_error, e));
+                    trace!(
+                        operation = "add_vector_error",
+                        vector_id = %id_for_error,
+                        error = %e,
+                        "Vector addition failed"
+                    );
                 }
             }
         }
+
+        // ✅ ENTERPRISE: Add duration timing to hot path
+        let duration_ms = start_time.elapsed().as_millis();
+        info!(
+            operation = "add_vectors_complete",
+            total_inserted = total_inserted,
+            total_errors = total_errors,
+            success_rate = if total_input_count > 0 { 
+                total_inserted as f64 / total_input_count as f64 * 100.0 
+            } else { 
+                100.0 
+            },
+            duration_ms = duration_ms,
+            "Vector addition completed"
+        );
 
         Ok(AddResult {
             total_inserted,
@@ -811,37 +972,6 @@ impl HNSWIndex {
             vector_shape,
         })
     }
-
-
-
-
-
-    // /// ENHANCED STATISTICS with training progress
-    // pub fn get_training_progress(&self) -> f32 {
-    //     if let Some(config) = &self.quantization_config {
-    //         if self.training_threshold_reached.load(Ordering::Acquire) {
-    //             100.0
-    //         } else {
-    //             let training_ids = self.training_ids.read().unwrap();
-    //             (training_ids.len() as f32 / config.training_size as f32 * 100.0).min(100.0)
-    //         }
-    //     } else {
-    //         0.0
-    //     }
-    // }
-
-
-    // /// ENHANCED STATISTICS with training progress
-    // pub fn get_training_progress(&self) -> f32 {
-    //     if let Some(config) = &self.quantization_config {
-    //         let training_ids = self.training_ids.read().unwrap();
-    //         (training_ids.len() as f32 / config.training_size as f32 * 100.0).min(100.0)
-    //     } else {
-    //         0.0
-    //     }
-    // }
-
-
 
     pub fn get_training_progress(&self) -> f32 {
         if let Some(config) = &self.quantization_config {
@@ -857,13 +987,6 @@ impl HNSWIndex {
             0.0
         }
     }
-
-
-
-
-
-
-
 
     /// Get number of training vectors still needed
     pub fn training_vectors_needed(&self) -> usize {
@@ -901,11 +1024,14 @@ impl HNSWIndex {
         }
     }
 
-
-
-
     /// Enhanced search method with automatic ADC usage
     #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, return_vector=false))]
+    #[instrument(level = "debug", skip(self, py, vector, filter), fields(
+        top_k = top_k,
+        ef_search = ef_search,
+        return_vector = return_vector,
+        is_quantized = self.is_quantized()
+    ), err)]
     pub fn search(
         &self,
         py: Python<'_>,
@@ -915,7 +1041,8 @@ impl HNSWIndex {
         ef_search: Option<usize>,
         return_vector: bool,
     ) -> PyResult<PyObject> {
-        //let ef = ef_search.unwrap_or_else(|| std::cmp::max(2 * top_k, 100));
+        let start_time = Instant::now();
+
         let ef = ef_search.unwrap_or_else(|| {
             match self.space.to_lowercase().as_str() {
                 "l1" | "l2" => std::cmp::max(2 * top_k, 150),
@@ -923,14 +1050,18 @@ impl HNSWIndex {
             }
         });
 
+        trace!(operation = "search_config", ef = ef, space = %self.space, "Search parameters configured");
+
         let filter_conditions = filter.map(|f| self.python_dict_to_value_map(f)).transpose()?;
 
         // Detect batch vs single query with comprehensive input support
-        if let Ok(list_vec) = vector.extract::<Vec<Vec<f32>>>() {
+        // let result = if let Ok(list_vec) = vector.extract::<Vec<Vec<f32>>>() {
+        let result: PyObject = if let Ok(list_vec) = vector.extract::<Vec<Vec<f32>>>() {
             // Format: List of vectors [[0.1, 0.2], [0.3, 0.4]]
 
             // Validation for empty batch or empty vectors in batch
             if list_vec.is_empty() {
+                error!(operation = "search", error = "empty_batch", "Batch cannot be empty");
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                     "Batch cannot be empty"
                 ));
@@ -939,20 +1070,29 @@ impl HNSWIndex {
             // Check for empty vectors within the batch
             for (i, vec) in list_vec.iter().enumerate() {
                 if vec.is_empty() {
+                    error!(operation = "search", error = "empty_vector_in_batch", vector_index = i, "Vector in batch cannot be empty");
                     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                         format!("Vector {} in batch cannot be empty", i)
                     ));
                 }
             }
 
+            debug!(operation = "batch_search", batch_size = list_vec.len(), "Starting batch search");
             let results = self.batch_search_internal(&list_vec, filter_conditions.as_ref(), top_k, ef, return_vector, py)?;
-            Ok(PyList::new(py, results)?.into())
+            PyList::new(py, results)?.into()
         } else if let Ok(np_array) = vector.downcast::<PyArray2<f32>>() {
             // Format: NumPy 2D array (N, dims)
             let readonly = np_array.readonly();
             let shape = readonly.shape();
 
             if shape.len() != 2 || shape[1] != self.dim {
+                error!(
+                    operation = "search",
+                    error = "shape_mismatch",
+                    expected_shape = format!("(N, {})", self.dim),
+                    actual_shape = format!("{:?}", shape),
+                    "NumPy array shape mismatch"
+                );
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                     "NumPy array must have shape (N, {}), got {:?}", self.dim, shape
                 )));
@@ -960,12 +1100,11 @@ impl HNSWIndex {
 
             let flat = readonly.as_slice()?;
             let batch: Vec<Vec<f32>> = flat.chunks(self.dim).map(|chunk| chunk.to_vec()).collect();
+            debug!(operation = "batch_search_numpy", batch_size = batch.len(), "Starting NumPy batch search");
             let results = self.batch_search_internal(&batch, filter_conditions.as_ref(), top_k, ef, return_vector, py)?;
-            Ok(PyList::new(py, results)?.into())
+            PyList::new(py, results)?.into()
         } else {
-            // // Single vector path - enhanced with NumPy 1D support
-
-            // For single vector search:
+            // Single vector path - enhanced with NumPy 1D support
             let query_vector = if let Ok(array1d) = vector.downcast::<PyArray1<f32>>() {
                 array1d.readonly().as_slice()?.to_vec()
             } else {
@@ -975,36 +1114,35 @@ impl HNSWIndex {
             // PROCESS HERE using extract_single_vector logic
             let processed_query = self.validate_and_process_query_vector(query_vector)?;
 
-
+            trace!(operation = "single_search", query_dim = processed_query.len(), "Starting single vector search");
             
             let search_results = py.allow_threads(|| {
                 // Check if we should use quantized search
                 let use_quantized = self.is_quantized();
+
+                trace!(operation = "search_method", use_quantized = use_quantized, "Selected search method");
 
                 let hnsw_results = {
                     let hnsw_guard = self.hnsw.lock().unwrap();
 
                     if use_quantized {
                         // Use ADC search for quantized index
-                        //hnsw_guard.search(&single_vec, top_k, ef)
                         hnsw_guard.search(&processed_query, top_k, ef)
                             .unwrap_or_else(|e| {
-                                eprintln!("ADC search error: {}", e);
+                                error!(operation = "adc_search", error = %e, "ADC search failed");
                                 Vec::new()
                             })
                     } else {
                         // Use raw vector search
-                        //match hnsw_guard.search(&single_vec, top_k, ef) {
                         match hnsw_guard.search(&processed_query, top_k, ef) {
                             Ok(results) => results,
                             Err(e) => {
-                                eprintln!("Raw search error: {}", e);
+                                error!(operation = "raw_search", error = %e, "Raw search failed");
                                 Vec::new()
                             }
                         }
                     }
                 };
-
 
                 // Process results with enhanced vector retrieval
                 let vectors = self.vectors.read().unwrap();
@@ -1066,38 +1204,75 @@ impl HNSWIndex {
                 output.push(dict.into());
             }
 
-            Ok(PyList::new(py, output)?.into())
-        }
+            PyList::new(py, output)?.into()
+        };
+
+        // ✅ ENTERPRISE: Add duration timing to hot path with actual result count
+
+        // let duration_ms = start_time.elapsed().as_millis();
+        // let results_count = match &result {
+        //     r if r.is_instance_of::<PyList>() => {
+        //         let list: &Bound<PyList> = r.downcast().unwrap();
+        //         list.len()
+        //     }
+        //     _ => 0, // This shouldn't happen in normal operation
+        // };
+
+        let duration_ms = start_time.elapsed().as_millis();
+        let results_count = {
+            let any = result.bind(py); 
+            match any.downcast::<PyList>() {
+                Ok(list) => list.len(),
+                Err(_) => 0,
+            }
+        };
+
+        debug!(operation = "search_complete", results_count = results_count, duration_ms = duration_ms, "Search completed");
+
+        Ok(result)
     }
 
-
-
-
-
-
-
-
-
-    // /// Save the index to a .zdb directory structure
-    // pub fn save(&self, path: &str) -> PyResult<()> {
-    //     crate::persistence::save_index(self, path)
-    // }
-
     /// Enhanced Save method to include HNSW Graph
+    #[instrument(level = "info", skip(self), fields(
+        vector_count = self.get_vector_count(),
+        has_quantization = self.has_quantization(),
+        is_quantized = self.is_quantized()
+    ), err)]
     pub fn save(&self, path: &str) -> PyResult<()> {
+        let start_time = Instant::now();
+        info!(operation = "save_start", path = path, "Starting index save");
 
         let path_buf = Path::new(path);
 
         // Phase 1: Save all ZeusDB components (already tested to work)
+        debug!(operation = "save_phase1", "Saving ZeusDB components");
         crate::persistence::save_index(self, path)?;
 
         // Phase 2: Save HNSW graph using hnsw-rs native dump
+        debug!(operation = "save_phase2", "Saving HNSW graph");
         self.save_hnsw_graph(path_buf)?;
 
-        println!("✅ Phase 2 enhanced save completed successfully!");
+        let duration_ms = start_time.elapsed().as_millis();
+        info!(operation = "save_complete", path = path, duration_ms = duration_ms, "Index save completed successfully");
         Ok(())
     }
 
+
+
+
+
+
+    // /// Python method: `index.get_dim()`
+    // #[pyo3(name = "get_dim")]
+    // pub fn py_get_dim(&self) -> usize {
+    //     self.dim
+    // }
+
+    /// Python property: `index.dim`
+    #[getter]
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
 
 
 
@@ -1120,6 +1295,8 @@ impl HNSWIndex {
                 "Expected a string or a list of strings for ID(s)",
             ));
         };
+
+        trace!(operation = "get_records", record_count = ids.len(), return_vector = return_vector, "Retrieving records");
 
         let mut records = Vec::with_capacity(ids.len());
 
@@ -1149,7 +1326,7 @@ impl HNSWIndex {
                         match pq.reconstruct(codes) {
                             Ok(reconstructed) => Some(reconstructed),
                             Err(e) => {
-                                eprintln!("Warning: Failed to reconstruct vector for ID {}: {}", id, e);
+                                warn!(operation = "vector_reconstruction", vector_id = %id, error = %e, "Failed to reconstruct vector");
                                 None
                             }
                         }
@@ -1167,11 +1344,9 @@ impl HNSWIndex {
             }
         }
 
+        trace!(operation = "get_records_complete", found_records = records.len(), "Records retrieval completed");
         Ok(records)
     }
-
-
-
 
     /// Enhanced get_stats with storage mode information
     pub fn get_stats(&self) -> HashMap<String, String> {
@@ -1239,7 +1414,7 @@ impl HNSWIndex {
                 stats.insert("quantization_active".to_string(), self.is_quantized().to_string());
 
                 if is_trained {
-                    let compression_ratio = (pq.dim * 4) as f64 / pq.subvectors as f64;
+                    let compression_ratio = (pq.dim as f64 * 4.0) / pq.subvectors as f64;
                     stats.insert("quantization_compression_ratio".to_string(), format!("{:.1}x", compression_ratio));
                 }
             }
@@ -1252,11 +1427,8 @@ impl HNSWIndex {
 
         stats
     }
+
             
-
-
-
-
     /// List the first number of records in the index (ID and metadata)
     #[pyo3(signature = (number=10))]
     pub fn list(&self, py: Python<'_>, number: usize) -> PyResult<Vec<(String, PyObject)>> {
@@ -1313,9 +1485,9 @@ impl HNSWIndex {
 
             let active_status = if self.is_quantized() { "active" } else { "inactive" };
             
-            // Use cached compression ratio calculation
+            // Use cached compression ratio calculation with proper float division
             let compression_info = self.pq.as_ref()
-                .map(|pq| format!("{}x", (pq.dim * 4) / pq.subvectors))
+                .map(|pq| format!("{:.1}x", (pq.dim as f64 * 4.0) / pq.subvectors as f64))
                 .unwrap_or_else(|| "unknown".to_string());
             
             format!(
@@ -1340,8 +1512,10 @@ impl HNSWIndex {
             rev_map.remove(&internal_id);
             // Note: HNSW doesn't support removal, so the graph still contains the point
             // but it won't be accessible via the mappings
+            debug!(operation = "remove_point", vector_id = %id, internal_id = internal_id, "Vector removed from index");
             Ok(true)
         } else {
+            trace!(operation = "remove_point", vector_id = %id, "Vector not found for removal");
             Ok(false)
         }
     }
@@ -1374,10 +1548,19 @@ impl HNSWIndex {
     /// Concurrent benchmark for search performance
     #[pyo3(signature = (query_count, max_threads=None))]
     pub fn benchmark_concurrent_reads(&self, query_count: usize, max_threads: Option<usize>) -> PyResult<HashMap<String, f64>> {
-        use std::time::Instant;
+        use rand::random;  // Import for random number generation
+        
+        let start_time = Instant::now();
+        
+        debug!(
+            operation = "benchmark_start",
+            query_count = query_count,
+            max_threads = max_threads,
+            "Starting concurrent read benchmark"
+        );
         
         let queries: Vec<Vec<f32>> = (0..query_count)
-            .map(|_| (0..self.dim).map(|_| rand::random::<f32>()).collect())
+            .map(|_| (0..self.dim).map(|_| random::<f32>()).collect())
             .collect();
         
         let mut results = HashMap::new();
@@ -1409,20 +1592,32 @@ impl HNSWIndex {
         results.insert("speedup".to_string(), sequential_time / parallel_time);
         results.insert("threads_used".to_string(), num_threads as f64);
         
+        let total_duration_ms = start_time.elapsed().as_millis();
+        info!(
+            operation = "benchmark_complete",
+            sequential_qps = queries.len() as f64 / sequential_time,
+            parallel_qps = queries.len() as f64 / parallel_time,
+            speedup = sequential_time / parallel_time,
+            duration_ms = total_duration_ms,
+            "Benchmark completed"
+        );
+        
         Ok(results)
     }
 
     /// Raw performance benchmark
     #[pyo3(signature = (query_count, max_threads=None))]
     pub fn benchmark_raw_concurrent_performance(&self, query_count: usize, max_threads: Option<usize>) -> HashMap<String, f64> {
-        use std::time::Instant;
+        use rand::random;  // Import for random number generation
+        
+        let start_time = Instant::now();
         
         let queries: Vec<Vec<f32>> = (0..query_count)
-            .map(|_| (0..self.dim).map(|_| rand::random::<f32>()).collect())
+            .map(|_| (0..self.dim).map(|_| random::<f32>()).collect())
             .collect();
-        
+
         let mut results = HashMap::new();
-        
+
         // Sequential benchmark
         let start = Instant::now();
         for query in &queries {
@@ -1430,11 +1625,13 @@ impl HNSWIndex {
         }
         let sequential_time = start.elapsed().as_secs_f64();
         
+        
+        
         // Parallel benchmark
         let available_threads = rayon::current_num_threads();
         let num_threads = max_threads.unwrap_or(available_threads).min(available_threads);
         let chunk_size = (queries.len() + num_threads - 1) / num_threads;
-        
+
         let start = Instant::now();
         let total_processed: usize = queries
             .par_chunks(chunk_size)
@@ -1447,26 +1644,30 @@ impl HNSWIndex {
                 local_count
             })
             .sum();
-        
+
         let parallel_time = start.elapsed().as_secs_f64();
-        
-        results.insert("sequential_time_sec".to_string(), sequential_time);
-        results.insert("parallel_time_sec".to_string(), parallel_time);
-        results.insert("sequential_qps".to_string(), query_count as f64 / sequential_time);
-        results.insert("parallel_qps".to_string(), total_processed as f64 / parallel_time);
+
+        results.insert("sequential_time".to_string(), sequential_time);
+        results.insert("parallel_time".to_string(), parallel_time);
+        results.insert("sequential_qps".to_string(), queries.len() as f64 / sequential_time);
+        results.insert("parallel_qps".to_string(), queries.len() as f64 / parallel_time);
         results.insert("speedup".to_string(), sequential_time / parallel_time);
         results.insert("threads_used".to_string(), num_threads as f64);
         results.insert("note".to_string(), "limited_by_hnsw_mutex".parse().unwrap_or(0.0));
         
+        let total_duration_ms = start_time.elapsed().as_millis();
+        info!(
+            operation = "benchmark_complete",
+            sequential_qps = queries.len() as f64 / sequential_time,
+            parallel_qps = queries.len() as f64 / parallel_time,
+            speedup = sequential_time / parallel_time,
+            duration_ms = total_duration_ms,
+            "Benchmark completed"
+        );
+        
         results
     }
 
-    
-    
-    // /// Simple test method
-    // pub fn debug_test(&self) -> String {
-    //     "debug works".to_string()
-    // }
 
     /// Get current code version counter to verify build updates
     pub fn get_code_version(&self) -> String {
@@ -1477,13 +1678,7 @@ impl HNSWIndex {
     pub fn get_version_number(&self) -> u32 {
         CODE_VERSION_COUNTER
     }
-
 }
-
-
-
-
-
 
 // INTERNAL METHODS, HELPERS AND IMPLEMENTATIONS
 impl HNSWIndex {
@@ -1513,17 +1708,32 @@ impl HNSWIndex {
     fn validate_and_process_query_vector(&self, vector: Vec<f32>) -> PyResult<Vec<f32>> {
         // Same validation as extract_single_vector
         if vector.is_empty() {
+            error!(operation = "query_validation", error = "empty_vector", "Search vector cannot be empty");
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "Search vector cannot be empty"
             ));
         }
         if vector.len() != self.dim {
+            error!(
+                operation = "query_validation",
+                error = "dimension_mismatch",
+                expected = self.dim,
+                actual = vector.len(),
+                "Search vector dimension mismatch"
+            );
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                 "Search vector dimension mismatch: expected {}, got {}", self.dim, vector.len()
             )));
         }
         for (i, &val) in vector.iter().enumerate() {
             if !val.is_finite() {
+                error!(
+                    operation = "query_validation",
+                    error = "invalid_value",
+                    index = i,
+                    value = val,
+                    "Search vector contains invalid value"
+                );
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                     "Search vector contains invalid value at index {}: {}", i, val
                 )));
@@ -1534,40 +1744,8 @@ impl HNSWIndex {
         Ok(self.process_vector_for_space(vector))
     }
 
-
     // 1. CORE VECTOR OPERATIONS (6 methods)
     /// 3-PATH ARCHITECTURE - Main router
-    // fn add_single_vector(
-    //     &mut self,
-    //     id: String,
-    //     vector: Vec<f32>,
-    //     metadata: HashMap<String, Value>,
-    //     overwrite: bool
-    // ) -> PyResult<()> {
-    //     // Duplicate check (unless overwrite)
-    //     if !overwrite {
-    //         let id_map = self.id_map.read().unwrap();
-    //         if id_map.contains_key(&id) {
-    //             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-    //                 format!("Vector with ID '{}' already exists", id)
-    //             ));
-    //         }
-    //     }
-
-    //     // Clean 3-Path Architecture
-    //     if !self.has_quantization() {
-    //         // Path A: Raw storage (no quantization config)
-    //         self.add_raw_vector(id, vector, metadata)
-    //     } else if !self.is_quantized() {
-    //         // Path B: Raw storage + ID collection for training
-    //         self.add_with_id_collection(id, vector, metadata)
-    //     } else {
-    //         // Path C: Quantized storage (PQ trained and active)
-    //         self.add_quantized_vector(id, vector, metadata)
-    //     }
-    // }
-
-
     fn add_single_vector(
         &mut self,
         id: String,
@@ -1582,10 +1760,25 @@ impl HNSWIndex {
         };
 
         if !overwrite && !is_new {
+            warn!(
+                operation = "add_single_vector",
+                vector_id = %id,
+                reason = "already_exists",
+                "Vector already exists and overwrite=false"
+            );
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("Vector with ID '{}' already exists", id)
             ));
         }
+
+        trace!(
+            operation = "add_single_vector",
+            vector_id = %id,
+            is_new = is_new,
+            has_quantization = self.has_quantization(),
+            is_quantized = self.is_quantized(),
+            "Routing vector addition"
+        );
 
         // Clean 3-Path Architecture
         if !self.has_quantization() {
@@ -1602,37 +1795,11 @@ impl HNSWIndex {
         Ok(is_new)
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     /// Path A: Raw storage (no quantization)
+    #[instrument(level = "trace", skip(self, vector, metadata), fields(
+        vector_id = %id,
+        path = "raw_storage"
+    ))]
     fn add_raw_vector(
         &mut self,
         id: String,
@@ -1659,7 +1826,7 @@ impl HNSWIndex {
         // Store processed vector directly (no additional processing)
         {
             let mut vectors = self.vectors.write().unwrap();
-            vectors.insert(id, vector.clone()); // Already normalized
+            vectors.insert(id.clone(), vector.clone()); // Already normalized
         }
 
         // Insert processed vector into HNSW
@@ -1668,11 +1835,21 @@ impl HNSWIndex {
             hnsw_guard.insert(&vector, internal_id); // Already normalized
         }
 
-        Ok(())
+        trace!(
+            operation = "add_raw_vector_complete",
+            vector_id = %id,
+            internal_id = internal_id,
+            "Raw vector added successfully"
+        );
 
+        Ok(())
     }
 
     /// Path B: ID collection for consistent training
+    #[instrument(level = "trace", skip(self, vector, metadata), fields(
+        vector_id = %id,
+        path = "id_collection"
+    ))]
     fn add_with_id_collection(
         &mut self,
         id: String,
@@ -1680,12 +1857,17 @@ impl HNSWIndex {
         metadata: HashMap<String, Value>
     ) -> PyResult<()> {
         // 1. Store vector normally (single storage)
-        //self.add_raw_vector(id.clone(), vector, metadata)?;
-        let is_new = self.add_raw_vector(id.clone(), vector, metadata)?;
+        self.add_raw_vector(id.clone(), vector, metadata)?;
 
         // SKIP TRAINING ID COLLECTION DURING PERSISTENCE REBUILD
         if self.rebuilding_from_persistence.load(std::sync::atomic::Ordering::Acquire) {
-            return Ok(is_new); // Don't collect training IDs during rebuild
+            trace!(
+                operation = "add_with_id_collection",
+                vector_id = %id,
+                reason = "rebuilding_from_persistence",
+                "Skipping training ID collection during rebuild"
+            );
+            return Ok(());
         }
 
         // 2. Collect ID for training (minimal memory overhead)
@@ -1694,22 +1876,40 @@ impl HNSWIndex {
                 let mut training_ids = self.training_ids.write().unwrap();
 
                 if training_ids.len() < config.training_size {
-                    training_ids.push(id);
+                    training_ids.push(id.clone());
+                    let progress = (training_ids.len() as f32 / config.training_size as f32 * 100.0).min(100.0);
+
+                    trace!(
+                        operation = "training_id_collection",
+                        vector_id = %id,
+                        collected_count = training_ids.len(),
+                        target_size = config.training_size,
+                        progress_percent = progress,
+                        "Training ID collected"
+                    );
 
                     // Check if we've reached the threshold
                     if training_ids.len() >= config.training_size {
                         self.training_threshold_reached.store(true, Ordering::Release);
+                        info!(
+                            operation = "training_threshold_reached",
+                            collected_count = training_ids.len(),
+                            target_size = config.training_size,
+                            "Training threshold reached - ready for PQ training"
+                        );
                     }
                 }
             }
         }
 
-        Ok(is_new)
+        Ok(())
     }
 
-
-
     /// Path C: Quantized storage with configurable raw vector retention
+    #[instrument(level = "trace", skip(self, vector, metadata), fields(
+        vector_id = %id,
+        path = "quantized_storage"
+    ))]
     fn add_quantized_vector(
         &mut self,
         id: String,
@@ -1736,6 +1936,12 @@ impl HNSWIndex {
         // Quantize the vector
         let pq = self.pq.as_ref().unwrap();
         let codes = pq.quantize(&vector).map_err(|e| {
+            error!(
+                operation = "add_quantized_vector",
+                vector_id = %id,
+                error = %e,
+                "Failed to quantize vector"
+            );
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 format!("Failed to quantize vector: {}", e)
             )
@@ -1762,17 +1968,22 @@ impl HNSWIndex {
             hnsw_guard.insert_pq_codes(&codes, internal_id);
         }
 
+        trace!(
+            operation = "add_quantized_vector_complete",
+            vector_id = %id,
+            internal_id = internal_id,
+            codes_length = codes.len(),
+            "Quantized vector added successfully"
+        );
+
         Ok(())
     }
 
-
-
-
-
-
-
-
     /// TRAINING TRIGGER: Uses threshold flag for race condition safety
+    #[instrument(level = "info", skip(self), fields(
+        threshold_reached = self.training_threshold_reached.load(Ordering::Acquire),
+        has_quantization = self.has_quantization()
+    ))]
     fn maybe_trigger_training(&mut self) -> Result<(), String> {
         // Check atomic flag first (fast path)
         if !self.training_threshold_reached.load(Ordering::Acquire) {
@@ -1783,7 +1994,7 @@ impl HNSWIndex {
         if let Some(_config) = &self.quantization_config {
             if let Some(pq) = &self.pq {
                 if !pq.is_trained() {
-                    println!("Training threshold reached. Starting PQ training...");
+                    info!(operation = "training_trigger", "Training threshold reached - starting PQ training");
                     return self.train_quantization_from_ids();
                 }
             }
@@ -1793,27 +2004,27 @@ impl HNSWIndex {
     }
 
     /// TRAINING EXECUTION: Uses collected IDs for deterministic training set
+    #[instrument(level = "info", skip(self), fields(
+        has_pq = self.pq.is_some(),
+        has_config = self.quantization_config.is_some()
+    ))]
     fn train_quantization_from_ids(&mut self) -> Result<(), String> {
-        // let pq = self.pq.as_ref()
-        //     .ok_or("PQ instance not available")?;
-        let pq = self.pq.as_ref().ok_or("PQ not available")?.clone();
+        let start_time = Instant::now();
 
-        // let config = self.quantization_config.as_ref()
-        //     .ok_or("Quantization config not available")?;
+        let pq = self.pq.as_ref().ok_or("PQ not available")?.clone();
         let config = self.quantization_config.as_ref().ok_or("Config not available")?.clone();
         
-
         // Get consistent training set using collected IDs
         let training_vectors = {
             let training_ids = self.training_ids.read().unwrap();
 
             // ADD EARLY CHECK:
             if training_ids.is_empty() {
+                warn!(operation = "pq_training", reason = "no_training_ids", "No training IDs available");
                 // Reset threshold to prevent repeated attempts
                 self.training_threshold_reached.store(false, Ordering::Release);
                 return Err("No training IDs available for training".to_string());
             }
-
 
             let vectors = self.vectors.read().unwrap();
 
@@ -1829,13 +2040,32 @@ impl HNSWIndex {
             }
 
             if missing_vectors > 0 {
-                eprintln!("Warning: {} training vectors were removed before training", missing_vectors);
+                warn!(
+                    operation = "pq_training",
+                    missing_vectors = missing_vectors,
+                    available_vectors = training_data.len(),
+                    "Some training vectors were removed before training"
+                );
             }
+
+            debug!(
+                operation = "pq_training_dataset",
+                collected_ids = training_ids.len(),
+                available_vectors = training_data.len(),
+                target_size = config.training_size,
+                "Training dataset prepared"
+            );
 
             training_data
         };
 
         if training_vectors.len() < config.training_size {
+            error!(
+                operation = "pq_training",
+                available = training_vectors.len(),
+                required = config.training_size,
+                "Insufficient vectors for training"
+            );
             return Err(format!("Insufficient vectors for training: need {}, have {} (some may have been removed)",
                 config.training_size, training_vectors.len()));
         }
@@ -1844,6 +2074,12 @@ impl HNSWIndex {
         let final_training_set = if let Some(max_training) = config.max_training_vectors {
             if training_vectors.len() > max_training {
                 // Take first max_training vectors (deterministic)
+                debug!(
+                    operation = "pq_training_limit",
+                    available = training_vectors.len(),
+                    using = max_training,
+                    "Limiting training set size"
+                );
                 training_vectors.into_iter().take(max_training).collect()
             } else {
                 training_vectors
@@ -1852,14 +2088,25 @@ impl HNSWIndex {
             training_vectors
         };
 
-        println!("Training PQ with {} vectors (from {} collected IDs)...",
-            final_training_set.len(),
-            self.training_ids.read().unwrap().len());
+        info!(
+            operation = "pq_training_start",
+            training_vectors = final_training_set.len(),
+            subvectors = config.subvectors,
+            bits = config.bits,
+            "Starting PQ training"
+        );
 
         // Train the PQ model
+        let training_start = Instant::now();
         pq.train(&final_training_set)?;
+        let training_duration = training_start.elapsed();
 
-        println!("PQ training completed successfully!");
+        info!(
+            operation = "pq_training_complete",
+            training_vectors = final_training_set.len(),
+            duration_ms = training_duration.as_millis(),
+            "PQ training completed successfully"
+        );
 
         // Clear training IDs (no longer needed)
         {
@@ -1868,27 +2115,33 @@ impl HNSWIndex {
         }
 
         // Rebuild index with quantization
-        println!("Rebuilding index with quantization...");
+        debug!(operation = "pq_rebuild_start", "Rebuilding index with quantization");
+        let rebuild_start = Instant::now();
         let rebuild_success = self.rebuild_with_quantization()
             .map_err(|e| format!("Failed to rebuild with quantization: {}", e))?;
+        let rebuild_duration = rebuild_start.elapsed();
 
         if rebuild_success {
-            println!("Index successfully rebuilt with quantization!");
+            // Calculate compression info with proper float division
+            let compression_ratio = (self.dim as f64 * 4.0) / pq.subvectors as f64;
+            let memory_savings = (1.0 - (pq.subvectors as f64) / (self.dim as f64 * 4.0)) * 100.0;
 
-            // Calculate compression info
-            let compression_ratio = (self.dim * 4) / pq.subvectors;
-            let memory_savings = (1.0 - (pq.subvectors as f64) / (self.dim * 4) as f64) * 100.0;
-
-            println!("Compression: {}x, Memory saved: {:.1}%", 
-                compression_ratio, memory_savings);
+            let total_duration_ms = start_time.elapsed().as_millis();
+            info!(
+                operation = "pq_complete",
+                rebuild_duration_ms = rebuild_duration.as_millis(),
+                compression_ratio = compression_ratio,
+                memory_savings_percent = memory_savings,
+                total_duration_ms = total_duration_ms,
+                "Index successfully rebuilt with quantization"
+            );
         } else {
+            error!(operation = "pq_rebuild", "Index rebuild returned false");
             return Err("Index rebuild returned false".to_string());
         }
 
         Ok(())
     }
-
-
 
     // 2. SEARCH OPERATIONS (1 method)
     /// Raw search without Python objects (for benchmarking)
@@ -1896,7 +2149,6 @@ impl HNSWIndex {
         // HNSW search with locking
         let hnsw_results = {
             let hnsw_guard = self.hnsw.lock().unwrap();
-            //hnsw_guard.search(query, 10, 100)
             hnsw_guard.search(query, 10, 100).unwrap_or_else(|_| Vec::new())
         }; // Lock released immediately
         
@@ -1911,10 +2163,6 @@ impl HNSWIndex {
             })
             .collect()
     }
-
-
-
-
 
     /// Parse input data into (id, vector, metadata) tuples with error collection
     fn parse_input_data(&self, data: &Bound<PyAny>) -> (Vec<(String, Vec<f32>, HashMap<String, Value>)>, Vec<String>) {
@@ -1943,23 +2191,6 @@ impl HNSWIndex {
         }
 
         (parsed_vectors, errors)
-    }
-
-
-
-    /// Parse dictionary input format with comprehensive support
-    /// Fast-fail validation mode for strict data processing and debugging scenarios
-    #[allow(dead_code)]
-    fn parse_dict_input(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
-        // Detect single object format vs batch format
-        if dict.contains("id")? && (dict.contains("values")? || dict.contains("vector")?) {
-            // FORMAT 1: Single object {"id": "doc1", "values": [...], "metadata": {...}}
-            return self.parse_single_object_format(dict, parsed_vectors);
-        }
-
-        // Handle batch format with multiple key names
-        // FORMAT 3 & 5: Batch format {"vectors/embeddings": [...], "ids": [...], "metadatas": [...]}
-        return self.parse_batch_format(dict, parsed_vectors);
     }
 
     /// Safe dictionary parsing that collects errors
@@ -2019,62 +2250,6 @@ impl HNSWIndex {
                 }
             }
         }
-                        
-
-
-    /// Handle Format 1: Single object
-    fn parse_single_object_format(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
-        // Extract vector (support both "values" and "vector" keys)
-        let vector = if let Some(values_item) = dict.get_item("values")? {
-            self.extract_single_vector(&values_item)?
-        } else if let Some(vector_item) = dict.get_item("vector")? {
-            self.extract_single_vector(&vector_item)?
-        } else {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Missing 'vector' or 'values' key in single object format"
-            ));
-        };
-
-        // Extract ID
-        let id = dict.get_item("id")?
-            .map(|v| v.extract::<String>())
-            .transpose()?
-            .unwrap_or_else(|| self.generate_id());
-
-        // Extract metadata with comprehensive handling
-        let metadata = match dict.get_item("metadata")? {
-            Some(meta_obj) => {
-                if let Ok(meta_dict) = meta_obj.downcast::<PyDict>() {
-                    self.python_dict_to_value_map(meta_dict)?
-                } else {
-                    let mut map = HashMap::new();
-                    let value = self.python_object_to_value(&meta_obj)?;
-
-                    // Use descriptive key based on type
-                    let key = if value.is_string() {
-                        "text"
-                    } else if value.is_number() {
-                        "number"
-                    } else if value.is_boolean() {
-                        "flag"
-                    } else if value.is_array() {
-                        "list"
-                    } else {
-                        "value"
-                    };
-
-                    map.insert(key.to_string(), value);
-                    map
-                }
-            }
-            None => HashMap::new(),
-        };
-
-        parsed_vectors.push((id, vector, metadata));
-        Ok(())
-    }
-
-
 
     /// Handle Format 3 & 5: Batch format - WORKING SOLUTION
     fn parse_batch_format(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
@@ -2174,7 +2349,6 @@ impl HNSWIndex {
         Ok(())
     }
 
-
     /// Parse NumPy array with context (IDs and metadata from dict)
     fn parse_numpy_with_context(
         &self,
@@ -2185,10 +2359,16 @@ impl HNSWIndex {
         let readonly = np_array.readonly();
         let shape = readonly.shape();
 
-        //println!("🔍 DEBUG: parse_numpy_with_context - shape: {:?}", shape);
-        debug_log!("🔍 DEBUG: parse_numpy_with_context - shape: {:?}", shape);
+        trace!(operation = "parse_numpy_context", shape = ?shape, "Processing NumPy array with context");
 
         if shape.len() != 2 || shape[1] != self.dim {
+            error!(
+                operation = "parse_numpy_context",
+                error = "shape_mismatch",
+                expected_shape = format!("(N, {})", self.dim),
+                actual_shape = format!("{:?}", shape),
+                "NumPy array shape validation failed"
+            );
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                 "NumPy array must have shape (N, {}), got {:?}", self.dim, shape
             )));
@@ -2199,20 +2379,20 @@ impl HNSWIndex {
 
         // Extract IDs array
         let ids_list = dict.get_item("ids")?
-            //.and_then(|item| item.downcast::<PyList>().ok());
             .and_then(|item| item.downcast::<PyList>().ok().map(|list| list.clone()));
         
-
         // Extract metadata array
         let metadatas_list = dict.get_item("metadatas")?
             .or_else(|| dict.get_item("metadata").ok().flatten())
-            //.and_then(|item| item.downcast::<PyList>().ok());
             .and_then(|item| item.downcast::<PyList>().ok().map(|list| list.clone()));
 
-        // println!("🔍 DEBUG: Found IDs list: {}", ids_list.is_some());
-        // println!("🔍 DEBUG: Found metadata list: {}", metadatas_list.is_some());
-        debug_log!("🔍 DEBUG: Found IDs list: {}", ids_list.is_some());
-        debug_log!("🔍 DEBUG: Found metadata list: {}", metadatas_list.is_some());
+        trace!(
+            operation = "parse_numpy_context",
+            num_vectors = num_vectors,
+            has_ids = ids_list.is_some(),
+            has_metadata = metadatas_list.is_some(),
+            "Processing vectors with context"
+        );
 
         for i in 0..num_vectors {
             let start_idx = i * self.dim;
@@ -2249,81 +2429,20 @@ impl HNSWIndex {
                 HashMap::new()
             };
 
-            //println!("🔍 DEBUG: Vector {}: ID='{}', metadata keys: {:?}",
-            debug_log!("🔍 DEBUG: Vector {}: ID='{}', metadata keys: {:?}",
-                i, id, metadata.keys().collect::<Vec<_>>());
+            trace!(
+                operation = "parse_numpy_vector",
+                vector_index = i,
+                vector_id = %id,
+                metadata_keys = metadata.keys().len(),
+                "Parsed NumPy vector with context"
+            );
 
             parsed_vectors.push((id, processed_vector, metadata));
         }
 
-        //println!("🔍 DEBUG: parse_numpy_with_context completed. Total parsed: {}", num_vectors);
-        debug_log!("🔍 DEBUG: parse_numpy_with_context completed. Total parsed: {}", num_vectors);
+        trace!(operation = "parse_numpy_context_complete", parsed_count = num_vectors, "NumPy parsing completed");
         Ok(())
     }
-
-
-
-    /// Parse list input format with backward compatibility and enhanced metadata support
-    /// All-or-nothing list processing for research environments where data quality is critical
-    #[allow(dead_code)]
-    fn parse_list_input(&self, list: &Bound<PyList>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
-        for item in list.iter() {
-            if let Ok(item_dict) = item.downcast::<PyDict>() {
-                // Support both "vector" and "values" keys for backward compatibility
-                let vector = if let Some(vector_item) = item_dict.get_item("vector")? {
-                    self.extract_single_vector(&vector_item)?
-                } else if let Some(values_item) = item_dict.get_item("values")? {
-                    self.extract_single_vector(&values_item)?
-                } else {
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        "Missing 'vector' or 'values' key in item. Please use 'vector' key (recommended) or 'values' key (legacy)."
-                    ));
-                };
-
-                let id = item_dict.get_item("id")?
-                    .map(|v| v.extract::<String>())
-                    .transpose()?
-                    .unwrap_or_else(|| self.generate_id());
-
-                // Full metadata processing for list items
-                let metadata = match item_dict.get_item("metadata")? {
-                    Some(meta_obj) => {
-                        if let Ok(meta_dict) = meta_obj.downcast::<PyDict>() {
-                            self.python_dict_to_value_map(meta_dict)?
-                        } else {
-                            let mut map = HashMap::new();
-                            let value = self.python_object_to_value(&meta_obj)?;
-
-                            // Use descriptive key based on type
-                            let key = if value.is_string() {
-                                "text"
-                            } else if value.is_number() {
-                                "number"
-                            } else if value.is_boolean() {
-                                "flag"
-                            } else if value.is_array() {
-                                "list"
-                            } else {
-                                "value"
-                            };
-
-                            map.insert(key.to_string(), value);
-                            map
-                        }
-                    }
-                    None => HashMap::new(),
-                };
-
-                parsed_vectors.push((id, vector, metadata));
-            } else {
-                let vector = self.extract_single_vector(&item)?;
-                let id = self.generate_id();
-                parsed_vectors.push((id, vector, HashMap::new()));
-            }
-        }
-        Ok(())
-    }
-
 
     /// Safe list parsing that collects errors instead of failing immediately
     fn parse_list_input_safe(
@@ -2399,68 +2518,6 @@ impl HNSWIndex {
         }
     }
 
-
-
-
-    /// Parse NumPy 2D array input with enhanced ID support
-    /// Performance-optimized NumPy parsing that fails fast on first validation error
-    #[allow(dead_code)]
-    fn parse_numpy_input(&self, np_array: &Bound<PyArray2<f32>>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
-        let readonly = np_array.readonly();
-        let shape = readonly.shape();
-
-        // 🔍 DEBUG: Add detailed logging
-        //println!("🔍 DEBUG: NumPy array shape: {:?}", shape);
-        //println!("🔍 DEBUG: Expected dim: {}", self.dim);
-        debug_log!("🔍 DEBUG: NumPy array shape: {:?}", shape);
-        debug_log!("🔍 DEBUG: Expected dim: {}", self.dim);
-
-        if shape.len() != 2 || shape[1] != self.dim {
-            println!("❌ DEBUG: Shape validation failed!");
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "NumPy array must have shape (N, {}), got {:?}", self.dim, shape
-            )));
-        }
-
-        let flat = readonly.as_slice()?;
-        let num_vectors = shape[0];
-
-        //println!("🔍 DEBUG: Processing {} vectors from NumPy array", num_vectors);
-        //println!("🔍 DEBUG: Flat array length: {}", flat.len());
-        debug_log!("🔍 DEBUG: Processing {} vectors from NumPy array", num_vectors);
-        debug_log!("🔍 DEBUG: Flat array length: {}", flat.len());
-
-        for i in 0..num_vectors {
-            let start_idx = i * self.dim;
-            let end_idx = start_idx + self.dim;
-
-            //println!("🔍 DEBUG: Vector {}: indices {}..{}", i, start_idx, end_idx);
-            debug_log!("🔍 DEBUG: Vector {}: indices {}..{}", i, start_idx, end_idx);
-
-            let raw_vector = flat[start_idx..end_idx].to_vec();
-            //println!("🔍 DEBUG: Raw vector {}: {:?}", i, &raw_vector[..std::cmp::min(4, raw_vector.len())]);
-            debug_log!("🔍 DEBUG: Raw vector {}: {:?}", i, &raw_vector[..std::cmp::min(4, raw_vector.len())]);
-        
-            // ADD PROCESSING - only place besides extract_single_vector
-            let processed_vector = self.process_vector_for_space(raw_vector);
-            //println!("🔍 DEBUG: Processed vector {}: {:?}", i, &processed_vector[..std::cmp::min(4, processed_vector.len())]);
-            debug_log!("🔍 DEBUG: Processed vector {}: {:?}", i, &processed_vector[..std::cmp::min(4, processed_vector.len())]);
-
-            let id = self.generate_id();
-            //println!("🔍 DEBUG: Generated ID for vector {}: {}", i, id);
-            debug_log!("🔍 DEBUG: Generated ID for vector {}: {}", i, id);
-        
-            parsed_vectors.push((id.clone(), processed_vector, HashMap::new()));
-            //println!("🔍 DEBUG: Added vector {} with ID {} to parsed_vectors", i, id);
-            debug_log!("🔍 DEBUG: Added vector {} with ID {} to parsed_vectors", i, id);
-        }
-
-        //println!("🔍 DEBUG: parse_numpy_input completed. Total parsed: {}", parsed_vectors.len());
-        debug_log!("🔍 DEBUG: parse_numpy_input completed. Total parsed: {}", parsed_vectors.len());
-        Ok(())
-    }
-
-
     /// Safe NumPy parsing for error collection
     fn parse_numpy_input_safe(&self, np_array: &Bound<PyArray2<f32>>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> Result<(), String> {
         // This is the same as your current parse_numpy_input but returns Result<(), String>
@@ -2485,7 +2542,6 @@ impl HNSWIndex {
 
         Ok(())
     }
-
 
     /// Extract a single vector from various Python types (enhanced)
     fn extract_single_vector(&self, data: &Bound<PyAny>) -> PyResult<Vec<f32>> {
@@ -2522,7 +2578,6 @@ impl HNSWIndex {
             }
         }
 
-        //Ok(vector)
         // ✅ Apply space-specific processing
         Ok(self.process_vector_for_space(vector))
     }
@@ -2532,8 +2587,6 @@ impl HNSWIndex {
         let id = self.get_next_id();
         format!("vec_{}", id)
     }
-
-
 
     /// Safe version of extract_single_vector that returns String errors instead of PyErr
     fn extract_single_vector_safe(&self, data: &Bound<PyAny>) -> Result<Vec<f32>, String> {
@@ -2566,9 +2619,6 @@ impl HNSWIndex {
 
         Ok(self.process_vector_for_space(vector))
     }
-
-
-
 
     // 4. DATA CONVERSION & FILTERING (12 methods)
     // Helper methods for data conversion and filtering
@@ -2758,10 +2808,15 @@ impl HNSWIndex {
         Ok(py_obj)
     }
 
-
-
     // 5. BATCH SEARCH METHODS (3 methods)
     /// Internal batch search method for multiple query vectors
+    #[instrument(level = "debug", skip(self, vectors, filter_conditions, py), fields(
+        batch_size = vectors.len(),
+        top_k = top_k,
+        ef = ef,
+        return_vector = return_vector,
+        has_filter = filter_conditions.is_some()
+    ), err)]
     fn batch_search_internal(
         &self,
         vectors: &[Vec<f32>],
@@ -2771,9 +2826,18 @@ impl HNSWIndex {
         return_vector: bool,
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
+        let start_time = Instant::now();
+
         // Validate all vectors have correct dimension
         for (i, vector) in vectors.iter().enumerate() {
             if vector.len() != self.dim {
+                error!(
+                    operation = "batch_search_validation",
+                    vector_index = i,
+                    expected_dim = self.dim,
+                    actual_dim = vector.len(),
+                    "Vector dimension mismatch in batch"
+                );
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                     format!("Vector {}: dimension mismatch: expected {}, got {}", 
                            i, self.dim, vector.len())));
@@ -2781,11 +2845,24 @@ impl HNSWIndex {
         }
 
         // Choose strategy based on batch size
-        if vectors.len() <= 5 {
+        let result = if vectors.len() <= 5 {
+            trace!(operation = "batch_search_strategy", strategy = "sequential", "Using sequential processing");
             self.batch_search_sequential(vectors, filter_conditions, top_k, ef, return_vector, py)
         } else {
+            trace!(operation = "batch_search_strategy", strategy = "parallel", "Using parallel processing");
             self.batch_search_parallel(vectors, filter_conditions, top_k, ef, return_vector, py)
-        }
+        };
+
+        // ✅ ENTERPRISE: Add duration timing to hot path
+        let duration_ms = start_time.elapsed().as_millis();
+        debug!(
+            operation = "batch_search_complete",
+            batch_size = vectors.len(),
+            duration_ms = duration_ms,
+            "Batch search completed"
+        );
+
+        result
     }
 
     /// Sequential batch processing (for small batches)
@@ -2810,7 +2887,6 @@ impl HNSWIndex {
                 // FIX: Process each query vector for space
                 let processed_query = self.process_vector_for_space(vector.clone());
 
-                //let neighbors = hnsw_guard.search(vector, top_k, ef).unwrap_or_else(|_| Vec::new());
                 let neighbors = hnsw_guard.search(&processed_query, top_k, ef).unwrap_or_else(|_| Vec::new());
 
                 let mut query_results = Vec::with_capacity(neighbors.len());
@@ -2843,7 +2919,7 @@ impl HNSWIndex {
 
                 all_results.push(query_results);
             }
-            
+
             all_results
         });
 
@@ -2881,17 +2957,18 @@ impl HNSWIndex {
         return_vector: bool,
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
+        let span = tracing::Span::current();
         let rust_results = py.allow_threads(|| {
             let results: Vec<Vec<(String, f32, HashMap<String, Value>, Option<Vec<f32>>)>> = vectors
                 .par_iter()
                 .map(|vector| {
+                    let _entered = span.clone().entered();
                     // FIX: Process each query vector for space
                     let processed_query = self.process_vector_for_space(vector.clone());
 
                     // Brief HNSW search (individual lock per query)
                     let neighbors = {
                         let hnsw_guard = self.hnsw.lock().unwrap();
-                        //hnsw_guard.search(vector, top_k, ef).unwrap_or_else(|_| Vec::new())
                         hnsw_guard.search(&processed_query, top_k, ef).unwrap_or_else(|_| Vec::new())
                     };
 
@@ -2959,7 +3036,6 @@ impl HNSWIndex {
         Ok(output)
     }
 
-
     // 6. PERSISTENCE INTEGRATION METHODS (2 methods)
 
     /// Load an index from a .zdb directory structure (Phase 2)
@@ -2968,13 +3044,17 @@ impl HNSWIndex {
     }
 
     /// Save HNSW graph using hnsw-rs native file_dump
+    #[instrument(level = "info", skip(self), fields(
+        vector_count = self.get_vector_count(),
+        path = %path.display()
+    ))]
     fn save_hnsw_graph(&self, path: &Path) -> PyResult<()> {
-        println!("📊 Saving HNSW graph structure...");
+        debug!(operation = "save_hnsw_graph_start", "Starting HNSW graph save");
 
         // EMPTY INDEX CHECK:
         let vector_count = self.get_vector_count();
         if vector_count == 0 {
-            println!("  Index is empty - skipping HNSW graph dump");
+            debug!(operation = "save_hnsw_graph", reason = "empty_index", "Skipping HNSW graph dump - index is empty");
             return Ok(());
         }
 
@@ -2982,49 +3062,52 @@ impl HNSWIndex {
 
         let dump_result = match &*hnsw_guard {
             DistanceType::Cosine(hnsw) => {
-                println!("   Using Cosine distance HNSW");
+                trace!(operation = "save_hnsw_graph", distance_type = "cosine", "Using Cosine distance HNSW");
                 hnsw.file_dump(path, "hnsw_index")
             },
             DistanceType::L2(hnsw) => {
-                println!("   Using L2 distance HNSW");
+                trace!(operation = "save_hnsw_graph", distance_type = "l2", "Using L2 distance HNSW");
                 hnsw.file_dump(path, "hnsw_index")
             },
             DistanceType::L1(hnsw) => {
-                println!("   Using L1 distance HNSW");
+                trace!(operation = "save_hnsw_graph", distance_type = "l1", "Using L1 distance HNSW");
                 hnsw.file_dump(path, "hnsw_index")
             },
             DistanceType::CosinePQ(hnsw) => {
-                println!("   Using Cosine-PQ distance HNSW");
+                trace!(operation = "save_hnsw_graph", distance_type = "cosine_pq", "Using Cosine-PQ distance HNSW");
                 hnsw.file_dump(path, "hnsw_index")
             },
             DistanceType::L2PQ(hnsw) => {
-                println!("   Using L2-PQ distance HNSW");
+                trace!(operation = "save_hnsw_graph", distance_type = "l2_pq", "Using L2-PQ distance HNSW");
                 hnsw.file_dump(path, "hnsw_index")
             },
             DistanceType::L1PQ(hnsw) => {
-                println!("   Using L1-PQ distance HNSW");
+                trace!(operation = "save_hnsw_graph", distance_type = "l1_pq", "Using L1-PQ distance HNSW");
                 hnsw.file_dump(path, "hnsw_index")
             },
         };
 
         match dump_result {
             Ok(basename) => {
-                println!("✅ HNSW graph saved successfully!");
-                println!("   Files created:");
-                println!("     - {}.hnsw.graph (graph structure)", basename);
-                println!("     - {}.hnsw.data (ignored - we use our own data)", basename);
+                debug!(
+                    operation = "save_hnsw_graph_complete",
+                    basename = %basename,
+                    files_created = %["hnsw.graph", "hnsw.data"].iter()
+                        .map(|ext| format!("{}.{}", basename, ext))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    "HNSW graph saved successfully"
+                );
                 Ok(())
             }
             Err(e) => {
-                println!("❌ HNSW graph dump failed: {}", e);
+                error!(operation = "save_hnsw_graph", error = %e, "HNSW graph dump failed");
                 Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                     format!("HNSW graph dump failed: {}", e)
                 ))
             }
         }
     }
-
-
 
     // ============================================================================
     // PERSISTENCE Minimal Empty Constructor and SETTERS
@@ -3103,22 +3186,6 @@ impl HNSWIndex {
         self.training_threshold_reached.store(value, std::sync::atomic::Ordering::Release);
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     // ============================================================================
     // PERSISTENCE GETTERS - For accessing private fields from persistence module
     // ============================================================================
@@ -3127,11 +3194,6 @@ impl HNSWIndex {
     pub fn get_dim(&self) -> usize {
         self.dim
     }
-
-    // /// Get the distance space (cosine, l2, l1)
-    // pub fn get_space(&self) -> &str {
-    //     &self.space
-    // }
 
     /// Get the distance space (cosine, l2, l1) - changed to a more idiomatic getter
     pub fn space(&self) -> &str {  // Changed from get_space to space
@@ -3206,7 +3268,6 @@ impl HNSWIndex {
         &self.created_at
     }
 
-
     /// Get read access to training IDs (for persistence)
     pub fn get_training_ids(&self) -> std::sync::RwLockReadGuard<Vec<String>> {
         self.training_ids.read().unwrap()
@@ -3217,11 +3278,8 @@ impl HNSWIndex {
         self.training_threshold_reached.load(std::sync::atomic::Ordering::Acquire)
     }
 
-
     /// Set training IDs (for persistence loading only)
     pub(crate) fn set_training_ids(&mut self, ids: Vec<String>) {
         *self.training_ids.write().unwrap() = ids;
     }
-
-
 }
