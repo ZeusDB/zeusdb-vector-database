@@ -102,9 +102,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed storage mode detection and raw vector preservation based on configuration
 - Prevented training ID re-collection during persistence rebuild operations
 
-### Removed
-<!-- Add removals/deprecations here -->
-
 ---
 
 ## [0.2.1] - 2025-07-30
@@ -520,25 +517,15 @@ were actually validating that cosine normalization was properly implemented.
 
 ### Added
 - Initial implementation of the ZeusDB Vector Database Python package with Rust backend.
-
 - Support for HNSW (Hierarchical Navigable Small World) indexing.
-
 - Python bindings via PyO3 for creating and querying vector indexes.
-
 - HNSWIndex class with support for:
-
   - Vector insertion with optional metadata.
-
   - Top-K nearest neighbor search with optional metadata filtering.
-
   - Support for multiple distance metrics: cosine
-
 - Metadata storage and retrieval at both index and vector level.
-
 - VectorDatabase Python wrapper class to manage index creation and usage.
-
 - Example benchmarking script for inserting and querying vectors.
-
 - Introduced a new GitHub Actions workflow (`Check Package (without publishing to PyPI)`) for verifying ZeusDB builds across all supported platforms without pushing to PyPI. Includes metadata validation and artifact inspection.
 
 ### Fixed
