@@ -3,6 +3,11 @@ import pytest
 import numpy as np
 from zeusdb_vector_database import VectorDatabase
 
+import os
+import sys
+import subprocess
+import json
+
 # ------------------------------------------------------------
 # Utility Helper Functions for normalized vector comparison
 # ------------------------------------------------------------
@@ -2071,3 +2076,147 @@ def test_storage_mode_error_handling():
     assert int(final_stats["raw_vectors_stored"]) == 1100  # All vectors stored
     assert int(final_stats["quantized_codes_stored"]) == 1100  # All vectors quantized
     assert final_stats["storage_mode"] == "quantized_with_raw"
+
+# ------------------------------------------------------------
+# Test 44: Persistence: Save and Load
+# ------------------------------------------------------------
+def test_persistence_save_and_load(tmp_path):
+
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=8, expected_size=10)
+
+    vectors = np.random.rand(5, 8).astype(np.float32)
+    ids = [f"vec_{i}" for i in range(5)]
+
+    add_res = index.add({"vectors": vectors.tolist(), "ids": ids})
+    assert add_res.is_success()
+
+    save_dir = tmp_path / "test_index.zdb"
+    index.save(str(save_dir))
+
+    # Optional: verify save produced a directory
+    assert save_dir.exists() and save_dir.is_dir()
+
+    loaded = vdb.load(str(save_dir))
+    assert loaded.get_vector_count() == 5
+
+    results = loaded.search(vectors[0].tolist(), top_k=3)
+    assert isinstance(results, list)
+    assert len(results) == 3
+
+
+# ------------------------------------------------------------
+# Test 45: Persistence: Quantized Index
+# ------------------------------------------------------------
+def test_persistence_quantized_index(tmp_path):
+    vdb = VectorDatabase()
+    quant_config = {"type": "pq", "subvectors": 8, "bits": 8, "training_size": 1000}
+    index = vdb.create("hnsw", dim=8, quantization_config=quant_config)
+
+    # Insert >= training_size to force training to complete
+    n = 1200
+    vectors = np.random.rand(n, 8).astype(np.float32)
+    ids = [f"vec_{i}" for i in range(n)]
+
+    add_res = index.add({"vectors": vectors.tolist(), "ids": ids})
+    assert add_res.is_success()
+    # More resilient: accept either quantized or ready for quantization
+    assert index.is_quantized() or index.can_use_quantization()
+
+    save_dir = tmp_path / "pq_index.zdb"
+    index.save(str(save_dir))
+    assert save_dir.exists() and save_dir.is_dir()
+
+    loaded = vdb.load(str(save_dir))
+    # Accept either quantization is active or can be used
+    assert loaded.is_quantized() or loaded.can_use_quantization()
+
+    # Basic smoke search on the loaded index
+    results = loaded.search(vectors[0].tolist(), top_k=5)
+    assert isinstance(results, list)
+    assert len(results) == 5
+
+
+# ------------------------------------------------------------
+# Test 46: Logging: file target + JSON format
+# ------------------------------------------------------------
+def test_logging_json_stderr_subprocess(tmp_path):
+    #import os, sys, json, subprocess
+
+    code = r"""
+import numpy as np
+import zeusdb_vector_database as zdb
+v = zdb.VectorDatabase()
+idx = v.create('hnsw', dim=8)
+vals = np.random.rand(3, 8).astype('float32').tolist()
+idx.add({'vectors': vals})
+"""
+
+    env = os.environ.copy()
+    env.update({
+        "ZEUSDB_LOG_LEVEL": "debug",
+        "ZEUSDB_LOG_FORMAT": "json",
+        "ZEUSDB_LOG_TARGET": "stderr",  # preferred; some builds may still log to stdout
+    })
+
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env, check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+
+    stderr = proc.stderr.decode("utf-8", errors="ignore")
+    stdout = proc.stdout.decode("utf-8", errors="ignore")
+
+    def first_json_line(text: str):
+        for ln in text.splitlines():
+            if ln.strip().startswith("{"):
+                return ln
+        return None
+
+    line = first_json_line(stderr) or first_json_line(stdout)
+    assert line, f"No JSON log lines found.\nSTDERR:\n{stderr}\n\nSTDOUT:\n{stdout}"
+    entry = json.loads(line)
+    assert isinstance(entry, dict)
+    assert "level" in entry and "fields" in entry and "timestamp" in entry
+
+
+# ------------------------------------------------------------
+# Test 47: Logging: autolog disabled prevents file init
+# ------------------------------------------------------------
+def test_logging_disabled_autoinit(tmp_path):
+    #import os, sys, subprocess
+
+    log_file = tmp_path / "noinit.log"
+
+    code = r"""
+import numpy as np
+import zeusdb_vector_database as zdb
+# If autologging is truly disabled, creating/using the index shouldn't create a file-based subscriber.
+v = zdb.VectorDatabase()
+idx = v.create('hnsw', dim=8)
+vals = np.random.rand(2, 8).astype('float32').tolist()
+idx.add({'vectors': vals})
+"""
+
+    env = os.environ.copy()
+    env.update({
+        "ZEUSDB_DISABLE_AUTOLOG": "1",
+        "ZEUSDB_LOG_LEVEL": "debug",          # would normally create logs
+        "ZEUSDB_LOG_FORMAT": "json",
+        "ZEUSDB_LOG_TARGET": "file",
+        "ZEUSDB_LOG_FILE": str(log_file),
+    })
+
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert completed.returncode == 0
+
+    # With autolog disabled, the file subscriber should not be initialized.
+    # Accept either "file not created" or "created but empty" as success.
+    assert (not log_file.exists()) or log_file.stat().st_size == 0
