@@ -24,8 +24,8 @@ use crate::pq::PQ;
 // ============================================================================
 
 // 🔢 MANUAL VERSION COUNTER - Change this number after each code change
-const CODE_VERSION_COUNTER: u32 = 1026;  // ← INCREMENT THIS MANUALLY
-const CODE_VERSION_DESCRIPTION: &str = "Test of full logging capability";
+const CODE_VERSION_COUNTER: u32 = 1027;  // ← INCREMENT THIS MANUALLY
+const CODE_VERSION_DESCRIPTION: &str = "Test after stuffing up git and dev branch merge!";
 
 // ============================================================================
 
