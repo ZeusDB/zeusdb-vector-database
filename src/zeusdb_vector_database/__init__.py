@@ -16,3 +16,12 @@ _auto_configure_logging()  # Sets env vars for Rust BEFORE the PyO3 module is im
 from .vector_database import VectorDatabase # noqa: E402
 
 __all__ = ["VectorDatabase"]
+
+# STEP 3: Optional LangChain integration (only if installed).
+try:
+    from .langchain_integration import ZeusDBVectorStore, AsyncZeusDBVectorStore 
+except Exception:
+    # Keep __init__ lean; if langchain isn't present, we just don't export these.
+    pass
+else:
+    __all__ += ["ZeusDBVectorStore", "AsyncZeusDBVectorStore"]
