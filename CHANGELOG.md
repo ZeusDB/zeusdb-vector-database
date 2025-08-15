@@ -10,10 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.1] - 2025-0
 
 ### Added
-<!-- Add new features here -->
+- New langchain_integration.py with enterprise structured logging, perf timings, MMR search, and sync/async APIs (`ZeusDBVectorStore`, `AsyncZeusDBVectorStore`).
+- Optional langchain extra in pyproject.toml (langchain-core>=0.3.74,<0.4) for first-class LangChain support.
+Conditional exports in `__init__.py` to surface LangChain integrations when the dependency is available.
 
 ### Changed
-<!-- Add changed behavior here -->
+- Package init now guards LangChain symbols behind a soft import to avoid hard runtime dependency and keep base installs lean.
 
 ### Fixed
 <!-- Add bug fixes here -->
