@@ -24,8 +24,8 @@ use crate::pq::PQ;
 // ============================================================================
 
 // 🔢 MANUAL VERSION COUNTER - Change this number after each code change
-const CODE_VERSION_COUNTER: u32 = 1026;  // ← INCREMENT THIS MANUALLY
-const CODE_VERSION_DESCRIPTION: &str = "Test of full logging capability";
+const CODE_VERSION_COUNTER: u32 = 1027;  // ← INCREMENT THIS MANUALLY
+const CODE_VERSION_DESCRIPTION: &str = "Fixed overwrite bug - eliminates duplicate documents";
 
 // ============================================================================
 
@@ -864,11 +864,312 @@ impl HNSWIndex {
         }
     }
 
-    /// Add vectors to the index with graceful error collection
+
+
+
+
+
+
+
+
+
+    // /// Add vectors to the index with graceful error collection
+    // #[pyo3(signature = (data, overwrite = true))]
+    // #[instrument(level = "info", skip(self, data), fields(
+    //     overwrite = overwrite,
+    //     has_quantization = self.has_quantization()
+    // ), err)]
+    // pub fn add(&mut self, data: Bound<PyAny>, overwrite: bool) -> PyResult<AddResult> {
+    //     let start_time = Instant::now();
+
+    //     // Input validation
+    //     if data.is_none() {
+    //         error!(operation = "add_vectors", error = "data_is_none", "Data cannot be None");
+    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+    //             "Data cannot be None"
+    //         ));
+    //     }
+
+    //     // Use error-collecting parsing
+    //     let (parsed_data, parse_errors) = self.parse_input_data(&data);
+
+    //     let mut total_inserted = 0;
+    //     let mut total_errors = 0;
+    //     let mut errors = Vec::new();
+
+    //     // Add parse errors to the collection
+    //     for parse_error in parse_errors {
+    //         errors.push(parse_error);
+    //         total_errors += 1;
+    //     }
+
+    //     if parsed_data.is_empty() && errors.is_empty() {
+    //         trace!(operation = "add_vectors", result = "empty_input", "No vectors to process");
+    //         return Ok(AddResult {
+    //             total_inserted: 0,
+    //             total_errors: 0,
+    //             errors: vec![],
+    //             vector_shape: Some((0, self.dim)),
+    //         });
+    //     }
+
+    //     let total_input_count = parsed_data.len() + total_errors;
+    //     let vector_shape = Some((total_input_count, self.dim));
+
+    //     debug!(
+    //         operation = "add_vectors_start",
+    //         total_vectors = parsed_data.len(),
+    //         parse_errors = total_errors,
+    //         "Starting vector addition"
+    //     );
+
+    //     // Process successfully parsed vectors
+    //     for (id, vector, metadata) in parsed_data {
+    //         let id_for_error = id.clone();
+
+    //         match self.add_single_vector(id, vector, metadata, overwrite) {
+    //             Ok(inserted_new) => {
+    //                 total_inserted += 1;
+    //                 if inserted_new {
+    //                     let mut count = self.vector_count.lock().unwrap();
+    //                     *count += 1;
+    //                 }
+
+    //                 // Check training trigger (graceful failure handling)
+    //                 if let Err(training_error) = self.maybe_trigger_training() {
+    //                     warn!(
+    //                         operation = "training_trigger",
+    //                         error = %training_error,
+    //                         vector_id = %id_for_error,
+    //                         "Training trigger failed"
+    //                     );
+    //                     errors.push(format!("Training failed: {}", training_error));
+    //                 }
+    //             }
+    //             Err(e) => {
+    //                 total_errors += 1;
+    //                 errors.push(format!("Vector {}: {}", id_for_error, e));
+    //                 trace!(
+    //                     operation = "add_vector_error",
+    //                     vector_id = %id_for_error,
+    //                     error = %e,
+    //                     "Vector addition failed"
+    //                 );
+    //             }
+    //         }
+    //     }
+
+    //     // ✅ ENTERPRISE: Add duration timing to hot path
+    //     let duration_ms = start_time.elapsed().as_millis();
+    //     info!(
+    //         operation = "add_vectors_complete",
+    //         total_inserted = total_inserted,
+    //         total_errors = total_errors,
+    //         success_rate = if total_input_count > 0 { 
+    //             total_inserted as f64 / total_input_count as f64 * 100.0 
+    //         } else { 
+    //             100.0 
+    //         },
+    //         duration_ms = duration_ms,
+    //         "Vector addition completed"
+    //     );
+
+    //     Ok(AddResult {
+    //         total_inserted,
+    //         total_errors,
+    //         errors,
+    //         vector_shape,
+    //     })
+    // }
+
+
+
+
+
+    // /// Add vectors to the index with graceful error collection and proper overwrite support
+    // #[pyo3(signature = (data, overwrite = true))]
+    // #[instrument(level = "info", skip(self, data), fields(
+    //     overwrite = overwrite,
+    //     has_quantization = self.has_quantization()
+    // ), err)]
+    // pub fn add(&mut self, data: Bound<PyAny>, overwrite: bool) -> PyResult<AddResult> {
+    //     let start_time = Instant::now();
+
+    //     // Input validation
+    //     if data.is_none() {
+    //         error!(operation = "add_vectors", error = "data_is_none", "Data cannot be None");
+    //         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+    //             "Data cannot be None"
+    //         ));
+    //     }
+
+    //     // Use error-collecting parsing
+    //     let (parsed_data, parse_errors) = self.parse_input_data(&data);
+
+    //     let mut total_inserted = 0;
+    //     let mut total_errors = 0;
+    //     let mut errors = Vec::new();
+
+    //     // Add parse errors to the collection
+    //     for parse_error in parse_errors {
+    //         errors.push(parse_error);
+    //         total_errors += 1;
+    //     }
+
+    //     if parsed_data.is_empty() && errors.is_empty() {
+    //         trace!(operation = "add_vectors", result = "empty_input", "No vectors to process");
+    //         return Ok(AddResult {
+    //             total_inserted: 0,
+    //             total_errors: 0,
+    //             errors: vec![],
+    //             vector_shape: Some((0, self.dim)),
+    //         });
+    //     }
+
+    //     let total_input_count = parsed_data.len() + total_errors;
+    //     let vector_shape = Some((total_input_count, self.dim));
+
+    //     debug!(
+    //         operation = "add_vectors_start",
+    //         total_vectors = parsed_data.len(),
+    //         parse_errors = total_errors,
+    //         overwrite = overwrite,
+    //         "Starting vector addition"
+    //     );
+
+    //     // CRITICAL FIX: Handle overwrites properly to prevent duplicates
+    //     if overwrite {
+    //         // Phase 1: Batch identify and remove existing documents
+    //         let ids_to_remove: Vec<String> = {
+    //             let id_map = self.id_map.read().unwrap();
+    //             parsed_data.iter()
+    //                 .filter_map(|(id, _, _)| {
+    //                     if id_map.contains_key(id) {
+    //                         Some(id.clone())
+    //                     } else {
+    //                         None
+    //                     }
+    //                 })
+    //                 .collect()
+    //         }; // Release read lock here
+
+    //         if !ids_to_remove.is_empty() {
+    //             info!(
+    //                 operation = "overwrite_preparation",
+    //                 documents_to_remove = ids_to_remove.len(),
+    //                 "Removing existing documents for overwrite"
+    //             );
+
+    //             // Batch remove existing documents
+    //             let mut removed_count = 0;
+    //             let mut removal_errors = 0;
+
+    //             for id in ids_to_remove {
+    //                 match self.remove_point_internal(id.clone()) {
+    //                     Ok(was_removed) => {
+    //                         if was_removed {
+    //                             removed_count += 1;
+    //                             trace!(
+    //                                 operation = "overwrite_removal",
+    //                                 vector_id = %id,
+    //                                 "Removed existing vector for overwrite"
+    //                             );
+    //                         }
+    //                     }
+    //                     Err(e) => {
+    //                         removal_errors += 1;
+    //                         warn!(
+    //                             operation = "overwrite_removal",
+    //                             vector_id = %id,
+    //                             error = %e,
+    //                             "Failed to remove existing vector for overwrite"
+    //                         );
+    //                         // Don't fail the entire operation, but log the issue
+    //                         errors.push(format!("Failed to remove existing {}: {}", id, e));
+    //                         total_errors += 1;
+    //                     }
+    //                 }
+    //             }
+
+    //             info!(
+    //                 operation = "overwrite_removal_complete",
+    //                 removed_count = removed_count,
+    //                 removal_errors = removal_errors,
+    //                 "Completed removal phase for overwrite"
+    //             );
+    //         }
+    //     }
+
+    //     // Phase 2: Add new vectors (treat as fresh insertions since overwrites were handled)
+    //     debug!(operation = "add_vectors_insertion_phase", "Starting insertion phase");
+
+    //     for (id, vector, metadata) in parsed_data {
+    //          let id_for_error = id.clone();
+
+    //          // Use overwrite=false since we already handled removals above
+    //          match self.add_single_vector(id, vector, metadata, false) {
+    //             Ok(inserted_new) => {
+    //                 total_inserted += 1;
+    //                 if inserted_new {
+    //                     let mut count = self.vector_count.lock().unwrap();
+    //                     *count += 1;
+    //                 }
+
+    //                 // Check training trigger (graceful failure handling)
+    //                 if let Err(training_error) = self.maybe_trigger_training() {
+    //                     warn!(
+    //                         operation = "training_trigger",
+    //                         error = %training_error,
+    //                         vector_id = %id_for_error,
+    //                         "Training trigger failed"
+    //                     );
+    //                     errors.push(format!("Training failed: {}", training_error));
+    //                 }
+    //             }
+    //             Err(e) => {
+    //                 total_errors += 1;
+    //                 errors.push(format!("Vector {}: {}", id_for_error, e));
+    //                 trace!(
+    //                     operation = "add_vector_error",
+    //                     vector_id = %id_for_error,
+    //                     error = %e,
+    //                     "Vector addition failed"
+    //                 );
+    //             }
+    //         }
+    //     }
+
+    //     let duration_ms = start_time.elapsed().as_millis();
+    //     info!(
+    //         operation = "add_vectors_complete",
+    //         total_inserted = total_inserted,
+    //         total_errors = total_errors,
+    //         success_rate = if total_input_count > 0 {
+    //             total_inserted as f64 / total_input_count as f64 * 100.0
+    //         } else {
+    //             100.0
+    //         },
+    //         duration_ms = duration_ms,
+    //         overwrite_mode = overwrite,
+    //         "Vector addition completed"
+    //     );
+
+    //     Ok(AddResult {
+    //         total_inserted,
+    //         total_errors,
+    //         errors,
+    //         vector_shape,
+    //     })
+    // } 
+
+
+
+    /// Enhanced add method that properly handles PQ overwrite scenarios
     #[pyo3(signature = (data, overwrite = true))]
     #[instrument(level = "info", skip(self, data), fields(
         overwrite = overwrite,
-        has_quantization = self.has_quantization()
+        has_quantization = self.has_quantization(),
+        is_quantized = self.is_quantized()
     ), err)]
     pub fn add(&mut self, data: Bound<PyAny>, overwrite: bool) -> PyResult<AddResult> {
         let start_time = Instant::now();
@@ -911,14 +1212,107 @@ impl HNSWIndex {
             operation = "add_vectors_start",
             total_vectors = parsed_data.len(),
             parse_errors = total_errors,
+            overwrite = overwrite,
+            has_quantization = self.has_quantization(),
+            is_quantized = self.is_quantized(),
+            storage_mode = self.get_storage_mode(),
             "Starting vector addition"
         );
 
-        // Process successfully parsed vectors
+        // ENHANCED FIX: Handle overwrites properly for ALL paths (Raw, Training, PQ)
+        if overwrite {
+            // Phase 1: Batch identify and remove existing documents
+            let (ids_to_remove, storage_analysis) = {
+                let id_map = self.id_map.read().unwrap();
+                let vectors = self.vectors.read().unwrap();
+                let pq_codes = self.pq_codes.read().unwrap();
+
+                let mut ids_to_remove = Vec::new();
+                let mut has_raw = 0;
+                let mut has_pq = 0;
+                let mut has_both = 0;
+
+                for (id, _, _) in &parsed_data {
+                    if id_map.contains_key(id) {
+                        ids_to_remove.push(id.clone());
+
+                        // Analyze what's being replaced for logging
+                        let has_raw_vector = vectors.contains_key(id);
+                        let has_pq_codes = pq_codes.contains_key(id);
+
+                        match (has_raw_vector, has_pq_codes) {
+                            (true, true) => has_both += 1,
+                            (true, false) => has_raw += 1,
+                            (false, true) => has_pq += 1,
+                            (false, false) => {} // Shouldn't happen, but handle gracefully
+                        }
+                    }
+                }
+
+                (ids_to_remove, (has_raw, has_pq, has_both))
+            }; // Release all read locks here
+
+            if !ids_to_remove.is_empty() {
+                info!(
+                    operation = "overwrite_preparation",
+                    documents_to_remove = ids_to_remove.len(),
+                    storage_analysis = format!("raw_only: {}, pq_only: {}, both: {}", 
+                        storage_analysis.0, storage_analysis.1, storage_analysis.2),
+                    "Removing existing documents for overwrite"
+                );
+
+                // Batch remove existing documents (handles both raw and PQ data)
+                let mut removed_count = 0;
+                let mut removal_errors = 0;
+
+                for id in ids_to_remove {
+                    match self.remove_point_internal(id.clone()) {
+                        Ok(was_removed) => {
+                            if was_removed {
+                                removed_count += 1;
+                                trace!(
+                                    operation = "overwrite_removal",
+                                    vector_id = %id,
+                                    "Removed existing vector/codes for overwrite"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            removal_errors += 1;
+                            warn!(
+                                operation = "overwrite_removal",
+                                vector_id = %id,
+                                error = %e,
+                                "Failed to remove existing vector for overwrite"
+                            );
+                            errors.push(format!("Failed to remove existing {}: {}", id, e));
+                            total_errors += 1;
+                        }
+                    }
+                }
+
+                info!(
+                    operation = "overwrite_removal_complete",
+                    removed_count = removed_count,
+                    removal_errors = removal_errors,
+                    "Completed removal phase for overwrite"
+                );
+            }
+        }
+
+        // Phase 2: Add new vectors using the correct path based on current PQ state
+        debug!(
+            operation = "add_vectors_insertion_phase",
+            current_state = self.get_storage_mode(),
+            "Starting insertion phase"
+        );
+
         for (id, vector, metadata) in parsed_data {
             let id_for_error = id.clone();
 
-            match self.add_single_vector(id, vector, metadata, overwrite) {
+            // Use overwrite=false since we already handled removals above
+            // The add_single_vector method will route to the correct path based on current PQ state
+            match self.add_single_vector(id, vector, metadata, false) {
                 Ok(inserted_new) => {
                     total_inserted += 1;
                     if inserted_new {
@@ -950,18 +1344,19 @@ impl HNSWIndex {
             }
         }
 
-        // ✅ ENTERPRISE: Add duration timing to hot path
         let duration_ms = start_time.elapsed().as_millis();
         info!(
             operation = "add_vectors_complete",
             total_inserted = total_inserted,
             total_errors = total_errors,
             success_rate = if total_input_count > 0 { 
-                total_inserted as f64 / total_input_count as f64 * 100.0 
-            } else { 
-                100.0 
+                total_inserted as f64 / total_input_count as f64 * 100.0
+            } else {
+                100.0
             },
             duration_ms = duration_ms,
+            overwrite_mode = overwrite,
+            final_storage_mode = self.get_storage_mode(),
             "Vector addition completed"
         );
 
@@ -972,6 +1367,18 @@ impl HNSWIndex {
             vector_shape,
         })
     }
+
+
+
+
+
+
+
+
+
+
+
+
 
     pub fn get_training_progress(&self) -> f32 {
         if let Some(config) = &self.quantization_config {
@@ -1499,26 +1906,43 @@ impl HNSWIndex {
         }
     }
 
-    /// Remove vector by ID
-    pub fn remove_point(&mut self, id: String) -> PyResult<bool> {
-        let mut vectors = self.vectors.write().unwrap();
-        let mut vector_metadata = self.vector_metadata.write().unwrap();
-        let mut id_map = self.id_map.write().unwrap();
-        let mut rev_map = self.rev_map.write().unwrap();
+
+    // /// Remove vector by ID
+    // pub fn remove_point(&mut self, id: String) -> PyResult<bool> {
+    //     let mut vectors = self.vectors.write().unwrap();
+    //     let mut vector_metadata = self.vector_metadata.write().unwrap();
+    //     let mut id_map = self.id_map.write().unwrap();
+    //     let mut rev_map = self.rev_map.write().unwrap();
         
-        if let Some(internal_id) = id_map.remove(&id) {
-            vectors.remove(&id);
-            vector_metadata.remove(&id);
-            rev_map.remove(&internal_id);
-            // Note: HNSW doesn't support removal, so the graph still contains the point
-            // but it won't be accessible via the mappings
-            debug!(operation = "remove_point", vector_id = %id, internal_id = internal_id, "Vector removed from index");
-            Ok(true)
-        } else {
-            trace!(operation = "remove_point", vector_id = %id, "Vector not found for removal");
-            Ok(false)
+    //     if let Some(internal_id) = id_map.remove(&id) {
+    //         vectors.remove(&id);
+    //         vector_metadata.remove(&id);
+    //         rev_map.remove(&internal_id);
+    //         // Note: HNSW doesn't support removal, so the graph still contains the point
+    //         // but it won't be accessible via the mappings
+    //         debug!(operation = "remove_point", vector_id = %id, internal_id = internal_id, "Vector removed from index");
+    //         Ok(true)
+    //     } else {
+    //         trace!(operation = "remove_point", vector_id = %id, "Vector not found for removal");
+    //         Ok(false)
+    //     }
+    // }
+
+
+    /// Public remove_point method (unchanged for API compatibility)
+    /// This code delegates to remove_point_internal() which handles all the complex logic
+    pub fn remove_point(&mut self, id: String) -> PyResult<bool> {
+        match self.remove_point_internal(id) {
+            Ok(result) => Ok(result),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
     }
+
+
+
+
+
+
 
     /// Get performance characteristics and limitations
     pub fn get_performance_info(&self) -> HashMap<String, String> {
@@ -1743,6 +2167,159 @@ impl HNSWIndex {
         // Apply same processing as storage vectors
         Ok(self.process_vector_for_space(vector))
     }
+
+
+    // /// Internal remove_point method that can be called without Python bindings
+    // /// This is the core method that properly removes all traces of a document
+    // fn remove_point_internal(&mut self, id: String) -> Result<bool, String> {
+    //     // Get all write locks in a consistent order to prevent deadlocks
+    //     let mut vectors = self.vectors.write().unwrap();
+    //     let mut vector_metadata = self.vector_metadata.write().unwrap();
+    //     let mut id_map = self.id_map.write().unwrap();
+    //     let mut rev_map = self.rev_map.write().unwrap();
+    //     let mut pq_codes = self.pq_codes.write().unwrap();
+
+    //     // Check if the document exists
+    //     if let Some(internal_id) = id_map.remove(&id) {
+    //         // Remove from all data structures
+    //         vectors.remove(&id);
+    //         vector_metadata.remove(&id);
+    //         pq_codes.remove(&id);  // Also remove PQ codes if they exist
+    //         rev_map.remove(&internal_id);
+
+    //         // Handle training state cleanup for quantization
+    //         if self.has_quantization() && !self.can_use_quantization() {
+    //             // Remove from training IDs if present and not yet trained
+    //             let mut training_ids = self.training_ids.write().unwrap();
+    //             let original_len = training_ids.len();
+    //             training_ids.retain(|training_id| training_id != &id);
+
+    //             if training_ids.len() != original_len {
+    //                 trace!(
+    //                     operation = "training_cleanup",
+    //                     vector_id = %id,
+    //                     remaining_training_vectors = training_ids.len(),
+    //                     "Removed vector from training set"
+    //                 );
+
+    //                 // Update threshold status if we dropped below training size
+    //                 if training_ids.len() < self.quantization_config.as_ref().unwrap().training_size {
+    //                     self.training_threshold_reached.store(false, std::sync::atomic::Ordering::Release);
+    //                 }
+    //             }
+    //         }
+
+    //         // Decrement vector count since we removed a vector
+    //         {
+    //             let mut count = self.vector_count.lock().unwrap();
+    //             if *count > 0 {
+    //                 *count -= 1;
+    //             }
+    //         }
+
+    //         debug!(
+    //             operation = "remove_point_internal",
+    //             vector_id = %id,
+    //             internal_id = internal_id,
+    //             note = "hnsw_graph_entry_remains_unreachable",
+    //             "Vector completely removed from index (HNSW graph entry becomes unreachable)"
+    //         );
+    //         Ok(true)
+    //     } else {
+    //         trace!(
+    //             operation = "remove_point_internal",
+    //             vector_id = %id,
+    //             "Vector not found for removal"
+    //         );
+    //         Ok(false)
+    //     }
+    // }
+
+
+    /// Enhanced internal remove_point method with comprehensive PQ support
+    fn remove_point_internal(&mut self, id: String) -> Result<bool, String> {
+        // Get all write locks in a consistent order to prevent deadlocks
+        let mut vectors = self.vectors.write().unwrap();
+        let mut vector_metadata = self.vector_metadata.write().unwrap();
+        let mut id_map = self.id_map.write().unwrap();
+        let mut rev_map = self.rev_map.write().unwrap();
+        let mut pq_codes = self.pq_codes.write().unwrap();
+
+        // Check if the document exists
+        if let Some(internal_id) = id_map.remove(&id) {
+            // Track what we're removing for logging
+            let had_raw_vector = vectors.contains_key(&id);
+            let had_pq_codes = pq_codes.contains_key(&id);
+
+            // Remove from all data structures
+            vectors.remove(&id);           // Remove raw vectors (if present)
+            vector_metadata.remove(&id);   // Remove metadata
+            pq_codes.remove(&id);         // Remove PQ codes (if present)
+            rev_map.remove(&internal_id);  // Remove ID mapping
+
+            // Enhanced training state cleanup for quantization
+            if self.has_quantization() {
+                // Remove from training IDs if present and not yet trained
+                if !self.can_use_quantization() {
+                    let mut training_ids = self.training_ids.write().unwrap();
+                    let original_len = training_ids.len();
+                    training_ids.retain(|training_id| training_id != &id);
+
+                    if training_ids.len() != original_len {
+                        trace!(
+                            operation = "training_cleanup",
+                            vector_id = %id,
+                            remaining_training_vectors = training_ids.len(),
+                            "Removed vector from training set"
+                        );
+
+                        // Update threshold status if we dropped below training size
+                        if let Some(config) = &self.quantization_config {
+                            if training_ids.len() < config.training_size {
+                                self.training_threshold_reached.store(false, std::sync::atomic::Ordering::Release);
+                                debug!(
+                                    operation = "training_threshold_reset",
+                                    remaining_vectors = training_ids.len(),
+                                    required = config.training_size,
+                                    "Training threshold reset due to removal"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Decrement vector count since we removed a vector
+            {
+                let mut count = self.vector_count.lock().unwrap();
+                if *count > 0 {
+                    *count -= 1;
+                }
+            }
+
+            debug!(
+                operation = "remove_point_internal",
+                vector_id = %id,
+                internal_id = internal_id,
+                had_raw_vector = had_raw_vector,
+                had_pq_codes = had_pq_codes,
+                storage_mode = self.get_storage_mode(),
+                note = "hnsw_graph_entries_remain_unreachable",
+                "Vector completely removed from index (HNSW graph entries become unreachable)"
+            );
+            Ok(true)
+        } else {
+            trace!(
+                operation = "remove_point_internal",
+                vector_id = %id,
+                "Vector not found for removal"
+            );
+            Ok(false)
+        }
+    }
+
+
+
 
     // 1. CORE VECTOR OPERATIONS (6 methods)
     /// 3-PATH ARCHITECTURE - Main router
