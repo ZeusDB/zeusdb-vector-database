@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.1] - 2025-08-20
+
+### Added
+- Comprehensive test suite for overwrite behavior verification (`test_overwrite_fix.py`)
+- Product Quantization (PQ) overwrite testing across all storage modes (`test_pq_overwrite_comprehensive.py`)
+- Enhanced logging and storage analysis for overwrite operations
+- Training state cleanup during document removal operations
+
+### Changed
+- Overwrite operations now use two-phase process (remove then add) to prevent duplicates
+- `remove_point()` method now delegates to internal `remove_point_internal()` for better code reuse
+- Enhanced `add()` method with comprehensive PQ support and storage mode awareness
+- Improved error handling and logging throughout overwrite operations
+
+### Fixed
+- Critical: Fixed duplicate document bug where `overwrite=True` created multiple entries instead of replacing existing ones
+- Memory leak from accumulated duplicate vectors in HNSW graph during overwrites
+- Product Quantization codes and training state not properly cleaned up during document removal
+- Vector count inconsistencies when removing documents during overwrite operations
+
+### Removed
+- Legacy overwrite behavior that created duplicates instead of proper replacements
+
+---
+
 ## [0.4.0] - 2025-08-13
 
 ### Added
