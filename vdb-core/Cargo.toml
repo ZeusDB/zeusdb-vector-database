@@ -34,6 +34,11 @@ atty = ["dep:atty"]
 [dev-dependencies]
 tempfile = "3"
 
+# Redirect hnsw_rs to the vendored copy carrying the reverse link layer fix.
+# See vendor/hnsw_rs/ZEUSDB-PATCH.md. The path is relative to this manifest.
+[patch.crates-io]
+hnsw_rs = { path = "../vendor/hnsw_rs" }
+
 [profile.release]
 lto = true # <-- Enable Link-Time Optimization
 codegen-units = 1 # <-- Single compilation unit for better optimization

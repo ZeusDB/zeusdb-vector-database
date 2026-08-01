@@ -8,6 +8,11 @@ This product includes software developed by:
 - The PyO3 Project (https://pyo3.rs/)
 - Jean-pierreBoth (https://crates.io/crates/hnsw_rs/)
 
+The hnsw_rs crate, version 0.3.4, is vendored in source form at vendor/hnsw_rs
+and carries a single ZeusDB patch to the reverse link layer assignment. See
+vendor/hnsw_rs/ZEUSDB-PATCH.md for the patch record. hnsw_rs is dual licensed
+under MIT or Apache-2.0.
+
 Third-party components may be licensed under their respective terms. See LICENSES/ for full license texts.
 
 Licensed under the Apache License, Version 2.0 (the "License");

@@ -3943,3 +3943,46 @@ impl HNSWIndex {
         *self.training_ids.write().unwrap() = ids;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use hnsw_rs::prelude::{DistCosine, Hnsw};
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    /// Guards the vendored hnsw_rs patch that files reverse links at the
+    /// layer being processed instead of at the inserting point's own top
+    /// layer. Without the patch, points assigned a level above zero lose
+    /// their layer-zero inbound adjacency and can become unreachable to
+    /// similarity search, and at this index size roughly one to two
+    /// percent of self-queries fail. A failure here means the patch was
+    /// lost, most likely during an hnsw_rs upgrade. See
+    /// vendor/hnsw_rs/ZEUSDB-PATCH.md.
+    #[test]
+    fn self_query_reachability() {
+        const N: usize = 3000;
+        const DIM: usize = 32;
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let data: Vec<Vec<f32>> = (0..N)
+            .map(|_| (0..DIM).map(|_| rng.random::<f32>() - 0.5).collect())
+            .collect();
+
+        let hnsw = Hnsw::new(16, N, 16, 200, DistCosine {});
+        let items: Vec<(&Vec<f32>, usize)> = data.iter().zip(0..N).collect();
+        hnsw.parallel_insert(&items);
+
+        let failures: Vec<usize> = (0..N)
+            .filter(|&i| hnsw.search(&data[i], 1, 64).first().map(|n| n.d_id) != Some(i))
+            .collect();
+
+        assert!(
+            failures.is_empty(),
+            "{} of {} points cannot find themselves by self-query (first: {:?}); \
+             the hnsw_rs reverse link layer patch is missing",
+            failures.len(),
+            N,
+            &failures[..failures.len().min(10)]
+        );
+    }
+}
