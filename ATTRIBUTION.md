@@ -18,3 +18,12 @@ requires user consent. Stars help maintainers measure
 impact, attract contributors, and secure funding.
 
 See [https://attribution.md](https://attribution.md) for details.
+
+## Third-party source
+
+This repository vendors the [hnsw_rs](https://crates.io/crates/hnsw_rs)
+crate, version 0.3.4, by Jean-Pierre Both at `vendor/hnsw_rs`. The
+vendored copy is taken from the crates.io registry source and carries a
+single deliberate patch to the reverse link layer assignment, recorded
+in `vendor/hnsw_rs/ZEUSDB-PATCH.md`. hnsw_rs is dual licensed under MIT
+or Apache-2.0. Full licence texts are in `LICENSES/`.
