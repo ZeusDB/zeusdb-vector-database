@@ -1,13 +1,13 @@
 // lib.rs
 mod hnsw_index;
-mod pq;
-mod persistence;
 mod logging;
+mod persistence;
+mod pq;
 
 use pyo3::prelude::*;
 
 /// ZeusDB Vector Database Python Module
-/// 
+///
 /// Automatically initializes structured logging on import.
 /// Logs are controlled by environment variables or optional Python functions.
 #[pymodule]

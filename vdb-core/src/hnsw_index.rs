@@ -1,20 +1,20 @@
+use chrono::Utc;
+use hnsw_rs::api::AnnT; // This provides the file_dump method
+use hnsw_rs::prelude::{DistCosine, DistL1, DistL2, Distance, Hnsw};
+use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
-use std::collections::HashMap;
-use std::sync::{Mutex, RwLock, Arc};
-use std::sync::atomic::{AtomicBool, Ordering};
-use hnsw_rs::prelude::{Hnsw, DistCosine, DistL2, DistL1, Distance};
-use serde_json::Value;
 use rayon::prelude::*;
-use serde::{Serialize, Deserialize};
-use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
-use hnsw_rs::api::AnnT;  // This provides the file_dump method
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 // ✅ ENTERPRISE: Structured logging imports
-use tracing::{debug, info, warn, error, trace, instrument};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 // Import PQ module
 use crate::pq::PQ;
@@ -24,7 +24,7 @@ use crate::pq::PQ;
 // ============================================================================
 
 // 🔢 MANUAL VERSION COUNTER - Change this number after each code change
-const CODE_VERSION_COUNTER: u32 = 1028;  // ← INCREMENT THIS MANUALLY
+const CODE_VERSION_COUNTER: u32 = 1028; // ← INCREMENT THIS MANUALLY
 const CODE_VERSION_DESCRIPTION: &str = "Fixed overwrite bug - eliminates duplicate documents";
 
 // ============================================================================
@@ -46,7 +46,7 @@ impl StorageMode {
             _ => Err(format!(
                 "Invalid storage_mode: '{}'. Supported: quantized_only, quantized_with_raw",
                 s
-            ))
+            )),
         }
     }
 
@@ -91,12 +91,12 @@ impl DistPQ {
             lut: Arc::new(RwLock::new(None)),
         }
     }
-    
+
     pub fn set_query_lut(&self, query: &[f32]) -> Result<(), String> {
         if !self.pq.is_trained() {
             return Err("PQ must be trained before ADC computation".to_string());
         }
-        
+
         let lut = self.pq.compute_adc_lut(query)?;
         {
             let mut lut_guard = self.lut.write().unwrap();
@@ -104,7 +104,7 @@ impl DistPQ {
         }
         Ok(())
     }
-    
+
     pub fn clear_lut(&self) {
         let mut lut_guard = self.lut.write().unwrap();
         *lut_guard = None;
@@ -121,12 +121,13 @@ impl Distance<u8> for DistPQ {
             Some(l) => l,
             None => return f32::INFINITY,
         };
-        
+
         // b.len() should equal pq.subvectors
         let mut sum = 0.0f32;
         for (sv, &code) in b.iter().enumerate() {
             // lut[sv][code]
-            let distance_component = lut.get(sv)
+            let distance_component = lut
+                .get(sv)
                 .and_then(|row| row.get(code as usize))
                 .copied()
                 .unwrap_or(f32::INFINITY);
@@ -142,7 +143,7 @@ enum DistanceType {
     Cosine(Hnsw<'static, f32, DistCosine>),
     L2(Hnsw<'static, f32, DistL2>),
     L1(Hnsw<'static, f32, DistL1>),
-    
+
     // PQ variants - corrected to use u8 element type
     CosinePQ(Hnsw<'static, u8, DistPQ>),
     L2PQ(Hnsw<'static, u8, DistPQ>),
@@ -169,9 +170,27 @@ impl DistanceType {
         );
 
         match space {
-            "cosine" => DistanceType::Cosine(Hnsw::new(m, expected_size, max_layer, ef_construction, DistCosine {})),
-            "l2" => DistanceType::L2(Hnsw::new(m, expected_size, max_layer, ef_construction, DistL2 {})),
-            "l1" => DistanceType::L1(Hnsw::new(m, expected_size, max_layer, ef_construction, DistL1 {})),
+            "cosine" => DistanceType::Cosine(Hnsw::new(
+                m,
+                expected_size,
+                max_layer,
+                ef_construction,
+                DistCosine {},
+            )),
+            "l2" => DistanceType::L2(Hnsw::new(
+                m,
+                expected_size,
+                max_layer,
+                ef_construction,
+                DistL2 {},
+            )),
+            "l1" => DistanceType::L1(Hnsw::new(
+                m,
+                expected_size,
+                max_layer,
+                ef_construction,
+                DistL1 {},
+            )),
             _ => {
                 // ✅ ENTERPRISE: Replace panic with graceful error
                 error!(
@@ -188,11 +207,17 @@ impl DistanceType {
                     fallback = "cosine",
                     "Defaulting to cosine distance due to invalid space"
                 );
-                DistanceType::Cosine(Hnsw::new(m, expected_size, max_layer, ef_construction, DistCosine {}))
+                DistanceType::Cosine(Hnsw::new(
+                    m,
+                    expected_size,
+                    max_layer,
+                    ef_construction,
+                    DistCosine {},
+                ))
             }
         }
     }
-    
+
     fn new_pq(
         space: &str,
         m: usize,
@@ -217,15 +242,33 @@ impl DistanceType {
         match space {
             "cosine" => {
                 let dist_pq = DistPQ::new(pq);
-                DistanceType::CosinePQ(Hnsw::new(m, expected_size, max_layer, ef_construction, dist_pq))
+                DistanceType::CosinePQ(Hnsw::new(
+                    m,
+                    expected_size,
+                    max_layer,
+                    ef_construction,
+                    dist_pq,
+                ))
             }
             "l2" => {
                 let dist_pq = DistPQ::new(pq);
-                DistanceType::L2PQ(Hnsw::new(m, expected_size, max_layer, ef_construction, dist_pq))
+                DistanceType::L2PQ(Hnsw::new(
+                    m,
+                    expected_size,
+                    max_layer,
+                    ef_construction,
+                    dist_pq,
+                ))
             }
             "l1" => {
                 let dist_pq = DistPQ::new(pq);
-                DistanceType::L1PQ(Hnsw::new(m, expected_size, max_layer, ef_construction, dist_pq))
+                DistanceType::L1PQ(Hnsw::new(
+                    m,
+                    expected_size,
+                    max_layer,
+                    ef_construction,
+                    dist_pq,
+                ))
             }
             _ => {
                 // ✅ ENTERPRISE: Replace panic with graceful error
@@ -242,11 +285,17 @@ impl DistanceType {
                     "Defaulting to cosine distance due to invalid space"
                 );
                 let dist_pq = DistPQ::new(pq);
-                DistanceType::CosinePQ(Hnsw::new(m, expected_size, max_layer, ef_construction, dist_pq))
+                DistanceType::CosinePQ(Hnsw::new(
+                    m,
+                    expected_size,
+                    max_layer,
+                    ef_construction,
+                    dist_pq,
+                ))
             }
         }
     }
-    
+
     fn set_query_lut(&self, query: &[f32]) -> Result<(), String> {
         match self {
             DistanceType::CosinePQ(hnsw) => hnsw.get_distance().set_query_lut(query),
@@ -255,44 +304,47 @@ impl DistanceType {
             _ => Ok(()), // No-op for raw variants
         }
     }
-    
+
     fn clear_lut(&self) {
         match self {
             DistanceType::CosinePQ(hnsw) => hnsw.get_distance().clear_lut(),
             DistanceType::L2PQ(hnsw) => hnsw.get_distance().clear_lut(),
             DistanceType::L1PQ(hnsw) => hnsw.get_distance().clear_lut(),
-            _ => {}, // No-op for raw variants
+            _ => {} // No-op for raw variants
         }
     }
-    
-    fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<hnsw_rs::prelude::Neighbour>, String> {
+
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Result<Vec<hnsw_rs::prelude::Neighbour>, String> {
         match self {
             // Raw vector search
             DistanceType::Cosine(hnsw) => Ok(hnsw.search(query, k, ef)),
             DistanceType::L2(hnsw) => Ok(hnsw.search(query, k, ef)),
             DistanceType::L1(hnsw) => Ok(hnsw.search(query, k, ef)),
-            
+
             // PQ-based search with ADC
-            DistanceType::CosinePQ(hnsw) | 
-            DistanceType::L2PQ(hnsw) | 
-            DistanceType::L1PQ(hnsw) => {
+            DistanceType::CosinePQ(hnsw) | DistanceType::L2PQ(hnsw) | DistanceType::L1PQ(hnsw) => {
                 // Set the query LUT for ADC computation
                 self.set_query_lut(query)?;
-                
+
                 // Create dummy query vector for HNSW traversal (flat u8 codes)
                 let dummy_query = vec![0u8; self.get_code_size()];
-                
+
                 // Perform search
                 let results = hnsw.search(&dummy_query, k, ef);
-                
+
                 // Clear LUT after search for memory efficiency
                 self.clear_lut();
-                
+
                 Ok(results)
             }
         }
     }
-    
+
     fn get_code_size(&self) -> usize {
         match self {
             DistanceType::CosinePQ(hnsw) => hnsw.get_distance().pq.subvectors,
@@ -301,15 +353,14 @@ impl DistanceType {
             _ => 0,
         }
     }
-    
+
     fn is_quantized(&self) -> bool {
-        matches!(self, 
-            DistanceType::CosinePQ(_) | 
-            DistanceType::L2PQ(_) | 
-            DistanceType::L1PQ(_)
+        matches!(
+            self,
+            DistanceType::CosinePQ(_) | DistanceType::L2PQ(_) | DistanceType::L1PQ(_)
         )
     }
-    
+
     fn insert(&mut self, vector: &[f32], id: usize) {
         match self {
             DistanceType::Cosine(hnsw) => hnsw.insert((vector, id)),
@@ -326,19 +377,19 @@ impl DistanceType {
             }
         }
     }
-    
+
     /// Insert PQ codes into the index
     fn insert_pq_codes(&mut self, codes: &[u8], id: usize) {
         match self {
             DistanceType::CosinePQ(hnsw) => {
                 hnsw.insert((codes, id));
-            },
+            }
             DistanceType::L2PQ(hnsw) => {
                 hnsw.insert((codes, id));
-            },
+            }
             DistanceType::L1PQ(hnsw) => {
                 hnsw.insert((codes, id));
-            },
+            }
             _ => {
                 // ✅ ENTERPRISE: Replace panic with graceful error logging
                 error!(
@@ -386,7 +437,7 @@ impl DistanceType {
             }
         }
     }
-    
+
     fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize)]) -> Result<(), String> {
         let num_threads = rayon::current_num_threads();
         let threshold = 1000 * num_threads;
@@ -401,9 +452,7 @@ impl DistanceType {
         );
 
         match self {
-            DistanceType::CosinePQ(hnsw) |
-            DistanceType::L2PQ(hnsw) |
-            DistanceType::L1PQ(hnsw) => {
+            DistanceType::CosinePQ(hnsw) | DistanceType::L2PQ(hnsw) | DistanceType::L1PQ(hnsw) => {
                 if data.len() >= threshold {
                     hnsw.parallel_insert(data);
                 } else {
@@ -446,7 +495,10 @@ impl AddResult {
     }
 
     pub fn summary(&self) -> String {
-        format!("✅ {} inserted, ❌ {} errors", self.total_inserted, self.total_errors)
+        format!(
+            "✅ {} inserted, ❌ {} errors",
+            self.total_inserted, self.total_errors
+        )
     }
 }
 
@@ -471,17 +523,17 @@ pub struct HNSWIndex {
     vector_metadata: RwLock<HashMap<String, HashMap<String, Value>>>,
     id_map: RwLock<HashMap<String, usize>>,
     rev_map: RwLock<HashMap<usize, String>>,
-    
+
     // Mutex for write-only fields
     id_counter: Mutex<usize>,
     vector_count: Mutex<usize>, // Track total vectors for training trigger
-    
+
     // Mutex for HNSW (not thread-safe for concurrent reads)
     hnsw: Mutex<DistanceType>,
 
     // ID-based training collection
-    training_ids: RwLock<Vec<String>>,          // Just IDs, not vectors
-    training_threshold_reached: AtomicBool,     // Atomic flag for safety
+    training_ids: RwLock<Vec<String>>,      // Just IDs, not vectors
+    training_threshold_reached: AtomicBool, // Atomic flag for safety
 
     // Timestamp when the index was created
     created_at: String,
@@ -514,20 +566,49 @@ impl HNSWIndex {
 
         // Validation of parameters
         if dim == 0 {
-            error!(operation = "validation", field = "dim", value = dim, "Invalid dimension");
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("dim must be positive"));
+            error!(
+                operation = "validation",
+                field = "dim",
+                value = dim,
+                "Invalid dimension"
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "dim must be positive",
+            ));
         }
         if ef_construction == 0 {
-            error!(operation = "validation", field = "ef_construction", value = ef_construction, "Invalid ef_construction");
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("ef_construction must be positive"));
+            error!(
+                operation = "validation",
+                field = "ef_construction",
+                value = ef_construction,
+                "Invalid ef_construction"
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "ef_construction must be positive",
+            ));
         }
         if expected_size == 0 {
-            error!(operation = "validation", field = "expected_size", value = expected_size, "Invalid expected_size");
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("expected_size must be positive"));
+            error!(
+                operation = "validation",
+                field = "expected_size",
+                value = expected_size,
+                "Invalid expected_size"
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "expected_size must be positive",
+            ));
         }
         if m > 256 {
-            error!(operation = "validation", field = "m", value = m, max_allowed = 256, "m exceeds maximum");
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("m must be less than or equal to 256"));
+            error!(
+                operation = "validation",
+                field = "m",
+                value = m,
+                max_allowed = 256,
+                "m exceeds maximum"
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "m must be less than or equal to 256",
+            ));
         }
 
         // Early space validation with user-friendly error
@@ -535,47 +616,71 @@ impl HNSWIndex {
         match space_normalized.as_str() {
             "cosine" | "l2" | "l1" => {
                 debug!(operation = "validation", space = %space_normalized, "Distance space validated");
-            }, 
+            }
             _ => {
                 error!(operation = "validation", field = "space", value = %space, "Unsupported distance space");
-                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    format!("Unsupported space: '{}'. Supported spaces: 'cosine', 'l2', 'l1'", space)
-                ));
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Unsupported space: '{}'. Supported spaces: 'cosine', 'l2', 'l1'",
+                    space
+                )));
             }
         }
-        
+
         // Extract quantization configuration
         let (quantization_params, pq_instance) = if let Some(config) = quantization_config {
-            let qtype = config.get_item("type")?
-                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'type' in quantization_config"))?
+            let qtype = config
+                .get_item("type")?
+                .ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "Missing 'type' in quantization_config",
+                    )
+                })?
                 .extract::<String>()?;
-            
+
             if qtype != "pq" {
                 error!(operation = "validation", field = "quantization_type", value = %qtype, "Unsupported quantization type");
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Unsupported quantization type: '{}'. Only 'pq' is currently supported.", qtype)
-                ));
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Unsupported quantization type: '{}'. Only 'pq' is currently supported.",
+                    qtype
+                )));
             }
-            
+
             // Extract PQ parameters
-            let subvectors = config.get_item("subvectors")?
-                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'subvectors' in quantization_config"))?
+            let subvectors = config
+                .get_item("subvectors")?
+                .ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "Missing 'subvectors' in quantization_config",
+                    )
+                })?
                 .extract::<usize>()?;
-            
-            let bits = config.get_item("bits")?
-                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'bits' in quantization_config"))?
+
+            let bits = config
+                .get_item("bits")?
+                .ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "Missing 'bits' in quantization_config",
+                    )
+                })?
                 .extract::<usize>()?;
-            
-            let training_size = config.get_item("training_size")?
-                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'training_size' in quantization_config"))?
+
+            let training_size = config
+                .get_item("training_size")?
+                .ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "Missing 'training_size' in quantization_config",
+                    )
+                })?
                 .extract::<usize>()?;
-            
-            let max_training_vectors = config.get_item("max_training_vectors")?
+
+            let max_training_vectors = config
+                .get_item("max_training_vectors")?
                 .map(|v| v.extract::<usize>())
                 .transpose()?;
 
             // Extract storage_mode
-            let storage_mode_str = config.get_item("storage_mode")?
+            let storage_mode_str = config
+                .get_item("storage_mode")?
                 .map(|v| v.extract::<String>())
                 .transpose()?
                 .unwrap_or_else(|| "quantized_only".to_string());
@@ -592,25 +697,41 @@ impl HNSWIndex {
                     subvectors = subvectors,
                     "Subvectors must divide dimension evenly"
                 );
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("subvectors ({}) must divide dimension ({}) evenly", subvectors, dim)
-                ));
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "subvectors ({}) must divide dimension ({}) evenly",
+                    subvectors, dim
+                )));
             }
-            
+
             if bits < 1 || bits > 8 {
-                error!(operation = "validation", field = "bits", value = bits, min = 1, max = 8, "Bits out of range");
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("bits must be between 1 and 8, got {}", bits)
-                ));
+                error!(
+                    operation = "validation",
+                    field = "bits",
+                    value = bits,
+                    min = 1,
+                    max = 8,
+                    "Bits out of range"
+                );
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "bits must be between 1 and 8, got {}",
+                    bits
+                )));
             }
-            
+
             if training_size < 1000 {
-                error!(operation = "validation", field = "training_size", value = training_size, min = 1000, "Training size too small");
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("training_size must be at least 1000, got {}", training_size)
-                ));
+                error!(
+                    operation = "validation",
+                    field = "training_size",
+                    value = training_size,
+                    min = 1000,
+                    "Training size too small"
+                );
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "training_size must be at least 1000, got {}",
+                    training_size
+                )));
             }
-            
+
             let config = QuantizationConfig {
                 subvectors,
                 bits,
@@ -618,7 +739,7 @@ impl HNSWIndex {
                 max_training_vectors,
                 storage_mode,
             };
-            
+
             debug!(
                 operation = "pq_configuration",
                 subvectors = subvectors,
@@ -629,20 +750,37 @@ impl HNSWIndex {
                 num_centroids = 1 << bits,
                 "Product Quantization configured"
             );
-            
+
             // Create PQ instance
-            let pq = Arc::new(PQ::new(dim, subvectors, bits, training_size, max_training_vectors));
-            
+            let pq = Arc::new(PQ::new(
+                dim,
+                subvectors,
+                bits,
+                training_size,
+                max_training_vectors,
+            ));
+
             (Some(config), Some(pq))
         } else {
             (None, None)
         };
 
         let max_layer = 16; // Always use NB_LAYER_MAX for hnsw-rs compatibility
-        trace!(operation = "hnsw_config", max_layer = max_layer, reason = "hnsw-rs compatibility", "Using fixed max_layer");
+        trace!(
+            operation = "hnsw_config",
+            max_layer = max_layer,
+            reason = "hnsw-rs compatibility",
+            "Using fixed max_layer"
+        );
 
         // Create initial raw HNSW index (will be rebuilt as PQ after training)
-        let hnsw = DistanceType::new_raw(&space_normalized, m, expected_size, max_layer, ef_construction);
+        let hnsw = DistanceType::new_raw(
+            &space_normalized,
+            m,
+            expected_size,
+            max_layer,
+            ef_construction,
+        );
 
         let duration_ms = start_time.elapsed().as_millis();
         info!(
@@ -691,26 +829,26 @@ impl HNSWIndex {
                 dict.set_item("subvectors", config.subvectors).ok()?;
                 dict.set_item("bits", config.bits).ok()?;
                 dict.set_item("training_size", config.training_size).ok()?;
-                
+
                 if let Some(max_training) = config.max_training_vectors {
                     dict.set_item("max_training_vectors", max_training).ok()?;
                 }
-                
+
                 if let Some(pq) = &self.pq {
                     dict.set_item("is_trained", pq.is_trained()).ok()?;
-                    
+
                     // Use enhanced PQ methods
                     let (memory_mb, total_centroids) = pq.get_memory_stats();
                     dict.set_item("memory_mb", memory_mb).ok()?;
                     dict.set_item("total_centroids", total_centroids).ok()?;
-                    
+
                     // Calculate compression ratio using cached values
                     let original_bytes = pq.dim * 4; // f32
                     let compressed_bytes = pq.subvectors; // u8 per subvector
                     let compression_ratio = original_bytes as f64 / compressed_bytes as f64;
                     dict.set_item("compression_ratio", compression_ratio).ok()?;
                 }
-                
+
                 Some(dict.into())
             } else {
                 None
@@ -751,7 +889,11 @@ impl HNSWIndex {
         let pq = match &self.pq {
             Some(pq) if pq.is_trained() => pq.clone(),
             _ => {
-                warn!(operation = "rebuild_quantization", reason = "pq_not_trained", "Cannot rebuild: PQ not trained");
+                warn!(
+                    operation = "rebuild_quantization",
+                    reason = "pq_not_trained",
+                    "Cannot rebuild: PQ not trained"
+                );
                 return Ok(false);
             }
         };
@@ -759,46 +901,62 @@ impl HNSWIndex {
         // Get all current vectors for quantization
         let vectors = self.vectors.read().unwrap();
         if vectors.is_empty() {
-            warn!(operation = "rebuild_quantization", reason = "no_vectors", "Cannot rebuild: no vectors available");
+            warn!(
+                operation = "rebuild_quantization",
+                reason = "no_vectors",
+                "Cannot rebuild: no vectors available"
+            );
             return Ok(false);
         }
 
-        info!(operation = "quantization_rebuild_start", vector_count = vectors.len(), "Starting quantization rebuild");
+        info!(
+            operation = "quantization_rebuild_start",
+            vector_count = vectors.len(),
+            "Starting quantization rebuild"
+        );
 
         // Quantize all existing vectors
         let vector_refs: Vec<&[f32]> = vectors.values().map(|v| v.as_slice()).collect();
-        let quantized_codes = pq.quantize_batch(&vector_refs)
-            .map_err(|e| {
-                error!(operation = "quantization_rebuild", error = %e, "Failed to quantize vectors");
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    format!("Failed to quantize vectors: {}", e)
-                )
-            })?;
+        let quantized_codes = pq.quantize_batch(&vector_refs).map_err(|e| {
+            error!(operation = "quantization_rebuild", error = %e, "Failed to quantize vectors");
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to quantize vectors: {}",
+                e
+            ))
+        })?;
 
         // Create new PQ-based HNSW index
         let max_layer = 16; // Always use NB_LAYER_MAX for consistency
-        trace!(operation = "rebuild_quantization", max_layer = max_layer, "Creating new PQ HNSW index");
+        trace!(
+            operation = "rebuild_quantization",
+            max_layer = max_layer,
+            "Creating new PQ HNSW index"
+        );
 
         let new_hnsw = DistanceType::new_pq(
-            &self.space, 
-            self.m, 
-            self.expected_size, 
-            max_layer, 
-            self.ef_construction, 
-            pq.clone()
+            &self.space,
+            self.m,
+            self.expected_size,
+            max_layer,
+            self.ef_construction,
+            pq.clone(),
         );
 
         // Store quantized codes
         {
             let mut pq_codes = self.pq_codes.write().unwrap();
             pq_codes.clear(); // Clear any existing codes
-            
+
             for (i, (id, _)) in vectors.iter().enumerate() {
                 if i < quantized_codes.len() {
                     pq_codes.insert(id.clone(), quantized_codes[i].clone());
                 }
             }
-            debug!(operation = "quantization_rebuild", codes_stored = pq_codes.len(), "Quantized codes stored");
+            debug!(
+                operation = "quantization_rebuild",
+                codes_stored = pq_codes.len(),
+                "Quantized codes stored"
+            );
         }
 
         // Replace the HNSW index
@@ -811,7 +969,7 @@ impl HNSWIndex {
         let pq_codes = self.pq_codes.read().unwrap();
         let id_map = self.id_map.read().unwrap();
         let mut batch_data: Vec<(&Vec<u8>, usize)> = Vec::new();
-        
+
         for (id, codes) in pq_codes.iter() {
             if let Some(&internal_id) = id_map.get(id) {
                 batch_data.push((codes, internal_id));
@@ -864,8 +1022,6 @@ impl HNSWIndex {
         }
     }
 
-
-
     /// Enhanced add method that properly handles PQ overwrite scenarios
     #[pyo3(signature = (data, overwrite = true))]
     #[instrument(level = "info", skip(self, data), fields(
@@ -878,9 +1034,13 @@ impl HNSWIndex {
 
         // Input validation
         if data.is_none() {
-            error!(operation = "add_vectors", error = "data_is_none", "Data cannot be None");
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            error!(
+                operation = "add_vectors",
+                error = "data_is_none",
                 "Data cannot be None"
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Data cannot be None",
             ));
         }
 
@@ -898,7 +1058,11 @@ impl HNSWIndex {
         }
 
         if parsed_data.is_empty() && errors.is_empty() {
-            trace!(operation = "add_vectors", result = "empty_input", "No vectors to process");
+            trace!(
+                operation = "add_vectors",
+                result = "empty_input",
+                "No vectors to process"
+            );
             return Ok(AddResult {
                 total_inserted: 0,
                 total_errors: 0,
@@ -958,8 +1122,10 @@ impl HNSWIndex {
                 info!(
                     operation = "overwrite_preparation",
                     documents_to_remove = ids_to_remove.len(),
-                    storage_analysis = format!("raw_only: {}, pq_only: {}, both: {}", 
-                        storage_analysis.0, storage_analysis.1, storage_analysis.2),
+                    storage_analysis = format!(
+                        "raw_only: {}, pq_only: {}, both: {}",
+                        storage_analysis.0, storage_analysis.1, storage_analysis.2
+                    ),
                     "Removing existing documents for overwrite"
                 );
 
@@ -1051,7 +1217,7 @@ impl HNSWIndex {
             operation = "add_vectors_complete",
             total_inserted = total_inserted,
             total_errors = total_errors,
-            success_rate = if total_input_count > 0 { 
+            success_rate = if total_input_count > 0 {
                 total_inserted as f64 / total_input_count as f64 * 100.0
             } else {
                 100.0
@@ -1069,9 +1235,6 @@ impl HNSWIndex {
             vector_shape,
         })
     }
-
-
-
 
     pub fn get_training_progress(&self) -> f32 {
         if let Some(config) = &self.quantization_config {
@@ -1143,16 +1306,16 @@ impl HNSWIndex {
     ) -> PyResult<PyObject> {
         let start_time = Instant::now();
 
-        let ef = ef_search.unwrap_or_else(|| {
-            match self.space.to_lowercase().as_str() {
-                "l1" | "l2" => std::cmp::max(2 * top_k, 150),
-                _ => std::cmp::max(2 * top_k, 100),
-            }
+        let ef = ef_search.unwrap_or_else(|| match self.space.to_lowercase().as_str() {
+            "l1" | "l2" => std::cmp::max(2 * top_k, 150),
+            _ => std::cmp::max(2 * top_k, 100),
         });
 
         trace!(operation = "search_config", ef = ef, space = %self.space, "Search parameters configured");
 
-        let filter_conditions = filter.map(|f| self.python_dict_to_value_map(f)).transpose()?;
+        let filter_conditions = filter
+            .map(|f| self.python_dict_to_value_map(f))
+            .transpose()?;
 
         // Detect batch vs single query with comprehensive input support
         let result: PyObject = if let Ok(list_vec) = vector.extract::<Vec<Vec<f32>>>() {
@@ -1160,24 +1323,45 @@ impl HNSWIndex {
 
             // Validation for empty batch or empty vectors in batch
             if list_vec.is_empty() {
-                error!(operation = "search", error = "empty_batch", "Batch cannot be empty");
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                error!(
+                    operation = "search",
+                    error = "empty_batch",
                     "Batch cannot be empty"
+                );
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "Batch cannot be empty",
                 ));
             }
 
             // Check for empty vectors within the batch
             for (i, vec) in list_vec.iter().enumerate() {
                 if vec.is_empty() {
-                    error!(operation = "search", error = "empty_vector_in_batch", vector_index = i, "Vector in batch cannot be empty");
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        format!("Vector {} in batch cannot be empty", i)
-                    ));
+                    error!(
+                        operation = "search",
+                        error = "empty_vector_in_batch",
+                        vector_index = i,
+                        "Vector in batch cannot be empty"
+                    );
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "Vector {} in batch cannot be empty",
+                        i
+                    )));
                 }
             }
 
-            debug!(operation = "batch_search", batch_size = list_vec.len(), "Starting batch search");
-            let results = self.batch_search_internal(&list_vec, filter_conditions.as_ref(), top_k, ef, return_vector, py)?;
+            debug!(
+                operation = "batch_search",
+                batch_size = list_vec.len(),
+                "Starting batch search"
+            );
+            let results = self.batch_search_internal(
+                &list_vec,
+                filter_conditions.as_ref(),
+                top_k,
+                ef,
+                return_vector,
+                py,
+            )?;
             PyList::new(py, results)?.into()
         } else if let Ok(np_array) = vector.downcast::<PyArray2<f32>>() {
             // Format: NumPy 2D array (N, dims)
@@ -1193,14 +1377,26 @@ impl HNSWIndex {
                     "NumPy array shape mismatch"
                 );
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "NumPy array must have shape (N, {}), got {:?}", self.dim, shape
+                    "NumPy array must have shape (N, {}), got {:?}",
+                    self.dim, shape
                 )));
             }
 
             let flat = readonly.as_slice()?;
             let batch: Vec<Vec<f32>> = flat.chunks(self.dim).map(|chunk| chunk.to_vec()).collect();
-            debug!(operation = "batch_search_numpy", batch_size = batch.len(), "Starting NumPy batch search");
-            let results = self.batch_search_internal(&batch, filter_conditions.as_ref(), top_k, ef, return_vector, py)?;
+            debug!(
+                operation = "batch_search_numpy",
+                batch_size = batch.len(),
+                "Starting NumPy batch search"
+            );
+            let results = self.batch_search_internal(
+                &batch,
+                filter_conditions.as_ref(),
+                top_k,
+                ef,
+                return_vector,
+                py,
+            )?;
             PyList::new(py, results)?.into()
         } else {
             // Single vector path - enhanced with NumPy 1D support
@@ -1213,20 +1409,29 @@ impl HNSWIndex {
             // PROCESS HERE using extract_single_vector logic
             let processed_query = self.validate_and_process_query_vector(query_vector)?;
 
-            trace!(operation = "single_search", query_dim = processed_query.len(), "Starting single vector search");
-            
+            trace!(
+                operation = "single_search",
+                query_dim = processed_query.len(),
+                "Starting single vector search"
+            );
+
             let search_results = py.allow_threads(|| {
                 // Check if we should use quantized search
                 let use_quantized = self.is_quantized();
 
-                trace!(operation = "search_method", use_quantized = use_quantized, "Selected search method");
+                trace!(
+                    operation = "search_method",
+                    use_quantized = use_quantized,
+                    "Selected search method"
+                );
 
                 let hnsw_results = {
                     let hnsw_guard = self.hnsw.lock().unwrap();
 
                     if use_quantized {
                         // Use ADC search for quantized index
-                        hnsw_guard.search(&processed_query, top_k, ef)
+                        hnsw_guard
+                            .search(&processed_query, top_k, ef)
                             .unwrap_or_else(|e| {
                                 error!(operation = "adc_search", error = %e, "ADC search failed");
                                 Vec::new()
@@ -1271,14 +1476,13 @@ impl HNSWIndex {
                         let metadata = vector_metadata.get(ext_id).cloned().unwrap_or_default();
                         let vector_data = if return_vector {
                             // Try raw vector first, then PQ reconstruction
-                            vectors.get(ext_id).cloned()
-                                .or_else(|| {
-                                    if let (Some(pq), Some(codes)) = (&self.pq, pq_codes.get(ext_id)) {
-                                        pq.reconstruct(codes).ok()
-                                    } else {
-                                        None
-                                    }
-                                })
+                            vectors.get(ext_id).cloned().or_else(|| {
+                                if let (Some(pq), Some(codes)) = (&self.pq, pq_codes.get(ext_id)) {
+                                    pq.reconstruct(codes).ok()
+                                } else {
+                                    None
+                                }
+                            })
                         } else {
                             None
                         };
@@ -1309,14 +1513,19 @@ impl HNSWIndex {
         // ✅ ENTERPRISE: Add duration timing to hot path with actual result count
         let duration_ms = start_time.elapsed().as_millis();
         let results_count = {
-            let any = result.bind(py); 
+            let any = result.bind(py);
             match any.downcast::<PyList>() {
                 Ok(list) => list.len(),
                 Err(_) => 0,
             }
         };
 
-        debug!(operation = "search_complete", results_count = results_count, duration_ms = duration_ms, "Search completed");
+        debug!(
+            operation = "search_complete",
+            results_count = results_count,
+            duration_ms = duration_ms,
+            "Search completed"
+        );
 
         Ok(result)
     }
@@ -1342,10 +1551,14 @@ impl HNSWIndex {
         self.save_hnsw_graph(path_buf)?;
 
         let duration_ms = start_time.elapsed().as_millis();
-        info!(operation = "save_complete", path = path, duration_ms = duration_ms, "Index save completed successfully");
+        info!(
+            operation = "save_complete",
+            path = path,
+            duration_ms = duration_ms,
+            "Index save completed successfully"
+        );
         Ok(())
     }
-
 
     /// Python property: `index.dim`
     #[getter]
@@ -1353,11 +1566,14 @@ impl HNSWIndex {
         self.dim
     }
 
-
-
     /// Get records by ID(s) with PQ reconstruction support and storage mode awareness
     #[pyo3(signature = (input, return_vector = true))]
-    pub fn get_records(&self, py: Python<'_>, input: &Bound<PyAny>, return_vector: bool) -> PyResult<Vec<Py<PyDict>>> {
+    pub fn get_records(
+        &self,
+        py: Python<'_>,
+        input: &Bound<PyAny>,
+        return_vector: bool,
+    ) -> PyResult<Vec<Py<PyDict>>> {
         let ids: Vec<String> = if let Ok(id_str) = input.extract::<String>() {
             vec![id_str]
         } else if let Ok(id_list) = input.extract::<Vec<String>>() {
@@ -1368,7 +1584,12 @@ impl HNSWIndex {
             ));
         };
 
-        trace!(operation = "get_records", record_count = ids.len(), return_vector = return_vector, "Retrieving records");
+        trace!(
+            operation = "get_records",
+            record_count = ids.len(),
+            return_vector = return_vector,
+            "Retrieving records"
+        );
 
         let mut records = Vec::with_capacity(ids.len());
 
@@ -1416,7 +1637,11 @@ impl HNSWIndex {
             }
         }
 
-        trace!(operation = "get_records_complete", found_records = records.len(), "Records retrieval completed");
+        trace!(
+            operation = "get_records_complete",
+            found_records = records.len(),
+            "Records retrieval completed"
+        );
         Ok(records)
     }
 
@@ -1437,57 +1662,100 @@ impl HNSWIndex {
         stats.insert("index_type".to_string(), "HNSW".to_string());
 
         stats.insert("m".to_string(), self.m.to_string());
-        stats.insert("ef_construction".to_string(), self.ef_construction.to_string());
+        stats.insert(
+            "ef_construction".to_string(),
+            self.ef_construction.to_string(),
+        );
         stats.insert("thread_safety".to_string(), "RwLock+Mutex".to_string());
 
         // Storage breakdown
         stats.insert("raw_vectors_stored".to_string(), vectors.len().to_string());
-        stats.insert("quantized_codes_stored".to_string(), pq_codes.len().to_string());
+        stats.insert(
+            "quantized_codes_stored".to_string(),
+            pq_codes.len().to_string(),
+        );
 
         // Training info
         if let Some(config) = &self.quantization_config {
             stats.insert("quantization_type".to_string(), "pq".to_string());
-            stats.insert("quantization_training_size".to_string(), config.training_size.to_string());
+            stats.insert(
+                "quantization_training_size".to_string(),
+                config.training_size.to_string(),
+            );
 
             // Storage mode information
-            stats.insert("storage_mode".to_string(), config.storage_mode.to_string().to_string());
+            stats.insert(
+                "storage_mode".to_string(),
+                config.storage_mode.to_string().to_string(),
+            );
 
             // Calculate actual memory usage based on storage mode
             let raw_memory_mb = (vectors.len() * self.dim * 4) as f64 / (1024.0 * 1024.0);
-            let quantized_memory_mb = (pq_codes.len() * config.subvectors) as f64 / (1024.0 * 1024.0);
+            let quantized_memory_mb =
+                (pq_codes.len() * config.subvectors) as f64 / (1024.0 * 1024.0);
 
-            stats.insert("raw_vectors_memory_mb".to_string(), format!("{:.2}", raw_memory_mb));
-            stats.insert("quantized_codes_memory_mb".to_string(), format!("{:.2}", quantized_memory_mb));
+            stats.insert(
+                "raw_vectors_memory_mb".to_string(),
+                format!("{:.2}", raw_memory_mb),
+            );
+            stats.insert(
+                "quantized_codes_memory_mb".to_string(),
+                format!("{:.2}", quantized_memory_mb),
+            );
 
             match config.storage_mode {
                 StorageMode::QuantizedOnly => {
-                    stats.insert("storage_strategy".to_string(), "memory_optimized".to_string());
+                    stats.insert(
+                        "storage_strategy".to_string(),
+                        "memory_optimized".to_string(),
+                    );
                     stats.insert("memory_savings".to_string(), "maximum".to_string());
                 }
                 StorageMode::QuantizedWithRaw => {
-                    stats.insert("storage_strategy".to_string(), "quality_optimized".to_string());
+                    stats.insert(
+                        "storage_strategy".to_string(),
+                        "quality_optimized".to_string(),
+                    );
                     stats.insert("memory_savings".to_string(), "raw_vectors_kept".to_string());
                 }
             }
 
             let collected_count = training_ids.len();
             let progress = self.get_training_progress();
-            stats.insert("training_progress".to_string(),
-                format!("{}/{} ({:.1}%)", collected_count, config.training_size, progress));
-            
+            stats.insert(
+                "training_progress".to_string(),
+                format!(
+                    "{}/{} ({:.1}%)",
+                    collected_count, config.training_size, progress
+                ),
+            );
+
             let vectors_needed = self.training_vectors_needed();
-            stats.insert("training_vectors_needed".to_string(), vectors_needed.to_string());
-            stats.insert("training_threshold_reached".to_string(),
-                self.training_threshold_reached.load(Ordering::Acquire).to_string());
+            stats.insert(
+                "training_vectors_needed".to_string(),
+                vectors_needed.to_string(),
+            );
+            stats.insert(
+                "training_threshold_reached".to_string(),
+                self.training_threshold_reached
+                    .load(Ordering::Acquire)
+                    .to_string(),
+            );
 
             if let Some(pq) = &self.pq {
                 let is_trained = pq.is_trained();
                 stats.insert("quantization_trained".to_string(), is_trained.to_string());
-                stats.insert("quantization_active".to_string(), self.is_quantized().to_string());
+                stats.insert(
+                    "quantization_active".to_string(),
+                    self.is_quantized().to_string(),
+                );
 
                 if is_trained {
                     let compression_ratio = (pq.dim as f64 * 4.0) / pq.subvectors as f64;
-                    stats.insert("quantization_compression_ratio".to_string(), format!("{:.1}x", compression_ratio));
+                    stats.insert(
+                        "quantization_compression_ratio".to_string(),
+                        format!("{:.1}x", compression_ratio),
+                    );
                 }
             }
         } else {
@@ -1495,18 +1763,20 @@ impl HNSWIndex {
             stats.insert("storage_mode".to_string(), "raw_only".to_string());
         }
 
-        stats.insert("storage_mode_description".to_string(), self.get_storage_mode());
+        stats.insert(
+            "storage_mode_description".to_string(),
+            self.get_storage_mode(),
+        );
 
         stats
     }
 
-            
     /// List the first number of records in the index (ID and metadata)
     #[pyo3(signature = (number=10))]
     pub fn list(&self, py: Python<'_>, number: usize) -> PyResult<Vec<(String, PyObject)>> {
         let vectors = self.vectors.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
-        
+
         let mut results = Vec::new();
         for (id, _vec) in vectors.iter().take(number) {
             let metadata = vector_metadata.get(id).cloned().unwrap_or_default();
@@ -1545,32 +1815,51 @@ impl HNSWIndex {
     /// Get a human-readable info string
     pub fn info(&self) -> String {
         let vectors = self.vectors.read().unwrap();
-        let base_info = format!(
+        let base_info =
+            format!(
             "HNSWIndex(dim={}, space={}, m={}, ef_construction={}, expected_size={}, vectors={}",
             self.dim, self.space, self.m, self.ef_construction, self.expected_size, vectors.len()
         );
-        
+
         if let Some(config) = &self.quantization_config {
-            let trained_status = self.pq.as_ref()
-                .map(|pq| if pq.is_trained() { "trained" } else { "untrained" })
+            let trained_status = self
+                .pq
+                .as_ref()
+                .map(|pq| {
+                    if pq.is_trained() {
+                        "trained"
+                    } else {
+                        "untrained"
+                    }
+                })
                 .unwrap_or("unknown");
 
-            let active_status = if self.is_quantized() { "active" } else { "inactive" };
-            
+            let active_status = if self.is_quantized() {
+                "active"
+            } else {
+                "inactive"
+            };
+
             // Use cached compression ratio calculation with proper float division
-            let compression_info = self.pq.as_ref()
+            let compression_info = self
+                .pq
+                .as_ref()
                 .map(|pq| format!("{:.1}x", (pq.dim as f64 * 4.0) / pq.subvectors as f64))
                 .unwrap_or_else(|| "unknown".to_string());
-            
+
             format!(
                 "{}, quantization=pq(subvectors={}, bits={}, {}, {}, compression={}))",
-                base_info, config.subvectors, config.bits, trained_status, active_status, compression_info
+                base_info,
+                config.subvectors,
+                config.bits,
+                trained_status,
+                active_status,
+                compression_info
             )
         } else {
             format!("{}, quantization=none)", base_info)
         }
     }
-
 
     /// Remove vector by ID
     /// Public remove_point method (unchanged for API compatibility)
@@ -1582,51 +1871,80 @@ impl HNSWIndex {
         }
     }
 
-
-
     /// Get performance characteristics and limitations
     pub fn get_performance_info(&self) -> HashMap<String, String> {
         let mut info = HashMap::new();
         info.insert("search_speedup_expected".to_string(), "1.2x-2x".to_string());
-        info.insert("insertion_speedup_expected".to_string(), "4x-8x_large_batches".to_string());
-        info.insert("search_bottleneck".to_string(), "hnsw_mutex_serialization".to_string());
-        info.insert("insertion_bottleneck".to_string(), "hnsw_mutex_for_large_batches".to_string());
-        info.insert("benefits".to_string(), "gil_release_concurrent_metadata_processing_parallel_insert".to_string());
-        info.insert("limitation".to_string(), "parallel_insert_threshold_1000x_threads".to_string());
-        info.insert("recommendation".to_string(), "excellent_for_large_batch_workloads".to_string());
-        
+        info.insert(
+            "insertion_speedup_expected".to_string(),
+            "4x-8x_large_batches".to_string(),
+        );
+        info.insert(
+            "search_bottleneck".to_string(),
+            "hnsw_mutex_serialization".to_string(),
+        );
+        info.insert(
+            "insertion_bottleneck".to_string(),
+            "hnsw_mutex_for_large_batches".to_string(),
+        );
+        info.insert(
+            "benefits".to_string(),
+            "gil_release_concurrent_metadata_processing_parallel_insert".to_string(),
+        );
+        info.insert(
+            "limitation".to_string(),
+            "parallel_insert_threshold_1000x_threads".to_string(),
+        );
+        info.insert(
+            "recommendation".to_string(),
+            "excellent_for_large_batch_workloads".to_string(),
+        );
+
         // Add quantization performance info
         if let Some(config) = &self.quantization_config {
             let original_bytes = self.dim * 4; // f32
             let compressed_bytes = config.subvectors; // u8 per subvector
             let compression_ratio = original_bytes as f64 / compressed_bytes as f64;
-            
-            info.insert("quantization_compression".to_string(), format!("{:.1}x", compression_ratio));
-            info.insert("quantization_memory_savings".to_string(), format!("{:.1}%", (1.0 - 1.0/compression_ratio) * 100.0));
-            info.insert("quantization_accuracy_impact".to_string(), "slight_recall_reduction".to_string());
+
+            info.insert(
+                "quantization_compression".to_string(),
+                format!("{:.1}x", compression_ratio),
+            );
+            info.insert(
+                "quantization_memory_savings".to_string(),
+                format!("{:.1}%", (1.0 - 1.0 / compression_ratio) * 100.0),
+            );
+            info.insert(
+                "quantization_accuracy_impact".to_string(),
+                "slight_recall_reduction".to_string(),
+            );
         }
-        
+
         info
     }
 
     /// Concurrent benchmark for search performance
     #[pyo3(signature = (query_count, max_threads=None))]
-    pub fn benchmark_concurrent_reads(&self, query_count: usize, max_threads: Option<usize>) -> PyResult<HashMap<String, f64>> {
-        use rand::random;  // Import for random number generation
-        
+    pub fn benchmark_concurrent_reads(
+        &self,
+        query_count: usize,
+        max_threads: Option<usize>,
+    ) -> PyResult<HashMap<String, f64>> {
+        use rand::random; // Import for random number generation
+
         let start_time = Instant::now();
-        
+
         debug!(
             operation = "benchmark_start",
             query_count = query_count,
             max_threads = max_threads,
             "Starting concurrent read benchmark"
         );
-        
+
         let queries: Vec<Vec<f32>> = (0..query_count)
             .map(|_| (0..self.dim).map(|_| random::<f32>()).collect())
             .collect();
-        
+
         let mut results = HashMap::new();
 
         // Sequential benchmark
@@ -1636,26 +1954,32 @@ impl HNSWIndex {
         }
         let sequential_time = start.elapsed().as_secs_f64();
         results.insert("sequential_time".to_string(), sequential_time);
-        results.insert("sequential_qps".to_string(), queries.len() as f64 / sequential_time);
-        
+        results.insert(
+            "sequential_qps".to_string(),
+            queries.len() as f64 / sequential_time,
+        );
+
         // Parallel benchmark
         let available_threads = rayon::current_num_threads();
-        let num_threads = max_threads.unwrap_or(available_threads).min(available_threads);
+        let num_threads = max_threads
+            .unwrap_or(available_threads)
+            .min(available_threads);
 
         let start = Instant::now();
         let _: Vec<_> = queries
             .par_iter()
-            .map(|query| {
-                self.raw_search_no_gil(query)
-            })
+            .map(|query| self.raw_search_no_gil(query))
             .collect();
 
         let parallel_time = start.elapsed().as_secs_f64();
         results.insert("parallel_time".to_string(), parallel_time);
-        results.insert("parallel_qps".to_string(), queries.len() as f64 / parallel_time);
+        results.insert(
+            "parallel_qps".to_string(),
+            queries.len() as f64 / parallel_time,
+        );
         results.insert("speedup".to_string(), sequential_time / parallel_time);
         results.insert("threads_used".to_string(), num_threads as f64);
-        
+
         let total_duration_ms = start_time.elapsed().as_millis();
         info!(
             operation = "benchmark_complete",
@@ -1665,17 +1989,21 @@ impl HNSWIndex {
             duration_ms = total_duration_ms,
             "Benchmark completed"
         );
-        
+
         Ok(results)
     }
 
     /// Raw performance benchmark
     #[pyo3(signature = (query_count, max_threads=None))]
-    pub fn benchmark_raw_concurrent_performance(&self, query_count: usize, max_threads: Option<usize>) -> HashMap<String, f64> {
-        use rand::random;  // Import for random number generation
-        
+    pub fn benchmark_raw_concurrent_performance(
+        &self,
+        query_count: usize,
+        max_threads: Option<usize>,
+    ) -> HashMap<String, f64> {
+        use rand::random; // Import for random number generation
+
         let start_time = Instant::now();
-        
+
         let queries: Vec<Vec<f32>> = (0..query_count)
             .map(|_| (0..self.dim).map(|_| random::<f32>()).collect())
             .collect();
@@ -1688,12 +2016,12 @@ impl HNSWIndex {
             let _ = self.raw_search_no_gil(query);
         }
         let sequential_time = start.elapsed().as_secs_f64();
-        
-        
-        
+
         // Parallel benchmark
         let available_threads = rayon::current_num_threads();
-        let num_threads = max_threads.unwrap_or(available_threads).min(available_threads);
+        let num_threads = max_threads
+            .unwrap_or(available_threads)
+            .min(available_threads);
         let chunk_size = (queries.len() + num_threads - 1) / num_threads;
 
         let start = Instant::now();
@@ -1713,12 +2041,21 @@ impl HNSWIndex {
 
         results.insert("sequential_time".to_string(), sequential_time);
         results.insert("parallel_time".to_string(), parallel_time);
-        results.insert("sequential_qps".to_string(), queries.len() as f64 / sequential_time);
-        results.insert("parallel_qps".to_string(), queries.len() as f64 / parallel_time);
+        results.insert(
+            "sequential_qps".to_string(),
+            queries.len() as f64 / sequential_time,
+        );
+        results.insert(
+            "parallel_qps".to_string(),
+            queries.len() as f64 / parallel_time,
+        );
         results.insert("speedup".to_string(), sequential_time / parallel_time);
         results.insert("threads_used".to_string(), num_threads as f64);
-        results.insert("note".to_string(), "limited_by_hnsw_mutex".parse().unwrap_or(0.0));
-        
+        results.insert(
+            "note".to_string(),
+            "limited_by_hnsw_mutex".parse().unwrap_or(0.0),
+        );
+
         let total_duration_ms = start_time.elapsed().as_millis();
         info!(
             operation = "benchmark_complete",
@@ -1728,14 +2065,16 @@ impl HNSWIndex {
             duration_ms = total_duration_ms,
             "Benchmark completed"
         );
-        
+
         results
     }
 
-
     /// Get current code version counter to verify build updates
     pub fn get_code_version(&self) -> String {
-        format!("Version: {}, Description: {}", CODE_VERSION_COUNTER, CODE_VERSION_DESCRIPTION)
+        format!(
+            "Version: {}, Description: {}",
+            CODE_VERSION_COUNTER, CODE_VERSION_DESCRIPTION
+        )
     }
 
     /// Get just the version number for quick checking
@@ -1746,14 +2085,13 @@ impl HNSWIndex {
 
 // INTERNAL METHODS, HELPERS AND IMPLEMENTATIONS
 impl HNSWIndex {
-
     /// Pure function for vector normalization
     fn normalize_vector(&self, vector: Vec<f32>) -> Vec<f32> {
         let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 {
             vector.iter().map(|x| x / norm).collect()
         } else {
-            vector  // Return unchanged for zero vectors
+            vector // Return unchanged for zero vectors
         }
     }
 
@@ -1764,7 +2102,7 @@ impl HNSWIndex {
             // Future extensions:
             // "l2" => self.preprocess_l2(vector),
             // "l1" => self.preprocess_l1(vector),
-            _ => vector
+            _ => vector,
         }
     }
 
@@ -1772,9 +2110,13 @@ impl HNSWIndex {
     fn validate_and_process_query_vector(&self, vector: Vec<f32>) -> PyResult<Vec<f32>> {
         // Same validation as extract_single_vector
         if vector.is_empty() {
-            error!(operation = "query_validation", error = "empty_vector", "Search vector cannot be empty");
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            error!(
+                operation = "query_validation",
+                error = "empty_vector",
                 "Search vector cannot be empty"
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Search vector cannot be empty",
             ));
         }
         if vector.len() != self.dim {
@@ -1786,7 +2128,9 @@ impl HNSWIndex {
                 "Search vector dimension mismatch"
             );
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Search vector dimension mismatch: expected {}, got {}", self.dim, vector.len()
+                "Search vector dimension mismatch: expected {}, got {}",
+                self.dim,
+                vector.len()
             )));
         }
         for (i, &val) in vector.iter().enumerate() {
@@ -1799,7 +2143,8 @@ impl HNSWIndex {
                     "Search vector contains invalid value"
                 );
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Search vector contains invalid value at index {}: {}", i, val
+                    "Search vector contains invalid value at index {}: {}",
+                    i, val
                 )));
             }
         }
@@ -1807,7 +2152,6 @@ impl HNSWIndex {
         // Apply same processing as storage vectors
         Ok(self.process_vector_for_space(vector))
     }
-
 
     /// Internal remove_point method that can be called without Python bindings
     /// This is the core method that properly removes all traces of a document
@@ -1827,10 +2171,10 @@ impl HNSWIndex {
             let had_pq_codes = pq_codes.contains_key(&id);
 
             // Remove from all data structures
-            vectors.remove(&id);           // Remove raw vectors (if present)
-            vector_metadata.remove(&id);   // Remove metadata
-            pq_codes.remove(&id);         // Remove PQ codes (if present)
-            rev_map.remove(&internal_id);  // Remove ID mapping
+            vectors.remove(&id); // Remove raw vectors (if present)
+            vector_metadata.remove(&id); // Remove metadata
+            pq_codes.remove(&id); // Remove PQ codes (if present)
+            rev_map.remove(&internal_id); // Remove ID mapping
 
             // Enhanced training state cleanup for quantization
             if self.has_quantization() {
@@ -1851,7 +2195,8 @@ impl HNSWIndex {
                         // Update threshold status if we dropped below training size
                         if let Some(config) = &self.quantization_config {
                             if training_ids.len() < config.training_size {
-                                self.training_threshold_reached.store(false, std::sync::atomic::Ordering::Release);
+                                self.training_threshold_reached
+                                    .store(false, std::sync::atomic::Ordering::Release);
                                 debug!(
                                     operation = "training_threshold_reset",
                                     remaining_vectors = training_ids.len(),
@@ -1893,9 +2238,6 @@ impl HNSWIndex {
         }
     }
 
-
-
-
     // 1. CORE VECTOR OPERATIONS (6 methods)
     /// 3-PATH ARCHITECTURE - Main router
     fn add_single_vector(
@@ -1903,7 +2245,7 @@ impl HNSWIndex {
         id: String,
         vector: Vec<f32>,
         metadata: HashMap<String, Value>,
-        overwrite: bool
+        overwrite: bool,
     ) -> PyResult<bool> {
         // Check if this is a new vector or an overwrite
         let is_new = {
@@ -1918,9 +2260,10 @@ impl HNSWIndex {
                 reason = "already_exists",
                 "Vector already exists and overwrite=false"
             );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("Vector with ID '{}' already exists", id)
-            ));
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Vector with ID '{}' already exists",
+                id
+            )));
         }
 
         trace!(
@@ -1956,7 +2299,7 @@ impl HNSWIndex {
         &mut self,
         id: String,
         vector: Vec<f32>, // Already processed by extract_single_vector
-        metadata: HashMap<String, Value>
+        metadata: HashMap<String, Value>,
     ) -> PyResult<()> {
         let internal_id = self.get_next_id();
 
@@ -2005,14 +2348,17 @@ impl HNSWIndex {
     fn add_with_id_collection(
         &mut self,
         id: String,
-        vector: Vec<f32>,  // Already processed
-        metadata: HashMap<String, Value>
+        vector: Vec<f32>, // Already processed
+        metadata: HashMap<String, Value>,
     ) -> PyResult<()> {
         // 1. Store vector normally (single storage)
         self.add_raw_vector(id.clone(), vector, metadata)?;
 
         // SKIP TRAINING ID COLLECTION DURING PERSISTENCE REBUILD
-        if self.rebuilding_from_persistence.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .rebuilding_from_persistence
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             trace!(
                 operation = "add_with_id_collection",
                 vector_id = %id,
@@ -2029,7 +2375,9 @@ impl HNSWIndex {
 
                 if training_ids.len() < config.training_size {
                     training_ids.push(id.clone());
-                    let progress = (training_ids.len() as f32 / config.training_size as f32 * 100.0).min(100.0);
+                    let progress = (training_ids.len() as f32 / config.training_size as f32
+                        * 100.0)
+                        .min(100.0);
 
                     trace!(
                         operation = "training_id_collection",
@@ -2042,7 +2390,8 @@ impl HNSWIndex {
 
                     // Check if we've reached the threshold
                     if training_ids.len() >= config.training_size {
-                        self.training_threshold_reached.store(true, Ordering::Release);
+                        self.training_threshold_reached
+                            .store(true, Ordering::Release);
                         info!(
                             operation = "training_threshold_reached",
                             collected_count = training_ids.len(),
@@ -2065,8 +2414,8 @@ impl HNSWIndex {
     fn add_quantized_vector(
         &mut self,
         id: String,
-        vector: Vec<f32>,  // Already processed
-        metadata: HashMap<String, Value>
+        vector: Vec<f32>, // Already processed
+        metadata: HashMap<String, Value>,
     ) -> PyResult<()> {
         let internal_id = self.get_next_id();
 
@@ -2094,9 +2443,10 @@ impl HNSWIndex {
                 error = %e,
                 "Failed to quantize vector"
             );
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("Failed to quantize vector: {}", e)
-            )
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to quantize vector: {}",
+                e
+            ))
         })?;
 
         // Store quantized codes (always)
@@ -2146,7 +2496,10 @@ impl HNSWIndex {
         if let Some(_config) = &self.quantization_config {
             if let Some(pq) = &self.pq {
                 if !pq.is_trained() {
-                    info!(operation = "training_trigger", "Training threshold reached - starting PQ training");
+                    info!(
+                        operation = "training_trigger",
+                        "Training threshold reached - starting PQ training"
+                    );
                     return self.train_quantization_from_ids();
                 }
             }
@@ -2164,17 +2517,26 @@ impl HNSWIndex {
         let start_time = Instant::now();
 
         let pq = self.pq.as_ref().ok_or("PQ not available")?.clone();
-        let config = self.quantization_config.as_ref().ok_or("Config not available")?.clone();
-        
+        let config = self
+            .quantization_config
+            .as_ref()
+            .ok_or("Config not available")?
+            .clone();
+
         // Get consistent training set using collected IDs
         let training_vectors = {
             let training_ids = self.training_ids.read().unwrap();
 
             // ADD EARLY CHECK:
             if training_ids.is_empty() {
-                warn!(operation = "pq_training", reason = "no_training_ids", "No training IDs available");
+                warn!(
+                    operation = "pq_training",
+                    reason = "no_training_ids",
+                    "No training IDs available"
+                );
                 // Reset threshold to prevent repeated attempts
-                self.training_threshold_reached.store(false, Ordering::Release);
+                self.training_threshold_reached
+                    .store(false, Ordering::Release);
                 return Err("No training IDs available for training".to_string());
             }
 
@@ -2218,8 +2580,11 @@ impl HNSWIndex {
                 required = config.training_size,
                 "Insufficient vectors for training"
             );
-            return Err(format!("Insufficient vectors for training: need {}, have {} (some may have been removed)",
-                config.training_size, training_vectors.len()));
+            return Err(format!(
+                "Insufficient vectors for training: need {}, have {} (some may have been removed)",
+                config.training_size,
+                training_vectors.len()
+            ));
         }
 
         // Respect max_training_vectors limit
@@ -2267,9 +2632,13 @@ impl HNSWIndex {
         }
 
         // Rebuild index with quantization
-        debug!(operation = "pq_rebuild_start", "Rebuilding index with quantization");
+        debug!(
+            operation = "pq_rebuild_start",
+            "Rebuilding index with quantization"
+        );
         let rebuild_start = Instant::now();
-        let rebuild_success = self.rebuild_with_quantization()
+        let rebuild_success = self
+            .rebuild_with_quantization()
             .map_err(|e| format!("Failed to rebuild with quantization: {}", e))?;
         let rebuild_duration = rebuild_start.elapsed();
 
@@ -2301,23 +2670,29 @@ impl HNSWIndex {
         // HNSW search with locking
         let hnsw_results = {
             let hnsw_guard = self.hnsw.lock().unwrap();
-            hnsw_guard.search(query, 10, 100).unwrap_or_else(|_| Vec::new())
+            hnsw_guard
+                .search(query, 10, 100)
+                .unwrap_or_else(|_| Vec::new())
         }; // Lock released immediately
-        
+
         // Concurrent read access to ID mapping
         let rev_map = self.rev_map.read().unwrap();
-        
+
         hnsw_results
             .into_iter()
             .filter_map(|neighbor| {
-                rev_map.get(&neighbor.get_origin_id())
+                rev_map
+                    .get(&neighbor.get_origin_id())
                     .map(|id| (id.clone(), neighbor.distance))
             })
             .collect()
     }
 
     /// Parse input data into (id, vector, metadata) tuples with error collection
-    fn parse_input_data(&self, data: &Bound<PyAny>) -> (Vec<(String, Vec<f32>, HashMap<String, Value>)>, Vec<String>) {
+    fn parse_input_data(
+        &self,
+        data: &Bound<PyAny>,
+    ) -> (Vec<(String, Vec<f32>, HashMap<String, Value>)>, Vec<String>) {
         let mut parsed_vectors = Vec::new();
         let mut errors = Vec::new();
 
@@ -2347,64 +2722,72 @@ impl HNSWIndex {
 
     /// Safe dictionary parsing that collects errors
     fn parse_dict_input_safe(
-        &self, 
-        dict: &Bound<PyDict>, 
+        &self,
+        dict: &Bound<PyDict>,
         parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
-        errors: &mut Vec<String>
+        errors: &mut Vec<String>,
     ) {
         // Check for single object format
-        if dict.contains("id").unwrap_or(false) && 
-            (dict.contains("values").unwrap_or(false) || dict.contains("vector").unwrap_or(false)) {
-
-                // Single object format
-                let vector_result = if let Ok(Some(values_item)) = dict.get_item("values") {
-                    self.extract_single_vector_safe(&values_item)
-                } else if let Ok(Some(vector_item)) = dict.get_item("vector") {
-                    self.extract_single_vector_safe(&vector_item)
-                } else {
-                    Err("Missing 'vector' or 'values' key".to_string())
-                };
-
-                match vector_result {
-                    Ok(vector) => {
-                        let id = match dict.get_item("id") {
-                            Ok(Some(id_item)) => id_item.extract::<String>().unwrap_or_else(|_| self.generate_id()),
-                            _ => self.generate_id(),
-                        };
-
-                        let metadata = match dict.get_item("metadata") {
-                            Ok(Some(meta_item)) => {
-                                if let Ok(meta_dict) = meta_item.downcast::<PyDict>() {
-                                    self.python_dict_to_value_map(meta_dict).unwrap_or_default()
-                                } else {
-                                    HashMap::new()
-                                }
-                            }
-                            _ => HashMap::new(),
-                        };
-
-                        parsed_vectors.push((id, vector, metadata));
-                    }
-                    Err(e) => {
-                        let id = dict.get_item("id")
-                            .ok()
-                            .flatten()
-                            .and_then(|id_item| id_item.extract::<String>().ok())
-                            .unwrap_or_else(|| "single_object".to_string());
-
-                        errors.push(format!("Vector {}: {}", id, e));
-                    }
-                }
+        if dict.contains("id").unwrap_or(false)
+            && (dict.contains("values").unwrap_or(false)
+                || dict.contains("vector").unwrap_or(false))
+        {
+            // Single object format
+            let vector_result = if let Ok(Some(values_item)) = dict.get_item("values") {
+                self.extract_single_vector_safe(&values_item)
+            } else if let Ok(Some(vector_item)) = dict.get_item("vector") {
+                self.extract_single_vector_safe(&vector_item)
             } else {
-                // Batch format - try the existing parse_batch_format
-                if let Err(e) = self.parse_batch_format(dict, parsed_vectors) {
-                    errors.push(format!("Batch parsing error: {}", e));
+                Err("Missing 'vector' or 'values' key".to_string())
+            };
+
+            match vector_result {
+                Ok(vector) => {
+                    let id = match dict.get_item("id") {
+                        Ok(Some(id_item)) => id_item
+                            .extract::<String>()
+                            .unwrap_or_else(|_| self.generate_id()),
+                        _ => self.generate_id(),
+                    };
+
+                    let metadata = match dict.get_item("metadata") {
+                        Ok(Some(meta_item)) => {
+                            if let Ok(meta_dict) = meta_item.downcast::<PyDict>() {
+                                self.python_dict_to_value_map(meta_dict).unwrap_or_default()
+                            } else {
+                                HashMap::new()
+                            }
+                        }
+                        _ => HashMap::new(),
+                    };
+
+                    parsed_vectors.push((id, vector, metadata));
+                }
+                Err(e) => {
+                    let id = dict
+                        .get_item("id")
+                        .ok()
+                        .flatten()
+                        .and_then(|id_item| id_item.extract::<String>().ok())
+                        .unwrap_or_else(|| "single_object".to_string());
+
+                    errors.push(format!("Vector {}: {}", id, e));
                 }
             }
+        } else {
+            // Batch format - try the existing parse_batch_format
+            if let Err(e) = self.parse_batch_format(dict, parsed_vectors) {
+                errors.push(format!("Batch parsing error: {}", e));
+            }
         }
+    }
 
     /// Handle Format 3 & 5: Batch format - WORKING SOLUTION
-    fn parse_batch_format(&self, dict: &Bound<PyDict>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> PyResult<()> {
+    fn parse_batch_format(
+        &self,
+        dict: &Bound<PyDict>,
+        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+    ) -> PyResult<()> {
         // Process each key path immediately without storing references
 
         // Try "vectors" key
@@ -2417,7 +2800,7 @@ impl HNSWIndex {
             }
         }
 
-        // Try "embeddings" key  
+        // Try "embeddings" key
         if let Some(embeddings_item) = dict.get_item("embeddings")? {
             if let Ok(list) = embeddings_item.downcast::<PyList>() {
                 return self.process_vector_list(list, dict, parsed_vectors);
@@ -2433,23 +2816,23 @@ impl HNSWIndex {
                 return self.process_vector_list(list, dict, parsed_vectors);
             } else {
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "values field must be a list in batch format"
+                    "values field must be a list in batch format",
                 ));
             }
         }
 
         // No valid vector data found
         Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "Missing vector data. Expected one of: 'vectors', 'embeddings', or 'values' key"
+            "Missing vector data. Expected one of: 'vectors', 'embeddings', or 'values' key",
         ))
     }
 
     /// Helper method to process vector list (extracted to avoid code duplication)
     fn process_vector_list(
-        &self, 
-        vectors: &Bound<PyList>, 
-        dict: &Bound<PyDict>, 
-        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>
+        &self,
+        vectors: &Bound<PyList>,
+        dict: &Bound<PyDict>,
+        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
     ) -> PyResult<()> {
         // Process each vector in the batch
         for (i, vector_item) in vectors.iter().enumerate() {
@@ -2469,7 +2852,10 @@ impl HNSWIndex {
             };
 
             // Extract metadata from "metadatas" or "metadata" arrays
-            let meta = match dict.get_item("metadatas")?.or_else(|| dict.get_item("metadata").ok().flatten()) {
+            let meta = match dict
+                .get_item("metadatas")?
+                .or_else(|| dict.get_item("metadata").ok().flatten())
+            {
                 Some(item) => {
                     if let Ok(meta_list) = item.downcast::<PyList>() {
                         if i < meta_list.len() {
@@ -2504,9 +2890,9 @@ impl HNSWIndex {
     /// Parse NumPy array with context (IDs and metadata from dict)
     fn parse_numpy_with_context(
         &self,
-        np_array: &Bound<PyArray2<f32>>, 
+        np_array: &Bound<PyArray2<f32>>,
         dict: &Bound<PyDict>,
-        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>
+        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
     ) -> PyResult<()> {
         let readonly = np_array.readonly();
         let shape = readonly.shape();
@@ -2522,7 +2908,8 @@ impl HNSWIndex {
                 "NumPy array shape validation failed"
             );
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "NumPy array must have shape (N, {}), got {:?}", self.dim, shape
+                "NumPy array must have shape (N, {}), got {:?}",
+                self.dim, shape
             )));
         }
 
@@ -2530,11 +2917,13 @@ impl HNSWIndex {
         let num_vectors = shape[0];
 
         // Extract IDs array
-        let ids_list = dict.get_item("ids")?
+        let ids_list = dict
+            .get_item("ids")?
             .and_then(|item| item.downcast::<PyList>().ok().map(|list| list.clone()));
-        
+
         // Extract metadata array
-        let metadatas_list = dict.get_item("metadatas")?
+        let metadatas_list = dict
+            .get_item("metadatas")?
             .or_else(|| dict.get_item("metadata").ok().flatten())
             .and_then(|item| item.downcast::<PyList>().ok().map(|list| list.clone()));
 
@@ -2592,16 +2981,20 @@ impl HNSWIndex {
             parsed_vectors.push((id, processed_vector, metadata));
         }
 
-        trace!(operation = "parse_numpy_context_complete", parsed_count = num_vectors, "NumPy parsing completed");
+        trace!(
+            operation = "parse_numpy_context_complete",
+            parsed_count = num_vectors,
+            "NumPy parsing completed"
+        );
         Ok(())
     }
 
     /// Safe list parsing that collects errors instead of failing immediately
     fn parse_list_input_safe(
-        &self, 
-        list: &Bound<PyList>, 
+        &self,
+        list: &Bound<PyList>,
         parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
-        errors: &mut Vec<String>
+        errors: &mut Vec<String>,
     ) {
         for (item_index, item) in list.iter().enumerate() {
             if let Ok(item_dict) = item.downcast::<PyDict>() {
@@ -2618,9 +3011,9 @@ impl HNSWIndex {
                     Ok(vector) => {
                         // Extract ID
                         let id = match item_dict.get_item("id") {
-                            Ok(Some(id_item)) => {
-                                id_item.extract::<String>().unwrap_or_else(|_| self.generate_id())
-                            }
+                            Ok(Some(id_item)) => id_item
+                                .extract::<String>()
+                                .unwrap_or_else(|_| self.generate_id()),
                             _ => self.generate_id(),
                         };
 
@@ -2646,7 +3039,8 @@ impl HNSWIndex {
                     }
                     Err(e) => {
                         // Collect error with item index and ID for context
-                        let id = item_dict.get_item("id")
+                        let id = item_dict
+                            .get_item("id")
                             .ok()
                             .flatten()
                             .and_then(|id_item| id_item.extract::<String>().ok())
@@ -2671,16 +3065,25 @@ impl HNSWIndex {
     }
 
     /// Safe NumPy parsing for error collection
-    fn parse_numpy_input_safe(&self, np_array: &Bound<PyArray2<f32>>, parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>) -> Result<(), String> {
+    fn parse_numpy_input_safe(
+        &self,
+        np_array: &Bound<PyArray2<f32>>,
+        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+    ) -> Result<(), String> {
         // This is the same as your current parse_numpy_input but returns Result<(), String>
         let readonly = np_array.readonly();
         let shape = readonly.shape();
 
         if shape.len() != 2 || shape[1] != self.dim {
-            return Err(format!("NumPy array must have shape (N, {}), got {:?}", self.dim, shape));
+            return Err(format!(
+                "NumPy array must have shape (N, {}), got {:?}",
+                self.dim, shape
+            ));
         }
 
-        let flat = readonly.as_slice().map_err(|e| format!("NumPy access error: {}", e))?;
+        let flat = readonly
+            .as_slice()
+            .map_err(|e| format!("NumPy access error: {}", e))?;
         let num_vectors = shape[0];
 
         for i in 0..num_vectors {
@@ -2702,7 +3105,9 @@ impl HNSWIndex {
             array1d.readonly().as_slice()?.to_vec()
         } else if let Ok(list) = data.downcast::<PyList>() {
             // Python list
-            list.iter().map(|item| item.extract::<f32>()).collect::<PyResult<Vec<f32>>>()?
+            list.iter()
+                .map(|item| item.extract::<f32>())
+                .collect::<PyResult<Vec<f32>>>()?
         } else {
             // Direct extraction (e.g., from other numeric arrays)
             data.extract::<Vec<f32>>()?
@@ -2711,13 +3116,15 @@ impl HNSWIndex {
         // Comprehensive validation
         if vector.is_empty() {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Vector cannot be empty"
+                "Vector cannot be empty",
             ));
         }
 
         if vector.len() != self.dim {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Vector dimension mismatch: expected {}, got {}", self.dim, vector.len()
+                "Vector dimension mismatch: expected {}, got {}",
+                self.dim,
+                vector.len()
             )));
         }
 
@@ -2725,7 +3132,8 @@ impl HNSWIndex {
         for (i, &val) in vector.iter().enumerate() {
             if !val.is_finite() {
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Vector contains invalid value at index {}: {} (must be finite)", i, val
+                    "Vector contains invalid value at index {}: {} (must be finite)",
+                    i, val
                 )));
             }
         }
@@ -2743,13 +3151,17 @@ impl HNSWIndex {
     /// Safe version of extract_single_vector that returns String errors instead of PyErr
     fn extract_single_vector_safe(&self, data: &Bound<PyAny>) -> Result<Vec<f32>, String> {
         let vector = if let Ok(array1d) = data.downcast::<PyArray1<f32>>() {
-            array1d.readonly().as_slice()
+            array1d
+                .readonly()
+                .as_slice()
                 .map_err(|e| format!("NumPy access error: {}", e))?
                 .to_vec()
         } else if let Ok(list) = data.downcast::<PyList>() {
             list.iter()
-                .map(|item| item.extract::<f32>()
-                    .map_err(|e| format!("List item error: {}", e)))
+                .map(|item| {
+                    item.extract::<f32>()
+                        .map_err(|e| format!("List item error: {}", e))
+                })
                 .collect::<Result<Vec<f32>, String>>()?
         } else {
             data.extract::<Vec<f32>>()
@@ -2761,11 +3173,18 @@ impl HNSWIndex {
             return Err("Vector cannot be empty".to_string());
         }
         if vector.len() != self.dim {
-            return Err(format!("Vector dimension mismatch: expected {}, got {}", self.dim, vector.len()));
+            return Err(format!(
+                "Vector dimension mismatch: expected {}, got {}",
+                self.dim,
+                vector.len()
+            ));
         }
         for (i, &val) in vector.iter().enumerate() {
             if !val.is_finite() {
-                return Err(format!("Vector contains invalid value at index {}: {}", i, val));
+                return Err(format!(
+                    "Vector contains invalid value at index {}: {}",
+                    i, val
+                ));
             }
         }
 
@@ -2774,15 +3193,18 @@ impl HNSWIndex {
 
     // 4. DATA CONVERSION & FILTERING (12 methods)
     // Helper methods for data conversion and filtering
-    fn python_dict_to_value_map(&self, py_dict: &Bound<PyDict>) -> PyResult<HashMap<String, Value>> {
+    fn python_dict_to_value_map(
+        &self,
+        py_dict: &Bound<PyDict>,
+    ) -> PyResult<HashMap<String, Value>> {
         let mut map = HashMap::new();
-        
+
         for (key, value) in py_dict.iter() {
             let string_key = key.extract::<String>()?;
             let json_value = self.python_object_to_value(&value)?;
             map.insert(string_key, json_value);
         }
-        
+
         Ok(map)
     }
 
@@ -2820,7 +3242,11 @@ impl HNSWIndex {
         }
     }
 
-    fn matches_filter(&self, metadata: &HashMap<String, Value>, filter: &HashMap<String, Value>) -> PyResult<bool> {
+    fn matches_filter(
+        &self,
+        metadata: &HashMap<String, Value>,
+        filter: &HashMap<String, Value>,
+    ) -> PyResult<bool> {
         for (field, condition) in filter {
             if !self.field_matches(metadata, field, condition)? {
                 return Ok(false);
@@ -2829,7 +3255,12 @@ impl HNSWIndex {
         Ok(true)
     }
 
-    fn field_matches(&self, metadata: &HashMap<String, Value>, field: &str, condition: &Value) -> PyResult<bool> {
+    fn field_matches(
+        &self,
+        metadata: &HashMap<String, Value>,
+        field: &str,
+        condition: &Value,
+    ) -> PyResult<bool> {
         let field_value = match metadata.get(field) {
             Some(value) => value,
             None => return Ok(false),
@@ -2838,15 +3269,17 @@ impl HNSWIndex {
         match condition {
             Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => {
                 Ok(field_value == condition)
-            },
-            Value::Object(ops) => {
-                self.evaluate_value_conditions(field_value, ops)
-            },
+            }
+            Value::Object(ops) => self.evaluate_value_conditions(field_value, ops),
             _ => Ok(false),
         }
     }
 
-    fn evaluate_value_conditions(&self, field_value: &Value, operations: &serde_json::Map<String, Value>) -> PyResult<bool> {
+    fn evaluate_value_conditions(
+        &self,
+        field_value: &Value,
+        operations: &serde_json::Map<String, Value>,
+    ) -> PyResult<bool> {
         for (op, target_value) in operations {
             let matches = match op.as_str() {
                 "eq" => field_value == target_value,
@@ -2860,12 +3293,13 @@ impl HNSWIndex {
                 "endswith" => self.value_ends_with(field_value, target_value)?,
                 "in" => self.value_in_array(field_value, target_value)?,
                 _ => {
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        format!("Unknown filter operation: {}", op)
-                    ));
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "Unknown filter operation: {}",
+                        op
+                    )));
                 }
             };
-            
+
             if !matches {
                 return Ok(false);
             }
@@ -2882,7 +3316,7 @@ impl HNSWIndex {
                 let f1 = n1.as_f64().unwrap_or(0.0);
                 let f2 = n2.as_f64().unwrap_or(0.0);
                 Ok(op(f1, f2))
-            },
+            }
             _ => Ok(false),
         }
     }
@@ -2916,14 +3350,18 @@ impl HNSWIndex {
         }
     }
 
-    fn value_map_to_python(&self, value_map: &HashMap<String, Value>, py: Python<'_>) -> PyResult<PyObject> {
+    fn value_map_to_python(
+        &self,
+        value_map: &HashMap<String, Value>,
+        py: Python<'_>,
+    ) -> PyResult<PyObject> {
         let dict = PyDict::new(py);
-        
+
         for (key, value) in value_map {
             let py_value = self.value_to_python_object(value, py)?;
             dict.set_item(key, py_value)?;
         }
-        
+
         Ok(dict.into_pyobject(py)?.to_owned().unbind().into_any())
     }
 
@@ -2937,17 +3375,21 @@ impl HNSWIndex {
                 } else if let Some(f) = n.as_f64() {
                     f.into_pyobject(py)?.to_owned().unbind().into_any()
                 } else {
-                    n.to_string().into_pyobject(py)?.to_owned().unbind().into_any()
+                    n.to_string()
+                        .into_pyobject(py)?
+                        .to_owned()
+                        .unbind()
+                        .into_any()
                 }
-            },
+            }
             Value::String(s) => s.clone().into_pyobject(py)?.unbind().into_any(),
             Value::Array(arr) => {
                 let py_list = PyList::empty(py);
                 for item in arr {
                     py_list.append(self.value_to_python_object(item, py)?)?;
                 }
-                py_list.unbind().into_any() 
-            },
+                py_list.unbind().into_any()
+            }
             Value::Object(obj) => {
                 let py_dict = PyDict::new(py);
                 for (k, v) in obj {
@@ -2956,7 +3398,7 @@ impl HNSWIndex {
                 py_dict.unbind().into_any()
             }
         };
-        
+
         Ok(py_obj)
     }
 
@@ -2990,18 +3432,29 @@ impl HNSWIndex {
                     actual_dim = vector.len(),
                     "Vector dimension mismatch in batch"
                 );
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Vector {}: dimension mismatch: expected {}, got {}", 
-                           i, self.dim, vector.len())));
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Vector {}: dimension mismatch: expected {}, got {}",
+                    i,
+                    self.dim,
+                    vector.len()
+                )));
             }
         }
 
         // Choose strategy based on batch size
         let result = if vectors.len() <= 5 {
-            trace!(operation = "batch_search_strategy", strategy = "sequential", "Using sequential processing");
+            trace!(
+                operation = "batch_search_strategy",
+                strategy = "sequential",
+                "Using sequential processing"
+            );
             self.batch_search_sequential(vectors, filter_conditions, top_k, ef, return_vector, py)
         } else {
-            trace!(operation = "batch_search_strategy", strategy = "parallel", "Using parallel processing");
+            trace!(
+                operation = "batch_search_strategy",
+                strategy = "parallel",
+                "Using parallel processing"
+            );
             self.batch_search_parallel(vectors, filter_conditions, top_k, ef, return_vector, py)
         };
 
@@ -3032,14 +3485,16 @@ impl HNSWIndex {
             let vector_store = self.vectors.read().unwrap();
             let metadata_store = self.vector_metadata.read().unwrap();
             let rev_map = self.rev_map.read().unwrap();
-            
+
             let mut all_results = Vec::with_capacity(vectors.len());
 
             for vector in vectors {
                 // FIX: Process each query vector for space
                 let processed_query = self.process_vector_for_space(vector.clone());
 
-                let neighbors = hnsw_guard.search(&processed_query, top_k, ef).unwrap_or_else(|_| Vec::new());
+                let neighbors = hnsw_guard
+                    .search(&processed_query, top_k, ef)
+                    .unwrap_or_else(|_| Vec::new());
 
                 let mut query_results = Vec::with_capacity(neighbors.len());
 
@@ -3065,7 +3520,12 @@ impl HNSWIndex {
                             None
                         };
 
-                        query_results.push((ext_id.clone(), neighbor.distance, metadata, vector_data));
+                        query_results.push((
+                            ext_id.clone(),
+                            neighbor.distance,
+                            metadata,
+                            vector_data,
+                        ));
                     }
                 }
 
@@ -3092,7 +3552,7 @@ impl HNSWIndex {
 
                 py_batch.push(dict.into());
             }
-            
+
             output.push(py_batch);
         }
 
@@ -3111,56 +3571,66 @@ impl HNSWIndex {
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
         let span = tracing::Span::current();
         let rust_results = py.allow_threads(|| {
-            let results: Vec<Vec<(String, f32, HashMap<String, Value>, Option<Vec<f32>>)>> = vectors
-                .par_iter()
-                .map(|vector| {
-                    let _entered = span.clone().entered();
-                    // FIX: Process each query vector for space
-                    let processed_query = self.process_vector_for_space(vector.clone());
+            let results: Vec<Vec<(String, f32, HashMap<String, Value>, Option<Vec<f32>>)>> =
+                vectors
+                    .par_iter()
+                    .map(|vector| {
+                        let _entered = span.clone().entered();
+                        // FIX: Process each query vector for space
+                        let processed_query = self.process_vector_for_space(vector.clone());
 
-                    // Brief HNSW search (individual lock per query)
-                    let neighbors = {
-                        let hnsw_guard = self.hnsw.lock().unwrap();
-                        hnsw_guard.search(&processed_query, top_k, ef).unwrap_or_else(|_| Vec::new())
-                    };
+                        // Brief HNSW search (individual lock per query)
+                        let neighbors = {
+                            let hnsw_guard = self.hnsw.lock().unwrap();
+                            hnsw_guard
+                                .search(&processed_query, top_k, ef)
+                                .unwrap_or_else(|_| Vec::new())
+                        };
 
-                    // Concurrent data lookup
-                    let vector_store = self.vectors.read().unwrap();
-                    let metadata_store = self.vector_metadata.read().unwrap();
-                    let rev_map = self.rev_map.read().unwrap();
+                        // Concurrent data lookup
+                        let vector_store = self.vectors.read().unwrap();
+                        let metadata_store = self.vector_metadata.read().unwrap();
+                        let rev_map = self.rev_map.read().unwrap();
 
-                    let mut query_results = Vec::with_capacity(neighbors.len());
+                        let mut query_results = Vec::with_capacity(neighbors.len());
 
-                    for neighbor in neighbors {
-                        let internal_id = neighbor.get_origin_id();
+                        for neighbor in neighbors {
+                            let internal_id = neighbor.get_origin_id();
 
-                        if let Some(ext_id) = rev_map.get(&internal_id) {
-                            // Apply filter if specified
-                            if let Some(filter_conds) = filter_conditions {
-                                if let Some(meta) = metadata_store.get(ext_id) {
-                                    if !self.matches_filter(meta, filter_conds).unwrap_or(false) {
+                            if let Some(ext_id) = rev_map.get(&internal_id) {
+                                // Apply filter if specified
+                                if let Some(filter_conds) = filter_conditions {
+                                    if let Some(meta) = metadata_store.get(ext_id) {
+                                        if !self.matches_filter(meta, filter_conds).unwrap_or(false)
+                                        {
+                                            continue;
+                                        }
+                                    } else {
                                         continue;
                                     }
-                                } else {
-                                    continue;
                                 }
+
+                                let metadata =
+                                    metadata_store.get(ext_id).cloned().unwrap_or_default();
+                                let vector_data = if return_vector {
+                                    vector_store.get(ext_id).cloned()
+                                } else {
+                                    None
+                                };
+
+                                query_results.push((
+                                    ext_id.clone(),
+                                    neighbor.distance,
+                                    metadata,
+                                    vector_data,
+                                ));
                             }
-
-                            let metadata = metadata_store.get(ext_id).cloned().unwrap_or_default();
-                            let vector_data = if return_vector {
-                                vector_store.get(ext_id).cloned()
-                            } else {
-                                None
-                            };
-
-                            query_results.push((ext_id.clone(), neighbor.distance, metadata, vector_data));
                         }
-                    }
 
-                    query_results
-                })
-                .collect();
-                
+                        query_results
+                    })
+                    .collect();
+
             results
         });
 
@@ -3201,12 +3671,19 @@ impl HNSWIndex {
         path = %path.display()
     ))]
     fn save_hnsw_graph(&self, path: &Path) -> PyResult<()> {
-        debug!(operation = "save_hnsw_graph_start", "Starting HNSW graph save");
+        debug!(
+            operation = "save_hnsw_graph_start",
+            "Starting HNSW graph save"
+        );
 
         // EMPTY INDEX CHECK:
         let vector_count = self.get_vector_count();
         if vector_count == 0 {
-            debug!(operation = "save_hnsw_graph", reason = "empty_index", "Skipping HNSW graph dump - index is empty");
+            debug!(
+                operation = "save_hnsw_graph",
+                reason = "empty_index",
+                "Skipping HNSW graph dump - index is empty"
+            );
             return Ok(());
         }
 
@@ -3214,29 +3691,53 @@ impl HNSWIndex {
 
         let dump_result = match &*hnsw_guard {
             DistanceType::Cosine(hnsw) => {
-                trace!(operation = "save_hnsw_graph", distance_type = "cosine", "Using Cosine distance HNSW");
+                trace!(
+                    operation = "save_hnsw_graph",
+                    distance_type = "cosine",
+                    "Using Cosine distance HNSW"
+                );
                 hnsw.file_dump(path, "hnsw_index")
-            },
+            }
             DistanceType::L2(hnsw) => {
-                trace!(operation = "save_hnsw_graph", distance_type = "l2", "Using L2 distance HNSW");
+                trace!(
+                    operation = "save_hnsw_graph",
+                    distance_type = "l2",
+                    "Using L2 distance HNSW"
+                );
                 hnsw.file_dump(path, "hnsw_index")
-            },
+            }
             DistanceType::L1(hnsw) => {
-                trace!(operation = "save_hnsw_graph", distance_type = "l1", "Using L1 distance HNSW");
+                trace!(
+                    operation = "save_hnsw_graph",
+                    distance_type = "l1",
+                    "Using L1 distance HNSW"
+                );
                 hnsw.file_dump(path, "hnsw_index")
-            },
+            }
             DistanceType::CosinePQ(hnsw) => {
-                trace!(operation = "save_hnsw_graph", distance_type = "cosine_pq", "Using Cosine-PQ distance HNSW");
+                trace!(
+                    operation = "save_hnsw_graph",
+                    distance_type = "cosine_pq",
+                    "Using Cosine-PQ distance HNSW"
+                );
                 hnsw.file_dump(path, "hnsw_index")
-            },
+            }
             DistanceType::L2PQ(hnsw) => {
-                trace!(operation = "save_hnsw_graph", distance_type = "l2_pq", "Using L2-PQ distance HNSW");
+                trace!(
+                    operation = "save_hnsw_graph",
+                    distance_type = "l2_pq",
+                    "Using L2-PQ distance HNSW"
+                );
                 hnsw.file_dump(path, "hnsw_index")
-            },
+            }
             DistanceType::L1PQ(hnsw) => {
-                trace!(operation = "save_hnsw_graph", distance_type = "l1_pq", "Using L1-PQ distance HNSW");
+                trace!(
+                    operation = "save_hnsw_graph",
+                    distance_type = "l1_pq",
+                    "Using L1-PQ distance HNSW"
+                );
                 hnsw.file_dump(path, "hnsw_index")
-            },
+            }
         };
 
         match dump_result {
@@ -3254,9 +3755,10 @@ impl HNSWIndex {
             }
             Err(e) => {
                 error!(operation = "save_hnsw_graph", error = %e, "HNSW graph dump failed");
-                Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    format!("HNSW graph dump failed: {}", e)
-                ))
+                Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "HNSW graph dump failed: {}",
+                    e
+                )))
             }
         }
     }
@@ -3275,7 +3777,13 @@ impl HNSWIndex {
     ) -> Self {
         let space_normalized = space.to_lowercase();
         let max_layer = 16; // Always use NB_LAYER_MAX for consistency
-        let hnsw = DistanceType::new_raw(&space_normalized, m, expected_size, max_layer, ef_construction);
+        let hnsw = DistanceType::new_raw(
+            &space_normalized,
+            m,
+            expected_size,
+            max_layer,
+            ef_construction,
+        );
 
         HNSWIndex {
             dim,
@@ -3307,12 +3815,19 @@ impl HNSWIndex {
     }
 
     /// Set vector metadata (for persistence loading only)
-    pub(crate) fn set_vector_metadata(&mut self, metadata: HashMap<String, HashMap<String, serde_json::Value>>) {
+    pub(crate) fn set_vector_metadata(
+        &mut self,
+        metadata: HashMap<String, HashMap<String, serde_json::Value>>,
+    ) {
         *self.vector_metadata.write().unwrap() = metadata;
     }
 
     /// Set ID mappings (for persistence loading only)
-    pub(crate) fn set_id_mappings(&mut self, id_map: HashMap<String, usize>, rev_map: HashMap<usize, String>) {
+    pub(crate) fn set_id_mappings(
+        &mut self,
+        id_map: HashMap<String, usize>,
+        rev_map: HashMap<usize, String>,
+    ) {
         *self.id_map.write().unwrap() = id_map;
         *self.rev_map.write().unwrap() = rev_map;
     }
@@ -3335,7 +3850,8 @@ impl HNSWIndex {
 
     /// Set training threshold reached flag (for persistence loading only)
     pub(crate) fn set_training_threshold_reached(&mut self, value: bool) {
-        self.training_threshold_reached.store(value, std::sync::atomic::Ordering::Release);
+        self.training_threshold_reached
+            .store(value, std::sync::atomic::Ordering::Release);
     }
 
     // ============================================================================
@@ -3348,7 +3864,8 @@ impl HNSWIndex {
     }
 
     /// Get the distance space (cosine, l2, l1) - changed to a more idiomatic getter
-    pub fn space(&self) -> &str {  // Changed from get_space to space
+    pub fn space(&self) -> &str {
+        // Changed from get_space to space
         &self.space
     }
 
@@ -3383,7 +3900,9 @@ impl HNSWIndex {
     }
 
     /// Get read access to the vector metadata HashMap (thread-safe)
-    pub fn get_vector_metadata(&self) -> std::sync::RwLockReadGuard<HashMap<String, HashMap<String, Value>>> {
+    pub fn get_vector_metadata(
+        &self,
+    ) -> std::sync::RwLockReadGuard<HashMap<String, HashMap<String, Value>>> {
         self.vector_metadata.read().unwrap()
     }
 
@@ -3427,7 +3946,8 @@ impl HNSWIndex {
 
     /// Get training threshold reached flag (for persistence)
     pub fn get_training_threshold_reached(&self) -> bool {
-        self.training_threshold_reached.load(std::sync::atomic::Ordering::Acquire)
+        self.training_threshold_reached
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Set training IDs (for persistence loading only)
