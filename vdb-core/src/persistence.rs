@@ -399,7 +399,7 @@ fn restore_quantization_state_simple(
 
     // Convert QuantizationPersistence back to QuantizationConfig
     let storage_mode = StorageMode::from_string(&quant_data.storage_mode)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
+        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
     let quant_config = QuantizationConfig {
         subvectors: quant_data.subvectors,
@@ -908,7 +908,6 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
 
     let vectors = index.get_vectors();
     let pq_codes = index.get_pq_codes();
-    let vector_count = index.get_vector_count();
 
     // Determine what files are included based on what we actually saved
     let mut files_included = vec![
@@ -1039,12 +1038,22 @@ fn calculate_directory_size(path: &Path) -> Result<f64, std::io::Error> {
 // ============================================================================
 
 /// Check if a path contains a valid ZeusDB index (Phase 3)
+///
+/// Reserved surface. The body is a placeholder that reports every path invalid
+/// and must be implemented before any caller is wired up, including the module
+/// registration in lib.rs. The allow keeps the reservation visible instead of
+/// silencing dead code across the module.
+#[allow(dead_code)]
 pub fn is_valid_index(_path: &str) -> bool {
     // TODO: Implement in Phase 3
     false
 }
 
 /// Get index information without full loading (Phase 3)
+///
+/// Reserved surface. The body is a placeholder that reports no manifest for
+/// every path and must be implemented before any caller is wired up.
+#[allow(dead_code)]
 pub fn get_index_info(_path: &str) -> Option<IndexManifest> {
     // TODO: Implement in Phase 3
     None

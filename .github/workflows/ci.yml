@@ -41,15 +41,9 @@ jobs:
           cache-on-failure: true
       - name: Check Rust formatting
         working-directory: vdb-core
-        # Temporary. Reports every gate failure on one run instead of stopping
-        # at the first. Removed once the gate is green.
-        continue-on-error: true
         run: cargo fmt --all -- --check
       - name: Run clippy
         working-directory: vdb-core
-        # Temporary. Reports every gate failure on one run instead of stopping
-        # at the first. Removed once the gate is green.
-        continue-on-error: true
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
@@ -77,14 +71,7 @@ jobs:
       - name: Run the Python test suite
         # Scoped to tests, because seven scripts under benchmarks end in
         # _test.py and start with a digit, which pytest cannot import.
-        #
-        # Temporary. Reports every gate failure on one run instead of stopping
-        # at the first. Removed once the gate is green.
-        continue-on-error: true
         run: uv run --no-sync pytest tests
       - name: Run the Rust test suite
         working-directory: vdb-core
-        # Temporary. Reports every gate failure on one run instead of stopping
-        # at the first. Removed once the gate is green.
-        continue-on-error: true
         run: cargo test --workspace --locked

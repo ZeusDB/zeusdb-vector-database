@@ -441,7 +441,7 @@ fn create_file_appender(
     };
 
     // Silent failure for graceful degradation
-    if let Err(_) = std::fs::create_dir_all(directory) {
+    if std::fs::create_dir_all(directory).is_err() {
         return None;
     }
 
@@ -493,8 +493,42 @@ mod tests {
 
     #[test]
     fn test_env_filter_creation() {
-        let filter = create_env_filter("debug");
-        assert!(format!("{:?}", filter).contains("debug"));
+        use tracing_subscriber::prelude::*;
+
+        // Asserts on what the filter admits, not on its Debug rendering. The
+        // Debug form of EnvFilter is a derived, unstable representation and
+        // carries no compatibility promise across tracing-subscriber releases.
+        let subscriber = tracing_subscriber::registry().with(create_env_filter("debug"));
+
+        tracing::subscriber::with_default(subscriber, || {
+            // The crate target is configured at the requested level, so debug
+            // and everything above it is admitted.
+            assert!(tracing::event_enabled!(
+                target: "zeusdb_vector_database",
+                tracing::Level::DEBUG
+            ));
+            assert!(tracing::event_enabled!(
+                target: "zeusdb_vector_database",
+                tracing::Level::ERROR
+            ));
+
+            // Trace sits below the requested level and is rejected.
+            assert!(!tracing::event_enabled!(
+                target: "zeusdb_vector_database",
+                tracing::Level::TRACE
+            ));
+
+            // Dependency targets stay pinned at warn regardless of the level
+            // asked for, which is the point of the noise-suppressing directives.
+            assert!(!tracing::event_enabled!(
+                target: "hnsw_rs",
+                tracing::Level::INFO
+            ));
+            assert!(tracing::event_enabled!(
+                target: "hnsw_rs",
+                tracing::Level::WARN
+            ));
+        });
     }
 
     #[test]
