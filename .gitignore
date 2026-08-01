@@ -187,8 +187,8 @@ cython_debug/
 # macOS Finder artifacts
 .DS_Store
 
-# Ignore Cargo.lock for Rust library
-**/Cargo.lock
+# Cargo.lock is tracked, so CI and local builds compile identical dependency
+# versions. Do not add an ignore rule for it.
 
 # Ignore .cargo for local build artifacts
 .cargo/
