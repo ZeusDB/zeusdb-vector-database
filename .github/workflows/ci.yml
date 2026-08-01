@@ -5,6 +5,10 @@
 #
 # The Cargo manifest lives in vdb-core, so every cargo step sets
 # working-directory rather than running from the repository root.
+#
+# Cargo steps pass --locked, which fails the run when vdb-core/Cargo.lock is
+# out of date instead of silently updating it. Keep the flag on every cargo
+# step that accepts it.
 name: CI
 
 on:
@@ -46,7 +50,7 @@ jobs:
         # Temporary. Reports every gate failure on one run instead of stopping
         # at the first. Removed once the gate is green.
         continue-on-error: true
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     needs: lint
@@ -83,4 +87,4 @@ jobs:
         # Temporary. Reports every gate failure on one run instead of stopping
         # at the first. Removed once the gate is green.
         continue-on-error: true
-        run: cargo test --workspace
+        run: cargo test --workspace --locked

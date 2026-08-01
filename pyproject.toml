@@ -35,6 +35,12 @@ dev = [
     "psutil >=7.0.0",
 ]
 
+[tool.pytest.ini_options]
+# Scopes collection to tests. Seven scripts under benchmarks end in _test.py
+# and start with a digit, which is not a legal module name, so an unscoped run
+# fails at collection.
+testpaths = ["tests"]
+
 [project.urls]
 "Repository" = "https://github.com/zeusdb/zeusdb-vector-database"
 "Documentation" = "https://docs.zeusdb.com/en/latest/vector_database/"
