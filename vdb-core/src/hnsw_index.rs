@@ -29,8 +29,9 @@ const CODE_VERSION_DESCRIPTION: &str = "Fixed overwrite bug - eliminates duplica
 
 // ============================================================================
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageMode {
+    #[default]
     #[serde(rename = "quantized_only")]
     QuantizedOnly,
 
@@ -55,12 +56,6 @@ impl StorageMode {
             StorageMode::QuantizedOnly => "quantized_only",
             StorageMode::QuantizedWithRaw => "quantized_with_raw",
         }
-    }
-}
-
-impl Default for StorageMode {
-    fn default() -> Self {
-        StorageMode::QuantizedOnly
     }
 }
 
@@ -686,10 +681,10 @@ impl HNSWIndex {
                 .unwrap_or_else(|| "quantized_only".to_string());
 
             let storage_mode = StorageMode::from_string(&storage_mode_str)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))?;
+                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
             // Validate PQ parameters
-            if dim % subvectors != 0 {
+            if !dim.is_multiple_of(subvectors) {
                 error!(
                     operation = "validation",
                     field = "subvectors",
@@ -703,7 +698,7 @@ impl HNSWIndex {
                 )));
             }
 
-            if bits < 1 || bits > 8 {
+            if !(1..=8).contains(&bits) {
                 error!(
                     operation = "validation",
                     field = "bits",
@@ -2022,10 +2017,12 @@ impl HNSWIndex {
         let num_threads = max_threads
             .unwrap_or(available_threads)
             .min(available_threads);
-        let chunk_size = (queries.len() + num_threads - 1) / num_threads;
+        let chunk_size = queries.len().div_ceil(num_threads);
 
         let start = Instant::now();
-        let total_processed: usize = queries
+        // The sum is discarded, but the map runs every query through the search
+        // path, which is the work this benchmark times.
+        let _total_processed: usize = queries
             .par_chunks(chunk_size)
             .map(|chunk| {
                 let mut local_count = 0;
@@ -2082,6 +2079,16 @@ impl HNSWIndex {
         CODE_VERSION_COUNTER
     }
 }
+
+/// Records accepted by `add`, after parsing and before insertion, as
+/// (external id, vector, metadata). The vector is still in its input form and
+/// has not been normalized for the index space yet.
+type ParsedRecords = Vec<(String, Vec<f32>, HashMap<String, Value>)>;
+
+/// Search hits for one query vector, as (external id, distance, metadata,
+/// optional raw vector). The raw vector is present only when the caller asked
+/// for it and the index still holds one.
+type QueryHits = Vec<(String, f32, HashMap<String, Value>, Option<Vec<f32>>)>;
 
 // INTERNAL METHODS, HELPERS AND IMPLEMENTATIONS
 impl HNSWIndex {
@@ -2689,10 +2696,7 @@ impl HNSWIndex {
     }
 
     /// Parse input data into (id, vector, metadata) tuples with error collection
-    fn parse_input_data(
-        &self,
-        data: &Bound<PyAny>,
-    ) -> (Vec<(String, Vec<f32>, HashMap<String, Value>)>, Vec<String>) {
+    fn parse_input_data(&self, data: &Bound<PyAny>) -> (ParsedRecords, Vec<String>) {
         let mut parsed_vectors = Vec::new();
         let mut errors = Vec::new();
 
@@ -2866,7 +2870,7 @@ impl HNSWIndex {
                                 HashMap::new()
                             } else {
                                 let mut map = HashMap::new();
-                                let value = self.python_object_to_value(&metadata_item)?;
+                                let value = Self::python_object_to_value(&metadata_item)?;
                                 let key = if value.is_string() { "text" } else { "value" };
                                 map.insert(key.to_string(), value);
                                 map
@@ -2919,13 +2923,13 @@ impl HNSWIndex {
         // Extract IDs array
         let ids_list = dict
             .get_item("ids")?
-            .and_then(|item| item.downcast::<PyList>().ok().map(|list| list.clone()));
+            .and_then(|item| item.downcast::<PyList>().ok().cloned());
 
         // Extract metadata array
         let metadatas_list = dict
             .get_item("metadatas")?
             .or_else(|| dict.get_item("metadata").ok().flatten())
-            .and_then(|item| item.downcast::<PyList>().ok().map(|list| list.clone()));
+            .and_then(|item| item.downcast::<PyList>().ok().cloned());
 
         trace!(
             operation = "parse_numpy_context",
@@ -3025,7 +3029,7 @@ impl HNSWIndex {
                                 } else {
                                     // Handle non-dict metadata
                                     let mut map = HashMap::new();
-                                    if let Ok(value) = self.python_object_to_value(&meta_item) {
+                                    if let Ok(value) = Self::python_object_to_value(&meta_item) {
                                         let key = if value.is_string() { "text" } else { "value" };
                                         map.insert(key.to_string(), value);
                                     }
@@ -3201,14 +3205,14 @@ impl HNSWIndex {
 
         for (key, value) in py_dict.iter() {
             let string_key = key.extract::<String>()?;
-            let json_value = self.python_object_to_value(&value)?;
+            let json_value = Self::python_object_to_value(&value)?;
             map.insert(string_key, json_value);
         }
 
         Ok(map)
     }
 
-    fn python_object_to_value(&self, py_obj: &Bound<PyAny>) -> PyResult<Value> {
+    fn python_object_to_value(py_obj: &Bound<PyAny>) -> PyResult<Value> {
         if py_obj.is_none() {
             Ok(Value::Null)
         } else if let Ok(b) = py_obj.extract::<bool>() {
@@ -3226,14 +3230,14 @@ impl HNSWIndex {
         } else if let Ok(py_list) = py_obj.downcast::<PyList>() {
             let mut vec = Vec::new();
             for item in py_list.iter() {
-                vec.push(self.python_object_to_value(&item)?);
+                vec.push(Self::python_object_to_value(&item)?);
             }
             Ok(Value::Array(vec))
         } else if let Ok(py_dict) = py_obj.downcast::<PyDict>() {
             let mut map = serde_json::Map::new();
             for (key, value) in py_dict.iter() {
                 let string_key = key.extract::<String>()?;
-                let json_value = self.python_object_to_value(&value)?;
+                let json_value = Self::python_object_to_value(&value)?;
                 map.insert(string_key, json_value);
             }
             Ok(Value::Object(map))
@@ -3358,14 +3362,14 @@ impl HNSWIndex {
         let dict = PyDict::new(py);
 
         for (key, value) in value_map {
-            let py_value = self.value_to_python_object(value, py)?;
+            let py_value = Self::value_to_python_object(value, py)?;
             dict.set_item(key, py_value)?;
         }
 
         Ok(dict.into_pyobject(py)?.to_owned().unbind().into_any())
     }
 
-    fn value_to_python_object(&self, value: &Value, py: Python<'_>) -> PyResult<PyObject> {
+    fn value_to_python_object(value: &Value, py: Python<'_>) -> PyResult<PyObject> {
         let py_obj = match value {
             Value::Null => py.None(),
             Value::Bool(b) => b.into_pyobject(py)?.to_owned().unbind().into_any(),
@@ -3386,14 +3390,14 @@ impl HNSWIndex {
             Value::Array(arr) => {
                 let py_list = PyList::empty(py);
                 for item in arr {
-                    py_list.append(self.value_to_python_object(item, py)?)?;
+                    py_list.append(Self::value_to_python_object(item, py)?)?;
                 }
                 py_list.unbind().into_any()
             }
             Value::Object(obj) => {
                 let py_dict = PyDict::new(py);
                 for (k, v) in obj {
-                    py_dict.set_item(k, self.value_to_python_object(v, py)?)?;
+                    py_dict.set_item(k, Self::value_to_python_object(v, py)?)?;
                 }
                 py_dict.unbind().into_any()
             }
@@ -3571,65 +3575,62 @@ impl HNSWIndex {
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
         let span = tracing::Span::current();
         let rust_results = py.allow_threads(|| {
-            let results: Vec<Vec<(String, f32, HashMap<String, Value>, Option<Vec<f32>>)>> =
-                vectors
-                    .par_iter()
-                    .map(|vector| {
-                        let _entered = span.clone().entered();
-                        // FIX: Process each query vector for space
-                        let processed_query = self.process_vector_for_space(vector.clone());
+            let results: Vec<QueryHits> = vectors
+                .par_iter()
+                .map(|vector| {
+                    let _entered = span.clone().entered();
+                    // FIX: Process each query vector for space
+                    let processed_query = self.process_vector_for_space(vector.clone());
 
-                        // Brief HNSW search (individual lock per query)
-                        let neighbors = {
-                            let hnsw_guard = self.hnsw.lock().unwrap();
-                            hnsw_guard
-                                .search(&processed_query, top_k, ef)
-                                .unwrap_or_else(|_| Vec::new())
-                        };
+                    // Brief HNSW search (individual lock per query)
+                    let neighbors = {
+                        let hnsw_guard = self.hnsw.lock().unwrap();
+                        hnsw_guard
+                            .search(&processed_query, top_k, ef)
+                            .unwrap_or_else(|_| Vec::new())
+                    };
 
-                        // Concurrent data lookup
-                        let vector_store = self.vectors.read().unwrap();
-                        let metadata_store = self.vector_metadata.read().unwrap();
-                        let rev_map = self.rev_map.read().unwrap();
+                    // Concurrent data lookup
+                    let vector_store = self.vectors.read().unwrap();
+                    let metadata_store = self.vector_metadata.read().unwrap();
+                    let rev_map = self.rev_map.read().unwrap();
 
-                        let mut query_results = Vec::with_capacity(neighbors.len());
+                    let mut query_results = Vec::with_capacity(neighbors.len());
 
-                        for neighbor in neighbors {
-                            let internal_id = neighbor.get_origin_id();
+                    for neighbor in neighbors {
+                        let internal_id = neighbor.get_origin_id();
 
-                            if let Some(ext_id) = rev_map.get(&internal_id) {
-                                // Apply filter if specified
-                                if let Some(filter_conds) = filter_conditions {
-                                    if let Some(meta) = metadata_store.get(ext_id) {
-                                        if !self.matches_filter(meta, filter_conds).unwrap_or(false)
-                                        {
-                                            continue;
-                                        }
-                                    } else {
+                        if let Some(ext_id) = rev_map.get(&internal_id) {
+                            // Apply filter if specified
+                            if let Some(filter_conds) = filter_conditions {
+                                if let Some(meta) = metadata_store.get(ext_id) {
+                                    if !self.matches_filter(meta, filter_conds).unwrap_or(false) {
                                         continue;
                                     }
-                                }
-
-                                let metadata =
-                                    metadata_store.get(ext_id).cloned().unwrap_or_default();
-                                let vector_data = if return_vector {
-                                    vector_store.get(ext_id).cloned()
                                 } else {
-                                    None
-                                };
-
-                                query_results.push((
-                                    ext_id.clone(),
-                                    neighbor.distance,
-                                    metadata,
-                                    vector_data,
-                                ));
+                                    continue;
+                                }
                             }
-                        }
 
-                        query_results
-                    })
-                    .collect();
+                            let metadata = metadata_store.get(ext_id).cloned().unwrap_or_default();
+                            let vector_data = if return_vector {
+                                vector_store.get(ext_id).cloned()
+                            } else {
+                                None
+                            };
+
+                            query_results.push((
+                                ext_id.clone(),
+                                neighbor.distance,
+                                metadata,
+                                vector_data,
+                            ));
+                        }
+                    }
+
+                    query_results
+                })
+                .collect();
 
             results
         });
@@ -3809,19 +3810,6 @@ impl HNSWIndex {
         }
     }
 
-    /// Set vectors (for persistence loading only)
-    pub(crate) fn set_vectors(&mut self, vectors: HashMap<String, Vec<f32>>) {
-        *self.vectors.write().unwrap() = vectors;
-    }
-
-    /// Set vector metadata (for persistence loading only)
-    pub(crate) fn set_vector_metadata(
-        &mut self,
-        metadata: HashMap<String, HashMap<String, serde_json::Value>>,
-    ) {
-        *self.vector_metadata.write().unwrap() = metadata;
-    }
-
     /// Set ID mappings (for persistence loading only)
     pub(crate) fn set_id_mappings(
         &mut self,
@@ -3890,29 +3878,29 @@ impl HNSWIndex {
     }
 
     /// Get read access to the vectors HashMap (thread-safe)
-    pub fn get_vectors(&self) -> std::sync::RwLockReadGuard<HashMap<String, Vec<f32>>> {
+    pub fn get_vectors(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Vec<f32>>> {
         self.vectors.read().unwrap()
     }
 
     /// Get read access to the PQ codes HashMap (thread-safe)
-    pub fn get_pq_codes(&self) -> std::sync::RwLockReadGuard<HashMap<String, Vec<u8>>> {
+    pub fn get_pq_codes(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Vec<u8>>> {
         self.pq_codes.read().unwrap()
     }
 
     /// Get read access to the vector metadata HashMap (thread-safe)
     pub fn get_vector_metadata(
         &self,
-    ) -> std::sync::RwLockReadGuard<HashMap<String, HashMap<String, Value>>> {
+    ) -> std::sync::RwLockReadGuard<'_, HashMap<String, HashMap<String, Value>>> {
         self.vector_metadata.read().unwrap()
     }
 
     /// Get read access to the ID map (external ID -> internal ID)
-    pub fn get_id_map(&self) -> std::sync::RwLockReadGuard<HashMap<String, usize>> {
+    pub fn get_id_map(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, usize>> {
         self.id_map.read().unwrap()
     }
 
     /// Get read access to the reverse ID map (internal ID -> external ID)
-    pub fn get_rev_map(&self) -> std::sync::RwLockReadGuard<HashMap<usize, String>> {
+    pub fn get_rev_map(&self) -> std::sync::RwLockReadGuard<'_, HashMap<usize, String>> {
         self.rev_map.read().unwrap()
     }
 
@@ -3940,7 +3928,7 @@ impl HNSWIndex {
     }
 
     /// Get read access to training IDs (for persistence)
-    pub fn get_training_ids(&self) -> std::sync::RwLockReadGuard<Vec<String>> {
+    pub fn get_training_ids(&self) -> std::sync::RwLockReadGuard<'_, Vec<String>> {
         self.training_ids.read().unwrap()
     }
 
