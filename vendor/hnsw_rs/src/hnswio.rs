@@ -728,6 +728,10 @@ impl HnswIo {
                     // construct a corresponding PointWithOrder
                     let n_pwo = PointWithOrder::<T>::new(n_point, n.distance);
                     point.neighbours.write()[l].push(Arc::new(n_pwo));
+                    // ZEUSDB GUARD: install site 4. Rebuilding a dumped graph installs
+                    // edges directly, so the counters must be rebuilt with them or a
+                    // reloaded index would start with every counter at zero.
+                    n_point.in_degree[l].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } // end of for n
                 //  must sort
                 point.neighbours.write()[l].sort_unstable();

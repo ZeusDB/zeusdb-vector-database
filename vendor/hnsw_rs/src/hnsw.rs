@@ -13,6 +13,9 @@ use std::cmp::Ordering;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use rayon::prelude::*;
 use std::sync::Arc;
+// ZEUSDB GUARD: `Ordering` is already bound to std::cmp::Ordering above, so the
+// atomic ordering is imported under an alias.
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomOrd};
 use std::sync::mpsc::channel;
 
 use std::any::type_name;
@@ -39,6 +42,26 @@ pub struct NoData;
 
 /// maximum number of layers
 pub(crate) const NB_LAYER_MAX: u8 = 16; // so max layer is 15!!
+
+// ZEUSDB GUARD: counters for the minimum inbound-degree guard on the overflow pop.
+// GUARD_OVERFLOWS counts every overflow event, that is every time the reverse
+// update pushed an entry past the layer cap and had to remove one.
+// GUARD_SAVES counts the events where the guard skipped the farthest entry
+// because removing it would have taken its target to zero inbound links.
+// GUARD_FALLBACKS counts the events where no candidate qualified and the guard
+// removed the farthest entry, which is the unmodified crate behaviour.
+static GUARD_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static GUARD_SAVES: AtomicU64 = AtomicU64::new(0);
+static GUARD_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// ZEUSDB GUARD: read the guard counters as (overflows, saves, fallbacks).
+pub fn guard_stats() -> (u64, u64, u64) {
+    (
+        GUARD_OVERFLOWS.load(AtomOrd::Relaxed),
+        GUARD_SAVES.load(AtomOrd::Relaxed),
+        GUARD_FALLBACKS.load(AtomOrd::Relaxed),
+    )
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// The 2-uple represent layer as u8  and rank in layer as a i32 as stored in our structure
@@ -158,7 +181,7 @@ impl<'b, T: Clone + Send + Sync + 'b> PointData<'b, T> {
 ///
 // neighbours table : one vector by layer so neighbours is allocated to NB_LAYER_MAX
 //
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[allow(clippy::type_complexity)]
 pub struct Point<'b, T: Clone + Send + Sync> {
     /// The data of this point, coming from hnsw client and associated to origin_id,
@@ -169,6 +192,28 @@ pub struct Point<'b, T: Clone + Send + Sync> {
     p_id: PointId,
     /// neighbours info
     pub(crate) neighbours: Arc<RwLock<Vec<Vec<Arc<PointWithOrder<'b, T>>>>>>,
+    /// ZEUSDB GUARD: per layer, the number of adjacency lists that currently name
+    /// this point. Every site that installs an edge increments the entry for the
+    /// layer it installed at, and the single overflow pop decrements it. The
+    /// overflow guard reads it to avoid evicting a point's last inbound link.
+    pub(crate) in_degree: [AtomicU32; NB_LAYER_MAX as usize],
+}
+
+// ZEUSDB GUARD: Point carried #[derive(Clone)]. AtomicU32 is not Clone, so the
+// derive is replaced by an explicit impl. A cloned Point is a detached copy, so
+// its counters are snapshotted rather than shared.
+impl<T: Clone + Send + Sync> Clone for Point<'_, T> {
+    fn clone(&self) -> Self {
+        Point {
+            data: self.data.clone(),
+            origin_id: self.origin_id,
+            p_id: self.p_id,
+            neighbours: Arc::clone(&self.neighbours),
+            in_degree: std::array::from_fn(|l| {
+                AtomicU32::new(self.in_degree[l].load(AtomOrd::Relaxed))
+            }),
+        }
+    }
 }
 
 impl<'b, T: Clone + Send + Sync> Point<'b, T> {
@@ -183,6 +228,7 @@ impl<'b, T: Clone + Send + Sync> Point<'b, T> {
             origin_id,
             p_id,
             neighbours: Arc::new(RwLock::new(neighbours)),
+            in_degree: std::array::from_fn(|_| AtomicU32::new(0)),
         }
     }
 
@@ -197,6 +243,7 @@ impl<'b, T: Clone + Send + Sync> Point<'b, T> {
             origin_id,
             p_id,
             neighbours: Arc::new(RwLock::new(neighbours)),
+            in_degree: std::array::from_fn(|_| AtomicU32::new(0)),
         }
     }
 
@@ -1160,6 +1207,9 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                     < self.get_max_nb_connection() as usize
                 {
                     new_point.neighbours.write()[l as usize].push(Arc::clone(&ep));
+                    // ZEUSDB GUARD: install site 1. ep gains one inbound link at layer l.
+                    // This loop only runs for l > level, so it never touches layer zero.
+                    ep.point_ref.in_degree[l as usize].fetch_add(1, AtomOrd::Relaxed);
                 }
                 // get the lowest distance point
                 let tmp_dist = self.dist_f.eval(data, ep.point_ref.data.get_v());
@@ -1213,7 +1263,22 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                 // sort neighbours
                 neighbours.sort_unstable();
                 // we must add bidirecti*onal from data i.e new_point_id to neighbours
-                new_point.neighbours.write()[l as usize].clone_from(&neighbours);
+                // ZEUSDB GUARD: install site 2, and the only wholesale list replacement
+                // on the build path. Whatever the list already held is discarded here, so
+                // those targets lose an inbound link and the incoming ones gain one. The
+                // write guard is held across the whole accounting, which is the same guard
+                // a concurrent reverse update must take to push into this list, so the
+                // replacement and its bookkeeping are atomic with respect to that race.
+                {
+                    let mut new_point_neighbours = new_point.neighbours.write();
+                    for old in new_point_neighbours[l as usize].iter() {
+                        old.point_ref.in_degree[l as usize].fetch_sub(1, AtomOrd::Relaxed);
+                    }
+                    for n in neighbours.iter() {
+                        n.point_ref.in_degree[l as usize].fetch_add(1, AtomOrd::Relaxed);
+                    }
+                    new_point_neighbours[l as usize].clone_from(&neighbours);
+                }
                 // this reverse neighbour update could be done here but we put it at end to gather all code
                 // requiring a mutex guard for multi threading.
                 // update ep for loop iteration. As we sorted neighbours the nearest
@@ -1282,6 +1347,8 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                         continue;
                     }
                     q_point_neighbours[l_n].push(Arc::new(n_to_add));
+                    // ZEUSDB GUARD: install site 3. new_point gains one inbound link at l_n.
+                    new_point.in_degree[l_n].fetch_add(1, AtomOrd::Relaxed);
                     let nbn_at_l = q_point_neighbours[l_n].len();
                     //
                     // if l < level, update upward chaining, insert does a sort! t_q has a neighbour not yet in global table of points!
@@ -1295,7 +1362,37 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                         // sort and shring if necessary
                         q_point_neighbours[l_n].sort_unstable();
                         if shrink {
-                            q_point_neighbours[l_n].pop();
+                            // ZEUSDB GUARD: the single edge removal site in the crate.
+                            // The list is sorted ascending by distance to q_point, so the
+                            // farthest entry is last. Walk from the farthest inward and
+                            // remove the first entry whose target would still hold at
+                            // least one inbound link at this layer afterwards. If no
+                            // candidate qualifies, remove the farthest, which is the
+                            // unmodified crate behaviour.
+                            let list = &mut q_point_neighbours[l_n];
+                            let last = list.len() - 1;
+                            let mut victim = None;
+                            for i in (0..list.len()).rev() {
+                                if list[i].point_ref.in_degree[l_n].load(AtomOrd::Relaxed) >= 2 {
+                                    victim = Some(i);
+                                    break;
+                                }
+                            }
+                            GUARD_OVERFLOWS.fetch_add(1, AtomOrd::Relaxed);
+                            let idx = match victim {
+                                Some(i) => {
+                                    if i != last {
+                                        GUARD_SAVES.fetch_add(1, AtomOrd::Relaxed);
+                                    }
+                                    i
+                                }
+                                None => {
+                                    GUARD_FALLBACKS.fetch_add(1, AtomOrd::Relaxed);
+                                    last
+                                }
+                            };
+                            let removed = list.remove(idx);
+                            removed.point_ref.in_degree[l_n].fetch_sub(1, AtomOrd::Relaxed);
                         }
                     }
                 } // end protection against point identity

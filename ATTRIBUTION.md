@@ -24,7 +24,9 @@ See [https://attribution.md](https://attribution.md) for details.
 This repository vendors the [hnsw_rs](https://crates.io/crates/hnsw_rs)
 crate, version 0.3.4, by Jean-Pierre Both at `vendor/hnsw_rs`. The
 vendored copy is taken from the crates.io registry source and carries
-two deliberate patches, one to the reverse link layer assignment and one
-seeding level assignment so index builds are reproducible, both recorded
-in `vendor/hnsw_rs/ZEUSDB-PATCH.md`. hnsw_rs is dual licensed under MIT
-or Apache-2.0. Full licence texts are in `LICENSES/`.
+three deliberate patches, one to the reverse link layer assignment, one
+seeding level assignment so index builds are reproducible, and one
+guarding the neighbour list overflow pop against stranding a point's
+last inbound link, all recorded in `vendor/hnsw_rs/ZEUSDB-PATCH.md`.
+hnsw_rs is dual licensed under MIT or Apache-2.0. Full licence texts are
+in `LICENSES/`.
