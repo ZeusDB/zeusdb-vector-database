@@ -1,6 +1,7 @@
 """Saving an index to disk and loading it back."""
 
 import json
+import shutil
 
 import numpy as np
 import pytest
@@ -92,6 +93,60 @@ def _pq_config(storage_mode):
         "training_size": 1000,
         "storage_mode": storage_mode,
     }
+
+
+QO_TRAINING_SIZE = 1000
+QO_COUNT = 1010
+
+
+def _zero_codebook_bytes(subvectors, centroids, sub_dim):
+    """Encode an all-zero codebook the way bincode's standard config does.
+
+    Varint lengths followed by little endian f32 payloads, which is the layout
+    save_pq_centroids writes for a Vec<Vec<Vec<f32>>>. Building the file rather
+    than blanking the real one keeps the length prefixes intact, so the loader
+    sees a well formed codebook whose only problem is its content.
+    """
+    def varint(n):
+        return bytes([n]) if n < 251 else bytes([251]) + n.to_bytes(2, "little")
+
+    centroid = varint(sub_dim) + b"\x00" * (4 * sub_dim)
+    return varint(subvectors) + (varint(centroids) + centroid * centroids) * subvectors
+
+
+@pytest.fixture(scope="module")
+def quantized_only_saved(tmp_path_factory):
+    """A trained quantized_only index, built and saved once for the module.
+
+    Training runs k-means over training_size vectors and is the slowest thing
+    in this file, so the directory is shared. Any test that modifies it copies
+    it first. The 10 records past training_size are the ones stored as codes
+    alone, which is the case the loader has to reconstruct.
+    """
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=8,
+                       quantization_config=_pq_config("quantized_only"),
+                       expected_size=2000)
+
+    vectors = _sample_vectors(QO_COUNT, 8)
+    ids = [f"v_{i}" for i in range(QO_COUNT)]
+    assert index.add({"ids": ids, "embeddings": vectors,
+                      "metadatas": [{"i": i} for i in range(QO_COUNT)]}).is_success()
+    index.add_metadata({"owner": "relay24"})
+    assert index.is_quantized()
+
+    # What the live index returns for the code-only records, which is the
+    # reconstruction the reload has to match.
+    code_only = ids[QO_TRAINING_SIZE:]
+    before = {r["id"]: np.asarray(r["vector"], dtype=np.float64)
+              for r in index.get_records(code_only, return_vector=True)}
+    assert len(before) == QO_COUNT - QO_TRAINING_SIZE
+
+    save_dir = tmp_path_factory.mktemp("quantized_only") / "qo.zdb"
+    index.save(str(save_dir))
+
+    return {"path": save_dir, "ids": ids, "vectors": vectors,
+            "code_only": code_only, "before": before}
 
 # ------------------------------------------------------------
 # Test 68: Persistence: vectors survive a reload, per distance space
@@ -263,39 +318,55 @@ def test_persistence_preserves_record_metadata(tmp_path):
     assert hit["metadata"]["author"] == "Alice"
 
 # ------------------------------------------------------------
-# Test 72: Persistence: index level metadata is not written at all
+# Test 72: Persistence: index level metadata survives a round trip
 # ------------------------------------------------------------
-def test_persistence_drops_index_level_metadata(tmp_path):
-    """Current behaviour, asserted rather than expected.
+def test_persistence_preserves_index_level_metadata(tmp_path):
+    """add_metadata content is carried by config.json.
 
-    save_metadata writes index.get_vector_metadata() to metadata.json, which is
-    the per record map. The index level map that add_metadata writes to has no
-    slot in config.json and no file of its own, so it is dropped silently on
-    save. The expectation this violates is that everything add_metadata stores
-    survives a round trip, which is what the per record metadata does.
+    It belongs to the index rather than to any record, so it goes in the one
+    artefact that already holds whole index state instead of gaining a file and
+    a manifest entry of its own. metadata.json cannot take it, because that file
+    is a map of record id to metadata and adding an envelope would change its
+    type for every reader.
     """
     vdb = VectorDatabase()
     index = vdb.create("hnsw", dim=4, expected_size=10)
-    index.add_metadata({"owner": "relay22", "dataset": "docs_v2"})
+    index.add_metadata({"owner": "relay24", "dataset": "docs_v2"})
     index.add({"id": "r1", "values": [0.1, 0.2, 0.3, 0.4], "metadata": {"kept": "yes"}})
 
-    assert index.get_all_metadata() == {"owner": "relay22", "dataset": "docs_v2"}
+    assert index.get_all_metadata() == {"owner": "relay24", "dataset": "docs_v2"}
 
     save_dir = tmp_path / "indexmeta.zdb"
     index.save(str(save_dir))
 
-    # No file carries it. config.json holds construction parameters only.
     config = json.loads((save_dir / "config.json").read_text(encoding="utf-8"))
-    assert "metadata" not in config
+    assert config["metadata"] == {"owner": "relay24", "dataset": "docs_v2"}
     assert sorted(config) == ["dim", "ef_construction", "expected_size", "id_counter",
-                              "m", "space", "vector_count"]
+                              "m", "metadata", "space", "vector_count"]
 
     loaded = vdb.load(str(save_dir))
-    assert loaded.get_all_metadata() == {}
-    assert loaded.get_metadata("owner") is None
+    assert loaded.get_all_metadata() == {"owner": "relay24", "dataset": "docs_v2"}
+    assert loaded.get_metadata("owner") == "relay24"
+    assert loaded.get_metadata("absent") is None
 
-    # Per record metadata is unaffected, which is what makes the loss easy to miss.
+    # Per record metadata is unaffected.
     assert loaded.get_records("r1", return_vector=False)[0]["metadata"] == {"kept": "yes"}
+
+    # A second round trip keeps it too, so it is restored into the live index
+    # rather than only copied from file to file.
+    second = tmp_path / "indexmeta2.zdb"
+    loaded.save(str(second))
+    assert vdb.load(str(second)).get_all_metadata() == {"owner": "relay24",
+                                                        "dataset": "docs_v2"}
+
+    # An index that never called add_metadata writes an empty map, not a
+    # missing key, so the field is a stable part of config.json.
+    plain = vdb.create("hnsw", dim=4, expected_size=10)
+    plain.add({"id": "r1", "values": [0.1, 0.2, 0.3, 0.4], "metadata": {}})
+    plain_dir = tmp_path / "plain.zdb"
+    plain.save(str(plain_dir))
+    assert json.loads((plain_dir / "config.json").read_text(encoding="utf-8"))["metadata"] == {}
+    assert vdb.load(str(plain_dir)).get_all_metadata() == {}
 
 # ------------------------------------------------------------
 # Test 73: Persistence: the manifest and the on disk file inventory
@@ -334,7 +405,9 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
         "saved_at", "storage_mode", "total_size_mb", "total_vectors", "zeusdb_version",
     ]
 
-    assert manifest["format_version"] == "1.0.0"
+    # 1.1.0 rather than 1.0.0 because config.json gained the index level
+    # metadata field. The loader reads any 1.x and refuses another major.
+    assert manifest["format_version"] == "1.1.0"
     assert manifest["index_type"] == "HNSW"
     assert manifest["total_vectors"] == 3
     assert manifest["has_quantization"] is False
@@ -359,20 +432,20 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
     assert config["m"] == 16
     assert config["ef_construction"] == 200
     assert config["vector_count"] == 3
+    assert config["metadata"] == {}
 
 # ------------------------------------------------------------
 # Test 74: Persistence: a quantized_with_raw round trip
 # ------------------------------------------------------------
 def test_persistence_quantized_with_raw_round_trip(tmp_path):
-    """A trained PQ index does not come back quantized.
+    """The codebook and the codes both come back, the quantized graph does not.
 
-    Current behaviour, asserted rather than expected. The centroids and the
-    codes are both written, but load_index restores only the trained codebook,
-    so the loaded index reports raw_trained_not_rebuilt with zero stored codes.
-    The expectation this violates is the README's own save and load example,
-    which prints is_quantized() on the loaded index under the heading "Load and
-    verify quantization state is preserved". rebuild_with_quantization() is what
-    closes the gap, and that is asserted here too.
+    The loaded index holds its trained codebook and every stored code, so it can
+    quantize and reconstruct. Its graph is rebuilt over raw vectors rather than
+    codes, so is_quantized() is still false and the mode reads
+    raw_trained_not_rebuilt. Restoring the graph as a PQ graph is a separate
+    piece of work; rebuild_with_quantization() is the supported way to get there
+    and is asserted here.
     """
     vdb = VectorDatabase()
     with pytest.warns(UserWarning,
@@ -407,12 +480,13 @@ def test_persistence_quantized_with_raw_round_trip(tmp_path):
 
     loaded = vdb.load(str(save_dir))
 
-    # The trained codebook survives, the quantized state does not.
+    # The trained codebook and the stored codes survive, the quantized graph
+    # does not.
     assert loaded.can_use_quantization()
     assert loaded.get_quantization_info()["is_trained"] is True
     assert not loaded.is_quantized()
     assert loaded.get_storage_mode() == "raw_trained_not_rebuilt"
-    assert int(loaded.get_stats()["quantized_codes_stored"]) == 0
+    assert int(loaded.get_stats()["quantized_codes_stored"]) == count
 
     # quantized_with_raw keeps every raw vector, so nothing is lost.
     assert loaded.get_vector_count() == count
@@ -442,14 +516,13 @@ def test_persistence_quantized_with_raw_round_trip(tmp_path):
 # Test 75: Persistence: a PQ index saved before training completes
 # ------------------------------------------------------------
 def test_persistence_untrained_pq_index(tmp_path):
-    """A PQ index saved mid collection comes back with its progress reset.
+    """A PQ index saved mid collection resumes where it left off.
 
-    Current behaviour, asserted rather than expected. quantization.json carries
-    every training id and the loader calls set_training_ids with all of them,
-    but the reloaded index reports zero progress and needs a full training_size
-    again. The expectation this violates is benchmark 40's own assertion, which
-    compared the loaded progress against the saved progress and required them
-    to agree within one percent. That assertion does not hold today.
+    The collected ids are applied after the graph rebuild rather than before it,
+    because the rebuild re-adds every record through add(overwrite=true) and the
+    removal half of that strips each id from the collection. The reloaded index
+    also gets a PQ instance even though nothing is trained yet, without which
+    the training trigger could never fire again.
     """
     vdb = VectorDatabase()
     index = vdb.create("hnsw", dim=8,
@@ -503,94 +576,277 @@ def test_persistence_untrained_pq_index(tmp_path):
     assert not loaded.is_quantized()
     assert loaded.get_storage_mode() == "raw_collecting_for_training"
 
-    # The training progress is not intact. It reads as if no vector had ever
-    # been collected, and the full training_size is required again.
-    assert loaded.get_training_progress() == 0.0
-    assert loaded.training_vectors_needed() == 1000
+    # The training progress is intact. The collection picks up at 800 of 1000
+    # rather than restarting.
+    assert loaded.get_training_progress() == progress
+    assert loaded.training_vectors_needed() == 1000 - count
     assert not loaded.is_training_ready()
 
-    # The reloaded quantization info drops the fields that come from the PQ
-    # instance, so is_trained is absent rather than False.
+    # The reloaded index carries a PQ instance, so the fields that come from it
+    # are present and report an untrained codebook.
     reloaded_info = loaded.get_quantization_info()
     assert reloaded_info["type"] == "pq"
     assert reloaded_info["training_size"] == 1000
-    assert "is_trained" not in reloaded_info
+    assert reloaded_info["is_trained"] is False
 
-    # Adding the 200 vectors that would have completed training does not
-    # complete it, because the counter restarted.
+    # Adding the 200 vectors that complete the collection completes training,
+    # and the index reaches the quantized state it could never reach before.
     assert loaded.add({"ids": [f"w_{i}" for i in range(200)],
                        "embeddings": _sample_vectors(200, 8, seed=99)}).is_success()
-    assert loaded.get_training_progress() == 20.0
-    assert not loaded.can_use_quantization()
-    assert loaded.get_storage_mode() == "raw_collecting_for_training"
-
-    # Adding enough to pass training_size a second time reaches the threshold
-    # but still does not train, so a reloaded untrained index cannot reach the
-    # quantized state through ordinary adds at all.
-    assert loaded.add({"ids": [f"x_{i}" for i in range(1000)],
-                       "embeddings": _sample_vectors(1000, 8, seed=7)}).is_success()
     assert loaded.get_training_progress() == 100.0
     assert loaded.is_training_ready()
-    assert not loaded.can_use_quantization()
-    assert not loaded.is_quantized()
-    assert loaded.get_storage_mode() == "raw_ready_for_training"
+    assert loaded.can_use_quantization()
+    assert loaded.is_quantized()
+    assert loaded.get_storage_mode() == "quantized_active"
+
+    # Training used the restored collection together with the new records, so
+    # every one of them is still retrievable afterwards.
+    assert loaded.get_vector_count() == count + 200
+    assert len(loaded.get_records(["v_0", "v_799", "w_0", "w_199"])) == 4
+
+    # And the index that results survives its own round trip.
+    second = tmp_path / "trained_after_reload.zdb"
+    loaded.save(str(second))
+    again = vdb.load(str(second))
+    assert again.get_vector_count() == count + 200
+    assert again.can_use_quantization()
+    assert len(again.get_records(["v_0", "v_799", "w_0", "w_199"])) == 4
 
 # ------------------------------------------------------------
-# Test 76: Persistence: quantized_only loses post training records
+# Test 76: Persistence: a quantized_only round trip after training
 # ------------------------------------------------------------
-def test_persistence_quantized_only_loses_post_training_records(tmp_path):
-    """Current behaviour, asserted rather than expected.
+def test_persistence_quantized_only_round_trip(quantized_only_saved):
+    """Every record comes back, including the ones stored as codes alone.
 
     quantized_only stops storing raw vectors once training completes, so
-    vectors.bin holds the training set only. The codes for the post training
-    records are written to pq_codes.bin but are not restored, so after a reload
-    those records are retrievable by nothing. get_vector_count() still reports
-    the original total because it reads a counter rather than the stored data.
-    The expectation this violates is that a save and load round trip preserves
-    every record, which it does under quantized_with_raw.
+    vectors.bin holds the training set and pq_codes.bin holds everything. The
+    loader replays a record from its raw vector when there is one and
+    reconstructs it through the codebook when there is not, so the graph covers
+    every record either way. The stored codes are put back as written rather
+    than recomputed, and the reconstructed records are not promoted to raw
+    storage, so the mode keeps the memory saving that is its whole purpose.
     """
     vdb = VectorDatabase()
-    index = vdb.create("hnsw", dim=8,
-                       quantization_config=_pq_config("quantized_only"),
-                       expected_size=2000)
-
-    training_size = 1000
-    count = 1010
-    vectors = _sample_vectors(count, 8)
-    ids = [f"v_{i}" for i in range(count)]
-    assert index.add({"ids": ids, "embeddings": vectors,
-                      "metadatas": [{"i": i} for i in range(count)]}).is_success()
-    assert index.is_quantized()
-
-    # Before the save the post training record is reachable through
-    # get_records, which reconstructs it from its PQ code.
-    assert len(index.get_records("v_1005", return_vector=True)) == 1
-
-    save_dir = tmp_path / "qo.zdb"
-    index.save(str(save_dir))
+    ids = quantized_only_saved["ids"]
+    save_dir = quantized_only_saved["path"]
     assert "pq_codes.bin" in {p.name for p in save_dir.glob("*")}
 
     loaded = vdb.load(str(save_dir))
 
-    # The counter is unchanged and disagrees with what is actually stored.
-    assert loaded.get_vector_count() == count
-    assert int(loaded.get_stats()["raw_vectors_stored"]) == training_size
-    assert int(loaded.get_stats()["quantized_codes_stored"]) == 0
-    assert len(loaded.list(number=count + 10)) == training_size
+    # Nothing is lost, and the count now agrees with what is stored.
+    assert loaded.get_vector_count() == QO_COUNT
+    records = loaded.get_records(ids, return_vector=True)
+    assert len(records) == QO_COUNT
+    assert {r["id"] for r in records} == set(ids)
+    assert all("vector" in r for r in records)
 
-    # Training set records survive.
-    assert len(loaded.get_records("v_0", return_vector=True)) == 1
-    assert len(loaded.get_records("v_999", return_vector=True)) == 1
+    # The split between raw and coded storage is exactly what was saved.
+    assert int(loaded.get_stats()["raw_vectors_stored"]) == QO_TRAINING_SIZE
+    assert int(loaded.get_stats()["quantized_codes_stored"]) == QO_COUNT
+    assert len(loaded.list(number=QO_COUNT + 10)) == QO_TRAINING_SIZE
 
-    # Post training records do not.
-    for lost in ("v_1000", "v_1005", "v_1009"):
-        assert loaded.get_records(lost, return_vector=True) == []
-        assert not loaded.contains(lost)
+    # Per record metadata comes back for the reconstructed records too, which
+    # is where it used to be dropped.
+    by_id = {r["id"]: r for r in records}
+    assert by_id["v_0"]["metadata"] == {"i": 0}
+    assert by_id["v_1005"]["metadata"] == {"i": 1005}
+    assert by_id["v_1009"]["metadata"] == {"i": 1009}
 
-    # The rebuild recovers codes for what is still stored, not for what is gone.
+    # The codebook is restored, so the index can quantize and reconstruct. Its
+    # graph is rebuilt raw, so quantized search is not restored with it.
+    assert loaded.can_use_quantization()
+    assert not loaded.is_quantized()
+    assert loaded.get_storage_mode() == "raw_trained_not_rebuilt"
+
+    # A record with no raw vector is still found by search through the graph.
+    hits = loaded.search(quantized_only_saved["vectors"][1005].tolist(), top_k=5)
+    assert any(h["id"] == "v_1005" for h in hits)
+
+    # rebuild_with_quantization returns the index to quantized search without
+    # dropping the records that exist only as codes.
     assert loaded.rebuild_with_quantization() is True
-    assert int(loaded.get_stats()["quantized_codes_stored"]) == training_size
-    assert loaded.get_records("v_1005", return_vector=True) == []
+    assert loaded.is_quantized()
+    assert loaded.get_storage_mode() == "quantized_active"
+    assert int(loaded.get_stats()["quantized_codes_stored"]) == QO_COUNT
+    assert len(loaded.get_records(ids)) == QO_COUNT
+
+    # And the result of that rebuild survives a further round trip.
+    second = save_dir.parent / "qo_rebuilt.zdb"
+    loaded.save(str(second))
+    again = vdb.load(str(second))
+    assert again.get_vector_count() == QO_COUNT
+    assert len(again.get_records(ids)) == QO_COUNT
+
+# ------------------------------------------------------------
+# Test 78: Persistence: the restored count matches what was restored
+# ------------------------------------------------------------
+def test_persistence_vector_count_matches_reality(tmp_path, quantized_only_saved):
+    """vector_count is checked against the index that was actually built.
+
+    It is stored in config.json and used to be restored verbatim, so it could
+    report records the directory no longer contained. The count is now derived
+    from the restored data and asserted against the saved value, and a
+    disagreement fails the load rather than producing an index that misreports
+    what it holds.
+    """
+    vdb = VectorDatabase()
+
+    # The healthy case agrees, in both quantized and plain indexes.
+    loaded = vdb.load(str(quantized_only_saved["path"]))
+    assert loaded.get_vector_count() == QO_COUNT
+    assert loaded.get_vector_count() == len(loaded.get_records(quantized_only_saved["ids"]))
+
+    plain_dir = tmp_path / "plain.zdb"
+    plain = vdb.create("hnsw", dim=8, expected_size=50)
+    plain.add({"ids": [f"p_{i}" for i in range(6)], "embeddings": _sample_vectors(6, 8)})
+    plain.save(str(plain_dir))
+    assert vdb.load(str(plain_dir)).get_vector_count() == 6
+
+    # Losing vectors.bin from a plain index used to load zero records while
+    # still reporting the saved count. It is now refused, and the message names
+    # both numbers.
+    broken = tmp_path / "broken.zdb"
+    shutil.copytree(plain_dir, broken)
+    (broken / "vectors.bin").unlink()
+    with pytest.raises(RuntimeError, match=r"yields 0 records while config.json reports 6"):
+        vdb.load(str(broken))
+
+    # Losing pq_codes.bin from a quantized_only index loses the records that
+    # exist only as codes, so that is refused too.
+    no_codes = tmp_path / "no_codes.zdb"
+    shutil.copytree(quantized_only_saved["path"], no_codes)
+    (no_codes / "pq_codes.bin").unlink()
+    with pytest.raises(RuntimeError, match=r"yields 1000 records while config.json reports 1010"):
+        vdb.load(str(no_codes))
+
+    # Losing vectors.bin from a quantized_only index loses nothing, because
+    # every record still has its codes. This one loads.
+    no_vectors = tmp_path / "no_vectors.zdb"
+    shutil.copytree(quantized_only_saved["path"], no_vectors)
+    (no_vectors / "vectors.bin").unlink()
+    recovered = vdb.load(str(no_vectors))
+    assert recovered.get_vector_count() == QO_COUNT
+    assert len(recovered.get_records(quantized_only_saved["ids"])) == QO_COUNT
+
+# ------------------------------------------------------------
+# Test 79: Persistence: an unusable codebook fails the load
+# ------------------------------------------------------------
+def test_persistence_rejects_unusable_codebook(tmp_path, quantized_only_saved):
+    """A trained index needs its codebook, and a wrong one is worse than none.
+
+    Directories written by 0.3.0 through 0.4.1 contain an all-zero codebook if
+    they were ever saved a second time, because those versions never read
+    pq_centroids.bin back and re-saved the zeros a fresh PQ starts with. Every
+    code in such a directory decodes to the zero vector, so it is refused.
+    """
+    vdb = VectorDatabase()
+
+    missing = tmp_path / "missing_codebook.zdb"
+    shutil.copytree(quantized_only_saved["path"], missing)
+    (missing / "pq_centroids.bin").unlink()
+    with pytest.raises(FileNotFoundError,
+                       match=r"trained codebook but pq_centroids.bin is missing"):
+        vdb.load(str(missing))
+
+    # An all-zero codebook of the right shape is the signature of the second
+    # save, and it is what those directories hold today.
+    zeroed = tmp_path / "zero_codebook.zdb"
+    shutil.copytree(quantized_only_saved["path"], zeroed)
+    zero_bytes = _zero_codebook_bytes(subvectors=4, centroids=256, sub_dim=2)
+    # Same length as the real codebook, which is the check that the encoding
+    # above matches what save_pq_centroids writes.
+    assert len(zero_bytes) == len((zeroed / "pq_centroids.bin").read_bytes())
+    (zeroed / "pq_centroids.bin").write_bytes(zero_bytes)
+    with pytest.raises(RuntimeError, match=r"all-zero codebook"):
+        vdb.load(str(zeroed))
+
+    # A codebook of the wrong shape names both shapes rather than
+    # reconstructing against whatever it happens to hold.
+    wrong = tmp_path / "wrong_codebook.zdb"
+    shutil.copytree(quantized_only_saved["path"], wrong)
+    (wrong / "pq_centroids.bin").write_bytes(
+        _zero_codebook_bytes(subvectors=2, centroids=256, sub_dim=2))
+    with pytest.raises(RuntimeError,
+                       match=r"codebook is 2x256x2, expected 4x256x2"):
+        vdb.load(str(wrong))
+
+# ------------------------------------------------------------
+# Test 80: Persistence: a directory written in the previous format
+# ------------------------------------------------------------
+def test_persistence_reads_previous_format(tmp_path, quantized_only_saved):
+    """Format 1.0.0, written by 0.3.0 through 0.4.1, still opens.
+
+    The fixture is built by saving with this build and then reversing the only
+    two save side changes, being the index level metadata field in config.json
+    and the format version in manifest.json. Nothing else about what is written
+    changed, verified by comparing the persisted structures and the artefact
+    set against the v0.4.1 tag, so this is what those releases produced.
+    """
+    vdb = VectorDatabase()
+    legacy = tmp_path / "legacy.zdb"
+    shutil.copytree(quantized_only_saved["path"], legacy)
+
+    config = json.loads((legacy / "config.json").read_text(encoding="utf-8"))
+    had_metadata = config.pop("metadata")
+    assert had_metadata == {"owner": "relay24"}
+    (legacy / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+    manifest = json.loads((legacy / "manifest.json").read_text(encoding="utf-8"))
+    manifest["format_version"] = "1.0.0"
+    (legacy / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    loaded = vdb.load(str(legacy))
+
+    # Every record comes back, including the ten that the release which wrote
+    # this directory dropped on its own load.
+    assert loaded.get_vector_count() == QO_COUNT
+    assert len(loaded.get_records(quantized_only_saved["ids"])) == QO_COUNT
+    assert loaded.can_use_quantization()
+
+    # Index level metadata is the one thing a 1.0.0 directory cannot return,
+    # because it was never written. An empty map is the honest answer.
+    assert loaded.get_all_metadata() == {}
+
+    # Saving it again upgrades the directory in place.
+    upgraded = tmp_path / "upgraded.zdb"
+    loaded.save(str(upgraded))
+    assert json.loads((upgraded / "manifest.json").read_text(
+        encoding="utf-8"))["format_version"] == "1.1.0"
+    assert "metadata" in json.loads((upgraded / "config.json").read_text(encoding="utf-8"))
+    assert vdb.load(str(upgraded)).get_vector_count() == QO_COUNT
+
+# ------------------------------------------------------------
+# Test 81: Persistence: the format version gate
+# ------------------------------------------------------------
+def test_persistence_format_version_gate(tmp_path):
+    """A later minor is read, another major is refused.
+
+    Minor bumps are additive by construction, so any 1.x is accepted. A
+    different major means the layout changed in a way this build cannot reason
+    about, and guessing at it is how a format loses data quietly.
+    """
+    vdb = VectorDatabase()
+    source = tmp_path / "versioned.zdb"
+    index = vdb.create("hnsw", dim=4, expected_size=10)
+    index.add({"id": "r1", "values": [0.1, 0.2, 0.3, 0.4], "metadata": {}})
+    index.save(str(source))
+
+    def with_version(version, name):
+        target = tmp_path / name
+        shutil.copytree(source, target)
+        manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+        manifest["format_version"] = version
+        (target / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        return target
+
+    assert vdb.load(str(with_version("1.0.0", "v100.zdb"))).get_vector_count() == 1
+    assert vdb.load(str(with_version("1.9.3", "v193.zdb"))).get_vector_count() == 1
+
+    with pytest.raises(RuntimeError, match=r"format version 2.0.0 cannot be opened"):
+        vdb.load(str(with_version("2.0.0", "v200.zdb")))
+
+    with pytest.raises(RuntimeError, match=r"not a version this build can interpret"):
+        vdb.load(str(with_version("banana", "vbanana.zdb")))
 
 # ------------------------------------------------------------
 # Test 77: Persistence: load failure modes

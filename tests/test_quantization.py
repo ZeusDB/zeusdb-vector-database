@@ -1175,3 +1175,117 @@ def test_pq_rebuild_with_quantization():
     record = index.get_records("train_5", return_vector=True)[0]
     assert record["metadata"] == {"type": "training", "index": 5}
     assert len(record["vector"]) == PQ_DIM
+
+# ------------------------------------------------------------
+# Shared fixture for the persistence facing quantization coverage
+# ------------------------------------------------------------
+@pytest.fixture(scope="module")
+def saved_pq_index(tmp_path_factory):
+    """A trained quantized_only index saved once, with its live reconstructions.
+
+    Training runs k-means over PQ_TRAINING_SIZE vectors, so the index and the
+    directory are built once and shared. The records past PQ_TRAINING_SIZE hold
+    no raw vector, which makes them the ones the loader has to reconstruct.
+    """
+    index = _make_trained_pq_index("quantized_only")
+    rng = np.random.default_rng(20260802)
+    vectors = rng.random((PQ_TOTAL, PQ_DIM)).astype(np.float32)
+
+    ids = [f"train_{i}" for i in range(PQ_TOTAL)]
+    code_only = ids[PQ_TRAINING_SIZE:]
+
+    # What the live index returns for a record that exists only as codes. It
+    # reconstructs through the codebook, which is the same path the loader now
+    # uses, so this is the reference the reload must match.
+    before = {r["id"]: np.asarray(r["vector"], dtype=np.float64)
+              for r in index.get_records(code_only, return_vector=True)}
+    assert len(before) == PQ_TOTAL - PQ_TRAINING_SIZE
+
+    save_dir = tmp_path_factory.mktemp("pq_saved") / "pq.zdb"
+    index.save(str(save_dir))
+
+    return {"path": save_dir, "ids": ids, "code_only": code_only,
+            "vectors": vectors, "before": before}
+
+# ------------------------------------------------------------
+# Test 83: PQ codebook identity across a save and load
+# ------------------------------------------------------------
+def test_pq_codebook_survives_save_and_load(tmp_path, saved_pq_index):
+    """The restored codebook is the one that was written, byte for byte.
+
+    pq_centroids.bin used to be written and never read, so a reloaded index
+    held the zeros a fresh PQ starts with while reporting itself trained. Saving
+    that index wrote the zeros back, which destroyed the only thing that made
+    its coded records readable. The file is a Vec<Vec<Vec<f32>>>, whose encoding
+    is ordered, so comparing bytes across the two saves is meaningful.
+    """
+    vdb = VectorDatabase()
+    first = (saved_pq_index["path"] / "pq_centroids.bin").read_bytes()
+    assert first != bytes(len(first)), "the saved codebook must not be all zeros"
+
+    loaded = vdb.load(str(saved_pq_index["path"]))
+    assert loaded.can_use_quantization()
+    assert loaded.get_quantization_info()["is_trained"] is True
+
+    second_dir = tmp_path / "resaved.zdb"
+    loaded.save(str(second_dir))
+    second = (second_dir / "pq_centroids.bin").read_bytes()
+    assert second == first
+
+    # A third cycle is what used to be unrecoverable, so it is checked too.
+    third_dir = tmp_path / "resaved_again.zdb"
+    vdb.load(str(second_dir)).save(str(third_dir))
+    assert (third_dir / "pq_centroids.bin").read_bytes() == first
+
+    # The codes ride along with the codebook, so the records that exist only as
+    # codes are still there after two further saves.
+    final = vdb.load(str(third_dir))
+    assert final.get_vector_count() == PQ_TOTAL
+    assert len(final.get_records(saved_pq_index["ids"])) == PQ_TOTAL
+
+# ------------------------------------------------------------
+# Test 84: PQ reconstruction fidelity across a round trip
+# ------------------------------------------------------------
+def test_pq_reconstructed_record_fidelity(saved_pq_index):
+    """A reconstructed record is exactly what the live index returned.
+
+    A record with no raw vector is rebuilt through the codebook on load. Its
+    stored codes are put back as written rather than recomputed from the
+    reconstruction, which is why the reload adds no error at all rather than
+    compounding the quantization loss. The similarity against the original input
+    is asserted as a bound because the codebook comes from k-means, which is
+    seeded afresh on every training run.
+    """
+    vdb = VectorDatabase()
+    loaded = vdb.load(str(saved_pq_index["path"]))
+
+    after = {r["id"]: np.asarray(r["vector"], dtype=np.float64)
+             for r in loaded.get_records(saved_pq_index["code_only"], return_vector=True)}
+    assert set(after) == set(saved_pq_index["code_only"])
+
+    def cosine(a, b):
+        return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+    similarities = []
+    for record_id in saved_pq_index["code_only"]:
+        # Identical to the live reconstruction, so the round trip is lossless
+        # on top of the loss the storage mode already carries.
+        assert np.array_equal(after[record_id], saved_pq_index["before"][record_id])
+
+        original = saved_pq_index["vectors"][int(record_id.split("_")[1])]
+        similarities.append(cosine(after[record_id], original.astype(np.float64)))
+
+    # Measured at 0.9984 to 0.9993 over three training seeds at these settings,
+    # being 256 centroids over a two dimensional subvector. The bound leaves
+    # room for k-means variation while still failing on a wrong codebook, which
+    # scores near zero, or an all-zero one, which cannot be normalized at all.
+    assert min(similarities) > 0.95
+    assert sum(similarities) / len(similarities) > 0.98
+
+    # A record that kept its raw vector is returned from that vector, so it is
+    # unchanged by the round trip rather than approximated.
+    kept = loaded.get_records(["train_0", "train_500"], return_vector=True)
+    kept_by_id = {r["id"]: np.asarray(r["vector"], dtype=np.float64) for r in kept}
+    for record_id in ("train_0", "train_500"):
+        original = saved_pq_index["vectors"][int(record_id.split("_")[1])]
+        assert cosine(kept_by_id[record_id], original.astype(np.float64)) > 0.999999

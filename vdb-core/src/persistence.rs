@@ -30,6 +30,65 @@ use std::path::Path;
 use std::sync::Arc;
 
 // ============================================================================
+// FORMAT VERSION
+// ============================================================================
+
+/// Version written into manifest.json by this build
+///
+/// Bumped from 1.0.0 because config.json now carries an index level `metadata`
+/// map. The change is additive on both sides. A directory written by this build
+/// still opens in 0.4.1, which ignores unknown config fields and never read the
+/// version, and a directory written by 0.4.1 still opens here because the field
+/// is defaulted.
+const FORMAT_VERSION: &str = "1.1.0";
+
+/// Major version this build can interpret
+///
+/// A minor bump is additive by construction, so any 1.x is read. A different
+/// major means the layout changed in a way this build cannot reason about, and
+/// guessing at it would be the silent truncation this format has already
+/// suffered once.
+const SUPPORTED_FORMAT_MAJOR: u32 = 1;
+
+/// Refuse a directory this build cannot interpret
+fn check_format_version(format_version: &str) -> PyResult<()> {
+    let major = format_version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "manifest.json declares format_version '{}', which is not a version this \
+                 build can interpret. A ZeusDB index directory declares a dotted version \
+                 such as {}.",
+                format_version, FORMAT_VERSION
+            ))
+        })?;
+
+    if major != SUPPORTED_FORMAT_MAJOR {
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Index format version {} cannot be opened by this build, which reads format \
+             version {}.x only. The directory was written by a {} release of \
+             zeusdb-vector-database, so {}.",
+            format_version,
+            SUPPORTED_FORMAT_MAJOR,
+            if major > SUPPORTED_FORMAT_MAJOR {
+                "newer"
+            } else {
+                "much older"
+            },
+            if major > SUPPORTED_FORMAT_MAJOR {
+                "upgrade the package to open it"
+            } else {
+                "open it with the release that wrote it"
+            }
+        )));
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // PERSISTENCE DATA STRUCTURES
 // ============================================================================
 
@@ -69,6 +128,13 @@ pub struct IndexConfig {
     pub expected_size: usize,
     pub id_counter: usize,
     pub vector_count: usize,
+
+    /// Index level metadata set through `add_metadata`
+    ///
+    /// Defaulted rather than required, so a directory written before this field
+    /// existed loads with an empty map instead of failing to parse.
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 /// Complete quantization configuration and state
@@ -112,6 +178,63 @@ pub struct PQConfig {
 pub struct IdMappings {
     pub id_map: HashMap<String, usize>,
     pub rev_map: HashMap<usize, String>,
+}
+
+/// PQ codebook laid out as [subvector][centroid][dimension within subvector]
+type Centroids = Vec<Vec<Vec<f32>>>;
+
+/// Everything the loader reads back for a quantized index
+struct QuantizationArtefacts {
+    config: QuantizationPersistence,
+    centroids: Option<Centroids>,
+    codes: HashMap<String, Vec<u8>>,
+}
+
+/// Training collection state, held back until after the graph rebuild
+///
+/// The rebuild re-adds every record through `add(overwrite=true)`, and every id
+/// is already in the restored mapping, so each one goes through
+/// `remove_point_internal` first. That strips the id from `training_ids`, and
+/// re-insertion cannot refill the list because collection is suppressed during
+/// a rebuild. Applying the collected ids afterwards is what makes them survive.
+struct TrainingState {
+    ids: Vec<String>,
+    threshold_reached: bool,
+    is_trained: bool,
+    training_size: usize,
+}
+
+impl TrainingState {
+    fn from(config: &QuantizationPersistence) -> Self {
+        TrainingState {
+            ids: config.training_ids.clone(),
+            threshold_reached: config.training_threshold_reached,
+            is_trained: config.is_trained,
+            training_size: config.training_size,
+        }
+    }
+
+    fn apply(self, index: &mut HNSWIndex) {
+        // A trained index cleared its collection when training ran, so this is
+        // only ever populated for an index saved while still collecting.
+        let collected = self.ids.len();
+        index.set_training_ids(self.ids);
+
+        // The saved flag is authoritative for a trained index. For an untrained
+        // one it is recomputed, so a directory whose collection was truncated
+        // does not come back claiming a threshold it no longer meets.
+        let reached = if self.is_trained {
+            self.threshold_reached
+        } else {
+            collected >= self.training_size
+        };
+        index.set_training_threshold_reached(reached);
+
+        println!(
+            "✅ Training state restored ({} collected ids, threshold reached: {})",
+            collected, reached
+        );
+    }
 }
 
 // ============================================================================
@@ -243,8 +366,74 @@ fn load_manifest(path: &Path) -> PyResult<IndexManifest> {
     Ok(manifest)
 }
 
-/// Load quantization configuration and components (for later implementation)
-fn load_quantization(path: &Path) -> PyResult<Option<QuantizationPersistence>> {
+/// Load the PQ codebook from pq_centroids.bin
+///
+/// Absent means the index was saved before training completed, which is a
+/// legitimate state. A present but unreadable file is a hard failure, because
+/// the alternative is a codebook that decodes every code to the zero vector.
+fn load_pq_centroids(path: &Path) -> PyResult<Option<Centroids>> {
+    let centroids_path = path.join("pq_centroids.bin");
+    if !centroids_path.exists() {
+        return Ok(None);
+    }
+
+    println!("🎯 Loading pq_centroids.bin...");
+
+    let centroids_data = fs::read(&centroids_path).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
+            "Failed to read pq_centroids.bin: {}",
+            e
+        ))
+    })?;
+
+    let (centroids, _): (Centroids, usize) =
+        bincode::decode_from_slice(&centroids_data, bincode::config::standard()).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to deserialize pq_centroids.bin: {}",
+                e
+            ))
+        })?;
+
+    println!(
+        "✅ pq_centroids.bin loaded ({} subvectors)",
+        centroids.len()
+    );
+    Ok(Some(centroids))
+}
+
+/// Load the quantized codes from pq_codes.bin
+///
+/// Absent means no record has been quantized yet. In `quantized_only` these
+/// codes are the only copy of every record added after training completed.
+fn load_pq_codes(path: &Path) -> PyResult<HashMap<String, Vec<u8>>> {
+    let codes_path = path.join("pq_codes.bin");
+    if !codes_path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    println!("📦 Loading pq_codes.bin...");
+
+    let codes_data = fs::read(&codes_path).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
+            "Failed to read pq_codes.bin: {}",
+            e
+        ))
+    })?;
+
+    let (codes, _): (HashMap<String, Vec<u8>>, usize) =
+        bincode::decode_from_slice(&codes_data, bincode::config::standard()).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to deserialize pq_codes.bin: {}",
+                e
+            ))
+        })?;
+
+    println!("✅ pq_codes.bin loaded ({} records)", codes.len());
+    Ok(codes)
+}
+
+/// Load quantization configuration and the codebook that goes with it
+fn load_quantization(path: &Path) -> PyResult<Option<QuantizationArtefacts>> {
     println!("🔧 Loading quantization components...");
 
     let quant_path = path.join("quantization.json");
@@ -269,10 +458,14 @@ fn load_quantization(path: &Path) -> PyResult<Option<QuantizationPersistence>> {
 
     println!("✅ quantization.json loaded");
 
-    // TODO: Load PQ centroids and codes if they exist
-    // This will be implemented when we handle quantization reconstruction
+    let centroids = load_pq_centroids(path)?;
+    let codes = load_pq_codes(path)?;
 
-    Ok(Some(quant_config))
+    Ok(Some(QuantizationArtefacts {
+        config: quant_config,
+        centroids,
+        codes,
+    }))
 }
 
 // ============================================================================
@@ -327,7 +520,7 @@ fn reconstruct_index_simple(
     mappings: IdMappings,
     metadata: HashMap<String, HashMap<String, Value>>,
     vectors: HashMap<String, Vec<f32>>,
-    quantization: Option<QuantizationPersistence>,
+    quantization: Option<QuantizationArtefacts>,
 ) -> PyResult<HNSWIndex> {
     println!("🔧 Creating empty index with loaded configuration...");
 
@@ -342,6 +535,16 @@ fn reconstruct_index_simple(
 
     println!("📝 Restoring data fields...");
 
+    // The codes are needed twice, once to rebuild the graph for records that
+    // have no raw vector and once to restore the stored codes afterwards.
+    let pq_codes = quantization
+        .as_ref()
+        .map(|q| q.codes.clone())
+        .unwrap_or_default();
+    let training_state = quantization
+        .as_ref()
+        .map(|q| TrainingState::from(&q.config));
+
     // Step 2: Restore all data fields directly (but not the graph)
     restore_data_fields(
         &mut index,
@@ -354,11 +557,63 @@ fn reconstruct_index_simple(
 
     println!("🔄 Rebuilding HNSW graph from vectors...");
 
-    // Step 3: Rebuild the graph by re-adding all vectors
-    rebuild_graph_from_data(&mut index, vectors, metadata)?;
+    // Step 3: Rebuild the graph by re-adding every record, reconstructing the
+    // ones that were stored as codes alone
+    rebuild_graph_from_data(&mut index, &vectors, &pq_codes, &metadata)?;
+
+    // Step 4: Put the stored record data back exactly as it was written. The
+    // rebuild routes through add(), which stores whatever vector it was given,
+    // so without this a reconstructed record would be kept at full width and
+    // quantized_only would lose the memory saving that is its whole purpose.
+    let raw_count = vectors.len();
+    let code_count = pq_codes.len();
+    index.restore_storage_maps(vectors, pq_codes, metadata);
+
+    // Step 5: Put back the training collection the rebuild stripped
+    if let Some(state) = training_state {
+        state.apply(&mut index);
+    }
+
+    // Step 6: Check the saved count against the index that was actually built
+    check_restored_count(&mut index, &config, raw_count, code_count)?;
 
     println!("✅ Reconstruction completed!");
     Ok(index)
+}
+
+/// Reconcile the stored vector count with the records that were restored
+///
+/// `vector_count` is written to config.json and was previously restored
+/// verbatim, so it could report records the directory no longer contains. The
+/// count is derived here from the restored data and asserted against the saved
+/// value. They agree for every directory whose files are intact, so a
+/// disagreement means a file is missing or truncated and the load fails rather
+/// than producing an index that misreports what it holds.
+fn check_restored_count(
+    index: &mut HNSWIndex,
+    config: &IndexConfig,
+    raw_count: usize,
+    code_count: usize,
+) -> PyResult<()> {
+    let restored = index.count_stored_records();
+
+    if restored != config.vector_count {
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Restored record count does not match config.json: the directory yields {} \
+             records while config.json reports {}. vectors.bin holds {} records and \
+             pq_codes.bin holds {}, so a data file is missing or truncated. Refusing to \
+             load an index that would report a count it cannot produce; restore the \
+             directory from a copy.",
+            restored, config.vector_count, raw_count, code_count
+        )));
+    }
+
+    index.set_vector_count(restored);
+    println!(
+        "✅ Vector count verified against restored records: {}",
+        restored
+    );
+    Ok(())
 }
 
 /// Restore all data fields to the index (everything except the HNSW graph)
@@ -368,7 +623,7 @@ fn restore_data_fields(
     _metadata: HashMap<String, HashMap<String, Value>>,
     _vectors: HashMap<String, Vec<f32>>,
     config: &IndexConfig,
-    quantization: Option<QuantizationPersistence>,
+    quantization: Option<QuantizationArtefacts>,
 ) -> PyResult<()> {
     index.set_id_mappings(mappings.id_map, mappings.rev_map);
 
@@ -381,12 +636,82 @@ fn restore_data_fields(
     // Restore counters
     index.set_counters(config.id_counter, config.vector_count);
 
+    // Restore index level metadata. Empty for a directory written before
+    // config.json carried the field, which is what those directories held.
+    if !config.metadata.is_empty() {
+        index.add_metadata(config.metadata.clone());
+        println!(
+            "✅ Index level metadata restored ({} entries)",
+            config.metadata.len()
+        );
+    }
+
     // Restore quantization state if present
-    if let Some(quant_data) = quantization {
-        restore_quantization_state_simple(index, quant_data)?;
+    if let Some(artefacts) = quantization {
+        restore_quantization_state_simple(index, artefacts.config, artefacts.centroids)?;
     }
 
     println!("✅ All data fields restored successfully");
+    Ok(())
+}
+
+/// Install a codebook read from disk into a freshly built PQ instance
+///
+/// The shape check catches a codebook that belongs to a different index. The
+/// all-zero check catches the one written by v0.3.0 through v0.4.1, which never
+/// read pq_centroids.bin on load and so re-saved the zero codebook that
+/// `PQ::new` starts with. Both fail the load rather than let the index come
+/// back reporting itself trained while decoding every code to zeros.
+fn install_centroids(pq: &PQ, centroids: Centroids) -> PyResult<()> {
+    let expected = (pq.subvectors, pq.num_centroids, pq.sub_dim);
+    let actual = (
+        centroids.len(),
+        centroids.first().map(|s| s.len()).unwrap_or(0),
+        centroids
+            .first()
+            .and_then(|s| s.first())
+            .map(|c| c.len())
+            .unwrap_or(0),
+    );
+    let uniform = centroids
+        .iter()
+        .all(|sub| sub.len() == actual.1 && sub.iter().all(|c| c.len() == actual.2));
+
+    if actual != expected || !uniform {
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "pq_centroids.bin does not match quantization.json: codebook is {}x{}x{}, \
+             expected {}x{}x{} for {} subvectors at {} bits. The codebook belongs to a \
+             different index, so this directory cannot be loaded.",
+            actual.0,
+            actual.1,
+            actual.2,
+            expected.0,
+            expected.1,
+            expected.2,
+            pq.subvectors,
+            pq.bits
+        )));
+    }
+
+    if centroids
+        .iter()
+        .all(|sub| sub.iter().all(|c| c.iter().all(|&v| v == 0.0)))
+    {
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "pq_centroids.bin holds an all-zero codebook, so every PQ code in this \
+             directory decodes to the zero vector. This is what a save performed by \
+             zeusdb-vector-database 0.3.0 through 0.4.1 writes over a directory it has \
+             just loaded, because those versions never read the codebook back. Restore \
+             the directory from a copy taken before that save; the records cannot be \
+             recovered from this one."
+                .to_string(),
+        ));
+    }
+
+    {
+        let mut guard = pq.centroids.write().unwrap();
+        *guard = centroids;
+    }
     Ok(())
 }
 
@@ -394,6 +719,7 @@ fn restore_data_fields(
 fn restore_quantization_state_simple(
     index: &mut HNSWIndex,
     quant_data: QuantizationPersistence,
+    centroids: Option<Centroids>,
 ) -> PyResult<()> {
     println!("🔧 Restoring quantization state...");
 
@@ -412,37 +738,46 @@ fn restore_quantization_state_simple(
     // Set quantization config
     index.set_quantization_config(Some(quant_config));
 
-    // Restore training IDs
-    index.set_training_ids(quant_data.training_ids.clone());
+    // The training ids and the threshold flag are applied after the graph
+    // rebuild, which would otherwise strip them. See TrainingState.
 
-    // Robust threshold logic
+    // Every quantized index needs a PQ instance, trained or not. Without one
+    // maybe_trigger_training can never fire, so an index saved while still
+    // collecting could reach the threshold again and still never train.
+    let pq = Arc::new(PQ::new(
+        index.get_dim(),
+        quant_data.subvectors,
+        quant_data.bits,
+        quant_data.training_size,
+        quant_data.max_training_vectors,
+    ));
+
     if !quant_data.is_trained {
-        // For untrained PQ, recalculate threshold from actual data
-        let threshold_should_be_reached = quant_data.training_ids.len() >= quant_data.training_size;
-        index.set_training_threshold_reached(threshold_should_be_reached);
+        index.set_pq(Some(pq));
 
         println!(
-            "✅ Quantization state restored (untrained, {} training IDs, threshold: {})",
-            quant_data.training_ids.len(),
-            threshold_should_be_reached
+            "✅ Quantization state restored (untrained, {} collected training IDs)",
+            quant_data.training_ids.len()
         );
     } else {
-        // For trained PQ, use the saved threshold and restore PQ instance
-        index.set_training_threshold_reached(quant_data.training_threshold_reached);
-
-        let pq = Arc::new(PQ::new(
-            index.get_dim(),
-            quant_data.subvectors,
-            quant_data.bits,
-            quant_data.training_size,
-            quant_data.max_training_vectors,
-        ));
+        // The codebook is what makes a trained PQ trained. Without it the
+        // instance would report itself trained while holding the zeros that
+        // PQ::new starts with, and every reconstruction would return them.
+        let centroids = centroids.ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
+                "quantization.json reports a trained codebook but pq_centroids.bin is \
+                 missing from the index directory. The codebook cannot be rebuilt from \
+                 the other files, so restore it from a copy of the saved directory."
+                    .to_string(),
+            )
+        })?;
+        install_centroids(&pq, centroids)?;
 
         pq.set_trained(true);
         index.set_pq(Some(pq));
 
         println!(
-            "✅ Quantization state restored (trained, {} training IDs)",
+            "✅ Quantization state restored (trained, codebook loaded, {} training IDs)",
             quant_data.training_ids.len()
         );
     }
@@ -450,36 +785,93 @@ fn restore_quantization_state_simple(
     Ok(())
 }
 
-/// Rebuild the HNSW graph by re-inserting all vectors using existing add logic
+/// Rebuild the HNSW graph by re-inserting every record using existing add logic
+///
+/// A record that has a raw vector is replayed from it. A record that has only
+/// PQ codes is reconstructed through the codebook, which is what `get_records`
+/// already does for the same record while the index is live, so the graph is
+/// built at the fidelity the storage mode already delivers rather than losing
+/// the record. The codes themselves are restored as stored and are never
+/// recomputed from a reconstruction.
 fn rebuild_graph_from_data(
     index: &mut HNSWIndex,
-    vectors: HashMap<String, Vec<f32>>,
-    metadata: HashMap<String, HashMap<String, Value>>,
+    vectors: &HashMap<String, Vec<f32>>,
+    pq_codes: &HashMap<String, Vec<u8>>,
+    metadata: &HashMap<String, HashMap<String, Value>>,
 ) -> PyResult<()> {
-    if vectors.is_empty() {
-        println!("ℹ️  No vectors to rebuild (quantized_only mode or empty index)");
+    if vectors.is_empty() && pq_codes.is_empty() {
+        println!("ℹ️  No records to rebuild (empty index)");
         return Ok(());
     }
-
-    println!("🔄 Rebuilding graph with {} vectors...", vectors.len());
 
     // Prepare batch data for efficient insertion
     let mut batch_vectors = Vec::new();
     let mut batch_ids = Vec::new();
     let mut batch_metadatas = Vec::new();
+    let mut reconstructed = 0usize;
+    let mut missing_metadata = 0usize;
 
-    // Collect all data maintaining ID consistency
+    // Every record with a raw vector, replayed from it
     for (ext_id, vector) in vectors.iter() {
-        if let Some(meta) = metadata.get(ext_id) {
-            batch_vectors.push(vector.clone());
+        if !metadata.contains_key(ext_id) {
+            missing_metadata += 1;
+        }
+        batch_vectors.push(vector.clone());
+        batch_ids.push(ext_id.clone());
+        batch_metadatas.push(metadata.get(ext_id).cloned().unwrap_or_default());
+    }
+
+    // Every record that has codes and no raw vector, reconstructed
+    let code_only: Vec<&String> = pq_codes
+        .keys()
+        .filter(|id| !vectors.contains_key(*id))
+        .collect();
+
+    if !code_only.is_empty() {
+        let pq = index.get_pq().cloned().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "{} records are stored as PQ codes with no raw vector, but the index has \
+                 no codebook to reconstruct them with. pq_codes.bin and quantization.json \
+                 disagree about whether this index was trained, so the directory cannot \
+                 be loaded without dropping those records.",
+                code_only.len()
+            ))
+        })?;
+
+        for ext_id in code_only {
+            let codes = &pq_codes[ext_id];
+            let vector = pq.reconstruct(codes).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Failed to reconstruct record '{}' from its {} PQ codes: {}. The \
+                     codebook in pq_centroids.bin does not fit the codes in pq_codes.bin.",
+                    ext_id,
+                    codes.len(),
+                    e
+                ))
+            })?;
+
+            if !metadata.contains_key(ext_id) {
+                missing_metadata += 1;
+            }
+            batch_vectors.push(vector);
             batch_ids.push(ext_id.clone());
-            batch_metadatas.push(meta.clone());
+            batch_metadatas.push(metadata.get(ext_id).cloned().unwrap_or_default());
+            reconstructed += 1;
         }
     }
 
+    if missing_metadata > 0 {
+        println!(
+            "⚠️  {} records have no entry in metadata.json and are restored with empty metadata",
+            missing_metadata
+        );
+    }
+
     println!(
-        "📦 Prepared {} vectors for batch insertion",
-        batch_vectors.len()
+        "📦 Prepared {} records for batch insertion ({} replayed from raw vectors, {} reconstructed from PQ codes)",
+        batch_vectors.len(),
+        batch_vectors.len() - reconstructed,
+        reconstructed
     );
 
     // SET FLAG: Prevent training ID collection during rebuild
@@ -605,6 +997,7 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
     println!("📋 Phase 1: Loading ZeusDB components...");
 
     let manifest = load_manifest(path_buf)?;
+    check_format_version(&manifest.format_version)?;
     println!(
         "✅ Manifest loaded: {} vectors, format v{}",
         manifest.total_vectors, manifest.format_version
@@ -628,8 +1021,14 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
     let quantization = load_quantization(path_buf)?;
     if let Some(ref quant) = quantization {
         println!(
-            "✅ Quantization loaded: {} subvectors, trained={}",
-            quant.subvectors, quant.is_trained
+            "✅ Quantization loaded: {} subvectors, trained={}, codebook={}",
+            quant.config.subvectors,
+            quant.config.is_trained,
+            if quant.centroids.is_some() {
+                "present"
+            } else {
+                "absent"
+            }
         );
     }
 
@@ -661,6 +1060,7 @@ fn save_config(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         expected_size: index.get_expected_size(),
         id_counter: index.get_id_counter(),
         vector_count: index.get_vector_count(),
+        metadata: index.get_all_metadata(),
     };
 
     let config_path = path.join("config.json");
@@ -977,7 +1377,7 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
     let total_size_mb = calculate_directory_size(path).unwrap_or(0.0);
 
     let manifest = IndexManifest {
-        format_version: "1.0.0".to_string(),
+        format_version: FORMAT_VERSION.to_string(),
         zeusdb_version: env!("CARGO_PKG_VERSION").to_string(),
         created_at: index.get_created_at().to_string(),
         saved_at: Utc::now().to_rfc3339(),
