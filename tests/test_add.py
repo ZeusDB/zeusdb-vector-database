@@ -248,28 +248,6 @@ def test_mixed_format_error_handling():
     assert len(records) == 2
 
 # ------------------------------------------------------------
-# Test 17: Test error handling with AddResult
-# ------------------------------------------------------------
-def test_error_handling_add_result():
-    vdb = VectorDatabase()
-    index = vdb.create("hnsw", dim=4, expected_size=5)
-    
-    # Test batch with errors
-    error_records = [
-        {"id": "valid1", "values": [0.1, 0.2, 0.3, 0.4], "metadata": {"type": "valid"}},
-        {"id": "invalid", "values": [0.1, 0.2], "metadata": {"type": "invalid"}},  # Wrong dimension
-        {"id": "valid2", "values": [0.5, 0.6, 0.7, 0.8], "metadata": {"type": "valid"}},
-    ]
-    
-    result = index.add(error_records)
-    assert result.total_inserted == 2  # 2 valid records
-    assert result.total_errors == 1    # 1 invalid record
-    assert len(result.errors) == 1
-    assert not result.is_success()
-    assert "2 inserted" in result.summary()
-    assert "1 errors" in result.summary()
-
-# ------------------------------------------------------------
 # Test 23: Test overwrite functionality
 # ------------------------------------------------------------
 def test_overwrite_functionality():
@@ -464,3 +442,45 @@ def test_add_overwrite_replaces_metadata_wholesale():
     # An overwrite carrying empty metadata clears the map entirely.
     index.add({"id": "doc1", "values": [0.5, 0.6], "metadata": {}})
     assert index.get_records("doc1", return_vector=False)[0]["metadata"] == {}
+
+# ------------------------------------------------------------
+# Test 93: vector_shape on a batch that contains errors
+# ------------------------------------------------------------
+def test_add_result_vector_shape_counts_errors():
+    """vector_shape describes the input, not what was inserted.
+
+    The Rust computes it as parsed records plus parse errors, so a batch that
+    partly failed still reports its own length. Every existing assertion on
+    vector_shape is against a clean batch, where the two are the same number.
+    """
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=4, expected_size=10)
+
+    result = index.add([
+        {"id": "ok1", "values": [0.1, 0.2, 0.3, 0.4], "metadata": {}},
+        {"id": "bad", "values": [0.1, 0.2], "metadata": {}},  # Wrong dimension
+        {"id": "ok2", "values": [0.5, 0.6, 0.7, 0.8], "metadata": {}},
+    ])
+
+    assert result.total_inserted == 2
+    assert result.total_errors == 1
+    # Three rows, not two, and the second element is the index dimension rather
+    # than the dimension of any input vector.
+    assert result.vector_shape == (3, 4)
+    assert "(3, 4)" in repr(result)
+
+    # Every record failing still reports the input shape.
+    all_bad = index.add([
+        {"id": "bad1", "values": [0.1], "metadata": {}},
+        {"id": "bad2", "values": [0.1, 0.2, 0.3, 0.4, 0.5], "metadata": {}},
+    ])
+    assert all_bad.total_inserted == 0
+    assert all_bad.total_errors == 2
+    assert all_bad.vector_shape == (2, 4)
+
+    # An add carrying no records at all reports a zero row shape.
+    empty = index.add([])
+    assert empty.total_inserted == 0
+    assert empty.total_errors == 0
+    assert empty.vector_shape == (0, 4)
+    assert empty.is_success()

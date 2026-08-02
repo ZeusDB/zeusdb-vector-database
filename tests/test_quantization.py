@@ -200,69 +200,98 @@ def test_pq_memory_usage_and_compression():
     assert memory_mb < 100  # Should be less than 100MB for this config
 
 # ------------------------------------------------------------
-# Test 34: PQ Quantized Search Functionality
+# Test 34: PQ Quantized Search, Large Batches and Batch Search
 # ------------------------------------------------------------
-def test_pq_quantized_search():
+def test_pq_quantized_search_and_batch_operations():
+    """Search behaviour on a quantized index, built from one oversized batch.
+
+    This carries the distinguishing content of two earlier tests that each
+    built their own PQ index, added 1000 to 1500 vectors, asserted
+    is_quantized() and then asserted a search returned results. The shared
+    setup is now a single index and a single k-means run, and every clause that
+    distinguished the two is asserted below exactly once.
+    """
     vdb = VectorDatabase()
-    
-    # Use minimum valid training size
+
     quantization_config = {
         'type': 'pq',
         'subvectors': 8,
         'bits': 8,
         'training_size': 1000
     }
-    
+
     # ✅ EXPECT the compression warning (256÷8 = 32x, but 4 bytes = 128x)
     with pytest.warns(UserWarning, match="Very high compression ratio.*128.0x.*may significantly impact recall quality"):
         index = vdb.create(
-            "hnsw", 
+            "hnsw",
             dim=256,
             quantization_config=quantization_config,
-            expected_size=1500
+            expected_size=2000
         )
-    
-    # Add training data to trigger quantization
-    training_data = []
-    for i in range(1000):
-        training_data.append({
-            "id": f"doc_{i}",
-            "vector": np.random.rand(256).astype(np.float32).tolist(),
-            "metadata": {"category": "A" if i % 2 == 0 else "B", "index": i}
-        })
-    
-    result = index.add(training_data)
+
+    # The same subvector count at dim 384 produces a different ratio. The
+    # warning text asserts the dim * 4 / subvectors arithmetic, so the second
+    # pairing is kept even though this test does its work at dim 256. No
+    # vectors are added, so this costs a construction and nothing else.
+    with pytest.warns(UserWarning, match="Very high compression ratio.*192.0x.*may significantly impact recall quality"):
+        vdb.create("hnsw", dim=384, quantization_config=quantization_config, expected_size=10)
+
+    # A single batch larger than training_size, added through Format 5, which
+    # both triggers training and populates the index in one call.
+    batch_size = 1500  # Larger than training_size
+    large_batch = {
+        "ids": [f"doc_{i}" for i in range(batch_size)],
+        "embeddings": np.random.rand(batch_size, 256).astype(np.float32),
+        "metadatas": [{"category": "A" if i % 2 == 0 else "B", "batch": "large", "index": i}
+                      for i in range(batch_size)]
+    }
+
+    result = index.add(large_batch)
     assert result.is_success()
+    assert result.total_inserted == batch_size
     assert index.is_quantized()  # Should be using quantized search
-    
+
     # Test search on quantized index
     query_vector = np.random.rand(256).astype(np.float32).tolist()
     search_results = index.search(query_vector, top_k=5)
-    
+
     assert len(search_results) == 5
     for result in search_results:
         assert "id" in result
         assert "score" in result
         assert "metadata" in result
         assert result["score"] >= 0.0
-    
+
     # Test filtered search on quantized index
     filtered_results = index.search(
-        query_vector, 
-        filter={"category": "A"}, 
+        query_vector,
+        filter={"category": "A"},
         top_k=10
     )
-    
+
     assert len(filtered_results) >= 1
     for result in filtered_results:
         assert result["metadata"]["category"] == "A"
-    
+
     # Test search with vector return (should work with quantized index)
     vector_results = index.search(query_vector, top_k=3, return_vector=True)
     assert len(vector_results) == 3
     for result in vector_results:
         assert "vector" in result
         assert len(result["vector"]) == 256
+
+    # Test batch search on quantized index
+    num_queries = 10
+    query_batch = np.random.rand(num_queries, 256).astype(np.float32)
+
+    batch_results = index.search(query_batch, top_k=5)
+    assert len(batch_results) == num_queries
+
+    for query_results in batch_results:
+        assert len(query_results) == 5
+        for result in query_results:
+            assert result["metadata"]["batch"] == "large"
+            assert isinstance(result["metadata"]["index"], int)
 
 # ------------------------------------------------------------
 # Test 35: PQ Different Configurations Performance
@@ -337,54 +366,6 @@ def test_pq_different_configurations():
             assert result["metadata"]["config"] == name
             assert isinstance(result["score"], float)
             assert result["score"] >= 0.0
-
-# ------------------------------------------------------------
-# Test 36: PQ with Large Batch Operations
-# ------------------------------------------------------------
-def test_pq_large_batch_operations():
-    vdb = VectorDatabase()
-    
-    quantization_config = {
-        'type': 'pq',
-        'subvectors': 8,
-        'bits': 8,
-        'training_size': 1000
-    }
-    
-    # ✅ EXPECT the compression warning (384÷8 = 48x, but 4 bytes = 192x)
-    with pytest.warns(UserWarning, match="Very high compression ratio.*192.0x.*may significantly impact recall quality"):
-        index = vdb.create(
-            "hnsw",
-            dim=384,
-            quantization_config=quantization_config,
-            expected_size=2000
-        )
-    
-    # Add large batch to trigger training
-    batch_size = 1500  # Larger than training_size
-    large_batch = {
-        "ids": [f"batch_doc_{i}" for i in range(batch_size)],
-        "embeddings": np.random.rand(batch_size, 384).astype(np.float32),
-        "metadatas": [{"batch": "large", "index": i} for i in range(batch_size)]
-    }
-    
-    result = index.add(large_batch)
-    assert result.is_success()
-    assert result.total_inserted == batch_size
-    assert index.is_quantized()
-    
-    # Test batch search on quantized index
-    num_queries = 10
-    query_batch = np.random.rand(num_queries, 384).astype(np.float32)
-    
-    batch_results = index.search(query_batch, top_k=5)
-    assert len(batch_results) == num_queries
-    
-    for query_results in batch_results:
-        assert len(query_results) == 5
-        for result in query_results:
-            assert result["metadata"]["batch"] == "large"
-            assert isinstance(result["metadata"]["index"], int)
 
 # ------------------------------------------------------------
 # Test 37: PQ Training Size Limits and Max Training Vectors
@@ -801,18 +782,19 @@ def test_storage_mode_error_handling():
                 'training_size': 1000,
                 'storage_mode': variant
             }
-            
+
             with pytest.warns(UserWarning):  # Expect compression warning
                 index = vdb.create("hnsw", dim=256, quantization_config=config)
-            
+
             assert index is not None
             # Storage mode should be normalized to lowercase
             quant_info = index.get_quantization_info()
             assert quant_info is not None
-            
+            assert index.get_stats()["storage_mode"] == variant.lower()
+
         except Exception as e:
             pytest.fail(f"Case insensitive storage mode '{variant}' should work, but got: {e}")
-    
+
     # Test 3: Default storage mode behavior (no storage_mode specified)
     default_config = {
         'type': 'pq',
@@ -821,28 +803,18 @@ def test_storage_mode_error_handling():
         'training_size': 1000
         # No storage_mode specified - should default to quantized_only
     }
-    
+
     with pytest.warns(UserWarning, match="Very high compression ratio.*128.0x"):
         default_index = vdb.create("hnsw", dim=128, quantization_config=default_config)
-    
-    # Add training data
-    training_data = []
-    for i in range(1200):
-        training_data.append({
-            "id": f"default_doc_{i}",
-            "vector": np.random.rand(128).astype(np.float32).tolist(),
-            "metadata": {"type": "default_test"}
-        })
-    
-    result = default_index.add(training_data)
-    assert result.is_success()
-    
-    # Should behave like quantized_only (default)
-    stats = default_index.get_stats()
-    assert stats["storage_mode"] == "quantized_only"
-    assert int(stats["raw_vectors_stored"]) == 1000  # Only training vectors stored
-    assert int(stats["quantized_codes_stored"]) == 1200  # All vectors quantized
-    
+
+    # get_stats reports the configured storage mode from construction, while
+    # get_storage_mode reports the current lifecycle state, so the default is
+    # observable without adding any data. What quantized_only then does at
+    # runtime, storing raw vectors up to training_size and codes for every
+    # vector, is asserted for the explicit mode in test_storage_mode_configuration.
+    assert default_index.get_stats()["storage_mode"] == "quantized_only"
+    assert default_index.get_storage_mode() == "raw_collecting_for_training"
+
     # Test 4: Storage mode with backward compatibility (no quantization)
     no_quant_index = vdb.create("hnsw", dim=64)  # No quantization config
     
@@ -868,69 +840,338 @@ def test_storage_mode_error_handling():
     query = np.random.rand(64).tolist()
     search_results = no_quant_index.search(query, top_k=2)
     assert len(search_results) == 2
-    
-    # Test 5: Storage mode transitions during lifecycle
-    transition_config = {
-        'type': 'pq',
-        'subvectors': 8,
-        'bits': 8,
-        'training_size': 1000,
-        'storage_mode': 'quantized_with_raw'
+
+    # The lifecycle transition that used to close this test, a
+    # raw_collecting_for_training to quantized_active walk at dim 192 with
+    # quantized_with_raw, is covered without a second k-means run. The
+    # transition itself is asserted phase by phase in
+    # test_pq_storage_mode_transition_completes_training, the pre-training
+    # state in test_pq_training_trigger_and_progress, the quantized_active
+    # state in test_pq_stats_and_information, and the quantized_with_raw
+    # storage counters in test_storage_mode_configuration and
+    # test_pq_overwrite_after_training_quantized_with_raw.
+
+# ------------------------------------------------------------
+# Shared setup for the ported overwrite and rebuild coverage
+# ------------------------------------------------------------
+# Every test below uses dim 8 over 4 subvectors with training_size set
+# explicitly. Benchmark 43 omitted training_size, so
+# _calculate_smart_training_size(4, 8) returned 10,000 against 5,500 added
+# vectors, training never completed, and every overwrite it claimed to test in
+# a quantized state actually ran in raw_collecting_for_training. Setting
+# training_size to its 1000 minimum and adding 1,010 vectors reaches the
+# quantized state for the cost of one k-means run at sub dimension 2.
+#
+# 8 * 4 / 4 is 8x compression, below the 50x threshold in _check_memory_usage,
+# so quantized_only emits no warning. quantized_with_raw warns unconditionally
+# and that warning is matched where it is used.
+PQ_DIM = 8
+PQ_TRAINING_SIZE = 1000
+PQ_TOTAL = 1010
+
+
+def _overwrite_pq_config(storage_mode):
+    return {
+        "type": "pq",
+        "subvectors": 4,
+        "bits": 8,
+        "training_size": PQ_TRAINING_SIZE,
+        "storage_mode": storage_mode,
     }
-    
-    with pytest.warns(UserWarning):
-        transition_index = vdb.create("hnsw", dim=192, quantization_config=transition_config)
-    
-    # Before training: should be in collecting mode
-    assert transition_index.get_storage_mode() == "raw_collecting_for_training"
-    assert not transition_index.is_quantized()
-    
-    # Add training data
-    pre_training_data = []
-    for i in range(500):  # Less than training_size
-        pre_training_data.append({
-            "id": f"pre_{i}",
-            "vector": np.random.rand(192).tolist(),
-            "metadata": {"phase": "pre_training"}
-        })
-    
-    result = transition_index.add(pre_training_data)
+
+
+def _make_trained_pq_index(storage_mode, seed=20260802):
+    """Build a PQ index whose training has actually completed."""
+    vdb = VectorDatabase()
+    if storage_mode == "quantized_with_raw":
+        with pytest.warns(UserWarning,
+                          match=r"storage_mode='quantized_with_raw' will use ~8\.0x more memory"):
+            index = vdb.create("hnsw", dim=PQ_DIM,
+                               quantization_config=_overwrite_pq_config(storage_mode),
+                               expected_size=2000)
+    else:
+        index = vdb.create("hnsw", dim=PQ_DIM,
+                           quantization_config=_overwrite_pq_config(storage_mode),
+                           expected_size=2000)
+
+    # A local Generator keeps the draws reproducible without touching the
+    # global numpy random state.
+    rng = np.random.default_rng(seed)
+    result = index.add({
+        "ids": [f"train_{i}" for i in range(PQ_TOTAL)],
+        "embeddings": rng.random((PQ_TOTAL, PQ_DIM)).astype(np.float32),
+        "metadatas": [{"type": "training", "index": i} for i in range(PQ_TOTAL)],
+    })
     assert result.is_success()
-    
-    # Still collecting
-    assert not transition_index.is_training_ready()
-    assert transition_index.get_storage_mode() == "raw_collecting_for_training"
-    
-    # Complete training
-    post_training_data = []
-    for i in range(500, 1000):
-        post_training_data.append({
-            "id": f"post_{i}",
-            "vector": np.random.rand(192).tolist(),
-            "metadata": {"phase": "complete_training"}
-        })
-    
-    result = transition_index.add(post_training_data)
-    assert result.is_success()
-    
-    # Should now be quantized and active
-    assert transition_index.is_quantized()
-    assert transition_index.get_storage_mode() == "quantized_active"
-    
-    # Add post-training data to test storage mode behavior
-    final_data = []
-    for i in range(1000, 1100):
-        final_data.append({
-            "id": f"final_{i}",
-            "vector": np.random.rand(192).tolist(),
-            "metadata": {"phase": "post_training"}
-        })
-    
-    result = transition_index.add(final_data)
-    assert result.is_success()
-    
-    # Verify quantized_with_raw behavior: should store all vectors
-    final_stats = transition_index.get_stats()
-    assert int(final_stats["raw_vectors_stored"]) == 1100  # All vectors stored
-    assert int(final_stats["quantized_codes_stored"]) == 1100  # All vectors quantized
-    assert final_stats["storage_mode"] == "quantized_with_raw"
+    assert index.is_quantized(), "training must complete before the overwrite is exercised"
+    return index
+
+
+def _duplicate_ids(hits):
+    seen = {}
+    for hit in hits:
+        seen[hit["id"]] = seen.get(hit["id"], 0) + 1
+    return sorted(k for k, v in seen.items() if v > 1)
+
+# ------------------------------------------------------------
+# Test 78: Overwrite while still collecting vectors for training
+# ------------------------------------------------------------
+def test_pq_overwrite_while_collecting_for_training():
+    """The state benchmark 43 actually exercised, which was itself untested."""
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=PQ_DIM,
+                       quantization_config=_overwrite_pq_config("quantized_only"),
+                       expected_size=1000)
+
+    assert index.get_storage_mode() == "raw_collecting_for_training"
+    assert not index.is_quantized()
+
+    originals = [{"id": f"doc_{i}",
+                  "vector": [float(i + 1)] + [0.0] * (PQ_DIM - 1),
+                  "metadata": {"version": 1, "text": f"original {i}"}}
+                 for i in range(10)]
+    assert index.add(originals).is_success()
+    assert index.get_vector_count() == 10
+    assert index.get_storage_mode() == "raw_collecting_for_training"
+
+    # Overwrite half of them while the index is still collecting.
+    updated_vector = [0.0, 1.0] + [0.0] * (PQ_DIM - 2)
+    result = index.add([{"id": f"doc_{i}", "vector": updated_vector,
+                         "metadata": {"version": 2, "text": f"updated {i}"}}
+                        for i in range(5)])
+    assert result.total_inserted == 5
+    assert result.total_errors == 0
+
+    # No record was duplicated and none was lost.
+    assert index.get_vector_count() == 10
+    assert len(index.list(number=100)) == 10
+    for i in range(10):
+        assert len(index.get_records(f"doc_{i}", return_vector=False)) == 1
+
+    # Content is the second version for the overwritten half only.
+    for i in range(5):
+        assert index.get_records(f"doc_{i}", return_vector=False)[0]["metadata"]["version"] == 2
+    for i in range(5, 10):
+        assert index.get_records(f"doc_{i}", return_vector=False)[0]["metadata"]["version"] == 1
+
+    # Raw search still sees every record and returns each id once.
+    hits = index.search(updated_vector, top_k=20)
+    assert _duplicate_ids(hits) == []
+    assert {h["id"] for h in hits} == {f"doc_{i}" for i in range(10)}
+
+    # Training progress counts records, not add calls, so the five overwrites
+    # did not inflate it.
+    assert index.training_vectors_needed() == PQ_TRAINING_SIZE - 10
+    assert not index.is_training_ready()
+
+    # Rapid successive overwrites of one id leave exactly one record behind,
+    # and the last write wins.
+    for i in range(10):
+        rapid = index.add({"id": "rapid", "vector": [0.0, 0.0, float(i + 1)] + [0.0] * 5,
+                           "metadata": {"iteration": i}})
+        assert rapid.total_errors == 0
+    assert index.get_vector_count() == 11
+    assert len(index.get_records("rapid", return_vector=False)) == 1
+    assert index.get_records("rapid", return_vector=False)[0]["metadata"]["iteration"] == 9
+    rapid_hits = index.search([0.0, 0.0, 1.0] + [0.0] * 5, top_k=20)
+    assert sum(1 for h in rapid_hits if h["id"] == "rapid") == 1
+    assert _duplicate_ids(rapid_hits) == []
+
+# ------------------------------------------------------------
+# Test 79: Overwrite after training completes, quantized_only
+# ------------------------------------------------------------
+def test_pq_overwrite_after_training_quantized_only():
+    index = _make_trained_pq_index("quantized_only")
+    assert index.get_storage_mode() == "quantized_active"
+
+    baseline = index.get_stats()
+    assert int(baseline["raw_vectors_stored"]) == PQ_TRAINING_SIZE
+    assert int(baseline["quantized_codes_stored"]) == PQ_TOTAL
+
+    target = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert index.add({"id": "target", "vector": target,
+                      "metadata": {"version": 1}}).is_success()
+    assert index.get_vector_count() == PQ_TOTAL + 1
+
+    replacement = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    result = index.add({"id": "target", "vector": replacement,
+                        "metadata": {"version": 2}})
+    assert result.total_inserted == 1
+    assert result.total_errors == 0
+
+    # The count does not grow and the id resolves to exactly one record.
+    assert index.get_vector_count() == PQ_TOTAL + 1
+    records = index.get_records("target", return_vector=True)
+    assert len(records) == 1
+    assert records[0]["metadata"] == {"version": 2}
+
+    # Storage accounting is unchanged by the overwrite. quantized_only stops
+    # storing raw vectors once training completes, so the post training record
+    # contributes a code and no raw vector.
+    after = index.get_stats()
+    assert int(after["raw_vectors_stored"]) == PQ_TRAINING_SIZE
+    assert int(after["quantized_codes_stored"]) == PQ_TOTAL + 1
+    assert after["storage_mode"] == "quantized_only"
+
+    # Current behaviour, asserted rather than expected. contains and list both
+    # read the raw vector map, so under quantized_only they are blind to any
+    # record added after training even though get_records reconstructs it from
+    # its code. The expectation this violates is that the three agree on which
+    # ids the index holds.
+    assert not index.contains("target")
+    assert len(index.list(number=PQ_TOTAL + 100)) == PQ_TRAINING_SIZE
+
+    # Whatever quantized search returns, it returns each id at most once.
+    assert _duplicate_ids(index.search(replacement, top_k=25)) == []
+
+# ------------------------------------------------------------
+# Test 80: Overwrite after training completes, quantized_with_raw
+# ------------------------------------------------------------
+def test_pq_overwrite_after_training_quantized_with_raw():
+    index = _make_trained_pq_index("quantized_with_raw")
+    assert index.get_storage_mode() == "quantized_active"
+
+    baseline = index.get_stats()
+    assert int(baseline["raw_vectors_stored"]) == PQ_TOTAL
+    assert int(baseline["quantized_codes_stored"]) == PQ_TOTAL
+
+    target = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert index.add({"id": "target", "vector": target,
+                      "metadata": {"version": 1}}).is_success()
+
+    replacement = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    result = index.add({"id": "target", "vector": replacement,
+                        "metadata": {"version": 2}})
+    assert result.total_inserted == 1
+    assert result.total_errors == 0
+
+    assert index.get_vector_count() == PQ_TOTAL + 1
+    records = index.get_records("target", return_vector=True)
+    assert len(records) == 1
+    assert records[0]["metadata"] == {"version": 2}
+
+    # quantized_with_raw keeps every raw vector, so the replacement is exact
+    # after cosine normalization rather than reconstructed from its code.
+    assert records[0]["vector"] == pytest.approx(replacement, abs=1e-6)
+
+    # Both counters grow by one, and neither grows by two.
+    after = index.get_stats()
+    assert int(after["raw_vectors_stored"]) == PQ_TOTAL + 1
+    assert int(after["quantized_codes_stored"]) == PQ_TOTAL + 1
+    assert after["storage_mode"] == "quantized_with_raw"
+
+    # Unlike quantized_only, the raw map keeps the record visible everywhere.
+    assert index.contains("target")
+    assert len(index.list(number=PQ_TOTAL + 100)) == PQ_TOTAL + 1
+
+    assert _duplicate_ids(index.search(replacement, top_k=25)) == []
+
+    # Repeated overwrites of one id leave one record behind.
+    for i in range(3):
+        rapid = index.add({"id": "target", "vector": [0.0, float(i + 1)] + [0.0] * 6,
+                           "metadata": {"version": 3, "iteration": i}})
+        assert rapid.total_errors == 0
+    assert index.get_vector_count() == PQ_TOTAL + 1
+    assert len(index.get_records("target", return_vector=False)) == 1
+    assert index.get_records("target", return_vector=False)[0]["metadata"]["iteration"] == 2
+
+# ------------------------------------------------------------
+# Test 81: The storage mode transition through all three phases
+# ------------------------------------------------------------
+def test_pq_storage_mode_transition_completes_training():
+    """The lifecycle benchmark 43 named but never reached, at 1010 vectors."""
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=PQ_DIM,
+                       quantization_config=_overwrite_pq_config("quantized_only"),
+                       expected_size=2000)
+    rng = np.random.default_rng(20260802)
+
+    # Phase 1, empty and collecting.
+    assert index.get_storage_mode() == "raw_collecting_for_training"
+    assert not index.is_quantized()
+    assert not index.can_use_quantization()
+    assert index.get_training_progress() == 0.0
+    assert index.training_vectors_needed() == PQ_TRAINING_SIZE
+
+    # An overwrite in this phase is still a plain raw overwrite.
+    index.add({"id": "tracker", "vector": [1.0] + [0.0] * 7, "metadata": {"phase": "collecting"}})
+    index.add({"id": "tracker", "vector": [0.0, 1.0] + [0.0] * 6, "metadata": {"phase": "collecting_2"}})
+    assert index.get_vector_count() == 1
+    assert index.get_records("tracker", return_vector=False)[0]["metadata"]["phase"] == "collecting_2"
+
+    # Phase 2, half way to the training threshold.
+    half = PQ_TRAINING_SIZE // 2
+    assert index.add({"ids": [f"pre_{i}" for i in range(half - 1)],
+                      "embeddings": rng.random((half - 1, PQ_DIM)).astype(np.float32)}).is_success()
+    assert index.get_vector_count() == half
+    assert index.get_storage_mode() == "raw_collecting_for_training"
+    assert index.get_training_progress() == 50.0
+    assert index.training_vectors_needed() == half
+    assert not index.is_training_ready()
+    assert not index.is_quantized()
+
+    # Phase 3, the threshold is crossed and training runs.
+    assert index.add({"ids": [f"post_{i}" for i in range(half)],
+                      "embeddings": rng.random((half, PQ_DIM)).astype(np.float32)}).is_success()
+    assert index.get_training_progress() == 100.0
+    assert index.training_vectors_needed() == 0
+    assert index.is_training_ready()
+    assert index.can_use_quantization()
+    assert index.is_quantized()
+    assert index.get_storage_mode() == "quantized_active"
+
+    trained = index.get_stats()
+    assert int(trained["raw_vectors_stored"]) == PQ_TRAINING_SIZE
+    assert int(trained["quantized_codes_stored"]) == PQ_TRAINING_SIZE
+
+    # Phase 4, records added after training are quantized but not stored raw.
+    assert index.add({"ids": [f"late_{i}" for i in range(10)],
+                      "embeddings": rng.random((10, PQ_DIM)).astype(np.float32)}).is_success()
+    final = index.get_stats()
+    assert index.get_storage_mode() == "quantized_active"
+    assert int(final["raw_vectors_stored"]) == PQ_TRAINING_SIZE
+    assert int(final["quantized_codes_stored"]) == PQ_TRAINING_SIZE + 10
+    assert int(final["total_vectors"]) == PQ_TRAINING_SIZE + 10
+
+    # An overwrite after training still replaces rather than duplicating.
+    index.add({"id": "tracker", "vector": [0.0, 0.0, 1.0] + [0.0] * 5,
+               "metadata": {"phase": "quantized"}})
+    assert index.get_vector_count() == PQ_TRAINING_SIZE + 10
+    assert len(index.get_records("tracker", return_vector=False)) == 1
+    assert index.get_records("tracker", return_vector=False)[0]["metadata"]["phase"] == "quantized"
+
+# ------------------------------------------------------------
+# Test 82: rebuild_with_quantization
+# ------------------------------------------------------------
+def test_pq_rebuild_with_quantization():
+    """The only call site anywhere was benchmark 23, which is otherwise obsolete."""
+    vdb = VectorDatabase()
+
+    # An index with no quantization configured returns False rather than raising.
+    plain = vdb.create("hnsw", dim=PQ_DIM, expected_size=100)
+    plain.add({"id": "a", "vector": [0.1] * PQ_DIM, "metadata": {}})
+    assert plain.rebuild_with_quantization() is False
+
+    # A configured but untrained index also returns False. This is the case
+    # benchmark 23 asserted.
+    untrained = vdb.create("hnsw", dim=PQ_DIM,
+                           quantization_config=_overwrite_pq_config("quantized_only"),
+                           expected_size=2000)
+    untrained.add({"id": "a", "vector": [0.1] * PQ_DIM, "metadata": {}})
+    assert untrained.rebuild_with_quantization() is False
+    assert not untrained.is_quantized()
+
+    # A trained index rebuilds, and rebuilding an already quantized index is
+    # safe to repeat.
+    index = _make_trained_pq_index("quantized_with_raw")
+    assert index.is_quantized()
+    assert index.rebuild_with_quantization() is True
+    assert index.is_quantized()
+    assert index.get_storage_mode() == "quantized_active"
+    assert int(index.get_stats()["quantized_codes_stored"]) == PQ_TOTAL
+    assert index.get_vector_count() == PQ_TOTAL
+
+    # The rebuild does not disturb the records.
+    record = index.get_records("train_5", return_vector=True)[0]
+    assert record["metadata"] == {"type": "training", "index": 5}
+    assert len(record["vector"]) == PQ_DIM

@@ -1,5 +1,6 @@
 """Record retrieval, removal, listing and index level metadata."""
 
+import numpy as np
 from zeusdb_vector_database import VectorDatabase
 
 # ------------------------------------------------------------
@@ -123,3 +124,125 @@ def test_list_records():
         assert isinstance(doc_id, str)
         assert isinstance(metadata, dict)
         assert "author" in metadata
+
+# ------------------------------------------------------------
+# Test 91: A removed point stops appearing in search results
+# ------------------------------------------------------------
+def test_remove_point_removes_from_search_results():
+    """Removal was only ever checked through contains, never through search."""
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=16, expected_size=500)
+
+    # A local Generator keeps the draws reproducible without touching the
+    # global numpy random state.
+    rng = np.random.default_rng(20260802)
+    count = 200
+    vectors = rng.random((count, 16)).astype(np.float32)
+    ids = [f"doc_{i}" for i in range(count)]
+    assert index.add({
+        "ids": ids,
+        "embeddings": vectors,
+        "metadatas": [{"i": i} for i in range(count)],
+    }).is_success()
+
+    # The exact match for its own vector is the first hit before removal.
+    query = vectors[7].tolist()
+    before = index.search(query, top_k=10)
+    assert before[0]["id"] == "doc_7"
+    assert len(before) == 10
+
+    assert index.remove_point("doc_7") is True
+    assert not index.contains("doc_7")
+    assert index.get_vector_count() == count - 1
+    assert index.get_records("doc_7") == []
+
+    # The removed id is gone from the ranking. This is the part that holds.
+    after = index.search(query, top_k=10)
+    assert all(hit["id"] != "doc_7" for hit in after)
+
+    # Current behaviour, asserted rather than expected. remove_point_internal
+    # clears the id maps, the vector, the metadata and the codes, but it does
+    # not touch the HNSW graph, so the removed point keeps its node. The
+    # traversal still returns that node, the external id lookup finds nothing
+    # and the hit is dropped without another candidate taking its place, so
+    # the page comes back one short. The expectation this violates is that a
+    # search over 199 remaining records returns a full page of 10.
+    assert len(after) == 9
+    assert len(index.search(query, top_k=5)) == 4
+    assert len(index.search(query, top_k=20)) == 19
+
+    # Raising ef_search widens the candidate list but does not backfill the
+    # slot, so the shortfall is not a recall effect that more search fixes.
+    assert len(index.search(query, top_k=10, ef_search=200)) == 9
+
+    # A query whose candidate window never reaches the removed node is
+    # unaffected, which is what makes the shortfall easy to miss.
+    assert len(index.search(vectors[150].tolist(), top_k=10)) == 10
+
+    # Re-adding the same id does not reclaim the dead node. The record comes
+    # back and is returned, and the page is still one short.
+    index.add({"id": "doc_7", "values": query, "metadata": {"i": 7}})
+    assert index.contains("doc_7")
+    revived = index.search(query, top_k=10)
+    assert any(hit["id"] == "doc_7" for hit in revived)
+    assert len(revived) == 9
+    assert index.remove_point("doc_7") is True
+
+    # A wider removal is not visible in a wider search either.
+    removed = {f"doc_{i}" for i in range(10, 30)}
+    for doc_id in sorted(removed):
+        assert index.remove_point(doc_id) is True
+
+    assert index.get_vector_count() == count - 1 - len(removed)
+    assert len(index.list(number=count)) == count - 1 - len(removed)
+
+    wide = index.search(vectors[15].tolist(), top_k=50)
+    assert removed.isdisjoint({hit["id"] for hit in wide})
+    # The shortfall is one slot per dead node inside the candidate window, so
+    # it is bounded by the number removed and cannot be zero here. The observed
+    # value for this seed is 45 of 50, and that figure is not asserted because
+    # it depends on which dead nodes the traversal happens to reach.
+    assert 0 < len(wide) < 50
+    assert 50 - len(wide) <= len(removed) + 1
+
+    # The batch path agrees with the single path.
+    batch = index.search(np.array([vectors[15], vectors[7]], dtype=np.float32), top_k=25)
+    assert len(batch) == 2
+    returned = {hit["id"] for result in batch for hit in result}
+    assert returned.isdisjoint(removed | {"doc_7"})
+
+    # A filtered search cannot resurrect them either.
+    filtered = index.search(vectors[15].tolist(), filter={"i": {"gte": 10, "lt": 30}}, top_k=25)
+    assert all(hit["id"] not in removed for hit in filtered)
+
+# ------------------------------------------------------------
+# Test 92: add_metadata merges on a second call
+# ------------------------------------------------------------
+def test_add_metadata_merges_on_a_second_call():
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=4)
+
+    index.add_metadata({"owner": "Alice", "version": "1"})
+    index.add_metadata({"version": "2", "dataset": "docs_v2"})
+
+    # The second call inserts key by key rather than replacing the map, so a
+    # key present only in the first call survives and an overlapping key takes
+    # the newer value. This is the opposite of what add() does to per record
+    # metadata on an overwrite, which replaces the map wholesale.
+    assert index.get_all_metadata() == {"owner": "Alice", "version": "2", "dataset": "docs_v2"}
+    assert index.get_metadata("owner") == "Alice"
+    assert index.get_metadata("version") == "2"
+    assert index.get_metadata("dataset") == "docs_v2"
+
+    # An empty call is a no op rather than a clear.
+    index.add_metadata({})
+    assert index.get_all_metadata() == {"owner": "Alice", "version": "2", "dataset": "docs_v2"}
+
+    # Explicitly writing an empty string overwrites the value.
+    index.add_metadata({"owner": ""})
+    assert index.get_metadata("owner") == ""
+
+    # The map returned is a copy, so mutating it does not reach the index.
+    snapshot = index.get_all_metadata()
+    snapshot["injected"] = "no"
+    assert index.get_metadata("injected") is None
