@@ -3,6 +3,5 @@ include NOTICE
 include README.md
 recursive-include src *
 recursive-include tests *
-recursive-include benchmarks *
 recursive-include vendor *
 recursive-include LICENSES *

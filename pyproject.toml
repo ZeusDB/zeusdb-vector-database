@@ -45,9 +45,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-# Scopes collection to tests. Seven scripts under benchmarks end in _test.py
-# and start with a digit, which is not a legal module name, so an unscoped run
-# fails at collection.
+# Scopes collection to the tests directory.
 testpaths = ["tests"]
 
 [project.urls]
