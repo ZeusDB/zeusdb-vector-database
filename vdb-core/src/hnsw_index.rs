@@ -861,6 +861,22 @@ impl HNSWIndex {
         *self.vector_count.lock().unwrap()
     }
 
+    /// Count the records the index actually holds
+    ///
+    /// The union of the raw vectors and the PQ codes, because `quantized_only`
+    /// keeps a record added after training in the codes alone. This is derived
+    /// from the stored data rather than from the counter, so it is what the
+    /// counter is checked against after a load.
+    pub fn count_stored_records(&self) -> usize {
+        let vectors = self.vectors.read().unwrap();
+        let pq_codes = self.pq_codes.read().unwrap();
+        let code_only = pq_codes
+            .keys()
+            .filter(|id| !vectors.contains_key(*id))
+            .count();
+        vectors.len() + code_only
+    }
+
     /// Get the distance space configuration
     pub fn get_space(&self) -> String {
         self.space.clone()
@@ -937,10 +953,18 @@ impl HNSWIndex {
             pq.clone(),
         );
 
-        // Store quantized codes
-        {
+        // Store quantized codes. Codes for records that have no raw vector are
+        // kept rather than cleared, because under QuantizedOnly they are the
+        // only copy of every record added after training completed and there is
+        // nothing left to re-quantize them from. Clearing dropped those records
+        // from the index outright. Removal already deletes an id's codes, so
+        // nothing stale can survive here.
+        let retained = {
             let mut pq_codes = self.pq_codes.write().unwrap();
-            pq_codes.clear(); // Clear any existing codes
+            let retained = pq_codes
+                .keys()
+                .filter(|id| !vectors.contains_key(*id))
+                .count();
 
             for (i, (id, _)) in vectors.iter().enumerate() {
                 if i < quantized_codes.len() {
@@ -950,9 +974,11 @@ impl HNSWIndex {
             debug!(
                 operation = "quantization_rebuild",
                 codes_stored = pq_codes.len(),
+                codes_retained = retained,
                 "Quantized codes stored"
             );
-        }
+            retained
+        };
 
         // Replace the HNSW index
         {
@@ -989,6 +1015,7 @@ impl HNSWIndex {
             operation = "quantization_rebuild_complete",
             vector_count = vectors.len(),
             codes_inserted = batch_data.len(),
+            codes_retained = retained,
             compression_ratio = compression_ratio,
             duration_ms = duration_ms,
             "Quantization rebuild completed successfully"
@@ -3824,6 +3851,33 @@ impl HNSWIndex {
     pub(crate) fn set_counters(&mut self, id_counter: usize, vector_count: usize) {
         *self.id_counter.lock().unwrap() = id_counter;
         *self.vector_count.lock().unwrap() = vector_count;
+    }
+
+    /// Set the vector count alone (for persistence loading only)
+    ///
+    /// Separate from `set_counters` because the id counter must keep whatever
+    /// the graph rebuild advanced it to. Rewinding it would hand out internal
+    /// ids the rebuild has already used.
+    pub(crate) fn set_vector_count(&mut self, vector_count: usize) {
+        *self.vector_count.lock().unwrap() = vector_count;
+    }
+
+    /// Replace the stored record data with what was read from disk
+    ///
+    /// For persistence loading only, and only after the graph rebuild. The
+    /// rebuild routes every record through add(), which stores whatever vector
+    /// it was handed, so a record that was reconstructed from PQ codes would
+    /// otherwise be kept at full width. Writing the three maps back leaves the
+    /// loaded index holding exactly what was saved.
+    pub(crate) fn restore_storage_maps(
+        &mut self,
+        vectors: HashMap<String, Vec<f32>>,
+        pq_codes: HashMap<String, Vec<u8>>,
+        vector_metadata: HashMap<String, HashMap<String, Value>>,
+    ) {
+        *self.vectors.write().unwrap() = vectors;
+        *self.pq_codes.write().unwrap() = pq_codes;
+        *self.vector_metadata.write().unwrap() = vector_metadata;
     }
 
     /// Set quantization config (for persistence loading only)
