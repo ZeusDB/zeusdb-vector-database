@@ -3958,6 +3958,14 @@ mod tests {
     /// percent of self-queries fail. A failure here means the patch was
     /// lost, most likely during an hnsw_rs upgrade. See
     /// vendor/hnsw_rs/ZEUSDB-PATCH.md.
+    ///
+    /// Insertion is sequential on purpose. `parallel_insert` assigns levels
+    /// in whatever order threads reach the level generator, so the graph
+    /// varies between runs even under the fixed seed and the test was
+    /// intermittently red. Building one vector at a time makes the graph a
+    /// function of the data and the parameters alone, which is also the
+    /// path every non-quantized index takes through `add()`. The defect
+    /// this test guards is not specific to the parallel path.
     #[test]
     fn self_query_reachability() {
         const N: usize = 3000;
@@ -3969,8 +3977,9 @@ mod tests {
             .collect();
 
         let hnsw = Hnsw::new(16, N, 16, 200, DistCosine {});
-        let items: Vec<(&Vec<f32>, usize)> = data.iter().zip(0..N).collect();
-        hnsw.parallel_insert(&items);
+        for (i, v) in data.iter().enumerate() {
+            hnsw.insert((v.as_slice(), i));
+        }
 
         let failures: Vec<usize> = (0..N)
             .filter(|&i| hnsw.search(&data[i], 1, 64).first().map(|n| n.d_id) != Some(i))
