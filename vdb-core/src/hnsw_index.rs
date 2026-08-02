@@ -3994,4 +3994,65 @@ mod tests {
             &failures[..failures.len().min(10)]
         );
     }
+
+    /// Guards the vendored hnsw_rs patch that stops the layer-zero overflow
+    /// pop from evicting a point's last inbound link. Without the patch the
+    /// pop always discards the farthest entry, so a point whose only inbound
+    /// link happens to be that entry is left with no layer-zero in-edge and
+    /// becomes an orphan that no search can reach through the graph. A
+    /// failure here means the patch was lost, most likely during an hnsw_rs
+    /// upgrade. See vendor/hnsw_rs/ZEUSDB-PATCH.md.
+    ///
+    /// In-degree is counted from the adjacency lists rather than from the
+    /// patch's own counters, so the assertion holds against the graph itself
+    /// and stays meaningful if the counters are ever wrong.
+    ///
+    /// `M` is 4 rather than the shipped 16 on purpose. The layer-zero
+    /// neighbour cap is `2 * M`, so a small `M` fills lists early and makes
+    /// the overflow pop frequent, which is the only site that can strand a
+    /// point. Whether the shipped `M` of 16 strands points depends on the
+    /// data model rather than on index size. On uniform vectors like these
+    /// it strands none up to 30,000 points, while on clustered data, 50
+    /// Gaussian clusters at sigma 0.15 in 768 dimensions, it strands 6 of
+    /// 10,000. A small `M` lets this uniform generator fail fast instead,
+    /// and the unpatched crate strands 24 of these 5,000 points.
+    ///
+    /// Insertion is sequential for the same reason as `self_query_reachability`.
+    #[test]
+    fn layer_zero_in_degree() {
+        const N: usize = 5000;
+        const DIM: usize = 128;
+        const M: usize = 4;
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let data: Vec<Vec<f32>> = (0..N)
+            .map(|_| (0..DIM).map(|_| rng.random::<f32>() - 0.5).collect())
+            .collect();
+
+        let hnsw = Hnsw::new(M, N, 16, 200, DistCosine {});
+        for (i, v) in data.iter().enumerate() {
+            hnsw.insert((v.as_slice(), i));
+        }
+
+        let mut in_degree = vec![0usize; N];
+        let mut nb_seen = 0usize;
+        for point in hnsw.get_point_indexation() {
+            nb_seen += 1;
+            for neighbour in &point.get_neighborhood_id()[0] {
+                in_degree[neighbour.d_id] += 1;
+            }
+        }
+        assert_eq!(nb_seen, N, "walked {} points, expected {}", nb_seen, N);
+
+        let orphans: Vec<usize> = (0..N).filter(|&i| in_degree[i] == 0).collect();
+
+        assert!(
+            orphans.is_empty(),
+            "{} of {} points have zero layer-zero in-degree (first: {:?}); \
+             the hnsw_rs overflow pop guard is missing",
+            orphans.len(),
+            N,
+            &orphans[..orphans.len().min(10)]
+        );
+    }
 }

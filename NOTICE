@@ -9,8 +9,9 @@ This product includes software developed by:
 - Jean-pierreBoth (https://crates.io/crates/hnsw_rs/)
 
 The hnsw_rs crate, version 0.3.4, is vendored in source form at vendor/hnsw_rs
-and carries two ZeusDB patches, one to the reverse link layer assignment and
-one seeding level assignment so index builds are reproducible. See
+and carries three ZeusDB patches, one to the reverse link layer assignment, one
+seeding level assignment so index builds are reproducible, and one guarding the
+neighbour list overflow pop against stranding a point's last inbound link. See
 vendor/hnsw_rs/ZEUSDB-PATCH.md for the patch record. hnsw_rs is dual licensed
 under MIT or Apache-2.0.
 
