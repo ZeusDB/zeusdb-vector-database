@@ -310,6 +310,18 @@ impl<'b, T: Clone + Send + Sync> PointWithOrder<'b, T> {
 use rand::distr::Uniform;
 use rand::prelude::*;
 
+/// ZeusDB patch. Seed used for level assignment unless another one is set.
+///
+/// Upstream seeds this generator from OS entropy, so the same data built with
+/// the same parameters produces a structurally different graph on every run.
+/// That makes an index irreproducible and turns any A against B comparison
+/// into an unpaired one across two different graphs. A fixed default makes the
+/// graph a function of the data, the parameters and the insertion order alone.
+/// The value carries no meaning beyond being one fixed draw from the level
+/// distribution. Call `Hnsw::set_level_seed` to choose a different one.
+/// See vendor/hnsw_rs/ZEUSDB-PATCH.md.
+pub const DEFAULT_LEVEL_SEED: u64 = 0x5A45_5553_4442_5F30;
+
 /// a struct to randomly generate a level for an item according to an exponential law
 /// of parameter given by scale.
 /// The distribution is constrained to be in [0..maxlevel[
@@ -325,7 +337,7 @@ impl LayerGenerator {
     pub fn new(max_nb_connection: usize, maxlevel: usize) -> Self {
         let scale = 1. / (max_nb_connection as f64).ln();
         LayerGenerator {
-            rng: Arc::new(Mutex::new(StdRng::from_os_rng())),
+            rng: Arc::new(Mutex::new(StdRng::seed_from_u64(DEFAULT_LEVEL_SEED))),
             unif: Uniform::<f64>::new(0., 1.).unwrap(),
             scale,
             maxlevel,
@@ -340,11 +352,17 @@ impl LayerGenerator {
     ) -> Self {
         let scale_default = 1. / (max_nb_connection as f64).ln();
         LayerGenerator {
-            rng: Arc::new(Mutex::new(StdRng::from_os_rng())),
+            rng: Arc::new(Mutex::new(StdRng::seed_from_u64(DEFAULT_LEVEL_SEED))),
             unif: Uniform::<f64>::new(0., 1.).unwrap(),
             scale: scale_default * scale_factor,
             maxlevel,
         }
+    }
+
+    /// ZeusDB patch. Reseed the level generator. Call before inserting any
+    /// point, since it resets the stream rather than extending it.
+    pub fn set_seed(&self, seed: u64) {
+        *self.rng.lock() = StdRng::seed_from_u64(seed);
     }
     //
     // l=0 most densely packed layer
@@ -857,6 +875,16 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
     // When dumping we need to know if some file is mmapped
     pub(crate) fn get_datamap_opt(&self) -> bool {
         self.datamap_opt
+    }
+
+    /// ZeusDB patch. Choose the seed driving level assignment, overriding
+    /// `DEFAULT_LEVEL_SEED`. Call before inserting any point, since it resets
+    /// the stream rather than extending it. Two indexes built from the same
+    /// data and parameters under different seeds have different graphs, which
+    /// is the way to sample the graph distribution deliberately rather than by
+    /// accident. See vendor/hnsw_rs/ZEUSDB-PATCH.md.
+    pub fn set_level_seed(&mut self, seed: u64) {
+        self.layer_indexed_points.layer_g.set_seed(seed);
     }
 
     /// By default the levels are sampled using an exponential law of parameter **ln(max_nb_conn)**
