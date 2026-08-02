@@ -557,3 +557,160 @@ def test_batch_search_with_metadata_filter():
         # All filtered results should have published=True
         for result in filtered_results[i]:
             assert result["metadata"]["published"] is True
+
+# ------------------------------------------------------------
+# Helper for the input validation tests below
+# ------------------------------------------------------------
+def build_validation_index(dim=4):
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=dim, space="cosine", expected_size=10)
+    index.add([
+        {"id": "s1", "values": [0.1, 0.2, 0.3, 0.4], "metadata": {"type": "test"}},
+        {"id": "s2", "values": [0.5, 0.6, 0.7, 0.8], "metadata": {"type": "test"}},
+    ])
+    return index
+
+# ------------------------------------------------------------
+# Test 61: A single query vector of the wrong dimension
+# ------------------------------------------------------------
+def test_search_single_query_wrong_dimension():
+    index = build_validation_index()
+
+    # The message names both the expected and the actual length.
+    with pytest.raises(ValueError, match="dimension mismatch: expected 4, got 3"):
+        index.search([0.1, 0.2, 0.3])
+
+    with pytest.raises(ValueError, match="dimension mismatch: expected 4, got 5"):
+        index.search([0.1, 0.2, 0.3, 0.4, 0.5])
+
+    # A 1D NumPy query of the wrong length takes the same path.
+    with pytest.raises(ValueError, match="dimension mismatch: expected 4, got 3"):
+        index.search(np.array([0.1, 0.2, 0.3], dtype=np.float32))
+
+    # A batch names the offending position instead.
+    with pytest.raises(ValueError, match="Vector 1: dimension mismatch: expected 4, got 2"):
+        index.search([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6]])
+
+# ------------------------------------------------------------
+# Test 62: An empty list as a query
+# ------------------------------------------------------------
+def test_search_empty_list_query():
+    index = build_validation_index()
+
+    # Current behaviour, asserted rather than expected. An empty list extracts
+    # as an empty batch before the single vector path is reached, so a caller
+    # who passed one empty query vector is told the batch is empty. The
+    # expectation this violates is that the message describes what was passed,
+    # which here would be an empty search vector.
+    with pytest.raises(ValueError, match="Batch cannot be empty"):
+        index.search([])
+
+# ------------------------------------------------------------
+# Test 63: None as a query
+# ------------------------------------------------------------
+def test_search_none_query():
+    index = build_validation_index()
+
+    # Current behaviour, asserted rather than expected. None fails every
+    # extraction attempt and surfaces as the PyO3 conversion TypeError rather
+    # than as a ValueError raised by the index. The message names the offending
+    # type but not the parameter. The expectation this violates is that search
+    # validates its query argument the way add validates its data argument,
+    # which rejects None with an explicit message.
+    with pytest.raises(TypeError, match="NoneType"):
+        index.search(None)
+
+    # For contrast, add does reject None explicitly.
+    with pytest.raises(ValueError, match="Data cannot be None"):
+        index.add(None)
+
+# ------------------------------------------------------------
+# Test 64: An empty batch
+# ------------------------------------------------------------
+def test_search_empty_batch():
+    index = build_validation_index()
+
+    # A batch with no queries in it is the same object as the empty single
+    # query of test 62, and the two are indistinguishable to the index.
+    empty_batch = []
+    with pytest.raises(ValueError, match="Batch cannot be empty"):
+        index.search(empty_batch)
+
+    # A NumPy array with no rows is rejected the same way.
+    with pytest.raises(ValueError, match="Batch cannot be empty"):
+        index.search(np.zeros((0, 4), dtype=np.float32))
+
+# ------------------------------------------------------------
+# Test 65: A batch containing an empty vector
+# ------------------------------------------------------------
+def test_search_batch_with_empty_vector():
+    index = build_validation_index()
+
+    # The empty vector check runs before the dimension check, and the message
+    # names the position in the batch.
+    with pytest.raises(ValueError, match="Vector 0 in batch cannot be empty"):
+        index.search([[]])
+
+    with pytest.raises(ValueError, match="Vector 1 in batch cannot be empty"):
+        index.search([[0.1, 0.2, 0.3, 0.4], []])
+
+    with pytest.raises(ValueError, match="Vector 2 in batch cannot be empty"):
+        index.search([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8], []])
+
+# ------------------------------------------------------------
+# Test 66: A query containing a non-finite value
+# ------------------------------------------------------------
+def test_search_non_finite_query_values():
+    index = build_validation_index()
+
+    # The single vector path rejects NaN and both infinities, and the message
+    # names the offending index and value.
+    with pytest.raises(ValueError, match="invalid value at index 0: NaN"):
+        index.search([float("nan"), 0.2, 0.3, 0.4])
+
+    with pytest.raises(ValueError, match="invalid value at index 0: inf"):
+        index.search([float("inf"), 0.2, 0.3, 0.4])
+
+    with pytest.raises(ValueError, match="invalid value at index 3: -inf"):
+        index.search([0.1, 0.2, 0.3, float("-inf")])
+
+    # A 1D NumPy query is validated identically.
+    with pytest.raises(ValueError, match="invalid value at index 0: NaN"):
+        index.search(np.array([np.nan, 0.2, 0.3, 0.4], dtype=np.float32))
+
+    # Current behaviour, asserted rather than expected. batch_search_internal
+    # validates dimensions only, so the same NaN query inside a batch is not
+    # rejected. It is normalized to itself, because the norm of a vector
+    # containing NaN is not greater than zero, and the search returns hits
+    # whose scores carry no distance information. The expectation this violates
+    # is that the batch path applies the same value validation as the single
+    # path.
+    batch = index.search([[float("nan"), 0.2, 0.3, 0.4]], top_k=2)
+    assert isinstance(batch, list)
+    assert len(batch) == 1
+    assert all(r["id"] in {"s1", "s2"} for r in batch[0])
+
+    infinite_batch = index.search([[float("inf"), 0.2, 0.3, 0.4]], top_k=2)
+    assert len(infinite_batch) == 1
+
+# ------------------------------------------------------------
+# Test 67: Searching an empty index
+# ------------------------------------------------------------
+def test_search_empty_index():
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=4, space="cosine", expected_size=10)
+
+    assert int(index.get_stats()["total_vectors"]) == 0
+    assert not index.contains("anything")
+
+    # An empty index is not an error condition. Every search shape returns an
+    # empty result rather than raising, and a batch still returns one result
+    # set per query.
+    assert index.search([0.1, 0.2, 0.3, 0.4], top_k=5) == []
+    assert index.search([0.1, 0.2, 0.3, 0.4], top_k=5, return_vector=True) == []
+    assert index.search([0.1, 0.2, 0.3, 0.4], filter={"type": "test"}, top_k=5) == []
+    assert index.search([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]], top_k=5) == [[], []]
+
+    # Input validation still applies on an empty index.
+    with pytest.raises(ValueError, match="dimension mismatch: expected 4, got 2"):
+        index.search([0.1, 0.2])

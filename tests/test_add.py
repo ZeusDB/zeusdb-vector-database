@@ -301,3 +301,166 @@ def test_overwrite_functionality():
     assert updated_records[0]["metadata"]["version"] == "v2"
     # ✅ FIXED: Account for cosine normalization
     assert_vectors_close(updated_records[0]["vector"], [0.3, 0.4], space="cosine")
+
+# ------------------------------------------------------------
+# Test 56: overwrite=False against an id that already exists
+# ------------------------------------------------------------
+def test_add_overwrite_false_existing_id_reports_an_error():
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=2, expected_size=5)
+
+    index.add({"id": "doc1", "values": [0.1, 0.2], "metadata": {"version": "v1"}})
+
+    # Current behaviour, asserted rather than expected. add_single_vector does
+    # raise a ValueError naming the id, but add() catches every per record
+    # error and folds it into AddResult, so nothing reaches the caller as an
+    # exception. The expectation this violates is that a single record add
+    # which inserts nothing raises rather than returning a result object the
+    # caller has to inspect.
+    result = index.add(
+        {"id": "doc1", "values": [0.9, 0.9], "metadata": {"version": "v2"}},
+        overwrite=False,
+    )
+
+    assert result.total_inserted == 0
+    assert result.total_errors == 1
+    assert not result.is_success()
+    assert len(result.errors) == 1
+    assert "doc1" in result.errors[0]
+    assert "already exists" in result.errors[0]
+    assert "ValueError" in result.errors[0]
+
+    # vector_shape reports the input shape, not the inserted shape.
+    assert result.vector_shape == (1, 2)
+
+    # The stored record is untouched.
+    assert int(index.get_stats()["total_vectors"]) == 1
+    stored = index.get_records("doc1", return_vector=True)
+    assert len(stored) == 1
+    assert stored[0]["metadata"]["version"] == "v1"
+    assert_vectors_close(stored[0]["vector"], [0.1, 0.2], space="cosine")
+
+# ------------------------------------------------------------
+# Test 57: overwrite=False against an id that does not exist
+# ------------------------------------------------------------
+def test_add_overwrite_false_new_id_inserts_normally():
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=2, expected_size=5)
+
+    index.add({"id": "doc1", "values": [0.1, 0.2], "metadata": {"version": "v1"}})
+
+    result = index.add(
+        {"id": "doc2", "values": [0.3, 0.4], "metadata": {"version": "v1"}},
+        overwrite=False,
+    )
+
+    assert result.total_inserted == 1
+    assert result.total_errors == 0
+    assert result.is_success()
+    assert len(result.errors) == 0
+    assert result.vector_shape == (1, 2)
+
+    assert int(index.get_stats()["total_vectors"]) == 2
+    assert index.contains("doc2")
+    stored = index.get_records("doc2", return_vector=True)
+    assert stored[0]["metadata"]["version"] == "v1"
+    assert_vectors_close(stored[0]["vector"], [0.3, 0.4], space="cosine")
+
+# ------------------------------------------------------------
+# Test 58: overwrite=True passed explicitly
+# ------------------------------------------------------------
+def test_add_overwrite_true_replaces_without_duplicating():
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=2, expected_size=5)
+
+    index.add({"id": "doc1", "values": [0.1, 0.2], "metadata": {"version": "v1"}})
+    assert int(index.get_stats()["total_vectors"]) == 1
+
+    result = index.add(
+        {"id": "doc1", "values": [0.9, 0.1], "metadata": {"version": "v2"}},
+        overwrite=True,
+    )
+
+    assert result.total_inserted == 1
+    assert result.total_errors == 0
+    assert result.is_success()
+
+    # The existing record is removed before the new one is inserted, so the
+    # count does not grow and the id resolves to exactly one record.
+    assert int(index.get_stats()["total_vectors"]) == 1
+    assert len(index.get_records("doc1", return_vector=False)) == 1
+    assert len(index.list(number=10)) == 1
+
+    stored = index.get_records("doc1", return_vector=True)
+    assert stored[0]["metadata"]["version"] == "v2"
+    assert_vectors_close(stored[0]["vector"], [0.9, 0.1], space="cosine")
+
+# ------------------------------------------------------------
+# Test 59: A mixed batch under overwrite=False
+# ------------------------------------------------------------
+def test_add_overwrite_false_mixed_batch_reports_per_record():
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=2, expected_size=10)
+
+    index.add([
+        {"id": "existing1", "values": [0.1, 0.2], "metadata": {"version": "v1"}},
+        {"id": "existing2", "values": [0.3, 0.4], "metadata": {"version": "v1"}},
+    ])
+
+    # The batch is not rejected as a whole. Each record is attempted in turn
+    # and the two collisions are reported through AddResult while the new
+    # record is inserted.
+    result = index.add([
+        {"id": "existing1", "values": [0.5, 0.5], "metadata": {"version": "v2"}},
+        {"id": "brand_new", "values": [0.6, 0.7], "metadata": {"version": "v1"}},
+        {"id": "existing2", "values": [0.8, 0.9], "metadata": {"version": "v2"}},
+    ], overwrite=False)
+
+    assert result.total_inserted == 1
+    assert result.total_errors == 2
+    assert not result.is_success()
+    assert len(result.errors) == 2
+    assert "1 inserted" in result.summary()
+    assert "2 errors" in result.summary()
+    assert result.vector_shape == (3, 2)
+
+    error_text = " ".join(result.errors)
+    assert "existing1" in error_text
+    assert "existing2" in error_text
+    assert "brand_new" not in error_text
+
+    # The new record landed and neither existing record was replaced.
+    assert int(index.get_stats()["total_vectors"]) == 3
+    assert index.contains("brand_new")
+    assert index.get_records("existing1", return_vector=False)[0]["metadata"]["version"] == "v1"
+    assert index.get_records("existing2", return_vector=False)[0]["metadata"]["version"] == "v1"
+
+# ------------------------------------------------------------
+# Test 60: Metadata is replaced rather than merged on overwrite
+# ------------------------------------------------------------
+def test_add_overwrite_replaces_metadata_wholesale():
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=2, expected_size=5)
+
+    index.add({
+        "id": "doc1",
+        "values": [0.1, 0.2],
+        "metadata": {"version": "v1", "only_in_first": "kept?"},
+    })
+
+    # The record is removed and reinserted, so the second call decides the
+    # whole metadata map. A key present only in the first call does not
+    # survive, which makes add an overwrite rather than an upsert of fields.
+    index.add({
+        "id": "doc1",
+        "values": [0.3, 0.4],
+        "metadata": {"version": "v2", "only_in_second": "added"},
+    })
+
+    metadata = index.get_records("doc1", return_vector=False)[0]["metadata"]
+    assert metadata == {"version": "v2", "only_in_second": "added"}
+    assert "only_in_first" not in metadata
+
+    # An overwrite carrying empty metadata clears the map entirely.
+    index.add({"id": "doc1", "values": [0.5, 0.6], "metadata": {}})
+    assert index.get_records("doc1", return_vector=False)[0]["metadata"] == {}
