@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- `HNSWIndex`, `AddResult`, `init_logging`, `init_file_logging` and `is_logging_initialized` are exported from `zeusdb_vector_database`, and `__all__` names them explicitly. The documented programmatic logging recipe raised `AttributeError` at package level because `__all__` was `["VectorDatabase"]` and the functions were never imported here.
+- `m` has a lower bound of 1. `create("hnsw", m=0)` was accepted and built a graph with zero neighbour capacity.
+- Non-finite values are rejected on both NumPy `add` paths, per record through `AddResult`, naming the record and the component. The list and dict paths already rejected them.
+- `max_training_vectors >= training_size`, `subvectors > 0` and `subvectors <= dim` are enforced in the Rust builder as well as the Python factory.
+- Loading an index whose graph rebuild refuses a record now fails with the rejected records named, instead of returning an index that reports a vector count no query can reach.
+- `ZEUSDB_LOG_FILE` writes the file named, and the resolved path is logged at startup when the target is `file`.
+- `ZEUSDB_LOG_ROTATION` accepts `daily` or `never`, default `never`. `daily` routes the file target to the rolling appender, which appends the UTC date to the file name. The resolved path is logged at startup under both values, and an unrecognised value warns and falls back to `never`.
+
+### Changed
+- `HNSWIndex` no longer carries a constructor. An index comes from `VectorDatabase.create()` or `VectorDatabase.load()`. The class stays importable for `isinstance` checks and annotations, and direct construction raises `TypeError`.
+- `VectorDatabase._index_constructors` is replaced by `_index_types`, a name to description map that hands out no constructor.
+- Both the Rust and the Python layer read `ZEUSDB_DISABLE_AUTO_LOGGING`, the published name, and accept `ZEUSDB_DISABLE_AUTOLOG` as a deprecated alias. The Rust layer read only the alias, so the documented variable silently did nothing to it. Both layers require `true`, `1` or `yes`.
+- `ZEUSDB_LOG_FILE` names a file rather than a rotation prefix. `ZEUSDB_LOG_FILE=app.log` wrote `app.log.YYYY-MM-DD` and left `app.log` empty. Rotation is now a changed default rather than a removed capability. Set `ZEUSDB_LOG_ROTATION=daily` to keep the previous behaviour, or use `init_file_logging(log_dir, level, file_prefix)`.
+- `get_performance_info()` no longer reports `insertion_speedup_expected`, `insertion_bottleneck` or `limitation`, which described a parallel insert path that does not exist, and `benefits` no longer claims `parallel_insert`. An `insertion_path` key reports `sequential`.
+
+### Removed
+- `HNSWIndex.__new__`, `get_next_id()`, `benchmark_raw_concurrent_performance()`, `get_code_version()` and `get_version_number()`.
+- `count_stored_records()` and `load_index` leave the Python surface. `count_stored_records` stays a Rust function for the load path and `load_index` is registered as `_load_index`, which `VectorDatabase.load()` calls.
+- `MemoryInfo`, `auto_configure_logging` and `JSONFormatter` are renamed `_MemoryInfo`, `_auto_configure_logging` and `_JSONFormatter`.
+
+---
+
 ## [0.4.1] - 2025-08-20
 
 ### Added
@@ -308,9 +333,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Parallel batch insertion using `rayon` for large datasets (`insert_batch`).
-- GIL-optimized `add_batch_parallel_gil_optimized()` path for inserts ≥ 50 items.
+- GIL-optimized `add_batch_parallel_gil_optimized()` path for inserts ≥ 50 items. (Removed in 0.2.0. `add()` has run one record at a time since.)
 - Thread-safe locking using `RwLock` and `Mutex` for all core maps (`vectors`, `id_map`, etc.).
-- `benchmark_concurrent_reads()` and `benchmark_raw_concurrent_performance()` for performance diagnostics.
+- `benchmark_concurrent_reads()` and `benchmark_raw_concurrent_performance()` for performance diagnostics. (`benchmark_raw_concurrent_performance()` removed as a duplicate of `benchmark_concurrent_reads()`, see Unreleased.)
 - `get_performance_info()` for runtime introspection of bottlenecks and recommendations.
 - Added `normalize_vector()` helper function to match Rust implementation behavior
 - Added `assert_vectors_close()` utility for normalized vector comparison with tolerance
@@ -450,7 +475,7 @@ were actually validating that cosine normalization was properly implemented.
 
 ### Changed
 - Renamed BatchResult → AddResult to improve semantic clarity in both Rust and Python layers.
-- Updated unit tests for `create_index` and `similarity_search` methods to improve clarity and maintain edge case coverage.
+- Updated unit tests for `create_index_hnsw`, `query` and `search_with_metadata` methods to improve clarity and maintain edge case coverage. (Recorded as `create_index` and `similarity_search`. No `similarity_search` has ever existed in this package. The 0.0.5 test file exercised `query`, renamed to `search` in 0.0.9, and `search_with_metadata`.)
 - Refactored test structure for better readability and maintainability.
 - Expanded the README with clearer descriptions of the core 3-step workflow.
 - Improved formatting and language for better readability and developer onboarding.

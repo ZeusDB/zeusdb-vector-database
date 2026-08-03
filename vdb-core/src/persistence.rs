@@ -930,6 +930,24 @@ fn rebuild_using_add_method(
     // Call the existing add method - this rebuilds the graph automatically
     let result = index.add(batch_dict.into_any(), true)?; // overwrite=true
 
+    // add() reports per record and does not raise, so a record it refused
+    // would otherwise leave the graph short while the storage maps, which are
+    // written back afterwards, still report the full count. The load would
+    // succeed and every query would miss the records that never reached the
+    // graph. A saved directory holding a non-finite value is the case that
+    // reaches here, because add() has always refused those on the list path.
+    if result.total_errors > 0 {
+        let detail = result.errors.join("; ");
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Graph rebuild refused {} of {} records, so the loaded index would \
+             hold records that no query can reach. Refusing to load a partial \
+             graph. Rejected records: {}",
+            result.total_errors,
+            batch_ids.len(),
+            detail
+        )));
+    }
+
     println!("✅ Graph rebuild completed: {}", result.summary());
 
     // Verify the rebuild
@@ -980,7 +998,11 @@ fn convert_json_value_to_python(value: &Value, py: Python<'_>) -> PyResult<pyo3:
 // ============================================================================
 
 /// Load an HNSWIndex from a directory structure (Approach B: Simple Reconstruction)
+///
+/// Registered as `_load_index`. `VectorDatabase.load(path)` is the documented
+/// route and is a one line pass through to this.
 #[pyfunction]
+#[pyo3(name = "_load_index")]
 pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
     println!("🚀 Starting index load with reconstruction from: {}", path);
 

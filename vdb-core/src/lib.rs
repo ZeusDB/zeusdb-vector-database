@@ -16,11 +16,18 @@ fn zeusdb_vector_database(_py: Python, m: &Bound<pyo3::types::PyModule>) -> PyRe
     // Respects ZEUSDB_DISABLE_AUTOLOG for power users
     logging::init_logging();
 
-    // Core classes
+    // Core classes. Neither carries a `#[new]`, so both are importable for
+    // isinstance checks and annotations while direct construction raises
+    // TypeError. Indexes come from `_create_hnsw_index` or `_load_index`.
     m.add_class::<hnsw_index::HNSWIndex>()?;
     m.add_class::<hnsw_index::AddResult>()?;
 
-    // Persistence functions
+    // Index construction, private because VectorDatabase.create is the
+    // documented route and applies the defaults this function does not.
+    m.add_function(wrap_pyfunction!(hnsw_index::create_hnsw_index, m)?)?;
+
+    // Persistence functions, private because VectorDatabase.load is the
+    // documented route.
     m.add_function(wrap_pyfunction!(persistence::load_index, m)?)?;
 
     // Optional logging control for power users

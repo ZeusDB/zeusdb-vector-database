@@ -1,7 +1,30 @@
 """Index construction, parameter validation and index type discovery."""
 
+from importlib.metadata import version
+
 import pytest
-from zeusdb_vector_database import VectorDatabase
+
+import zeusdb_vector_database
+from zeusdb_vector_database import HNSWIndex, VectorDatabase
+from zeusdb_vector_database.zeusdb_vector_database import _create_hnsw_index
+
+
+def _build_rust(dim=16, space="cosine", m=16, ef_construction=200,
+                expected_size=1000, quantization_config=None):
+    """Call the extension factory directly, bypassing the Python factory.
+
+    Several rules used to live in VectorDatabase.create alone while the Rust
+    constructor stayed reachable, so a rule enforced only there was not a rule.
+    This is the path those rules have to hold on.
+    """
+    return _create_hnsw_index(
+        dim=dim,
+        space=space,
+        m=m,
+        ef_construction=ef_construction,
+        expected_size=expected_size,
+        quantization_config=quantization_config,
+    )
 
 # ------------------------------------------------------------
 # Test 1: Test the creation of an HNSW index with default parameters
@@ -157,44 +180,238 @@ def test_dim_property():
 # Test 89: version reporting
 # ------------------------------------------------------------
 def test_version_reporting():
+    """The build counter is gone and the package version is the only version.
+
+    get_version_number and get_code_version reported a hand incremented build
+    counter that no release note, documentation page or consumer ever read.
+    What the previous test was really asserting is that there is one version
+    identifier and that it does not vary between indexes, which the package
+    version satisfies.
+    """
     vdb = VectorDatabase()
     index = vdb.create("hnsw", dim=4)
 
-    number = index.get_version_number()
-    assert isinstance(number, int)
-    assert number > 0
+    assert not hasattr(index, "get_version_number")
+    assert not hasattr(index, "get_code_version")
 
-    description = index.get_code_version()
-    assert isinstance(description, str)
-    # The two are the same constant, one bare and one wrapped in a sentence.
-    assert description.startswith(f"Version: {number}, Description: ")
-    assert len(description) > len(f"Version: {number}, Description: ")
-
-    # Both are properties of the build rather than of the index, so a second
-    # index with a different configuration reports the same values.
-    other = vdb.create("hnsw", dim=64, space="l2")
-    assert other.get_version_number() == number
-    assert other.get_code_version() == description
-
-    # This counter is not the package version. Benchmark 36 recorded 1001 as
-    # the expected output and the current build reports a higher number, so it
-    # is a monotonic build counter and nothing here pins its value.
-    assert number != 0
+    assert isinstance(zeusdb_vector_database.__version__, str)
+    assert zeusdb_vector_database.__version__
+    assert (
+        version("zeusdb-vector-database") == zeusdb_vector_database.__version__
+    )
 
 # ------------------------------------------------------------
-# Test 90: get_performance_info returns a mapping
+# Test 90: get_performance_info reports only what the code does
 # ------------------------------------------------------------
-def test_get_performance_info_returns_a_dict():
-    """Deliberately shallow.
+def test_get_performance_info_reports_only_real_behaviour():
+    """langchain-zeusdb calls this method, so it stays and the fields are fixed.
 
-    Three of the fields this returns describe a parallel insert path that does
-    not exist, and they are being removed. Asserting their contents would lock
-    them in, so this pins the return type only.
+    The three fields that described a parallel insert path are gone, because
+    add() runs one record at a time through add_single_vector on every
+    unquantized index. The concurrent and batched search claims were verified
+    and stay.
     """
     vdb = VectorDatabase()
     index = vdb.create("hnsw", dim=4)
 
     info = index.get_performance_info()
     assert isinstance(info, dict)
-    assert info
     assert all(isinstance(k, str) and isinstance(v, str) for k, v in info.items())
+
+    assert set(info) == {
+        "search_speedup_expected",
+        "search_bottleneck",
+        "benefits",
+        "insertion_path",
+    }
+    assert info["insertion_path"] == "sequential"
+    assert "parallel_insert" not in info["benefits"]
+
+    for gone in ("insertion_speedup_expected", "insertion_bottleneck", "limitation"):
+        assert gone not in info
+
+    # A quantized index adds the three quantization keys and nothing else.
+    quantized = vdb.create(
+        "hnsw",
+        dim=16,
+        quantization_config={"type": "pq", "subvectors": 4, "bits": 8, "training_size": 1000},
+    )
+    quantized_info = quantized.get_performance_info()
+    assert set(quantized_info) - set(info) == {
+        "quantization_compression",
+        "quantization_memory_savings",
+        "quantization_accuracy_impact",
+    }
+
+# ------------------------------------------------------------
+# Test 93: HNSWIndex cannot be constructed directly
+# ------------------------------------------------------------
+def test_hnsw_index_has_no_public_constructor():
+    """The class is importable and uninstantiable.
+
+    It carried a PyO3 #[new] reachable from three import paths, and building
+    through it skipped every rule that lives in the Python factory. The class
+    stays exported so isinstance checks and return annotations work.
+    """
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=4)
+
+    assert isinstance(index, HNSWIndex)
+
+    with pytest.raises(TypeError, match="No constructor defined"):
+        HNSWIndex(dim=4, space="cosine", m=16, ef_construction=200, expected_size=10)
+
+    with pytest.raises(TypeError, match="No constructor defined"):
+        HNSWIndex(4, "cosine", 16, 200, 10)
+
+    # The registry no longer holds a constructor for a caller who finds it.
+    assert not hasattr(VectorDatabase, "_index_constructors")
+    assert VectorDatabase._index_types["hnsw"]
+    assert isinstance(VectorDatabase._index_types["hnsw"], str)
+
+# ------------------------------------------------------------
+# Test 94: every exported name resolves at package level
+# ------------------------------------------------------------
+def test_public_exports():
+    """The README logging recipe raised AttributeError on line three.
+
+    __all__ was ["VectorDatabase"] and nothing else was bound here, so
+    zeusdb_vector_database.init_logging did not resolve. The names come from
+    the #[pyfunction(name = ...)] attributes in vdb-core/src/logging.rs.
+    """
+    assert zeusdb_vector_database.__all__ == [
+        "AddResult",
+        "HNSWIndex",
+        "VectorDatabase",
+        "__version__",
+        "init_file_logging",
+        "init_logging",
+        "is_logging_initialized",
+    ]
+
+    for name in zeusdb_vector_database.__all__:
+        assert hasattr(zeusdb_vector_database, name), name
+
+    assert isinstance(zeusdb_vector_database.HNSWIndex, type)
+    assert isinstance(zeusdb_vector_database.AddResult, type)
+    assert isinstance(zeusdb_vector_database.VectorDatabase, type)
+    assert isinstance(zeusdb_vector_database.__version__, str)
+
+    for name in ("init_logging", "init_file_logging", "is_logging_initialized"):
+        assert callable(getattr(zeusdb_vector_database, name)), name
+
+    # The types are the ones the API really hands back.
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=4)
+    result = index.add({"id": "a", "values": [0.1, 0.2, 0.3, 0.4]})
+    assert isinstance(index, zeusdb_vector_database.HNSWIndex)
+    assert isinstance(result, zeusdb_vector_database.AddResult)
+
+    # is_logging_initialized answers without side effects and reports a bool.
+    assert isinstance(zeusdb_vector_database.is_logging_initialized(), bool)
+
+# ------------------------------------------------------------
+# Test 95: m has a lower bound
+# ------------------------------------------------------------
+def test_m_lower_bound():
+    """m=0 built a graph with zero neighbour capacity and was accepted."""
+    vdb = VectorDatabase()
+
+    with pytest.raises(RuntimeError, match="m must be at least 1"):
+        vdb.create("hnsw", dim=4, m=0)
+
+    # One is the smallest value that is accepted, and it still works.
+    index = vdb.create("hnsw", dim=4, m=1, expected_size=10)
+    index.add({"id": "a", "values": [0.1, 0.2, 0.3, 0.4]})
+    assert index.get_vector_count() == 1
+
+# ------------------------------------------------------------
+# Test 96: max_training_vectors is enforced in Rust, not only in Python
+# ------------------------------------------------------------
+def test_max_training_vectors_floor():
+    """A max below the threshold produces an index that can never train.
+
+    The rule lived in the Python factory alone, and the Rust constructor was
+    reachable directly, so it could be skipped. It is now enforced in the
+    Rust builder that both paths go through, which is what _build_rust asserts.
+    """
+    vdb = VectorDatabase()
+
+    with pytest.raises(ValueError, match="must be >= training_size"):
+        vdb.create(
+            "hnsw",
+            dim=16,
+            quantization_config={
+                "type": "pq",
+                "subvectors": 4,
+                "bits": 8,
+                "training_size": 2000,
+                "max_training_vectors": 1500,
+            },
+        )
+
+    with pytest.raises(ValueError, match="must be >= training_size"):
+        _build_rust(
+            dim=16,
+            quantization_config={
+                "type": "pq",
+                "subvectors": 4,
+                "bits": 8,
+                "training_size": 2000,
+                "max_training_vectors": 1500,
+            },
+        )
+
+    # Equal is accepted, which is the boundary the rule names.
+    index = vdb.create(
+        "hnsw",
+        dim=16,
+        quantization_config={
+            "type": "pq",
+            "subvectors": 4,
+            "bits": 8,
+            "training_size": 2000,
+            "max_training_vectors": 2000,
+        },
+    )
+    assert index.get_quantization_info()["max_training_vectors"] == 2000
+
+# ------------------------------------------------------------
+# Test 97: the subvector rules are enforced in Rust as well as in Python
+# ------------------------------------------------------------
+@pytest.mark.parametrize("subvectors,message", [
+    (0, "positive integer"),
+    (32, "cannot exceed dimension"),
+    (7, "must divide dimension"),
+])
+def test_subvector_rules(subvectors, message):
+    """Python keeps the friendlier message and Rust holds the rule.
+
+    Python rejects first, so create() reports the message it always did. The
+    Rust builder is checked separately, because it is the layer that has to
+    hold when the Python factory is not in the path.
+    """
+    vdb = VectorDatabase()
+
+    with pytest.raises(ValueError):
+        vdb.create(
+            "hnsw",
+            dim=16,
+            quantization_config={
+                "type": "pq",
+                "subvectors": subvectors,
+                "bits": 8,
+                "training_size": 1000,
+            },
+        )
+
+    with pytest.raises(ValueError, match=message):
+        _build_rust(
+            dim=16,
+            quantization_config={
+                "type": "pq",
+                "subvectors": subvectors,
+                "bits": 8,
+                "training_size": 1000,
+            },
+        )

@@ -16,24 +16,44 @@ import shutil
 _logging_configured = False
 _config_lock = Lock()
 
-def auto_configure_logging():
+# The published name for the auto-logging disable flag, and the deprecated
+# alias the Rust layer used to read on its own. Both layers now read both, so
+# the documented variable works and a process that set the old one keeps
+# working.
+_DISABLE_AUTOLOG_VAR = 'ZEUSDB_DISABLE_AUTO_LOGGING'
+_DISABLE_AUTOLOG_VAR_DEPRECATED = 'ZEUSDB_DISABLE_AUTOLOG'
+
+
+def _autolog_disabled() -> bool:
+    """Return True if the caller has asked for auto-configuration to be skipped."""
+    truthy = ('true', '1', 'yes')
+    return any(
+        os.getenv(name, '').strip().lower() in truthy
+        for name in (_DISABLE_AUTOLOG_VAR, _DISABLE_AUTOLOG_VAR_DEPRECATED)
+    )
+
+
+def _auto_configure_logging():
     """
     Smart auto-configuration that handles the 3 key scenarios:
     1. Silent by default (minimal logging)
-    2. Easy debugging when needed  
+    2. Easy debugging when needed
     3. Production-ready logging in deployments
-    
+
     Also coordinates Python + Rust logging for consistency.
+
+    Private. Called once from the package __init__ before the Rust extension is
+    imported, and never intended as a user entry point.
     """
     global _logging_configured
-    
+
     with _config_lock:
         if _logging_configured:
             return
-        
+
         # Respect disable flag early
-        disabled = os.getenv('ZEUSDB_DISABLE_AUTO_LOGGING', '').lower() in ('true', '1', 'yes')
-        
+        disabled = _autolog_disabled()
+
         # Always compute environment and config (needed for Rust coordination)
         env_context = _detect_environment()
         config = _get_smart_defaults(env_context)
@@ -180,7 +200,7 @@ def _should_configure_logging() -> bool:
         bool: True if we should configure, False if existing setup should be preserved
     """
     # Check if explicit disable flag is set
-    if os.getenv('ZEUSDB_DISABLE_AUTO_LOGGING', '').lower() in ('true', '1', 'yes'):
+    if _autolog_disabled():
         return False
     
     # Check if root logger already has handlers (enterprise setup)
@@ -381,7 +401,7 @@ def _create_formatter(config: Dict[str, Any]) -> logging.Formatter:
     """Create appropriate formatter based on configuration."""
     
     if config['format'] == 'json':
-        return JSONFormatter(
+        return _JSONFormatter(
             include_timestamp=config['include_timestamp'],
             include_process_info=config['include_process_info']
         )
@@ -404,8 +424,11 @@ def _create_formatter(config: Dict[str, Any]) -> logging.Formatter:
             datefmt='%Y-%m-%d %H:%M:%S'
         )
 
-class JSONFormatter(logging.Formatter):
-    """JSON formatter for production logging with proper timestamp handling."""
+class _JSONFormatter(logging.Formatter):
+    """JSON formatter for production logging with proper timestamp handling.
+
+    Private. The only consumer is _create_formatter in this module.
+    """
     
     def __init__(self, include_timestamp=True, include_process_info=True):
         super().__init__()
@@ -486,8 +509,12 @@ ZEUSDB_LOG_FILE: /path/to/logfile.log
 ZEUSDB_LOG_CONSOLE: true, false
     Default: true (development), false (production)
 
-ZEUSDB_DISABLE_AUTO_LOGGING: true, false
-    Default: false (set to true to disable all auto-configuration)
+ZEUSDB_DISABLE_AUTO_LOGGING: true, 1, yes
+    Default: unset (set to one of the above to disable all auto-configuration
+    in both the Python and the Rust layer)
+
+ZEUSDB_DISABLE_AUTOLOG: true, 1, yes
+    Deprecated alias for ZEUSDB_DISABLE_AUTO_LOGGING, honoured for compatibility
 
 ENVIRONMENT: production, development, testing
     Used for auto-detection if set explicitly

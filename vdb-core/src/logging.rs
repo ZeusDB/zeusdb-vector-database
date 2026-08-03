@@ -8,10 +8,14 @@
 //! - **Global and immutable**: After any initialization (auto or manual), the logging
 //!   configuration is process-global and cannot be changed. Subsequent `init_*` calls
 //!   will return `False` and have no effect.
-//! - **File rotation**: `ZEUSDB_LOG_FILE` is treated as "directory + base filename"
-//!   for daily rotation (e.g., `logs/zeusdb.log` creates `logs/zeusdb.log.2024-01-15`).
+//! - **File target**: `ZEUSDB_LOG_FILE` names the file that is written, exactly as
+//!   given (e.g. `app.log` writes `app.log`). Set `ZEUSDB_LOG_ROTATION=daily` to
+//!   bound disk growth, which appends a date (`app.log.2026-08-03`). The resolved
+//!   path is logged at startup either way. Rotation is also available through
+//!   `init_file_logging(log_dir, level, file_prefix)`, whose `file_prefix` is a
+//!   prefix by name and by behaviour.
 //! - **Programmatic control**: To take control programmatically, set
-//!   `ZEUSDB_DISABLE_AUTOLOG=1` before import, then call Python `init_*` functions.
+//!   `ZEUSDB_DISABLE_AUTO_LOGGING=1` before import, then call Python `init_*` functions.
 //!
 //! ## Environment Variables
 //!
@@ -19,8 +23,10 @@
 //! - `ZEUSDB_LOG_LEVEL`: trace, debug, info, warn, error (default: warn)
 //! - `ZEUSDB_LOG_FORMAT`: human, json (default: human)
 //! - `ZEUSDB_LOG_TARGET`: stdout, stderr, file (default: stderr)
-//! - `ZEUSDB_LOG_FILE`: log file path (default: zeusdb.log)
-//! - `ZEUSDB_DISABLE_AUTOLOG`: Set to disable auto-init (for programmatic control)
+//! - `ZEUSDB_LOG_FILE`: log file path, written exactly as given (default: zeusdb.log)
+//! - `ZEUSDB_LOG_ROTATION`: daily, never (default: never). daily appends a date to the file name
+//! - `ZEUSDB_DISABLE_AUTO_LOGGING`: true, 1 or yes to disable auto-init (for programmatic control)
+//! - `ZEUSDB_DISABLE_AUTOLOG`: deprecated alias for the above, honoured for compatibility
 //! - `NO_COLOR`: Disable colored output (respects standard)
 //!
 //! ## Usage Examples
@@ -47,10 +53,13 @@
 //! export ZEUSDB_LOG_FORMAT=json
 //! export ZEUSDB_LOG_TARGET=stdout
 //!
-//! # Human-readable to file with daily rotation
+//! # Human-readable to a named file
 //! export ZEUSDB_LOG_FORMAT=human
 //! export ZEUSDB_LOG_TARGET=file
-//! export ZEUSDB_LOG_FILE=logs/zeusdb.log  # Creates logs/zeusdb.log.2024-01-15
+//! export ZEUSDB_LOG_FILE=logs/zeusdb.log  # Writes logs/zeusdb.log
+//!
+//! # The same, rotated daily to bound disk growth
+//! export ZEUSDB_LOG_ROTATION=daily        # Writes logs/zeusdb.log.2026-08-03
 //! ```
 
 use pyo3::prelude::*;
@@ -71,15 +80,46 @@ use tracing_subscriber::fmt::format::FmtSpan;
 static INIT: Once = Once::new();
 static WORKER_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
+/// Names of the auto-logging disable flag
+///
+/// `ZEUSDB_DISABLE_AUTO_LOGGING` is the published name. It is what the
+/// documentation site, the package README and the Python layer all use, and it
+/// is the one this reads. `ZEUSDB_DISABLE_AUTOLOG` is what the Rust read before
+/// and is honoured as a deprecated alias so a process that set it keeps working.
+const DISABLE_AUTOLOG_VAR: &str = "ZEUSDB_DISABLE_AUTO_LOGGING";
+const DISABLE_AUTOLOG_VAR_DEPRECATED: &str = "ZEUSDB_DISABLE_AUTOLOG";
+
+/// Read a boolean environment variable the way the Python layer reads it
+///
+/// A bare name with no value, or a value outside the truthy set, does not
+/// disable anything. The Python layer has always required `true`, `1` or `yes`,
+/// and the two layers disagreeing about what counts as set is the defect this
+/// closes.
+fn env_flag_is_set(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase()
+            .as_str(),
+        "true" | "1" | "yes"
+    )
+}
+
+/// Whether auto-initialization has been disabled by the caller
+fn autolog_disabled() -> bool {
+    env_flag_is_set(DISABLE_AUTOLOG_VAR) || env_flag_is_set(DISABLE_AUTOLOG_VAR_DEPRECATED)
+}
+
 /// Initialize logging automatically on module import
 ///
-/// Respects ZEUSDB_DISABLE_AUTOLOG for power users who want programmatic control.
-/// Uses RUST_LOG if set; otherwise uses ZEUSDB_* environment variables.
+/// Respects ZEUSDB_DISABLE_AUTO_LOGGING for power users who want programmatic
+/// control. Uses RUST_LOG if set; otherwise uses ZEUSDB_* environment variables.
 ///
 /// Called automatically from lib.rs - users don't need to call this directly.
 pub(crate) fn init_from_env_if_unset() {
     // Allow power users to opt out of auto-init
-    if std::env::var("ZEUSDB_DISABLE_AUTOLOG").is_ok() {
+    if autolog_disabled() {
         return;
     }
 
@@ -150,6 +190,28 @@ pub(crate) fn init_from_env_if_unset() {
             rust_log_set = std::env::var("RUST_LOG").is_ok(),
             "ZeusDB logging initialized successfully"
         );
+
+        // Name the destination when the target is a file, so the resolved path
+        // is discoverable rather than inferred. Under daily rotation the
+        // resolved name carries a date suffix and is not the name the caller
+        // typed, which is the case this record exists for.
+        if log_target == "file" {
+            let requested_rotation = std::env::var("ZEUSDB_LOG_ROTATION").unwrap_or_default();
+            if parse_rotation(&requested_rotation).is_none() {
+                tracing::warn!(
+                    operation = "logging_init_file",
+                    value = %requested_rotation,
+                    "Unrecognised ZEUSDB_LOG_ROTATION, using never. Valid values: daily, never"
+                );
+            }
+
+            tracing::info!(
+                operation = "logging_init_file",
+                rotation = %configured_rotation().as_str(),
+                log_file = %resolved_log_file_path(),
+                "ZeusDB file logging writing to resolved path"
+            );
+        }
     });
 }
 
@@ -422,7 +484,69 @@ where
     })
 }
 
-/// Create file appender with intelligent path handling and daily rotation
+/// How the `file` target rotates
+///
+/// `never` is the default, so `ZEUSDB_LOG_FILE` names the file that is written
+/// and the Python and Rust layers write the same one. `daily` routes to the
+/// rolling appender, which reads the value as a directory plus a base name and
+/// appends the date, and is the way to bound disk growth without an external
+/// log rotator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogRotation {
+    Never,
+    Daily,
+}
+
+impl LogRotation {
+    fn as_str(self) -> &'static str {
+        match self {
+            LogRotation::Never => "never",
+            LogRotation::Daily => "daily",
+        }
+    }
+
+    /// The suffix the appender appends to the base filename, if any
+    fn filename_suffix(self) -> String {
+        match self {
+            LogRotation::Never => String::new(),
+            // tracing-appender formats a DAILY rotation as `{base}.{YYYY-MM-DD}`
+            // against the UTC date.
+            LogRotation::Daily => format!(".{}", chrono::Utc::now().format("%Y-%m-%d")),
+        }
+    }
+}
+
+/// Parse a `ZEUSDB_LOG_ROTATION` value, returning None for anything unrecognised
+///
+/// An unset or empty value is `never`, which is what makes the file target write
+/// the file the caller named unless rotation is asked for.
+fn parse_rotation(raw: &str) -> Option<LogRotation> {
+    match raw.trim().to_lowercase().as_str() {
+        "" | "never" => Some(LogRotation::Never),
+        "daily" => Some(LogRotation::Daily),
+        _ => None,
+    }
+}
+
+/// The rotation the environment asks for, falling back to `never`
+fn configured_rotation() -> LogRotation {
+    let raw = std::env::var("ZEUSDB_LOG_ROTATION").unwrap_or_default();
+    parse_rotation(&raw).unwrap_or(LogRotation::Never)
+}
+
+/// Create a file appender for the file the caller named
+///
+/// `ZEUSDB_LOG_FILE=app.log` writes `app.log` under the default rotation of
+/// `never`. It previously always went through `tracing_appender::rolling::daily`,
+/// which reads the path as a directory plus a base name and appends the date, so
+/// the file the caller named was never written and nothing said where the output
+/// had gone. Three things point at a file and none pointed at a prefix. The
+/// published documentation calls it a log file path with a default of
+/// `zeusdb.log`, the Python layer opens the same value with
+/// `logging.FileHandler` and writes it verbatim, and the variable is named
+/// `_FILE`. Rotation stays available for the callers who need disk growth
+/// bounded, under `ZEUSDB_LOG_ROTATION=daily`, where the date suffix is asked
+/// for rather than imposed.
 fn create_file_appender(
     log_file_path: &str,
 ) -> Option<(
@@ -445,10 +569,49 @@ fn create_file_appender(
         return None;
     }
 
-    let file_appender = tracing_appender::rolling::daily(directory, &*filename);
+    let file_appender = match configured_rotation() {
+        LogRotation::Never => tracing_appender::rolling::never(directory, &*filename),
+        LogRotation::Daily => tracing_appender::rolling::daily(directory, &*filename),
+    };
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     Some((non_blocking, guard))
+}
+
+/// The file the `file` target resolves to, absolute where that can be worked out
+///
+/// Emitted at startup so the destination is discoverable from the logs rather
+/// than by guessing. Under `daily` this carries the date suffix, which is the
+/// case where the resolved name differs from the one the caller typed.
+fn resolved_log_file_path() -> String {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    let configured = std::env::var("ZEUSDB_LOG_FILE").unwrap_or_else(|_| "zeusdb.log".to_string());
+    let path = Path::new(&configured);
+
+    let mut filename = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| OsString::from("zeusdb.log"));
+    filename.push(configured_rotation().filename_suffix());
+
+    match std::fs::canonicalize(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    ) {
+        Ok(dir) => dir.join(&filename).to_string_lossy().into_owned(),
+        // The directory could not be canonicalized, which is not a reason to
+        // report the name the caller typed when rotation has changed it.
+        Err(_) => path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.join(&filename))
+            .unwrap_or_else(|| std::path::PathBuf::from(&filename))
+            .to_string_lossy()
+            .into_owned(),
+    }
 }
 
 /// Check if output is a TTY and colors should be used
