@@ -678,20 +678,54 @@ def test_search_non_finite_query_values():
     with pytest.raises(ValueError, match="invalid value at index 0: NaN"):
         index.search(np.array([np.nan, 0.2, 0.3, 0.4], dtype=np.float32))
 
-    # Current behaviour, asserted rather than expected. batch_search_internal
-    # validates dimensions only, so the same NaN query inside a batch is not
-    # rejected. It is normalized to itself, because the norm of a vector
+    # The batch path applies the same value check, and the message names the
+    # entry in the batch as well as the component within it. Without the check
+    # the vector is normalized to itself, because the norm of a vector
     # containing NaN is not greater than zero, and the search returns hits
-    # whose scores carry no distance information. The expectation this violates
-    # is that the batch path applies the same value validation as the single
-    # path.
-    batch = index.search([[float("nan"), 0.2, 0.3, 0.4]], top_k=2)
-    assert isinstance(batch, list)
-    assert len(batch) == 1
-    assert all(r["id"] in {"s1", "s2"} for r in batch[0])
+    # whose scores carry no distance information.
+    with pytest.raises(
+        ValueError, match=r"Vector 0 in batch contains invalid value at index 0: NaN"
+    ):
+        index.search([[float("nan"), 0.2, 0.3, 0.4]], top_k=2)
 
-    infinite_batch = index.search([[float("inf"), 0.2, 0.3, 0.4]], top_k=2)
-    assert len(infinite_batch) == 1
+    with pytest.raises(
+        ValueError, match=r"Vector 0 in batch contains invalid value at index 0: inf"
+    ):
+        index.search([[float("inf"), 0.2, 0.3, 0.4]], top_k=2)
+
+    # The failing entry is named by its position in the batch, which is the
+    # point of the check for a batch large enough that finding it by hand is
+    # not practical.
+    with pytest.raises(
+        ValueError, match=r"Vector 2 in batch contains invalid value at index 3: -inf"
+    ):
+        index.search(
+            [
+                [0.1, 0.2, 0.3, 0.4],
+                [0.5, 0.6, 0.7, 0.8],
+                [0.1, 0.2, 0.3, float("-inf")],
+            ],
+            top_k=2,
+        )
+
+    # Batches above five queries take the parallel path, and the check runs
+    # before either path is chosen.
+    with pytest.raises(
+        ValueError, match=r"Vector 7 in batch contains invalid value at index 1: NaN"
+    ):
+        index.search([[0.1, 0.2, 0.3, 0.4]] * 7 + [[0.1, float("nan"), 0.3, 0.4]], top_k=2)
+
+    # A NumPy 2D batch reaches the same check.
+    with pytest.raises(
+        ValueError, match=r"Vector 1 in batch contains invalid value at index 2: NaN"
+    ):
+        index.search(
+            np.array([[0.1, 0.2, 0.3, 0.4], [0.1, 0.2, np.nan, 0.4]], dtype=np.float32),
+            top_k=2,
+        )
+
+    # A valid batch is unaffected.
+    assert len(index.search([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]], top_k=2)) == 2
 
 # ------------------------------------------------------------
 # Test 67: Searching an empty index
