@@ -122,6 +122,7 @@ def operator_index():
                 "flag": True,
                 "tags": ["ai", "science"],
                 "nullable": None,
+                "nested": {"key": "value", "n": 1},
             },
         },
         {
@@ -183,12 +184,13 @@ def test_filter_operator_eq(operator_index):
     assert filtered_ids(index, {"flag": {"eq": True}}) == ["r01", "r03"]
     assert filtered_ids(index, {"flag": {"eq": False}}) == ["r02"]
 
-    # eq compares serde_json Values, and an integer Value never equals a float
-    # Value even when the two numbers are mathematically equal. count is the
-    # integer 10 for r01 and r04, and 10.0 matches nothing.
-    assert filtered_ids(index, {"count": {"eq": 10.0}}) == []
+    # eq compares numbers by magnitude, so an integer field matches an equal
+    # float target. count is the integer 10 for r01 and r04, and 10.0 selects
+    # both, exactly as lt and gte already did.
+    assert filtered_ids(index, {"count": {"eq": 10.0}}) == ["r01", "r04"]
 
-    # A boolean field is not equal to the integer 1 either.
+    # Numeric equality does not extend to booleans. A boolean field is not
+    # equal to the integer 1.
     assert filtered_ids(index, {"flag": {"eq": 1}}) == []
 
     # A cross type comparison returns no match rather than raising.
@@ -219,10 +221,10 @@ def test_filter_operator_ne(operator_index):
     # A field no record carries yields nothing at all under ne.
     assert filtered_ids(index, {"missing_field": {"ne": 1}}) == []
 
-    # The integer against float behaviour noted in test 48 inverts here. Every
-    # record with a count is unequal to 10.0, including the two whose count is
-    # the integer 10.
-    assert filtered_ids(index, {"count": {"ne": 10.0}}) == OPERATOR_ALL_IDS
+    # ne is the negation of eq over the records that carry the field, so the
+    # numeric equality of test 48 applies here too. r01 and r04 hold the
+    # integer 10 and are excluded by a float target of 10.0.
+    assert filtered_ids(index, {"count": {"ne": 10.0}}) == ["r02", "r03"]
 
 # ------------------------------------------------------------
 # Test 50: The lt and lte operators
@@ -297,10 +299,10 @@ def test_filter_operator_in(operator_index):
     # A candidate absent from the array simply does not match.
     assert filtered_ids(index, {"name": {"in": ["nothing", "here"]}}) == []
 
-    # in tests array membership by Value equality, so it inherits the integer
-    # against float behaviour of eq. count is the integer 10 for r01 and r04,
-    # and 10.0 is not a member.
-    assert filtered_ids(index, {"count": {"in": [10.0]}}) == []
+    # in tests array membership with the same equality eq uses, so it inherits
+    # the numeric comparison. count is the integer 10 for r01 and r04, and a
+    # float member of 10.0 selects both.
+    assert filtered_ids(index, {"count": {"in": [10.0]}}) == ["r01", "r04"]
 
     # An empty array matches nothing, which follows from membership rather than
     # being a special case.
@@ -343,57 +345,174 @@ def test_filter_null_values(operator_index):
     assert filtered_ids(index, {"count": {"eq": None}}) == []
 
 # ------------------------------------------------------------
-# Test 54: Direct equality against an array value
+# Test 54: Direct equality against an array or an object value
 # ------------------------------------------------------------
-def test_filter_direct_equality_ignores_array_values(operator_index):
+def test_filter_direct_equality_compares_arrays(operator_index):
     index = operator_index
 
-    # Current behaviour, asserted rather than expected. field_matches compares
-    # a condition directly only when it is a String, Number, Bool or Null, and
-    # every other variant falls through to a bare false. An array filter value
-    # written without an operator is therefore dropped, while the same array
-    # under an explicit eq matches. The README describes direct equality as
-    # exact equality for any type, which this contradicts for arrays.
-    assert filtered_ids(index, {"tags": ["tech"]}) == []
+    # An array filter value written without an operator is exact equality, the
+    # same comparison an explicit eq performs. The README describes direct
+    # equality as exact equality for any type and this is now that.
+    assert filtered_ids(index, {"tags": ["tech"]}) == ["r02"]
     assert filtered_ids(index, {"tags": {"eq": ["tech"]}}) == ["r02"]
+    assert filtered_ids(index, {"tags": ["ai", "science"]}) == ["r01"]
+
+    # Equality, not membership. in already covers membership, so an array is
+    # compared element by element and in order.
+    assert filtered_ids(index, {"tags": ["science", "ai"]}) == []
+    assert filtered_ids(index, {"tags": ["ai"]}) == []
+
+    # An empty array is a value like any other and matches the record whose
+    # tags are empty rather than matching everything or nothing.
+    assert filtered_ids(index, {"tags": []}) == ["r03"]
 
     # A float filter value written without an operator behaves as it does under
-    # eq, which is the integer against float mismatch again.
+    # eq, so it matches an equal integer field.
     assert filtered_ids(index, {"count": 10}) == ["r01", "r04"]
-    assert filtered_ids(index, {"count": 10.0}) == []
+    assert filtered_ids(index, {"count": 10.0}) == ["r01", "r04"]
 
     # An empty filter matches every record, so it is not equivalent to a filter
     # no record satisfies.
     assert filtered_ids(index, {}) == OPERATOR_ALL_IDS
 
+
+# ------------------------------------------------------------
+# Test 94: A dict filter value is always the operator form
+# ------------------------------------------------------------
+def test_filter_object_condition_is_always_the_operator_form(operator_index):
+    index = operator_index
+
+    # A dict filter value is the operator map, and there is no separate syntax
+    # for direct equality against a nested object because the two would be
+    # indistinguishable. The keys of an object written as a bare condition are
+    # read as operator names, so this raises rather than comparing.
+    with pytest.raises(ValueError, match="Unknown filter operation: key"):
+        filtered_ids(index, {"nested": {"key": "value"}})
+
+    # eq is how equality against a nested object is written, and it compares
+    # the whole object including its numbers.
+    assert filtered_ids(index, {"nested": {"eq": {"key": "value", "n": 1}}}) == ["r01"]
+    assert filtered_ids(index, {"nested": {"eq": {"key": "value", "n": 1.0}}}) == ["r01"]
+
+    # Equality is over the whole object, so a subset of the keys does not
+    # match and neither does a different value.
+    assert filtered_ids(index, {"nested": {"eq": {"key": "value"}}}) == []
+    assert filtered_ids(index, {"nested": {"eq": {"key": "other", "n": 1}}}) == []
+
 # ------------------------------------------------------------
 # Test 55: An unrecognised filter operator
 # ------------------------------------------------------------
-def test_filter_unknown_operator_is_silently_dropped(operator_index):
+def test_filter_unknown_operator_raises(operator_index):
     index = operator_index
 
-    # Current behaviour, asserted rather than expected. evaluate_value_conditions
-    # builds a ValueError naming the operator, but every call site reaches it
-    # through matches_filter(...).unwrap_or(false), so the error is discarded
-    # and the record is treated as a non match. The expectation this violates is
-    # that a filter naming an operator the engine does not implement reaches the
-    # caller as a ValueError rather than as an empty result set.
-    assert filtered_ids(index, {"count": {"not_an_operator": 10}}) == []
-    assert filtered_ids(index, {"name": {"regex": "Alpha"}}) == []
+    # A filter naming an operator the engine does not implement is a mistake in
+    # the query rather than a condition of the data, so it fails the search
+    # with a ValueError naming the operator.
+    with pytest.raises(ValueError, match="Unknown filter operation: not_an_operator"):
+        filtered_ids(index, {"count": {"not_an_operator": 10}})
 
-    # A satisfied known operator alongside an unknown one does not rescue the
-    # record either.
-    assert filtered_ids(index, {"count": {"gt": 0, "not_an_operator": 1}}) == []
+    with pytest.raises(ValueError, match="Unknown filter operation: regex"):
+        filtered_ids(index, {"name": {"regex": "Alpha"}})
 
-    # An unknown operator on a field no record carries is short circuited by the
-    # missing field check, so it is indistinguishable from the cases above.
-    assert filtered_ids(index, {"missing_field": {"not_an_operator": 1}}) == []
+    # A satisfied known operator alongside an unknown one does not suppress it.
+    with pytest.raises(ValueError, match="Unknown filter operation: not_an_operator"):
+        filtered_ids(index, {"count": {"gt": 0, "not_an_operator": 1}})
 
-    # The batch path discards the error the same way, returning one empty
-    # result set per query rather than raising.
-    batch = index.search(
-        vector=[OPERATOR_QUERY, OPERATOR_QUERY],
-        filter={"count": {"not_an_operator": 10}},
-        **OPERATOR_SEARCH_KWARGS,
-    )
-    assert batch == [[], []]
+    # The filter is checked before any record is examined, so a field no record
+    # carries raises exactly as a populated one does. Checking during
+    # evaluation alone would not, because a record without the field never
+    # reaches the operator.
+    with pytest.raises(ValueError, match="Unknown filter operation: not_an_operator"):
+        filtered_ids(index, {"missing_field": {"not_an_operator": 1}})
+
+    # The batch path raises for the whole call rather than returning one empty
+    # result set per query.
+    with pytest.raises(ValueError, match="Unknown filter operation: not_an_operator"):
+        index.search(
+            vector=[OPERATOR_QUERY, OPERATOR_QUERY],
+            filter={"count": {"not_an_operator": 10}},
+            **OPERATOR_SEARCH_KWARGS,
+        )
+
+    # Batches above five queries take the parallel path, which raises the same
+    # way rather than losing the error in a worker thread.
+    with pytest.raises(ValueError, match="Unknown filter operation: not_an_operator"):
+        index.search(
+            vector=[OPERATOR_QUERY] * 8,
+            filter={"count": {"not_an_operator": 10}},
+            **OPERATOR_SEARCH_KWARGS,
+        )
+
+    # Every documented operator survives the check, so validation and dispatch
+    # agree about what is known.
+    for condition in (
+        {"count": {"eq": 10}},
+        {"count": {"ne": 10}},
+        {"count": {"gt": 0}},
+        {"count": {"gte": 0}},
+        {"count": {"lt": 99}},
+        {"count": {"lte": 99}},
+        {"tags": {"contains": "ai"}},
+        {"name": {"startswith": "A"}},
+        {"name": {"endswith": ".pdf"}},
+        {"count": {"in": [10]}},
+    ):
+        filtered_ids(index, condition)
+
+# ------------------------------------------------------------
+# Test 95: Numbers compare by magnitude under every operator
+# ------------------------------------------------------------
+def test_filter_numeric_comparison_is_consistent_across_operators():
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=4, space="cosine", expected_size=16)
+
+    # 9007199254740993 is the first integer above 2^53 that no f64 can hold, so
+    # it and its predecessor share one float representation. They are the pair
+    # that separates an exact integer comparison from a comparison that casts
+    # both sides to f64 first.
+    records = [
+        {
+            "id": "m1",
+            "values": [1.0, 0.0, 0.0, 0.0],
+            "metadata": {"count": 10, "ratio": 10.0, "big": 9007199254740993},
+        },
+        {
+            "id": "m2",
+            "values": [0.9, 0.1, 0.0, 0.0],
+            "metadata": {"count": 20, "ratio": 20.5, "big": 9007199254740992},
+        },
+    ]
+    assert index.add(records).is_success()
+
+    def ids(filter):
+        results = index.search(vector=[1.0, 0.0, 0.0, 0.0], filter=filter, top_k=10, ef_search=200)
+        return sorted(r["id"] for r in results)
+
+    assert ids({}) == ["m1", "m2"]
+
+    # An integer field and an equal float target match under every operator
+    # that compares values, and a float field and an equal integer target do
+    # the same in the other direction.
+    assert ids({"count": {"eq": 10.0}}) == ["m1"]
+    assert ids({"count": 10.0}) == ["m1"]
+    assert ids({"count": {"in": [10.0]}}) == ["m1"]
+    assert ids({"count": {"ne": 10.0}}) == ["m2"]
+    assert ids({"count": {"gte": 10.0, "lte": 10.0}}) == ["m1"]
+    assert ids({"ratio": {"eq": 10}}) == ["m1"]
+    assert ids({"ratio": 10}) == ["m1"]
+    assert ids({"ratio": {"in": [10]}}) == ["m1"]
+
+    # Two integers above 2^53 that share an f64 representation stay distinct
+    # under the ordered operators as well as under equality.
+    assert ids({"big": {"eq": 9007199254740993}}) == ["m1"]
+    assert ids({"big": {"eq": 9007199254740992}}) == ["m2"]
+    assert ids({"big": {"lte": 9007199254740992}}) == ["m2"]
+    assert ids({"big": {"gt": 9007199254740992}}) == ["m1"]
+    assert ids({"big": {"gte": 9007199254740993}}) == ["m1"]
+
+    # A boolean is not a number and a numeric string is not a number, under
+    # equality and under ordering alike.
+    assert ids({"count": {"eq": True}}) == []
+    assert ids({"count": {"eq": "10"}}) == []
+    assert ids({"count": {"in": ["10", True]}}) == []
+    assert ids({"count": {"gte": "10"}}) == []

@@ -7,6 +7,8 @@ use pyo3::types::{PyDict, PyList};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+// Aliased because `std::sync::atomic::Ordering` already holds the bare name.
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1339,6 +1341,13 @@ impl HNSWIndex {
             .map(|f| self.python_dict_to_value_map(f))
             .transpose()?;
 
+        // Reject an unrecognised operator before the search runs. Checking it
+        // per record would make the error depend on the data, because a record
+        // that lacks the field never reaches the operator at all.
+        if let Some(conditions) = filter_conditions.as_ref() {
+            self.validate_filter_conditions(conditions)?;
+        }
+
         // Detect batch vs single query with comprehensive input support
         let result: PyObject = if let Ok(list_vec) = vector.extract::<Vec<Vec<f32>>>() {
             // Format: List of vectors [[0.1, 0.2], [0.3, 0.4]]
@@ -1437,7 +1446,7 @@ impl HNSWIndex {
                 "Starting single vector search"
             );
 
-            let search_results = py.allow_threads(|| {
+            let search_results = py.allow_threads(|| -> PyResult<QueryHits> {
                 // Check if we should use quantized search
                 let use_quantized = self.is_quantized();
 
@@ -1487,7 +1496,7 @@ impl HNSWIndex {
                         if has_filter {
                             if let Some(meta) = vector_metadata.get(ext_id) {
                                 let filter_conds = filter_conditions.as_ref().unwrap();
-                                if !self.matches_filter(meta, filter_conds).unwrap_or(false) {
+                                if !self.matches_filter(meta, filter_conds)? {
                                     continue;
                                 }
                             } else {
@@ -1513,8 +1522,8 @@ impl HNSWIndex {
                     }
                 }
 
-                results
-            });
+                Ok(results)
+            })?;
 
             // Convert to Python objects
             let mut output: Vec<Py<PyDict>> = Vec::with_capacity(search_results.len());
@@ -2116,6 +2125,14 @@ type ParsedRecords = Vec<(String, Vec<f32>, HashMap<String, Value>)>;
 /// optional raw vector). The raw vector is present only when the caller asked
 /// for it and the index still holds one.
 type QueryHits = Vec<(String, f32, HashMap<String, Value>, Option<Vec<f32>>)>;
+
+/// A JSON number as either an exact integer or a float. `serde_json` stores an
+/// integer and a float in different variants, and comparing those variants is
+/// what made 10 and 10.0 unequal under some operators and equal under others.
+enum NumericValue {
+    Integer(i128),
+    Float(f64),
+}
 
 // INTERNAL METHODS, HELPERS AND IMPLEMENTATIONS
 impl HNSWIndex {
@@ -3298,12 +3315,32 @@ impl HNSWIndex {
         };
 
         match condition {
-            Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => {
-                Ok(field_value == condition)
-            }
+            // A map is always the operator form. Direct equality against a
+            // nested object has no syntax of its own, because the two forms
+            // would be indistinguishable, so it is written {"eq": {...}}.
             Value::Object(ops) => self.evaluate_value_conditions(field_value, ops),
-            _ => Ok(false),
+            _ => Ok(Self::values_equal(field_value, condition)),
         }
+    }
+
+    /// Reject an operator the engine does not implement, before any record is
+    /// examined. Checking during evaluation is not enough on its own, because a
+    /// record that lacks the field never reaches the operator and a filter that
+    /// fails an earlier field short circuits, so whether the typo is noticed
+    /// would depend on the data. `evaluate_operator` is the only list of
+    /// operator names, so validation cannot disagree with dispatch about what
+    /// is known. The field value here is a placeholder, which is sound because
+    /// every operator helper is total and the unknown operator arm is the one
+    /// error the dispatch can produce.
+    fn validate_filter_conditions(&self, filter: &HashMap<String, Value>) -> PyResult<()> {
+        for condition in filter.values() {
+            if let Value::Object(operations) = condition {
+                for (op, target_value) in operations {
+                    self.evaluate_operator(&Value::Null, op, target_value)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn evaluate_value_conditions(
@@ -3312,41 +3349,127 @@ impl HNSWIndex {
         operations: &serde_json::Map<String, Value>,
     ) -> PyResult<bool> {
         for (op, target_value) in operations {
-            let matches = match op.as_str() {
-                "eq" => field_value == target_value,
-                "ne" => field_value != target_value,
-                "gt" => self.compare_values(field_value, target_value, |a, b| a > b)?,
-                "gte" => self.compare_values(field_value, target_value, |a, b| a >= b)?,
-                "lt" => self.compare_values(field_value, target_value, |a, b| a < b)?,
-                "lte" => self.compare_values(field_value, target_value, |a, b| a <= b)?,
-                "contains" => self.value_contains(field_value, target_value)?,
-                "startswith" => self.value_starts_with(field_value, target_value)?,
-                "endswith" => self.value_ends_with(field_value, target_value)?,
-                "in" => self.value_in_array(field_value, target_value)?,
-                _ => {
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                        "Unknown filter operation: {}",
-                        op
-                    )));
-                }
-            };
-
-            if !matches {
+            if !self.evaluate_operator(field_value, op, target_value)? {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
+    fn evaluate_operator(
+        &self,
+        field_value: &Value,
+        op: &str,
+        target_value: &Value,
+    ) -> PyResult<bool> {
+        match op {
+            "eq" => Ok(Self::values_equal(field_value, target_value)),
+            "ne" => Ok(!Self::values_equal(field_value, target_value)),
+            "gt" => self.compare_values(field_value, target_value, CmpOrdering::is_gt),
+            "gte" => self.compare_values(field_value, target_value, CmpOrdering::is_ge),
+            "lt" => self.compare_values(field_value, target_value, CmpOrdering::is_lt),
+            "lte" => self.compare_values(field_value, target_value, CmpOrdering::is_le),
+            "contains" => self.value_contains(field_value, target_value),
+            "startswith" => self.value_starts_with(field_value, target_value),
+            "endswith" => self.value_ends_with(field_value, target_value),
+            "in" => self.value_in_array(field_value, target_value),
+            _ => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Unknown filter operation: {}",
+                op
+            ))),
+        }
+    }
+
+    /// Equality over the whole value tree. Numbers compare by magnitude, so a
+    /// stored integer matches an equal float, and arrays and objects compare
+    /// element by element so their numbers do too. Every other pairing keeps
+    /// `serde_json` equality, which is why a boolean is not equal to a number
+    /// and a numeric string is not equal to a number.
+    fn values_equal(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Number(left), Value::Number(right)) => {
+                Self::compare_numbers(left, right) == Some(CmpOrdering::Equal)
+            }
+            (Value::Array(left), Value::Array(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right.iter())
+                        .all(|(item, other)| Self::values_equal(item, other))
+            }
+            (Value::Object(left), Value::Object(right)) => {
+                left.len() == right.len()
+                    && left.iter().all(|(key, item)| {
+                        right
+                            .get(key)
+                            .is_some_and(|other| Self::values_equal(item, other))
+                    })
+            }
+            _ => a == b,
+        }
+    }
+
+    /// Order two JSON numbers by magnitude. Integers compare as integers, so
+    /// two values above 2^53 that share an f64 representation stay distinct,
+    /// and a mixed pair compares exactly rather than through a lossy cast.
+    fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Option<CmpOrdering> {
+        match (Self::numeric_value(a)?, Self::numeric_value(b)?) {
+            (NumericValue::Integer(left), NumericValue::Integer(right)) => Some(left.cmp(&right)),
+            (NumericValue::Float(left), NumericValue::Float(right)) => left.partial_cmp(&right),
+            (NumericValue::Integer(left), NumericValue::Float(right)) => {
+                Self::compare_integer_to_float(left, right)
+            }
+            (NumericValue::Float(left), NumericValue::Integer(right)) => {
+                Self::compare_integer_to_float(right, left).map(CmpOrdering::reverse)
+            }
+        }
+    }
+
+    /// `i128` holds every `serde_json` integer, which is an `i64` or a `u64`,
+    /// so the widening is lossless.
+    fn numeric_value(number: &serde_json::Number) -> Option<NumericValue> {
+        if let Some(value) = number.as_i64() {
+            Some(NumericValue::Integer(value as i128))
+        } else if let Some(value) = number.as_u64() {
+            Some(NumericValue::Integer(value as i128))
+        } else {
+            number.as_f64().map(NumericValue::Float)
+        }
+    }
+
+    /// Order an integer against a float without casting the integer to f64.
+    /// The float splits into a truncated part, which converts to an integer
+    /// exactly, and a fraction that breaks the tie when the integer parts are
+    /// equal. A float outside the `i128` range saturates on conversion, and
+    /// the comparison still lands on the correct side because every integer
+    /// reaching this point fits in a `u64`.
+    fn compare_integer_to_float(integer: i128, float: f64) -> Option<CmpOrdering> {
+        if float.is_nan() {
+            return None;
+        }
+        if float.is_infinite() {
+            return Some(if float.is_sign_positive() {
+                CmpOrdering::Less
+            } else {
+                CmpOrdering::Greater
+            });
+        }
+
+        let truncated = float.trunc();
+        let integer_part = truncated as i128;
+        Some(match integer.cmp(&integer_part) {
+            CmpOrdering::Equal => truncated.partial_cmp(&float)?,
+            ordering => ordering,
+        })
+    }
+
     fn compare_values<F>(&self, a: &Value, b: &Value, op: F) -> PyResult<bool>
     where
-        F: Fn(f64, f64) -> bool,
+        F: Fn(CmpOrdering) -> bool,
     {
         match (a, b) {
             (Value::Number(n1), Value::Number(n2)) => {
-                let f1 = n1.as_f64().unwrap_or(0.0);
-                let f2 = n2.as_f64().unwrap_or(0.0);
-                Ok(op(f1, f2))
+                Ok(Self::compare_numbers(n1, n2).is_some_and(op))
             }
             _ => Ok(false),
         }
@@ -3355,7 +3478,7 @@ impl HNSWIndex {
     fn value_contains(&self, field: &Value, target: &Value) -> PyResult<bool> {
         match (field, target) {
             (Value::String(s1), Value::String(s2)) => Ok(s1.contains(s2)),
-            (Value::Array(arr), val) => Ok(arr.contains(val)),
+            (Value::Array(arr), val) => Ok(arr.iter().any(|item| Self::values_equal(item, val))),
             _ => Ok(false),
         }
     }
@@ -3376,7 +3499,7 @@ impl HNSWIndex {
 
     fn value_in_array(&self, field: &Value, target: &Value) -> PyResult<bool> {
         match target {
-            Value::Array(arr) => Ok(arr.contains(field)),
+            Value::Array(arr) => Ok(arr.iter().any(|item| Self::values_equal(item, field))),
             _ => Ok(false),
         }
     }
@@ -3470,6 +3593,28 @@ impl HNSWIndex {
                     vector.len()
                 )));
             }
+
+            // The same value check the single query path applies. A non-finite
+            // component survives normalization, because the norm of a vector
+            // containing one is not greater than zero, and the search then
+            // returns hits whose scores carry no distance information. The
+            // message names the batch entry as well as the component, so one
+            // bad vector is findable in a batch of thousands.
+            for (component, &value) in vector.iter().enumerate() {
+                if !value.is_finite() {
+                    error!(
+                        operation = "batch_search_validation",
+                        vector_index = i,
+                        value_index = component,
+                        value = value,
+                        "Vector in batch contains invalid value"
+                    );
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "Vector {} in batch contains invalid value at index {}: {} (must be finite)",
+                        i, component, value
+                    )));
+                }
+            }
         }
 
         // Choose strategy based on batch size
@@ -3511,7 +3656,7 @@ impl HNSWIndex {
         return_vector: bool,
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
-        let rust_results = py.allow_threads(|| {
+        let rust_results = py.allow_threads(|| -> PyResult<Vec<QueryHits>> {
             let hnsw_guard = self.hnsw.lock().unwrap();
             let vector_store = self.vectors.read().unwrap();
             let metadata_store = self.vector_metadata.read().unwrap();
@@ -3536,7 +3681,7 @@ impl HNSWIndex {
                         // Apply filter if specified
                         if let Some(filter_conds) = filter_conditions {
                             if let Some(meta) = metadata_store.get(ext_id) {
-                                if !self.matches_filter(meta, filter_conds).unwrap_or(false) {
+                                if !self.matches_filter(meta, filter_conds)? {
                                     continue;
                                 }
                             } else {
@@ -3563,8 +3708,8 @@ impl HNSWIndex {
                 all_results.push(query_results);
             }
 
-            all_results
-        });
+            Ok(all_results)
+        })?;
 
         // Convert to Python objects
         let mut output = Vec::with_capacity(rust_results.len());
@@ -3601,10 +3746,10 @@ impl HNSWIndex {
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
         let span = tracing::Span::current();
-        let rust_results = py.allow_threads(|| {
-            let results: Vec<QueryHits> = vectors
+        let rust_results = py.allow_threads(|| -> PyResult<Vec<QueryHits>> {
+            let results: PyResult<Vec<QueryHits>> = vectors
                 .par_iter()
-                .map(|vector| {
+                .map(|vector| -> PyResult<QueryHits> {
                     let _entered = span.clone().entered();
                     // FIX: Process each query vector for space
                     let processed_query = self.process_vector_for_space(vector.clone());
@@ -3631,7 +3776,7 @@ impl HNSWIndex {
                             // Apply filter if specified
                             if let Some(filter_conds) = filter_conditions {
                                 if let Some(meta) = metadata_store.get(ext_id) {
-                                    if !self.matches_filter(meta, filter_conds).unwrap_or(false) {
+                                    if !self.matches_filter(meta, filter_conds)? {
                                         continue;
                                     }
                                 } else {
@@ -3655,12 +3800,12 @@ impl HNSWIndex {
                         }
                     }
 
-                    query_results
+                    Ok(query_results)
                 })
                 .collect();
 
             results
-        });
+        })?;
 
         // Convert to Python objects
         let mut output = Vec::with_capacity(rust_results.len());
