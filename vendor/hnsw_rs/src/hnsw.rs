@@ -1002,6 +1002,12 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         // here we allocate a binary_heap on values not on reference beccause we want to return
         // log2(skiplist_size) must be greater than 1.
         let skiplist_size = ef.max(2);
+        // ZEUSDB PATCH 4. A width of zero leaves the result heap with no room at all,
+        // so under a filter it would empty itself after every admission and the
+        // traversal would lose its stopping bound and walk the whole component. One
+        // slot is the smallest width that terminates. Without a filter the heap is
+        // never empty, so this changes nothing on the unfiltered path.
+        let ef = ef.max(1);
         // we will store positive distances in this one
         let mut return_points = BinaryHeap::<Arc<PointWithOrder<T>>>::with_capacity(skiplist_size);
         //
@@ -1027,44 +1033,51 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
             &entry_point,
             -dist_to_entry_point,
         )));
-        return_points.push(Arc::new(PointWithOrder::new(
-            &entry_point,
-            dist_to_entry_point,
-        )));
+        // ZEUSDB PATCH 4. The entry point routes the traversal whatever the filter
+        // says about it, but it may only be kept as a result if the filter admits it.
+        // Seeding it unconditionally let a rejected entry point hold a result slot it
+        // could never fill, and forced the code below to take it back out of a heap
+        // the rest of the function assumed was never empty.
+        let entry_admitted = match filter {
+            None => true,
+            Some(f) => f.hnsw_filter(&entry_point.get_origin_id()),
+        };
+        if entry_admitted {
+            return_points.push(Arc::new(PointWithOrder::new(
+                &entry_point,
+                dist_to_entry_point,
+            )));
+        }
         // at the beginning candidate_points contains point passed as arg in layer entry_point_id.0
         while !candidate_points.is_empty() {
             // get nearest point in candidate_points
             let c = candidate_points.pop().unwrap();
-            // f farthest point to
-            let f = return_points.peek().unwrap();
-            assert!(f.dist_to_ref >= 0.);
             assert!(c.dist_to_ref <= 0.);
-            trace!(
-                "Comparaing c : {:?} f : {:?}",
-                -(c.dist_to_ref),
-                f.dist_to_ref
-            );
-            if -(c.dist_to_ref) > f.dist_to_ref {
+            // ZEUSDB PATCH 4. f is the farthest point kept so far and its distance is
+            // the bound the traversal stops against. Under a filter the heap can be
+            // legitimately empty, meaning nothing admissible has been found yet, so
+            // there is no bound and the search must keep going.
+            let f_dist_to_ref = match return_points.peek() {
+                Some(f) => {
+                    assert!(f.dist_to_ref >= 0.);
+                    f.dist_to_ref
+                }
+                None => f32::INFINITY,
+            };
+            trace!("Comparaing c : {:?} f : {:?}", -(c.dist_to_ref), f_dist_to_ref);
+            if -(c.dist_to_ref) > f_dist_to_ref {
                 // this comparison requires that we are sure that distances compared are distances to the same point :
                 // This is the case we compare distance to point passed as arg.
                 trace!(
-                    "Fast return from search_layer, nb points : {:?} \n \t c {:?} \n \t f {:?} dists: {:?}  {:?}",
+                    "Fast return from search_layer, nb points : {:?} \n \t c {:?} \n \t dists: {:?}  {:?}",
                     return_points.len(),
                     c.point_ref.p_id,
-                    f.point_ref.p_id,
                     -(c.dist_to_ref),
-                    f.dist_to_ref
+                    f_dist_to_ref
                 );
-                if filter.is_none() {
-                    return return_points;
-                } else if return_points.len() >= ef {
-                    return_points.retain(|p| {
-                        filter
-                            .as_ref()
-                            .unwrap()
-                            .hnsw_filter(&p.point_ref.get_origin_id())
-                    });
-                }
+                // ZEUSDB PATCH 4. Every point in the heap now satisfies the filter, so
+                // the early return is correct with a filter as well as without one.
+                return return_points;
             }
             // now we scan neighborhood of c in layer and increment visited_point, candidate_points
             // and optimize candidate_points so that it contains points with lowest distances to point arg
@@ -1082,40 +1095,31 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                 if !visited_point_id.contains_key(&e.point_ref.p_id) {
                     visited_point_id.insert(e.point_ref.p_id, Arc::clone(&e.point_ref));
                     trace!("             visited insertion {:?}", e.point_ref.p_id);
-                    let f_opt = return_points.peek();
-                    if f_opt.is_none() {
-                        // do some debug info, dumped distance is from e to c! as e is in c neighbours
-                        debug!("return points empty when inserting {:?}", e.point_ref.p_id);
-                        return return_points;
-                    }
-                    let f = f_opt.unwrap();
+                    // ZEUSDB PATCH 4. An empty heap is no longer a reason to abandon the
+                    // search. It means only that nothing admissible has been found yet,
+                    // so every candidate still improves on the bound.
+                    let f_dist_to_p = match return_points.peek() {
+                        Some(f) => f.dist_to_ref,
+                        None => f32::INFINITY,
+                    };
                     let e_dist_to_p = self.dist_f.eval(point, e.point_ref.data.get_v());
-                    let f_dist_to_p = f.dist_to_ref;
                     if e_dist_to_p < f_dist_to_p || return_points.len() < ef {
-                        let e_prime = Arc::new(PointWithOrder::new(&e.point_ref, e_dist_to_p));
                         // a neighbour of neighbour is better, we insert it into candidate with the distance to point
-                        trace!(
-                            "                inserting new candidate {:?}",
-                            e_prime.point_ref.p_id
-                        );
+                        trace!("                inserting new candidate {:?}", e.point_ref.p_id);
                         candidate_points
                             .push(Arc::new(PointWithOrder::new(&e.point_ref, -e_dist_to_p)));
-                        if filter.is_none() {
-                            return_points.push(Arc::clone(&e_prime));
-                        } else {
-                            let id: &usize = &e_prime.point_ref.get_origin_id();
-                            if filter.as_ref().unwrap().hnsw_filter(id) {
-                                if return_points.len() == 1 {
-                                    let only_id = return_points.peek().unwrap().point_ref.origin_id;
-                                    if !filter.as_ref().unwrap().hnsw_filter(&only_id) {
-                                        return_points.clear()
-                                    }
-                                }
-                                return_points.push(Arc::clone(&e_prime))
+                        // ZEUSDB PATCH 4. Route through a rejected point but never keep
+                        // it, so the heap holds admissible points only.
+                        let admitted = match filter {
+                            None => true,
+                            Some(f) => f.hnsw_filter(&e.point_ref.get_origin_id()),
+                        };
+                        if admitted {
+                            return_points
+                                .push(Arc::new(PointWithOrder::new(&e.point_ref, e_dist_to_p)));
+                            if return_points.len() > ef {
+                                return_points.pop();
                             }
-                        }
-                        if return_points.len() > ef {
-                            return_points.pop();
                         }
                     } // end if e.dist_to_ref < f.dist_to_ref
                 }

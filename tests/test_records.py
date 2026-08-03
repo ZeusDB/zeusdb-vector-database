@@ -160,32 +160,32 @@ def test_remove_point_removes_from_search_results():
     after = index.search(query, top_k=10)
     assert all(hit["id"] != "doc_7" for hit in after)
 
-    # Current behaviour, asserted rather than expected. remove_point_internal
-    # clears the id maps, the vector, the metadata and the codes, but it does
-    # not touch the HNSW graph, so the removed point keeps its node. The
-    # traversal still returns that node, the external id lookup finds nothing
-    # and the hit is dropped without another candidate taking its place, so
-    # the page comes back one short. The expectation this violates is that a
-    # search over 199 remaining records returns a full page of 10.
-    assert len(after) == 9
-    assert len(index.search(query, top_k=5)) == 4
-    assert len(index.search(query, top_k=20)) == 19
+    # The page is full. remove_point_internal still cannot delete the graph
+    # node, so the removed point keeps its vector and both directions of its
+    # adjacency, but search now passes a live-record predicate into the
+    # traversal, so that node routes the search without consuming a result
+    # slot. A search over 199 remaining records returns a full page of 10.
+    # This assertion read 9 until relay 31.
+    assert len(after) == 9 + 1
+    assert len(index.search(query, top_k=5)) == 5
+    assert len(index.search(query, top_k=20)) == 20
 
-    # Raising ef_search widens the candidate list but does not backfill the
-    # slot, so the shortfall is not a recall effect that more search fixes.
-    assert len(index.search(query, top_k=10, ef_search=200)) == 9
+    # ef_search is no longer load bearing here, and was never able to backfill
+    # the slot when the shortfall existed.
+    assert len(index.search(query, top_k=10, ef_search=200)) == 10
 
-    # A query whose candidate window never reaches the removed node is
-    # unaffected, which is what makes the shortfall easy to miss.
+    # A query whose candidate window never reaches the removed node was
+    # unaffected before the fix, which is what made the shortfall easy to miss.
     assert len(index.search(vectors[150].tolist(), top_k=10)) == 10
 
-    # Re-adding the same id does not reclaim the dead node. The record comes
-    # back and is returned, and the page is still one short.
+    # Re-adding the same id still does not reclaim the dead node, which is what
+    # compact() is for, but the record comes back, is returned, and the page
+    # stays full.
     index.add({"id": "doc_7", "values": query, "metadata": {"i": 7}})
     assert index.contains("doc_7")
     revived = index.search(query, top_k=10)
     assert any(hit["id"] == "doc_7" for hit in revived)
-    assert len(revived) == 9
+    assert len(revived) == 10
     assert index.remove_point("doc_7") is True
 
     # A wider removal is not visible in a wider search either.
@@ -198,12 +198,11 @@ def test_remove_point_removes_from_search_results():
 
     wide = index.search(vectors[15].tolist(), top_k=50)
     assert removed.isdisjoint({hit["id"] for hit in wide})
-    # The shortfall is one slot per dead node inside the candidate window, so
-    # it is bounded by the number removed and cannot be zero here. The observed
-    # value for this seed is 45 of 50, and that figure is not asserted because
-    # it depends on which dead nodes the traversal happens to reach.
-    assert 0 < len(wide) < 50
-    assert 50 - len(wide) <= len(removed) + 1
+    # A wider removal is not visible in a wider search either, and now it is not
+    # visible because nothing is lost rather than because the loss is hidden.
+    # The dead nodes inside the candidate window no longer take slots, so the
+    # page is full. This assertion read `0 < len(wide) < 50` until relay 31.
+    assert len(wide) == 50
 
     # The batch path agrees with the single path.
     batch = index.search(np.array([vectors[15], vectors[7]], dtype=np.float32), top_k=25)
