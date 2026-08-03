@@ -2,7 +2,7 @@
 
 Upstream crate: hnsw_rs 0.3.4 (crates.io, checksum
 43a5258f079b97bf2e8311ff9579e903c899dcbac0d9a138d62e9a066778bd07).
-This directory is a copy of the registry source with three deliberate
+This directory is a copy of the registry source with four deliberate
 changes plus this file. Resolution is redirected here through
 `[patch.crates-io]` in `vdb-core/Cargo.toml`.
 
@@ -173,12 +173,91 @@ quantized path can see it and the sequential default cannot.
 This is recorded rather than fixed. Closing it needs either a compare
 and swap on the counter or a lock ordering across points.
 
+## Patch 4. The filtered search path
+
+File `src/hnsw.rs`, function `search_layer`. Four changes in one place,
+all of them consequences of a single decision.
+
+```diff
+-        return_points.push(Arc::new(PointWithOrder::new(
+-            &entry_point,
+-            dist_to_entry_point,
+-        )));
++        let entry_admitted = match filter {
++            None => true,
++            Some(f) => f.hnsw_filter(&entry_point.get_origin_id()),
++        };
++        if entry_admitted {
++            return_points.push(Arc::new(PointWithOrder::new(
++                &entry_point,
++                dist_to_entry_point,
++            )));
++        }
+```
+
+The result heap is now seeded only with an entry point the filter admits.
+Three further changes follow from it.
+
+- The two reads of the farthest kept point, at the head of the candidate
+  loop and inside the neighbour loop, become `match return_points.peek()`
+  with `f32::INFINITY` for the empty case. An empty heap means nothing
+  admissible has been found yet, so there is no stopping bound and the
+  traversal continues.
+- The stopping branch returns unconditionally. Upstream returned early
+  only when `filter.is_none()` and otherwise ran an O(`ef`) `retain` over
+  the heap on that turn and every turn after it. Every point in the heap
+  now satisfies the filter, so the plain early return is correct with a
+  filter as well as without one.
+- The neighbour admission branch collapses to one filter test and one
+  push, dropping the special case that cleared the heap when it held
+  exactly one rejected element. That case can no longer arise.
+- `let ef = ef.max(1);` is added beside `skiplist_size`. A width of zero
+  leaves the heap no room, so under a filter it would empty itself after
+  every admission, lose its stopping bound and walk the whole connected
+  component. Without a filter the heap is never empty, so this changes
+  nothing on the unfiltered path.
+
+### Why it exists
+
+ZeusDB passes a live-record predicate into every graph search, so that a
+node stranded by `remove_point` or by `add(overwrite=True)` routes the
+traversal but never consumes one of the `top_k` result slots. Upstream's
+filtered path could not carry that load.
+
+**It panicked.** `search_layer` seeded `return_points` with the entry
+point whatever the filter said, then removed it again through the
+`retain` on the stopping branch. If that emptied the heap and the popped
+candidate had no unvisited neighbour, the loop took another turn and
+`return_points.peek().unwrap()` unwrapped a `None`. Measured on a 4,000
+point graph with half the ids filtered out, `search_filter` with `knbn`
+of 0 and `ef_arg` of 0 panicked, and the same call with `filter` set to
+`None` did not. ZeusDB reaches those arguments through
+`search(vector, top_k=0, ef_search=0)`, since `search_filter` resolves
+the width as `ef_arg.max(knbn)`. Reachable, and reachable only because a
+filter is now passed.
+
+**It returned nothing.** With the width resolving to 1 the single heap
+slot was held by the rejected entry point, which `search_filter` then
+dropped in its post-truncation filter, so the query returned an empty
+list rather than the one live record it asked for. On the same graph,
+`knbn` of 1 with `ef_arg` of 1 returned nothing on 25 of 300 queries at
+half the ids filtered out, on 63 of 300 at nine tenths, and on 254 of 300
+at 999 in 1,000. After the patch every one of those cells returns a
+result on all 300 queries.
+
+**It abandoned the early return.** With a filter present the stopping
+condition retained instead of returning, so the search drained the whole
+candidate heap and ran an O(`ef`) `retain` on every turn after the first.
+That is a quadratic term on the hot path of every ZeusDB search.
+
 ## Total against the pristine registry copy
 
-`src/hnsw.rs` differs by 137 lines, 131 added and 6 removed. Patch 1
+`src/hnsw.rs` differs by 249 lines, 189 added and 60 removed. Patch 1
 accounts for 1 added and 1 removed. Patch 2 accounts for 30 added and 2
-removed. Patch 3 accounts for 100 added and 3 removed. `src/hnswio.rs`
-differs by 4 lines, all added, all patch 3. `ZEUSDB-PATCH.md` is an
+removed. Patch 3 accounts for 100 added and 3 removed. Patch 4 accounts
+for 58 added and 54 removed, of which 20 of the additions are comment.
+`src/hnswio.rs` differs by 4 lines, all added, all patch 3.
+`ZEUSDB-PATCH.md` is an
 added file. Five files carry no content change and differ only in line
 endings, which relay 07 pinned across the repository:
 `.cargo_vcs_info.json`, `.gitignore`, `Cargo.toml.orig`,
@@ -210,10 +289,27 @@ strands none. The test counts in-degree from the adjacency lists rather
 than from the counters this patch adds, so it holds against the graph
 itself.
 
+Patch 4 is caught partly by the Python regression tests
+`test_search_after_deletes_returns_full_top_k` and
+`test_repeatedly_overwritten_record_still_returns` in
+`tests/test_compaction.py`, which exercise the filtered path and fail on the
+returned count if it stops behaving. They do not distinguish this patch
+from the call-site change in `vdb-core` that supplies the filter. The
+panic and the empty result set need the boundary arguments, a `top_k` of
+0 with an `ef_search` of 0 for the first and a `top_k` of 1 with an
+`ef_search` of 1 for the second, and neither is in the suite because
+both are degenerate parameter choices no ordinary caller makes. The
+reliable check is textual. Without this patch `search_layer` contains
+`return_points.retain(` and `let f = return_points.peek().unwrap();`.
+With it, it contains neither.
+
 ## On upgrade
 
-All three patches MUST be reapplied whenever the vendored copy is
+All four patches MUST be reapplied whenever the vendored copy is
 refreshed or the version is bumped, and the line counts above rechecked
-so a lost patch is visible. Both regression tests insert sequentially,
-so they depend on patch 2 for their own determinism. Do not make any
-other change to this tree.
+so a lost patch is visible. Both Rust regression tests insert
+sequentially, so they depend on patch 2 for their own determinism. Patch
+4 is load bearing rather than optional, because `vdb-core` passes a
+filter into `search_filter` on every search call site and the unpatched
+filtered path panics on some legal arguments. Do not make any other
+change to this tree.

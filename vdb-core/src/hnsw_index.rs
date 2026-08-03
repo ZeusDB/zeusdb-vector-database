@@ -1,6 +1,6 @@
 use chrono::Utc;
 use hnsw_rs::api::AnnT; // This provides the file_dump method
-use hnsw_rs::prelude::{DistCosine, DistL1, DistL2, Distance, Hnsw};
+use hnsw_rs::prelude::{DistCosine, DistL1, DistL2, Distance, FilterT, Hnsw};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -301,17 +301,26 @@ impl DistanceType {
         }
     }
 
+    /// Search the graph, admitting only the internal ids the filter accepts.
+    ///
+    /// The filter runs inside the traversal, before the fixed `top_k` cut, so a
+    /// node the caller rejects routes the search but never consumes a result
+    /// slot. Removal and overwrite both leave a node behind that no longer
+    /// resolves to a record, and without the filter each such node inside a
+    /// query's `top_k` costs one result. Passing `None` restores the previous
+    /// unfiltered behaviour.
     fn search(
         &self,
         query: &[f32],
         k: usize,
         ef: usize,
+        filter: Option<&dyn FilterT>,
     ) -> Result<Vec<hnsw_rs::prelude::Neighbour>, String> {
         match self {
             // Raw vector search
-            DistanceType::Cosine(hnsw) => Ok(hnsw.search(query, k, ef)),
-            DistanceType::L2(hnsw) => Ok(hnsw.search(query, k, ef)),
-            DistanceType::L1(hnsw) => Ok(hnsw.search(query, k, ef)),
+            DistanceType::Cosine(hnsw) => Ok(hnsw.search_filter(query, k, ef, filter)),
+            DistanceType::L2(hnsw) => Ok(hnsw.search_filter(query, k, ef, filter)),
+            DistanceType::L1(hnsw) => Ok(hnsw.search_filter(query, k, ef, filter)),
 
             // PQ-based search with ADC
             DistanceType::CosinePQ(hnsw) | DistanceType::L2PQ(hnsw) | DistanceType::L1PQ(hnsw) => {
@@ -322,13 +331,27 @@ impl DistanceType {
                 let dummy_query = vec![0u8; self.get_code_size()];
 
                 // Perform search
-                let results = hnsw.search(&dummy_query, k, ef);
+                let results = hnsw.search_filter(&dummy_query, k, ef, filter);
 
                 // Clear LUT after search for memory efficiency
                 self.clear_lut();
 
                 Ok(results)
             }
+        }
+    }
+
+    /// Number of nodes the graph holds, which is the number of insertions it has
+    /// taken. It exceeds the live record count by exactly the number of nodes
+    /// that removal and overwrite have stranded.
+    fn nb_points(&self) -> usize {
+        match self {
+            DistanceType::Cosine(hnsw) => hnsw.get_nb_point(),
+            DistanceType::L2(hnsw) => hnsw.get_nb_point(),
+            DistanceType::L1(hnsw) => hnsw.get_nb_point(),
+            DistanceType::CosinePQ(hnsw) => hnsw.get_nb_point(),
+            DistanceType::L2PQ(hnsw) => hnsw.get_nb_point(),
+            DistanceType::L1PQ(hnsw) => hnsw.get_nb_point(),
         }
     }
 
@@ -1510,20 +1533,28 @@ impl HNSWIndex {
                     "Selected search method"
                 );
 
+                // One read guard for the whole search, taken before the graph lock
+                // and held across it. The predicate runs once per candidate the
+                // traversal visits, so acquiring the guard inside it would put a
+                // lock acquisition on the hot path. See the same pattern in the
+                // two batch paths.
+                let rev_map = self.rev_map.read().unwrap();
+                let live = |internal_id: &usize| rev_map.contains_key(internal_id);
+
                 let hnsw_results = {
                     let hnsw_guard = self.hnsw.lock().unwrap();
 
                     if use_quantized {
                         // Use ADC search for quantized index
                         hnsw_guard
-                            .search(&processed_query, top_k, ef)
+                            .search(&processed_query, top_k, ef, Some(&live))
                             .unwrap_or_else(|e| {
                                 error!(operation = "adc_search", error = %e, "ADC search failed");
                                 Vec::new()
                             })
                     } else {
                         // Use raw vector search
-                        match hnsw_guard.search(&processed_query, top_k, ef) {
+                        match hnsw_guard.search(&processed_query, top_k, ef, Some(&live)) {
                             Ok(results) => results,
                             Err(e) => {
                                 error!(operation = "raw_search", error = %e, "Raw search failed");
@@ -1537,7 +1568,6 @@ impl HNSWIndex {
                 let vectors = self.vectors.read().unwrap();
                 let pq_codes = self.pq_codes.read().unwrap();
                 let vector_metadata = self.vector_metadata.read().unwrap();
-                let rev_map = self.rev_map.read().unwrap();
 
                 let mut results = Vec::with_capacity(hnsw_results.len());
                 let has_filter = filter_conditions.is_some();
@@ -1753,6 +1783,16 @@ impl HNSWIndex {
         );
         stats.insert("thread_safety".to_string(), "RwLock+Mutex".to_string());
 
+        // Nodes the graph holds, which exceeds the live record count by exactly the
+        // number of nodes removal and overwrite have stranded. `compact` reclaims the
+        // difference.
+        let graph_nodes = self.hnsw.lock().unwrap().nb_points();
+        stats.insert("graph_nodes".to_string(), graph_nodes.to_string());
+        stats.insert(
+            "stranded_graph_nodes".to_string(),
+            graph_nodes.saturating_sub(vector_count).to_string(),
+        );
+
         // Storage breakdown
         stats.insert("raw_vectors_stored".to_string(), vectors.len().to_string());
         stats.insert(
@@ -1954,6 +1994,161 @@ impl HNSWIndex {
             Ok(result) => Ok(result),
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
+    }
+
+    /// Rebuild the graph in memory and reclaim the nodes removal and overwrite strand.
+    ///
+    /// `remove_point` clears a record from every storage map but cannot delete its
+    /// graph node, and `add(overwrite=True)` is a removal followed by an insertion,
+    /// so both leave behind a node that still holds a copy of the vector and both
+    /// directions of adjacency while resolving to no record. Search already excludes
+    /// those nodes, so this is a resource operation and not a correctness one. What it
+    /// reclaims is their memory, their edge slots in live neighbour lists, and the
+    /// traversal steps they cost.
+    ///
+    /// Returns the number of nodes reclaimed. Zero means the graph held no stranded
+    /// nodes, in which case nothing is rebuilt and the call is a no-op.
+    ///
+    /// The cost is a full sequential rebuild, proportional to the live record count
+    /// rather than to the amount of debris. Nothing outside the graph is touched.
+    /// Internal ids, external ids, metadata, stored vectors, quantized codes, PQ
+    /// training state and the id counter all survive unchanged, so the record any
+    /// given id resolves to is the same before and after.
+    ///
+    /// The replacement graph is built in full before the old one is dropped, so peak
+    /// memory holds both for the duration and a failure part way through leaves the
+    /// index exactly as it was.
+    ///
+    /// This is never automatic. Calling it is a decision a deployment can schedule.
+    pub fn compact(&mut self) -> PyResult<usize> {
+        let start_time = Instant::now();
+
+        let live_count = self.id_map.read().unwrap().len();
+        let nodes_before = self.hnsw.lock().unwrap().nb_points();
+
+        if nodes_before <= live_count {
+            debug!(
+                operation = "compact",
+                graph_nodes = nodes_before,
+                live_records = live_count,
+                "No stranded nodes, compact is a no-op"
+            );
+            return Ok(0);
+        }
+
+        let quantized = self.is_quantized();
+        // NB_LAYER_MAX, matching every other construction site in this file.
+        let max_layer = 16;
+
+        let mut new_hnsw = if quantized {
+            let pq = self.pq.as_ref().cloned().ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Index reports a quantized graph but holds no product quantizer",
+                )
+            })?;
+            DistanceType::new_pq(
+                &self.space,
+                self.m,
+                self.expected_size,
+                max_layer,
+                self.ef_construction,
+                pq,
+            )
+        } else {
+            DistanceType::new_raw(
+                &self.space,
+                self.m,
+                self.expected_size,
+                max_layer,
+                self.ef_construction,
+            )
+        };
+
+        // Re-insert every live record under the internal id it already holds, so the
+        // two id maps stay correct without being rewritten. A record whose source data
+        // is missing is collected rather than skipped, because skipping it would drop
+        // it from the index silently.
+        let missing: Vec<String> = {
+            let id_map = self.id_map.read().unwrap();
+
+            if quantized {
+                let pq_codes = self.pq_codes.read().unwrap();
+                let mut batch: Vec<(&Vec<u8>, usize)> = Vec::with_capacity(id_map.len());
+                let mut missing = Vec::new();
+
+                for (ext_id, &internal_id) in id_map.iter() {
+                    match pq_codes.get(ext_id) {
+                        Some(codes) => batch.push((codes, internal_id)),
+                        None => missing.push(ext_id.clone()),
+                    }
+                }
+
+                if missing.is_empty() && !batch.is_empty() {
+                    new_hnsw.insert_batch_pq(&batch).map_err(|e| {
+                        error!(operation = "compact", error = %e, "Failed to re-insert quantized codes");
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                            "Failed to re-insert quantized codes during compact: {}",
+                            e
+                        ))
+                    })?;
+                }
+
+                missing
+            } else {
+                let vectors = self.vectors.read().unwrap();
+                let mut missing = Vec::new();
+
+                for (ext_id, &internal_id) in id_map.iter() {
+                    match vectors.get(ext_id) {
+                        Some(vector) => new_hnsw.insert(vector, internal_id),
+                        None => missing.push(ext_id.clone()),
+                    }
+                }
+
+                missing
+            }
+        };
+
+        if !missing.is_empty() {
+            error!(
+                operation = "compact",
+                missing_records = missing.len(),
+                live_records = live_count,
+                quantized = quantized,
+                "Refusing to compact, some live records have no source data to rebuild from"
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Refusing to compact: {} of {} live records have no stored {} to rebuild \
+                 the graph from, so compacting would drop them. The index is unchanged.",
+                missing.len(),
+                live_count,
+                if quantized {
+                    "quantized codes"
+                } else {
+                    "vector"
+                }
+            )));
+        }
+
+        let nodes_after = new_hnsw.nb_points();
+        {
+            let mut hnsw_guard = self.hnsw.lock().unwrap();
+            *hnsw_guard = new_hnsw;
+        }
+
+        let reclaimed = nodes_before - nodes_after;
+        info!(
+            operation = "compact_complete",
+            nodes_before = nodes_before,
+            nodes_after = nodes_after,
+            nodes_reclaimed = reclaimed,
+            live_records = live_count,
+            quantized = quantized,
+            duration_ms = start_time.elapsed().as_millis(),
+            "Graph compacted"
+        );
+
+        Ok(reclaimed)
     }
 
     /// Get performance characteristics and limitations
@@ -2698,16 +2893,18 @@ impl HNSWIndex {
     // 2. SEARCH OPERATIONS (1 method)
     /// Raw search without Python objects (for benchmarking)
     fn raw_search_no_gil(&self, query: &[f32]) -> Vec<(String, f32)> {
+        // Concurrent read access to ID mapping, taken before the graph lock so the
+        // traversal predicate can consult it without acquiring anything itself.
+        let rev_map = self.rev_map.read().unwrap();
+        let live = |internal_id: &usize| rev_map.contains_key(internal_id);
+
         // HNSW search with locking
         let hnsw_results = {
             let hnsw_guard = self.hnsw.lock().unwrap();
             hnsw_guard
-                .search(query, 10, 100)
+                .search(query, 10, 100, Some(&live))
                 .unwrap_or_else(|_| Vec::new())
         }; // Lock released immediately
-
-        // Concurrent read access to ID mapping
-        let rev_map = self.rev_map.read().unwrap();
 
         hnsw_results
             .into_iter()
@@ -3697,10 +3894,15 @@ impl HNSWIndex {
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
         let rust_results = py.allow_threads(|| -> PyResult<Vec<QueryHits>> {
+            // The read guard is taken before the graph lock and held across every
+            // query in the batch, so the traversal predicate below is a hash lookup
+            // rather than a lock acquisition.
+            let rev_map = self.rev_map.read().unwrap();
+            let live = |internal_id: &usize| rev_map.contains_key(internal_id);
+
             let hnsw_guard = self.hnsw.lock().unwrap();
             let vector_store = self.vectors.read().unwrap();
             let metadata_store = self.vector_metadata.read().unwrap();
-            let rev_map = self.rev_map.read().unwrap();
 
             let mut all_results = Vec::with_capacity(vectors.len());
 
@@ -3709,7 +3911,7 @@ impl HNSWIndex {
                 let processed_query = self.process_vector_for_space(vector.clone());
 
                 let neighbors = hnsw_guard
-                    .search(&processed_query, top_k, ef)
+                    .search(&processed_query, top_k, ef, Some(&live))
                     .unwrap_or_else(|_| Vec::new());
 
                 let mut query_results = Vec::with_capacity(neighbors.len());
@@ -3794,18 +3996,22 @@ impl HNSWIndex {
                     // FIX: Process each query vector for space
                     let processed_query = self.process_vector_for_space(vector.clone());
 
+                    // Taken before the graph lock, as in the other two search paths,
+                    // so every path acquires these two locks in the same order.
+                    let rev_map = self.rev_map.read().unwrap();
+                    let live = |internal_id: &usize| rev_map.contains_key(internal_id);
+
                     // Brief HNSW search (individual lock per query)
                     let neighbors = {
                         let hnsw_guard = self.hnsw.lock().unwrap();
                         hnsw_guard
-                            .search(&processed_query, top_k, ef)
+                            .search(&processed_query, top_k, ef, Some(&live))
                             .unwrap_or_else(|_| Vec::new())
                     };
 
                     // Concurrent data lookup
                     let vector_store = self.vectors.read().unwrap();
                     let metadata_store = self.vector_metadata.read().unwrap();
-                    let rev_map = self.rev_map.read().unwrap();
 
                     let mut query_results = Vec::with_capacity(neighbors.len());
 
