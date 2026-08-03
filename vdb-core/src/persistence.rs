@@ -708,11 +708,12 @@ fn install_centroids(pq: &PQ, centroids: Centroids) -> PyResult<()> {
         ));
     }
 
-    {
-        let mut guard = pq.centroids.write().unwrap();
-        *guard = centroids;
-    }
-    Ok(())
+    // Going through set_centroids rather than writing the field rebuilds the
+    // symmetric distance table from the codebook that has just been read, so a
+    // loaded index can build a graph on real distances exactly as a freshly
+    // trained one does.
+    pq.set_centroids(centroids)
+        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
 }
 
 /// Restore quantization state (simplified for reconstruction)

@@ -99,14 +99,35 @@ impl DistPQ {
 }
 
 impl Distance<u8> for DistPQ {
-    /// Compute distance between query (via LUT) and stored PQ codes
-    /// The first parameter `_a` is ignored since we use the pre-computed LUT
-    /// The second parameter `b` contains the PQ codes for the stored vector (one u8 per subvector)
-    fn eval(&self, _a: &[u8], b: &[u8]) -> f32 {
+    /// Distance between two points the graph holds, both of which are PQ codes
+    ///
+    /// A query table set means a search is running. `a` is then the dummy code
+    /// vector `DistanceType::search` passes, the real query lives in the table,
+    /// and the distance is asymmetric: query subvector against stored centroid.
+    ///
+    /// No query table means graph construction, where there is no query and
+    /// both `a` and `b` are stored codes. The distance is then symmetric,
+    /// centroid against centroid, read from the table the codebook carries.
+    /// Returning infinity here, which is what this did until the symmetric
+    /// table existed, made every candidate tie in the neighbour selection
+    /// heuristic and left the graph with one edge per node.
+    ///
+    /// Both branches return a sum of squared L2 distances, so they are on the
+    /// same scale and neither takes a square root.
+    ///
+    /// Choosing the branch on the table rather than on `a` is deliberate. The
+    /// dummy query is a valid code slice and cannot be told apart from real
+    /// codes by inspection. It is sound because `HNSWIndex::hnsw` is a `Mutex`,
+    /// so a search and an insertion never overlap and an insertion can never
+    /// observe another caller's query table.
+    fn eval(&self, a: &[u8], b: &[u8]) -> f32 {
         let lut_guard = self.lut.read().unwrap();
         let lut = match lut_guard.as_ref() {
             Some(l) => l,
-            None => return f32::INFINITY,
+            None => {
+                drop(lut_guard);
+                return self.pq.symmetric_distance(a, b);
+            }
         };
 
         // b.len() should equal pq.subvectors
@@ -938,6 +959,17 @@ impl HNSWIndex {
                     let (memory_mb, total_centroids) = pq.get_memory_stats();
                     dict.set_item("memory_mb", memory_mb).ok()?;
                     dict.set_item("total_centroids", total_centroids).ok()?;
+
+                    // The symmetric distance table graph construction reads.
+                    // Reported separately because it is derived from the
+                    // codebook rather than part of it, and because it scales
+                    // with subvectors and bits alone while memory_mb scales
+                    // with the dimension too.
+                    dict.set_item(
+                        "sdc_memory_mb",
+                        pq.sdc_memory_bytes() as f64 / (1024.0 * 1024.0),
+                    )
+                    .ok()?;
 
                     // Calculate compression ratio using cached values
                     let original_bytes = pq.dim * 4; // f32
@@ -4391,9 +4423,333 @@ impl HNSWIndex {
 
 #[cfg(test)]
 mod tests {
+    use super::DistPQ;
+    use crate::pq::PQ;
     use hnsw_rs::prelude::{DistCosine, Hnsw};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+    use std::collections::HashSet;
+    use std::sync::{Arc, OnceLock};
+
+    // Scale for the quantized graph tests. Small enough for CI and large
+    // enough that the neighbour selection heuristic runs, which needs
+    // `search_layer` to return more than `2 * M` candidates.
+    //
+    // Eight bits is the setting the README recommends and it is not
+    // negotiable here for speed. Six was tried, and on data with this cluster
+    // structure a 64 centroid codebook is coarse enough that every record in a
+    // cluster quantizes to the same codes in every subvector. Their distance is
+    // then genuinely zero, the diversity heuristic ties for real, and roughly
+    // 45 percent of nodes come out with one neighbour. That is the quantizer
+    // being too coarse for the data rather than the defect these tests guard,
+    // but it is indistinguishable from it at the assertion, so the tests run at
+    // the width real indexes use. k-means over 256 centroids is what makes them
+    // the slowest in the crate.
+    const PQ_N: usize = 1200;
+    const PQ_NQ: usize = 100;
+    const PQ_DIM: usize = 32;
+    const PQ_SUBVECTORS: usize = 8;
+    const PQ_BITS: usize = 8;
+    const PQ_M: usize = 16;
+    const PQ_EF_C: usize = 200;
+
+    /// Clustered unit vectors. Fifty Gaussian centres, points drawn as a centre
+    /// plus 0.15 times a Gaussian perturbation, then L2 normalised, with the
+    /// centres deliberately left unnormalised. This is the shape real
+    /// embeddings have and the specification every quantized measurement in
+    /// this project uses, so the figures in the relay reports and the
+    /// thresholds below describe the same data.
+    ///
+    /// Uniform noise was tried and rejected. Its spread is too small relative
+    /// to the centre separation, so records within a cluster quantize to the
+    /// same codes, their distance is genuinely zero, and the graph partially
+    /// collapses for a reason that has nothing to do with what these tests
+    /// assert.
+    fn clustered(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let gauss = |rng: &mut StdRng| {
+            let u: f32 = rng.random::<f32>().max(1e-12);
+            let v: f32 = rng.random::<f32>();
+            (-2.0 * u.ln()).sqrt() * (std::f32::consts::TAU * v).cos()
+        };
+        let centres: Vec<Vec<f32>> = (0..50)
+            .map(|_| (0..dim).map(|_| gauss(&mut rng)).collect())
+            .collect();
+        (0..n)
+            .map(|i| {
+                let c = &centres[i % 50];
+                let mut v: Vec<f32> = (0..dim).map(|d| c[d] + 0.15 * gauss(&mut rng)).collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                for x in v.iter_mut() {
+                    *x /= norm;
+                }
+                v
+            })
+            .collect()
+    }
+
+    struct PqFixture {
+        data: Vec<Vec<f32>>,
+        queries: Vec<Vec<f32>>,
+        pq: Arc<PQ>,
+        codes: Vec<Vec<u8>>,
+    }
+
+    /// One trained codebook shared by every quantized graph test, because
+    /// k-means over 256 centroids is the expensive part and it is the same
+    /// codebook each time. The graphs themselves are built per test, since
+    /// that is what is under assertion.
+    fn fixture() -> &'static PqFixture {
+        static FIXTURE: OnceLock<PqFixture> = OnceLock::new();
+        FIXTURE.get_or_init(|| {
+            let all = clustered(PQ_N + PQ_NQ, PQ_DIM, 42);
+            let data: Vec<Vec<f32>> = all[..PQ_N].to_vec();
+            let queries: Vec<Vec<f32>> = all[PQ_N..].to_vec();
+
+            let pq = Arc::new(PQ::new(PQ_DIM, PQ_SUBVECTORS, PQ_BITS, 1000, None));
+            pq.train(&data).expect("pq training");
+            let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
+            let codes = pq.quantize_batch(&refs).expect("quantization");
+
+            PqFixture {
+                data,
+                queries,
+                pq,
+                codes,
+            }
+        })
+    }
+
+    /// Build the quantized graph exactly as `insert_pq_codes` does, one code
+    /// vector at a time with no query table set.
+    fn build_pq_graph(pq: Arc<PQ>, codes: &[Vec<u8>]) -> Hnsw<'static, u8, DistPQ> {
+        let hnsw = Hnsw::new(PQ_M, codes.len(), 16, PQ_EF_C, DistPQ::new(pq));
+        for (i, c) in codes.iter().enumerate() {
+            hnsw.insert((c.as_slice(), i));
+        }
+        hnsw
+    }
+
+    /// Layer zero adjacency keyed by origin id, each list sorted.
+    fn layer_zero_adjacency(hnsw: &Hnsw<'static, u8, DistPQ>) -> Vec<(usize, Vec<usize>)> {
+        let mut adj: Vec<(usize, Vec<usize>)> = hnsw
+            .get_point_indexation()
+            .into_iter()
+            .map(|p| {
+                let mut v: Vec<usize> = p.get_neighborhood_id()[0].iter().map(|x| x.d_id).collect();
+                v.sort_unstable();
+                (p.get_origin_id(), v)
+            })
+            .collect();
+        adj.sort_unstable_by_key(|(id, _)| *id);
+        adj
+    }
+
+    /// The strongest assertion available about the quantized graph: that the
+    /// data it is built from has any effect on it at all.
+    ///
+    /// Build the same graph twice, in the same insertion order so the level
+    /// sequence is identical, once with each id holding its own codes and once
+    /// with every id holding a different record's codes. A graph built on real
+    /// distances comes out different. A graph built on a constant comes out
+    /// byte for byte identical, which is what `DistPQ::eval` produced for every
+    /// release that shipped quantization: it returned infinity whenever no
+    /// query table was set, and no insertion path sets one.
+    ///
+    /// Measured on the shipped v0.4.1 code at 10,000 records, layer zero
+    /// adjacency was identical for 10,000 of 10,000 nodes.
+    #[test]
+    fn quantized_graph_depends_on_the_data() {
+        let f = fixture();
+
+        let own = layer_zero_adjacency(&build_pq_graph(f.pq.clone(), &f.codes));
+
+        let mut shuffled = f.codes.clone();
+        shuffled.reverse();
+        let other = layer_zero_adjacency(&build_pq_graph(f.pq.clone(), &shuffled));
+
+        assert_eq!(own.len(), PQ_N);
+        assert_eq!(other.len(), PQ_N);
+
+        let identical = own
+            .iter()
+            .zip(other.iter())
+            .filter(|((id_a, a), (id_b, b))| id_a == id_b && a == b)
+            .count();
+
+        assert!(
+            identical * 20 < PQ_N,
+            "layer zero adjacency is identical for {} of {} nodes when every id is given a \
+             different record's codes, so the graph is not being built on the codes. \
+             DistPQ::eval is returning a constant on the insertion path.",
+            identical,
+            PQ_N
+        );
+    }
+
+    /// A graph whose distances all tie leaves every node with one neighbour,
+    /// because the diversity heuristic in `select_neighbours` rejects a
+    /// candidate that is at least as close to an already chosen neighbour as it
+    /// is to the new point, and under a total tie that is every candidate after
+    /// the first. Measured on the shipped code, layer zero out-degree was
+    /// exactly one for 99.64 percent of nodes and a traversal reached 33 of
+    /// 10,000.
+    #[test]
+    fn quantized_graph_layer_zero_out_degree() {
+        let f = fixture();
+        let adj = layer_zero_adjacency(&build_pq_graph(f.pq.clone(), &f.codes));
+
+        let degenerate = adj.iter().filter(|(_, n)| n.len() <= 1).count();
+        assert!(
+            degenerate * 100 < PQ_N,
+            "{} of {} nodes have layer zero out-degree of one or less; the quantized graph \
+             has collapsed to a star",
+            degenerate,
+            PQ_N
+        );
+
+        let total: usize = adj.iter().map(|(_, n)| n.len()).sum();
+        let mean = total as f64 / PQ_N as f64;
+        assert!(
+            mean > (PQ_M as f64) / 2.0,
+            "mean layer zero out-degree is {:.2}, expected well above {} for m = {}",
+            mean,
+            PQ_M / 2,
+            PQ_M
+        );
+    }
+
+    /// Quantized search has to find the right answers, not merely return the
+    /// right number of them. Measured on the shipped code at this scale the
+    /// graph reached 33 nodes of 1,200 and recall was under one percent, so
+    /// the threshold below fails against the old behaviour by a wide margin.
+    ///
+    /// The ceiling is the quantizer rather than the graph, so this asserts a
+    /// floor and not equality with the raw path.
+    #[test]
+    fn quantized_graph_recall_against_brute_force() {
+        const K: usize = 10;
+
+        let f = fixture();
+        let (data, queries) = (&f.data, &f.queries);
+        let hnsw = build_pq_graph(f.pq.clone(), &f.codes);
+
+        let mut hits = 0usize;
+        let mut returned = usize::MAX;
+        for q in queries.iter() {
+            hnsw.get_distance().set_query_lut(q).expect("query lut");
+            let dummy = vec![0u8; PQ_SUBVECTORS];
+            let found = hnsw.search(&dummy, K, 100);
+            hnsw.get_distance().clear_lut();
+            returned = returned.min(found.len());
+
+            let mut truth: Vec<(f32, usize)> = data
+                .iter()
+                .enumerate()
+                .map(|(j, v)| {
+                    (
+                        v.iter().zip(q.iter()).map(|(x, y)| (x - y) * (x - y)).sum(),
+                        j,
+                    )
+                })
+                .collect();
+            truth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let truth: HashSet<usize> = truth[..K].iter().map(|x| x.1).collect();
+
+            hits += found.iter().filter(|n| truth.contains(&n.d_id)).count();
+        }
+
+        assert_eq!(returned, K, "a top {} request came back short", K);
+
+        let recall = hits as f64 / (K * PQ_NQ) as f64;
+        assert!(
+            recall > 0.30,
+            "quantized recall at top {} is {:.4}, which is far below what these codes support",
+            K,
+            recall
+        );
+    }
+
+    /// The whole graph has to be reachable, which is the property the shipped
+    /// code lost most visibly. Asking for more results than the graph can reach
+    /// is what exposed it: a request for 1,000 came back with 34.
+    #[test]
+    fn quantized_graph_is_fully_reachable() {
+        let f = fixture();
+        let hnsw = build_pq_graph(f.pq.clone(), &f.codes);
+
+        hnsw.get_distance()
+            .set_query_lut(&f.data[0])
+            .expect("query lut");
+        let dummy = vec![0u8; PQ_SUBVECTORS];
+        let found = hnsw.search(&dummy, PQ_N, PQ_N);
+        hnsw.get_distance().clear_lut();
+
+        assert_eq!(
+            found.len(),
+            PQ_N,
+            "a request for all {} records returned {}, so the traversal cannot reach the \
+             whole graph",
+            PQ_N,
+            found.len()
+        );
+    }
+
+    /// The symmetric distance must not leak into search. With a query table set
+    /// the distance has to be the asymmetric one, byte for byte as before, so
+    /// a quantized graph and a raw graph rank a query's own record the same way.
+    #[test]
+    fn quantized_search_still_uses_the_query_table() {
+        let f = fixture();
+        let hnsw = build_pq_graph(f.pq.clone(), &f.codes);
+
+        // The ADC distance from a query to a stored code, computed directly.
+        let query = &f.data[7];
+        let lut = f.pq.compute_adc_lut(query).expect("adc lut");
+        let expected: f32 = f.codes[7]
+            .iter()
+            .enumerate()
+            .map(|(sv, &c)| lut[sv][c as usize])
+            .sum();
+
+        hnsw.get_distance().set_query_lut(query).expect("query lut");
+        let dummy = vec![0u8; PQ_SUBVECTORS];
+        let found = hnsw.search(&dummy, 10, 200);
+        hnsw.get_distance().clear_lut();
+
+        assert!(
+            found.iter().any(|n| n.d_id == 7),
+            "a record could not find itself"
+        );
+
+        // Every distance the search reports must be the asymmetric one. The
+        // symmetric table would give a different number here, since it compares
+        // the dummy query's all-zero codes rather than the query itself.
+        for n in found.iter() {
+            let adc: f32 = f.codes[n.d_id]
+                .iter()
+                .enumerate()
+                .map(|(sv, &c)| lut[sv][c as usize])
+                .sum();
+            assert!(
+                (n.distance - adc).abs() <= 1e-4 * adc.max(1.0),
+                "search reported {} for record {} where its asymmetric distance is {}, \
+                 so the query path is no longer using the query table",
+                n.distance,
+                n.d_id,
+                adc
+            );
+        }
+
+        // The record's own ADC distance is the smallest of the ten returned,
+        // which is what the ranking has to produce.
+        assert!(
+            found[0].distance <= expected + 1e-4,
+            "the top hit scored {} against the query's own record at {}",
+            found[0].distance,
+            expected
+        );
+    }
 
     /// Guards the vendored hnsw_rs patch that files reverse links at the
     /// layer being processed instead of at the inserting point's own top

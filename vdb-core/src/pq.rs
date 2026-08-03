@@ -17,6 +17,20 @@ pub struct PQ {
     /// Training status to track whether PQ has been trained
     pub is_trained: RwLock<bool>,
 
+    /// Symmetric distance table, holding the squared L2 distance between every
+    /// pair of centroids within a subvector. Flat and row major, indexed
+    /// `[s * num_centroids * num_centroids + i * num_centroids + j]`.
+    ///
+    /// Graph construction compares two stored points, and under quantization
+    /// both of those are codes rather than vectors, so there is no query to
+    /// build an ADC table from. This table answers that comparison in
+    /// `subvectors` lookups, which is the same cost as an ADC lookup.
+    ///
+    /// Empty until the codebook exists. `set_centroids` is the only way to
+    /// install a codebook and it always fills this, so a trained PQ always
+    /// carries a table that matches its centroids.
+    sdc_table: RwLock<Vec<f32>>,
+
     /// Cache computed values for performance
     pub sub_dim: usize,
     pub num_centroids: usize,
@@ -45,6 +59,7 @@ impl PQ {
             max_training_vectors,
             centroids: RwLock::new(centroids),
             is_trained: RwLock::new(false),
+            sdc_table: RwLock::new(Vec::new()),
             sub_dim,
             num_centroids,
         }
@@ -59,6 +74,115 @@ impl PQ {
     pub fn set_trained(&self, value: bool) {
         let mut trained = self.is_trained.write().unwrap();
         *trained = value;
+    }
+
+    /// Install a codebook and rebuild everything derived from it
+    ///
+    /// This is the only way a codebook reaches a `PQ`, whether it comes from
+    /// k-means or from a saved index, so the symmetric distance table can never
+    /// fall out of step with the centroids it was computed from. Retraining
+    /// arrives here as well and overwrites the table.
+    pub fn set_centroids(&self, centroids: Vec<Vec<Vec<f32>>>) -> Result<(), String> {
+        if centroids.len() != self.subvectors {
+            return Err(format!(
+                "Codebook subvector count mismatch: expected {}, got {}",
+                self.subvectors,
+                centroids.len()
+            ));
+        }
+
+        for (s, sub) in centroids.iter().enumerate() {
+            if sub.len() != self.num_centroids {
+                return Err(format!(
+                    "Codebook centroid count mismatch in subvector {}: expected {}, got {}",
+                    s,
+                    self.num_centroids,
+                    sub.len()
+                ));
+            }
+            if let Some(bad) = sub.iter().position(|c| c.len() != self.sub_dim) {
+                return Err(format!(
+                    "Codebook centroid {} in subvector {} has dimension {}, expected {}",
+                    bad,
+                    s,
+                    sub[bad].len(),
+                    self.sub_dim
+                ));
+            }
+        }
+
+        let table = Self::compute_sdc_table(&centroids, self.num_centroids);
+
+        {
+            let mut guard = self.centroids.write().unwrap();
+            *guard = centroids;
+        }
+        {
+            let mut guard = self.sdc_table.write().unwrap();
+            *guard = table;
+        }
+
+        Ok(())
+    }
+
+    /// Compute the squared L2 distance between every pair of centroids
+    ///
+    /// Squared rather than rooted, because the distance the search path returns
+    /// is the plain sum of the squared ADC lookups. Rooting one and not the
+    /// other would put graph construction and search on different scales.
+    fn compute_sdc_table(centroids: &[Vec<Vec<f32>>], num_centroids: usize) -> Vec<f32> {
+        let plane = num_centroids * num_centroids;
+
+        centroids
+            .par_iter()
+            .flat_map(|sub| {
+                let mut rows = vec![0.0f32; plane];
+                for i in 0..num_centroids {
+                    for j in (i + 1)..num_centroids {
+                        let d = l2_distance_squared(&sub[i], &sub[j]);
+                        rows[i * num_centroids + j] = d;
+                        rows[j * num_centroids + i] = d;
+                    }
+                }
+                rows
+            })
+            .collect()
+    }
+
+    /// Distance between two stored points, both held as codes
+    ///
+    /// Graph construction has no query, so it cannot use an ADC table. This
+    /// reads the precomputed centroid pair distances instead, at the same cost
+    /// as an ADC lookup and on the same squared L2 scale.
+    ///
+    /// Returns zero when no codebook has been installed. Nothing can hold a
+    /// code before then, so the case is unreachable through the index, and zero
+    /// keeps the value finite rather than reintroducing the infinity that
+    /// collapsed neighbour selection.
+    pub fn symmetric_distance(&self, a: &[u8], b: &[u8]) -> f32 {
+        let table = self.sdc_table.read().unwrap();
+        if table.is_empty() {
+            return 0.0;
+        }
+
+        let k = self.num_centroids;
+        let plane = k * k;
+        let mut sum = 0.0f32;
+
+        for (s, (&code_a, &code_b)) in a.iter().zip(b.iter()).enumerate() {
+            let (i, j) = (code_a as usize, code_b as usize);
+            if i >= k || j >= k {
+                continue;
+            }
+            sum += table.get(s * plane + i * k + j).copied().unwrap_or(0.0);
+        }
+
+        sum
+    }
+
+    /// Bytes held by the symmetric distance table
+    pub fn sdc_memory_bytes(&self) -> usize {
+        self.sdc_table.read().unwrap().len() * std::mem::size_of::<f32>()
     }
 
     /// Train the PQ codebook using k-means clustering
@@ -124,11 +248,10 @@ impl PQ {
 
         match new_centroids {
             Ok(centroids_vec) => {
-                // Update centroids atomically
-                {
-                    let mut centroids = self.centroids.write().unwrap();
-                    *centroids = centroids_vec;
-                }
+                // Install the codebook and the symmetric distance table derived
+                // from it, then mark trained. Nothing reads the table before
+                // the flag is set, so the graph never sees a half-built one.
+                self.set_centroids(centroids_vec)?;
 
                 // Mark as trained
                 {
@@ -303,38 +426,12 @@ impl PQ {
         Ok(lut)
     }
 
-    /// Compute ADC distance using precomputed lookup table
-    pub fn adc_distance(&self, codes: &[u8], lut: &[Vec<f32>]) -> Result<f32, String> {
-        if codes.len() != self.subvectors {
-            return Err(format!(
-                "Code length mismatch: expected {}, got {}",
-                self.subvectors,
-                codes.len()
-            ));
-        }
-
-        if lut.len() != self.subvectors {
-            return Err(format!(
-                "LUT length mismatch: expected {}, got {}",
-                self.subvectors,
-                lut.len()
-            ));
-        }
-
-        let mut distance = 0.0;
-        for s in 0..self.subvectors {
-            let centroid_idx = codes[s] as usize;
-            if centroid_idx >= lut[s].len() {
-                return Err(format!(
-                    "Invalid centroid index: {} for subvector {}",
-                    centroid_idx, s
-                ));
-            }
-            distance += lut[s][centroid_idx];
-        }
-
-        Ok(distance.sqrt()) // Convert squared distance to distance
-    }
+    // `adc_distance` used to sit here. It was reachable only from this file's
+    // own unit test, and it rooted the sum that the live `DistPQ::eval` returns
+    // unrooted, so the two disagreed by a square root. A second implementation
+    // of a distance, unused and on a different scale from the one that runs, is
+    // how the graph came to be built on infinity. It is gone rather than
+    // corrected, since `DistPQ::eval` is the implementation.
 
     /// Get memory usage statistics
     pub fn get_memory_stats(&self) -> (f64, usize) {
@@ -559,9 +656,130 @@ mod tests {
         let lut = pq.compute_adc_lut(&vectors[0]).unwrap();
         assert_eq!(lut.len(), 2); // 2 subvectors
         assert_eq!(lut[0].len(), 4); // 2^2 = 4 centroids
+    }
 
-        let distance = pq.adc_distance(&codes, &lut).unwrap();
-        assert!(distance >= 0.0);
+    #[test]
+    fn test_sdc_table_shape_and_symmetry() {
+        let pq = PQ::new(4, 2, 2, 4, None);
+
+        // No codebook yet, so no table and a defined distance rather than
+        // infinity.
+        assert_eq!(pq.sdc_memory_bytes(), 0);
+        assert_eq!(pq.symmetric_distance(&[0, 0], &[1, 1]), 0.0);
+
+        let vectors = vec![
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![2.0, 3.0, 4.0, 5.0],
+            vec![3.0, 4.0, 5.0, 6.0],
+            vec![4.0, 5.0, 6.0, 7.0],
+        ];
+        pq.train(&vectors).unwrap();
+
+        // subvectors * 2^bits * 2^bits entries of f32
+        assert_eq!(pq.sdc_memory_bytes(), 2 * 4 * 4 * 4);
+
+        // A code against itself is zero, and the table is symmetric.
+        assert_eq!(pq.symmetric_distance(&[0, 1], &[0, 1]), 0.0);
+        assert_eq!(
+            pq.symmetric_distance(&[0, 1], &[2, 3]),
+            pq.symmetric_distance(&[2, 3], &[0, 1])
+        );
+    }
+
+    #[test]
+    fn test_sdc_matches_reconstructed_distance() {
+        let pq = PQ::new(4, 2, 2, 4, None);
+
+        let vectors = vec![
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![2.0, 3.0, 4.0, 5.0],
+            vec![3.0, 4.0, 5.0, 6.0],
+            vec![4.0, 5.0, 6.0, 7.0],
+        ];
+        pq.train(&vectors).unwrap();
+
+        // The table has to agree with the squared L2 distance between the two
+        // reconstructions, which is what a symmetric distance means.
+        for a in 0..4u8 {
+            for b in 0..4u8 {
+                let codes_a = [a, b];
+                for c in 0..4u8 {
+                    for d in 0..4u8 {
+                        let codes_b = [c, d];
+                        let expected = l2_distance_squared(
+                            &pq.reconstruct(&codes_a).unwrap(),
+                            &pq.reconstruct(&codes_b).unwrap(),
+                        );
+                        let actual = pq.symmetric_distance(&codes_a, &codes_b);
+                        assert!(
+                            (actual - expected).abs() <= 1e-4 * expected.max(1.0),
+                            "codes {:?} vs {:?}: expected {}, got {}",
+                            codes_a,
+                            codes_b,
+                            expected,
+                            actual
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The table is indexed `[s * k * k + i * k + j]`, so a code near the top
+    /// of the u8 range reads from the far end of its own subvector's plane and
+    /// must not spill into the next one. Eight bits is the only setting where
+    /// that boundary is reachable, and the graph tests run at six.
+    #[test]
+    fn test_sdc_indexing_over_the_full_code_range() {
+        // Two subvectors so a spill across the plane boundary would show, and
+        // 300 training points so k-means can fill all 256 centroids.
+        let pq = PQ::new(4, 2, 8, 256, None);
+
+        let mut seed = 12345u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32) / (u32::MAX as f32)
+        };
+        let vectors: Vec<Vec<f32>> = (0..300).map(|_| (0..4).map(|_| next()).collect()).collect();
+        pq.train(&vectors).unwrap();
+
+        assert_eq!(pq.sdc_memory_bytes(), 2 * 256 * 256 * 4);
+
+        for &a in &[0u8, 1, 127, 128, 254, 255] {
+            for &b in &[0u8, 1, 127, 128, 254, 255] {
+                let codes_a = [a, b];
+                let codes_b = [b, a];
+                let expected = l2_distance_squared(
+                    &pq.reconstruct(&codes_a).unwrap(),
+                    &pq.reconstruct(&codes_b).unwrap(),
+                );
+                let actual = pq.symmetric_distance(&codes_a, &codes_b);
+                assert!(
+                    (actual - expected).abs() <= 1e-4 * expected.max(1.0),
+                    "codes {:?} vs {:?}: expected {}, got {}",
+                    codes_a,
+                    codes_b,
+                    expected,
+                    actual
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_set_centroids_rejects_wrong_shape() {
+        let pq = PQ::new(4, 2, 2, 4, None);
+
+        // Wrong subvector count
+        assert!(pq.set_centroids(vec![vec![vec![0.0; 2]; 4]]).is_err());
+        // Wrong centroid count
+        assert!(pq.set_centroids(vec![vec![vec![0.0; 2]; 3]; 2]).is_err());
+        // Wrong sub-dimension
+        assert!(pq.set_centroids(vec![vec![vec![0.0; 3]; 4]; 2]).is_err());
+        // A rejected codebook leaves no table behind
+        assert_eq!(pq.sdc_memory_bytes(), 0);
     }
 
     #[test]

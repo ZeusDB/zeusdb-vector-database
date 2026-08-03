@@ -1289,3 +1289,222 @@ def test_pq_reconstructed_record_fidelity(saved_pq_index):
     for record_id in ("train_0", "train_500"):
         original = saved_pq_index["vectors"][int(record_id.split("_")[1])]
         assert cosine(kept_by_id[record_id], original.astype(np.float64)) > 0.999999
+
+# ------------------------------------------------------------
+# Shared setup for the quantized graph quality coverage
+# ------------------------------------------------------------
+# Until the symmetric distance table landed, DistPQ::eval returned infinity
+# whenever no query lookup table was set, and no insertion path sets one. Every
+# distance the graph builder saw was therefore the same value, the diversity
+# heuristic in select_neighbours rejected every candidate after the first, and
+# layer zero out-degree was exactly one for 99.64 percent of nodes. A traversal
+# reached 33 nodes of 10,000 whatever ef_search was set to, and recall at top_k
+# 10 was 0.0035 against 0.9995 for the raw path on the same data.
+#
+# The tests below are the public API half of that guard. The graph structure
+# itself is not reachable from Python, so the shuffle test that proves the
+# adjacency depends on the codes lives in vdb-core's own test module.
+#
+# 16 * 4 / 8 is 8x compression, below the 50x threshold in
+# _check_memory_usage, so neither mode warns about the ratio. Clustered unit
+# vectors are used rather than uniform ones because uniform vectors are close
+# to equidistant, which would let a broken graph score well.
+#
+# Eight subvectors rather than four. At four the codebook is coarse enough
+# relative to this data that a handful of records quantize to identical codes,
+# and a record whose codes another record shares cannot be told apart from it
+# by any quantized search. That is the quantizer rather than the graph, but it
+# makes the self query assertion flap. Measured over three data seeds, four
+# subvectors gave 1 to 4 colliding records and recall 0.58 to 0.60, while eight
+# gave none and recall 0.78 to 0.79.
+GRAPH_DIM = 16
+GRAPH_SUBVECTORS = 8
+GRAPH_TRAINING_SIZE = 1000
+GRAPH_TOTAL = 1500
+GRAPH_QUERIES = 50
+
+
+def _graph_vectors(n, dim, seed):
+    """Twenty Gaussian centres, a small perturbation, then L2 normalised."""
+    rng = np.random.default_rng(seed)
+    centres = rng.standard_normal((20, dim))
+    points = centres[rng.integers(0, 20, size=n)] + 0.15 * rng.standard_normal((n, dim))
+    return (points / np.linalg.norm(points, axis=1, keepdims=True)).astype(np.float32)
+
+
+@pytest.fixture(scope="module", params=["quantized_only", "quantized_with_raw"])
+def quantized_graph(request):
+    """A trained quantized index over clustered data, plus its ground truth.
+
+    Module scoped and parametrised, so both storage modes are covered for the
+    cost of two k-means runs. Both route through insert_pq_codes, so both were
+    affected identically and both have to be asserted.
+    """
+    all_vectors = _graph_vectors(GRAPH_TOTAL + GRAPH_QUERIES, GRAPH_DIM, 20260804)
+    data = all_vectors[:GRAPH_TOTAL]
+    queries = all_vectors[GRAPH_TOTAL:]
+    ids = [f"g_{i}" for i in range(GRAPH_TOTAL)]
+
+    config = {
+        "type": "pq",
+        "subvectors": GRAPH_SUBVECTORS,
+        "bits": 8,
+        "training_size": GRAPH_TRAINING_SIZE,
+        "storage_mode": request.param,
+    }
+    with warnings.catch_warnings():
+        # quantized_with_raw warns unconditionally about its memory use, which
+        # is asserted where it is the subject rather than here.
+        warnings.simplefilter("ignore")
+        index = VectorDatabase().create(
+            "hnsw", dim=GRAPH_DIM, expected_size=GRAPH_TOTAL,
+            quantization_config=config,
+        )
+
+    assert index.add({"ids": ids, "embeddings": data}).is_success()
+    assert index.is_quantized(), "training did not complete"
+
+    return {
+        "index": index,
+        "ids": ids,
+        "data": data,
+        "queries": queries,
+        # Brute force cosine over the original vectors, which is what the
+        # quantized path is being scored against.
+        "truth": np.argsort(-(queries @ data.T), axis=1)[:, :10],
+        "mode": request.param,
+    }
+
+
+def _recall_at_10(index, fixture, ef_search=100):
+    hits = 0
+    for qi, query in enumerate(fixture["queries"]):
+        found = {r["id"] for r in index.search(query.tolist(), top_k=10,
+                                               ef_search=ef_search)}
+        hits += len(found & {fixture["ids"][j] for j in fixture["truth"][qi]})
+    return hits / (10 * len(fixture["queries"]))
+
+# ------------------------------------------------------------
+# Test 85: the quantized traversal reaches the whole graph
+# ------------------------------------------------------------
+def test_quantized_graph_reaches_every_record(quantized_graph):
+    """A request for every record returns every record.
+
+    This is the cheapest proxy for a sound graph and it fails hardest against
+    the old behaviour. The star the collapsed heuristic produced was reachable
+    only 33 nodes deep, so this request came back with 34 results regardless of
+    index size or ef_search. Any test that asked for a single page of ten saw
+    nothing wrong.
+    """
+    index = quantized_graph["index"]
+    for query in quantized_graph["queries"][:10]:
+        found = index.search(query.tolist(), top_k=GRAPH_TOTAL,
+                             ef_search=GRAPH_TOTAL)
+        assert len(found) == GRAPH_TOTAL, (
+            f"asked for {GRAPH_TOTAL} records and got {len(found)}; the quantized "
+            f"traversal cannot reach the whole graph"
+        )
+
+# ------------------------------------------------------------
+# Test 86: quantized search finds the right records
+# ------------------------------------------------------------
+def test_quantized_search_recall(quantized_graph):
+    """Recall against brute force over the original vectors.
+
+    The threshold is a floor rather than a match against the raw path, because
+    the remaining gap is quantization loss and not a graph defect. Measured at
+    0.78 to 0.79 at these settings over three data seeds. The old behaviour
+    scored under 0.01, so the margin is wide in the direction that matters.
+    """
+    recall = _recall_at_10(quantized_graph["index"], quantized_graph)
+    assert recall > 0.60, (
+        f"quantized recall at top_k 10 is {recall:.4f} for "
+        f"{quantized_graph['mode']}, far below what these codes support"
+    )
+
+# ------------------------------------------------------------
+# Test 87: a quantized record can be found by its own vector
+# ------------------------------------------------------------
+def test_quantized_self_query(quantized_graph):
+    """Handing a record's own vector back returns that record.
+
+    On the collapsed graph this succeeded 4 times in 500. It is the plainest
+    statement of whether the index works at all.
+
+    A small allowance is left rather than demanding a clean sweep. Two records
+    that quantize to the same codes are indistinguishable to any quantized
+    search, so whichever the ranking puts first is arbitrary, and the codebook
+    comes from k-means, which is seeded afresh on every run. Measured at zero
+    misses over three data seeds at these settings.
+    """
+    index = quantized_graph["index"]
+    data = quantized_graph["data"]
+    ids = quantized_graph["ids"]
+
+    checked = list(range(0, GRAPH_TOTAL, 15))
+    misses = []
+    for i in checked:
+        found = [r["id"] for r in index.search(data[i].tolist(), top_k=10,
+                                               ef_search=100)]
+        if not found or found[0] != ids[i]:
+            misses.append(ids[i])
+
+    assert len(misses) <= 3, (
+        f"{len(misses)} of {len(checked)} records cannot find themselves by "
+        f"their own vector (first: {misses[:5]})"
+    )
+
+# ------------------------------------------------------------
+# Test 88: rebuild_with_quantization produces a sound graph
+# ------------------------------------------------------------
+def test_rebuild_with_quantization_produces_a_sound_graph(quantized_graph):
+    """The documented rebuild call has to build the same graph as training did.
+
+    It is the one place a quantized graph is built in bulk rather than one
+    record at a time, and it used to rebuild the degenerate star: calling it on
+    a healthy index took recall from 0.1220 back to 0.0065. A user reaching for
+    it to restore quantized search got the opposite.
+
+    The index is rebuilt in place, which is safe because every later test takes
+    its own copy of the results rather than the index state.
+    """
+    index = quantized_graph["index"]
+    before = _recall_at_10(index, quantized_graph)
+
+    assert index.rebuild_with_quantization() is True
+    assert index.is_quantized()
+    assert index.get_storage_mode() == "quantized_active"
+
+    after = _recall_at_10(index, quantized_graph)
+    assert after > 0.60, (
+        f"recall fell to {after:.4f} after rebuild_with_quantization() for "
+        f"{quantized_graph['mode']}"
+    )
+    # The rebuild quantizes from the same codebook, so it should land where it
+    # started rather than merely above the floor. Measured identical to four
+    # decimal places over three data seeds, and the bound leaves room for the
+    # insertion order to differ.
+    assert abs(after - before) < 0.05, (
+        f"rebuild_with_quantization() moved recall from {before:.4f} to {after:.4f}"
+    )
+
+    for query in quantized_graph["queries"][:5]:
+        found = index.search(query.tolist(), top_k=GRAPH_TOTAL,
+                             ef_search=GRAPH_TOTAL)
+        assert len(found) == GRAPH_TOTAL
+
+# ------------------------------------------------------------
+# Test 89: the symmetric table is reported and sized correctly
+# ------------------------------------------------------------
+def test_quantized_symmetric_table_memory(quantized_graph):
+    """The centroid pair table is subvectors * 2^bits * 2^bits floats.
+
+    It is reported apart from the codebook because it scales with subvectors
+    and bits alone while the codebook also scales with the dimension. At the
+    configuration the README recommends, 16 subvectors at 8 bits, it is 4 MiB
+    whatever the dimension.
+    """
+    info = quantized_graph["index"].get_quantization_info()
+    expected_mb = GRAPH_SUBVECTORS * (2 ** 8) * (2 ** 8) * 4 / (1024 * 1024)
+    assert info["sdc_memory_mb"] == pytest.approx(expected_mb)
+    assert info["is_trained"] is True
