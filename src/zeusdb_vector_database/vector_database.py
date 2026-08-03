@@ -4,12 +4,16 @@ vector_database.py
 Factory for creating vector indexes with support for multiple types and quantization.
 Currently supports HNSW (Hierarchical Navigable Small World) with extensible design.
 """
-from typing import Callable, Dict, Any, Optional, TypedDict
-from .zeusdb_vector_database import HNSWIndex
-# from .zeusdb_vector_database import HNSWIndex, IVFIndex, LSHIndex, AnnoyIndex, FlatIndex # Future support planned
+from typing import Dict, Any, Optional, TypedDict
+from .zeusdb_vector_database import _create_hnsw_index
+# Future index types are registered in _index_types and dispatched in _build_index.
 
-class MemoryInfo(TypedDict):
-    """Type definition for quantization memory information."""
+class _MemoryInfo(TypedDict):
+    """Type definition for quantization memory information.
+
+    Private. The only consumer is _check_memory_usage, and the value it
+    produces is stripped from the config before it reaches Rust.
+    """
     centroid_storage_mb: float
     compression_ratio: float
     centroids_per_subvector: int
@@ -19,17 +23,27 @@ class MemoryInfo(TypedDict):
 class VectorDatabase:
     """
     Factory for creating various types of vector indexes with optional quantization.
-    Each index type is registered via _index_constructors.
+    Each index type is registered in _index_types and built in _build_index.
     """
 
-    _index_constructors: Dict[str, Callable[..., Any]] = {
-        "hnsw": HNSWIndex,
-        # "ivf": IVFIndex,      # Future support planned
-        # "lsh": LSHIndex,      # Future support planned
-        # "annoy": AnnoyIndex,  # Future support planned
-        # "flat": FlatIndex,    # Future support planned
+    # Index type name to a one line description. Deliberately not a mapping to
+    # a constructor. A registry that held one would hand a user a way to build
+    # an index without the defaults create() applies, which is the second
+    # construction path this factory exists to prevent.
+    _index_types: Dict[str, str] = {
+        "hnsw": "Hierarchical Navigable Small World graph",
+        # "ivf": "Inverted file index",    # Future support planned
+        # "lsh": "Locality sensitive hashing",  # Future support planned
     }
-    
+
+    @staticmethod
+    def _build_index(index_type: str, **kwargs) -> Any:
+        """Dispatch to the extension factory for the requested index type."""
+        if index_type == "hnsw":
+            return _create_hnsw_index(**kwargs)
+        raise ValueError(f"No builder registered for index type '{index_type}'")
+
+
     def __init__(self):
         """Initialize the vector database factory."""
         pass
@@ -105,8 +119,8 @@ class VectorDatabase:
         """
         index_type = (index_type or "").strip().lower()
 
-        if index_type not in self._index_constructors:
-            available = ', '.join(sorted(self._index_constructors.keys()))
+        if index_type not in self._index_types:
+            available = ', '.join(sorted(self._index_types.keys()))
             raise ValueError(f"Unknown index type '{index_type}'. Available: {available}")
         
         # Centralize dim early to ensure consistency
@@ -124,8 +138,6 @@ class VectorDatabase:
             kwargs.setdefault("ef_construction", 200)
             kwargs.setdefault("expected_size", 10000)
         
-        constructor = self._index_constructors[index_type]
-        
         try:
             # Always pass quantization_config parameter
             if quantization_config is not None:
@@ -134,7 +146,7 @@ class VectorDatabase:
             else:
                 clean_config = None
 
-            return constructor(quantization_config=clean_config, **kwargs)
+            return self._build_index(index_type, quantization_config=clean_config, **kwargs)
         except Exception as e:
             raise RuntimeError(f"Failed to create {index_type.upper()} index: {e}") from e
 
@@ -154,8 +166,8 @@ class VectorDatabase:
             >>> loaded_index = vdb.load("my_index.zdb")
             >>> results = loaded_index.search(query_vector, top_k=5)
         """
-        from .zeusdb_vector_database import load_index  # Direct function import
-        return load_index(path)
+        from .zeusdb_vector_database import _load_index  # Direct function import
+        return _load_index(path)
 
 
     def _validate_quantization_config(self, config: Dict[str, Any], dim: int) -> Dict[str, Any]:
@@ -318,7 +330,7 @@ class VectorDatabase:
         compression_ratio = original_bytes_per_vector / compressed_bytes_per_vector
         
         # Add memory info to config for user reference (internal)
-        memory_info: MemoryInfo = {
+        memory_info: _MemoryInfo = {
             'centroid_storage_mb': round(centroid_memory_mb, 2),
             'compression_ratio': round(compression_ratio, 1),
             'centroids_per_subvector': num_centroids_per_subvector,
@@ -359,5 +371,5 @@ class VectorDatabase:
     @classmethod
     def available_index_types(cls) -> list[str]:
         """Return list of all supported index types."""
-        return sorted(cls._index_constructors.keys())
+        return sorted(cls._index_types.keys())
     

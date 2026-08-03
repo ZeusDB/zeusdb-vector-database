@@ -6,6 +6,8 @@ import sys
 import subprocess
 import json
 
+import pytest
+
 # ------------------------------------------------------------
 # Test 46: Logging: file target + JSON format
 # ------------------------------------------------------------
@@ -93,7 +95,7 @@ idx.add({'vectors': vals})
 # The environment matrix from benchmark 41
 # ------------------------------------------------------------
 # The script set three environment combinations in one process and re-imported
-# the package each time. That cannot work. auto_configure_logging() is guarded
+# the package each time. That cannot work. _auto_configure_logging() is guarded
 # by a module level _logging_configured flag and _configure_rust_logging uses
 # os.environ.setdefault, so the second and third settings had no effect. One
 # subprocess per combination is the only shape that exercises the matrix.
@@ -219,34 +221,24 @@ def test_logging_env_error_level_file_target(tmp_path):
     assert stdout == ""
     assert stderr == ""
 
-    # The path the caller named is created by the Python file handler and left
-    # empty. The Rust layer writes to a daily rotated sibling instead, which is
-    # created even when the level is high enough that nothing is written to it.
+    # One file, the one the caller named. Both layers open it, and nothing
+    # creates a dated sibling any more.
     written = sorted(p.name for p in tmp_path.glob("*"))
-    assert written[0] == "zeus.log"
-    assert len(written) == 2
+    assert written == ["zeus.log"]
+
+    # At error level a clean run produces no records at all.
     assert log_file.stat().st_size == 0
 
-    rotated = written[1]
-    assert rotated.startswith("zeus.log.")
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", rotated[len("zeus.log."):])
-
-    # At error level a clean run produces no records at all, in either file.
-    assert (tmp_path / rotated).stat().st_size == 0
-
 # ------------------------------------------------------------
-# Test 86: Logging: the file target writes to a rotated sibling
+# Test 86: Logging: the file target writes to the file that was named
 # ------------------------------------------------------------
-def test_logging_env_file_target_writes_to_rotated_sibling(tmp_path):
-    """Current behaviour, asserted rather than expected.
+def test_logging_env_file_target_writes_to_the_named_file(tmp_path):
+    """ZEUSDB_LOG_FILE names the file, and the records land in it.
 
-    ZEUSDB_LOG_FILE names a path, and no records are ever written to it. The
-    Rust layer builds a daily rotating appender whose stem is that path, so the
-    records land in a sibling carrying a date suffix, while the Python file
-    handler creates the named path and leaves it empty at these levels. The
-    expectation this violates is that a caller who names a log file finds the
-    log in it. This is also why test_logging_disabled_autoinit cannot fail on
-    the behaviour it names, since the named path is empty either way.
+    It previously always went through a daily rotating appender that read the
+    value as a directory plus a base name, so ZEUSDB_LOG_FILE=zeus.log wrote
+    zeus.log.2026-08-03 and the named path stayed empty. Rotation is now asked
+    for through ZEUSDB_LOG_ROTATION rather than imposed.
     """
     log_file = tmp_path / "zeus.log"
 
@@ -258,14 +250,189 @@ def test_logging_env_file_target_writes_to_rotated_sibling(tmp_path):
     )
 
     assert log_file.exists()
-    assert log_file.stat().st_size == 0
+    assert log_file.stat().st_size > 0
 
-    rotated = [p for p in tmp_path.glob("zeus.log.*")]
-    assert len(rotated) == 1
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", rotated[0].name[len("zeus.log."):])
+    # No dated sibling is created alongside it.
+    assert [p.name for p in tmp_path.glob("*")] == ["zeus.log"]
 
-    entries = _json_lines(rotated[0].read_text(encoding="utf-8", errors="ignore"))
+    entries = _json_lines(log_file.read_text(encoding="utf-8", errors="ignore"))
     assert entries
     assert "DEBUG" in {entry["level"] for entry in entries}
     messages = [entry["fields"]["message"] for entry in entries]
     assert any("HNSW index created successfully" in m for m in messages)
+
+    # The resolved destination is named in the log itself, so a caller who
+    # cannot find the output can read where it went.
+    assert any("ZeusDB file logging writing to resolved path" in m for m in messages)
+    resolved = [
+        entry["fields"]["log_file"]
+        for entry in entries
+        if "log_file" in entry["fields"]
+    ]
+    assert resolved
+    assert os.path.basename(resolved[0]) == "zeus.log"
+
+# ------------------------------------------------------------
+# Test 101: ZEUSDB_LOG_ROTATION=never writes the file that was named
+# ------------------------------------------------------------
+def test_log_rotation_never_writes_the_named_file(tmp_path):
+    """never is the default, and naming it explicitly does the same thing.
+
+    This is the pair of test 102. Between them they pin both values of the knob
+    that decides whether the file target rotates.
+    """
+    log_file = tmp_path / "zeus.log"
+
+    _run_with_logging_env(
+        ZEUSDB_LOG_LEVEL="debug",
+        ZEUSDB_LOG_FORMAT="json",
+        ZEUSDB_LOG_TARGET="file",
+        ZEUSDB_LOG_FILE=str(log_file),
+        ZEUSDB_LOG_ROTATION="never",
+    )
+
+    assert [p.name for p in tmp_path.glob("*")] == ["zeus.log"]
+    assert log_file.stat().st_size > 0
+
+    entries = _json_lines(log_file.read_text(encoding="utf-8", errors="ignore"))
+    init = [e for e in entries if e["fields"].get("operation") == "logging_init_file"]
+    assert len(init) == 1
+    assert init[0]["fields"]["rotation"] == "never"
+    assert os.path.basename(init[0]["fields"]["log_file"]) == "zeus.log"
+
+# ------------------------------------------------------------
+# Test 102: ZEUSDB_LOG_ROTATION=daily bounds disk growth
+# ------------------------------------------------------------
+def test_log_rotation_daily_writes_a_dated_file(tmp_path):
+    """daily is the way to keep the file from growing without bound.
+
+    The rotating appender reads ZEUSDB_LOG_FILE as a directory plus a base name
+    and appends the UTC date, so the Rust records land in a file that is not the
+    one the caller typed. The startup record names the resolved path, which is
+    what makes the dated file discoverable.
+    """
+    log_file = tmp_path / "zeus.log"
+
+    _run_with_logging_env(
+        ZEUSDB_LOG_LEVEL="debug",
+        ZEUSDB_LOG_FORMAT="json",
+        ZEUSDB_LOG_TARGET="file",
+        ZEUSDB_LOG_FILE=str(log_file),
+        ZEUSDB_LOG_ROTATION="daily",
+    )
+
+    written = sorted(p.name for p in tmp_path.glob("*"))
+    dated = [name for name in written if name != "zeus.log"]
+    assert len(dated) == 1
+    dated = dated[0]
+    assert dated.startswith("zeus.log.")
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", dated[len("zeus.log."):])
+
+    # The Rust records are in the dated file, not the name the caller typed,
+    # which is the whole reason the resolved path has to be reported.
+    entries = _json_lines((tmp_path / dated).read_text(encoding="utf-8", errors="ignore"))
+    assert entries
+    assert "DEBUG" in {entry["level"] for entry in entries}
+    messages = [entry["fields"]["message"] for entry in entries]
+    assert any("HNSW index created successfully" in m for m in messages)
+
+    init = [e for e in entries if e["fields"].get("operation") == "logging_init_file"]
+    assert len(init) == 1
+    assert init[0]["fields"]["rotation"] == "daily"
+    assert os.path.basename(init[0]["fields"]["log_file"]) == dated
+
+    # The Python file handler opens the name it was given and does not rotate,
+    # so under daily the named path is created and stays empty, because nothing
+    # in this package logs through the Python logger. Asserted rather than
+    # expected. Under never the two layers share one file and this does not
+    # arise.
+    assert log_file.exists()
+    assert log_file.stat().st_size == 0
+
+# ------------------------------------------------------------
+# Test 103: an unrecognised rotation value falls back to never and says so
+# ------------------------------------------------------------
+def test_log_rotation_unrecognised_value_warns_and_falls_back(tmp_path):
+    """A knob that bounds disk growth must not fail silently.
+
+    Falling back to never without a word would leave a caller who mistyped
+    daily believing rotation was on while the file grew unbounded. The warning
+    is emitted at warn, which is the default level, so it is visible without
+    turning logging up.
+    """
+    log_file = tmp_path / "zeus.log"
+
+    _run_with_logging_env(
+        ZEUSDB_LOG_LEVEL="debug",
+        ZEUSDB_LOG_FORMAT="json",
+        ZEUSDB_LOG_TARGET="file",
+        ZEUSDB_LOG_FILE=str(log_file),
+        ZEUSDB_LOG_ROTATION="dayly",
+    )
+
+    assert [p.name for p in tmp_path.glob("*")] == ["zeus.log"]
+
+    entries = _json_lines(log_file.read_text(encoding="utf-8", errors="ignore"))
+    warnings = [
+        entry for entry in entries
+        if entry["level"] == "WARN"
+        and "Unrecognised ZEUSDB_LOG_ROTATION" in entry["fields"]["message"]
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["fields"]["value"] == "dayly"
+
+    init = [e for e in entries if e["fields"].get("operation") == "logging_init_file"
+            and e["level"] == "INFO"]
+    assert len(init) == 1
+    assert init[0]["fields"]["rotation"] == "never"
+
+# ------------------------------------------------------------
+# Test 91: the documented disable flag reaches both layers
+# ------------------------------------------------------------
+@pytest.mark.parametrize(
+    "flag", ["ZEUSDB_DISABLE_AUTO_LOGGING", "ZEUSDB_DISABLE_AUTOLOG"]
+)
+def test_disable_flag_stops_both_layers(tmp_path, flag):
+    """The published name and the deprecated alias both disable both layers.
+
+    ZEUSDB_DISABLE_AUTO_LOGGING is what the documentation site, the package
+    README and the Python layer name. The Rust layer read ZEUSDB_DISABLE_AUTOLOG
+    and nothing else, so the documented variable silently did nothing to it.
+    Both layers now read both names.
+    """
+    log_file = tmp_path / "disabled.log"
+
+    _run_with_logging_env(**{
+        flag: "1",
+        "ZEUSDB_LOG_LEVEL": "trace",
+        "ZEUSDB_LOG_FORMAT": "json",
+        "ZEUSDB_LOG_TARGET": "file",
+        "ZEUSDB_LOG_FILE": str(log_file),
+    })
+
+    # Neither layer installed a writer, so nothing created the named file.
+    assert not log_file.exists()
+    assert list(tmp_path.glob("*")) == []
+
+# ------------------------------------------------------------
+# Test 92: a value outside the truthy set does not disable anything
+# ------------------------------------------------------------
+def test_disable_flag_requires_a_truthy_value(tmp_path):
+    """The flag reads the way the Python layer has always read it.
+
+    The Rust layer used to disable on the variable merely being present, so
+    ZEUSDB_DISABLE_AUTOLOG=0 silenced the Rust half while the Python half
+    stayed configured. Both now require true, 1 or yes.
+    """
+    log_file = tmp_path / "still-on.log"
+
+    _run_with_logging_env(
+        ZEUSDB_DISABLE_AUTO_LOGGING="0",
+        ZEUSDB_LOG_LEVEL="debug",
+        ZEUSDB_LOG_FORMAT="json",
+        ZEUSDB_LOG_TARGET="file",
+        ZEUSDB_LOG_FILE=str(log_file),
+    )
+
+    assert log_file.exists()
+    assert log_file.stat().st_size > 0

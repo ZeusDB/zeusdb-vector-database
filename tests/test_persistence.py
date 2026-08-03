@@ -2,6 +2,7 @@
 
 import json
 import shutil
+import struct
 
 import numpy as np
 import pytest
@@ -901,3 +902,37 @@ def test_persistence_load_failure_modes(tmp_path):
     not_a_dir.write_text("x", encoding="utf-8")
     with pytest.raises(FileNotFoundError, match="Failed to read manifest.json"):
         vdb.load(str(not_a_dir))
+
+# ------------------------------------------------------------
+# Test 100: a saved directory holding a non-finite value fails loudly
+# ------------------------------------------------------------
+def test_load_refuses_a_saved_index_holding_a_non_finite_value(tmp_path):
+    """A NaN could reach disk before add validated the NumPy branches.
+
+    The rebuild replays every record through add(), which has always refused a
+    non-finite value on the list path, and add() reports rather than raises.
+    The rebuild ignored that report, and the storage maps are written back
+    afterwards from the file, so the count check still agreed and the load
+    succeeded holding records that no query could reach. It now fails.
+
+    The directory is poisoned by patching the float in vectors.bin, because
+    add() no longer accepts one, which is the point of the other half of this
+    change.
+    """
+    marker_value = 123456.75  # exactly representable in f32 and unique here
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=4, space="l2", expected_size=10)
+    index.add({"id": "poisoned", "values": [marker_value, 0.25, 0.5, 0.75]})
+    index.add({"id": "clean", "values": [0.25, 0.5, 0.75, 1.0]})
+
+    save_dir = tmp_path / "poisoned.zdb"
+    index.save(str(save_dir))
+
+    vectors_bin = save_dir / "vectors.bin"
+    blob = vectors_bin.read_bytes()
+    marker = struct.pack("<f", marker_value)
+    assert blob.count(marker) == 1
+    vectors_bin.write_bytes(blob.replace(marker, struct.pack("<f", float("nan"))))
+
+    with pytest.raises(RuntimeError, match="Graph rebuild refused"):
+        vdb.load(str(save_dir))

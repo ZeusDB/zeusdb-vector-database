@@ -484,3 +484,86 @@ def test_add_result_vector_shape_counts_errors():
     assert empty.total_errors == 0
     assert empty.vector_shape == (0, 4)
     assert empty.is_success()
+
+# ------------------------------------------------------------
+# Test 98: non-finite values are rejected on every add path
+# ------------------------------------------------------------
+def test_add_rejects_non_finite_values():
+    """A NaN in the graph degrades every later query, not only its own.
+
+    The search path validated finiteness and add did not, on either NumPy
+    branch, so a NaN vector inserted with zero errors. add reports per record
+    for every other error, so it reports per record for this one too, and the
+    surrounding good records are still inserted.
+    """
+    vdb = VectorDatabase()
+
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        index = vdb.create("hnsw", dim=4, expected_size=10)
+
+        # Bare NumPy array. Rows are named by position, since none carry an id.
+        result = index.add(
+            np.array(
+                [[0.1, 0.2, 0.3, 0.4], [bad, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]],
+                dtype=np.float32,
+            )
+        )
+        assert result.total_inserted == 2
+        assert result.total_errors == 1
+        assert "Vector row_1" in result.errors[0]
+        assert "invalid value at index 0" in result.errors[0]
+        assert index.get_vector_count() == 2
+
+        # NumPy inside a batch dict. The offending record is named by its id.
+        index = vdb.create("hnsw", dim=4, expected_size=10)
+        result = index.add({
+            "vectors": np.array(
+                [[0.1, 0.2, 0.3, 0.4], [0.1, 0.2, 0.3, bad]], dtype=np.float32
+            ),
+            "ids": ["good", "poisoned"],
+            "metadatas": [{"n": 1}, {"n": 2}],
+        })
+        assert result.total_inserted == 1
+        assert result.total_errors == 1
+        assert "Vector poisoned" in result.errors[0]
+        assert "invalid value at index 3" in result.errors[0]
+        assert index.contains("good")
+        assert not index.contains("poisoned")
+
+        # The list and dict paths already validated, and still do.
+        index = vdb.create("hnsw", dim=4, expected_size=10)
+        result = index.add([
+            {"id": "ok", "values": [0.1, 0.2, 0.3, 0.4]},
+            {"id": "bad", "values": [0.1, bad, 0.3, 0.4]},
+        ])
+        assert result.total_inserted == 1
+        assert result.total_errors == 1
+        assert "Vector bad" in result.errors[0]
+
+        single = index.add({"id": "solo", "values": [bad, 0.2, 0.3, 0.4]})
+        assert single.total_inserted == 0
+        assert single.total_errors == 1
+
+
+# ------------------------------------------------------------
+# Test 99: a rejected NumPy row does not burn an internal id
+# ------------------------------------------------------------
+def test_rejected_numpy_row_keeps_generated_ids_contiguous():
+    """A row that is never stored should not advance the id counter."""
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=4, expected_size=10)
+
+    result = index.add(
+        np.array(
+            [
+                [0.1, 0.2, 0.3, 0.4],
+                [float("nan"), 0.2, 0.3, 0.4],
+                [0.5, 0.6, 0.7, 0.8],
+            ],
+            dtype=np.float32,
+        )
+    )
+
+    assert result.total_inserted == 2
+    stored = sorted(record_id for record_id, _ in index.list(10))
+    assert stored == ["vec_1", "vec_2"]

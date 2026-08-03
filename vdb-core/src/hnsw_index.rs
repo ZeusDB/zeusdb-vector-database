@@ -21,16 +21,6 @@ use tracing::{debug, error, info, instrument, trace, warn};
 // Import PQ module
 use crate::pq::PQ;
 
-// ============================================================================
-// VERSION COUNTER - MANUALLY INCREMENT TO TEST BUILD UPDATES
-// ============================================================================
-
-// 🔢 MANUAL VERSION COUNTER - Change this number after each code change
-const CODE_VERSION_COUNTER: u32 = 1028; // ← INCREMENT THIS MANUALLY
-const CODE_VERSION_DESCRIPTION: &str = "Fixed overwrite bug - eliminates duplicate documents";
-
-// ============================================================================
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageMode {
     #[default]
@@ -539,10 +529,35 @@ pub struct HNSWIndex {
     pub rebuilding_from_persistence: AtomicBool,
 }
 
-#[pymethods]
+/// Build an `HNSWIndex`
+///
+/// The only way to construct an index from Python other than loading one from
+/// disk. `HNSWIndex` carries no `#[new]`, so the class is importable for
+/// `isinstance` checks and type annotations while direct construction raises
+/// `TypeError`. Every rule that governs a valid index is enforced here, which
+/// is what makes the Python factory and this function agree.
+#[pyfunction]
+#[pyo3(name = "_create_hnsw_index")]
+#[pyo3(signature = (dim, space, m, ef_construction, expected_size, quantization_config = None))]
+pub fn create_hnsw_index(
+    dim: usize,
+    space: String,
+    m: usize,
+    ef_construction: usize,
+    expected_size: usize,
+    quantization_config: Option<&Bound<PyDict>>,
+) -> PyResult<HNSWIndex> {
+    HNSWIndex::build(
+        dim,
+        space,
+        m,
+        ef_construction,
+        expected_size,
+        quantization_config,
+    )
+}
+
 impl HNSWIndex {
-    #[new]
-    #[pyo3(signature = (dim, space, m, ef_construction, expected_size, quantization_config = None))]
     #[instrument(level = "info", skip(quantization_config), fields(
         dim = dim,
         space = %space,
@@ -551,7 +566,7 @@ impl HNSWIndex {
         expected_size = expected_size,
         has_quantization = quantization_config.is_some()
     ))]
-    fn new(
+    pub(crate) fn build(
         dim: usize,
         space: String,
         m: usize,
@@ -593,6 +608,18 @@ impl HNSWIndex {
             );
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "expected_size must be positive",
+            ));
+        }
+        if m == 0 {
+            error!(
+                operation = "validation",
+                field = "m",
+                value = m,
+                min_allowed = 1,
+                "m below minimum"
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "m must be at least 1",
             ));
         }
         if m > 256 {
@@ -686,6 +713,32 @@ impl HNSWIndex {
                 .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
             // Validate PQ parameters
+            if subvectors == 0 {
+                error!(
+                    operation = "validation",
+                    field = "subvectors",
+                    value = subvectors,
+                    "Subvectors must be positive"
+                );
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "subvectors must be a positive integer, got 0",
+                ));
+            }
+
+            if subvectors > dim {
+                error!(
+                    operation = "validation",
+                    field = "subvectors",
+                    dim = dim,
+                    subvectors = subvectors,
+                    "Subvectors exceed dimension"
+                );
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "subvectors ({}) cannot exceed dimension ({})",
+                    subvectors, dim
+                )));
+            }
+
             if !dim.is_multiple_of(subvectors) {
                 error!(
                     operation = "validation",
@@ -727,6 +780,27 @@ impl HNSWIndex {
                     "training_size must be at least 1000, got {}",
                     training_size
                 )));
+            }
+
+            // A max below the threshold produces an index that reaches its
+            // training threshold and then fails training on every record from
+            // then on, because the cap is already exceeded by the time the
+            // trigger fires. Enforced here so it holds on every construction
+            // path rather than only the Python factory.
+            if let Some(max_training) = max_training_vectors {
+                if max_training < training_size {
+                    error!(
+                        operation = "validation",
+                        field = "max_training_vectors",
+                        value = max_training,
+                        training_size = training_size,
+                        "max_training_vectors below training_size"
+                    );
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "max_training_vectors ({}) must be >= training_size ({})",
+                        max_training, training_size
+                    )));
+                }
             }
 
             let config = QuantizationConfig {
@@ -816,7 +890,10 @@ impl HNSWIndex {
             rebuilding_from_persistence: AtomicBool::new(false),
         })
     }
+}
 
+#[pymethods]
+impl HNSWIndex {
     /// Get quantization configuration and status
     pub fn get_quantization_info(&self) -> Option<PyObject> {
         Python::with_gil(|py| {
@@ -863,32 +940,9 @@ impl HNSWIndex {
         *self.vector_count.lock().unwrap()
     }
 
-    /// Count the records the index actually holds
-    ///
-    /// The union of the raw vectors and the PQ codes, because `quantized_only`
-    /// keeps a record added after training in the codes alone. This is derived
-    /// from the stored data rather than from the counter, so it is what the
-    /// counter is checked against after a load.
-    pub fn count_stored_records(&self) -> usize {
-        let vectors = self.vectors.read().unwrap();
-        let pq_codes = self.pq_codes.read().unwrap();
-        let code_only = pq_codes
-            .keys()
-            .filter(|id| !vectors.contains_key(*id))
-            .count();
-        vectors.len() + code_only
-    }
-
     /// Get the distance space configuration
     pub fn get_space(&self) -> String {
         self.space.clone()
-    }
-
-    /// Get next available internal ID
-    fn get_next_id(&self) -> usize {
-        let mut counter = self.id_counter.lock().unwrap();
-        *counter += 1;
-        *counter
     }
 
     /// Rebuild the HNSW index to use PQ codes after training is complete
@@ -1903,33 +1957,22 @@ impl HNSWIndex {
     }
 
     /// Get performance characteristics and limitations
+    ///
+    /// Reports only what the code does. Insertion runs one record at a time
+    /// through `add_single_vector`, so the fields that described a parallel
+    /// insert path were removed rather than corrected.
     pub fn get_performance_info(&self) -> HashMap<String, String> {
         let mut info = HashMap::new();
         info.insert("search_speedup_expected".to_string(), "1.2x-2x".to_string());
-        info.insert(
-            "insertion_speedup_expected".to_string(),
-            "4x-8x_large_batches".to_string(),
-        );
         info.insert(
             "search_bottleneck".to_string(),
             "hnsw_mutex_serialization".to_string(),
         );
         info.insert(
-            "insertion_bottleneck".to_string(),
-            "hnsw_mutex_for_large_batches".to_string(),
-        );
-        info.insert(
             "benefits".to_string(),
-            "gil_release_concurrent_metadata_processing_parallel_insert".to_string(),
+            "gil_release_concurrent_metadata_processing_batched_search".to_string(),
         );
-        info.insert(
-            "limitation".to_string(),
-            "parallel_insert_threshold_1000x_threads".to_string(),
-        );
-        info.insert(
-            "recommendation".to_string(),
-            "excellent_for_large_batch_workloads".to_string(),
-        );
+        info.insert("insertion_path".to_string(), "sequential".to_string());
 
         // Add quantization performance info
         if let Some(config) = &self.quantization_config {
@@ -2023,97 +2066,6 @@ impl HNSWIndex {
 
         Ok(results)
     }
-
-    /// Raw performance benchmark
-    #[pyo3(signature = (query_count, max_threads=None))]
-    pub fn benchmark_raw_concurrent_performance(
-        &self,
-        query_count: usize,
-        max_threads: Option<usize>,
-    ) -> HashMap<String, f64> {
-        use rand::random; // Import for random number generation
-
-        let start_time = Instant::now();
-
-        let queries: Vec<Vec<f32>> = (0..query_count)
-            .map(|_| (0..self.dim).map(|_| random::<f32>()).collect())
-            .collect();
-
-        let mut results = HashMap::new();
-
-        // Sequential benchmark
-        let start = Instant::now();
-        for query in &queries {
-            let _ = self.raw_search_no_gil(query);
-        }
-        let sequential_time = start.elapsed().as_secs_f64();
-
-        // Parallel benchmark
-        let available_threads = rayon::current_num_threads();
-        let num_threads = max_threads
-            .unwrap_or(available_threads)
-            .min(available_threads);
-        let chunk_size = queries.len().div_ceil(num_threads);
-
-        let start = Instant::now();
-        // The sum is discarded, but the map runs every query through the search
-        // path, which is the work this benchmark times.
-        let _total_processed: usize = queries
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                let mut local_count = 0;
-                for query in chunk {
-                    let _ = self.raw_search_no_gil(query);
-                    local_count += 1;
-                }
-                local_count
-            })
-            .sum();
-
-        let parallel_time = start.elapsed().as_secs_f64();
-
-        results.insert("sequential_time".to_string(), sequential_time);
-        results.insert("parallel_time".to_string(), parallel_time);
-        results.insert(
-            "sequential_qps".to_string(),
-            queries.len() as f64 / sequential_time,
-        );
-        results.insert(
-            "parallel_qps".to_string(),
-            queries.len() as f64 / parallel_time,
-        );
-        results.insert("speedup".to_string(), sequential_time / parallel_time);
-        results.insert("threads_used".to_string(), num_threads as f64);
-        results.insert(
-            "note".to_string(),
-            "limited_by_hnsw_mutex".parse().unwrap_or(0.0),
-        );
-
-        let total_duration_ms = start_time.elapsed().as_millis();
-        info!(
-            operation = "benchmark_complete",
-            sequential_qps = queries.len() as f64 / sequential_time,
-            parallel_qps = queries.len() as f64 / parallel_time,
-            speedup = sequential_time / parallel_time,
-            duration_ms = total_duration_ms,
-            "Benchmark completed"
-        );
-
-        results
-    }
-
-    /// Get current code version counter to verify build updates
-    pub fn get_code_version(&self) -> String {
-        format!(
-            "Version: {}, Description: {}",
-            CODE_VERSION_COUNTER, CODE_VERSION_DESCRIPTION
-        )
-    }
-
-    /// Get just the version number for quick checking
-    pub fn get_version_number(&self) -> u32 {
-        CODE_VERSION_COUNTER
-    }
 }
 
 /// Records accepted by `add`, after parsing and before insertion, as
@@ -2136,6 +2088,34 @@ enum NumericValue {
 
 // INTERNAL METHODS, HELPERS AND IMPLEMENTATIONS
 impl HNSWIndex {
+    /// Count the records the index actually holds
+    ///
+    /// The union of the raw vectors and the PQ codes, because `quantized_only`
+    /// keeps a record added after training in the codes alone. This is derived
+    /// from the stored data rather than from the counter, so it is what the
+    /// counter is checked against after a load. Not exposed to Python, since
+    /// the only caller is the load path in `persistence`.
+    pub fn count_stored_records(&self) -> usize {
+        let vectors = self.vectors.read().unwrap();
+        let pq_codes = self.pq_codes.read().unwrap();
+        let code_only = pq_codes
+            .keys()
+            .filter(|id| !vectors.contains_key(*id))
+            .count();
+        vectors.len() + code_only
+    }
+
+    /// Get next available internal ID
+    ///
+    /// Not exposed to Python. Every call takes the counter mutex and
+    /// increments it, so a call from outside the insertion path burns an
+    /// internal id that no record will ever hold.
+    fn get_next_id(&self) -> usize {
+        let mut counter = self.id_counter.lock().unwrap();
+        *counter += 1;
+        *counter
+    }
+
     /// Pure function for vector normalization
     fn normalize_vector(&self, vector: Vec<f32>) -> Vec<f32> {
         let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -2749,7 +2729,8 @@ impl HNSWIndex {
         } else if let Ok(list) = data.downcast::<PyList>() {
             self.parse_list_input_safe(list, &mut parsed_vectors, &mut errors);
         } else if let Ok(np_array) = data.downcast::<PyArray2<f32>>() {
-            if let Err(e) = self.parse_numpy_input_safe(np_array, &mut parsed_vectors) {
+            if let Err(e) = self.parse_numpy_input_safe(np_array, &mut parsed_vectors, &mut errors)
+            {
                 errors.push(format!("NumPy parsing error: {}", e));
             }
         } else {
@@ -2824,7 +2805,7 @@ impl HNSWIndex {
             }
         } else {
             // Batch format - try the existing parse_batch_format
-            if let Err(e) = self.parse_batch_format(dict, parsed_vectors) {
+            if let Err(e) = self.parse_batch_format(dict, parsed_vectors, errors) {
                 errors.push(format!("Batch parsing error: {}", e));
             }
         }
@@ -2835,6 +2816,7 @@ impl HNSWIndex {
         &self,
         dict: &Bound<PyDict>,
         parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+        errors: &mut Vec<String>,
     ) -> PyResult<()> {
         // Process each key path immediately without storing references
 
@@ -2844,7 +2826,7 @@ impl HNSWIndex {
                 return self.process_vector_list(list, dict, parsed_vectors);
             } else if let Ok(np_array) = vectors_item.downcast::<PyArray2<f32>>() {
                 // FIX: Handle NumPy with IDs and metadata
-                return self.parse_numpy_with_context(np_array, dict, parsed_vectors);
+                return self.parse_numpy_with_context(np_array, dict, parsed_vectors, errors);
             }
         }
 
@@ -2854,7 +2836,7 @@ impl HNSWIndex {
                 return self.process_vector_list(list, dict, parsed_vectors);
             } else if let Ok(np_array) = embeddings_item.downcast::<PyArray2<f32>>() {
                 // FIX: Handle NumPy with IDs and metadata
-                return self.parse_numpy_with_context(np_array, dict, parsed_vectors);
+                return self.parse_numpy_with_context(np_array, dict, parsed_vectors, errors);
             }
         }
 
@@ -2941,6 +2923,7 @@ impl HNSWIndex {
         np_array: &Bound<PyArray2<f32>>,
         dict: &Bound<PyDict>,
         parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+        errors: &mut Vec<String>,
     ) -> PyResult<()> {
         let readonly = np_array.readonly();
         let shape = readonly.shape();
@@ -2983,23 +2966,45 @@ impl HNSWIndex {
             "Processing vectors with context"
         );
 
+        let mut rejected = 0usize;
+
         for i in 0..num_vectors {
             let start_idx = i * self.dim;
             let end_idx = start_idx + self.dim;
-            let raw_vector = flat[start_idx..end_idx].to_vec();
-            let processed_vector = self.process_vector_for_space(raw_vector);
+            let raw_vector = &flat[start_idx..end_idx];
+
+            // Resolve the caller's id before validating, so a rejected row can
+            // be named without advancing the internal id counter for a record
+            // that is never stored.
+            let provided_id = match &ids_list {
+                Some(ids) if i < ids.len() => ids.get_item(i)?.extract::<String>().ok(),
+                _ => None,
+            };
+
+            if let Some((component, value)) = Self::first_non_finite(raw_vector) {
+                let label = provided_id.clone().unwrap_or_else(|| format!("row_{}", i));
+                error!(
+                    operation = "parse_numpy_context",
+                    error = "invalid_value",
+                    vector_id = %label,
+                    index = component,
+                    value = value,
+                    "NumPy row contains a non-finite value"
+                );
+                errors.push(format!(
+                    "Vector {}: contains invalid value at index {}: {} (must be finite)",
+                    label, component, value
+                ));
+                rejected += 1;
+                continue;
+            }
+
+            let processed_vector = self.process_vector_for_space(raw_vector.to_vec());
 
             // Get ID from provided IDs or generate
-            let id = if let Some(ids) = &ids_list {
-                if i < ids.len() {
-                    ids.get_item(i)?
-                        .extract::<String>()
-                        .unwrap_or_else(|_| self.generate_id())
-                } else {
-                    self.generate_id()
-                }
-            } else {
-                self.generate_id()
+            let id = match provided_id {
+                Some(id) => id,
+                None => self.generate_id(),
             };
 
             // Get metadata from provided metadata or use empty
@@ -3031,7 +3036,8 @@ impl HNSWIndex {
 
         trace!(
             operation = "parse_numpy_context_complete",
-            parsed_count = num_vectors,
+            parsed_count = num_vectors - rejected,
+            rejected_count = rejected,
             "NumPy parsing completed"
         );
         Ok(())
@@ -3117,6 +3123,7 @@ impl HNSWIndex {
         &self,
         np_array: &Bound<PyArray2<f32>>,
         parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+        errors: &mut Vec<String>,
     ) -> Result<(), String> {
         // This is the same as your current parse_numpy_input but returns Result<(), String>
         let readonly = np_array.readonly();
@@ -3137,13 +3144,46 @@ impl HNSWIndex {
         for i in 0..num_vectors {
             let start_idx = i * self.dim;
             let end_idx = start_idx + self.dim;
-            let raw_vector = flat[start_idx..end_idx].to_vec();
-            let processed_vector = self.process_vector_for_space(raw_vector);
+            let raw_vector = &flat[start_idx..end_idx];
+
+            // A bare array carries no ids, so a rejected row is named by its
+            // position and no id is generated for it.
+            if let Some((component, value)) = Self::first_non_finite(raw_vector) {
+                error!(
+                    operation = "parse_numpy",
+                    error = "invalid_value",
+                    row = i,
+                    index = component,
+                    value = value,
+                    "NumPy row contains a non-finite value"
+                );
+                errors.push(format!(
+                    "Vector row_{}: contains invalid value at index {}: {} (must be finite)",
+                    i, component, value
+                ));
+                continue;
+            }
+
+            let processed_vector = self.process_vector_for_space(raw_vector.to_vec());
             let id = self.generate_id();
             parsed_vectors.push((id, processed_vector, HashMap::new()));
         }
 
         Ok(())
+    }
+
+    /// Report the first non-finite component of a vector, if there is one
+    ///
+    /// The two NumPy branches read their rows straight out of the buffer, so
+    /// they skip the per-value check that `extract_single_vector` runs. A NaN
+    /// that reaches the graph degrades every later query rather than only the
+    /// one that carried it, so both branches route through this.
+    fn first_non_finite(vector: &[f32]) -> Option<(usize, f32)> {
+        vector
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+            .map(|(index, value)| (index, *value))
     }
 
     /// Extract a single vector from various Python types (enhanced)
