@@ -7,6 +7,7 @@ use pyo3::types::{PyDict, PyList};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cell::RefCell;
 // Aliased because `std::sync::atomic::Ordering` already holds the bare name.
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
@@ -176,49 +177,79 @@ fn take_best<T>(scored: &mut Vec<(T, f32)>, top_k: usize) {
     scored.truncate(top_k);
 }
 
+thread_local! {
+    /// The ADC lookup table for the query the calling thread is running.
+    ///
+    /// The table belongs to a query, not to an index. It used to live on
+    /// `DistPQ`, one per index, which meant two searches overlapping would each
+    /// overwrite the other's table and score candidates against a query they
+    /// were never given. An exclusive lock on the graph was the only thing
+    /// preventing that, so the table had to move before the lock could be
+    /// relaxed.
+    ///
+    /// `Distance::eval` takes `&self` and has no parameter to carry per query
+    /// state, so the table cannot be threaded through as an argument. Thread
+    /// local storage is the way to give it to `eval` without giving it to the
+    /// index, and it needs no change to the vendored crate.
+    ///
+    /// The invariant this rests on is that one query's traversal runs entirely
+    /// on the thread that installed its table. `Hnsw::search` is sequential
+    /// within a single query, so that holds. `batch_search_parallel` splits
+    /// across queries rather than within one, and each query installs its own
+    /// table on the worker that runs it. Adopting `Hnsw::parallel_search`, which
+    /// would fan one query's distance evaluations out across the pool, would
+    /// break this and must not be done without replacing the mechanism.
+    static QUERY_LUT: RefCell<Option<Vec<Vec<f32>>>> = const { RefCell::new(None) };
+}
+
+/// Holds a query's ADC table on the calling thread and removes it on drop.
+///
+/// Drop rather than an explicit clear, so an early return or a panic inside the
+/// traversal cannot leave a stale table behind for the next query this thread
+/// runs. A leftover table would be read as if it belonged to that next query.
+struct QueryLut;
+
+impl Drop for QueryLut {
+    fn drop(&mut self) {
+        QUERY_LUT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 /// Custom distance function for Product Quantization using ADC
 #[derive(Clone)]
 pub struct DistPQ {
     /// Reference to the PQ instance for accessing centroids
     pq: Arc<PQ>,
-    /// Pre-computed ADC lookup table for the current query
-    /// Thread-safe storage since multiple threads may search simultaneously
-    lut: Arc<RwLock<Option<Vec<Vec<f32>>>>>,
 }
 
 impl DistPQ {
     pub fn new(pq: Arc<PQ>) -> Self {
-        DistPQ {
-            pq,
-            lut: Arc::new(RwLock::new(None)),
-        }
+        DistPQ { pq }
     }
 
-    pub fn set_query_lut(&self, query: &[f32]) -> Result<(), String> {
+    /// Compute this query's ADC table and install it for the calling thread.
+    ///
+    /// The returned guard must be held for the whole traversal. Dropping it
+    /// early returns the thread to graph construction mode, where `eval` reads
+    /// the codebook's symmetric table instead.
+    fn install_query_lut(&self, query: &[f32]) -> Result<QueryLut, String> {
         if !self.pq.is_trained() {
             return Err("PQ must be trained before ADC computation".to_string());
         }
 
         let lut = self.pq.compute_adc_lut(query)?;
-        {
-            let mut lut_guard = self.lut.write().unwrap();
-            *lut_guard = Some(lut);
-        }
-        Ok(())
-    }
-
-    pub fn clear_lut(&self) {
-        let mut lut_guard = self.lut.write().unwrap();
-        *lut_guard = None;
+        QUERY_LUT.with(|slot| *slot.borrow_mut() = Some(lut));
+        Ok(QueryLut)
     }
 }
 
 impl Distance<u8> for DistPQ {
     /// Distance between two points the graph holds, both of which are PQ codes
     ///
-    /// A query table set means a search is running. `a` is then the dummy code
-    /// vector `DistanceType::search` passes, the real query lives in the table,
-    /// and the distance is asymmetric: query subvector against stored centroid.
+    /// A query table on this thread means a search is running. `a` is then the
+    /// dummy code vector `DistanceType::search` passes, the real query lives in
+    /// the table, and the distance is asymmetric: query subvector against stored
+    /// centroid.
     ///
     /// No query table means graph construction, where there is no query and
     /// both `a` and `b` are stored codes. The distance is then symmetric,
@@ -232,31 +263,31 @@ impl Distance<u8> for DistPQ {
     ///
     /// Choosing the branch on the table rather than on `a` is deliberate. The
     /// dummy query is a valid code slice and cannot be told apart from real
-    /// codes by inspection. It is sound because `HNSWIndex::hnsw` is a `Mutex`,
-    /// so a search and an insertion never overlap and an insertion can never
-    /// observe another caller's query table.
+    /// codes by inspection. It is sound because the table is thread local, so an
+    /// insertion can never observe a query table it did not install itself, no
+    /// matter what any other thread is doing at the time. That used to depend on
+    /// the graph mutex serialising searches against insertions, which is the
+    /// dependency this removes.
     fn eval(&self, a: &[u8], b: &[u8]) -> f32 {
-        let lut_guard = self.lut.read().unwrap();
-        let lut = match lut_guard.as_ref() {
-            Some(l) => l,
-            None => {
-                drop(lut_guard);
+        QUERY_LUT.with(|slot| {
+            let slot = slot.borrow();
+            let Some(lut) = slot.as_ref() else {
                 return self.pq.symmetric_distance(a, b);
-            }
-        };
+            };
 
-        // b.len() should equal pq.subvectors
-        let mut sum = 0.0f32;
-        for (sv, &code) in b.iter().enumerate() {
-            // lut[sv][code]
-            let distance_component = lut
-                .get(sv)
-                .and_then(|row| row.get(code as usize))
-                .copied()
-                .unwrap_or(f32::INFINITY);
-            sum += distance_component;
-        }
-        sum
+            // b.len() should equal pq.subvectors
+            let mut sum = 0.0f32;
+            for (sv, &code) in b.iter().enumerate() {
+                // lut[sv][code]
+                let distance_component = lut
+                    .get(sv)
+                    .and_then(|row| row.get(code as usize))
+                    .copied()
+                    .unwrap_or(f32::INFINITY);
+                sum += distance_component;
+            }
+            sum
+        })
     }
 }
 
@@ -419,24 +450,6 @@ impl DistanceType {
         }
     }
 
-    fn set_query_lut(&self, query: &[f32]) -> Result<(), String> {
-        match self {
-            DistanceType::CosinePQ(hnsw) => hnsw.get_distance().set_query_lut(query),
-            DistanceType::L2PQ(hnsw) => hnsw.get_distance().set_query_lut(query),
-            DistanceType::L1PQ(hnsw) => hnsw.get_distance().set_query_lut(query),
-            _ => Ok(()), // No-op for raw variants
-        }
-    }
-
-    fn clear_lut(&self) {
-        match self {
-            DistanceType::CosinePQ(hnsw) => hnsw.get_distance().clear_lut(),
-            DistanceType::L2PQ(hnsw) => hnsw.get_distance().clear_lut(),
-            DistanceType::L1PQ(hnsw) => hnsw.get_distance().clear_lut(),
-            _ => {} // No-op for raw variants
-        }
-    }
-
     /// Search the graph, admitting only the internal ids the filter accepts.
     ///
     /// The filter runs inside the traversal, before the fixed `top_k` cut, so a
@@ -460,19 +473,16 @@ impl DistanceType {
 
             // PQ-based search with ADC
             DistanceType::CosinePQ(hnsw) | DistanceType::L2PQ(hnsw) | DistanceType::L1PQ(hnsw) => {
-                // Set the query LUT for ADC computation
-                self.set_query_lut(query)?;
+                // This query's ADC table, installed on this thread alone. The
+                // guard is named so it lives to the end of the arm rather than
+                // dropping at the end of the statement, and it releases the
+                // table once the traversal is done.
+                let _query_lut = hnsw.get_distance().install_query_lut(query)?;
 
                 // Create dummy query vector for HNSW traversal (flat u8 codes)
                 let dummy_query = vec![0u8; self.get_code_size()];
 
-                // Perform search
-                let results = hnsw.search_filter(&dummy_query, k, ef, filter);
-
-                // Clear LUT after search for memory efficiency
-                self.clear_lut();
-
-                Ok(results)
+                Ok(hnsw.search_filter(&dummy_query, k, ef, filter))
             }
         }
     }
@@ -507,7 +517,7 @@ impl DistanceType {
         )
     }
 
-    fn insert(&mut self, vector: &[f32], id: usize) {
+    fn insert(&self, vector: &[f32], id: usize) {
         match self {
             DistanceType::Cosine(hnsw) => hnsw.insert((vector, id)),
             DistanceType::L2(hnsw) => hnsw.insert((vector, id)),
@@ -525,7 +535,7 @@ impl DistanceType {
     }
 
     /// Insert PQ codes into the index
-    fn insert_pq_codes(&mut self, codes: &[u8], id: usize) {
+    fn insert_pq_codes(&self, codes: &[u8], id: usize) {
         match self {
             DistanceType::CosinePQ(hnsw) => {
                 hnsw.insert((codes, id));
@@ -549,7 +559,7 @@ impl DistanceType {
     }
 
     #[allow(dead_code)]
-    fn insert_batch(&mut self, data: &[(&Vec<f32>, usize)]) {
+    fn insert_batch(&self, data: &[(&Vec<f32>, usize)]) {
         let num_threads = rayon::current_num_threads();
         let threshold = 1000 * num_threads;
 
@@ -584,7 +594,7 @@ impl DistanceType {
         }
     }
 
-    fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize)]) -> Result<(), String> {
+    fn insert_batch_pq(&self, data: &[(&Vec<u8>, usize)]) -> Result<(), String> {
         let num_threads = rayon::current_num_threads();
         let threshold = 1000 * num_threads;
 
@@ -648,6 +658,29 @@ impl AddResult {
     }
 }
 
+/// Lock acquisition order for `HNSWIndex`
+///
+/// Every path that holds two of these guards at once acquires them in this
+/// order, top to bottom. Releasing may happen in any order.
+///
+/// ```text
+/// id_map < rev_map < hnsw < vectors < pq_codes < vector_metadata
+///        < training_ids < metadata < id_counter < vector_count
+/// ```
+///
+/// This exists because search and mutation now overlap. Until the receivers
+/// were relaxed, PyO3's exclusive borrow kept every mutating method away from
+/// every search, so no reader and no writer were ever in flight together and
+/// the acquisition order could not matter. It matters now. A search holds
+/// `rev_map` for its whole traversal and takes `vectors` afterwards, so a
+/// removal taking `vectors` before `rev_map`, which is what it used to do,
+/// deadlocks against it on the first interleaving that lands.
+///
+/// One further rule, which the order alone does not express. No path forks to
+/// rayon while holding a write guard. Mutations are serialised against each
+/// other by `writers`, so a read guard held across a fork can only ever be
+/// blocked by that one writer, and a fork under a write guard is exactly the
+/// case where the pool's workers can all end up waiting on the forking thread.
 #[pyclass]
 pub struct HNSWIndex {
     dim: usize,
@@ -674,8 +707,26 @@ pub struct HNSWIndex {
     id_counter: Mutex<usize>,
     vector_count: Mutex<usize>, // Track total vectors for training trigger
 
-    // Mutex for HNSW (not thread-safe for concurrent reads)
-    hnsw: Mutex<DistanceType>,
+    /// The graph. A read guard covers a traversal and a single record insertion,
+    /// because `hnsw_rs` takes `&self` on both and does its own interior locking.
+    /// A write guard covers replacing the whole backend, which `compact`,
+    /// `rebuild_with_quantization` and the persistence rebuild each do once.
+    hnsw: RwLock<DistanceType>,
+
+    /// Serialises the mutating operations against each other, not against reads.
+    ///
+    /// `add`, `remove_point`, `compact` and `rebuild_with_quantization` were
+    /// serialised against everything by PyO3's exclusive borrow. Relaxing the
+    /// receivers removes that, and their internals are not written to interleave
+    /// with each other. Id allocation, the training trigger and the overwrite
+    /// path each read state and then act on it, so two of them in flight would
+    /// race. This restores exactly the mutual exclusion the borrow flag gave
+    /// them and nothing more, which leaves searches free to run throughout.
+    ///
+    /// Held by the Python entry points only. An internal caller reaching a
+    /// mutating helper is already inside the guard, so the helpers never take
+    /// it and cannot deadlock against the caller that owns it.
+    writers: Mutex<()>,
 
     // ID-based training collection
     training_ids: RwLock<Vec<String>>,      // Just IDs, not vectors
@@ -1042,7 +1093,8 @@ impl HNSWIndex {
             rev_map: RwLock::new(HashMap::new()),
             id_counter: Mutex::new(0),
             vector_count: Mutex::new(0),
-            hnsw: Mutex::new(hnsw),
+            hnsw: RwLock::new(hnsw),
+            writers: Mutex::new(()),
             training_ids: RwLock::new(Vec::new()),
             training_threshold_reached: AtomicBool::new(false),
             created_at: Utc::now().to_rfc3339(),
@@ -1120,7 +1172,17 @@ impl HNSWIndex {
         vector_count = self.get_vector_count(),
         has_quantization = self.has_quantization()
     ), err)]
-    pub fn rebuild_with_quantization(&mut self) -> PyResult<bool> {
+    pub fn rebuild_with_quantization(&self) -> PyResult<bool> {
+        let _writers = self.writers.lock().unwrap();
+        self.rebuild_with_quantization_locked()
+    }
+
+    /// The body of `rebuild_with_quantization`, with the writers guard already held
+    ///
+    /// Training reaches this from inside `add`, which owns the guard for the whole
+    /// call, so the two entry points are separate rather than one taking the guard
+    /// twice and deadlocking on itself.
+    fn rebuild_with_quantization_locked(&self) -> PyResult<bool> {
         let start_time = Instant::now();
 
         let pq = match &self.pq {
@@ -1135,33 +1197,6 @@ impl HNSWIndex {
             }
         };
 
-        // Get all current vectors for quantization
-        let vectors = self.vectors.read().unwrap();
-        if vectors.is_empty() {
-            warn!(
-                operation = "rebuild_quantization",
-                reason = "no_vectors",
-                "Cannot rebuild: no vectors available"
-            );
-            return Ok(false);
-        }
-
-        info!(
-            operation = "quantization_rebuild_start",
-            vector_count = vectors.len(),
-            "Starting quantization rebuild"
-        );
-
-        // Quantize all existing vectors
-        let vector_refs: Vec<&[f32]> = vectors.values().map(|v| v.as_slice()).collect();
-        let quantized_codes = pq.quantize_batch(&vector_refs).map_err(|e| {
-            error!(operation = "quantization_rebuild", error = %e, "Failed to quantize vectors");
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to quantize vectors: {}",
-                e
-            ))
-        })?;
-
         // Create new PQ-based HNSW index
         let max_layer = 16; // Always use NB_LAYER_MAX for consistency
         trace!(
@@ -1170,22 +1205,42 @@ impl HNSWIndex {
             "Creating new PQ HNSW index"
         );
 
-        let new_hnsw = DistanceType::new_pq(
-            &self.space,
-            self.m,
-            self.expected_size,
-            max_layer,
-            self.ef_construction,
-            pq.clone(),
-        );
+        // Quantize every stored vector and record the codes, then release the
+        // storage guards. Nothing below this block holds one, which is what lets
+        // the graph work take its own guards in the declared order rather than
+        // under a `vectors` guard taken first.
+        let (vector_count, retained) = {
+            let vectors = self.vectors.read().unwrap();
+            if vectors.is_empty() {
+                warn!(
+                    operation = "rebuild_quantization",
+                    reason = "no_vectors",
+                    "Cannot rebuild: no vectors available"
+                );
+                return Ok(false);
+            }
 
-        // Store quantized codes. Codes for records that have no raw vector are
-        // kept rather than cleared, because under QuantizedOnly they are the
-        // only copy of every record added after training completed and there is
-        // nothing left to re-quantize them from. Clearing dropped those records
-        // from the index outright. Removal already deletes an id's codes, so
-        // nothing stale can survive here.
-        let retained = {
+            info!(
+                operation = "quantization_rebuild_start",
+                vector_count = vectors.len(),
+                "Starting quantization rebuild"
+            );
+
+            let vector_refs: Vec<&[f32]> = vectors.values().map(|v| v.as_slice()).collect();
+            let quantized_codes = pq.quantize_batch(&vector_refs).map_err(|e| {
+                error!(operation = "quantization_rebuild", error = %e, "Failed to quantize vectors");
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Failed to quantize vectors: {}",
+                    e
+                ))
+            })?;
+
+            // Store quantized codes. Codes for records that have no raw vector are
+            // kept rather than cleared, because under QuantizedOnly they are the
+            // only copy of every record added after training completed and there is
+            // nothing left to re-quantize them from. Clearing dropped those records
+            // from the index outright. Removal already deletes an id's codes, so
+            // nothing stale can survive here.
             let mut pq_codes = self.pq_codes.write().unwrap();
             let retained = pq_codes
                 .keys()
@@ -1203,29 +1258,41 @@ impl HNSWIndex {
                 codes_retained = retained,
                 "Quantized codes stored"
             );
-            retained
+            (vectors.len(), retained)
         };
 
-        // Replace the HNSW index
-        {
-            let mut hnsw_guard = self.hnsw.lock().unwrap();
-            *hnsw_guard = new_hnsw;
-        }
+        // The codes are copied out so the graph is built with no lock held at
+        // all. A large batch insert forks to rayon, and a fork under the graph's
+        // write guard can leave every worker in the pool waiting on the thread
+        // that holds it. Copying costs one byte per subvector per record.
+        let batch_data: Vec<(Vec<u8>, usize)> = {
+            let id_map = self.id_map.read().unwrap();
+            let pq_codes = self.pq_codes.read().unwrap();
+            pq_codes
+                .iter()
+                .filter_map(|(id, codes)| {
+                    id_map
+                        .get(id)
+                        .map(|&internal_id| (codes.clone(), internal_id))
+                })
+                .collect()
+        };
 
-        // Insert quantized vectors into new index
-        let pq_codes = self.pq_codes.read().unwrap();
-        let id_map = self.id_map.read().unwrap();
-        let mut batch_data: Vec<(&Vec<u8>, usize)> = Vec::new();
-
-        for (id, codes) in pq_codes.iter() {
-            if let Some(&internal_id) = id_map.get(id) {
-                batch_data.push((codes, internal_id));
-            }
-        }
+        let new_hnsw = DistanceType::new_pq(
+            &self.space,
+            self.m,
+            self.expected_size,
+            max_layer,
+            self.ef_construction,
+            pq.clone(),
+        );
 
         if !batch_data.is_empty() {
-            let mut hnsw_guard = self.hnsw.lock().unwrap();
-            hnsw_guard.insert_batch_pq(&batch_data)
+            let batch: Vec<(&Vec<u8>, usize)> = batch_data
+                .iter()
+                .map(|(codes, internal_id)| (codes, *internal_id))
+                .collect();
+            new_hnsw.insert_batch_pq(&batch)
                 .map_err(|e| {
                     error!(operation = "quantization_rebuild", error = %e, "Failed to insert quantized vectors");
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
@@ -1234,12 +1301,21 @@ impl HNSWIndex {
                 })?;
         }
 
+        // The replacement is built in full before it is installed, so a search
+        // running alongside this sees the old graph or the new one and never a
+        // partly filled one. It used to see the empty new graph for as long as
+        // the insertions took.
+        {
+            let mut hnsw_guard = self.hnsw.write().unwrap();
+            *hnsw_guard = new_hnsw;
+        }
+
         // ✅ ENTERPRISE: Add duration timing with fixed compression ratio calculation
         let duration_ms = start_time.elapsed().as_millis();
         let compression_ratio = (pq.dim as f64 * 4.0) / pq.subvectors as f64;
         info!(
             operation = "quantization_rebuild_complete",
-            vector_count = vectors.len(),
+            vector_count = vector_count,
             codes_inserted = batch_data.len(),
             codes_retained = retained,
             compression_ratio = compression_ratio,
@@ -1254,7 +1330,7 @@ impl HNSWIndex {
     pub fn is_quantized(&self) -> bool {
         if let Some(pq) = &self.pq {
             if pq.is_trained() {
-                let hnsw_guard = self.hnsw.lock().unwrap();
+                let hnsw_guard = self.hnsw.read().unwrap();
                 return hnsw_guard.is_quantized();
             }
         }
@@ -1277,7 +1353,9 @@ impl HNSWIndex {
         has_quantization = self.has_quantization(),
         is_quantized = self.is_quantized()
     ), err)]
-    pub fn add(&mut self, data: Bound<PyAny>, overwrite: bool) -> PyResult<AddResult> {
+    pub fn add(&self, data: Bound<PyAny>, overwrite: bool) -> PyResult<AddResult> {
+        // Serialised against the other mutating methods, not against searches.
+        let _writers = self.writers.lock().unwrap();
         let start_time = Instant::now();
 
         // Input validation
@@ -1707,7 +1785,7 @@ impl HNSWIndex {
                 let fetch_k = params.fetch_k(rev_map.len());
 
                 let hnsw_results = {
-                    let hnsw_guard = self.hnsw.lock().unwrap();
+                    let hnsw_guard = self.hnsw.read().unwrap();
 
                     if use_quantized {
                         // Use ADC search for quantized index
@@ -1842,6 +1920,14 @@ impl HNSWIndex {
         is_quantized = self.is_quantized()
     ), err)]
     pub fn save(&self, path: &str) -> PyResult<()> {
+        // A save reads the mappings, the metadata, the codes, the vectors and
+        // the graph in five separate passes, so it needs the index to hold
+        // still. PyO3's exclusive borrow used to guarantee that by keeping every
+        // mutating method away from it. Relaxing the receivers removes that, and
+        // a save overlapping an add would write a directory whose mappings and
+        // vectors came from different instants. This takes the mutation lock
+        // instead, which blocks a concurrent write and no reader at all.
+        let _writers = self.writers.lock().unwrap();
         let start_time = Instant::now();
         info!(operation = "save_start", path = path, "Starting index save");
 
@@ -1954,10 +2040,16 @@ impl HNSWIndex {
     pub fn get_stats(&self) -> HashMap<String, String> {
         let mut stats = HashMap::new();
 
+        // Nodes the graph holds, which exceeds the live record count by exactly the
+        // number of nodes removal and overwrite have stranded. `compact` reclaims the
+        // difference. Read first, because the declared lock order puts the graph
+        // above every map read below it.
+        let graph_nodes = self.hnsw.read().unwrap().nb_points();
+
         let vectors = self.vectors.read().unwrap();
         let pq_codes = self.pq_codes.read().unwrap();
-        let vector_count = *self.vector_count.lock().unwrap();
         let training_ids = self.training_ids.read().unwrap();
+        let vector_count = *self.vector_count.lock().unwrap();
 
         // Basic stats
         stats.insert("total_vectors".to_string(), vector_count.to_string());
@@ -1973,10 +2065,6 @@ impl HNSWIndex {
         );
         stats.insert("thread_safety".to_string(), "RwLock+Mutex".to_string());
 
-        // Nodes the graph holds, which exceeds the live record count by exactly the
-        // number of nodes removal and overwrite have stranded. `compact` reclaims the
-        // difference.
-        let graph_nodes = self.hnsw.lock().unwrap().nb_points();
         stats.insert("graph_nodes".to_string(), graph_nodes.to_string());
         stats.insert(
             "stranded_graph_nodes".to_string(),
@@ -2108,7 +2196,7 @@ impl HNSWIndex {
     }
 
     /// Add index-level metadata
-    pub fn add_metadata(&mut self, metadata: HashMap<String, String>) {
+    pub fn add_metadata(&self, metadata: HashMap<String, String>) {
         let mut meta_lock = self.metadata.lock().unwrap();
         for (key, value) in metadata {
             meta_lock.insert(key, value);
@@ -2179,7 +2267,8 @@ impl HNSWIndex {
     /// Remove vector by ID
     /// Public remove_point method (unchanged for API compatibility)
     /// This code delegates to remove_point_internal() which handles all the complex logic
-    pub fn remove_point(&mut self, id: String) -> PyResult<bool> {
+    pub fn remove_point(&self, id: String) -> PyResult<bool> {
+        let _writers = self.writers.lock().unwrap();
         match self.remove_point_internal(id) {
             Ok(result) => Ok(result),
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
@@ -2210,11 +2299,12 @@ impl HNSWIndex {
     /// index exactly as it was.
     ///
     /// This is never automatic. Calling it is a decision a deployment can schedule.
-    pub fn compact(&mut self) -> PyResult<usize> {
+    pub fn compact(&self) -> PyResult<usize> {
+        let _writers = self.writers.lock().unwrap();
         let start_time = Instant::now();
 
         let live_count = self.id_map.read().unwrap().len();
-        let nodes_before = self.hnsw.lock().unwrap().nb_points();
+        let nodes_before = self.hnsw.read().unwrap().nb_points();
 
         if nodes_before <= live_count {
             debug!(
@@ -2230,7 +2320,7 @@ impl HNSWIndex {
         // NB_LAYER_MAX, matching every other construction site in this file.
         let max_layer = 16;
 
-        let mut new_hnsw = if quantized {
+        let new_hnsw = if quantized {
             let pq = self.pq.as_ref().cloned().ok_or_else(|| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                     "Index reports a quantized graph but holds no product quantizer",
@@ -2322,7 +2412,7 @@ impl HNSWIndex {
 
         let nodes_after = new_hnsw.nb_points();
         {
-            let mut hnsw_guard = self.hnsw.lock().unwrap();
+            let mut hnsw_guard = self.hnsw.write().unwrap();
             *hnsw_guard = new_hnsw;
         }
 
@@ -2572,13 +2662,20 @@ impl HNSWIndex {
     /// Internal remove_point method that can be called without Python bindings
     /// This is the core method that properly removes all traces of a document
     /// Enhanced internal remove_point method with comprehensive PQ support
-    fn remove_point_internal(&mut self, id: String) -> Result<bool, String> {
-        // Get all write locks in a consistent order to prevent deadlocks
-        let mut vectors = self.vectors.write().unwrap();
-        let mut vector_metadata = self.vector_metadata.write().unwrap();
+    fn remove_point_internal(&self, id: String) -> Result<bool, String> {
+        // Read before the guards are taken, because it reaches the graph lock and
+        // the declared order puts the graph above every map held below.
+        let storage_mode = self.get_storage_mode();
+
+        // Every write guard, in the order declared on `HNSWIndex`. This used to
+        // take `vectors` before `rev_map`, which is the reverse of what a search
+        // does, and a search holds `rev_map` for its whole traversal. That pair
+        // could not overlap while the receivers were exclusive. It can now.
         let mut id_map = self.id_map.write().unwrap();
         let mut rev_map = self.rev_map.write().unwrap();
+        let mut vectors = self.vectors.write().unwrap();
         let mut pq_codes = self.pq_codes.write().unwrap();
+        let mut vector_metadata = self.vector_metadata.write().unwrap();
 
         // Check if the document exists
         if let Some(internal_id) = id_map.remove(&id) {
@@ -2639,7 +2736,7 @@ impl HNSWIndex {
                 internal_id = internal_id,
                 had_raw_vector = had_raw_vector,
                 had_pq_codes = had_pq_codes,
-                storage_mode = self.get_storage_mode(),
+                storage_mode = storage_mode,
                 note = "hnsw_graph_entries_remain_unreachable",
                 "Vector completely removed from index (HNSW graph entries become unreachable)"
             );
@@ -2657,7 +2754,7 @@ impl HNSWIndex {
     // 1. CORE VECTOR OPERATIONS (6 methods)
     /// 3-PATH ARCHITECTURE - Main router
     fn add_single_vector(
-        &mut self,
+        &self,
         id: String,
         vector: Vec<f32>,
         metadata: HashMap<String, Value>,
@@ -2712,7 +2809,7 @@ impl HNSWIndex {
         path = "raw_storage"
     ))]
     fn add_raw_vector(
-        &mut self,
+        &self,
         id: String,
         vector: Vec<f32>, // Already processed by extract_single_vector
         metadata: HashMap<String, Value>,
@@ -2742,7 +2839,7 @@ impl HNSWIndex {
 
         // Insert processed vector into HNSW
         {
-            let mut hnsw_guard = self.hnsw.lock().unwrap();
+            let hnsw_guard = self.hnsw.read().unwrap();
             hnsw_guard.insert(&vector, internal_id); // Already normalized
         }
 
@@ -2762,7 +2859,7 @@ impl HNSWIndex {
         path = "id_collection"
     ))]
     fn add_with_id_collection(
-        &mut self,
+        &self,
         id: String,
         vector: Vec<f32>, // Already processed
         metadata: HashMap<String, Value>,
@@ -2828,7 +2925,7 @@ impl HNSWIndex {
         path = "quantized_storage"
     ))]
     fn add_quantized_vector(
-        &mut self,
+        &self,
         id: String,
         vector: Vec<f32>, // Already processed
         metadata: HashMap<String, Value>,
@@ -2882,7 +2979,7 @@ impl HNSWIndex {
 
         // Insert codes into quantized HNSW
         {
-            let mut hnsw_guard = self.hnsw.lock().unwrap();
+            let hnsw_guard = self.hnsw.read().unwrap();
             hnsw_guard.insert_pq_codes(&codes, internal_id);
         }
 
@@ -2902,7 +2999,7 @@ impl HNSWIndex {
         threshold_reached = self.training_threshold_reached.load(Ordering::Acquire),
         has_quantization = self.has_quantization()
     ))]
-    fn maybe_trigger_training(&mut self) -> Result<(), String> {
+    fn maybe_trigger_training(&self) -> Result<(), String> {
         // Check atomic flag first (fast path)
         if !self.training_threshold_reached.load(Ordering::Acquire) {
             return Ok(());
@@ -2929,7 +3026,7 @@ impl HNSWIndex {
         has_pq = self.pq.is_some(),
         has_config = self.quantization_config.is_some()
     ))]
-    fn train_quantization_from_ids(&mut self) -> Result<(), String> {
+    fn train_quantization_from_ids(&self) -> Result<(), String> {
         let start_time = Instant::now();
 
         let pq = self.pq.as_ref().ok_or("PQ not available")?.clone();
@@ -2939,8 +3036,11 @@ impl HNSWIndex {
             .ok_or("Config not available")?
             .clone();
 
-        // Get consistent training set using collected IDs
+        // Get consistent training set using collected IDs. `vectors` is taken
+        // first because the declared lock order puts it above `training_ids`,
+        // and every reader that holds both takes them that way round.
         let training_vectors = {
+            let vectors = self.vectors.read().unwrap();
             let training_ids = self.training_ids.read().unwrap();
 
             // ADD EARLY CHECK:
@@ -2955,8 +3055,6 @@ impl HNSWIndex {
                     .store(false, Ordering::Release);
                 return Err("No training IDs available for training".to_string());
             }
-
-            let vectors = self.vectors.read().unwrap();
 
             let mut training_data = Vec::new();
             let mut missing_vectors = 0;
@@ -3054,7 +3152,7 @@ impl HNSWIndex {
         );
         let rebuild_start = Instant::now();
         let rebuild_success = self
-            .rebuild_with_quantization()
+            .rebuild_with_quantization_locked()
             .map_err(|e| format!("Failed to rebuild with quantization: {}", e))?;
         let rebuild_duration = rebuild_start.elapsed();
 
@@ -3131,7 +3229,7 @@ impl HNSWIndex {
 
         // HNSW search with locking
         let hnsw_results = {
-            let hnsw_guard = self.hnsw.lock().unwrap();
+            let hnsw_guard = self.hnsw.read().unwrap();
             hnsw_guard
                 .search(query, 10, 100, Some(&live))
                 .unwrap_or_else(|_| Vec::new())
@@ -4128,7 +4226,7 @@ impl HNSWIndex {
             let rev_map = self.rev_map.read().unwrap();
             let live = |internal_id: &usize| rev_map.contains_key(internal_id);
 
-            let hnsw_guard = self.hnsw.lock().unwrap();
+            let hnsw_guard = self.hnsw.read().unwrap();
             let vector_store = self.vectors.read().unwrap();
             let code_store = self.pq_codes.read().unwrap();
             let metadata_store = self.vector_metadata.read().unwrap();
@@ -4254,7 +4352,7 @@ impl HNSWIndex {
 
                     // Brief HNSW search (individual lock per query)
                     let neighbors = {
-                        let hnsw_guard = self.hnsw.lock().unwrap();
+                        let hnsw_guard = self.hnsw.read().unwrap();
                         hnsw_guard
                             .search(&processed_query, fetch_k, params.ef, Some(&live))
                             .unwrap_or_else(|_| Vec::new())
@@ -4375,7 +4473,7 @@ impl HNSWIndex {
             return Ok(());
         }
 
-        let hnsw_guard = self.hnsw.lock().unwrap();
+        let hnsw_guard = self.hnsw.read().unwrap();
 
         let dump_result = match &*hnsw_guard {
             DistanceType::Cosine(hnsw) => {
@@ -4489,7 +4587,8 @@ impl HNSWIndex {
             rev_map: RwLock::new(HashMap::new()),
             id_counter: Mutex::new(0),
             vector_count: Mutex::new(0),
-            hnsw: Mutex::new(hnsw),
+            hnsw: RwLock::new(hnsw),
+            writers: Mutex::new(()),
             training_ids: RwLock::new(Vec::new()),
             training_threshold_reached: AtomicBool::new(false),
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -4594,10 +4693,6 @@ impl HNSWIndex {
             self.ef_construction,
             pq,
         );
-        {
-            let mut hnsw_guard = self.hnsw.lock().unwrap();
-            *hnsw_guard = new_hnsw;
-        }
 
         let mut batch: Vec<(&Vec<u8>, usize)> = Vec::with_capacity(pq_codes.len() + extra.len());
         let mut lost: Vec<(&String, &Vec<u8>)> = Vec::new();
@@ -4624,9 +4719,16 @@ impl HNSWIndex {
             batch.push((codes, internal_id));
         }
 
+        // Filled before it is installed, and installed under one write guard, so
+        // the graph the index holds is never a partly rebuilt one. The batch
+        // insert forks to rayon when it is large, which must not happen while
+        // the graph's write guard is held.
         if !batch.is_empty() {
-            let mut hnsw_guard = self.hnsw.lock().unwrap();
-            hnsw_guard.insert_batch_pq(&batch)?;
+            new_hnsw.insert_batch_pq(&batch)?;
+        }
+        {
+            let mut hnsw_guard = self.hnsw.write().unwrap();
+            *hnsw_guard = new_hnsw;
         }
 
         Ok((batch.len(), extra.len(), remapped))
@@ -5084,10 +5186,11 @@ mod tests {
         let mut hits = 0usize;
         let mut returned = usize::MAX;
         for q in queries.iter() {
-            hnsw.get_distance().set_query_lut(q).expect("query lut");
-            let dummy = vec![0u8; PQ_SUBVECTORS];
-            let found = hnsw.search(&dummy, K, 100);
-            hnsw.get_distance().clear_lut();
+            let found = {
+                let _lut = hnsw.get_distance().install_query_lut(q).expect("query lut");
+                let dummy = vec![0u8; PQ_SUBVECTORS];
+                hnsw.search(&dummy, K, 100)
+            };
             returned = returned.min(found.len());
 
             let mut truth: Vec<(f32, usize)> = data
@@ -5125,12 +5228,14 @@ mod tests {
         let f = fixture();
         let hnsw = build_pq_graph(f.pq.clone(), &f.codes);
 
-        hnsw.get_distance()
-            .set_query_lut(&f.data[0])
-            .expect("query lut");
-        let dummy = vec![0u8; PQ_SUBVECTORS];
-        let found = hnsw.search(&dummy, PQ_N, PQ_N);
-        hnsw.get_distance().clear_lut();
+        let found = {
+            let _lut = hnsw
+                .get_distance()
+                .install_query_lut(&f.data[0])
+                .expect("query lut");
+            let dummy = vec![0u8; PQ_SUBVECTORS];
+            hnsw.search(&dummy, PQ_N, PQ_N)
+        };
 
         assert_eq!(
             found.len(),
@@ -5159,10 +5264,14 @@ mod tests {
             .map(|(sv, &c)| lut[sv][c as usize])
             .sum();
 
-        hnsw.get_distance().set_query_lut(query).expect("query lut");
-        let dummy = vec![0u8; PQ_SUBVECTORS];
-        let found = hnsw.search(&dummy, 10, 200);
-        hnsw.get_distance().clear_lut();
+        let found = {
+            let _lut = hnsw
+                .get_distance()
+                .install_query_lut(query)
+                .expect("query lut");
+            let dummy = vec![0u8; PQ_SUBVECTORS];
+            hnsw.search(&dummy, 10, 200)
+        };
 
         assert!(
             found.iter().any(|n| n.d_id == 7),
