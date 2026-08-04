@@ -555,15 +555,23 @@ fn reconstruct_index_simple(
         quantization,
     )?;
 
-    println!("🔄 Rebuilding HNSW graph from vectors...");
-
-    // Step 3: Rebuild the graph by re-adding every record, reconstructing the
-    // ones that were stored as codes alone
-    rebuild_graph_from_data(&mut index, &vectors, &pq_codes, &metadata)?;
+    // Step 3: Rebuild the graph. A trained quantized index rebuilds through
+    // the quantized path, inserting the stored codes into a fresh PQ graph, so
+    // it comes back quantized and nothing is materialised at full width. An
+    // index saved mid-collection or one with no quantization at all replays
+    // its raw vectors through add() exactly as before.
+    if index.can_use_quantization() {
+        println!("🔄 Rebuilding quantized HNSW graph from stored PQ codes...");
+        rebuild_graph_from_codes(&mut index, &pq_codes, &vectors)?;
+    } else {
+        println!("🔄 Rebuilding HNSW graph from vectors...");
+        rebuild_graph_from_data(&mut index, &vectors, &pq_codes, &metadata)?;
+    }
 
     // Step 4: Put the stored record data back exactly as it was written. The
-    // rebuild routes through add(), which stores whatever vector it was given,
-    // so without this a reconstructed record would be kept at full width and
+    // quantized rebuild never touches the storage maps, and the raw rebuild
+    // routes through add(), which stores whatever vector it was given, so
+    // without this a reconstructed record would be kept at full width and
     // quantized_only would lose the memory saving that is its whole purpose.
     let raw_count = vectors.len();
     let code_count = pq_codes.len();
@@ -786,8 +794,49 @@ fn restore_quantization_state_simple(
     Ok(())
 }
 
+/// Rebuild the graph for a trained quantized index from its stored codes
+///
+/// The saved graph was a PQ graph over the codes, so the rebuild inserts those
+/// same codes into a fresh PQ graph rather than reconstructing vectors and
+/// replaying them through the raw add() path. The loaded index therefore
+/// reports `is_quantized()` true and `quantized_active`, searches through ADC
+/// exactly as the saved one did, and never holds a reconstructed vector at
+/// full width. The internal ids come from mappings.bin, so no id is reassigned
+/// and the counters stay as saved.
+fn rebuild_graph_from_codes(
+    index: &mut HNSWIndex,
+    pq_codes: &HashMap<String, Vec<u8>>,
+    vectors: &HashMap<String, Vec<f32>>,
+) -> PyResult<()> {
+    let (inserted, quantized_from_raw, remapped) = index
+        .rebuild_graph_from_codes(pq_codes, vectors)
+        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+
+    if quantized_from_raw > 0 {
+        println!(
+            "⚠️  {} records had a raw vector and no stored PQ codes and were quantized \
+             through the loaded codebook",
+            quantized_from_raw
+        );
+    }
+    if remapped > 0 {
+        println!(
+            "⚠️  {} records were missing from mappings.bin and were assigned fresh \
+             internal ids",
+            remapped
+        );
+    }
+    println!(
+        "✅ Quantized graph rebuilt ({} records inserted from stored PQ codes)",
+        inserted
+    );
+    Ok(())
+}
+
 /// Rebuild the HNSW graph by re-inserting every record using existing add logic
 ///
+/// This is the path for an index that is not trained, meaning one saved with no
+/// quantization at all or one saved while still collecting training vectors.
 /// A record that has a raw vector is replayed from it. A record that has only
 /// PQ codes is reconstructed through the codebook, which is what `get_records`
 /// already does for the same record while the index is live, so the graph is

@@ -4540,6 +4540,98 @@ impl HNSWIndex {
         *self.vector_metadata.write().unwrap() = vector_metadata;
     }
 
+    /// Rebuild the graph from the stored PQ codes (for persistence loading only)
+    ///
+    /// Requires a trained product quantizer, which the loader installs before
+    /// any rebuild runs. Replaces the raw graph `new_empty` built with a fresh
+    /// PQ graph and inserts every record's codes under the internal id restored
+    /// from mappings.bin, so the loaded index is quantized exactly as the saved
+    /// one was and no vector is reconstructed to full width on the way.
+    ///
+    /// A record that has a raw vector but no stored codes is quantized through
+    /// the loaded codebook rather than dropped. An intact directory saved by a
+    /// trained index holds codes for every record, so that path only runs on a
+    /// directory that lost pq_codes.bin while keeping its raw vectors. A record
+    /// missing from mappings.bin is assigned a fresh internal id for the same
+    /// reason: every record must come back.
+    ///
+    /// Returns (records inserted, quantized from raw, remapped).
+    pub(crate) fn rebuild_graph_from_codes(
+        &mut self,
+        pq_codes: &HashMap<String, Vec<u8>>,
+        vectors: &HashMap<String, Vec<f32>>,
+    ) -> Result<(usize, usize, usize), String> {
+        let pq = match &self.pq {
+            Some(pq) if pq.is_trained() => pq.clone(),
+            _ => {
+                return Err(
+                    "the quantized graph rebuild requires a trained product quantizer".to_string(),
+                )
+            }
+        };
+
+        let mut extra: Vec<(String, Vec<u8>)> = Vec::new();
+        for (id, vector) in vectors {
+            if !pq_codes.contains_key(id) {
+                let codes = pq.quantize(vector).map_err(|e| {
+                    format!(
+                        "record '{}' has a raw vector but no stored PQ codes, and quantizing \
+                         it through the loaded codebook failed: {}",
+                        id, e
+                    )
+                })?;
+                extra.push((id.clone(), codes));
+            }
+        }
+
+        // NB_LAYER_MAX, matching every other construction site in this file.
+        let max_layer = 16;
+        let new_hnsw = DistanceType::new_pq(
+            &self.space,
+            self.m,
+            self.expected_size,
+            max_layer,
+            self.ef_construction,
+            pq,
+        );
+        {
+            let mut hnsw_guard = self.hnsw.lock().unwrap();
+            *hnsw_guard = new_hnsw;
+        }
+
+        let mut batch: Vec<(&Vec<u8>, usize)> = Vec::with_capacity(pq_codes.len() + extra.len());
+        let mut lost: Vec<(&String, &Vec<u8>)> = Vec::new();
+        {
+            let id_map = self.id_map.read().unwrap();
+            for (id, codes) in pq_codes
+                .iter()
+                .chain(extra.iter().map(|(id, codes)| (id, codes)))
+            {
+                match id_map.get(id) {
+                    Some(&internal_id) => batch.push((codes, internal_id)),
+                    None => lost.push((id, codes)),
+                }
+            }
+        }
+        let remapped = lost.len();
+        for (id, codes) in lost {
+            let internal_id = self.get_next_id();
+            self.id_map.write().unwrap().insert(id.clone(), internal_id);
+            self.rev_map
+                .write()
+                .unwrap()
+                .insert(internal_id, id.clone());
+            batch.push((codes, internal_id));
+        }
+
+        if !batch.is_empty() {
+            let mut hnsw_guard = self.hnsw.lock().unwrap();
+            hnsw_guard.insert_batch_pq(&batch)?;
+        }
+
+        Ok((batch.len(), extra.len(), remapped))
+    }
+
     /// Set quantization config (for persistence loading only)
     pub(crate) fn set_quantization_config(&mut self, config: Option<QuantizationConfig>) {
         self.quantization_config = config;
