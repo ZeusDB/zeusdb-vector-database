@@ -43,6 +43,38 @@ class VectorDatabase:
             return _create_hnsw_index(**kwargs)
         raise ValueError(f"No builder registered for index type '{index_type}'")
 
+    @staticmethod
+    def _default_m(expected_size: Any) -> int:
+        """Graph degree for an index of this declared size.
+
+        A fixed m of 16 was adequate up to about 25,000 records and clearly
+        inadequate above it. On clustered 768 dimensional data at the default
+        search width, recall at 10 was 1.0000 at 10,000 records, 0.9475 at
+        50,000 and 0.8025 at 100,000. At m 32 the same three cells are 1.0000,
+        0.9985 and 0.9870, and no search width recovers what m 16 loses.
+        Raising m is not free, so the ladder only pays where it buys something:
+        at 10,000 records m 16 already returns 1.0000 and m 32 would cost 1.10x
+        the memory and 1.30x the build time for nothing.
+
+        The ladder stops at 32 because that is where the measurements stop. At
+        100,000 records m 64 bought 0.0060 recall over m 32 for 1.55x the build
+        time, and it raises the capacity the graph reserves at creation from
+        3,787 to 4,542 bytes per declared record, which matters most to exactly
+        the large indexes a third step would be aimed at. An index well past
+        250,000 records may want 64, but nothing here measured that, so it is
+        left to the caller rather than guessed at.
+
+        expected_size is a declaration rather than a limit, so understating it
+        leaves the graph under-provisioned for the data that actually arrives.
+        m is fixed at construction and no later add() revises it.
+
+        A non-integer expected_size returns 16 so that the Rust layer reports
+        the real validation error instead of this function raising a worse one.
+        """
+        if isinstance(expected_size, bool) or not isinstance(expected_size, int):
+            return 16
+        return 32 if expected_size > 25_000 else 16
+
 
     def __init__(self):
         """Initialize the vector database factory."""
@@ -60,9 +92,14 @@ class VectorDatabase:
             For "hnsw", supported parameters are:
                 - dim (int): Vector dimension (default: 1536)
                 - space (str): Distance metric — supports 'cosine', 'l2', or 'l1' (default: 'cosine')
-                - m (int): Bidirectional links per node (default: 16, max: 256)
+                - m (int): Bidirectional links per node (min: 1, max: 256). Defaults
+                  to 16 up to an expected_size of 25,000 and 32 above it. A graph
+                  too sparse for the record count loses recall that no search
+                  width recovers, and m is fixed at construction, so set
+                  expected_size honestly or set m directly.
                 - ef_construction (int): Construction candidate list size (default: 200)
-                - expected_size (int): Expected number of vectors (default: 10000)
+                - expected_size (int): Expected number of vectors (default: 10000).
+                  Also selects the default m, see above.
 
             Quantization config format:
                 {
@@ -134,9 +171,10 @@ class VectorDatabase:
         if index_type == "hnsw":
             kwargs.setdefault("dim", dim)
             kwargs.setdefault("space", "cosine")
-            kwargs.setdefault("m", 16)
             kwargs.setdefault("ef_construction", 200)
             kwargs.setdefault("expected_size", 10000)
+            # After expected_size, since the graph degree is derived from it.
+            kwargs.setdefault("m", self._default_m(kwargs["expected_size"]))
         
         try:
             # Always pass quantization_config parameter

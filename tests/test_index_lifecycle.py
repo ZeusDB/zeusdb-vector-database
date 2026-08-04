@@ -415,3 +415,75 @@ def test_subvector_rules(subvectors, message):
                 "training_size": 1000,
             },
         )
+
+# ------------------------------------------------------------
+# Test 98: the default m scales with expected_size
+# ------------------------------------------------------------
+@pytest.mark.parametrize("expected_size,expected_m", [
+    (1, 16),
+    (1_000, 16),
+    (10_000, 16),
+    (25_000, 16),          # last size measured adequate at m 16
+    (25_001, 32),
+    (100_000, 32),
+    (1_000_000, 32),
+    (100_000_000, 32),     # the ladder stops at 32, where the measurements stop
+])
+def test_default_m_scales_with_expected_size(expected_size, expected_m):
+    """A fixed m of 16 capped recall on any index past about 25,000 records.
+
+    At 100,000 records on clustered 768 dimensional data, recall at 10 at the
+    default search width was 0.8025 at m 16 against 0.9870 at m 32, and no
+    search width recovered the difference. m is the parameter that has to
+    scale, and expected_size is the size the user already declares.
+
+    The expression is checked directly rather than through create() for every
+    size, because the graph reserves about 3KB of capacity per declared record
+    at creation, so building an index at the larger sizes here would commit
+    tens of gigabytes. The sizes that are built are checked below.
+    """
+    assert VectorDatabase._default_m(expected_size) == expected_m
+
+
+@pytest.mark.parametrize("expected_size,expected_m", [
+    (1_000, 16),
+    (25_000, 16),
+    (25_001, 32),
+    (50_000, 32),
+])
+def test_scaled_default_m_reaches_the_built_index(expected_size, expected_m):
+    """The ladder is applied by create(), not merely computed by it."""
+    index = VectorDatabase().create("hnsw", dim=4, expected_size=expected_size)
+    assert index.get_stats()["m"] == str(expected_m)
+    assert f"m={expected_m}," in index.info()
+
+# ------------------------------------------------------------
+# Test 99: an explicit m still wins, and the ladder never leaves the valid range
+# ------------------------------------------------------------
+def test_explicit_m_overrides_the_scaled_default():
+    """The scaled default is a default, not a policy applied over the caller."""
+    vdb = VectorDatabase()
+
+    # Below the ladder, above it, and at both ends of the valid range, on the
+    # side of the threshold where the default would otherwise answer 32.
+    for m in (1, 8, 16, 48, 256):
+        index = vdb.create("hnsw", dim=4, m=m, expected_size=30_000)
+        assert index.get_stats()["m"] == str(m)
+
+    # The bounds are unchanged, and the ladder never produces a value outside
+    # them for any expected_size the Rust layer accepts.
+    with pytest.raises(RuntimeError, match="m must be at least 1"):
+        vdb.create("hnsw", dim=4, m=0, expected_size=30_000)
+    with pytest.raises(RuntimeError, match="less than or equal to 256"):
+        vdb.create("hnsw", dim=4, m=257, expected_size=10)
+
+    # An index created with no expected_size keeps the historical m 16, so the
+    # smallest indexes see no change at all.
+    assert vdb.create("hnsw", dim=4).get_stats()["m"] == "16"
+
+    # A non-integer expected_size is left for the Rust layer to reject, rather
+    # than failing inside the ladder with a worse message.
+    assert VectorDatabase._default_m("large") == 16
+    assert VectorDatabase._default_m(True) == 16
+    with pytest.raises(RuntimeError):
+        vdb.create("hnsw", dim=4, expected_size="large")

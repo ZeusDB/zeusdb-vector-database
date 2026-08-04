@@ -1121,3 +1121,46 @@ def test_quantized_reload_rerank_behaviour(quantized_reload):
         with_off = [(r["id"], round(float(r["score"]), 6))
                     for r in loaded.search(query.tolist(), top_k=10, rerank=0)]
         assert with_default == with_off
+
+# ------------------------------------------------------------
+# Test 104: a saved index keeps the m it was built with
+# ------------------------------------------------------------
+def test_reload_preserves_m_against_a_changed_default(tmp_path):
+    """The default m now scales with expected_size, so a saved index has to
+    carry its own m rather than pick one up at load time.
+
+    An index declared at 30,000 records built before the change holds m 16.
+    Loading it must rebuild the graph at 16, because rebuilding at the new
+    default of 32 would change the index under a user who only asked to open
+    it, and would cost memory and load time they did not agree to.
+    """
+    vdb = VectorDatabase()
+
+    # m 16 at an expected_size the scaled default would now answer with 32.
+    index = vdb.create("hnsw", dim=8, space="cosine", m=16,
+                       ef_construction=200, expected_size=30_000)
+    assert VectorDatabase._default_m(30_000) == 32, "the default has to differ"
+    index.add({
+        "ids": [f"r{i}" for i in range(20)],
+        "embeddings": _sample_vectors(20, 8),
+    })
+
+    save_dir = tmp_path / "old_default.zdb"
+    index.save(str(save_dir))
+    assert json.loads((save_dir / "config.json").read_text(encoding="utf-8"))["m"] == 16
+
+    loaded = vdb.load(str(save_dir))
+    assert loaded.get_stats()["m"] == "16"
+    assert loaded.get_stats()["expected_size"] == "30000"
+    assert loaded.get_vector_count() == 20
+
+    # It survives a second round trip, so the value is restored into the live
+    # index rather than only copied from file to file.
+    again = tmp_path / "old_default2.zdb"
+    loaded.save(str(again))
+    assert vdb.load(str(again)).get_stats()["m"] == "16"
+
+    # And the reloaded graph works, so 16 was used to build it rather than
+    # merely recorded.
+    hits = loaded.search(_sample_vectors(1, 8)[0].tolist(), top_k=5)
+    assert len(hits) == 5
