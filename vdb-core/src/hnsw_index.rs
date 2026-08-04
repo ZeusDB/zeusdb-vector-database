@@ -61,6 +61,121 @@ pub struct QuantizationConfig {
     pub storage_mode: StorageMode,
 }
 
+/// Candidates pulled from the graph per requested result when a quantized
+/// search reranks and the caller named no factor of its own.
+///
+/// Measured at 10,000 records of dimension 768, 48 subvectors at 8 bits, over
+/// two data draws of 200 held out queries. Recall at `top_k` 10 runs 0.105 and
+/// 0.115 with no rerank, 0.404 and 0.415 at factor 5, 0.690 and 0.693 at 10,
+/// 0.889 at 15, 0.995 on both draws at 20, and 1.000 from 25 upward, against
+/// 1.000 for the raw path on the same data. Latency at factor 20 is 0.76 and
+/// 0.67 milliseconds against the raw path's 0.68, rising to 0.98 at factor 25
+/// and 1.7 at 50 for at most five thousandths more recall.
+///
+/// The curve turns here. Twenty is the last point where recall is still buying
+/// its latency.
+///
+/// It is a factor rather than a candidate count, so a large `top_k` multiplies
+/// it. The candidate count that saturates recall is close to 200 whatever the
+/// page size, so `top_k` 100 reaches 0.986 at factor 2 and 1.000 at factor 5,
+/// and paying factor 20 there costs 7.4 milliseconds for nothing. A caller
+/// asking for a large page should lower it.
+pub const DEFAULT_RERANK_FACTOR: usize = 20;
+
+/// The raw vector distance for a space
+///
+/// These are the same `anndists` implementations `DistanceType::new_raw` hands
+/// to a raw graph, so a rescored score is the number a raw index would have
+/// reported for the same pair rather than a second implementation of the same
+/// formula.
+fn raw_distance_fn(space: &str) -> fn(&[f32], &[f32]) -> f32 {
+    match space {
+        "l2" => |a: &[f32], b: &[f32]| DistL2 {}.eval(a, b),
+        "l1" => |a: &[f32], b: &[f32]| DistL1 {}.eval(a, b),
+        _ => |a: &[f32], b: &[f32]| DistCosine {}.eval(a, b),
+    }
+}
+
+/// How a quantized search over-fetches and rescores
+///
+/// Present only when the index is quantized, its storage mode keeps raw
+/// vectors, and the caller has not turned rerank off. `HNSWIndex::rerank_plan`
+/// is the single place that decides, and all three search paths take it from
+/// there.
+#[derive(Clone, Copy)]
+struct RerankPlan {
+    /// Candidates to pull from the graph per requested result.
+    factor: usize,
+    /// The space's raw vector distance.
+    distance: fn(&[f32], &[f32]) -> f32,
+}
+
+/// The settings a search carries once its input has been parsed
+///
+/// Bundled rather than threaded through one at a time, because the three batch
+/// entry points forward every one of them unchanged and the page size, the
+/// traversal breadth and the rerank plan are read together wherever they are
+/// read at all.
+#[derive(Clone, Copy)]
+struct SearchParams {
+    top_k: usize,
+    ef: usize,
+    return_vector: bool,
+    rerank: Option<RerankPlan>,
+}
+
+impl SearchParams {
+    /// Candidates to ask the graph for
+    ///
+    /// The requested page unless the page is going to be reordered, and the
+    /// over-fetch capped at the live record count when it is. The cap means a
+    /// large factor degrades to a full scan rather than to an allocation the
+    /// size of the factor.
+    fn fetch_k(&self, live_records: usize) -> usize {
+        match self.rerank {
+            Some(plan) => self
+                .top_k
+                .saturating_mul(plan.factor)
+                .min(live_records.max(self.top_k)),
+            None => self.top_k,
+        }
+    }
+}
+
+/// Score one candidate against the query on the raw vector scale
+///
+/// The stored raw vector where the index holds one, which under
+/// `quantized_with_raw` is every record, and the reconstruction from its codes
+/// otherwise. Both are vectors of the index's own dimension, so a page mixing
+/// them is still ordered by one distance.
+///
+/// `None` means the candidate holds neither a raw vector nor codes, which no
+/// record resolving through `rev_map` can be. The callers sort such a candidate
+/// last rather than letting an unscored one displace a scored one.
+fn rescore_candidate(
+    plan: &RerankPlan,
+    query: &[f32],
+    ext_id: &str,
+    vectors: &HashMap<String, Vec<f32>>,
+    pq: Option<&Arc<PQ>>,
+    pq_codes: &HashMap<String, Vec<u8>>,
+) -> Option<f32> {
+    if let Some(stored) = vectors.get(ext_id) {
+        return Some((plan.distance)(query, stored));
+    }
+    let reconstructed = pq?.reconstruct(pq_codes.get(ext_id)?).ok()?;
+    Some((plan.distance)(query, &reconstructed))
+}
+
+/// Order a rescored page and cut it to the requested size
+///
+/// `total_cmp` rather than `partial_cmp`, so a non-finite score orders rather
+/// than panicking the sort.
+fn take_best<T>(scored: &mut Vec<(T, f32)>, top_k: usize) {
+    scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+    scored.truncate(top_k);
+}
+
 /// Custom distance function for Product Quantization using ADC
 #[derive(Clone)]
 pub struct DistPQ {
@@ -1421,11 +1536,22 @@ impl HNSWIndex {
     }
 
     /// Enhanced search method with automatic ADC usage
-    #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, return_vector=false))]
+    ///
+    /// `rerank` controls how far a quantized search over-fetches before it
+    /// rescores the candidates against raw vectors. Omitted, it uses
+    /// `DEFAULT_RERANK_FACTOR`. An integer of 1 or more pulls that many
+    /// candidates per requested result. Zero turns rerank off and restores the
+    /// ADC scores and ordering. It has no effect on a raw index or on a
+    /// `quantized_only` one, both of which never rerank; see `rerank_plan`.
+    // The argument list is the Python signature, so it is not free to be
+    // bundled the way the internal batch paths bundle theirs.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (vector, filter=None, top_k=10, ef_search=None, return_vector=false, rerank=None))]
     #[instrument(level = "debug", skip(self, py, vector, filter), fields(
         top_k = top_k,
         ef_search = ef_search,
         return_vector = return_vector,
+        rerank = rerank,
         is_quantized = self.is_quantized()
     ), err)]
     pub fn search(
@@ -1436,6 +1562,7 @@ impl HNSWIndex {
         top_k: usize,
         ef_search: Option<usize>,
         return_vector: bool,
+        rerank: Option<usize>,
     ) -> PyResult<PyObject> {
         let start_time = Instant::now();
 
@@ -1444,7 +1571,23 @@ impl HNSWIndex {
             _ => std::cmp::max(2 * top_k, 100),
         });
 
-        trace!(operation = "search_config", ef = ef, space = %self.space, "Search parameters configured");
+        // Resolved once here rather than per query, because it locks the graph
+        // to read whether the index is quantized and the batch paths take that
+        // lock themselves.
+        let params = SearchParams {
+            top_k,
+            ef,
+            return_vector,
+            rerank: self.rerank_plan(rerank),
+        };
+
+        trace!(
+            operation = "search_config",
+            ef = ef,
+            space = %self.space,
+            rerank_factor = params.rerank.map(|plan| plan.factor),
+            "Search parameters configured"
+        );
 
         let filter_conditions = filter
             .map(|f| self.python_dict_to_value_map(f))
@@ -1494,14 +1637,8 @@ impl HNSWIndex {
                 batch_size = list_vec.len(),
                 "Starting batch search"
             );
-            let results = self.batch_search_internal(
-                &list_vec,
-                filter_conditions.as_ref(),
-                top_k,
-                ef,
-                return_vector,
-                py,
-            )?;
+            let results =
+                self.batch_search_internal(&list_vec, filter_conditions.as_ref(), params, py)?;
             PyList::new(py, results)?.into()
         } else if let Ok(np_array) = vector.downcast::<PyArray2<f32>>() {
             // Format: NumPy 2D array (N, dims)
@@ -1529,14 +1666,8 @@ impl HNSWIndex {
                 batch_size = batch.len(),
                 "Starting NumPy batch search"
             );
-            let results = self.batch_search_internal(
-                &batch,
-                filter_conditions.as_ref(),
-                top_k,
-                ef,
-                return_vector,
-                py,
-            )?;
+            let results =
+                self.batch_search_internal(&batch, filter_conditions.as_ref(), params, py)?;
             PyList::new(py, results)?.into()
         } else {
             // Single vector path - enhanced with NumPy 1D support
@@ -1573,20 +1704,22 @@ impl HNSWIndex {
                 let rev_map = self.rev_map.read().unwrap();
                 let live = |internal_id: &usize| rev_map.contains_key(internal_id);
 
+                let fetch_k = params.fetch_k(rev_map.len());
+
                 let hnsw_results = {
                     let hnsw_guard = self.hnsw.lock().unwrap();
 
                     if use_quantized {
                         // Use ADC search for quantized index
                         hnsw_guard
-                            .search(&processed_query, top_k, ef, Some(&live))
+                            .search(&processed_query, fetch_k, params.ef, Some(&live))
                             .unwrap_or_else(|e| {
                                 error!(operation = "adc_search", error = %e, "ADC search failed");
                                 Vec::new()
                             })
                     } else {
                         // Use raw vector search
-                        match hnsw_guard.search(&processed_query, top_k, ef, Some(&live)) {
+                        match hnsw_guard.search(&processed_query, fetch_k, params.ef, Some(&live)) {
                             Ok(results) => results,
                             Err(e) => {
                                 error!(operation = "raw_search", error = %e, "Raw search failed");
@@ -1601,11 +1734,14 @@ impl HNSWIndex {
                 let pq_codes = self.pq_codes.read().unwrap();
                 let vector_metadata = self.vector_metadata.read().unwrap();
 
-                let mut results = Vec::with_capacity(hnsw_results.len());
+                // Resolve, filter and score first, holding only a borrowed id
+                // and a float per candidate. Metadata and vectors are cloned
+                // after the cut, so an over-fetched page pays for the results
+                // it returns rather than for every candidate it considered.
+                let mut scored: Vec<(&String, f32)> = Vec::with_capacity(hnsw_results.len());
                 let has_filter = filter_conditions.is_some();
 
                 for neighbor in hnsw_results {
-                    let score = neighbor.distance;
                     let internal_id = neighbor.get_origin_id();
 
                     if let Some(ext_id) = rev_map.get(&internal_id) {
@@ -1620,22 +1756,44 @@ impl HNSWIndex {
                             }
                         }
 
-                        let metadata = vector_metadata.get(ext_id).cloned().unwrap_or_default();
-                        let vector_data = if return_vector {
-                            // Try raw vector first, then PQ reconstruction
-                            vectors.get(ext_id).cloned().or_else(|| {
-                                if let (Some(pq), Some(codes)) = (&self.pq, pq_codes.get(ext_id)) {
-                                    pq.reconstruct(codes).ok()
-                                } else {
-                                    None
-                                }
-                            })
-                        } else {
-                            None
+                        let score = match params.rerank.as_ref() {
+                            Some(plan) => rescore_candidate(
+                                plan,
+                                &processed_query,
+                                ext_id,
+                                &vectors,
+                                self.pq.as_ref(),
+                                &pq_codes,
+                            )
+                            .unwrap_or(f32::INFINITY),
+                            None => neighbor.distance,
                         };
 
-                        results.push((ext_id.clone(), score, metadata, vector_data));
+                        scored.push((ext_id, score));
                     }
+                }
+
+                if params.rerank.is_some() {
+                    take_best(&mut scored, top_k);
+                }
+
+                let mut results = Vec::with_capacity(scored.len());
+                for (ext_id, score) in scored {
+                    let metadata = vector_metadata.get(ext_id).cloned().unwrap_or_default();
+                    let vector_data = if return_vector {
+                        // Try raw vector first, then PQ reconstruction
+                        vectors.get(ext_id).cloned().or_else(|| {
+                            if let (Some(pq), Some(codes)) = (&self.pq, pq_codes.get(ext_id)) {
+                                pq.reconstruct(codes).ok()
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    };
+
+                    results.push((ext_id.clone(), score, metadata, vector_data));
                 }
 
                 Ok(results)
@@ -2922,7 +3080,48 @@ impl HNSWIndex {
         Ok(())
     }
 
-    // 2. SEARCH OPERATIONS (1 method)
+    // 2. SEARCH OPERATIONS (2 methods)
+
+    /// Decide whether a search reranks, and how far it over-fetches
+    ///
+    /// Rerank rescores the candidates the graph returns against raw vectors,
+    /// so it needs a raw vector for every candidate. Three cases resolve to no
+    /// rerank.
+    ///
+    /// A raw index already ranks by the raw distance, so over-fetching and
+    /// rescoring would return the same page at a higher cost.
+    ///
+    /// A `quantized_only` index has no raw vector for the records added after
+    /// training, and rescoring those against their reconstruction gains
+    /// nothing, because the reconstruction carries exactly the information the
+    /// ADC distance already used. Measured at 10,000 records of dimension 768,
+    /// recall at `top_k` 10 over the code held records moved from 0.1320 to
+    /// 0.1330 across one data seed and from 0.1440 to 0.1400 across another,
+    /// which is noise in both directions. The mode keeps raw vectors for the
+    /// records collected before training, one in ten at these settings, and
+    /// rescoring only those would put two accuracies in one ranking for a
+    /// tenth of the page.
+    ///
+    /// `rerank = 0` from the caller turns it off and restores the ADC scores.
+    fn rerank_plan(&self, rerank: Option<usize>) -> Option<RerankPlan> {
+        if rerank == Some(0) || !self.is_quantized() {
+            return None;
+        }
+
+        let keeps_raw = self
+            .quantization_config
+            .as_ref()
+            .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw);
+        if !keeps_raw {
+            return None;
+        }
+
+        Some(RerankPlan {
+            factor: rerank.unwrap_or(DEFAULT_RERANK_FACTOR).max(1),
+            distance: raw_distance_fn(&self.space),
+        })
+    }
+
     /// Raw search without Python objects (for benchmarking)
     fn raw_search_no_gil(&self, query: &[f32]) -> Vec<(String, f32)> {
         // Concurrent read access to ID mapping, taken before the graph lock so the
@@ -3827,20 +4026,19 @@ impl HNSWIndex {
 
     // 5. BATCH SEARCH METHODS (3 methods)
     /// Internal batch search method for multiple query vectors
-    #[instrument(level = "debug", skip(self, vectors, filter_conditions, py), fields(
+    #[instrument(level = "debug", skip(self, vectors, filter_conditions, params, py), fields(
         batch_size = vectors.len(),
-        top_k = top_k,
-        ef = ef,
-        return_vector = return_vector,
-        has_filter = filter_conditions.is_some()
+        top_k = params.top_k,
+        ef = params.ef,
+        return_vector = params.return_vector,
+        has_filter = filter_conditions.is_some(),
+        rerank_factor = params.rerank.map(|plan| plan.factor)
     ), err)]
     fn batch_search_internal(
         &self,
         vectors: &[Vec<f32>],
         filter_conditions: Option<&HashMap<String, Value>>,
-        top_k: usize,
-        ef: usize,
-        return_vector: bool,
+        params: SearchParams,
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
         let start_time = Instant::now();
@@ -3893,14 +4091,14 @@ impl HNSWIndex {
                 strategy = "sequential",
                 "Using sequential processing"
             );
-            self.batch_search_sequential(vectors, filter_conditions, top_k, ef, return_vector, py)
+            self.batch_search_sequential(vectors, filter_conditions, params, py)
         } else {
             trace!(
                 operation = "batch_search_strategy",
                 strategy = "parallel",
                 "Using parallel processing"
             );
-            self.batch_search_parallel(vectors, filter_conditions, top_k, ef, return_vector, py)
+            self.batch_search_parallel(vectors, filter_conditions, params, py)
         };
 
         // ✅ ENTERPRISE: Add duration timing to hot path
@@ -3920,9 +4118,7 @@ impl HNSWIndex {
         &self,
         vectors: &[Vec<f32>],
         filter_conditions: Option<&HashMap<String, Value>>,
-        top_k: usize,
-        ef: usize,
-        return_vector: bool,
+        params: SearchParams,
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
         let rust_results = py.allow_threads(|| -> PyResult<Vec<QueryHits>> {
@@ -3934,7 +4130,12 @@ impl HNSWIndex {
 
             let hnsw_guard = self.hnsw.lock().unwrap();
             let vector_store = self.vectors.read().unwrap();
+            let code_store = self.pq_codes.read().unwrap();
             let metadata_store = self.vector_metadata.read().unwrap();
+
+            // The same over-fetch the single query path applies, so a batch of
+            // one query returns what that query returns on its own.
+            let fetch_k = params.fetch_k(rev_map.len());
 
             let mut all_results = Vec::with_capacity(vectors.len());
 
@@ -3943,10 +4144,10 @@ impl HNSWIndex {
                 let processed_query = self.process_vector_for_space(vector.clone());
 
                 let neighbors = hnsw_guard
-                    .search(&processed_query, top_k, ef, Some(&live))
+                    .search(&processed_query, fetch_k, params.ef, Some(&live))
                     .unwrap_or_else(|_| Vec::new());
 
-                let mut query_results = Vec::with_capacity(neighbors.len());
+                let mut scored: Vec<(&String, f32)> = Vec::with_capacity(neighbors.len());
 
                 for neighbor in neighbors {
                     let internal_id = neighbor.get_origin_id();
@@ -3963,20 +4164,37 @@ impl HNSWIndex {
                             }
                         }
 
-                        let metadata = metadata_store.get(ext_id).cloned().unwrap_or_default();
-                        let vector_data = if return_vector {
-                            vector_store.get(ext_id).cloned()
-                        } else {
-                            None
+                        let score = match params.rerank.as_ref() {
+                            Some(plan) => rescore_candidate(
+                                plan,
+                                &processed_query,
+                                ext_id,
+                                &vector_store,
+                                self.pq.as_ref(),
+                                &code_store,
+                            )
+                            .unwrap_or(f32::INFINITY),
+                            None => neighbor.distance,
                         };
 
-                        query_results.push((
-                            ext_id.clone(),
-                            neighbor.distance,
-                            metadata,
-                            vector_data,
-                        ));
+                        scored.push((ext_id, score));
                     }
+                }
+
+                if params.rerank.is_some() {
+                    take_best(&mut scored, params.top_k);
+                }
+
+                let mut query_results = Vec::with_capacity(scored.len());
+                for (ext_id, score) in scored {
+                    let metadata = metadata_store.get(ext_id).cloned().unwrap_or_default();
+                    let vector_data = if params.return_vector {
+                        vector_store.get(ext_id).cloned()
+                    } else {
+                        None
+                    };
+
+                    query_results.push((ext_id.clone(), score, metadata, vector_data));
                 }
 
                 all_results.push(query_results);
@@ -4014,9 +4232,7 @@ impl HNSWIndex {
         &self,
         vectors: &[Vec<f32>],
         filter_conditions: Option<&HashMap<String, Value>>,
-        top_k: usize,
-        ef: usize,
-        return_vector: bool,
+        params: SearchParams,
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
         let span = tracing::Span::current();
@@ -4033,19 +4249,23 @@ impl HNSWIndex {
                     let rev_map = self.rev_map.read().unwrap();
                     let live = |internal_id: &usize| rev_map.contains_key(internal_id);
 
+                    // The same over-fetch the other two search paths apply.
+                    let fetch_k = params.fetch_k(rev_map.len());
+
                     // Brief HNSW search (individual lock per query)
                     let neighbors = {
                         let hnsw_guard = self.hnsw.lock().unwrap();
                         hnsw_guard
-                            .search(&processed_query, top_k, ef, Some(&live))
+                            .search(&processed_query, fetch_k, params.ef, Some(&live))
                             .unwrap_or_else(|_| Vec::new())
                     };
 
                     // Concurrent data lookup
                     let vector_store = self.vectors.read().unwrap();
+                    let code_store = self.pq_codes.read().unwrap();
                     let metadata_store = self.vector_metadata.read().unwrap();
 
-                    let mut query_results = Vec::with_capacity(neighbors.len());
+                    let mut scored: Vec<(&String, f32)> = Vec::with_capacity(neighbors.len());
 
                     for neighbor in neighbors {
                         let internal_id = neighbor.get_origin_id();
@@ -4062,20 +4282,37 @@ impl HNSWIndex {
                                 }
                             }
 
-                            let metadata = metadata_store.get(ext_id).cloned().unwrap_or_default();
-                            let vector_data = if return_vector {
-                                vector_store.get(ext_id).cloned()
-                            } else {
-                                None
+                            let score = match params.rerank.as_ref() {
+                                Some(plan) => rescore_candidate(
+                                    plan,
+                                    &processed_query,
+                                    ext_id,
+                                    &vector_store,
+                                    self.pq.as_ref(),
+                                    &code_store,
+                                )
+                                .unwrap_or(f32::INFINITY),
+                                None => neighbor.distance,
                             };
 
-                            query_results.push((
-                                ext_id.clone(),
-                                neighbor.distance,
-                                metadata,
-                                vector_data,
-                            ));
+                            scored.push((ext_id, score));
                         }
+                    }
+
+                    if params.rerank.is_some() {
+                        take_best(&mut scored, params.top_k);
+                    }
+
+                    let mut query_results = Vec::with_capacity(scored.len());
+                    for (ext_id, score) in scored {
+                        let metadata = metadata_store.get(ext_id).cloned().unwrap_or_default();
+                        let vector_data = if params.return_vector {
+                            vector_store.get(ext_id).cloned()
+                        } else {
+                            None
+                        };
+
+                        query_results.push((ext_id.clone(), score, metadata, vector_data));
                     }
 
                     Ok(query_results)
@@ -4423,12 +4660,12 @@ impl HNSWIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::DistPQ;
+    use super::{raw_distance_fn, rescore_candidate, take_best, DistPQ, RerankPlan, SearchParams};
     use crate::pq::PQ;
-    use hnsw_rs::prelude::{DistCosine, Hnsw};
+    use hnsw_rs::prelude::{DistCosine, DistL1, DistL2, Distance, Hnsw};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, OnceLock};
 
     // Scale for the quantized graph tests. Small enough for CI and large
@@ -4486,6 +4723,124 @@ mod tests {
                 v
             })
             .collect()
+    }
+
+    /// The rescored score has to be the number a raw index would report, not a
+    /// second implementation of the same formula that happens to agree today.
+    #[test]
+    fn rerank_scores_come_from_the_raw_distances() {
+        let a = vec![0.6f32, 0.8, 0.0, -0.5];
+        let b = vec![-0.2f32, 0.3, 0.9, 0.4];
+
+        assert_eq!(
+            raw_distance_fn("cosine")(&a, &b),
+            DistCosine {}.eval(&a, &b)
+        );
+        assert_eq!(raw_distance_fn("l2")(&a, &b), DistL2 {}.eval(&a, &b));
+        assert_eq!(raw_distance_fn("l1")(&a, &b), DistL1 {}.eval(&a, &b));
+
+        // An unrecognised space falls back the way `DistanceType::new_raw`
+        // does, so the score still matches the graph that was built.
+        assert_eq!(
+            raw_distance_fn("nonsense")(&a, &b),
+            DistCosine {}.eval(&a, &b)
+        );
+    }
+
+    fn plan(factor: usize) -> RerankPlan {
+        RerankPlan {
+            factor,
+            distance: raw_distance_fn("cosine"),
+        }
+    }
+
+    fn params(top_k: usize, rerank: Option<RerankPlan>) -> SearchParams {
+        SearchParams {
+            top_k,
+            ef: 100,
+            return_vector: false,
+            rerank,
+        }
+    }
+
+    /// The over-fetch is the factor the caller asked for, and it cannot ask the
+    /// graph for more nodes than the index holds.
+    #[test]
+    fn fetch_k_over_fetches_and_stays_bounded() {
+        assert_eq!(params(10, None).fetch_k(10_000), 10);
+        assert_eq!(params(10, Some(plan(1))).fetch_k(10_000), 10);
+        assert_eq!(params(10, Some(plan(20))).fetch_k(10_000), 200);
+
+        // Capped at the live record count rather than at the product.
+        assert_eq!(params(10, Some(plan(20))).fetch_k(50), 50);
+
+        // A page larger than the index still asks for the page, so a short
+        // result stays short rather than being cut further.
+        assert_eq!(params(500, Some(plan(20))).fetch_k(50), 500);
+
+        // A factor big enough to overflow the multiply degrades to a full scan.
+        assert_eq!(params(usize::MAX, Some(plan(2))).fetch_k(50), usize::MAX);
+        assert_eq!(params(10, Some(plan(usize::MAX))).fetch_k(50), 50);
+    }
+
+    /// The page comes back ascending and cut to size, and a non-finite score
+    /// orders rather than panicking the sort.
+    #[test]
+    fn take_best_orders_ascending_and_cuts() {
+        let mut scored = vec![
+            ("d", 0.9f32),
+            ("a", 0.1),
+            ("e", f32::INFINITY),
+            ("c", 0.5),
+            ("b", 0.2),
+        ];
+        take_best(&mut scored, 3);
+        assert_eq!(
+            scored.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+
+        let mut short = vec![("a", 2.0f32), ("b", 1.0)];
+        take_best(&mut short, 10);
+        assert_eq!(short.len(), 2);
+        assert_eq!(short[0].0, "b");
+    }
+
+    /// A candidate is scored from its raw vector where the index kept one and
+    /// from its reconstruction otherwise, and both land on the space's own
+    /// distance scale.
+    #[test]
+    fn rescore_prefers_the_raw_vector_and_falls_back_to_the_codes() {
+        let data = clustered(64, 8, 99);
+        let pq = Arc::new(PQ::new(8, 4, 4, 16, None));
+        pq.train(&data).unwrap();
+
+        let query = data[0].clone();
+        let stored = data[7].clone();
+        let codes = pq.quantize(&stored).unwrap();
+
+        let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+        let mut pq_codes: HashMap<String, Vec<u8>> = HashMap::new();
+        vectors.insert("kept".to_string(), stored.clone());
+        pq_codes.insert("kept".to_string(), codes.clone());
+        pq_codes.insert("coded".to_string(), codes.clone());
+
+        let p = plan(1);
+
+        // The raw vector wins where there is one, so the score is exact.
+        let exact = rescore_candidate(&p, &query, "kept", &vectors, Some(&pq), &pq_codes);
+        assert_eq!(exact, Some(DistCosine {}.eval(&query, &stored)));
+
+        // Codes alone still score, against the reconstruction.
+        let approximate =
+            rescore_candidate(&p, &query, "coded", &vectors, Some(&pq), &pq_codes).unwrap();
+        let reconstructed = pq.reconstruct(&codes).unwrap();
+        assert_eq!(approximate, DistCosine {}.eval(&query, &reconstructed));
+
+        // Neither is unscoreable rather than silently zero, which is what keeps
+        // an unscored candidate from displacing a scored one.
+        assert!(rescore_candidate(&p, &query, "absent", &vectors, Some(&pq), &pq_codes).is_none());
+        assert!(rescore_candidate(&p, &query, "coded", &vectors, None, &pq_codes).is_none());
     }
 
     struct PqFixture {

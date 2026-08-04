@@ -1508,3 +1508,352 @@ def test_quantized_symmetric_table_memory(quantized_graph):
     expected_mb = GRAPH_SUBVECTORS * (2 ** 8) * (2 ** 8) * 4 / (1024 * 1024)
     assert info["sdc_memory_mb"] == pytest.approx(expected_mb)
     assert info["is_trained"] is True
+
+# ------------------------------------------------------------
+# Shared setup for the rerank coverage
+# ------------------------------------------------------------
+# Relay 33 left the quantized graph sound and the codes lossy. Recall at top_k
+# 10 was 0.1235 against 0.9995 for the raw path on the same data, and the graph
+# was measured returning exactly what an exhaustive scan of every code returns,
+# so the shortfall was the 64x compression rather than the traversal.
+#
+# Rerank closes it by over-fetching candidates with the codes and rescoring
+# them against the raw vectors the index kept. It applies to
+# quantized_with_raw, which holds a raw vector for every record, and not to
+# quantized_only, which holds one only for the records collected before
+# training. Rescoring a code held record against its reconstruction gains
+# nothing, because the reconstruction carries exactly the information the ADC
+# distance already used.
+#
+# Dimension 64 over 4 subvectors is 64x compression, the ratio every relay 33
+# and relay 34 measurement used, which puts recall without rerank near 0.35 and
+# leaves the bounds below a wide margin. Twenty clusters and the same 0.15
+# perturbation as the graph fixture above.
+RERANK_DIM = 64
+RERANK_SUBVECTORS = 4
+RERANK_TRAINING_SIZE = 1000
+RERANK_TOTAL = 1500
+RERANK_QUERIES = 50
+
+
+def _rerank_fixture(mode, seed=20260804):
+    everything = _graph_vectors(RERANK_TOTAL + RERANK_QUERIES, RERANK_DIM, seed)
+    data = everything[:RERANK_TOTAL]
+    queries = everything[RERANK_TOTAL:]
+    ids = [f"r_{i}" for i in range(RERANK_TOTAL)]
+
+    config = {
+        "type": "pq",
+        "subvectors": RERANK_SUBVECTORS,
+        "bits": 8,
+        "training_size": RERANK_TRAINING_SIZE,
+        "storage_mode": mode,
+    }
+    with warnings.catch_warnings():
+        # 64x compression trips the ratio warning, and quantized_with_raw warns
+        # about its memory unconditionally. Both are asserted where they are the
+        # subject rather than here.
+        warnings.simplefilter("ignore")
+        index = VectorDatabase().create(
+            "hnsw", dim=RERANK_DIM, expected_size=RERANK_TOTAL,
+            quantization_config=config,
+        )
+
+    assert index.add({
+        "ids": ids,
+        "embeddings": data,
+        "metadatas": [{"band": i % 4} for i in range(RERANK_TOTAL)],
+    }).is_success()
+    assert index.is_quantized(), "training did not complete"
+
+    return {
+        "index": index,
+        "ids": ids,
+        "data": data,
+        "queries": queries,
+        "truth": np.argsort(-(queries @ data.T), axis=1)[:, :10],
+        "mode": mode,
+    }
+
+
+@pytest.fixture(scope="module")
+def rerank_index():
+    """quantized_with_raw, the mode rerank applies to."""
+    return _rerank_fixture("quantized_with_raw")
+
+
+@pytest.fixture(scope="module")
+def rerank_index_code_only():
+    """quantized_only, the mode rerank leaves alone."""
+    return _rerank_fixture("quantized_only")
+
+
+def _rerank_recall(fixture, **kwargs):
+    index = fixture["index"]
+    hits = 0
+    for qi, query in enumerate(fixture["queries"]):
+        found = {r["id"] for r in index.search(query.tolist(), top_k=10, **kwargs)}
+        hits += len(found & {fixture["ids"][j] for j in fixture["truth"][qi]})
+    return hits / (10 * len(fixture["queries"]))
+
+# ------------------------------------------------------------
+# Test 90: rerank lifts recall on the mode that keeps raw vectors
+# ------------------------------------------------------------
+def test_rerank_lifts_recall(rerank_index):
+    """The whole point of the feature, asserted as a gap rather than a level.
+
+    Measured over two data seeds at these settings: 0.346 and 0.360 with rerank
+    off, 0.948 and 0.920 at factor 5, and 1.000 at the default factor of 20.
+    The pre-rerank behaviour is the rerank off arm, so the bound of 0.90 on the
+    default fails against it by more than half.
+    """
+    off = _rerank_recall(rerank_index, rerank=0)
+    on = _rerank_recall(rerank_index)
+
+    assert off < 0.60, (
+        f"recall without rerank is {off:.4f}, too high for the bound below to "
+        f"mean anything; the fixture no longer loses enough to quantization"
+    )
+    assert on > 0.90, f"recall with the default rerank is only {on:.4f}"
+    assert on - off > 0.40, (
+        f"rerank moved recall from {off:.4f} to {on:.4f}, a gain of {on - off:.4f}"
+    )
+
+# ------------------------------------------------------------
+# Test 91: a reranked score is the raw distance, and the page is ordered
+# ------------------------------------------------------------
+def test_rerank_returns_ordered_raw_distances(rerank_index):
+    """What comes back is the cosine distance to the stored vector.
+
+    This is the behaviour change a caller feels. Without rerank the score is the
+    ADC distance, a sum of squared subvector distances against the codebook.
+    With it the score is 1 minus the cosine similarity against the raw vector,
+    which is exactly what a raw index reports for the same pair.
+    """
+    index = rerank_index["index"]
+    data = rerank_index["data"]
+
+    for query in rerank_index["queries"][:10]:
+        hits = index.search(query.tolist(), top_k=10)
+        assert len(hits) == 10
+
+        scores = [h["score"] for h in hits]
+        assert scores == sorted(scores), f"page is not ordered: {scores}"
+
+        for hit in hits:
+            stored = data[int(hit["id"].split("_")[1])]
+            expected = 1.0 - float(np.dot(query, stored))
+            assert hit["score"] == pytest.approx(expected, abs=1e-5), (
+                f"{hit['id']} scored {hit['score']}, which is not the cosine "
+                f"distance {expected}"
+            )
+
+    # And the ADC score for the same query is a different number, so the change
+    # is real rather than the two happening to agree.
+    query = rerank_index["queries"][0].tolist()
+    reranked = index.search(query, top_k=10)[0]
+    adc = index.search(query, top_k=10, rerank=0)[0]
+    assert adc["score"] != pytest.approx(reranked["score"], abs=1e-5)
+
+# ------------------------------------------------------------
+# Test 92: quantized_only is left alone
+# ------------------------------------------------------------
+def test_quantized_only_does_not_rerank(rerank_index_code_only):
+    """Every rerank setting returns the same page, including an exhaustive one.
+
+    The mode drops raw vectors for every record added after training, so the
+    only thing available to rescore a code held record against is its
+    reconstruction, and that carries exactly the information the ADC distance
+    already used. Measured at 10,000 records of dimension 768, recall at top_k
+    10 over the code held records moved from 0.1320 to 0.1330 on one data draw
+    and from 0.1440 to 0.1400 on another, which is noise in both directions.
+    """
+    index = rerank_index_code_only["index"]
+    stats = index.get_stats()
+    assert stats["storage_mode"] == "quantized_only"
+
+    # The collection phase kept raw vectors and nothing clears them, so the mode
+    # holds a raw vector for exactly the records it trained on. That mixed pool
+    # is why the decision is made per index rather than per candidate.
+    assert int(stats["raw_vectors_stored"]) == RERANK_TRAINING_SIZE
+    assert int(stats["quantized_codes_stored"]) == RERANK_TOTAL
+
+    for query in rerank_index_code_only["queries"][:10]:
+        baseline = [(h["id"], h["score"]) for h in
+                    index.search(query.tolist(), top_k=10, rerank=0)]
+        for setting in (None, 1, 20, RERANK_TOTAL):
+            page = [(h["id"], h["score"]) for h in
+                    index.search(query.tolist(), top_k=10, rerank=setting)]
+            assert page == baseline, (
+                f"rerank={setting} changed the page on a quantized_only index"
+            )
+
+    # The scores are still ADC distances rather than cosine distances.
+    query = rerank_index_code_only["queries"][0]
+    hit = index.search(query.tolist(), top_k=10)[0]
+    stored = rerank_index_code_only["data"][int(hit["id"].split("_")[1])]
+    assert hit["score"] != pytest.approx(1.0 - float(np.dot(query, stored)), abs=1e-5)
+
+# ------------------------------------------------------------
+# Test 93: the over-fetch factor is honoured
+# ------------------------------------------------------------
+def test_rerank_factor_is_honoured(rerank_index):
+    """Three checks that pin what the factor does to the candidate pool.
+
+    At factor 1 the pool is the requested page, so rescoring can reorder it but
+    cannot bring in a record the ADC ordering missed. At a factor that covers
+    the whole index the pool is every record, so the rescore is exhaustive and
+    the page has to be the brute force page. In between, recall rises with the
+    factor.
+    """
+    index = rerank_index["index"]
+    query = rerank_index["queries"][0].tolist()
+
+    # Factor 1 fetches exactly top_k, so the ids match the unreranked page and
+    # only the order and the scores move.
+    unreranked = index.search(query, top_k=10, rerank=0)
+    factor_one = index.search(query, top_k=10, rerank=1)
+    assert {h["id"] for h in factor_one} == {h["id"] for h in unreranked}
+    assert [h["id"] for h in factor_one] != [h["id"] for h in unreranked]
+
+    # More candidates, more of the true neighbours.
+    by_factor = [_rerank_recall(rerank_index, rerank=f) for f in (1, 5, 20)]
+    assert by_factor[0] < by_factor[1] < by_factor[2], (
+        f"recall did not rise with the factor: {by_factor}"
+    )
+
+    # A factor covering the index rescores every record, so the page is the
+    # brute force page. The cap keeps the request at the record count rather
+    # than at ten times it.
+    for qi, held_out in enumerate(rerank_index["queries"][:10]):
+        page = {h["id"] for h in index.search(held_out.tolist(), top_k=10,
+                                              rerank=RERANK_TOTAL)}
+        assert page == {rerank_index["ids"][j] for j in rerank_index["truth"][qi]}, (
+            "an exhaustive rescore did not return the brute force page"
+        )
+
+# ------------------------------------------------------------
+# Test 94: metadata filters still hold, and the pages get longer
+# ------------------------------------------------------------
+def test_rerank_with_metadata_filter(rerank_index):
+    """The filter runs on the over-fetched pool, before the rescore.
+
+    That ordering costs nothing, because a candidate the filter drops never
+    needs a raw distance, and it fixes a shortfall that predates rerank. The
+    filter used to run on a page of exactly top_k candidates, so a selective
+    filter left a short page. Measured at 3,000 records of dimension 768 with a
+    filter admitting a quarter of them, a request for ten came back with 2.74
+    results on average without rerank and 10.00 with it.
+    """
+    index = rerank_index["index"]
+
+    lengths = {}
+    for factor in (0, 20):
+        pages = [index.search(q.tolist(), filter={"band": 1}, top_k=10, rerank=factor)
+                 for q in rerank_index["queries"]]
+        for page in pages:
+            for hit in page:
+                assert hit["metadata"]["band"] == 1, "a filtered page leaked a record"
+                assert int(hit["id"].split("_")[1]) % 4 == 1
+        lengths[factor] = sum(len(page) for page in pages) / len(pages)
+
+    assert lengths[20] > lengths[0], (
+        f"over-fetching did not lengthen the filtered pages: {lengths}"
+    )
+    assert lengths[20] == pytest.approx(10.0), (
+        f"a filter admitting a quarter of the index still returns short pages "
+        f"with rerank on: mean {lengths[20]:.2f} of 10"
+    )
+
+# ------------------------------------------------------------
+# Test 95: batch search matches single search
+# ------------------------------------------------------------
+def test_rerank_batch_matches_single(rerank_index):
+    """Both batch paths rerank, and they agree with the single query path.
+
+    batch_search_internal switches to the parallel path above five queries, so
+    four and eight cover both. All three paths take the same plan, which is
+    resolved once in search rather than per query.
+    """
+    index = rerank_index["index"]
+    queries = [q.tolist() for q in rerank_index["queries"][:8]]
+
+    single = [[(h["id"], h["score"]) for h in index.search(q, top_k=10)]
+              for q in queries]
+    assert all(len(page) == 10 for page in single)
+
+    sequential = [[(h["id"], h["score"]) for h in page]
+                  for page in index.search(queries[:4], top_k=10)]
+    assert sequential == single[:4]
+
+    parallel = [[(h["id"], h["score"]) for h in page]
+                for page in index.search(queries, top_k=10)]
+    assert parallel == single
+
+    # An explicit factor reaches both paths too.
+    single_five = [[(h["id"], h["score"]) for h in index.search(q, top_k=10, rerank=5)]
+                   for q in queries]
+    batch_five = [[(h["id"], h["score"]) for h in page]
+                  for page in index.search(queries, top_k=10, rerank=5)]
+    assert batch_five == single_five
+
+# ------------------------------------------------------------
+# Test 96: rerank does not disturb a raw index
+# ------------------------------------------------------------
+def test_rerank_leaves_the_raw_path_alone():
+    """A raw index already ranks by the raw distance, so the parameter is inert.
+
+    It is accepted rather than rejected so that one call site can serve both
+    kinds of index, and it must not change the page, the scores or the order.
+    """
+    rng = np.random.default_rng(20260804)
+    data = rng.standard_normal((300, RERANK_DIM)).astype(np.float32)
+    index = VectorDatabase().create("hnsw", dim=RERANK_DIM, expected_size=300)
+    assert index.add({"ids": [f"p_{i}" for i in range(300)],
+                      "embeddings": data}).is_success()
+    assert not index.is_quantized()
+
+    query = data[7].tolist()
+    baseline = [(h["id"], h["score"]) for h in index.search(query, top_k=10)]
+    assert baseline[0][0] == "p_7"
+
+    for setting in (0, 1, 20, 100000):
+        assert [(h["id"], h["score"]) for h in
+                index.search(query, top_k=10, rerank=setting)] == baseline, (
+            f"rerank={setting} changed a raw index result"
+        )
+
+# ------------------------------------------------------------
+# Test 97: removed records stay out of a reranked page
+# ------------------------------------------------------------
+def test_rerank_excludes_removed_records(rerank_index):
+    """The live record predicate runs inside the traversal, ahead of everything.
+
+    Relay 31 added it so a stranded graph node routes the search without
+    consuming a result slot. Over-fetching multiplies the slots, so a leak here
+    would be twenty times as visible as it was.
+
+    This test removes records from the shared index, so it is last in the module
+    and nothing after it may rely on that fixture being whole.
+    """
+    index = rerank_index["index"]
+    removed = [f"r_{i}" for i in range(400)]
+    for record_id in removed:
+        assert index.remove_point(record_id) is True
+    assert index.get_vector_count() == RERANK_TOTAL - len(removed)
+
+    gone = set(removed)
+    for query in rerank_index["queries"]:
+        hits = index.search(query.tolist(), top_k=10)
+        assert len(hits) == 10, f"a reranked page came back short: {len(hits)}"
+        assert not (gone & {h["id"] for h in hits}), "a removed record was returned"
+
+    # And the page is still the brute force page over what is left.
+    survivors = np.arange(len(removed), RERANK_TOTAL)
+    data = rerank_index["data"]
+    for query in rerank_index["queries"][:10]:
+        similarity = data[survivors] @ query
+        want = {f"r_{survivors[j]}" for j in np.argsort(-similarity)[:10]}
+        got = {h["id"] for h in index.search(query.tolist(), top_k=10,
+                                             rerank=RERANK_TOTAL)}
+        assert got == want
