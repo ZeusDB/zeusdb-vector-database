@@ -3,6 +3,7 @@
 import json
 import shutil
 import struct
+import warnings
 
 import numpy as np
 import pytest
@@ -439,14 +440,13 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
 # Test 74: Persistence: a quantized_with_raw round trip
 # ------------------------------------------------------------
 def test_persistence_quantized_with_raw_round_trip(tmp_path):
-    """The codebook and the codes both come back, the quantized graph does not.
+    """The codebook, the codes and the quantized graph all come back.
 
-    The loaded index holds its trained codebook and every stored code, so it can
-    quantize and reconstruct. Its graph is rebuilt over raw vectors rather than
-    codes, so is_quantized() is still false and the mode reads
-    raw_trained_not_rebuilt. Restoring the graph as a PQ graph is a separate
-    piece of work; rebuild_with_quantization() is the supported way to get there
-    and is asserted here.
+    The loaded index holds its trained codebook and every stored code, and its
+    graph is rebuilt from those codes rather than from the raw vectors, so
+    is_quantized() is true and the mode reads quantized_active exactly as it
+    did before the save. rebuild_with_quantization() is no longer needed after
+    a load, and calling it anyway is asserted to be a safe no-op.
     """
     vdb = VectorDatabase()
     with pytest.warns(UserWarning,
@@ -481,12 +481,12 @@ def test_persistence_quantized_with_raw_round_trip(tmp_path):
 
     loaded = vdb.load(str(save_dir))
 
-    # The trained codebook and the stored codes survive, the quantized graph
-    # does not.
+    # The trained codebook, the stored codes and the quantized graph all
+    # survive, so the loaded index is the index that was saved.
     assert loaded.can_use_quantization()
     assert loaded.get_quantization_info()["is_trained"] is True
-    assert not loaded.is_quantized()
-    assert loaded.get_storage_mode() == "raw_trained_not_rebuilt"
+    assert loaded.is_quantized()
+    assert loaded.get_storage_mode() == "quantized_active"
     assert int(loaded.get_stats()["quantized_codes_stored"]) == count
 
     # quantized_with_raw keeps every raw vector, so nothing is lost.
@@ -502,12 +502,14 @@ def test_persistence_quantized_with_raw_round_trip(tmp_path):
         assert np.allclose(after_by_id[vec_id]["vector"],
                            before_by_id[vec_id]["vector"], atol=1e-6)
 
-    # Search works on the loaded index, over raw vectors rather than codes.
+    # Search works on the loaded index, through the quantized graph with the
+    # default rerank against the raw vectors this mode keeps.
     hits = loaded.search(vectors[0].tolist(), top_k=5)
     assert 0 < len(hits) <= 5
     assert any(h["id"] == "v_0" for h in hits)
 
-    # rebuild_with_quantization moves the loaded index back to quantized_active.
+    # rebuild_with_quantization is redundant after a load now, and calling it
+    # anyway must leave the index quantized with nothing lost.
     assert loaded.rebuild_with_quantization() is True
     assert loaded.is_quantized()
     assert loaded.get_storage_mode() == "quantized_active"
@@ -621,11 +623,12 @@ def test_persistence_quantized_only_round_trip(quantized_only_saved):
 
     quantized_only stops storing raw vectors once training completes, so
     vectors.bin holds the training set and pq_codes.bin holds everything. The
-    loader replays a record from its raw vector when there is one and
-    reconstructs it through the codebook when there is not, so the graph covers
-    every record either way. The stored codes are put back as written rather
-    than recomputed, and the reconstructed records are not promoted to raw
-    storage, so the mode keeps the memory saving that is its whole purpose.
+    loader rebuilds the graph by inserting those stored codes into a PQ graph,
+    so every record is covered, nothing is reconstructed to full width on the
+    way, and the loaded index is quantized exactly as the saved one was. The
+    stored codes are put back as written rather than recomputed, and no record
+    is promoted to raw storage, so the mode keeps the memory saving that is
+    its whole purpose.
     """
     vdb = VectorDatabase()
     ids = quantized_only_saved["ids"]
@@ -653,18 +656,18 @@ def test_persistence_quantized_only_round_trip(quantized_only_saved):
     assert by_id["v_1005"]["metadata"] == {"i": 1005}
     assert by_id["v_1009"]["metadata"] == {"i": 1009}
 
-    # The codebook is restored, so the index can quantize and reconstruct. Its
-    # graph is rebuilt raw, so quantized search is not restored with it.
+    # The codebook is restored and the graph is rebuilt from the stored codes,
+    # so quantized search comes back with it.
     assert loaded.can_use_quantization()
-    assert not loaded.is_quantized()
-    assert loaded.get_storage_mode() == "raw_trained_not_rebuilt"
+    assert loaded.is_quantized()
+    assert loaded.get_storage_mode() == "quantized_active"
 
     # A record with no raw vector is still found by search through the graph.
     hits = loaded.search(quantized_only_saved["vectors"][1005].tolist(), top_k=5)
     assert any(h["id"] == "v_1005" for h in hits)
 
-    # rebuild_with_quantization returns the index to quantized search without
-    # dropping the records that exist only as codes.
+    # rebuild_with_quantization is redundant after a load now, and calling it
+    # anyway must not drop the records that exist only as codes.
     assert loaded.rebuild_with_quantization() is True
     assert loaded.is_quantized()
     assert loaded.get_storage_mode() == "quantized_active"
@@ -936,3 +939,185 @@ def test_load_refuses_a_saved_index_holding_a_non_finite_value(tmp_path):
 
     with pytest.raises(RuntimeError, match="Graph rebuild refused"):
         vdb.load(str(save_dir))
+
+# ------------------------------------------------------------
+# Shared fixture for the quantized reload coverage
+# ------------------------------------------------------------
+RELOAD_DIM = 16
+RELOAD_SUBVECTORS = 8
+RELOAD_TRAINING_SIZE = 1000
+RELOAD_TOTAL = 1500
+RELOAD_QUERIES = 50
+
+
+def _clustered_unit_vectors(n, dim, seed):
+    """Twenty Gaussian centres, a small perturbation, then L2 normalised.
+
+    Clustered rather than uniform, because uniform vectors are close to
+    equidistant and recall saturates on them, which would hide a regression.
+    Same specification as the graph quality fixtures in test_quantization.py.
+    """
+    rng = np.random.default_rng(seed)
+    centres = rng.standard_normal((20, dim))
+    points = centres[rng.integers(0, 20, size=n)] + 0.15 * rng.standard_normal((n, dim))
+    return (points / np.linalg.norm(points, axis=1, keepdims=True)).astype(np.float32)
+
+
+def _reload_recall(index, ids, queries, truth, **search_kwargs):
+    hits = 0
+    for qi, query in enumerate(queries):
+        found = {r["id"] for r in index.search(query.tolist(), top_k=10,
+                                               **search_kwargs)}
+        hits += len(found & {ids[j] for j in truth[qi]})
+    return hits / (10 * len(queries))
+
+
+@pytest.fixture(scope="module", params=["quantized_only", "quantized_with_raw"])
+def quantized_reload(request, tmp_path_factory):
+    """A trained quantized index saved together with its pre-save behaviour.
+
+    Module scoped and parametrised over both storage modes, so each mode pays
+    for one k-means run. The 500 records past training_size arrive through the
+    quantized add path, which under quantized_only stores codes and no raw
+    vector, so they are the records a lossy loader would drop.
+    """
+    mode = request.param
+    all_vectors = _clustered_unit_vectors(RELOAD_TOTAL + RELOAD_QUERIES,
+                                          RELOAD_DIM, 20260804)
+    data, queries = all_vectors[:RELOAD_TOTAL], all_vectors[RELOAD_TOTAL:]
+    ids = [f"r_{i}" for i in range(RELOAD_TOTAL)]
+
+    config = {"type": "pq", "subvectors": RELOAD_SUBVECTORS, "bits": 8,
+              "training_size": RELOAD_TRAINING_SIZE, "storage_mode": mode}
+    with warnings.catch_warnings():
+        # quantized_with_raw warns unconditionally about its memory use, which
+        # test 74 asserts where it is the subject.
+        warnings.simplefilter("ignore")
+        index = VectorDatabase().create("hnsw", dim=RELOAD_DIM,
+                                        expected_size=RELOAD_TOTAL,
+                                        quantization_config=config)
+
+    assert index.add({"ids": ids, "embeddings": data,
+                      "metadatas": [{"i": i} for i in range(RELOAD_TOTAL)]
+                      }).is_success()
+    assert index.is_quantized(), "training did not complete"
+
+    truth = np.argsort(-(queries @ data.T), axis=1)[:, :10]
+    recall_before = {
+        "default": _reload_recall(index, ids, queries, truth),
+        "rerank0": _reload_recall(index, ids, queries, truth, rerank=0),
+    }
+
+    save_dir = tmp_path_factory.mktemp(f"reload_{mode}") / "idx.zdb"
+    index.save(str(save_dir))
+
+    return {"mode": mode, "path": save_dir, "ids": ids, "data": data,
+            "queries": queries, "truth": truth, "recall_before": recall_before}
+
+# ------------------------------------------------------------
+# Test 101: a trained quantized index loads back quantized
+# ------------------------------------------------------------
+def test_quantized_index_loads_back_quantized(quantized_reload):
+    """The state, the records and the recall all survive the round trip.
+
+    The loader rebuilds the graph by inserting the stored PQ codes into a PQ
+    graph, so the reloaded index reports quantized_active rather than
+    raw_trained_not_rebuilt and searches through ADC exactly as it did before
+    the save. Insertion order on load follows HashMap iteration rather than
+    arrival order, so the graph need not be identical, and the recall bound
+    below is a tolerance rather than an equality for that reason.
+    """
+    fixture = quantized_reload
+    loaded = VectorDatabase().load(str(fixture["path"]))
+
+    assert loaded.is_quantized()
+    assert loaded.get_storage_mode() == "quantized_active"
+    assert loaded.can_use_quantization()
+
+    # Every record survives, including the 500 added after training that have
+    # codes and no raw vector under quantized_only.
+    assert loaded.get_vector_count() == RELOAD_TOTAL
+    records = loaded.get_records(fixture["ids"])
+    assert len(records) == RELOAD_TOTAL
+    post_training = fixture["ids"][RELOAD_TRAINING_SIZE:]
+    assert len(loaded.get_records(post_training)) == len(post_training)
+
+    # The whole graph is reachable, so nothing was silently left out of it.
+    page = loaded.search(fixture["queries"][0].tolist(), top_k=RELOAD_TOTAL,
+                         ef_search=RELOAD_TOTAL)
+    assert len(page) == RELOAD_TOTAL
+
+    # Recall matches the pre-save figure within the variation a different
+    # insertion order produces. Measured at 10,000 records, reordering the
+    # same codes moved recall by under 0.001; the bound leaves room for the
+    # smaller index here.
+    for label, kwargs in (("default", {}), ("rerank0", {"rerank": 0})):
+        after = _reload_recall(loaded, fixture["ids"], fixture["queries"],
+                               fixture["truth"], **kwargs)
+        before = fixture["recall_before"][label]
+        assert abs(after - before) <= 0.05, (
+            f"{fixture['mode']} {label}: recall moved from {before:.4f} to "
+            f"{after:.4f} across the reload"
+        )
+
+# ------------------------------------------------------------
+# Test 102: the raw vector store is not inflated by a reload
+# ------------------------------------------------------------
+def test_quantized_reload_raw_store_holds_only_what_was_saved(quantized_reload):
+    """quantized_only comes back holding raw vectors for the training set alone.
+
+    That is exactly what the live index held before the save, because the
+    collection phase stores raw vectors and nothing clears them at training.
+    The 500 code-only records must not be materialised at full width on load;
+    before this fix the loader reconstructed them into the graph, which is
+    where the mode's memory saving went to die.
+    """
+    fixture = quantized_reload
+    loaded = VectorDatabase().load(str(fixture["path"]))
+
+    expected_raw = (RELOAD_TRAINING_SIZE if fixture["mode"] == "quantized_only"
+                    else RELOAD_TOTAL)
+    stats = loaded.get_stats()
+    assert int(stats["raw_vectors_stored"]) == expected_raw
+    assert int(stats["quantized_codes_stored"]) == RELOAD_TOTAL
+
+# ------------------------------------------------------------
+# Test 103: rerank behaviour survives the reload
+# ------------------------------------------------------------
+def test_quantized_reload_rerank_behaviour(quantized_reload):
+    """quantized_with_raw reranks after a reload, quantized_only stays inert.
+
+    Before this fix a reloaded index was a raw index, so the rerank plan never
+    engaged and quantized_with_raw searched at raw recall with raw scores. Now
+    the mode comes back quantized and the default search over-fetches and
+    rescores against the raw vectors exactly as it did before the save.
+    """
+    fixture = quantized_reload
+    loaded = VectorDatabase().load(str(fixture["path"]))
+    query = fixture["queries"][0]
+
+    if fixture["mode"] == "quantized_with_raw":
+        # Reranked recall is near the raw ceiling and far above the ADC page.
+        reranked = _reload_recall(loaded, fixture["ids"], fixture["queries"],
+                                  fixture["truth"])
+        unreranked = _reload_recall(loaded, fixture["ids"], fixture["queries"],
+                                    fixture["truth"], rerank=0)
+        assert reranked >= 0.90
+        assert reranked > unreranked + 0.10
+
+        # The reranked score is the cosine distance to the stored raw vector,
+        # which is what a raw index reports for the same pair.
+        top = loaded.search(query.tolist(), top_k=1)[0]
+        stored = loaded.get_records(top["id"], return_vector=True)[0]["vector"]
+        expected = 1.0 - float(
+            np.dot(query, stored) / (np.linalg.norm(query) * np.linalg.norm(stored))
+        )
+        assert abs(top["score"] - expected) < 1e-5
+    else:
+        # quantized_only has nothing to rerank, so the parameter changes
+        # neither the page nor the scores.
+        with_default = [(r["id"], round(float(r["score"]), 6))
+                        for r in loaded.search(query.tolist(), top_k=10)]
+        with_off = [(r["id"], round(float(r["score"]), 6))
+                    for r in loaded.search(query.tolist(), top_k=10, rerank=0)]
+        assert with_default == with_off
