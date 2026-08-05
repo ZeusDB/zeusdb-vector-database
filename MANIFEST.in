@@ -1,7 +1,0 @@
-include LICENSE
-include NOTICE
-include README.md
-recursive-include src *
-recursive-include tests *
-recursive-include vendor *
-recursive-include LICENSES *
