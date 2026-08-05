@@ -1,12 +1,16 @@
 """Concurrent search, and search running alongside a write.
 
-Two separate defects sat on this path. Search held an exclusive lock on the
+Three separate defects sat on this path. Search held an exclusive lock on the
 graph, so two searches never ran at once. Above that, the mutating methods took
 `&mut self`, which PyO3 enforces as an exclusive borrow of the whole object, so a
 write arriving while a search held its shared borrow across `allow_threads`
-raised `RuntimeError: Already borrowed` before any lock was reached. These tests
-hold the line on both, which is that concurrent searches return exactly what the
-same queries return alone and that a write in flight never makes a search raise.
+raised `RuntimeError: Already borrowed` before any lock was reached. Below both,
+`add` held the interpreter lock for its entire duration, so a write in flight
+stopped every Python thread in the process rather than only the ones touching the
+index. These tests hold the line on all three, which is that concurrent searches
+return exactly what the same queries return alone, that a write in flight never
+makes a search raise, and that searches keep running at a real rate while an
+insert is underway.
 
 Every test here is built to fail for a reason rather than on timing.
 
@@ -43,6 +47,44 @@ PQ_CONFIG = {"type": "pq", "subvectors": 8, "bits": 8, "training_size": 1000}
 # Wide enough to contend on a developer machine, small enough to stay quick.
 THREADS = 8
 ROUNDS = 6
+
+# The interpreter lock tests below. `GIL_INSERT` is sized so the single `add`
+# call lasts long enough to sample a rate against, on any machine that runs the
+# rest of this file in seconds.
+GIL_DIM = 32
+GIL_BASE = 1500
+GIL_INSERT = 6000
+SOLO_WINDOW_S = 0.30
+MIN_ADD_WINDOW_S = 0.10
+
+# The search rate during an insert, as a share of the rate the same thread
+# reaches with no insert running, measured moments earlier in the same process.
+# A share rather than a count, so the bound is a fraction of what this machine
+# actually does rather than a number tuned to one machine.
+#
+# Relay 36 measured 2.2 to 2.4 percent for a build where `add` never released
+# the lock. Releasing it puts the two threads in ordinary competition for the
+# CPU, which is a half share on a single core and close to a full share on
+# anything wider. A fifth sits an order of magnitude above the first and well
+# below the second.
+MIN_SEARCH_SHARE = 0.20
+
+# The sustained mixed workload. Short enough for the suite, and its assertions
+# are counts and known answers rather than durations, so a slow machine runs
+# fewer rounds rather than failing.
+SUSTAINED_SECONDS = 2.0
+SUSTAINED_BASE = 800
+SUSTAINED_BATCH = 100
+EXACT_SCORE_TOLERANCE = 1e-5
+
+# Training fires on a record count, so a run where it did not fire is a failed
+# test rather than a quiet pass. Sized to cross the threshold part way through
+# the writer's batches.
+TRAIN_DIM = 32
+TRAIN_SIZE = 1000
+TRAIN_PRELOAD = 600
+TRAIN_BATCH = 200
+TRAIN_BATCHES = 6
 
 # A batch search holds its shared borrow of the index for the whole batch, which
 # is what gives a writer a window wide enough to land in reliably.
@@ -393,3 +435,308 @@ def test_concurrent_searches_during_add_stay_correct(build):
     if failure:
         raise failure[0]
     assert sum(counts) > 0, "no search ran during the add, so nothing was proved"
+
+
+# ------------------------------------------------------------
+# The interpreter lock during a write
+# ------------------------------------------------------------
+
+
+class SearchCounter:
+    """One thread issuing single queries in a loop, counting completed calls.
+
+    Single queries rather than batches, because a batch releases the lock once
+    for the whole batch and would hide the thing being measured.
+    """
+
+    def __init__(self, index, queries):
+        self.index = index
+        self.queries = queries
+        self.count = 0
+        self.error = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run)
+
+    def _run(self):
+        cursor = 0
+        size = len(self.queries)
+        try:
+            while not self._stop.is_set():
+                self.index.search(self.queries[cursor], top_k=TOP_K)
+                cursor = cursor + 1 if cursor + 1 < size else 0
+                self.count += 1
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the caller
+            self.error = exc
+
+    def __enter__(self):
+        self._thread.start()
+        # Do not sample until the thread has actually issued a search, so the
+        # first window is a steady state rather than thread start-up.
+        deadline = time.monotonic() + 30.0
+        while self.count == 0 and self.error is None and time.monotonic() < deadline:
+            time.sleep(0.001)
+        return self
+
+    def __exit__(self, *_):
+        self._stop.set()
+        self._thread.join(timeout=120)
+        return False
+
+    def rate_over(self, seconds):
+        started = time.monotonic()
+        before = self.count
+        time.sleep(seconds)
+        return (self.count - before) / (time.monotonic() - started)
+
+
+def test_search_keeps_its_rate_while_one_insert_runs():
+    """A search thread keeps running at a real rate through a long insert.
+
+    `add` used to hold the interpreter lock for its whole duration, so no other
+    Python thread could start a search at all while one ran. Relay 36 measured
+    the collapse at 97.6 to 98.4 percent of the solo rate, and the cause was the
+    lock rather than any lock inside the index.
+
+    The bound is a share of the rate this same thread reaches with no insert
+    running, sampled seconds earlier in the same process, so it does not depend
+    on the machine being fast. A build that holds the lock cannot reach a fifth
+    of its solo rate on any machine, and a build that releases it cannot fall
+    below a half share on any machine, because the two threads then simply
+    compete for the CPU.
+
+    The insert is one call rather than a loop, so the window being measured is
+    exactly one `add` and there are no gaps between calls to hide in. The test
+    asserts the window was long enough to sample, so a machine that finished the
+    insert too fast to measure fails rather than passing on three samples.
+    """
+    index, _ = build_raw(n=GIL_BASE, dim=GIL_DIM, seed=17)
+    queries = query_set(GIL_DIM, 64, seed=808)
+    batch = {
+        "ids": [f"bulk_{i}" for i in range(GIL_INSERT)],
+        "embeddings": clustered(GIL_INSERT, GIL_DIM, seed=909),
+    }
+
+    with SearchCounter(index, queries) as reader:
+        solo_rate = reader.rate_over(SOLO_WINDOW_S)
+
+        before = reader.count
+        started = time.monotonic()
+        result = index.add(batch)
+        window = time.monotonic() - started
+        during_rate = (reader.count - before) / window
+
+    assert reader.error is None, reader.error
+    assert result.total_inserted == GIL_INSERT
+    assert window >= MIN_ADD_WINDOW_S, (
+        f"the insert took {window:.3f}s, too short to sample a rate against"
+    )
+    assert solo_rate > 0, "the reader never completed a search on its own"
+    assert during_rate >= MIN_SEARCH_SHARE * solo_rate, (
+        f"searches ran at {during_rate:.0f}/s during the insert against "
+        f"{solo_rate:.0f}/s alone, a share of {during_rate / solo_rate:.3f}"
+    )
+
+
+# ------------------------------------------------------------
+# A sustained mixed workload
+# ------------------------------------------------------------
+
+
+def half_space(n, dim, seed, upper):
+    """Unit vectors confined to one half of the axes.
+
+    Two sets built on opposite halves are orthogonal, so their cosine distance
+    is exactly 1. That is what lets a query keep a known answer while records
+    are being inserted, since nothing arriving in the other half can ever come
+    closer than a record's own vector at distance 0.
+    """
+    rng = np.random.default_rng(seed)
+    points = np.zeros((n, dim), dtype=np.float64)
+    half = dim // 2
+    block = np.abs(rng.standard_normal((n, half))) + 0.1
+    if upper:
+        points[:, half:] = block
+    else:
+        points[:, :half] = block
+    return unit(points)
+
+
+def test_sustained_mixed_workload_leaves_the_index_exact():
+    """Search and insert together for a while, then check the index is right.
+
+    The known answer is a record's own vector. Every base record lives in one
+    half of the axes and every inserted record in the other, so the two sets are
+    orthogonal and an inserted record is at distance 1 from any base query while
+    the base record itself is at distance 0. No amount of insertion can change
+    which record answers a base query, which is what makes this a correctness
+    assertion rather than an invariant.
+
+    The premise is checked rather than assumed. Before the concurrent phase
+    starts, every query is run alone and asserted to return its own record first
+    at distance 0, with the runner up far enough behind that a tie is not
+    possible. A query set that did not have that property would make the whole
+    test vacuous.
+
+    The count assertion is exact and independent of timing. The writer inserts a
+    fixed number of batches with fixed ids, the readers stop when it finishes,
+    and the final record count must equal the base plus every id written.
+    """
+    dim = 32
+    base = half_space(SUSTAINED_BASE, dim, seed=21, upper=False)
+    ids = [f"base_{i}" for i in range(SUSTAINED_BASE)]
+    index = VectorDatabase().create("hnsw", dim=dim, expected_size=SUSTAINED_BASE * 8)
+    assert index.add({"ids": ids, "embeddings": base}).is_success()
+
+    probes = list(range(0, SUSTAINED_BASE, SUSTAINED_BASE // THREADS))[:THREADS]
+    for probe in probes:
+        results = index.search(base[probe], top_k=TOP_K)
+        assert results[0]["id"] == ids[probe]
+        assert results[0]["score"] < EXACT_SCORE_TOLERANCE
+        assert results[1]["score"] > 100 * EXACT_SCORE_TOLERANCE, (
+            "the runner up is too close for the first hit to be a known answer"
+        )
+
+    writing = threading.Event()
+    writing.set()
+    written = []
+    failure = []
+
+    def writer():
+        try:
+            round_ = 0
+            deadline = time.monotonic() + SUSTAINED_SECONDS
+            while time.monotonic() < deadline:
+                batch_ids = [f"other_{round_}_{i}" for i in range(SUSTAINED_BATCH)]
+                index.add(
+                    {
+                        "ids": batch_ids,
+                        "embeddings": half_space(
+                            SUSTAINED_BATCH, dim, seed=3000 + round_, upper=True
+                        ),
+                    }
+                )
+                written.extend(batch_ids)
+                round_ += 1
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
+            failure.append(exc)
+        finally:
+            writing.clear()
+
+    def read(worker):
+        probe = probes[worker]
+        expected = ids[probe]
+        query = base[probe]
+        seen = 0
+        while writing.is_set():
+            results = index.search(query, top_k=TOP_K)
+            assert results[0]["id"] == expected
+            assert results[0]["score"] < EXACT_SCORE_TOLERANCE
+            found = [hit["id"] for hit in results]
+            assert len(set(found)) == len(found)
+            scores = [hit["score"] for hit in results]
+            assert scores == sorted(scores)
+            seen += 1
+        return seen
+
+    write_thread = threading.Thread(target=writer)
+    write_thread.start()
+    try:
+        counts = run_on_threads(read)
+    finally:
+        writing.clear()
+        write_thread.join(timeout=180)
+        assert not write_thread.is_alive(), "writer did not finish"
+
+    if failure:
+        raise failure[0]
+    assert sum(counts) > 0, "no search ran during the workload"
+    assert written, "no batch was written"
+
+    assert index.get_vector_count() == SUSTAINED_BASE + len(written)
+    for written_id in (written[0], written[len(written) // 2], written[-1]):
+        assert index.contains(written_id)
+
+    # The same queries once the index is still, against the same known answer.
+    for worker, probe in enumerate(probes):
+        results = index.search(base[probe], top_k=TOP_K)
+        assert results[0]["id"] == ids[probe]
+        assert results[0]["score"] < EXACT_SCORE_TOLERANCE
+
+
+# ------------------------------------------------------------
+# Training completing under load
+# ------------------------------------------------------------
+
+
+def test_training_completes_under_a_concurrent_search_load():
+    """Product quantization training fires mid-workload without breaking it.
+
+    Training is the longest thing an insert can do. It runs k-means over the
+    collected vectors and then rebuilds the whole graph from quantized codes, and
+    all of it now happens with the interpreter lock released. This checks that
+    the transition is safe while searches are in flight, and that searches keep
+    completing through it.
+
+    Nothing here depends on a duration. Training fires on a record count, so the
+    test asserts the index was not quantized before the crossing batch and is
+    quantized after it. A run where training did not fire fails on that pair
+    rather than passing without exercising anything.
+
+    The overlap is proved by counting. The reader pool's completed reads are
+    sampled either side of the batch that crosses the threshold, and the test
+    asserts reads landed inside that window. A build that held the interpreter
+    lock through training records none.
+    """
+    vectors = clustered(TRAIN_PRELOAD, TRAIN_DIM, seed=31)
+    index = VectorDatabase().create(
+        "hnsw",
+        dim=TRAIN_DIM,
+        expected_size=20000,
+        quantization_config={
+            "type": "pq",
+            "subvectors": 8,
+            "bits": 8,
+            "training_size": TRAIN_SIZE,
+        },
+    )
+    assert index.add(
+        {"ids": [f"pre_{i}" for i in range(TRAIN_PRELOAD)], "embeddings": vectors}
+    ).is_success()
+    assert not index.is_quantized(), "training must not have fired yet"
+
+    read_batch = query_set(TRAIN_DIM, READ_BATCH, seed=707)
+    total = TRAIN_PRELOAD
+    crossing_reads = 0
+    quantized_before_crossing = None
+
+    with ReadLoad(index, read_batch) as load:
+        for round_ in range(TRAIN_BATCHES):
+            quantized_before = index.is_quantized()
+            before = load.reads
+            index.add(
+                {
+                    "ids": [f"t_{round_}_{i}" for i in range(TRAIN_BATCH)],
+                    "embeddings": clustered(TRAIN_BATCH, TRAIN_DIM, seed=800 + round_),
+                }
+            )
+            total += TRAIN_BATCH
+            load.check()
+            if not quantized_before and index.is_quantized():
+                quantized_before_crossing = quantized_before
+                crossing_reads = load.reads - before
+        load.check()
+
+    assert quantized_before_crossing is False, (
+        "training never completed, so the transition was not exercised"
+    )
+    assert index.is_quantized()
+    assert crossing_reads > 0, "no search completed while training ran"
+    assert index.get_vector_count() == total
+
+    # The index still answers after the rebuild the training triggered.
+    for query in query_set(TRAIN_DIM, 4, seed=1212):
+        results = index.search(query, top_k=TOP_K)
+        assert 0 < len(results) <= TOP_K
+        assert [hit["score"] for hit in results] == sorted(
+            hit["score"] for hit in results
+        )
