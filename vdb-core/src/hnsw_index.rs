@@ -1,6 +1,7 @@
+use crate::distance::{CosineDist, L1Dist, L2Dist};
 use chrono::Utc;
 use hnsw_rs::api::AnnT; // This provides the file_dump method
-use hnsw_rs::prelude::{DistCosine, DistL1, DistL2, Distance, FilterT, Hnsw};
+use hnsw_rs::prelude::{Distance, FilterT, Hnsw};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -85,15 +86,15 @@ pub const DEFAULT_RERANK_FACTOR: usize = 20;
 
 /// The raw vector distance for a space
 ///
-/// These are the same `anndists` implementations `DistanceType::new_raw` hands
-/// to a raw graph, so a rescored score is the number a raw index would have
-/// reported for the same pair rather than a second implementation of the same
-/// formula.
+/// These are the same `crate::distance` implementations `DistanceType::new_raw`
+/// hands to a raw graph, so a rescored score is the number a raw index would
+/// have reported for the same pair rather than a second implementation of the
+/// same formula.
 fn raw_distance_fn(space: &str) -> fn(&[f32], &[f32]) -> f32 {
     match space {
-        "l2" => |a: &[f32], b: &[f32]| DistL2 {}.eval(a, b),
-        "l1" => |a: &[f32], b: &[f32]| DistL1 {}.eval(a, b),
-        _ => |a: &[f32], b: &[f32]| DistCosine {}.eval(a, b),
+        "l2" => |a: &[f32], b: &[f32]| L2Dist {}.eval(a, b),
+        "l1" => |a: &[f32], b: &[f32]| L1Dist {}.eval(a, b),
+        _ => |a: &[f32], b: &[f32]| CosineDist {}.eval(a, b),
     }
 }
 
@@ -294,9 +295,9 @@ impl Distance<u8> for DistPQ {
 // Enhanced DistanceType enum to support PQ variants
 enum DistanceType {
     // Raw vector variants
-    Cosine(Hnsw<'static, f32, DistCosine>),
-    L2(Hnsw<'static, f32, DistL2>),
-    L1(Hnsw<'static, f32, DistL1>),
+    Cosine(Hnsw<'static, f32, CosineDist>),
+    L2(Hnsw<'static, f32, L2Dist>),
+    L1(Hnsw<'static, f32, L1Dist>),
 
     // PQ variants - corrected to use u8 element type
     CosinePQ(Hnsw<'static, u8, DistPQ>),
@@ -329,21 +330,21 @@ impl DistanceType {
                 expected_size,
                 max_layer,
                 ef_construction,
-                DistCosine {},
+                CosineDist {},
             )),
             "l2" => DistanceType::L2(Hnsw::new(
                 m,
                 expected_size,
                 max_layer,
                 ef_construction,
-                DistL2 {},
+                L2Dist {},
             )),
             "l1" => DistanceType::L1(Hnsw::new(
                 m,
                 expected_size,
                 max_layer,
                 ef_construction,
-                DistL1 {},
+                L1Dist {},
             )),
             _ => {
                 // ✅ ENTERPRISE: Replace panic with graceful error
@@ -366,7 +367,7 @@ impl DistanceType {
                     expected_size,
                     max_layer,
                     ef_construction,
-                    DistCosine {},
+                    CosineDist {},
                 ))
             }
         }
@@ -4855,8 +4856,14 @@ impl HNSWIndex {
 #[cfg(test)]
 mod tests {
     use super::{raw_distance_fn, rescore_candidate, take_best, DistPQ, RerankPlan, SearchParams};
+    use crate::distance::{CosineDist, L1Dist, L2Dist};
     use crate::pq::PQ;
-    use hnsw_rs::prelude::{DistCosine, DistL1, DistL2, Distance, Hnsw};
+    // `DistCosine` is the `anndists` implementation these distances replaced.
+    // The two graph guard tests keep it on purpose. They guard patches in the
+    // vendored crate rather than anything about the distance, their data is
+    // deliberately unnormalised, and holding the distance fixed keeps the
+    // orphan counts their comments record comparable across relays.
+    use hnsw_rs::prelude::{DistCosine, Distance, Hnsw};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::collections::{HashMap, HashSet};
@@ -4928,16 +4935,16 @@ mod tests {
 
         assert_eq!(
             raw_distance_fn("cosine")(&a, &b),
-            DistCosine {}.eval(&a, &b)
+            CosineDist {}.eval(&a, &b)
         );
-        assert_eq!(raw_distance_fn("l2")(&a, &b), DistL2 {}.eval(&a, &b));
-        assert_eq!(raw_distance_fn("l1")(&a, &b), DistL1 {}.eval(&a, &b));
+        assert_eq!(raw_distance_fn("l2")(&a, &b), L2Dist {}.eval(&a, &b));
+        assert_eq!(raw_distance_fn("l1")(&a, &b), L1Dist {}.eval(&a, &b));
 
         // An unrecognised space falls back the way `DistanceType::new_raw`
         // does, so the score still matches the graph that was built.
         assert_eq!(
             raw_distance_fn("nonsense")(&a, &b),
-            DistCosine {}.eval(&a, &b)
+            CosineDist {}.eval(&a, &b)
         );
     }
 
@@ -5023,13 +5030,13 @@ mod tests {
 
         // The raw vector wins where there is one, so the score is exact.
         let exact = rescore_candidate(&p, &query, "kept", &vectors, Some(&pq), &pq_codes);
-        assert_eq!(exact, Some(DistCosine {}.eval(&query, &stored)));
+        assert_eq!(exact, Some(CosineDist {}.eval(&query, &stored)));
 
         // Codes alone still score, against the reconstruction.
         let approximate =
             rescore_candidate(&p, &query, "coded", &vectors, Some(&pq), &pq_codes).unwrap();
         let reconstructed = pq.reconstruct(&codes).unwrap();
-        assert_eq!(approximate, DistCosine {}.eval(&query, &reconstructed));
+        assert_eq!(approximate, CosineDist {}.eval(&query, &reconstructed));
 
         // Neither is unscoreable rather than silently zero, which is what keeps
         // an unscored candidate from displacing a scored one.

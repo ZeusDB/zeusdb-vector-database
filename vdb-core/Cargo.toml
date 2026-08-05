@@ -19,7 +19,10 @@ rayon = "1.10"
 rand = "0.9.1"
 bincode = "2.0.1"
 chrono = { version = "0.4.41", features = ["serde"] } # <-- For timestamps
-anndists = "0.1"
+# anndists is not declared here. The distances live in src/distance.rs, and the
+# `Distance` trait they implement arrives through the hnsw_rs prelude, which
+# re-exports anndists wholesale. Declaring it again bought nothing and made the
+# dependency graph read as though vdb-core called it directly.
 
 # Modern structured logging
 tracing = "0.1"

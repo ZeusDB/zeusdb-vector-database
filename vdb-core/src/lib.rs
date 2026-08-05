@@ -1,4 +1,5 @@
 // lib.rs
+mod distance;
 mod hnsw_index;
 mod logging;
 mod persistence;
