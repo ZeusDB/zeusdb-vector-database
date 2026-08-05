@@ -51,16 +51,22 @@ def test_persistence_quantized_index(tmp_path):
 
     add_res = index.add({"vectors": vectors.tolist(), "ids": ids})
     assert add_res.is_success()
-    # More resilient: accept either quantized or ready for quantization
-    assert index.is_quantized() or index.can_use_quantization()
+    # Both hold once training has run: the quantizer is trained and the graph
+    # has been rebuilt onto the codes. This was a disjunction, which pinned
+    # neither state.
+    assert index.can_use_quantization()
+    assert index.is_quantized()
 
     save_dir = tmp_path / "pq_index.zdb"
     index.save(str(save_dir))
     assert save_dir.exists() and save_dir.is_dir()
 
     loaded = vdb.load(str(save_dir))
-    # Accept either quantization is active or can be used
-    assert loaded.is_quantized() or loaded.can_use_quantization()
+    # A quantized index loads back quantized rather than in a state that merely
+    # could be. Same disjunction, same reason for collapsing it.
+    assert loaded.can_use_quantization()
+    assert loaded.is_quantized()
+    assert loaded.get_storage_mode() == "quantized_active"
 
     # Basic smoke search on the loaded index
     results = loaded.search(vectors[0].tolist(), top_k=5)
@@ -644,10 +650,15 @@ def test_persistence_quantized_only_round_trip(quantized_only_saved):
     assert {r["id"] for r in records} == set(ids)
     assert all("vector" in r for r in records)
 
-    # The split between raw and coded storage is exactly what was saved.
+    # The split between raw and coded storage is exactly what was saved. Only
+    # get_stats reports the split. list() enumerates the id map, so it returns
+    # every record regardless of which store holds its vector, and a reloaded
+    # index is no different from a live one here.
     assert int(loaded.get_stats()["raw_vectors_stored"]) == QO_TRAINING_SIZE
     assert int(loaded.get_stats()["quantized_codes_stored"]) == QO_COUNT
-    assert len(loaded.list(number=QO_COUNT + 10)) == QO_TRAINING_SIZE
+    assert len(loaded.list(number=QO_COUNT + 10)) == QO_COUNT
+    assert {rid for rid, _ in loaded.list(number=QO_COUNT + 10)} == set(ids)
+    assert all(loaded.contains(record_id) for record_id in ids)
 
     # Per record metadata comes back for the reconstructed records too, which
     # is where it used to be dropped.

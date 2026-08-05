@@ -52,6 +52,57 @@ idx.add({'vectors': vals})
     assert "level" in entry and "fields" in entry and "timestamp" in entry
 
 # ------------------------------------------------------------
+# Outgrowing expected_size warns once
+# ------------------------------------------------------------
+def test_expected_size_overgrowth_warns_exactly_once(tmp_path):
+    """An index that outgrows its declaration says so, once.
+
+    expected_size is a capacity hint and exceeding it is legal, so this is a
+    warning and not an error. What it costs is m, which the factory derives from
+    expected_size and which is fixed at construction, and nothing else told a
+    caller their index had outgrown the value they declared. Three separate
+    add() calls cross and stay past the threshold, and exactly one line is
+    emitted.
+    """
+    log_file = tmp_path / "overgrowth.log"
+
+    code = r"""
+import numpy as np
+import zeusdb_vector_database as zdb
+idx = zdb.VectorDatabase().create('hnsw', dim=8, expected_size=10)
+rng = np.random.default_rng(4242)
+for _ in range(3):
+    idx.add({'vectors': rng.random((40, 8)).astype('float32').tolist()})
+assert idx.get_vector_count() == 120
+"""
+
+    env = os.environ.copy()
+    env.update({
+        "ZEUSDB_LOG_LEVEL": "info",
+        "ZEUSDB_LOG_FORMAT": "json",
+        "ZEUSDB_LOG_TARGET": "file",
+        "ZEUSDB_LOG_FILE": str(log_file),
+    })
+
+    subprocess.run(
+        [sys.executable, "-c", code],
+        env=env, check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    assert log_file.exists()
+    text = log_file.read_text(encoding="utf-8", errors="ignore")
+    lines = [ln for ln in text.splitlines() if "expected_size_exceeded" in ln]
+    assert len(lines) == 1, f"expected one warning, got {len(lines)}"
+    entry = json.loads(lines[0])
+    assert entry["level"] == "WARN"
+    # Reported on the add() that crossed the threshold, which is the first of
+    # the three, not on the final count.
+    assert entry["fields"]["live_records"] == 40
+    assert entry["fields"]["expected_size"] == 10
+
+
+# ------------------------------------------------------------
 # Test 47: Logging: autolog disabled prevents file init
 # ------------------------------------------------------------
 def test_logging_disabled_autoinit(tmp_path):
@@ -87,9 +138,13 @@ idx.add({'vectors': vals})
     )
     assert completed.returncode == 0
 
-    # With autolog disabled, the file subscriber should not be initialized.
-    # Accept either "file not created" or "created but empty" as success.
-    assert (not log_file.exists()) or log_file.stat().st_size == 0
+    # With autolog disabled, neither layer configures a file writer, so nothing
+    # is written at all. This used to accept "not created" or "created but
+    # empty", because the Python layer read ZEUSDB_DISABLE_AUTO_LOGGING while
+    # only the Rust layer read the ZEUSDB_DISABLE_AUTOLOG this test sets. Both
+    # layers now honour both names, so the weaker form no longer buys anything.
+    assert not log_file.exists()
+    assert list(tmp_path.iterdir()) == []
 
 # ------------------------------------------------------------
 # The environment matrix from benchmark 41

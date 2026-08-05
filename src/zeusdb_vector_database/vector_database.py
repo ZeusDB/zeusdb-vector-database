@@ -91,15 +91,19 @@ class VectorDatabase:
 
             For "hnsw", supported parameters are:
                 - dim (int): Vector dimension (default: 1536)
-                - space (str): Distance metric — supports 'cosine', 'l2', or 'l1' (default: 'cosine')
-                - m (int): Bidirectional links per node (min: 1, max: 256). Defaults
+                - space (str): Distance metric, one of 'cosine', 'l2', or 'l1' (default: 'cosine')
+                - m (int): Bidirectional links per node (min: 2, max: 256). Defaults
                   to 16 up to an expected_size of 25,000 and 32 above it. A graph
                   too sparse for the record count loses recall that no search
                   width recovers, and m is fixed at construction, so set
-                  expected_size honestly or set m directly.
+                  expected_size honestly or set m directly. The floor is 2
+                  because at 1 the layer scale is infinite and the graph is
+                  degenerate.
                 - ef_construction (int): Construction candidate list size (default: 200)
-                - expected_size (int): Expected number of vectors (default: 10000).
-                  Also selects the default m, see above.
+                - expected_size (int): Expected number of vectors (default: 10000,
+                  max: 100,000,000). Also selects the default m, see above. It is
+                  a capacity hint rather than a limit, and an index that grows
+                  past twice its declaration logs a warning once.
 
             Quantization config format:
                 {

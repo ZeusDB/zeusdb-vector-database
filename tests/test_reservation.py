@@ -102,6 +102,35 @@ def test_declared_size_that_previously_aborted_the_process():
 
 
 # ------------------------------------------------------------
+# Test 2b: The declared size has an upper bound
+# ------------------------------------------------------------
+def test_declared_size_above_the_bound_raises_rather_than_aborting():
+    """Above the bound the caller gets a ValueError, not a dead process.
+
+    The reservation is one Arc slot per declared record and it is not fallible.
+    Vec::with_capacity aborts on allocation failure rather than unwinding, so a
+    declaration too large for the machine cannot be caught after the fact. A
+    declared 20,000,000,000 asks for 155 GB in the layer zero reservation alone
+    and the process exits with no traceback. The bound converts that into an
+    error, and the message carries the size the declaration would have asked
+    for.
+    """
+    vdb = VectorDatabase()
+    bound = 100_000_000
+
+    with pytest.raises((ValueError, RuntimeError)) as excinfo:
+        vdb.create(index_type="hnsw", dim=8, expected_size=bound + 1)
+    message = str(excinfo.value)
+    assert "expected_size must be at most 100000000" in message
+    assert "0.8 GB" in message
+
+    with pytest.raises((ValueError, RuntimeError), match="expected_size must be positive"):
+        vdb.create(index_type="hnsw", dim=8, expected_size=0)
+
+    # The bound itself is accepted, which Test 2 above already exercises.
+
+
+# ------------------------------------------------------------
 # Test 3: An index that outgrows its declared size
 # ------------------------------------------------------------
 def test_index_exceeding_its_declared_size_still_works():

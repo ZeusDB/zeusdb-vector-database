@@ -122,9 +122,11 @@ def test_pq_training_trigger_and_progress():
     result = index.add(partial_batch)
     assert result.is_success()
     
-    # Should be 50% progress
+    # Exactly 50% progress. This is a collected count over a configured target,
+    # 500 over 1000, so nothing about it is approximate and the tolerance of 5.0
+    # it carried was hiding that.
     progress = index.get_training_progress()
-    assert abs(progress - 50.0) < 5.0  # Allow some tolerance
+    assert progress == 50.0
     assert index.training_vectors_needed() == 500
     assert not index.is_training_ready()
     
@@ -357,9 +359,11 @@ def test_pq_different_configurations():
 
     for name, index in indexes.items():
         results = index.search(query_vector, top_k=5)
-        # Approximate search may return fewer than top_k results, so an
-        # assertion on an exact result count is invalid here.
-        assert 0 < len(results) <= 5
+        # 1,000 records and top_k of 5, so the traversal has no shortage of
+        # candidates and returns a full page. The count is a golden value tied to
+        # the seed above and to the current graph construction, which is what
+        # makes it worth asserting exactly.
+        assert len(results) == 5
 
         # All configurations should return valid results
         for result in results:
@@ -720,21 +724,33 @@ def test_storage_mode_configuration():
     assert len(records1) == 1 and len(records2) == 1
     assert "vector" in records1[0] and "vector" in records2[0]
     assert len(records1[0]["vector"]) == len(records2[0]["vector"]) == 256
-    
-    # quantized_with_raw should have exact vector, quantized_only should have reconstructed
-    # (We can't easily test for exactness due to floating point precision, but both should work)
-    
+
+    # doc_1100 was added after training, so quantized_with_raw kept its raw
+    # vector and quantized_only kept only its code. The first reads back exactly,
+    # to float32 precision against the unit vector cosine normalization produced
+    # on insert. The second reads back a reconstruction, which is close but not
+    # equal. This used to be a comment saying exactness could not easily be
+    # tested.
+    supplied = np.asarray(training_data[1100]["vector"], dtype=np.float64)
+    supplied /= np.linalg.norm(supplied)
+    from_raw = np.asarray(records2[0]["vector"], dtype=np.float64)
+    from_code = np.asarray(records1[0]["vector"], dtype=np.float64)
+    assert np.allclose(from_raw, supplied, atol=1e-6)
+    assert not np.allclose(from_code, supplied, atol=1e-6)
+    assert float(from_code @ supplied / np.linalg.norm(from_code)) > 0.5
+
+
     # Test search functionality works identically
     query_vector = rng.random(256).astype(np.float32).tolist()
 
     search1 = index_only.search(query_vector, top_k=5)
     search2 = index_with_raw.search(query_vector, top_k=5)
 
-    # Approximate search may return fewer than top_k results, so an assertion on
-    # an exact result count is invalid here, and the two storage modes search
-    # different representations so their counts need not agree either.
+    # 1,200 records and top_k of 5, so both modes return a full page. The counts
+    # are golden values tied to the seed above and to the current graph
+    # construction.
     for hits in (search1, search2):
-        assert 0 < len(hits) <= 5
+        assert len(hits) == 5
         assert all(r["id"].startswith("doc_") for r in hits)
         scores = [r["score"] for r in hits]
         assert all(np.isfinite(s) for s in scores)
@@ -744,10 +760,13 @@ def test_storage_mode_configuration():
     filtered1 = index_only.search(query_vector, filter={"category": "A"}, top_k=3)
     filtered2 = index_with_raw.search(query_vector, filter={"category": "A"}, top_k=3)
 
-    # The filter is applied to the candidates the graph returned rather than
-    # driving the traversal, so a filtered search can legitimately return
-    # nothing and any assertion on the result count is invalid here. What holds
-    # is that every result matches the filter.
+    # Left as an upper bound deliberately. The filter is applied to the
+    # candidates the graph returned rather than driving the traversal, so a
+    # filtered search can legitimately return nothing. The two modes measured 1
+    # and 3 here on the same data and the same query, which is the evidence that
+    # the count is a property of the traversal rather than of the data, so an
+    # exact assertion would be wrong in principle even though it passes today.
+    # What holds is that every result matches the filter.
     assert len(filtered1) <= 3 and len(filtered2) <= 3
     for result in filtered1 + filtered2:
         assert result["metadata"]["category"] == "A"
@@ -1013,13 +1032,15 @@ def test_pq_overwrite_after_training_quantized_only():
     assert int(after["quantized_codes_stored"]) == PQ_TOTAL + 1
     assert after["storage_mode"] == "quantized_only"
 
-    # Current behaviour, asserted rather than expected. contains and list both
-    # read the raw vector map, so under quantized_only they are blind to any
-    # record added after training even though get_records reconstructs it from
-    # its code. The expectation this violates is that the three agree on which
-    # ids the index holds.
-    assert not index.contains("target")
-    assert len(index.list(number=PQ_TOTAL + 100)) == PQ_TRAINING_SIZE
+    # contains, list and get_records agree on which ids the index holds, and
+    # they agree with get_vector_count. All three read the id map now. contains
+    # and list used to read the raw vector map, so under quantized_only they
+    # were blind to a record added after training while get_records
+    # reconstructed it from its code.
+    assert index.contains("target")
+    assert len(index.list(number=PQ_TOTAL + 100)) == PQ_TOTAL + 1
+    assert "target" in {rid for rid, _ in index.list(number=PQ_TOTAL + 100)}
+    assert index.info().split("vectors=")[1].split(",")[0] == str(PQ_TOTAL + 1)
 
     # Whatever quantized search returns, it returns each id at most once.
     assert _duplicate_ids(index.search(replacement, top_k=25)) == []
