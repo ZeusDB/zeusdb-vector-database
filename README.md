@@ -29,7 +29,7 @@
 
 ## ℹ️ What is ZeusDB Vector Database?
 
-ZeusDB Vector Database is a high-performance, Rust-powered vector database designed for blazing-fast similarity search across high-dimensional data. It enables efficient approximate nearest neighbor (ANN) search, ideal for use cases like document retrieval, semantic search, recommendation systems, and AI-powered assistants. 
+ZeusDB Vector Database is a high-performance, Rust-powered vector database designed for fast similarity search across high-dimensional data. It enables efficient approximate nearest neighbor (ANN) search, ideal for use cases like document retrieval, semantic search, recommendation systems, and AI-powered assistants.
 
 ZeusDB leverages the HNSW (Hierarchical Navigable Small World) algorithm for speed and accuracy, with native Python bindings for easy integration into data science and machine learning workflows. Whether you're indexing millions of vectors or running low-latency queries in production, ZeusDB offers a lightweight, extensible foundation for scalable vector search.
 
@@ -43,24 +43,13 @@ ZeusDB leverages the HNSW (Hierarchical Navigable Small World) algorithm for spe
 
 🔍 Approximate Nearest Neighbor (ANN) search using HNSW for fast, accurate results
 
-📦 Product Quantization (PQ) for compact storage, faster distance computations, and scalability for Big Data
+📦 Product Quantization (PQ) for compact storage and faster distance computations
 
-📥 Flexible input formats, including native Python types and zero-copy NumPy arrays
+📥 Flexible input formats, including native Python types and NumPy arrays
 
 🗂️ Metadata-aware filtering for precise and contextual querying
 
-
-
-
-<!-- 
-📋 Supports multiple distance metrics: `cosine`, `L1`, `L2` 
-
-📥 Supports multiple input formats using a single, easy-to-use Python method
-
-⚡ Smart multi-threaded inserts that automatically speed up large batch uploads
-
-🚀 Fast, concurrent searches so you can run multiple queries at the same time
--->
+💾 Save and load complete indexes to disk
 
 <br/>
 
@@ -70,21 +59,22 @@ ZeusDB Vector Database supports the following metrics for vector similarity sear
 
 | Metric | Description                          | Accepted Values (case-insensitive)  |
 |--------|--------------------------------------|--------|
-| cosine | Cosine Distance (1 - Cosine Similiarity) | "cosine", "COSINE", "Cosine" |
+| cosine | Cosine Distance (1 - Cosine Similarity) | "cosine", "COSINE", "Cosine" |
 | l1     | Manhattan distance                   | "l1", "L1" |
 | l2     | Euclidean distance                 | "l2", "L2" |
 
-
-### 📏 Scores vs Distances 
+### 📏 Scores vs Distances
 
 All distance metrics in ZeusDB Vector Database return distance values, not similarity scores:
 
  - Lower values = more similar
- - A score of 0.0 means a perfect match
+ - A vector identical to the query scores 0.0, or a value within floating point error of it
 
 This applies to all distance types, including cosine.
 
+Under `cosine`, vectors are normalized to unit length when they are stored. A vector you read back with `return_vector=True` or `get_records()` is therefore the normalized form, not the values you supplied. Under `l1` and `l2` the values are stored unchanged.
 
+A zero vector has no direction, so under `cosine` it sits at distance 1.0 from everything, including itself.
 
 <br/>
 
@@ -102,10 +92,9 @@ uv pip install zeusdb-vector-database
 pip install zeusdb-vector-database
 ```
 
-
 <br/>
 
-## 🔥 Quick Start Example 
+## 🔥 Quick Start Example
 
 ```python
 # Import the vector database module
@@ -128,35 +117,25 @@ records = [
 
 # Upload records using the `add()` method
 add_result = index.add(records)
-print("\n--- Add Results Summary ---")
-print(add_result.summary())
+print("Inserted:", add_result.total_inserted, "Errors:", add_result.total_errors)
 
 # Perform a similarity search and print the top 2 results
-# Query Vector
 query_vector = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
 
-# Query with no filter (all documents)
 results = index.search(vector=query_vector, filter=None, top_k=2)
-print("\n--- Query Results Output - Raw ---")
-print(results)
 
-print("\n--- Query Results Output - Formatted ---")
 for i, res in enumerate(results, 1):
-    print(f"{i}. ID: {res['id']}, Score: {res['score']:.4f}, Metadata: {res['metadata']}")
+    print(f"{i}. ID: {res['id']}, Score: {res['score']:.6f}, Metadata: {res['metadata']}")
 ```
 
 *Results Output:*
 ```
---- Add Results Summary ---
-✅ 5 inserted, ❌ 0 errors
-
---- Raw Results Format ---
-[{'id': 'doc_001', 'score': 0.0, 'metadata': {'author': 'Alice'}}, {'id': 'doc_003', 'score': 0.0009883458260446787, 'metadata': {'author': 'Alice'}}]
-
---- Formatted Results ---
-1. ID: doc_001, Score: 0.0000, Metadata: {'author': 'Alice'}
-2. ID: doc_003, Score: 0.0010, Metadata: {'author': 'Alice'}
+Inserted: 5 Errors: 0
+1. ID: doc_001, Score: 0.000000, Metadata: {'author': 'Alice'}
+2. ID: doc_003, Score: 0.000988, Metadata: {'author': 'Alice'}
 ```
+
+`add_result.summary()` returns the same counts as a string containing emoji. On a Windows console still using the legacy code page it raises `UnicodeEncodeError`, so the counts are printed directly above. Set `PYTHONIOENCODING=utf-8` if you want to print the summary string.
 
 <br/>
 
@@ -170,7 +149,7 @@ ZeusDB Vector Database makes it easy to work with high-dimensional vector data u
 2. **Add data** using `.add(...)`
 3. **Conduct a similarity search** using `.search(...)`
 
-Each step is covered below. 
+Each step is covered below.
 
 <br/>
 
@@ -187,13 +166,19 @@ vdb = VectorDatabase()
 
 # Initialize and set up the database resources
 index = vdb.create(
-  index_type = "hnsw",
-  dim = 8, 
-  space = "cosine", 
-  m = 16, 
-  ef_construction = 200, 
-  expected_size = 5
-  )
+    index_type="hnsw",
+    dim=8,
+    space="cosine",
+    m=16,
+    ef_construction=200,
+    expected_size=5,
+)
+print(index.info())
+```
+
+*Output*
+```
+HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=5, vectors=0, quantization=none)
 ```
 
 <br/>
@@ -202,59 +187,91 @@ index = vdb.create(
 
 | Parameter        | Type   | Default   | Description                                                                 |
 |------------------|--------|-----------|-----------------------------------------------------------------------------|
-| `index_type`     | `str`  | `"hnsw"`  | The type of vector index to create. Currently supports `"hnsw"`. Future options include `"ivf"`, `"flat"`, etc. Case-insensitive. |
-| `dim`            | `int`  | `1536`    | Dimensionality of the vectors to be indexed. Each vector must have this length. The default dim=1536 is chosen to match the output dimensionality of OpenAI’s text-embedding-ada-002 model. |
-| `space`          | `str`  | `"cosine"`| Distance metric used for similarity search. Options include `"cosine"`, `"L1"` and `"L2"`.|
-| `m`              | `int`  | `16`      | Number of bi-directional connections created for each new node. Higher `m` improves recall but increases index size and build time. |
-| `ef_construction`| `int`  | `200`     | Size of the dynamic list used during index construction. Larger values increase indexing time and memory, but improve quality. |
-| `expected_size`  | `int`  | `10000`   | Estimated number of elements to be inserted. Used for preallocating internal data structures. Not a hard limit. |
-| `quantization_config` | `dict` | `None` | Product Quantization configuration for memory-efficient vector compression. |
+| `index_type`     | `str`  | `"hnsw"`  | The type of vector index to create. Currently only `"hnsw"` is supported. Case-insensitive. |
+| `dim`            | `int`  | `1536`    | Dimensionality of the vectors to be indexed. Each vector must have this length. Must be positive. The default of 1536 matches the output dimensionality of OpenAI's `text-embedding-3-small` and `text-embedding-ada-002` models. |
+| `space`          | `str`  | `"cosine"`| Distance metric used for similarity search. One of `"cosine"`, `"l1"`, `"l2"`. Case-insensitive. |
+| `m`              | `int`  | `16` or `32`, see below | Number of bi-directional connections created for each new node, from 1 to 256. Higher `m` improves recall but increases index size and build time. |
+| `ef_construction`| `int`  | `200`     | Size of the dynamic list used during index construction. Must be positive. Larger values increase indexing time and memory, but improve quality. |
+| `expected_size`  | `int`  | `10000`   | Estimated number of records to be inserted. Must be positive. Used for preallocating internal data structures and for choosing the default `m`. Not a hard limit. |
+| `quantization_config` | `dict` | `None` | Product Quantization configuration for memory-efficient vector compression. See [Product Quantization](#️-product-quantization). |
+
+**The default `m` depends on `expected_size`.** It is 16 for an `expected_size` of 25,000 or less, and 32 above that. A graph too sparse for the number of records loses recall that no search width recovers, and `m` is fixed once the index is created, so declare `expected_size` honestly or set `m` yourself. Passing `m` explicitly always wins.
+
+```python
+vdb.create("hnsw", dim=8, expected_size=25_000).get_stats()["m"]   # '16'
+vdb.create("hnsw", dim=8, expected_size=25_001).get_stats()["m"]   # '32'
+```
 
 <br/>
-
 
 ### 2️⃣ Add Data to the Index
 
 ZeusDB provides a flexible `.add(...)` method that supports multiple input formats for inserting or updating vectors in the index. Whether you're adding a single record, a list of documents, or structured arrays, the API is designed to be both intuitive and robust. Each record can include optional metadata for filtering or downstream use.
 
-All formats return an AddResult containing total_inserted, total_errors, and detailed error messages for any invalid entries.
+All formats return an `AddResult` containing `total_inserted`, `total_errors`, `errors` and `vector_shape`.
 
 #### ✅ Format 1 – Single Object
 
 ```python
+index = vdb.create("hnsw", dim=2)
+
 add_result = index.add({
     "id": "doc1",
     "values": [0.1, 0.2],
     "metadata": {"text": "hello"}
 })
 
-print(add_result.summary())     # ✅ 1 inserted, ❌ 0 errors
-print(add_result.is_success())  # True
+print(add_result.total_inserted, add_result.total_errors)
+print(add_result.is_success())
+```
+
+*Output*
+```
+1 0
+True
 ```
 
 #### ✅ Format 2 – List of Objects
 
 ```python
+index = vdb.create("hnsw", dim=2)
+
 add_result = index.add([
     {"id": "doc1", "values": [0.1, 0.2], "metadata": {"text": "hello"}},
-    {"id": "doc2", "values": [0.3, 0.4], "metadata": {"text": "world"}}
+    {"id": "doc2", "values": [0.3, 0.4], "metadata": {"text": "world"}},
 ])
 
-print(add_result.summary())       # ✅ 2 inserted, ❌ 0 errors
-print(add_result.vector_shape)    # (2, 2)
-print(add_result.errors)          # []
+print(add_result.total_inserted, add_result.total_errors)
+print(add_result.vector_shape)
+print(add_result.errors)
+```
+
+*Output*
+```
+2 0
+(2, 2)
+[]
 ```
 
 #### ✅ Format 3 – Separate Arrays
 
 ```python
+index = vdb.create("hnsw", dim=2)
+
 add_result = index.add({
     "ids": ["doc1", "doc2"],
     "embeddings": [[0.1, 0.2], [0.3, 0.4]],
-    "metadatas": [{"text": "hello"}, {"text": "world"}]
+    "metadatas": [{"text": "hello"}, {"text": "world"}],
 })
-print(add_result)  # AddResult(inserted=2, errors=0, shape=(2, 2))
+print(add_result)
 ```
+
+*Output*
+```
+AddResult(inserted=2, errors=0, shape=Some((2, 2)))
+```
+
+The `Some(...)` wrapper appears only in the printed form. `add_result.vector_shape` is the plain tuple `(2, 2)`.
 
 #### ✅ Format 4 – Using NumPy Arrays
 
@@ -263,6 +280,8 @@ ZeusDB also supports NumPy arrays as input for seamless integration with scienti
 ```python
 import numpy as np
 
+index = vdb.create("hnsw", dim=4)
+
 data = [
     {"id": "doc2", "values": np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32), "metadata": {"type": "blog"}},
     {"id": "doc3", "values": np.array([0.5, 0.6, 0.7, 0.8], dtype=np.float32), "metadata": {"type": "news"}},
@@ -270,297 +289,405 @@ data = [
 
 result = index.add(data)
 
-print(result.summary())   # ✅ 2 inserted, ❌ 0 errors
+print(result.total_inserted, result.total_errors)
+```
+
+*Output*
+```
+2 0
 ```
 
 #### ✅ Format 5 – Separate Arrays with NumPy
 
-This format is highly performant and leverages NumPy's internal memory layout for efficient transfer of data.
-
 ```python
+index = vdb.create("hnsw", dim=2)
+
 add_result = index.add({
     "ids": ["doc1", "doc2"],
     "embeddings": np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
-    "metadatas": [{"text": "hello"}, {"text": "world"}]
+    "metadatas": [{"text": "hello"}, {"text": "world"}],
 })
-print(add_result)  # AddResult(inserted=2, errors=0, shape=(2, 2))
+print(add_result)
 ```
 
-Each format is parsed and validated automatically. Invalid records are skipped, and detailed error messages are returned to help with debugging and retry workflows.
+*Output*
+```
+AddResult(inserted=2, errors=0, shape=Some((2, 2)))
+```
+
+Each format is parsed and validated automatically. Invalid records are skipped rather than aborting the call, and the reason for each is returned in `errors`. A record whose vector contains `NaN` or an infinity is rejected this way.
+
+<br/>
+
+#### ⚠️ Adding an ID that already exists
+
+`add()` upserts by default. Re-adding an existing ID **replaces the whole record**, metadata included. Metadata is not merged, so a key you leave out of the new record is gone.
+
+```python
+index = vdb.create("hnsw", dim=2)
+index.add({"id": "doc1", "values": [0.1, 0.2], "metadata": {"text": "hello", "lang": "en"}})
+
+# "lang" is not carried over
+index.add({"id": "doc1", "values": [0.3, 0.4], "metadata": {"text": "goodbye"}})
+print(index.get_records("doc1", return_vector=False))
+
+# overwrite=False rejects the record instead, and counts it as an error
+rejected = index.add({"id": "doc1", "values": [0.5, 0.6]}, overwrite=False)
+print(rejected.total_inserted, rejected.total_errors)
+print(rejected.errors)
+```
+
+*Output*
+```
+[{'id': 'doc1', 'metadata': {'text': 'goodbye'}}]
+0 1
+["Vector doc1: ValueError: Vector with ID 'doc1' already exists"]
+```
+
+A rejected record is reported in the `AddResult`. It does not raise. The rejection is also logged at WARNING level, which is visible on stderr under the default development settings.
+
+Every overwrite leaves a node behind in the graph. See [`compact()`](#️-reclaim-space-left-by-removals-and-overwrites).
 
 <br/>
 
 #### 📘 Parameters - `add()`
 
-The `add()` method inserts one or more vectors into the index. Multiple data formats are supported to accommodate different workflows, including native Python types and NumPy arrays.
+The `add()` method inserts or replaces one or more vectors in the index.
 
 | Parameter | Type                                | Default | Description |
 |-----------|-------------------------------------|---------|-------------|
-| `data`    | `dict`, `list[dict]`, or `dict of arrays` | *required* | Input records to upsert into the index. Supports multiple formats |
+| `data`    | `dict`, `list[dict]`, `dict` of arrays, or `np.ndarray` | *required* | Input records to upsert into the index. Supports the five formats above. |
+| `overwrite` | `bool`                            | `True`  | Whether an ID already in the index is replaced. With `False`, a colliding record is skipped and counted as an error. |
 
-**Returns:**  
-`AddResult` includes: – 
-- `total_success`: number of vectors successfully inserted or updated
+**Returns:**
+`AddResult` with:
+- `total_inserted`: number of records successfully inserted or replaced
 - `total_errors`: number of failed records
 - `errors`: list of error messages
-- `vector_shape`: the shape of the processed vector batch
-
-Helpful for validation, logging, and debugging.
+- `vector_shape`: the shape of the processed batch, as `(rows, dim)`
+- `is_success()`: `True` when `total_errors` is zero
+- `summary()`: a one-line string of the two counts
 
 <br/>
 
 ### 3️⃣ Conduct a Similarity Search
 
-Query the index using a new vector and retrieve the top-k nearest neighbors. You can also filter by metadata or return the original stored vectors.
+Query the index using a new vector and retrieve the top-k nearest neighbors. You can also filter by metadata or return the stored vectors.
+
+The examples below all run against this index:
+
+```python
+index = vdb.create(index_type="hnsw", dim=8)
+index.add([
+    {"id": "doc_001", "values": [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7], "metadata": {"author": "Alice"}},
+    {"id": "doc_002", "values": [0.9, 0.1, 0.4, 0.2, 0.8, 0.5, 0.3, 0.9], "metadata": {"author": "Bob"}},
+    {"id": "doc_003", "values": [0.11, 0.21, 0.31, 0.15, 0.41, 0.22, 0.61, 0.72], "metadata": {"author": "Alice"}},
+    {"id": "doc_004", "values": [0.85, 0.15, 0.42, 0.27, 0.83, 0.52, 0.33, 0.95], "metadata": {"author": "Bob"}},
+    {"id": "doc_005", "values": [0.12, 0.22, 0.33, 0.13, 0.45, 0.23, 0.65, 0.71], "metadata": {"author": "Alice"}},
+])
+query_vector = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
+```
 
 #### 🔍 Search Example 1 - Basic (Returning Top 2 most similar)
 
 ```python
 results = index.search(vector=query_vector, top_k=2)
-print(results)
+for res in results:
+    print(res["id"], round(res["score"], 6), res["metadata"])
 ```
 
 *Output*
 ```
-[
-  {'id': 'doc_37', 'score': 0.016932480037212372, 'metadata': {'index': '37', 'split': 'test'}}, 
-  {'id': 'doc_33', 'score': 0.019877362996339798, 'metadata': {'split': 'test', 'index': '33'}}
-]
+doc_001 0.0 {'author': 'Alice'}
+doc_003 0.000988 {'author': 'Alice'}
 ```
 
 #### 🔍 Search Example 2 - Query with metadata filter
 
-This filters on the given metadata after conducting the similarity search.
-
 ```python
-query_vector = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
 results = index.search(vector=query_vector, filter={"author": "Alice"}, top_k=5)
-print(results)
+for res in results:
+    print(res["id"], round(res["score"], 6), res["metadata"])
 ```
 
 *Output*
 ```
-[
-  {'id': 'doc_001', 'score': 0.0, 'metadata': {'author': 'Alice'}}, 
-  {'id': 'doc_003', 'score': 0.0009883458260446787, 'metadata': {'author': 'Alice'}}, 
-  {'id': 'doc_005', 'score': 0.0011433829786255956, 'metadata': {'author': 'Alice'}}
-]
+doc_001 0.0 {'author': 'Alice'}
+doc_003 0.000988 {'author': 'Alice'}
+doc_005 0.001143 {'author': 'Alice'}
 ```
+
+**The filter is applied after the graph search, not during it.** The index finds the `top_k` nearest vectors first and then discards the ones the filter rejects, so a selective filter can return fewer than `top_k` results, or none at all. Raise `top_k` when you filter. See [Metadata Filtering](#️-metadata-filtering) for a worked example.
 
 #### 🔍 Search Example 3 - Search results include vectors
 
-You can optionally return the stored embedding vectors alongside metadata and similarity scores by setting `return_vector=True`. This is useful when you need access to the raw vectors for downstream tasks such as re-ranking, inspection, or hybrid scoring.
+Set `return_vector=True` to get the stored embedding alongside the metadata and score. Under `cosine` this is the normalized vector, not the values you supplied.
 
 ```python
-results = index.search(vector=query_vector, filter={"split": "test"}, top_k=2, return_vector=True)
-print(results)
+results = index.search(vector=query_vector, top_k=1, return_vector=True)
+print(results[0]["id"], round(results[0]["score"], 6))
+print([round(v, 4) for v in results[0]["vector"]])
 ```
 
 *Output*
 ```
-[
-  {'id': 'doc_37', 'score': 0.016932480037212372, 'metadata': {'index': '37', 'split': 'test'}, 'vector': [0.36544516682624817, 0.11984539777040482, 0.7143614292144775, 0.8995016813278198]}, 
-  {'id': 'doc_33', 'score': 0.019877362996339798, 'metadata': {'split': 'test', 'index': '33'}, 'vector': [0.8367619514465332, 0.6394991874694824, 0.9291712641716003, 0.9777664542198181]}
-]
+doc_001 0.0
+[0.0913, 0.1826, 0.2739, 0.0913, 0.3651, 0.1826, 0.5477, 0.639]
 ```
 
 #### 🔍 Search Example 4 - Batch Search with a list of vectors
 
-Perform a similarity search on multiple query vectors simultaneously, returning results for each query.
+Perform a similarity search on multiple query vectors at once. The result is a list of result lists, one per query, in the order the queries were given.
 
 ```python
-query_vector =
-[
-    [0.1, 0.2, 0.3],
-    [0.4, 0.5, 0.6]
+batch = [
+    [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7],
+    [0.9, 0.1, 0.4, 0.2, 0.8, 0.5, 0.3, 0.9],
 ]
-results = index.search(vector=query_vector, top_k=3)
-print(results)
+results = index.search(vector=batch, top_k=2)
+for q, hits in enumerate(results):
+    print(f"query {q}:", [(h["id"], round(h["score"], 6)) for h in hits])
 ```
 
 *Output*
 ```
-[
-[{'id': 'a', 'score': 4.999447078546382e-09, 'metadata': {'category': 'A'}}, {'id': 'b', 'score': 0.02536815218627453, 'metadata': {'category': 'B'}}, {'id': 'c', 'score': 0.04058804363012314, 'metadata': {'category': 'A'}}],
-[{'id': 'b', 'score': 4.591760305316939e-09, 'metadata': {'category': 'B'}}, {'id': 'c', 'score': 0.0018091063247993588, 'metadata': {'category': 'A'}}, {'id': 'a', 'score': 0.025368161499500275, 'metadata': {'category': 'A'}}]
-]
+query 0: [('doc_001', 0.0), ('doc_003', 0.000988)]
+query 1: [('doc_002', 0.0), ('doc_004', 0.002238)]
 ```
 
 #### 🔍 Search Example 5 - Batch Search with NumPy Array
 
-Perform a similarity search on multiple query vectors from a NumPy array, returning results for each query.
-
 ```python
-query_vector = np.array(
-[
-    [0.1, 0.2, 0.3],
-    [0.7, 0.8, 0.9]
-], dtype=np.float32)
+query_batch = np.array(batch, dtype=np.float32)
 
-results = index.search(vector=query_vector, top_k=3)
-print(results)
+results = index.search(vector=query_batch, top_k=2)
+for q, hits in enumerate(results):
+    print(f"query {q}:", [h["id"] for h in hits])
+```
+
+*Output*
+```
+query 0: ['doc_001', 'doc_003']
+query 1: ['doc_002', 'doc_004']
 ```
 
 #### 🔍 Search Example 6 - Batch Search with metadata filter
 
-Performs similarity search on multiple query vectors with metadata filtering, returning filtered results for each query.
+The same filter is applied to every query in the batch. The second query below returns nothing, because both of its two nearest neighbours are Bob's.
 
 ```python
-results = index.search(
-    [[0.1, 0.2, 0.3], [0.7, 0.8, 0.9]],
-    filter={"category": "A"},
-    top_k=3
-)
-print(results)
+results = index.search(batch, filter={"author": "Alice"}, top_k=2)
+for q, hits in enumerate(results):
+    print(f"query {q}:", [h["id"] for h in hits])
 ```
 
+*Output*
+```
+query 0: ['doc_001', 'doc_003']
+query 1: []
+```
 
 <br/>
 
-#### 📘 Parameters - `search()` 
+#### 📘 Parameters - `search()`
 
-The `search()` method retrieves the top-k most similar vectors from the index given an input query vector. Results include the vector ID, similarity score, metadata, and (optionally) the stored vector itself.
+The `search()` method retrieves the top-k most similar vectors from the index given an input query vector. Results include the vector ID, distance score, metadata, and optionally the stored vector.
 
 | Parameter         | Type                            | Default   | Description                                                                 |
 |------------------|----------------------------------|-----------|-----------------------------------------------------------------------------|
-| `vector`         | `List[float]` or `List[List[float]]` or `np.ndarray`  | *required* | The query vector (single: `List[float]`) or batch of query vectors (`List[List[float]]` or 2D `np.ndarray`) to compare against the index. Must match the index dimension. |
-| `filter`         | `Dict[str, str] \| None`         | `None`    | Optional metadata filter. Only vectors with matching key-value metadata pairs will be considered in the search. |
+| `vector`         | `List[float]`, `List[List[float]]`, or `np.ndarray`  | *required* | The query vector (single: `List[float]` or 1D `np.ndarray`) or batch of query vectors (`List[List[float]]` or 2D `np.ndarray`). Must match the index dimension and contain only finite values. |
+| `filter`         | `Dict[str, Any] \| None`         | `None`    | Optional metadata filter. Values may be a plain value for equality or a dict of operators. See [Filter Operators](#-filter-operators-reference). |
 | `top_k`          | `int`                            | `10`      | Number of nearest neighbors to return. |
-| `ef_search`      | `int \| None`                    | `max(2 × top_k, 100)` | Search complexity parameter. Higher values improve accuracy at the cost of speed. |
-| `return_vector`  | `bool`                           | `False`   | If `True`, the result objects will include the original embedding vector. Useful for downstream processing like re-ranking or hybrid search. |
+| `ef_search`      | `int \| None`                    | see below | Search complexity parameter. Higher values improve accuracy at the cost of speed. |
+| `return_vector`  | `bool`                           | `False`   | If `True`, each result includes the stored embedding vector under a `vector` key. |
+| `rerank`         | `int \| None`                    | `20`      | Candidates fetched per requested result before rescoring against raw vectors. Only applies to a quantized index whose `storage_mode` is `quantized_with_raw`. See [Quantized search accuracy](#-quantized-search-accuracy). |
+
+**The default `ef_search` depends on the distance metric.** It is `max(2 × top_k, 100)` for `cosine` and `max(2 × top_k, 150)` for `l1` and `l2`.
+
+A query vector containing `NaN` or an infinity raises `ValueError` rather than returning meaningless distances.
 
 <br/>
 
 ### 🧰 Additional functionality
 
-ZeusDB Vector Database includes a suite of utility functions to help you inspect, manage, and maintain your index. You can view index configuration, attach custom metadata, list stored records, and remove vectors by ID. These tools make it easy to monitor and evolve your index over time,  whether you are experimenting locally or deploying in production.
+ZeusDB Vector Database includes a suite of utility functions to help you inspect, manage, and maintain your index. You can view index configuration, attach custom metadata, list stored records, and remove vectors by ID.
 
-#### ☑️ Check the details of your HNSW index 
+#### ☑️ Check the details of your HNSW index
 
 ```python
-print(index.info()) 
+print(index.info())
 ```
 *Output*
 ```
-HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=5, vectors=5)
+HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=10000, vectors=5, quantization=none)
 ```
+
+The `vectors=` field counts the raw vectors the index holds, which is the record count for an unquantized index. On a `quantized_only` index it is lower than the record count, because records added after training are held as codes alone. Use `get_vector_count()` for the record count in every case.
+
+Other single-value accessors: `index.dim`, `index.get_space()`, `index.get_vector_count()`, `index.has_quantization()`, `index.can_use_quantization()`, and `VectorDatabase.available_index_types()`.
 
 <br/>
 
-
 #### ☑️ Add index level metadata
+
+Index level metadata is a flat `str` to `str` map, separate from the per-record metadata used for filtering. It is preserved by `save()` and `load()`.
 
 ```python
 index.add_metadata({
-  "creator": "John Smith",
-  "version": "0.1",
-  "created_at": "2024-01-28T11:35:55Z",
-  "index_type": "HNSW",
-  "embedding_model": "openai/text-embedding-ada-002",
-  "dataset": "docs_corpus_v2",
-  "environment": "production",
-  "description": "Knowledge base index for customer support articles",
-  "num_documents": "15000",
-  "tags": "['support', 'docs', '2024']"
+    "creator": "John Smith",
+    "version": "0.1",
+    "created_at": "2024-01-28T11:35:55Z",
+    "embedding_model": "openai/text-embedding-ada-002",
+    "environment": "production",
 })
 
 # View index level metadata by key
-print(index.get_metadata("creator"))  
+print(index.get_metadata("creator"))
 
-# View all index level metadata 
-print(index.get_all_metadata())       
+# View all index level metadata
+for key, value in sorted(index.get_all_metadata().items()):
+    print(f"{key}: {value}")
 ```
 *Output*
 ```
 John Smith
-{'description': 'Knowledge base index for customer support articles', 'environment': 'production', 'embedding_model': 'openai/text-embedding-ada-002', 'creator': 'John Smith', 'tags': "['support', 'docs', '2024']", 'num_documents': '15000', 'version': '0.1', 'index_type': 'HNSW', 'dataset': 'docs_corpus_v2', 'created_at': '2024-01-28T11:35:55Z'}
+created_at: 2024-01-28T11:35:55Z
+creator: John Smith
+embedding_model: openai/text-embedding-ada-002
+environment: production
+version: 0.1
 ```
 
-<br/>
+`get_all_metadata()` returns a `dict` whose iteration order is not stable, which is why the example sorts it.
 
+<br/>
 
 #### ☑️ List records in the index
 
 ```python
-print("\n--- Index Shows first 5 records ---")
-print(index.list(number=5)) # Shows first 5 records
+for record_id, metadata in sorted(index.list(number=5)):
+    print(record_id, metadata)
 ```
 *Output*
 ```
-[('doc_004', {'author': 'Bob'}), ('doc_003', {'author': 'Alice'}), ('doc_005', {'author': 'Alice'}), ('doc_002', {'author': 'Bob'}), ('doc_001', {'author': 'Alice'})]
+doc_001 {'author': 'Alice'}
+doc_002 {'author': 'Bob'}
+doc_003 {'author': 'Alice'}
+doc_004 {'author': 'Bob'}
+doc_005 {'author': 'Alice'}
 ```
+
+`list()` returns `(id, metadata)` tuples in no particular order, so the example sorts them. It is not a paging API: `number` takes the first N in whatever order internal storage yields, and the same N are not guaranteed across calls. On a `quantized_only` index it lists only the records that still hold a raw vector.
 
 <br/>
 
-#### ☑️ Remove Records 
-
-ZeusDB allows you to remove a vector and its associated metadata from the index using the .remove_point(id) method. This performs a <u>logical deletion</u>, meaning:
-- The vector is deleted from internal storage.
-- The metadata is removed.
-- The vector ID is no longer accessible via .contains(), .get_vector(), or .search().
+#### ☑️ Inspect index statistics
 
 ```python
-# Remove the point using its ID
-index.remove_point("doc1")  # "doc1" is the unique vector ID
-
-print("\n--- Check Removal ---")
-exists = index.contains("doc1")
-print(f"Point 'doc1' {'found' if exists else 'not found'} in index")
+stats = index.get_stats()
+for key in ["total_vectors", "graph_nodes", "stranded_graph_nodes", "storage_mode_description"]:
+    print(f"{key}: {stats[key]}")
 ```
 *Output*
 ```
---- Check Removal ---
-Point 'doc1' not found in index
+total_vectors: 5
+graph_nodes: 5
+stranded_graph_nodes: 0
+storage_mode_description: raw_only
 ```
 
-**⚠️ Please Note:** Due to the nature of HNSW, the underlying graph node remains in memory, even after removing a point. This is common for HNSW implementations. To fully remove stale graph entries, consider rebuilding the index.
+`get_stats()` returns a `str` to `str` map. It also carries `dimension`, `space`, `m`, `ef_construction`, `expected_size`, `index_type`, `raw_vectors_stored`, `quantized_codes_stored` and `storage_mode`, plus training and compression fields once quantization is configured.
+
+<br/>
+
+#### ☑️ Remove Records
+
+Remove a vector and its metadata with `.remove_point(id)`. This performs a <u>logical deletion</u>:
+- The vector is deleted from internal storage.
+- The metadata is removed.
+- The vector ID is no longer returned by `.contains()`, `.get_records()`, or `.search()`.
+
+```python
+index.remove_point("doc_001")
+print("doc_001 present:", index.contains("doc_001"))
+print("records remaining:", index.get_vector_count())
+```
+*Output*
+```
+doc_001 present: False
+records remaining: 4
+```
+
+**⚠️ Please Note:** Due to the nature of HNSW, the underlying graph node remains in memory after a point is removed. Searches never return it, but it still occupies memory and edge slots. `compact()` reclaims those nodes.
+
+<br/>
+
+#### ♻️ Reclaim space left by removals and overwrites
+
+Both `remove_point()` and an overwriting `add()` leave a node behind in the graph. `compact()` rebuilds the graph in memory and returns the number of nodes it reclaimed. Nothing else changes: IDs, metadata, stored vectors, quantized codes and PQ training state all survive, so every ID resolves to the same record before and after.
+
+```python
+print("stranded graph nodes:", index.get_stats()["stranded_graph_nodes"])
+print("reclaimed:", index.compact())
+print("stranded graph nodes:", index.get_stats()["stranded_graph_nodes"])
+```
+*Output*
+```
+stranded graph nodes: 1
+reclaimed: 1
+stranded graph nodes: 0
+```
+
+`compact()` costs a full rebuild, proportional to the number of live records rather than to the amount of debris, and it holds both graphs in memory while it runs. It returns 0 and does nothing when there is nothing to reclaim. It is never automatic, so schedule it when your workload has accumulated deletions.
 
 <br/>
 
 #### ☑️ Retrieve records by ID
 
-Use `get_records()` to fetch one or more records by ID, with optional vector inclusion.
+Use `get_records()` to fetch one or more records by ID, with optional vector inclusion. It returns a list of dicts with `id`, `metadata`, and, when `return_vector` is true, `vector`.
 
 ```python
 # Single record
-print("\n--- Get Single Record ---")
-rec = index.get_records("doc1")
-print(rec)
+print(index.get_records("doc_002", return_vector=False))
 
 # Multiple records
-print("\n--- Get Multiple Records ---")
-batch = index.get_records(["doc1", "doc3"])
-print(batch)
+print(index.get_records(["doc_002", "doc_003"], return_vector=False))
 
-# Metadata only
-print("\n--- Get Metadata only ---")
-meta_only = index.get_records(["doc1", "doc2"], return_vector=False)
-print(meta_only)
+# Missing IDs are silently skipped
+print(index.get_records(["doc_002", "missing_id"], return_vector=False))
 
-# Missing ID silently ignored
-print("\n--- Partial only ---")
-partial = index.get_records(["doc1", "missing_id"])
-print(partial)
+# Vectors are included by default
+record = index.get_records("doc_002")[0]
+print(sorted(record.keys()), len(record["vector"]))
 ```
 
-⚠️ `get_records()` only returns results for IDs that exist in the index. Missing IDs are silently skipped.
+*Output*
+```
+[{'id': 'doc_002', 'metadata': {'author': 'Bob'}}]
+[{'id': 'doc_002', 'metadata': {'author': 'Bob'}}, {'id': 'doc_003', 'metadata': {'author': 'Alice'}}]
+[{'id': 'doc_002', 'metadata': {'author': 'Bob'}}]
+['id', 'metadata', 'vector'] 8
+```
+
+⚠️ `get_records()` only returns results for IDs that exist in the index. Missing IDs are silently skipped, so a shorter list than you asked for is how a missing ID is reported.
 
 <br />
 
-
 ## 🗜️ Product Quantization
 
-Product Quantization (PQ) is a vector compression technique that significantly reduces memory usage while preserving high search accuracy. Commonly used in HNSW-based vector databases, PQ works by dividing each vector into subvectors and quantizing them independently. This enables compression ratios of 4× to 256×, making it ideal for large-scale, high-dimensional datasets.
+Product Quantization (PQ) is a vector compression technique that reduces memory usage by dividing each vector into subvectors and quantizing them independently. A record's compressed form is one byte per subvector, whatever the dimension, so an index over 1536-dimensional vectors with 8 subvectors stores 8 bytes per code in place of 6144 bytes of float32.
 
-ZeusDB Vector Database’s PQ implementation features:
+ZeusDB Vector Database's PQ implementation features:
 
-✅ Intelligent Training – PQ model trains automatically at defined thresholds
+✅ Automatic training, triggered on the `add()` call that reaches the configured threshold
 
-✅ Efficient Memory Use – Store 4× to 256× more vectors in the same RAM footprint
+✅ Compact codes, one byte per subvector per record
 
-✅ Fast Approximate Search – Uses Asymmetric Distance Computation (ADC) for high-speed search computation
+✅ Asymmetric Distance Computation (ADC) for fast search against the codes
 
-✅ Seamless Operation – Index automatically switches from raw to quantized storage modes
+✅ Automatic switch from raw to quantized storage once training completes
+
+Compression is not free, and the accuracy cost is much larger than the memory saving suggests. Read [Quantized search accuracy](#-quantized-search-accuracy) before choosing a storage mode.
 
 <br />
 
@@ -571,15 +698,19 @@ To enable PQ, pass a `quantization_config` dictionary to the `.create()` index m
 | Parameter | Type | Description | Valid Range | Default |
 |-----------|------|-------------|-------------|---------|
 | `type` | `str` | Quantization algorithm type | `"pq"` | *required* |
-| `subvectors` | `int` | Number of vector subspaces (must divide dimension evenly) | 1 to dimension | `8` |
-| `bits` | `int` | Bits per quantized code (controls centroids per subvector) | 1-8 | `8` |
-| `training_size` | `int` | Minimum vectors needed for stable k-means clustering | ≥ 1000 | 1000 |
-| `max_training_vectors` | `int` | Maximum vectors used during training (optional limit) | ≥ training_size | `None` |
-| `storage_mode` | `str` | Storage strategy: "quantized_only" (memory optimized) or "quantized_with_raw" (keep raw vectors for exact reconstruction) | "quantized_only", "quantized_with_raw" | `"quantized_only"` |
+| `subvectors` | `int` | Number of vector subspaces. Must divide `dim` evenly | 1 to `dim` | `8` |
+| `bits` | `int` | Bits per quantized code, which sets the centroids per subvector to 2^bits | 1 to 8 | `8` |
+| `training_size` | `int` | Records collected before training is triggered | ≥ 1000 | `10000` |
+| `max_training_vectors` | `int \| None` | Maximum records used during training | ≥ `training_size` | `None` |
+| `storage_mode` | `str` | `"quantized_only"` or `"quantized_with_raw"` | see below | `"quantized_only"` |
 
+**Compression ratio is `dim × 4 / subvectors`.** More subvectors means a longer code, so it lowers the compression ratio and raises accuracy. Fewer subvectors means the opposite. At `dim=1536`, 8 subvectors gives 768x and 16 subvectors gives 384x.
+
+`bits` does not change the size of a record's code, which is always one byte per subvector. It sets the number of centroids in the codebook, so it trades codebook memory and training time against quantization accuracy.
+
+`create()` emits a `UserWarning` when the configuration looks unbalanced, for example when the compression ratio exceeds 50x, and another when `storage_mode` is `quantized_with_raw`.
 
 <br/>
-
 
 ### 🔧 Usage Example 1
 
@@ -587,279 +718,316 @@ To enable PQ, pass a `quantization_config` dictionary to the `.create()` index m
 from zeusdb_vector_database import VectorDatabase
 import numpy as np
 
-# Create index with product quantization
 vdb = VectorDatabase()
 
-# Configure quantization for memory efficiency
 quantization_config = {
-    'type': 'pq',                  # `pq` for Product Quantization
-    'subvectors': 8,               # Divide 1536-dim vectors into 8 subvectors of 192 dims each
-    'bits': 8,                     # 256 centroids per subvector (2^8)
-    'training_size': 10000,        # Train when 10k vectors are collected
-    'max_training_vectors': 50000  # Use max 50k vectors for training
+    "type": "pq",                        # `pq` for Product Quantization
+    "subvectors": 8,                     # 8 subvectors of 192 dims each
+    "bits": 8,                           # 256 centroids per subvector (2^8)
+    "training_size": 1000,               # Train once 1,000 records are collected
+    "storage_mode": "quantized_with_raw" # Keep raw vectors so results can be reranked
 }
 
-# Create index with quantization
-# This will automatically handle training when enough vectors are added
 index = vdb.create(
     index_type="hnsw",
-    dim=1536,                                  # OpenAI `text-embedding-3-small` dimension
-    quantization_config=quantization_config    # Add the compression configuration
+    dim=1536,                                # OpenAI `text-embedding-3-small` dimension
+    expected_size=2500,
+    quantization_config=quantization_config
 )
 
-# Add vectors - training triggers automatically at threshold
-documents = [
-    {
-        "id": f"doc_{i}", 
-        "values": np.random.rand(1536).astype(float).tolist(),
-        "metadata": {"category": "tech", "year": 2026}
-    }
-    for i in range(15000) 
-]
+# Add vectors. Training triggers automatically at the threshold.
+rng = np.random.default_rng(0)
+documents = {
+    "ids": [f"doc_{i}" for i in range(2500)],
+    "embeddings": rng.random((2500, 1536), dtype=np.float32),
+    "metadatas": [{"category": "tech", "year": 2026} for _ in range(2500)],
+}
 
-# Training will trigger automatically when 10k vectors are added
 result = index.add(documents)
-print(f"Added {result.total_inserted} vectors")
+print("inserted:", result.total_inserted)
 
 # Check quantization status
-print(f"Training progress: {index.get_training_progress():.1f}%")
-print(f"Storage mode: {index.get_storage_mode()}")
-print(f"Is quantized: {index.is_quantized()}")
+print("training progress:", f"{index.get_training_progress():.1f}%")
+print("storage mode:", index.get_storage_mode())
+print("is quantized:", index.is_quantized())
 
 # Get compression statistics
 quant_info = index.get_quantization_info()
-if quant_info:
-    print(f"Compression ratio: {quant_info['compression_ratio']:.1f}x")
-    print(f"Memory usage: {quant_info['memory_mb']:.1f} MB")
+print("compression ratio:", f"{quant_info['compression_ratio']:.1f}x")
+print("codebook memory:", f"{quant_info['memory_mb']:.1f} MB")
 
-# Search works seamlessly with quantized storage
-query_vector = np.random.rand(1536).astype(float).tolist()
+# Search works the same way on a quantized index
+query_vector = rng.random(1536, dtype=np.float32)
 results = index.search(vector=query_vector, top_k=3)
-
-# Simply print raw results
-print(results)
+print("results:", len(results), "| keys:", sorted(results[0].keys()))
 ```
 
-Results
+*Output*
+```
+inserted: 2500
+training progress: 100.0%
+storage mode: quantized_active
+is quantized: True
+compression ratio: 768.0x
+codebook memory: 1.5 MB
+results: 3 | keys: ['id', 'metadata', 'score']
+```
+
+The result IDs and scores depend on the data, so they are not shown. Production indexes use a much larger `training_size`; 1,000 is the minimum the validator accepts and keeps this example quick.
+
+`index.info()` reports the quantization state as well:
+
 ```python
-[
-{'id': 'doc_9719', 'score': 0.5133496522903442, 'metadata': {'category': 'tech', 'year': 2026}},
-{'id': 'doc_8148', 'score': 0.5139288306236267, 'metadata': {'category': 'tech', 'year': 2026}}, 
-{'id': 'doc_7822', 'score': 0.5151920914649963, 'metadata': {'category': 'tech', 'year': 2026}}, 
-]
+print(index.info())
 ```
+
+*Output*
+```
+HNSWIndex(dim=1536, space=cosine, m=16, ef_construction=200, expected_size=2500, vectors=2500, quantization=pq(subvectors=8, bits=8, trained, active, compression=768.0x))
+```
+
 <br />
 
 ### 🔧 Usage Example 2 - with explicit storage mode
 
 ```python
 from zeusdb_vector_database import VectorDatabase
-import numpy as np
 
-# Create index with product quantization
 vdb = VectorDatabase()
 
-# Configure quantization for memory efficiency
 quantization_config = {
-    'type': 'pq',                  # `pq` for Product Quantization
-    'subvectors': 8,               # Divide 1536-dim vectors into 8 subvectors of 192 dims each
-    'bits': 8,                     # 256 centroids per subvector (2^8)
-    'training_size': 10000,        # Train when 10k vectors are collected
-    'max_training_vectors': 50000,  # Use max 50k vectors for training
-    'storage_mode': 'quantized_only'  # Explicitly set storage mode to only keep quantized values
+    "type": "pq",
+    "subvectors": 8,
+    "bits": 8,
+    "training_size": 10000,
+    "max_training_vectors": 50000,
+    "storage_mode": "quantized_only"    # Drop raw vectors once training completes
 }
 
-# Create index with quantization
-# This will automatically handle training when enough vectors are added
 index = vdb.create(
     index_type="hnsw",
-    dim=3072,                                  # OpenAI `text-embedding-3-large` dimension
-    quantization_config=quantization_config    # Add the compression configuration
+    dim=3072,                           # OpenAI `text-embedding-3-large` dimension
+    expected_size=100000,
+    quantization_config=quantization_config
 )
-
 ```
 
-<br />
+<br/>
 
-### ⚙️ Configuration Guidelines
+### 📦 Storage modes
 
-For Balanced Memory & Accuracy (Recommended to start with)
+| Mode | What it stores | Rerank available | Memory |
+|------|----------------|------------------|--------|
+| `quantized_only` | Codes for every record, plus the raw vectors of the records collected before training | No | Lowest |
+| `quantized_with_raw` | Codes and raw vectors for every record | Yes | Higher than raw storage for the records, lower for the graph |
+
+Two consequences of `quantized_only` are worth knowing before you pick it.
+
+**The training records keep their raw vectors.** Records collected before the training threshold is reached are stored at full width and stay that way, so an index whose `training_size` is a large fraction of its total size saves much less than the compression ratio suggests.
+
+**A record added after training exists only as a code, and some accessors do not see it.** `contains()` and `list()` consult raw storage only, so both miss those records. `get_records()`, `search()` and `get_vector_count()` see all of them. `get_records()` reconstructs the vector from the code, so what it returns is an approximation of the original.
+
 ```python
-quantization_config = {
-    'type': 'pq',
-    'subvectors': 8,      # Balanced: moderate compression, good accuracy
-    'bits': 8,            # 256 centroids per subvector (high precision)
-    'training_size': 10000,  # Or higher for large datasets
-    'storage_mode': 'quantized_only'  # Default, memory efficient
-}
-# Achieves ~16x–32x compression with strong recall for most applications
+only = vdb.create("hnsw", dim=1536, expected_size=2500, quantization_config={
+    "type": "pq",
+    "subvectors": 8,
+    "bits": 8,
+    "training_size": 1000,
+    "storage_mode": "quantized_only",
+})
+only.add(documents)   # the same 2,500 records used in Usage Example 1
+
+print("storage mode:", only.get_storage_mode())
+stats = only.get_stats()
+print("raw vectors kept:", stats["raw_vectors_stored"])
+print("quantized codes:", stats["quantized_codes_stored"])
+print("contains doc_0 (added before training):", only.contains("doc_0"))
+print("contains doc_2000 (added after training):", only.contains("doc_2000"))
+print("get_records doc_2000 returns:", len(only.get_records("doc_2000")), "record")
 ```
 
-
-For Memory Optimization:
-```python
-quantization_config = {
-    'type': 'pq',
-    'subvectors': 16,      # More subvectors = better compression
-    'bits': 6,             # Fewer bits = less memory per centroid
-    'training_size': 20000,
-    'storage_mode': 'quantized_only'
-}
-# Achieves ~32x compression ratio
+*Output*
+```
+storage mode: quantized_active
+raw vectors kept: 1000
+quantized codes: 2500
+contains doc_0 (added before training): True
+contains doc_2000 (added after training): False
+get_records doc_2000 returns: 1 record
 ```
 
-For Accuracy Optimization:
-```python
-quantization_config = {
-    'type': 'pq',
-    'subvectors': 4,       # Fewer subvectors = better accuracy
-    'bits': 8,             # More bits = more precise quantization
-    'training_size': 50000 # More training data = better centroids
-    'storage_mode': 'quantized_with_raw'  # Keep raw vectors for exact recall
-}
-# Achieves ~4x compression ratio with minimal accuracy loss
-```
+<br/>
+
+### 🎯 Quantized search accuracy
+
+**Quantized search is far less accurate than raw search, and `quantized_only` cannot be repaired by tuning.** ADC scores candidates against the codes, and a code discards most of the information in a vector. Rerank fixes this by over-fetching candidates and rescoring them against raw vectors, which is only possible when the raw vectors are still there.
+
+Measured on 6,000 clustered 128-dimensional vectors with 8 subvectors and 8 bits, recall at 10 against exact cosine search:
+
+| Configuration | Recall@10 |
+|---------------|-----------|
+| No quantization | 1.00 |
+| `quantized_only` | 0.16 |
+| `quantized_with_raw`, `rerank=0` | 0.15 |
+| `quantized_with_raw`, default rerank | 1.00 |
+
+The exact figures depend on your data, but the shape does not. If you need quantization and you need accuracy, use `quantized_with_raw` and leave rerank on.
+
+- `rerank` defaults to 20, meaning 20 candidates are fetched per requested result and the page is reordered by raw distance. The over-fetch is capped at the number of live records.
+- `rerank=0` turns reranking off and returns the ADC scores and ordering.
+- The fetch is `top_k × rerank` candidates, so a large `top_k` multiplies the cost. Lower `rerank` when you ask for a large page.
+- `rerank` has no effect on an unquantized index or on a `quantized_only` one. Both ignore it.
+- With rerank on, the scores you get back are raw-vector distances. With it off, they are ADC estimates. The two are not comparable.
+
+`ef_search` still applies to the quantized traversal, but it moves recall very little compared with rerank.
 
 ### 📊 Performance Characteristics
 
-- Training: Occurs once when threshold is reached (typically 1-5 minutes for 50k vectors)
-- Memory Reduction: 4x-256x depending on configuration
-- Search Speed: Comparable or faster than raw vectors due to ADC optimization
-- Accuracy Impact: Typically 1-5% recall reduction with proper tuning
-
-Quantization is ideal for production deployments with large vector datasets (100k+ vectors) where memory efficiency is critical.
-
-`"quantized_only"` is recommended for most use cases and maximizes memory savings.
-
-`"quantized_with_raw"` keeps both quantized and raw vectors for exact reconstruction, but uses more memory.
-
+- **Training**: happens once, on the `add()` call that reaches `training_size`. That call takes noticeably longer than the others.
+- **Memory**: a record's code is `subvectors` bytes against `dim × 4` for a raw vector. The graph shrinks by the same factor, because it holds codes rather than vectors.
+- **Search speed**: quantized search is faster than raw search. Measured over 20,000 256-dimensional vectors, 0.93 ms per query against 1.52 ms.
+- **Accuracy**: see the table above. Treat quantization as a memory decision that costs accuracy, not as a free win.
 
 <br/>
 
 ## 💾 Persistence
 
-ZeusDB Vector Database provides production-ready persistence capabilities that allow you to save and restore your vector indexes to disk. This enables you to preserve your work, share indexes between systems, and implement backup strategies for production deployments.
+ZeusDB Vector Database can save and restore complete indexes on disk, which lets you preserve your work, move indexes between systems, and back up production deployments.
 
 The persistence system supports:
 
-✅ **Complete state preservation** – vectors, metadata, HNSW graph structure, and quantization models  
-✅ **Hybrid storage format** – efficient binary encoding for vectors with human-readable JSON for metadata  
-✅ **Quantization support** – seamlessly handles both raw and quantized storage modes  
-✅ **Training state recovery** – preserves PQ training progress and model parameters  
-✅ **Cross-platform compatibility** – indexes saved on one system can be loaded on another  
+✅ **Complete state preservation** for vectors, per-record metadata, index level metadata, ID mappings and quantization models
+✅ **Hybrid storage format**, binary encoding for vectors with human-readable JSON for metadata
+✅ **Quantization support**, both raw and quantized storage modes, including the trained codebook
+✅ **Training state recovery**, so an index saved mid-collection resumes collecting
+✅ **Format versioning**, so a directory this build cannot interpret is refused rather than misread
+
+**`save()` and `load()` print progress to stdout.** Every step writes a line. This is not configurable, so redirect stdout if it is a problem in your application.
 
 <br/>
 
 ### 💾 Saving an Index - .save()
 
-Use the `.save()` method to persist your index to a `.zdb` directory structure:
+Use the `.save()` method to persist your index to a `.zdb` directory:
 
 ```python
-# Import the vector database module
 from zeusdb_vector_database import VectorDatabase
 import numpy as np
+import os
 
-# Create and populate an index
 vdb = VectorDatabase()
-index = vdb.create("hnsw", dim=1536, space="cosine")
+index = vdb.create("hnsw", dim=1536, space="cosine", expected_size=1000)
 
-# Add some vectors
-vectors = np.random.random((1000, 1536)).astype(np.float32)
-data = {
-    'vectors': vectors.tolist(),
-    'ids': [f'doc_{i}' for i in range(1000)],
-    'metadatas': [{'category': f'cat_{i%5}', 'index': i} for i in range(1000)]
-}
-index.add(data)
+rng = np.random.default_rng(1)
+vectors = rng.random((1000, 1536), dtype=np.float32)
+index.add({
+    "ids": [f"doc_{i}" for i in range(1000)],
+    "embeddings": vectors,
+    "metadatas": [{"category": f"cat_{i % 5}", "index": i} for i in range(1000)],
+})
 
-# Save the complete index to disk
 index.save("my_index.zdb")
+print("saved:", sorted(os.listdir("my_index.zdb")))
+```
+
+*Output, with the progress lines omitted*
+```
+saved: ['config.json', 'hnsw_index.hnsw.data', 'hnsw_index.hnsw.graph', 'manifest.json', 'mappings.bin', 'metadata.json', 'vectors.bin']
 ```
 
 <br />
 
 ### 📂 Loading an Index - .load()
 
-Use the .load() method to restore a previously saved index:
+Use the `.load()` method to restore a previously saved index:
 
 ```python
-# Load the index from disk
 vdb = VectorDatabase()
 loaded_index = vdb.load("my_index.zdb")
 
-# Verify the index loaded correctly
-print(f"Loaded index with {loaded_index.get_vector_count()} vectors")
-print(f"Index configuration: {loaded_index.info()}")
+print("vectors:", loaded_index.get_vector_count())
+print(loaded_index.info())
 
-# Test search on loaded index
-query_vector = np.random.random(1536).tolist()
-results = loaded_index.search(query_vector, top_k=3)
-print(f"Search returned {len(results)} results")
-print(results)
+results = loaded_index.search(vectors[0].tolist(), top_k=3)
+print("top hit:", results[0]["id"])
 ```
+
+*Output, with the progress lines omitted*
+```
+vectors: 1000
+HNSWIndex(dim=1536, space=cosine, m=16, ef_construction=200, expected_size=1000, vectors=1000, quantization=none)
+top hit: doc_0
+```
+
+**Loading rebuilds the graph rather than reading it back**, so load time is proportional to the number of records, not to the size of the directory. The saved graph files are written but not consumed on load.
 
 <br />
 
 ### 🗜️ Persistence with Product Quantization
 
-Persistence seamlessly handles quantized indexes, preserving both the compression model and training state:
+A quantized index comes back quantized, with its codebook and training state intact:
 
 ```python
-# Create index with quantization
 quantization_config = {
-    'type': 'pq',
-    'subvectors': 8,
-    'bits': 8,
-    'training_size': 1000,
-    'storage_mode': 'quantized_only'
+    "type": "pq",
+    "subvectors": 8,
+    "bits": 8,
+    "training_size": 1000,
+    "storage_mode": "quantized_with_raw",
 }
 
 vdb = VectorDatabase()
-index = vdb.create("hnsw", dim=1536, quantization_config=quantization_config)
+index = vdb.create("hnsw", dim=1536, expected_size=2000,
+                   quantization_config=quantization_config)
 
-# Add enough vectors to trigger PQ training
-vectors = np.random.random((2000, 1536)).astype(np.float32)
-data = {
-    'vectors': vectors.tolist(),
-    'ids': [f'vec_{i}' for i in range(2000)]
-}
+rng = np.random.default_rng(2)
+index.add({
+    "ids": [f"vec_{i}" for i in range(2000)],
+    "embeddings": rng.random((2000, 1536), dtype=np.float32),
+})
 
-add_result = index.add(data)
-print(f"Added {add_result.total_inserted} vectors")
-print(f"Training progress: {index.get_training_progress():.1f}%")
-print(f"Quantization active: {index.is_quantized()}")
-
-# Save quantized index
+print("quantization active:", index.is_quantized())
 index.save("quantized_index.zdb")
 
-# Load and verify quantization state is preserved
 loaded_index = vdb.load("quantized_index.zdb")
-print(f"Loaded quantization state: {loaded_index.is_quantized()}")
-print(f"Compression info: {loaded_index.get_quantization_info()}")
+print("quantization active after load:", loaded_index.is_quantized())
+print("storage mode after load:", loaded_index.get_storage_mode())
+print("saved:", sorted(os.listdir("quantized_index.zdb")))
+```
+
+*Output, with the progress lines omitted*
+```
+quantization active: True
+quantization active after load: True
+storage mode after load: quantized_active
+saved: ['config.json', 'hnsw_index.hnsw.data', 'hnsw_index.hnsw.graph', 'manifest.json', 'mappings.bin', 'metadata.json', 'pq_centroids.bin', 'pq_codes.bin', 'quantization.json', 'vectors.bin']
 ```
 
 <br/>
 
 ### 📁 Index Directory Structure
-The .save() method creates a structured directory containing all index components:
+The `.save()` method creates a directory containing all index components:
 
 ```
 my_index.zdb/
 ├── manifest.json           # Index metadata and file inventory
-├── config.json             # HNSW configuration parameters
+├── config.json             # HNSW configuration and index level metadata
 ├── mappings.bin            # ID mappings (binary format)
-├── metadata.json           # Vector metadata (JSON format)
-├── vectors.bin             # Raw vectors (if applicable)
+├── metadata.json           # Per-record metadata (JSON format)
+├── vectors.bin             # Raw vectors (whenever the index holds any)
 ├── quantization.json       # PQ configuration (if enabled)
 ├── pq_centroids.bin        # Trained centroids (if PQ trained)
 ├── pq_codes.bin            # Quantized codes (if PQ active)
-└── hnsw_index.hnsw.graph   # HNSW graph structure
+├── hnsw_index.hnsw.graph   # HNSW graph structure
+└── hnsw_index.hnsw.data    # HNSW graph payload
 ```
+
+`manifest.json` lists `hnsw_index.hnsw.data` under `files_excluded` because the load path does not read it, but the file is written for every non-empty index.
 
 <br/>
 
 ### 🔄 Complete Save/Load Workflow
-Here's a comprehensive example showing the full persistence lifecycle:
+A full persistence lifecycle with integrity checks:
 
 ```python
 from zeusdb_vector_database import VectorDatabase
@@ -867,205 +1035,243 @@ import numpy as np
 
 # === PHASE 1: CREATE AND POPULATE INDEX ===
 vdb = VectorDatabase()
-original_index = vdb.create("hnsw", dim=1536, space="cosine", m=16)
+original_index = vdb.create("hnsw", dim=1536, space="cosine", expected_size=500)
 
-# Add vectors with rich metadata
-np.random.seed(42)  # For reproducible results
-vectors = np.random.random((500, 1536)).astype(np.float32)
+rng = np.random.default_rng(42)
+vectors = rng.random((500, 1536), dtype=np.float32)
 
-data = {
-    'vectors': vectors.tolist(),
-    'ids': [f'doc_{i:03d}' for i in range(500)],
-    'metadatas': [
+original_index.add({
+    "ids": [f"doc_{i:03d}" for i in range(500)],
+    "embeddings": vectors,
+    "metadatas": [
         {
-            'category': ['science', 'tech', 'health', 'finance'][i % 4],
-            'priority': i % 10,
-            'published': i % 2 == 0,
-            'tags': ['important', 'featured'] if i % 5 == 0 else ['standard']
+            "category": ["science", "tech", "health", "finance"][i % 4],
+            "priority": i % 10,
+            "published": i % 2 == 0,
+            "tags": ["important", "featured"] if i % 5 == 0 else ["standard"],
         }
         for i in range(500)
-    ]
-}
+    ],
+})
 
-# Populate the index
-add_result = original_index.add(data)
-print(f"✅ Added {add_result.total_inserted} vectors")
-
-# Add some index-level metadata
 original_index.add_metadata({
     "dataset": "demo_collection",
     "created_by": "data_team",
-    "version": "1.0"
+    "version": "1.0",
 })
 
-# Test search before saving
-query_vector = vectors[0].tolist()  # Use first vector as query
+query_vector = vectors[0].tolist()
 original_results = original_index.search(query_vector, top_k=3)
-print(f"🔍 Original search found {len(original_results)} results")
 
-# === PHASE 2: SAVE INDEX ===
-save_path = "demo_index.zdb"
-original_index.save(save_path)
-print(f"💾 Index saved to {save_path}")
+# === PHASE 2: SAVE, THEN LOAD ===
+original_index.save("demo_index.zdb")
+loaded_index = vdb.load("demo_index.zdb")
 
-# === PHASE 3: LOAD INDEX ===
-loaded_index = vdb.load(save_path)
-print(f"📂 Index loaded from {save_path}")
-
-# === PHASE 4: VERIFY INTEGRITY ===
-# Check vector count
+# === PHASE 3: VERIFY INTEGRITY ===
 assert loaded_index.get_vector_count() == original_index.get_vector_count()
-print(f"✅ Vector count verified: {loaded_index.get_vector_count()}")
-
-# Check configuration
 assert loaded_index.info() == original_index.info()
-print(f"✅ Configuration verified: {loaded_index.info()}")
+assert loaded_index.get_all_metadata() == original_index.get_all_metadata()
 
-# Check metadata preservation
-original_meta = original_index.get_all_metadata()
-loaded_meta = loaded_index.get_all_metadata()
-#assert original_meta == loaded_meta
-print(f"Original meta fields: {len(original_meta)}, Loaded meta fields: {len(loaded_meta)}")
-print(f"✅ Index metadata verified: {len(loaded_meta)} fields")
-
-# Test search consistency
 loaded_results = loaded_index.search(query_vector, top_k=3)
-assert len(loaded_results) == len(original_results)
-assert loaded_results[0]['id'] == original_results[0]['id']
-print("✅ Search consistency verified")
+assert [r["id"] for r in loaded_results] == [r["id"] for r in original_results]
 
-# Test filtering on loaded index
-filtered_results = loaded_index.search(
-    query_vector, 
-    filter={'category': 'science', 'published': True}, 
-    top_k=5
+filtered = loaded_index.search(
+    query_vector,
+    filter={"category": "science", "published": True},
+    top_k=20,
 )
-print(f"🔍 Filtered search found {len(filtered_results)} results")
 
-print("\n🎉 Complete persistence workflow successful!")
+print("records:", loaded_index.get_vector_count())
+print("index metadata fields:", len(loaded_index.get_all_metadata()))
+print("filtered hits:", len(filtered))
+print("all checks passed")
+```
+
+*Output, with the progress lines omitted*
+```
+records: 500
+index metadata fields: 3
+filtered hits: 5
+all checks passed
 ```
 
 ### ⚠️ Important Notes on Persistence
-- Directory Structure: The .save() method creates a directory, not a single file. Ensure you have write permissions for the target location.
+- **Directory, not a file.** `.save()` creates a directory. You need write permission for the target location.
 
-- Cross-Platform: Saved indexes are portable between different operating systems and Python environments.
+- **Not atomic.** Files are written one at a time into the target directory. An interrupted save leaves a partial directory behind, and a later `load()` of it fails rather than returning a truncated index. Save to a new path and move it into place if you need an atomic swap.
 
-- Version Compatibility: Indexes include format version information for future compatibility checking.
+- **Overwriting is not clean either.** Saving over an existing directory replaces files individually and does not remove ones that no longer apply. Save to a fresh directory.
 
-- Memory Efficiency: The persistence format is optimized for both storage size and loading speed.
+- **Version compatibility.** The manifest records a format version. This build writes 1.1.0 and reads any 1.x. A different major version is refused.
 
-- Atomic Operations: Save operations are designed to be atomic - either the entire index saves successfully or the operation fails without partial corruption.
-
+- **Integrity check on load.** The restored record count is checked against the count in `config.json`. A missing or truncated data file fails the load with a message naming what disagreed.
 
 <br />
 
 ## 🏷️ Metadata Filtering
 
-ZeusDB supports rich metadata with full type fidelity. This means your metadata preserves the original Python data types (integers stay integers, floats stay floats, etc.) and enables powerful filtering capabilities.
+ZeusDB supports rich metadata with full type fidelity. Your metadata preserves the original Python data types, so integers stay integers and floats stay floats.
 
 ### 📘 Supported Types
 
-The following Python types are supported for metadata and preserved during filtering and retrieval.
+| Type | Python Example | Notes |
+|------|----------------|-------|
+| **String** | `"Alice"` | Text data, IDs, categories |
+| **Integer** | `42`, `2024` | Counts, years, IDs |
+| **Float** | `4.5`, `29.99` | Ratings, prices, scores |
+| **Boolean** | `True`, `False` | Flags, status indicators |
+| **Null** | `None` | Missing or empty values |
+| **Array** | `["ai", "science"]` | Tags, categories, lists |
+| **Nested Object** | `{"key": "value"}` | Structured data |
 
-| Type | Python Example | Stored As | Notes |
-|------|----------------|-----------|-------|
-| **String** | `"Alice"` | `Value::String` | Text data, IDs, categories |
-| **Integer** | `42`, `2024` | `Value::Number` | Counts, years, IDs |
-| **Float** | `4.5`, `29.99` | `Value::Number` | Ratings, prices, scores |
-| **Boolean** | `True`, `False` | `Value::Bool` | Flags, status indicators |
-| **Null** | `None` | `Value::Null` | Missing/empty values |
-| **Array** | `["ai", "science"]` | `Value::Array` | Tags, categories, lists |
-| **Nested Object** | `{"key": "value"}` | `Value::Object` | Structured data |
+Integers and floats compare by magnitude, so a stored integer `10` matches `{"eq": 10.0}` and `{"gte": 10.0}` alike. Booleans and strings do not cross into numbers.
 
 <br/>
 
 ### 📘 Filter Operators Reference
 
-These operators can be used in metadata filters:
+A filter is a dict of field names. A field maps either to a plain value, which means equality, or to a dict of operators, all of which must hold.
 
 | Operator | Usage | Example | Description |
 |----------|-------|---------|-------------|
-| **Direct equality** | `{"field": value}` | `{"author": "Alice"}` | Exact equality for any type |
+| **Direct equality** | `{"field": value}` | `{"author": "Alice"}` | Equality for strings, numbers, booleans, null and arrays |
+| `eq` | `{"eq": value}` | `{"source": {"eq": {"kind": "web"}}}` | Equality, including for nested objects |
+| `ne` | `{"ne": value}` | `{"author": {"ne": "Alice"}}` | Not equal |
 | `gt` | `{"gt": value}` | `{"rating": {"gt": 4.0}}` | Greater than (numeric) |
 | `gte` | `{"gte": value}` | `{"year": {"gte": 2024}}` | Greater than or equal (numeric) |
 | `lt` | `{"lt": value}` | `{"price": {"lt": 30}}` | Less than (numeric) |
 | `lte` | `{"lte": value}` | `{"pages": {"lte": 100}}` | Less than or equal (numeric) |
-| `contains` | `{"contains": value}` | `{"tags": {"contains": "ai"}}` | String contains substring or array contains value |
+| `contains` | `{"contains": value}` | `{"tags": {"contains": "ai"}}` | String contains substring, or array contains value |
 | `startswith` | `{"startswith": value}` | `{"title": {"startswith": "The"}}` | String starts with substring |
 | `endswith` | `{"endswith": value}` | `{"file": {"endswith": ".pdf"}}` | String ends with substring |
 | `in` | `{"in": [values]}` | `{"lang": {"in": ["en", "es"]}}` | Value is in the provided array |
+
+Three behaviours are worth knowing.
+
+**A record that lacks the field never matches, whatever the operator.** That includes `ne`. `{"lang": {"ne": "en"}}` does not match a record with no `lang` at all.
+
+**A dict value is always read as operators.** Direct equality against a nested object has no plain form, because the two would be indistinguishable, so write it as `{"source": {"eq": {"kind": "web"}}}`. Writing `{"source": {"kind": "web"}}` raises `ValueError: Unknown filter operation: kind`.
+
+**An unrecognised operator raises `ValueError` before the search runs**, rather than quietly matching nothing.
 
 <br/>
 
 ### 💡 Practical Filter Examples
 
-Below are common real-world examples of how to apply metadata filters using ZeusDB's metadata filtering:
+The examples below all run against this index:
 
-#### ✔️ Find high-quality recent documents
 ```python
-filter = {
-    "published": True,
-    "rating": {"gte": 4.0},
-    "year": {"gte": 2024}
-}
+from zeusdb_vector_database import VectorDatabase
 
-results = index.search(vector=query_embedding, filter=filter, top_k=5)
+vdb = VectorDatabase()
+index = vdb.create("hnsw", dim=4, space="l2")
+index.add([
+    {"id": "doc_1", "values": [0.1, 0.1, 0.1, 0.1], "metadata": {
+        "author": "Alice", "rating": 4.5, "year": 2024, "price": 29.99,
+        "published": True, "tags": ["ai", "science"], "title": "The Guide",
+        "filename": "report.pdf", "lang": "en"}},
+    {"id": "doc_2", "values": [0.2, 0.2, 0.2, 0.2], "metadata": {
+        "author": "Bob", "rating": 3.0, "year": 2023, "price": 45.00,
+        "published": False, "tags": ["cooking"], "title": "A Book",
+        "filename": "notes.txt", "lang": "es"}},
+    {"id": "doc_3", "values": [0.3, 0.3, 0.3, 0.3], "metadata": {
+        "author": "Charlie", "rating": 5.0, "year": 2026, "price": 25.00,
+        "published": True, "tags": ["ai"], "title": "Theory",
+        "filename": "paper.pdf", "lang": "fr"}},
+])
+query_embedding = [0.1, 0.1, 0.1, 0.1]
 ```
 
-#### ✔️ Find documents by specific authors
+#### ✔️ Filtering happens after the search, so raise `top_k`
+
 ```python
-filter = {"author": {"in": ["Alice", "Bob", "Charlie"]}}
-results = index.search(vector=query_embedding, filter=filter, top_k=5)
+def matched(filter, top_k=10):
+    return [hit["id"] for hit in index.search(vector=query_embedding, filter=filter, top_k=top_k)]
+
+# doc_3 is the furthest of the three from the query, so a top_k of 1 finds
+# nothing once the filter is applied
+print(matched({"author": "Charlie"}, top_k=1))
+print(matched({"author": "Charlie"}, top_k=10))
 ```
 
-#### ✔️ Find AI-related content
-```python
-filter = {"tags": {"contains": "ai"}}
-results = index.search(vector=query_embedding, filter=filter, top_k=5)
+*Output*
+```
+[]
+['doc_3']
 ```
 
-#### ✔️ Find documents in price range
+#### ✔️ Common filters
+
 ```python
-filter = {"price": {"gte": 20.0, "lte": 40.0}}
-results = index.search(vector=query_embedding, filter=filter, top_k=5)
+# Find high-quality recent documents
+print(matched({"published": True, "rating": {"gte": 4.0}, "year": {"gte": 2024}}))
+
+# Find documents by specific authors
+print(matched({"author": {"in": ["Alice", "Bob"]}}))
+
+# Find AI-related content
+print(matched({"tags": {"contains": "ai"}}))
+
+# Find documents in a price range
+print(matched({"price": {"gte": 20.0, "lte": 40.0}}))
+
+# Find documents with a specific file type
+print(matched({"filename": {"endswith": ".pdf"}}))
+
+# Match on a title prefix
+print(matched({"title": {"startswith": "The"}}))
+
+# Exclude an author
+print(matched({"author": {"ne": "Alice"}}))
+
+# Match a whole array
+print(matched({"tags": ["ai"]}))
 ```
 
-#### ✔️ Find documents with specific file types
-```python
-filter = {"filename": {"endswith": ".pdf"}}
-results = index.search(vector=query_embedding, filter=filter, top_k=5)
+*Output*
 ```
-
+['doc_1', 'doc_3']
+['doc_1', 'doc_2']
+['doc_1', 'doc_3']
+['doc_1', 'doc_3']
+['doc_1', 'doc_3']
+['doc_1', 'doc_3']
+['doc_2', 'doc_3']
+['doc_3']
+```
 
 <br />
 
 ## 📝 Logging
 
-ZeusDB Vector Database includes enterprise-grade structured logging that works automatically out of the box while providing extensive customization for advanced users.
+ZeusDB Vector Database includes structured logging that works automatically out of the box while providing customization for advanced users.
 
 ### 🚀 Basic Usage - it just works!
 
 **For most users, logging works automatically with sensible defaults:**
 
+<!-- zeusdb:skip -->
 ```python
 from zeusdb_vector_database import VectorDatabase
-# Logging is automatically configured - no setup required!
+# Logging is automatically configured, no setup required
 
 vdb = VectorDatabase()
 index = vdb.create("hnsw", dim=1536)
 
 # Operations are automatically logged with structured data
-result = index.add({"vectors": vectors, "ids": ids})
+result = index.add({"ids": ids, "embeddings": vectors})
 results = index.search(query_vector, top_k=5)
 ```
 
 **What you get automatically:**
-- ✅ **Silent by default** - Only errors and warnings in production
-- ✅ **Environment detection** - Appropriate defaults for dev/prod/testing
-- ✅ **Structured JSON logs** in production environments  
+- ✅ **Quiet by default**, only warnings and errors outside development
+- ✅ **Environment detection**, appropriate defaults for dev, prod, testing, CI and notebooks
+- ✅ **Structured JSON logs** in production environments
 - ✅ **Human-readable logs** in development environments
-- ✅ **Performance timing** on all operations
-- ✅ **Cross-platform compatibility** 
+- ✅ **Operation timing** on index creation, additions, searches and saves
+- ✅ **Cross-platform compatibility**
+
+Note that `save()` and `load()` print progress directly to stdout. That output is not part of the logging system and is not affected by any of the settings below.
 
 ### ⚙️ Intermediate Usage (Environment Variables)
 
@@ -1077,7 +1283,7 @@ export ZEUSDB_LOG_LEVEL=debug
 python your_app.py
 ```
 
-#### Production JSON Logging  
+#### Production JSON Logging
 ```bash
 export ZEUSDB_LOG_LEVEL=error
 export ZEUSDB_LOG_FORMAT=json
@@ -1090,26 +1296,36 @@ python your_app.py
 
 | Variable | Options | Default | Description |
 |----------|---------|---------|-------------|
-| `ZEUSDB_LOG_LEVEL` | `trace`, `debug`, `info`, `warning`, `error`, `critical` | `warning` (dev), `error` (prod) | Controls log verbosity |
+| `ZEUSDB_LOG_LEVEL` | `trace`, `debug`, `info`, `error` | `warning` (dev), `error` (prod) | Controls log verbosity |
 | `ZEUSDB_LOG_FORMAT` | `human`, `json` | `human` (dev), `json` (prod) | Output format |
 | `ZEUSDB_LOG_TARGET` | `stdout`, `stderr`, `file` | `stderr` | Where logs go |
-| `ZEUSDB_LOG_FILE` | `/path/to/file.log` | `zeusdb.log` | Log file path (if target=file) |
+| `ZEUSDB_LOG_FILE` | `/path/to/file.log` | `zeusdb.log` | Log file path, written exactly as given (if target=file) |
+| `ZEUSDB_LOG_ROTATION` | `daily`, `never` | `never` | With `daily`, a UTC date is appended to the file name |
 | `ZEUSDB_LOG_CONSOLE` | `true`, `false` | Auto-detected | Force console output |
+| `ZEUSDB_DISABLE_AUTO_LOGGING` | `true`, `1`, `yes` | unset | Skip automatic configuration entirely |
+| `RUST_LOG` | standard `env_logger` syntax | unset | Overrides `ZEUSDB_LOG_LEVEL` for the Rust layer |
+
+**⚠️ `warning` and `critical` are not accepted level names.** The Python layer accepts them, but the Rust layer rejects them and prints `ignoring 'zeusdb_vector_database=warning': invalid filter directive`. The bare `warn` is the opposite, accepted by Rust and rejected by Python. Use `trace`, `debug`, `info` or `error`, which both layers accept.
+
+Under `ZEUSDB_LOG_ROTATION=daily` with `ZEUSDB_LOG_FILE=logs/app.log`, two files appear: `logs/app.log` and a dated `logs/app.log.2026-08-05`. Rotation applies to the Rust layer, which writes the dated one.
 
 #### Smart Environment Detection
-The system automatically detects your environment and applies appropriate defaults:
+The system detects your environment and applies appropriate defaults:
 
-- **🏭 Production** (`ENVIRONMENT=production`): ERROR level, JSON format, often file output
-- **💻 Development** (`ENVIRONMENT=development`): WARNING level, human format, console output  
-- **🧪 Testing** (`pytest`, `PYTEST_CURRENT_TEST`): CRITICAL level, minimal output
-- **📓 Jupyter** (`JUPYTER_SERVER_ROOT`): INFO level, human format, clean output
-- **🔄 CI/CD** (`CI`, `GITHUB_ACTIONS`): WARNING level, human format for readability
+- **🏭 Production** (`ENVIRONMENT=production`, or Kubernetes or Docker markers): ERROR level, JSON format, file output
+- **💻 Development** (default): WARNING level, human format, console output
+- **🧪 Testing** (`ENVIRONMENT=testing`, `PYTEST_CURRENT_TEST`, or `pytest` imported): CRITICAL level, minimal output
+- **📓 Jupyter** (`JUPYTER_SERVER_ROOT`, `JPY_PARENT_PID`, or IPython imported): INFO level, human format
+- **🔄 CI/CD** (`CI`, `GITHUB_ACTIONS`, `GITLAB_CI`): WARNING level, human format for readability
+
+Environment variables always override the detected defaults.
 
 ### 🔧 Advanced Usage (Programmatic Control)
 
 **For enterprise environments with existing logging infrastructure:**
 
 #### Option 1: Disable Auto-Configuration
+<!-- zeusdb:skip -->
 ```python
 import os
 os.environ["ZEUSDB_DISABLE_AUTO_LOGGING"] = "1"
@@ -1122,27 +1338,32 @@ from zeusdb_vector_database import VectorDatabase  # Will respect your existing 
 ```
 
 #### Option 2: Programmatic Initialization
+<!-- zeusdb:skip -->
 ```python
 import os
 os.environ["ZEUSDB_DISABLE_AUTO_LOGGING"] = "1"
 
 import zeusdb_vector_database
 
-# Initialize with JSON to console 
+# JSON to stdout
 success = zeusdb_vector_database.init_logging(level="info")
 
-# OR initialize with file logging
-success = zeusdb_vector_database.init_file_logging(
-    log_dir="/var/log/myapp",
-    level="debug", 
-    file_prefix="zeusdb"
-)
+# OR JSON to a directory of daily rotating files. Pick one, not both.
+# success = zeusdb_vector_database.init_file_logging(
+#     log_dir="/var/log/myapp",
+#     level="debug",
+#     file_prefix="zeusdb"
+# )
 
-# Then use normally
+print("initialized:", success)
+
 vdb = zeusdb_vector_database.VectorDatabase()
 ```
 
+**Only the first initializer to run takes effect.** Both functions return `True` if they installed the subscriber and `False` if one was already installed, so calling both leaves the second with no effect and a `False` return. `zeusdb_vector_database.is_logging_initialized()` reports whether either has run.
+
 #### Option 3: Custom Logger Integration
+<!-- zeusdb:skip -->
 ```python
 import logging
 import os
@@ -1166,37 +1387,34 @@ from zeusdb_vector_database import VectorDatabase
 
 #### Human-Readable (Development)
 ```
-2025-01-15 10:30:15 - zeusdb.vector - INFO - Index created: dim=1536, vectors=0
-2025-01-15 10:30:16 - zeusdb.vector - INFO - Added 1000 vectors in 45ms
-2025-01-15 10:30:16 - zeusdb.vector - DEBUG - Search completed: 5 results in 2ms
+2026-08-05T12:19:39.261318Z  INFO build: HNSW index created successfully operation="index_creation_complete" dim=8 space=cosine m=16 ef_construction=200 expected_size=10000 has_quantization=false duration_ms=0
+2026-08-05T12:19:39.3491294Z  INFO add: Vector addition completed operation="add_vectors_complete" total_inserted=2 total_errors=0 success_rate=100.0 duration_ms=87 overwrite_mode=true final_storage_mode="raw_only"
 ```
 
 #### Structured JSON (Production)
 ```json
-{"timestamp":"2025-01-15T10:30:15.123Z","level":"INFO","operation":"index_creation","dim":1536,"space":"cosine","duration_ms":12}
-{"timestamp":"2025-01-15T10:30:16.456Z","level":"INFO","operation":"vector_addition","total_inserted":1000,"duration_ms":45}
-{"timestamp":"2025-01-15T10:30:16.789Z","level":"DEBUG","operation":"search_complete","results_count":5,"duration_ms":2}
+{"timestamp":"2026-08-05T12:19:39.4853862Z","level":"INFO","fields":{"message":"HNSW index created successfully","operation":"index_creation_complete","dim":8,"space":"cosine","m":16,"ef_construction":200,"expected_size":10000,"has_quantization":false,"duration_ms":"0"},"target":"zeusdb_vector_database::hnsw_index","filename":"src\\hnsw_index.rs","line_number":1068,"threadId":"ThreadId(1)"}
 ```
 
 ### 🔍 Monitoring and Observability
 
-#### Key Metrics to Monitor
-- **`operation`**: Type of operation (index_creation, vector_addition, search, etc.)
-- **`duration_ms`**: Performance timing for all operations
-- **`total_inserted`**, **`total_errors`**: Success/failure rates
-- **`compression_ratio`**: Memory efficiency with quantization
-- **`training_progress`**: Quantization training status
+#### Key Fields to Monitor
+- **`operation`**: the operation name, for example `index_creation_complete`, `add_vectors_complete`, `search_complete`, `pq_training_complete`, `save_complete`, `compact_complete`
+- **`duration_ms`**: timing on index creation, additions, searches, saves and compaction
+- **`total_inserted`**, **`total_errors`**, **`success_rate`**: outcome of each `add()`
+- **`final_storage_mode`**: whether an index is serving raw or quantized results
+- **`results_count`**: results returned by a search
 
 #### Production Alerting Examples
 ```bash
 # Monitor error rates
 grep '"level":"ERROR"' /var/log/zeusdb/app.log | wc -l
 
-# Track performance degradation  
-grep '"operation":"search"' /var/log/zeusdb/app.log | jq '.duration_ms' | avg
+# Track search latency
+grep '"operation":"search_complete"' /var/log/zeusdb/app.log | jq '.fields.duration_ms'
 
 # Watch quantization training
-grep '"operation":"pq_training"' /var/log/zeusdb/app.log | tail -f
+grep '"operation":"pq_training' /var/log/zeusdb/app.log
 ```
 
 ### 🛠️ Troubleshooting
@@ -1208,8 +1426,8 @@ grep '"operation":"pq_training"' /var/log/zeusdb/app.log | tail -f
 # Check if auto-logging is disabled
 echo $ZEUSDB_DISABLE_AUTO_LOGGING
 
-# Verify log level
-ZEUSDB_LOG_LEVEL=debug python -c "import zeusdb; print('Logging active')"
+# Verify the level is one both layers accept
+ZEUSDB_LOG_LEVEL=debug python -c "import zeusdb_vector_database as z; print(z.is_logging_initialized())"
 ```
 
 **File logging not working?**
@@ -1227,10 +1445,9 @@ ZEUSDB_LOG_TARGET=stderr ZEUSDB_LOG_LEVEL=info python your_app.py
 ZEUSDB_LOG_LEVEL=trace python your_app.py
 ```
 
-#### Performance Impact
-- **Minimal overhead**: Structured logging adds <1% performance impact
-- **Async file writing**: File logging doesn't block operations
-- **Smart buffering**: Logs are efficiently batched for performance
+#### Performance Notes
+- File logging is non-blocking: records are handed to a background writer rather than written on the calling thread.
+- `trace` and `debug` are verbose enough to dominate runtime on a hot loop. Leave production at `error`.
 
 ### 🎯 Best Practices
 
@@ -1240,24 +1457,24 @@ export ZEUSDB_LOG_LEVEL=debug
 export ZEUSDB_LOG_FORMAT=human
 ```
 
-#### Staging  
+#### Staging
 ```bash
 export ZEUSDB_LOG_LEVEL=info
 export ZEUSDB_LOG_FORMAT=json
 export ZEUSDB_LOG_TARGET=file
 export ZEUSDB_LOG_FILE=logs/zeusdb-staging.log
+export ZEUSDB_LOG_ROTATION=daily
 ```
 
 #### Production
 ```bash
 export ENVIRONMENT=production
-export ZEUSDB_LOG_LEVEL=error  
+export ZEUSDB_LOG_LEVEL=error
 export ZEUSDB_LOG_FORMAT=json
 export ZEUSDB_LOG_TARGET=file
 export ZEUSDB_LOG_FILE=/var/log/zeusdb/production.log
+export ZEUSDB_LOG_ROTATION=daily
 ```
-
-The logging system is designed to be **invisible when you don't need it** and **powerful when you do**. Most users will never need to configure anything, while enterprise users get full control over observability.
 
 <br/>
 
