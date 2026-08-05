@@ -515,7 +515,10 @@ impl<'b, T: Clone + Send + Sync> PointIndexation<'b, T> {
             // recall that range are right extremeity excluded
             // compute fraction of points going into layer i and do expected memory reservation
             let s = 1. / (max_nb_connection as f64).ln();
-            let frac = (-(i as f64) / s).exp() - (-((i + 1) as f64) / s);
+            // ZeusDB patch. The second term needs its own .exp(), or frac grows
+            // with the layer index instead of decaying and every layer reserves
+            // several times the whole dataset.
+            let frac = (-(i as f64) / s).exp() - (-((i + 1) as f64) / s).exp();
             let expected_size = ((frac * max_elements as f64).round()) as usize;
             points_by_layer.push(Vec::with_capacity(expected_size));
         }

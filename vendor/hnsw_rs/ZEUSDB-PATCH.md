@@ -2,7 +2,7 @@
 
 Upstream crate: hnsw_rs 0.3.4 (crates.io, checksum
 43a5258f079b97bf2e8311ff9579e903c899dcbac0d9a138d62e9a066778bd07).
-This directory is a copy of the registry source with four deliberate
+This directory is a copy of the registry source with five deliberate
 changes plus this file. Resolution is redirected here through
 `[patch.crates-io]` in `vdb-core/Cargo.toml`.
 
@@ -250,12 +250,64 @@ condition retained instead of returning, so the search drained the whole
 candidate heap and ran an O(`ef`) `retain` on every turn after the first.
 That is a quadratic term on the hot path of every ZeusDB search.
 
+## Patch 5. Layer capacity reservation
+
+File `src/hnsw.rs`, function `PointIndexation::new`.
+
+```diff
+-            let frac = (-(i as f64) / s).exp() - (-((i + 1) as f64) / s);
++            // ZeusDB patch. The second term needs its own .exp(), or frac grows
++            // with the layer index instead of decaying and every layer reserves
++            // several times the whole dataset.
++            let frac = (-(i as f64) / s).exp() - (-((i + 1) as f64) / s).exp();
+```
+
+### Why it exists
+
+`PointIndexation::new` sizes the `Vec::with_capacity` reservation for each
+of the 16 layers from `max_elements`, which ZeusDB supplies as the
+caller's `expected_size`. With `s = 1 / ln(m)` the intended fraction is
+`P(level == i) = exp(-i/s) - exp(-(i+1)/s)`, which is the distribution the
+crate's own comment above `LayerGenerator::generate` states. Upstream
+omits the `.exp()` on the second term, so the expression evaluates to
+`m^-i + (i+1) * ln(m)`. The subtracted term is negative and grows with the
+layer index, so instead of decaying the fraction rises, and layer 15 alone
+reserves 16 `ln(m)` times the whole declared size.
+
+Summed over the 16 layers the unpatched reservation is
+`136 * ln(m) + (1 - m^-16) / (1 - 1/m)` slots per declared record, where 136
+is the sum of 1 through 16. At 8 bytes per `Arc` slot that is 3,025 bytes per
+declared record at `m` 16 and 4,533 at `m` 64, against a measured 3,031 and
+4,542. The patched expression sums to one slot per declared record at every
+`m`, measured at 8.0 bytes and flat across `m` 8, 16, 32 and 64.
+
+The reservation is a partition rather than a cumulative membership.
+`generate_new_point` pushes each point into `points_by_layer[p_id.0]` only,
+the layer of its own top level, so the populations sum to the record count
+and not to `n * m / (m - 1)`. Lower layer adjacency is held in each
+`Point`'s own `neighbours` array and never in `points_by_layer`.
+
+Measured on an empty index, private commit falls from 2,890.7 MB to 7.6 MB
+at a declared 1,000,000 and `m` 16, and from 28,906.2 MB to 76.4 MB at a
+declared 10,000,000. A declared 100,000,000 previously aborted the process
+with `0xC0000409` on a failed 19.96 GB allocation, raising no Python
+exception, and now creates in 764.4 MB. On a real 100,000 record build at
+`m` 16 the total falls from 13,693 to 10,617 bytes per record, and at `m` 32
+from 15,141 to 11,235, with recall at 10 unchanged at 0.8025 and 0.9870.
+
+Under-reserving is safe. A layer that receives more points than reserved
+reallocates through the ordinary `Vec::push` growth path, which is why a
+tight reservation is acceptable and why an index may exceed its declared
+`expected_size` as the ZeusDB README states.
+
 ## Total against the pristine registry copy
 
-`src/hnsw.rs` differs by 249 lines, 189 added and 60 removed. Patch 1
+`src/hnsw.rs` differs by 254 lines, 193 added and 61 removed. Patch 1
 accounts for 1 added and 1 removed. Patch 2 accounts for 30 added and 2
 removed. Patch 3 accounts for 100 added and 3 removed. Patch 4 accounts
 for 58 added and 54 removed, of which 20 of the additions are comment.
+Patch 5 accounts for 4 added and 1 removed, of which 3 of the additions
+are comment.
 `src/hnswio.rs` differs by 4 lines, all added, all patch 3.
 `ZEUSDB-PATCH.md` is an
 added file. Five files carry no content change and differ only in line
@@ -303,13 +355,31 @@ reliable check is textual. Without this patch `search_layer` contains
 `return_points.retain(` and `let f = return_points.peek().unwrap();`.
 With it, it contains neither.
 
+Patch 5 is caught by the Python regression tests in
+`tests/test_reservation.py`. A memory assertion is practical here, because
+the reservation is committed at creation and is visible before a single
+record is added.
+`test_empty_index_at_a_large_declared_size_stays_under_the_bound` creates an
+empty index at a declared 5,000,000 and asserts the process commits under
+256 MB, parametrized over `m` 8, 16, 32 and 64. It reads
+`psutil.memory_info().vms` rather than `rss`, since the reservation is
+committed and never written, so `rss` sees almost none of it on Windows and
+the untouched pages never enter the resident set on Linux. Without this
+patch the four cells commit 10,853, 14,455, 18,053 and 21,657 MB, so the
+bound is missed by between 42 and 85 times.
+`test_declared_size_that_previously_aborted_the_process` creates at a
+declared 100,000,000, where without this patch pytest itself exits with
+`0xC0000409`.
+
 ## On upgrade
 
-All four patches MUST be reapplied whenever the vendored copy is
+All five patches MUST be reapplied whenever the vendored copy is
 refreshed or the version is bumped, and the line counts above rechecked
 so a lost patch is visible. Both Rust regression tests insert
 sequentially, so they depend on patch 2 for their own determinism. Patch
 4 is load bearing rather than optional, because `vdb-core` passes a
 filter into `search_filter` on every search call site and the unpatched
-filtered path panics on some legal arguments. Do not make any other
-change to this tree.
+filtered path panics on some legal arguments. Patch 5 is load bearing at
+any large `expected_size`, since without it a declared 100,000,000 aborts
+the interpreter rather than raising. Do not make any other change to this
+tree.
