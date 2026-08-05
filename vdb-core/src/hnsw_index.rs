@@ -1169,162 +1169,20 @@ impl HNSWIndex {
     }
 
     /// Rebuild the HNSW index to use PQ codes after training is complete
-    #[instrument(level = "info", skip(self), fields(
+    #[instrument(level = "info", skip(self, py), fields(
         vector_count = self.get_vector_count(),
         has_quantization = self.has_quantization()
     ), err)]
-    pub fn rebuild_with_quantization(&self) -> PyResult<bool> {
-        let _writers = self.writers.lock().unwrap();
-        self.rebuild_with_quantization_locked()
-    }
-
-    /// The body of `rebuild_with_quantization`, with the writers guard already held
-    ///
-    /// Training reaches this from inside `add`, which owns the guard for the whole
-    /// call, so the two entry points are separate rather than one taking the guard
-    /// twice and deadlocking on itself.
-    fn rebuild_with_quantization_locked(&self) -> PyResult<bool> {
-        let start_time = Instant::now();
-
-        let pq = match &self.pq {
-            Some(pq) if pq.is_trained() => pq.clone(),
-            _ => {
-                warn!(
-                    operation = "rebuild_quantization",
-                    reason = "pq_not_trained",
-                    "Cannot rebuild: PQ not trained"
-                );
-                return Ok(false);
-            }
-        };
-
-        // Create new PQ-based HNSW index
-        let max_layer = 16; // Always use NB_LAYER_MAX for consistency
-        trace!(
-            operation = "rebuild_quantization",
-            max_layer = max_layer,
-            "Creating new PQ HNSW index"
-        );
-
-        // Quantize every stored vector and record the codes, then release the
-        // storage guards. Nothing below this block holds one, which is what lets
-        // the graph work take its own guards in the declared order rather than
-        // under a `vectors` guard taken first.
-        let (vector_count, retained) = {
-            let vectors = self.vectors.read().unwrap();
-            if vectors.is_empty() {
-                warn!(
-                    operation = "rebuild_quantization",
-                    reason = "no_vectors",
-                    "Cannot rebuild: no vectors available"
-                );
-                return Ok(false);
-            }
-
-            info!(
-                operation = "quantization_rebuild_start",
-                vector_count = vectors.len(),
-                "Starting quantization rebuild"
-            );
-
-            let vector_refs: Vec<&[f32]> = vectors.values().map(|v| v.as_slice()).collect();
-            let quantized_codes = pq.quantize_batch(&vector_refs).map_err(|e| {
-                error!(operation = "quantization_rebuild", error = %e, "Failed to quantize vectors");
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to quantize vectors: {}",
-                    e
-                ))
-            })?;
-
-            // Store quantized codes. Codes for records that have no raw vector are
-            // kept rather than cleared, because under QuantizedOnly they are the
-            // only copy of every record added after training completed and there is
-            // nothing left to re-quantize them from. Clearing dropped those records
-            // from the index outright. Removal already deletes an id's codes, so
-            // nothing stale can survive here.
-            let mut pq_codes = self.pq_codes.write().unwrap();
-            let retained = pq_codes
-                .keys()
-                .filter(|id| !vectors.contains_key(*id))
-                .count();
-
-            for (i, (id, _)) in vectors.iter().enumerate() {
-                if i < quantized_codes.len() {
-                    pq_codes.insert(id.clone(), quantized_codes[i].clone());
-                }
-            }
-            debug!(
-                operation = "quantization_rebuild",
-                codes_stored = pq_codes.len(),
-                codes_retained = retained,
-                "Quantized codes stored"
-            );
-            (vectors.len(), retained)
-        };
-
-        // The codes are copied out so the graph is built with no lock held at
-        // all. A large batch insert forks to rayon, and a fork under the graph's
-        // write guard can leave every worker in the pool waiting on the thread
-        // that holds it. Copying costs one byte per subvector per record.
-        let batch_data: Vec<(Vec<u8>, usize)> = {
-            let id_map = self.id_map.read().unwrap();
-            let pq_codes = self.pq_codes.read().unwrap();
-            pq_codes
-                .iter()
-                .filter_map(|(id, codes)| {
-                    id_map
-                        .get(id)
-                        .map(|&internal_id| (codes.clone(), internal_id))
-                })
-                .collect()
-        };
-
-        let new_hnsw = DistanceType::new_pq(
-            &self.space,
-            self.m,
-            self.expected_size,
-            max_layer,
-            self.ef_construction,
-            pq.clone(),
-        );
-
-        if !batch_data.is_empty() {
-            let batch: Vec<(&Vec<u8>, usize)> = batch_data
-                .iter()
-                .map(|(codes, internal_id)| (codes, *internal_id))
-                .collect();
-            new_hnsw.insert_batch_pq(&batch)
-                .map_err(|e| {
-                    error!(operation = "quantization_rebuild", error = %e, "Failed to insert quantized vectors");
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        format!("Failed to insert quantized vectors: {}", e)
-                    )
-                })?;
-        }
-
-        // The replacement is built in full before it is installed, so a search
-        // running alongside this sees the old graph or the new one and never a
-        // partly filled one. It used to see the empty new graph for as long as
-        // the insertions took.
-        {
-            let mut hnsw_guard = self.hnsw.write().unwrap();
-            *hnsw_guard = new_hnsw;
-        }
-
-        // ✅ ENTERPRISE: Add duration timing with fixed compression ratio calculation
-        let duration_ms = start_time.elapsed().as_millis();
-        let compression_ratio = (pq.dim as f64 * 4.0) / pq.subvectors as f64;
-        info!(
-            operation = "quantization_rebuild_complete",
-            vector_count = vector_count,
-            codes_inserted = batch_data.len(),
-            codes_retained = retained,
-            compression_ratio = compression_ratio,
-            duration_ms = duration_ms,
-            "Quantization rebuild completed successfully"
-        );
-
-        Ok(true)
+    pub fn rebuild_with_quantization(&self, py: Python<'_>) -> PyResult<bool> {
+        // The whole rebuild runs with the interpreter lock released, the mutation
+        // guard included. Waiting for another writer while holding the lock would
+        // stall every Python thread in the process for the length of that writer,
+        // which is the failure `add` releasing the lock would otherwise create.
+        py.allow_threads(|| {
+            let _writers = self.writers.lock().unwrap();
+            self.rebuild_with_quantization_locked()
+        })
+        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 
     /// Check if the index is using quantized search
@@ -1355,8 +1213,6 @@ impl HNSWIndex {
         is_quantized = self.is_quantized()
     ), err)]
     pub fn add(&self, data: Bound<PyAny>, overwrite: bool) -> PyResult<AddResult> {
-        // Serialised against the other mutating methods, not against searches.
-        let _writers = self.writers.lock().unwrap();
         let start_time = Instant::now();
 
         // Input validation
@@ -1412,129 +1268,46 @@ impl HNSWIndex {
             "Starting vector addition"
         );
 
-        // ENHANCED FIX: Handle overwrites properly for ALL paths (Raw, Training, PQ)
-        if overwrite {
-            // Phase 1: Batch identify and remove existing documents
-            let (ids_to_remove, storage_analysis) = {
-                let id_map = self.id_map.read().unwrap();
-                let vectors = self.vectors.read().unwrap();
-                let pq_codes = self.pq_codes.read().unwrap();
+        // Parsing is the whole of what reads Python objects, and it is done.
+        // Everything below works on `parsed_data`, which is owned Rust, so the
+        // insertion phase runs with the interpreter lock released. The mutation
+        // guard is taken inside that region rather than above it, so a caller
+        // waiting for another writer waits without the lock. Holding it while
+        // waiting would stall every Python thread in the process for the length
+        // of the writer ahead, which is the failure this change would otherwise
+        // introduce in place of the one it removes.
+        //
+        // `insert_parsed_records` carries the proof that nothing inside touches
+        // Python.
+        let py = data.py();
+        let (inserted, insert_errors) = py.allow_threads(|| {
+            let _writers = self.writers.lock().unwrap();
+            self.insert_parsed_records(parsed_data, overwrite)
+        });
+        total_inserted += inserted;
 
-                let mut ids_to_remove = Vec::new();
-                let mut has_raw = 0;
-                let mut has_pq = 0;
-                let mut has_both = 0;
-
-                for (id, _, _) in &parsed_data {
-                    if id_map.contains_key(id) {
-                        ids_to_remove.push(id.clone());
-
-                        // Analyze what's being replaced for logging
-                        let has_raw_vector = vectors.contains_key(id);
-                        let has_pq_codes = pq_codes.contains_key(id);
-
-                        match (has_raw_vector, has_pq_codes) {
-                            (true, true) => has_both += 1,
-                            (true, false) => has_raw += 1,
-                            (false, true) => has_pq += 1,
-                            (false, false) => {} // Shouldn't happen, but handle gracefully
-                        }
-                    }
-                }
-
-                (ids_to_remove, (has_raw, has_pq, has_both))
-            }; // Release all read locks here
-
-            if !ids_to_remove.is_empty() {
-                info!(
-                    operation = "overwrite_preparation",
-                    documents_to_remove = ids_to_remove.len(),
-                    storage_analysis = format!(
-                        "raw_only: {}, pq_only: {}, both: {}",
-                        storage_analysis.0, storage_analysis.1, storage_analysis.2
-                    ),
-                    "Removing existing documents for overwrite"
-                );
-
-                // Batch remove existing documents (handles both raw and PQ data)
-                let mut removed_count = 0;
-                let mut removal_errors = 0;
-
-                for id in ids_to_remove {
-                    match self.remove_point_internal(id.clone()) {
-                        Ok(was_removed) => {
-                            if was_removed {
-                                removed_count += 1;
-                                trace!(
-                                    operation = "overwrite_removal",
-                                    vector_id = %id,
-                                    "Removed existing vector/codes for overwrite"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            removal_errors += 1;
-                            warn!(
-                                operation = "overwrite_removal",
-                                vector_id = %id,
-                                error = %e,
-                                "Failed to remove existing vector for overwrite"
-                            );
-                            errors.push(format!("Failed to remove existing {}: {}", id, e));
-                            total_errors += 1;
-                        }
-                    }
-                }
-
-                info!(
-                    operation = "overwrite_removal_complete",
-                    removed_count = removed_count,
-                    removal_errors = removal_errors,
-                    "Completed removal phase for overwrite"
-                );
-            }
-        }
-
-        // Phase 2: Add new vectors using the correct path based on current PQ state
-        debug!(
-            operation = "add_vectors_insertion_phase",
-            current_state = self.get_storage_mode(),
-            "Starting insertion phase"
-        );
-
-        for (id, vector, metadata) in parsed_data {
-            let id_for_error = id.clone();
-
-            // Use overwrite=false since we already handled removals above
-            // The add_single_vector method will route to the correct path based on current PQ state
-            match self.add_single_vector(id, vector, metadata, false) {
-                Ok(inserted_new) => {
-                    total_inserted += 1;
-                    if inserted_new {
-                        let mut count = self.vector_count.lock().unwrap();
-                        *count += 1;
-                    }
-
-                    // Check training trigger (graceful failure handling)
-                    if let Err(training_error) = self.maybe_trigger_training() {
-                        warn!(
-                            operation = "training_trigger",
-                            error = %training_error,
-                            vector_id = %id_for_error,
-                            "Training trigger failed"
-                        );
-                        errors.push(format!("Training failed: {}", training_error));
-                    }
-                }
-                Err(e) => {
+        // The errors come back in the order they happened. Two of the three
+        // variants carry a message Rust already built. The third carries a
+        // `PyErr`, which is formatted here because `PyErr`'s `Display` acquires
+        // the interpreter lock and so could not run above.
+        for insert_error in insert_errors {
+            match insert_error {
+                InsertError::Counted(message) => {
+                    errors.push(message);
                     total_errors += 1;
-                    errors.push(format!("Vector {}: {}", id_for_error, e));
+                }
+                InsertError::Training(message) => {
+                    errors.push(message);
+                }
+                InsertError::Vector { id, err } => {
                     trace!(
                         operation = "add_vector_error",
-                        vector_id = %id_for_error,
-                        error = %e,
+                        vector_id = %id,
+                        error = %err,
                         "Vector addition failed"
                     );
+                    errors.push(format!("Vector {}: {}", id, err));
+                    total_errors += 1;
                 }
             }
         }
@@ -1915,41 +1688,22 @@ impl HNSWIndex {
     }
 
     /// Enhanced Save method to include HNSW Graph
-    #[instrument(level = "info", skip(self), fields(
+    ///
+    /// The whole save runs with the interpreter lock released. `save_index`
+    /// reaches `save_config`, `save_mappings`, `save_metadata`,
+    /// `save_quantization_config`, `save_pq_centroids`, `save_pq_codes`,
+    /// `save_vectors` and `save_manifest`, and every one of them speaks only to
+    /// `serde_json`, `bincode` and `std::fs`. Every Python token in
+    /// `persistence.rs` sits in the load path, in `rebuild_using_add_method` and
+    /// `convert_json_value_to_python`. `save_hnsw_graph` calls the vendored
+    /// crate's `file_dump`, which names PyO3 nowhere.
+    #[instrument(level = "info", skip(self, py), fields(
         vector_count = self.get_vector_count(),
         has_quantization = self.has_quantization(),
         is_quantized = self.is_quantized()
     ), err)]
-    pub fn save(&self, path: &str) -> PyResult<()> {
-        // A save reads the mappings, the metadata, the codes, the vectors and
-        // the graph in five separate passes, so it needs the index to hold
-        // still. PyO3's exclusive borrow used to guarantee that by keeping every
-        // mutating method away from it. Relaxing the receivers removes that, and
-        // a save overlapping an add would write a directory whose mappings and
-        // vectors came from different instants. This takes the mutation lock
-        // instead, which blocks a concurrent write and no reader at all.
-        let _writers = self.writers.lock().unwrap();
-        let start_time = Instant::now();
-        info!(operation = "save_start", path = path, "Starting index save");
-
-        let path_buf = Path::new(path);
-
-        // Phase 1: Save all ZeusDB components (already tested to work)
-        debug!(operation = "save_phase1", "Saving ZeusDB components");
-        crate::persistence::save_index(self, path)?;
-
-        // Phase 2: Save HNSW graph using hnsw-rs native dump
-        debug!(operation = "save_phase2", "Saving HNSW graph");
-        self.save_hnsw_graph(path_buf)?;
-
-        let duration_ms = start_time.elapsed().as_millis();
-        info!(
-            operation = "save_complete",
-            path = path,
-            duration_ms = duration_ms,
-            "Index save completed successfully"
-        );
-        Ok(())
+    pub fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        py.allow_threads(|| self.save_locked(path))
     }
 
     /// Python property: `index.dim`
@@ -2268,12 +2022,17 @@ impl HNSWIndex {
     /// Remove vector by ID
     /// Public remove_point method (unchanged for API compatibility)
     /// This code delegates to remove_point_internal() which handles all the complex logic
-    pub fn remove_point(&self, id: String) -> PyResult<bool> {
-        let _writers = self.writers.lock().unwrap();
-        match self.remove_point_internal(id) {
-            Ok(result) => Ok(result),
-            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
-        }
+    pub fn remove_point(&self, py: Python<'_>, id: String) -> PyResult<bool> {
+        // `id` arrives already converted, and `remove_point_internal` is in the
+        // set `insert_parsed_records` verifies, so the whole body is Rust. The
+        // removal itself is short, but the wait for the mutation guard is not,
+        // because `add` can now hold it for a long insert with the lock released.
+        // Waiting here with the lock held would stall every Python thread.
+        py.allow_threads(|| {
+            let _writers = self.writers.lock().unwrap();
+            self.remove_point_internal(id)
+        })
+        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 
     /// Rebuild the graph in memory and reclaim the nodes removal and overwrite strand.
@@ -2300,136 +2059,13 @@ impl HNSWIndex {
     /// index exactly as it was.
     ///
     /// This is never automatic. Calling it is a decision a deployment can schedule.
-    pub fn compact(&self) -> PyResult<usize> {
-        let _writers = self.writers.lock().unwrap();
-        let start_time = Instant::now();
-
-        let live_count = self.id_map.read().unwrap().len();
-        let nodes_before = self.hnsw.read().unwrap().nb_points();
-
-        if nodes_before <= live_count {
-            debug!(
-                operation = "compact",
-                graph_nodes = nodes_before,
-                live_records = live_count,
-                "No stranded nodes, compact is a no-op"
-            );
-            return Ok(0);
-        }
-
-        let quantized = self.is_quantized();
-        // NB_LAYER_MAX, matching every other construction site in this file.
-        let max_layer = 16;
-
-        let new_hnsw = if quantized {
-            let pq = self.pq.as_ref().cloned().ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    "Index reports a quantized graph but holds no product quantizer",
-                )
-            })?;
-            DistanceType::new_pq(
-                &self.space,
-                self.m,
-                self.expected_size,
-                max_layer,
-                self.ef_construction,
-                pq,
-            )
-        } else {
-            DistanceType::new_raw(
-                &self.space,
-                self.m,
-                self.expected_size,
-                max_layer,
-                self.ef_construction,
-            )
-        };
-
-        // Re-insert every live record under the internal id it already holds, so the
-        // two id maps stay correct without being rewritten. A record whose source data
-        // is missing is collected rather than skipped, because skipping it would drop
-        // it from the index silently.
-        let missing: Vec<String> = {
-            let id_map = self.id_map.read().unwrap();
-
-            if quantized {
-                let pq_codes = self.pq_codes.read().unwrap();
-                let mut batch: Vec<(&Vec<u8>, usize)> = Vec::with_capacity(id_map.len());
-                let mut missing = Vec::new();
-
-                for (ext_id, &internal_id) in id_map.iter() {
-                    match pq_codes.get(ext_id) {
-                        Some(codes) => batch.push((codes, internal_id)),
-                        None => missing.push(ext_id.clone()),
-                    }
-                }
-
-                if missing.is_empty() && !batch.is_empty() {
-                    new_hnsw.insert_batch_pq(&batch).map_err(|e| {
-                        error!(operation = "compact", error = %e, "Failed to re-insert quantized codes");
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                            "Failed to re-insert quantized codes during compact: {}",
-                            e
-                        ))
-                    })?;
-                }
-
-                missing
-            } else {
-                let vectors = self.vectors.read().unwrap();
-                let mut missing = Vec::new();
-
-                for (ext_id, &internal_id) in id_map.iter() {
-                    match vectors.get(ext_id) {
-                        Some(vector) => new_hnsw.insert(vector, internal_id),
-                        None => missing.push(ext_id.clone()),
-                    }
-                }
-
-                missing
-            }
-        };
-
-        if !missing.is_empty() {
-            error!(
-                operation = "compact",
-                missing_records = missing.len(),
-                live_records = live_count,
-                quantized = quantized,
-                "Refusing to compact, some live records have no source data to rebuild from"
-            );
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Refusing to compact: {} of {} live records have no stored {} to rebuild \
-                 the graph from, so compacting would drop them. The index is unchanged.",
-                missing.len(),
-                live_count,
-                if quantized {
-                    "quantized codes"
-                } else {
-                    "vector"
-                }
-            )));
-        }
-
-        let nodes_after = new_hnsw.nb_points();
-        {
-            let mut hnsw_guard = self.hnsw.write().unwrap();
-            *hnsw_guard = new_hnsw;
-        }
-
-        let reclaimed = nodes_before - nodes_after;
-        info!(
-            operation = "compact_complete",
-            nodes_before = nodes_before,
-            nodes_after = nodes_after,
-            nodes_reclaimed = reclaimed,
-            live_records = live_count,
-            quantized = quantized,
-            duration_ms = start_time.elapsed().as_millis(),
-            "Graph compacted"
-        );
-
-        Ok(reclaimed)
+    ///
+    /// The rebuild runs with the interpreter lock released. Every function it
+    /// reaches is in the set `insert_parsed_records` verifies, plus
+    /// `DistanceType::new_raw` and `insert_batch`, which are the same shape as
+    /// the quantized pair already listed there.
+    pub fn compact(&self, py: Python<'_>) -> PyResult<usize> {
+        py.allow_threads(|| self.compact_locked())
     }
 
     /// Get performance characteristics and limitations
@@ -2548,6 +2184,27 @@ impl HNSWIndex {
 /// (external id, vector, metadata). The vector is still in its input form and
 /// has not been normalized for the index space yet.
 type ParsedRecords = Vec<(String, Vec<f32>, HashMap<String, Value>)>;
+
+/// An error raised inside `add`'s insertion phase, carried out to be recorded
+///
+/// The insertion phase runs with the interpreter lock released, so it cannot
+/// build the message for an error that arrives as a `PyErr`. `PyErr`'s
+/// `Display` implementation calls `Python::with_gil`, which would reacquire the
+/// lock in the middle of the region that exists to have released it, and would
+/// do so while the mutation guard and possibly a storage guard are held.
+/// `add` formats those once the lock is back.
+enum InsertError {
+    /// A message Rust already holds, counted against `total_errors`
+    Counted(String),
+
+    /// A training failure. Recorded but not counted, which is what the training
+    /// path has always done, because a training failure is not a rejected record
+    Training(String),
+
+    /// A `PyErr` from one of the three insert paths, with the id it belongs to.
+    /// Counted against `total_errors` once formatted
+    Vector { id: String, err: PyErr },
+}
 
 /// Search hits for one query vector, as (external id, distance, metadata,
 /// optional raw vector). The raw vector is present only when the caller asked
@@ -2750,6 +2407,527 @@ impl HNSWIndex {
             );
             Ok(false)
         }
+    }
+
+    /// The body of `rebuild_with_quantization`, with the writers guard already held
+    ///
+    /// Training reaches this from inside `add`, which owns the guard for the whole
+    /// call, so the two entry points are separate rather than one taking the guard
+    /// twice and deadlocking on itself.
+    ///
+    /// Errors are `String` rather than `PyErr` because both callers reach this with
+    /// the interpreter lock released, and `PyErr`'s `Display` acquires it. The
+    /// entry point above turns the message back into the `PyRuntimeError` it always
+    /// raised.
+    fn rebuild_with_quantization_locked(&self) -> Result<bool, String> {
+        let start_time = Instant::now();
+
+        let pq = match &self.pq {
+            Some(pq) if pq.is_trained() => pq.clone(),
+            _ => {
+                warn!(
+                    operation = "rebuild_quantization",
+                    reason = "pq_not_trained",
+                    "Cannot rebuild: PQ not trained"
+                );
+                return Ok(false);
+            }
+        };
+
+        // Create new PQ-based HNSW index
+        let max_layer = 16; // Always use NB_LAYER_MAX for consistency
+        trace!(
+            operation = "rebuild_quantization",
+            max_layer = max_layer,
+            "Creating new PQ HNSW index"
+        );
+
+        // Quantize every stored vector and record the codes, then release the
+        // storage guards. Nothing below this block holds one, which is what lets
+        // the graph work take its own guards in the declared order rather than
+        // under a `vectors` guard taken first.
+        let (vector_count, retained) = {
+            let vectors = self.vectors.read().unwrap();
+            if vectors.is_empty() {
+                warn!(
+                    operation = "rebuild_quantization",
+                    reason = "no_vectors",
+                    "Cannot rebuild: no vectors available"
+                );
+                return Ok(false);
+            }
+
+            info!(
+                operation = "quantization_rebuild_start",
+                vector_count = vectors.len(),
+                "Starting quantization rebuild"
+            );
+
+            let vector_refs: Vec<&[f32]> = vectors.values().map(|v| v.as_slice()).collect();
+            let quantized_codes = pq.quantize_batch(&vector_refs).map_err(|e| {
+                error!(operation = "quantization_rebuild", error = %e, "Failed to quantize vectors");
+                format!("Failed to quantize vectors: {}", e)
+            })?;
+
+            // Store quantized codes. Codes for records that have no raw vector are
+            // kept rather than cleared, because under QuantizedOnly they are the
+            // only copy of every record added after training completed and there is
+            // nothing left to re-quantize them from. Clearing dropped those records
+            // from the index outright. Removal already deletes an id's codes, so
+            // nothing stale can survive here.
+            let mut pq_codes = self.pq_codes.write().unwrap();
+            let retained = pq_codes
+                .keys()
+                .filter(|id| !vectors.contains_key(*id))
+                .count();
+
+            for (i, (id, _)) in vectors.iter().enumerate() {
+                if i < quantized_codes.len() {
+                    pq_codes.insert(id.clone(), quantized_codes[i].clone());
+                }
+            }
+            debug!(
+                operation = "quantization_rebuild",
+                codes_stored = pq_codes.len(),
+                codes_retained = retained,
+                "Quantized codes stored"
+            );
+            (vectors.len(), retained)
+        };
+
+        // The codes are copied out so the graph is built with no lock held at
+        // all. A large batch insert forks to rayon, and a fork under the graph's
+        // write guard can leave every worker in the pool waiting on the thread
+        // that holds it. Copying costs one byte per subvector per record.
+        let batch_data: Vec<(Vec<u8>, usize)> = {
+            let id_map = self.id_map.read().unwrap();
+            let pq_codes = self.pq_codes.read().unwrap();
+            pq_codes
+                .iter()
+                .filter_map(|(id, codes)| {
+                    id_map
+                        .get(id)
+                        .map(|&internal_id| (codes.clone(), internal_id))
+                })
+                .collect()
+        };
+
+        let new_hnsw = DistanceType::new_pq(
+            &self.space,
+            self.m,
+            self.expected_size,
+            max_layer,
+            self.ef_construction,
+            pq.clone(),
+        );
+
+        if !batch_data.is_empty() {
+            let batch: Vec<(&Vec<u8>, usize)> = batch_data
+                .iter()
+                .map(|(codes, internal_id)| (codes, *internal_id))
+                .collect();
+            new_hnsw.insert_batch_pq(&batch)
+                .map_err(|e| {
+                    error!(operation = "quantization_rebuild", error = %e, "Failed to insert quantized vectors");
+                    format!("Failed to insert quantized vectors: {}", e)
+                })?;
+        }
+
+        // The replacement is built in full before it is installed, so a search
+        // running alongside this sees the old graph or the new one and never a
+        // partly filled one. It used to see the empty new graph for as long as
+        // the insertions took.
+        //
+        // The old graph is moved out and dropped after the guard is released.
+        // See `replace_graph`.
+        self.replace_graph(new_hnsw);
+
+        // ✅ ENTERPRISE: Add duration timing with fixed compression ratio calculation
+        let duration_ms = start_time.elapsed().as_millis();
+        let compression_ratio = (pq.dim as f64 * 4.0) / pq.subvectors as f64;
+        info!(
+            operation = "quantization_rebuild_complete",
+            vector_count = vector_count,
+            codes_inserted = batch_data.len(),
+            codes_retained = retained,
+            compression_ratio = compression_ratio,
+            duration_ms = duration_ms,
+            "Quantization rebuild completed successfully"
+        );
+
+        Ok(true)
+    }
+
+    /// The body of `compact`, with the interpreter lock already released
+    fn compact_locked(&self) -> PyResult<usize> {
+        let _writers = self.writers.lock().unwrap();
+        let start_time = Instant::now();
+
+        let live_count = self.id_map.read().unwrap().len();
+        let nodes_before = self.hnsw.read().unwrap().nb_points();
+
+        if nodes_before <= live_count {
+            debug!(
+                operation = "compact",
+                graph_nodes = nodes_before,
+                live_records = live_count,
+                "No stranded nodes, compact is a no-op"
+            );
+            return Ok(0);
+        }
+
+        let quantized = self.is_quantized();
+        // NB_LAYER_MAX, matching every other construction site in this file.
+        let max_layer = 16;
+
+        let new_hnsw = if quantized {
+            let pq = self.pq.as_ref().cloned().ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Index reports a quantized graph but holds no product quantizer",
+                )
+            })?;
+            DistanceType::new_pq(
+                &self.space,
+                self.m,
+                self.expected_size,
+                max_layer,
+                self.ef_construction,
+                pq,
+            )
+        } else {
+            DistanceType::new_raw(
+                &self.space,
+                self.m,
+                self.expected_size,
+                max_layer,
+                self.ef_construction,
+            )
+        };
+
+        // Re-insert every live record under the internal id it already holds, so the
+        // two id maps stay correct without being rewritten. A record whose source data
+        // is missing is collected rather than skipped, because skipping it would drop
+        // it from the index silently.
+        let missing: Vec<String> = {
+            let id_map = self.id_map.read().unwrap();
+
+            if quantized {
+                let pq_codes = self.pq_codes.read().unwrap();
+                let mut batch: Vec<(&Vec<u8>, usize)> = Vec::with_capacity(id_map.len());
+                let mut missing = Vec::new();
+
+                for (ext_id, &internal_id) in id_map.iter() {
+                    match pq_codes.get(ext_id) {
+                        Some(codes) => batch.push((codes, internal_id)),
+                        None => missing.push(ext_id.clone()),
+                    }
+                }
+
+                if missing.is_empty() && !batch.is_empty() {
+                    new_hnsw.insert_batch_pq(&batch).map_err(|e| {
+                        error!(operation = "compact", error = %e, "Failed to re-insert quantized codes");
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                            "Failed to re-insert quantized codes during compact: {}",
+                            e
+                        ))
+                    })?;
+                }
+
+                missing
+            } else {
+                let vectors = self.vectors.read().unwrap();
+                let mut missing = Vec::new();
+
+                for (ext_id, &internal_id) in id_map.iter() {
+                    match vectors.get(ext_id) {
+                        Some(vector) => new_hnsw.insert(vector, internal_id),
+                        None => missing.push(ext_id.clone()),
+                    }
+                }
+
+                missing
+            }
+        };
+
+        if !missing.is_empty() {
+            error!(
+                operation = "compact",
+                missing_records = missing.len(),
+                live_records = live_count,
+                quantized = quantized,
+                "Refusing to compact, some live records have no source data to rebuild from"
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Refusing to compact: {} of {} live records have no stored {} to rebuild \
+                 the graph from, so compacting would drop them. The index is unchanged.",
+                missing.len(),
+                live_count,
+                if quantized {
+                    "quantized codes"
+                } else {
+                    "vector"
+                }
+            )));
+        }
+
+        let nodes_after = new_hnsw.nb_points();
+        self.replace_graph(new_hnsw);
+
+        let reclaimed = nodes_before - nodes_after;
+        info!(
+            operation = "compact_complete",
+            nodes_before = nodes_before,
+            nodes_after = nodes_after,
+            nodes_reclaimed = reclaimed,
+            live_records = live_count,
+            quantized = quantized,
+            duration_ms = start_time.elapsed().as_millis(),
+            "Graph compacted"
+        );
+
+        Ok(reclaimed)
+    }
+
+    /// The body of `save`, with the interpreter lock already released
+    fn save_locked(&self, path: &str) -> PyResult<()> {
+        // A save reads the mappings, the metadata, the codes, the vectors and
+        // the graph in five separate passes, so it needs the index to hold
+        // still. PyO3's exclusive borrow used to guarantee that by keeping every
+        // mutating method away from it. Relaxing the receivers removes that, and
+        // a save overlapping an add would write a directory whose mappings and
+        // vectors came from different instants. This takes the mutation lock
+        // instead, which blocks a concurrent write and no reader at all.
+        let _writers = self.writers.lock().unwrap();
+        let start_time = Instant::now();
+        info!(operation = "save_start", path = path, "Starting index save");
+
+        let path_buf = Path::new(path);
+
+        // Phase 1: Save all ZeusDB components (already tested to work)
+        debug!(operation = "save_phase1", "Saving ZeusDB components");
+        crate::persistence::save_index(self, path)?;
+
+        // Phase 2: Save HNSW graph using hnsw-rs native dump
+        debug!(operation = "save_phase2", "Saving HNSW graph");
+        self.save_hnsw_graph(path_buf)?;
+
+        let duration_ms = start_time.elapsed().as_millis();
+        info!(
+            operation = "save_complete",
+            path = path,
+            duration_ms = duration_ms,
+            "Index save completed successfully"
+        );
+        Ok(())
+    }
+
+    /// Install a replacement graph, and drop the old one outside the guard
+    ///
+    /// The three paths that replace the whole backend, `compact`, the
+    /// quantization rebuild and the persistence rebuild, all used to write
+    /// `*hnsw_guard = new_hnsw` directly. That assignment drops the old graph
+    /// while the write guard is still held, and dropping a graph is not a quiet
+    /// operation. `PointIndexation::drop` in the vendored crate clears each
+    /// layer with `into_par_iter().for_each(...)`, so the drop forks to rayon.
+    ///
+    /// A rayon fork under the graph's write guard deadlocks whenever the pool is
+    /// occupied by search tasks. `batch_search_parallel` fans a batch of more
+    /// than five queries across the pool and each task takes a read guard, so
+    /// once a writer is queued every worker blocks behind it. The fork then has
+    /// no worker to run on and the writer never reaches the point of releasing.
+    /// Relay 36 wrote the rule that no path forks to rayon while holding a write
+    /// guard, and this is the fork that rule missed, because it is hidden inside
+    /// an assignment rather than written as a call.
+    ///
+    /// Moving the old value out and dropping it after the guard is released
+    /// keeps the swap to a pointer move under the guard.
+    fn replace_graph(&self, new_hnsw: DistanceType) {
+        let old = {
+            let mut hnsw_guard = self.hnsw.write().unwrap();
+            std::mem::replace(&mut *hnsw_guard, new_hnsw)
+        };
+        drop(old);
+    }
+
+    /// The insertion phase of `add`, run with the interpreter lock released
+    ///
+    /// Everything here operates on `ParsedRecords`, which is
+    /// `Vec<(String, Vec<f32>, HashMap<String, Value>)>` and holds no Python
+    /// object, no `Py<T>`, no `PyObject` and no borrow of anything Python owns.
+    /// The caller holds the mutation guard.
+    ///
+    /// The complete set of functions reachable from here, verified by reading
+    /// each one rather than by inference:
+    ///
+    /// - `remove_point_internal`, and through it `get_storage_mode`,
+    ///   `has_quantization` and `can_use_quantization`
+    /// - `add_single_vector`, and the three paths below it, `add_raw_vector`,
+    ///   `add_with_id_collection` and `add_quantized_vector`
+    /// - `get_next_id`, `is_quantized`
+    /// - `maybe_trigger_training`, `train_quantization_from_ids` and
+    ///   `rebuild_with_quantization_locked`
+    /// - `PQ::is_trained`, `quantize`, `quantize_batch` and `train`, plus the
+    ///   k-means below `train`
+    /// - `DistanceType::insert`, `insert_pq_codes`, `insert_batch_pq`,
+    ///   `new_pq` and `nb_points`, and the vendored `hnsw_rs` graph below them
+    ///
+    /// None of them takes a `Python` token, and none of them calls into the
+    /// interpreter. `pq.rs`, `distance.rs` and the vendored crate name PyO3
+    /// nowhere at all. The two places that did reach Python were both removed
+    /// rather than worked around. `rebuild_with_quantization_locked` returned a
+    /// `PyResult` whose error the training path formatted into a message, and it
+    /// now returns `Result<bool, String>`. The per-record errors are carried out
+    /// as `InsertError` values instead of being formatted here.
+    ///
+    /// Training completing mid-insert is the longest thing this can run, since it
+    /// fires k-means and then rebuilds the whole graph from quantized codes, and
+    /// it is entirely Rust.
+    ///
+    /// Logging is safe. The `tracing` subscriber this crate installs writes to
+    /// stdout, to stderr, or to a rotating file through `tracing-appender`. No
+    /// layer bridges to Python's `logging`, and the Python layer only ever sets
+    /// environment variables that the Rust initialiser reads at import.
+    ///
+    /// A panic in here is safe too. `Python::allow_threads` restores the
+    /// interpreter lock from a `Drop` guard, so an unwind reacquires it before it
+    /// reaches PyO3's boundary.
+    fn insert_parsed_records(
+        &self,
+        parsed_data: ParsedRecords,
+        overwrite: bool,
+    ) -> (usize, Vec<InsertError>) {
+        let mut total_inserted = 0;
+        let mut errors: Vec<InsertError> = Vec::new();
+
+        // ENHANCED FIX: Handle overwrites properly for ALL paths (Raw, Training, PQ)
+        if overwrite {
+            // Phase 1: Batch identify and remove existing documents
+            let (ids_to_remove, storage_analysis) = {
+                let id_map = self.id_map.read().unwrap();
+                let vectors = self.vectors.read().unwrap();
+                let pq_codes = self.pq_codes.read().unwrap();
+
+                let mut ids_to_remove = Vec::new();
+                let mut has_raw = 0;
+                let mut has_pq = 0;
+                let mut has_both = 0;
+
+                for (id, _, _) in &parsed_data {
+                    if id_map.contains_key(id) {
+                        ids_to_remove.push(id.clone());
+
+                        // Analyze what's being replaced for logging
+                        let has_raw_vector = vectors.contains_key(id);
+                        let has_pq_codes = pq_codes.contains_key(id);
+
+                        match (has_raw_vector, has_pq_codes) {
+                            (true, true) => has_both += 1,
+                            (true, false) => has_raw += 1,
+                            (false, true) => has_pq += 1,
+                            (false, false) => {} // Shouldn't happen, but handle gracefully
+                        }
+                    }
+                }
+
+                (ids_to_remove, (has_raw, has_pq, has_both))
+            }; // Release all read locks here
+
+            if !ids_to_remove.is_empty() {
+                info!(
+                    operation = "overwrite_preparation",
+                    documents_to_remove = ids_to_remove.len(),
+                    storage_analysis = format!(
+                        "raw_only: {}, pq_only: {}, both: {}",
+                        storage_analysis.0, storage_analysis.1, storage_analysis.2
+                    ),
+                    "Removing existing documents for overwrite"
+                );
+
+                // Batch remove existing documents (handles both raw and PQ data)
+                let mut removed_count = 0;
+                let mut removal_errors = 0;
+
+                for id in ids_to_remove {
+                    match self.remove_point_internal(id.clone()) {
+                        Ok(was_removed) => {
+                            if was_removed {
+                                removed_count += 1;
+                                trace!(
+                                    operation = "overwrite_removal",
+                                    vector_id = %id,
+                                    "Removed existing vector/codes for overwrite"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            removal_errors += 1;
+                            warn!(
+                                operation = "overwrite_removal",
+                                vector_id = %id,
+                                error = %e,
+                                "Failed to remove existing vector for overwrite"
+                            );
+                            errors.push(InsertError::Counted(format!(
+                                "Failed to remove existing {}: {}",
+                                id, e
+                            )));
+                        }
+                    }
+                }
+
+                info!(
+                    operation = "overwrite_removal_complete",
+                    removed_count = removed_count,
+                    removal_errors = removal_errors,
+                    "Completed removal phase for overwrite"
+                );
+            }
+        }
+
+        // Phase 2: Add new vectors using the correct path based on current PQ state
+        debug!(
+            operation = "add_vectors_insertion_phase",
+            current_state = self.get_storage_mode(),
+            "Starting insertion phase"
+        );
+
+        for (id, vector, metadata) in parsed_data {
+            let id_for_error = id.clone();
+
+            // Use overwrite=false since we already handled removals above
+            // The add_single_vector method will route to the correct path based on current PQ state
+            match self.add_single_vector(id, vector, metadata, false) {
+                Ok(inserted_new) => {
+                    total_inserted += 1;
+                    if inserted_new {
+                        let mut count = self.vector_count.lock().unwrap();
+                        *count += 1;
+                    }
+
+                    // Check training trigger (graceful failure handling)
+                    if let Err(training_error) = self.maybe_trigger_training() {
+                        warn!(
+                            operation = "training_trigger",
+                            error = %training_error,
+                            vector_id = %id_for_error,
+                            "Training trigger failed"
+                        );
+                        errors.push(InsertError::Training(format!(
+                            "Training failed: {}",
+                            training_error
+                        )));
+                    }
+                }
+                Err(e) => {
+                    errors.push(InsertError::Vector {
+                        id: id_for_error,
+                        err: e,
+                    });
+                }
+            }
+        }
+
+        (total_inserted, errors)
     }
 
     // 1. CORE VECTOR OPERATIONS (6 methods)
@@ -4727,10 +4905,7 @@ impl HNSWIndex {
         if !batch.is_empty() {
             new_hnsw.insert_batch_pq(&batch)?;
         }
-        {
-            let mut hnsw_guard = self.hnsw.write().unwrap();
-            *hnsw_guard = new_hnsw;
-        }
+        self.replace_graph(new_hnsw);
 
         Ok((batch.len(), extra.len(), remapped))
     }
