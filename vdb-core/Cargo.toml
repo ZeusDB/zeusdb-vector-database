@@ -43,6 +43,6 @@ tempfile = "3"
 hnsw_rs = { path = "../vendor/hnsw_rs" }
 
 [profile.release]
-lto = true # <-- Enable Link-Time Optimization
-codegen-units = 1 # <-- Single compilation unit for better optimization
-opt-level = 3 # <-- Full optimization for speed
+lto = true          # Fat link-time optimization
+codegen-units = 1   # Single compilation unit
+opt-level = 3       # Full optimization

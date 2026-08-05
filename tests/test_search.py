@@ -66,33 +66,37 @@ def test_all_formats_search_functionality():
     for record_id in expected_ids:
         assert index.contains(record_id)
 
-    # Approximate search may return fewer than top_k results, so an assertion on
-    # an exact result count is invalid here. What the index promises is that
-    # every hit is a real record, that scores are finite and ascending, and that
-    # the count never exceeds top_k.
+    # Seven records, literal vectors, top_k above the record count and a
+    # sequential build with a seeded level generator, so the search is exhaustive
+    # here and the count is exact. This was relaxed to a range while the graph
+    # varied between runs.
     all_results = index.search(query_vector, top_k=10)
-    assert 0 < len(all_results) <= 10
+    assert len(all_results) == 7
     all_ids = {r["id"] for r in all_results}
-    assert all_ids.issubset(expected_ids)
+    assert all_ids == expected_ids
     assert len(all_ids) == len(all_results)  # no id returned twice
     scores = [r["score"] for r in all_results]
     assert all(np.isfinite(s) for s in scores)
     assert scores == sorted(scores)
 
-    # Filters are applied to the candidates the graph returned, so a filtered
-    # search can yield fewer results than the number of matching records and an
-    # assertion on an exact result count is invalid here. What holds is that
-    # every result satisfies the filter.
+    # The filter is applied to the candidates the graph returned rather than
+    # driving the traversal, so in general a filtered search yields fewer results
+    # than there are matching records. On this index the unfiltered search
+    # already returns all seven, so every matching record survives the filter and
+    # the counts are exact.
     filtered_results = index.search(query_vector, filter={"type": "test"}, top_k=10)
+    assert len(filtered_results) == 7
     assert all(r["metadata"]["type"] == "test" for r in filtered_results)
 
     single_format = index.search(query_vector, filter={"format": "single"}, top_k=10)
+    assert len(single_format) == 1
     assert all(r["metadata"]["format"] == "single" for r in single_format)
-    assert {r["id"] for r in single_format}.issubset({"single"})
+    assert {r["id"] for r in single_format} == {"single"}
 
     list_format = index.search(query_vector, filter={"format": "list"}, top_k=10)
+    assert len(list_format) == 2
     assert all(r["metadata"]["format"] == "list" for r in list_format)
-    assert {r["id"] for r in list_format}.issubset({"list1", "list2"})
+    assert {r["id"] for r in list_format} == {"list1", "list2"}
 
 # ------------------------------------------------------------
 # Test 13: Test comprehensive search functionality with filters
@@ -124,18 +128,21 @@ def test_comprehensive_search():
         # Check all results to see what's there
         all_results = index.search(vector=query_vec, top_k=10)
         print(f"All results: {[(r['id'], r['metadata']['author']) for r in all_results]}")
-    assert alice_count >= 2  # At least 2 Alice results
+    # Three Alice records exist and all three come back. Five literal vectors and
+    # a sequential build make this exact. It was relaxed to >= 2 while the graph
+    # varied between runs.
+    assert alice_count == 3
     for result in alice_results:
         assert result["metadata"]["author"] == "Alice"
-    
-    # ✅ FIXED: Search might return fewer due to HNSW approximation + normalization
-    # Test unfiltered search - HNSW may not find all vectors due to graph structure
-    all_results = index.search(vector=query_vec, filter=None, top_k=10)  # Increase top_k
-    assert len(all_results) >= 3  # At least 3 results (might not find all 5 due to HNSW approximation)
-    
-    # Test high ef_search
+
+    # top_k above the record count over five records, so the search is
+    # exhaustive. Relaxed to >= 3 for the same reason.
+    all_results = index.search(vector=query_vec, filter=None, top_k=10)
+    assert len(all_results) == 5
+
+    # A wider ef_search cannot find fewer, so this is the same three.
     high_ef_results = index.search(vector=query_vec, filter={"author": "Alice"}, top_k=5, ef_search=400)
-    assert len(high_ef_results) >= 2  # At least 2 Alice results
+    assert len(high_ef_results) == 3
 
 # ------------------------------------------------------------
 # Test 16: Test search with return_vector option
@@ -179,12 +186,13 @@ def test_distance_metrics():
     result_cos = index_cos.add(records)
     assert result_cos.is_success()
     results_cos = index_cos.search(query_vector, top_k=2)
-    # Approximate search may return fewer than top_k results, so an assertion on
-    # an exact result count is invalid here. The metric under test is the
-    # distance space, and what it promises is real ids and finite ascending
-    # scores.
-    assert 0 < len(results_cos) <= 2
-    assert {r["id"] for r in results_cos}.issubset(expected_ids)
+    # Two records and top_k of 2, so both come back. This was the assertion relay
+    # 08 relaxed after it failed with 1 == 2 against an unseeded parallel build.
+    # The build is sequential and the level generator is seeded, and the vendored
+    # reverse link fix files layer zero adjacency for both points, so neither
+    # point can be unreachable.
+    assert len(results_cos) == 2
+    assert {r["id"] for r in results_cos} == expected_ids
     assert all(np.isfinite(r["score"]) for r in results_cos)
     assert [r["score"] for r in results_cos] == sorted(r["score"] for r in results_cos)
 
@@ -194,10 +202,8 @@ def test_distance_metrics():
     result_l2 = index_l2.add(records)
     assert result_l2.is_success()
     results_l2 = index_l2.search(query_vector, top_k=2, ef_search=150)
-    # Approximate search may return fewer than top_k results, so an assertion on
-    # an exact result count is invalid here.
-    assert 0 < len(results_l2) <= 2
-    assert {r["id"] for r in results_l2}.issubset(expected_ids)
+    assert len(results_l2) == 2
+    assert {r["id"] for r in results_l2} == expected_ids
     assert all(np.isfinite(r["score"]) for r in results_l2)
     assert [r["score"] for r in results_l2] == sorted(r["score"] for r in results_l2)
 
@@ -207,10 +213,8 @@ def test_distance_metrics():
     result_l1 = index_l1.add(records)
     assert result_l1.is_success()
     results_l1 = index_l1.search(query_vector, top_k=2, ef_search=150)
-    # Approximate search may return fewer than top_k results, so an assertion on
-    # an exact result count is invalid here.
-    assert 0 < len(results_l1) <= 2
-    assert {r["id"] for r in results_l1}.issubset(expected_ids)
+    assert len(results_l1) == 2
+    assert {r["id"] for r in results_l1} == expected_ids
     assert all(np.isfinite(r["score"]) for r in results_l1)
     assert [r["score"] for r in results_l1] == sorted(r["score"] for r in results_l1)
 
@@ -259,25 +263,22 @@ def test_edge_cases():
     no_filter_results = index.search([0.1, 0.2], filter=None, top_k=5)
     print(f"Search with no filter found {len(no_filter_results)} results: {[r['id'] for r in no_filter_results]}")
     
-    # The issue might be that empty filter {} behaves differently than no filter None
-    # Accept the actual behavior rather than forcing our expectations
-    if actual_count == 1 and len(no_filter_results) == 2:
-        # Empty filter {} excludes records without metadata - this might be correct behavior
-        print("Empty filter {} appears to exclude records without metadata")
-        assert actual_count == 1  # Accept this behavior
-    elif len(no_filter_results) >= 2:
-        # Both records exist, so empty filter should find both
-        assert actual_count == 2
-    else:
-        assert actual_count >= 1  # At least the first record should be found
-    
+    # An empty filter imposes no conditions, so every record satisfies it and it
+    # is equivalent to passing no filter. Both find both records, including the
+    # one added without a metadata field. This used to be an if/elif/else that
+    # accepted three different outcomes and so could not fail on the behaviour it
+    # names.
+    assert len(no_filter_results) == 2
+    assert actual_count == 2
+    assert {r["id"] for r in results} == {"empty_meta", "no_meta"}
+
     # Test very small top_k
     results_small = index.search([0.1, 0.2], top_k=1)
     assert len(results_small) == 1
-    
-    # Test large top_k (more than available)
+
+    # A top_k above the record count returns the whole index and no more.
     results_large = index.search([0.1, 0.2], top_k=100)
-    assert len(results_large) >= 1  # Should find at least one record
+    assert len(results_large) == 2
 
 # ------------------------------------------------------------
 # Test 27: Batch Search with List of Vectors

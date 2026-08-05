@@ -117,7 +117,7 @@ records = [
 
 # Upload records using the `add()` method
 add_result = index.add(records)
-print("Inserted:", add_result.total_inserted, "Errors:", add_result.total_errors)
+print(add_result.summary())
 
 # Perform a similarity search and print the top 2 results
 query_vector = [0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.6, 0.7]
@@ -130,12 +130,12 @@ for i, res in enumerate(results, 1):
 
 *Results Output:*
 ```
-Inserted: 5 Errors: 0
+5 inserted, 0 errors
 1. ID: doc_001, Score: 0.000000, Metadata: {'author': 'Alice'}
 2. ID: doc_003, Score: 0.000988, Metadata: {'author': 'Alice'}
 ```
 
-`add_result.summary()` returns the same counts as a string containing emoji. On a Windows console still using the legacy code page it raises `UnicodeEncodeError`, so the counts are printed directly above. Set `PYTHONIOENCODING=utf-8` if you want to print the summary string.
+`add_result.summary()` returns a plain ASCII string, so it prints on any console encoding. The same counts are on `add_result.total_inserted` and `add_result.total_errors` if you want the numbers rather than the sentence.
 
 <br/>
 
@@ -190,9 +190,9 @@ HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=5, vecto
 | `index_type`     | `str`  | `"hnsw"`  | The type of vector index to create. Currently only `"hnsw"` is supported. Case-insensitive. |
 | `dim`            | `int`  | `1536`    | Dimensionality of the vectors to be indexed. Each vector must have this length. Must be positive. The default of 1536 matches the output dimensionality of OpenAI's `text-embedding-3-small` and `text-embedding-ada-002` models. |
 | `space`          | `str`  | `"cosine"`| Distance metric used for similarity search. One of `"cosine"`, `"l1"`, `"l2"`. Case-insensitive. |
-| `m`              | `int`  | `16` or `32`, see below | Number of bi-directional connections created for each new node, from 1 to 256. Higher `m` improves recall but increases index size and build time. |
+| `m`              | `int`  | `16` or `32`, see below | Number of bi-directional connections created for each new node, from 2 to 256. Higher `m` improves recall but increases index size and build time. |
 | `ef_construction`| `int`  | `200`     | Size of the dynamic list used during index construction. Must be positive. Larger values increase indexing time and memory, but improve quality. |
-| `expected_size`  | `int`  | `10000`   | Estimated number of records to be inserted. Must be positive. Used for preallocating internal data structures and for choosing the default `m`. Not a hard limit. |
+| `expected_size`  | `int`  | `10000`   | Estimated number of records to be inserted, from 1 to 100,000,000. Used for preallocating internal data structures and for choosing the default `m`. Not a hard limit, see below. |
 | `quantization_config` | `dict` | `None` | Product Quantization configuration for memory-efficient vector compression. See [Product Quantization](#️-product-quantization). |
 
 **The default `m` depends on `expected_size`.** It is 16 for an `expected_size` of 25,000 or less, and 32 above that. A graph too sparse for the number of records loses recall that no search width recovers, and `m` is fixed once the index is created, so declare `expected_size` honestly or set `m` yourself. Passing `m` explicitly always wins.
@@ -201,6 +201,12 @@ HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=5, vecto
 vdb.create("hnsw", dim=8, expected_size=25_000).get_stats()["m"]   # '16'
 vdb.create("hnsw", dim=8, expected_size=25_001).get_stats()["m"]   # '32'
 ```
+
+**`expected_size` is a hint and not a limit.** An index accepts more records than it declared, and the graph grows to fit them. What it does not change is `m`, which is chosen at creation from the declaration and fixed there, so an index that has badly outgrown its `expected_size` is running at a degree meant for a smaller one. Passing twice the declared size logs a warning once, on the `add()` that crosses it.
+
+The upper bound of 100,000,000 exists because the graph reserves one slot per declared record at creation, 8 bytes each, and that allocation aborts the process rather than raising if it fails. The bound turns an abort into a `ValueError`. Declaring less than the truth is safe.
+
+**`m` starts at 2, not 1.** Layer assignment samples from a scale of `1 / ln(m)`, which is infinity at `m` of 1, so every point is redispatched uniformly across all 16 layers rather than following the exponential distribution the graph depends on. On 3,000 records of 32 dimensions, recall at 10 measured 0.0220 at `m` of 1 against 0.6880 at 2 and 1.0000 at 16.
 
 <br/>
 
@@ -522,7 +528,7 @@ print(index.info())
 HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=10000, vectors=5, quantization=none)
 ```
 
-The `vectors=` field counts the raw vectors the index holds, which is the record count for an unquantized index. On a `quantized_only` index it is lower than the record count, because records added after training are held as codes alone. Use `get_vector_count()` for the record count in every case.
+The `vectors=` field is the live record count, in every storage mode. `get_vector_count()` returns the same number. `get_stats()["raw_vectors_stored"]` is the one that counts raw vectors specifically, and on a `quantized_only` index it is lower.
 
 Other single-value accessors: `index.dim`, `index.get_space()`, `index.get_vector_count()`, `index.has_quantization()`, `index.can_use_quantization()`, and `VectorDatabase.available_index_types()`.
 
@@ -577,7 +583,7 @@ doc_004 {'author': 'Bob'}
 doc_005 {'author': 'Alice'}
 ```
 
-`list()` returns `(id, metadata)` tuples in no particular order, so the example sorts them. It is not a paging API: `number` takes the first N in whatever order internal storage yields, and the same N are not guaranteed across calls. On a `quantized_only` index it lists only the records that still hold a raw vector.
+`list()` returns `(id, metadata)` tuples in no particular order, so the example sorts them. It is not a paging API: `number` takes the first N in whatever order internal storage yields, and the same N are not guaranteed across calls. It lists every record, in every storage mode.
 
 <br/>
 
@@ -825,7 +831,7 @@ Two consequences of `quantized_only` are worth knowing before you pick it.
 
 **The training records keep their raw vectors.** Records collected before the training threshold is reached are stored at full width and stay that way, so an index whose `training_size` is a large fraction of its total size saves much less than the compression ratio suggests.
 
-**A record added after training exists only as a code, and some accessors do not see it.** `contains()` and `list()` consult raw storage only, so both miss those records. `get_records()`, `search()` and `get_vector_count()` see all of them. `get_records()` reconstructs the vector from the code, so what it returns is an approximation of the original.
+**A record added after training exists only as a code, so the vector you read back is an approximation.** Every accessor sees the record. `get_records(..., return_vector=True)` and `search(..., return_vector=True)` reconstruct its vector from the code, so what they hand back is close to the value supplied rather than equal to it. A record collected before training still holds its raw vector and reads back exactly. `get_stats()["raw_vectors_stored"]` is what tells you how many of each you have.
 
 ```python
 only = vdb.create("hnsw", dim=1536, expected_size=2500, quantization_config={
@@ -841,6 +847,7 @@ print("storage mode:", only.get_storage_mode())
 stats = only.get_stats()
 print("raw vectors kept:", stats["raw_vectors_stored"])
 print("quantized codes:", stats["quantized_codes_stored"])
+print("records:", only.get_vector_count())
 print("contains doc_0 (added before training):", only.contains("doc_0"))
 print("contains doc_2000 (added after training):", only.contains("doc_2000"))
 print("get_records doc_2000 returns:", len(only.get_records("doc_2000")), "record")
@@ -851,8 +858,9 @@ print("get_records doc_2000 returns:", len(only.get_records("doc_2000")), "recor
 storage mode: quantized_active
 raw vectors kept: 1000
 quantized codes: 2500
+records: 2500
 contains doc_0 (added before training): True
-contains doc_2000 (added after training): False
+contains doc_2000 (added after training): True
 get_records doc_2000 returns: 1 record
 ```
 

@@ -314,16 +314,29 @@ def test_public_exports():
 # Test 95: m has a lower bound
 # ------------------------------------------------------------
 def test_m_lower_bound():
-    """m=0 built a graph with zero neighbour capacity and was accepted."""
+    """m below 2 builds a degenerate graph and is refused.
+
+    Zero gave every node zero neighbour capacity. One is worse than it looks:
+    the layer scale is 1 / ln(m), which is infinity at 1, so every point
+    overflows the layer cap and is redispatched uniformly across all 16 layers
+    rather than following the exponential distribution. Measured on 3,000
+    records of 32 dimensions, recall at 10 was 0.0220 at m 1 against 0.6880 at
+    m 2. Both are refused, and the message says why.
+    """
     vdb = VectorDatabase()
 
-    with pytest.raises(RuntimeError, match="m must be at least 1"):
-        vdb.create("hnsw", dim=4, m=0)
+    for bad in (0, 1):
+        with pytest.raises(RuntimeError, match="m must be at least 2"):
+            vdb.create("hnsw", dim=4, m=bad)
 
-    # One is the smallest value that is accepted, and it still works.
-    index = vdb.create("hnsw", dim=4, m=1, expected_size=10)
+    with pytest.raises(RuntimeError, match="scale of 1 / ln"):
+        vdb.create("hnsw", dim=4, m=1)
+
+    # Two is the smallest value that is accepted, and it works.
+    index = vdb.create("hnsw", dim=4, m=2, expected_size=10)
     index.add({"id": "a", "values": [0.1, 0.2, 0.3, 0.4]})
     assert index.get_vector_count() == 1
+    assert index.get_stats()["m"] == "2"
 
 # ------------------------------------------------------------
 # Test 96: max_training_vectors is enforced in Rust, not only in Python
@@ -466,13 +479,13 @@ def test_explicit_m_overrides_the_scaled_default():
 
     # Below the ladder, above it, and at both ends of the valid range, on the
     # side of the threshold where the default would otherwise answer 32.
-    for m in (1, 8, 16, 48, 256):
+    for m in (2, 8, 16, 48, 256):
         index = vdb.create("hnsw", dim=4, m=m, expected_size=30_000)
         assert index.get_stats()["m"] == str(m)
 
-    # The bounds are unchanged, and the ladder never produces a value outside
-    # them for any expected_size the Rust layer accepts.
-    with pytest.raises(RuntimeError, match="m must be at least 1"):
+    # The ladder never produces a value outside the bounds for any
+    # expected_size the Rust layer accepts.
+    with pytest.raises(RuntimeError, match="m must be at least 2"):
         vdb.create("hnsw", dim=4, m=0, expected_size=30_000)
     with pytest.raises(RuntimeError, match="less than or equal to 256"):
         vdb.create("hnsw", dim=4, m=257, expected_size=10)

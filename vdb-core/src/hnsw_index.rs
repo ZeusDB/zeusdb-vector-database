@@ -23,6 +23,38 @@ use tracing::{debug, error, info, instrument, trace, warn};
 // Import PQ module
 use crate::pq::PQ;
 
+/// Largest `expected_size` a caller may declare.
+///
+/// `expected_size` reaches `PointIndexation::new` in the vendored graph crate,
+/// which reserves capacity for it across the 16 layers at creation. Since the
+/// layer reservation was corrected the reservation is one `Arc` slot per
+/// declared record, measured at 8.02 bytes per declared record and flat across
+/// declarations of 10 million through 4 billion. This bound therefore caps the
+/// creation-time reservation at 764 MB, which was measured rather than derived.
+///
+/// The bound exists because the reservation is not fallible. `Vec::with_capacity`
+/// aborts the process on allocation failure rather than unwinding, so a
+/// declaration too large for the machine cannot be turned into a Python
+/// exception after the fact. A declared 20 billion asks for 155 GB in the layer
+/// zero reservation alone and the process dies with no traceback. Making that
+/// path fallible means `try_reserve` inside the vendored crate, which is not a
+/// change this package makes.
+///
+/// One hundred million is far above anything this index holds. A real 100,000
+/// record build at 768 dimensions measured 10,617 bytes per record, so a hundred
+/// million records is roughly a terabyte of process memory for the data alone.
+/// Declaring less than the truth is safe, because a layer that receives more
+/// points than reserved grows through the ordinary `Vec::push` path, so capping
+/// the declaration costs a caller nothing it can observe.
+///
+/// The bound is not a guarantee. A machine whose commit limit is below the
+/// reservation can still abort at a declaration under it.
+const MAX_EXPECTED_SIZE: usize = 100_000_000;
+
+/// Multiple of `expected_size` at which an index warns that it has outgrown its
+/// declaration. Fires once per index.
+const EXPECTED_SIZE_OVERGROWTH_FACTOR: usize = 2;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageMode {
     #[default]
@@ -651,9 +683,24 @@ impl AddResult {
         self.total_errors == 0
     }
 
+    /// One line human-readable summary of the insertion
+    ///
+    /// ASCII only, deliberately. This used to open with a check mark and carry a
+    /// cross before the error count, and it is the first thing the README and the
+    /// documentation site tell a new user to print. `print()` encodes through the
+    /// console's code page, so on a Windows console still using the legacy one
+    /// that first statement raised `UnicodeEncodeError` before the reader had
+    /// added a second record.
+    ///
+    /// The counts stay available as `total_inserted` and `total_errors`, so the
+    /// alternative of returning them as structured data would only duplicate two
+    /// attributes that already exist while breaking every caller that prints
+    /// this. The numbers and the words around them are unchanged, so a substring
+    /// test or a `(\d+) inserted` match still holds. What no longer holds is a
+    /// parse keyed on the emoji themselves or on a fixed character offset.
     pub fn summary(&self) -> String {
         format!(
-            "✅ {} inserted, ❌ {} errors",
+            "{} inserted, {} errors",
             self.total_inserted, self.total_errors
         )
     }
@@ -738,6 +785,11 @@ pub struct HNSWIndex {
 
     // NEW: Flag to prevent training ID collection during persistence rebuild
     pub rebuilding_from_persistence: AtomicBool,
+
+    /// Set once the index has warned that it holds materially more records than
+    /// `expected_size` declared, so the warning fires once rather than on every
+    /// subsequent `add`.
+    overgrowth_warned: AtomicBool,
 }
 
 /// Build an `HNSWIndex`
@@ -821,17 +873,45 @@ impl HNSWIndex {
                 "expected_size must be positive",
             ));
         }
-        if m == 0 {
+        if expected_size > MAX_EXPECTED_SIZE {
+            error!(
+                operation = "validation",
+                field = "expected_size",
+                value = expected_size,
+                max_allowed = MAX_EXPECTED_SIZE,
+                "expected_size exceeds maximum"
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "expected_size must be at most {}, got {}. The graph reserves one \
+                 slot per declared record at creation, 8 bytes each, so this \
+                 declaration would ask for {:.1} GB before a single record is \
+                 added. That allocation is not fallible: above this bound the \
+                 process aborts rather than raising. expected_size is a capacity \
+                 hint and not a limit, and under-declaring only costs some \
+                 reallocation, so declare what you expect to hold.",
+                MAX_EXPECTED_SIZE,
+                expected_size,
+                (expected_size as f64 * 8.0) / 1_000_000_000.0
+            )));
+        }
+        if m < 2 {
             error!(
                 operation = "validation",
                 field = "m",
                 value = m,
-                min_allowed = 1,
+                min_allowed = 2,
                 "m below minimum"
             );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "m must be at least 1",
-            ));
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "m must be at least 2, got {}. Layer assignment samples from a \
+                 scale of 1 / ln(m), which is infinity at m 1, so every point \
+                 overflows the layer cap and is redispatched uniformly across all \
+                 16 layers instead of following the exponential distribution the \
+                 graph depends on. Measured on 3,000 records of 32 dimensions, \
+                 recall at 10 was 0.0220 at m 1 against 0.6880 at m 2 and 1.0000 \
+                 at m 16.",
+                m
+            )));
         }
         if m > 256 {
             error!(
@@ -1100,6 +1180,7 @@ impl HNSWIndex {
             training_threshold_reached: AtomicBool::new(false),
             created_at: Utc::now().to_rfc3339(),
             rebuilding_from_persistence: AtomicBool::new(false),
+            overgrowth_warned: AtomicBool::new(false),
         })
     }
 }
@@ -1327,6 +1408,8 @@ impl HNSWIndex {
             final_storage_mode = self.get_storage_mode(),
             "Vector addition completed"
         );
+
+        self.warn_if_outgrown_expected_size();
 
         Ok(AddResult {
             total_inserted,
@@ -1713,6 +1796,21 @@ impl HNSWIndex {
     }
 
     /// Get records by ID(s) with PQ reconstruction support and storage mode awareness
+    ///
+    /// Looks the ids up in the union of the raw vectors and the quantized codes,
+    /// so it already saw every record before the other accessors did. An id that
+    /// resolves to no record is dropped from the result rather than reported, so
+    /// the returned list can be shorter than the list of ids asked for.
+    ///
+    /// `return_vector` is served from the raw vector where one exists and from a
+    /// reconstruction of the code where one does not, which is the case for a
+    /// record added after training under `quantized_only`. The returned value is
+    /// then an approximation rather than the value supplied. Measured on 16
+    /// dimensional data with 4 subvectors and 8 bits, a reconstructed vector
+    /// differed from the stored unit vector by 0.066 at the worst component and
+    /// sat at cosine similarity 0.991 to it, while a raw-backed record returned
+    /// exactly. `get_stats()["raw_vectors_stored"]` is what tells the two apart
+    /// in aggregate.
     #[pyo3(signature = (input, return_vector = true))]
     pub fn get_records(
         &self,
@@ -1930,13 +2028,21 @@ impl HNSWIndex {
     }
 
     /// List the first number of records in the index (ID and metadata)
+    ///
+    /// Enumerates `id_map`, which holds every live record. It used to enumerate
+    /// `vectors`, which under `quantized_only` holds only the records collected
+    /// before training, so every record added afterwards was missing from the
+    /// listing while search still returned it.
+    ///
+    /// Iteration order is a hash map's and is not stable between calls, so
+    /// `number` takes an arbitrary N rather than a defined page.
     #[pyo3(signature = (number=10))]
     pub fn list(&self, py: Python<'_>, number: usize) -> PyResult<Vec<(String, PyObject)>> {
-        let vectors = self.vectors.read().unwrap();
+        let id_map = self.id_map.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
 
         let mut results = Vec::new();
-        for (id, _vec) in vectors.iter().take(number) {
+        for id in id_map.keys().take(number) {
             let metadata = vector_metadata.get(id).cloned().unwrap_or_default();
             let py_metadata = self.value_map_to_python(&metadata, py)?;
             results.push((id.clone(), py_metadata));
@@ -1944,10 +2050,17 @@ impl HNSWIndex {
         Ok(results)
     }
 
-    /// Check if vector exists
+    /// Check whether a record with this id is in the index
+    ///
+    /// Reads `id_map`, which is the record set. Every insertion path writes it,
+    /// `remove_point_internal` keys its removal on it, `add(overwrite=True)`
+    /// keys its collision test on it, and `compact` rebuilds the graph from it.
+    /// It used to read `vectors`, which under `quantized_only` holds only the
+    /// records collected before training, so this returned `false` for a record
+    /// that search returned and `remove_point` removed.
     pub fn contains(&self, id: String) -> bool {
-        let vectors = self.vectors.read().unwrap();
-        vectors.contains_key(&id)
+        let id_map = self.id_map.read().unwrap();
+        id_map.contains_key(&id)
     }
 
     /// Add index-level metadata
@@ -1971,12 +2084,21 @@ impl HNSWIndex {
     }
 
     /// Get a human-readable info string
+    ///
+    /// `vectors=` is the live record count, taken from `id_map`. It used to be
+    /// `vectors.len()`, which under `quantized_only` counts only the records
+    /// that still hold a raw vector and therefore reported fewer records than
+    /// the index contains.
+    ///
+    /// The count is read into a local and the guard dropped before anything
+    /// else is touched. `is_quantized()` below takes the graph lock, and the
+    /// declared order puts the graph above `vectors`, so holding that guard
+    /// across the call was an inversion.
     pub fn info(&self) -> String {
-        let vectors = self.vectors.read().unwrap();
-        let base_info =
-            format!(
+        let record_count = self.id_map.read().unwrap().len();
+        let base_info = format!(
             "HNSWIndex(dim={}, space={}, m={}, ef_construction={}, expected_size={}, vectors={}",
-            self.dim, self.space, self.m, self.ef_construction, self.expected_size, vectors.len()
+            self.dim, self.space, self.m, self.ef_construction, self.expected_size, record_count
         );
 
         if let Some(config) = &self.quantization_config {
@@ -2236,6 +2358,56 @@ impl HNSWIndex {
             .filter(|id| !vectors.contains_key(*id))
             .count();
         vectors.len() + code_only
+    }
+
+    /// Warn once when the index holds materially more records than it declared
+    ///
+    /// `expected_size` is a capacity hint rather than a limit, so exceeding it is
+    /// legal and the index keeps working. What it costs is not the reservation,
+    /// which grows through the ordinary `Vec::push` path, but the graph degree.
+    /// The Python factory derives the default `m` from `expected_size`, and `m`
+    /// is fixed at construction, so an index that has outgrown its declaration by
+    /// a wide margin is running at a degree chosen for a smaller index and no
+    /// later `add` revises it. Nothing else tells a caller that.
+    ///
+    /// A warning rather than an error, because the index is correct and the only
+    /// remedy is to rebuild at an honest declaration, which is the caller's call.
+    ///
+    /// Fires once per index. The flag is claimed with a compare and exchange, so
+    /// two writers crossing the threshold together produce one line and not two.
+    fn warn_if_outgrown_expected_size(&self) {
+        if self.overgrowth_warned.load(Ordering::Acquire) {
+            return;
+        }
+
+        let threshold = self
+            .expected_size
+            .saturating_mul(EXPECTED_SIZE_OVERGROWTH_FACTOR);
+        let live_records = self.id_map.read().unwrap().len();
+        if live_records <= threshold {
+            return;
+        }
+
+        if self
+            .overgrowth_warned
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        warn!(
+            operation = "expected_size_exceeded",
+            live_records = live_records,
+            expected_size = self.expected_size,
+            m = self.m,
+            "Index holds more than {}x the records its expected_size declared. \
+             expected_size is a hint and not a limit, so nothing is broken, but m \
+             is fixed at construction and was sized for the declaration. Recreate \
+             the index with an expected_size matching what it actually holds if \
+             recall matters. This warning fires once.",
+            EXPECTED_SIZE_OVERGROWTH_FACTOR
+        );
     }
 
     /// Get next available internal ID
@@ -4772,6 +4944,7 @@ impl HNSWIndex {
             training_threshold_reached: AtomicBool::new(false),
             created_at: chrono::Utc::now().to_rfc3339(),
             rebuilding_from_persistence: AtomicBool::new(false),
+            overgrowth_warned: AtomicBool::new(false),
         }
     }
 
