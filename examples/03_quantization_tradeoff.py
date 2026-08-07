@@ -111,9 +111,9 @@ def main():
     # ------------------------------------------------------------------
     # What each mode stores
     # ------------------------------------------------------------------
-    # quantized_only keeps the raw vectors of every record collected before
-    # training and never discards them, so an index whose training_size is a
-    # large share of its total size saves much less than the ratio suggests.
+    # quantized_only holds codes alone once training completes. The records
+    # collected for training are held at full width only until that moment,
+    # then released, so a trained index in this mode has no raw vector left.
     # The codebook and the centroid distance table are fixed by dim, subvectors
     # and bits. They do not move as records arrive, and at this record count
     # they are larger than everything the records themselves hold, which is why
@@ -137,11 +137,10 @@ def main():
             f"{raw_mb + code_mb + fixed_mb:>6.2f}"
         )
     print()
-    print("quantized_only saves far less than the 32x ratio, because a third of")
-    print("the records were collected before training and kept their raw vectors.")
+    print("quantized_only holds codes alone, the training records included, yet")
+    print("at this size it still costs more than no quantization at all, because")
+    print("the fixed table is paid whether you hold 3,000 records or 3 million.")
     print("quantized_with_raw stores more than an unquantized index, not less.")
-    print("At this size both quantized modes cost more than no quantization at all,")
-    print("because the fixed table is paid whether you hold 3,000 records or 3 million.")
     print()
 
     # ------------------------------------------------------------------
@@ -165,11 +164,12 @@ def main():
     print()
 
     # ------------------------------------------------------------------
-    # A record added after training is stored only as a code
+    # Every record is stored only as a code once training completes
     # ------------------------------------------------------------------
-    # Reading it back reconstructs the vector from the code, so what you get is
-    # close to what you supplied rather than equal to it. A record collected
-    # before training still holds its raw vector and reads back exactly.
+    # Reading any record back reconstructs its vector from the code, the
+    # training records included, since their raw copies are released the moment
+    # training completes. What you get is close to what you supplied rather
+    # than equal to it. Only quantized_with_raw reads back exactly.
     before = only.get_records(ids[0], return_vector=True)[0]["vector"]
     after = only.get_records(ids[-1], return_vector=True)[0]["vector"]
     before_error = np.abs(np.array(before) - vectors[0]).max()
@@ -203,14 +203,13 @@ compression ratio: 32x
 stored per mode
   mode                    raw  codes  raw MB  code MB  fixed MB  total
   no quantization        3000      0    0.73     0.00      0.00   0.73
-  quantized_only         1000   3000    0.24     0.02      1.06   1.32
+  quantized_only            0   3000    0.00     0.02      1.06   1.08
   quantized_with_raw     3000   3000    0.73     0.02      1.06   1.81
 
-quantized_only saves far less than the 32x ratio, because a third of
-the records were collected before training and kept their raw vectors.
+quantized_only holds codes alone, the training records included, yet
+at this size it still costs more than no quantization at all, because
+the fixed table is paid whether you hold 3,000 records or 3 million.
 quantized_with_raw stores more than an unquantized index, not less.
-At this size both quantized modes cost more than no quantization at all,
-because the fixed table is paid whether you hold 3,000 records or 3 million.
 
 recall@10 against exact cosine search
   no quantization                    good  1.00
@@ -223,7 +222,7 @@ rerank changes nothing on quantized_only, because the raw vectors it
 would rescore against are gone. That mode cannot be tuned back up.
 
 largest error in a vector read back from quantized_only
-  collected before training  exact 0.000000
+  collected before training  lossy 0...
   added after training       lossy 0...
 
 same query, same index, scores on different scales: differ

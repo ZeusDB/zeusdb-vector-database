@@ -702,27 +702,29 @@ def test_storage_mode_configuration():
     # Different raw vector storage behavior
     raw_stored_only = int(stats1["raw_vectors_stored"])
     raw_stored_with_raw = int(stats2["raw_vectors_stored"])
-    
-    # quantized_only: should only store vectors up to training (1000)
-    assert raw_stored_only == 1000
-    
+
+    # quantized_only: the training records are released once training
+    # completes, so a trained index in this mode holds no raw vector at all.
+    assert raw_stored_only == 0
+
     # quantized_with_raw: should store ALL vectors (1200)
     assert raw_stored_with_raw == 1200
-    
+
     # Test storage mode reporting
     assert stats1["storage_mode"] == "quantized_only"
     assert stats2["storage_mode"] == "quantized_with_raw"
-    
+
     # Test memory usage reporting
     assert "raw_vectors_memory_mb" in stats1 and "raw_vectors_memory_mb" in stats2
     raw_memory_only = float(stats1["raw_vectors_memory_mb"])
     raw_memory_with_raw = float(stats2["raw_vectors_memory_mb"])
+    assert raw_memory_only == 0.0
     assert raw_memory_with_raw > raw_memory_only  # quantized_with_raw uses more memory
 
     # Which records still have a raw vector, which is what raw_vectors_stored
     # above can be checked against. This key replaced memory_savings, which read
     # "maximum" under quantized_only and was not a maximum of anything.
-    assert stats1["raw_vectors_retained"] == "training_records_only"
+    assert stats1["raw_vectors_retained"] == "none_once_trained"
     assert stats2["raw_vectors_retained"] == "all_records"
     assert "memory_savings" not in stats1 and "memory_savings" not in stats2
 
@@ -740,13 +742,17 @@ def test_storage_mode_configuration():
                                                                    abs=0.01)
 
     # And the point the storage mode warning used to get wrong. The codes are
-    # 128x smaller than the vectors, and the two modes are within a fifth of
-    # each other on what they store, because quantized_only keeps 1,000 of the
-    # 1,200 records at full width and both pay the same 1.25 MB of fixed cost.
+    # 128x smaller than the vectors. quantized_only now holds codes alone once
+    # trained, so on vectors and codes the gap between the modes is close to
+    # that ratio rather than the fifth it was while the training records stayed
+    # at full width. It lands at 118 rather than 128 here only because the
+    # reported figures carry two decimal places. Both modes still pay the same
+    # 1.25 MB of fixed cost, which at this record count is larger than
+    # everything the records themselves hold.
     assert stats1["quantization_compression_ratio"] == "128.0x"
     payload_only = raw_memory_only + float(stats1["quantized_codes_memory_mb"])
     payload_with_raw = raw_memory_with_raw + float(stats2["quantized_codes_memory_mb"])
-    assert 1.1 < payload_with_raw / payload_only < 1.3
+    assert payload_with_raw > 50 * payload_only
     assert expected_codebook_mb + expected_sdc_mb > payload_with_raw
 
     # Test vector retrieval behavior
@@ -1040,7 +1046,7 @@ def test_pq_overwrite_after_training_quantized_only():
     assert index.get_storage_mode() == "quantized_active"
 
     baseline = index.get_stats()
-    assert int(baseline["raw_vectors_stored"]) == PQ_TRAINING_SIZE
+    assert int(baseline["raw_vectors_stored"]) == 0
     assert int(baseline["quantized_codes_stored"]) == PQ_TOTAL
 
     target = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -1060,11 +1066,11 @@ def test_pq_overwrite_after_training_quantized_only():
     assert len(records) == 1
     assert records[0]["metadata"] == {"version": 2}
 
-    # Storage accounting is unchanged by the overwrite. quantized_only stops
-    # storing raw vectors once training completes, so the post training record
+    # Storage accounting is unchanged by the overwrite. quantized_only holds
+    # no raw vectors once training completes, so the post training record
     # contributes a code and no raw vector.
     after = index.get_stats()
-    assert int(after["raw_vectors_stored"]) == PQ_TRAINING_SIZE
+    assert int(after["raw_vectors_stored"]) == 0
     assert int(after["quantized_codes_stored"]) == PQ_TOTAL + 1
     assert after["storage_mode"] == "quantized_only"
 
@@ -1178,7 +1184,9 @@ def test_pq_storage_mode_transition_completes_training():
     assert index.get_storage_mode() == "quantized_active"
 
     trained = index.get_stats()
-    assert int(trained["raw_vectors_stored"]) == PQ_TRAINING_SIZE
+    # Training completing is also the moment the raw store empties: every
+    # collected record was encoded and its raw copy released.
+    assert int(trained["raw_vectors_stored"]) == 0
     assert int(trained["quantized_codes_stored"]) == PQ_TRAINING_SIZE
 
     # Phase 4, records added after training are quantized but not stored raw.
@@ -1186,7 +1194,7 @@ def test_pq_storage_mode_transition_completes_training():
                       "embeddings": rng.random((10, PQ_DIM)).astype(np.float32)}).is_success()
     final = index.get_stats()
     assert index.get_storage_mode() == "quantized_active"
-    assert int(final["raw_vectors_stored"]) == PQ_TRAINING_SIZE
+    assert int(final["raw_vectors_stored"]) == 0
     assert int(final["quantized_codes_stored"]) == PQ_TRAINING_SIZE + 10
     assert int(final["total_vectors"]) == PQ_TRAINING_SIZE + 10
 
@@ -1241,8 +1249,9 @@ def saved_pq_index(tmp_path_factory):
     """A trained quantized_only index saved once, with its live reconstructions.
 
     Training runs k-means over PQ_TRAINING_SIZE vectors, so the index and the
-    directory are built once and shared. The records past PQ_TRAINING_SIZE hold
-    no raw vector, which makes them the ones the loader has to reconstruct.
+    directory are built once and shared. No record holds a raw vector, since
+    the mode releases the training records' raw copies at training completion,
+    so the loader reconstructs everything from the stored codes.
     """
     index = _make_trained_pq_index("quantized_only")
     rng = np.random.default_rng(20260802)
@@ -1339,13 +1348,15 @@ def test_pq_reconstructed_record_fidelity(saved_pq_index):
     assert min(similarities) > 0.95
     assert sum(similarities) / len(similarities) > 0.98
 
-    # A record that kept its raw vector is returned from that vector, so it is
-    # unchanged by the round trip rather than approximated.
-    kept = loaded.get_records(["train_0", "train_500"], return_vector=True)
-    kept_by_id = {r["id"]: np.asarray(r["vector"], dtype=np.float64) for r in kept}
+    # The training records are reconstructions too, because the mode released
+    # their raw vectors at training completion, so they carry the same bound
+    # as the code-only records rather than exactness.
+    released = loaded.get_records(["train_0", "train_500"], return_vector=True)
+    released_by_id = {r["id"]: np.asarray(r["vector"], dtype=np.float64)
+                      for r in released}
     for record_id in ("train_0", "train_500"):
         original = saved_pq_index["vectors"][int(record_id.split("_")[1])]
-        assert cosine(kept_by_id[record_id], original.astype(np.float64)) > 0.999999
+        assert cosine(released_by_id[record_id], original.astype(np.float64)) > 0.95
 
 # ------------------------------------------------------------
 # Shared setup for the quantized graph quality coverage
@@ -1731,21 +1742,20 @@ def test_rerank_returns_ordered_raw_distances(rerank_index):
 def test_quantized_only_does_not_rerank(rerank_index_code_only):
     """Every rerank setting returns the same page, including an exhaustive one.
 
-    The mode drops raw vectors for every record added after training, so the
-    only thing available to rescore a code held record against is its
-    reconstruction, and that carries exactly the information the ADC distance
-    already used. Measured at 10,000 records of dimension 768, recall at top_k
-    10 over the code held records moved from 0.1320 to 0.1330 on one data draw
-    and from 0.1440 to 0.1400 on another, which is noise in both directions.
+    The mode holds no raw vectors once trained, so the only thing available to
+    rescore any candidate against is its reconstruction, and that carries
+    exactly the information the ADC distance already used. Measured at 10,000
+    records of dimension 768, recall at top_k 10 over the code held records
+    moved from 0.1320 to 0.1330 on one data draw and from 0.1440 to 0.1400 on
+    another, which is noise in both directions.
     """
     index = rerank_index_code_only["index"]
     stats = index.get_stats()
     assert stats["storage_mode"] == "quantized_only"
 
-    # The collection phase kept raw vectors and nothing clears them, so the mode
-    # holds a raw vector for exactly the records it trained on. That mixed pool
-    # is why the decision is made per index rather than per candidate.
-    assert int(stats["raw_vectors_stored"]) == RERANK_TRAINING_SIZE
+    # Training released the collected raw vectors, so every record is code
+    # held and there is nothing anywhere for a rescore to read.
+    assert int(stats["raw_vectors_stored"]) == 0
     assert int(stats["quantized_codes_stored"]) == RERANK_TOTAL
 
     for query in rerank_index_code_only["queries"][:10]:
@@ -1990,10 +2000,10 @@ def test_recall_survives_the_triangular_table(quantized_graph):
 def test_fixed_memory_warning_fires_when_quantization_cannot_pay():
     """Below the break even record count the warning fires, above it it does not.
 
-    Break even is training_size + (fixed bytes + training_size * subvectors) /
-    (dim * 4 - subvectors). At dim 64 with 8 subvectors of 8 bits and a
-    training_size of 1000 the fixed cost is 1,110,016 bytes and each record
-    beyond training saves 248, so the figure is 5,509.
+    Break even is fixed bytes / (dim * 4 - subvectors), independent of
+    training_size now that the training records are released at training
+    completion. At dim 64 with 8 subvectors of 8 bits the fixed cost is
+    1,110,016 bytes and each record saves 248, so the figure is 4,476.
     """
     vdb = VectorDatabase()
     config = {"type": "pq", "subvectors": 8, "bits": 8, "training_size": 1000}
@@ -2011,7 +2021,7 @@ def test_fixed_memory_warning_fires_when_quantization_cannot_pay():
     )
 
     # The message carries the break even figure, so a caller can act on it.
-    with pytest.warns(UserWarning, match=r"starts saving above 5509 records"):
+    with pytest.warns(UserWarning, match=r"starts saving above 4476 records"):
         vdb.create("hnsw", dim=64, expected_size=3000,
                    quantization_config=dict(config))
 
@@ -2033,3 +2043,144 @@ def test_fixed_memory_warning_fires_when_quantization_cannot_pay():
     messages = [str(w.message) for w in caught]
     assert not [m for m in messages if "unquantized index at expected_size" in m]
     assert [m for m in messages if "keeps a raw vector for every record" in m]
+
+# ------------------------------------------------------------
+# Test 109: the default configuration saves memory once trained
+# ------------------------------------------------------------
+def test_default_quantized_only_saves_memory_at_the_default_expected_size():
+    """A default quantized index holds less than an unquantized one at 10,000.
+
+    The default training_size and expected_size are both 10,000, and until
+    this relay quantized_only kept the 10,000 training records at full width
+    forever, so the default configuration held strictly more than an
+    unquantized index at its own declared size and warned about itself at
+    creation. Releasing the training records at training completion is what
+    this asserts: the storage the index reports must come in below the raw
+    store an unquantized index holds for the same data, fixed costs included.
+    The graph is excluded from both sides, which biases against the quantized
+    index, whose graph holds codes rather than vectors.
+    """
+    vdb = VectorDatabase()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        index = vdb.create("hnsw", dim=64, quantization_config={"type": "pq"})
+
+    assert index.get_quantization_info()["training_size"] == 10000, (
+        "the default training_size moved, so this no longer tests the default")
+    assert int(index.get_stats()["expected_size"]) == 10000
+
+    records = 10000
+    rng = np.random.default_rng(20260807)
+    assert index.add({
+        "ids": [f"v_{i}" for i in range(records)],
+        "embeddings": rng.random((records, 64), dtype=np.float32),
+    }).is_success()
+    assert index.is_quantized(), "the default index must train at its declared size"
+
+    stats = index.get_stats()
+    assert int(stats["raw_vectors_stored"]) == 0
+    quantized_total_mb = (float(stats["raw_vectors_memory_mb"])
+                          + float(stats["quantized_codes_memory_mb"])
+                          + float(stats["codebook_memory_mb"])
+                          + float(stats["sdc_table_memory_mb"]))
+    unquantized_mb = records * 64 * 4 / (1024 * 1024)
+    assert quantized_total_mb < unquantized_mb, (
+        f"the default quantized_only index holds {quantized_total_mb:.2f}MB "
+        f"against {unquantized_mb:.2f}MB unquantized at its declared size"
+    )
+
+# ------------------------------------------------------------
+# Test 110: every record is retrievable once training completes
+# ------------------------------------------------------------
+def test_every_record_retrievable_after_training():
+    """The release does not cost a single record, on any read path.
+
+    The training records lose their raw copies at training completion, so this
+    walks the accessors: get_records returns every id with a vector of the
+    right width, and the single, sequential batch and parallel batch search
+    paths each hand back a vector for whatever they return, served from the
+    reconstruction now that no raw vector exists anywhere.
+    """
+    index = _make_trained_pq_index("quantized_only")
+    ids = [f"train_{i}" for i in range(PQ_TOTAL)]
+    assert int(index.get_stats()["raw_vectors_stored"]) == 0
+
+    records = index.get_records(ids, return_vector=True)
+    assert len(records) == PQ_TOTAL
+    assert {r["id"] for r in records} == set(ids)
+    assert all(len(r["vector"]) == PQ_DIM for r in records)
+
+    assert index.contains("train_0") and index.contains(f"train_{PQ_TOTAL - 1}")
+    assert len(index.list(number=PQ_TOTAL + 10)) == PQ_TOTAL
+
+    # Every search path serves a vector for every hit. The two batch paths
+    # used to read the raw store alone, which this mode now leaves empty, so
+    # the pages below pin the reconstruction fallback in both: a batch of
+    # three runs sequentially and a batch of eight fans out in parallel.
+    rng = np.random.default_rng(20260807)
+    single = index.search(rng.random(PQ_DIM).astype(np.float32).tolist(),
+                          top_k=5, return_vector=True)
+    assert len(single) == 5
+    assert all("vector" in h and len(h["vector"]) == PQ_DIM for h in single)
+
+    for batch_size in (3, 8):
+        pages = index.search(rng.random((batch_size, PQ_DIM)).astype(np.float32),
+                             top_k=5, return_vector=True)
+        assert len(pages) == batch_size
+        for page in pages:
+            assert len(page) == 5
+            assert all("vector" in h and len(h["vector"]) == PQ_DIM for h in page)
+
+# ------------------------------------------------------------
+# Test 111: recall holds with no raw vectors anywhere
+# ------------------------------------------------------------
+def test_recall_holds_after_the_training_records_are_released(quantized_graph):
+    """Recall at 10 stays above the floor now that nothing is stored raw.
+
+    The release changes storage alone: the codebook is trained on the same
+    vectors, the codes are unchanged, and the graph is built from the same
+    codes, so recall sits where it always did. Measured 0.78 to 0.79 at these
+    settings over three data seeds before the release and the same after it.
+    """
+    index = quantized_graph["index"]
+    if quantized_graph["mode"] == "quantized_only":
+        assert int(index.get_stats()["raw_vectors_stored"]) == 0
+    assert _recall_at_10(index, quantized_graph) > 0.60
+
+# ------------------------------------------------------------
+# Test 112: the default configuration no longer warns at creation
+# ------------------------------------------------------------
+def test_creation_warning_is_silent_at_the_default_configuration():
+    """The default index does not warn that it cannot pay, at any dimension.
+
+    Until this relay the default configuration warned about itself: break even
+    sat above the default expected_size at every dimension, because the
+    training records stayed at full width and the default training_size equals
+    the default expected_size. With the records released at training, break
+    even is fixed_bytes / (dim * 4 - subvectors), which the default
+    expected_size of 10,000 clears at every dimension from 64 up.
+    """
+    vdb = VectorDatabase()
+
+    for dim in (64, 256, 768, 1536):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            vdb.create("hnsw", dim=dim, quantization_config={"type": "pq"})
+        messages = [str(w.message) for w in caught]
+        assert not [m for m in messages
+                    if "more memory than an unquantized index" in m], (
+            f"the default configuration still warns about itself at dim {dim}")
+        assert not [m for m in messages if "will never trigger" in m]
+
+    # An expected_size that cannot reach the training threshold never trains,
+    # so quantization never engages and the memory warnings describe a state
+    # the index will not reach. It gets the warning that names that instead.
+    with pytest.warns(UserWarning, match="training will never trigger"):
+        vdb.create("hnsw", dim=64, expected_size=5000,
+                   quantization_config={"type": "pq"})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        vdb.create("hnsw", dim=64, expected_size=5000,
+                   quantization_config={"type": "pq"})
+    assert not [w for w in caught
+                if "more memory than an unquantized index" in str(w.message)]

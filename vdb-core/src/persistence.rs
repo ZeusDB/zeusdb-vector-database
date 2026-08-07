@@ -575,6 +575,35 @@ fn reconstruct_index_simple(
     // quantized_only would lose the memory saving that is its whole purpose.
     let raw_count = vectors.len();
     let code_count = pq_codes.len();
+
+    // A trained quantized_only index holds no raw vectors, but a directory
+    // written before that was true carries its training records in
+    // vectors.bin. They are dropped here rather than restored, so an old
+    // directory sheds them on load exactly as a live index sheds them at
+    // training. Only a vector whose record also has stored codes is dropped;
+    // a raw vector without codes is the record's sole copy, which only a
+    // directory that lost pq_codes.bin while keeping vectors.bin can contain,
+    // and the count check below is what judges that case. The restored record
+    // count is unaffected because every dropped vector's record keeps its
+    // codes.
+    let quantized_only_trained = index.can_use_quantization()
+        && index
+            .get_quantization_config()
+            .is_some_and(|config| config.storage_mode == StorageMode::QuantizedOnly);
+    let vectors = if quantized_only_trained {
+        let (kept, dropped): (HashMap<_, _>, HashMap<_, _>) = vectors
+            .into_iter()
+            .partition(|(id, _)| !pq_codes.contains_key(id));
+        if !dropped.is_empty() {
+            println!(
+                "📉 Released {} raw training vectors quantized_only no longer keeps",
+                dropped.len()
+            );
+        }
+        kept
+    } else {
+        vectors
+    };
     index.restore_storage_maps(vectors, pq_codes, metadata);
 
     // Step 5: Put back the training collection the rebuild stripped
