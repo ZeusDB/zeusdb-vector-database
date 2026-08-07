@@ -111,13 +111,14 @@ class VectorDatabase:
 
             Note: Quantization replaces each vector with a code of one byte per
             subvector, so the code is dim * 4 / subvectors smaller than the vector.
-            The memory an index saves is smaller than that, because the codebook,
-            the centroid distance table, the graph and the training records kept at
-            full width are all unaffected. get_stats() reports the actual figures.
-            Recall falls sharply, not slightly. Only 'quantized_with_raw' can
-            recover it, by reranking against the raw vectors it keeps. Training
-            triggers automatically on the first .add() call that reaches the
-            training_size threshold.
+            The memory an index saves is smaller than that, because the codebook
+            and the centroid distance table are held whatever the record count.
+            Under 'quantized_only' the records collected for training are held at
+            full width only until training completes, then released. get_stats()
+            reports the actual figures. Recall falls sharply, not slightly. Only
+            'quantized_with_raw' can recover it, by reranking against the raw
+            vectors it keeps. Training triggers automatically on the first .add()
+            call that reaches the training_size threshold.
 
         Returns:
             An instance of the created vector index.
@@ -312,13 +313,9 @@ class VectorDatabase:
         # This used to quote the compression ratio as a memory multiplier. The
         # two are different quantities. The compression ratio is the size of a
         # code against the size of the vector it replaces, while the ratio
-        # between the modes also depends on the training records quantized_only
-        # keeps at full width, on the codebook, on the centroid distance table
-        # and on the graph. Measured over record counts from 1,000 to 50,000,
-        # dimensions from 64 to 768 and 4 to 96 subvectors, the true multiplier
-        # ran 1.0x to 20x on vectors and codes and 1.0x to 1.6x on the whole
-        # resident index, against ratios of 16x to 384x. It moves with the
-        # record count, which is not known here.
+        # between the modes also depends on the codebook, on the centroid
+        # distance table and on the graph, which both modes hold identically.
+        # It moves with the record count, which is not known here.
         #
         # The second sentence is this relay's addition. quantized_with_raw adds
         # the codes, the codebook and the centroid distance table on top of
@@ -438,41 +435,56 @@ class VectorDatabase:
         compressed_bytes_per_vector = subvectors  # 1 byte per subvector code
         compression_ratio = original_bytes_per_vector / compressed_bytes_per_vector
 
+        # An index whose declared size never reaches training_size never
+        # trains, so quantization never engages at all. It holds every record
+        # raw exactly as an unquantized index does, pays no fixed cost, and
+        # gains nothing. The memory warnings below describe the trained state,
+        # which this configuration never reaches at its declared size, so this
+        # one replaces them.
+        declared_size = (
+            expected_size
+            if isinstance(expected_size, int) and not isinstance(expected_size, bool)
+            else None
+        )
+        never_trains = declared_size is not None and declared_size < training_size
+        if never_trains:
+            warnings.warn(
+                f"expected_size={expected_size} is below "
+                f"training_size={training_size}, so training will never trigger "
+                f"at the declared size and quantization will never engage. Raise "
+                f"expected_size if the estimate is low, lower training_size, or "
+                f"drop quantization_config.",
+                UserWarning,
+                stacklevel=2
+            )
+
         # Whether the configuration can repay its fixed cost at the size the
         # caller declared.
         #
-        # Under quantized_only the index keeps a raw vector for each of the
-        # training_size records and a code for every record. So against an
-        # unquantized index of N records it saves (N - training_size) whole
-        # vectors and pays a code for each of the training_size records it still
-        # holds at full width, on top of the fixed cost:
+        # Under quantized_only every record is a code once training completes,
+        # because the raw vectors collected for training are released the
+        # moment their codes are stored. So against an unquantized index of N
+        # records it saves the whole vector of every record, pays a code for
+        # each, and pays the fixed cost:
         #
-        #   saved(N) = (N - training_size) * (dim * 4 - subvectors)
-        #              - training_size * subvectors
-        #              - fixed_bytes
+        #   saved(N) = N * (dim * 4 - subvectors) - fixed_bytes
         #
         # Setting that to zero gives the record count above which quantization
-        # starts saving. quantized_with_raw is excluded because it drops no raw
-        # vector at all, so saved(N) is negative at every N and the advice to
-        # raise expected_size would be false. The storage mode warning covers
-        # that case instead.
-        #
-        # The check runs whether or not expected_size was set. The default is
-        # 10,000 and the default training_size is also 10,000, so the default
-        # configuration cannot save anything at the default size, and that is
-        # precisely what a caller needs told.
+        # starts saving, and training_size no longer appears in it.
+        # quantized_with_raw is excluded because it drops no raw vector at all,
+        # so saved(N) is negative at every N and the advice to raise
+        # expected_size would be false. The storage mode warning covers that
+        # case instead.
         break_even = None
         if storage_mode == 'quantized_only' and original_bytes_per_vector > subvectors:
             per_record = original_bytes_per_vector - subvectors
-            break_even = training_size + -(
-                -(fixed_bytes + training_size * subvectors) // per_record
-            )
+            break_even = -(-fixed_bytes // per_record)
 
         cannot_pay = (
-            break_even is not None
-            and isinstance(expected_size, int)
-            and not isinstance(expected_size, bool)
-            and expected_size < break_even
+            not never_trains
+            and break_even is not None
+            and declared_size is not None
+            and declared_size < break_even
         )
 
         if cannot_pay:
@@ -480,24 +492,23 @@ class VectorDatabase:
                 f"This quantization configuration will use more memory than an "
                 f"unquantized index at expected_size={expected_size}. It holds "
                 f"{fixed_memory_mb:.2f}MB of codebook and centroid distance table "
-                f"whatever the record count, and keeps the first {training_size} "
-                f"records at full width. It starts saving above {break_even} records. "
-                f"Raise expected_size if the estimate is low, or drop "
+                f"whatever the record count, and starts saving above {break_even} "
+                f"records. Raise expected_size if the estimate is low, or drop "
                 f"quantization_config.",
                 UserWarning,
                 stacklevel=2
             )
 
         # Warn about large fixed memory, but only where the configuration does
-        # pay, since the warning above already names the same figure. Exactly
-        # one of the two fires.
+        # pay and does train, since the warnings above already cover the other
+        # cases. At most one of the three fires.
         #
         # The threshold was 100MB while the table was a full square. Halving the
         # table halved the quantity the threshold measures, so it halves with
         # it, keeping the same configurations in scope. At dim 1536 with 512
         # subvectors of 8 bits the fixed memory is 65.2MB, which fired at 129.5MB
         # against 100 before this change and fires at 65.2MB against 50 after it.
-        if fixed_memory_mb > 50 and not cannot_pay:
+        if fixed_memory_mb > 50 and not cannot_pay and not never_trains:
             warnings.warn(
                 f"Large fixed quantization memory: {fixed_memory_mb:.1f}MB, being "
                 f"{centroid_memory_mb:.1f}MB of centroids and {sdc_memory_mb:.1f}MB of "

@@ -745,7 +745,14 @@ pub struct HNSWIndex {
     // Index-level metadata (simple, infrequently accessed)
     metadata: Mutex<HashMap<String, String>>,
 
-    // Thread-safe vector store with RwLock for concurrent reads
+    /// The raw vector store.
+    ///
+    /// Holds every record for an unquantized index and under
+    /// `quantized_with_raw`. Under `quantized_only` it holds the records
+    /// collected before training and nothing after: the quantization rebuild
+    /// releases them once their codes are stored, and the loader drops them
+    /// from a directory written before that was true. A trained
+    /// `quantized_only` index therefore holds no raw vector anywhere.
     vectors: RwLock<HashMap<String, Vec<f32>>>,
     vector_metadata: RwLock<HashMap<String, HashMap<String, Value>>>,
     id_map: RwLock<HashMap<String, usize>>,
@@ -1250,6 +1257,14 @@ impl HNSWIndex {
     }
 
     /// Rebuild the HNSW index to use PQ codes after training is complete
+    ///
+    /// Re-encodes whatever raw vectors the index still holds through the
+    /// trained codebook and rebuilds the graph from the stored codes. It never
+    /// retrains the codebook; training runs exactly once, on the `add` that
+    /// reaches `training_size`. A trained `quantized_only` index holds no raw
+    /// vectors, so there the rebuild proceeds from the codes alone, and under
+    /// either mode nothing is lost by calling it. Returns false when there is
+    /// no trained quantizer or nothing stored to rebuild from.
     #[instrument(level = "info", skip(self, py), fields(
         vector_count = self.get_vector_count(),
         has_quantization = self.has_quantization()
@@ -1803,14 +1818,16 @@ impl HNSWIndex {
     /// the returned list can be shorter than the list of ids asked for.
     ///
     /// `return_vector` is served from the raw vector where one exists and from a
-    /// reconstruction of the code where one does not, which is the case for a
-    /// record added after training under `quantized_only`. The returned value is
-    /// then an approximation rather than the value supplied. Measured on 16
-    /// dimensional data with 4 subvectors and 8 bits, a reconstructed vector
-    /// differed from the stored unit vector by 0.066 at the worst component and
-    /// sat at cosine similarity 0.991 to it, while a raw-backed record returned
-    /// exactly. `get_stats()["raw_vectors_stored"]` is what tells the two apart
-    /// in aggregate.
+    /// reconstruction of the code where one does not. Under `quantized_only`
+    /// that is every record once training completes, the training records
+    /// included, since the rebuild releases their raw vectors the moment their
+    /// codes are stored. The returned value is then an approximation rather
+    /// than the value supplied. Measured on 16 dimensional data with 4
+    /// subvectors and 8 bits, a reconstructed vector differed from the stored
+    /// unit vector by 0.066 at the worst component and sat at cosine similarity
+    /// 0.991 to it. Under `quantized_with_raw` every record keeps its raw
+    /// vector and returns exactly. `get_stats()["raw_vectors_stored"]` is what
+    /// tells the two apart in aggregate.
     #[pyo3(signature = (input, return_vector = true))]
     pub fn get_records(
         &self,
@@ -1965,7 +1982,11 @@ impl HNSWIndex {
             // 64 dimensions it held more resident memory than the same index
             // unquantized, because the centroid distance table is a fixed 1 MB.
             // What replaces it is the fact the figures above can be checked
-            // against, being which records still have a raw vector.
+            // against, being which records still have a raw vector. Under
+            // QuantizedOnly that is every record while the index is still
+            // collecting for training and none from the moment training
+            // completes, since the rebuild releases the training records once
+            // their codes are stored.
             match config.storage_mode {
                 StorageMode::QuantizedOnly => {
                     stats.insert(
@@ -1974,7 +1995,7 @@ impl HNSWIndex {
                     );
                     stats.insert(
                         "raw_vectors_retained".to_string(),
-                        "training_records_only".to_string(),
+                        "none_once_trained".to_string(),
                     );
                 }
                 StorageMode::QuantizedWithRaw => {
@@ -2656,57 +2677,73 @@ impl HNSWIndex {
             "Creating new PQ HNSW index"
         );
 
-        // Quantize every stored vector and record the codes, then release the
-        // storage guards. Nothing below this block holds one, which is what lets
-        // the graph work take its own guards in the declared order rather than
-        // under a `vectors` guard taken first.
+        // Quantize every stored raw vector and record the codes, then release
+        // the storage guards. Nothing below this block holds one, which is what
+        // lets the graph work take its own guards in the declared order rather
+        // than under a `vectors` guard taken first.
+        //
+        // An empty raw store is not an error. Under QuantizedOnly the raw
+        // vectors are released the moment training completes, so a trained
+        // index in that mode holds codes alone, and the rebuild proceeds from
+        // those stored codes exactly as `compact` does. Only an index with
+        // neither raw vectors nor codes has nothing to rebuild from.
         let (vector_count, retained) = {
             let vectors = self.vectors.read().unwrap();
             if vectors.is_empty() {
-                warn!(
-                    operation = "rebuild_quantization",
-                    reason = "no_vectors",
-                    "Cannot rebuild: no vectors available"
-                );
-                return Ok(false);
-            }
-
-            info!(
-                operation = "quantization_rebuild_start",
-                vector_count = vectors.len(),
-                "Starting quantization rebuild"
-            );
-
-            let vector_refs: Vec<&[f32]> = vectors.values().map(|v| v.as_slice()).collect();
-            let quantized_codes = pq.quantize_batch(&vector_refs).map_err(|e| {
-                error!(operation = "quantization_rebuild", error = %e, "Failed to quantize vectors");
-                format!("Failed to quantize vectors: {}", e)
-            })?;
-
-            // Store quantized codes. Codes for records that have no raw vector are
-            // kept rather than cleared, because under QuantizedOnly they are the
-            // only copy of every record added after training completed and there is
-            // nothing left to re-quantize them from. Clearing dropped those records
-            // from the index outright. Removal already deletes an id's codes, so
-            // nothing stale can survive here.
-            let mut pq_codes = self.pq_codes.write().unwrap();
-            let retained = pq_codes
-                .keys()
-                .filter(|id| !vectors.contains_key(*id))
-                .count();
-
-            for (i, (id, _)) in vectors.iter().enumerate() {
-                if i < quantized_codes.len() {
-                    pq_codes.insert(id.clone(), quantized_codes[i].clone());
+                let code_count = self.pq_codes.read().unwrap().len();
+                if code_count == 0 {
+                    warn!(
+                        operation = "rebuild_quantization",
+                        reason = "no_vectors_or_codes",
+                        "Cannot rebuild: no vectors or codes available"
+                    );
+                    return Ok(false);
                 }
+                info!(
+                    operation = "quantization_rebuild_start",
+                    vector_count = 0,
+                    codes_retained = code_count,
+                    "Starting quantization rebuild from stored codes"
+                );
+                (0, code_count)
+            } else {
+                info!(
+                    operation = "quantization_rebuild_start",
+                    vector_count = vectors.len(),
+                    "Starting quantization rebuild"
+                );
+
+                let vector_refs: Vec<&[f32]> = vectors.values().map(|v| v.as_slice()).collect();
+                let quantized_codes = pq.quantize_batch(&vector_refs).map_err(|e| {
+                    error!(operation = "quantization_rebuild", error = %e, "Failed to quantize vectors");
+                    format!("Failed to quantize vectors: {}", e)
+                })?;
+
+                // Store quantized codes. Codes for records that have no raw vector
+                // are kept rather than cleared, because under QuantizedOnly they
+                // are the only copy of every record added after training completed
+                // and there is nothing left to re-quantize them from. Clearing
+                // dropped those records from the index outright. Removal already
+                // deletes an id's codes, so nothing stale can survive here.
+                let mut pq_codes = self.pq_codes.write().unwrap();
+                let retained = pq_codes
+                    .keys()
+                    .filter(|id| !vectors.contains_key(*id))
+                    .count();
+
+                for (i, (id, _)) in vectors.iter().enumerate() {
+                    if i < quantized_codes.len() {
+                        pq_codes.insert(id.clone(), quantized_codes[i].clone());
+                    }
+                }
+                debug!(
+                    operation = "quantization_rebuild",
+                    codes_stored = pq_codes.len(),
+                    codes_retained = retained,
+                    "Quantized codes stored"
+                );
+                (vectors.len(), retained)
             }
-            debug!(
-                operation = "quantization_rebuild",
-                codes_stored = pq_codes.len(),
-                codes_retained = retained,
-                "Quantized codes stored"
-            );
-            (vectors.len(), retained)
         };
 
         // The codes are copied out so the graph is built with no lock held at
@@ -2756,6 +2793,29 @@ impl HNSWIndex {
         // See `replace_graph`.
         self.replace_graph(new_hnsw);
 
+        // Release the raw vectors QuantizedOnly no longer needs. Every one of
+        // them was encoded above and its codes stored before the graph was
+        // built, so from here the codes are the record and the raw copies are
+        // dead weight. This runs only after the new graph is installed, so a
+        // failed rebuild leaves the raw store untouched. The map is replaced
+        // rather than cleared so its allocation is returned as well. Training
+        // completion is the only path that reaches here with a populated raw
+        // store under QuantizedOnly, which is what makes this the single point
+        // where the mode sheds its training records.
+        let released = if vector_count > 0
+            && self
+                .quantization_config
+                .as_ref()
+                .is_some_and(|config| config.storage_mode == StorageMode::QuantizedOnly)
+        {
+            let mut vectors = self.vectors.write().unwrap();
+            let released = vectors.len();
+            *vectors = HashMap::new();
+            released
+        } else {
+            0
+        };
+
         // ✅ ENTERPRISE: Add duration timing with fixed compression ratio calculation
         let duration_ms = start_time.elapsed().as_millis();
         let compression_ratio = (pq.dim as f64 * 4.0) / pq.subvectors as f64;
@@ -2764,6 +2824,7 @@ impl HNSWIndex {
             vector_count = vector_count,
             codes_inserted = batch_data.len(),
             codes_retained = retained,
+            raw_vectors_released = released,
             compression_ratio = compression_ratio,
             duration_ms = duration_ms,
             "Quantization rebuild completed successfully"
@@ -3583,16 +3644,13 @@ impl HNSWIndex {
     /// A raw index already ranks by the raw distance, so over-fetching and
     /// rescoring would return the same page at a higher cost.
     ///
-    /// A `quantized_only` index has no raw vector for the records added after
-    /// training, and rescoring those against their reconstruction gains
-    /// nothing, because the reconstruction carries exactly the information the
-    /// ADC distance already used. Measured at 10,000 records of dimension 768,
-    /// recall at `top_k` 10 over the code held records moved from 0.1320 to
-    /// 0.1330 across one data seed and from 0.1440 to 0.1400 across another,
-    /// which is noise in both directions. The mode keeps raw vectors for the
-    /// records collected before training, one in ten at these settings, and
-    /// rescoring only those would put two accuracies in one ranking for a
-    /// tenth of the page.
+    /// A `quantized_only` index holds no raw vectors once trained, the
+    /// training records included, so the only thing available to rescore any
+    /// candidate against is its reconstruction, and that carries exactly the
+    /// information the ADC distance already used. Measured at 10,000 records
+    /// of dimension 768, recall at `top_k` 10 over code held records moved
+    /// from 0.1320 to 0.1330 across one data seed and from 0.1440 to 0.1400
+    /// across another, which is noise in both directions.
     ///
     /// `rerank = 0` from the caller turns it off and restores the ADC scores.
     fn rerank_plan(&self, rerank: Option<usize>) -> Option<RerankPlan> {
@@ -4680,8 +4738,16 @@ impl HNSWIndex {
                 let mut query_results = Vec::with_capacity(scored.len());
                 for (ext_id, score) in scored {
                     let metadata = metadata_store.get(ext_id).cloned().unwrap_or_default();
+                    // The raw vector where one exists and the reconstruction
+                    // from the codes where none does, exactly as the single
+                    // query path serves it. Under quantized_only every record
+                    // is code held once training completes, so without the
+                    // fallback a batch search returned no vectors at all.
                     let vector_data = if params.return_vector {
-                        vector_store.get(ext_id).cloned()
+                        vector_store.get(ext_id).cloned().or_else(|| {
+                            let codes = code_store.get(ext_id)?;
+                            self.pq.as_ref()?.reconstruct(codes).ok()
+                        })
                     } else {
                         None
                     };
@@ -4798,8 +4864,13 @@ impl HNSWIndex {
                     let mut query_results = Vec::with_capacity(scored.len());
                     for (ext_id, score) in scored {
                         let metadata = metadata_store.get(ext_id).cloned().unwrap_or_default();
+                        // The same raw-then-reconstruction service as the
+                        // single query and sequential batch paths.
                         let vector_data = if params.return_vector {
-                            vector_store.get(ext_id).cloned()
+                            vector_store.get(ext_id).cloned().or_else(|| {
+                                let codes = code_store.get(ext_id)?;
+                                self.pq.as_ref()?.reconstruct(codes).ok()
+                            })
                         } else {
                             None
                         };

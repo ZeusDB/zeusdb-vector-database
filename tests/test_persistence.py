@@ -129,8 +129,9 @@ def quantized_only_saved(tmp_path_factory):
 
     Training runs k-means over training_size vectors and is the slowest thing
     in this file, so the directory is shared. Any test that modifies it copies
-    it first. The 10 records past training_size are the ones stored as codes
-    alone, which is the case the loader has to reconstruct.
+    it first. Every record is stored as codes alone, since the mode releases
+    the training records' raw vectors at training completion, so the directory
+    carries no vectors.bin and the loader rebuilds everything from the codes.
     """
     vdb = VectorDatabase()
     index = vdb.create("hnsw", dim=8,
@@ -639,19 +640,20 @@ def test_persistence_untrained_pq_index(tmp_path):
 def test_persistence_quantized_only_round_trip(quantized_only_saved):
     """Every record comes back, including the ones stored as codes alone.
 
-    quantized_only stops storing raw vectors once training completes, so
-    vectors.bin holds the training set and pq_codes.bin holds everything. The
-    loader rebuilds the graph by inserting those stored codes into a PQ graph,
-    so every record is covered, nothing is reconstructed to full width on the
-    way, and the loaded index is quantized exactly as the saved one was. The
-    stored codes are put back as written rather than recomputed, and no record
-    is promoted to raw storage, so the mode keeps the memory saving that is
-    its whole purpose.
+    A trained quantized_only index holds no raw vectors, so its directory has
+    pq_codes.bin and no vectors.bin at all. The loader rebuilds the graph by
+    inserting those stored codes into a PQ graph, so every record is covered,
+    nothing is reconstructed to full width on the way, and the loaded index is
+    quantized exactly as the saved one was. The stored codes are put back as
+    written rather than recomputed, and no record is promoted to raw storage,
+    so the mode keeps the memory saving that is its whole purpose.
     """
     vdb = VectorDatabase()
     ids = quantized_only_saved["ids"]
     save_dir = quantized_only_saved["path"]
-    assert "pq_codes.bin" in {p.name for p in save_dir.glob("*")}
+    on_disk = {p.name for p in save_dir.glob("*")}
+    assert "pq_codes.bin" in on_disk
+    assert "vectors.bin" not in on_disk
 
     loaded = vdb.load(str(save_dir))
 
@@ -662,11 +664,12 @@ def test_persistence_quantized_only_round_trip(quantized_only_saved):
     assert {r["id"] for r in records} == set(ids)
     assert all("vector" in r for r in records)
 
-    # The split between raw and coded storage is exactly what was saved. Only
+    # The split between raw and coded storage is exactly what was saved, which
+    # for this mode is codes for everything and no raw vector anywhere. Only
     # get_stats reports the split. list() enumerates the id map, so it returns
     # every record regardless of which store holds its vector, and a reloaded
     # index is no different from a live one here.
-    assert int(loaded.get_stats()["raw_vectors_stored"]) == QO_TRAINING_SIZE
+    assert int(loaded.get_stats()["raw_vectors_stored"]) == 0
     assert int(loaded.get_stats()["quantized_codes_stored"]) == QO_COUNT
     assert len(loaded.list(number=QO_COUNT + 10)) == QO_COUNT
     assert {rid for rid, _ in loaded.list(number=QO_COUNT + 10)} == set(ids)
@@ -738,22 +741,17 @@ def test_persistence_vector_count_matches_reality(tmp_path, quantized_only_saved
     with pytest.raises(RuntimeError, match=r"yields 0 records while config.json reports 6"):
         vdb.load(str(broken))
 
-    # Losing pq_codes.bin from a quantized_only index loses the records that
-    # exist only as codes, so that is refused too.
+    # Losing pq_codes.bin from a quantized_only index loses every record,
+    # because the codes are the only copy the mode keeps, so that is refused
+    # too. The directory carries no vectors.bin to fall back on: a trained
+    # index in this mode saved none, having released the training records'
+    # raw vectors when training completed.
+    assert not (quantized_only_saved["path"] / "vectors.bin").exists()
     no_codes = tmp_path / "no_codes.zdb"
     shutil.copytree(quantized_only_saved["path"], no_codes)
     (no_codes / "pq_codes.bin").unlink()
-    with pytest.raises(RuntimeError, match=r"yields 1000 records while config.json reports 1010"):
+    with pytest.raises(RuntimeError, match=r"yields 0 records while config.json reports 1010"):
         vdb.load(str(no_codes))
-
-    # Losing vectors.bin from a quantized_only index loses nothing, because
-    # every record still has its codes. This one loads.
-    no_vectors = tmp_path / "no_vectors.zdb"
-    shutil.copytree(quantized_only_saved["path"], no_vectors)
-    (no_vectors / "vectors.bin").unlink()
-    recovered = vdb.load(str(no_vectors))
-    assert recovered.get_vector_count() == QO_COUNT
-    assert len(recovered.get_records(quantized_only_saved["ids"])) == QO_COUNT
 
 # ------------------------------------------------------------
 # Test 79: Persistence: an unusable codebook fails the load
@@ -803,11 +801,13 @@ def test_persistence_rejects_unusable_codebook(tmp_path, quantized_only_saved):
 def test_persistence_reads_previous_format(tmp_path, quantized_only_saved):
     """Format 1.0.0, written by 0.3.0 through 0.4.1, still opens.
 
-    The fixture is built by saving with this build and then reversing the only
-    two save side changes, being the index level metadata field in config.json
-    and the format version in manifest.json. Nothing else about what is written
-    changed, verified by comparing the persisted structures and the artefact
-    set against the v0.4.1 tag, so this is what those releases produced.
+    The fixture is built by saving with this build and then reversing two of
+    the save side changes since, being the index level metadata field in
+    config.json and the format version in manifest.json. The third difference
+    is that those releases also wrote the training records to vectors.bin for
+    a trained quantized_only index; that file's handling is covered by
+    test_persistence_drops_raw_vectors_from_an_old_quantized_only_directory,
+    which loads a directory that carries one.
     """
     vdb = VectorDatabase()
     legacy = tmp_path / "legacy.zdb"
@@ -841,6 +841,88 @@ def test_persistence_reads_previous_format(tmp_path, quantized_only_saved):
         encoding="utf-8"))["format_version"] == "1.1.0"
     assert "metadata" in json.loads((upgraded / "config.json").read_text(encoding="utf-8"))
     assert vdb.load(str(upgraded)).get_vector_count() == QO_COUNT
+
+# ------------------------------------------------------------
+# Test 106: Persistence: an old quantized_only directory sheds its raw vectors
+# ------------------------------------------------------------
+def test_persistence_drops_raw_vectors_from_an_old_quantized_only_directory(tmp_path):
+    """A directory that carries vectors.bin loads, and the raw vectors go.
+
+    Releases up to 0.4.1 kept the training records at full width under
+    quantized_only and wrote them to vectors.bin, so their directories carry
+    raw vectors this build no longer keeps. The loader drops every raw vector
+    whose record has stored codes, which in an intact directory is all of
+    them, so an old directory sheds its training records on load exactly as a
+    live index sheds them at training. Nothing is lost: the codes are the
+    record, and the count check still passes because the union of raws and
+    codes is unchanged.
+
+    The fixture is a quantized_with_raw save, whose vectors.bin holds a raw
+    vector for every record alongside full codes, relabelled quantized_only in
+    quantization.json. That is a superset of what 0.4.1 wrote for
+    quantized_only, where vectors.bin held the training records alone.
+    """
+    vdb = VectorDatabase()
+    count = 1100
+    with pytest.warns(UserWarning, match="keeps a raw vector for every record"):
+        index = vdb.create("hnsw", dim=8,
+                           quantization_config=_pq_config("quantized_with_raw"),
+                           expected_size=2000)
+    vectors = _sample_vectors(count, 8)
+    ids = [f"v_{i}" for i in range(count)]
+    assert index.add({"ids": ids, "embeddings": vectors,
+                      "metadatas": [{"i": i} for i in range(count)]}).is_success()
+    assert index.is_quantized()
+    # The live quantized_with_raw index serves these exactly, from raw storage.
+    live_raw = {
+        r["id"]: r["vector"]
+        for r in index.get_records(ids[:5] + ids[-5:], return_vector=True)
+    }
+
+    old_style = tmp_path / "old_quantized_only.zdb"
+    index.save(str(old_style))
+    assert (old_style / "vectors.bin").exists()
+
+    quantization = json.loads(
+        (old_style / "quantization.json").read_text(encoding="utf-8"))
+    assert quantization["storage_mode"] == "quantized_with_raw"
+    quantization["storage_mode"] = "quantized_only"
+    (old_style / "quantization.json").write_text(
+        json.dumps(quantization, indent=2), encoding="utf-8")
+
+    loaded = vdb.load(str(old_style))
+
+    # Every record is present, served from its codes, and the raw store is
+    # empty despite vectors.bin holding a copy of every record.
+    assert loaded.get_vector_count() == count
+    stats = loaded.get_stats()
+    assert int(stats["raw_vectors_stored"]) == 0
+    assert int(stats["quantized_codes_stored"]) == count
+    assert stats["storage_mode"] == "quantized_only"
+    records = loaded.get_records(ids, return_vector=True)
+    assert len(records) == count
+    assert all("vector" in r for r in records)
+
+    # What comes back is the reconstruction from the stored codes rather than
+    # the raw copy vectors.bin carried: close to the vector the raw store
+    # held, not equal to it.
+    by_id = {r["id"]: r["vector"] for r in loaded.get_records(
+        ids[:5] + ids[-5:], return_vector=True)}
+    for record_id, raw_vector in live_raw.items():
+        reconstructed = np.asarray(by_id[record_id], dtype=np.float64)
+        raw = np.asarray(raw_vector, dtype=np.float64)
+        assert not np.allclose(reconstructed, raw, atol=1e-6)
+        cosine = float(reconstructed @ raw
+                       / (np.linalg.norm(reconstructed) * np.linalg.norm(raw)))
+        assert cosine > 0.90
+
+    # A save after the load writes the new shape, with no vectors.bin.
+    resaved = tmp_path / "resaved.zdb"
+    loaded.save(str(resaved))
+    assert not (resaved / "vectors.bin").exists()
+    again = vdb.load(str(resaved))
+    assert again.get_vector_count() == count
+    assert len(again.get_records(ids)) == count
 
 # ------------------------------------------------------------
 # Test 81: Persistence: the format version gate
@@ -1087,19 +1169,18 @@ def test_quantized_index_loads_back_quantized(quantized_reload):
 # Test 102: the raw vector store is not inflated by a reload
 # ------------------------------------------------------------
 def test_quantized_reload_raw_store_holds_only_what_was_saved(quantized_reload):
-    """quantized_only comes back holding raw vectors for the training set alone.
+    """The raw store comes back exactly as the live index held it.
 
-    That is exactly what the live index held before the save, because the
-    collection phase stores raw vectors and nothing clears them at training.
-    The 500 code-only records must not be materialised at full width on load;
-    before this fix the loader reconstructed them into the graph, which is
-    where the mode's memory saving went to die.
+    For quantized_only that is empty, since training releases the collected
+    raw vectors the moment their codes are stored, and for quantized_with_raw
+    it is every record. No code-only record may be materialised at full width
+    on load; before relay 35's fix the loader reconstructed them into the
+    graph, which is where the mode's memory saving went to die.
     """
     fixture = quantized_reload
     loaded = VectorDatabase().load(str(fixture["path"]))
 
-    expected_raw = (RELOAD_TRAINING_SIZE if fixture["mode"] == "quantized_only"
-                    else RELOAD_TOTAL)
+    expected_raw = 0 if fixture["mode"] == "quantized_only" else RELOAD_TOTAL
     stats = loaded.get_stats()
     assert int(stats["raw_vectors_stored"]) == expected_raw
     assert int(stats["quantized_codes_stored"]) == RELOAD_TOTAL
