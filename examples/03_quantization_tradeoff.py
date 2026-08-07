@@ -114,24 +114,34 @@ def main():
     # quantized_only keeps the raw vectors of every record collected before
     # training and never discards them, so an index whose training_size is a
     # large share of its total size saves much less than the ratio suggests.
+    # The codebook and the centroid distance table are fixed by dim, subvectors
+    # and bits. They do not move as records arrive, and at this record count
+    # they are larger than everything the records themselves hold, which is why
+    # they are in the total rather than left out of it.
     print("stored per mode")
-    print(f"  {'mode':<20s} {'raw':>6s} {'codes':>6s} {'raw MB':>7s} {'code MB':>8s} {'total':>6s}")
+    print(f"  {'mode':<20s} {'raw':>6s} {'codes':>6s} {'raw MB':>7s} {'code MB':>8s} "
+          f"{'fixed MB':>9s} {'total':>6s}")
     unquantized_mb = RECORDS * DIM * 4 / 1024 / 1024
     print(f"  {'no quantization':<20s} {RECORDS:>6d} {0:>6d} "
-          f"{unquantized_mb:>7.2f} {0.0:>8.2f} {unquantized_mb:>6.2f}")
+          f"{unquantized_mb:>7.2f} {0.0:>8.2f} {0.0:>9.2f} {unquantized_mb:>6.2f}")
     for label, index in (("quantized_only", only), ("quantized_with_raw", with_raw)):
         stats = index.get_stats()
         raw_mb = megabytes(stats, "raw_vectors_memory_mb")
         code_mb = megabytes(stats, "quantized_codes_memory_mb")
+        fixed_mb = (megabytes(stats, "codebook_memory_mb")
+                    + megabytes(stats, "sdc_table_memory_mb"))
         print(
             f"  {label:<20s} {stats['raw_vectors_stored']:>6s} "
             f"{stats['quantized_codes_stored']:>6s} "
-            f"{raw_mb:>7.2f} {code_mb:>8.2f} {raw_mb + code_mb:>6.2f}"
+            f"{raw_mb:>7.2f} {code_mb:>8.2f} {fixed_mb:>9.2f} "
+            f"{raw_mb + code_mb + fixed_mb:>6.2f}"
         )
     print()
     print("quantized_only saves far less than the 32x ratio, because a third of")
     print("the records were collected before training and kept their raw vectors.")
     print("quantized_with_raw stores more than an unquantized index, not less.")
+    print("At this size both quantized modes cost more than no quantization at all,")
+    print("because the fixed table is paid whether you hold 3,000 records or 3 million.")
     print()
 
     # ------------------------------------------------------------------
@@ -191,14 +201,16 @@ EXPECTED_OUTPUT = """\
 compression ratio: 32x
 
 stored per mode
-  mode                    raw  codes  raw MB  code MB  total
-  no quantization        3000      0    0.73     0.00   0.73
-  quantized_only         1000   3000    0.24     0.02   0.26
-  quantized_with_raw     3000   3000    0.73     0.02   0.75
+  mode                    raw  codes  raw MB  code MB  fixed MB  total
+  no quantization        3000      0    0.73     0.00      0.00   0.73
+  quantized_only         1000   3000    0.24     0.02      1.06   1.32
+  quantized_with_raw     3000   3000    0.73     0.02      1.06   1.81
 
 quantized_only saves far less than the 32x ratio, because a third of
 the records were collected before training and kept their raw vectors.
 quantized_with_raw stores more than an unquantized index, not less.
+At this size both quantized modes cost more than no quantization at all,
+because the fixed table is paid whether you hold 3,000 records or 3 million.
 
 recall@10 against exact cosine search
   no quantization                    good  1.00

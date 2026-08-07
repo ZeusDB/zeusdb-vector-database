@@ -93,7 +93,8 @@ def _pq_config(storage_mode):
     # dim 8 over 4 subvectors is 8x compression, below the 50x threshold in
     # _check_memory_usage, so no compression warning is emitted. The
     # quantized_with_raw mode warns unconditionally and that is asserted where
-    # it is used.
+    # it is used. quantized_only warns that it cannot repay its fixed cost at
+    # these sizes, which is true and is asserted in test_quantization.py.
     return {
         "type": "pq",
         "subvectors": 4,
@@ -455,8 +456,13 @@ def test_persistence_quantized_with_raw_round_trip(tmp_path):
     a load, and calling it anyway is asserted to be a safe no-op.
     """
     vdb = VectorDatabase()
+    # The warning used to quote the compression ratio as a memory multiplier,
+    # and this asserted the 8.0x it printed. The ratio between the two storage
+    # modes is a different quantity that depends on the record count, so the
+    # warning no longer quotes one.
     with pytest.warns(UserWarning,
-                      match=r"storage_mode='quantized_with_raw' will use ~8\.0x more memory"):
+                      match=r"storage_mode='quantized_with_raw' keeps a raw vector "
+                            r"for every record"):
         index = vdb.create("hnsw", dim=8,
                            quantization_config=_pq_config("quantized_with_raw"),
                            expected_size=2000)
@@ -483,7 +489,13 @@ def test_persistence_quantized_with_raw_round_trip(tmp_path):
     assert manifest["has_quantization"] is True
     assert manifest["quantization_trained"] is True
     assert manifest["storage_mode"] == "quantized_active"
+    # dim 8 at 4 subvectors, so a code is 4 bytes against 32 for the vector.
+    # This mode keeps a raw vector for every coded record, so the manifest read
+    # 8.0 before the numerator was changed to count the coded records too, and
+    # it reads 8.0 after. Under quantized_only it did not; see test 105.
     assert manifest["compression_info"]["compression_ratio"] == 8.0
+    assert manifest["compression_info"]["original_size_mb"] == pytest.approx(
+        count * 8 * 4 / (1024 * 1024))
 
     loaded = vdb.load(str(save_dir))
 
@@ -1175,3 +1187,35 @@ def test_reload_preserves_m_against_a_changed_default(tmp_path):
     # merely recorded.
     hits = loaded.search(_sample_vectors(1, 8)[0].tolist(), top_k=5)
     assert len(hits) == 5
+
+# ------------------------------------------------------------
+# Test 105: the manifest compression ratio is the compression ratio
+# ------------------------------------------------------------
+def test_manifest_compression_ratio_is_mode_independent(quantized_reload):
+    """Both sizes are taken over the coded records, so the ratio is dim * 4 / subvectors.
+
+    The fixture is parametrised over both storage modes, so this runs twice and
+    the two runs assert the same number.
+
+    The numerator used to count the raw vectors the index still holds. Under
+    quantized_with_raw that is every coded record and the ratio came out right.
+    Under quantized_only it is only the training records, so with 1,000 of the
+    1,500 collected before training the manifest read 5.3x where the codes are
+    8x smaller than the vectors. The figure now matches the ratio the index
+    reports live, in both modes.
+    """
+    expected = RELOAD_DIM * 4 / RELOAD_SUBVECTORS
+    manifest = json.loads(
+        (quantized_reload["path"] / "manifest.json").read_text(encoding="utf-8"))
+    info = manifest["compression_info"]
+
+    assert info["compression_ratio"] == pytest.approx(expected)
+    assert info["original_size_mb"] == pytest.approx(
+        RELOAD_TOTAL * RELOAD_DIM * 4 / (1024 * 1024))
+    assert info["compressed_size_mb"] == pytest.approx(
+        RELOAD_TOTAL * RELOAD_SUBVECTORS / (1024 * 1024))
+
+    # And it agrees with what the live index reports, which is the point of
+    # having it in the manifest at all.
+    loaded = VectorDatabase().load(str(quantized_reload["path"]))
+    assert loaded.get_quantization_info()["compression_ratio"] == pytest.approx(expected)

@@ -1425,9 +1425,19 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
     }
 
     // Calculate compression info for quantized indexes
+    //
+    // Both sizes are taken over the coded records, so the ratio is the size of
+    // a code against the size of the vector it stands for. `original_size_mb`
+    // used to count the raw vectors the index still holds, which under
+    // quantized_only is only the training records. That put a record count in
+    // the numerator and a different one in the denominator, and the ratio came
+    // out as the compression ratio scaled by the share of records collected
+    // before training. At 1,000 training records in 3,000 it read 10.7x where
+    // the codes are 32x smaller than the vectors. Under quantized_with_raw the
+    // two counts were already equal, so this changes nothing there.
     let compression_info =
         if index.has_quantization() && index.can_use_quantization() && !pq_codes.is_empty() {
-            let raw_size_mb = (vectors.len() * index.get_dim() * 4) as f64 / (1024.0 * 1024.0);
+            let raw_size_mb = (pq_codes.len() * index.get_dim() * 4) as f64 / (1024.0 * 1024.0);
             let compressed_size_mb =
                 (pq_codes.len() * index.get_quantization_subvectors()) as f64 / (1024.0 * 1024.0);
             let compression_ratio = if compressed_size_mb > 0.0 {

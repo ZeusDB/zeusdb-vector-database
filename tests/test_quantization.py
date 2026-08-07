@@ -663,10 +663,15 @@ def test_storage_mode_configuration():
             expected_size=1500
         )
     
-    # Verify we got both warnings
+    # Verify we got both warnings. The storage mode warning used to quote the
+    # compression ratio as a memory multiplier and this asserted the 128.0x it
+    # printed. That was the wrong quantity, so it quotes no multiplier now and
+    # this asserts the fact it does state.
     warning_messages = [str(w.message) for w in warning_info.list]
     assert any("Very high compression ratio" in msg for msg in warning_messages)
-    assert any("storage_mode='quantized_with_raw' will use ~128.0x more memory" in msg for msg in warning_messages)
+    assert any("storage_mode='quantized_with_raw' keeps a raw vector for every record"
+               in msg for msg in warning_messages)
+    assert not any("x more memory" in msg for msg in warning_messages)
     
     # Add identical training data to both indexes.
     # A local Generator keeps the draws reproducible without touching the global
@@ -713,7 +718,37 @@ def test_storage_mode_configuration():
     raw_memory_only = float(stats1["raw_vectors_memory_mb"])
     raw_memory_with_raw = float(stats2["raw_vectors_memory_mb"])
     assert raw_memory_with_raw > raw_memory_only  # quantized_with_raw uses more memory
-    
+
+    # Which records still have a raw vector, which is what raw_vectors_stored
+    # above can be checked against. This key replaced memory_savings, which read
+    # "maximum" under quantized_only and was not a maximum of anything.
+    assert stats1["raw_vectors_retained"] == "training_records_only"
+    assert stats2["raw_vectors_retained"] == "all_records"
+    assert "memory_savings" not in stats1 and "memory_savings" not in stats2
+
+    # The two fixed costs, reported here as well as on get_quantization_info so
+    # that one call answers the memory question. The codebook is 2^bits
+    # centroids of dim float32 and the centroid distance table is the strict
+    # upper triangle of a k by k symmetric matrix per subvector, being
+    # subvectors * k * (k - 1) / 2 float32. Neither depends on the record count.
+    expected_codebook_mb = (2 ** 8) * 256 * 4 / (1024 * 1024)
+    expected_sdc_mb = 8 * (2 ** 8) * (2 ** 8 - 1) // 2 * 4 / (1024 * 1024)
+    for stats in (stats1, stats2):
+        assert float(stats["codebook_memory_mb"]) == pytest.approx(expected_codebook_mb,
+                                                                  abs=0.01)
+        assert float(stats["sdc_table_memory_mb"]) == pytest.approx(expected_sdc_mb,
+                                                                   abs=0.01)
+
+    # And the point the storage mode warning used to get wrong. The codes are
+    # 128x smaller than the vectors, and the two modes are within a fifth of
+    # each other on what they store, because quantized_only keeps 1,000 of the
+    # 1,200 records at full width and both pay the same 1.25 MB of fixed cost.
+    assert stats1["quantization_compression_ratio"] == "128.0x"
+    payload_only = raw_memory_only + float(stats1["quantized_codes_memory_mb"])
+    payload_with_raw = raw_memory_with_raw + float(stats2["quantized_codes_memory_mb"])
+    assert 1.1 < payload_with_raw / payload_only < 1.3
+    assert expected_codebook_mb + expected_sdc_mb > payload_with_raw
+
     # Test vector retrieval behavior
     # Both should be able to retrieve vectors (different mechanisms)
     test_id = "doc_1100"  # Added after training
@@ -904,7 +939,8 @@ def _make_trained_pq_index(storage_mode, seed=20260802):
     vdb = VectorDatabase()
     if storage_mode == "quantized_with_raw":
         with pytest.warns(UserWarning,
-                          match=r"storage_mode='quantized_with_raw' will use ~8\.0x more memory"):
+                          match=r"storage_mode='quantized_with_raw' keeps a raw vector "
+                                r"for every record"):
             index = vdb.create("hnsw", dim=PQ_DIM,
                                quantization_config=_overwrite_pq_config(storage_mode),
                                expected_size=2000)
@@ -1518,17 +1554,30 @@ def test_rebuild_with_quantization_produces_a_sound_graph(quantized_graph):
 # Test 89: the symmetric table is reported and sized correctly
 # ------------------------------------------------------------
 def test_quantized_symmetric_table_memory(quantized_graph):
-    """The centroid pair table is subvectors * 2^bits * 2^bits floats.
+    """The centroid pair table is the strict upper triangle, not the square.
+
+    The distance from centroid i to centroid j equals the distance from j to i
+    and a centroid is at distance zero from itself, so a full square held every
+    value twice plus a zero diagonal. Only subvectors * k * (k - 1) / 2 floats
+    are stored, which at 16 subvectors of 8 bits is 1.99 MiB rather than 4 MiB.
+
+    The bound below is the halved figure with a little headroom. The square
+    layout is 2.008x it, so this fails against the previous behaviour by
+    slightly more than a factor of two.
 
     It is reported apart from the codebook because it scales with subvectors
-    and bits alone while the codebook also scales with the dimension. At the
-    configuration the README recommends, 16 subvectors at 8 bits, it is 4 MiB
-    whatever the dimension.
+    and bits alone while the codebook also scales with the dimension.
     """
     info = quantized_graph["index"].get_quantization_info()
-    expected_mb = GRAPH_SUBVECTORS * (2 ** 8) * (2 ** 8) * 4 / (1024 * 1024)
+    k = 2 ** 8
+    expected_mb = GRAPH_SUBVECTORS * (k * (k - 1) // 2) * 4 / (1024 * 1024)
     assert info["sdc_memory_mb"] == pytest.approx(expected_mb)
     assert info["is_trained"] is True
+
+    # A stated bound rather than only the analytic equality, so the intent
+    # survives a change to GRAPH_SUBVECTORS.
+    square_mb = GRAPH_SUBVECTORS * k * k * 4 / (1024 * 1024)
+    assert info["sdc_memory_mb"] < 0.51 * square_mb
 
 # ------------------------------------------------------------
 # Shared setup for the rerank coverage
@@ -1878,3 +1927,109 @@ def test_rerank_excludes_removed_records(rerank_index):
         got = {h["id"] for h in index.search(query.tolist(), top_k=10,
                                              rerank=RERANK_TOTAL)}
         assert got == want
+
+# ------------------------------------------------------------
+# Test 106: the centroid distance table is the triangle, not the square
+# ------------------------------------------------------------
+def test_sdc_table_is_triangular_at_the_default_configuration():
+    """The table holds subvectors * k * (k - 1) / 2 floats, not subvectors * k * k.
+
+    The matrix is symmetric and its diagonal is zero, so the square held every
+    off diagonal value twice and a row of zeros besides. At the default 8
+    subvectors of 8 bits that is 0.996 MiB rather than 2.000 MiB.
+
+    The bound is stated as an absolute figure rather than as a ratio, so it
+    fails against the square layout by a factor of two whatever else changes.
+    """
+    data = _graph_vectors(1200, 64, 20260807)
+    config = {"type": "pq", "subvectors": 8, "bits": 8, "training_size": 1000}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        index = VectorDatabase().create(
+            "hnsw", dim=64, expected_size=1200, quantization_config=config,
+        )
+    assert index.add({"ids": [f"t_{i}" for i in range(1200)],
+                      "embeddings": data}).is_success()
+    assert index.is_quantized()
+
+    k = 2 ** 8
+    triangle_mb = 8 * (k * (k - 1) // 2) * 4 / (1024 * 1024)
+    square_mb = 8 * k * k * 4 / (1024 * 1024)
+    assert triangle_mb < 1.0 < 1.05 < square_mb  # the bound below has meaning
+
+    info = index.get_quantization_info()
+    assert info["sdc_memory_mb"] == pytest.approx(triangle_mb)
+    assert info["sdc_memory_mb"] < 1.05, (
+        f"the centroid distance table is {info['sdc_memory_mb']:.3f} MB at the "
+        f"default configuration, so it is not the strict upper triangle"
+    )
+    assert float(index.get_stats()["sdc_table_memory_mb"]) < 1.05
+
+# ------------------------------------------------------------
+# Test 107: the triangular table still orders neighbour selection
+# ------------------------------------------------------------
+def test_recall_survives_the_triangular_table(quantized_graph):
+    """Recall at a fixed configuration, which a mis-indexed table would sink.
+
+    The table is read on every graph construction comparison, so an offset that
+    lands on the wrong pair, or spills into the next subvector's plane, feeds
+    neighbour selection values belonging to other centroids. That does not
+    raise, it degrades. Measured at 0.78 to 0.79 here, and under 0.01 when the
+    distance was a constant, so the floor is far below the working value and
+    far above the broken one.
+    """
+    recall = _recall_at_10(quantized_graph["index"], quantized_graph, ef_search=100)
+    assert recall > 0.60, (
+        f"recall at top_k 10 is {recall:.4f} for {quantized_graph['mode']}, "
+        f"which the centroid distance table cannot support if it is intact"
+    )
+
+# ------------------------------------------------------------
+# Test 108: the creation warning fires only when the configuration cannot pay
+# ------------------------------------------------------------
+def test_fixed_memory_warning_fires_when_quantization_cannot_pay():
+    """Below the break even record count the warning fires, above it it does not.
+
+    Break even is training_size + (fixed bytes + training_size * subvectors) /
+    (dim * 4 - subvectors). At dim 64 with 8 subvectors of 8 bits and a
+    training_size of 1000 the fixed cost is 1,110,016 bytes and each record
+    beyond training saves 248, so the figure is 5,509.
+    """
+    vdb = VectorDatabase()
+    config = {"type": "pq", "subvectors": 8, "bits": 8, "training_size": 1000}
+
+    with pytest.warns(UserWarning, match="use more memory than an unquantized index"):
+        vdb.create("hnsw", dim=64, expected_size=3000,
+                   quantization_config=dict(config))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        vdb.create("hnsw", dim=64, expected_size=50000,
+                   quantization_config=dict(config))
+    assert not [w for w in caught if "unquantized index" in str(w.message)], (
+        "the warning fired at an expected_size well above break even"
+    )
+
+    # The message carries the break even figure, so a caller can act on it.
+    with pytest.warns(UserWarning, match=r"starts saving above 5509 records"):
+        vdb.create("hnsw", dim=64, expected_size=3000,
+                   quantization_config=dict(config))
+
+    # High dimensions repay the fixed cost almost immediately, so the same
+    # expected_size that warns at 64 dimensions does not warn at 1536.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        vdb.create("hnsw", dim=1536, expected_size=3000,
+                   quantization_config=dict(config))
+    assert not [w for w in caught if "unquantized index" in str(w.message)]
+
+    # quantized_with_raw drops no raw vector, so raising expected_size never
+    # makes it pay and this warning would be advice that cannot be followed.
+    # The storage mode warning covers that case instead.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        vdb.create("hnsw", dim=64, expected_size=3000,
+                   quantization_config=dict(config, storage_mode="quantized_with_raw"))
+    messages = [str(w.message) for w in caught]
+    assert not [m for m in messages if "unquantized index at expected_size" in m]
+    assert [m for m in messages if "keeps a raw vector for every record" in m]

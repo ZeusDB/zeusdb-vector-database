@@ -1959,20 +1959,33 @@ impl HNSWIndex {
                 format!("{:.2}", quantized_memory_mb),
             );
 
+            // `memory_savings` used to sit beside `storage_strategy`, reading
+            // "maximum" under QuantizedOnly. That mode is the smaller of the two
+            // and it is not a maximum of anything. Measured at 3,000 records of
+            // 64 dimensions it held more resident memory than the same index
+            // unquantized, because the centroid distance table is a fixed 1 MB.
+            // What replaces it is the fact the figures above can be checked
+            // against, being which records still have a raw vector.
             match config.storage_mode {
                 StorageMode::QuantizedOnly => {
                     stats.insert(
                         "storage_strategy".to_string(),
                         "memory_optimized".to_string(),
                     );
-                    stats.insert("memory_savings".to_string(), "maximum".to_string());
+                    stats.insert(
+                        "raw_vectors_retained".to_string(),
+                        "training_records_only".to_string(),
+                    );
                 }
                 StorageMode::QuantizedWithRaw => {
                     stats.insert(
                         "storage_strategy".to_string(),
                         "quality_optimized".to_string(),
                     );
-                    stats.insert("memory_savings".to_string(), "raw_vectors_kept".to_string());
+                    stats.insert(
+                        "raw_vectors_retained".to_string(),
+                        "all_records".to_string(),
+                    );
                 }
             }
 
@@ -2004,6 +2017,22 @@ impl HNSWIndex {
                 stats.insert(
                     "quantization_active".to_string(),
                     self.is_quantized().to_string(),
+                );
+
+                // The two fixed costs, reported here so that the whole memory
+                // question can be answered from one call. Both are independent
+                // of the record count, and at small record counts the table is
+                // the largest single thing a quantized index holds. They were
+                // only on `get_quantization_info`, which is where a caller
+                // reading the storage breakdown above would not look.
+                let (centroid_mb, _) = pq.get_memory_stats();
+                stats.insert(
+                    "codebook_memory_mb".to_string(),
+                    format!("{:.2}", centroid_mb),
+                );
+                stats.insert(
+                    "sdc_table_memory_mb".to_string(),
+                    format!("{:.2}", pq.sdc_memory_bytes() as f64 / (1024.0 * 1024.0)),
                 );
 
                 if is_trained {
@@ -2209,6 +2238,15 @@ impl HNSWIndex {
         info.insert("insertion_path".to_string(), "sequential".to_string());
 
         // Add quantization performance info
+        //
+        // `quantization_memory_savings` used to sit here, reporting
+        // 1 - 1/compression_ratio as a percentage. That is the share of a
+        // vector a code replaces, not the memory an index saves, and under
+        // QuantizedWithRaw the index saves nothing on the vectors because it
+        // keeps every one of them. It carried no information
+        // `quantization_compression` does not, so it is gone rather than
+        // qualified. Memory belongs to `get_stats`, which measures rather than
+        // projects.
         if let Some(config) = &self.quantization_config {
             let original_bytes = self.dim * 4; // f32
             let compressed_bytes = config.subvectors; // u8 per subvector
@@ -2218,13 +2256,17 @@ impl HNSWIndex {
                 "quantization_compression".to_string(),
                 format!("{:.1}x", compression_ratio),
             );
-            info.insert(
-                "quantization_memory_savings".to_string(),
-                format!("{:.1}%", (1.0 - 1.0 / compression_ratio) * 100.0),
-            );
+            // Measured at 0.16 recall at 10 against 1.00 for the same data
+            // unquantized, so "slight" was wrong by a factor the word cannot
+            // carry. Rerank recovers it in full and only QuantizedWithRaw can
+            // rerank, so the two modes get different answers.
             info.insert(
                 "quantization_accuracy_impact".to_string(),
-                "slight_recall_reduction".to_string(),
+                match config.storage_mode {
+                    StorageMode::QuantizedOnly => "large_recall_loss_no_rerank_available",
+                    StorageMode::QuantizedWithRaw => "large_recall_loss_unless_reranked",
+                }
+                .to_string(),
             );
         }
 
@@ -3508,16 +3550,17 @@ impl HNSWIndex {
         let rebuild_duration = rebuild_start.elapsed();
 
         if rebuild_success {
-            // Calculate compression info with proper float division
+            // The code size against the vector size. A `memory_savings_percent`
+            // field used to sit beside it, carrying 1 - 1/compression_ratio,
+            // which is the same number in another form and was labelled as a
+            // saving the index does not make.
             let compression_ratio = (self.dim as f64 * 4.0) / pq.subvectors as f64;
-            let memory_savings = (1.0 - (pq.subvectors as f64) / (self.dim as f64 * 4.0)) * 100.0;
 
             let total_duration_ms = start_time.elapsed().as_millis();
             info!(
                 operation = "pq_complete",
                 rebuild_duration_ms = rebuild_duration.as_millis(),
                 compression_ratio = compression_ratio,
-                memory_savings_percent = memory_savings,
                 total_duration_ms = total_duration_ms,
                 "Index successfully rebuilt with quantization"
             );
