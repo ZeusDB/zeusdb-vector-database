@@ -604,6 +604,8 @@ storage_mode_description: raw_only
 
 `get_stats()` returns a `str` to `str` map. It also carries `dimension`, `space`, `m`, `ef_construction`, `expected_size`, `index_type`, `raw_vectors_stored`, `quantized_codes_stored` and `storage_mode`, plus training and compression fields once quantization is configured.
 
+On a quantized index it is also where the memory figures live. `raw_vectors_memory_mb` and `quantized_codes_memory_mb` scale with the record count, while `codebook_memory_mb` and `sdc_table_memory_mb` are fixed by `dim`, `subvectors` and `bits` and do not move as records arrive. `raw_vectors_retained` says whether the raw vectors kept are the training records or all of them.
+
 <br/>
 
 #### ☑️ Remove Records
@@ -716,6 +718,14 @@ To enable PQ, pass a `quantization_config` dictionary to the `.create()` index m
 
 `create()` emits a `UserWarning` when the configuration looks unbalanced, for example when the compression ratio exceeds 50x, and another when `storage_mode` is `quantized_with_raw`.
 
+It also warns when the configuration cannot repay its fixed memory at the `expected_size` you declared. The codebook and the centroid distance table are held whatever the record count, and under `quantized_only` the first `training_size` records keep their raw vectors, so quantization only starts saving above
+
+```
+training_size + (fixed bytes + training_size × subvectors) / (dim × 4 − subvectors)
+```
+
+records. The warning names that figure. Raise `expected_size` if your estimate was low, or drop `quantization_config`. With the default `expected_size` of 10,000 and the default `training_size` of 10,000 it fires at every dimension, because an index that trains exactly at its expected size has saved nothing yet.
+
 <br/>
 
 ### 🔧 Usage Example 1
@@ -824,12 +834,16 @@ index = vdb.create(
 
 | Mode | What it stores | Rerank available | Memory |
 |------|----------------|------------------|--------|
-| `quantized_only` | Codes for every record, plus the raw vectors of the records collected before training | No | Lowest |
+| `quantized_only` | Codes for every record, plus the raw vectors of the records collected before training | No | Lower of the two |
 | `quantized_with_raw` | Codes and raw vectors for every record | Yes | Higher than raw storage for the records, lower for the graph |
 
 Two consequences of `quantized_only` are worth knowing before you pick it.
 
 **The training records keep their raw vectors.** Records collected before the training threshold is reached are stored at full width and stay that way, so an index whose `training_size` is a large fraction of its total size saves much less than the compression ratio suggests.
+
+**The gap between the two modes is not the compression ratio.** Measured across record counts from 1,000 to 50,000, dimensions from 64 to 768 and 4 to 96 subvectors, `quantized_with_raw` held 1.0x to 20x what `quantized_only` held on vectors and codes, and 1.0x to 1.6x on the whole resident index. The compression ratio is an upper bound the vector figure approaches only as `training_size` becomes negligible against the record count, and the resident figure never approaches it because the graph, the codebook and the centroid distance table are the same in both modes. `get_stats()` reports the four figures for your own index.
+
+**Quantization can cost memory rather than save it.** The centroid distance table is `subvectors × 2^bits × (2^bits − 1) / 2 × 4` bytes, being the strict upper triangle of a symmetric matrix per subvector, and it is held whatever the record count. That is 1.0 MB at the default 8 subvectors and 8 bits and 12 MB at 96 subvectors. Measured resident against the same data unquantized, with `training_size` at 1,000, `quantized_only` crosses from costing to saving between 3,000 and 10,000 records at 64 and 256 dimensions and between 1,000 and 3,000 at 768 and 1,536. At the default `training_size` of 10,000 every crossover moves to roughly 10,500 to 15,000 records, because the records collected before training keep their raw vectors. Below the crossover quantization costs memory. `create()` warns when the configuration cannot repay the fixed cost at your `expected_size`.
 
 **A record added after training exists only as a code, so the vector you read back is an approximation.** Every accessor sees the record. `get_records(..., return_vector=True)` and `search(..., return_vector=True)` reconstruct its vector from the code, so what they hand back is close to the value supplied rather than equal to it. A record collected before training still holds its raw vector and reads back exactly. `get_stats()["raw_vectors_stored"]` is what tells you how many of each you have.
 

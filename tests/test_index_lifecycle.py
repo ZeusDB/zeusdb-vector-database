@@ -230,7 +230,14 @@ def test_get_performance_info_reports_only_real_behaviour():
     for gone in ("insertion_speedup_expected", "insertion_bottleneck", "limitation"):
         assert gone not in info
 
-    # A quantized index adds the three quantization keys and nothing else.
+    # A quantized index adds the two quantization keys and nothing else.
+    #
+    # quantization_memory_savings was the third. It carried
+    # 1 - 1/compression_ratio as a percentage, which is the share of a vector a
+    # code replaces rather than the memory the index saves, and under
+    # quantized_with_raw the index saves nothing on the vectors because it keeps
+    # every one of them. quantization_compression is the same number in the form
+    # that is true, so the field went rather than being qualified.
     quantized = vdb.create(
         "hnsw",
         dim=16,
@@ -239,9 +246,27 @@ def test_get_performance_info_reports_only_real_behaviour():
     quantized_info = quantized.get_performance_info()
     assert set(quantized_info) - set(info) == {
         "quantization_compression",
-        "quantization_memory_savings",
         "quantization_accuracy_impact",
     }
+    assert quantized_info["quantization_compression"] == "16.0x"
+
+    # The accuracy claim was "slight_recall_reduction". Measured on clustered
+    # data it is 0.16 at 10 against 1.00 unquantized, which rerank recovers and
+    # only quantized_with_raw can rerank, so the two modes now say different
+    # things and neither says slight.
+    assert quantized_info["quantization_accuracy_impact"] == (
+        "large_recall_loss_no_rerank_available")
+
+    with pytest.warns(UserWarning, match="keeps a raw vector for every record"):
+        with_raw = vdb.create(
+            "hnsw",
+            dim=16,
+            quantization_config={"type": "pq", "subvectors": 4, "bits": 8,
+                                 "training_size": 1000,
+                                 "storage_mode": "quantized_with_raw"},
+        )
+    assert with_raw.get_performance_info()["quantization_accuracy_impact"] == (
+        "large_recall_loss_unless_reranked")
 
 # ------------------------------------------------------------
 # Test 93: HNSWIndex cannot be constructed directly

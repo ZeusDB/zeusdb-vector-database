@@ -4,21 +4,15 @@ vector_database.py
 Factory for creating vector indexes with support for multiple types and quantization.
 Currently supports HNSW (Hierarchical Navigable Small World) with extensible design.
 """
-from typing import Dict, Any, Optional, TypedDict
+from typing import Dict, Any, Optional
 from .zeusdb_vector_database import _create_hnsw_index
 # Future index types are registered in _index_types and dispatched in _build_index.
 
-class _MemoryInfo(TypedDict):
-    """Type definition for quantization memory information.
-
-    Private. The only consumer is _check_memory_usage, and the value it
-    produces is stripped from the config before it reaches Rust.
-    """
-    centroid_storage_mb: float
-    compression_ratio: float
-    centroids_per_subvector: int
-    total_centroids: int
-    calculated_training_size: int
+# A _MemoryInfo TypedDict used to sit here, describing a __memory_info__ entry
+# _check_memory_usage wrote into the config. Its only reader took the
+# compression ratio out of it and printed it as a memory multiplier, which it
+# is not. With that reader gone the entry was written and never read, and
+# create() stripped it before the config reached Rust, so it is gone too.
 
 class VectorDatabase:
     """
@@ -115,9 +109,15 @@ class VectorDatabase:
                     'storage_mode': 'quantized_only' # Storage mode for quantized vectors (or 'quantized_with_raw')  
                 }
 
-            Note: Quantization reduces memory usage (typically 4-32x compression) but may 
-            slightly degrade recall accuracy. Training triggers automatically on the first 
-            .add() call that reaches the training_size threshold.
+            Note: Quantization replaces each vector with a code of one byte per
+            subvector, so the code is dim * 4 / subvectors smaller than the vector.
+            The memory an index saves is smaller than that, because the codebook,
+            the centroid distance table, the graph and the training records kept at
+            full width are all unaffected. get_stats() reports the actual figures.
+            Recall falls sharply, not slightly. Only 'quantized_with_raw' can
+            recover it, by reranking against the raw vectors it keeps. Training
+            triggers automatically on the first .add() call that reaches the
+            training_size threshold.
 
         Returns:
             An instance of the created vector index.
@@ -139,18 +139,18 @@ class VectorDatabase:
                 quantization_config=quantization_config
             )
             
-            # Memory-optimized configuration with manual training size
-            memory_optimized_config = {
+            # Accuracy-weighted configuration with manual training size
+            longer_code_config = {
                 'type': 'pq',
-                'subvectors': 16,         # More subvectors = better compression
-                'bits': 6,                # Fewer bits = less memory per centroid
+                'subvectors': 16,         # More subvectors = longer code, lower ratio, better accuracy
+                'bits': 6,                # Fewer bits = fewer centroids, smaller codebook and table
                 'training_size': 75000,    # Override auto-calculation
-                'storage_mode': 'quantized_only'  # Only store quantized vectors
+                'storage_mode': 'quantized_only'  # Drop raw vectors once training completes
             }
             index = vdb.create(
                 index_type="hnsw",
                 dim=1536,
-                quantization_config=memory_optimized_config,
+                quantization_config=longer_code_config,
                 expected_size=1000000     # Large dataset
             )
 
@@ -167,11 +167,13 @@ class VectorDatabase:
         # Centralize dim early to ensure consistency
         dim = kwargs.get('dim', 1536)
         
-        # Validate and process quantization config
-        if quantization_config is not None:
-            quantization_config = self._validate_quantization_config(quantization_config, dim)
-        
         # Apply index-specific defaults
+        #
+        # Before the quantization validation rather than after it, because that
+        # validation now needs expected_size to decide whether the fixed memory
+        # quantization costs can be repaid. The default of 10,000 has to be in
+        # place by then, since an unset expected_size is the case where the
+        # answer is most often no.
         if index_type == "hnsw":
             kwargs.setdefault("dim", dim)
             kwargs.setdefault("space", "cosine")
@@ -179,7 +181,13 @@ class VectorDatabase:
             kwargs.setdefault("expected_size", 10000)
             # After expected_size, since the graph degree is derived from it.
             kwargs.setdefault("m", self._default_m(kwargs["expected_size"]))
-        
+
+        # Validate and process quantization config
+        if quantization_config is not None:
+            quantization_config = self._validate_quantization_config(
+                quantization_config, dim, kwargs.get("expected_size")
+            )
+
         try:
             # Always pass quantization_config parameter
             if quantization_config is not None:
@@ -212,17 +220,22 @@ class VectorDatabase:
         return _load_index(path)
 
 
-    def _validate_quantization_config(self, config: Dict[str, Any], dim: int) -> Dict[str, Any]:
+    def _validate_quantization_config(self, config: Dict[str, Any], dim: int,
+                                      expected_size: Any = None) -> Dict[str, Any]:
         """
         Validate and normalize quantization configuration.
-        
+
         Args:
             config: Raw quantization configuration
             dim: Vector dimension for validation
-            
+            expected_size: The declared record count, used only to decide
+                whether the fixed memory quantization costs can be repaid.
+                None or a non-integer skips that check and leaves the Rust
+                layer to report the real validation error.
+
         Returns:
             Validated and normalized configuration
-            
+
         Raises:
             ValueError: If configuration is invalid
         """
@@ -292,15 +305,37 @@ class VectorDatabase:
         validated_config['storage_mode'] = storage_mode
 
         # Calculate and warn about memory usage
-        self._check_memory_usage(validated_config, dim)
+        self._check_memory_usage(validated_config, dim, expected_size)
 
-        # Add helpful warnings about storage mode
+        # Warn about the memory cost of keeping raw vectors.
+        #
+        # This used to quote the compression ratio as a memory multiplier. The
+        # two are different quantities. The compression ratio is the size of a
+        # code against the size of the vector it replaces, while the ratio
+        # between the modes also depends on the training records quantized_only
+        # keeps at full width, on the codebook, on the centroid distance table
+        # and on the graph. Measured over record counts from 1,000 to 50,000,
+        # dimensions from 64 to 768 and 4 to 96 subvectors, the true multiplier
+        # ran 1.0x to 20x on vectors and codes and 1.0x to 1.6x on the whole
+        # resident index, against ratios of 16x to 384x. It moves with the
+        # record count, which is not known here.
+        #
+        # The second sentence is this relay's addition. quantized_with_raw adds
+        # the codes, the codebook and the centroid distance table on top of
+        # every raw vector, and removes nothing, so it is above an unquantized
+        # index at every record count. That is why _check_memory_usage runs its
+        # break even arithmetic on quantized_only alone.
         if storage_mode == 'quantized_with_raw':
             import warnings
-            compression_ratio = validated_config.get('__memory_info__', {}).get('compression_ratio', 1.0)
             warnings.warn(
-                f"storage_mode='quantized_with_raw' will use ~{compression_ratio:.1f}x more memory "
-                f"than 'quantized_only' but enables exact vector reconstruction.",
+                "storage_mode='quantized_with_raw' keeps a raw vector for every record "
+                "as well as its code, so it uses more memory than 'quantized_only'. It "
+                "also uses more than an unquantized index at every record count, since "
+                "it adds the codes, the codebook and the centroid distance table and "
+                "drops nothing. How much more depends on the final record count, which "
+                "is not known at creation. get_stats() reports the memory each part "
+                "holds once records are loaded. This mode is required for rerank and "
+                "for exact vector reconstruction.",
                 UserWarning,
                 stacklevel=2
             )
@@ -349,63 +384,143 @@ class VectorDatabase:
 
 
 
-    def _check_memory_usage(self, config: Dict[str, Any], dim: int) -> None:
+    def _check_memory_usage(self, config: Dict[str, Any], dim: int,
+                            expected_size: Any = None) -> None:
         """
-        Calculate and warn about memory usage for the quantization configuration.
-        
+        Warn about the fixed memory and the compression the configuration implies.
+
+        Every figure here is fixed by the configuration and by the declared
+        expected_size. Nothing that depends on the record count the index
+        actually reaches belongs here, because create() does not know it.
+        get_stats() reports the record dependent figures.
+
         Args:
             config: Validated quantization configuration
             dim: Vector dimension
+            expected_size: The declared record count, or None to skip the break
+                even check
         """
+        import warnings
+
         subvectors = config['subvectors']
         bits = config['bits']
+        training_size = config['training_size']
+        storage_mode = config.get('storage_mode', 'quantized_only')
         sub_dim = dim // subvectors
-        
-        # Calculate centroid storage requirements
+
+        # The codebook is one centroid set per subvector, each of 2^bits
+        # centroids of sub_dim float32. Since sub_dim is dim // subvectors,
+        # subvectors cancels and the size is 2^bits * dim * 4 bytes.
         num_centroids_per_subvector = 2 ** bits
         total_centroids = subvectors * num_centroids_per_subvector
-        centroid_memory_mb = (total_centroids * sub_dim * 4) / (1024 * 1024)  # 4 bytes per float32
-        
-        # Calculate compression ratio
+        centroid_bytes = total_centroids * sub_dim * 4
+        centroid_memory_mb = centroid_bytes / (1024 * 1024)
+
+        # Graph construction reads a table of the squared distance between every
+        # pair of centroids within a subvector. The matrix is symmetric and its
+        # diagonal is zero, so only the strict upper triangle is held, being
+        # subvectors * k * (k - 1) / 2 float32 for k centroids. That is 0.996MB
+        # at the default 8 subvectors of 8 bits, where the full square was
+        # 2.00MB. It is built at training and it is usually the larger of the
+        # two fixed costs, so a warning that counted only the codebook was
+        # looking at the smaller number.
+        k = num_centroids_per_subvector
+        sdc_bytes = subvectors * (k * (k - 1) // 2) * 4
+        sdc_memory_mb = sdc_bytes / (1024 * 1024)
+        fixed_bytes = centroid_bytes + sdc_bytes
+        fixed_memory_mb = fixed_bytes / (1024 * 1024)
+
+        # A code is one byte per subvector whatever bits is, so this is the size
+        # of a code against the size of the vector it replaces. It is not the
+        # ratio between the two storage modes and it is not the memory an index
+        # saves, both of which depend on the record count.
         original_bytes_per_vector = dim * 4  # float32
         compressed_bytes_per_vector = subvectors  # 1 byte per subvector code
         compression_ratio = original_bytes_per_vector / compressed_bytes_per_vector
-        
-        # Add memory info to config for user reference (internal)
-        memory_info: _MemoryInfo = {
-            'centroid_storage_mb': round(centroid_memory_mb, 2),
-            'compression_ratio': round(compression_ratio, 1),
-            'centroids_per_subvector': num_centroids_per_subvector,
-            'total_centroids': total_centroids,
-            'calculated_training_size': config['training_size']
-        }
-        config['__memory_info__'] = memory_info        
-        # Warn about large memory usage
-        if centroid_memory_mb > 100:
-            import warnings
+
+        # Whether the configuration can repay its fixed cost at the size the
+        # caller declared.
+        #
+        # Under quantized_only the index keeps a raw vector for each of the
+        # training_size records and a code for every record. So against an
+        # unquantized index of N records it saves (N - training_size) whole
+        # vectors and pays a code for each of the training_size records it still
+        # holds at full width, on top of the fixed cost:
+        #
+        #   saved(N) = (N - training_size) * (dim * 4 - subvectors)
+        #              - training_size * subvectors
+        #              - fixed_bytes
+        #
+        # Setting that to zero gives the record count above which quantization
+        # starts saving. quantized_with_raw is excluded because it drops no raw
+        # vector at all, so saved(N) is negative at every N and the advice to
+        # raise expected_size would be false. The storage mode warning covers
+        # that case instead.
+        #
+        # The check runs whether or not expected_size was set. The default is
+        # 10,000 and the default training_size is also 10,000, so the default
+        # configuration cannot save anything at the default size, and that is
+        # precisely what a caller needs told.
+        break_even = None
+        if storage_mode == 'quantized_only' and original_bytes_per_vector > subvectors:
+            per_record = original_bytes_per_vector - subvectors
+            break_even = training_size + -(
+                -(fixed_bytes + training_size * subvectors) // per_record
+            )
+
+        cannot_pay = (
+            break_even is not None
+            and isinstance(expected_size, int)
+            and not isinstance(expected_size, bool)
+            and expected_size < break_even
+        )
+
+        if cannot_pay:
             warnings.warn(
-                f"Large centroid storage required: {centroid_memory_mb:.1f}MB. "
-                f"Consider reducing bits ({bits}) or subvectors ({subvectors}) for memory efficiency.",
+                f"This quantization configuration will use more memory than an "
+                f"unquantized index at expected_size={expected_size}. It holds "
+                f"{fixed_memory_mb:.2f}MB of codebook and centroid distance table "
+                f"whatever the record count, and keeps the first {training_size} "
+                f"records at full width. It starts saving above {break_even} records. "
+                f"Raise expected_size if the estimate is low, or drop "
+                f"quantization_config.",
                 UserWarning,
                 stacklevel=2
             )
-        
-        # Warn about low compression
-        if compression_ratio < 4:
-            import warnings
+
+        # Warn about large fixed memory, but only where the configuration does
+        # pay, since the warning above already names the same figure. Exactly
+        # one of the two fires.
+        #
+        # The threshold was 100MB while the table was a full square. Halving the
+        # table halved the quantity the threshold measures, so it halves with
+        # it, keeping the same configurations in scope. At dim 1536 with 512
+        # subvectors of 8 bits the fixed memory is 65.2MB, which fired at 129.5MB
+        # against 100 before this change and fires at 65.2MB against 50 after it.
+        if fixed_memory_mb > 50 and not cannot_pay:
             warnings.warn(
-                f"Low compression ratio: {compression_ratio:.1f}x. "
-                f"Consider increasing subvectors ({subvectors}) or reducing bits ({bits}) for better compression.",
+                f"Large fixed quantization memory: {fixed_memory_mb:.1f}MB, being "
+                f"{centroid_memory_mb:.1f}MB of centroids and {sdc_memory_mb:.1f}MB of "
+                f"centroid distance table. This is held whatever the record count. "
+                f"Reduce bits ({bits}) to lower both, or subvectors ({subvectors}) to "
+                f"lower the table.",
                 UserWarning,
                 stacklevel=2
             )
-        
-        # Warn about extremely high compression
+
+        # A `compression_ratio < 4` branch used to sit here, advising a larger
+        # subvectors count for better compression. It could not fire and the
+        # advice was backwards. subvectors is validated at no more than dim, so
+        # the ratio is at least dim * 4 / dim, which is exactly 4 and never
+        # below it. Raising subvectors lowers the ratio rather than raising it.
+
+        # Warn about extremely high compression. The ratio is dim * 4 /
+        # subvectors, so only subvectors moves it. bits sets the centroid count
+        # and leaves the code at one byte per subvector, so it does not.
         if compression_ratio > 50:
-            import warnings
             warnings.warn(
                 f"Very high compression ratio: {compression_ratio:.1f}x may significantly impact recall quality. "
-                f"Consider reducing subvectors ({subvectors}) or increasing bits ({bits}) for better accuracy.",
+                f"Increase subvectors ({subvectors}) to lower it, at the cost of memory and build time.",
                 UserWarning,
                 stacklevel=2
             )
