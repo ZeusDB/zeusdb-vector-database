@@ -506,7 +506,7 @@ The `search()` method retrieves the top-k most similar vectors from the index gi
 | `top_k`          | `int`                            | `10`      | Number of nearest neighbors to return. |
 | `ef_search`      | `int \| None`                    | see below | Search complexity parameter. Higher values improve accuracy at the cost of speed. |
 | `return_vector`  | `bool`                           | `False`   | If `True`, each result includes the stored embedding vector under a `vector` key. |
-| `rerank`         | `int \| None`                    | `20`      | Candidates fetched per requested result before rescoring against raw vectors. Only applies to a quantized index whose `storage_mode` is `quantized_with_raw`. See [Quantized search accuracy](#-quantized-search-accuracy). |
+| `rerank`         | `int \| None`                    | derived from the record count | Candidates fetched per requested result before rescoring against raw vectors. Only applies to a quantized index whose `storage_mode` is `quantized_with_raw`. See [Quantized search accuracy](#-quantized-search-accuracy). |
 
 **The default `ef_search` depends on the distance metric.** It is `max(2 × top_k, 100)` for `cosine` and `max(2 × top_k, 150)` for `l1` and `l2`.
 
@@ -605,6 +605,8 @@ storage_mode_description: raw_only
 `get_stats()` returns a `str` to `str` map. It also carries `dimension`, `space`, `m`, `ef_construction`, `expected_size`, `index_type`, `raw_vectors_stored`, `quantized_codes_stored` and `storage_mode`, plus training and compression fields once quantization is configured.
 
 On a quantized index it is also where the memory figures live. `raw_vectors_memory_mb` and `quantized_codes_memory_mb` scale with the record count, while `codebook_memory_mb` and `sdc_table_memory_mb` are fixed by `dim`, `subvectors` and `bits` and do not move as records arrive. `raw_vectors_retained` states the mode's policy: `none_once_trained` for `quantized_only`, whose raw vectors are released when training completes, and `all_records` for `quantized_with_raw`.
+
+It is also where the rerank calibration is reported. `rerank_default_fetch` is the number of candidates a search at `top_k=10` will fetch and rescore at the record count the index holds now, and it is the figure to read if you want to know what a quantized search is paying for. `rerank_calibrated` is `true` on a trained `quantized_with_raw` index, and `false` on every other index, including one saved before the calibration existed. When it is `true`, `rerank_calibration_fetch`, `rerank_calibration_fit_fetches`, `rerank_calibration_exponent`, `rerank_calibration_records`, `rerank_calibration_queries`, `rerank_calibration_target_recall` and `rerank_calibration_ms` report what training measured, on how many records, and what it cost. `rerank_calibration_fit_fetches` is the fetch measured at each quarter of the training sample, comma separated, and it is what the exponent is fitted from.
 
 <br/>
 
@@ -706,7 +708,7 @@ To enable PQ, pass a `quantization_config` dictionary to the `.create()` index m
 | Parameter | Type | Description | Valid Range | Default |
 |-----------|------|-------------|-------------|---------|
 | `type` | `str` | Quantization algorithm type | `"pq"` | *required* |
-| `subvectors` | `int` | Number of vector subspaces. Must divide `dim` evenly | 1 to `dim` | `8` |
+| `subvectors` | `int` | Number of vector subspaces. Must divide `dim` evenly | 1 to `dim` | derived from `dim`, see below |
 | `bits` | `int` | Bits per quantized code, which sets the centroids per subvector to 2^bits | 1 to 8 | `8` |
 | `training_size` | `int` | Records collected before training is triggered | ≥ 1000 | `10000` |
 | `max_training_vectors` | `int \| None` | Maximum records used during training | ≥ `training_size` | `None` |
@@ -714,17 +716,41 @@ To enable PQ, pass a `quantization_config` dictionary to the `.create()` index m
 
 **Compression ratio is `dim × 4 / subvectors`.** More subvectors means a longer code, so it lowers the compression ratio and raises accuracy. Fewer subvectors means the opposite. At `dim=1536`, 8 subvectors gives 768x and 16 subvectors gives 384x.
 
-`bits` does not change the size of a record's code, which is always one byte per subvector. It sets the number of centroids in the codebook, so it trades codebook memory and training time against quantization accuracy.
+**`subvectors` defaults to `dim / 32`, clamped to between 8 and 192, snapped to a divisor of `dim`.** That holds the compression ratio at 128x rather than holding the code length at 8 bytes, which is what a fixed default did. The ratio is the quantity accuracy follows, because `dim / subvectors` is the width of a subvector and the ratio is exactly four times that width. Measured on clustered data at 10,000 records, recall at 10 without reranking runs 0.187, 0.182 and 0.184 at 128x for `dim` 256, 768 and 1536, and 0.405 and 0.406 at 32x for 256 and 768. Two indexes at the same ratio return the same recall at different dimensions, and two at the same subvector count do not.
 
-`create()` emits a `UserWarning` when the configuration looks unbalanced, for example when the compression ratio exceeds 50x, and another when `storage_mode` is `quantized_with_raw`.
+| `dim` | default `subvectors` | compression |
+|-------|----------------------|-------------|
+| 64 | 8 | 32x |
+| 128 | 8 | 64x |
+| 256 | 8 | 128x |
+| 768 | 24 | 128x |
+| 1536 | 48 | 128x |
+| 3072 | 96 | 128x |
 
-It also warns when the configuration cannot repay its fixed memory at the `expected_size` you declared. The codebook and the centroid distance table are held whatever the record count, so under `quantized_only`, which stores a code and no raw vector for every record once trained, quantization only starts saving above
+128x is where the default sits because it is the highest ratio that returns recall at 10 above 0.99 at the fetch the default uses, at every corpus size measured on clustered data. At `dim=768` over 200 queries, recall at 10 at the default fetch reads 0.9800 at 384x, 0.9850 at 192x, 0.9925 at 128x and 0.9995 at 64x on 10,000 records, and 0.9935, 0.9980, 0.9980 and 1.0000 on 100,000. The binding size is the smaller one, because the fetch there is the rerank floor rather than 2% of the corpus, and 384x needs 208 candidates to reach 0.99. On data whose groups the codes cannot resolve, no ratio in this range returns 0.99 at any fetch. See [Quantized search accuracy](#-quantized-search-accuracy).
+
+Going lower than 128x costs memory and build time and returns nothing on recall. At `dim=768` and 100,000 records, 32x holds 111 MB more resident memory and builds in 521 s against 170 for the same recall, and 16x holds 160 MB more and builds in 846 s. At 10,000 records 16x holds 94 MB where not quantizing at all holds 90, so quantization has stopped saving anything by then.
+
+**Query time is the one axis where a lower ratio can win, and only at the bottom of the range and at scale.** A lower ratio puts the true neighbours shallower in the code ordering, so the fetch that reaches them is smaller, and it lengthens the code, so each candidate costs more to score. Between 384x and 32x the two cancel. At 16x the fetch collapses and the first effect wins. See [Quantized search accuracy](#-quantized-search-accuracy) for the table and for when that trade is worth taking.
+
+The default is not free. At `dim=768` and 100,000 records it raises resident memory from 463 MB to 585 MB against the old fixed 8, and build time from 79 s to 170 s. Below `dim=256` the floor of 8 subvectors binds and the default is the old one, because a code is one byte per subvector and 2 subvectors would give the whole corpus only 65,536 distinct codes. Pass `subvectors` explicitly for the older, cheaper, less accurate setting.
+
+`bits` does not change the size of a record's code, which is always one byte per subvector at every value, so lowering it saves no memory per record. It sets the number of centroids per subvector to 2^bits, which sizes the codebook linearly and the centroid distance table quadratically. Both are fixed costs that grow with `subvectors`, so how much a lower `bits` saves depends on how many subvectors you have. At `dim=768` the two tables hold 3.7 MB at the default 24 subvectors and 12.7 MB at 96, and dropping `bits` to 6 takes those to 0.4 MB and 0.9 MB.
+
+What it costs is recall. Measured at `dim=768` and 10,000 records, dropping `bits` from 8 to 6 takes recall at 10 without reranking from 0.153 to 0.057 at 8 subvectors, and from 0.408 to 0.346 at 96, and it takes the build of 10,000 records at 96 subvectors from 40 s to 16 s. Leave `bits` at 8 unless the fixed cost or the build time is the constraint, and do not read a lower value as a per-record saving.
+
+`create()` emits a `UserWarning` when the configuration looks unbalanced, for example when the compression ratio exceeds 50x, and another when `storage_mode` is `quantized_with_raw`. The ratio warning does not fire on a `subvectors` the library derived, only on one you passed.
+
+It also warns when the configuration cannot repay its fixed memory at the `expected_size` you declared. The codebook and the centroid distance table are held whatever the record count. A record is held twice, once in a storage map and once inside the HNSW graph, and quantization replaces a copy of `dim × 4` bytes with a code of `subvectors` bytes. `quantized_only` replaces both copies and `quantized_with_raw` replaces the graph's, so quantization starts saving above
 
 ```
-fixed bytes / (dim × 4 − subvectors)
+quantized_only       fixed bytes / (dim × 4 − subvectors)
+quantized_with_raw   fixed bytes / (dim × 4 − 2 × subvectors)
 ```
 
-records. The warning names that figure. Raise `expected_size` if your estimate was low, or drop `quantization_config`. The default configuration clears it at every dimension: at the default 8 subvectors of 8 bits the figure runs from roughly 4,500 records at `dim=64` down to a few hundred at `dim=1536`, all below the default `expected_size` of 10,000.
+records. The warning names that figure. Raise `expected_size` if your estimate was low, or drop `quantization_config`.
+
+Both figures are analytic and describe the steady state. The `quantized_only` figure is deliberately conservative, because it counts only one of the two copies that mode replaces, so it warns above the true crossover rather than below it. The `quantized_with_raw` figure has no second copy to leave out, and measured against resident memory it runs low, because training leaves an allocator high water mark the arithmetic does not model. At `dim=768` with 8 subvectors of 8 bits it names 599 records where the measured crossover is near 1,700.
 
 A separate warning fires when `expected_size` is below `training_size`, because an index that never reaches its training threshold never trains, so quantization never engages at the size you declared.
 
@@ -836,8 +862,8 @@ index = vdb.create(
 
 | Mode | What it stores | Rerank available | Memory |
 |------|----------------|------------------|--------|
-| `quantized_only` | Codes for every record; the raw vectors collected for training are released when training completes | No | Lower of the two |
-| `quantized_with_raw` | Codes and raw vectors for every record | Yes | Higher than raw storage for the records, lower for the graph |
+| `quantized_only` | Codes for every record; the raw vectors collected for training are released when training completes | No | Lowest of the three |
+| `quantized_with_raw` | Codes and raw vectors for every record | Yes | Between the two. Measured at 0.69x an unquantized index at 10,000 records of `dim=768` and 0.59x at 100,000, at the default `subvectors` |
 
 Two consequences of `quantized_only` are worth knowing before you pick it.
 
@@ -845,7 +871,24 @@ Two consequences of `quantized_only` are worth knowing before you pick it.
 
 **The gap between the two modes is not the compression ratio.** `quantized_with_raw` holds every raw vector on top of every code, so on the vectors and codes alone it holds close to the compression ratio times more than a trained `quantized_only` index. The whole resident index differs far less, because the graph, the codebook and the centroid distance table are identical in both modes and at small record counts they dominate. `get_stats()` reports the figures for your own index.
 
-**Quantization can cost memory rather than save it.** The centroid distance table is `subvectors × 2^bits × (2^bits − 1) / 2 × 4` bytes, being the strict upper triangle of a symmetric matrix per subvector, and it is held whatever the record count. That is 1.0 MB at the default 8 subvectors and 8 bits and 12 MB at 96 subvectors. Measured resident against the same data unquantized, `quantized_only` crosses from costing to saving between 3,000 and 10,000 records at 64 dimensions, between 1,000 and 3,000 at 256, and at or below 1,000 at 768 and 1,536. The crossover no longer depends on `training_size`, because the training records are released once training completes. Below the crossover quantization costs memory. `create()` warns when the configuration cannot repay the fixed cost at your `expected_size`.
+**Both modes hold less than an unquantized index once they clear the fixed cost, `quantized_with_raw` included.** The HNSW graph owns a second copy of every point, separate from the storage map, and that copy is `dim × 4` bytes in an unquantized index and `subvectors` bytes in a quantized one whichever storage mode is set. `quantized_only` drops both copies and `quantized_with_raw` drops the graph's, which at `dim=768` is 3,072 bytes per record. Measured resident against the same data unquantized at `dim=768`, `quantized_with_raw` holds 0.69x at 10,000 records and 0.59x at 100,000 at the default `subvectors`, and 0.60x and 0.47x at 8 subvectors. `quantized_only` holds 0.35x and 0.29x at the default `subvectors`. `get_stats()` does not report the graph, so its totals understate what quantization saves.
+
+**How much quantization saves is set by the dimension, and below `dim=256` it is not much.** Quantization removes the graph's copy of the vector and puts a code in its place, so what it can save per record is `dim × 4 − 2 × subvectors` bytes against the `dim × 8` an unquantized index holds for its two copies plus about 2,740 bytes of graph neighbour lists, id maps and metadata that neither mode touches. Measured resident, one dimension per process, 25,000 records at `m=32`, an unquantized index and a `quantized_with_raw` one built over the same records:
+
+| dim | unquantized | `quantized_with_raw` | ratio | saving |
+|---:|---:|---:|---:|---:|
+| 64 | 75.7 MiB | 73.4 MiB | 0.97x | 3% |
+| 96 | 83.4 | 73.8 | 0.88x | 12% |
+| 128 | 89.7 | 75.0 | 0.84x | 16% |
+| 192 | 102.6 | 82.7 | 0.81x | 19% |
+| 256 | 115.5 | 88.2 | 0.76x | 24% |
+| 384 | 140.5 | 105.8 | 0.75x | 25% |
+| 768 | 216.1 | 151.5 | 0.70x | 30% |
+| 1,536 | 369.6 | 236.0 | 0.64x | 36% |
+
+`create()` warns when the saving falls below a fifth of what an unquantized index holds, which the arithmetic above puts at `dim=235` for `quantized_with_raw` and at `dim=88` for `quantized_only`. Below that a quantized search still fetches and rescores hundreds of candidates on every query, for a saving of under 20 percent. The measured column crosses a fifth between `dim=192` and `dim=256`.
+
+**Quantization can cost memory rather than save it.** The centroid distance table is `subvectors × 2^bits × (2^bits − 1) / 2 × 4` bytes, being the strict upper triangle of a symmetric matrix per subvector, and it is held whatever the record count. That is 1.0 MB at 8 subvectors of 8 bits and 12 MB at 96. Measured resident against the same data unquantized, `quantized_only` crosses from costing to saving at roughly 1,800 records at `dim=256` and below 1,000 at `dim=768`, and `quantized_with_raw` at roughly 2,600 and 1,700 for the same two dimensions, all at 8 subvectors of 8 bits. The crossover no longer depends on `training_size`, because the training records are released once training completes. Below the crossover quantization costs memory. `create()` warns when the configuration cannot repay the fixed cost at your `expected_size`.
 
 **Once training completes every record exists only as a code, so the vector you read back is an approximation.** Every accessor sees every record. `get_records(..., return_vector=True)` and `search(..., return_vector=True)` reconstruct the vector from its code, so what they hand back is close to the value supplied rather than equal to it, for the training records exactly as for the ones added later. Only `quantized_with_raw` reads back exactly. `get_stats()["raw_vectors_stored"]` reports zero once a `quantized_only` index has trained, which is how you can confirm the release happened.
 
@@ -897,20 +940,102 @@ Measured on 6,000 clustered 128-dimensional vectors with 8 subvectors and 8 bits
 
 The exact figures depend on your data, but the shape does not. If you need quantization and you need accuracy, use `quantized_with_raw` and leave rerank on.
 
-- `rerank` defaults to 20, meaning 20 candidates are fetched per requested result and the page is reordered by raw distance. The over-fetch is capped at the number of live records.
+**What the fetch has to reach is the group of records the codes cannot tell apart from your query, and how large that group is depends on your data.** A 128x code resolves which cluster a record belongs to and very little inside it, so the fetch has to cover the query's own group. Measured on three real datasets at 100,000 records with the default `subvectors`, the fetch that reaches mean recall at 10 of 0.99:
+
+| dataset | dim | compression | fetch for 0.99 | share of corpus |
+|---|---:|---:|---:|---:|
+| dbpedia-openai (ada-002) | 1,536 | 128x | 494 | 0.49% |
+| sift-128 | 128 | 64x | 426 | 0.43% |
+| glove-100 | 100 | 40x | 5,143 | 5.14% |
+
+**No formula in the record count fits those three.** At the same corpus size one needs 426 candidates and another needs 5,143. That is why the fetch is not a formula.
+
+**ZeusDB measures it on your data instead.** When a `quantized_with_raw` index finishes training it holds `training_size` raw vectors and a codebook fitted to them, so it measures the fetch directly. It takes 512 of the training records as queries, finds their exact nearest neighbours over the training sample, locates each of those neighbours in the code ordering, and takes the 0.99 percentile of the ranks. A query is removed from its own corpus and from its own ordering, so the measurement is leave one out. The training sample is held in a seeded random order rather than the order your records arrived in, so the queries and every subset of it are random draws. `get_stats()` reports the result under `rerank_calibration_fetch` and the fetch it produces at your current record count under `rerank_default_fetch`.
+
+**The depth grows with the record count, and how fast it grows is also a property of your data**, so the calibration measures that too. It repeats the measurement over a quarter, a half and three quarters of the training sample and fits the exponent the fetch is scaled by as the least squares slope of the log fetch on the log record count. A corpus that keeps a fixed number of topics as it grows puts more records in each of them, and its depth grows linearly. A corpus that gains new topics as it grows puts its depth on a root of the record count. Measured over 10,000 to 100,000 records, the exponent reads 0.48 to 0.58 on sift-128, 0.27 to 0.32 on dbpedia-openai and 0.64 to 0.74 on glove-100, and 0.95 to 0.99 on generators holding a fixed number of clusters at every size.
+
+The result is clamped between 0.40 and 1.00, multiplied by a safety factor of 1.75, floored at 250 candidates and at `5 × top_k`, and capped at a quarter of the record count.
+
+What the calibration asks for at 100,000 records, against what the data needs and against the fixed 2%. Every figure is measured on a built index through the ordinary search path, 1,000 queries at `top_k=10` against exact ground truth. The requirement is the smallest fetch on that same index reaching recall at 10 of 0.99, read off a sweep of the explicit `rerank` argument:
+
+| dataset | calibrated fetch | measured requirement | the old fixed fetch | recall, calibrated | recall, fixed |
+|---|---:|---:|---:|---:|---:|
+| dbpedia-openai | 776 | 750 | 2,000 | 0.9905 | 0.9954 |
+| glove-100 | 7,749 | 4,500 | 2,000 | 0.9962 | 0.9723 |
+| sift-128 | 596 | 450 | 2,000 | 0.9941 | 1.0000 |
+
+The calibration clears the requirement on all three. **It does not land on it and it is not meant to**, since the measurement is taken on a tenth of the records with queries drawn from the corpus, where your queries will not be.
+
+**On data with no resolvable structure no fetch works.** Once the group the codes cannot separate is smaller than `top_k`, the true top ten span groups, the distances between groups differ in the fourth decimal, and nothing reaches them. At 5,000 clusters over 25,000 records, being five records to a cluster, recall at 10 reaches 0.917 at a fetch of half the corpus, and uniform points on the sphere reach 0.859. Measure recall on your own data before you rely on quantization.
+
+- `rerank` omitted uses the calibrated fetch above. It is the only setting that holds recall across corpus sizes and across datasets.
+- An index trained before this release, and any index loaded from a directory saved by one, carries no calibration. It falls back to the fixed fetch of 2% of the record count, floored at 250 candidates and at `5 × top_k`. `get_stats()` reports `rerank_calibrated: false` for it. Rebuild the index to calibrate it.
+- `rerank=N` for N of 1 or more fetches `top_k × N` candidates, a fixed multiple of the page that does not move with the corpus. Use it to override the default deliberately, not as the normal path.
 - `rerank=0` turns reranking off and returns the ADC scores and ordering.
-- The fetch is `top_k × rerank` candidates, so a large `top_k` multiplies the cost. Lower `rerank` when you ask for a large page.
 - `rerank` has no effect on an unquantized index or on a `quantized_only` one. Both ignore it.
 - With rerank on, the scores you get back are raw-vector distances. With it off, they are ADC estimates. The two are not comparable.
 
-`ef_search` still applies to the quantized traversal, but it moves recall very little compared with rerank.
+**Above roughly 10,000 records a reranked quantized search is slower than an unquantized one, and the gap widens as the index grows.** That is the price of the default holding recall. On dbpedia-openai at `dim=1,536`, paired against an unquantized index over the same records, 200 queries one each in turn:
+
+| records | calibrated fetch | unquantized | quantized, default rerank | ratio |
+|---:|---:|---:|---:|---:|
+| 10,000 | 277 | 1.97 ms | 1.89 ms | 0.96 |
+| 25,000 | 459 | 2.75 ms | 4.29 ms | 1.56 |
+| 50,000 | 561 | 3.44 ms | 5.30 ms | 1.54 |
+| 100,000 | 776 | 3.17 ms | 7.65 ms | 2.42 |
+
+Each row is one process building both indexes over the same records, so the ratio is the figure to read. The absolute times move between rows because each row is its own process, and the 100,000 row is unpaired, being the loaded index above against the unquantized figure from the grid.
+
+The crossover is structural rather than a tuning accident. The traversal has to be as wide as the fetch because HNSW cannot return more results than its candidate list holds, an HNSW search costs roughly linear time in that width, and the fetch grows with the record count while an unquantized search grows with its logarithm, so the two cross once. What the calibration changes is where and how steeply. The fixed 2% of the corpus reached a ratio of 6.91 at 100,000 records on this dataset, and a fetch measured on the data reaches 2.42.
+
+**What the calibration costs and saves, measured on real data.** Both arms on the same loaded index at 100,000 records, in one process, 500 queries each. The before arm names `rerank` so it fetches exactly the 2,000 candidates the fixed 2% produced, and the after arm names nothing and takes the calibration:
+
+| dataset | fixed fetch | calibrated fetch | fixed | calibrated | ratio | fixed recall@10 | calibrated recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| sift-128 | 2,000 | 596 | 11.99 ms | 3.63 ms | 0.30 | 1.0000 | 0.9938 |
+| dbpedia-openai | 2,000 | 776 | 19.44 ms | 8.62 ms | 0.44 | 0.9958 | 0.9910 |
+| glove-100 | 2,000 | 7,744 | 26.22 ms | 82.70 ms | 3.15 | 0.9666 | 0.9960 |
+
+**Read that as three different answers, because the calibration gives each dataset the fetch its own data needs.** sift-128 and dbpedia-openai need far less than the fixed fetch gave them and get two thirds and over half of their query time back, for 0.006 and 0.005 of recall. glove-100 needs far more, and buys 0.029 of recall for 3.15 times the query time. If query time matters more to you than the last hundredth of recall, `rerank=N` overrides the calibration and `get_stats()["rerank_default_fetch"]` tells you what you are overriding.
+
+**Where they cross depends on your data.** The table above is 50 Gaussian clusters, where the crossover is between 10,000 and 15,000 records. On the anisotropic embedding-like corpus it is below 10,000, because an unquantized search converges faster on that data while the fetch does not shrink:
+
+| data model | records | unquantized | quantized, default rerank | ratio | quantized recall |
+|---|---:|---:|---:|---:|---:|
+| 50 clusters | 25,000 | 0.90 ms | 1.99 ms | 2.22 | 0.996 |
+| embedding-like | 10,000 | 0.57 ms | 1.03 ms | 1.80 | 0.988 |
+| embedding-like | 100,000 | 1.59 ms | 9.48 ms | 5.97 | 0.989 |
+
+Memory goes the other way and is not data dependent. On the embedding-like corpus at 100,000 records the quantized index holds 552 MB against 877 MB unquantized, being 0.63 times.
+
+**No `subvectors` value moves that crossing, and one gets close.** A lower compression ratio puts the true neighbours shallower in the code ordering, so the fetch that reaches them is smaller, but each candidate costs more to score because the code is longer. Measured at `dim=768` and 100,000 records, the smallest fetch each ratio needs to reach recall at 10 of 0.99 and what that fetch costs:
+
+| compression | `subvectors` | fetch for 0.99 | share of corpus | query | resident | build |
+|---:|---:|---:|---:|---:|---:|---:|
+| 384x | 8 | 1,995 | 1.99% | 9.40 ms | 463 MB | 79 s |
+| 192x | 16 | 1,945 | 1.94% | 10.89 ms | 576 MB | 131 s |
+| 128x | 24 | 1,921 | 1.92% | 13.08 ms | 585 MB | 170 s |
+| 64x | 48 | 1,522 | 1.52% | 11.46 ms | 617 MB | 281 s |
+| 32x | 96 | 960 | 0.96% | 9.34 ms | 696 MB | 521 s |
+| 16x | 192 | 222 | 0.22% | 4.32 ms | 745 MB | 846 s |
+
+An unquantized index over the same records holds 994 MB, builds in 313 s and answers in 3.05 ms.
+
+**If query time above the crossover is what matters to you, `subvectors = dim / 4` is the setting, and set `rerank` with it.** At 16x the fetch collapses and the query falls to 4.32 ms. You pay for it twice: the index holds 745 MB against 585 at the default, and it builds in 846 s against 170 and against 313 for no quantization at all. At 10,000 records that same setting holds 94 MB where not quantizing holds 90, so it is a choice for large indexes only. The default fetch is 2% of the corpus whatever `subvectors` is, so pass `rerank` explicitly to take the benefit, for example `rerank=30` at 100,000 records with `top_k=10`.
+
+Quantization remains a memory decision. At 100,000 records of `dim=768` the default holds 585 MB against 994 MB unquantized and answers in 13.4 ms against 3.05 ms. Lower `rerank` explicitly if query time matters more to you than recall, and measure what it costs you.
+
+**`ef_search` does nothing on a reranked quantized search.** The graph traversal widens to the number of candidates asked for, so a fetch of 2,000 already searches far wider than any `ef_search` a caller is likely to set, and setting it smaller is discarded. HNSW cannot return more results than its candidate list holds, so a fetch of 2,000 genuinely requires a traversal 2,000 wide. At the defaults the fetch is at least 250 and `ef_search` is 100, so raising `ef_search` alone changes nothing. Change `rerank` instead. On an unquantized search, and on a quantized search with `rerank=0`, `ef_search` applies normally.
+
+Setting `ef_search` *above* the fetch does not help either. Measured at `dim=768` over 200 queries, quadrupling `ef_search` at a fixed fetch moves recall at 10 by at most 0.008 and by nothing at all in fourteen of twenty configurations, because the candidates a fetch returns are limited by the code ordering rather than by the traversal. It costs query time in every case.
 
 ### 📊 Performance Characteristics
 
-- **Training**: happens once, on the `add()` call that reaches `training_size`. That call takes noticeably longer than the others.
-- **Memory**: a record's code is `subvectors` bytes against `dim × 4` for a raw vector. The graph shrinks by the same factor, because it holds codes rather than vectors.
-- **Search speed**: quantized search is faster than raw search. Measured over 20,000 256-dimensional vectors, 0.93 ms per query against 1.52 ms.
-- **Accuracy**: see the table above. Treat quantization as a memory decision that costs accuracy, not as a free win.
+- **Training**: happens once, on the `add()` call that reaches `training_size`. That call takes noticeably longer than the others. On `quantized_with_raw` it also calibrates the rerank fetch, which is reported in `get_stats()["rerank_calibration_ms"]` and measured at 3.3 s inside a 103 s training call at `dim=1536`, and at 0.21 s and 0.28 s at `dim=100` and `dim=128`. The calibration is linear in the dimension and it is paid once.
+- **Memory**: a record's code is `subvectors` bytes against `dim × 4` for a raw vector. The graph holds a second copy of every point and it shrinks by the same factor, which is why both storage modes hold less than an unquantized index above their break even. How much less is set by the dimension, and the table in Storage modes prices it from `dim=64` to `dim=1536`.
+- **Search speed**: an unreranked quantized search is faster than a raw search. A reranked one is slower, and the table above prices it.
+- **Build speed**: a quantized build is faster than an unquantized one, because the graph compares codes rather than vectors. At 100,000 records of `dim=768` it is 137 s against 231 s at the default `subvectors`, and it slows as `subvectors` rises.
+- **Accuracy**: see the tables above. Treat quantization as a memory decision that costs accuracy and query time, not as a free win.
 
 <br/>
 
