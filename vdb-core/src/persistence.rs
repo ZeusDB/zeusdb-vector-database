@@ -14,8 +14,13 @@
 //! ├── quantization.json       # PQ configuration (if enabled)
 //! ├── pq_codes.bin            # Quantized codes (if PQ enabled)
 //! ├── pq_centroids.bin        # PQ centroids (if trained)
-//! └── hnsw_index.hnsw.graph   # HNSW graph (Phase 2)
+//! ├── hnsw_index.hnsw.graph   # HNSW graph topology
+//! └── hnsw_index.hnsw.data    # The point each graph node holds
 //! ```
+//!
+//! The two graph files are the dump the vendored `hnsw_rs` crate writes, and
+//! the loader restores the graph from them rather than rebuilding it by
+//! re-inserting every record. See `HNSWIndex::restore_graph_from_dump`.
 
 use crate::hnsw_index::{HNSWIndex, QuantizationConfig, RerankCalibration, StorageMode};
 use crate::pq::PQ;
@@ -346,8 +351,47 @@ fn load_vectors(path: &Path) -> PyResult<HashMap<String, Vec<f32>>> {
             ))
         })?;
 
+    check_vectors_are_finite(&vectors)?;
+
     println!("✅ vectors.bin loaded");
     Ok(vectors)
+}
+
+/// Refuse a stored vector holding a NaN or an infinity
+///
+/// `add` has always refused a non-finite value, so one can only reach
+/// vectors.bin through a release that did not validate every input path or
+/// through a directory edited after it was written. The check belongs to the
+/// loader rather than to the graph rebuild, because the graph is now restored
+/// from its dump and the rebuild that used to catch this does not run. A record
+/// holding a NaN scores as NaN against every query and orders arbitrarily, so
+/// the index would answer wrongly rather than visibly fail.
+fn check_vectors_are_finite(vectors: &HashMap<String, Vec<f32>>) -> PyResult<()> {
+    let mut offenders: Vec<&String> = vectors
+        .iter()
+        .filter(|(_, vector)| vector.iter().any(|value| !value.is_finite()))
+        .map(|(id, _)| id)
+        .collect();
+
+    if offenders.is_empty() {
+        return Ok(());
+    }
+
+    offenders.sort();
+    let named: Vec<&str> = offenders.iter().take(5).map(|id| id.as_str()).collect();
+    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+        "vectors.bin holds a NaN or an infinity in {} of {} records, so those records \
+         would score as NaN against every query and take an arbitrary place in every \
+         result page. Refusing to load. Affected records include: {}{}",
+        offenders.len(),
+        vectors.len(),
+        named.join(", "),
+        if offenders.len() > named.len() {
+            ", ..."
+        } else {
+            ""
+        }
+    )))
 }
 
 /// Load manifest for validation and metadata
@@ -523,6 +567,7 @@ pub fn save_index(index: &HNSWIndex, path: &str) -> PyResult<()> {
 
 /// Reconstruct HNSWIndex using Simple Reconstruction
 fn reconstruct_index_simple(
+    path: &Path,
     config: IndexConfig,
     mappings: IdMappings,
     metadata: HashMap<String, HashMap<String, Value>>,
@@ -562,17 +607,28 @@ fn reconstruct_index_simple(
         quantization,
     )?;
 
-    // Step 3: Rebuild the graph. A trained quantized index rebuilds through
-    // the quantized path, inserting the stored codes into a fresh PQ graph, so
-    // it comes back quantized and nothing is materialised at full width. An
-    // index saved mid-collection or one with no quantization at all replays
-    // its raw vectors through add() exactly as before.
-    if index.can_use_quantization() {
-        println!("🔄 Rebuilding quantized HNSW graph from stored PQ codes...");
-        rebuild_graph_from_codes(&mut index, &pq_codes, &vectors)?;
-    } else {
-        println!("🔄 Rebuilding HNSW graph from vectors...");
-        rebuild_graph_from_data(&mut index, &vectors, &pq_codes, &metadata)?;
+    // Step 3: Restore the graph the save wrote. Every save dumps the graph, so
+    // the ordinary path is a read. A dump that is absent, damaged, or written
+    // by a release this build cannot interpret falls back to the rebuild, which
+    // is the path that also upgrades a graph carrying a defect the vendored
+    // patches have since fixed. See `restore_graph_from_dump`.
+    match index.restore_graph_from_dump(path) {
+        Ok(nodes) => {
+            println!(
+                "✅ HNSW graph restored from the saved dump ({} nodes)",
+                nodes
+            );
+        }
+        Err(reason) => {
+            println!("ℹ️  Rebuilding the HNSW graph, because {}", reason);
+            if index.can_use_quantization() {
+                println!("🔄 Rebuilding quantized HNSW graph from stored PQ codes...");
+                rebuild_graph_from_codes(&mut index, &pq_codes, &vectors)?;
+            } else {
+                println!("🔄 Rebuilding HNSW graph from vectors...");
+                rebuild_graph_from_data(&mut index, &vectors, &pq_codes, &metadata)?;
+            }
+        }
     }
 
     // Step 4: Put the stored record data back exactly as it was written. The
@@ -896,9 +952,9 @@ fn rebuild_graph_from_data(
     }
 
     // Prepare batch data for efficient insertion
-    let mut batch_vectors = Vec::new();
-    let mut batch_ids = Vec::new();
-    let mut batch_metadatas = Vec::new();
+    let mut batch_vectors: Vec<Vec<f32>> = Vec::new();
+    let mut batch_ids: Vec<String> = Vec::new();
+    let mut batch_metadatas: Vec<HashMap<String, Value>> = Vec::new();
     let mut reconstructed = 0usize;
     let mut missing_metadata = 0usize;
 
@@ -956,6 +1012,26 @@ fn rebuild_graph_from_data(
             "⚠️  {} records have no entry in metadata.json and are restored with empty metadata",
             missing_metadata
         );
+    }
+
+    // Insert in the order the records were first added rather than in the order
+    // a hash map hands them out. A HashMap's iteration order varies per process,
+    // so two rebuilds of one directory used to produce two differently wired
+    // graphs that answered the same query differently. Internal ids are handed
+    // out in arrival order, so sorting on them also puts the rebuild as close to
+    // the original build as a rebuild can get.
+    {
+        let id_map = index.get_id_map();
+        let mut order: Vec<usize> = (0..batch_ids.len()).collect();
+        order.sort_by_key(|&i| {
+            (
+                id_map.get(&batch_ids[i]).copied().unwrap_or(usize::MAX),
+                batch_ids[i].clone(),
+            )
+        });
+        batch_vectors = order.iter().map(|&i| batch_vectors[i].clone()).collect();
+        batch_metadatas = order.iter().map(|&i| batch_metadatas[i].clone()).collect();
+        batch_ids = order.iter().map(|&i| batch_ids[i].clone()).collect();
     }
 
     println!(
@@ -1145,14 +1221,15 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
         );
     }
 
-    // Skip HNSW graph loading - we'll rebuild it
+    // The graph dump itself is read inside the reconstruction, which needs the
+    // mappings and the codebook first to judge it against.
 
     // Phase 2: Create empty index and restore state
     println!("🔧 Phase 2: Creating empty index and restoring state...");
     let restored_index =
-        reconstruct_index_simple(config, mappings, metadata, vectors, quantization)?;
+        reconstruct_index_simple(path_buf, config, mappings, metadata, vectors, quantization)?;
 
-    println!("✅ Index reconstruction with graph rebuild completed successfully!");
+    println!("✅ Index reconstruction completed successfully!");
     Ok(restored_index)
 }
 
@@ -1452,14 +1529,19 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
     }
 
     // Phase 2: Add HNSW graph files
-    // REPLACE WITH THIS CONDITIONAL LOGIC:
+    //
+    // Both are included. The data file used to be declared excluded, on the
+    // reasoning that the load path read the records from vectors.bin and never
+    // opened it. The load path now restores the saved graph, and the graph
+    // cannot be read without the points that go with it, so both files are
+    // required to reopen the directory.
     let vector_count = index.get_vector_count();
     if vector_count > 0 {
         files_included.push("hnsw_index.hnsw.graph".to_string());
-        files_excluded.push("hnsw_index.hnsw.data".to_string());
+        files_included.push("hnsw_index.hnsw.data".to_string());
         println!("📋 Graph files in manifest:");
         println!("   ✅ Included: hnsw_index.hnsw.graph");
-        println!("   ❌ Excluded: hnsw_index.hnsw.data (we use our own data files)");
+        println!("   ✅ Included: hnsw_index.hnsw.data");
     } else {
         files_excluded.push("hnsw_index.hnsw.graph".to_string());
         files_excluded.push("hnsw_index.hnsw.data".to_string());

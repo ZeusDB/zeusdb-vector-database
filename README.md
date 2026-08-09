@@ -1108,7 +1108,9 @@ HNSWIndex(dim=1536, space=cosine, m=16, ef_construction=200, expected_size=1000,
 top hit: doc_0
 ```
 
-**Loading rebuilds the graph rather than reading it back**, so load time is proportional to the number of records, not to the size of the directory. The saved graph files are written but not consumed on load.
+**Loading reads the saved graph back rather than rebuilding it**, so a reloaded index returns the same result pages as the index that was saved, with the same IDs and the same scores. Load time is proportional to the size of the directory rather than to the cost of building the index: 50,000 records at 1,536 dimensions load in 1.1 seconds against a 156 second build.
+
+The graph is rebuilt by re-inserting every record only when the saved graph cannot be used, which covers a directory whose graph files were lost or damaged and one written by a release too old for this build to interpret. Set `ZEUSDB_LOAD_REBUILD_GRAPH=1` to ask for that rebuild on a directory whose graph is perfectly readable, which is how an index built by an earlier release picks up graph improvements made since.
 
 <br />
 
@@ -1171,7 +1173,7 @@ my_index.zdb/
 └── hnsw_index.hnsw.data    # HNSW graph payload
 ```
 
-`manifest.json` lists `hnsw_index.hnsw.data` under `files_excluded` because the load path does not read it, but the file is written for every non-empty index.
+`manifest.json` lists both graph files under `files_included`. The load path restores the saved graph rather than rebuilding it, so both are required to reopen a directory holding records.
 
 <br/>
 
