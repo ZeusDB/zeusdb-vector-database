@@ -17,7 +17,7 @@
 //! └── hnsw_index.hnsw.graph   # HNSW graph (Phase 2)
 //! ```
 
-use crate::hnsw_index::{HNSWIndex, QuantizationConfig, StorageMode};
+use crate::hnsw_index::{HNSWIndex, QuantizationConfig, RerankCalibration, StorageMode};
 use crate::pq::PQ;
 use chrono::Utc;
 use pyo3::prelude::*;
@@ -154,6 +154,13 @@ pub struct QuantizationPersistence {
     pub training_ids: Vec<String>,
     #[serde(default)]
     pub training_threshold_reached: bool,
+    /// What training measured about the rerank fetch on this index's own data.
+    ///
+    /// Absent from every directory written before the calibration existed, so
+    /// it defaults to `None` and those indexes fall back to the corpus terms
+    /// they were built against. See `RerankCalibration`.
+    #[serde(default)]
+    pub rerank_calibration: Option<RerankCalibration>,
 }
 
 /// Memory usage statistics for quantization
@@ -776,6 +783,11 @@ fn restore_quantization_state_simple(
     // Set quantization config
     index.set_quantization_config(Some(quant_config));
 
+    // Restore what training measured about the rerank fetch. `None` here means
+    // the directory was written before the calibration existed, and the search
+    // falls back to the corpus terms. See `RerankCalibration`.
+    index.set_rerank_calibration(quant_data.rerank_calibration);
+
     // The training ids and the threshold flag are applied after the graph
     // rebuild, which would otherwise strip them. See TrainingState.
 
@@ -1294,6 +1306,7 @@ fn save_quantization_config(index: &HNSWIndex, path: &Path) -> PyResult<()> {
             pq_config,
             training_ids,
             training_threshold_reached,
+            rerank_calibration: index.get_rerank_calibration(),
         };
 
         let quant_path = path.join("quantization.json");

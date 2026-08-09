@@ -1,5 +1,6 @@
 """Product quantization configuration, training, quantized search and storage modes."""
 
+import time
 import warnings
 import pytest
 import numpy as np
@@ -74,12 +75,17 @@ def test_pq_configuration_validation():
         index = vdb.create("hnsw", dim=1536, quantization_config=warning_config)
         assert index is not None  # Should still create successfully
     
-    # ✅ Test that reasonable configs don't warn (8x compression < 50x threshold)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")  # Turn warnings into errors
+    # A ratio below the threshold does not draw the compression warning. dim 64
+    # draws the warning that quantization does not repay there, which
+    # test_quantization_warns_where_the_dimension_cannot_repay is the subject
+    # of, so this asserts the absence of the compression one rather than the
+    # absence of every warning.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         reasonable_config = {'type': 'pq', 'subvectors': 8, 'bits': 8, 'training_size': 1000}
         index = vdb.create("hnsw", dim=64, quantization_config=reasonable_config)  # 64÷8=8x compression
         assert index is not None
+    assert not [w for w in caught if "compression ratio" in str(w.message)]
 
 # ------------------------------------------------------------
 # Test 32: PQ Training Trigger and Progress
@@ -2016,7 +2022,8 @@ def test_fixed_memory_warning_fires_when_quantization_cannot_pay():
         warnings.simplefilter("always")
         vdb.create("hnsw", dim=64, expected_size=50000,
                    quantization_config=dict(config))
-    assert not [w for w in caught if "unquantized index" in str(w.message)], (
+    assert not [w for w in caught
+                if "unquantized index at expected_size" in str(w.message)], (
         "the warning fired at an expected_size well above break even"
     )
 
@@ -2031,18 +2038,33 @@ def test_fixed_memory_warning_fires_when_quantization_cannot_pay():
         warnings.simplefilter("always")
         vdb.create("hnsw", dim=1536, expected_size=3000,
                    quantization_config=dict(config))
-    assert not [w for w in caught if "unquantized index" in str(w.message)]
+    assert not [w for w in caught
+                if "unquantized index at expected_size" in str(w.message)]
 
-    # quantized_with_raw drops no raw vector, so raising expected_size never
-    # makes it pay and this warning would be advice that cannot be followed.
-    # The storage mode warning covers that case instead.
+    # quantized_with_raw has a break even too, and it used to be excluded here
+    # on the claim that it drops no raw vector and so can never pay. It drops
+    # the graph's copy of every point, which is dim * 4 bytes, and it pays for
+    # two codes rather than one, so its per record saving is
+    # dim * 4 - 2 * subvectors. At dim 64 with 8 subvectors that is 240 bytes
+    # against the other mode's 248, and the figure is 4,626 against 4,476.
+    with pytest.warns(UserWarning, match=r"starts saving above 4626 records"):
+        vdb.create("hnsw", dim=64, expected_size=3000,
+                   quantization_config=dict(config, storage_mode="quantized_with_raw"))
+
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         vdb.create("hnsw", dim=64, expected_size=3000,
                    quantization_config=dict(config, storage_mode="quantized_with_raw"))
     messages = [str(w.message) for w in caught]
-    assert not [m for m in messages if "unquantized index at expected_size" in m]
     assert [m for m in messages if "keeps a raw vector for every record" in m]
+
+    # And above its own break even it does not warn.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        vdb.create("hnsw", dim=64, expected_size=50000,
+                   quantization_config=dict(config, storage_mode="quantized_with_raw"))
+    assert not [w for w in caught
+                if "unquantized index at expected_size" in str(w.message)]
 
 # ------------------------------------------------------------
 # Test 109: the default configuration saves memory once trained
@@ -2184,3 +2206,783 @@ def test_creation_warning_is_silent_at_the_default_configuration():
                    quantization_config={"type": "pq"})
     assert not [w for w in caught
                 if "more memory than an unquantized index" in str(w.message)]
+
+# ------------------------------------------------------------
+# Test 113: the derived subvectors default holds the compression ratio
+# ------------------------------------------------------------
+def test_subvectors_default_holds_the_compression_ratio():
+    """An unset subvectors resolves to dim / 32, so the ratio is 128x.
+
+    The old default was the constant 8, which is a constant code length and a
+    ratio that moved with the dimension: 32x at dim 64, 128x at 256, 384x at
+    768 and 768x at 1,536. Recall follows the ratio and not the dimension,
+    measured at 0.187, 0.182 and 0.184 without reranking at 128x for those
+    three dimensions against 0.405 and 0.406 at 32x for two of them, so the
+    ratio is the quantity a default has to hold steady.
+
+    The floor of 8 subvectors binds below dim 256, because a code is one byte
+    per subvector and 2 subvectors would give a whole corpus 65,536 distinct
+    codes. The ceiling of 192 binds above dim 6,144.
+    """
+    vdb = VectorDatabase()
+
+    expected = {
+        64: (8, 32.0),      # floor binds
+        128: (8, 64.0),     # floor binds
+        256: (8, 128.0),
+        384: (12, 128.0),
+        512: (16, 128.0),
+        768: (24, 128.0),
+        1024: (32, 128.0),
+        1536: (48, 128.0),
+        3072: (96, 128.0),
+    }
+    for dim, (subvectors, ratio) in expected.items():
+        assert vdb._default_subvectors(dim) == subvectors, f"at dim {dim}"
+        assert dim * 4 / subvectors == ratio, f"at dim {dim}"
+        assert dim % subvectors == 0, f"at dim {dim}"
+
+    # The derived value reaches the index, and it is what get_quantization_info
+    # reports back.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        index = vdb.create("hnsw", dim=768, expected_size=5000,
+                           quantization_config={"type": "pq", "training_size": 1000})
+    info = index.get_quantization_info()
+    assert info["subvectors"] == 24
+    assert info["compression_ratio"] == pytest.approx(128.0)
+
+    # A derived value never trips the ratio warning, which exists to tell a
+    # caller their own choice looks unbalanced. 128x is above the 50x threshold
+    # at every dimension from 256 up, so without the exemption create() would
+    # warn about its own default.
+    for dim in (256, 768, 1536):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            vdb.create("hnsw", dim=dim, expected_size=20000,
+                       quantization_config={"type": "pq", "training_size": 1000})
+        assert not [w for w in caught
+                    if "Very high compression ratio" in str(w.message)], (
+            f"the default configuration warns about itself at dim {dim}")
+
+
+# ------------------------------------------------------------
+# Test 114: an explicit subvectors is left exactly as given
+# ------------------------------------------------------------
+def test_explicit_subvectors_is_unaffected_by_the_derived_default():
+    """A caller who names subvectors gets that value and the old warning.
+
+    The default moved. Anything passed explicitly did not, including the ratio
+    warning, which still fires on a caller's own high ratio.
+    """
+    vdb = VectorDatabase()
+
+    with pytest.warns(UserWarning, match="Very high compression ratio.*384.0x"):
+        index = vdb.create("hnsw", dim=768, expected_size=5000,
+                           quantization_config={"type": "pq", "subvectors": 8,
+                                                "bits": 8, "training_size": 1000})
+    info = index.get_quantization_info()
+    assert info["subvectors"] == 8
+    assert info["compression_ratio"] == pytest.approx(384.0)
+
+    # Values the derived default would never pick, in both directions.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        for subvectors in (2, 4, 96, 192, 384):
+            built = vdb.create("hnsw", dim=768, expected_size=5000,
+                               quantization_config={"type": "pq",
+                                                    "subvectors": subvectors,
+                                                    "bits": 8,
+                                                    "training_size": 1000})
+            assert built.get_quantization_info()["subvectors"] == subvectors
+
+
+# ------------------------------------------------------------
+# Test 115: the rerank default holds recall as the corpus grows
+# ------------------------------------------------------------
+def test_rerank_default_scales_with_the_live_record_count():
+    """The default fetch grows with the corpus, so recall holds as it grows.
+
+    The old default was the constant factor 20, being 200 candidates at top_k
+    10, measured at 10,000 records and correct there. What a fetch has to reach
+    is the group of records the codes cannot tell apart from the query, and on
+    this corpus that is the query's own cluster. The generator draws fifty
+    clusters at every size, so the cluster is one fiftieth of whatever the
+    record count is, and a fixed factor covers a shrinking share of it as the
+    index grows. The same index that returns 0.9975 at 10,000 records returns
+    0.3025 at 100,000.
+
+    That is a property of this corpus rather than of the codes. A generator
+    drawing 200 clusters over 100,000 records puts 500 records in a cluster and
+    the required depth is 461, being the same rank a fifty cluster corpus needs
+    at 25,000 records. The default is corpus proportional because it has to
+    cover the coarse case, not because the depth is a fixed share.
+
+    This asserts the two arms on one index at two sizes. The larger size here
+    is 20,000 rather than 100,000, because a 100,000 record build takes minutes
+    and this suite has to stay quick. The gap is already decisive at 20,000.
+    """
+    dim, first, second, queries = 256, 10_000, 20_000, 100
+
+    # Fifty centres at sigma 1.0. A tighter cluster than this makes the code
+    # ordering easy and hides the effect.
+    rng = np.random.default_rng(20260807)
+    centres = rng.standard_normal((50, dim))
+    points = centres[rng.integers(0, 50, second)] + rng.standard_normal((second, dim))
+    data = (points / np.linalg.norm(points, axis=1, keepdims=True)).astype(np.float32)
+    ids = [f"s_{i}" for i in range(second)]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        index = VectorDatabase().create(
+            "hnsw", dim=dim, expected_size=second,
+            quantization_config={"type": "pq", "training_size": 1000,
+                                 "storage_mode": "quantized_with_raw"})
+
+    # dim 256 derives 8 subvectors, which is 128x, the default ratio.
+    assert index.get_quantization_info()["subvectors"] == 8
+
+    def recall(live, **kwargs):
+        picks = rng.choice(live, queries, replace=False)
+        truth = np.argsort(-(data[picks] @ data[:live].T), axis=1)[:, :10]
+        hits = 0
+        for row, pick in enumerate(picks):
+            found = {h["id"] for h in index.search(data[pick], top_k=10, **kwargs)}
+            hits += len(found & {ids[j] for j in truth[row]})
+        return hits / (10 * queries)
+
+    assert index.add({"ids": ids[:first], "embeddings": data[:first]}).is_success()
+    assert index.is_quantized()
+
+    # The default fetch here comes from the calibration, which was measured on
+    # 1,000 training records and is scaled to whatever the index holds now.
+    # Factor 20 fetches 200 candidates at every size instead. At 10,000 records
+    # the two arms are close and both are good.
+    assert recall(first) > 0.90
+    assert recall(first, rerank=20) > 0.90
+
+    assert index.add({"ids": ids[first:], "embeddings": data[first:]}).is_success()
+
+    # At 20,000 the default has doubled its fetch and factor 20 is still 200.
+    # The bounds are set wide of both measured levels, so the assertion is the
+    # gap.
+    grown = recall(second)
+    fixed = recall(second, rerank=20)
+    assert grown > 0.90, f"the derived default lost recall as the corpus grew: {grown}"
+    assert fixed < grown - 0.05, (
+        f"factor 20 kept up at 20,000 records, {fixed} against {grown}, so this "
+        f"test no longer distinguishes the two defaults")
+
+
+# ------------------------------------------------------------
+# Test 116: an index saved at the old defaults still loads
+# ------------------------------------------------------------
+def test_index_saved_at_the_old_subvectors_default_loads_and_searches(tmp_path):
+    """subvectors is stored per index, so the default moving cannot reach it.
+
+    An index built when the default was the constant 8 holds 8 in its own
+    quantization config and its codes are 8 bytes. Loading it must reproduce
+    that rather than the value this build would derive, which at dim 768 is 24.
+    """
+    dim, count = 768, 1200
+    rng = np.random.default_rng(20260807)
+    # Clustered rather than uniform, so the top five are separated by more than
+    # the float noise. On uniform data the fifth and sixth neighbours sit close
+    # enough that the loaded index, whose graph is rebuilt from the codes in its
+    # own insertion order, can return them in the other order.
+    centres = rng.standard_normal((20, dim))
+    points = centres[rng.integers(0, 20, count)] + 0.2 * rng.standard_normal((count, dim))
+    data = (points / np.linalg.norm(points, axis=1, keepdims=True)).astype(np.float32)
+    ids = [f"o_{i}" for i in range(count)]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        index = VectorDatabase().create(
+            "hnsw", dim=dim, expected_size=count,
+            quantization_config={"type": "pq", "subvectors": 8, "bits": 8,
+                                 "training_size": 1000,
+                                 "storage_mode": "quantized_with_raw"})
+    assert index.add({"ids": ids, "embeddings": data}).is_success()
+    assert index.is_quantized()
+    assert index.get_quantization_info()["subvectors"] == 8
+
+    before = [h["id"] for h in index.search(data[0], top_k=5)]
+
+    save_dir = tmp_path / "old_defaults.zdb"
+    index.save(str(save_dir))
+    loaded = VectorDatabase().load(str(save_dir))
+
+    info = loaded.get_quantization_info()
+    assert info["subvectors"] == 8, "the loaded index took this build's default"
+    assert info["compression_ratio"] == pytest.approx(384.0)
+    assert loaded.get_vector_count() == count
+    assert loaded.is_quantized()
+
+    # The loaded index rebuilds its graph from the codes, so the traversal can
+    # reach a different candidate set and a page is asserted as an overlap
+    # rather than as an equality.
+    after = [h["id"] for h in loaded.search(data[0], top_k=5)]
+    assert after[0] == before[0]
+    assert len(set(after) & set(before)) >= 4, f"{after} against {before}"
+
+
+# ------------------------------------------------------------
+# Tests 117 and 118: what the defaults deliver below the crossover
+# ------------------------------------------------------------
+CROSSOVER_DIM = 1536
+CROSSOVER_RECORDS = 3000
+
+
+@pytest.fixture(scope="module")
+def crossover_pair():
+    """One unquantized index and one quantized index over the same records.
+
+    3,000 records of dimension 1536, which is below the crossover where a
+    reranked quantized search stops being faster than an unquantized one. The
+    two tests below assert the two properties the defaults are chosen to hold
+    there, being recall and query time, and they share the build because
+    building it twice would double what the suite pays for them.
+
+    The dimension is high because the margin depends on it. A quantized
+    traversal replaces a distance over dim floats with one over subvectors
+    bytes, so the wider the vector the more it saves, and at dim 128 with 8,000
+    records the reranked search is 1.39 times an unquantized one where at dim
+    1536 with 3,000 it is 0.73 times.
+    """
+    dim, records, queries = CROSSOVER_DIM, CROSSOVER_RECORDS, 60
+
+    rng = np.random.default_rng(20260807)
+    centres = rng.standard_normal((50, dim))
+    points = centres[rng.integers(0, 50, records)] + rng.standard_normal((records, dim))
+    data = (points / np.linalg.norm(points, axis=1, keepdims=True)).astype(np.float32)
+    ids = [f"c_{i}" for i in range(records)]
+
+    picks = rng.choice(records, queries, replace=False)
+    truth = [{ids[j] for j in row}
+             for row in np.argsort(-(data[picks] @ data.T), axis=1)[:, :10]]
+
+    built = {}
+    for label, quantization in (("raw", None),
+                                ("quantized", {"type": "pq", "training_size": 1000,
+                                               "storage_mode": "quantized_with_raw"})):
+        kwargs = dict(dim=dim, expected_size=records)
+        if quantization:
+            kwargs["quantization_config"] = quantization
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            index = VectorDatabase().create("hnsw", **kwargs)
+        assert index.add({"ids": ids, "embeddings": data}).is_success()
+        built[label] = index
+    assert built["quantized"].is_quantized()
+
+    return {"indexes": built, "queries": [data[p] for p in picks], "truth": truth}
+
+
+def test_default_fetch_holds_recall_below_the_crossover(crossover_pair):
+    """The defaults return almost the page an unquantized index returns.
+
+    Below 12,500 records at top_k 10 the fetch is the floor of 250 candidates.
+    What that has to reach is the group of records the codes cannot tell apart
+    from the query, which on clustered data is the query's own cluster. This
+    fixture puts 60 records in a cluster, so the floor covers it several times
+    over, and recall measures at 1.0000 here.
+
+    The bound is set below the level this fixture measures, because the
+    codebook is trained by an unseeded k-means and a rebuild draws a different
+    one, which moves a quantized recall figure by about 0.013.
+    """
+    pair = crossover_pair
+    scores = {}
+    for label, index in pair["indexes"].items():
+        hits = 0
+        for query, truth in zip(pair["queries"], pair["truth"]):
+            hits += len({h["id"] for h in index.search(query, top_k=10)} & truth)
+        scores[label] = hits / (10.0 * len(pair["queries"]))
+
+    assert scores["raw"] > 0.99, f"the unquantized index is not the baseline: {scores}"
+    assert scores["quantized"] > 0.95, (
+        f"the default fetch lost recall: {scores['quantized']} against the "
+        f"unquantized index's {scores['raw']}")
+
+
+def test_default_quantized_search_is_not_slower_below_the_crossover(crossover_pair):
+    """Below the crossover the defaults are a memory saving that costs no time.
+
+    Above it they are not, and that is the property this test pins to a size.
+    The fetch is a share of the corpus, the traversal widens to the fetch
+    because HNSW cannot return more results than its candidate list holds, and
+    an HNSW search costs roughly linear time in that width. So a reranked
+    quantized search costs time proportional to the record count where an
+    unquantized one costs time proportional to its logarithm, and the two cross
+    once.
+
+    Timed round robin, one query to each index in turn, so a load spike lands
+    on both rather than on whichever ran second. The comparison is on the
+    median rather than the mean for the same reason, and the bound carries
+    headroom over the measured ratio because a shared machine is not a quiet
+    one.
+
+    Where the two cross depends on the data as well as the record count. On
+    clustered vectors of dim 768 it is between 10,000 and 15,000 records. On an
+    anisotropic corpus that resembles real embeddings a reranked quantized
+    search already reads 1.80 times an unquantized one at 10,000 records,
+    because the unquantized search converges faster there while the fetch does
+    not shrink. This fixture is clustered and sits below both.
+    """
+    pair = crossover_pair
+    queries = pair["queries"]
+    samples = {label: [] for label in pair["indexes"]}
+
+    for index in pair["indexes"].values():   # warm both before timing
+        for query in queries[:10]:
+            index.search(query, top_k=10)
+
+    for round_index in range(120):
+        query = queries[round_index % len(queries)]
+        for label, index in pair["indexes"].items():
+            start = time.perf_counter()
+            index.search(query, top_k=10)
+            samples[label].append(time.perf_counter() - start)
+
+    median = {label: sorted(values)[len(values) // 2]
+              for label, values in samples.items()}
+    assert median["quantized"] < median["raw"], (
+        f"the default quantized search is slower than an unquantized one at "
+        f"{CROSSOVER_RECORDS} records, {median['quantized'] * 1000:.3f} ms "
+        f"against {median['raw'] * 1000:.3f} ms")
+
+
+# ------------------------------------------------------------
+# Tests 119 and 120: recall where the corpus term sets the fetch
+# ------------------------------------------------------------
+CORPUS_TERM_DIM = 256
+CORPUS_TERM_RECORDS = 25000
+
+
+@pytest.fixture(scope="module", params=[50, 200], ids=["coarse", "fine"])
+def corpus_term_index(request):
+    """A quantized index at a size where the corpus term sets the fetch.
+
+    The floor of 250 candidates governs up to 12,500 records at top_k 10, so
+    25,000 records puts the corpus term in charge at 500 candidates. The two
+    parameters are two cluster structures over the same record count, because
+    what a fetch has to reach is the size of the group the codes cannot
+    separate and on clustered data that is the cluster. 50 clusters puts 500
+    records in one and 200 clusters puts 125, and the default has to hold
+    recall on both.
+
+    Measured at dim 768 over 100 queries, the 90th percentile depth of the
+    deepest true neighbour is 469 at 50 clusters and 461 at 200 clusters over
+    100,000 records, which is the same 500 records to a cluster. Recall at the
+    default measures 1.0000 on both.
+    """
+    clusters = request.param
+    dim, records, queries = CORPUS_TERM_DIM, CORPUS_TERM_RECORDS, 60
+
+    rng = np.random.default_rng(20260808)
+    centres = rng.standard_normal((clusters, dim))
+    points = centres[rng.integers(0, clusters, records)] + rng.standard_normal((records, dim))
+    data = (points / np.linalg.norm(points, axis=1, keepdims=True)).astype(np.float32)
+    ids = [f"t_{i}" for i in range(records)]
+
+    picks = rng.choice(records, queries, replace=False)
+    truth = [{ids[j] for j in row}
+             for row in np.argsort(-(data[picks] @ data.T), axis=1)[:, :10]]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        index = VectorDatabase().create(
+            "hnsw", dim=dim, expected_size=records,
+            quantization_config={"type": "pq", "training_size": 1000,
+                                 "storage_mode": "quantized_with_raw"},
+        )
+    for start in range(0, records, 5000):
+        stop = min(start + 5000, records)
+        assert index.add({"ids": ids[start:stop],
+                          "embeddings": data[start:stop]}).is_success()
+    assert index.is_quantized()
+
+    return {"index": index, "clusters": clusters,
+            "queries": [data[p] for p in picks], "truth": truth}
+
+
+def test_default_fetch_holds_recall_where_the_corpus_term_governs(corpus_term_index):
+    """The defaults hold recall at a size the floor does not reach.
+
+    Both cluster structures are covered because the required depth is set by
+    the data rather than by the record count. The default fetch of 500
+    candidates covers a 500 record cluster once and a 125 record cluster four
+    times, so the coarse parameter is the binding one and the fine one has
+    margin.
+
+    The bound sits below the measured level because the codebook is trained by
+    an unseeded k-means and a rebuild draws a different one, which moves a
+    quantized recall figure by about 0.013.
+    """
+    case = corpus_term_index
+    hits = 0
+    for query, truth in zip(case["queries"], case["truth"]):
+        hits += len({h["id"] for h in case["index"].search(query, top_k=10)} & truth)
+    recall = hits / (10.0 * len(case["queries"]))
+
+    assert recall > 0.95, (
+        f"the default fetch lost recall at {CORPUS_TERM_RECORDS} records over "
+        f"{case['clusters']} clusters: {recall}")
+
+
+# ------------------------------------------------------------
+# Test 118: the rerank fetch is calibrated at training completion
+# ------------------------------------------------------------
+CALIBRATION_DIM = 256
+CALIBRATION_TRAINING = 2000
+CALIBRATION_RECORDS = 8000
+
+
+def _calibration_vectors(n, dim, seed):
+    """Fifty Gaussian centres at sigma 1.0, then L2 normalised."""
+    rng = np.random.default_rng(seed)
+    centres = rng.standard_normal((50, dim))
+    points = centres[rng.integers(0, 50, n)] + rng.standard_normal((n, dim))
+    return (points / np.linalg.norm(points, axis=1, keepdims=True)).astype(np.float32)
+
+
+def _calibration_index(storage_mode="quantized_with_raw",
+                       records=CALIBRATION_RECORDS, seed=20260808):
+    data = _calibration_vectors(records, CALIBRATION_DIM, seed)
+    ids = [f"c_{i}" for i in range(records)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        index = VectorDatabase().create(
+            "hnsw", dim=CALIBRATION_DIM, expected_size=records,
+            quantization_config={"type": "pq",
+                                 "training_size": CALIBRATION_TRAINING,
+                                 "storage_mode": storage_mode})
+    assert index.add({"ids": ids, "embeddings": data}).is_success()
+    return index, ids, data
+
+
+@pytest.fixture(scope="module")
+def calibrated_index():
+    """One trained quantized_with_raw index, reused across the tests below."""
+    index, ids, data = _calibration_index()
+    assert index.is_quantized(), "training did not complete"
+    return {"index": index, "ids": ids, "data": data}
+
+
+def test_the_rerank_fetch_is_calibrated_at_training(calibrated_index):
+    """Training measures the fetch on its own records and reports it.
+
+    The calibration is a leave one out measurement over the training sample,
+    so what it can report is bounded by that sample rather than by the corpus.
+    The fetch it produces at the live record count is a separate figure and it
+    is larger, because the depth grows with the record count.
+    """
+    stats = calibrated_index["index"].get_stats()
+
+    assert stats["rerank_calibrated"] == "true"
+    assert int(stats["rerank_calibration_records"]) == CALIBRATION_TRAINING
+    assert int(stats["rerank_calibration_queries"]) > 0
+    assert float(stats["rerank_calibration_target_recall"]) == pytest.approx(0.99)
+    assert int(stats["rerank_calibration_ms"]) >= 0
+
+    measured = int(stats["rerank_calibration_fetch"])
+    assert 1 <= measured <= CALIBRATION_TRAINING, (
+        f"a fetch of {measured} cannot come from {CALIBRATION_TRAINING} records")
+
+    # On fifty clusters over 2,000 training records a cluster holds 40, so the
+    # measured depth is a small share of the sample rather than most of it.
+    assert measured < CALIBRATION_TRAINING // 2
+
+    # The reported default is what a search at top_k 10 will actually fetch,
+    # and it is above the measured value because there are four times as many
+    # records as the calibration saw.
+    assert int(stats["rerank_default_fetch"]) >= measured
+
+
+def test_the_calibrated_fetch_holds_recall(calibrated_index):
+    """The page the calibrated default returns is the page exact search returns.
+
+    The bound sits below the level the calibration targets because the codebook
+    is trained by an unseeded k-means and a draw moves a quantized recall figure
+    by about 0.013.
+    """
+    case = calibrated_index
+    index, ids, data = case["index"], case["ids"], case["data"]
+    rng = np.random.default_rng(4242)
+    picks = rng.choice(len(ids), 100, replace=False)
+    truth = np.argsort(-(data[picks] @ data.T), axis=1)[:, :10]
+
+    hits = 0
+    for row, pick in enumerate(picks):
+        found = {h["id"] for h in index.search(data[pick], top_k=10)}
+        hits += len(found & {ids[j] for j in truth[row]})
+    recall = hits / (10.0 * len(picks))
+
+    assert recall > 0.95, f"the calibrated default lost recall: {recall}"
+
+
+def test_an_explicit_rerank_overrides_the_calibration(calibrated_index):
+    """A named factor is a multiple of the page and the calibration is ignored.
+
+    A factor of 1 fetches ten candidates at top_k 10, which is far below the
+    calibrated fetch, so the page it returns is measurably worse. Zero returns
+    the ADC ordering, which is worse still.
+    """
+    case = calibrated_index
+    index, ids, data = case["index"], case["ids"], case["data"]
+    rng = np.random.default_rng(4243)
+    picks = rng.choice(len(ids), 60, replace=False)
+    truth = np.argsort(-(data[picks] @ data.T), axis=1)[:, :10]
+
+    def recall(**kwargs):
+        hits = 0
+        for row, pick in enumerate(picks):
+            found = {h["id"] for h in index.search(data[pick], top_k=10, **kwargs)}
+            hits += len(found & {ids[j] for j in truth[row]})
+        return hits / (10.0 * len(picks))
+
+    calibrated = recall()
+    narrow = recall(rerank=1)
+    off = recall(rerank=0)
+
+    assert narrow < calibrated - 0.05, (
+        f"rerank=1 did not override the calibration, {narrow} against {calibrated}")
+    assert off < calibrated - 0.05, (
+        f"rerank=0 did not turn reranking off, {off} against {calibrated}")
+
+
+def test_an_untrained_index_reports_no_calibration():
+    """A calibration exists only once training has produced a codebook."""
+    data = _calibration_vectors(500, CALIBRATION_DIM, 20260809)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        index = VectorDatabase().create(
+            "hnsw", dim=CALIBRATION_DIM, expected_size=CALIBRATION_RECORDS,
+            quantization_config={"type": "pq",
+                                 "training_size": CALIBRATION_TRAINING,
+                                 "storage_mode": "quantized_with_raw"})
+    assert index.add({"ids": [f"u_{i}" for i in range(500)],
+                      "embeddings": data}).is_success()
+    assert not index.is_quantized()
+
+    stats = index.get_stats()
+    assert stats["rerank_calibrated"] == "false"
+    assert "rerank_calibration_fetch" not in stats
+
+    # The fallback is the largest of the corpus term, the floor and the page
+    # term, which at 500 records is the floor.
+    assert int(stats["rerank_default_fetch"]) == 250
+
+
+def test_quantized_only_is_not_calibrated():
+    """quantized_only never reranks, so it is not calibrated and pays nothing."""
+    index, _, _ = _calibration_index(storage_mode="quantized_only",
+                                     records=CALIBRATION_TRAINING + 500)
+    assert index.is_quantized()
+
+    stats = index.get_stats()
+    assert stats["rerank_calibrated"] == "false"
+    assert "rerank_calibration_ms" not in stats
+
+
+def test_the_calibration_survives_a_save_and_load(tmp_path, calibrated_index):
+    """The measurement is stored with the index rather than recomputed."""
+    index = calibrated_index["index"]
+    before = index.get_stats()
+    path = str(tmp_path / "calibrated.zdb")
+    index.save(path)
+
+    loaded = VectorDatabase().load(path)
+    after = loaded.get_stats()
+
+    for key in ("rerank_calibrated", "rerank_calibration_fetch",
+                "rerank_calibration_records", "rerank_calibration_queries",
+                "rerank_calibration_target_recall"):
+        assert after[key] == before[key], f"{key} did not survive the round trip"
+
+
+def test_an_index_saved_without_a_calibration_loads_and_uses_the_fallback(
+        tmp_path, calibrated_index):
+    """A directory written before the calibration existed still opens.
+
+    quantization.json gained one field. Removing it reproduces a directory
+    written by an earlier build, which has to load, search, and take the corpus
+    term the way that build did.
+    """
+    import json
+
+    path = tmp_path / "legacy.zdb"
+    calibrated_index["index"].save(str(path))
+
+    quant_path = path / "quantization.json"
+    payload = json.loads(quant_path.read_text())
+    assert payload.pop("rerank_calibration", None) is not None, (
+        "the field this test removes was not written")
+    quant_path.write_text(json.dumps(payload, indent=2))
+
+    loaded = VectorDatabase().load(str(path))
+    stats = loaded.get_stats()
+    assert stats["rerank_calibrated"] == "false"
+
+    # The fallback at this record count is the floor of 250, since the corpus
+    # term reaches it only at 12,500 records.
+    assert int(stats["rerank_default_fetch"]) == 250
+
+    data = calibrated_index["data"]
+    ids = calibrated_index["ids"]
+    page = loaded.search(data[0], top_k=5)
+    assert len(page) == 5
+    assert page[0]["id"] == ids[0]
+
+
+def test_the_calibration_reports_the_points_it_fitted(calibrated_index):
+    """The exponent is fitted over fractions of the sample, and they are shown.
+
+    One fetch per quarter of the training sample, the last of them being the
+    fetch over the whole of it, each no deeper than the records it was measured
+    over. Those four numbers are what the reported exponent comes from.
+    """
+    stats = calibrated_index["index"].get_stats()
+
+    fitted = [int(part) for part in stats["rerank_calibration_fit_fetches"].split(",")]
+    assert len(fitted) == 4, f"expected four fitting points, got {fitted}"
+    assert fitted[-1] == int(stats["rerank_calibration_fetch"])
+
+    sample = int(stats["rerank_calibration_records"])
+    for position, measured in enumerate(fitted, start=1):
+        bound = sample * position // 4
+        assert 1 <= measured <= bound, (
+            f"a fetch of {measured} cannot come from {bound} records")
+
+    exponent = float(stats["rerank_calibration_exponent"])
+    assert 0.40 <= exponent <= 1.00, f"exponent {exponent} escaped the clamp"
+
+
+def test_the_calibration_holds_recall_on_records_that_arrive_in_order():
+    """Records grouped by cluster are the case the seeded shuffle exists for.
+
+    Training fires on the record that reaches training_size, so an insertion
+    order that groups the corpus puts a slice of it in the codebook and in the
+    calibration. Here the first 2,000 of 8,000 records are twelve of the fifty
+    clusters. The sample is shuffled before either reads it, so the fractions
+    the exponent is fitted over are random draws over that slice rather than
+    narrower slices again, and the fetch the calibration produces still holds
+    recall over the whole corpus.
+
+    The bound matches the sibling test on randomly ordered records, because a
+    codebook fitted per contiguous coordinate slice depends on the per
+    coordinate marginals rather than on the joint distribution.
+    """
+    records = CALIBRATION_RECORDS
+    rng = np.random.default_rng(20260810)
+    centres = rng.standard_normal((50, CALIBRATION_DIM))
+    labels = np.sort(rng.integers(0, 50, records))
+    points = centres[labels] + rng.standard_normal((records, CALIBRATION_DIM))
+    data = (points / np.linalg.norm(points, axis=1, keepdims=True)).astype(np.float32)
+    ids = [f"o_{i}" for i in range(records)]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        index = VectorDatabase().create(
+            "hnsw", dim=CALIBRATION_DIM, expected_size=records,
+            quantization_config={"type": "pq",
+                                 "training_size": CALIBRATION_TRAINING,
+                                 "storage_mode": "quantized_with_raw"})
+    assert index.add({"ids": ids, "embeddings": data}).is_success()
+    assert index.is_quantized(), "training did not complete"
+
+    # The training sample really is a slice: the first CALIBRATION_TRAINING
+    # records hold well under half of the clusters.
+    assert len(set(labels[:CALIBRATION_TRAINING].tolist())) < 25
+
+    stats = index.get_stats()
+    assert stats["rerank_calibrated"] == "true"
+
+    picks = rng.choice(records, 100, replace=False)
+    truth = np.argsort(-(data[picks] @ data.T), axis=1)[:, :10]
+    hits = 0
+    for row, pick in enumerate(picks):
+        found = {h["id"] for h in index.search(data[pick], top_k=10)}
+        hits += len(found & {ids[j] for j in truth[row]})
+    recall = hits / (10.0 * len(picks))
+
+    assert recall > 0.95, (
+        f"the calibrated default lost recall on ordered records: {recall}, "
+        f"fetch {stats['rerank_default_fetch']}")
+
+
+# ------------------------------------------------------------
+# Test 119: the low dimension warning
+# ------------------------------------------------------------
+def test_quantization_warns_where_the_dimension_cannot_repay():
+    """The warning fires where the saving is below a fifth and not above it.
+
+    The bar is the share, so the dimension it fires below differs by storage
+    mode. quantized_with_raw replaces one copy of the vector and crosses a
+    fifth at dim 235. quantized_only replaces both and crosses at dim 88.
+    """
+    vdb = VectorDatabase()
+    phrase = "less memory than an unquantized index over the same records"
+
+    with pytest.warns(UserWarning, match=r"At dim=128 a trained "
+                                         r"quantized_with_raw index holds about"):
+        vdb.create("hnsw", dim=128, expected_size=100_000,
+                   quantization_config={"type": "pq",
+                                        "storage_mode": "quantized_with_raw"})
+
+    # Above the crossing the same mode is silent.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        vdb.create("hnsw", dim=256, expected_size=100_000,
+                   quantization_config={"type": "pq",
+                                        "storage_mode": "quantized_with_raw"})
+    assert not [w for w in caught if phrase in str(w.message)]
+
+    # quantized_only saves more at the same dimension, so it clears the bar at
+    # 128 where quantized_with_raw does not, and it still warns at 64.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        vdb.create("hnsw", dim=128, expected_size=100_000,
+                   quantization_config={"type": "pq",
+                                        "storage_mode": "quantized_only"})
+    assert not [w for w in caught if phrase in str(w.message)]
+
+    with pytest.warns(UserWarning, match=r"At dim=64 a trained quantized_only"):
+        vdb.create("hnsw", dim=64, expected_size=100_000,
+                   quantization_config={"type": "pq",
+                                        "storage_mode": "quantized_only"})
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        vdb.create("hnsw", dim=1536, expected_size=100_000,
+                   quantization_config={"type": "pq",
+                                        "storage_mode": "quantized_only"})
+    assert not [w for w in caught if phrase in str(w.message)]
+
+
+def test_the_memory_saving_share_matches_the_measured_sweep():
+    """The arithmetic the threshold is derived from reproduces the sweep.
+
+    Measured at 25,000 records and m 32, one dimension per process. The bound
+    is loose because a resident set reading carries a few MiB of allocator
+    slack either way, and the arithmetic is a per record model with no term
+    for that.
+    """
+    vdb = VectorDatabase()
+    measured = {64: 0.0301, 96: 0.1151, 128: 0.1647, 192: 0.1934,
+                256: 0.2363, 384: 0.2469, 768: 0.2988, 1536: 0.3614}
+
+    for dim, saving in measured.items():
+        subvectors = vdb._default_subvectors(dim)
+        modelled = vdb._memory_saving_share(dim, subvectors, "quantized_with_raw")
+        assert abs(modelled - saving) < 0.07, (
+            f"dim {dim}: modelled {modelled:.4f} against measured {saving:.4f}")
+
+    # The bar is where the model crosses one fifth, which the measured column
+    # brackets between dim 192 and dim 256 for quantized_with_raw.
+    assert vdb._memory_saving_share(192, 8, "quantized_with_raw") < 0.20
+    assert vdb._memory_saving_share(256, 8, "quantized_with_raw") > 0.20
+
+    # quantized_only replaces both copies, so it crosses far lower.
+    assert vdb._memory_saving_share(64, 8, "quantized_only") < 0.20
+    assert vdb._memory_saving_share(128, 8, "quantized_only") > 0.20

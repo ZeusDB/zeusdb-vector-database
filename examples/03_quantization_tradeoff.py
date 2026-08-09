@@ -1,10 +1,29 @@
 """Measure what product quantization costs you, on your own machine.
 
-Quantization is a memory decision that costs accuracy. The size of that cost is
-much larger than most people expect, and one of the two storage modes cannot
-recover it at all. This file builds the same 3,000 vectors three ways, measures
-the memory each holds and the recall each returns against exact search, and
-prints the comparison.
+Quantization is a memory decision that costs accuracy, and above roughly 10,000
+records it costs query time as well. The size of the accuracy cost is much
+larger than most people expect, and one of the two storage modes cannot recover
+it at all. This file builds the same 3,000 vectors three ways, measures the
+memory each holds and the recall each returns against exact search, and prints
+the comparison.
+
+At 3,000 records the reranked quantized search is still faster than an
+unquantized one. It stops being faster somewhere above that, because the rerank
+fetch grows with the corpus and the graph traversal has to be as wide as the
+fetch. Where it stops depends on your data. On clustered vectors of dimension
+768 it is between 10,000 and 15,000 records, and on real OpenAI embeddings it is
+near 11,000. See the README for the measured tables.
+
+How deep the fetch has to go is measured on your own data when training
+completes, not set by a formula, so `get_stats()["rerank_default_fetch"]` tells
+you what each search is paying for. The measurement runs over a seeded random
+draw of the training sample rather than the order your records arrived in, and
+it is repeated at a quarter, a half and three quarters of that sample so the
+fetch can be scaled to a corpus larger than the one it was measured on. This
+file runs at dimension 64, where
+`create()` warns that quantization removes only a few percent of what an
+unquantized index holds. That warning is the point of the file rather than a
+problem with it.
 
 The short version, which the numbers below reproduce every run. Use
 `quantized_with_raw` and leave rerank on, or do not quantize.
@@ -118,12 +137,22 @@ def main():
     # and bits. They do not move as records arrive, and at this record count
     # they are larger than everything the records themselves hold, which is why
     # they are in the total rather than left out of it.
+    # get_stats() reports the codes, the raw vectors, the codebook and the
+    # table. It does not report the graph, and the graph owns a second copy of
+    # every point. That copy is dim * 4 bytes in an unquantized index and
+    # subvectors bytes in a quantized one, in both storage modes, so it is
+    # computed here rather than read. Leaving it out is what made an earlier
+    # version of this file claim that quantized_with_raw stores more than an
+    # unquantized index. It does not, once the graph is counted and the record
+    # count clears the fixed cost.
     print("stored per mode")
     print(f"  {'mode':<20s} {'raw':>6s} {'codes':>6s} {'raw MB':>7s} {'code MB':>8s} "
-          f"{'fixed MB':>9s} {'total':>6s}")
+          f"{'fixed MB':>9s} {'graph MB':>9s} {'total':>6s}")
     unquantized_mb = RECORDS * DIM * 4 / 1024 / 1024
+    graph_quantized_mb = RECORDS * PQ["subvectors"] / 1024 / 1024
     print(f"  {'no quantization':<20s} {RECORDS:>6d} {0:>6d} "
-          f"{unquantized_mb:>7.2f} {0.0:>8.2f} {0.0:>9.2f} {unquantized_mb:>6.2f}")
+          f"{unquantized_mb:>7.2f} {0.0:>8.2f} {0.0:>9.2f} {unquantized_mb:>9.2f} "
+          f"{2 * unquantized_mb:>6.2f}")
     for label, index in (("quantized_only", only), ("quantized_with_raw", with_raw)):
         stats = index.get_stats()
         raw_mb = megabytes(stats, "raw_vectors_memory_mb")
@@ -133,14 +162,16 @@ def main():
         print(
             f"  {label:<20s} {stats['raw_vectors_stored']:>6s} "
             f"{stats['quantized_codes_stored']:>6s} "
-            f"{raw_mb:>7.2f} {code_mb:>8.2f} {fixed_mb:>9.2f} "
-            f"{raw_mb + code_mb + fixed_mb:>6.2f}"
+            f"{raw_mb:>7.2f} {code_mb:>8.2f} {fixed_mb:>9.2f} {graph_quantized_mb:>9.2f} "
+            f"{raw_mb + code_mb + fixed_mb + graph_quantized_mb:>6.2f}"
         )
     print()
-    print("quantized_only holds codes alone, the training records included, yet")
-    print("at this size it still costs more than no quantization at all, because")
-    print("the fixed table is paid whether you hold 3,000 records or 3 million.")
-    print("quantized_with_raw stores more than an unquantized index, not less.")
+    print("Both modes drop the graph's full width copy of every point, so both")
+    print("save there. At 3,000 vectors of 64 dimensions that copy is 0.73 MB and")
+    print("the fixed table is 1.06 MB, so neither mode has repaid the fixed cost")
+    print("yet. The fixed cost does not grow with the record count and the saving")
+    print("does, so both cross into saving as the index grows, quantized_only")
+    print("first because it drops the raw vectors as well.")
     print()
 
     # ------------------------------------------------------------------
@@ -201,15 +232,17 @@ EXPECTED_OUTPUT = """\
 compression ratio: 32x
 
 stored per mode
-  mode                    raw  codes  raw MB  code MB  fixed MB  total
-  no quantization        3000      0    0.73     0.00      0.00   0.73
-  quantized_only            0   3000    0.00     0.02      1.06   1.08
-  quantized_with_raw     3000   3000    0.73     0.02      1.06   1.81
+  mode                    raw  codes  raw MB  code MB  fixed MB  graph MB  total
+  no quantization        3000      0    0.73     0.00      0.00      0.73   1.46
+  quantized_only            0   3000    0.00     0.02      1.06      0.02   1.10
+  quantized_with_raw     3000   3000    0.73     0.02      1.06      0.02   1.83
 
-quantized_only holds codes alone, the training records included, yet
-at this size it still costs more than no quantization at all, because
-the fixed table is paid whether you hold 3,000 records or 3 million.
-quantized_with_raw stores more than an unquantized index, not less.
+Both modes drop the graph's full width copy of every point, so both
+save there. At 3,000 vectors of 64 dimensions that copy is 0.73 MB and
+the fixed table is 1.06 MB, so neither mode has repaid the fixed cost
+yet. The fixed cost does not grow with the record count and the saving
+does, so both cross into saving as the index grows, quantized_only
+first because it drops the raw vectors as well.
 
 recall@10 against exact cosine search
   no quantization                    good  1.00
