@@ -2432,6 +2432,15 @@ def test_index_saved_at_the_old_subvectors_default_loads_and_searches(tmp_path):
 CROSSOVER_DIM = 1536
 CROSSOVER_RECORDS = 3000
 
+# Ratio of quantized to unquantized median query time this fixture is allowed to
+# reach. A quiet machine measures 0.73 here, and a shared runner has been seen at
+# 1.04, so the bound is set at 1.5 to leave room for a loaded runner while still
+# failing on a fetch default that has gone materially wrong. The fetch below the
+# crossover is the floor of 250 candidates, and the next step up in the corpus
+# term, being 1,000 candidates at 50,000 records, reads 2.19 times an unquantized
+# search on this shape of data.
+CROSSOVER_MAX_TIME_RATIO = 1.5
+
 
 @pytest.fixture(scope="module")
 def crossover_pair():
@@ -2506,21 +2515,26 @@ def test_default_fetch_holds_recall_below_the_crossover(crossover_pair):
 
 
 def test_default_quantized_search_is_not_slower_below_the_crossover(crossover_pair):
-    """Below the crossover the defaults are a memory saving that costs no time.
+    """Below the crossover the defaults cost roughly what an unquantized index does.
 
-    Above it they are not, and that is the property this test pins to a size.
-    The fetch is a share of the corpus, the traversal widens to the fetch
-    because HNSW cannot return more results than its candidate list holds, and
-    an HNSW search costs roughly linear time in that width. So a reranked
+    Above it they cost a multiple of it, and that is the property this test pins
+    to a size. The fetch is a share of the corpus, the traversal widens to the
+    fetch because HNSW cannot return more results than its candidate list holds,
+    and an HNSW search costs roughly linear time in that width. So a reranked
     quantized search costs time proportional to the record count where an
     unquantized one costs time proportional to its logarithm, and the two cross
     once.
 
-    Timed round robin, one query to each index in turn, so a load spike lands
-    on both rather than on whichever ran second. The comparison is on the
-    median rather than the mean for the same reason, and the bound carries
-    headroom over the measured ratio because a shared machine is not a quiet
-    one.
+    What is asserted is the ratio of the two medians against
+    CROSSOVER_MAX_TIME_RATIO, not that one is faster than the other. A quiet
+    machine measures 0.73 here and a shared runner has read 1.04, so an
+    assertion that the quantized search wins is an assertion about the runner
+    rather than about the fetch. The bound is 1.5, which a fetch several times
+    the floor would break and a loaded runner will not.
+
+    Timed round robin, one query to each index in turn, so a load spike lands on
+    both rather than on whichever ran second, and compared on the median rather
+    than the mean for the same reason.
 
     Where the two cross depends on the data as well as the record count. On
     clustered vectors of dim 768 it is between 10,000 and 15,000 records. On an
@@ -2546,10 +2560,13 @@ def test_default_quantized_search_is_not_slower_below_the_crossover(crossover_pa
 
     median = {label: sorted(values)[len(values) // 2]
               for label, values in samples.items()}
-    assert median["quantized"] < median["raw"], (
-        f"the default quantized search is slower than an unquantized one at "
-        f"{CROSSOVER_RECORDS} records, {median['quantized'] * 1000:.3f} ms "
-        f"against {median['raw'] * 1000:.3f} ms")
+    ratio = median["quantized"] / median["raw"]
+    assert ratio < CROSSOVER_MAX_TIME_RATIO, (
+        f"the default quantized search costs {ratio:.3f} times an unquantized "
+        f"one at {CROSSOVER_RECORDS} records, against a bound of "
+        f"{CROSSOVER_MAX_TIME_RATIO}, being "
+        f"{median['quantized'] * 1000:.3f} ms against "
+        f"{median['raw'] * 1000:.3f} ms")
 
 
 # ------------------------------------------------------------
