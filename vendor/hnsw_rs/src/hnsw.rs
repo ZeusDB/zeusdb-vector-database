@@ -392,6 +392,10 @@ impl LayerGenerator {
     }
 
     // new when we know scale used. Should replace the one without scale
+    // ZeusDB patch. Its one caller, the reload, now uses
+    // `new_with_absolute_scale`. Kept rather than deleted so that reapplying
+    // the patches after an upgrade is a matter of adding rather than removing.
+    #[allow(dead_code)]
     pub(crate) fn new_with_scale(
         max_nb_connection: usize,
         scale_factor: f64,
@@ -402,6 +406,21 @@ impl LayerGenerator {
             rng: Arc::new(Mutex::new(StdRng::seed_from_u64(DEFAULT_LEVEL_SEED))),
             unif: Uniform::<f64>::new(0., 1.).unwrap(),
             scale: scale_default * scale_factor,
+            maxlevel,
+        }
+    }
+
+    /// ZeusDB patch. Build a generator whose scale is the given value itself.
+    ///
+    /// `new_with_scale` takes a modification factor and multiplies the default
+    /// scale by it, while a dump stores the scale the generator held. Deriving
+    /// the factor and letting the constructor undo it does not round trip, so
+    /// the reload sets the value directly. See vendor/hnsw_rs/ZEUSDB-PATCH.md.
+    pub(crate) fn new_with_absolute_scale(scale: f64, maxlevel: usize) -> Self {
+        LayerGenerator {
+            rng: Arc::new(Mutex::new(StdRng::seed_from_u64(DEFAULT_LEVEL_SEED))),
+            unif: Uniform::<f64>::new(0., 1.).unwrap(),
+            scale,
             maxlevel,
         }
     }

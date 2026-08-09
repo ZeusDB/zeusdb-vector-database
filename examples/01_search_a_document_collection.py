@@ -116,8 +116,9 @@ def main():
         print("saved files:", sorted(os.listdir(path)))
         print()
 
-        # load() rebuilds the graph from the stored records, so it costs roughly
-        # what the original insert cost rather than what the directory weighs.
+        # load() reads the saved graph back rather than rebuilding it, so it
+        # costs what the directory weighs rather than what the original insert
+        # cost, and the reopened index answers exactly as this one does.
         reopened = VectorDatabase().load(path)
 
     print("reopened:", reopened.get_vector_count(), "documents")

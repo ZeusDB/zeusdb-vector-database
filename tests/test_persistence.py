@@ -1,6 +1,7 @@
 """Saving an index to disk and loading it back."""
 
 import json
+import os
 import shutil
 import struct
 import warnings
@@ -131,7 +132,7 @@ def quantized_only_saved(tmp_path_factory):
     in this file, so the directory is shared. Any test that modifies it copies
     it first. Every record is stored as codes alone, since the mode releases
     the training records' raw vectors at training completion, so the directory
-    carries no vectors.bin and the loader rebuilds everything from the codes.
+    carries no vectors.bin and the codes are the only copy of every record.
     """
     vdb = VectorDatabase()
     index = vdb.create("hnsw", dim=8,
@@ -167,10 +168,9 @@ def test_persistence_vector_equality_by_space(tmp_path, space):
 
     The rule is not the same for every space, so it is established here rather
     than assumed. add() runs process_vector_for_space, which normalizes on the
-    cosine path and returns the vector untouched on l1 and l2. The load path
-    rebuilds the index by re-adding the saved vectors through add(), so cosine
-    vectors are normalized a second time and land within one float32 step of
-    where they started, while l1 and l2 vectors come back bit for bit.
+    cosine path and returns the vector untouched on l1 and l2. What the load
+    path returns is the stored vector as it was written, bit for bit, in every
+    space, because vectors.bin is restored verbatim.
     """
     vdb = VectorDatabase()
     index = vdb.create("hnsw", dim=8, space=space, expected_size=50)
@@ -214,9 +214,9 @@ def test_persistence_vector_equality_by_space(tmp_path, space):
             # Stored form is the normalized input, not the input itself.
             assert np.allclose(stored_before, _normalize(vectors[i]), atol=1e-6)
             assert not np.array_equal(stored_before, vectors[i].astype(np.float64))
-            # The reload renormalizes, so equality holds to float32 precision
-            # rather than exactly. One float32 step near 1.0 is about 1.2e-07.
-            assert np.allclose(stored_before, stored_after, atol=1e-6)
+            # And the stored form comes back exactly, because vectors.bin is
+            # restored as written and nothing normalizes it a second time.
+            assert np.array_equal(stored_before, stored_after)
         else:
             # l1 and l2 do not normalize, so the stored vector is the input and
             # the reload is bit for bit.
@@ -427,12 +427,13 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
     assert manifest["total_size_mb"] > 0
 
     # files_included is the inventory the loader reads back, and it is a strict
-    # subset of what is on disk. The graph data file is deliberately excluded.
+    # subset of what is on disk. Both graph files are in it, because the loader
+    # restores the saved graph and cannot do that without the points.
     assert manifest["files_included"] == [
         "config.json", "mappings.bin", "metadata.json", "vectors.bin",
-        "hnsw_index.hnsw.graph",
+        "hnsw_index.hnsw.graph", "hnsw_index.hnsw.data",
     ]
-    assert manifest["files_excluded"] == ["hnsw_index.hnsw.data"]
+    assert manifest["files_excluded"] == []
     assert set(manifest["files_included"]).issubset(on_disk)
     assert set(manifest["files_excluded"]).issubset(on_disk)
 
@@ -517,7 +518,8 @@ def test_persistence_quantized_with_raw_round_trip(tmp_path):
     assert set(after_by_id) == {"v_0", "v_1050"}
     for vec_id in ("v_0", "v_1050"):
         assert after_by_id[vec_id]["metadata"] == before_by_id[vec_id]["metadata"]
-        # Cosine renormalizes on the rebuild, so this holds to float32 precision.
+        # The reconstruction a loaded index returns is the reconstruction the
+        # live index returned, since the codes are restored as written.
         assert np.allclose(after_by_id[vec_id]["vector"],
                            before_by_id[vec_id]["vector"], atol=1e-6)
 
@@ -540,11 +542,11 @@ def test_persistence_quantized_with_raw_round_trip(tmp_path):
 def test_persistence_untrained_pq_index(tmp_path):
     """A PQ index saved mid collection resumes where it left off.
 
-    The collected ids are applied after the graph rebuild rather than before it,
-    because the rebuild re-adds every record through add(overwrite=true) and the
-    removal half of that strips each id from the collection. The reloaded index
-    also gets a PQ instance even though nothing is trained yet, without which
-    the training trigger could never fire again.
+    The collected ids are applied after the graph step rather than before it,
+    because the fallback rebuild re-adds every record through add(overwrite=true)
+    and the removal half of that strips each id from the collection. The reloaded
+    index also gets a PQ instance even though nothing is trained yet, without
+    which the training trigger could never fire again.
     """
     vdb = VectorDatabase()
     index = vdb.create("hnsw", dim=8,
@@ -641,11 +643,11 @@ def test_persistence_quantized_only_round_trip(quantized_only_saved):
     """Every record comes back, including the ones stored as codes alone.
 
     A trained quantized_only index holds no raw vectors, so its directory has
-    pq_codes.bin and no vectors.bin at all. The loader rebuilds the graph by
-    inserting those stored codes into a PQ graph, so every record is covered,
-    nothing is reconstructed to full width on the way, and the loaded index is
-    quantized exactly as the saved one was. The stored codes are put back as
-    written rather than recomputed, and no record is promoted to raw storage,
+    pq_codes.bin and no vectors.bin at all. The loader restores the PQ graph the
+    save dumped, so every record is covered, nothing is reconstructed to full
+    width on the way, and the loaded index is quantized exactly as the saved one
+    was. The stored codes are put back as written rather than recomputed, and no
+    record is promoted to raw storage,
     so the mode keeps the memory saving that is its whole purpose.
     """
     vdb = VectorDatabase()
@@ -700,7 +702,7 @@ def test_persistence_quantized_only_round_trip(quantized_only_saved):
     assert int(loaded.get_stats()["quantized_codes_stored"]) == QO_COUNT
     assert len(loaded.get_records(ids)) == QO_COUNT
 
-    # And the result of that rebuild survives a further round trip.
+    # And that state survives a further round trip.
     second = save_dir.parent / "qo_rebuilt.zdb"
     loaded.save(str(second))
     again = vdb.load(str(second))
@@ -1017,11 +1019,11 @@ def test_persistence_load_failure_modes(tmp_path):
 def test_load_refuses_a_saved_index_holding_a_non_finite_value(tmp_path):
     """A NaN could reach disk before add validated the NumPy branches.
 
-    The rebuild replays every record through add(), which has always refused a
-    non-finite value on the list path, and add() reports rather than raises.
-    The rebuild ignored that report, and the storage maps are written back
-    afterwards from the file, so the count check still agreed and the load
-    succeeded holding records that no query could reach. It now fails.
+    The guard is in the loader rather than in the graph rebuild. The rebuild
+    used to catch this by replaying every record through add(), which refuses a
+    non-finite value, but the loader now restores the saved graph and the
+    rebuild does not run. vectors.bin is checked as it is read, so the refusal
+    holds whichever graph path the directory takes.
 
     The directory is poisoned by patching the float in vectors.bin, because
     add() no longer accepts one, which is the point of the other half of this
@@ -1042,8 +1044,17 @@ def test_load_refuses_a_saved_index_holding_a_non_finite_value(tmp_path):
     assert blob.count(marker) == 1
     vectors_bin.write_bytes(blob.replace(marker, struct.pack("<f", float("nan"))))
 
-    with pytest.raises(RuntimeError, match="Graph rebuild refused"):
+    with pytest.raises(RuntimeError, match="holds a NaN or an infinity"):
         vdb.load(str(save_dir))
+
+    # The same refusal when the graph is rebuilt rather than restored, so the
+    # guard does not depend on which path the load takes.
+    os.environ["ZEUSDB_LOAD_REBUILD_GRAPH"] = "1"
+    try:
+        with pytest.raises(RuntimeError, match="holds a NaN or an infinity"):
+            vdb.load(str(save_dir))
+    finally:
+        del os.environ["ZEUSDB_LOAD_REBUILD_GRAPH"]
 
 # ------------------------------------------------------------
 # Shared fixture for the quantized reload coverage
@@ -1113,11 +1124,33 @@ def quantized_reload(request, tmp_path_factory):
         "rerank0": _reload_recall(index, ids, queries, truth, rerank=0),
     }
 
+    pages_before = _pages(index, queries)
+
     save_dir = tmp_path_factory.mktemp(f"reload_{mode}") / "idx.zdb"
     index.save(str(save_dir))
 
     return {"mode": mode, "path": save_dir, "ids": ids, "data": data,
-            "queries": queries, "truth": truth, "recall_before": recall_before}
+            "queries": queries, "truth": truth, "recall_before": recall_before,
+            "pages_before": pages_before}
+
+
+def _pages(index, queries, top_k=10, **search_kwargs):
+    """Result pages as ids paired with the exact float32 bits of each score."""
+    return [
+        [(r["id"], np.float32(r["score"]).tobytes())
+         for r in index.search(q.tolist(), top_k=top_k, **search_kwargs)]
+        for q in queries
+    ]
+
+
+def _page_differences(left, right):
+    """(pages whose ids differ, pages whose scores differ) between two runs."""
+    assert len(left) == len(right)
+    ids_differ = sum(1 for a, b in zip(left, right)
+                     if [x[0] for x in a] != [x[0] for x in b])
+    scores_differ = sum(1 for a, b in zip(left, right)
+                        if [x[0] for x in a] == [x[0] for x in b] and a != b)
+    return ids_differ, scores_differ
 
 # ------------------------------------------------------------
 # Test 101: a trained quantized index loads back quantized
@@ -1125,12 +1158,12 @@ def quantized_reload(request, tmp_path_factory):
 def test_quantized_index_loads_back_quantized(quantized_reload):
     """The state, the records and the recall all survive the round trip.
 
-    The loader rebuilds the graph by inserting the stored PQ codes into a PQ
-    graph, so the reloaded index reports quantized_active rather than
-    raw_trained_not_rebuilt and searches through ADC exactly as it did before
-    the save. Insertion order on load follows HashMap iteration rather than
-    arrival order, so the graph need not be identical, and the recall bound
-    below is a tolerance rather than an equality for that reason.
+    The loader restores the PQ graph the save dumped, so the reloaded index
+    reports quantized_active rather than raw_trained_not_rebuilt and searches
+    through ADC exactly as it did before the save. The recall bound below is a
+    tolerance rather than an equality because it also has to hold on the
+    fallback rebuild, which wires a different graph over the same codes. Test
+    106 asserts the equality that the restored path actually delivers.
     """
     fixture = quantized_reload
     loaded = VectorDatabase().load(str(fixture["path"]))
@@ -1234,9 +1267,11 @@ def test_reload_preserves_m_against_a_changed_default(tmp_path):
     carry its own m rather than pick one up at load time.
 
     An index declared at 30,000 records built before the change holds m 16.
-    Loading it must rebuild the graph at 16, because rebuilding at the new
-    default of 32 would change the index under a user who only asked to open
-    it, and would cost memory and load time they did not agree to.
+    Loading it must carry 16 forward, because taking the new default of 32
+    would change the index under a user who only asked to open it, and would
+    cost memory and load time they did not agree to. It is also what the graph
+    dump is checked against, so an index that lost its m would rebuild rather
+    than restore.
     """
     vdb = VectorDatabase()
 
@@ -1300,3 +1335,224 @@ def test_manifest_compression_ratio_is_mode_independent(quantized_reload):
     # having it in the manifest at all.
     loaded = VectorDatabase().load(str(quantized_reload["path"]))
     assert loaded.get_quantization_info()["compression_ratio"] == pytest.approx(expected)
+
+# ------------------------------------------------------------
+# Test 106: the round trip is exact, not merely close
+# ------------------------------------------------------------
+def test_round_trip_returns_identical_ids_and_scores(quantized_reload):
+    """Every page comes back with the same ids and the same score bits.
+
+    The loader restores the graph the save dumped instead of rebuilding it by
+    re-inserting every record, so the reloaded index is the saved index rather
+    than another index over the same data. Scores are compared as raw float32
+    bytes, because the defect this replaces moved them by one unit in the last
+    place while leaving the ids alone.
+    """
+    fixture = quantized_reload
+    loaded = VectorDatabase().load(str(fixture["path"]))
+    after = _pages(loaded, fixture["queries"])
+
+    ids_differ, scores_differ = _page_differences(fixture["pages_before"], after)
+    assert ids_differ == 0, f"{ids_differ} pages returned different ids"
+    assert scores_differ == 0, f"{scores_differ} pages returned different scores"
+    assert after == fixture["pages_before"]
+
+
+def test_round_trip_is_exact_without_quantization(tmp_path):
+    """The same equality on a raw index, where the drift used to appear.
+
+    An unquantized search scores against the graph's own copy of each vector.
+    The rebuild put that copy through add(), which normalises, so a vector that
+    was already unit length was normalised twice and every score moved by one
+    unit in the last place. Restoring the dump takes the copy the save wrote.
+    """
+    vectors = _clustered_unit_vectors(600, 32, 20260809)
+    queries = _clustered_unit_vectors(40, 32, 917)
+    ids = [f"v_{i}" for i in range(len(vectors))]
+
+    index = VectorDatabase().create("hnsw", dim=32, expected_size=600)
+    assert index.add({"ids": ids, "embeddings": vectors}).is_success()
+    before = _pages(index, queries)
+
+    save_dir = tmp_path / "exact.zdb"
+    index.save(str(save_dir))
+    loaded = VectorDatabase().load(str(save_dir))
+
+    assert _pages(loaded, queries) == before
+    assert loaded.get_stats()["graph_nodes"] == index.get_stats()["graph_nodes"]
+
+# ------------------------------------------------------------
+# Test 107: two loads of one directory agree with each other
+# ------------------------------------------------------------
+def test_two_loads_of_one_directory_agree(quantized_reload):
+    """Loading twice gives one answer rather than two.
+
+    The rebuild inserted records in hash map order, which varies between
+    processes and between two calls in one process, so two loads of the same
+    directory used to disagree on some pages. Nothing iterates a map to insert
+    any more.
+    """
+    fixture = quantized_reload
+    first = _pages(VectorDatabase().load(str(fixture["path"])), fixture["queries"])
+    second = _pages(VectorDatabase().load(str(fixture["path"])), fixture["queries"])
+
+    assert _page_differences(first, second) == (0, 0)
+    assert first == second
+
+
+def test_save_after_load_rewrites_the_same_graph(quantized_reload, tmp_path):
+    """A load, a save and a second load return the same pages again.
+
+    The vendored dump refuses to overwrite its own files when the graph it
+    holds may be memory mapped, and mints a basename with a random suffix
+    instead. The loader takes the entry point that leaves that flag clear, so a
+    saved index keeps one pair of graph files however many times it is saved.
+    """
+    fixture = quantized_reload
+    first = VectorDatabase().load(str(fixture["path"]))
+    again = tmp_path / "again.zdb"
+    first.save(str(again))
+
+    names = sorted(p.name for p in again.iterdir() if ".hnsw." in p.name)
+    assert names == ["hnsw_index.hnsw.data", "hnsw_index.hnsw.graph"]
+
+    second = VectorDatabase().load(str(again))
+    assert _pages(second, fixture["queries"]) == fixture["pages_before"]
+
+    # The graph dump itself is reproduced byte for byte, which the JSON and the
+    # bincode maps around it cannot be, since they carry a save timestamp and a
+    # hash map's iteration order.
+    for name in names:
+        assert (again / name).read_bytes() == (fixture["path"] / name).read_bytes()
+
+# ------------------------------------------------------------
+# Test 108: a restored index still mutates
+# ------------------------------------------------------------
+def test_restored_graph_accepts_inserts_removals_and_compaction(tmp_path):
+    """A loaded graph is a working graph, not a frozen one."""
+    vectors = _clustered_unit_vectors(500, 24, 5150)
+    ids = [f"v_{i}" for i in range(len(vectors))]
+    index = VectorDatabase().create("hnsw", dim=24, expected_size=500)
+    assert index.add({"ids": ids, "embeddings": vectors}).is_success()
+
+    save_dir = tmp_path / "mutable.zdb"
+    index.save(str(save_dir))
+    loaded = VectorDatabase().load(str(save_dir))
+
+    # Insertion after load, and every new record findable by its own vector.
+    fresh = _clustered_unit_vectors(30, 24, 6161)
+    fresh_ids = [f"n_{i}" for i in range(len(fresh))]
+    result = loaded.add({"ids": fresh_ids, "embeddings": fresh})
+    assert result.total_inserted == 30 and result.total_errors == 0
+    assert loaded.get_vector_count() == 530
+    for wanted, vector in zip(fresh_ids, fresh):
+        assert loaded.search(vector.tolist(), top_k=1)[0]["id"] == wanted
+
+    # Every record that was there before the save is still findable.
+    for wanted, vector in list(zip(ids, vectors))[:50]:
+        assert loaded.search(vector.tolist(), top_k=1)[0]["id"] == wanted
+
+    # Removal after load, and the record leaves every accessor.
+    assert loaded.remove_point("v_0") is True
+    assert loaded.contains("v_0") is False
+    assert loaded.get_vector_count() == 529
+
+    # Compaction after load reclaims exactly the nodes the removal stranded and
+    # leaves the ids on the pages it does not touch alone.
+    queries = _clustered_unit_vectors(20, 24, 7272)
+    before = _pages(loaded, queries)
+    stranded = int(loaded.get_stats()["stranded_graph_nodes"])
+    assert loaded.compact() == stranded
+    assert loaded.get_stats()["stranded_graph_nodes"] == "0"
+    assert loaded.get_vector_count() == 529
+    assert [[x[0] for x in page] for page in _pages(loaded, queries)] == \
+           [[x[0] for x in page] for page in before]
+
+    # And the whole thing survives a second round trip.
+    again = tmp_path / "mutable2.zdb"
+    loaded.save(str(again))
+    reloaded = VectorDatabase().load(str(again))
+    assert reloaded.get_vector_count() == 529
+    assert _pages(reloaded, queries) == _pages(loaded, queries)
+
+# ------------------------------------------------------------
+# Test 109: the rebuild is still there when the dump cannot be used
+# ------------------------------------------------------------
+@pytest.mark.parametrize("damage", ["absent", "truncated_graph", "truncated_data",
+                                    "wrong_m"])
+def test_load_falls_back_to_the_rebuild_when_the_dump_is_unusable(tmp_path, damage):
+    """Every record comes back whatever state the dump is in.
+
+    A directory written by a release whose distance types were named
+    differently, or one whose graph files were lost or damaged, still loads.
+    The truncated data file is the case that matters most, because the vendored
+    reader reaches std::process::exit on a short read, so the loader measures
+    that file before it is opened rather than after.
+    """
+    vectors = _clustered_unit_vectors(400, 16, 31415)
+    ids = [f"v_{i}" for i in range(len(vectors))]
+    index = VectorDatabase().create("hnsw", dim=16, expected_size=400)
+    assert index.add({"ids": ids, "embeddings": vectors}).is_success()
+
+    save_dir = tmp_path / "damaged.zdb"
+    index.save(str(save_dir))
+    graph = save_dir / "hnsw_index.hnsw.graph"
+    data = save_dir / "hnsw_index.hnsw.data"
+
+    if damage == "absent":
+        graph.unlink()
+        data.unlink()
+    elif damage == "truncated_graph":
+        blob = graph.read_bytes()
+        graph.write_bytes(blob[: len(blob) // 2])
+    elif damage == "truncated_data":
+        data.write_bytes(data.read_bytes()[:-64])
+    elif damage == "wrong_m":
+        # A dump written at one m against a config declaring another is what a
+        # directory assembled from two indexes looks like.
+        config = json.loads((save_dir / "config.json").read_text(encoding="utf-8"))
+        config["m"] = 17
+        (save_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    loaded = VectorDatabase().load(str(save_dir))
+    assert loaded.get_vector_count() == 400
+    assert all(loaded.contains(i) for i in ids)
+    assert len(loaded.search(vectors[0].tolist(), top_k=10)) == 10
+
+# ------------------------------------------------------------
+# Test 110: the rebuild can be asked for on an intact directory
+# ------------------------------------------------------------
+def test_the_rebuild_can_be_requested_on_an_intact_directory(tmp_path):
+    """The escape hatch that makes a graph defect recoverable by upgrading.
+
+    Restoring the dump restores the graph exactly as it was written, so an
+    index whose graph was built by a release carrying a defect keeps it. The
+    environment variable is what asks for the graph to be built again by the
+    current build instead.
+    """
+    vectors = _clustered_unit_vectors(400, 16, 2718)
+    ids = [f"v_{i}" for i in range(len(vectors))]
+    index = VectorDatabase().create("hnsw", dim=16, expected_size=400)
+    assert index.add({"ids": ids, "embeddings": vectors}).is_success()
+
+    save_dir = tmp_path / "rebuildable.zdb"
+    index.save(str(save_dir))
+
+    restored = VectorDatabase().load(str(save_dir))
+    os.environ["ZEUSDB_LOAD_REBUILD_GRAPH"] = "1"
+    try:
+        rebuilt = VectorDatabase().load(str(save_dir))
+        rebuilt_twice = VectorDatabase().load(str(save_dir))
+    finally:
+        del os.environ["ZEUSDB_LOAD_REBUILD_GRAPH"]
+
+    assert rebuilt.get_vector_count() == restored.get_vector_count() == 400
+    assert all(rebuilt.contains(i) for i in ids)
+
+    # Two rebuilds of one directory agree with each other, since neither
+    # iterates a hash map to decide the insertion order. This holds below the
+    # batch size at which insertion forks to rayon, being 1,000 times the
+    # thread count, above which thread scheduling reorders the work and two
+    # rebuilds diverge again. 400 records is below it on any machine.
+    queries = _clustered_unit_vectors(30, 16, 1618)
+    assert _pages(rebuilt, queries) == _pages(rebuilt_twice, queries)

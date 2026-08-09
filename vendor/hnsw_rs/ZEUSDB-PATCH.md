@@ -2,7 +2,7 @@
 
 Upstream crate: hnsw_rs 0.3.4 (crates.io, checksum
 43a5258f079b97bf2e8311ff9579e903c899dcbac0d9a138d62e9a066778bd07).
-This directory is a copy of the registry source with five deliberate
+This directory is a copy of the registry source with six deliberate
 changes plus this file. Resolution is redirected here through
 `[patch.crates-io]` in `vdb-core/Cargo.toml`.
 
@@ -300,15 +300,90 @@ reallocates through the ordinary `Vec::push` growth path, which is why a
 tight reservation is acceptable and why an index may exceed its declared
 `expected_size` as the ZeusDB README states.
 
+## Patch 6. Level scale on reload
+
+File `src/hnswio.rs`, function `HnswIo::load_point_indexation`, with one
+added item in `src/hnsw.rs`.
+
+```diff
++        let level_scale = if descr.format_version >= 4 {
++            descr.level_scale
++        } else {
++            1. / (descr.max_nb_connection as f64).ln()
++        };
+         let point_indexation = PointIndexation {
+             ...
+-            layer_g: LayerGenerator::new_with_scale(
+-                descr.max_nb_connection as usize,
+-                descr.level_scale,
+-                NB_LAYER_MAX as usize,
+-            ),
++            layer_g: LayerGenerator::new_with_absolute_scale(
++                level_scale,
++                NB_LAYER_MAX as usize,
++            ),
+```
+
+`LayerGenerator::new_with_absolute_scale` is added beside `new_with_scale`
+and differs from it only in storing the scale rather than multiplying the
+default by it.
+
+### The defect
+
+The dump writes `level_scale` from `PointIndexation::get_level_scale`, which
+returns the generator's own `scale` field, being the absolute scale. The reload
+hands that value to `LayerGenerator::new_with_scale`, whose second parameter is
+a modification factor it multiplies the default scale by. The two are different
+quantities, so every reload squares the scale.
+
+At `m` 16 the built index dumps 0.36067376022224085, which is 1 / ln(16). Reload
+it and the generator holds 0.13008556131285048, which is that value squared.
+Dump it again and the file carries the squared value, so the error compounds on
+every round trip and the third dump reads 0.04691844854932665. Measured by
+parsing the dumped headers of three successive save and load cycles over one
+800 point index.
+
+The scale drives level assignment for points inserted after the reload. The
+probability that a point stays at layer zero is `1 - exp(-1/scale)`, which is
+0.9375 at the correct scale and 0.99954 at the squared one. A reloaded index
+therefore promotes roughly one new point in 2,200 above layer zero where it
+should promote one in 16, so the upper layers stop growing as records are added
+across restarts. Points loaded from the dump keep the levels they were dumped
+with, so only records added after a reload are affected.
+
+It also makes a graph dump unreproducible. Save, load and save again produced
+two files differing in exactly the 8 bytes of this field and identical in the
+other 423,541.
+
+### Why the value is installed rather than converted to a factor
+
+Handing `new_with_scale` a factor of `level_scale * ln(m)` restores the right
+scale in exact arithmetic and not in `f64`. At `m` 32 the two multiplications
+lose a bit, the reload holds 0.2885390081777926 where the dump carried
+0.28853900817779266, and each further round trip loses another bit rather than
+settling. Measured over a 50,000 point index, where the re-dumped graph file
+then differed from the original in exactly one byte out of 35,764,408. At `m`
+8, 16, 64 and 128 the same expression happens to be exact. Installing the value
+makes a dump a fixed point at every `m`.
+
+### Why it is here rather than worked around
+
+The scale is private and the only public route to it, `Hnsw::modify_level_scale`,
+clamps its argument to the range 0.2 to 1 while the correction needed is `ln(m)`,
+which is 2.77 at `m` 16. There is no way to correct the value from outside the
+crate.
+
 ## Total against the pristine registry copy
 
-`src/hnsw.rs` differs by 254 lines, 193 added and 61 removed. Patch 1
+`src/hnsw.rs` differs by 273 lines, 212 added and 61 removed. Patch 1
 accounts for 1 added and 1 removed. Patch 2 accounts for 30 added and 2
 removed. Patch 3 accounts for 100 added and 3 removed. Patch 4 accounts
 for 58 added and 54 removed, of which 20 of the additions are comment.
 Patch 5 accounts for 4 added and 1 removed, of which 3 of the additions
-are comment.
-`src/hnswio.rs` differs by 4 lines, all added, all patch 3.
+are comment. Patch 6 accounts for 19 added, of which 10 are comment.
+`src/hnswio.rs` differs by 21 lines, 17 added and 4 removed. Patch 3
+accounts for 4 added. Patch 6 accounts for 13 added and 4 removed, of
+which 10 of the additions are comment.
 `ZEUSDB-PATCH.md` is an
 added file. Five files carry no content change and differ only in line
 endings, which relay 07 pinned across the repository:
@@ -371,9 +446,16 @@ bound is missed by between 42 and 85 times.
 declared 100,000,000, where without this patch pytest itself exits with
 `0xC0000409`.
 
+Patch 6 is caught by the Python regression test
+`test_save_after_load_rewrites_the_same_graph` in
+`tests/test_persistence.py`, which asserts that the two graph dump files a
+loaded index writes are byte identical to the ones it was loaded from.
+Without this patch they differ in exactly the 8 bytes of `level_scale` and
+in nothing else.
+
 ## On upgrade
 
-All five patches MUST be reapplied whenever the vendored copy is
+All six patches MUST be reapplied whenever the vendored copy is
 refreshed or the version is bumped, and the line counts above rechecked
 so a lost patch is visible. Both Rust regression tests insert
 sequentially, so they depend on patch 2 for their own determinism. Patch
@@ -381,5 +463,7 @@ sequentially, so they depend on patch 2 for their own determinism. Patch
 filter into `search_filter` on every search call site and the unpatched
 filtered path panics on some legal arguments. Patch 5 is load bearing at
 any large `expected_size`, since without it a declared 100,000,000 aborts
-the interpreter rather than raising. Do not make any other change to this
-tree.
+the interpreter rather than raising. Patch 6 is load bearing because the
+loader restores the saved graph rather than rebuilding it, so every loaded
+index carries whatever level scale the reload gives it. Do not make any
+other change to this tree.

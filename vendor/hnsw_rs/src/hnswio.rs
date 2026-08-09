@@ -772,15 +772,27 @@ impl HnswIo {
             entry_point.get_point_id()
         );
         //
+        // ZEUSDB PATCH 6: the dump carries the absolute level scale, being the
+        // value `get_level_scale` reads off the generator, while
+        // `new_with_scale` takes a factor it multiplies the default by. Passing
+        // one as the other squares the scale on every reload, so a reloaded
+        // index draws every new point's level from a steeper distribution than
+        // the one it was built with and the error compounds across round trips.
+        // The value is installed rather than derived back into a factor,
+        // because dividing by the default and multiplying by it again loses a
+        // bit at some m and the dump then never settles. Format 2 and 3 dumps
+        // carry no scale at all and `load_description` leaves the field at 1.0,
+        // so those take the default the generator would have built.
+        let level_scale = if descr.format_version >= 4 {
+            descr.level_scale
+        } else {
+            1. / (descr.max_nb_connection as f64).ln()
+        };
         let point_indexation = PointIndexation {
             max_nb_connection: descr.max_nb_connection as usize,
             max_layer: NB_LAYER_MAX as usize,
             points_by_layer: Arc::new(RwLock::new(points_by_layer)),
-            layer_g: LayerGenerator::new_with_scale(
-                descr.max_nb_connection as usize,
-                descr.level_scale,
-                NB_LAYER_MAX as usize,
-            ),
+            layer_g: LayerGenerator::new_with_absolute_scale(level_scale, NB_LAYER_MAX as usize),
             nb_point: Arc::new(RwLock::new(nb_points_loaded)), // CAVEAT , we should increase , the whole thing is to be able to increment graph ?
             entry_point: Arc::new(RwLock::new(Some(entry_point))),
         };

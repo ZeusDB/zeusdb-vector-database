@@ -2418,9 +2418,9 @@ def test_index_saved_at_the_old_subvectors_default_loads_and_searches(tmp_path):
     assert loaded.get_vector_count() == count
     assert loaded.is_quantized()
 
-    # The loaded index rebuilds its graph from the codes, so the traversal can
-    # reach a different candidate set and a page is asserted as an overlap
-    # rather than as an equality.
+    # An overlap rather than an equality, so this holds whether the directory
+    # restores its saved graph or falls back to rebuilding one. The equality
+    # the restored path delivers is asserted in test_persistence.py.
     after = [h["id"] for h in loaded.search(data[0], top_k=5)]
     assert after[0] == before[0]
     assert len(set(after) & set(before)) >= 4, f"{after} against {before}"

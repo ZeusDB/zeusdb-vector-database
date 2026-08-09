@@ -1293,6 +1293,288 @@ impl DistanceType {
             _ => Err("Cannot insert PQ codes into raw HNSW index".to_string()),
         }
     }
+
+    /// Match a freshly constructed graph's insertion settings.
+    ///
+    /// `Hnsw::new` starts with `extend_candidates` false and the vendored
+    /// reload sets it true, so a restored graph would build the neighbourhood
+    /// of every record added after the load differently from the same record
+    /// added before the save. Nothing else `load_hnsw_with_dist` fills in
+    /// differs from what `new` sets.
+    fn settle_after_reload(&mut self) {
+        match self {
+            DistanceType::Cosine(hnsw) => hnsw.set_extend_candidates(false),
+            DistanceType::L2(hnsw) => hnsw.set_extend_candidates(false),
+            DistanceType::L1(hnsw) => hnsw.set_extend_candidates(false),
+            DistanceType::CosinePQ(hnsw) => hnsw.set_extend_candidates(false),
+            DistanceType::L2PQ(hnsw) => hnsw.set_extend_candidates(false),
+            DistanceType::L1PQ(hnsw) => hnsw.set_extend_candidates(false),
+        }
+    }
+}
+
+// ============================================================================
+// RESTORING THE SAVED GRAPH
+// ============================================================================
+
+/// Basename `save_hnsw_graph` dumps under and the loader reads back.
+const HNSW_DUMP_BASENAME: &str = "hnsw_index";
+
+/// Header of the dumped data file, being one magic and the data dimension.
+const DUMP_DATA_HEADER_BYTES: usize = 4 + 8;
+
+/// What the dumped data file spends per point before the vector itself, being
+/// one magic, the origin id and the serialized byte length.
+const DUMP_DATA_POINT_BYTES: usize = 4 + 8 + 8;
+
+/// Layers the vendored crate always dumps, being its `NB_LAYER_MAX`.
+const DUMP_LAYERS: u8 = 16;
+
+/// Set to any non-empty value other than `0` to skip the saved graph and
+/// rebuild it by re-inserting every record.
+///
+/// The rebuild is what upgrades an index whose graph was built by a release
+/// carrying a defect the vendored patches have since fixed, since restoring the
+/// dump restores the graph exactly as it was written, defects included. Without
+/// this there is no way to ask for that upgrade on a directory whose dump is
+/// perfectly readable.
+const REBUILD_ENV: &str = "ZEUSDB_LOAD_REBUILD_GRAPH";
+
+/// Whether the caller has asked for the rebuild rather than the saved graph
+fn rebuild_requested() -> bool {
+    match std::env::var(REBUILD_ENV) {
+        Ok(value) => !value.is_empty() && value != "0",
+        Err(_) => false,
+    }
+}
+
+/// Read the dump's own description and judge it against what this index expects
+///
+/// Everything here runs before the vendored reload is entered, because that
+/// reload reaches `std::process::exit(1)` when the data file is short. The data
+/// file's length is fully determined by the point count and the dimension, so
+/// an exact size comparison closes that path. Every other malformed dump the
+/// vendored reader meets raises a panic it can unwind from, which the caller
+/// catches.
+///
+/// Returns the node count the dump declares.
+#[allow(clippy::too_many_arguments)]
+fn inspect_graph_dump(
+    dir: &Path,
+    dimension: usize,
+    element_bytes: usize,
+    t_name: &str,
+    dist_name: &str,
+    m: usize,
+    ef_construction: usize,
+    min_nodes: usize,
+) -> Result<usize, String> {
+    let graph_path = dir.join(format!("{}.hnsw.graph", HNSW_DUMP_BASENAME));
+    let data_path = dir.join(format!("{}.hnsw.data", HNSW_DUMP_BASENAME));
+
+    if !graph_path.exists() || !data_path.exists() {
+        return Err("the directory holds no HNSW graph dump".to_string());
+    }
+
+    let file = std::fs::File::open(&graph_path)
+        .map_err(|e| format!("the graph dump could not be opened: {}", e))?;
+    let mut reader = std::io::BufReader::new(file);
+
+    // `load_description` unwraps a UTF-8 conversion on the two names it reads,
+    // so a dump whose header is garbage panics here rather than returning.
+    let described = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hnsw_rs::hnswio::load_description(&mut reader)
+    }));
+    let descr = match described {
+        Ok(Ok(descr)) => descr,
+        Ok(Err(e)) => return Err(format!("the graph dump has no readable header: {}", e)),
+        Err(_) => return Err("the graph dump has an unreadable header".to_string()),
+    };
+
+    if descr.t_name != t_name {
+        return Err(format!(
+            "the dump stores {} points where this index holds {}",
+            descr.t_name, t_name
+        ));
+    }
+    if descr.distname != dist_name {
+        return Err(format!(
+            "the dump was written under distance {} and this build uses {}",
+            descr.distname, dist_name
+        ));
+    }
+    if descr.dimension != dimension {
+        return Err(format!(
+            "the dump stores {} values per point where this index expects {}",
+            descr.dimension, dimension
+        ));
+    }
+    if descr.nb_layer != DUMP_LAYERS {
+        return Err(format!(
+            "the dump declares {} layers where this build uses {}",
+            descr.nb_layer, DUMP_LAYERS
+        ));
+    }
+    if descr.max_nb_connection as usize != m {
+        return Err(format!(
+            "the dump was written at m {} and config.json declares {}",
+            descr.max_nb_connection, m
+        ));
+    }
+    if descr.ef != ef_construction {
+        return Err(format!(
+            "the dump was written at ef_construction {} and config.json declares {}",
+            descr.ef, ef_construction
+        ));
+    }
+    if descr.nb_point < min_nodes {
+        return Err(format!(
+            "the dump holds {} graph nodes and the index holds {} records",
+            descr.nb_point, min_nodes
+        ));
+    }
+
+    let expected = DUMP_DATA_HEADER_BYTES
+        + descr
+            .nb_point
+            .saturating_mul(DUMP_DATA_POINT_BYTES + dimension * element_bytes);
+    let actual = std::fs::metadata(&data_path)
+        .map_err(|e| format!("the data dump could not be measured: {}", e))?
+        .len();
+    if actual != expected as u64 {
+        return Err(format!(
+            "the data dump is {} bytes where {} nodes of {} values need {}",
+            actual, descr.nb_point, dimension, expected
+        ));
+    }
+
+    Ok(descr.nb_point)
+}
+
+/// Reload one graph of a known element type and distance
+///
+/// `load_hnsw_with_dist` rather than `load_hnsw`, for two reasons. It takes the
+/// distance by value, which is the only way to restore a PQ graph, since
+/// `DistPQ` carries the codebook and cannot be produced by `Default`. And it
+/// leaves `datamap_opt` false, where `load_hnsw` sets it true and a later
+/// `file_dump` then refuses to overwrite its own files and writes
+/// `hnsw_index-4173.hnsw.graph` beside them instead. Measured on the vendored
+/// crate.
+///
+/// The reader is leaked because the vendored signature ties the returned graph's
+/// lifetime to it, so that a graph reading a memory mapped data file cannot
+/// outlive the mapping. Nothing is mapped here, since neither the default
+/// options nor this entry point ever construct a `DataMap`, so the leak is 280
+/// bytes per successful load and holds no file open.
+fn reload_graph<T, D>(dir: &Path, dist: D) -> Result<Hnsw<'static, T, D>, String>
+where
+    T: 'static
+        + Serialize
+        + serde::de::DeserializeOwned
+        + Clone
+        + Sized
+        + Send
+        + Sync
+        + std::fmt::Debug,
+    D: Distance<T> + Send + Sync,
+{
+    let reader = Box::leak(Box::new(hnsw_rs::hnswio::HnswIo::new(
+        dir,
+        HNSW_DUMP_BASENAME,
+    )));
+
+    let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        reader.load_hnsw_with_dist::<T, D>(dist)
+    }));
+
+    match loaded {
+        Ok(Ok(hnsw)) => Ok(hnsw),
+        Ok(Err(e)) => Err(format!("the graph dump could not be read: {}", e)),
+        Err(_) => Err("the graph dump is malformed and reading it panicked".to_string()),
+    }
+}
+
+/// Restore the saved graph for one index configuration
+///
+/// `pq` present means the saved graph was a quantized one, which is exactly the
+/// condition the loader branches on, since training is what replaces the raw
+/// graph with a PQ graph. A directory whose dump disagrees is caught by the
+/// element type and distance name in `inspect_graph_dump` and falls back.
+fn restore_graph(
+    dir: &Path,
+    space: &str,
+    m: usize,
+    ef_construction: usize,
+    dim: usize,
+    pq: Option<Arc<PQ>>,
+    min_nodes: usize,
+) -> Result<(DistanceType, usize), String> {
+    let mut graph = match pq {
+        Some(pq) => {
+            let nodes = inspect_graph_dump(
+                dir,
+                pq.subvectors,
+                std::mem::size_of::<u8>(),
+                std::any::type_name::<u8>(),
+                std::any::type_name::<DistPQ>(),
+                m,
+                ef_construction,
+                min_nodes,
+            )?;
+            let hnsw = reload_graph::<u8, DistPQ>(dir, DistPQ::new(pq))?;
+            let restored = hnsw.get_nb_point();
+            if restored != nodes {
+                return Err(format!(
+                    "the dump declares {} graph nodes and yielded {}",
+                    nodes, restored
+                ));
+            }
+            match space {
+                "l2" => DistanceType::L2PQ(hnsw),
+                "l1" => DistanceType::L1PQ(hnsw),
+                _ => DistanceType::CosinePQ(hnsw),
+            }
+        }
+        None => {
+            // The raw graphs differ only in their distance type, so each arm
+            // states the name the dump must carry and the value the reload
+            // needs, and nothing else about them differs.
+            macro_rules! raw {
+                ($dist:ty, $value:expr, $variant:ident) => {{
+                    let nodes = inspect_graph_dump(
+                        dir,
+                        dim,
+                        std::mem::size_of::<f32>(),
+                        std::any::type_name::<f32>(),
+                        std::any::type_name::<$dist>(),
+                        m,
+                        ef_construction,
+                        min_nodes,
+                    )?;
+                    let hnsw = reload_graph::<f32, $dist>(dir, $value)?;
+                    let restored = hnsw.get_nb_point();
+                    if restored != nodes {
+                        return Err(format!(
+                            "the dump declares {} graph nodes and yielded {}",
+                            nodes, restored
+                        ));
+                    }
+                    DistanceType::$variant(hnsw)
+                }};
+            }
+            match space {
+                "l2" => raw!(L2Dist, L2Dist {}, L2),
+                "l1" => raw!(L1Dist, L1Dist {}, L1),
+                // `new_raw` also falls back to cosine on an unrecognised space,
+                // so the two construction paths agree on what a bad space means.
+                _ => raw!(CosineDist, CosineDist {}, Cosine),
+            }
+        }
+    };
+
+    graph.settle_after_reload();
+    let nodes = graph.nb_points();
+    Ok((graph, nodes))
 }
 
 #[derive(Debug, Clone)]
@@ -3612,12 +3894,22 @@ impl HNSWIndex {
         let missing: Vec<String> = {
             let id_map = self.id_map.read().unwrap();
 
+            // Internal id order, which is arrival order, rather than the order a
+            // hash map hands its entries out. Two compactions of the same index
+            // in two processes otherwise wire the replacement graph differently
+            // and answer the same query differently.
+            let mut live: Vec<(&String, usize)> = id_map
+                .iter()
+                .map(|(id, &internal)| (id, internal))
+                .collect();
+            live.sort_by_key(|&(_, internal_id)| internal_id);
+
             if quantized {
                 let pq_codes = self.pq_codes.read().unwrap();
                 let mut batch: Vec<(&Vec<u8>, usize)> = Vec::with_capacity(id_map.len());
                 let mut missing = Vec::new();
 
-                for (ext_id, &internal_id) in id_map.iter() {
+                for (ext_id, internal_id) in live {
                     match pq_codes.get(ext_id) {
                         Some(codes) => batch.push((codes, internal_id)),
                         None => missing.push(ext_id.clone()),
@@ -3639,7 +3931,7 @@ impl HNSWIndex {
                 let vectors = self.vectors.read().unwrap();
                 let mut missing = Vec::new();
 
-                for (ext_id, &internal_id) in id_map.iter() {
+                for (ext_id, internal_id) in live {
                     match vectors.get(ext_id) {
                         Some(vector) => new_hnsw.insert(vector, internal_id),
                         None => missing.push(ext_id.clone()),
@@ -5917,6 +6209,51 @@ impl HNSWIndex {
         *self.vector_metadata.write().unwrap() = vector_metadata;
     }
 
+    /// Restore the graph the save wrote, instead of rebuilding it
+    ///
+    /// For persistence loading only, and only after `restore_data_fields` has
+    /// installed the id mappings and the product quantizer, because both decide
+    /// what the dump is checked against.
+    ///
+    /// Returns the number of graph nodes restored, or the reason the dump
+    /// cannot be used. Every reason is a fallback rather than a failure: the
+    /// caller rebuilds instead, so a directory whose dump is absent, was written
+    /// by a release whose distance types were named differently, or is damaged
+    /// still loads.
+    pub(crate) fn restore_graph_from_dump(&mut self, dir: &Path) -> Result<usize, String> {
+        if rebuild_requested() {
+            return Err(format!("{} asked for the rebuild", REBUILD_ENV));
+        }
+
+        // A save skips the graph dump entirely when the index holds nothing, so
+        // any dump left in an empty index's directory belongs to an earlier
+        // save and describes records this one no longer holds.
+        let live = self.id_map.read().unwrap().len();
+        if live == 0 {
+            return Err("the index holds no records".to_string());
+        }
+
+        // A trained product quantizer is what makes the saved graph a quantized
+        // one, so it is what decides which element type the dump must carry.
+        let pq = match &self.pq {
+            Some(pq) if pq.is_trained() => Some(pq.clone()),
+            _ => None,
+        };
+
+        let (graph, nodes) = restore_graph(
+            dir,
+            &self.space,
+            self.m,
+            self.ef_construction,
+            self.dim,
+            pq,
+            live,
+        )?;
+
+        self.replace_graph(graph);
+        Ok(nodes)
+    }
+
     /// Rebuild the graph from the stored PQ codes (for persistence loading only)
     ///
     /// Requires a trained product quantizer, which the loader installs before
@@ -5960,6 +6297,9 @@ impl HNSWIndex {
                 extra.push((id.clone(), codes));
             }
         }
+        // Sorted so the internal ids the missing records are about to be handed
+        // are handed in a fixed order rather than in hash map order.
+        extra.sort_by(|a, b| a.0.cmp(&b.0));
 
         // NB_LAYER_MAX, matching every other construction site in this file.
         let max_layer = 16;
@@ -5987,6 +6327,7 @@ impl HNSWIndex {
             }
         }
         let remapped = lost.len();
+        lost.sort_by(|a, b| a.0.cmp(b.0));
         for (id, codes) in lost {
             let internal_id = self.get_next_id();
             self.id_map.write().unwrap().insert(id.clone(), internal_id);
@@ -5996,6 +6337,11 @@ impl HNSWIndex {
                 .insert(internal_id, id.clone());
             batch.push((codes, internal_id));
         }
+
+        // Insert in internal id order, which is arrival order, rather than in
+        // the order a hash map hands the codes out. Two rebuilds of one
+        // directory otherwise wire the graph differently in each process.
+        batch.sort_by_key(|&(_, internal_id)| internal_id);
 
         // Filled before it is installed, and installed under one write guard, so
         // the graph the index holds is never a partly rebuilt one. The batch
