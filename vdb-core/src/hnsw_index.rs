@@ -1,6 +1,7 @@
 use crate::distance::{CosineDist, L1Dist, L2Dist};
 use chrono::Utc;
 use hnsw_rs::api::AnnT; // This provides the file_dump method
+use hnsw_rs::hnsw::Point;
 use hnsw_rs::prelude::{Distance, FilterT, Hnsw};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
@@ -215,6 +216,11 @@ pub struct QuantizationConfig {
 /// size, and at `top_k` 100 on 10,000 records recall reaches 0.986 at a fetch
 /// of 200 and 1.000 at 500.
 ///
+/// On a calibrated index this term is a floor and nothing else. The page is
+/// handled by the page exponent the calibration measures, and five times
+/// `top_k` sits below the calibrated fetch at every corpus size measured, so it
+/// never governs there. See `RERANK_CALIBRATION_PAGES`.
+///
 /// # Why the fetch is the whole cost, and why nothing narrows it
 ///
 /// `Hnsw::search_filter` raises the traversal width to the number of
@@ -417,6 +423,14 @@ pub const DEFAULT_RERANK_PAGE_FACTOR: usize = 5;
 /// 0.744 and 0.794, because a codebook fitted to twenty records per cluster
 /// does not order those clusters and no fetch repairs that.
 ///
+/// # The page
+///
+/// The measurement above is taken at one page, being `RERANK_CALIBRATION_TOP_K`,
+/// and a deeper page needs a deeper fetch. How much deeper is measured at
+/// training as well and it is fitted as an exponent of the page in the same way
+/// the record term is fitted as an exponent of the record count. See
+/// `RERANK_CALIBRATION_PAGES`.
+///
 /// # The floor and the cap
 ///
 /// The floor is `DEFAULT_RERANK_MIN_CANDIDATES` and the page term, unchanged,
@@ -460,9 +474,68 @@ pub const RERANK_CALIBRATION_QUERIES: usize = 512;
 
 /// Page size the calibration measures the depth for
 ///
-/// The fetch a page of 10 needs. A larger page sits deeper, which is what
-/// `DEFAULT_RERANK_PAGE_FACTOR` covers, and it is not calibrated.
+/// The fetch a page of 10 needs. It is the reference page, so the scaling in
+/// `RerankCalibration::fetch_at` is exactly one at this page and a search at
+/// `top_k` 10 fetches what it fetched before the page term was calibrated.
 pub const RERANK_CALIBRATION_TOP_K: usize = 10;
+
+/// Pages the calibration measures the depth at, ascending
+///
+/// The reference page has to be one of them, since the page exponent is the
+/// slope through these points and the fetch the search scales from is measured
+/// at the reference.
+///
+/// # Why a page term is calibrated at all
+///
+/// The fetch used to be measured for a page of ten and nothing scaled it, so a
+/// search at `top_k` 100 fetched exactly what a search at `top_k` 10 fetched.
+/// `DEFAULT_RERANK_PAGE_FACTOR` was the only page term and at five times
+/// `top_k` it is 500 at a page of 100, which sits below the calibrated fetch at
+/// every corpus this was measured on and therefore never governed. Measured
+/// recall at 100 on `quantized_with_raw` read 0.9243 at 50,000 dbpedia-openai
+/// records against 0.9940 for the same records unquantized, and it got worse as
+/// the corpus shrank, because a smaller corpus calibrates a smaller fetch.
+///
+/// # The page requirement is sublinear
+///
+/// The smallest fetch reaching mean recall 0.99 at a page, read off built
+/// indexes by sweeping the explicit `rerank` argument, 200 queries against
+/// exact ground truth to depth 1,000.
+///
+/// See the report for the full table. The requirement rises with the page and
+/// it rises far more slowly than the page does, because what buries a true
+/// neighbour in the ADC ordering is the number of records the codes cannot
+/// separate from the query and that count does not move when a caller asks for
+/// more results. Only once the page approaches that count does the requirement
+/// track it, which is why the exponent is fitted rather than fixed and why it
+/// is clamped below one.
+pub const RERANK_CALIBRATION_PAGES: [usize; 3] = [1, 10, 100];
+
+/// Bounds on the fitted page exponent
+///
+/// Zero is a fetch that ignores the page, which is what shipped before this was
+/// measured. One is a fetch proportional to the page, which is what every
+/// constant multiple of `top_k` assumes and which no measured corpus needs.
+pub const RERANK_CALIBRATION_PAGE_EXPONENT_MIN: f64 = 0.0;
+pub const RERANK_CALIBRATION_PAGE_EXPONENT_MAX: f64 = 1.0;
+
+/// The page exponent an index that never measured one falls back to
+///
+/// An index trained before the page term existed carries a `quantization.json`
+/// with no field for it, and a sample too small to compare two pages measures
+/// no slope. Both take this value rather than a flat fetch.
+///
+/// It is the median of the six exponents the calibration fitted on the three
+/// real datasets at 50,000 and 100,000 records, being 0.346 and 0.381 on
+/// glove-100, 0.474 and 0.499 on sift-128 and 0.551 and 0.567 on
+/// dbpedia-openai. It is a default and not a calibration, since it is not
+/// anything the index it applies to measured.
+///
+/// Applying it to an index that did not measure its own pages cannot cost
+/// recall at the reference page, because the scaling is exactly one there
+/// whatever the exponent is. Above the reference page it can only deepen the
+/// fetch.
+pub const RERANK_CALIBRATION_DEFAULT_PAGE_EXPONENT: f64 = 0.49;
 
 /// What the calibration measured, and on what
 ///
@@ -483,6 +556,18 @@ pub struct RerankCalibration {
     /// slope of the log fetch on the log record count over `fit_fetches`,
     /// corrected and clamped.
     pub exponent: f64,
+    /// The fetch at each of `RERANK_CALIBRATION_PAGES`, measured over the whole
+    /// sample, which is what `page_exponent` is fitted from. Zero where the
+    /// sample was too small for that page, and all zero on a calibration read
+    /// back from a directory written before the page term existed.
+    #[serde(default)]
+    pub page_fetches: [usize; RERANK_CALIBRATION_PAGES.len()],
+    /// The power of the requested page the fetch is scaled by. The least
+    /// squares slope of the log fetch on the log page over `page_fetches`,
+    /// clamped. `RERANK_CALIBRATION_DEFAULT_PAGE_EXPONENT` on a calibration
+    /// that did not measure it.
+    #[serde(default = "default_page_exponent")]
+    pub page_exponent: f64,
     /// Records `fetch` was measured over.
     pub sample_records: usize,
     /// Queries the ranks were pooled across.
@@ -493,13 +578,130 @@ pub struct RerankCalibration {
     pub millis: u64,
 }
 
+/// Serde's fallback for a calibration written before the page term existed.
+fn default_page_exponent() -> f64 {
+    RERANK_CALIBRATION_DEFAULT_PAGE_EXPONENT
+}
+
+/// `y` at `x`, by straight lines through `points`
+///
+/// `points` is ascending in `x`. Outside the measured range the nearest
+/// segment's slope carries on, which is an extrapolation and is bounded by the
+/// caller rather than trusted. Fewer than two points leave no line to read, and
+/// the single value or zero is the answer rather than an index out of bounds.
+fn interpolate(points: &[(f64, f64)], x: f64) -> f64 {
+    match points.len() {
+        0 => return 0.0,
+        1 => return points[0].1,
+        _ => {}
+    }
+    let first = points[0];
+    let last = points[points.len() - 1];
+    if x <= first.0 {
+        let next = points[1];
+        let run = next.0 - first.0;
+        if run.abs() < f64::EPSILON {
+            return first.1;
+        }
+        return first.1 + (next.1 - first.1) / run * (x - first.0);
+    }
+    if x >= last.0 {
+        let prev = points[points.len() - 2];
+        let run = last.0 - prev.0;
+        if run.abs() < f64::EPSILON {
+            return last.1;
+        }
+        return last.1 + (last.1 - prev.1) / run * (x - last.0);
+    }
+    for pair in points.windows(2) {
+        let (x0, y0) = pair[0];
+        let (x1, y1) = pair[1];
+        if x >= x0 && x <= x1 {
+            let run = x1 - x0;
+            if run.abs() < f64::EPSILON {
+                return y0;
+            }
+            return y0 + (y1 - y0) * (x - x0) / run;
+        }
+    }
+    last.1
+}
+
 impl RerankCalibration {
+    /// What the requested page multiplies the reference fetch by
+    ///
+    /// The measured pages are interpolated rather than fitted to one exponent,
+    /// because the relation is convex in log space and a single slope through
+    /// it is wrong at both ends. On dbpedia-openai the calibration measures 60,
+    /// 162 and 777 candidates at pages 1, 10 and 100, which is a slope of 0.431
+    /// over the first decade and 0.681 over the second, and the least squares
+    /// line through all three reads 0.556. Against the requirement read off a
+    /// built index at 50,000 records, the second decade is the one that matters
+    /// and it needs 0.652. The line asks for 2,062 candidates at a page of 100
+    /// where interpolating asks for 2,748 and the index needs 2,962.
+    ///
+    /// Interpolation passes exactly through the reference page, so the
+    /// multiplier there is exactly one and a search at `RERANK_CALIBRATION_TOP_K`
+    /// asks for precisely what it asked for before any page term existed.
+    ///
+    /// Outside the measured pages the nearest segment's slope carries on.
+    ///
+    /// **The result is never below one, so the page term only ever deepens the
+    /// fetch.** The measurement says a page below the reference needs less, and
+    /// acting on that costs recall. Measured on glove-100 at 50,000 records, the
+    /// calibration reads 310 and 811 candidates at pages 1 and 10 over its
+    /// training sample, which is a ratio of 0.382, where the requirement read
+    /// off the built index is 1,673 against 3,468, a ratio of 0.482. Scaling the
+    /// live fetch of 3,490 by the sample's ratio asks for 1,334 where the index
+    /// needs 1,673, and recall at a page of one fell from 1.000 to 0.988. The
+    /// ratio between two pages measured on a tenth of the records does not carry
+    /// the safety factor the reference measurement carries, so it is trusted
+    /// upward and not downward.
+    ///
+    /// It is also held at or below the page ratio, so no extrapolation can ask
+    /// for more than a fetch proportional to the page.
+    ///
+    /// A calibration with fewer than two measured pages takes `page_exponent`,
+    /// which is the shipped default on an index trained before the page term
+    /// existed.
+    fn page_scale(&self, top_k: usize) -> f64 {
+        let reference = RERANK_CALIBRATION_TOP_K.max(1) as f64;
+        let page = top_k.max(1) as f64;
+        let ratio = page / reference;
+
+        let measured: Vec<(f64, f64)> = RERANK_CALIBRATION_PAGES
+            .iter()
+            .zip(self.page_fetches.iter())
+            .filter(|(_, &fetch)| fetch > 0)
+            .map(|(&p, &fetch)| ((p as f64).ln(), (fetch as f64).ln()))
+            .collect();
+
+        let scale = if measured.len() < 2 {
+            let exponent = self.page_exponent.clamp(
+                RERANK_CALIBRATION_PAGE_EXPONENT_MIN,
+                RERANK_CALIBRATION_PAGE_EXPONENT_MAX,
+            );
+            ratio.powf(exponent)
+        } else {
+            (interpolate(&measured, page.ln()) - interpolate(&measured, reference.ln())).exp()
+        };
+
+        if !scale.is_finite() || scale <= 0.0 {
+            return 1.0;
+        }
+        scale.clamp(1.0, ratio.max(1.0))
+    }
+
     /// The fetch this calibration asks for at a live record count
     ///
     /// The measured fetch scaled by the record ratio raised to the fitted
-    /// `exponent`, multiplied by the safety factor, held between the floor
-    /// terms and the cap. The caller applies the live record count as the
-    /// final bound.
+    /// `exponent` and by what the requested page asks for, multiplied by the
+    /// safety factor, held between the floor terms and the cap. The caller
+    /// applies the live record count as the final bound.
+    ///
+    /// `page_scale` is exactly one at `RERANK_CALIBRATION_TOP_K`, which is the
+    /// page `fetch` was measured at, so a search there asks for exactly what it
+    /// asked for before the page term existed.
     fn fetch_at(&self, live_records: usize, top_k: usize) -> usize {
         let floor =
             DEFAULT_RERANK_MIN_CANDIDATES.max(top_k.saturating_mul(DEFAULT_RERANK_PAGE_FACTOR));
@@ -512,7 +714,10 @@ impl RerankCalibration {
             RERANK_CALIBRATION_EXPONENT_MIN,
             RERANK_CALIBRATION_EXPONENT_MAX,
         );
-        let scaled = RERANK_CALIBRATION_SAFETY * self.fetch as f64 * ratio.powf(exponent);
+        let scaled = RERANK_CALIBRATION_SAFETY
+            * self.fetch as f64
+            * ratio.powf(exponent)
+            * self.page_scale(top_k);
 
         // A non-finite or negative product cannot come from a stored
         // calibration this crate wrote, and the floor answers it rather than a
@@ -542,27 +747,41 @@ fn raw_distance_fn(space: &str) -> fn(&[f32], &[f32]) -> f32 {
     }
 }
 
-/// The fetch a sample of `records` needs, measured over that sample
+/// The fetch a sample of `records` needs at each of `pages`, measured over that
+/// sample
 ///
 /// The 0.99 percentile of every true neighbour rank pooled across queries, the
 /// query itself removed from both the true neighbour list and the ADC ordering.
 /// `codes` holds the whole sample and only its first `records` entries are
-/// scored, so the two measurements `calibrate_rerank_from_sample` takes share
-/// one quantization pass.
+/// scored, so the measurements `calibrate_rerank_from_sample` takes share one
+/// quantization pass.
 ///
-/// `None` where the sample has no room for a rank distribution, being fewer
-/// records than twice the page.
-fn measure_rerank_fetch(
+/// Every page is answered from one pass. The exact neighbours are found once to
+/// the deepest page asked for and their ranks are kept in true neighbour order,
+/// so the pool for a shallower page is a prefix of the pool for a deeper one.
+/// The deepest page therefore costs a longer running best list and nothing
+/// else, and the distances and the ADC ordering are computed once whatever is
+/// asked for.
+///
+/// `pages` must be ascending. The returned vector is one fetch per page.
+/// `None` where the sample has no room for a rank distribution at the shallowest
+/// page, being fewer records than twice that page. A page the sample is too
+/// small for returns zero in its slot.
+fn measure_rerank_fetches(
     pq: &PQ,
     sample: &[Vec<f32>],
     codes: &[Vec<u8>],
     distance: fn(&[f32], &[f32]) -> f32,
     records: usize,
-) -> Option<usize> {
-    let top_k = RERANK_CALIBRATION_TOP_K;
-    if records < top_k * 2 + 1 || records > sample.len() {
+    pages: &[usize],
+) -> Option<Vec<usize>> {
+    let top_k = *pages.last()?;
+    let shallowest = *pages.first()?;
+    if records < shallowest * 2 + 1 || records > sample.len() {
         return None;
     }
+    // The deepest page the sample can carry a rank distribution for.
+    let top_k = top_k.min((records - 1) / 2).max(shallowest);
 
     // Spread the queries over insertion order rather than taking a prefix,
     // since a prefix of a corpus inserted in a meaningful order is a narrower
@@ -578,9 +797,11 @@ fn measure_rerank_fetch(
 
     let subvectors = pq.subvectors;
 
-    let ranks: Vec<usize> = query_ids
+    // One rank list per query, in true neighbour order, so that the pool for a
+    // page is a prefix of each of them.
+    let per_query: Vec<Vec<usize>> = query_ids
         .par_iter()
-        .flat_map_iter(|&qi| {
+        .map(|&qi| {
             let query = &sample[qi];
 
             // The exact top_k, the query itself excluded. A running list of the
@@ -611,7 +832,7 @@ fn measure_rerank_fetch(
             // and with the query excluded from it as well.
             let lut = match pq.compute_adc_lut(query) {
                 Ok(lut) => lut,
-                Err(_) => return Vec::new().into_iter(),
+                Err(_) => return Vec::new(),
             };
             let adc: Vec<f32> = codes
                 .iter()
@@ -629,28 +850,49 @@ fn measure_rerank_fetch(
                 })
                 .collect();
 
+            // Ranks come off a sorted copy rather than a scan per neighbour.
+            // The scan is one pass over the sample for every true neighbour,
+            // which is affordable at a page of ten and is not at a page of a
+            // hundred, and one sort serves every page.
+            let mut ordered = adc.clone();
+            ordered.sort_unstable_by(|a, b| a.total_cmp(b));
+
             best.iter()
                 .map(|&(_, neighbour)| {
                     let target = adc[neighbour];
-                    1 + adc.iter().filter(|&&d| d < target).count()
+                    1 + ordered.partition_point(|&d| d < target)
                 })
                 .collect::<Vec<usize>>()
-                .into_iter()
         })
         .collect();
 
-    if ranks.is_empty() {
+    if per_query.iter().all(|ranks| ranks.is_empty()) {
         return None;
     }
 
-    let mut sorted = ranks;
-    sorted.sort_unstable();
-    // Mean recall at 10 over a fetch of F is the share of pooled ranks at or
-    // below F, so the fetch reaching the target is the rank at that position in
-    // the sorted pool.
-    let position =
-        ((RERANK_CALIBRATION_TARGET * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
-    Some(sorted[position - 1])
+    // Mean recall at a page of P over a fetch of F is the share of the pooled
+    // ranks of the first P true neighbours that sit at or below F, so the fetch
+    // reaching the target is that percentile of the pool.
+    let mut out = Vec::with_capacity(pages.len());
+    for &page in pages {
+        if page > top_k {
+            out.push(0);
+            continue;
+        }
+        let mut pool: Vec<usize> = Vec::with_capacity(per_query.len() * page);
+        for ranks in &per_query {
+            pool.extend(ranks.iter().take(page).copied());
+        }
+        if pool.is_empty() {
+            out.push(0);
+            continue;
+        }
+        pool.sort_unstable();
+        let position =
+            ((RERANK_CALIBRATION_TARGET * pool.len() as f64).ceil() as usize).clamp(1, pool.len());
+        out.push(pool[position - 1]);
+    }
+    Some(out)
 }
 
 /// The rerank calibration, with no index around it
@@ -661,7 +903,9 @@ fn measure_rerank_fetch(
 ///
 /// One measurement per fraction in `RERANK_CALIBRATION_FIT_FRACTIONS`. The one
 /// over the whole sample is the fetch the sample itself needs, and the set of
-/// them is what fixes the exponent; see `RerankCalibration`.
+/// them is what fixes the record exponent. That last measurement also answers
+/// every page in `RERANK_CALIBRATION_PAGES` from the same pass, which is what
+/// fixes the page exponent; see `RerankCalibration`.
 fn calibrate_rerank_from_sample(
     pq: &PQ,
     sample: &[Vec<f32>],
@@ -682,13 +926,38 @@ fn calibrate_rerank_from_sample(
 
     // The sample is in a seeded random order, so its first `records` entries
     // are a random draw over it and no separate sampling pass is needed.
+    //
+    // Every fraction but the last measures the reference page alone, since the
+    // record exponent is fitted from that one page. The last one is the whole
+    // sample and it measures every page, because the pages have to be compared
+    // at one record count and the whole sample is the largest available.
+    let reference = [RERANK_CALIBRATION_TOP_K];
     let mut fit_fetches = [0usize; RERANK_CALIBRATION_FIT_FRACTIONS.len()];
+    let mut page_fetches = [0usize; RERANK_CALIBRATION_PAGES.len()];
     let mut points: Vec<(f64, f64)> = Vec::with_capacity(fit_fetches.len());
-    for (slot, fraction) in fit_fetches.iter_mut().zip(RERANK_CALIBRATION_FIT_FRACTIONS) {
+    let last = fit_fetches.len() - 1;
+    for (i, fraction) in RERANK_CALIBRATION_FIT_FRACTIONS.iter().enumerate() {
         let records = ((total as f64 * fraction).round() as usize).min(total);
-        if let Some(measured) = measure_rerank_fetch(pq, sample, &codes, distance, records) {
-            *slot = measured;
-            points.push(((records as f64).ln(), (measured as f64).ln()));
+        let pages: &[usize] = if i == last {
+            &RERANK_CALIBRATION_PAGES
+        } else {
+            &reference
+        };
+        let Some(measured) = measure_rerank_fetches(pq, sample, &codes, distance, records, pages)
+        else {
+            continue;
+        };
+        let at_reference = pages
+            .iter()
+            .position(|&p| p == RERANK_CALIBRATION_TOP_K)
+            .and_then(|slot| measured.get(slot).copied())
+            .unwrap_or(0);
+        if i == last && measured.len() == page_fetches.len() {
+            page_fetches.copy_from_slice(&measured);
+        }
+        if at_reference > 0 {
+            fit_fetches[i] = at_reference;
+            points.push(((records as f64).ln(), (at_reference as f64).ln()));
         }
     }
 
@@ -712,10 +981,29 @@ fn calibrate_rerank_from_sample(
         )
     };
 
+    // The page exponent, over whichever pages the sample was large enough to
+    // measure. A sample that could only answer one page carries no slope, and
+    // the shipped default is the honest answer there rather than a flat fetch.
+    let page_points: Vec<(f64, f64)> = RERANK_CALIBRATION_PAGES
+        .iter()
+        .zip(page_fetches.iter())
+        .filter(|(_, &f)| f > 0)
+        .map(|(&p, &f)| ((p as f64).ln(), (f as f64).ln()))
+        .collect();
+    let page_exponent = match least_squares_slope(&page_points) {
+        Some(slope) => slope.clamp(
+            RERANK_CALIBRATION_PAGE_EXPONENT_MIN,
+            RERANK_CALIBRATION_PAGE_EXPONENT_MAX,
+        ),
+        None => RERANK_CALIBRATION_DEFAULT_PAGE_EXPONENT,
+    };
+
     Some(RerankCalibration {
         fetch,
         fit_fetches,
         exponent,
+        page_fetches,
+        page_exponent,
         sample_records: total,
         queries: (0..total)
             .step_by((total / RERANK_CALIBRATION_QUERIES).max(1))
@@ -962,6 +1250,190 @@ impl Distance<u8> for DistPQ {
     }
 }
 
+/// Bytes an `Arc<T>` allocation carries beyond `T`, being the strong and the
+/// weak count.
+const ARC_COUNTS_BYTES: usize = 2 * std::mem::size_of::<usize>();
+
+/// Bytes a `Vec<T>` header occupies, being a pointer, a capacity and a length.
+const VEC_HEADER_BYTES: usize = 3 * std::mem::size_of::<usize>();
+
+/// Bytes `parking_lot::RwLock<()>` occupies, being one `AtomicUsize`.
+const PARKING_LOT_LOCK_BYTES: usize = std::mem::size_of::<usize>();
+
+/// The capacity `Vec::push` gives a buffer it has just allocated for the first
+/// time. `RawVec::MIN_NON_ZERO_CAP` is 4 for an element of 8 bytes.
+const MIN_VEC_CAP: usize = 4;
+
+/// Points whose neighbour lists the graph memory figure is measured over.
+///
+/// The adjacency count is a property of the data rather than of `m`, so it is
+/// sampled rather than derived; see `graph_memory_bytes`. The sample is taken
+/// by striding the point enumeration, which is insertion order within a layer,
+/// because a prefix would be all early records and an early record has taken
+/// more reverse links than a late one.
+const GRAPH_SAMPLE_POINTS: usize = 4096;
+
+/// Layer indices `graph_memory_bytes` asks the graph about.
+///
+/// The vendored crate fixes the layer count at `NB_LAYER_MAX`, which is 16 and
+/// is `pub(crate)`, and `get_layer_nb_point` answers zero for an index it does
+/// not have. Probing past the end therefore costs one lock and no correctness.
+const GRAPH_LAYER_PROBE: usize = 32;
+
+/// Layer `Vec` headers a point carries when nothing was sampled to count them.
+///
+/// Only reachable on a graph that reports points and holds none in any layer,
+/// which no path produces. It is the crate's `NB_LAYER_MAX`.
+const GRAPH_LAYERS_FALLBACK: usize = 16;
+
+/// What the HNSW graph holds, in bytes it has asked the allocator for
+///
+/// `get_stats` used to report the storage maps and the two quantization tables
+/// and stop there, which on a trained `quantized_only` index at 50,000 records
+/// of dimension 1,536 named 9.77 MB against a measured 231 MiB resident. The
+/// graph is the rest of it and this is what it holds.
+///
+/// # Per point
+///
+/// The graph owns a second copy of every point, separate from the storage map,
+/// and it is `dim * 4` bytes in a raw graph and `subvectors` bytes in a
+/// quantized one. That copy is one allocation. Around it the vendored crate
+/// carries five more, all of them fixed and none of them proportional to the
+/// dimension.
+///
+/// ```text
+///   Arc<Point<T>>                              16 + size_of::<Point<T>>()
+///   the point's own data vector                dim * 4, or subvectors
+///   Arc<RwLock<Vec<Vec<Arc<PointWithOrder>>>>>  16 + 8 + 24
+///   sixteen layer Vec headers                  16 * 24
+///   its Arc slot in points_by_layer            8
+/// ```
+///
+/// `Point` is 112 bytes on a 64 bit target, being a 24 byte `PointData` enum,
+/// a `DataId`, a `PointId`, the `Arc` to the neighbour lists and a 64 byte
+/// `[AtomicU32; 16]` of in-degree counters. `size_of` is taken rather than
+/// written down. The sixteen layer headers are allocated for every point
+/// whatever level it was drawn at, because `Point::new` fills the outer `Vec`
+/// to `NB_LAYER_MAX` before it knows anything about the point.
+///
+/// # Per adjacency entry
+///
+/// Every entry in a neighbour list is an `Arc<PointWithOrder>`, which is 16
+/// bytes of `Arc` counts around a pointer to the target and an `f32` distance,
+/// and a pointer slot in the list itself.
+///
+/// **The number of entries is a property of the data and not of `m`.** Layer
+/// zero caps a list at `2 * m` and the crate does fill it on data with no
+/// structure, measured at exactly 32.000 entries per point at `m` 16 and
+/// exactly 64.000 at `m` 32 over 40,000 uniform points on the sphere. Real
+/// embeddings do not fill it, because `select_neighbours` prunes a candidate
+/// that sits closer to an already chosen neighbour than to the query and
+/// clustered data gives it far more to prune. The same measurement over 50,000
+/// dbpedia-openai records at `m` 32 reads 29.95 at the full 1,536 dimensions
+/// and 36.75 over their first 128, and over 10,000 of them at `m` 16 it reads
+/// 24.81. **A count derived from `m` alone is 2.03 times the truth** at 50,000
+/// records of dimension 1,536, being 3,401,398 entries against the 1,677,300
+/// the saved graph dump holds. So the entry count is measured over
+/// `GRAPH_SAMPLE_POINTS` points and scaled.
+///
+/// A list holds more slots than entries. It is filled once by `clone_from`,
+/// which sizes it exactly, and grown afterwards by the reverse link updates,
+/// which double it. `2 * len` is the capacity that produces, and it is what the
+/// measurement on the uniform corpus asks for: at `m` 32 the live bytes exceed
+/// a length based count by 506 per point where doubling a full layer zero list
+/// predicts 512.
+///
+/// # What it does not cover
+///
+/// The allocator. Every block above carries a header and is rounded up, and the
+/// process commits more than the sum of the blocks. Measured on this platform a
+/// 32 byte request occupies 52 bytes of commit and a 512 byte request occupies
+/// 551, and the whole graph commits between 1.4 and 1.7 times what this figure
+/// names. That is allocator behaviour rather than something the graph holds,
+/// and folding a platform factor into a reported number would state it as
+/// though the structure carried it.
+fn graph_memory_bytes<T, D>(hnsw: &Hnsw<'_, T, D>) -> usize
+where
+    T: Clone + Send + Sync + 'static,
+    D: Distance<T> + Send + Sync,
+{
+    let indexation = hnsw.get_point_indexation();
+    let nb_point = indexation.get_nb_point();
+    if nb_point == 0 {
+        return 0;
+    }
+
+    let element_bytes = indexation.get_data_dimension() * std::mem::size_of::<T>();
+    let point_bytes = ARC_COUNTS_BYTES + std::mem::size_of::<Point<'static, T>>();
+    let neighbour_cell_bytes = ARC_COUNTS_BYTES + PARKING_LOT_LOCK_BYTES + VEC_HEADER_BYTES;
+    // `PointWithOrder` is a pointer to the target and an `f32` distance, and it
+    // is padded to the pointer's alignment, so it is two words rather than one
+    // and a half. It is `pub(crate)` in the vendored crate, so its size is
+    // written out rather than taken.
+    let entry_bytes = ARC_COUNTS_BYTES + 2 * std::mem::size_of::<usize>();
+    let slot_bytes = std::mem::size_of::<usize>();
+
+    // The adjacency, over a strided sample. `get_neighborhood_id` is the only
+    // way out of the crate and it reallocates, so it is not called on every
+    // point of a large graph. The stride runs across the concatenation of the
+    // layers rather than within one, so the sample holds upper layer points in
+    // the proportion the graph does, and a point at an upper layer carries more
+    // adjacency than one at layer zero.
+    //
+    // One layer at a time, and never two iterators at once. Each iterator holds
+    // a read guard on `points_by_layer` for its whole life, `parking_lot` does
+    // not admit a recursive read while a writer is queued, and a concurrent
+    // `add` queues exactly that writer. `get_layer_nb_point` takes the same
+    // guard, so the counts are read before the first iterator exists.
+    // Every layer is probed rather than stopping at the first empty one,
+    // because a level is drawn independently per point and an empty layer below
+    // an occupied one is legal. A layer index the graph does not have returns
+    // zero rather than raising, so the probe is bounded by the crate's own
+    // `NB_LAYER_MAX` without naming it.
+    let layer_counts: Vec<usize> = (0..GRAPH_LAYER_PROBE)
+        .map(|layer| indexation.get_layer_nb_point(layer))
+        .collect();
+
+    let stride = nb_point.div_ceil(GRAPH_SAMPLE_POINTS).max(1);
+    let mut seen = 0usize;
+    let mut sampled = 0usize;
+    let mut adjacency = 0usize;
+    let mut layers = 0usize;
+    for (index, count) in layer_counts.iter().enumerate() {
+        if *count == 0 {
+            continue;
+        }
+        for point in indexation.get_layer_iterator(index) {
+            let take = seen.is_multiple_of(stride);
+            seen += 1;
+            if !take {
+                continue;
+            }
+            let neighbourhood = point.get_neighborhood_id();
+            layers = layers.max(neighbourhood.len());
+            for list in &neighbourhood {
+                if list.is_empty() {
+                    continue;
+                }
+                let capacity = (2 * list.len()).max(MIN_VEC_CAP);
+                adjacency += capacity * slot_bytes + list.len() * entry_bytes;
+            }
+            sampled += 1;
+        }
+    }
+
+    if layers == 0 {
+        layers = GRAPH_LAYERS_FALLBACK;
+    }
+    let fixed =
+        point_bytes + element_bytes + neighbour_cell_bytes + layers * VEC_HEADER_BYTES + slot_bytes;
+    let mut total = nb_point * fixed;
+    if sampled > 0 {
+        total += ((adjacency as f64 / sampled as f64) * nb_point as f64).round() as usize;
+    }
+    total
+}
+
 // Enhanced DistanceType enum to support PQ variants
 enum DistanceType {
     // Raw vector variants
@@ -1178,6 +1650,18 @@ impl DistanceType {
             DistanceType::L2PQ(hnsw) => hnsw.get_distance().pq.subvectors,
             DistanceType::L1PQ(hnsw) => hnsw.get_distance().pq.subvectors,
             _ => 0,
+        }
+    }
+
+    /// Bytes the graph asks the allocator for. See `graph_memory_bytes`.
+    fn memory_bytes(&self) -> usize {
+        match self {
+            DistanceType::Cosine(hnsw) => graph_memory_bytes(hnsw),
+            DistanceType::L2(hnsw) => graph_memory_bytes(hnsw),
+            DistanceType::L1(hnsw) => graph_memory_bytes(hnsw),
+            DistanceType::CosinePQ(hnsw) => graph_memory_bytes(hnsw),
+            DistanceType::L2PQ(hnsw) => graph_memory_bytes(hnsw),
+            DistanceType::L1PQ(hnsw) => graph_memory_bytes(hnsw),
         }
     }
 
@@ -2856,7 +3340,13 @@ impl HNSWIndex {
         // number of nodes removal and overwrite have stranded. `compact` reclaims the
         // difference. Read first, because the declared lock order puts the graph
         // above every map read below it.
-        let graph_nodes = self.hnsw.read().unwrap().nb_points();
+        let (graph_nodes, graph_memory_mb) = {
+            let hnsw = self.hnsw.read().unwrap();
+            (
+                hnsw.nb_points(),
+                hnsw.memory_bytes() as f64 / (1024.0 * 1024.0),
+            )
+        };
 
         let vectors = self.vectors.read().unwrap();
         let pq_codes = self.pq_codes.read().unwrap();
@@ -2883,6 +3373,25 @@ impl HNSWIndex {
             graph_nodes.saturating_sub(vector_count).to_string(),
         );
 
+        // The memory keys, reported on every index rather than only on a
+        // quantized one. `raw_vectors_memory_mb` used to sit inside the
+        // quantization branch, so an unquantized index reported no memory at
+        // all, and `graph_memory_mb` did not exist, so no index reported the
+        // largest thing it holds. Both are additions. Nothing that reads a key
+        // this call already returned sees a different value, which matters
+        // because the langchain adapter forwards `memory_mb` from
+        // `get_quantization_info` verbatim and that key is untouched.
+        let raw_memory_mb = (vectors.len() * self.dim * 4) as f64 / (1024.0 * 1024.0);
+        let mut total_memory_mb = graph_memory_mb + raw_memory_mb;
+        stats.insert(
+            "graph_memory_mb".to_string(),
+            format!("{:.2}", graph_memory_mb),
+        );
+        stats.insert(
+            "raw_vectors_memory_mb".to_string(),
+            format!("{:.2}", raw_memory_mb),
+        );
+
         // Storage breakdown
         stats.insert("raw_vectors_stored".to_string(), vectors.len().to_string());
         stats.insert(
@@ -2904,15 +3413,13 @@ impl HNSWIndex {
                 config.storage_mode.to_string().to_string(),
             );
 
-            // Calculate actual memory usage based on storage mode
-            let raw_memory_mb = (vectors.len() * self.dim * 4) as f64 / (1024.0 * 1024.0);
+            // Calculate actual memory usage based on storage mode. The raw
+            // vector figure is reported above, on every index rather than only
+            // on this branch.
             let quantized_memory_mb =
                 (pq_codes.len() * config.subvectors) as f64 / (1024.0 * 1024.0);
+            total_memory_mb += quantized_memory_mb;
 
-            stats.insert(
-                "raw_vectors_memory_mb".to_string(),
-                format!("{:.2}", raw_memory_mb),
-            );
             stats.insert(
                 "quantized_codes_memory_mb".to_string(),
                 format!("{:.2}", quantized_memory_mb),
@@ -2989,14 +3496,13 @@ impl HNSWIndex {
                 // only on `get_quantization_info`, which is where a caller
                 // reading the storage breakdown above would not look.
                 let (centroid_mb, _) = pq.get_memory_stats();
+                let sdc_mb = pq.sdc_memory_bytes() as f64 / (1024.0 * 1024.0);
+                total_memory_mb += centroid_mb + sdc_mb;
                 stats.insert(
                     "codebook_memory_mb".to_string(),
                     format!("{:.2}", centroid_mb),
                 );
-                stats.insert(
-                    "sdc_table_memory_mb".to_string(),
-                    format!("{:.2}", pq.sdc_memory_bytes() as f64 / (1024.0 * 1024.0)),
-                );
+                stats.insert("sdc_table_memory_mb".to_string(), format!("{:.2}", sdc_mb));
 
                 if is_trained {
                     let compression_ratio = (pq.dim as f64 * 4.0) / pq.subvectors as f64;
@@ -3044,6 +3550,27 @@ impl HNSWIndex {
                             format!("{:.3}", calibration.exponent),
                         );
                         stats.insert(
+                            "rerank_calibration_page_fetches".to_string(),
+                            calibration
+                                .page_fetches
+                                .iter()
+                                .map(|f| f.to_string())
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        );
+                        stats.insert(
+                            "rerank_calibration_pages".to_string(),
+                            RERANK_CALIBRATION_PAGES
+                                .iter()
+                                .map(|p| p.to_string())
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        );
+                        stats.insert(
+                            "rerank_calibration_page_exponent".to_string(),
+                            format!("{:.3}", calibration.page_exponent),
+                        );
+                        stats.insert(
                             "rerank_calibration_ms".to_string(),
                             calibration.millis.to_string(),
                         );
@@ -3077,6 +3604,23 @@ impl HNSWIndex {
         stats.insert(
             "storage_mode_description".to_string(),
             self.get_storage_mode(),
+        );
+
+        // The sum of the five memory keys above. It is what the index holds in
+        // the structures this call can price, being the graph, the raw vector
+        // store, the codes, the codebook and the centroid distance table.
+        //
+        // It is not the resident set. The id maps, the metadata map, the hash
+        // table slots and the allocator's own headers and fragmentation sit
+        // outside it. Measured on three loaded indexes of 50,000
+        // dbpedia-openai records at dimension 1,536, the process held 805.9,
+        // 474.8 and 181.4 MiB where this reports 692.4, 401.2 and 107.8, being
+        // 1.16, 1.18 and 1.68 times. The share it misses is roughly 1,500 bytes
+        // per record and it does not move with the dimension, so it dominates
+        // the ratio on the mode that holds least.
+        stats.insert(
+            "total_memory_mb".to_string(),
+            format!("{:.2}", total_memory_mb),
         );
 
         stats
@@ -6476,12 +7020,12 @@ impl HNSWIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        calibrate_rerank_from_sample, least_squares_slope, raw_distance_fn, rescore_candidate,
-        take_best, DistPQ, RerankCalibration, RerankPlan, SearchParams,
+        calibrate_rerank_from_sample, interpolate, least_squares_slope, raw_distance_fn,
+        rescore_candidate, take_best, DistPQ, RerankCalibration, RerankPlan, SearchParams,
         DEFAULT_RERANK_MIN_CANDIDATES, RERANK_CALIBRATION_CAP_DIVISOR,
         RERANK_CALIBRATION_EXPONENT_MAX, RERANK_CALIBRATION_EXPONENT_MIN,
-        RERANK_CALIBRATION_FIT_FRACTIONS, RERANK_CALIBRATION_QUERIES, RERANK_CALIBRATION_TARGET,
-        TRAINING_SAMPLE_SEED,
+        RERANK_CALIBRATION_FIT_FRACTIONS, RERANK_CALIBRATION_PAGES, RERANK_CALIBRATION_QUERIES,
+        RERANK_CALIBRATION_TARGET, RERANK_CALIBRATION_TOP_K, TRAINING_SAMPLE_SEED,
     };
     use crate::distance::{CosineDist, L1Dist, L2Dist};
     use crate::pq::PQ;
@@ -6595,6 +7139,10 @@ mod tests {
     }
 
     /// The plan a caller who named no factor gets on a calibrated index.
+    ///
+    /// No page was measured and the page exponent is zero, so the page term is
+    /// exactly one at every page. That is the behaviour this relay changed, and
+    /// keeping it here is what lets the tests below compare against it.
     fn calibrated_plan(fetch: usize, sample_records: usize, exponent: f64) -> RerankPlan {
         RerankPlan {
             factor: None,
@@ -6602,6 +7150,8 @@ mod tests {
                 fetch,
                 fit_fetches: [fetch; RERANK_CALIBRATION_FIT_FRACTIONS.len()],
                 exponent,
+                page_fetches: [0; RERANK_CALIBRATION_PAGES.len()],
+                page_exponent: 0.0,
                 sample_records,
                 queries: RERANK_CALIBRATION_QUERIES,
                 target: RERANK_CALIBRATION_TARGET,
@@ -6696,6 +7246,207 @@ mod tests {
         // what a corpus holding a fixed number of groups gets.
         let linear = calibrated_plan(164, 10_000, 1.00);
         assert!(params(10, Some(linear)).fetch_k(100_000) > params(10, Some(ada)).fetch_k(100_000));
+    }
+
+    /// The same plan carrying a page exponent and no measured page, which is
+    /// what an index trained before the page term existed looks like once the
+    /// loader has filled the missing field in.
+    fn paged_plan(
+        fetch: usize,
+        sample_records: usize,
+        exponent: f64,
+        page_exponent: f64,
+    ) -> RerankPlan {
+        let mut plan = calibrated_plan(fetch, sample_records, exponent);
+        if let Some(calibration) = plan.calibration.as_mut() {
+            calibration.page_exponent = page_exponent;
+        }
+        plan
+    }
+
+    /// A plan carrying the pages the calibration measured, which is what an
+    /// index trained by this build carries.
+    fn measured_page_plan(
+        sample_records: usize,
+        exponent: f64,
+        page_fetches: [usize; RERANK_CALIBRATION_PAGES.len()],
+    ) -> RerankPlan {
+        let reference = RERANK_CALIBRATION_PAGES
+            .iter()
+            .position(|&p| p == RERANK_CALIBRATION_TOP_K)
+            .expect("the reference page is measured");
+        let mut plan = calibrated_plan(page_fetches[reference], sample_records, exponent);
+        if let Some(calibration) = plan.calibration.as_mut() {
+            calibration.page_fetches = page_fetches;
+            calibration.page_exponent = 0.0;
+        }
+        plan
+    }
+
+    /// The measured pages are interpolated, not fitted to one slope.
+    ///
+    /// The three page fetches below are what the calibration measures on
+    /// dbpedia-openai over 10,000 training records, and the relation through
+    /// them is convex: 0.431 over the first decade and 0.681 over the second.
+    #[test]
+    fn the_measured_pages_are_interpolated() {
+        let dbpedia = measured_page_plan(10_000, 0.437, [60, 162, 777]);
+        let flat = calibrated_plan(162, 10_000, 0.437);
+
+        // The reference page is exactly what it was.
+        assert_eq!(
+            params(RERANK_CALIBRATION_TOP_K, Some(dbpedia)).fetch_k(50_000),
+            params(RERANK_CALIBRATION_TOP_K, Some(flat)).fetch_k(50_000),
+        );
+
+        // A page of 100 asks for the measured ratio between the two pages,
+        // which is 777 over 162 rather than a line through all three.
+        let reference = params(10, Some(dbpedia)).fetch_k(50_000) as f64;
+        let hundred = params(100, Some(dbpedia)).fetch_k(50_000) as f64;
+        assert!(
+            (hundred / reference - 777.0 / 162.0).abs() < 0.02,
+            "the page of 100 scaled by {:.4} where the measurement says {:.4}",
+            hundred / reference,
+            777.0 / 162.0
+        );
+
+        // A least squares line through all three would ask for less, which is
+        // the reason for interpolating.
+        let fitted = paged_plan(162, 10_000, 0.437, 0.556);
+        assert!(
+            params(100, Some(fitted)).fetch_k(50_000) < hundred as usize,
+            "the line asked for at least as much as the interpolation"
+        );
+
+        // A page between two measured ones lands between the two fetches.
+        let between = params(30, Some(dbpedia)).fetch_k(50_000) as f64 / reference;
+        assert!(
+            between > 1.0 && between < 777.0 / 162.0,
+            "a page of 30 scaled by {:.4}",
+            between
+        );
+
+        // At a page below the reference the measurement asks for less and the
+        // clamp refuses it, so the fetch is the reference fetch.
+        assert_eq!(
+            params(1, Some(dbpedia)).fetch_k(50_000),
+            params(10, Some(dbpedia)).fetch_k(50_000),
+        );
+    }
+
+    /// The straight lines the page term is read off, on points whose answer is
+    /// known.
+    #[test]
+    fn the_interpolation_is_piecewise_linear() {
+        let points = [(0.0, 0.0), (1.0, 2.0), (2.0, 10.0)];
+
+        // On a knot, and between two of them.
+        assert!((interpolate(&points, 0.0) - 0.0).abs() < 1e-12);
+        assert!((interpolate(&points, 1.0) - 2.0).abs() < 1e-12);
+        assert!((interpolate(&points, 0.5) - 1.0).abs() < 1e-12);
+        assert!((interpolate(&points, 1.5) - 6.0).abs() < 1e-12);
+
+        // Outside, the nearest segment's slope carries on.
+        assert!((interpolate(&points, -1.0) - -2.0).abs() < 1e-12);
+        assert!((interpolate(&points, 3.0) - 18.0).abs() < 1e-12);
+
+        // Two points that share an x leave the slope undefined, and the value
+        // rather than an infinity is the answer.
+        let flat = [(1.0, 5.0), (1.0, 7.0)];
+        assert!(interpolate(&flat, 0.0).is_finite());
+        assert!(interpolate(&flat, 2.0).is_finite());
+
+        // Fewer than two points leave no line at all.
+        assert_eq!(interpolate(&[(3.0, 9.0)], 100.0), 9.0);
+        assert_eq!(interpolate(&[], 100.0), 0.0);
+    }
+
+    /// The page term scales the fetch and leaves the reference page alone.
+    ///
+    /// The reference page is what the calibration measured, so a search there
+    /// has to ask for exactly what it asked for before the page term existed.
+    /// That is the whole guarantee that recall at ten cannot regress.
+    #[test]
+    fn the_page_term_leaves_the_reference_page_alone() {
+        let flat = calibrated_plan(164, 10_000, 0.432);
+        let paged = paged_plan(164, 10_000, 0.432, 0.45);
+
+        assert_eq!(
+            params(RERANK_CALIBRATION_TOP_K, Some(flat)).fetch_k(50_000),
+            params(RERANK_CALIBRATION_TOP_K, Some(paged)).fetch_k(50_000),
+        );
+
+        // Below the reference page the fetch does not move. The measurement
+        // says a shallower page needs less, and acting on that costs recall;
+        // see `page_scale`.
+        assert_eq!(
+            params(1, Some(paged)).fetch_k(50_000),
+            params(10, Some(paged)).fetch_k(50_000),
+        );
+
+        // Above it the fetch rises, and it rises less than the page does.
+        let at_ten = params(10, Some(paged)).fetch_k(50_000);
+        let at_hundred = params(100, Some(paged)).fetch_k(50_000);
+        assert!(at_hundred > at_ten, "{} against {}", at_hundred, at_ten);
+        assert!(
+            at_hundred < 10 * at_ten,
+            "{} against {}",
+            at_hundred,
+            at_ten
+        );
+
+        // A page exponent of zero is the behaviour before this was measured,
+        // and a page exponent of one is a fetch proportional to the page.
+        let ignores_page = paged_plan(164, 10_000, 0.432, 0.0);
+        assert_eq!(
+            params(100, Some(ignores_page)).fetch_k(50_000),
+            params(10, Some(ignores_page)).fetch_k(50_000),
+        );
+        let linear = paged_plan(164, 10_000, 0.432, 1.0);
+        let ten = params(10, Some(linear)).fetch_k(50_000);
+        let hundred = params(100, Some(linear)).fetch_k(50_000);
+        assert!(
+            hundred.abs_diff(10 * ten) <= 10,
+            "{} against {}",
+            hundred,
+            10 * ten
+        );
+
+        // The cap still binds, so a page term cannot ask for more than a
+        // quarter of the records.
+        assert_eq!(
+            params(500, Some(linear)).fetch_k(50_000),
+            50_000 / RERANK_CALIBRATION_CAP_DIVISOR,
+        );
+    }
+
+    /// A calibration that measured no page exponent takes the shipped default,
+    /// which is what a directory written before the page term existed carries.
+    #[test]
+    fn a_calibration_without_a_page_exponent_takes_the_default() {
+        let json = r#"{"fetch":164,"fit_fetches":[109,124,152,164],"exponent":0.432,
+                       "sample_records":10000,"queries":512,"target":0.99,"millis":3164}"#;
+        let restored: RerankCalibration = serde_json::from_str(json).expect("older calibration");
+        assert_eq!(restored.fetch, 164);
+        assert_eq!(restored.page_fetches, [0; RERANK_CALIBRATION_PAGES.len()]);
+        assert_eq!(
+            restored.page_exponent,
+            super::RERANK_CALIBRATION_DEFAULT_PAGE_EXPONENT
+        );
+
+        // It reaches the reference page at exactly the fetch it always did, and
+        // it deepens above it.
+        let plan = RerankPlan {
+            factor: None,
+            calibration: Some(restored),
+            distance: raw_distance_fn("cosine"),
+        };
+        let flat = calibrated_plan(164, 10_000, 0.432);
+        assert_eq!(
+            params(10, Some(plan)).fetch_k(50_000),
+            params(10, Some(flat)).fetch_k(50_000),
+        );
+        assert!(params(100, Some(plan)).fetch_k(50_000) > params(100, Some(flat)).fetch_k(50_000));
     }
 
     /// The slope the exponent is fitted with, on points whose answer is known.

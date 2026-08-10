@@ -2875,6 +2875,229 @@ def test_the_calibration_reports_the_points_it_fitted(calibrated_index):
     assert 0.40 <= exponent <= 1.00, f"exponent {exponent} escaped the clamp"
 
 
+# ------------------------------------------------------------
+# Test 129: the calibration measures the page as well as the corpus
+# ------------------------------------------------------------
+def _page_recall(index, data, ids, picks, truth, page, **kwargs):
+    """Mean recall at `page` over `picks`, against exact cosine neighbours."""
+    hits = 0
+    for row, pick in enumerate(picks):
+        found = [hit["id"] for hit in index.search(data[pick], **kwargs)][:page]
+        hits += len(set(found) & {ids[j] for j in truth[row, :page]})
+    return hits / (page * len(picks))
+
+
+def test_the_calibration_reports_the_pages_it_fitted(calibrated_index):
+    """One fetch per page, and an exponent fitted through them.
+
+    The reference page has to be one of the pages measured, since the fetch the
+    search scales from is measured there and the scaling is exactly one there.
+    """
+    stats = calibrated_index["index"].get_stats()
+
+    pages = [int(part) for part in stats["rerank_calibration_pages"].split(",")]
+    fetches = [int(part) for part in stats["rerank_calibration_page_fetches"].split(",")]
+    assert len(pages) == len(fetches) == 3, f"{pages} against {fetches}"
+    assert 10 in pages, "the reference page is not among the pages measured"
+    assert fetches[pages.index(10)] == int(stats["rerank_calibration_fetch"]), (
+        "the fetch at the reference page is not the fetch the search scales from")
+
+    # A deeper page needs a deeper fetch, and the sample bounds every one of them.
+    assert fetches == sorted(fetches), f"the fetch fell as the page grew: {fetches}"
+    sample = int(stats["rerank_calibration_records"])
+    assert all(1 <= f <= sample for f in fetches), fetches
+
+    page_exponent = float(stats["rerank_calibration_page_exponent"])
+    assert 0.0 <= page_exponent <= 1.0, f"{page_exponent} escaped the clamp"
+
+    # Sublinear. A fetch proportional to the page is what a constant multiple of
+    # top_k assumes and no corpus measured here needs it.
+    assert page_exponent < 1.0, (
+        f"the page requirement measured linear at {page_exponent}, which no "
+        "corpus measured for this change did")
+
+
+# A corpus with depth at a page of 100
+#
+# Fifty Gaussian clusters over 8,000 records put a whole page of 100 inside one
+# cluster of 160, and a fetch sized for a page of ten already covers that
+# cluster, so recall at 100 reads 1.0000 either way and the corpus cannot tell
+# the two behaviours apart. This one has no cluster structure and a power law
+# covariance spectrum, which is the model relay 57 used for embedding-like data,
+# and on it the hundredth true neighbour really does sit deeper than the tenth.
+PAGE_DIM = 256
+PAGE_RECORDS = 10000
+PAGE_TRAINING = 2000
+
+
+def _anisotropic(n, dim, seed):
+    """Unit vectors with a power law covariance spectrum and no clusters."""
+    rng = np.random.default_rng(seed)
+    scale = np.power(np.arange(1, dim + 1, dtype=np.float64), -0.7)
+    points = rng.standard_normal((n, dim)) * scale
+    rotation, _ = np.linalg.qr(rng.standard_normal((dim, dim)))
+    points = points @ rotation.T
+    return (points / np.linalg.norm(points, axis=1, keepdims=True)).astype(np.float32)
+
+
+@pytest.fixture(scope="module")
+def page_index():
+    """One trained quantized_with_raw index over a corpus with page depth."""
+    data = _anisotropic(PAGE_RECORDS, PAGE_DIM, 20260812)
+    ids = [f"p_{i}" for i in range(PAGE_RECORDS)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        index = VectorDatabase().create(
+            "hnsw", dim=PAGE_DIM, expected_size=PAGE_RECORDS,
+            quantization_config={"type": "pq", "training_size": PAGE_TRAINING,
+                                 "storage_mode": "quantized_with_raw"})
+    assert index.add({"ids": ids, "embeddings": data}).is_success()
+    assert index.is_quantized(), "training did not complete"
+
+    rng = np.random.default_rng(5151)
+    picks = rng.choice(PAGE_RECORDS, 100, replace=False)
+    truth = np.argsort(-(data[picks] @ data.T), axis=1)[:, :100]
+    return {"index": index, "ids": ids, "data": data, "picks": picks, "truth": truth}
+
+
+def test_the_default_fetch_scales_with_the_requested_page(page_index):
+    """A larger page fetches deeper, and the reference page is untouched.
+
+    `rerank_default_fetch` is reported at the reference page, so the fetch a
+    page of 100 asks for is read off the search rather than off the stats. The
+    two searches below differ only in the page they request.
+    """
+    case = page_index
+    index, data, ids = case["index"], case["data"], case["ids"]
+    stats = index.get_stats()
+    reference = int(stats["rerank_default_fetch"])
+    page_exponent = float(stats["rerank_calibration_page_exponent"])
+
+    # What the arithmetic says the fetch at a page of 100 is. The floor and the
+    # cap are wide open at this record count and this page.
+    assert reference * 10 ** page_exponent > reference, (
+        "the page term did not deepen the fetch")
+
+    # And the search really pays for it. A page of 100 with rerank named at the
+    # reference fetch returns a worse page than the default does.
+    default = _page_recall(index, data, ids, case["picks"], case["truth"], 100,
+                           top_k=100)
+    reference_only = _page_recall(index, data, ids, case["picks"], case["truth"],
+                                  100, top_k=reference, rerank=1, ef_search=100)
+
+    assert default > reference_only, (
+        f"recall at 100 is {default:.4f} on the default and {reference_only:.4f} "
+        "on the fetch a page of ten asks for, so the page term bought nothing")
+
+
+def test_recall_at_a_hundred_clears_the_bound_the_old_fetch_missed(page_index):
+    """Recall at a page of 100, against a bound the page of ten fetch fails.
+
+    The fetch used to be measured for a page of ten and applied at every page,
+    so a search at `top_k=100` paid for a hundred results with a fetch sized for
+    ten. The bound below is what the page term buys and it is chosen so that the
+    old behaviour, reproduced in the second arm, does not reach it.
+
+    The second arm names `ef_search`. An unset one resolves to `max(2 * top_k,
+    100)` and the crate then raises the traversal to the candidate count, so
+    leaving it unset would give that arm a traversal twice as wide as the arm it
+    is reproducing.
+    """
+    case = page_index
+    index, data, ids = case["index"], case["data"], case["ids"]
+    reference = int(index.get_stats()["rerank_default_fetch"])
+
+    after = _page_recall(index, data, ids, case["picks"], case["truth"], 100,
+                         top_k=100)
+    before = _page_recall(index, data, ids, case["picks"], case["truth"], 100,
+                          top_k=reference, rerank=1, ef_search=100)
+
+    assert after >= 0.97, f"recall at 100 is {after:.4f} under the page term"
+    assert before < 0.97, (
+        f"the fetch a page of ten asks for already reached {before:.4f} at a "
+        "page of 100, so this bound no longer separates the two")
+
+
+def test_recall_at_ten_is_untouched_by_the_page_term(calibrated_index):
+    """The reference page asks for exactly what it asked for before.
+
+    This is the whole guarantee. The page ratio is one at the reference page
+    whatever the exponent is, so the fetch, the candidate set and the page are
+    identical to the ones the calibration shipped without a page term.
+    """
+    case = calibrated_index
+    index, data, ids = case["index"], case["data"], case["ids"]
+    reference = int(index.get_stats()["rerank_default_fetch"])
+
+    rng = np.random.default_rng(5151)
+    picks = rng.choice(len(ids), 100, replace=False)
+    truth = np.argsort(-(data[picks] @ data.T), axis=1)[:, :10]
+
+    default = _page_recall(index, data, ids, picks, truth, 10, top_k=10)
+    explicit = _page_recall(index, data, ids, picks, truth, 10,
+                            top_k=reference, rerank=1, ef_search=100)
+
+    # One result slot out of the 1,000 this compares is the tolerance, because
+    # the second arm asks for a page of `reference` and cuts it, so a tie at
+    # equal rescored distance can fall the other way. The fetch itself is
+    # identical by construction and the Rust suite asserts that directly.
+    assert default == pytest.approx(explicit, abs=0.002), (
+        f"recall at 10 is {default:.6f} on the default and {explicit:.6f} at the "
+        "same fetch named explicitly, so the default is no longer that fetch")
+
+
+def test_the_page_term_survives_a_save_and_load(tmp_path, calibrated_index):
+    """The page fetches and the exponent are stored, not recomputed."""
+    index = calibrated_index["index"]
+    before = index.get_stats()
+    path = str(tmp_path / "paged.zdb")
+    index.save(path)
+
+    after = VectorDatabase().load(path).get_stats()
+    for key in ("rerank_calibration_page_fetches", "rerank_calibration_pages",
+                "rerank_calibration_page_exponent"):
+        assert after[key] == before[key], f"{key} did not survive the round trip"
+
+
+def test_an_index_calibrated_without_a_page_term_takes_the_default(
+        tmp_path, calibrated_index):
+    """A directory written before the page term still opens and still deepens.
+
+    quantization.json gained two fields inside the calibration. Removing them
+    reproduces a directory written by the previous build, which has to load,
+    keep its record scaling, and fall back to the shipped page exponent rather
+    than to no page term at all.
+    """
+    import json
+
+    path = tmp_path / "no_page_term.zdb"
+    calibrated_index["index"].save(str(path))
+
+    quant_path = path / "quantization.json"
+    payload = json.loads(quant_path.read_text())
+    calibration = payload["rerank_calibration"]
+    assert calibration.pop("page_fetches", None) is not None
+    assert calibration.pop("page_exponent", None) is not None
+    quant_path.write_text(json.dumps(payload, indent=2))
+
+    loaded = VectorDatabase().load(str(path))
+    stats = loaded.get_stats()
+
+    assert stats["rerank_calibrated"] == "true"
+    assert stats["rerank_calibration_fetch"] == (
+        calibrated_index["index"].get_stats()["rerank_calibration_fetch"])
+    assert stats["rerank_calibration_page_fetches"] == "0,0,0", (
+        "a calibration that measured no pages should report none")
+    assert float(stats["rerank_calibration_page_exponent"]) > 0.0, (
+        "the fallback page exponent is what such an index deepens by")
+
+    # It still searches, and the reference page is untouched.
+    assert stats["rerank_default_fetch"] == (
+        calibrated_index["index"].get_stats()["rerank_default_fetch"])
+    page = loaded.search(calibrated_index["data"][0], top_k=100)
+    assert len(page) == 100
+
+
 def test_the_calibration_holds_recall_on_records_that_arrive_in_order():
     """Records grouped by cluster are the case the seeded shuffle exists for.
 

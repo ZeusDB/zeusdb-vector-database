@@ -604,9 +604,21 @@ storage_mode_description: raw_only
 
 `get_stats()` returns a `str` to `str` map. It also carries `dimension`, `space`, `m`, `ef_construction`, `expected_size`, `index_type`, `raw_vectors_stored`, `quantized_codes_stored` and `storage_mode`, plus training and compression fields once quantization is configured.
 
-On a quantized index it is also where the memory figures live. `raw_vectors_memory_mb` and `quantized_codes_memory_mb` scale with the record count, while `codebook_memory_mb` and `sdc_table_memory_mb` are fixed by `dim`, `subvectors` and `bits` and do not move as records arrive. `raw_vectors_retained` states the mode's policy: `none_once_trained` for `quantized_only`, whose raw vectors are released when training completes, and `all_records` for `quantized_with_raw`.
+It is also where the memory figures live, on every index rather than only on a quantized one. `graph_memory_mb` is the HNSW graph, `raw_vectors_memory_mb` is the raw vector store and `total_memory_mb` is the sum of everything below. On a quantized index `quantized_codes_memory_mb` scales with the record count, while `codebook_memory_mb` and `sdc_table_memory_mb` are fixed by `dim`, `subvectors` and `bits` and do not move as records arrive. `raw_vectors_retained` states the mode's policy: `none_once_trained` for `quantized_only`, whose raw vectors are released when training completes, and `all_records` for `quantized_with_raw`.
 
-It is also where the rerank calibration is reported. `rerank_default_fetch` is the number of candidates a search at `top_k=10` will fetch and rescore at the record count the index holds now, and it is the figure to read if you want to know what a quantized search is paying for. `rerank_calibrated` is `true` on a trained `quantized_with_raw` index, and `false` on every other index, including one saved before the calibration existed. When it is `true`, `rerank_calibration_fetch`, `rerank_calibration_fit_fetches`, `rerank_calibration_exponent`, `rerank_calibration_records`, `rerank_calibration_queries`, `rerank_calibration_target_recall` and `rerank_calibration_ms` report what training measured, on how many records, and what it cost. `rerank_calibration_fit_fetches` is the fetch measured at each quarter of the training sample, comma separated, and it is what the exponent is fitted from.
+**The graph is usually the largest of those figures, and on a memory optimized index it is nearly all of it.** It owns a second copy of every point on top of its neighbour lists, its sixteen per point layer headers and the counters around them. At 50,000 records of `dim=1536` a trained `quantized_only` index reports 98.1 MB of graph against 2.3 MB of codes and 7.5 MB of fixed tables.
+
+**`total_memory_mb` is not the resident set and it does not claim to be.** It prices the five structures above. The id maps, the metadata map, the hash table slots and the allocator's own headers and fragmentation sit outside it, and together they run at roughly 1,500 bytes per record whatever the dimension. Measured on three loaded indexes of 50,000 real 1,536-dimensional embeddings, one process each:
+
+| storage mode | `total_memory_mb` | resident | ratio |
+|---|---:|---:|---:|
+| no quantization | 692.4 MB | 805.9 MiB | 1.16x |
+| `quantized_with_raw` | 401.2 MB | 474.8 MiB | 1.18x |
+| `quantized_only` | 107.8 MB | 181.4 MiB | 1.68x |
+
+Size infrastructure from the resident column rather than the reported one. The reported figure is what the index holds; the process holds that plus what the allocator takes to hold it.
+
+It is also where the rerank calibration is reported. `rerank_default_fetch` is the number of candidates a search at `top_k=10` will fetch and rescore at the record count the index holds now, and it is the figure to read if you want to know what a quantized search is paying for. `rerank_calibrated` is `true` on a trained `quantized_with_raw` index, and `false` on every other index, including one saved before the calibration existed. When it is `true`, `rerank_calibration_fetch`, `rerank_calibration_fit_fetches`, `rerank_calibration_exponent`, `rerank_calibration_records`, `rerank_calibration_queries`, `rerank_calibration_target_recall` and `rerank_calibration_ms` report what training measured, on how many records, and what it cost. `rerank_calibration_fit_fetches` is the fetch measured at each quarter of the training sample, comma separated, and it is what the exponent is fitted from. `rerank_calibration_pages` and `rerank_calibration_page_fetches` are the page sizes the fetch was measured at and the fetch at each, and a search interpolates between them for the page it was given, so a search at a `top_k` above ten fetches more than `rerank_default_fetch` reports.
 
 <br/>
 
@@ -871,7 +883,9 @@ Two consequences of `quantized_only` are worth knowing before you pick it.
 
 **The gap between the two modes is not the compression ratio.** `quantized_with_raw` holds every raw vector on top of every code, so on the vectors and codes alone it holds close to the compression ratio times more than a trained `quantized_only` index. The whole resident index differs far less, because the graph, the codebook and the centroid distance table are identical in both modes and at small record counts they dominate. `get_stats()` reports the figures for your own index.
 
-**Both modes hold less than an unquantized index once they clear the fixed cost, `quantized_with_raw` included.** The HNSW graph owns a second copy of every point, separate from the storage map, and that copy is `dim × 4` bytes in an unquantized index and `subvectors` bytes in a quantized one whichever storage mode is set. `quantized_only` drops both copies and `quantized_with_raw` drops the graph's, which at `dim=768` is 3,072 bytes per record. Measured resident against the same data unquantized at `dim=768`, `quantized_with_raw` holds 0.69x at 10,000 records and 0.59x at 100,000 at the default `subvectors`, and 0.60x and 0.47x at 8 subvectors. `quantized_only` holds 0.35x and 0.29x at the default `subvectors`. `get_stats()` does not report the graph, so its totals understate what quantization saves.
+**Both modes hold less than an unquantized index once they clear the fixed cost, `quantized_with_raw` included.** The HNSW graph owns a second copy of every point, separate from the storage map, and that copy is `dim × 4` bytes in an unquantized index and `subvectors` bytes in a quantized one whichever storage mode is set. `quantized_only` drops both copies and `quantized_with_raw` drops the graph's, which at `dim=768` is 3,072 bytes per record. Measured resident against the same data unquantized at `dim=768`, `quantized_with_raw` holds 0.69x at 10,000 records and 0.59x at 100,000 at the default `subvectors`, and 0.60x and 0.47x at 8 subvectors. `quantized_only` holds 0.35x and 0.29x at the default `subvectors`. `get_stats()["graph_memory_mb"]` reports the graph for your own index and `total_memory_mb` includes it.
+
+**Quantization shrinks the graph's copy of the point and nothing else in the graph.** The neighbour lists, the sixteen layer headers every point carries and the counters around them are the same in all three configurations, so a quantized graph is smaller rather than negligible. Measured on 50,000 real 1,536-dimensional embeddings at `m=32`, `graph_memory_mb` reads 399.4 MB unquantized and 98.1 MB quantized, and 293.0 MB of that difference is the copy.
 
 **How much quantization saves is set by the dimension, and below `dim=256` it is not much.** Quantization removes the graph's copy of the vector and puts a code in its place, so what it can save per record is `dim × 4 − 2 × subvectors` bytes against the `dim × 8` an unquantized index holds for its two copies plus about 2,740 bytes of graph neighbour lists, id maps and metadata that neither mode touches. Measured resident, one dimension per process, 25,000 records at `m=32`, an unquantized index and a `quantized_with_raw` one built over the same records:
 
@@ -956,6 +970,25 @@ The exact figures depend on your data, but the shape does not. If you need quant
 
 The result is clamped between 0.40 and 1.00, multiplied by a safety factor of 1.75, floored at 250 candidates and at `5 × top_k`, and capped at a quarter of the record count.
 
+**A larger page needs a deeper fetch, and the calibration measures that too.** The fetch above is measured for a page of ten. A search asking for a hundred results needs the hundredth true neighbour to survive the code ordering rather than only the tenth, and the hundredth sits deeper. So the calibration measures the fetch at pages of 1, 10 and 100 in the same pass, which costs almost nothing because finding the exact neighbours once to the deepest page answers all three, and a search interpolates between those points for whatever page it was asked for. A page of ten is one of the points, so a search at the default `top_k` asks for exactly what the record scaling alone asked for.
+
+**The requirement is sublinear in the page.** The smallest fetch reaching mean recall 0.99 at each page, read off built `quantized_with_raw` indexes by sweeping the explicit `rerank` argument, 200 queries against exact ground truth to depth 1,000:
+
+| dataset | records | page 1 | page 10 | page 100 | page 1,000 |
+|---|---:|---:|---:|---:|---:|
+| dbpedia-openai | 50,000 | 150 | 660 | 2,962 | above 5,600 |
+| dbpedia-openai | 100,000 | 131 | 462 | 2,274 | above 4,000 |
+| sift-128 | 50,000 | 100 | 296 | 1,228 | 4,346 |
+| sift-128 | 100,000 | 150 | 365 | 1,704 | 5,909 |
+| glove-100 | 50,000 | 1,673 | 3,468 | above 8,000 | above 8,000 |
+| glove-100 | 100,000 | 1,400 | 4,576 | above 8,000 | above 8,000 |
+
+A page a hundred times larger needs between 2.4 and 20 times the fetch, never a hundred times. What buries a true neighbour in the code ordering is the number of records the codes cannot separate from your query, and that count does not move when you ask for more results. **A constant multiple of `top_k` is therefore the wrong shape**, which is why `5 × top_k` is a floor here rather than the page term.
+
+The relation is curved as well as sublinear. On dbpedia-openai the calibration measures 60, 162 and 777 candidates at the three pages, which is a slope of 0.43 over the first decade of page size and 0.68 over the second, and a single line through all three would under-fetch at a page of 100 by a third. That is why the pages are interpolated rather than fitted to one exponent.
+
+**The page term only ever deepens the fetch.** A page smaller than ten measures as needing less, and acting on that costs recall, because the ratio between two pages is measured on the training sample and does not carry the safety factor the reference measurement carries. On glove-100 at 50,000 records the sample's ratio between a page of 1 and a page of 10 is 0.382 where the built index needs 0.482, and scaling by the sample's ratio took recall at `top_k=1` from 1.000 to 0.988. So a page below ten fetches what a page of ten fetches. Pass `rerank` explicitly if you want a shallower page to cost less. `get_stats()` reports the pages under `rerank_calibration_pages`, the fetch at each under `rerank_calibration_page_fetches`, and the least squares slope through them under `rerank_calibration_page_exponent`, which is what an index calibrated before this release falls back to.
+
 What the calibration asks for at 100,000 records, against what the data needs and against the fixed 2%. Every figure is measured on a built index through the ordinary search path, 1,000 queries at `top_k=10` against exact ground truth. The requirement is the smallest fetch on that same index reaching recall at 10 of 0.99, read off a sweep of the explicit `rerank` argument:
 
 | dataset | calibrated fetch | measured requirement | the old fixed fetch | recall, calibrated | recall, fixed |
@@ -969,7 +1002,8 @@ The calibration clears the requirement on all three. **It does not land on it an
 **On data with no resolvable structure no fetch works.** Once the group the codes cannot separate is smaller than `top_k`, the true top ten span groups, the distances between groups differ in the fourth decimal, and nothing reaches them. At 5,000 clusters over 25,000 records, being five records to a cluster, recall at 10 reaches 0.917 at a fetch of half the corpus, and uniform points on the sphere reach 0.859. Measure recall on your own data before you rely on quantization.
 
 - `rerank` omitted uses the calibrated fetch above. It is the only setting that holds recall across corpus sizes and across datasets.
-- An index trained before this release, and any index loaded from a directory saved by one, carries no calibration. It falls back to the fixed fetch of 2% of the record count, floored at 250 candidates and at `5 × top_k`. `get_stats()` reports `rerank_calibrated: false` for it. Rebuild the index to calibrate it.
+- An index trained before the calibration existed, and any index loaded from a directory saved by one, carries no calibration. It falls back to the fixed fetch of 2% of the record count, floored at 250 candidates and at `5 × top_k`. `get_stats()` reports `rerank_calibrated: false` for it. Rebuild the index to calibrate it.
+- An index calibrated before the page term existed keeps its record scaling and takes a shipped page exponent of 0.49 in place of the pages it never measured, so a large page still deepens its fetch. `rerank_calibration_page_fetches` reads `0,0,0` for it, which is how you can tell. A page of ten is unaffected either way. Rebuild the index to measure its own pages.
 - `rerank=N` for N of 1 or more fetches `top_k × N` candidates, a fixed multiple of the page that does not move with the corpus. Use it to override the default deliberately, not as the normal path.
 - `rerank=0` turns reranking off and returns the ADC scores and ordering.
 - `rerank` has no effect on an unquantized index or on a `quantized_only` one. Both ignore it.
@@ -1021,7 +1055,7 @@ Memory goes the other way and is not data dependent. On the embedding-like corpu
 
 An unquantized index over the same records holds 994 MB, builds in 313 s and answers in 3.05 ms.
 
-**If query time above the crossover is what matters to you, `subvectors = dim / 4` is the setting, and set `rerank` with it.** At 16x the fetch collapses and the query falls to 4.32 ms. You pay for it twice: the index holds 745 MB against 585 at the default, and it builds in 846 s against 170 and against 313 for no quantization at all. At 10,000 records that same setting holds 94 MB where not quantizing holds 90, so it is a choice for large indexes only. The default fetch is 2% of the corpus whatever `subvectors` is, so pass `rerank` explicitly to take the benefit, for example `rerank=30` at 100,000 records with `top_k=10`.
+**If query time above the crossover is what matters to you, `subvectors = dim / 4` is the setting, and set `rerank` with it.** At 16x the fetch collapses and the query falls to 4.32 ms. You pay for it twice: the index holds 745 MB against 585 at the default, and it builds in 846 s against 170 and against 313 for no quantization at all. At 10,000 records that same setting holds 94 MB where not quantizing holds 90, so it is a choice for large indexes only. The fetch column above is the requirement rather than what the default asks for, and the default is measured on your data rather than derived from `subvectors`, so read `get_stats()["rerank_default_fetch"]` and pass `rerank` explicitly to take the benefit.
 
 Quantization remains a memory decision. At 100,000 records of `dim=768` the default holds 585 MB against 994 MB unquantized and answers in 13.4 ms against 3.05 ms. Lower `rerank` explicitly if query time matters more to you than recall, and measure what it costs you.
 

@@ -120,8 +120,11 @@ class VectorDatabase:
             less than an unquantized index above their break even record count.
             Under 'quantized_only' the records collected for training are held at
             full width only until training completes, then released. get_stats()
-            reports the codes, the raw vectors, the codebook and the centroid
-            distance table, and does not report the graph. Recall falls sharply,
+            reports the codes, the raw vectors, the codebook, the centroid
+            distance table and the graph, and sums them under total_memory_mb.
+            That sum is what the index holds rather than what the process holds,
+            since the id maps, the metadata map and the allocator's own headers
+            sit outside it at roughly 1,500 bytes a record. Recall falls sharply,
             not slightly. Only 'quantized_with_raw' can recover it, by reranking
             against the raw vectors it keeps. Training triggers automatically on
             the first .add() call that reaches the training_size threshold, and
@@ -355,10 +358,10 @@ class VectorDatabase:
                 f"{dim * 4}. Measured at dimension 768 and the derived subvectors it "
                 "holds 0.69 times an unquantized index at 10,000 records and 0.59 "
                 "times at 100,000. "
-                "get_stats() reports the memory the codes, the raw vectors, the codebook "
-                "and the centroid distance table hold once records are loaded, and does "
-                "not report the graph. This mode is required for rerank and for exact "
-                "vector reconstruction.",
+                "get_stats() reports the memory the codes, the raw vectors, the codebook, "
+                "the centroid distance table and the graph hold once records are loaded, "
+                "and sums them under total_memory_mb. This mode is required for rerank "
+                "and for exact vector reconstruction.",
                 UserWarning,
                 stacklevel=2
             )
