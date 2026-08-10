@@ -8,9 +8,12 @@ the truth. These tests cover the graph figure being reported at all, its shape
 against the parameters that drive it, and the reported total against the
 resident set of a process that holds one index and nothing else.
 
-Memory is read as `psutil` `memory_info().rss`, which on Windows is the working
-set. The figure is a delta across the build with the source array already
-allocated on both sides, so what it measures is the index.
+Memory is read as `psutil` `memory_info().rss`, which is the working set on
+Windows and the pages faulted in and still held on Linux. The figure is a delta
+across the build with the source array already allocated on both sides, so what
+it measures is the index. It is not the same quantity as the reported total and
+it does not bound it in either direction; see
+`TOTAL_AGAINST_RESIDENT_CEILING`.
 """
 
 import warnings
@@ -138,15 +141,38 @@ def test_graph_memory_rises_with_the_graph_degree():
 # ------------------------------------------------------------
 # The total against the resident set
 # ------------------------------------------------------------
-# The bound is measured rather than chosen. On the relay 60 grid, being three
-# dimensions, two record counts and three storage modes over real
-# dbpedia-openai embeddings, the reported total ran between 0.62 and 0.89 of
-# the resident set the build added, and the rest is the id maps, the metadata
-# map, the hash table slots and the allocator's own headers and fragmentation.
-# The assertion below is deliberately looser than that band, because the
-# allocator's share is a property of the machine.
+# `total_memory_mb` and the resident set are not the same quantity, and neither
+# one bounds the other.
+#
+# The report counts bytes the index asked the allocator for. The resident set
+# counts pages the process has touched and still holds. They diverge in both
+# directions and the bounds below are asymmetric for that reason.
+#
+# Downward, the process holds more than the report names. The allocator's own
+# block headers and its rounding, its fragmentation, and the id maps, the
+# metadata map and the hash table slots that `total_memory_mb` does not price
+# all sit outside the report. Measured on Windows over the relay 60 grid, being
+# three dimensions, two record counts and three storage modes over real
+# dbpedia-openai embeddings, the report ran 0.62 to 0.89 of the resident delta.
+#
+# Upward, the report names more than the process holds. Capacity that was
+# requested and never written never faults in, so it never enters the resident
+# set at all. The layer reservation `expected_size` makes at creation and the
+# slack in the neighbour list buffers are the largest of those, and their share
+# is fixed by the declared size rather than by the bytes the records occupy, so
+# it dominates at the 8,000 records this test builds and washes out by 50,000.
+# Measured on Linux at this size the report ran 1.196, 1.229 and 1.579 of the
+# resident delta across the three storage modes.
+#
+# The ceiling therefore sits well above one. It is 2.00 rather than just above
+# the 1.579 seen, so that a different allocator or a different kernel's fault-in
+# behaviour does not fail a test that is about neither.
+#
+# The floor is unchanged. Under-reporting is the defect this test exists to
+# catch, and nothing about page accounting makes a report that misses half of
+# what an index holds acceptable.
 TOTAL_AGAINST_RESIDENT_FLOOR = 0.45
-TOTAL_AGAINST_RESIDENT_CEILING = 1.00
+TOTAL_AGAINST_RESIDENT_CEILING = 2.00
 
 
 _RESIDENT_PROBE = '''
@@ -182,12 +208,13 @@ print(json.dumps({"resident": after - before,
 
 @pytest.mark.parametrize("storage_mode", ["none", "quantized_with_raw", "quantized_only"])
 def test_the_reported_total_tracks_the_resident_set(storage_mode):
-    """What the index says it holds is most of what the process gained.
+    """What the index says it holds, against what the process gained.
 
-    It cannot be all of it. `total_memory_mb` prices the structures this call
-    can price and names what it leaves out, and no figure derived from the
-    structures can account for the allocator's own headers or its
-    fragmentation.
+    The report can land either side of the resident delta, and the bounds are
+    asymmetric for reasons recorded on `TOTAL_AGAINST_RESIDENT_CEILING`. What
+    this test is for is the floor. A report that misses most of what an index
+    holds is the defect the graph figure was added to fix, and it would be
+    caught here whatever the pages say.
 
     One index per process. In a shared process the second build reuses the
     pages the first one freed, so the resident delta stops measuring the index
@@ -206,11 +233,11 @@ def test_the_reported_total_tracks_the_resident_set(storage_mode):
     resident_mb = measured["resident"] / (1024 * 1024)
     reported_mb = measured["reported"]
 
-    # A process that gained nothing measurable cannot grade the report. The
-    # working set is not a clean instrument and this leaves the assertion to
-    # the runs where it is.
+    # A process that gained nothing measurable cannot grade the report. Page
+    # accounting is not a clean instrument and this leaves the assertion to the
+    # runs where it is.
     if resident_mb < 8.0:
-        pytest.skip(f"the build added only {resident_mb:.1f} MiB of working set")
+        pytest.skip(f"the build added only {resident_mb:.1f} MiB of resident set")
 
     share = reported_mb / resident_mb
     assert TOTAL_AGAINST_RESIDENT_FLOOR <= share <= TOTAL_AGAINST_RESIDENT_CEILING, (
