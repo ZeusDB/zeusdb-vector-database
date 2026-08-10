@@ -16,11 +16,13 @@ near 11,000. See the README for the measured tables.
 
 How deep the fetch has to go is measured on your own data when training
 completes, not set by a formula, so `get_stats()["rerank_default_fetch"]` tells
-you what each search is paying for. The measurement runs over a seeded random
-draw of the training sample rather than the order your records arrived in, and
-it is repeated at a quarter, a half and three quarters of that sample so the
-fetch can be scaled to a corpus larger than the one it was measured on. This
-file runs at dimension 64, where
+you what each search is paying for at a page of ten. The measurement runs over a
+seeded random draw of the training sample rather than the order your records
+arrived in, and it is repeated at a quarter, a half and three quarters of that
+sample so the fetch can be scaled to a corpus larger than the one it was
+measured on. It is also taken at pages of 1, 10 and 100, because the hundredth
+true neighbour sits deeper than the tenth, and a search interpolates between
+those three for whatever page you ask for. This file runs at dimension 64, where
 `create()` warns that quantization removes only a few percent of what an
 unquantized index holds. That warning is the point of the file rather than a
 problem with it.
@@ -137,41 +139,46 @@ def main():
     # and bits. They do not move as records arrive, and at this record count
     # they are larger than everything the records themselves hold, which is why
     # they are in the total rather than left out of it.
-    # get_stats() reports the codes, the raw vectors, the codebook and the
-    # table. It does not report the graph, and the graph owns a second copy of
-    # every point. That copy is dim * 4 bytes in an unquantized index and
-    # subvectors bytes in a quantized one, in both storage modes, so it is
-    # computed here rather than read. Leaving it out is what made an earlier
-    # version of this file claim that quantized_with_raw stores more than an
-    # unquantized index. It does not, once the graph is counted and the record
-    # count clears the fixed cost.
+    # get_stats() reports the codes, the raw vectors, the codebook, the table
+    # and the graph, and total_memory_mb is the sum of those five. The graph
+    # owns a second copy of every point on top of its neighbour lists, and that
+    # copy is dim * 4 bytes in an unquantized index and subvectors bytes in a
+    # quantized one, in both storage modes. It used to be left out of this
+    # table, which is what made an earlier version of this file claim that
+    # quantized_with_raw stores more than an unquantized index. It does not,
+    # once the graph is counted and the record count clears the fixed cost.
     print("stored per mode")
     print(f"  {'mode':<20s} {'raw':>6s} {'codes':>6s} {'raw MB':>7s} {'code MB':>8s} "
           f"{'fixed MB':>9s} {'graph MB':>9s} {'total':>6s}")
-    unquantized_mb = RECORDS * DIM * 4 / 1024 / 1024
-    graph_quantized_mb = RECORDS * PQ["subvectors"] / 1024 / 1024
-    print(f"  {'no quantization':<20s} {RECORDS:>6d} {0:>6d} "
-          f"{unquantized_mb:>7.2f} {0.0:>8.2f} {0.0:>9.2f} {unquantized_mb:>9.2f} "
-          f"{2 * unquantized_mb:>6.2f}")
-    for label, index in (("quantized_only", only), ("quantized_with_raw", with_raw)):
+    for label, index in (("no quantization", raw),
+                         ("quantized_only", only),
+                         ("quantized_with_raw", with_raw)):
         stats = index.get_stats()
         raw_mb = megabytes(stats, "raw_vectors_memory_mb")
         code_mb = megabytes(stats, "quantized_codes_memory_mb")
         fixed_mb = (megabytes(stats, "codebook_memory_mb")
                     + megabytes(stats, "sdc_table_memory_mb"))
+        graph_mb = megabytes(stats, "graph_memory_mb")
         print(
             f"  {label:<20s} {stats['raw_vectors_stored']:>6s} "
             f"{stats['quantized_codes_stored']:>6s} "
-            f"{raw_mb:>7.2f} {code_mb:>8.2f} {fixed_mb:>9.2f} {graph_quantized_mb:>9.2f} "
-            f"{raw_mb + code_mb + fixed_mb + graph_quantized_mb:>6.2f}"
+            f"{raw_mb:>7.2f} {code_mb:>8.2f} {fixed_mb:>9.2f} {graph_mb:>9.2f} "
+            f"{megabytes(stats, 'total_memory_mb'):>6.2f}"
         )
     print()
     print("Both modes drop the graph's full width copy of every point, so both")
-    print("save there. At 3,000 vectors of 64 dimensions that copy is 0.73 MB and")
-    print("the fixed table is 1.06 MB, so neither mode has repaid the fixed cost")
-    print("yet. The fixed cost does not grow with the record count and the saving")
-    print("does, so both cross into saving as the index grows, quantized_only")
-    print("first because it drops the raw vectors as well.")
+    print("save there. The graph column holds more than that copy. The neighbour")
+    print("lists, the sixteen layer headers every point carries and the counters")
+    print("around them do not shrink when the copy does, so the quantized graph")
+    print("is smaller rather than negligible. The fixed table is 1.06 MB at this")
+    print("configuration and neither mode has repaid it at 3,000 records. The")
+    print("fixed cost does not grow with the record count and the saving does, so")
+    print("both cross into saving as the index grows, quantized_only first")
+    print("because it drops the raw vectors as well.")
+    print()
+    print("total_memory_mb is what the index holds in the structures get_stats()")
+    print("can price. The id maps, the metadata map and the allocator's own")
+    print("headers sit outside it, so a process holds rather more than this.")
     print()
 
     # ------------------------------------------------------------------
@@ -233,16 +240,23 @@ compression ratio: 32x
 
 stored per mode
   mode                    raw  codes  raw MB  code MB  fixed MB  graph MB  total
-  no quantization        3000      0    0.73     0.00      0.00      0.73   1.46
-  quantized_only            0   3000    0.00     0.02      1.06      0.02   1.10
-  quantized_with_raw     3000   3000    0.73     0.02      1.06      0.02   1.83
+  no quantization        3000      0    0.73     0.00      0.00      5.14   5.87
+  quantized_only            0   3000    0.00     0.02      1.06      4...   5...
+  quantized_with_raw     3000   3000    0.73     0.02      1.06      4...   6...
 
 Both modes drop the graph's full width copy of every point, so both
-save there. At 3,000 vectors of 64 dimensions that copy is 0.73 MB and
-the fixed table is 1.06 MB, so neither mode has repaid the fixed cost
-yet. The fixed cost does not grow with the record count and the saving
-does, so both cross into saving as the index grows, quantized_only
-first because it drops the raw vectors as well.
+save there. The graph column holds more than that copy. The neighbour
+lists, the sixteen layer headers every point carries and the counters
+around them do not shrink when the copy does, so the quantized graph
+is smaller rather than negligible. The fixed table is 1.06 MB at this
+configuration and neither mode has repaid it at 3,000 records. The
+fixed cost does not grow with the record count and the saving does, so
+both cross into saving as the index grows, quantized_only first
+because it drops the raw vectors as well.
+
+total_memory_mb is what the index holds in the structures get_stats()
+can price. The id maps, the metadata map and the allocator's own
+headers sit outside it, so a process holds rather more than this.
 
 recall@10 against exact cosine search
   no quantization                    good  1.00
