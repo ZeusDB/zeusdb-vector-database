@@ -7,28 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.5.0] - 2026-08-10
+
+This release repairs the index graph. Search results change on upgrade for every index type, in each case for the better, so any test that pins exact result sets against a 0.4.x index needs its expectations refreshed.
+
+### Breaking
+
+- A search on a `quantized_with_raw` index reranks its candidates against the stored raw vectors by default, and the returned score is the raw distance rather than the quantized approximation. Scores and result order both change. Pass `rerank=0` to `search()` to restore the previous scoring.
+- Under `quantized_only`, raw vectors are released once training completes. `return_vector=True` and `get_records()` then return a reconstruction from the stored codes rather than the value supplied, for every record including the training records. Saving a trained `quantized_only` index writes no `vectors.bin`, and loading a quantized directory written by an earlier release drops any retained raw vector for a record that carries codes. Use `quantized_with_raw` where the exact vector has to come back.
+- The default `subvectors` is derived from the dimension as `dim / 32`, clamped to 8 through 192 and snapped to a divisor of `dim`. It was a fixed 8. A quantized index created without an explicit `subvectors` gets different codes, memory and recall. Pass `subvectors=8` to keep the previous configuration. A saved index keeps the configuration it was built with.
+- The default `m` scales with `expected_size`: 16 up to 25,000 and 32 above. An index created above 25,000 records on defaults uses more memory and returns better results. Pass `m=16` to keep the previous density. An explicit `m` is unaffected and a saved index keeps the `m` it was built with.
+- An unknown filter operator raises `ValueError`. It previously matched nothing and returned an empty result set, so a misspelled operator now surfaces instead of silently filtering everything out.
+- Numbers in filter conditions compare by magnitude, so an integer and an equal float match under `eq`, `ne`, `in` and direct equality. A filter that relied on `10` and `10.0` being distinct values returns different results.
+- An array filter condition such as `{"tags": ["ai", "science"]}` matches by exact element-by-element equality, in order. It previously matched nothing at all.
+- Non-finite values (NaN or infinity) are rejected everywhere: `add()` reports them per record through `AddResult`, naming the record and component, single and batch `search()` raise naming the entry and component, and a load that finds one in a saved index fails.
+- `m` has a floor of 2 and `expected_size` a ceiling of 100,000,000. Values outside these bounds raise instead of building a degenerate or unallocatable graph.
+- `HNSWIndex` can no longer be constructed directly and `HNSWIndex(...)` raises `TypeError`. An index comes from `VectorDatabase.create()` or `VectorDatabase.load()`. The class stays importable for `isinstance` checks and annotations.
+- `get_next_id()`, `benchmark_raw_concurrent_performance()`, `get_code_version()`, `get_version_number()`, `count_stored_records()` and `load_index` are removed from the Python surface. Use `VectorDatabase.load()` in place of `load_index` and `zeusdb_vector_database.__version__` in place of the version getters.
+- `MemoryInfo`, `auto_configure_logging` and `JSONFormatter` are renamed `_MemoryInfo`, `_auto_configure_logging` and `_JSONFormatter`. `VectorDatabase._index_constructors` is replaced by `_index_types`, a name to description map that hands out no constructor.
+- `get_stats()` no longer reports `memory_savings`, and `get_performance_info()` no longer reports `quantization_memory_savings`, `insertion_speedup_expected`, `insertion_bottleneck` or `limitation`, and its `benefits` list no longer claims `parallel_insert`. Read the new memory keys listed under Added instead.
+- `ZEUSDB_LOG_FILE` writes exactly the file named. `ZEUSDB_LOG_FILE=app.log` used to write `app.log.YYYY-MM-DD` and leave `app.log` empty. Set `ZEUSDB_LOG_ROTATION=daily` to keep the dated files.
+- Wheels are no longer published for macOS x86_64, 32-bit x86, armv7, s390x or ppc64le. The wheel targets are Linux x86_64 and aarch64 (glibc and musl), Windows x64 and macOS arm64. Any other platform installs from the sdist, which needs a Rust toolchain.
+
+### Fixed
+
+- Quantized search returned meaningless results in every release that offered it. The graph of a quantized index was built on distances that all evaluated as infinite, so its structure carried no information about the data. Measured at 10,000 records of dimension 768 at `top_k` 10, recall against exact search was 0.0035 where an unquantized index reached 0.9995, and a large result request returned 34 results out of 1,000 asked for. The graph is now built on real distances between codes and reranked against raw vectors where they are stored. Upgrading fixes this. A quantized directory saved by an earlier release is rebuilt on load with the corrected construction, so loading it once and saving it again persists the repaired graph.
+- Between 1 and 2 percent of records were unreachable by any query, including a search for the record's own vector, measured at 1,000 and 10,000 points. Two graph construction defects caused this, one assigning reverse links to the wrong layers and one evicting a point's last inbound link. Both are fixed. Newly built graphs no longer strand records, and a directory saved by an earlier release gets the corrected construction when its graph is rebuilt on load.
+- A deleted or overwritten record kept its node in the graph, where it consumed result slots and degraded search results as churn accumulated. Removed records are now excluded from traversal, and `compact()` rebuilds the graph to reclaim the stranded nodes when their memory matters.
+- Loading a `quantized_only` directory dropped every record added after training, and restored the codebook as all zeroes, so quantized distances after a reload were meaningless. Both are fixed. A directory saved once by an earlier release recovers in full when loaded under this release. A directory that an earlier release loaded and then saved again lost those records permanently, and no upgrade can recover them.
+- A quantized index came back from `load()` in a degraded state that kept full-width vectors in memory. It now loads back as quantized and the memory saving survives the reload.
+- Creating an index reserved graph capacity for hundreds of neighbours per expected record. It now reserves one slot per record, and memory at creation drops accordingly.
+- Index builds are reproducible. The same records added in the same order produce the same graph, and save followed by load returns identical results to the index that was saved.
+- Metadata added through `add_metadata()` survives a save and load.
+- The documented `ZEUSDB_DISABLE_AUTO_LOGGING` variable now reaches the Rust layer, which previously read only the undocumented `ZEUSDB_DISABLE_AUTOLOG`. Both layers accept the old name as a deprecated alias and require `true`, `1` or `yes`.
+- Loading an index whose graph rebuild refuses a record fails with the rejected records named, instead of returning an index that reports a vector count no query can reach.
 
 ### Added
-- `HNSWIndex`, `AddResult`, `init_logging`, `init_file_logging` and `is_logging_initialized` are exported from `zeusdb_vector_database`, and `__all__` names them explicitly. The documented programmatic logging recipe raised `AttributeError` at package level because `__all__` was `["VectorDatabase"]` and the functions were never imported here.
-- `m` has a lower bound of 1. `create("hnsw", m=0)` was accepted and built a graph with zero neighbour capacity.
-- Non-finite values are rejected on both NumPy `add` paths, per record through `AddResult`, naming the record and the component. The list and dict paths already rejected them.
+
+- `rerank` argument on `search()`. An integer sets the over-fetch factor for the raw-vector rescoring pass on `quantized_with_raw`, and `0` turns rescoring off. When unset, the fetch comes from a calibration measured on the index's own data at training completion, stored in `quantization.json` and scaled to the live record count and the requested page.
+- `compact()` rebuilds the graph in memory, reclaiming the nodes stranded by `remove_point()` and `add(overwrite=True)`. It returns the number of nodes reclaimed and is never automatic.
+- `HNSWIndex`, `AddResult`, `init_logging`, `init_file_logging` and `is_logging_initialized` are exported from `zeusdb_vector_database`, and `__all__` names them explicitly. The documented programmatic logging recipe previously raised `AttributeError` at package level.
+- Memory reporting in `get_stats()`: `graph_memory_mb`, `raw_vectors_memory_mb` and `total_memory_mb` on every index, plus `codebook_memory_mb`, `sdc_table_memory_mb`, `raw_vectors_retained` and the rerank calibration figures on a quantized one. `get_performance_info()` reports the measured recall loss for each quantized storage mode and an `insertion_path` key reading `sequential`.
+- `create()` warns when a quantization configuration cannot repay its fixed memory cost at the declared `expected_size`, and when `expected_size` is below `training_size`, since such an index never trains. An index warns when its record count outgrows the declared `expected_size`.
+- `ZEUSDB_LOG_ROTATION` accepts `daily` or `never`, default `never`. `daily` routes the file target to a rolling appender that appends the UTC date to the file name. The resolved log path is logged at startup.
+- `ZEUSDB_LOAD_REBUILD_GRAPH` forces `load()` to rebuild the graph from the stored records instead of restoring the saved dump.
 - `max_training_vectors >= training_size`, `subvectors > 0` and `subvectors <= dim` are enforced in the Rust builder as well as the Python factory.
-- Loading an index whose graph rebuild refuses a record now fails with the rejected records named, instead of returning an index that reports a vector count no query can reach.
-- `ZEUSDB_LOG_FILE` writes the file named, and the resolved path is logged at startup when the target is `file`.
-- `ZEUSDB_LOG_ROTATION` accepts `daily` or `never`, default `never`. `daily` routes the file target to the rolling appender, which appends the UTC date to the file name. The resolved path is logged at startup under both values, and an unrecognised value warns and falls back to `never`.
+- Six worked examples under `examples/`, each carrying the transcript it reproduces, and test suites that execute the examples and every README example against a freshly built module.
 
 ### Changed
-- `HNSWIndex` no longer carries a constructor. An index comes from `VectorDatabase.create()` or `VectorDatabase.load()`. The class stays importable for `isinstance` checks and annotations, and direct construction raises `TypeError`.
-- `VectorDatabase._index_constructors` is replaced by `_index_types`, a name to description map that hands out no constructor.
-- Both the Rust and the Python layer read `ZEUSDB_DISABLE_AUTO_LOGGING`, the published name, and accept `ZEUSDB_DISABLE_AUTOLOG` as a deprecated alias. The Rust layer read only the alias, so the documented variable silently did nothing to it. Both layers require `true`, `1` or `yes`.
-- `ZEUSDB_LOG_FILE` names a file rather than a rotation prefix. `ZEUSDB_LOG_FILE=app.log` wrote `app.log.YYYY-MM-DD` and left `app.log` empty. Rotation is now a changed default rather than a removed capability. Set `ZEUSDB_LOG_ROTATION=daily` to keep the previous behaviour, or use `init_file_logging(log_dir, level, file_prefix)`.
-- `get_performance_info()` no longer reports `insertion_speedup_expected`, `insertion_bottleneck` or `limitation`, which described a parallel insert path that does not exist, and `benefits` no longer claims `parallel_insert`. An `insertion_path` key reports `sequential`.
 
-### Removed
-- `HNSWIndex.__new__`, `get_next_id()`, `benchmark_raw_concurrent_performance()`, `get_code_version()` and `get_version_number()`.
-- `count_stored_records()` and `load_index` leave the Python surface. `count_stored_records` stays a Rust function for the load path and `load_index` is registered as `_load_index`, which `VectorDatabase.load()` calls.
-- `MemoryInfo`, `auto_configure_logging` and `JSONFormatter` are renamed `_MemoryInfo`, `_auto_configure_logging` and `_JSONFormatter`.
+- `load()` restores the saved graph instead of rebuilding it. Loading a 50,000 record index of 1,536 dimensional embeddings drops from roughly three minutes to under two seconds. A directory whose dump is absent, damaged or written by an earlier release falls back to the rebuild, which produces a working index from any intact directory.
+- Searches from different threads run concurrently, and a search no longer blocks behind an add. The interpreter lock is released during `add()`, `remove_point()`, `compact()`, `save()` and `rebuild_with_quantization()`, so other Python threads make progress during mutation.
+- The `hnsw_rs` graph crate is vendored into the source tree at 0.3.4 with six patches, recorded in `vendor/hnsw_rs/ZEUSDB-PATCH.md`. The sdist ships the vendored tree and its licences, and building from source no longer pulls `hnsw_rs` from the registry.
+- The centroid distance table stores only its strict upper triangle, halving its memory on a quantized index.
+- `AddResult.summary()` returns plain ASCII.
+- The saved directory manifest declares format version 1.1.0. Directories written by earlier releases still load.
 
 ---
 
