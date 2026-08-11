@@ -2,7 +2,7 @@
 
 Upstream crate: hnsw_rs 0.3.4 (crates.io, checksum
 43a5258f079b97bf2e8311ff9579e903c899dcbac0d9a138d62e9a066778bd07).
-This directory is a copy of the registry source with six deliberate
+This directory is a copy of the registry source with seven deliberate
 changes plus this file. Resolution is redirected here through
 `[patch.crates-io]` in `vdb-core/Cargo.toml`.
 
@@ -373,6 +373,103 @@ clamps its argument to the range 0.2 to 1 while the correction needed is `ln(m)`
 which is 2.77 at `m` 16. There is no way to correct the value from outside the
 crate.
 
+## Patch 7. Default-off features over three unreached modules
+
+Files `src/lib.rs`, `src/hnswio.rs`, `Cargo.toml` and `Cargo.toml.orig`.
+
+```diff
++#[cfg(feature = "mmap")]
+ pub mod datamap;
++#[cfg(feature = "flatten")]
+ pub mod flatten;
++#[cfg(feature = "libext")]
+ pub mod libext;
+```
+
+with three features added to the manifest, `mmap` carrying the two
+dependencies only `datamap.rs` needs.
+
+```diff
+ [features]
+ default = []
++flatten = []
++libext = []
++mmap = ["dep:indexmap", "dep:mmap-rs"]
+```
+
+`indexmap` and `mmap-rs` become `optional = true`. Six further sites in
+`src/hnswio.rs` follow the `mmap` feature, being the `use crate::datamap::*`
+import, the `datamap` field on `HnswIo` with its two initialisers and its
+reset in `set_values`, the `DataMap` construction block in `load_hnsw`, the
+`true` arm of `load_point`, the private `skip_point_data` that only that arm
+calls, and the `reload_with_mmap` test. A `#[cfg(not(feature = "mmap"))]`
+arm is added beside the `true` arm, returning an error rather than
+panicking, because `ReloadOptions::new(true)` can still ask for a map a
+build without the feature cannot provide.
+
+### Why it exists
+
+None of the three modules is reachable from anything ZeusDB does.
+
+`datamap.rs` is entered only through `load_hnsw`, whose `if
+self.options.use_mmap().0` block is the sole `DataMap` construction site in
+the crate. ZeusDB calls `load_hnsw_with_dist` instead, which has no such
+block, and it builds its reader with `HnswIo::new`, which installs
+`ReloadOptions::default()` and so leaves `datamap` false. With that false,
+`load_point_indexation` passes `point_use_mmap` false for every point and
+the only reader of `self.datamap` is never entered. The `datamap_opt` field
+on `Hnsw` is unrelated. It is a plain bool whose one consumer is the
+overwrite decision in `AnnT::file_dump`.
+
+`flatten.rs` and `libext.rs` are named by no other module in the crate, and
+`prelude.rs` re-exports neither. `libext.rs` is a C foreign function surface
+written for Julia.
+
+### What it is worth
+
+Twenty six crates leave the resolution, measured as the difference between
+`cargo metadata` with and without the `mmap` feature, 183 packages against
+157. `mmap-rs` and `indexmap` are the two direct dependencies, and the other
+twenty four are theirs. `bytes`, `byteorder`, `cfg_aliases`, `combine`,
+`enum-as-inner`, `hashbrown` 0.17.1, `mach2`, `nix`, `same-file`, `sysctl`,
+`thiserror` 1.0.69, `thiserror-impl` 1.0.69, `walkdir`, `widestring`,
+`winapi-util`, `windows` 0.48.0, `windows-targets` 0.48.5 and the seven
+`windows_*` 0.48.5 target crates.
+
+That closes GHSA-434x-w66g-qw3r against `bytes`, by removal rather than by
+version.
+
+`flatten` and `libext` remove no crate. They remove 1,440 compiled lines,
+and they remove 64 exported symbols from the built Python extension module.
+Before this patch the `.pyd` exported 65 names, of which
+`PyInit_zeusdb_vector_database` was the only one belonging to ZeusDB and the
+other 64 were `libext.rs`, including names as general as `insert_f32` and
+`search_neighbours_f32`.
+
+### Why gating rather than deletion
+
+Both were available, since this copy is vendored. Gating was chosen on a
+measurement and on an upgrade argument.
+
+The measurement is that gating clears the alert. A lockfile that still
+listed the optional dependency would clear nothing, because Dependabot reads
+the lockfile. Making the two dependencies optional and regenerating
+`vdb-core/Cargo.lock` removed both, and their whole subtrees, from it. Cargo
+resolves optional dependencies no enabled feature activates out of the
+lockfile entirely, so gating and deletion are equivalent for alert purposes.
+
+The upgrade argument is that this file already carries six patches that must
+be reapplied by hand on every version bump. Every change this patch makes to
+upstream source is an inserted attribute line, so the diff against a fresh
+registry copy stays mechanical and merges cleanly with upstream edits to the
+surrounding code. Deleting 1,896 lines would conflict with any upstream
+change to them and would make a lost patch harder to see, since absence is
+harder to spot than a missing attribute.
+
+It is also reversible. `cargo build --features hnsw_rs/mmap,hnsw_rs/flatten,hnsw_rs/libext`
+compiles all three modules and was run to confirm the gated code still
+builds rather than being left to rot.
+
 ## Total against the pristine registry copy
 
 `src/hnsw.rs` differs by 273 lines, 212 added and 61 removed. Patch 1
@@ -381,15 +478,29 @@ removed. Patch 3 accounts for 100 added and 3 removed. Patch 4 accounts
 for 58 added and 54 removed, of which 20 of the additions are comment.
 Patch 5 accounts for 4 added and 1 removed, of which 3 of the additions
 are comment. Patch 6 accounts for 19 added, of which 10 are comment.
-`src/hnswio.rs` differs by 21 lines, 17 added and 4 removed. Patch 3
-accounts for 4 added. Patch 6 accounts for 13 added and 4 removed, of
-which 10 of the additions are comment.
+`src/hnswio.rs` differs by 56 lines, 50 added and 6 removed. Patch 3
+accounts for 4 added. Patch 6 accounts for 17 added and 5 removed, of
+which 11 of the additions are comment. Patch 7 accounts for 29 added and
+1 removed, of which 21 of the additions are comment or `cfg` attribute.
+`src/lib.rs` differs by 6 lines, all added by patch 7, of which 3 are
+comment and 3 are `cfg` attributes.
+`Cargo.toml` differs by 8 added lines, all patch 7, being the three
+feature entries and the two `optional = true` lines.
+`Cargo.toml.orig` differs by 12 lines, 10 added and 2 removed, all patch 7,
+mirroring the same declarations so the vendored tree stays self-consistent.
+Cargo does not read that file.
 `ZEUSDB-PATCH.md` is an
-added file. Five files carry no content change and differ only in line
+added file. Four files carry no content change and differ only in line
 endings, which relay 07 pinned across the repository:
-`.cargo_vcs_info.json`, `.gitignore`, `Cargo.toml.orig`,
-`LICENSE-APACHE` and `LICENSE-MIT`. `Cargo.toml` and `Cargo.lock` are
-byte-identical to the registry copy. Nothing else in the tree differs.
+`.cargo_vcs_info.json`, `.gitignore`, `LICENSE-APACHE` and
+`LICENSE-MIT`. `Cargo.lock` is byte-identical to the registry copy.
+Nothing else in the tree differs.
+
+Relay 62 found the previous `src/hnswio.rs` figures understated. They read
+21 lines, 17 added and 4 removed, where the file at that point differed by
+26 lines, 21 added and 5 removed. The error was in the patch 6 attribution,
+recorded as 13 added and 4 removed against an actual 17 added and 5 removed.
+The `src/hnsw.rs` figures were remeasured and are correct as written.
 
 ## Detecting a lost patch
 
@@ -453,9 +564,24 @@ loaded index writes are byte identical to the ones it was loaded from.
 Without this patch they differ in exactly the 8 bytes of `level_scale` and
 in nothing else.
 
+Patch 7 cannot be caught by a test, because losing it changes no behaviour.
+Everything it gates is unreachable, so a build without it passes every
+assertion in both suites and merely carries 26 crates and 1,896 lines it
+does not use. Check the resolution instead. From `vdb-core`,
+
+```sh
+cargo tree --locked -e normal -i mmap-rs
+```
+
+must report `error: package ID specification mmap-rs did not match any
+packages`, and `grep -c '^\[\[package\]\]' Cargo.lock` must report 157 at
+the resolution relay 62 left. A second check is the built extension module,
+which must export exactly one symbol, `PyInit_zeusdb_vector_database`. If it
+exports 65, `libext` is being compiled again.
+
 ## On upgrade
 
-All six patches MUST be reapplied whenever the vendored copy is
+All seven patches MUST be reapplied whenever the vendored copy is
 refreshed or the version is bumped, and the line counts above rechecked
 so a lost patch is visible. Both Rust regression tests insert
 sequentially, so they depend on patch 2 for their own determinism. Patch

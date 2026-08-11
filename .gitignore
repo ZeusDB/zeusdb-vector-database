@@ -192,3 +192,4 @@ cython_debug/
 
 # Ignore .cargo for local build artifacts
 .cargo/
+src/zeusdb_vector_database/*.pdb

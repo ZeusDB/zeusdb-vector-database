@@ -28,11 +28,8 @@ chrono = { version = "0.4.41", features = ["serde"] } # <-- For timestamps
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "time", "ansi", "registry"] }
-atty = { version = "0.2", optional = true }
-
-[features]
-default = ["atty"] # <-- Default feature set
-atty = ["dep:atty"]
+# Terminal detection is `std::io::IsTerminal`, stable since Rust 1.70. The
+# `atty` crate this replaced was unmaintained and carried RUSTSEC-2021-0145.
 
 [dev-dependencies]
 tempfile = "3"

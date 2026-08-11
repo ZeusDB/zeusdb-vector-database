@@ -64,6 +64,7 @@
 
 use pyo3::prelude::*;
 use std::io;
+use std::io::IsTerminal;
 use std::sync::{Once, OnceLock};
 use tracing::Subscriber;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -615,27 +616,22 @@ fn resolved_log_file_path() -> String {
 }
 
 /// Check if output is a TTY and colors should be used
+///
+/// `std::io::IsTerminal` rather than the `atty` crate, which is unmaintained
+/// and carries RUSTSEC-2021-0145. The standard library has answered this
+/// question since Rust 1.70 and does so through the same system calls, being
+/// `isatty` on unix and `GetConsoleMode` plus the msys named pipe check on
+/// Windows. A redirected stream fails that check and reports false, which is
+/// what `atty` reported for the same handle.
 fn is_tty_with_color(target: &str) -> bool {
     // Respect NO_COLOR environment variable
     if std::env::var("NO_COLOR").is_ok() {
         return false;
     }
 
-    #[cfg(feature = "atty")]
-    {
-        match target {
-            "stderr" => atty::is(atty::Stream::Stderr),
-            _ => atty::is(atty::Stream::Stdout),
-        }
-    }
-
-    #[cfg(not(feature = "atty"))]
-    {
-        let _ = target;
-        // Simple fallback: check if TERM is set and we're not in CI
-        std::env::var("TERM").is_ok()
-            && !std::env::var("CI").is_ok()
-            && !std::env::var("GITHUB_ACTIONS").is_ok()
+    match target {
+        "stderr" => io::stderr().is_terminal(),
+        _ => io::stdout().is_terminal(),
     }
 }
 

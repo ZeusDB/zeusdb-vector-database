@@ -70,13 +70,15 @@ num-traits = { version = "0.2" }
 
 #  for hashing . hashbrown still needed beccause of get_key_value(&key)
 hashbrown = { version = "0.15" }
-indexmap = { version = ">= 2.11" }
+# ZEUSDB PATCH 7: only datamap.rs uses this, so it follows the mmap feature.
+indexmap = { version = ">= 2.11", optional = true }
 
 rand = { version = "0.9" }
 lazy_static = { version = "1.4" }
 
 #
-mmap-rs = { version = "0.7" }
+# ZEUSDB PATCH 7: only datamap.rs uses this, so it follows the mmap feature.
+mmap-rs = { version = "0.7", optional = true }
 #
 # decreasing order of log for debug build : (max_level_)trace debug info warn error off
 # decreasing order of log for release build (release_max_level_)  .. idem
@@ -104,6 +106,12 @@ itertools = {version = "0.14"}
 [features]
 
 default = []
+
+# ZEUSDB PATCH 7. Three modules ZeusDB never reaches, each behind a default-off
+# feature. mmap also carries the two dependencies only datamap.rs needs.
+flatten = []
+libext = []
+mmap = ["dep:mmap-rs", "dep:indexmap"]
 
 # feature for std simd on nightly
 stdsimd = ["anndists/stdsimd"]
