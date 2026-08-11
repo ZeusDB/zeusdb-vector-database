@@ -33,6 +33,12 @@ repository = "https://github.com/jean-pierreBoth/hnswlib-rs"
 
 [features]
 default = []
+flatten = []
+libext = []
+mmap = [
+    "dep:indexmap",
+    "dep:mmap-rs",
+]
 simdeez_f = ["anndists/simdeez_f"]
 stdsimd = ["anndists/stdsimd"]
 
@@ -95,6 +101,7 @@ version = "0.15"
 
 [dependencies.indexmap]
 version = ">= 2.11"
+optional = true
 
 [dependencies.lazy_static]
 version = "1.4"
@@ -104,6 +111,7 @@ version = "0.4"
 
 [dependencies.mmap-rs]
 version = "0.7"
+optional = true
 
 [dependencies.num-traits]
 version = "0.2"

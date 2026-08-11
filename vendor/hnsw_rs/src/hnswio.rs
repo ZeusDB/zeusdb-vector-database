@@ -40,6 +40,8 @@ use std::any::type_name;
 use anndists::dist::distances::*;
 
 use self::hnsw::*;
+// ZEUSDB PATCH 7: `datamap` is behind the default-off `mmap` feature.
+#[cfg(feature = "mmap")]
 use crate::datamap::*;
 use crate::hnsw;
 use log::{debug, error, info, trace};
@@ -305,6 +307,8 @@ pub struct HnswIo {
     basename: String,
     /// options
     options: ReloadOptions,
+    // ZEUSDB PATCH 7: names `DataMap`, so it follows the `mmap` feature.
+    #[cfg(feature = "mmap")]
     datamap: Option<DataMap>,
     /// for Hnswio to be async
     nb_point_loaded: Arc<AtomicUsize>,
@@ -321,6 +325,7 @@ impl HnswIo {
             dir: directory.to_path_buf(),
             basename: basename.to_string(),
             options: ReloadOptions::default(),
+            #[cfg(feature = "mmap")]
             datamap: None,
             nb_point_loaded: Arc::new(AtomicUsize::new(0)),
             initialized: true,
@@ -333,6 +338,7 @@ impl HnswIo {
             dir: directory.to_path_buf(),
             basename: basename.to_string(),
             options,
+            #[cfg(feature = "mmap")]
             datamap: None,
             nb_point_loaded: Arc::new(AtomicUsize::new(0)),
             initialized: true,
@@ -358,7 +364,10 @@ impl HnswIo {
         self.dir = directory.to_path_buf();
         self.basename = basename;
         self.options = options;
-        self.datamap = None;
+        #[cfg(feature = "mmap")]
+        {
+            self.datamap = None;
+        }
         //
         self.initialized = true;
         //
@@ -493,6 +502,9 @@ impl HnswIo {
         let t_type = description.t_name.clone();
         debug!("T type name in dump = {:?}", t_type);
         // Do we use mmap at reload
+        // ZEUSDB PATCH 7: the only DataMap construction site in the crate, and
+        // the reason `mmap-rs` and `indexmap` were in the resolution.
+        #[cfg(feature = "mmap")]
         if self.options.use_mmap().0 {
             let datamap_res = DataMap::from_hnswdump::<T>(self.dir.as_path(), &self.basename);
             if datamap_res.is_err() {
@@ -838,11 +850,22 @@ impl HnswIo {
                 }
                 Point::<T>::new(v.unwrap(), origin_id, p_id)
             }
+            #[cfg(feature = "mmap")]
             true => {
                 skip_point_data(origin_id, data_in, descr)?; // keep cohrence between data file and graph file!
                 debug!("constructing point from datamap, dataid : {:?}", origin_id);
                 let s: Option<&'b [T]> = self.datamap.as_ref().unwrap().get_data::<T>(&origin_id);
                 Point::<T>::new_from_mmap(s.unwrap(), origin_id, p_id)
+            }
+            // ZEUSDB PATCH 7: an error rather than a panic, because
+            // `ReloadOptions::new(true)` can still ask for a map this build
+            // cannot provide. `load_hnsw_with_dist`, the entry point ZeusDB
+            // uses, never asks.
+            #[cfg(not(feature = "mmap"))]
+            true => {
+                return Err(anyhow!(
+                    "reload from a memory mapped data file needs the hnsw_rs `mmap` feature"
+                ));
             }
         };
         self.nb_point_loaded.fetch_add(1, Ordering::Relaxed);
@@ -1196,6 +1219,9 @@ where
 } // end of load_point_data
 
 // We need to maintain coherence in data and graph stream, so we read to keep in phase
+// ZEUSDB PATCH 7: the mmap arm of `load_point` is its only caller, so without
+// the feature it is dead and warns.
+#[cfg(feature = "mmap")]
 fn skip_point_data(origin_id: usize, data_in: &mut dyn Read, _descr: &Description) -> Result<()> {
     //
     let mut it_slice = [0u8; std::mem::size_of::<u32>()];
@@ -1574,6 +1600,8 @@ mod tests {
     } // end of test_dump_reload
 
     // this tests reloads a dump with memory mapping of data, inserts new data and redump
+    // ZEUSDB PATCH 7: exercises the mmap reload, so it follows the feature.
+    #[cfg(feature = "mmap")]
     #[test]
     fn reload_with_mmap() {
         println!("\n\n hnswio tests : reload_with_mmap");
