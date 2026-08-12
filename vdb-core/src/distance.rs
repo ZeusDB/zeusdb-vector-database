@@ -45,7 +45,10 @@
 //! every machine, because there is no second code path for a different processor
 //! to take.
 
-use hnsw_rs::prelude::Distance;
+// The graph crate's trait, taken from the seam that owns that crate rather than
+// from the crate itself. ZeusDB implements it, so the name has to be visible
+// here; see the note at the top of `graph.rs`.
+use crate::graph::Distance;
 
 /// Independent accumulators each kernel carries.
 ///
