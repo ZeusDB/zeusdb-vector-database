@@ -29,8 +29,11 @@ pub struct PQ {
     pub max_training_vectors: Option<usize>,
 
     /// Centroids: [subvector_idx][centroid_idx][dimension_within_subvector]
-    /// Thread-safe storage for concurrent access during search
-    pub centroids: RwLock<Vec<Vec<Vec<f32>>>>,
+    ///
+    /// Thread-safe storage for concurrent access during search. Private, and
+    /// reached from outside this module only through `with_centroids`, so the
+    /// guard's lifetime stays inside the module that owns the lock.
+    centroids: RwLock<Vec<Vec<Vec<f32>>>>,
 
     /// Training status to track whether PQ has been trained
     pub is_trained: RwLock<bool>,
@@ -98,6 +101,17 @@ impl PQ {
     /// Check if PQ has been trained
     pub fn is_trained(&self) -> bool {
         *self.is_trained.read().unwrap()
+    }
+
+    /// Serve the codebook to a caller that must not own the guard
+    ///
+    /// The save writes the codebook to pq_centroids.bin and used to take this
+    /// lock itself, which put the guard's lifetime in the storage layer and
+    /// held it across the file write. The closure receives a borrow and returns
+    /// whatever it built from it, so the codebook is not copied and the lock is
+    /// released the moment the closure returns.
+    pub fn with_centroids<R>(&self, f: impl FnOnce(&Vec<Vec<Vec<f32>>>) -> R) -> R {
+        f(&self.centroids.read().unwrap())
     }
 
     /// Set the training state (for persistence restoration)
