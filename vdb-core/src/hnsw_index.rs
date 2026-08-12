@@ -1432,8 +1432,14 @@ pub struct HNSWIndex {
     // Timestamp when the index was created
     created_at: String,
 
-    // NEW: Flag to prevent training ID collection during persistence rebuild
-    pub rebuilding_from_persistence: AtomicBool,
+    /// Set while a load rebuilds the graph, so the rebuild does not refill the
+    /// training collection with the ids it is replaying.
+    ///
+    /// Private, and written only through `set_rebuilding_from_persistence`.
+    /// It was the one field of this struct that `persistence.rs` named, and a
+    /// field the storage layer can reach is a field the storage layer can leave
+    /// set, which would suppress training collection for the life of the index.
+    rebuilding_from_persistence: AtomicBool,
 
     /// Set once the index has warned that it holds materially more records than
     /// `expected_size` declared, so the warning fires once rather than on every
@@ -6097,6 +6103,16 @@ impl HNSWIndex {
     /// Set training threshold reached flag (for persistence loading only)
     pub(crate) fn set_training_threshold_reached(&mut self, value: bool) {
         self.training_threshold_reached
+            .store(value, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Suppress or resume training id collection (for persistence loading only)
+    ///
+    /// Wraps the flag the graph rebuild sets while it replays every record
+    /// through `add`. Every id being replayed is already in the restored
+    /// collection, so collecting them again would double the list.
+    pub(crate) fn set_rebuilding_from_persistence(&self, value: bool) {
+        self.rebuilding_from_persistence
             .store(value, std::sync::atomic::Ordering::Release);
     }
 

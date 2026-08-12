@@ -1042,19 +1042,22 @@ fn rebuild_graph_from_data(
     );
 
     // SET FLAG: Prevent training ID collection during rebuild
-    index
-        .rebuilding_from_persistence
-        .store(true, std::sync::atomic::Ordering::Release);
+    index.set_rebuilding_from_persistence(true);
 
     // Use the existing add() method to rebuild the graph
-    Python::attach(|py| {
+    let rebuilt = Python::attach(|py| {
         rebuild_using_add_method(index, batch_vectors, batch_ids, batch_metadatas, py)
-    })?;
+    });
 
     // 🔥 CLEAR FLAG: Resume normal operation
-    index
-        .rebuilding_from_persistence
-        .store(false, std::sync::atomic::Ordering::Release);
+    //
+    // Cleared before the rebuild's result is propagated rather than after, so
+    // the flag is not left set on the way out of a failed rebuild. Nothing
+    // observes that today, because a failed rebuild fails the whole load and
+    // the half-built index is dropped without ever reaching the caller. It
+    // holds the pairing together if that ever stops being true.
+    index.set_rebuilding_from_persistence(false);
+    rebuilt?;
 
     Ok(())
 }
@@ -1276,13 +1279,18 @@ fn save_config(index: &HNSWIndex, path: &Path) -> PyResult<()> {
 fn save_mappings(index: &HNSWIndex, path: &Path) -> PyResult<()> {
     println!("🗂️  Saving mappings.bin...");
 
-    let id_map = index.get_id_map();
-    let rev_map = index.get_rev_map();
-
-    let mappings = IdMappings {
-        id_map: id_map.clone(),
-        rev_map: rev_map.clone(),
+    // Both guards end with this block. They are taken in the documented order,
+    // id_map before rev_map, and the copy they were already making is what the
+    // rest of the function works from.
+    let mappings = {
+        let id_map = index.get_id_map();
+        let rev_map = index.get_rev_map();
+        IdMappings {
+            id_map: id_map.clone(),
+            rev_map: rev_map.clone(),
+        }
     };
+    let mapping_count = mappings.id_map.len();
 
     let mappings_data =
         bincode::encode_to_vec(&mappings, bincode::config::standard()).map_err(|e| {
@@ -1300,7 +1308,7 @@ fn save_mappings(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         ))
     })?;
 
-    println!("✅ mappings.bin saved ({} mappings)", id_map.len());
+    println!("✅ mappings.bin saved ({} mappings)", mapping_count);
     Ok(())
 }
 
@@ -1308,15 +1316,22 @@ fn save_mappings(index: &HNSWIndex, path: &Path) -> PyResult<()> {
 fn save_metadata(index: &HNSWIndex, path: &Path) -> PyResult<()> {
     println!("📋 Saving metadata.json...");
 
-    let vector_metadata = index.get_vector_metadata();
-
-    let metadata_path = path.join("metadata.json");
-    let metadata_json = serde_json::to_string_pretty(&*vector_metadata).map_err(|e| {
+    // The guard ends with the serialize. `to_string_pretty` returns an owned
+    // String, so the file is written with nothing held and nothing is copied
+    // that was not being copied already.
+    let (metadata_json, record_count) = {
+        let vector_metadata = index.get_vector_metadata();
+        let json = serde_json::to_string_pretty(&*vector_metadata);
+        (json, vector_metadata.len())
+    };
+    let metadata_json = metadata_json.map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
             "Failed to serialize metadata: {}",
             e
         ))
     })?;
+
+    let metadata_path = path.join("metadata.json");
 
     fs::write(&metadata_path, metadata_json).map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -1325,7 +1340,7 @@ fn save_metadata(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         ))
     })?;
 
-    println!("✅ metadata.json saved ({} records)", vector_metadata.len());
+    println!("✅ metadata.json saved ({} records)", record_count);
     Ok(())
 }
 
@@ -1416,14 +1431,19 @@ fn save_pq_centroids(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         if pq.is_trained() {
             println!("🎯 Saving pq_centroids.bin...");
 
-            let centroids = pq.centroids.read().unwrap();
-            let centroids_data = bincode::encode_to_vec(&*centroids, bincode::config::standard())
+            // The codebook is serialized inside the closure and written outside
+            // it, so the lock is held for the encode alone. `bincode` returns an
+            // owned buffer, so narrowing the guard this way copies nothing.
+            let centroids_data = pq
+                .with_centroids(|centroids| {
+                    bincode::encode_to_vec(centroids, bincode::config::standard())
+                })
                 .map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to serialize PQ centroids: {}",
-                    e
-                ))
-            })?;
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "Failed to serialize PQ centroids: {}",
+                        e
+                    ))
+                })?;
 
             let centroids_path = path.join("pq_centroids.bin");
             fs::write(&centroids_path, centroids_data).map_err(|e| {
@@ -1441,55 +1461,71 @@ fn save_pq_centroids(index: &HNSWIndex, path: &Path) -> PyResult<()> {
 
 /// Save quantized vector codes
 fn save_pq_codes(index: &HNSWIndex, path: &Path) -> PyResult<()> {
-    let pq_codes = index.get_pq_codes();
-    if !pq_codes.is_empty() {
+    // The guard ends with the serialize, so the file is written with nothing
+    // held. `encode_to_vec` was already producing an owned buffer, so this
+    // narrows the guard rather than adding a copy.
+    let (codes_data, code_count) = {
+        let pq_codes = index.get_pq_codes();
+        if pq_codes.is_empty() {
+            return Ok(());
+        }
         println!("📦 Saving pq_codes.bin...");
+        (
+            bincode::encode_to_vec(&*pq_codes, bincode::config::standard()),
+            pq_codes.len(),
+        )
+    };
 
-        let codes_data =
-            bincode::encode_to_vec(&*pq_codes, bincode::config::standard()).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to serialize PQ codes: {}",
-                    e
-                ))
-            })?;
+    let codes_data = codes_data.map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to serialize PQ codes: {}",
+            e
+        ))
+    })?;
 
-        let codes_path = path.join("pq_codes.bin");
-        fs::write(&codes_path, codes_data).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to write pq_codes.bin: {}",
-                e
-            ))
-        })?;
+    let codes_path = path.join("pq_codes.bin");
+    fs::write(&codes_path, codes_data).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to write pq_codes.bin: {}",
+            e
+        ))
+    })?;
 
-        println!("✅ pq_codes.bin saved ({} vectors)", pq_codes.len());
-    }
+    println!("✅ pq_codes.bin saved ({} vectors)", code_count);
     Ok(())
 }
 
 /// Save raw vectors based on storage mode configuration
 fn save_vectors(index: &HNSWIndex, path: &Path) -> PyResult<()> {
-    let vectors = index.get_vectors();
-    if !vectors.is_empty() {
+    // The guard ends with the serialize, as in `save_pq_codes`.
+    let (vectors_data, vector_count) = {
+        let vectors = index.get_vectors();
+        if vectors.is_empty() {
+            return Ok(());
+        }
         println!("📊 Saving vectors.bin...");
+        (
+            bincode::encode_to_vec(&*vectors, bincode::config::standard()),
+            vectors.len(),
+        )
+    };
 
-        let vectors_data =
-            bincode::encode_to_vec(&*vectors, bincode::config::standard()).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to serialize vectors: {}",
-                    e
-                ))
-            })?;
+    let vectors_data = vectors_data.map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to serialize vectors: {}",
+            e
+        ))
+    })?;
 
-        let vectors_path = path.join("vectors.bin");
-        fs::write(&vectors_path, vectors_data).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to write vectors.bin: {}",
-                e
-            ))
-        })?;
+    let vectors_path = path.join("vectors.bin");
+    fs::write(&vectors_path, vectors_data).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to write vectors.bin: {}",
+            e
+        ))
+    })?;
 
-        println!("✅ vectors.bin saved ({} vectors)", vectors.len());
-    }
+    println!("✅ vectors.bin saved ({} vectors)", vector_count);
     Ok(())
 }
 
@@ -1497,8 +1533,18 @@ fn save_vectors(index: &HNSWIndex, path: &Path) -> PyResult<()> {
 fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
     println!("📝 Saving manifest.json...");
 
-    let vectors = index.get_vectors();
-    let pq_codes = index.get_pq_codes();
+    // The manifest needs two facts about the stores rather than the stores
+    // themselves, so it takes those two facts and releases both guards here.
+    //
+    // This used to hold the `vectors` and `pq_codes` read guards for the whole
+    // function, and `get_storage_mode` below takes the graph's read guard. The
+    // documented order is `hnsw < vectors < pq_codes`, so that acquired the
+    // three in exactly the wrong order. It could not deadlock, because a save
+    // holds the mutation lock and every path that takes the graph's write guard
+    // holds it too, so no counterparty could be in flight. That is the same
+    // reasoning that failed the three inversions found before this one.
+    let has_raw_vectors = !index.get_vectors().is_empty();
+    let code_count = index.get_pq_codes().len();
 
     // Determine what files are included based on what we actually saved
     let mut files_included = vec![
@@ -1515,14 +1561,14 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
 
         if index.can_use_quantization() {
             files_included.push("pq_centroids.bin".to_string());
-            if !pq_codes.is_empty() {
+            if code_count > 0 {
                 files_included.push("pq_codes.bin".to_string());
             }
         }
     }
 
     // Add vectors.bin if it was saved
-    if !vectors.is_empty() {
+    if has_raw_vectors {
         files_included.push("vectors.bin".to_string());
     } else {
         files_excluded.push("vectors.bin".to_string());
@@ -1560,10 +1606,10 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
     // the codes are 32x smaller than the vectors. Under quantized_with_raw the
     // two counts were already equal, so this changes nothing there.
     let compression_info =
-        if index.has_quantization() && index.can_use_quantization() && !pq_codes.is_empty() {
-            let raw_size_mb = (pq_codes.len() * index.get_dim() * 4) as f64 / (1024.0 * 1024.0);
+        if index.has_quantization() && index.can_use_quantization() && code_count > 0 {
+            let raw_size_mb = (code_count * index.get_dim() * 4) as f64 / (1024.0 * 1024.0);
             let compressed_size_mb =
-                (pq_codes.len() * index.get_quantization_subvectors()) as f64 / (1024.0 * 1024.0);
+                (code_count * index.get_quantization_subvectors()) as f64 / (1024.0 * 1024.0);
             let compression_ratio = if compressed_size_mb > 0.0 {
                 raw_size_mb / compressed_size_mb
             } else {
