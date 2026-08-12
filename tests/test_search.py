@@ -615,10 +615,15 @@ def test_search_none_query():
     # Current behaviour, asserted rather than expected. None fails every
     # extraction attempt and surfaces as the PyO3 conversion TypeError rather
     # than as a ValueError raised by the index. The message names the offending
-    # type but not the parameter. The expectation this violates is that search
+    # value but not the parameter. The expectation this violates is that search
     # validates its query argument the way add validates its data argument,
     # which rejects None with an explicit message.
-    with pytest.raises(TypeError, match="NoneType"):
+    #
+    # PyO3 owns this wording and changed it at 0.29. It used to name the type,
+    # so this matched NoneType, and it now names the value. The rejection is
+    # the same one from the same line, the extract to Vec<f32> that follows the
+    # failed cast to a one dimensional array.
+    with pytest.raises(TypeError, match="'None' is not an instance of 'Sequence'"):
         index.search(None)
 
     # For contrast, add does reject None explicitly.

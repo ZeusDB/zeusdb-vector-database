@@ -10,9 +10,18 @@ name = "zeusdb_vector_database" # <-- This is the name of the compiled Python mo
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.25.1", features = ["extension-module"] }
+# abi3-py310 builds against CPython's stable ABI, so one wheel per platform
+# loads on every CPython from 3.10 up, including versions that do not exist
+# yet. The feature lives here rather than in pyproject's [tool.maturin]
+# features, so that cargo build, cargo clippy and cargo test all compile the
+# same configuration the wheel ships. The floor matches requires-python.
+#
+# The cost is PyPy and the free-threaded builds. Neither is expressible in the
+# stable ABI, and the abi3t feature that PEP 803 adds for free-threading is
+# 3.15 only, so it buys nothing at a 3.10 floor.
+pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py310"] }
 hnsw_rs = "0.3.4"
-numpy = "0.25.0"
+numpy = "0.29.0"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 rayon = "1.10"

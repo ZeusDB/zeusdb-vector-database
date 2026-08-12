@@ -2061,8 +2061,13 @@ fn restore_graph(
     Ok((graph, nodes))
 }
 
+/// `skip_from_py_object` because nothing extracts an `AddResult`. It is the
+/// return type of `add` and appears in no argument position, in this crate or
+/// in the Python layer. PyO3 0.29 derives `FromPyObject` for a `#[pyclass]`
+/// that is `Clone` and warns that the derive becomes opt-in, so the choice has
+/// to be stated. Opting in would generate an extraction path no caller reaches.
 #[derive(Debug, Clone)]
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 pub struct AddResult {
     #[pyo3(get)]
     pub total_inserted: usize,
@@ -2609,8 +2614,8 @@ impl HNSWIndex {
 #[pymethods]
 impl HNSWIndex {
     /// Get quantization configuration and status
-    pub fn get_quantization_info(&self) -> Option<PyObject> {
-        Python::with_gil(|py| {
+    pub fn get_quantization_info(&self) -> Option<Py<PyAny>> {
+        Python::attach(|py| {
             if let Some(config) = &self.quantization_config {
                 let dict = PyDict::new(py);
                 dict.set_item("type", "pq").ok()?;
@@ -2688,7 +2693,7 @@ impl HNSWIndex {
         // guard included. Waiting for another writer while holding the lock would
         // stall every Python thread in the process for the length of that writer,
         // which is the failure `add` releasing the lock would otherwise create.
-        py.allow_threads(|| {
+        py.detach(|| {
             let _writers = self.writers.lock().unwrap();
             self.rebuild_with_quantization_locked()
         })
@@ -2790,7 +2795,7 @@ impl HNSWIndex {
         // `insert_parsed_records` carries the proof that nothing inside touches
         // Python.
         let py = data.py();
-        let (inserted, insert_errors) = py.allow_threads(|| {
+        let (inserted, insert_errors) = py.detach(|| {
             let _writers = self.writers.lock().unwrap();
             self.insert_parsed_records(parsed_data, overwrite)
         });
@@ -2939,7 +2944,7 @@ impl HNSWIndex {
         ef_search: Option<usize>,
         return_vector: bool,
         rerank: Option<usize>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let start_time = Instant::now();
 
         let ef = ef_search.unwrap_or_else(|| match self.space.to_lowercase().as_str() {
@@ -2977,7 +2982,7 @@ impl HNSWIndex {
         }
 
         // Detect batch vs single query with comprehensive input support
-        let result: PyObject = if let Ok(list_vec) = vector.extract::<Vec<Vec<f32>>>() {
+        let result: Py<PyAny> = if let Ok(list_vec) = vector.extract::<Vec<Vec<f32>>>() {
             // Format: List of vectors [[0.1, 0.2], [0.3, 0.4]]
 
             // Validation for empty batch or empty vectors in batch
@@ -3016,7 +3021,7 @@ impl HNSWIndex {
             let results =
                 self.batch_search_internal(&list_vec, filter_conditions.as_ref(), params, py)?;
             PyList::new(py, results)?.into()
-        } else if let Ok(np_array) = vector.downcast::<PyArray2<f32>>() {
+        } else if let Ok(np_array) = vector.cast::<PyArray2<f32>>() {
             // Format: NumPy 2D array (N, dims)
             let readonly = np_array.readonly();
             let shape = readonly.shape();
@@ -3047,7 +3052,7 @@ impl HNSWIndex {
             PyList::new(py, results)?.into()
         } else {
             // Single vector path - enhanced with NumPy 1D support
-            let query_vector = if let Ok(array1d) = vector.downcast::<PyArray1<f32>>() {
+            let query_vector = if let Ok(array1d) = vector.cast::<PyArray1<f32>>() {
                 array1d.readonly().as_slice()?.to_vec()
             } else {
                 vector.extract::<Vec<f32>>()?
@@ -3062,7 +3067,7 @@ impl HNSWIndex {
                 "Starting single vector search"
             );
 
-            let search_results = py.allow_threads(|| -> PyResult<QueryHits> {
+            let search_results = py.detach(|| -> PyResult<QueryHits> {
                 // Check if we should use quantized search
                 let use_quantized = self.is_quantized();
 
@@ -3195,7 +3200,7 @@ impl HNSWIndex {
         let duration_ms = start_time.elapsed().as_millis();
         let results_count = {
             let any = result.bind(py);
-            match any.downcast::<PyList>() {
+            match any.cast::<PyList>() {
                 Ok(list) => list.len(),
                 Err(_) => 0,
             }
@@ -3227,7 +3232,7 @@ impl HNSWIndex {
         is_quantized = self.is_quantized()
     ), err)]
     pub fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        py.allow_threads(|| self.save_locked(path))
+        py.detach(|| self.save_locked(path))
     }
 
     /// Python property: `index.dim`
@@ -3636,7 +3641,7 @@ impl HNSWIndex {
     /// Iteration order is a hash map's and is not stable between calls, so
     /// `number` takes an arbitrary N rather than a defined page.
     #[pyo3(signature = (number=10))]
-    pub fn list(&self, py: Python<'_>, number: usize) -> PyResult<Vec<(String, PyObject)>> {
+    pub fn list(&self, py: Python<'_>, number: usize) -> PyResult<Vec<(String, Py<PyAny>)>> {
         let id_map = self.id_map.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
 
@@ -3749,7 +3754,7 @@ impl HNSWIndex {
         // removal itself is short, but the wait for the mutation guard is not,
         // because `add` can now hold it for a long insert with the lock released.
         // Waiting here with the lock held would stall every Python thread.
-        py.allow_threads(|| {
+        py.detach(|| {
             let _writers = self.writers.lock().unwrap();
             self.remove_point_internal(id)
         })
@@ -3786,7 +3791,7 @@ impl HNSWIndex {
     /// `DistanceType::new_raw` and `insert_batch`, which are the same shape as
     /// the quantized pair already listed there.
     pub fn compact(&self, py: Python<'_>) -> PyResult<usize> {
-        py.allow_threads(|| self.compact_locked())
+        py.detach(|| self.compact_locked())
     }
 
     /// Get performance characteristics and limitations
@@ -3926,7 +3931,7 @@ type ParsedRecords = Vec<(String, Vec<f32>, HashMap<String, Value>)>;
 ///
 /// The insertion phase runs with the interpreter lock released, so it cannot
 /// build the message for an error that arrives as a `PyErr`. `PyErr`'s
-/// `Display` implementation calls `Python::with_gil`, which would reacquire the
+/// `Display` implementation calls `Python::attach`, which would reacquire the
 /// lock in the middle of the region that exists to have released it, and would
 /// do so while the mutation guard and possibly a storage guard are held.
 /// `add` formats those once the lock is back.
@@ -4590,7 +4595,7 @@ impl HNSWIndex {
     ///
     /// Everything here operates on `ParsedRecords`, which is
     /// `Vec<(String, Vec<f32>, HashMap<String, Value>)>` and holds no Python
-    /// object, no `Py<T>`, no `PyObject` and no borrow of anything Python owns.
+    /// object, no `Py<T>` and no borrow of anything Python owns.
     /// The caller holds the mutation guard.
     ///
     /// The complete set of functions reachable from here, verified by reading
@@ -4625,7 +4630,7 @@ impl HNSWIndex {
     /// layer bridges to Python's `logging`, and the Python layer only ever sets
     /// environment variables that the Rust initialiser reads at import.
     ///
-    /// A panic in here is safe too. `Python::allow_threads` restores the
+    /// A panic in here is safe too. `Python::detach` restores the
     /// interpreter lock from a `Drop` guard, so an unwind reacquires it before it
     /// reaches PyO3's boundary.
     fn insert_parsed_records(
@@ -5349,11 +5354,11 @@ impl HNSWIndex {
         let mut parsed_vectors = Vec::new();
         let mut errors = Vec::new();
 
-        if let Ok(dict) = data.downcast::<PyDict>() {
+        if let Ok(dict) = data.cast::<PyDict>() {
             self.parse_dict_input_safe(dict, &mut parsed_vectors, &mut errors);
-        } else if let Ok(list) = data.downcast::<PyList>() {
+        } else if let Ok(list) = data.cast::<PyList>() {
             self.parse_list_input_safe(list, &mut parsed_vectors, &mut errors);
-        } else if let Ok(np_array) = data.downcast::<PyArray2<f32>>() {
+        } else if let Ok(np_array) = data.cast::<PyArray2<f32>>() {
             if let Err(e) = self.parse_numpy_input_safe(np_array, &mut parsed_vectors, &mut errors)
             {
                 errors.push(format!("NumPy parsing error: {}", e));
@@ -5406,7 +5411,7 @@ impl HNSWIndex {
 
                     let metadata = match dict.get_item("metadata") {
                         Ok(Some(meta_item)) => {
-                            if let Ok(meta_dict) = meta_item.downcast::<PyDict>() {
+                            if let Ok(meta_dict) = meta_item.cast::<PyDict>() {
                                 self.python_dict_to_value_map(meta_dict).unwrap_or_default()
                             } else {
                                 HashMap::new()
@@ -5447,9 +5452,9 @@ impl HNSWIndex {
 
         // Try "vectors" key
         if let Some(vectors_item) = dict.get_item("vectors")? {
-            if let Ok(list) = vectors_item.downcast::<PyList>() {
+            if let Ok(list) = vectors_item.cast::<PyList>() {
                 return self.process_vector_list(list, dict, parsed_vectors);
-            } else if let Ok(np_array) = vectors_item.downcast::<PyArray2<f32>>() {
+            } else if let Ok(np_array) = vectors_item.cast::<PyArray2<f32>>() {
                 // FIX: Handle NumPy with IDs and metadata
                 return self.parse_numpy_with_context(np_array, dict, parsed_vectors, errors);
             }
@@ -5457,9 +5462,9 @@ impl HNSWIndex {
 
         // Try "embeddings" key
         if let Some(embeddings_item) = dict.get_item("embeddings")? {
-            if let Ok(list) = embeddings_item.downcast::<PyList>() {
+            if let Ok(list) = embeddings_item.cast::<PyList>() {
                 return self.process_vector_list(list, dict, parsed_vectors);
-            } else if let Ok(np_array) = embeddings_item.downcast::<PyArray2<f32>>() {
+            } else if let Ok(np_array) = embeddings_item.cast::<PyArray2<f32>>() {
                 // FIX: Handle NumPy with IDs and metadata
                 return self.parse_numpy_with_context(np_array, dict, parsed_vectors, errors);
             }
@@ -5467,7 +5472,7 @@ impl HNSWIndex {
 
         // Try "values" key
         if let Some(values_item) = dict.get_item("values")? {
-            if let Ok(list) = values_item.downcast::<PyList>() {
+            if let Ok(list) = values_item.cast::<PyList>() {
                 return self.process_vector_list(list, dict, parsed_vectors);
             } else {
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -5496,7 +5501,7 @@ impl HNSWIndex {
             // Extract ID from "ids" array
             let id = match dict.get_item("ids")? {
                 Some(item) => {
-                    let ids_list = item.downcast::<PyList>()?;
+                    let ids_list = item.cast::<PyList>()?;
                     if i < ids_list.len() {
                         ids_list.get_item(i)?.extract::<String>()?
                     } else {
@@ -5512,10 +5517,10 @@ impl HNSWIndex {
                 .or_else(|| dict.get_item("metadata").ok().flatten())
             {
                 Some(item) => {
-                    if let Ok(meta_list) = item.downcast::<PyList>() {
+                    if let Ok(meta_list) = item.cast::<PyList>() {
                         if i < meta_list.len() {
                             let metadata_item = meta_list.get_item(i)?;
-                            if let Ok(meta_dict) = metadata_item.downcast::<PyDict>() {
+                            if let Ok(meta_dict) = metadata_item.cast::<PyDict>() {
                                 self.python_dict_to_value_map(meta_dict)?
                             } else if metadata_item.is_none() {
                                 HashMap::new()
@@ -5575,13 +5580,13 @@ impl HNSWIndex {
         // Extract IDs array
         let ids_list = dict
             .get_item("ids")?
-            .and_then(|item| item.downcast::<PyList>().ok().cloned());
+            .and_then(|item| item.cast::<PyList>().ok().cloned());
 
         // Extract metadata array
         let metadatas_list = dict
             .get_item("metadatas")?
             .or_else(|| dict.get_item("metadata").ok().flatten())
-            .and_then(|item| item.downcast::<PyList>().ok().cloned());
+            .and_then(|item| item.cast::<PyList>().ok().cloned());
 
         trace!(
             operation = "parse_numpy_context",
@@ -5636,7 +5641,7 @@ impl HNSWIndex {
             let metadata = if let Some(metas) = &metadatas_list {
                 if i < metas.len() {
                     let meta_item = metas.get_item(i)?;
-                    if let Ok(meta_dict) = meta_item.downcast::<PyDict>() {
+                    if let Ok(meta_dict) = meta_item.cast::<PyDict>() {
                         self.python_dict_to_value_map(meta_dict)?
                     } else {
                         HashMap::new()
@@ -5676,7 +5681,7 @@ impl HNSWIndex {
         errors: &mut Vec<String>,
     ) {
         for (item_index, item) in list.iter().enumerate() {
-            if let Ok(item_dict) = item.downcast::<PyDict>() {
+            if let Ok(item_dict) = item.cast::<PyDict>() {
                 // Extract vector safely
                 let vector_result = if let Ok(Some(vector_item)) = item_dict.get_item("vector") {
                     self.extract_single_vector_safe(&vector_item)
@@ -5699,7 +5704,7 @@ impl HNSWIndex {
                         // Extract metadata
                         let metadata = match item_dict.get_item("metadata") {
                             Ok(Some(meta_item)) => {
-                                if let Ok(meta_dict) = meta_item.downcast::<PyDict>() {
+                                if let Ok(meta_dict) = meta_item.cast::<PyDict>() {
                                     self.python_dict_to_value_map(meta_dict).unwrap_or_default()
                                 } else {
                                     // Handle non-dict metadata
@@ -5813,10 +5818,10 @@ impl HNSWIndex {
 
     /// Extract a single vector from various Python types (enhanced)
     fn extract_single_vector(&self, data: &Bound<PyAny>) -> PyResult<Vec<f32>> {
-        let vector = if let Ok(array1d) = data.downcast::<PyArray1<f32>>() {
+        let vector = if let Ok(array1d) = data.cast::<PyArray1<f32>>() {
             // NumPy 1D array
             array1d.readonly().as_slice()?.to_vec()
-        } else if let Ok(list) = data.downcast::<PyList>() {
+        } else if let Ok(list) = data.cast::<PyList>() {
             // Python list
             list.iter()
                 .map(|item| item.extract::<f32>())
@@ -5863,13 +5868,13 @@ impl HNSWIndex {
 
     /// Safe version of extract_single_vector that returns String errors instead of PyErr
     fn extract_single_vector_safe(&self, data: &Bound<PyAny>) -> Result<Vec<f32>, String> {
-        let vector = if let Ok(array1d) = data.downcast::<PyArray1<f32>>() {
+        let vector = if let Ok(array1d) = data.cast::<PyArray1<f32>>() {
             array1d
                 .readonly()
                 .as_slice()
                 .map_err(|e| format!("NumPy access error: {}", e))?
                 .to_vec()
-        } else if let Ok(list) = data.downcast::<PyList>() {
+        } else if let Ok(list) = data.cast::<PyList>() {
             list.iter()
                 .map(|item| {
                     item.extract::<f32>()
@@ -5936,13 +5941,13 @@ impl HNSWIndex {
             }
         } else if let Ok(s) = py_obj.extract::<String>() {
             Ok(Value::String(s))
-        } else if let Ok(py_list) = py_obj.downcast::<PyList>() {
+        } else if let Ok(py_list) = py_obj.cast::<PyList>() {
             let mut vec = Vec::new();
             for item in py_list.iter() {
                 vec.push(Self::python_object_to_value(&item)?);
             }
             Ok(Value::Array(vec))
-        } else if let Ok(py_dict) = py_obj.downcast::<PyDict>() {
+        } else if let Ok(py_dict) = py_obj.cast::<PyDict>() {
             let mut map = serde_json::Map::new();
             for (key, value) in py_dict.iter() {
                 let string_key = key.extract::<String>()?;
@@ -6173,7 +6178,7 @@ impl HNSWIndex {
         &self,
         value_map: &HashMap<String, Value>,
         py: Python<'_>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
 
         for (key, value) in value_map {
@@ -6184,7 +6189,7 @@ impl HNSWIndex {
         Ok(dict.into_pyobject(py)?.to_owned().unbind().into_any())
     }
 
-    fn value_to_python_object(value: &Value, py: Python<'_>) -> PyResult<PyObject> {
+    fn value_to_python_object(value: &Value, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let py_obj = match value {
             Value::Null => py.None(),
             Value::Bool(b) => b.into_pyobject(py)?.to_owned().unbind().into_any(),
@@ -6318,7 +6323,7 @@ impl HNSWIndex {
         params: SearchParams,
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
-        let rust_results = py.allow_threads(|| -> PyResult<Vec<QueryHits>> {
+        let rust_results = py.detach(|| -> PyResult<Vec<QueryHits>> {
             // The read guard is taken before the graph lock and held across every
             // query in the batch, so the traversal predicate below is a hash lookup
             // rather than a lock acquisition.
@@ -6441,7 +6446,7 @@ impl HNSWIndex {
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
         let span = tracing::Span::current();
-        let rust_results = py.allow_threads(|| -> PyResult<Vec<QueryHits>> {
+        let rust_results = py.detach(|| -> PyResult<Vec<QueryHits>> {
             let results: PyResult<Vec<QueryHits>> = vectors
                 .par_iter()
                 .map(|vector| -> PyResult<QueryHits> {

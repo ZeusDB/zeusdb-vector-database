@@ -283,10 +283,15 @@ def test_hnsw_index_has_no_public_constructor():
 
     assert isinstance(index, HNSWIndex)
 
-    with pytest.raises(TypeError, match="No constructor defined"):
+    # PyO3 owns this message and changed it at 0.29. Up to 0.25 it raised its
+    # own "No constructor defined". From 0.28 the module uses PEP 489 multi
+    # phase initialisation and the class is built from a type spec carrying no
+    # tp_new, so CPython raises the refusal itself and words it its own way.
+    # The exception type, the refusal and the two call shapes are unchanged.
+    with pytest.raises(TypeError, match="cannot create .*HNSWIndex"):
         HNSWIndex(dim=4, space="cosine", m=16, ef_construction=200, expected_size=10)
 
-    with pytest.raises(TypeError, match="No constructor defined"):
+    with pytest.raises(TypeError, match="cannot create .*HNSWIndex"):
         HNSWIndex(4, "cosine", 16, 200, 10)
 
     # The registry no longer holds a constructor for a caller who finds it.
