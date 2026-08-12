@@ -1047,7 +1047,7 @@ fn rebuild_graph_from_data(
         .store(true, std::sync::atomic::Ordering::Release);
 
     // Use the existing add() method to rebuild the graph
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         rebuild_using_add_method(index, batch_vectors, batch_ids, batch_metadatas, py)
     })?;
 
