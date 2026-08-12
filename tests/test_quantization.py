@@ -3226,3 +3226,75 @@ def test_the_memory_saving_share_matches_the_measured_sweep():
     # quantized_only replaces both copies, so it crosses far lower.
     assert vdb._memory_saving_share(64, 8, "quantized_only") < 0.20
     assert vdb._memory_saving_share(128, 8, "quantized_only") > 0.20
+
+
+# ------------------------------------------------------------
+# Training reproducibility. The trainer draws under a fixed seed, the level
+# generator draws under a fixed seed, and the training rebuild inserts in
+# internal id order, so building twice on identical data is building the same
+# index. Each check would fail on the unseeded trainer on every run.
+# ------------------------------------------------------------
+
+def _repro_corpus(seed):
+    rng = np.random.default_rng(seed)
+    return rng.standard_normal((1200, 32)).astype(np.float32)
+
+
+def _repro_index(data, tmp_path, name):
+    """One small quantized index, trained on `data`, saved under `name`."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        index = VectorDatabase().create(
+            "hnsw", dim=32, space="cosine", expected_size=1200,
+            quantization_config={"type": "pq", "subvectors": 4, "bits": 4,
+                                 "training_size": 1000,
+                                 "storage_mode": "quantized_with_raw"})
+    ids = [f"r{i:05d}" for i in range(data.shape[0])]
+    result = index.add({"ids": ids, "embeddings": data})
+    assert result.total_inserted == data.shape[0]
+    assert index.is_quantized()
+    path = tmp_path / name
+    index.save(str(path))
+    return index, path
+
+
+def test_two_trainings_produce_one_codebook(tmp_path):
+    data = _repro_corpus(65)
+    _, first = _repro_index(data, tmp_path, "first")
+    _, second = _repro_index(data, tmp_path, "second")
+
+    a = (first / "pq_centroids.bin").read_bytes()
+    b = (second / "pq_centroids.bin").read_bytes()
+    assert a == b, "two trainings of identical data wrote different codebooks"
+
+
+def test_identical_data_builds_identical_search_results(tmp_path):
+    data = _repro_corpus(65)
+    first, _ = _repro_index(data, tmp_path, "first")
+    second, _ = _repro_index(data, tmp_path, "second")
+
+    queries = np.random.default_rng(66).standard_normal((25, 32)).astype(np.float32)
+    for rerank in (None, 0):
+        kwargs = {} if rerank is None else {"rerank": rerank}
+        for q in queries:
+            one = [(h["id"], float(h["score"]).hex())
+                   for h in first.search(q, top_k=10, **kwargs)]
+            two = [(h["id"], float(h["score"]).hex())
+                   for h in second.search(q, top_k=10, **kwargs)]
+            assert one == two, f"rerank={rerank}: results diverge"
+
+    # The calibration is part of what training produces, so it matches too.
+    first_stats = first.get_stats()
+    second_stats = second.get_stats()
+    for key in ("rerank_calibration_fetch", "rerank_calibration_exponent",
+                "rerank_calibration_fit_fetches", "rerank_default_fetch"):
+        assert first_stats[key] == second_stats[key], key
+
+
+def test_different_data_trains_a_different_codebook(tmp_path):
+    _, first = _repro_index(_repro_corpus(65), tmp_path, "first")
+    _, second = _repro_index(_repro_corpus(66), tmp_path, "second")
+
+    a = (first / "pq_centroids.bin").read_bytes()
+    b = (second / "pq_centroids.bin").read_bytes()
+    assert a != b, "a fixed seed must not mean a fixed codebook"

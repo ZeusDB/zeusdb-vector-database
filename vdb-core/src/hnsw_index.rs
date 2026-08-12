@@ -3528,9 +3528,8 @@ impl HNSWIndex {
         };
 
         // The codes are copied out so the graph is built with no lock held at
-        // all. A large batch insert forks to rayon, and a fork under the graph's
-        // write guard can leave every worker in the pool waiting on the thread
-        // that holds it. Copying costs one byte per subvector per record.
+        // all, which keeps the storage guards free while the insertions run.
+        // Copying costs one byte per subvector per record.
         let batch_data: Vec<(Vec<u8>, usize)> = {
             let id_map = self.id_map.read().unwrap();
             let pq_codes = self.pq_codes.read().unwrap();
@@ -3543,6 +3542,14 @@ impl HNSWIndex {
                 })
                 .collect()
         };
+
+        // Internal id order, which is arrival order, rather than the order a
+        // hash map hands its entries out. The level generator is seeded and the
+        // codebook is trained under a seed, so insertion order was the one
+        // remaining draw deciding how this graph is wired. `compact` and the
+        // persistence rebuild already sort for the same reason.
+        let mut batch_data = batch_data;
+        batch_data.sort_unstable_by_key(|&(_, internal_id)| internal_id);
 
         let new_hnsw = VectorGraph::new_pq(
             &self.space,
@@ -6068,9 +6075,7 @@ impl HNSWIndex {
         batch.sort_by_key(|&(_, internal_id)| internal_id);
 
         // Filled before it is installed, and installed under one write guard, so
-        // the graph the index holds is never a partly rebuilt one. The batch
-        // insert forks to rayon when it is large, which must not happen while
-        // the graph's write guard is held.
+        // the graph the index holds is never a partly rebuilt one.
         if !batch.is_empty() {
             new_hnsw.insert_batch_pq(&batch)?;
         }

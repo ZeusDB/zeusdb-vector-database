@@ -1,6 +1,24 @@
-use rand::{rng, seq::SliceRandom, Rng};
+use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::sync::RwLock;
+
+/// Seed driving every draw training makes.
+///
+/// Training used to draw from the thread generator, which is seeded from OS
+/// entropy, so two trainings of one data set produced two codebooks, two sets
+/// of codes, two graphs and two rerank calibrations. A fixed seed makes the
+/// codebook a function of the training data alone, the same way
+/// `DEFAULT_LEVEL_SEED` in the vendored graph crate fixes level assignment
+/// and `TRAINING_SAMPLE_SEED` in `hnsw_index` fixes the sample order.
+///
+/// The k-means of each subvector runs on its own rayon worker, so one shared
+/// generator would hand out draws in thread arrival order and reintroduce the
+/// nondeterminism the seed exists to remove. Each subvector therefore derives
+/// its own stream as `PQ_TRAINING_SEED ^ (s + 1)`, which no scheduling order
+/// can perturb, and the sampling shuffle in `train` takes the base stream.
+/// `seed_from_u64` expands the value through SplitMix64, so the nearby seeds
+/// produce unrelated streams.
+const PQ_TRAINING_SEED: u64 = 0x5A_EE_5D_B0_5E_ED_57_02;
 
 /// Product Quantization implementation for vector compression
 pub struct PQ {
@@ -266,7 +284,7 @@ impl PQ {
 
         // Sample training vectors if we have more than needed
         let training_vectors = if sample_size < vectors.len() {
-            let mut rng = rng();
+            let mut rng = StdRng::seed_from_u64(PQ_TRAINING_SEED);
             let mut indices: Vec<usize> = (0..vectors.len()).collect();
             indices.shuffle(&mut rng);
             indices.truncate(sample_size);
@@ -294,7 +312,9 @@ impl PQ {
                 } else {
                     100
                 };
-                self.kmeans(&subvectors, self.num_centroids, max_iter)
+                // This subvector's own stream; see `PQ_TRAINING_SEED`.
+                let mut rng = StdRng::seed_from_u64(PQ_TRAINING_SEED ^ (s as u64 + 1));
+                self.kmeans(&subvectors, self.num_centroids, max_iter, &mut rng)
             })
             .collect();
 
@@ -529,11 +549,15 @@ impl PQ {
     }
 
     /// K-means clustering implementation
+    ///
+    /// Every draw comes from the generator the caller hands in, so the result
+    /// is a function of the data and that generator's seed.
     fn kmeans(
         &self,
         data: &[Vec<f32>],
         k: usize,
         max_iter: usize,
+        rng: &mut impl Rng,
     ) -> Result<Vec<Vec<f32>>, String> {
         if data.is_empty() {
             return Err("Cannot perform k-means on empty data".to_string());
@@ -548,10 +572,9 @@ impl PQ {
         }
 
         let dim = data[0].len();
-        let mut rng = rng();
 
         // Initialize centroids using k-means++ for better convergence
-        let mut centroids = self.kmeans_plus_plus_init(data, k, &mut rng)?;
+        let mut centroids = self.kmeans_plus_plus_init(data, k, rng)?;
 
         let mut prev_inertia = f32::INFINITY;
         let convergence_threshold = 1e-6;
@@ -643,8 +666,7 @@ impl PQ {
                 centroids.push(data[idx].clone());
             } else {
                 let mut cumulative = 0.0;
-                // let target = rng.gen::<f32>() * total_distance;
-                let target = rand::random::<f32>() * total_distance;
+                let target = rng.random::<f32>() * total_distance;
 
                 for (idx, &distance) in distances.iter().enumerate() {
                     cumulative += distance;
@@ -853,6 +875,76 @@ mod tests {
         assert!(pq.set_centroids(vec![vec![vec![0.0; 3]; 4]; 2]).is_err());
         // A rejected codebook leaves no table behind
         assert_eq!(pq.sdc_memory_bytes(), 0);
+    }
+
+    /// Deterministic pseudo-random vectors for the reproducibility tests, so
+    /// the data itself cannot be the thing that varies between two trainings.
+    fn lcg_vectors(seed: u64, count: usize, dim: usize) -> Vec<Vec<f32>> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32) / (u32::MAX as f32)
+        };
+        (0..count)
+            .map(|_| (0..dim).map(|_| next()).collect())
+            .collect()
+    }
+
+    /// The codebook as bits, so the comparison is exact rather than within a
+    /// tolerance. Reproducible means identical, not close.
+    fn codebook_bits(pq: &PQ) -> Vec<u32> {
+        pq.centroids
+            .read()
+            .unwrap()
+            .iter()
+            .flatten()
+            .flatten()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    /// Two trainings of one data set produce one codebook. This is the
+    /// regression test for the unseeded generator the trainer used to draw
+    /// from, and it failed on every run of the old code.
+    #[test]
+    fn test_training_is_reproducible() {
+        let vectors = lcg_vectors(65, 300, 8);
+
+        let first = PQ::new(8, 2, 4, 200, None);
+        first.train(&vectors).unwrap();
+        let second = PQ::new(8, 2, 4, 200, None);
+        second.train(&vectors).unwrap();
+
+        assert_eq!(codebook_bits(&first), codebook_bits(&second));
+    }
+
+    /// The sampling path draws its own shuffle, so it is covered separately.
+    /// `max_training_vectors` below the data size is what reaches it.
+    #[test]
+    fn test_training_is_reproducible_through_sampling() {
+        let vectors = lcg_vectors(65, 300, 8);
+
+        let first = PQ::new(8, 2, 4, 200, Some(250));
+        first.train(&vectors).unwrap();
+        let second = PQ::new(8, 2, 4, 200, Some(250));
+        second.train(&vectors).unwrap();
+
+        assert_eq!(codebook_bits(&first), codebook_bits(&second));
+    }
+
+    /// A fixed seed must not mean a fixed codebook. Different data has to
+    /// produce a different codebook, or the reproducibility checks above
+    /// would pass on a trainer that ignores its input.
+    #[test]
+    fn test_training_varies_with_data() {
+        let first = PQ::new(8, 2, 4, 200, None);
+        first.train(&lcg_vectors(65, 300, 8)).unwrap();
+        let second = PQ::new(8, 2, 4, 200, None);
+        second.train(&lcg_vectors(66, 300, 8)).unwrap();
+
+        assert_ne!(codebook_bits(&first), codebook_bits(&second));
     }
 
     #[test]

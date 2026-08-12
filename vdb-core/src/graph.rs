@@ -589,27 +589,25 @@ impl VectorGraph {
         }
     }
 
+    /// Insertion is sequential whatever the batch size. Every caller is a
+    /// one-time structural rebuild, at training completion, in `compact` or in
+    /// the persistence loader, and each of them sorts its batch by internal id
+    /// so that two rebuilds of the same records wire the same graph. Above
+    /// 1,000 insertions per thread this used to fork to `parallel_insert`,
+    /// which draws levels from the shared seeded generator in thread arrival
+    /// order and interleaves the neighbour list updates, so the sort bought
+    /// nothing at exactly the sizes where reproducibility costs the most.
     pub(crate) fn insert_batch_pq(&self, data: &[(&Vec<u8>, usize)]) -> Result<(), String> {
-        let num_threads = rayon::current_num_threads();
-        let threshold = 1000 * num_threads;
-
         debug!(
             operation = "batch_insert_pq",
             batch_size = data.len(),
-            num_threads = num_threads,
-            threshold = threshold,
-            parallel = data.len() >= threshold,
             "Starting PQ batch insertion"
         );
 
         match self {
             VectorGraph::CosinePQ(hnsw) | VectorGraph::L2PQ(hnsw) | VectorGraph::L1PQ(hnsw) => {
-                if data.len() >= threshold {
-                    hnsw.parallel_insert(data);
-                } else {
-                    for (codes, id) in data {
-                        hnsw.insert((codes.as_slice(), *id));
-                    }
+                for (codes, id) in data {
+                    hnsw.insert((codes.as_slice(), *id));
                 }
 
                 Ok(())
