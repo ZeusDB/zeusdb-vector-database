@@ -1,10 +1,16 @@
 // lib.rs
+mod conversion;
 mod distance;
+mod filter;
 mod graph;
 mod hnsw_index;
 mod logging;
 mod persistence;
 mod pq;
+mod rerank;
+// Test data two test modules measure against, so it is defined once.
+#[cfg(test)]
+mod test_vectors;
 
 use pyo3::prelude::*;
 

@@ -22,11 +22,12 @@
 //! the loader restores the graph from them rather than rebuilding it by
 //! re-inserting every record. See `HNSWIndex::restore_graph_from_dump`.
 
-use crate::hnsw_index::{HNSWIndex, QuantizationConfig, RerankCalibration, StorageMode};
+use crate::conversion::value_to_python_object;
+use crate::hnsw_index::{HNSWIndex, QuantizationConfig, StorageMode};
 use crate::pq::PQ;
+use crate::rerank::RerankCalibration;
 use chrono::Utc;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -1082,7 +1083,7 @@ fn rebuild_using_add_method(
         .map(|m| {
             let dict = PyDict::new(py);
             for (k, v) in m {
-                dict.set_item(k, convert_json_value_to_python(v, py)?)?;
+                dict.set_item(k, value_to_python_object(v, py)?)?;
             }
             Ok(dict)
         })
@@ -1125,42 +1126,6 @@ fn rebuild_using_add_method(
     println!("📊 Final vector count: {}", final_vector_count);
 
     Ok(())
-}
-
-/// Convert JSON Value to Python object (same as before)
-fn convert_json_value_to_python(value: &Value, py: Python<'_>) -> PyResult<pyo3::Py<pyo3::PyAny>> {
-    match value {
-        Value::Null => Ok(py.None()),
-        Value::Bool(b) => {
-            let bound = b.into_pyobject(py)?;
-            //Ok(bound.unbind().into())
-            Ok(bound.to_owned().into())
-        }
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(i.into_pyobject(py)?.unbind().into())
-            } else if let Some(f) = n.as_f64() {
-                Ok(f.into_pyobject(py)?.unbind().into())
-            } else {
-                Ok(n.to_string().into_pyobject(py)?.unbind().into())
-            }
-        }
-        Value::String(s) => Ok(s.clone().into_pyobject(py)?.unbind().into()),
-        Value::Array(arr) => {
-            let py_list = PyList::empty(py);
-            for item in arr {
-                py_list.append(convert_json_value_to_python(item, py)?)?;
-            }
-            Ok(py_list.into_pyobject(py)?.unbind().into())
-        }
-        Value::Object(obj) => {
-            let py_dict = PyDict::new(py);
-            for (k, v) in obj {
-                py_dict.set_item(k, convert_json_value_to_python(v, py)?)?;
-            }
-            Ok(py_dict.into_pyobject(py)?.unbind().into())
-        }
-    }
 }
 
 // ============================================================================
