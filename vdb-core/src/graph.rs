@@ -19,14 +19,17 @@
 //!
 //! `Hnsw::file_dump` writes `std::any::type_name::<D>()` into the dump header
 //! and [`inspect_graph_dump`] compares the saved string against the same call.
-//! `type_name` is a full module path, so moving `CosineDist`, `L1Dist`,
-//! `L2Dist` or `DistPQ` to another module changes what a save writes and stops
-//! every previously saved index from loading. That is why `DistPQ` stays in
-//! `hnsw_index.rs` and the three raw distances stay in `distance.rs` even
-//! though the graph is what uses them.
+//! `type_name` is the full module path of the declaration, so moving
+//! `CosineDist`, `L1Dist`, `L2Dist` or `DistPQ` to another module changes what a
+//! save writes and stops every previously saved index from loading. That is why
+//! `DistPQ` is declared in `hnsw_index` and the three raw distances in
+//! `distance.rs`, even though the graph is what uses them.
+//!
+//! All four are imported here from `distance.rs`, which re-exports `DistPQ`. A
+//! re-export is an import site and `type_name` reports the declaration site, so
+//! reading the name from one module costs nothing on disk.
 
-use crate::distance::{CosineDist, L1Dist, L2Dist};
-use crate::hnsw_index::DistPQ;
+use crate::distance::{CosineDist, DistPQ, L1Dist, L2Dist};
 use crate::pq::PQ;
 use hnsw_rs::api::AnnT; // This provides the file_dump method
 use hnsw_rs::hnsw::Point;

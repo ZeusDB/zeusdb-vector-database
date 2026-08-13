@@ -50,6 +50,18 @@
 // here; see the note at the top of `graph.rs`.
 use crate::graph::Distance;
 
+/// The quantized distance, re-exported so every call site imports its distances
+/// from one module.
+///
+/// The declaration cannot follow the name here. `Hnsw::file_dump` writes
+/// `std::any::type_name::<D>()` into the dump header and the load path compares
+/// it by exact equality, and `type_name` reports where a type is **declared**,
+/// so moving `DistPQ` out of `hnsw_index` would change what every save writes and
+/// stop every saved quantized index from loading. A re-export is an import site
+/// and changes nothing on disk, which was verified by loading a directory saved
+/// before it existed.
+pub(crate) use crate::hnsw_index::DistPQ;
+
 /// Independent accumulators each kernel carries.
 ///
 /// Eight, which is one AVX register of `f32` and two SSE2 registers, so the
