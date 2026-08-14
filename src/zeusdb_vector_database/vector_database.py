@@ -69,6 +69,71 @@ class VectorDatabase:
             return 16
         return 32 if expected_size > 25_000 else 16
 
+    @staticmethod
+    def _warn_if_selection_disabled(m: Any, ef_construction: Any) -> None:
+        """Warn where ef_construction switches the neighbour selection heuristic off.
+
+        `select_neighbours` in the vendored crate opens with
+        `if candidates.len() <= nb_neighbours_asked`, and with
+        `extend_candidates` false it copies every candidate into the neighbour
+        list and returns from inside that branch. The budget is `2 * m` at
+        layer zero and `m` above it, both set at `hnsw.rs:1270` to `:1278`.
+
+        The candidate list is exactly `ef_construction` long once the index
+        holds more records than that, which is a property of `search_layer`
+        rather than an assumption. Insertion passes it no filter, so every
+        point it pushes into the candidate heap it also pushes into the result
+        heap, and the result heap is trimmed only above `ef`. While the result
+        heap is short it therefore holds every visited point, which makes the
+        nearest unexplored candidate a member of it and leaves the early
+        return unable to fire. The traversal
+        therefore stops either at `ef` results or with the whole reachable
+        component visited. Measured at m 8 over 2,000 records, mean layer zero
+        out-degree is 16.000 at ef_construction 16 with every node at the cap,
+        and 7.170 at ef_construction 17 with 6.5 percent of nodes at it, so the
+        flip lands exactly on `2 * m` and needs no margin. That measurement is
+        `neighbour_selection_threshold_is_twice_m` in the Rust guard tests.
+
+        The threshold is therefore `ef_construction <= 2 * m` and the warning
+        carries no slack. Slack would claim something the source does not say
+        and would fire on m 64 with the default ef_construction, which measured
+        higher recall on real embeddings than the default m of 32 does.
+
+        A pair the Rust layer is going to reject returns without warning, so
+        that an invalid m or ef_construction produces its real validation error
+        and nothing else. That covers a non-integer of either, an
+        ef_construction below 1, and an m outside the 2 to 256 the graph
+        accepts.
+        """
+        integral = (
+            isinstance(m, int) and not isinstance(m, bool)
+            and isinstance(ef_construction, int)
+            and not isinstance(ef_construction, bool)
+        )
+        if not integral or ef_construction < 1 or not 2 <= m <= 256:
+            return
+
+        budget = 2 * m
+        if ef_construction > budget:
+            return
+
+        # The largest m that leaves the heuristic running at this
+        # ef_construction. Below the floor of 2 there is no such m, so the
+        # message offers the one remedy that exists.
+        largest_m = (ef_construction - 1) // 2
+        remedy = f"Raise ef_construction above {budget}"
+        if largest_m >= 2:
+            remedy += f", or lower m to {largest_m} or below"
+
+        import warnings
+        warnings.warn(
+            f"ef_construction={ef_construction} is not greater than 2*m={budget}, "
+            f"so the neighbour selection heuristic does not run. Layer zero "
+            f"insertion keeps every candidate the construction search returns, in "
+            f"distance order, and prunes none of them. {remedy}, to run it.",
+            UserWarning,
+            stacklevel=3
+        )
 
     def __init__(self):
         """Initialize the vector database factory."""
@@ -93,7 +158,17 @@ class VectorDatabase:
                   expected_size honestly or set m directly. The floor is 2
                   because at 1 the layer scale is infinite and the graph is
                   degenerate.
-                - ef_construction (int): Construction candidate list size (default: 200)
+                - ef_construction (int): Width of the candidate search each
+                  insertion runs (default: 200). It sets the supply the
+                  neighbour selection draws from, and m sets how much of it is
+                  kept, so it changes neither search latency nor the size of
+                  the finished index. Build time is linear in it above 100: at
+                  50,000 records of 1,536 dimensions, 62.7s, 131.2s, 262.8s and
+                  464.9s at 100, 200, 400 and 800. Recall at 10 plateaus at 100
+                  on SIFT and at 200 on OpenAI embeddings, and on GloVe raising
+                  ef_search on the graph already built buys more than raising
+                  this. The neighbour selection heuristic runs only while this
+                  is above 2 * m, and create() warns where it is not.
                 - expected_size (int): Expected number of vectors (default: 10000,
                   max: 100,000,000). Also selects the default m, see above. It is
                   a capacity hint rather than a limit, and an index that grows
@@ -195,6 +270,10 @@ class VectorDatabase:
             kwargs.setdefault("expected_size", 10000)
             # After expected_size, since the graph degree is derived from it.
             kwargs.setdefault("m", self._default_m(kwargs["expected_size"]))
+            # After both, since the pair is what decides it. No default
+            # combination reaches it: the default m is 16 or 32, so the budget
+            # is 32 or 64, and the default ef_construction of 200 clears both.
+            self._warn_if_selection_disabled(kwargs["m"], kwargs["ef_construction"])
 
         # Validate and process quantization config
         if quantization_config is not None:

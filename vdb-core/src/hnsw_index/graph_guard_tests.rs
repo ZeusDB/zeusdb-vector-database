@@ -420,3 +420,69 @@ fn layer_zero_in_degree() {
         &orphans[..orphans.len().min(10)]
     );
 }
+
+/// The `ef_construction` at which the neighbour selection heuristic stops
+/// running, which `VectorDatabase._warn_if_selection_disabled` warns at.
+///
+/// `select_neighbours` opens with `if candidates.len() <= nb_neighbours_asked`
+/// and, with `extend_candidates` false, copies every candidate into the
+/// neighbour list and returns from inside that branch. The budget is
+/// `2 * max_nb_connection` at layer zero. The candidate list is exactly
+/// `ef_construction` long once the graph holds more points than that, because
+/// `search_layer` pushes every point it visits into the result heap as well as
+/// the candidate heap and trims the result heap only above `ef`.
+///
+/// So at `ef_construction == 2 * m` every node takes exactly `2 * m`
+/// neighbours and sits at the degree cap, and one above it the heuristic runs
+/// and prunes. Measured here, mean layer zero out-degree is 16.000 with 2,000
+/// of 2,000 nodes at the cap at `ef_construction` 16, and 7.170 with 129 of
+/// 2,000 at the cap at 17. The gap is what makes the threshold exact rather
+/// than approximate, and it is why the warning carries no margin.
+///
+/// Insertion is sequential for the reason `self_query_reachability` records.
+#[test]
+fn neighbour_selection_threshold_is_twice_m() {
+    const N: usize = 2000;
+    const DIM: usize = 16;
+    const M: usize = 8;
+
+    let data = clustered(N, DIM, 7);
+
+    let at_cap_fraction = |efc: usize| -> (f64, f64) {
+        let hnsw: Hnsw<'static, f32, DistCosine> = Hnsw::new(M, N, 16, efc, DistCosine {});
+        for (i, v) in data.iter().enumerate() {
+            hnsw.insert((v.as_slice(), i));
+        }
+        let degrees: Vec<usize> = hnsw
+            .get_point_indexation()
+            .into_iter()
+            .map(|p| p.get_neighborhood_id()[0].len())
+            .collect();
+        assert_eq!(degrees.len(), N);
+        let at_cap = degrees.iter().filter(|d| **d == 2 * M).count();
+        let mean = degrees.iter().sum::<usize>() as f64 / N as f64;
+        (at_cap as f64 / N as f64, mean)
+    };
+
+    let (off_at_cap, off_mean) = at_cap_fraction(2 * M);
+    assert!(
+        off_at_cap > 0.99,
+        "at ef_construction = 2*m = {} only {:.1}% of nodes reach the degree cap and the \
+         mean out-degree is {:.3}; the heuristic is running where the source says it is \
+         skipped",
+        2 * M,
+        off_at_cap * 100.0,
+        off_mean
+    );
+
+    let (on_at_cap, on_mean) = at_cap_fraction(2 * M + 1);
+    assert!(
+        on_at_cap < 0.5,
+        "at ef_construction = 2*m + 1 = {} {:.1}% of nodes still reach the degree cap and \
+         the mean out-degree is {:.3}; the heuristic is not pruning, so the threshold is \
+         not 2*m",
+        2 * M + 1,
+        on_at_cap * 100.0,
+        on_mean
+    );
+}
