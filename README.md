@@ -191,7 +191,7 @@ HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=5, vecto
 | `dim`            | `int`  | `1536`    | Dimensionality of the vectors to be indexed. Each vector must have this length. Must be positive. The default of 1536 matches the output dimensionality of OpenAI's `text-embedding-3-small` and `text-embedding-ada-002` models. |
 | `space`          | `str`  | `"cosine"`| Distance metric used for similarity search. One of `"cosine"`, `"l1"`, `"l2"`. Case-insensitive. |
 | `m`              | `int`  | `16` or `32`, see below | Number of bi-directional connections created for each new node, from 2 to 256. Higher `m` improves recall but increases index size and build time. |
-| `ef_construction`| `int`  | `200`     | Size of the dynamic list used during index construction. Must be positive. Larger values increase indexing time and memory, but improve quality. |
+| `ef_construction`| `int`  | `200`     | Width of the candidate search each insertion runs. Must be positive. It costs build time and buys graph quality, and it changes neither search latency nor the size of the finished index. See below. |
 | `expected_size`  | `int`  | `10000`   | Estimated number of records to be inserted, from 1 to 100,000,000. Used for preallocating internal data structures and for choosing the default `m`. Not a hard limit, see below. |
 | `quantization_config` | `dict` | `None` | Product Quantization configuration for memory-efficient vector compression. See [Product Quantization](#️-product-quantization). |
 
@@ -207,6 +207,24 @@ vdb.create("hnsw", dim=8, expected_size=25_001).get_stats()["m"]   # '32'
 The upper bound of 100,000,000 exists because the graph reserves one slot per declared record at creation, 8 bytes each, and that allocation aborts the process rather than raising if it fails. The bound turns an abort into a `ValueError`. Declaring less than the truth is safe.
 
 **`m` starts at 2, not 1.** Layer assignment samples from a scale of `1 / ln(m)`, which is infinity at `m` of 1, so every point is redispatched uniformly across all 16 layers rather than following the exponential distribution the graph depends on. On 3,000 records of 32 dimensions, recall at 10 measured 0.0220 at `m` of 1 against 0.6880 at 2 and 1.0000 at 16.
+
+**`ef_construction` governs insertion and nothing else.** It is the width of the candidate search each insertion runs, at the new point's own layer and at every layer below it. The descent above that layer runs at a width of 1 and ignores it. The candidates that search returns are the pool the neighbour selection draws from, so `ef_construction` sets the supply and `m` sets how much of it is kept.
+
+**It does not change search latency or index size.** A node holds at most `2 × m` neighbours at layer zero and `m` above it whatever width found them, so the finished graph is the same size at every `ef_construction`. Measured over 50,000 records, mean query latency moved between 0.89 ms and 2.85 ms across a sixteenfold range of `ef_construction` with no trend in it, and resident memory ran backwards on one of the three datasets. What it does change is build time, which is linear in it above 100. On OpenAI embeddings of 1,536 dimensions, 50,000 records built in 62.7 s, 131.2 s, 262.8 s and 464.9 s at `ef_construction` 100, 200, 400 and 800. On GloVe of 100 dimensions the same four are 37.7 s, 75.0 s, 140.4 s and 239.1 s. Below 100 the curve flattens, because the fixed per-insert work stops being dominated by the candidate search.
+
+**Recall stops improving at or near the default.** Recall at 10 over 50,000 records at the default `m` of 32, 500 queries, at the default search width:
+
+| `ef_construction` | GloVe 100d | SIFT 128d | OpenAI 1536d |
+|-------------------|------------|-----------|--------------|
+| 50                | 0.9176     | 0.9982    | 0.9852       |
+| 100               | 0.9400     | 0.9992    | 0.9912       |
+| 200               | 0.9606     | 0.9996    | 0.9962       |
+| 400               | 0.9684     | 0.9998    | 0.9972       |
+| 800               | 0.9714     | 0.9996    | 0.9978       |
+
+SIFT plateaus at 100 and OpenAI at 200. GloVe is the one dataset that keeps climbing, and there the cheaper move is the search width rather than the build. At `ef_construction` 200 GloVe returns 0.9606 at the default width and 0.9984 at `ef_search=500`, so widening the search buys 0.0378 on the graph already built where doubling `ef_construction` buys 0.0078 for 1.9 times the build time. Raise `ef_search` before raising this.
+
+**Keep `ef_construction` above `2 × m`.** The neighbour selection heuristic runs only when the candidate list is longer than the neighbour budget, which is `2 × m` at layer zero, and the candidate list is exactly `ef_construction` long on any index holding more records than that. At or below the budget the graph keeps every candidate the search returned, in distance order, and prunes none of them. `create()` warns when the pair reaches that point. `m` is capped at 256, so `m=100` with the default `ef_construction` is enough to switch the heuristic off. The defaults are clear of it, 200 against a budget of 32 at `m` 16 and 64 at `m` 32.
 
 <br/>
 

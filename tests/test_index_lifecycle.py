@@ -1,5 +1,7 @@
 """Index construction, parameter validation and index type discovery."""
 
+import contextlib
+import warnings
 from importlib.metadata import version
 
 import pytest
@@ -530,3 +532,82 @@ def test_explicit_m_overrides_the_scaled_default():
     assert VectorDatabase._default_m(True) == 16
     with pytest.raises(RuntimeError):
         vdb.create("hnsw", dim=4, expected_size="large")
+
+
+# ------------------------------------------------------------
+# Test 19: The neighbour selection heuristic warning
+# ------------------------------------------------------------
+@contextlib.contextmanager
+def _no_user_warning():
+    """A context in which any UserWarning becomes a failure."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        yield
+
+
+def test_neighbour_selection_heuristic_warning():
+    """`create()` warns exactly where `ef_construction` is not above `2 * m`.
+
+    The heuristic in `select_neighbours` is skipped when the candidate list is
+    no longer than the neighbour budget, which is `2 * m` at layer zero, and
+    the candidate list is exactly `ef_construction` long on any index holding
+    more records than that. The threshold is therefore exact and the warning
+    carries no margin, which is what the pairs at 64 and 65 assert.
+    """
+    vdb = VectorDatabase()
+
+    # The scaling default produces two values of m and nothing else, so those
+    # two are the whole of what the default ef_construction has to clear.
+    produced = {VectorDatabase._default_m(size)
+                for size in (1, 10, 1_000, 24_999, 25_000, 25_001,
+                             50_000, 1_000_000, 100_000_000)}
+    assert produced == {16, 32}
+    assert all(200 > 2 * m for m in produced)
+
+    # And no default combination reaches it in practice either.
+    with _no_user_warning():
+        for expected_size in (1, 10, 10_000, 25_000, 25_001, 1_000_000):
+            vdb.create("hnsw", dim=4, expected_size=expected_size)
+        vdb.create("hnsw", dim=4)
+
+    # Exactly at the budget it fires, and one above it does not.
+    with pytest.warns(UserWarning,
+                      match=r"ef_construction=64 is not greater than 2\*m=64"):
+        vdb.create("hnsw", dim=4, m=32, ef_construction=64)
+    with _no_user_warning():
+        vdb.create("hnsw", dim=4, m=32, ef_construction=65)
+
+    # The documented configuration that reaches it: a raised m with the
+    # ef_construction default left alone. The message names the largest m that
+    # leaves the heuristic running at that ef_construction.
+    with pytest.warns(UserWarning, match=r"lower m to 99 or below"):
+        vdb.create("hnsw", dim=4, m=100)
+    with _no_user_warning():
+        vdb.create("hnsw", dim=4, m=99)
+
+    # Well below the budget it still fires, since the heuristic is skipped
+    # there too.
+    with pytest.warns(UserWarning, match=r"2\*m=512"):
+        vdb.create("hnsw", dim=4, m=256)
+
+    # Below the m floor of 2 there is no m that would run the heuristic, so
+    # the message offers only the one remedy that exists.
+    with pytest.warns(UserWarning) as caught:
+        vdb.create("hnsw", dim=4, m=2, ef_construction=4)
+    assert "Raise ef_construction above 4, to run it." in str(caught[0].message)
+    assert "lower m" not in str(caught[0].message)
+
+    # A pair the Rust layer rejects gets its real error and no warning.
+    with _no_user_warning():
+        with pytest.raises(RuntimeError, match="ef_construction must be positive"):
+            vdb.create("hnsw", dim=4, ef_construction=0)
+        with pytest.raises(RuntimeError, match="less than or equal to 256"):
+            vdb.create("hnsw", dim=4, m=257)
+        with pytest.raises(RuntimeError, match="m must be at least 2"):
+            vdb.create("hnsw", dim=4, m=1)
+
+    # The warning points at the caller's create() rather than inside the
+    # factory, so a user sees their own line.
+    with pytest.warns(UserWarning) as caught:
+        vdb.create("hnsw", dim=4, m=100)
+    assert caught[0].filename == __file__
