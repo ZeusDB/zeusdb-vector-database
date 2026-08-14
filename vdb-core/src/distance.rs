@@ -24,31 +24,64 @@
 //!
 //! # How they are compiled
 //!
-//! Every kernel is one loop over eight independent accumulators, which is the
-//! shape an auto-vectoriser can widen. No intrinsics appear anywhere in this
-//! file. Rust does not reassociate floating point additions, so a plain
-//! `sum += a * b` loop compiles to a scalar chain no matter how it is written.
-//! Fixing the accumulator count in the source is what makes the reduction
-//! associative enough to vectorise while keeping the result determined by the
-//! source rather than by the compiler.
+//! Every kernel is one loop over eight independent accumulators, held in a
+//! single [`f32x8`]. Rust does not reassociate floating point additions, so a
+//! plain `sum += a * b` loop compiles to a scalar chain no matter how it is
+//! written. Fixing the accumulator count in the source is what makes the
+//! reduction associative enough to widen, while keeping the result determined
+//! by the source rather than by the compiler.
 //!
-//! There is no run time dispatch and no `unsafe`. Compiling each kernel a second
-//! time inside a `#[target_feature(enable = "avx")]` wrapper was tried, on the
-//! reasoning that the wheel is built for baseline `x86-64` and would otherwise
-//! never see eight wide registers. It was measured at 1.04, 0.97 and 1.07 times
-//! the baseline at dimensions 128, 768 and 1536, which is nothing, because on
-//! rustc 1.94 the vectoriser emits the same 128-bit code either way. It was
-//! removed rather than carried. Section 2.3 of the relay 40 report records the
-//! assembly and what it leaves on the table.
+//! The accumulator was an ordinary `[f32; 8]` until relay 70, on the reasoning
+//! that the auto-vectoriser would widen a loop shaped that way. It did widen it,
+//! and it stopped at half the register. The emitted inner loop loaded with
+//! `movsd`, being two `f32`, and issued four `mulps` and four `addps` per eight
+//! element block on 128-bit registers whose upper halves were zeroes. Four
+//! source shapes were compiled looking for one LLVM would take further, being
+//! the `[f32; 8]` array, two `[f32; 4]` halves, a whole-block copy into local
+//! arrays, and two separate four element sub-block loads. All four produced
+//! byte-identical assembly. Rebuilding the same shape at `+avx2` also produced
+//! two lanes, which is why the `#[target_feature(enable = "avx")]` attempt
+//! recorded below measured at parity. The width was not reachable from the
+//! source.
+//!
+//! Naming the vector type reaches it. The same loop over `f32x8` compiles to
+//! `movups` at sixteen bytes with two `mulps` and two `addps` per block, which
+//! is the whole 128-bit register, and it halves the instruction count of the
+//! inner loop.
+//!
+//! **The values do not move.** Lane `i` accumulates `a[8k + i]` against
+//! `b[8k + i]` over ascending `k`, which is exactly what `acc[i]` accumulated
+//! before, and [`reduce`] is unchanged and still fed those same eight lanes
+//! through `to_array`. The tail is untouched and still scalar. Packed SSE
+//! arithmetic rounds identically to its scalar counterpart, and nothing is
+//! contracted into a fused multiply-add, which the assembly confirms by still
+//! issuing separate `mulps` and `addps` at `+avx2` where an FMA is available.
+//! So the results are bit-identical rather than merely close, and
+//! `kernels_match_the_previous_shape_bit_for_bit` asserts that against a copy of
+//! the previous shape kept in the tests.
+//!
+//! There is no run time dispatch and no `unsafe` in this file. Compiling each
+//! kernel a second time inside a `#[target_feature(enable = "avx")]` wrapper was
+//! tried, on the reasoning that the wheel is built for baseline `x86-64` and
+//! would otherwise never see eight wide registers. It was measured at 1.04, 0.97
+//! and 1.07 times the baseline at dimensions 128, 768 and 1536, which is
+//! nothing, for the reason given above. It was removed rather than carried.
 //!
 //! One compilation also means one answer. A saved index scores identically on
 //! every machine, because there is no second code path for a different processor
-//! to take.
+//! to take. `wide` picks its representation at compile time from the target's
+//! own features rather than by detecting anything, so that property survives.
 
 // The graph crate's trait, taken from the seam that owns that crate rather than
 // from the crate itself. ZeusDB implements it, so the name has to be visible
 // here; see the note at the top of `graph.rs`.
 use crate::graph::Distance;
+
+// The eight lane `f32` vector the kernels accumulate into. It is a compile time
+// selection over the target's registers rather than a run time one, so it adds
+// no branch and no second code path. On the baseline `x86-64` the wheel builds
+// for it is a pair of SSE registers.
+use wide::f32x8;
 
 /// The quantized distance, re-exported so every call site imports its distances
 /// from one module.
@@ -67,7 +100,8 @@ pub(crate) use crate::hnsw_index::DistPQ;
 /// Eight, which is one AVX register of `f32` and two SSE2 registers, so the
 /// source has enough independent work for either width. It is part of the
 /// arithmetic rather than a tuning knob, since changing it changes the summation
-/// order and therefore the last bits of every result.
+/// order and therefore the last bits of every result. It is also the lane count
+/// of [`f32x8`], and the two have to agree.
 const LANES: usize = 8;
 
 /// Sum the lanes.
@@ -85,14 +119,16 @@ fn reduce(acc: [f32; LANES]) -> f32 {
 
 /// Accumulate `$term` over both slices, `LANES` elements at a time.
 ///
-/// `$term` is written in terms of two names the caller supplies, which are bound
-/// to one element of each slice per step. It is a macro rather than a function
-/// taking a closure so that the three kernels share one loop without any of them
-/// depending on the optimiser to see through a call.
+/// `$term` is written in terms of two names the caller supplies. In the block
+/// loop those names are bound to a [`f32x8`] each and in the tail they are bound
+/// to one `f32` each, and the same expression serves both because the operators
+/// and `abs` the three kernels use are spelled the same on either type. It is a
+/// macro rather than a function taking a closure both for that and so that the
+/// kernels share one loop without depending on the optimiser to see through a
+/// call.
 ///
-/// The `try_into` is what removes the bounds check on the inner loop. The block
-/// is a subslice of known length, the conversion turns that length into a type,
-/// and indexing a `[f32; LANES]` by a counter bounded at `LANES` needs no check.
+/// The `try_into` is what turns a subslice of known length into an array, which
+/// is the form `f32x8::new` takes and the form that carries no bounds check.
 ///
 /// Lengths are not required to match. A mismatch scores the common prefix rather
 /// than panicking, which the graph never exercises because every vector in an
@@ -102,22 +138,19 @@ macro_rules! lane_loop {
         // Both slices are trimmed to the same whole number of blocks up front,
         // and the blocks are walked by one index. Zipping two `chunks_exact`
         // iterators instead leaves the compiler an exit test per slice per
-        // iteration, and with two ways out of the loop it will not widen the
-        // body past two lanes.
+        // iteration, which costs a compare and a branch in the hot loop.
         let n = core::cmp::min($a.len(), $b.len());
         let blocks = n / LANES;
         let main = blocks * LANES;
         let head_a = &$a[..main];
         let head_b = &$b[..main];
 
-        let mut acc = [0.0f32; LANES];
+        let mut acc = f32x8::ZERO;
         for k in 0..blocks {
             let block_a: &[f32; LANES] = head_a[k * LANES..(k + 1) * LANES].try_into().unwrap();
             let block_b: &[f32; LANES] = head_b[k * LANES..(k + 1) * LANES].try_into().unwrap();
-            for i in 0..LANES {
-                let ($x, $y) = (block_a[i], block_b[i]);
-                acc[i] += $term;
-            }
+            let ($x, $y) = (f32x8::new(*block_a), f32x8::new(*block_b));
+            acc += $term;
         }
 
         // The tail carries its own accumulator rather than folding into lane
@@ -129,13 +162,15 @@ macro_rules! lane_loop {
             tail += $term;
         }
 
-        reduce(acc) + tail
+        // `to_array` reads the lanes back in index order, so `reduce` sees the
+        // same eight values in the same positions it saw when the accumulator
+        // was an array.
+        reduce(acc.to_array()) + tail
     }};
 }
 
 /// Inner product of two vectors.
 #[inline]
-#[allow(clippy::needless_range_loop)]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     lane_loop!(a, b, x, y, x * y)
@@ -143,7 +178,6 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 /// Sum of absolute differences.
 #[inline]
-#[allow(clippy::needless_range_loop)]
 pub fn l1(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     lane_loop!(a, b, x, y, (x - y).abs())
@@ -151,7 +185,6 @@ pub fn l1(a: &[f32], b: &[f32]) -> f32 {
 
 /// Sum of squared differences, before the square root.
 #[inline]
-#[allow(clippy::needless_range_loop)]
 fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     lane_loop!(a, b, x, y, {
@@ -358,6 +391,110 @@ mod tests {
     /// tests print the worst observed deviation so a regression against it is
     /// visible rather than absorbed.
     const TOLERANCE: f64 = 2e-6;
+
+    /// The kernel shape that shipped before relay 70, kept verbatim.
+    ///
+    /// It is the same arithmetic in the same order over the same eight lanes,
+    /// written with an `[f32; 8]` accumulator instead of an `f32x8`. It exists
+    /// so the claim that the vector type changed nothing but the instruction
+    /// count can be asserted rather than argued, and so the throughput harness
+    /// can time the two against each other in one process.
+    mod previous {
+        use super::super::{reduce, LANES};
+
+        macro_rules! blocked_loop {
+            ($a:expr, $b:expr, $x:ident, $y:ident, $term:expr) => {{
+                let n = core::cmp::min($a.len(), $b.len());
+                let blocks = n / LANES;
+                let main = blocks * LANES;
+                let head_a = &$a[..main];
+                let head_b = &$b[..main];
+
+                let mut acc = [0.0f32; LANES];
+                for k in 0..blocks {
+                    let block_a: &[f32; LANES] =
+                        head_a[k * LANES..(k + 1) * LANES].try_into().unwrap();
+                    let block_b: &[f32; LANES] =
+                        head_b[k * LANES..(k + 1) * LANES].try_into().unwrap();
+                    for i in 0..LANES {
+                        let ($x, $y) = (block_a[i], block_b[i]);
+                        acc[i] += $term;
+                    }
+                }
+
+                let mut tail = 0.0f32;
+                for j in main..n {
+                    let ($x, $y) = ($a[j], $b[j]);
+                    tail += $term;
+                }
+
+                reduce(acc) + tail
+            }};
+        }
+
+        #[inline]
+        #[allow(clippy::needless_range_loop)]
+        pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+            blocked_loop!(a, b, x, y, x * y)
+        }
+
+        #[inline]
+        #[allow(clippy::needless_range_loop)]
+        pub fn l1(a: &[f32], b: &[f32]) -> f32 {
+            blocked_loop!(a, b, x, y, (x - y).abs())
+        }
+
+        #[inline]
+        #[allow(clippy::needless_range_loop)]
+        pub fn l2(a: &[f32], b: &[f32]) -> f32 {
+            blocked_loop!(a, b, x, y, {
+                let d = x - y;
+                d * d
+            })
+            .sqrt()
+        }
+
+        #[inline]
+        pub fn cosine_normalized(a: &[f32], b: &[f32]) -> f32 {
+            let d = 1.0 - dot(a, b);
+            if d < 0.0 {
+                0.0
+            } else {
+                d
+            }
+        }
+
+        /// The previous shape wearing the trait, so it can build a graph.
+        #[derive(Default, Copy, Clone, Debug)]
+        pub struct PrevCosine;
+
+        impl crate::graph::Distance<f32> for PrevCosine {
+            #[inline]
+            fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
+                cosine_normalized(va, vb)
+            }
+        }
+
+        #[derive(Default, Copy, Clone, Debug)]
+        pub struct PrevL2;
+
+        impl crate::graph::Distance<f32> for PrevL2 {
+            #[inline]
+            fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
+                l2(va, vb)
+            }
+        }
+
+        #[derive(Default, Copy, Clone, Debug)]
+        pub struct PrevL1;
+
+        impl crate::graph::Distance<f32> for PrevL1 {
+            #[inline]
+            fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
+                l1(va, vb)
+            }
+        }
+    }
 
     /// Every kernel against its `f64` reference, over the dimension grid.
     ///
@@ -569,6 +706,83 @@ mod tests {
         assert!(worst_l1 < TOLERANCE, "l1 deviated by {worst_l1:.3e}");
         assert!(worst_l2 < TOLERANCE, "l2 deviated by {worst_l2:.3e}");
         assert!(worst_cos < TOLERANCE, "cosine deviated by {worst_cos:.3e}");
+    }
+
+    /// The vector accumulator against the array accumulator, bit for bit.
+    ///
+    /// This is the assertion the relay 70 change rests on. Widening the
+    /// accumulator from four lanes of a register to eight was a change of
+    /// instruction selection and not of arithmetic, so every kernel must return
+    /// the identical `f32`, not a close one. Compared as bit patterns rather
+    /// than by value, so a signed zero or a NaN payload would show.
+    ///
+    /// Magnitudes are swept as well as dimensions, because a packed rounding
+    /// that differed from a scalar one would show at the ends of the range
+    /// rather than in the middle.
+    #[test]
+    fn kernels_match_the_previous_shape_bit_for_bit() {
+        let mut r = rng(70_70_70);
+        let mut compared = 0usize;
+
+        for scale in [1.0e-15f32, 1.0e-6, 1.0, 1.0e6, 1.0e15] {
+            for dim in DIMS {
+                for _ in 0..100 {
+                    let a: Vec<f32> = random_vector(&mut r, dim)
+                        .iter()
+                        .map(|x| x * scale)
+                        .collect();
+                    let b: Vec<f32> = random_vector(&mut r, dim)
+                        .iter()
+                        .map(|x| x * scale)
+                        .collect();
+                    let (na, nb) = (normalize(&a), normalize(&b));
+
+                    for (name, got, want) in [
+                        ("dot", dot(&a, &b), previous::dot(&a, &b)),
+                        ("l1", l1(&a, &b), previous::l1(&a, &b)),
+                        ("l2", l2(&a, &b), previous::l2(&a, &b)),
+                        (
+                            "cosine",
+                            cosine_normalized(&na, &nb),
+                            previous::cosine_normalized(&na, &nb),
+                        ),
+                    ] {
+                        compared += 1;
+                        assert_eq!(
+                            got.to_bits(),
+                            want.to_bits(),
+                            "{name} at dim {dim} scale {scale:e} returned {got:e} \
+                             where the previous shape returned {want:e}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Zeros, a lone non-zero, and the non-finite cases the kernels can see.
+        for dim in DIMS {
+            let z = vec![0.0f32; dim];
+            let mut one = vec![0.0f32; dim];
+            one[dim - 1] = 3.0;
+            let mut nan = vec![0.1f32; dim];
+            nan[0] = f32::NAN;
+            let mut inf = vec![0.1f32; dim];
+            inf[0] = f32::INFINITY;
+            let ones = vec![0.1f32; dim];
+
+            for (u, v) in [(&z, &z), (&one, &z), (&nan, &ones), (&inf, &ones)] {
+                compared += 4;
+                assert_eq!(dot(u, v).to_bits(), previous::dot(u, v).to_bits());
+                assert_eq!(l1(u, v).to_bits(), previous::l1(u, v).to_bits());
+                assert_eq!(l2(u, v).to_bits(), previous::l2(u, v).to_bits());
+                assert_eq!(
+                    cosine_normalized(u, v).to_bits(),
+                    previous::cosine_normalized(u, v).to_bits()
+                );
+            }
+        }
+
+        println!("bit identity against the previous shape  compared {compared}  differing 0");
     }
 
     /// The property the graph actually depends on.
@@ -958,6 +1172,108 @@ mod tests {
         }
     }
 
+    /// The vector accumulator and the array accumulator build the same graph.
+    ///
+    /// Bit identity already implies this, since a comparison cannot separate two
+    /// identical values. It is measured rather than inferred because the graph
+    /// is what the change is actually risking, and a zero here is the statement
+    /// that matters. All three spaces, since L1 and L2 are the two that tie-break
+    /// against `anndists` and so are the two with anything to lose.
+    #[test]
+    fn the_two_accumulator_shapes_build_the_same_graph() {
+        const N: usize = 3000;
+        const DIM: usize = 64;
+
+        let mut r = rng(2718);
+        let data: Vec<Vec<f32>> = (0..N)
+            .map(|_| normalize(&random_vector(&mut r, DIM)))
+            .collect();
+
+        for (name, (nodes, edges, total, queries)) in [
+            (
+                "cosine",
+                compare_graphs(previous::PrevCosine {}, CosineDist {}, &data),
+            ),
+            ("l2", compare_graphs(previous::PrevL2 {}, L2Dist {}, &data)),
+            ("l1", compare_graphs(previous::PrevL1 {}, L1Dist {}, &data)),
+        ] {
+            println!(
+                "graph comparison against the previous shape {name}  nodes {N}  edges {total}  \
+                 differing nodes {nodes}  differing edges {edges}  \
+                 differing queries {queries} of 200"
+            );
+            assert_eq!(nodes, 0, "{name}: {nodes} of {N} nodes differ");
+            assert_eq!(edges, 0, "{name}: {edges} of {total} edges differ");
+            assert_eq!(queries, 0, "{name}: {queries} of 200 queries differ");
+        }
+    }
+
+    /// Ordering equivalence against the previous shape, counted rather than
+    /// assumed.
+    ///
+    /// The same question the `anndists` pass asks, put to the shape this one
+    /// replaced. Near ties are built deliberately, by perturbing one component
+    /// of the second candidate, because that is where a last bit difference
+    /// would decide an order if there were one to find.
+    #[test]
+    fn ordering_matches_the_previous_shape() {
+        let mut r = rng(7070);
+        let (mut compared, mut ties, mut disagreed) = (0usize, 0usize, 0usize);
+
+        for dim in [8usize, 128, 768, 1536] {
+            for _ in 0..2000 {
+                let q = normalize(&random_vector(&mut r, dim));
+                let b = normalize(&random_vector(&mut r, dim));
+
+                // Half the triples are independent draws and half are near
+                // ties, so both the easy and the hard case are counted.
+                let c = if compared % 2 == 0 {
+                    normalize(&random_vector(&mut r, dim))
+                } else {
+                    let mut c = b.clone();
+                    c[dim / 2] += 1e-5;
+                    normalize(&c)
+                };
+
+                for (new_qb, new_qc, old_qb, old_qc) in [
+                    (
+                        cosine_normalized(&q, &b),
+                        cosine_normalized(&q, &c),
+                        previous::cosine_normalized(&q, &b),
+                        previous::cosine_normalized(&q, &c),
+                    ),
+                    (
+                        l2(&q, &b),
+                        l2(&q, &c),
+                        previous::l2(&q, &b),
+                        previous::l2(&q, &c),
+                    ),
+                    (
+                        l1(&q, &b),
+                        l1(&q, &c),
+                        previous::l1(&q, &b),
+                        previous::l1(&q, &c),
+                    ),
+                ] {
+                    compared += 1;
+                    if new_qb == new_qc || old_qb == old_qc {
+                        ties += 1;
+                        continue;
+                    }
+                    if (new_qb < new_qc) != (old_qb < old_qc) {
+                        disagreed += 1;
+                    }
+                }
+            }
+        }
+
+        println!(
+            "ordering against the previous shape  compared {compared}  ties {ties}  \
+             disagreed {disagreed}"
+        );
+        assert_eq!(disagreed, 0, "{disagreed} of {compared} pairs reordered");
+    }
+
     /// Nanoseconds per call, old against new, at the three measured dimensions.
     ///
     /// Ignored by default because it is a timing harness rather than an
@@ -976,7 +1292,10 @@ mod tests {
         const PAIRS: usize = 128;
         const REPEATS: usize = 4000;
 
-        println!("\ndim  metric  old ns/call  new ns/call  speedup");
+        println!(
+            "\ndim  metric  anndists ns   blocked ns   wide ns   \
+             over blocked   over anndists"
+        );
         for dim in [128usize, 768, 1536] {
             let mut r = rng(555);
             let a: Vec<Vec<f32>> = (0..PAIRS)
@@ -1016,24 +1335,29 @@ mod tests {
                 (
                     "cosine",
                     time(&a, &b, REPEATS, calls, |x, y| DistCosine {}.eval(x, y)),
+                    time(&a, &b, REPEATS, calls, previous::cosine_normalized),
                     time(&a, &b, REPEATS, calls, cosine_normalized),
                 ),
                 (
                     "l2",
                     time(&a, &b, REPEATS, calls, |x, y| DistL2 {}.eval(x, y)),
+                    time(&a, &b, REPEATS, calls, previous::l2),
                     time(&a, &b, REPEATS, calls, l2),
                 ),
                 (
                     "l1",
                     time(&a, &b, REPEATS, calls, |x, y| DistL1 {}.eval(x, y)),
+                    time(&a, &b, REPEATS, calls, previous::l1),
                     time(&a, &b, REPEATS, calls, l1),
                 ),
             ];
 
-            for (name, old_ns, new_ns) in cells {
+            for (name, anndists_ns, blocked_ns, wide_ns) in cells {
                 println!(
-                    "{dim:<5}{name:<8}{old_ns:>11.2}{new_ns:>13.2}{:>9.2}x",
-                    old_ns / new_ns
+                    "{dim:<5}{name:<8}{anndists_ns:>11.2}{blocked_ns:>13.2}{wide_ns:>10.2}\
+                     {:>13.2}x{:>13.2}x",
+                    blocked_ns / wide_ns,
+                    anndists_ns / wide_ns
                 );
             }
         }

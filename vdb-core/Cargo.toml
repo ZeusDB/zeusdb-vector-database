@@ -26,6 +26,13 @@ serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 rayon = "1.10"
 rand = "0.9.1"
+# The distance kernels' vector type. See the "How they are compiled" section of
+# src/distance.rs for what it buys and why the auto-vectoriser could not.
+# Three crates, being wide, safe_arch and bytemuck, taking the lock from 154 to
+# 157. It is a build-time abstraction over the target's own vector registers
+# with no run time component, so it adds nothing to the wheel beyond the code
+# it generates.
+wide = "1"
 bincode = "2.0.1"
 chrono = { version = "0.4.41", features = ["serde"] } # <-- For timestamps
 # anndists is not declared here. The distances live in src/distance.rs, and the
