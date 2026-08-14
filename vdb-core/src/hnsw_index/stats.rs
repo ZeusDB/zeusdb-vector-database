@@ -17,25 +17,66 @@ use std::time::Instant;
 use tracing::{debug, info};
 impl HNSWIndex {
     /// Every counter and every memory figure, as `get_stats` reports them.
+    ///
+    /// Every guard is taken alone, in the declared order, released within its
+    /// own statement, and the map is built from the captured values with
+    /// nothing held. This used to hold `vectors`, `pq_codes` and `training_ids`
+    /// for the whole body, and three things inside that hold inverted the
+    /// declared order. It took `id_map` for the live record count, which
+    /// deadlocked against `remove_point_internal` holding `id_map` and waiting
+    /// on `vectors`, and a three thread loop of stats, adds and removes froze
+    /// the process inside a minute. It reached the graph lock through
+    /// `is_quantized` and `get_storage_mode`, an inversion with no partner
+    /// because every graph write holds nothing else. And it re-read
+    /// `training_ids` inside `get_training_progress` and
+    /// `training_vectors_needed`, which deadlocks the moment a writer queues
+    /// between the two reads, because the standard library's lock queues
+    /// readers behind waiting writers. The same loop without removes froze on
+    /// exactly that.
+    ///
+    /// The counts are therefore point in time rather than one snapshot, which
+    /// a statistics call can afford: mutations are serialised by `writers`, so
+    /// the figures can disagree by at most the records one in flight operation
+    /// has partially applied, and no caller reads two of these keys as a
+    /// consistency check. Nothing here re-enters a helper that locks; the
+    /// storage mode, the training progress and the vectors still needed are
+    /// derived from the captured values by the same rules the helpers apply.
     pub(super) fn collect_stats(&self) -> HashMap<String, String> {
-        let mut stats = HashMap::new();
+        let live = self.id_map.read().unwrap().len();
 
         // Nodes the graph holds, which exceeds the live record count by exactly the
         // number of nodes removal and overwrite have stranded. `compact` reclaims the
-        // difference. Read first, because the declared lock order puts the graph
-        // above every map read below it.
-        let (graph_nodes, graph_memory_mb) = {
+        // difference. The quantized flag rides along so nothing below has to go
+        // back to the graph lock for it.
+        let (graph_nodes, graph_memory_mb, graph_quantized) = {
             let hnsw = self.hnsw.read().unwrap();
             (
                 hnsw.nb_points(),
                 hnsw.memory_bytes() as f64 / (1024.0 * 1024.0),
+                hnsw.is_quantized(),
             )
         };
 
-        let vectors = self.vectors.read().unwrap();
-        let pq_codes = self.pq_codes.read().unwrap();
-        let training_ids = self.training_ids.read().unwrap();
+        let raw_vector_count = self.vectors.read().unwrap().len();
+        let pq_code_count = self.pq_codes.read().unwrap().len();
+        let training_id_count = self.training_ids.read().unwrap().len();
         let vector_count = *self.vector_count.lock().unwrap();
+
+        // Loaded once so the three keys derived from it agree with each other.
+        let threshold_reached = self.training_threshold_reached.load(Ordering::Acquire);
+
+        // `rerank_calibration` sits outside the declared order and is never
+        // held together with another guard; see the order note on `HNSWIndex`.
+        let calibration = self.get_rerank_calibration();
+
+        // The quantizer's own locks are leaves: nothing in `pq.rs` can reach an
+        // index guard, so its accessors are safe wherever they are called.
+        let pq_trained = self.pq.as_ref().is_some_and(|pq| pq.is_trained());
+
+        // What `is_quantized` answers, from the captured flag.
+        let quantization_active = pq_trained && graph_quantized;
+
+        let mut stats = HashMap::new();
 
         // Basic stats
         stats.insert("total_vectors".to_string(), vector_count.to_string());
@@ -65,7 +106,7 @@ impl HNSWIndex {
         // this call already returned sees a different value, which matters
         // because the langchain adapter forwards `memory_mb` from
         // `get_quantization_info` verbatim and that key is untouched.
-        let raw_memory_mb = (vectors.len() * self.dim * 4) as f64 / (1024.0 * 1024.0);
+        let raw_memory_mb = (raw_vector_count * self.dim * 4) as f64 / (1024.0 * 1024.0);
         let mut total_memory_mb = graph_memory_mb + raw_memory_mb;
         stats.insert(
             "graph_memory_mb".to_string(),
@@ -77,10 +118,13 @@ impl HNSWIndex {
         );
 
         // Storage breakdown
-        stats.insert("raw_vectors_stored".to_string(), vectors.len().to_string());
+        stats.insert(
+            "raw_vectors_stored".to_string(),
+            raw_vector_count.to_string(),
+        );
         stats.insert(
             "quantized_codes_stored".to_string(),
-            pq_codes.len().to_string(),
+            pq_code_count.to_string(),
         );
 
         // Training info
@@ -101,7 +145,7 @@ impl HNSWIndex {
             // vector figure is reported above, on every index rather than only
             // on this branch.
             let quantized_memory_mb =
-                (pq_codes.len() * config.subvectors) as f64 / (1024.0 * 1024.0);
+                (pq_code_count * config.subvectors) as f64 / (1024.0 * 1024.0);
             total_memory_mb += quantized_memory_mb;
 
             stats.insert(
@@ -143,34 +187,41 @@ impl HNSWIndex {
                 }
             }
 
-            let collected_count = training_ids.len();
-            let progress = self.get_training_progress();
+            // What `get_training_progress` and `training_vectors_needed`
+            // compute, from the captured count rather than from a second read
+            // of the guard those helpers take themselves.
+            let progress = if pq_trained {
+                100.0
+            } else {
+                (training_id_count as f32 / config.training_size as f32 * 100.0).min(100.0)
+            };
             stats.insert(
                 "training_progress".to_string(),
                 format!(
                     "{}/{} ({:.1}%)",
-                    collected_count, config.training_size, progress
+                    training_id_count, config.training_size, progress
                 ),
             );
 
-            let vectors_needed = self.training_vectors_needed();
+            let vectors_needed = if threshold_reached {
+                0
+            } else {
+                config.training_size.saturating_sub(training_id_count)
+            };
             stats.insert(
                 "training_vectors_needed".to_string(),
                 vectors_needed.to_string(),
             );
             stats.insert(
                 "training_threshold_reached".to_string(),
-                self.training_threshold_reached
-                    .load(Ordering::Acquire)
-                    .to_string(),
+                threshold_reached.to_string(),
             );
 
             if let Some(pq) = &self.pq {
-                let is_trained = pq.is_trained();
-                stats.insert("quantization_trained".to_string(), is_trained.to_string());
+                stats.insert("quantization_trained".to_string(), pq_trained.to_string());
                 stats.insert(
                     "quantization_active".to_string(),
-                    self.is_quantized().to_string(),
+                    quantization_active.to_string(),
                 );
 
                 // The two fixed costs, reported here so that the whole memory
@@ -188,7 +239,7 @@ impl HNSWIndex {
                 );
                 stats.insert("sdc_table_memory_mb".to_string(), format!("{:.2}", sdc_mb));
 
-                if is_trained {
+                if pq_trained {
                     let compression_ratio = (pq.dim as f64 * 4.0) / pq.subvectors as f64;
                     stats.insert(
                         "quantization_compression_ratio".to_string(),
@@ -199,9 +250,9 @@ impl HNSWIndex {
                 // What the default rerank fetch is derived from, and what it
                 // resolves to at the record count the index holds now, so a
                 // caller can see the number their searches are paying for
-                // rather than deriving it. See `RerankCalibration`.
-                let calibration = self.get_rerank_calibration();
-                let live = self.id_map.read().unwrap().len();
+                // rather than deriving it. See `RerankCalibration`. Both were
+                // captured at the top; the live count read here is what
+                // deadlocked against removal.
                 match calibration {
                     Some(calibration) => {
                         stats.insert("rerank_calibrated".to_string(), "true".to_string());
@@ -278,9 +329,25 @@ impl HNSWIndex {
             stats.insert("storage_mode".to_string(), "raw_only".to_string());
         }
 
+        // What `get_storage_mode` answers, from the captured flags rather than
+        // through it, because it reaches the graph lock via `is_quantized` and
+        // this used to call it while holding three storage guards.
+        let storage_mode_description = if self.quantization_config.is_none() {
+            "raw_only"
+        } else if !pq_trained {
+            if threshold_reached {
+                "raw_ready_for_training"
+            } else {
+                "raw_collecting_for_training"
+            }
+        } else if quantization_active {
+            "quantized_active"
+        } else {
+            "raw_trained_not_rebuilt"
+        };
         stats.insert(
             "storage_mode_description".to_string(),
-            self.get_storage_mode(),
+            storage_mode_description.to_string(),
         );
 
         // The sum of the five memory keys above. It is what the index holds in
