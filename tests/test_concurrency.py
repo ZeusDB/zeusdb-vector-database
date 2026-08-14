@@ -26,6 +26,8 @@ afterwards that the write genuinely landed on top of a read. A run that failed t
 construct the overlap fails the test rather than passing on an empty exercise.
 """
 
+import subprocess
+import sys
 import threading
 import time
 
@@ -740,3 +742,150 @@ def test_training_completes_under_a_concurrent_search_load():
         assert [hit["score"] for hit in results] == sorted(
             hit["score"] for hit in results
         )
+
+
+# ------------------------------------------------------------
+# get_stats against concurrent mutation
+# ------------------------------------------------------------
+
+# get_stats used to hold the vectors read guard and then take id_map, while
+# remove_point_internal holds id_map and then takes vectors, so the two in
+# flight together deadlocked with the stats thread holding the interpreter
+# lock and the whole process froze. It also re-read training_ids inside its
+# own training_ids hold, which deadlocks the moment a writer queues between
+# the two reads, because the standard library queues readers behind waiting
+# writers. Each mode below isolates one mechanism: "removal" runs on a
+# trained index, where the recursive read cannot happen, and
+# "training_collection" runs pure adds against an unreachable training_size,
+# where no remove ever holds two guards.
+#
+# The probe runs in a subprocess because the failure mode is a frozen
+# interpreter. No assertion can run inside the deadlocked process, so the
+# parent's timeout is the detector. On a build where every stats guard is
+# taken alone the workload finishes in a few seconds regardless of
+# scheduling; the wide budget absorbs a loaded machine rather than tuning a
+# race, and a regression hangs the child outright rather than making it slow,
+# so this cannot flake red on good code. What one pass cannot promise is
+# sensitivity, since a single clean run proves the loop completed rather than
+# that no window exists. The window itself froze seven of seven twenty second
+# runs on the build that carried it.
+
+PROBE_CHURN_SECONDS = 8.0
+PROBE_TIMEOUT_S = 150.0
+
+PROBE_SCRIPT = '''
+import sys
+import threading
+import time
+from collections import deque
+
+import numpy as np
+from zeusdb_vector_database import VectorDatabase
+
+mode = sys.argv[1]
+seconds = float(sys.argv[2])
+DIM = 16
+BATCH = 200
+rng = np.random.default_rng(11)
+
+index = VectorDatabase().create(
+    "hnsw",
+    dim=DIM,
+    expected_size=20000,
+    quantization_config={
+        "type": "pq",
+        "subvectors": 8,
+        "bits": 8,
+        "training_size": 100000 if mode == "training_collection" else 1000,
+        "storage_mode": "quantized_with_raw",
+    },
+)
+seed_count = 1400 if mode == "removal" else 500
+seeds = rng.standard_normal((seed_count, DIM)).astype(np.float32)
+index.add({"ids": [f"seed_{i}" for i in range(seed_count)], "embeddings": seeds})
+assert index.is_quantized() == (mode == "removal"), index.get_storage_mode()
+
+stop = threading.Event()
+counts = {"stats": 0, "adds": 0, "removes": 0}
+pending = deque()
+pending_lock = threading.Lock()
+
+
+def stats_loop():
+    while not stop.is_set():
+        index.get_stats()
+        counts["stats"] += 1
+
+
+def add_loop():
+    # Long detached batch inserts keep the writers mutex busy, so the remove
+    # thread wakes from the writers queue at a point uncorrelated with the
+    # stats loop. The two thread version of this probe never reproduced the
+    # deadlock, because a remove entered at a GIL hand-off always cleared its
+    # guard window before get_stats reached the vulnerable span.
+    batch = rng.standard_normal((BATCH, DIM)).astype(np.float32)
+    n = 0
+    while not stop.is_set():
+        ids = [f"churn_{n}_{i}" for i in range(BATCH)]
+        index.add({"ids": ids, "embeddings": batch})
+        with pending_lock:
+            pending.extend(ids)
+        counts["adds"] += 1
+        n += 1
+
+
+def remove_loop():
+    while not stop.is_set():
+        with pending_lock:
+            rid = pending.popleft() if pending else None
+        if rid is None:
+            time.sleep(0.001)
+            continue
+        index.remove_point(rid)
+        counts["removes"] += 1
+
+
+threads = [
+    threading.Thread(target=stats_loop, daemon=True),
+    threading.Thread(target=add_loop, daemon=True),
+]
+if mode == "removal":
+    threads.append(threading.Thread(target=remove_loop, daemon=True))
+for t in threads:
+    t.start()
+deadline = time.monotonic() + seconds
+while time.monotonic() < deadline:
+    time.sleep(0.2)
+stop.set()
+for t in threads:
+    t.join(timeout=30)
+assert not any(t.is_alive() for t in threads), "a worker never came back"
+print(f"OK {counts['stats']} {counts['adds']} {counts['removes']}")
+'''
+
+
+@pytest.mark.parametrize("probe_mode", ["removal", "training_collection"])
+def test_get_stats_never_deadlocks_against_mutation(tmp_path, probe_mode):
+    """get_stats loops beside mutation without freezing the process."""
+    script = tmp_path / "stats_deadlock_probe.py"
+    script.write_text(PROBE_SCRIPT, encoding="utf-8")
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script), probe_mode, str(PROBE_CHURN_SECONDS)],
+            capture_output=True,
+            text=True,
+            timeout=PROBE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            f"get_stats deadlocked against {probe_mode}: the probe froze and "
+            f"was killed after {PROBE_TIMEOUT_S:.0f}s"
+        )
+    assert result.returncode == 0, result.stderr
+
+    # The run must have exercised both sides, not idled to a quiet pass.
+    stats_calls, add_calls, remove_calls = map(int, result.stdout.split()[1:4])
+    assert stats_calls > 100, "the stats loop barely ran"
+    assert add_calls > 1, "the churn loop barely ran"
+    if probe_mode == "removal":
+        assert remove_calls > 10, "no removal pressure was generated"

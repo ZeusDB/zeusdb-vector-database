@@ -316,6 +316,20 @@ impl AddResult {
 /// other by `writers`, so a read guard held across a fork can only ever be
 /// blocked by that one writer, and a fork under a write guard is exactly the
 /// case where the pool's workers can all end up waiting on the forking thread.
+///
+/// Two locks sit outside the order. `writers` is taken by the mutating Python
+/// entry points before any guard and never by an internal helper; see the
+/// field. `rerank_calibration` is never held together with any other guard:
+/// training and the loader write it with nothing held, and both readers take
+/// it alone. The locks inside `PQ` are leaves, since nothing in `pq.rs` can
+/// name an index guard, so they may be taken under any of the above but no
+/// index guard may be taken under them, which no path does.
+///
+/// Taking the same guard twice on one thread is forbidden even for reads.
+/// The standard library queues readers behind a waiting writer, so a second
+/// read on the thread already holding one deadlocks the moment a writer lands
+/// between them, which is how `get_stats` used to hang against training id
+/// collection.
 #[pyclass]
 pub struct HNSWIndex {
     dim: usize,
