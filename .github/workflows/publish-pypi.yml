@@ -17,6 +17,10 @@
 # A workflow_dispatch run can only ever reach TestPyPI. Production publishing
 # requires a stable tag.
 #
+# A successful production publish is followed by github-release, which creates
+# the GitHub Release for the tag from the matching CHANGELOG.md section. No
+# other path reaches it, so a dispatch run and a prerelease tag create nothing.
+#
 # This filename is registered in the PyPI and TestPyPI Trusted Publisher
 # records. Renaming this file breaks publishing until both records are updated.
 #
@@ -397,3 +401,80 @@ jobs:
         with:
           command: upload
           args: --non-interactive --skip-existing dist/*
+
+  github-release:
+    name: Create the GitHub Release
+    runs-on: ubuntu-latest
+    # No condition of its own. A job whose needs were skipped is skipped in
+    # turn, so this runs exactly when publish-pypi ran and succeeded, which is
+    # a stable tag push that reached production PyPI. A dispatch run skips
+    # publish-pypi and therefore skips this, whether or not the publish box was
+    # ticked, and a prerelease tag does the same. A failed publish leaves it
+    # unrun, because needs defaults to requiring success.
+    needs: [publish-pypi]
+    permissions:
+      # Creating a release writes to the repository. Nothing else is needed
+      # here, and no other job gains anything from this declaration.
+      contents: write
+    steps:
+      # Checks out the tag, so CHANGELOG.md is the file the release was cut
+      # from rather than whatever main holds now.
+      - uses: actions/checkout@v7
+      - name: Create the release from the changelog section for this tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+          notes="$RUNNER_TEMP/release-notes.md"
+
+          # A re-run of the workflow on the same tag must not go red because
+          # the release is already there, and it must not overwrite a body
+          # that was edited by hand after the first run.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG already exists. Leaving it untouched."
+            exit 0
+          fi
+
+          # Prints the section for this version, from the line after its
+          # heading to the line before the next one. Leading blank lines, and
+          # the trailing blank lines and horizontal rule that separate the
+          # section from the next, are dropped. Blank lines and rules inside
+          # the section are held back and flushed once more content follows,
+          # so the body keeps its internal shape.
+          awk -v heading="## [${version}]" '
+            index($0, heading) == 1 && !found { found = 1; grab = 1; next }
+            grab && index($0, "## [") == 1 { exit }
+            grab {
+              if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^-{3,}[[:space:]]*$/) { hold[held++] = $0; next }
+              if (started) { for (i = 0; i < held; i++) print hold[i] }
+              held = 0
+              started = 1
+              print
+            }
+          ' CHANGELOG.md > "$notes"
+
+          # The package is already on PyPI by this point, so a missing section
+          # is not worth failing the run over. The release is created with a
+          # pointer instead of notes, and the warning annotation records that
+          # the body needs writing by hand.
+          if [ ! -s "$notes" ]; then
+            echo "::warning::CHANGELOG.md holds no '## [${version}]' section. Creating the release with a pointer in place of notes."
+            cat > "$notes" <<EOF
+          No changelog section was found for ${version} when this release was created.
+
+          See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${TAG}/CHANGELOG.md) and the [package on PyPI](https://pypi.org/project/zeusdb-vector-database/${version}/).
+          EOF
+          fi
+
+          # --latest is deliberately absent. Its default is automatic, by date
+          # and version, which marks the newest release latest and leaves an
+          # older tag alone. Passing --latest would mark any tag latest.
+          # No artifacts are attached, because PyPI serves the wheels and the
+          # sdist and GitHub attaches the source archives on its own.
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "Version ${version}" \
+            --notes-file "$notes"
