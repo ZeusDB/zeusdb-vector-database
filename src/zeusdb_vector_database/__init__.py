@@ -5,7 +5,7 @@
 """
 ZeusDB Vector Database Module
 """
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # STEP 1: Configure logging FIRST, before importing anything that uses Rust.
 from .logging_config import _auto_configure_logging

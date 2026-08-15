@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.0] - 2026-08-15
+
+This release changes which interpreters receive a wheel. The extension is built against CPython's stable ABI, so one wheel per platform serves every CPython from 3.10 up, and PyPy and the free-threaded builds install from the source distribution instead. A saved index is unaffected and a directory written by 0.5.0 loads unchanged.
+
+### Breaking
+
+- **PyPy and free-threaded CPython no longer receive a wheel.** Neither can load a stable ABI wheel, so `pip install zeusdb-vector-database` builds the extension from the source distribution on both. That needs a Rust toolchain on the machine and takes about seventy seconds where a wheel install takes a few. The install succeeds and the package behaves as it did, so this is a slower install rather than a broken one. Ordinary CPython still gets a wheel, on Linux x86_64 and aarch64 for both glibc and musl, on Windows x64 and on macOS arm64. That set of platforms is unchanged from 0.5.0, as is the minimum Python of 3.10.
+- The published wheel set is 6 files rather than 41, one per platform, each tagged `cp310-abi3` and loading on every CPython from 3.10 up including releases that do not exist yet. A pinned wheel filename or a download URL carrying an interpreter tag such as `cp312-cp312` no longer resolves.
+- A quantized index trained under this release returns slightly different results, because k-means training now draws from a fixed seed rather than an unseeded generator. Measured on 50,000 records of 1,536 dimensional embeddings at `top_k` 10, recall went from 0.4872 to 0.4861 without reranking and from 0.9907 to 0.9883 reranked. The earlier figures were single draws from an unseeded distribution rather than fixed values, and two unseeded builds of the same data differed from each other by 0.0005 on the same measure. A saved index keeps the codebook it was trained with and answers exactly as before.
+- Two `TypeError` messages are reworded, because PyO3 owns them and changed them at 0.29. `HNSWIndex(...)` reports `cannot create 'builtins.HNSWIndex' instances` where it reported `No constructor defined`, and `search(None)` reports `'None' is not an instance of 'Sequence'` where it named `NoneType`. Both raise the same exception from the same place. Code matching on the message text needs updating.
+
+### Fixed
+
+- `get_stats()` could hang the calling thread forever on a quantized index when another thread was adding or removing records. Two lock ordering defects caused it, one taking the record map while three storage locks were held and one re-entering the training id lock it already held. Every figure `get_stats()` reports is unchanged.
+
+### Added
+
+- Quantization training is reproducible. The same records trained with the same configuration produce the same codebook, the same codes and the same graph on every run of the same build. Unquantized index builds were already reproducible.
+- `create()` warns when `ef_construction` is not greater than `2 * m`. At or below that the neighbour selection heuristic does not run, and layer zero insertion keeps every candidate the construction search returns rather than pruning them. The warning names the budget and the largest `m` that leaves the heuristic running. No default combination reaches it, since the default `ef_construction` of 200 clears the budget of 32 at `m` 16 and 64 at `m` 32.
+
+### Changed
+
+- `compact()` is slower on a quantized index. Its graph rebuild now inserts sequentially so that two rebuilds of the same records wire the same graph, and at 50,000 records it takes about 78 seconds against about 27. `add()`, `search()` and a normal `load()` are unaffected, as is `compact()` on an unquantized index. The same cost applies to the rebuild that `load()` falls back to when a saved graph dump is absent or damaged.
+- Index building is about 1.1 times faster at 768 and 1,536 dimensions, from accumulating the distance kernels into a vector register. The distances the new kernels compute are bit-identical to the ones 0.5.0 computed, so this change moves no result list and no recall figure. Search latency did not move measurably.
+- The Rust dependency tree fell from 185 crates to 157, which shortens a build from source, and the unmaintained `atty` crate carrying RUSTSEC-2021-0145 is gone. The built extension is under half the size it was and exports one symbol, `PyInit_zeusdb_vector_database`, where it exported 65.
+- The README entry for `ef_construction` is corrected. It claimed larger values increase memory, which they do not, since a node holds at most `2 * m` neighbours at layer zero whatever width found them. It now records what the parameter governs, the measured build time, the recall plateau per dataset and the `2 * m` threshold. The `create()` docstring matches it. Neither default changed.
+
+---
+
 ## [0.5.0] - 2026-08-10
 
 This release repairs the index graph. Search results change on upgrade for every index type, in each case for the better, so any test that pins exact result sets against a 0.4.x index needs its expectations refreshed.
