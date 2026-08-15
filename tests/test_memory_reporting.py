@@ -246,13 +246,45 @@ def test_the_reported_total_tracks_the_resident_set(storage_mode):
 
 
 def test_the_total_is_the_sum_of_the_parts():
-    """`total_memory_mb` adds up the five figures beside it and nothing else."""
+    """`total_memory_mb` adds up the six figures beside it and nothing else."""
     index, _ = _build(3000, 128, "quantized_with_raw")
     stats = index.get_stats()
     parts = sum(float(stats[k]) for k in (
         "graph_memory_mb", "raw_vectors_memory_mb", "quantized_codes_memory_mb",
-        "codebook_memory_mb", "sdc_table_memory_mb"))
+        "codebook_memory_mb", "sdc_table_memory_mb", "index_bookkeeping_memory_mb"))
     assert float(stats["total_memory_mb"]) == pytest.approx(parts, abs=0.05)
+
+
+def test_the_bookkeeping_is_reported_on_every_index():
+    """The tables that find a record are priced, quantized or not."""
+    for storage_mode in (None, "quantized_only", "quantized_with_raw"):
+        index, _ = _build(2000, 128, storage_mode)
+        book = float(index.get_stats()["index_bookkeeping_memory_mb"])
+        assert book > 0.0, f"the bookkeeping is {book} at storage_mode {storage_mode}"
+
+
+def test_the_bookkeeping_tracks_the_records_and_not_the_dimension():
+    """Five hash tables and two id copies per record, and no vector in any of them.
+
+    An eightfold dimension moves the raw vector store eightfold and must leave
+    this figure where it was. Doubling the records doubles it, within the step
+    a power of two bucket array takes: 3,000 and 6,000 records both sit in the
+    same half of their table, so the ratio lands near two rather than exactly on
+    it.
+    """
+    small, _ = _build(3000, 64, None, seed=7)
+    wide, _ = _build(3000, 512, None, seed=7)
+    many, _ = _build(6000, 64, None, seed=7)
+
+    def book(index):
+        return float(index.get_stats()["index_bookkeeping_memory_mb"])
+
+    assert book(wide) == pytest.approx(book(small), rel=0.01), (
+        f"an eightfold dimension moved the bookkeeping from {book(small):.3f} "
+        f"to {book(wide):.3f} MB")
+    assert book(many) / book(small) == pytest.approx(2.0, rel=0.25), (
+        f"doubling the records took the bookkeeping from {book(small):.3f} to "
+        f"{book(many):.3f} MB")
 
 
 def test_the_graph_figure_survives_a_save_and_a_load(tmp_path):

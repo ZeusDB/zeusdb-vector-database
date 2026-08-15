@@ -622,17 +622,21 @@ storage_mode_description: raw_only
 
 `get_stats()` returns a `str` to `str` map. It also carries `dimension`, `space`, `m`, `ef_construction`, `expected_size`, `index_type`, `raw_vectors_stored`, `quantized_codes_stored` and `storage_mode`, plus training and compression fields once quantization is configured.
 
-It is also where the memory figures live, on every index rather than only on a quantized one. `graph_memory_mb` is the HNSW graph, `raw_vectors_memory_mb` is the raw vector store and `total_memory_mb` is the sum of everything below. On a quantized index `quantized_codes_memory_mb` scales with the record count, while `codebook_memory_mb` and `sdc_table_memory_mb` are fixed by `dim`, `subvectors` and `bits` and do not move as records arrive. `raw_vectors_retained` states the mode's policy: `none_once_trained` for `quantized_only`, whose raw vectors are released when training completes, and `all_records` for `quantized_with_raw`.
+It is also where the memory figures live, on every index rather than only on a quantized one. `graph_memory_mb` is the HNSW graph, `raw_vectors_memory_mb` is the raw vector store, `index_bookkeeping_memory_mb` is the hash tables that find a record, and `total_memory_mb` is the sum of everything below. On a quantized index `quantized_codes_memory_mb` scales with the record count, while `codebook_memory_mb` and `sdc_table_memory_mb` are fixed by `dim`, `subvectors` and `bits` and do not move as records arrive. `raw_vectors_retained` states the mode's policy: `none_once_trained` for `quantized_only`, whose raw vectors are released when training completes, and `all_records` for `quantized_with_raw`.
 
 **The graph is usually the largest of those figures, and on a memory optimized index it is nearly all of it.** It owns a second copy of every point on top of its neighbour lists, its sixteen per point layer headers and the counters around them. At 50,000 records of `dim=1536` a trained `quantized_only` index reports 98.1 MB of graph against 2.3 MB of codes and 7.5 MB of fixed tables.
 
-**`total_memory_mb` is not the resident set and it does not claim to be.** It prices the five structures above. The id maps, the metadata map, the hash table slots and the allocator's own headers and fragmentation sit outside it, and together they run at roughly 1,500 bytes per record whatever the dimension. Measured on three loaded indexes of 50,000 real 1,536-dimensional embeddings, one process each:
+`index_bookkeeping_memory_mb` is what the index spends on finding a record rather than on holding one. Five hash tables carry a record, being `id_map`, `rev_map`, the metadata map, the raw vector store and the code store, and two of them carry a second copy of its id. It is proportional to the record count and independent of the dimension, at 265 bytes per record with no quantization, 334 under `quantized_with_raw` and 265 under `quantized_only` at 50,000 records.
 
-| storage mode | `total_memory_mb` | resident | ratio |
-|---|---:|---:|---:|
-| no quantization | 692.4 MB | 805.9 MiB | 1.16x |
-| `quantized_with_raw` | 401.2 MB | 474.8 MiB | 1.18x |
-| `quantized_only` | 107.8 MB | 181.4 MiB | 1.68x |
+**`total_memory_mb` is not the resident set and it does not claim to be.** It prices the six structures above, meaning the bytes the index asked the allocator for. What it leaves out is the allocator itself, being its own block headers, its rounding and its fragmentation, and that is a property of the platform rather than something the index holds. Measured on three loaded indexes of 50,000 real 1,536-dimensional embeddings, one process each, with the interpreter's own resident set subtracted:
+
+| storage mode | `total_memory_mb` | resident | share reported | unpriced |
+|---|---:|---:|---:|---:|
+| no quantization | 705.1 MB | 805.4 MiB | 0.88 | 2,103 B per record |
+| `quantized_with_raw` | 415.9 MB | 473.3 MiB | 0.88 | 1,202 B per record |
+| `quantized_only` | 119.7 MB | 181.0 MiB | 0.66 | 1,285 B per record |
+
+The unpriced share is almost all allocator overhead on the graph, which asks for six small blocks per point. It runs 1.25 times the graph figure with no quantization, where the per point data block is 6,144 bytes and rounding is a small share of it, and 1.63 and 1.67 times under the two quantized modes, where that block is 48 bytes. That is why `quantized_only` reports the smallest share of its resident set.
 
 Size infrastructure from the resident column rather than the reported one. The reported figure is what the index holds; the process holds that plus what the allocator takes to hold it.
 
@@ -1009,13 +1013,22 @@ The relation is curved as well as sublinear. On dbpedia-openai the calibration m
 
 What the calibration asks for at 100,000 records, against what the data needs and against the fixed 2%. Every figure is measured on a built index through the ordinary search path, 1,000 queries at `top_k=10` against exact ground truth. The requirement is the smallest fetch on that same index reaching recall at 10 of 0.99, read off a sweep of the explicit `rerank` argument:
 
-| dataset | calibrated fetch | measured requirement | the old fixed fetch | recall, calibrated | recall, fixed |
-|---|---:|---:|---:|---:|---:|
-| dbpedia-openai | 776 | 750 | 2,000 | 0.9905 | 0.9954 |
-| glove-100 | 7,749 | 4,500 | 2,000 | 0.9962 | 0.9723 |
-| sift-128 | 596 | 450 | 2,000 | 0.9941 | 1.0000 |
+| dataset | records | calibrated fetch | measured requirement | ratio | recall at 10 | mean query |
+|---|---:|---:|---:|---:|---:|---:|
+| dbpedia-openai | 50,000 | 554 | 860 | 0.64 | 0.9883 | 3.33 ms |
+| glove-100 | 50,000 | 6,534 | 3,060 | 2.14 | 0.9982 | 35.79 ms |
+| sift-128 | 50,000 | 465 | 370 | 1.26 | 0.9953 | 1.88 ms |
+| dbpedia-openai | 100,000 | 747 | 620 | 1.20 | 0.9907 | 5.02 ms |
+| glove-100 | 100,000 | 11,439 | 4,620 | 2.48 | 0.9985 | 140.08 ms |
+| sift-128 | 100,000 | 656 | 450 | 1.46 | 0.9968 | 3.19 ms |
 
-The calibration clears the requirement on all three. **It does not land on it and it is not meant to**, since the measurement is taken on a tenth of the records with queries drawn from the corpus, where your queries will not be.
+**The margin is not the same on the three, and glove-100 carries most of it.** The rule is one measurement per index scaled by two constants that are the same everywhere, being a safety factor of 1.75 and a bias of 0.15 on the fitted exponent. Taking the fitted exponent alone with neither constant, the extrapolation to 100,000 records asks for 4,626 candidates on glove-100 against a requirement of 4,620, which is 1.001 times what that index needs. On the other two it asks for 0.49 and 0.59 times what they need. The constants exist for those two, and on glove-100 they are margin over a fetch that was already right.
+
+Neither constant can come down without costing recall elsewhere. The constant that would bring glove-100 to the 1.20 ratio dbpedia-openai has at 100,000 records takes the dbpedia-openai fetch from 747 to 359, and a sweep of that same index reads recall 0.9787 at 360 candidates. dbpedia-openai also sits under 0.99 at 10,000, 25,000 and 50,000 records, at 0.9878, 0.9800 and 0.9883, so it has nothing to give back. What separates the datasets is the ratio between the requirement on a built index and the depth the calibration measures in the code ordering over its training sample, and the training sample cannot measure that ratio because the graph does not exist yet when it runs.
+
+**If query time on glove-like data matters more to you than the last thousandth of recall, name `rerank` yourself.** On glove-100 at 50,000 records a fetch of 3,060 reads recall 0.9900 at 18.14 ms against 0.9982 at 35.79 ms, so half the query time buys back 0.008 of recall.
+
+The two tables below carry fetch figures measured before the codebook seeding this release ships, which moved the calibrated fetch upward on glove-100. Read their ratios as the shape rather than as current figures.
 
 **On data with no resolvable structure no fetch works.** Once the group the codes cannot separate is smaller than `top_k`, the true top ten span groups, the distances between groups differ in the fourth decimal, and nothing reaches them. At 5,000 clusters over 25,000 records, being five records to a cluster, recall at 10 reaches 0.917 at a fetch of half the corpus, and uniform points on the sphere reach 0.859. Measure recall on your own data before you rely on quantization.
 

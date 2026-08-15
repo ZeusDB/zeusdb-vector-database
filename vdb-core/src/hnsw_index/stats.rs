@@ -15,6 +15,52 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, info};
+
+/// Control bytes a hashbrown table allocates past its last bucket.
+///
+/// The table is `buckets` entries followed by `buckets + Group::WIDTH` control
+/// bytes, and the group is sixteen on every x86 target and on aarch64.
+const HASH_CONTROL_TAIL: usize = 16;
+
+/// Buckets a `HashMap` holds, from the capacity it reports.
+///
+/// hashbrown sizes a table as the smallest power of two at or above `cap * 8 / 7`
+/// and then reports seven eighths of that back as the capacity, so undoing the
+/// division and rounding up to the power of two recovers the count. Below eight
+/// buckets it reports one less than the count instead, which is what the floor
+/// covers: an allocated table never holds fewer than four buckets.
+fn table_buckets(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    (capacity.saturating_mul(8) / 7).next_power_of_two().max(4)
+}
+
+/// Bytes a `HashMap`'s own table asks the allocator for.
+///
+/// The bucket array and the control bytes. What a key or a value owns on the
+/// heap is not counted here, because only the caller knows what that is: the
+/// `Vec` in `vectors` is a 24 byte header inside the bucket and 6,144 bytes
+/// outside it at dimension 1,536, and that outside part is already reported as
+/// `raw_vectors_memory_mb`.
+fn table_bytes<K, V, S>(map: &HashMap<K, V, S>) -> usize {
+    let buckets = table_buckets(map.capacity());
+    if buckets == 0 {
+        return 0;
+    }
+    buckets * std::mem::size_of::<(K, V)>() + buckets + HASH_CONTROL_TAIL
+}
+
+/// Bytes the record ids in a map's keys hold on the heap.
+///
+/// A `String` is a 24 byte header inside the bucket and its text outside it.
+/// The scan is over the bucket array rather than over the heap, since a
+/// `String`'s length sits in the header, so it is a linear read of a few
+/// megabytes and not one pointer chase per record.
+fn key_text_bytes<V, S>(map: &HashMap<String, V, S>) -> usize {
+    map.keys().map(|id| id.len()).sum()
+}
+
 impl HNSWIndex {
     /// Every counter and every memory figure, as `get_stats` reports them.
     ///
@@ -42,7 +88,21 @@ impl HNSWIndex {
     /// storage mode, the training progress and the vectors still needed are
     /// derived from the captured values by the same rules the helpers apply.
     pub(super) fn collect_stats(&self) -> HashMap<String, String> {
-        let live = self.id_map.read().unwrap().len();
+        // The record count and, from the same guard, what the map itself
+        // occupies. Every `bookkeeping` term below is one structure's own
+        // storage, and none of them is the payload the five memory keys price.
+        // See `index_bookkeeping_memory_mb`.
+        let (live, mut bookkeeping) = {
+            let id_map = self.id_map.read().unwrap();
+            (id_map.len(), table_bytes(&id_map) + key_text_bytes(&id_map))
+        };
+
+        // The reverse map holds a second copy of every id, as a value rather
+        // than as a key, so its text is counted again on purpose.
+        bookkeeping += {
+            let rev_map = self.rev_map.read().unwrap();
+            table_bytes(&rev_map) + rev_map.values().map(|id| id.len()).sum::<usize>()
+        };
 
         // Nodes the graph holds, which exceeds the live record count by exactly the
         // number of nodes removal and overwrite have stranded. `compact` reclaims the
@@ -57,9 +117,51 @@ impl HNSWIndex {
             )
         };
 
-        let raw_vector_count = self.vectors.read().unwrap().len();
-        let pq_code_count = self.pq_codes.read().unwrap().len();
-        let training_id_count = self.training_ids.read().unwrap().len();
+        let raw_vector_count = {
+            let vectors = self.vectors.read().unwrap();
+            bookkeeping += table_bytes(&vectors) + key_text_bytes(&vectors);
+            vectors.len()
+        };
+        let pq_code_count = {
+            let pq_codes = self.pq_codes.read().unwrap();
+            bookkeeping += table_bytes(&pq_codes) + key_text_bytes(&pq_codes);
+            pq_codes.len()
+        };
+
+        // The metadata map holds an id and a map per record. The inner maps are
+        // empty on a record added without metadata, and an empty `HashMap`
+        // allocates nothing, so the outer table is the whole cost there.
+        bookkeeping += {
+            let vector_metadata = self.vector_metadata.read().unwrap();
+            let mut bytes = table_bytes(&vector_metadata) + key_text_bytes(&vector_metadata);
+            for fields in vector_metadata.values() {
+                bytes += table_bytes(fields) + key_text_bytes(fields);
+                // A `Value` is 32 bytes inside its bucket whatever it holds. A
+                // string is the one variant that also owns text, and it is the
+                // variant a filterable field usually is.
+                bytes += fields
+                    .values()
+                    .filter_map(|value| value.as_str())
+                    .map(|text| text.len())
+                    .sum::<usize>();
+            }
+            bytes
+        };
+
+        let training_id_count = {
+            let training_ids = self.training_ids.read().unwrap();
+            bookkeeping += training_ids.capacity() * std::mem::size_of::<String>()
+                + training_ids.iter().map(|id| id.len()).sum::<usize>();
+            training_ids.len()
+        };
+
+        bookkeeping += {
+            let metadata = self.metadata.lock().unwrap();
+            table_bytes(&metadata)
+                + key_text_bytes(&metadata)
+                + metadata.values().map(|value| value.len()).sum::<usize>()
+        };
+
         let vector_count = *self.vector_count.lock().unwrap();
 
         // Loaded once so the three keys derived from it agree with each other.
@@ -350,18 +452,59 @@ impl HNSWIndex {
             storage_mode_description.to_string(),
         );
 
-        // The sum of the five memory keys above. It is what the index holds in
-        // the structures this call can price, being the graph, the raw vector
-        // store, the codes, the codebook and the centroid distance table.
+        // What the index spends on finding a record rather than on holding one.
         //
-        // It is not the resident set. The id maps, the metadata map, the hash
-        // table slots and the allocator's own headers and fragmentation sit
-        // outside it. Measured on three loaded indexes of 50,000
-        // dbpedia-openai records at dimension 1,536, the process held 805.9,
-        // 474.8 and 181.4 MiB where this reports 692.4, 401.2 and 107.8, being
-        // 1.16, 1.18 and 1.68 times. The share it misses is roughly 1,500 bytes
-        // per record and it does not move with the dimension, so it dominates
-        // the ratio on the mode that holds least.
+        // Five hash tables and two id copies per record. `id_map` and `rev_map`
+        // each hold the record's id, one as a key and one as a value, and
+        // `vectors`, `pq_codes` and `vector_metadata` each hold it again as a
+        // key. A table is a power of two bucket array with one control byte per
+        // bucket, sized from the capacity the map reports, so it is between
+        // eight sevenths and sixteen sevenths of the entries it currently
+        // holds and it steps rather than growing smoothly. The `Vec` in
+        // `vectors` and in `pq_codes` contributes only its 24 byte header here,
+        // since the bytes it points at are already priced above.
+        //
+        // It is proportional to the record count and independent of the
+        // dimension. Measured on three loaded indexes of 50,000 dbpedia-openai
+        // records at dimension 1,536 it reads 12.66, 15.95 and 12.66 MiB under
+        // no quantization, `quantized_with_raw` and `quantized_only`, being
+        // 265, 334 and 265 bytes per record. The middle mode is the one holding
+        // both stores, so it carries five tables where the others carry four.
+        //
+        // This is a request count and not a commitment. The allocator's own
+        // headers, its rounding and its fragmentation sit outside it, the same
+        // way they sit outside `graph_memory_mb`; see `graph_memory_bytes`.
+        let bookkeeping_mb = bookkeeping as f64 / (1024.0 * 1024.0);
+        total_memory_mb += bookkeeping_mb;
+        stats.insert(
+            "index_bookkeeping_memory_mb".to_string(),
+            format!("{:.2}", bookkeeping_mb),
+        );
+
+        // The sum of the six memory keys above. It is what the index holds in
+        // the structures this call can price, being the graph, the raw vector
+        // store, the codes, the codebook, the centroid distance table and the
+        // bookkeeping.
+        //
+        // The bookkeeping term is an addition, and it changes this figure on
+        // every index. It used to be the sum of five keys and to miss the id
+        // maps entirely. Nothing outside this call reads it; the `memory_mb`
+        // an integration package forwards comes from `get_quantization_info`
+        // and is the codebook alone, which is untouched.
+        //
+        // It is still not the resident set. The allocator's headers and its
+        // fragmentation sit outside it. Measured on three loaded indexes of
+        // 50,000 dbpedia-openai records at dimension 1,536, the index held
+        // 805.4, 473.3 and 181.0 MiB of resident where the five key sum
+        // reported 692.4, 400.0 and 107.0, being 0.860, 0.845 and 0.591 of it,
+        // and where this six key sum reports 705.1, 415.9 and 119.7, being
+        // 0.876, 0.879 and 0.661.
+        //
+        // What is left is 2,103, 1,202 and 1,285 bytes per record and it is
+        // almost all allocator overhead on the graph, which asks for six small
+        // blocks per point. It runs 1.25 times the graph figure unquantized,
+        // where the per point data block is 6,144 bytes, and 1.63 and 1.67
+        // times under the quantized modes, where that block is 48 bytes.
         stats.insert(
             "total_memory_mb".to_string(),
             format!("{:.2}", total_memory_mb),

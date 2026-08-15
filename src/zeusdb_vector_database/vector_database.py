@@ -196,10 +196,11 @@ class VectorDatabase:
             Under 'quantized_only' the records collected for training are held at
             full width only until training completes, then released. get_stats()
             reports the codes, the raw vectors, the codebook, the centroid
-            distance table and the graph, and sums them under total_memory_mb.
-            That sum is what the index holds rather than what the process holds,
-            since the id maps, the metadata map and the allocator's own headers
-            sit outside it at roughly 1,500 bytes a record. Recall falls sharply,
+            distance table, the graph and the hash tables that find a record,
+            and sums them under total_memory_mb. That sum is what the index
+            asked the allocator for rather than what the process holds, since
+            the allocator's own headers and its rounding sit outside it at
+            between 1,200 and 2,100 bytes a record. Recall falls sharply,
             not slightly. Only 'quantized_with_raw' can recover it, by reranking
             against the raw vectors it keeps. Training triggers automatically on
             the first .add() call that reaches the training_size threshold, and
@@ -438,7 +439,8 @@ class VectorDatabase:
                 "holds 0.69 times an unquantized index at 10,000 records and 0.59 "
                 "times at 100,000. "
                 "get_stats() reports the memory the codes, the raw vectors, the codebook, "
-                "the centroid distance table and the graph hold once records are loaded, "
+                "the centroid distance table, the graph and the index bookkeeping hold "
+                "once records are loaded, "
                 "and sums them under total_memory_mb. This mode is required for rerank "
                 "and for exact vector reconstruction.",
                 UserWarning,

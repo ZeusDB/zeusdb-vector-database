@@ -60,17 +60,42 @@
 //! `kernels_match_the_previous_shape_bit_for_bit` asserts that against a copy of
 //! the previous shape kept in the tests.
 //!
-//! There is no run time dispatch and no `unsafe` in this file. Compiling each
-//! kernel a second time inside a `#[target_feature(enable = "avx")]` wrapper was
-//! tried, on the reasoning that the wheel is built for baseline `x86-64` and
-//! would otherwise never see eight wide registers. It was measured at 1.04, 0.97
-//! and 1.07 times the baseline at dimensions 128, 768 and 1536, which is
-//! nothing, for the reason given above. It was removed rather than carried.
+//! # The second path, chosen at run time
 //!
-//! One compilation also means one answer. A saved index scores identically on
-//! every machine, because there is no second code path for a different processor
-//! to take. `wide` picks its representation at compile time from the target's
-//! own features rather than by detecting anything, so that property survives.
+//! `wide` picks its representation when this crate is compiled, and the wheel
+//! is compiled for baseline `x86-64`, so `f32x8` is a pair of SSE registers on
+//! every machine the wheel runs on however wide that machine's registers are.
+//! A `target-cpu` build would reach the wider register and would also raise an
+//! illegal instruction on a processor without it, so the wheel cannot take one.
+//!
+//! What it can take is a second compilation of the same loop behind a run time
+//! check. [`dot_avx`], [`l1_avx`] and [`l2_squared_avx`] are the block loop
+//! written in 256-bit intrinsics under `#[target_feature(enable = "avx")]`, and
+//! the three public kernels call them where the processor has the feature and
+//! the baseline where it does not. A machine without AVX takes exactly the code
+//! it took before this existed.
+//!
+//! An earlier attempt wrapped the kernels in the same attribute and measured at
+//! parity, at 1.04, 0.97 and 1.07 times the baseline at dimensions 128, 768 and
+//! 1536. It compiled a second copy and never chose between them, and the copy
+//! was the same `f32x8` source, so both copies were the same two SSE registers.
+//! The intrinsics are what make the second copy different.
+//!
+//! **Both paths return the identical `f32`.** Lane `i` of the 256-bit
+//! accumulator holds `a[8k + i]` against `b[8k + i]` over ascending `k`, which
+//! is what lane `i` of the `f32x8` holds, the lanes leave the register in index
+//! order through a store into the same `[f32; LANES]`, [`reduce`] is the same
+//! function, and the tail is the same scalar loop. Every operation is an
+//! element-wise IEEE-754 single-precision multiply, subtract, add or sign-bit
+//! clear, and those round the same at any register width. Only `avx` is
+//! enabled, never `fma`, so the multiply and the add cannot be contracted into
+//! one rounding even in principle. `the_two_paths_are_bit_identical` asserts it
+//! over the same grid the previous kernel change used, and three further tests
+//! carry the ordering, the graph and the search page.
+//!
+//! A saved index therefore scores identically on every machine, which is the
+//! property the single compilation used to hold by construction and this one
+//! holds by measurement.
 
 // The graph crate's trait, taken from the seam that owns that crate rather than
 // from the crate itself. ZeusDB implements it, so the name has to be visible
@@ -82,6 +107,15 @@ use crate::graph::Distance;
 // no branch and no second code path. On the baseline `x86-64` the wheel builds
 // for it is a pair of SSE registers.
 use wide::f32x8;
+
+// The 256-bit intrinsics the second path is written in. They are names only
+// until a function carrying the feature calls them, so importing them costs
+// nothing on a processor that never takes that path.
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::{
+    _mm256_add_ps, _mm256_and_ps, _mm256_castsi256_ps, _mm256_loadu_ps, _mm256_mul_ps,
+    _mm256_set1_epi32, _mm256_setzero_ps, _mm256_storeu_ps, _mm256_sub_ps,
+};
 
 /// The quantized distance, re-exported so every call site imports its distances
 /// from one module.
@@ -169,28 +203,218 @@ macro_rules! lane_loop {
     }};
 }
 
+/// Inner product of two vectors, over the pair of SSE registers `f32x8` is on
+/// the target the wheel is built for.
+#[inline]
+fn dot_baseline(a: &[f32], b: &[f32]) -> f32 {
+    lane_loop!(a, b, x, y, x * y)
+}
+
+/// Sum of absolute differences, baseline path.
+#[inline]
+fn l1_baseline(a: &[f32], b: &[f32]) -> f32 {
+    lane_loop!(a, b, x, y, (x - y).abs())
+}
+
+/// Sum of squared differences before the square root, baseline path.
+#[inline]
+fn l2_squared_baseline(a: &[f32], b: &[f32]) -> f32 {
+    lane_loop!(a, b, x, y, {
+        let d = x - y;
+        d * d
+    })
+}
+
+/// The same block loop in 256-bit intrinsics.
+///
+/// `$wide` is the term over a pair of `__m256` and `$scalar` is the term over a
+/// pair of `f32`, written separately because the sign-bit clear `l1` needs is
+/// `_mm256_and_ps` on the register and `f32::abs` on the scalar. Everything
+/// else about the loop matches [`lane_loop`], including the block width, the
+/// order the lanes are accumulated in, the separate tail accumulator and the
+/// reduction.
+///
+/// The loads are unaligned. A slice carries no alignment beyond four bytes and
+/// `_mm256_loadu_ps` is the load that does not require one, which costs nothing
+/// on any processor that has AVX at all.
+///
+/// # Safety
+///
+/// Expanded only inside a function carrying `#[target_feature(enable = "avx")]`,
+/// which every caller below does, and reached only where the feature was
+/// detected. The pointer arithmetic stays inside both slices, because `blocks`
+/// is the floor of the shorter length divided by the block width.
+#[cfg(target_arch = "x86_64")]
+macro_rules! avx_lane_loop {
+    ($a:expr, $b:expr, $x:ident, $y:ident, $wide:expr, $scalar:expr) => {{
+        let n = core::cmp::min($a.len(), $b.len());
+        let blocks = n / LANES;
+        let main = blocks * LANES;
+
+        let mut acc = _mm256_setzero_ps();
+        for k in 0..blocks {
+            let ($x, $y) = (
+                _mm256_loadu_ps($a.as_ptr().add(k * LANES)),
+                _mm256_loadu_ps($b.as_ptr().add(k * LANES)),
+            );
+            acc = _mm256_add_ps(acc, $wide);
+        }
+
+        // Lane `i` leaves the register at index `i`, which is where `to_array`
+        // puts lane `i` of an `f32x8`, so `reduce` sees the same eight values
+        // in the same positions on either path.
+        let mut lanes = [0.0f32; LANES];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+
+        let mut tail = 0.0f32;
+        for j in main..n {
+            let ($x, $y) = ($a[j], $b[j]);
+            tail += $scalar;
+        }
+
+        reduce(lanes) + tail
+    }};
+}
+
+/// Inner product over eight wide registers.
+///
+/// # Safety
+///
+/// The caller must have detected `avx`; [`dot`] is the only caller and it does.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn dot_avx(a: &[f32], b: &[f32]) -> f32 {
+    avx_lane_loop!(a, b, x, y, _mm256_mul_ps(x, y), x * y)
+}
+
+/// Sum of absolute differences over eight wide registers.
+///
+/// The absolute value is a sign-bit clear on both paths. `wide` clears it with
+/// a bitwise and against `0x7fff_ffff` and so does this, so a negative zero and
+/// a NaN payload survive identically rather than through two different rules.
+///
+/// # Safety
+///
+/// The caller must have detected `avx`; [`l1`] is the only caller and it does.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn l1_avx(a: &[f32], b: &[f32]) -> f32 {
+    let mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+    avx_lane_loop!(
+        a,
+        b,
+        x,
+        y,
+        _mm256_and_ps(_mm256_sub_ps(x, y), mask),
+        (x - y).abs()
+    )
+}
+
+/// Sum of squared differences over eight wide registers, before the square
+/// root.
+///
+/// # Safety
+///
+/// The caller must have detected `avx`; [`l2`] is the only caller and it does.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn l2_squared_avx(a: &[f32], b: &[f32]) -> f32 {
+    avx_lane_loop!(
+        a,
+        b,
+        x,
+        y,
+        {
+            let d = _mm256_sub_ps(x, y);
+            _mm256_mul_ps(d, d)
+        },
+        {
+            let d = x - y;
+            d * d
+        }
+    )
+}
+
+/// Whether this processor has AVX, decided once and remembered.
+///
+/// The answer is a property of the processor, so it is read from a single byte
+/// of static state rather than recomputed. The load is `Relaxed` because
+/// nothing is published behind it: the byte is the whole message, two threads
+/// racing to fill it write the same value, and no path reads a pointer or a
+/// buffer whose initialisation the flag would have to order.
+///
+/// The detection itself is `#[cold]` and out of line, so the inlined form at
+/// every call site is a load, a compare and a predictable branch. It runs once
+/// per process. `is_x86_feature_detected!` reads `cpuid` and caches its own
+/// answer as well, so even a miss here costs one further branch rather than an
+/// instruction that serialises the pipeline.
+#[cfg(target_arch = "x86_64")]
+mod feature {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    const UNKNOWN: u8 = 0;
+    const ABSENT: u8 = 1;
+    const PRESENT: u8 = 2;
+
+    static AVX: AtomicU8 = AtomicU8::new(UNKNOWN);
+
+    #[cold]
+    fn detect() -> bool {
+        let present = std::arch::is_x86_feature_detected!("avx");
+        AVX.store(if present { PRESENT } else { ABSENT }, Ordering::Relaxed);
+        present
+    }
+
+    #[inline(always)]
+    pub(super) fn avx() -> bool {
+        match AVX.load(Ordering::Relaxed) {
+            PRESENT => true,
+            ABSENT => false,
+            _ => detect(),
+        }
+    }
+
+    /// What the dispatch resolved to, for the tests and for the report.
+    #[cfg(test)]
+    pub(super) fn avx_detected() -> bool {
+        avx()
+    }
+}
+
 /// Inner product of two vectors.
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    lane_loop!(a, b, x, y, x * y)
+    #[cfg(target_arch = "x86_64")]
+    if feature::avx() {
+        // SAFETY: the feature was detected on the line above.
+        return unsafe { dot_avx(a, b) };
+    }
+    dot_baseline(a, b)
 }
 
 /// Sum of absolute differences.
 #[inline]
 pub fn l1(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    lane_loop!(a, b, x, y, (x - y).abs())
+    #[cfg(target_arch = "x86_64")]
+    if feature::avx() {
+        // SAFETY: the feature was detected on the line above.
+        return unsafe { l1_avx(a, b) };
+    }
+    l1_baseline(a, b)
 }
 
 /// Sum of squared differences, before the square root.
 #[inline]
 fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    lane_loop!(a, b, x, y, {
-        let d = x - y;
-        d * d
-    })
+    #[cfg(target_arch = "x86_64")]
+    if feature::avx() {
+        // SAFETY: the feature was detected on the line above.
+        return unsafe { l2_squared_avx(a, b) };
+    }
+    l2_squared_baseline(a, b)
 }
 
 /// Euclidean distance, square root taken.
@@ -1272,6 +1496,543 @@ mod tests {
              disagreed {disagreed}"
         );
         assert_eq!(disagreed, 0, "{disagreed} of {compared} pairs reordered");
+    }
+
+    /// The two dispatch paths, reachable by name rather than through the
+    /// public kernels, so a test can put the same input to both.
+    ///
+    /// Every `avx_` function here is called only after
+    /// `feature::avx_detected()` has returned true, which is the same check the
+    /// public kernels make.
+    #[cfg(target_arch = "x86_64")]
+    mod paths {
+        use super::super::{
+            dot_avx, dot_baseline, l1_avx, l1_baseline, l2_squared_avx, l2_squared_baseline,
+        };
+
+        pub fn base_dot(a: &[f32], b: &[f32]) -> f32 {
+            dot_baseline(a, b)
+        }
+
+        pub fn avx_dot(a: &[f32], b: &[f32]) -> f32 {
+            unsafe { dot_avx(a, b) }
+        }
+
+        pub fn base_l1(a: &[f32], b: &[f32]) -> f32 {
+            l1_baseline(a, b)
+        }
+
+        pub fn avx_l1(a: &[f32], b: &[f32]) -> f32 {
+            unsafe { l1_avx(a, b) }
+        }
+
+        pub fn base_l2(a: &[f32], b: &[f32]) -> f32 {
+            l2_squared_baseline(a, b).sqrt()
+        }
+
+        pub fn avx_l2(a: &[f32], b: &[f32]) -> f32 {
+            unsafe { l2_squared_avx(a, b) }.sqrt()
+        }
+
+        pub fn base_cosine(a: &[f32], b: &[f32]) -> f32 {
+            let d = 1.0 - base_dot(a, b);
+            if d < 0.0 {
+                0.0
+            } else {
+                d
+            }
+        }
+
+        pub fn avx_cosine(a: &[f32], b: &[f32]) -> f32 {
+            let d = 1.0 - avx_dot(a, b);
+            if d < 0.0 {
+                0.0
+            } else {
+                d
+            }
+        }
+
+        macro_rules! wear_the_trait {
+            ($name:ident, $f:path) => {
+                #[derive(Default, Copy, Clone, Debug)]
+                pub struct $name;
+
+                impl crate::graph::Distance<f32> for $name {
+                    #[inline]
+                    fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
+                        $f(va, vb)
+                    }
+                }
+            };
+        }
+
+        wear_the_trait!(BaseCosine, base_cosine);
+        wear_the_trait!(AvxCosine, avx_cosine);
+        wear_the_trait!(BaseL2, base_l2);
+        wear_the_trait!(AvxL2, avx_l2);
+        wear_the_trait!(BaseL1, base_l1);
+        wear_the_trait!(AvxL1, avx_l1);
+    }
+
+    /// Whether the second path exists on the processor running the tests,
+    /// printed once so an absent feature reads as a skip rather than a pass.
+    #[cfg(target_arch = "x86_64")]
+    fn avx_or_skip(test: &str) -> bool {
+        if feature::avx_detected() {
+            return true;
+        }
+        println!(
+            "{test}  avx absent on this processor, so every kernel takes the baseline \
+             and there is no second path to compare  compared 0"
+        );
+        false
+    }
+
+    /// The correctness bar for the run time dispatch.
+    ///
+    /// The two paths are the same arithmetic over the same eight lanes in the
+    /// same order, one in a pair of SSE registers and one in a single AVX
+    /// register, so every kernel must return the identical `f32` and not a
+    /// close one. Compared as bit patterns, so a signed zero or a NaN payload
+    /// would show.
+    ///
+    /// The grid is the one the previous kernel change used, being several
+    /// dimensions including shapes that are not a multiple of the block width,
+    /// several magnitudes, zero vectors, a lone non-zero element and non-finite
+    /// input.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_two_paths_are_bit_identical() {
+        if !avx_or_skip("dispatch bit identity") {
+            return;
+        }
+        let mut r = rng(75_75_75);
+        let (mut compared, mut differing) = (0usize, 0usize);
+        // The first disagreement, kept rather than raised where it is found, so
+        // the count covers the whole grid and the report is a count and an
+        // example rather than a stack trace at the first cell.
+        let mut first: Option<String> = None;
+
+        for scale in [1.0e-15f32, 1.0e-6, 1.0, 1.0e6, 1.0e15] {
+            for dim in DIMS {
+                for _ in 0..100 {
+                    let a: Vec<f32> = random_vector(&mut r, dim)
+                        .iter()
+                        .map(|x| x * scale)
+                        .collect();
+                    let b: Vec<f32> = random_vector(&mut r, dim)
+                        .iter()
+                        .map(|x| x * scale)
+                        .collect();
+                    let (na, nb) = (normalize(&a), normalize(&b));
+
+                    for (name, base, avx) in [
+                        ("dot", paths::base_dot(&a, &b), paths::avx_dot(&a, &b)),
+                        ("l1", paths::base_l1(&a, &b), paths::avx_l1(&a, &b)),
+                        ("l2", paths::base_l2(&a, &b), paths::avx_l2(&a, &b)),
+                        (
+                            "cosine",
+                            paths::base_cosine(&na, &nb),
+                            paths::avx_cosine(&na, &nb),
+                        ),
+                    ] {
+                        compared += 1;
+                        if base.to_bits() != avx.to_bits() {
+                            differing += 1;
+                            first.get_or_insert_with(|| {
+                                format!(
+                                    "{name} at dim {dim} scale {scale:e} returned {avx:e} on \
+                                     the avx path where the baseline returned {base:e}"
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        for dim in DIMS {
+            let z = vec![0.0f32; dim];
+            let mut one = vec![0.0f32; dim];
+            one[dim - 1] = 3.0;
+            let mut nan = vec![0.1f32; dim];
+            nan[0] = f32::NAN;
+            let mut inf = vec![0.1f32; dim];
+            inf[0] = f32::INFINITY;
+            let ones = vec![0.1f32; dim];
+
+            for (u, v) in [(&z, &z), (&one, &z), (&nan, &ones), (&inf, &ones)] {
+                for (base, avx) in [
+                    (paths::base_dot(u, v), paths::avx_dot(u, v)),
+                    (paths::base_l1(u, v), paths::avx_l1(u, v)),
+                    (paths::base_l2(u, v), paths::avx_l2(u, v)),
+                    (paths::base_cosine(u, v), paths::avx_cosine(u, v)),
+                ] {
+                    compared += 1;
+                    if base.to_bits() != avx.to_bits() {
+                        differing += 1;
+                        first.get_or_insert_with(|| {
+                            format!("an edge case at dim {dim} returned {avx:e} against {base:e}")
+                        });
+                    }
+                }
+            }
+        }
+
+        println!("dispatch bit identity  compared {compared}  differing {differing}");
+        assert_eq!(
+            differing,
+            0,
+            "{differing} of {compared} results differ, the first being {}",
+            first.unwrap_or_default()
+        );
+    }
+
+    /// Ordering equivalence between the paths, counted rather than inferred
+    /// from bit identity.
+    ///
+    /// Bit identity already implies it, since a comparison cannot separate two
+    /// identical values. It is measured because the order is what the graph
+    /// reads, and half the triples are deliberate near ties, built by
+    /// perturbing one component of the second candidate, because that is where
+    /// a last bit difference would decide an order if there were one to find.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ordering_matches_between_the_paths() {
+        if !avx_or_skip("dispatch ordering") {
+            return;
+        }
+        let mut r = rng(7575);
+        let (mut compared, mut ties, mut disagreed) = (0usize, 0usize, 0usize);
+
+        for dim in [8usize, 128, 768, 1536] {
+            for _ in 0..2000 {
+                let q = normalize(&random_vector(&mut r, dim));
+                let b = normalize(&random_vector(&mut r, dim));
+                let c = if compared % 2 == 0 {
+                    normalize(&random_vector(&mut r, dim))
+                } else {
+                    let mut c = b.clone();
+                    c[dim / 2] += 1e-5;
+                    normalize(&c)
+                };
+
+                for (base_qb, base_qc, avx_qb, avx_qc) in [
+                    (
+                        paths::base_cosine(&q, &b),
+                        paths::base_cosine(&q, &c),
+                        paths::avx_cosine(&q, &b),
+                        paths::avx_cosine(&q, &c),
+                    ),
+                    (
+                        paths::base_l2(&q, &b),
+                        paths::base_l2(&q, &c),
+                        paths::avx_l2(&q, &b),
+                        paths::avx_l2(&q, &c),
+                    ),
+                    (
+                        paths::base_l1(&q, &b),
+                        paths::base_l1(&q, &c),
+                        paths::avx_l1(&q, &b),
+                        paths::avx_l1(&q, &c),
+                    ),
+                ] {
+                    compared += 1;
+                    if base_qb == base_qc || avx_qb == avx_qc {
+                        ties += 1;
+                        continue;
+                    }
+                    if (base_qb < base_qc) != (avx_qb < avx_qc) {
+                        disagreed += 1;
+                    }
+                }
+            }
+        }
+
+        println!("dispatch ordering  compared {compared}  ties {ties}  disagreed {disagreed}");
+        assert_eq!(disagreed, 0, "{disagreed} of {compared} triples reordered");
+    }
+
+    /// Two graphs on identical data, one distance path each.
+    ///
+    /// The end to end statement. The level assignment is seeded through
+    /// `DEFAULT_LEVEL_SEED`, insertion is sequential, and the only thing that
+    /// differs between the two builds is which of the two kernels computed
+    /// every distance. All three spaces, since L1 and L2 are the two whose
+    /// values differ from `anndists` in the last bits and so the two with
+    /// anything to lose.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_two_paths_build_the_same_graph() {
+        if !avx_or_skip("dispatch graph") {
+            return;
+        }
+        const N: usize = 3000;
+        const DIM: usize = 64;
+
+        let mut r = rng(2718);
+        let data: Vec<Vec<f32>> = (0..N)
+            .map(|_| normalize(&random_vector(&mut r, DIM)))
+            .collect();
+
+        for (name, (nodes, edges, total, queries)) in [
+            (
+                "cosine",
+                compare_graphs(paths::BaseCosine {}, paths::AvxCosine {}, &data),
+            ),
+            (
+                "l2",
+                compare_graphs(paths::BaseL2 {}, paths::AvxL2 {}, &data),
+            ),
+            (
+                "l1",
+                compare_graphs(paths::BaseL1 {}, paths::AvxL1 {}, &data),
+            ),
+        ] {
+            println!(
+                "dispatch graph {name}  nodes {N}  edges {total}  differing nodes {nodes}  \
+                 differing edges {edges}  differing queries {queries} of 200"
+            );
+            assert_eq!(nodes, 0, "{name}: {nodes} of {N} nodes differ");
+            assert_eq!(edges, 0, "{name}: {edges} of {total} edges differ");
+            assert_eq!(queries, 0, "{name}: {queries} of 200 pages differ");
+        }
+    }
+
+    /// The search page itself, in ids and in score bits.
+    ///
+    /// `compare_graphs` counts pages whose id list differs and stops there. A
+    /// score is returned to the caller as well, so this compares the whole hit,
+    /// over a query set larger than the 200 that pass counts.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_two_paths_return_the_same_page() {
+        if !avx_or_skip("dispatch page") {
+            return;
+        }
+        const N: usize = 3000;
+        const DIM: usize = 64;
+        const QUERIES: usize = 250;
+
+        let mut r = rng(2718);
+        let data: Vec<Vec<f32>> = (0..N)
+            .map(|_| normalize(&random_vector(&mut r, DIM)))
+            .collect();
+        let mut q = rng(999);
+        let queries: Vec<Vec<f32>> = (0..QUERIES)
+            .map(|_| normalize(&random_vector(&mut q, DIM)))
+            .collect();
+
+        let base = Hnsw::new(16, N, 16, 200, paths::BaseCosine {});
+        let avx = Hnsw::new(16, N, 16, 200, paths::AvxCosine {});
+        for (i, v) in data.iter().enumerate() {
+            base.insert((v.as_slice(), i));
+            avx.insert((v.as_slice(), i));
+        }
+
+        let (mut compared, mut differing_ids, mut differing_scores) = (0usize, 0usize, 0usize);
+        for query in &queries {
+            let a = base.search(query, 10, 100);
+            let b = avx.search(query, 10, 100);
+            compared += 1;
+            if a.iter().map(|h| h.d_id).ne(b.iter().map(|h| h.d_id)) {
+                differing_ids += 1;
+            }
+            if a.iter()
+                .map(|h| h.distance.to_bits())
+                .ne(b.iter().map(|h| h.distance.to_bits()))
+            {
+                differing_scores += 1;
+            }
+        }
+
+        println!(
+            "dispatch page  queries {compared}  differing ids {differing_ids}  \
+             differing score bits {differing_scores}"
+        );
+        assert_eq!(differing_ids, 0);
+        assert_eq!(differing_scores, 0);
+    }
+
+    /// Nanoseconds per call, baseline against the dispatched path.
+    ///
+    /// Ignored by default because it is a timing harness rather than an
+    /// assertion. Run it with
+    /// `cargo test --release --locked distance::tests::throughput -- --ignored --nocapture`.
+    ///
+    /// The third column is the public kernel, which on a processor with AVX is
+    /// the second path reached through the dispatch, so the difference between
+    /// the second and third columns carries the cost of the feature check as
+    /// well as the gain from the wider register.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "timing harness, run with --ignored --nocapture on a release build"]
+    fn throughput_baseline_against_avx() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const PAIRS: usize = 128;
+        const REPEATS: usize = 4000;
+        const ROUNDS: usize = 5;
+
+        println!(
+            "\navx detected {}\n\ndim  metric  baseline ns  avx ns  dispatched ns  \
+             avx over baseline  spread",
+            feature::avx_detected()
+        );
+
+        fn time<F: Fn(&[f32], &[f32]) -> f32>(
+            a: &[Vec<f32>],
+            b: &[Vec<f32>],
+            calls: f64,
+            f: F,
+        ) -> f64 {
+            for i in 0..a.len() {
+                black_box(f(black_box(&a[i]), black_box(&b[i])));
+            }
+            let t = Instant::now();
+            for _ in 0..REPEATS {
+                for i in 0..a.len() {
+                    black_box(f(black_box(&a[i]), black_box(&b[i])));
+                }
+            }
+            t.elapsed().as_secs_f64() * 1e9 / calls
+        }
+
+        for dim in [128usize, 768, 1536] {
+            let mut r = rng(555);
+            let a: Vec<Vec<f32>> = (0..PAIRS)
+                .map(|_| normalize(&random_vector(&mut r, dim)))
+                .collect();
+            let b: Vec<Vec<f32>> = (0..PAIRS)
+                .map(|_| normalize(&random_vector(&mut r, dim)))
+                .collect();
+            let calls = (PAIRS * REPEATS) as f64;
+
+            for metric in ["cosine", "l2", "l1"] {
+                let mut cells: Vec<[f64; 3]> = Vec::with_capacity(ROUNDS);
+                for _ in 0..ROUNDS {
+                    cells.push(match metric {
+                        "cosine" => [
+                            time(&a, &b, calls, paths::base_cosine),
+                            time(&a, &b, calls, paths::avx_cosine),
+                            time(&a, &b, calls, cosine_normalized),
+                        ],
+                        "l2" => [
+                            time(&a, &b, calls, paths::base_l2),
+                            time(&a, &b, calls, paths::avx_l2),
+                            time(&a, &b, calls, l2),
+                        ],
+                        _ => [
+                            time(&a, &b, calls, paths::base_l1),
+                            time(&a, &b, calls, paths::avx_l1),
+                            time(&a, &b, calls, l1),
+                        ],
+                    });
+                }
+                // The median of the rounds, with the full spread beside it, so
+                // a single noisy round neither sets the figure nor hides.
+                let pick = |slot: usize| {
+                    let mut v: Vec<f64> = cells.iter().map(|c| c[slot]).collect();
+                    v.sort_by(|x, y| x.total_cmp(y));
+                    (v[ROUNDS / 2], v[0], v[ROUNDS - 1])
+                };
+                let (base, base_lo, base_hi) = pick(0);
+                let (avx, avx_lo, avx_hi) = pick(1);
+                let (disp, disp_lo, disp_hi) = pick(2);
+                println!(
+                    "{dim:5}  {metric:6}  {base:10.2}  {avx:6.2}  {disp:12.2}  \
+                     {:16.2}  base {base_lo:.2}-{base_hi:.2} avx {avx_lo:.2}-{avx_hi:.2} \
+                     dispatched {disp_lo:.2}-{disp_hi:.2}",
+                    base / avx
+                );
+            }
+        }
+    }
+
+    /// What the wider register is worth once a graph is around it.
+    ///
+    /// Ignored by default, for the same reason the kernel harness is. Run it
+    /// with
+    /// `cargo test --release --locked distance::tests::build_and_search -- --ignored --nocapture`.
+    ///
+    /// A build is dominated by the neighbour selection and a search by the
+    /// pointer chasing through the layers, and the distance is one term inside
+    /// both. This is the figure that says how much of a kernel gain survives
+    /// that, measured over whole rounds so the spread between rounds is
+    /// visible beside the median rather than hidden by it.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "timing harness, run with --ignored --nocapture on a release build"]
+    fn build_and_search_baseline_against_avx() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const N: usize = 8000;
+        const DIM: usize = 768;
+        const QUERIES: usize = 500;
+        const ROUNDS: usize = 3;
+
+        let mut r = rng(4242);
+        let data: Vec<Vec<f32>> = (0..N)
+            .map(|_| normalize(&random_vector(&mut r, DIM)))
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..QUERIES)
+            .map(|_| normalize(&random_vector(&mut r, DIM)))
+            .collect();
+
+        fn round<D>(dist: D, data: &[Vec<f32>], queries: &[Vec<f32>]) -> (f64, f64)
+        where
+            D: Distance<f32> + Send + Sync + Clone,
+        {
+            let hnsw = Hnsw::new(16, data.len(), 16, 200, dist);
+            let t = Instant::now();
+            for (i, v) in data.iter().enumerate() {
+                hnsw.insert((v.as_slice(), i));
+            }
+            let build = t.elapsed().as_secs_f64();
+
+            for q in queries.iter().take(25) {
+                black_box(hnsw.search(q, 10, 100));
+            }
+            let t = Instant::now();
+            for q in queries {
+                black_box(hnsw.search(q, 10, 100));
+            }
+            let search = t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64;
+            (build, search)
+        }
+
+        println!(
+            "\navx detected {}\nrecords {N}  dim {DIM}  queries {QUERIES}  rounds {ROUNDS}\n\n\
+             path      build s (median, range)        search ms (median, range)",
+            feature::avx_detected()
+        );
+
+        let mut cells: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(ROUNDS);
+        for _ in 0..ROUNDS {
+            let (bb, bs) = round(paths::BaseCosine {}, &data, &queries);
+            let (ab, asr) = round(paths::AvxCosine {}, &data, &queries);
+            cells.push((bb, bs, ab, asr));
+        }
+
+        let pick = |f: fn(&(f64, f64, f64, f64)) -> f64| {
+            let mut v: Vec<f64> = cells.iter().map(f).collect();
+            v.sort_by(|a, b| a.total_cmp(b));
+            (v[ROUNDS / 2], v[0], v[ROUNDS - 1])
+        };
+        let (bb, bb_lo, bb_hi) = pick(|c| c.0);
+        let (bs, bs_lo, bs_hi) = pick(|c| c.1);
+        let (ab, ab_lo, ab_hi) = pick(|c| c.2);
+        let (asr, as_lo, as_hi) = pick(|c| c.3);
+
+        println!("baseline  {bb:.2} ({bb_lo:.2}-{bb_hi:.2})   {bs:.4} ({bs_lo:.4}-{bs_hi:.4})");
+        println!("avx       {ab:.2} ({ab_lo:.2}-{ab_hi:.2})   {asr:.4} ({as_lo:.4}-{as_hi:.4})");
+        println!(
+            "avx over baseline  build {:.3}  search {:.3}",
+            bb / ab,
+            bs / asr
+        );
     }
 
     /// Nanoseconds per call, old against new, at the three measured dimensions.
