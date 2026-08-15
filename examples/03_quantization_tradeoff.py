@@ -139,8 +139,13 @@ def main():
     # and bits. They do not move as records arrive, and at this record count
     # they are larger than everything the records themselves hold, which is why
     # they are in the total rather than left out of it.
-    # get_stats() reports the codes, the raw vectors, the codebook, the table
-    # and the graph, and total_memory_mb is the sum of those five. The graph
+    # get_stats() reports the codes, the raw vectors, the codebook, the table,
+    # the graph and the hash tables that find a record, and total_memory_mb is
+    # the sum of those six. The bookkeeping is not one of the columns here, and
+    # it is why every total below exceeds the columns beside it. It is set by
+    # the record count rather than by the dimension, and the mode holding both
+    # a raw vector and a code carries one more table than the other two. The
+    # graph
     # owns a second copy of every point on top of its neighbour lists, and that
     # copy is dim * 4 bytes in an unquantized index and subvectors bytes in a
     # quantized one, in both storage modes. It used to be left out of this
@@ -176,9 +181,9 @@ def main():
     print("both cross into saving as the index grows, quantized_only first")
     print("because it drops the raw vectors as well.")
     print()
-    print("total_memory_mb is what the index holds in the structures get_stats()")
-    print("can price. The id maps, the metadata map and the allocator's own")
-    print("headers sit outside it, so a process holds rather more than this.")
+    print("total_memory_mb is what the index asked the allocator for, and it")
+    print("adds the hash tables that find a record to the columns above. The")
+    print("allocator's own headers sit outside it, so a process holds more.")
     print()
 
     # ------------------------------------------------------------------
@@ -240,9 +245,9 @@ compression ratio: 32x
 
 stored per mode
   mode                    raw  codes  raw MB  code MB  fixed MB  graph MB  total
-  no quantization        3000      0    0.73     0.00      0.00      5.14   5.87
-  quantized_only            0   3000    0.00     0.02      1.06      4...   5...
-  quantized_with_raw     3000   3000    0.73     0.02      1.06      4...   6...
+  no quantization        3000      0    0.73     0.00      0.00      5.14   6.71
+  quantized_only            0   3000    0.00     0.02      1.06      4...   6...
+  quantized_with_raw     3000   3000    0.73     0.02      1.06      4...   7...
 
 Both modes drop the graph's full width copy of every point, so both
 save there. The graph column holds more than that copy. The neighbour
@@ -254,9 +259,9 @@ fixed cost does not grow with the record count and the saving does, so
 both cross into saving as the index grows, quantized_only first
 because it drops the raw vectors as well.
 
-total_memory_mb is what the index holds in the structures get_stats()
-can price. The id maps, the metadata map and the allocator's own
-headers sit outside it, so a process holds rather more than this.
+total_memory_mb is what the index asked the allocator for, and it
+adds the hash tables that find a record to the columns above. The
+allocator's own headers sit outside it, so a process holds more.
 
 recall@10 against exact cosine search
   no quantization                    good  1.00

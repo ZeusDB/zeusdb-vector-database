@@ -296,21 +296,58 @@ pub const DEFAULT_RERANK_PAGE_FACTOR: usize = 5;
 ///
 /// # What the whole rule delivers
 ///
-/// Mean recall at 10 measured on built indexes at 100,000 records, one query at
-/// a time through the ordinary search path. The requirement is the smallest
-/// fetch on the same index reaching 0.99, read off a sweep of the explicit
-/// `rerank` argument over that index.
+/// Mean recall at 10 measured on built indexes, one query at a time through the
+/// ordinary search path, 1,000 queries. The requirement is the smallest fetch on
+/// the same index reaching 0.99, read off a sweep of the explicit `rerank`
+/// argument over that index at 300 queries.
 ///
-///   corpus     calibrated   recall   requirement   corpus term   its recall
-///   ada-002           776   0.9905           750         2,000       0.9954
-///   GloVe           7,744   0.9962         4,500         2,000       0.9723
-///   SIFT              596   0.9941           450         2,000       1.0000
+///   records   corpus     calibrated   requirement   ratio   recall
+///    50,000   ada-002           554           860    0.64   0.9883
+///    50,000   GloVe           6,534         3,060    2.14   0.9982
+///    50,000   SIFT              465           370    1.26   0.9953
+///   100,000   ada-002           747           620    1.20   0.9907
+///   100,000   GloVe          11,439         4,620    2.48   0.9985
+///   100,000   SIFT              656           450    1.46   0.9968
 ///
 /// A requirement has to be read off the index the fetch will run on, and not
-/// off the codes. Ordering the codes exactly over the same corpus asks for the
-/// same fetch on GloVe and SIFT, at 1.01 and 0.98 times these, and three fifths
-/// of it on ada-002, at 0.63. A fetch is served by a traversal of the graph over
-/// the codes and a traversal of width F does not return the F nearest by code.
+/// off the codes. A fetch is served by a traversal of the graph over the codes
+/// and a traversal of width F does not return the F nearest by code.
+///
+/// # Why the ratio is not the same on the three
+///
+/// The rule is `SAFETY * fetch * ratio.powf(slope + BIAS)`, and everything in it
+/// except `fetch` and `slope` is the same constant on every index. Taking the
+/// raw least squares slope alone, with no safety factor and no bias, the
+/// extrapolation to 100,000 records reads 4,626 candidates on GloVe against a
+/// requirement of 4,620, being 1.001 times what the index needs. On ada-002 it
+/// reads 302 against 620 and on SIFT 265 against 450, being 0.49 and 0.59 times.
+/// **The uncorrected extrapolation is exact on GloVe and about half of what the
+/// other two need**, and the correction those constants apply is 2.47 at a
+/// tenfold ratio, being 1.75 for the safety factor and 1.41 for the bias.
+///
+/// So the margin on GloVe is not a defect in GloVe's calibration. It is the
+/// correction sized for the dataset whose calibration is least accurate,
+/// applied to the one whose calibration needs none. The correction the three
+/// need spans 2.05 to 1.00 at 100,000 records and 3.46 to 1.06 at 50,000, and
+/// one constant cannot serve that.
+///
+/// Neither constant can come down. At 100,000 records the constant that would
+/// bring GloVe to a 1.20 ratio, being what ada-002 has there, is 0.48 of the
+/// present one, and it takes the ada-002 fetch from 747 to 359 where a sweep of
+/// that index reads recall 0.9787 at 360 candidates. ada-002 also sits below the
+/// target at three of the four sizes measured, reading 0.9878, 0.9800 and 0.9883
+/// at 10,000, 25,000 and 50,000 records, so it has nothing to give back.
+///
+/// What separates them is the ratio between the requirement read off a built
+/// index and the depth this calibration measures in the exact code ordering over
+/// the training sample. At 10,000 records those read 340 against 158 on ada-002,
+/// 880 against 1,017 on GloVe and 140 against 119 on SIFT, so the sample
+/// understates the index by 2.15 times on one corpus and overstates it by 1.16
+/// on another. Nothing in the training sample measures that ratio, because the
+/// graph the fetch will traverse does not exist until the rebuild that follows
+/// the calibration. Measuring it there is the change that would let the safety
+/// factor come down, and it is a change to what training measures rather than to
+/// a constant.
 ///
 /// A generator holding a fixed number of clusters at every size is the case
 /// that breaks a constant exponent, and it is checked rather than assumed. At
