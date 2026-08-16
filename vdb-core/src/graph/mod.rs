@@ -1,4 +1,4 @@
-﻿//! The boundary between ZeusDB and the vendored `hnsw_rs` graph.
+//! The boundary between ZeusDB and the vendored `hnsw_rs` graph.
 //!
 //! This module is the only place in the crate that names `hnsw_rs` outside a
 //! test module. Everything the index does to the graph goes through
@@ -44,17 +44,35 @@ use tracing::{debug, error, info, trace, warn};
 
 pub(crate) mod dump;
 
-// The replacement graph structure and its traversal, ahead of the 0.7.0
-// cutover. Compiled and tested, and deliberately reached by nothing outside
-// this module: a graph is one object, so the read path cannot move to it while
-// writes still go to the vendored structure. Construction is what wires it in,
-// and until then the only callers are the parity tests, which is why the
-// non-test build carries it as dead code. Being generic and never instantiated
-// outside `cfg(test)`, it contributes no code to the shipped extension.
+// The replacement graph structure, ahead of the 0.7.0 cutover. Compiled and
+// tested, and deliberately reached by nothing outside this module: a graph is
+// one object, so the read path cannot move to it while writes still go to the
+// vendored structure. Construction is what wires it in, and until then the only
+// callers are the parity tests, which is why the non-test build carries all of
+// this as dead code. Being generic and never instantiated outside `cfg(test)`,
+// none of it contributes code to the shipped extension.
+//
+// `flat` is the read-only form and `mutable` is the form the cutover ships. The
+// first cannot take an appended node and no ZeusDB index is read-only, so the
+// second is what the load path will build. `flat` stays as the reference the
+// mutable traversal is proved against and retires at cutover.
 #[cfg_attr(not(test), allow(dead_code))]
 mod flat;
+// The level generator, which draws a new point's top level. Reached by nothing
+// outside `graph/` for the same reason: the vendored structure draws its own
+// levels from its own generator, and two generators on one graph would be two
+// streams. See `levels.rs` for what it reproduces and why exactly.
+#[cfg_attr(not(test), allow(dead_code))]
+mod levels;
+// The mutable form of the same graph, which is what construction writes into.
+#[cfg_attr(not(test), allow(dead_code))]
+mod mutable;
 #[cfg(test)]
 mod parity;
+// The traversal, written once against an accessor and shared by both
+// structures.
+#[cfg_attr(not(test), allow(dead_code))]
+mod traverse;
 
 use dump::{Expected, GraphKind};
 

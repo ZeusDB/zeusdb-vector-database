@@ -1,12 +1,21 @@
-//! ZeusDB's own graph structure, and the traversal over it.
+//! ZeusDB's own graph structure in read-only form.
 //!
-//! This is the replacement for the vendored `Hnsw`, built ahead of the 0.7.0
-//! cutover. It exists in the tree fully tested and reached by nothing outside
-//! `graph/`, because a graph is one object and cannot be half replaced: either
-//! the vendored crate holds the points and edges or this does. Construction has
-//! not been written yet, so wiring this in would put reads on one structure
-//! while writes still go to the other. The parity tests in `parity.rs` are what
-//! hold it to the vendored traversal until the cutover lands.
+//! This was built ahead of the 0.7.0 cutover as the replacement for the
+//! vendored `Hnsw`, and its frozen CSR is the smallest shape a loaded graph can
+//! take. It is not the shape the cutover ships. A node cannot be appended to
+//! it, for the reason [`super::mutable`] opens with, and no ZeusDB index is
+//! read-only, so a load path producing this form would be producing a form the
+//! index may have to abandon on the next `add`. [`super::mutable::MutableGraph`]
+//! is what ships and this stays as the reference the mutable structure's
+//! traversal is proved against, since it is the layout relay 77 held to the
+//! vendored page over 45,465 pages of real data.
+//!
+//! It is reached by nothing outside `graph/`, because a graph is one object and
+//! cannot be half replaced: either the vendored crate holds the points and
+//! edges or ZeusDB's own structure does. Construction has not been written yet,
+//! so wiring either in would put reads on one structure while writes still go
+//! to the other. The parity tests in `parity.rs` are what hold both to the
+//! vendored traversal until the cutover lands.
 //!
 //! # The shape
 //!
@@ -76,17 +85,14 @@
 //!
 //! # The traversal
 //!
-//! [`FlatGraph::search`] is a line-for-line port of the vendored
-//! `Hnsw::search_filter` with patch 4 applied, over indices instead of `Arc`s.
-//! The parity contract it holds, and the places it deliberately differs, are
-//! written on the function.
+//! The traversal is [`super::traverse::search`], which this structure reaches
+//! by implementing [`Topology`]. It used to live here, and it moved out
+//! unchanged when the mutable structure arrived, so that one port of the
+//! vendored `Hnsw::search_filter` serves both layouts rather than two.
 
+use super::traverse::{self, Topology, LAYERS};
 use super::{Distance, GraphHit};
-use hnsw_rs::hnsw::{LoadedEdge, LoadedPoint, PointId, NB_LAYER_MAX};
-use std::collections::BinaryHeap;
-
-/// Layers every graph carries, which is the vendored crate's fixed count.
-const LAYERS: usize = NB_LAYER_MAX as usize;
+use hnsw_rs::hnsw::{LoadedEdge, LoadedPoint, PointId};
 
 /// One layer's adjacency, in compressed sparse row form.
 ///
@@ -132,73 +138,6 @@ pub(super) struct FlatGraph<T, D> {
     above_level_edges: usize,
     /// The distance, evaluated between the query and a stored vector.
     dist_f: D,
-}
-
-/// A heap entry: one node ordered by its distance to the query.
-///
-/// The ordering is the vendored `PointWithOrder` ordering exactly, being the
-/// distance alone with the same panic on a NaN, so `std::BinaryHeap` evolves
-/// through the identical sequence of comparisons and equal distances resolve
-/// identically. The node index takes no part in the order.
-#[derive(Clone, Copy, Debug)]
-struct OrderedNode {
-    dist_to_ref: f32,
-    node: u32,
-}
-
-impl PartialEq for OrderedNode {
-    fn eq(&self, other: &Self) -> bool {
-        self.dist_to_ref == other.dist_to_ref
-    }
-}
-
-impl Eq for OrderedNode {}
-
-impl PartialOrd for OrderedNode {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for OrderedNode {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        if !self.dist_to_ref.is_nan() && !other.dist_to_ref.is_nan() {
-            self.dist_to_ref.partial_cmp(&other.dist_to_ref).unwrap()
-        } else {
-            // The vendored ordering's exact behaviour, message included, so a
-            // non-finite distance that reaches a heap fails the same way on
-            // both structures.
-            panic!("got a NaN in a distance");
-        }
-    }
-}
-
-/// Nodes already seen by one traversal, as one bit each.
-///
-/// The vendored `search_layer` keeps a `HashMap<PointId, Arc<Point>>` and asks
-/// `contains_key` before inserting. Only the set membership is ever read, so
-/// this carries the membership and nothing else: no hash, no allocation per
-/// visit, one allocation per search.
-struct Visited {
-    words: Vec<u64>,
-}
-
-impl Visited {
-    fn new(nodes: usize) -> Self {
-        Visited {
-            words: vec![0u64; nodes.div_ceil(64)],
-        }
-    }
-
-    /// Mark `node` visited, answering whether it already was.
-    #[inline]
-    fn test_and_set(&mut self, node: u32) -> bool {
-        let word = &mut self.words[(node >> 6) as usize];
-        let mask = 1u64 << (node & 63);
-        let was = *word & mask != 0;
-        *word |= mask;
-        was
-    }
 }
 
 impl<T, D> FlatGraph<T, D>
@@ -422,41 +361,11 @@ where
         )
     }
 
-    /// Points in one layer.
-    #[inline]
-    fn layer_len(&self, layer: usize) -> usize {
-        (self.layer_offsets[layer + 1] - self.layer_offsets[layer]) as usize
-    }
-
     /// The stored vector of one node.
     #[inline]
     pub(super) fn vector(&self, node: u32) -> &[T] {
         let at = node as usize * self.dim;
         &self.data[at..at + self.dim]
-    }
-
-    /// The id the node was inserted under, which is what hits report and what
-    /// a filter is asked about.
-    pub(super) fn origin_id(&self, node: u32) -> usize {
-        self.origin_ids[node as usize]
-    }
-
-    /// The neighbour list of one node at one layer.
-    ///
-    /// Empty for a node below the layer, which is how the vendored structure
-    /// answers the same question, since every vendored point carries all
-    /// sixteen lists and only fills the ones up to its own level.
-    #[inline]
-    fn neighbours(&self, node: u32, layer: usize) -> &[u32] {
-        let base = self.layer_offsets[layer];
-        if node < base {
-            return &[];
-        }
-        let adjacency = &self.layers[layer];
-        let at = (node - base) as usize;
-        let start = adjacency.starts[at] as usize;
-        let end = adjacency.starts[at + 1] as usize;
-        &adjacency.targets[start..end]
     }
 
     /// Bytes the structure has asked the allocator for.
@@ -503,6 +412,11 @@ where
     /// vendored path: a NaN distance panics with the vendored message the
     /// moment it enters a heap comparison, and an infinite distance traverses
     /// normally and scores the page it returns.
+    /// Search the graph, which is [`traverse::search`] over this layout.
+    ///
+    /// The traversal itself lives in `traverse.rs` and is shared with the
+    /// mutable structure. What this layout contributes is the [`Topology`]
+    /// implementation below, being the CSR lookup and the arena reads.
     pub(super) fn search<F>(
         &self,
         data: &[T],
@@ -513,150 +427,69 @@ where
     where
         F: Fn(&usize) -> bool,
     {
-        let mut dist_to_entry = self.dist_f.eval(data, self.vector(self.entry));
-        let mut pivot = self.entry;
-        let mut new_pivot = None;
+        traverse::search(self, data, knbn, ef_arg, filter)
+    }
+}
 
-        for layer in (1..=self.entry_level).rev() {
-            let mut has_changed = false;
-            for &neighbour in self.neighbours(pivot, layer as usize) {
-                let tmp_dist = self.dist_f.eval(data, self.vector(neighbour));
-                if tmp_dist < dist_to_entry {
-                    new_pivot = Some(neighbour);
-                    has_changed = true;
-                    dist_to_entry = tmp_dist;
-                }
-            }
-            if has_changed {
-                pivot = new_pivot.expect("has_changed is only set beside new_pivot");
-            }
-        }
+impl<T, D> Topology for FlatGraph<T, D>
+where
+    T: Clone + Send + Sync,
+    D: Distance<T> + Send + Sync,
+{
+    type Elem = T;
+    type Dist = D;
 
-        let ef = ef_arg.max(knbn);
-        let layer_to_search = (0..LAYERS)
-            .find(|&layer| self.layer_len(layer) > 0)
-            .expect("a loaded graph holds at least one point");
-
-        let neighbours_heap = self.search_layer(data, pivot, ef, layer_to_search, filter);
-        let neighbours = neighbours_heap.into_sorted_vec();
-        let last = knbn.min(ef).min(neighbours.len());
-
-        let mut hits = Vec::with_capacity(last);
-        match filter {
-            Some(admits) => {
-                for point in &neighbours[..last] {
-                    let origin_id = self.origin_ids[point.node as usize];
-                    if admits(&origin_id) {
-                        hits.push(GraphHit {
-                            internal_id: origin_id,
-                            distance: point.dist_to_ref,
-                        });
-                    }
-                }
-            }
-            None => {
-                for point in &neighbours[..last] {
-                    hits.push(GraphHit {
-                        internal_id: self.origin_ids[point.node as usize],
-                        distance: point.dist_to_ref,
-                    });
-                }
-            }
-        }
-        hits
+    fn distance(&self) -> &D {
+        &self.dist_f
     }
 
-    /// The bottom-layer traversal: the vendored `search_layer` with patch 4,
-    /// over flat indices.
+    fn nb_points(&self) -> usize {
+        self.origin_ids.len()
+    }
+
+    fn entry(&self) -> u32 {
+        self.entry
+    }
+
+    fn entry_level(&self) -> u8 {
+        self.entry_level
+    }
+
+    /// Points in one layer.
+    #[inline]
+    fn layer_len(&self, layer: usize) -> usize {
+        (self.layer_offsets[layer + 1] - self.layer_offsets[layer]) as usize
+    }
+
+    #[inline]
+    fn vector(&self, node: u32) -> &[T] {
+        let at = node as usize * self.dim;
+        &self.data[at..at + self.dim]
+    }
+
+    /// The id the node was inserted under, which is what hits report and what
+    /// a filter is asked about.
+    #[inline]
+    fn origin_id(&self, node: u32) -> usize {
+        self.origin_ids[node as usize]
+    }
+
+    /// The neighbour list of one node at one layer.
     ///
-    /// Positive distances in the result heap, negated distances in the
-    /// candidate heap, the entry admitted to the results only where the filter
-    /// admits it, `INFINITY` standing for the bound while the result heap is
-    /// empty, the candidate pushed before the filter is consulted, and the
-    /// result heap trimmed above `ef`. The two vendored assertions are kept,
-    /// because they are behaviour.
-    fn search_layer<F>(
-        &self,
-        point: &[T],
-        entry: u32,
-        ef: usize,
-        layer: usize,
-        filter: Option<&F>,
-    ) -> BinaryHeap<OrderedNode>
-    where
-        F: Fn(&usize) -> bool,
-    {
-        let skiplist_size = ef.max(2);
-        // Patch 4: one slot is the smallest width that terminates under a
-        // filter; see the vendored function.
-        let ef = ef.max(1);
-        let mut return_points = BinaryHeap::with_capacity(skiplist_size);
-        if self.layer_len(layer) == 0 {
-            return return_points;
+    /// Empty for a node below the layer, which is how the vendored structure
+    /// answers the same question, since every vendored point carries all
+    /// sixteen lists and only fills the ones up to its own level.
+    #[inline]
+    fn neighbours(&self, node: u32, layer: usize) -> &[u32] {
+        let base = self.layer_offsets[layer];
+        if node < base {
+            return &[];
         }
-
-        let dist_to_entry_point = self.dist_f.eval(point, self.vector(entry));
-        let mut visited = Visited::new(self.origin_ids.len());
-        visited.test_and_set(entry);
-
-        let mut candidate_points = BinaryHeap::with_capacity(skiplist_size);
-        candidate_points.push(OrderedNode {
-            dist_to_ref: -dist_to_entry_point,
-            node: entry,
-        });
-        let entry_admitted = match filter {
-            None => true,
-            Some(admits) => admits(&self.origin_ids[entry as usize]),
-        };
-        if entry_admitted {
-            return_points.push(OrderedNode {
-                dist_to_ref: dist_to_entry_point,
-                node: entry,
-            });
-        }
-
-        while let Some(c) = candidate_points.pop() {
-            assert!(c.dist_to_ref <= 0.);
-            let f_dist_to_ref = match return_points.peek() {
-                Some(f) => {
-                    assert!(f.dist_to_ref >= 0.);
-                    f.dist_to_ref
-                }
-                None => f32::INFINITY,
-            };
-            if -(c.dist_to_ref) > f_dist_to_ref {
-                return return_points;
-            }
-            for &e in self.neighbours(c.node, layer) {
-                if !visited.test_and_set(e) {
-                    let f_dist_to_p = match return_points.peek() {
-                        Some(f) => f.dist_to_ref,
-                        None => f32::INFINITY,
-                    };
-                    let e_dist_to_p = self.dist_f.eval(point, self.vector(e));
-                    if e_dist_to_p < f_dist_to_p || return_points.len() < ef {
-                        candidate_points.push(OrderedNode {
-                            dist_to_ref: -e_dist_to_p,
-                            node: e,
-                        });
-                        let admitted = match filter {
-                            None => true,
-                            Some(admits) => admits(&self.origin_ids[e as usize]),
-                        };
-                        if admitted {
-                            return_points.push(OrderedNode {
-                                dist_to_ref: e_dist_to_p,
-                                node: e,
-                            });
-                            if return_points.len() > ef {
-                                return_points.pop();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return_points
+        let adjacency = &self.layers[layer];
+        let at = (node - base) as usize;
+        let start = adjacency.starts[at] as usize;
+        let end = adjacency.starts[at + 1] as usize;
+        &adjacency.targets[start..end]
     }
 }
 
