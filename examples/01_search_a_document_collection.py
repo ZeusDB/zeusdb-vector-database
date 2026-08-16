@@ -150,7 +150,7 @@ filtered to garden, top_k=12
   1.0000  doc_09  Pruning fruit trees
   1.0000  doc_10  Composting at home
 
-saved files: ['config.json', 'hnsw_index.hnsw.data', 'hnsw_index.hnsw.graph', 'manifest.json', 'mappings.bin', 'metadata.json', 'vectors.bin']
+saved files: ['config.json', 'hnsw_index.zdbgraph', 'manifest.json', 'mappings.bin', 'metadata.json', 'vectors.bin']
 
 reopened: 12 documents
 collection: demo_library

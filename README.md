@@ -1146,7 +1146,7 @@ print("saved:", sorted(os.listdir("my_index.zdb")))
 
 *Output, with the progress lines omitted*
 ```
-saved: ['config.json', 'hnsw_index.hnsw.data', 'hnsw_index.hnsw.graph', 'manifest.json', 'mappings.bin', 'metadata.json', 'vectors.bin']
+saved: ['config.json', 'hnsw_index.zdbgraph', 'manifest.json', 'mappings.bin', 'metadata.json', 'vectors.bin']
 ```
 
 <br />
@@ -1216,7 +1216,7 @@ print("saved:", sorted(os.listdir("quantized_index.zdb")))
 quantization active: True
 quantization active after load: True
 storage mode after load: quantized_active
-saved: ['config.json', 'hnsw_index.hnsw.data', 'hnsw_index.hnsw.graph', 'manifest.json', 'mappings.bin', 'metadata.json', 'pq_centroids.bin', 'pq_codes.bin', 'quantization.json', 'vectors.bin']
+saved: ['config.json', 'hnsw_index.zdbgraph', 'manifest.json', 'mappings.bin', 'metadata.json', 'pq_centroids.bin', 'pq_codes.bin', 'quantization.json', 'vectors.bin']
 ```
 
 <br/>
@@ -1234,11 +1234,12 @@ my_index.zdb/
 ├── quantization.json       # PQ configuration (if enabled)
 ├── pq_centroids.bin        # Trained centroids (if PQ trained)
 ├── pq_codes.bin            # Quantized codes (if PQ active)
-├── hnsw_index.hnsw.graph   # HNSW graph structure
-└── hnsw_index.hnsw.data    # HNSW graph payload
+└── hnsw_index.zdbgraph     # HNSW graph structure and payload
 ```
 
-`manifest.json` lists both graph files under `files_included`. The load path restores the saved graph rather than rebuilding it, so both are required to reopen a directory holding records.
+`manifest.json` lists the graph file under `files_included`. The load path restores the saved graph rather than rebuilding it, so the file is required to reopen a directory holding records.
+
+A directory saved by 0.6.0 or earlier holds `hnsw_index.hnsw.graph` and `hnsw_index.hnsw.data` instead. Opening it still works: the graph is rebuilt once from the stored records, and the next `.save()` writes the single file.
 
 <br/>
 

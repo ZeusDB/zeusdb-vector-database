@@ -41,7 +41,10 @@ use anndists::dist::distances::Distance;
 pub struct NoData;
 
 /// maximum number of layers
-pub(crate) const NB_LAYER_MAX: u8 = 16; // so max layer is 15!!
+// ZEUSDB PATCH 8: public, so a caller writing its own dump format can state the
+// layer count its file carries and reject one that disagrees before it reads
+// any further. See ZEUSDB-PATCH.md.
+pub const NB_LAYER_MAX: u8 = 16; // so max layer is 15!!
 
 // ZEUSDB GUARD: counters for the minimum inbound-degree guard on the overflow pop.
 // GUARD_OVERFLOWS counts every overflow event, that is every time the reverse
@@ -306,6 +309,39 @@ impl<'b, T: Clone + Send + Sync> Point<'b, T> {
 
 //===========================================================================================
 
+/// ZEUSDB PATCH 8. One adjacency entry as a caller hands it back to the crate.
+///
+/// The target is named by where it sits rather than by its origin id, because
+/// the origin id is a property of the target point and the crate's own reload
+/// resolves the target through the position alone, ignoring the `d_id` its own
+/// format spends eight bytes per entry recording. A caller writing its own dump
+/// format therefore has no reason to record it either.
+/// See ZEUSDB-PATCH.md.
+#[derive(Clone, Copy, Debug)]
+pub struct LoadedEdge {
+    /// where the target sits, being its layer and its rank within that layer
+    pub target: PointId,
+    /// distance from the point holding this entry to the target
+    pub distance: f32,
+}
+
+/// ZEUSDB PATCH 8. One point as a caller hands it back to the crate.
+///
+/// The point's own `PointId` is not a field. It is the point's position in the
+/// structure passed to [`Hnsw::from_loaded_points`], which is the same identity
+/// the crate's own reload asserts rather than reads.
+/// See ZEUSDB-PATCH.md.
+#[derive(Clone, Debug)]
+pub struct LoadedPoint<T> {
+    /// the id the client inserted this point under
+    pub origin_id: DataId,
+    /// the point's own copy of its data
+    pub data: Vec<T>,
+    /// adjacency by layer, lowest layer first. Fewer entries than
+    /// `NB_LAYER_MAX` is allowed and the layers beyond are taken as empty.
+    pub neighbours: Vec<Vec<LoadedEdge>>,
+}
+
 /// A structure to store neighbours for of a point.
 #[derive(Debug, Clone)]
 pub(crate) struct PointWithOrder<'b, T: Clone + Send + Sync> {
@@ -563,6 +599,17 @@ impl<'b, T: Clone + Send + Sync> PointIndexation<'b, T> {
 
     pub fn get_level_scale(&self) -> f64 {
         self.layer_g.get_level_scale()
+    }
+
+    /// ZEUSDB PATCH 8. Where the entry point sits, or None on an empty graph.
+    ///
+    /// `get_max_level_observed` already returns the entry point's layer, which
+    /// is half of what a dump has to record. The rank within that layer is the
+    /// other half and nothing public reached it, so a caller writing its own
+    /// dump could not name the point the traversal starts from. See
+    /// ZEUSDB-PATCH.md.
+    pub fn get_entry_point_id(&self) -> Option<PointId> {
+        self.entry_point.read().as_ref().map(|point| point.p_id)
     }
 
     fn debug_dump(&self) {
@@ -888,6 +935,227 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         }
     } // end of new
 
+    /// ZEUSDB PATCH 8. Build a graph from a topology the caller already holds.
+    ///
+    /// The crate offers two ways to obtain a `Hnsw`. `new` followed by `insert`
+    /// recomputes every edge, so it rebuilds rather than restores, and
+    /// `HnswIo::load_hnsw*` reads the crate's own two-file dump. Every field a
+    /// third way would have to fill is `pub(crate)`, so a caller that keeps its
+    /// own on-disk format had no way to turn it back into a graph. This is that
+    /// third way, and it takes the topology alone.
+    ///
+    /// `points_by_layer[l][r]` is the point at rank `r` of layer `l`, and that
+    /// position is the point's `PointId`. Every edge names its target by the
+    /// same coordinates. The points are all built before any edge is installed,
+    /// so an edge may name any point in any layer including its own.
+    ///
+    /// # What it validates
+    ///
+    /// Every bound the structure depends on, because the caller's input came
+    /// off a disk. Layer count, rank range against `i32`, one data width across
+    /// all points, the layer index of every adjacency list, the layer and rank
+    /// of every edge target, finiteness of every distance, and the entry point's
+    /// coordinates. A malformed argument returns an error rather than panicking
+    /// or indexing out of bounds.
+    ///
+    /// Finiteness is checked because the lists are sorted afterwards and
+    /// `PointWithOrder`'s `Ord` panics on a NaN.
+    ///
+    /// # What it sets that is not passed in
+    ///
+    /// `extend_candidates`, `keep_pruned`, `searching` and `datamap_opt` take
+    /// the values `new` gives them, so a graph restored through here inserts
+    /// exactly as a freshly built one does. `HnswIo::load_hnsw*` differs here,
+    /// setting `extend_candidates` true where `new` sets it false.
+    ///
+    /// `max_nb_connection` is a `usize` and is stored at full width. The crate's
+    /// own `Description` narrows it to a `u8`, so its format cannot carry the
+    /// 256 that `new` admits.
+    ///
+    /// The per layer inbound degree counters are rebuilt as the edges are
+    /// installed, so they are a function of the adjacency and are not passed in.
+    ///
+    /// See ZEUSDB-PATCH.md.
+    #[allow(clippy::type_complexity)]
+    pub fn from_loaded_points(
+        points_by_layer: Vec<Vec<LoadedPoint<T>>>,
+        entry_point: PointId,
+        max_nb_connection: usize,
+        ef_construction: usize,
+        level_scale: f64,
+        dist_f: D,
+    ) -> Result<Self, String> {
+        let nb_layer = points_by_layer.len();
+        if nb_layer == 0 || nb_layer > NB_LAYER_MAX as usize {
+            return Err(format!(
+                "a graph carries between 1 and {} layers and this one carries {}",
+                NB_LAYER_MAX, nb_layer
+            ));
+        }
+        if max_nb_connection == 0 || max_nb_connection > 256 {
+            return Err(format!(
+                "max_nb_connection is between 1 and 256 and this graph declares {}",
+                max_nb_connection
+            ));
+        }
+        if !level_scale.is_finite() || level_scale <= 0. {
+            return Err(format!(
+                "the level scale is a positive finite number and this graph declares {}",
+                level_scale
+            ));
+        }
+
+        // Two passes, because an edge may name a point in any layer and every
+        // target has to exist before the first edge is installed. The first
+        // pass builds the points and sets each adjacency list aside, the second
+        // resolves the targets and wires them.
+        let mut built: Vec<Vec<Arc<Point<'b, T>>>> = Vec::with_capacity(NB_LAYER_MAX as usize);
+        let mut adjacency: Vec<Vec<Vec<Vec<LoadedEdge>>>> = Vec::with_capacity(nb_layer);
+        let mut data_dimension: Option<usize> = None;
+        let mut nb_point = 0usize;
+        for (layer, points) in points_by_layer.into_iter().enumerate() {
+            if points.len() > i32::MAX as usize {
+                return Err(format!(
+                    "layer {} holds {} points and a rank is an i32",
+                    layer,
+                    points.len()
+                ));
+            }
+            let mut layer_points = Vec::with_capacity(points.len());
+            let mut layer_adjacency = Vec::with_capacity(points.len());
+            for (rank, point) in points.into_iter().enumerate() {
+                match data_dimension {
+                    None => data_dimension = Some(point.data.len()),
+                    Some(width) if width == point.data.len() => {}
+                    Some(width) => {
+                        return Err(format!(
+                            "the point at layer {} rank {} holds {} values where the graph \
+                             holds {}",
+                            layer,
+                            rank,
+                            point.data.len(),
+                            width
+                        ));
+                    }
+                }
+                if point.neighbours.len() > NB_LAYER_MAX as usize {
+                    return Err(format!(
+                        "the point at layer {} rank {} carries adjacency for {} layers and \
+                         a point carries at most {}",
+                        layer,
+                        rank,
+                        point.neighbours.len(),
+                        NB_LAYER_MAX
+                    ));
+                }
+                let p_id = PointId(layer as u8, rank as i32);
+                layer_points.push(Arc::new(Point::new(point.data, point.origin_id, p_id)));
+                layer_adjacency.push(point.neighbours);
+                nb_point += 1;
+            }
+            built.push(layer_points);
+            adjacency.push(layer_adjacency);
+        }
+        if nb_point == 0 {
+            return Err("a graph holding no points has no entry point".to_string());
+        }
+        // The crate allocates a point's neighbour lists to NB_LAYER_MAX whatever
+        // level it was drawn at, so the layer vector is filled to the same
+        // length rather than left at whatever the caller passed.
+        while built.len() < NB_LAYER_MAX as usize {
+            built.push(Vec::new());
+        }
+
+        for (layer, layer_adjacency) in adjacency.into_iter().enumerate() {
+            for (rank, lists) in layer_adjacency.into_iter().enumerate() {
+                let mut neighbours = built[layer][rank].neighbours.write();
+                for (l, list) in lists.into_iter().enumerate() {
+                    for edge in list {
+                        if !edge.distance.is_finite() {
+                            return Err(format!(
+                                "the point at layer {} rank {} carries a distance of {} at \
+                                 layer {}",
+                                layer, rank, edge.distance, l
+                            ));
+                        }
+                        let target_layer = edge.target.0 as usize;
+                        if target_layer >= built.len() {
+                            return Err(format!(
+                                "the point at layer {} rank {} names a target at layer {} \
+                                 and the graph carries {}",
+                                layer,
+                                rank,
+                                target_layer,
+                                built.len()
+                            ));
+                        }
+                        if edge.target.1 < 0
+                            || edge.target.1 as usize >= built[target_layer].len()
+                        {
+                            return Err(format!(
+                                "the point at layer {} rank {} names rank {} of layer {} \
+                                 and that layer holds {} points",
+                                layer,
+                                rank,
+                                edge.target.1,
+                                target_layer,
+                                built[target_layer].len()
+                            ));
+                        }
+                        let target = &built[target_layer][edge.target.1 as usize];
+                        neighbours[l].push(Arc::new(PointWithOrder::new(target, edge.distance)));
+                        // ZEUSDB GUARD: install site 5. Wiring a graph from a
+                        // caller's topology installs edges directly, so the
+                        // counters are rebuilt with them exactly as the crate's
+                        // own reload rebuilds them.
+                        target.in_degree[l].fetch_add(1, AtomOrd::Relaxed);
+                    }
+                    // A stable sort, where the crate's own reload sorts
+                    // unstably. The list arrives in the order the caller
+                    // recorded it, which is the order the graph held, and that
+                    // order is already sorted by distance. An unstable sort is
+                    // free to permute entries at equal distance, so the graph
+                    // that comes back would not be the graph that went out.
+                    neighbours[l].sort_by(|a, b| a.cmp(b));
+                }
+            }
+        }
+
+        let entry_layer = entry_point.0 as usize;
+        if entry_layer >= built.len()
+            || entry_point.1 < 0
+            || entry_point.1 as usize >= built[entry_layer].len()
+        {
+            return Err(format!(
+                "the entry point sits at layer {} rank {} and no point is there",
+                entry_point.0, entry_point.1
+            ));
+        }
+        let entry = Arc::clone(&built[entry_layer][entry_point.1 as usize]);
+
+        let layer_indexed_points = PointIndexation {
+            max_nb_connection,
+            max_layer: NB_LAYER_MAX as usize,
+            points_by_layer: Arc::new(RwLock::new(built)),
+            layer_g: LayerGenerator::new_with_absolute_scale(level_scale, NB_LAYER_MAX as usize),
+            nb_point: Arc::new(RwLock::new(nb_point)),
+            entry_point: Arc::new(RwLock::new(Some(entry))),
+        };
+
+        Ok(Hnsw {
+            ef_construction,
+            max_nb_connection,
+            extend_candidates: false,
+            keep_pruned: false,
+            max_layer: NB_LAYER_MAX as usize,
+            layer_indexed_points,
+            data_dimension: data_dimension.unwrap_or(0),
+            dist_f,
+            searching: false,
+            datamap_opt: false,
+        })
+    } // end of from_loaded_points
+
     /// get ef_construction used in graph creation
     pub fn get_ef_construction(&self) -> usize {
         self.ef_construction
@@ -904,6 +1172,15 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
     /// returns the maximum of links between a point and others points in each layer
     pub fn get_max_nb_connection(&self) -> u8 {
         self.max_nb_connection as u8
+    }
+    /// ZEUSDB PATCH 8. `max_nb_connection` at the width it is held.
+    ///
+    /// `get_max_nb_connection` narrows to a `u8` where `new` admits 256, so it
+    /// answers 0 at the top of the range it admits, and the crate's own dump
+    /// records that 0. A caller writing its own format needs the value itself.
+    /// See ZEUSDB-PATCH.md.
+    pub fn get_max_nb_connection_full(&self) -> usize {
+        self.max_nb_connection
     }
     /// returns number of points stored in hnsw structure
     pub fn get_nb_point(&self) -> usize {

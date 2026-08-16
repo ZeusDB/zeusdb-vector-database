@@ -14,15 +14,20 @@
 //! ├── quantization.json       # PQ configuration (if enabled)
 //! ├── pq_codes.bin            # Quantized codes (if PQ enabled)
 //! ├── pq_centroids.bin        # PQ centroids (if trained)
-//! ├── hnsw_index.hnsw.graph   # HNSW graph topology
-//! └── hnsw_index.hnsw.data    # The point each graph node holds
+//! └── hnsw_index.zdbgraph     # HNSW graph topology and the point each node holds
 //! ```
 //!
-//! The two graph files are the dump the vendored `hnsw_rs` crate writes, and
-//! the loader restores the graph from them rather than rebuilding it by
+//! The graph file is ZeusDB's own format, written and read by `graph::dump`,
+//! and the loader restores the graph from it rather than rebuilding it by
 //! re-inserting every record. See `HNSWIndex::restore_graph_from_dump`.
+//!
+//! It replaces the two files the vendored `hnsw_rs` crate wrote,
+//! `hnsw_index.hnsw.graph` and `hnsw_index.hnsw.data`. A directory saved by
+//! 0.6.0 or earlier still holds those two, and opening it rebuilds the graph
+//! once and writes the new file on the next save. Nothing reads the old format.
 
 use crate::conversion::value_to_python_object;
+use crate::graph::dump::DUMP_FILENAME as GRAPH_DUMP_FILENAME;
 use crate::hnsw_index::{HNSWIndex, QuantizationConfig, StorageMode};
 use crate::pq::PQ;
 use crate::rerank::RerankCalibration;
@@ -1539,24 +1544,21 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         files_excluded.push("vectors.bin".to_string());
     }
 
-    // Phase 2: Add HNSW graph files
+    // Phase 2: Add the HNSW graph file
     //
-    // Both are included. The data file used to be declared excluded, on the
-    // reasoning that the load path read the records from vectors.bin and never
-    // opened it. The load path now restores the saved graph, and the graph
-    // cannot be read without the points that go with it, so both files are
-    // required to reopen the directory.
+    // One file where there used to be two. The vendored format split the
+    // topology from the points so the points could be memory mapped, which this
+    // build never asked for, and the split meant the two halves could disagree
+    // with each other. ZeusDB's format carries both, so the pair is now one
+    // length check rather than a cross file comparison.
     let vector_count = index.get_vector_count();
     if vector_count > 0 {
-        files_included.push("hnsw_index.hnsw.graph".to_string());
-        files_included.push("hnsw_index.hnsw.data".to_string());
-        println!("📋 Graph files in manifest:");
-        println!("   ✅ Included: hnsw_index.hnsw.graph");
-        println!("   ✅ Included: hnsw_index.hnsw.data");
+        files_included.push(GRAPH_DUMP_FILENAME.to_string());
+        println!("📋 Graph file in manifest:");
+        println!("   ✅ Included: {}", GRAPH_DUMP_FILENAME);
     } else {
-        files_excluded.push("hnsw_index.hnsw.graph".to_string());
-        files_excluded.push("hnsw_index.hnsw.data".to_string());
-        println!("ℹ️  No graph files (empty index)");
+        files_excluded.push(GRAPH_DUMP_FILENAME.to_string());
+        println!("ℹ️  No graph file (empty index)");
     }
 
     // Calculate compression info for quantized indexes

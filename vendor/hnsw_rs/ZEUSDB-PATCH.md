@@ -2,9 +2,17 @@
 
 Upstream crate: hnsw_rs 0.3.4 (crates.io, checksum
 43a5258f079b97bf2e8311ff9579e903c899dcbac0d9a138d62e9a066778bd07).
-This directory is a copy of the registry source with seven deliberate
+This directory is a copy of the registry source with eight deliberate
 changes plus this file. Resolution is redirected here through
 `[patch.crates-io]` in `vdb-core/Cargo.toml`.
+
+Since 0.7.0 ZeusDB writes and reads its own graph format and no longer
+enters `HnswIo`. Patches 1 to 5 and patch 8 are on paths ZeusDB still
+runs. Patch 6 and the fourth install site of patch 3 are not, and the
+section on each says so. They are kept rather than reverted, because the
+vendored crate's own tests reach them and because reapplying a patch set
+after an upgrade is a matter of adding rather than of remembering what
+was removed.
 
 ## Patch 1. Reverse link layer assignment
 
@@ -302,6 +310,13 @@ tight reservation is acceptable and why an index may exceed its declared
 
 ## Patch 6. Level scale on reload
 
+**ZeusDB no longer reaches the `src/hnswio.rs` half of this patch.** Since
+0.7.0 the loader reads ZeusDB's own format and never enters `HnswIo`, so
+the corrected reload runs only for the vendored crate's own tests. The
+`src/hnsw.rs` half is very much alive: `new_with_absolute_scale` is what
+patch 8 installs the saved scale through, and the defect recorded below is
+exactly the one it exists to avoid.
+
 File `src/hnswio.rs`, function `HnswIo::load_point_indexation`, with one
 added item in `src/hnsw.rs`.
 
@@ -470,14 +485,104 @@ It is also reversible. `cargo build --features hnsw_rs/mmap,hnsw_rs/flatten,hnsw
 compiles all three modules and was run to confirm the gated code still
 builds rather than being left to rot.
 
+## Patch 8. A public constructor from a caller's own topology
+
+File `src/hnsw.rs`. Two added types, two added accessors, one added
+constructor, and one visibility change.
+
+```diff
+-pub(crate) const NB_LAYER_MAX: u8 = 16;
++pub const NB_LAYER_MAX: u8 = 16;
+```
+
+together with five additions.
+
+- `pub struct LoadedEdge`, being a target `PointId` and an `f32` distance.
+- `pub struct LoadedPoint<T>`, being an origin id, a data vector and the
+  adjacency by layer.
+- `PointIndexation::get_entry_point_id`, returning the entry point's
+  `PointId`.
+- `Hnsw::get_max_nb_connection_full`, returning `max_nb_connection` as the
+  `usize` it is held as.
+- `Hnsw::from_loaded_points`, which builds every point, then wires every
+  edge, then assembles the `PointIndexation` and the `Hnsw` around them.
+
+### Why it exists
+
+The crate offers two ways to obtain a `Hnsw`. `new` followed by `insert`
+recomputes every edge, so it rebuilds rather than restores. `HnswIo::load_hnsw`
+and `load_hnsw_with_dist` read the crate's own two file dump. Every field a
+third way would have to fill is `pub(crate)`, on `Hnsw`, on `PointIndexation`
+and on `Point::neighbours`, and `PointWithOrder` is `pub(crate)` outright. A
+caller that keeps its own on-disk format therefore had no way to turn it back
+into a graph.
+
+ZeusDB now keeps its own format, in `vdb-core/src/graph/dump.rs`, and five
+things follow from writing the reader in ZeusDB rather than in the crate.
+
+The dump header carries a ZeusDB discriminant rather than
+`std::any::type_name::<D>()`, which the crate's format records and its reload
+compares by exact equality, so the four ZeusDB distance types are no longer
+pinned to the modules they are declared in.
+
+`from_loaded_points` returns a `Hnsw` that borrows nothing, where
+`load_hnsw_with_dist` ties the returned graph's lifetime to the `HnswIo`, so
+reaching `'static` meant leaking the loader.
+
+Malformed input is refused by ZeusDB's reader before it reaches the crate at
+all, where `load_description` unwraps a UTF-8 conversion and panics on a
+garbage header and `load_point` reaches `std::process::exit(1)` on a short
+data file. Two `catch_unwind` calls and one exact size check went with them.
+
+`max_nb_connection` travels as a `usize`. `Description` narrows it to a `u8`
+while `new` admits 256, so a dump written at `m` 256 declared 0 and the index
+rebuilt its graph on every load for ever.
+
+### What it validates
+
+Every bound the structure depends on, because the caller's argument came off a
+disk. The layer count, the rank range against `i32`, one data width across all
+points, the layer index of every adjacency list, the layer and rank of every
+edge target, the finiteness of every distance, and the entry point's
+coordinates. A malformed argument returns an error rather than panicking or
+indexing out of bounds.
+
+Finiteness is checked because the lists are sorted afterwards and
+`PointWithOrder`'s `Ord` panics on a NaN.
+
+### Where it differs from the crate's own reload deliberately
+
+It sorts each neighbour list with a stable `sort_by` where
+`load_point_indexation` uses `sort_unstable`. The list arrives in the order the
+caller recorded, which is the order the graph held, and that order is already
+sorted by distance. An unstable sort is free to permute entries at equal
+distance, so the graph that came back would not be the graph that went out.
+
+It sets `extend_candidates` false, which is what `new` sets and the opposite of
+what the reload sets, so a restored graph and a freshly built one build the
+neighbourhood of a later insertion alike. ZeusDB used to put this back by hand
+after every load.
+
+It carries a fifth install site for patch 3's inbound degree counters, since it
+installs edges directly. **The fourth install site, in
+`src/hnswio.rs`, is no longer reached by ZeusDB**, for the same reason patch 6
+is not.
+
+### Detecting a lost patch
+
+It cannot be lost quietly. `vdb-core/src/graph/dump.rs` will not compile
+without it, so the whole crate fails to build.
+
 ## Total against the pristine registry copy
 
-`src/hnsw.rs` differs by 273 lines, 212 added and 61 removed. Patch 1
+`src/hnsw.rs` differs by 552 lines, 490 added and 62 removed. Patch 1
 accounts for 1 added and 1 removed. Patch 2 accounts for 30 added and 2
 removed. Patch 3 accounts for 100 added and 3 removed. Patch 4 accounts
 for 58 added and 54 removed, of which 20 of the additions are comment.
 Patch 5 accounts for 4 added and 1 removed, of which 3 of the additions
 are comment. Patch 6 accounts for 19 added, of which 10 are comment.
+Patch 8 accounts for 278 added and 1 removed, of which 94 of the additions
+are comment.
 `src/hnswio.rs` differs by 56 lines, 50 added and 6 removed. Patch 3
 accounts for 4 added. Patch 6 accounts for 17 added and 5 removed, of
 which 11 of the additions are comment. Patch 7 accounts for 29 added and
@@ -581,7 +686,7 @@ exports 65, `libext` is being compiled again.
 
 ## On upgrade
 
-All seven patches MUST be reapplied whenever the vendored copy is
+All eight patches MUST be reapplied whenever the vendored copy is
 refreshed or the version is bumped, and the line counts above rechecked
 so a lost patch is visible. Both Rust regression tests insert
 sequentially, so they depend on patch 2 for their own determinism. Patch

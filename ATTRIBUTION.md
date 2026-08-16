@@ -24,15 +24,17 @@ See [https://attribution.md](https://attribution.md) for details.
 This repository vendors the [hnsw_rs](https://crates.io/crates/hnsw_rs)
 crate, version 0.3.4, by Jean-Pierre Both at `vendor/hnsw_rs`. The
 vendored copy is taken from the crates.io registry source and carries
-seven deliberate patches, one to the reverse link layer assignment, one
+eight deliberate patches, one to the reverse link layer assignment, one
 seeding level assignment so index builds are reproducible, one guarding
 the neighbour list overflow pop against stranding a point's last inbound
 link, one correcting the filtered search path so it cannot panic or
 return an empty result set, one correcting the per-layer capacity
 reservation so a declared index size does not commit hundreds of times
 the memory it needs, one correcting the level scale a reload installs,
-and one putting three modules ZeusDB never reaches behind default-off
-cargo features, all recorded in
+one putting three modules ZeusDB never reaches behind default-off
+cargo features, and one adding a public constructor that builds a graph
+from a topology the caller already holds, so ZeusDB can keep its own
+on-disk format, all recorded in
 `vendor/hnsw_rs/ZEUSDB-PATCH.md`.
 hnsw_rs is dual licensed under MIT or Apache-2.0. Full licence texts are
 in `LICENSES/`.

@@ -120,13 +120,15 @@ use core::arch::x86_64::{
 /// The quantized distance, re-exported so every call site imports its distances
 /// from one module.
 ///
-/// The declaration cannot follow the name here. `Hnsw::file_dump` writes
-/// `std::any::type_name::<D>()` into the dump header and the load path compares
-/// it by exact equality, and `type_name` reports where a type is **declared**,
-/// so moving `DistPQ` out of `hnsw_index` would change what every save writes and
-/// stop every saved quantized index from loading. A re-export is an import site
-/// and changes nothing on disk, which was verified by loading a directory saved
-/// before it existed.
+/// The declaration used to be unable to follow the name. `Hnsw::file_dump`
+/// wrote `std::any::type_name::<D>()` into the dump header and the load path
+/// compared it by exact equality, and `type_name` reports where a type is
+/// **declared**, so moving `DistPQ` out of `hnsw_index` would have changed what
+/// every save wrote and stopped every saved quantized index from loading.
+///
+/// ZeusDB's format carries a discriminant instead, so the declaration is free
+/// to move now. It has not been moved here, because that is a change to make on
+/// its own rather than alongside a format change.
 pub(crate) use crate::hnsw_index::DistPQ;
 
 /// Independent accumulators each kernel carries.
