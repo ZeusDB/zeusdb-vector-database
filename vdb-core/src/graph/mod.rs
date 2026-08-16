@@ -44,6 +44,18 @@ use tracing::{debug, error, info, trace, warn};
 
 pub(crate) mod dump;
 
+// The replacement graph structure and its traversal, ahead of the 0.7.0
+// cutover. Compiled and tested, and deliberately reached by nothing outside
+// this module: a graph is one object, so the read path cannot move to it while
+// writes still go to the vendored structure. Construction is what wires it in,
+// and until then the only callers are the parity tests, which is why the
+// non-test build carries it as dead code. Being generic and never instantiated
+// outside `cfg(test)`, it contributes no code to the shipped extension.
+#[cfg_attr(not(test), allow(dead_code))]
+mod flat;
+#[cfg(test)]
+mod parity;
+
 use dump::{Expected, GraphKind};
 
 /// The vendored crate's distance trait, re-exported at the seam.
