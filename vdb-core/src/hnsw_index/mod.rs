@@ -20,19 +20,22 @@
 //! | `stats` | what the index reports about itself |
 //! | `persist` | the accessors and setters `persistence.rs` speaks to |
 //!
-//! # Why `DistPQ` cannot move
+//! # Why `DistPQ` is declared here
 //!
-//! `Hnsw::file_dump` writes `std::any::type_name::<D>()` of the distance into
-//! the dump header, and both `graph::inspect_graph_dump` and the vendored
-//! `load_hnsw_with_dist` compare it by exact equality. `type_name` is the full
-//! module path of the **declaration**, so declaring `DistPQ` anywhere else
-//! changes what every save writes and stops every saved quantized index from
-//! loading. Its path is `zeusdb_vector_database::hnsw_index::DistPQ` and it stays
-//! that, which is also why this module is a directory rather than a rename.
+//! It used to be unable to live anywhere else. `Hnsw::file_dump` wrote
+//! `std::any::type_name::<D>()` of the distance into the dump header, and both
+//! the loader and the vendored `load_hnsw_with_dist` compared it by exact
+//! equality. `type_name` is the full module path of the **declaration**, so
+//! declaring `DistPQ` anywhere else changed what every save wrote and stopped
+//! every saved quantized index from loading. That is also why this module is a
+//! directory rather than a rename.
+//!
+//! ZeusDB's format carries a `graph::dump::GraphKind` discriminant instead, so
+//! the pin is gone and the declaration is free to move. It stays here for now,
+//! since moving it is a change to make on its own.
 //!
 //! `distance.rs` re-exports the name so that every call site imports its
-//! distances from one place. A re-export is an import site and `type_name`
-//! reports the declaration site, so the re-export costs nothing on disk.
+//! distances from one place.
 
 mod construct;
 #[cfg(test)]
@@ -159,9 +162,11 @@ impl Drop for QueryLut {
 /// Custom distance function for Product Quantization using ADC
 ///
 /// This lives here rather than beside the raw distances in `distance.rs`
-/// because `std::any::type_name::<DistPQ>()` is written into every saved graph
-/// dump and checked on load. Moving the type to another module changes that
-/// string and stops every previously saved quantized index from loading.
+/// because `std::any::type_name::<DistPQ>()` used to be written into every
+/// saved graph dump and checked on load, so moving the type to another module
+/// changed that string and stopped every previously saved quantized index from
+/// loading. ZeusDB's format records a discriminant instead, so the constraint
+/// is gone and only the habit remains.
 #[derive(Clone)]
 pub struct DistPQ {
     /// Reference to the PQ instance for accessing centroids
@@ -919,8 +924,8 @@ impl HNSWIndex {
     /// `save_vectors` and `save_manifest`, and every one of them speaks only to
     /// `serde_json`, `bincode` and `std::fs`. Every Python token in
     /// `persistence.rs` sits in the load path, in `rebuild_using_add_method` and
-    /// the `conversion` module it calls. `save_hnsw_graph` calls the vendored
-    /// crate's `file_dump`, which names PyO3 nowhere.
+    /// the `conversion` module it calls. `save_hnsw_graph` reaches
+    /// `graph::dump::write_dump`, which names PyO3 nowhere.
     #[instrument(level = "info", skip(self, py), fields(
         vector_count = self.get_vector_count(),
         has_quantization = self.has_quantization(),

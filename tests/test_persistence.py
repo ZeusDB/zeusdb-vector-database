@@ -395,13 +395,12 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
     index.save(str(save_dir))
 
     on_disk = sorted(p.name for p in save_dir.glob("*"))
-    # The README documents this directory listing at lines 843 to 857 and does
-    # not mention hnsw_index.hnsw.data, which is written by the vendored graph
-    # writer and is present on disk for every non empty index.
+    # One graph file rather than the two the vendored writer used to leave. The
+    # split existed so the points could be memory mapped, which this build never
+    # asks for, and it meant the topology and the points could disagree.
     assert on_disk == [
         "config.json",
-        "hnsw_index.hnsw.data",
-        "hnsw_index.hnsw.graph",
+        "hnsw_index.zdbgraph",
         "manifest.json",
         "mappings.bin",
         "metadata.json",
@@ -427,11 +426,11 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
     assert manifest["total_size_mb"] > 0
 
     # files_included is the inventory the loader reads back, and it is a strict
-    # subset of what is on disk. Both graph files are in it, because the loader
+    # subset of what is on disk. The graph file is in it, because the loader
     # restores the saved graph and cannot do that without the points.
     assert manifest["files_included"] == [
         "config.json", "mappings.bin", "metadata.json", "vectors.bin",
-        "hnsw_index.hnsw.graph", "hnsw_index.hnsw.data",
+        "hnsw_index.zdbgraph",
     ]
     assert manifest["files_excluded"] == []
     assert set(manifest["files_included"]).issubset(on_disk)
@@ -1403,18 +1402,19 @@ def test_two_loads_of_one_directory_agree(quantized_reload):
 def test_save_after_load_rewrites_the_same_graph(quantized_reload, tmp_path):
     """A load, a save and a second load return the same pages again.
 
-    The vendored dump refuses to overwrite its own files when the graph it
-    holds may be memory mapped, and mints a basename with a random suffix
-    instead. The loader takes the entry point that leaves that flag clear, so a
-    saved index keeps one pair of graph files however many times it is saved.
+    The vendored dump refused to overwrite its own files when the graph it held
+    may have been memory mapped, and minted a basename with a random suffix
+    instead, so the loader had to take the entry point that left that flag
+    clear. Nothing here maps anything and the file is replaced outright, so a
+    saved index keeps one graph file however many times it is saved.
     """
     fixture = quantized_reload
     first = VectorDatabase().load(str(fixture["path"]))
     again = tmp_path / "again.zdb"
     first.save(str(again))
 
-    names = sorted(p.name for p in again.iterdir() if ".hnsw." in p.name)
-    assert names == ["hnsw_index.hnsw.data", "hnsw_index.hnsw.graph"]
+    names = sorted(p.name for p in again.iterdir() if p.suffix == ".zdbgraph")
+    assert names == ["hnsw_index.zdbgraph"]
 
     second = VectorDatabase().load(str(again))
     assert _pages(second, fixture["queries"]) == fixture["pages_before"]
@@ -1478,16 +1478,37 @@ def test_restored_graph_accepts_inserts_removals_and_compaction(tmp_path):
 # ------------------------------------------------------------
 # Test 109: the rebuild is still there when the dump cannot be used
 # ------------------------------------------------------------
-@pytest.mark.parametrize("damage", ["absent", "truncated_graph", "truncated_data",
-                                    "wrong_m"])
+@pytest.mark.parametrize("damage", [
+    "absent",
+    "empty",
+    "header_only",
+    "truncated_early",
+    "truncated_half",
+    "truncated_by_one",
+    "truncated_trailer",
+    "extra_bytes",
+    "wrong_magic",
+    "wrong_version",
+    "corrupt_header",
+    "huge_nb_point",
+    "corrupt_body",
+    "corrupt_trailer_magic",
+    "wrong_m",
+    "vendored_dump",
+])
 def test_load_falls_back_to_the_rebuild_when_the_dump_is_unusable(tmp_path, damage):
     """Every record comes back whatever state the dump is in.
 
-    A directory written by a release whose distance types were named
-    differently, or one whose graph files were lost or damaged, still loads.
-    The truncated data file is the case that matters most, because the vendored
-    reader reaches std::process::exit on a short read, so the loader measures
-    that file before it is opened rather than after.
+    None of these may panic, exit the process, or size a buffer from a length
+    the file has not earned. That is the class of failure the vendored reader
+    had: it panicked on a malformed header and reached std::process::exit(1) on
+    a short data file, which is why the loader used to measure the data file
+    beforehand and wrap the reload in two catch_unwind calls.
+
+    A dump written by 0.6.0 or earlier is one of these cases rather than a
+    special one. There is deliberately no reader for the vendored format, so
+    such a directory reaches the rebuild, comes back whole, and writes the new
+    format on its next save.
     """
     vectors = _clustered_unit_vectors(400, 16, 31415)
     ids = [f"v_{i}" for i in range(len(vectors))]
@@ -1496,28 +1517,75 @@ def test_load_falls_back_to_the_rebuild_when_the_dump_is_unusable(tmp_path, dama
 
     save_dir = tmp_path / "damaged.zdb"
     index.save(str(save_dir))
-    graph = save_dir / "hnsw_index.hnsw.graph"
-    data = save_dir / "hnsw_index.hnsw.data"
+    dump = save_dir / "hnsw_index.zdbgraph"
+    blob = dump.read_bytes()
 
     if damage == "absent":
-        graph.unlink()
-        data.unlink()
-    elif damage == "truncated_graph":
-        blob = graph.read_bytes()
-        graph.write_bytes(blob[: len(blob) // 2])
-    elif damage == "truncated_data":
-        data.write_bytes(data.read_bytes()[:-64])
+        dump.unlink()
+    elif damage == "empty":
+        dump.write_bytes(b"")
+    elif damage == "header_only":
+        dump.write_bytes(blob[:96])
+    elif damage == "truncated_early":
+        dump.write_bytes(blob[:200])
+    elif damage == "truncated_half":
+        dump.write_bytes(blob[: len(blob) // 2])
+    elif damage == "truncated_by_one":
+        dump.write_bytes(blob[:-1])
+    elif damage == "truncated_trailer":
+        dump.write_bytes(blob[:-16])
+    elif damage == "extra_bytes":
+        dump.write_bytes(blob + b"\x00" * 32)
+    elif damage == "wrong_magic":
+        dump.write_bytes(b"NOTZEUSD" + blob[8:])
+    elif damage == "wrong_version":
+        dump.write_bytes(blob[:8] + struct.pack("<I", 99) + blob[12:])
+    elif damage == "corrupt_header":
+        # One flipped bit inside the header, which the header checksum catches
+        # before any field is believed.
+        dump.write_bytes(blob[:24] + bytes([blob[24] ^ 0x01]) + blob[25:])
+    elif damage == "huge_nb_point":
+        # A header claiming a billion points. Rewriting the field alone breaks
+        # the header checksum, so this case is caught there. The case where the
+        # checksum agrees and the count is still absurd is a Rust unit test,
+        # since only the writer can produce a consistent header.
+        dump.write_bytes(blob[:40] + struct.pack("<Q", 1_000_000_000) + blob[48:])
+    elif damage == "corrupt_body":
+        # A flipped bit in the vector region, which only the payload checksum
+        # can see: every length in the file still agrees.
+        at = len(blob) - 64
+        dump.write_bytes(blob[:at] + bytes([blob[at] ^ 0x08]) + blob[at + 1:])
+    elif damage == "corrupt_trailer_magic":
+        dump.write_bytes(blob[:-8] + b"XXXXXXXX")
     elif damage == "wrong_m":
         # A dump written at one m against a config declaring another is what a
         # directory assembled from two indexes looks like.
         config = json.loads((save_dir / "config.json").read_text(encoding="utf-8"))
         config["m"] = 17
         (save_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    elif damage == "vendored_dump":
+        # What a directory saved by 0.6.0 or earlier holds. The vendored magic
+        # is MAGICDESCR_4, and the two files sit beside a name this build does
+        # not write.
+        dump.unlink()
+        (save_dir / "hnsw_index.hnsw.graph").write_bytes(
+            struct.pack("<I", 0x002A6779) + blob[8:2048])
+        (save_dir / "hnsw_index.hnsw.data").write_bytes(
+            struct.pack("<I", 0xA67F0000) + blob[8:4096])
 
     loaded = VectorDatabase().load(str(save_dir))
     assert loaded.get_vector_count() == 400
     assert all(loaded.contains(i) for i in ids)
     assert len(loaded.search(vectors[0].tolist(), top_k=10)) == 10
+
+    # And the rebuilt index saves in the new format, so the directory is only
+    # ever wrong once.
+    again = tmp_path / "repaired.zdb"
+    loaded.save(str(again))
+    assert (again / "hnsw_index.zdbgraph").exists()
+    assert not (again / "hnsw_index.hnsw.graph").exists()
+    assert _pages(VectorDatabase().load(str(again)), vectors[3:6]) == \
+           _pages(loaded, vectors[3:6])
 
 # ------------------------------------------------------------
 # Test 110: the rebuild can be asked for on an intact directory
@@ -1556,3 +1624,36 @@ def test_the_rebuild_can_be_requested_on_an_intact_directory(tmp_path):
     # rebuilds diverge again. 400 records is below it on any machine.
     queries = _clustered_unit_vectors(30, 16, 1618)
     assert _pages(rebuilt, queries) == _pages(rebuilt_twice, queries)
+
+# ------------------------------------------------------------
+# Test 111: an index at the top of the m range restores
+# ------------------------------------------------------------
+@pytest.mark.parametrize("m", [16, 255, 256])
+def test_an_index_at_the_top_of_the_m_range_restores(tmp_path, m):
+    """m 256 used to rebuild on every load, for ever.
+
+    The vendored header stored max_nb_connection as a u8 while the graph admits
+    256, so a dump written at 256 declared 0, the loader compared 0 against the
+    256 in config.json, and the directory fell back to the rebuild every single
+    time it was opened. m is a u64 in ZeusDB's header.
+
+    The evidence that the dump was read rather than rebuilt is the score bits.
+    A rebuild wires a different graph over the same records and would not
+    reproduce them exactly.
+    """
+    vectors = _clustered_unit_vectors(300, 16, 4096)
+    ids = [f"v_{i}" for i in range(len(vectors))]
+    index = VectorDatabase().create("hnsw", dim=16, m=m, expected_size=300)
+    assert index.add({"ids": ids, "embeddings": vectors}).is_success()
+
+    save_dir = tmp_path / f"m{m}.zdb"
+    index.save(str(save_dir))
+
+    with open(save_dir / "hnsw_index.zdbgraph", "rb") as handle:
+        header = handle.read(96)
+    assert struct.unpack_from("<Q", header, 24)[0] == m
+
+    queries = _clustered_unit_vectors(40, 16, 8192)
+    loaded = VectorDatabase().load(str(save_dir))
+    assert loaded.get_vector_count() == 300
+    assert _pages(loaded, queries) == _pages(index, queries)

@@ -1,9 +1,13 @@
-//! The boundary between ZeusDB and the vendored `hnsw_rs` graph.
+﻿//! The boundary between ZeusDB and the vendored `hnsw_rs` graph.
 //!
-//! This is the only file in the crate that names `hnsw_rs` outside a test
-//! module. Everything the index does to the graph goes through [`VectorGraph`],
-//! and everything the graph hands back arrives as a [`GraphHit`], so the crate's
-//! own types stop here rather than travelling into `hnsw_index.rs`.
+//! This module is the only place in the crate that names `hnsw_rs` outside a
+//! test module. Everything the index does to the graph goes through
+//! [`VectorGraph`], and everything the graph hands back arrives as a
+//! [`GraphHit`], so the crate's own types stop here rather than travelling into
+//! `hnsw_index.rs`.
+//!
+//! The on-disk format is [`dump`], which is ZeusDB's own. The vendored crate's
+//! two file dump is no longer written or read.
 //!
 //! # What the seam does not cover
 //!
@@ -15,29 +19,32 @@
 //! seam and one line changes if the graph is ever replaced. The coupling is
 //! real and this re-export does not remove it.
 //!
-//! # The distance types are pinned to their modules
+//! # The distance types are no longer pinned to their modules
 //!
-//! `Hnsw::file_dump` writes `std::any::type_name::<D>()` into the dump header
-//! and [`inspect_graph_dump`] compares the saved string against the same call.
-//! `type_name` is the full module path of the declaration, so moving
-//! `CosineDist`, `L1Dist`, `L2Dist` or `DistPQ` to another module changes what a
-//! save writes and stops every previously saved index from loading. That is why
-//! `DistPQ` is declared in `hnsw_index` and the three raw distances in
-//! `distance.rs`, even though the graph is what uses them.
+//! `Hnsw::file_dump` wrote `std::any::type_name::<D>()` into the dump header
+//! and the loader compared the saved string against the same call. `type_name`
+//! is the full module path of the declaration, so moving `CosineDist`,
+//! `L1Dist`, `L2Dist` or `DistPQ` to another module changed what a save wrote
+//! and stopped every previously saved index from loading. That is why `DistPQ`
+//! was declared in `hnsw_index` and the three raw distances in `distance.rs`,
+//! even though the graph is what uses them.
 //!
-//! All four are imported here from `distance.rs`, which re-exports `DistPQ`. A
-//! re-export is an import site and `type_name` reports the declaration site, so
-//! reading the name from one module costs nothing on disk.
+//! ZeusDB's header carries a [`dump::GraphKind`] discriminant instead, which is
+//! a number ZeusDB chose rather than a fact about where a type is declared. The
+//! four types can now be moved, renamed or replaced without a saved index
+//! becoming unreadable. None of them is moved here.
 
 use crate::distance::{CosineDist, DistPQ, L1Dist, L2Dist};
 use crate::pq::PQ;
-use hnsw_rs::api::AnnT; // This provides the file_dump method
 use hnsw_rs::hnsw::Point;
 use hnsw_rs::prelude::{FilterT, Hnsw};
-use serde::Serialize;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
+
+pub(crate) mod dump;
+
+use dump::{Expected, GraphKind};
 
 /// The vendored crate's distance trait, re-exported at the seam.
 ///
@@ -320,7 +327,7 @@ impl VectorGraph {
                 L1Dist {},
             )),
             _ => {
-                // ✅ ENTERPRISE: Replace panic with graceful error
+                // âœ… ENTERPRISE: Replace panic with graceful error
                 error!(
                     operation = "hnsw_creation",
                     space = space,
@@ -399,7 +406,7 @@ impl VectorGraph {
                 ))
             }
             _ => {
-                // ✅ ENTERPRISE: Replace panic with graceful error
+                // âœ… ENTERPRISE: Replace panic with graceful error
                 error!(
                     operation = "hnsw_creation",
                     space = space,
@@ -521,7 +528,7 @@ impl VectorGraph {
             VectorGraph::L2(hnsw) => hnsw.insert((vector, id)),
             VectorGraph::L1(hnsw) => hnsw.insert((vector, id)),
             _ => {
-                // ✅ ENTERPRISE: Replace panic with graceful error logging
+                // âœ… ENTERPRISE: Replace panic with graceful error logging
                 error!(
                     operation = "vector_insert",
                     error = "invalid_operation",
@@ -545,7 +552,7 @@ impl VectorGraph {
                 hnsw.insert((codes, id));
             }
             _ => {
-                // ✅ ENTERPRISE: Replace panic with graceful error logging
+                // âœ… ENTERPRISE: Replace panic with graceful error logging
                 error!(
                     operation = "pq_codes_insert",
                     error = "invalid_operation",
@@ -576,7 +583,7 @@ impl VectorGraph {
                 VectorGraph::L2(hnsw) => hnsw.parallel_insert(data),
                 VectorGraph::L1(hnsw) => hnsw.parallel_insert(data),
                 _ => {
-                    // ✅ ENTERPRISE: Replace panic with graceful error
+                    // âœ… ENTERPRISE: Replace panic with graceful error
                     error!(
                         operation = "batch_insert",
                         error = "invalid_operation",
@@ -619,83 +626,41 @@ impl VectorGraph {
         }
     }
 
-    /// Match a freshly constructed graph's insertion settings.
-    ///
-    /// `Hnsw::new` starts with `extend_candidates` false and the vendored
-    /// reload sets it true, so a restored graph would build the neighbourhood
-    /// of every record added after the load differently from the same record
-    /// added before the save. Nothing else `load_hnsw_with_dist` fills in
-    /// differs from what `new` sets.
-    fn settle_after_reload(&mut self) {
+    /// Which of the six graphs this is, as the dump header records it.
+    fn kind(&self) -> GraphKind {
         match self {
-            VectorGraph::Cosine(hnsw) => hnsw.set_extend_candidates(false),
-            VectorGraph::L2(hnsw) => hnsw.set_extend_candidates(false),
-            VectorGraph::L1(hnsw) => hnsw.set_extend_candidates(false),
-            VectorGraph::CosinePQ(hnsw) => hnsw.set_extend_candidates(false),
-            VectorGraph::L2PQ(hnsw) => hnsw.set_extend_candidates(false),
-            VectorGraph::L1PQ(hnsw) => hnsw.set_extend_candidates(false),
+            VectorGraph::Cosine(_) => GraphKind::Cosine,
+            VectorGraph::L2(_) => GraphKind::L2,
+            VectorGraph::L1(_) => GraphKind::L1,
+            VectorGraph::CosinePQ(_) => GraphKind::CosinePq,
+            VectorGraph::L2PQ(_) => GraphKind::L2Pq,
+            VectorGraph::L1PQ(_) => GraphKind::L1Pq,
         }
     }
 
-    /// Write the graph to `dir` under the basename the loader reads back.
+    /// Write the graph to `dir` in ZeusDB's own format.
     ///
-    /// Returns the basename the dump was written under, which the vendored
-    /// crate reports and which is not always the one asked for: it appends a
-    /// suffix rather than overwriting when a memory mapped data file is active.
-    /// See `reload_graph` for why this index never reaches that path.
+    /// Returns the name of the file written, which is fixed. The vendored
+    /// writer returned a basename that was not always the one asked for,
+    /// because it appended a random suffix rather than overwriting when a
+    /// memory mapped data file was active. Nothing maps anything here and the
+    /// file is replaced outright, so the name is a constant.
     pub(crate) fn dump(&self, dir: &Path) -> Result<String, String> {
-        let dumped = match self {
-            VectorGraph::Cosine(hnsw) => {
-                trace!(
-                    operation = "save_hnsw_graph",
-                    distance_type = "cosine",
-                    "Using Cosine distance HNSW"
-                );
-                hnsw.file_dump(dir, HNSW_DUMP_BASENAME)
-            }
-            VectorGraph::L2(hnsw) => {
-                trace!(
-                    operation = "save_hnsw_graph",
-                    distance_type = "l2",
-                    "Using L2 distance HNSW"
-                );
-                hnsw.file_dump(dir, HNSW_DUMP_BASENAME)
-            }
-            VectorGraph::L1(hnsw) => {
-                trace!(
-                    operation = "save_hnsw_graph",
-                    distance_type = "l1",
-                    "Using L1 distance HNSW"
-                );
-                hnsw.file_dump(dir, HNSW_DUMP_BASENAME)
-            }
-            VectorGraph::CosinePQ(hnsw) => {
-                trace!(
-                    operation = "save_hnsw_graph",
-                    distance_type = "cosine_pq",
-                    "Using Cosine-PQ distance HNSW"
-                );
-                hnsw.file_dump(dir, HNSW_DUMP_BASENAME)
-            }
-            VectorGraph::L2PQ(hnsw) => {
-                trace!(
-                    operation = "save_hnsw_graph",
-                    distance_type = "l2_pq",
-                    "Using L2-PQ distance HNSW"
-                );
-                hnsw.file_dump(dir, HNSW_DUMP_BASENAME)
-            }
-            VectorGraph::L1PQ(hnsw) => {
-                trace!(
-                    operation = "save_hnsw_graph",
-                    distance_type = "l1_pq",
-                    "Using L1-PQ distance HNSW"
-                );
-                hnsw.file_dump(dir, HNSW_DUMP_BASENAME)
-            }
-        };
-
-        dumped.map_err(|e| e.to_string())
+        let kind = self.kind();
+        trace!(
+            operation = "save_hnsw_graph",
+            distance_type = kind.label(),
+            "Writing the graph dump"
+        );
+        match self {
+            VectorGraph::Cosine(hnsw) => dump::write_dump(hnsw, kind, dir),
+            VectorGraph::L2(hnsw) => dump::write_dump(hnsw, kind, dir),
+            VectorGraph::L1(hnsw) => dump::write_dump(hnsw, kind, dir),
+            VectorGraph::CosinePQ(hnsw) => dump::write_dump(hnsw, kind, dir),
+            VectorGraph::L2PQ(hnsw) => dump::write_dump(hnsw, kind, dir),
+            VectorGraph::L1PQ(hnsw) => dump::write_dump(hnsw, kind, dir),
+        }?;
+        Ok(dump::DUMP_FILENAME.to_string())
     }
 }
 
@@ -703,175 +668,33 @@ impl VectorGraph {
 // RESTORING THE SAVED GRAPH
 // ============================================================================
 
-/// Basename `VectorGraph::dump` writes under and the loader reads back.
-///
-/// Private to the seam. The save path used to pass the literal in from
-/// `hnsw_index.rs` while the load path read this constant, so the two halves of
-/// the on-disk contract were written in two places. They are one now.
-const HNSW_DUMP_BASENAME: &str = "hnsw_index";
-
-/// Header of the dumped data file, being one magic and the data dimension.
-const DUMP_DATA_HEADER_BYTES: usize = 4 + 8;
-
-/// What the dumped data file spends per point before the vector itself, being
-/// one magic, the origin id and the serialized byte length.
-const DUMP_DATA_POINT_BYTES: usize = 4 + 8 + 8;
-
-/// Layers the vendored crate always dumps, being its `NB_LAYER_MAX`.
-const DUMP_LAYERS: u8 = 16;
-
-/// Read the dump's own description and judge it against what this index expects
-///
-/// Everything here runs before the vendored reload is entered, because that
-/// reload reaches `std::process::exit(1)` when the data file is short. The data
-/// file's length is fully determined by the point count and the dimension, so
-/// an exact size comparison closes that path. Every other malformed dump the
-/// vendored reader meets raises a panic it can unwind from, which the caller
-/// catches.
-///
-/// Returns the node count the dump declares.
-#[allow(clippy::too_many_arguments)]
-fn inspect_graph_dump(
-    dir: &Path,
-    dimension: usize,
-    element_bytes: usize,
-    t_name: &str,
-    dist_name: &str,
-    m: usize,
-    ef_construction: usize,
-    min_nodes: usize,
-) -> Result<usize, String> {
-    let graph_path = dir.join(format!("{}.hnsw.graph", HNSW_DUMP_BASENAME));
-    let data_path = dir.join(format!("{}.hnsw.data", HNSW_DUMP_BASENAME));
-
-    if !graph_path.exists() || !data_path.exists() {
-        return Err("the directory holds no HNSW graph dump".to_string());
-    }
-
-    let file = std::fs::File::open(&graph_path)
-        .map_err(|e| format!("the graph dump could not be opened: {}", e))?;
-    let mut reader = std::io::BufReader::new(file);
-
-    // `load_description` unwraps a UTF-8 conversion on the two names it reads,
-    // so a dump whose header is garbage panics here rather than returning.
-    let described = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        hnsw_rs::hnswio::load_description(&mut reader)
-    }));
-    let descr = match described {
-        Ok(Ok(descr)) => descr,
-        Ok(Err(e)) => return Err(format!("the graph dump has no readable header: {}", e)),
-        Err(_) => return Err("the graph dump has an unreadable header".to_string()),
-    };
-
-    if descr.t_name != t_name {
-        return Err(format!(
-            "the dump stores {} points where this index holds {}",
-            descr.t_name, t_name
-        ));
-    }
-    if descr.distname != dist_name {
-        return Err(format!(
-            "the dump was written under distance {} and this build uses {}",
-            descr.distname, dist_name
-        ));
-    }
-    if descr.dimension != dimension {
-        return Err(format!(
-            "the dump stores {} values per point where this index expects {}",
-            descr.dimension, dimension
-        ));
-    }
-    if descr.nb_layer != DUMP_LAYERS {
-        return Err(format!(
-            "the dump declares {} layers where this build uses {}",
-            descr.nb_layer, DUMP_LAYERS
-        ));
-    }
-    if descr.max_nb_connection as usize != m {
-        return Err(format!(
-            "the dump was written at m {} and config.json declares {}",
-            descr.max_nb_connection, m
-        ));
-    }
-    if descr.ef != ef_construction {
-        return Err(format!(
-            "the dump was written at ef_construction {} and config.json declares {}",
-            descr.ef, ef_construction
-        ));
-    }
-    if descr.nb_point < min_nodes {
-        return Err(format!(
-            "the dump holds {} graph nodes and the index holds {} records",
-            descr.nb_point, min_nodes
-        ));
-    }
-
-    let expected = DUMP_DATA_HEADER_BYTES
-        + descr
-            .nb_point
-            .saturating_mul(DUMP_DATA_POINT_BYTES + dimension * element_bytes);
-    let actual = std::fs::metadata(&data_path)
-        .map_err(|e| format!("the data dump could not be measured: {}", e))?
-        .len();
-    if actual != expected as u64 {
-        return Err(format!(
-            "the data dump is {} bytes where {} nodes of {} values need {}",
-            actual, descr.nb_point, dimension, expected
-        ));
-    }
-
-    Ok(descr.nb_point)
-}
-
-/// Reload one graph of a known element type and distance
-///
-/// `load_hnsw_with_dist` rather than `load_hnsw`, for two reasons. It takes the
-/// distance by value, which is the only way to restore a PQ graph, since
-/// `DistPQ` carries the codebook and cannot be produced by `Default`. And it
-/// leaves `datamap_opt` false, where `load_hnsw` sets it true and a later
-/// `file_dump` then refuses to overwrite its own files and writes
-/// `hnsw_index-4173.hnsw.graph` beside them instead. Measured on the vendored
-/// crate.
-///
-/// The reader is leaked because the vendored signature ties the returned graph's
-/// lifetime to it, so that a graph reading a memory mapped data file cannot
-/// outlive the mapping. Nothing is mapped here, since neither the default
-/// options nor this entry point ever construct a `DataMap`, so the leak is 280
-/// bytes per successful load and holds no file open.
-fn reload_graph<T, D>(dir: &Path, dist: D) -> Result<Hnsw<'static, T, D>, String>
-where
-    T: 'static
-        + Serialize
-        + serde::de::DeserializeOwned
-        + Clone
-        + Sized
-        + Send
-        + Sync
-        + std::fmt::Debug,
-    D: Distance<T> + Send + Sync,
-{
-    let reader = Box::leak(Box::new(hnsw_rs::hnswio::HnswIo::new(
-        dir,
-        HNSW_DUMP_BASENAME,
-    )));
-
-    let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        reader.load_hnsw_with_dist::<T, D>(dist)
-    }));
-
-    match loaded {
-        Ok(Ok(hnsw)) => Ok(hnsw),
-        Ok(Err(e)) => Err(format!("the graph dump could not be read: {}", e)),
-        Err(_) => Err("the graph dump is malformed and reading it panicked".to_string()),
-    }
-}
-
 /// Restore the saved graph for one index configuration
 ///
 /// `pq` present means the saved graph was a quantized one, which is exactly the
 /// condition the loader branches on, since training is what replaces the raw
 /// graph with a PQ graph. A directory whose dump disagrees is caught by the
-/// element type and distance name in `inspect_graph_dump` and falls back.
+/// element type and the distance discriminant in the header and falls back.
+///
+/// Every reason this returns an error is a reason to rebuild rather than a
+/// reason to fail, and the caller treats it that way. A dump written by 0.6.0
+/// or earlier is one of them: it carries the vendored magic, this reader does
+/// not recognise it, and the index rebuilds its graph once and writes the new
+/// format on the next save. There is deliberately no reader for the old format.
+///
+/// # What this no longer does
+///
+/// It used to inspect the dump's header, compare the data file's length against
+/// what the point count implied, and only then enter the vendored reload inside
+/// a `catch_unwind`, because that reload panics on a malformed header and calls
+/// `std::process::exit(1)` on a short data file. It also leaked the vendored
+/// loader, because the returned graph borrowed it. [`dump::read_dump`] returns
+/// an error on every malformed input and owns nothing borrowed, so all four are
+/// gone.
+///
+/// It also used to reset `extend_candidates`, which the vendored reload set
+/// true where `Hnsw::new` sets it false. `Hnsw::from_loaded_points` sets the
+/// insertion flags to what `new` sets, so a restored graph and a fresh one
+/// insert alike without anything being put back afterwards.
 pub(crate) fn restore_graph(
     dir: &Path,
     space: &str,
@@ -881,70 +704,55 @@ pub(crate) fn restore_graph(
     pq: Option<Arc<PQ>>,
     min_nodes: usize,
 ) -> Result<(VectorGraph, usize), String> {
-    let mut graph = match pq {
+    let graph = match pq {
         Some(pq) => {
-            let nodes = inspect_graph_dump(
-                dir,
-                pq.subvectors,
-                std::mem::size_of::<u8>(),
-                std::any::type_name::<u8>(),
-                std::any::type_name::<DistPQ>(),
+            let kind = match space {
+                "l2" => GraphKind::L2Pq,
+                "l1" => GraphKind::L1Pq,
+                // `new_pq` also falls back to cosine on an unrecognised space,
+                // so the two construction paths agree on what a bad space means.
+                _ => GraphKind::CosinePq,
+            };
+            let expected = Expected {
+                kind,
+                dimension: pq.subvectors,
                 m,
                 ef_construction,
                 min_nodes,
-            )?;
-            let hnsw = reload_graph::<u8, DistPQ>(dir, DistPQ::new(pq))?;
-            let restored = hnsw.get_nb_point();
-            if restored != nodes {
-                return Err(format!(
-                    "the dump declares {} graph nodes and yielded {}",
-                    nodes, restored
-                ));
-            }
-            match space {
-                "l2" => VectorGraph::L2PQ(hnsw),
-                "l1" => VectorGraph::L1PQ(hnsw),
+            };
+            let hnsw = dump::read_dump::<u8, DistPQ>(dir, &expected, DistPQ::new(pq))?;
+            match kind {
+                GraphKind::L2Pq => VectorGraph::L2PQ(hnsw),
+                GraphKind::L1Pq => VectorGraph::L1PQ(hnsw),
                 _ => VectorGraph::CosinePQ(hnsw),
             }
         }
         None => {
             // The raw graphs differ only in their distance type, so each arm
-            // states the name the dump must carry and the value the reload
-            // needs, and nothing else about them differs.
+            // states the discriminant the dump must carry and the value the
+            // reload needs, and nothing else about them differs.
             macro_rules! raw {
-                ($dist:ty, $value:expr, $variant:ident) => {{
-                    let nodes = inspect_graph_dump(
-                        dir,
-                        dim,
-                        std::mem::size_of::<f32>(),
-                        std::any::type_name::<f32>(),
-                        std::any::type_name::<$dist>(),
+                ($kind:expr, $dist:ty, $value:expr, $variant:ident) => {{
+                    let expected = Expected {
+                        kind: $kind,
+                        dimension: dim,
                         m,
                         ef_construction,
                         min_nodes,
-                    )?;
-                    let hnsw = reload_graph::<f32, $dist>(dir, $value)?;
-                    let restored = hnsw.get_nb_point();
-                    if restored != nodes {
-                        return Err(format!(
-                            "the dump declares {} graph nodes and yielded {}",
-                            nodes, restored
-                        ));
-                    }
-                    VectorGraph::$variant(hnsw)
+                    };
+                    VectorGraph::$variant(dump::read_dump::<f32, $dist>(dir, &expected, $value)?)
                 }};
             }
             match space {
-                "l2" => raw!(L2Dist, L2Dist {}, L2),
-                "l1" => raw!(L1Dist, L1Dist {}, L1),
+                "l2" => raw!(GraphKind::L2, L2Dist, L2Dist {}, L2),
+                "l1" => raw!(GraphKind::L1, L1Dist, L1Dist {}, L1),
                 // `new_raw` also falls back to cosine on an unrecognised space,
                 // so the two construction paths agree on what a bad space means.
-                _ => raw!(CosineDist, CosineDist {}, Cosine),
+                _ => raw!(GraphKind::Cosine, CosineDist, CosineDist {}, Cosine),
             }
         }
     };
 
-    graph.settle_after_reload();
     let nodes = graph.nb_points();
     Ok((graph, nodes))
 }

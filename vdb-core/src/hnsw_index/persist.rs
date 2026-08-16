@@ -82,7 +82,7 @@ impl HNSWIndex {
         Ok(())
     }
 
-    /// Save HNSW graph using hnsw-rs native file_dump
+    /// Write the HNSW graph in ZeusDB's own format. See `graph::dump`.
     #[instrument(level = "info", skip(self), fields(
         vector_count = self.get_vector_count(),
         path = %path.display()
@@ -109,14 +109,10 @@ impl HNSWIndex {
         let dump_result = hnsw_guard.dump(path);
 
         match dump_result {
-            Ok(basename) => {
+            Ok(filename) => {
                 debug!(
                     operation = "save_hnsw_graph_complete",
-                    basename = %basename,
-                    files_created = %["hnsw.graph", "hnsw.data"].iter()
-                        .map(|ext| format!("{}.{}", basename, ext))
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    file_created = %filename,
                     "HNSW graph saved successfully"
                 );
                 Ok(())
