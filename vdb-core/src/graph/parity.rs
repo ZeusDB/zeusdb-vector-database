@@ -17,6 +17,9 @@
 
 use super::dump::{parse_dump, write_dump, DumpElement, Expected, GraphKind, ParsedDump};
 use super::flat::FlatGraph;
+use super::levels::{LevelGenerator, DEFAULT_LEVEL_SEED};
+use super::mutable::MutableGraph;
+use super::traverse::Topology;
 use super::{Distance, GraphHit};
 use crate::distance::{CosineDist, L1Dist, L2Dist};
 use crate::hnsw_index::DistPQ;
@@ -111,11 +114,101 @@ fn compare_pages(
     }
 }
 
-/// Run one query through both implementations and compare.
+/// One of ZeusDB's two structures, as the comparison sees it.
+///
+/// Both run the same traversal, so this is not an abstraction over two
+/// searches. It is what lets one grid be run twice, once per layout, so that
+/// the mutable structure is held to the vendored page by exactly the cells the
+/// CSR was held to.
+trait Candidate<T> {
+    fn page(
+        &self,
+        query: &[T],
+        knbn: usize,
+        ef: usize,
+        filter: Option<&BoxedFilter>,
+    ) -> Vec<GraphHit>;
+    fn nodes(&self) -> usize;
+    fn stored_vector(&self, node: u32) -> Vec<T>;
+    fn stored_edges(&self) -> usize;
+    fn above_level(&self) -> usize;
+    fn bytes(&self) -> usize;
+    fn layout(&self) -> &'static str;
+}
+
+impl<T, D> Candidate<T> for FlatGraph<T, D>
+where
+    T: Clone + Send + Sync,
+    D: Distance<T> + Send + Sync,
+{
+    fn page(
+        &self,
+        query: &[T],
+        knbn: usize,
+        ef: usize,
+        filter: Option<&BoxedFilter>,
+    ) -> Vec<GraphHit> {
+        self.search(query, knbn, ef, filter)
+    }
+    fn nodes(&self) -> usize {
+        FlatGraph::nb_points(self)
+    }
+    fn stored_vector(&self, node: u32) -> Vec<T> {
+        FlatGraph::vector(self, node).to_vec()
+    }
+    fn stored_edges(&self) -> usize {
+        FlatGraph::nb_edges(self)
+    }
+    fn above_level(&self) -> usize {
+        FlatGraph::above_level_edges(self)
+    }
+    fn bytes(&self) -> usize {
+        FlatGraph::memory_bytes(self)
+    }
+    fn layout(&self) -> &'static str {
+        "flat"
+    }
+}
+
+impl<T, D> Candidate<T> for MutableGraph<T, D>
+where
+    T: Clone + Send + Sync,
+    D: Distance<T> + Send + Sync,
+{
+    fn page(
+        &self,
+        query: &[T],
+        knbn: usize,
+        ef: usize,
+        filter: Option<&BoxedFilter>,
+    ) -> Vec<GraphHit> {
+        self.search(query, knbn, ef, filter)
+    }
+    fn nodes(&self) -> usize {
+        MutableGraph::nb_points(self)
+    }
+    fn stored_vector(&self, node: u32) -> Vec<T> {
+        MutableGraph::vector(self, node).to_vec()
+    }
+    fn stored_edges(&self) -> usize {
+        MutableGraph::nb_edges(self)
+    }
+    fn above_level(&self) -> usize {
+        MutableGraph::above_level_edges(self)
+    }
+    fn bytes(&self) -> usize {
+        MutableGraph::memory_bytes(self)
+    }
+    fn layout(&self) -> &'static str {
+        "mutable"
+    }
+}
+
+/// Run one query through the vendored graph and one candidate, and compare.
 #[allow(clippy::too_many_arguments)]
-fn compare_one<T, D>(
+fn compare_one<T, D, C>(
     hnsw: &Hnsw<'static, T, D>,
-    flat: &FlatGraph<T, D>,
+    candidate: &C,
     query: &[T],
     knbn: usize,
     ef: usize,
@@ -125,10 +218,11 @@ fn compare_one<T, D>(
 ) where
     T: Clone + Send + Sync + DumpElement,
     D: Distance<T> + Send + Sync,
+    C: Candidate<T> + ?Sized,
 {
     let vendored = hnsw.search_filter(query, knbn, ef, filter.map(|f| f as &dyn FilterT));
-    let flat_hits = flat.search(query, knbn, ef, filter);
-    compare_pages(label, &vendored, &flat_hits, outcome);
+    let hits = candidate.page(query, knbn, ef, filter);
+    compare_pages(label, &vendored, &hits, outcome);
 }
 
 /// The predicate a filter kind stands for, over origin ids.
@@ -226,52 +320,88 @@ fn clone_parse<T: Clone>(parsed: &ParsedDump<T>) -> ParsedDump<T> {
     }
 }
 
-/// Both implementations, fed the identical parsed topology.
-fn pair_from<T, D>(
-    parsed: ParsedDump<T>,
-    vendored_dist: D,
-    flat_dist: D,
-) -> (Hnsw<'static, T, D>, FlatGraph<T, D>)
+/// All three implementations, fed the identical parsed topology.
+struct Trio<T, D>
+where
+    T: Clone + Send + Sync + 'static,
+    D: Distance<T> + Send + Sync,
+{
+    vendored: Hnsw<'static, T, D>,
+    flat: FlatGraph<T, D>,
+    mutable: MutableGraph<T, D>,
+}
+
+fn trio_from<T, D>(parsed: ParsedDump<T>, dist: impl Fn() -> D) -> Trio<T, D>
 where
     T: Clone + Send + Sync + DumpElement,
     D: Distance<T> + Send + Sync,
 {
-    let copy = clone_parse(&parsed);
-    let hnsw = Hnsw::from_loaded_points(
-        copy.points_by_layer,
-        copy.entry,
-        copy.m,
-        copy.ef_construction,
-        copy.level_scale,
-        vendored_dist,
+    let first = clone_parse(&parsed);
+    let second = clone_parse(&parsed);
+    let vendored = Hnsw::from_loaded_points(
+        first.points_by_layer,
+        first.entry,
+        first.m,
+        first.ef_construction,
+        first.level_scale,
+        dist(),
     )
     .unwrap();
     let flat = FlatGraph::from_loaded(
+        second.points_by_layer,
+        second.entry,
+        second.m,
+        second.ef_construction,
+        second.level_scale,
+        dist(),
+    )
+    .unwrap();
+    let mutable = MutableGraph::from_loaded(
         parsed.points_by_layer,
         parsed.entry,
         parsed.m,
         parsed.ef_construction,
         parsed.level_scale,
-        flat_dist,
+        dist(),
     )
     .unwrap();
-    (hnsw, flat)
+    Trio {
+        vendored,
+        flat,
+        mutable,
+    }
+}
+
+/// Run the standard small grid over both candidates and assert both clean.
+fn check_trio<D>(name: &str, space: &str, trio: &Trio<f32, D>, queries: &[Vec<f32>])
+where
+    D: Distance<f32> + Send + Sync,
+{
+    assert_clean(
+        &format!("{} flat", name),
+        run_small_grid(&trio.vendored, &trio.flat, space, queries),
+    );
+    assert_clean(
+        &format!("{} mutable", name),
+        run_small_grid(&trio.vendored, &trio.mutable, space, queries),
+    );
 }
 
 /// The standard small grid: every `top_k`, width and filter combination the
 /// relay names, with held-out queries and self queries both.
-fn run_small_grid<D>(
+fn run_small_grid<D, C>(
     hnsw: &Hnsw<'static, f32, D>,
-    flat: &FlatGraph<f32, D>,
+    candidate: &C,
     space: &str,
     queries: &[Vec<f32>],
 ) -> CellOutcome
 where
     D: Distance<f32> + Send + Sync,
+    C: Candidate<f32> + ?Sized,
 {
-    let nb = flat.nb_points();
+    let nb = candidate.nodes();
     let self_queries: Vec<Vec<f32>> = (0..20)
-        .map(|i| flat.vector((i * nb / 20) as u32).to_vec())
+        .map(|i| candidate.stored_vector((i * nb / 20) as u32))
         .collect();
 
     let mut outcome = CellOutcome::default();
@@ -283,7 +413,7 @@ where
                 for query in queries.iter().chain(self_queries.iter()) {
                     compare_one(
                         hnsw,
-                        flat,
+                        candidate,
                         query,
                         top_k,
                         ef,
@@ -307,7 +437,7 @@ where
         for query in queries.iter().take(10).chain(self_queries.iter().take(5)) {
             compare_one(
                 hnsw,
-                flat,
+                candidate,
                 query,
                 top_k,
                 ef,
@@ -341,12 +471,9 @@ fn flat_matches_vendored_on_cosine() {
     let data = sample_vectors(1500, 24, 0x77_01);
     let hnsw = build_raw(&data, 16, 64, CosineDist {});
     let parsed = parsed_topology(&hnsw, GraphKind::Cosine);
-    let (vendored, flat) = pair_from(parsed, CosineDist {}, CosineDist {});
+    let trio = trio_from(parsed, || CosineDist {});
     let queries = sample_vectors(60, 24, 0x77_02);
-    assert_clean(
-        "cosine",
-        run_small_grid(&vendored, &flat, "cosine", &queries),
-    );
+    check_trio("cosine", "cosine", &trio, &queries);
 }
 
 #[test]
@@ -354,9 +481,9 @@ fn flat_matches_vendored_on_l2() {
     let data = sample_vectors(900, 16, 0x77_03);
     let hnsw = build_raw(&data, 16, 48, L2Dist {});
     let parsed = parsed_topology(&hnsw, GraphKind::L2);
-    let (vendored, flat) = pair_from(parsed, L2Dist {}, L2Dist {});
+    let trio = trio_from(parsed, || L2Dist {});
     let queries = sample_vectors(40, 16, 0x77_04);
-    assert_clean("l2", run_small_grid(&vendored, &flat, "l2", &queries));
+    check_trio("l2", "l2", &trio, &queries);
 }
 
 #[test]
@@ -364,9 +491,9 @@ fn flat_matches_vendored_on_l1() {
     let data = sample_vectors(700, 12, 0x77_05);
     let hnsw = build_raw(&data, 8, 48, L1Dist {});
     let parsed = parsed_topology(&hnsw, GraphKind::L1);
-    let (vendored, flat) = pair_from(parsed, L1Dist {}, L1Dist {});
+    let trio = trio_from(parsed, || L1Dist {});
     let queries = sample_vectors(40, 12, 0x77_06);
-    assert_clean("l1", run_small_grid(&vendored, &flat, "l1", &queries));
+    check_trio("l1", "l1", &trio, &queries);
 }
 
 /// Ties are where a merely plausible traversal drifts: with many identical
@@ -378,30 +505,34 @@ fn flat_matches_vendored_under_ties() {
     let data: Vec<Vec<f32>> = (0..600).map(|i| distinct[i % 25].clone()).collect();
     let hnsw = build_raw(&data, 16, 48, CosineDist {});
     let parsed = parsed_topology(&hnsw, GraphKind::Cosine);
-    let (vendored, flat) = pair_from(parsed, CosineDist {}, CosineDist {});
+    let trio = trio_from(parsed, || CosineDist {});
 
-    let mut outcome = CellOutcome::default();
-    for &top_k in &[1usize, 10, 100] {
-        for &ef in &[100usize, 10] {
-            for kind in ["none", "half"] {
-                let filter = predicate(kind);
-                let label = format!("ties k{} ef{} {}", top_k, ef, kind);
-                for query in distinct.iter() {
-                    compare_one(
-                        &vendored,
-                        &flat,
-                        query,
-                        top_k,
-                        ef,
-                        filter.as_ref(),
-                        &label,
-                        &mut outcome,
-                    );
+    let tie_grid = |candidate: &dyn Candidate<f32>| {
+        let mut outcome = CellOutcome::default();
+        for &top_k in &[1usize, 10, 100] {
+            for &ef in &[100usize, 10] {
+                for kind in ["none", "half"] {
+                    let filter = predicate(kind);
+                    let label = format!("ties {} k{} ef{} {}", candidate.layout(), top_k, ef, kind);
+                    for query in distinct.iter() {
+                        compare_one(
+                            &trio.vendored,
+                            candidate,
+                            query,
+                            top_k,
+                            ef,
+                            filter.as_ref(),
+                            &label,
+                            &mut outcome,
+                        );
+                    }
                 }
             }
         }
-    }
-    assert_clean("ties", outcome);
+        outcome
+    };
+    assert_clean("ties flat", tie_grid(&trio.flat));
+    assert_clean("ties mutable", tie_grid(&trio.mutable));
 }
 
 /// The quantized ADC path: codes in the graph, the query living in the thread
@@ -428,32 +559,40 @@ fn flat_matches_vendored_on_quantized_adc() {
     }
 
     let parsed = parsed_topology(&built, GraphKind::CosinePq);
-    let (vendored, flat) = pair_from(parsed, DistPQ::new(pq.clone()), DistPQ::new(pq.clone()));
+    let trio = trio_from(parsed, || DistPQ::new(pq.clone()));
 
     let dummy = vec![0u8; SUBVECTORS];
-    let mut outcome = CellOutcome::default();
-    for &top_k in &[1usize, 10, 50] {
-        for &ef in &[100usize, 10] {
-            for kind in ["none", "half", "sparse", "nothing"] {
-                let filter = predicate(kind);
-                let label = format!("adc k{} ef{} {}", top_k, ef, kind);
-                for query in queries.iter().chain(data.iter().step_by(40)) {
-                    let _lut = vendored.get_distance().install_query_lut(query).unwrap();
-                    compare_one(
-                        &vendored,
-                        &flat,
-                        &dummy,
-                        top_k,
-                        ef,
-                        filter.as_ref(),
-                        &label,
-                        &mut outcome,
-                    );
+    let adc_grid = |candidate: &dyn Candidate<u8>| {
+        let mut outcome = CellOutcome::default();
+        for &top_k in &[1usize, 10, 50] {
+            for &ef in &[100usize, 10] {
+                for kind in ["none", "half", "sparse", "nothing"] {
+                    let filter = predicate(kind);
+                    let label = format!("adc {} k{} ef{} {}", candidate.layout(), top_k, ef, kind);
+                    for query in queries.iter().chain(data.iter().step_by(40)) {
+                        let _lut = trio
+                            .vendored
+                            .get_distance()
+                            .install_query_lut(query)
+                            .unwrap();
+                        compare_one(
+                            &trio.vendored,
+                            candidate,
+                            &dummy,
+                            top_k,
+                            ef,
+                            filter.as_ref(),
+                            &label,
+                            &mut outcome,
+                        );
+                    }
                 }
             }
         }
-    }
-    assert_clean("quantized adc", outcome);
+        outcome
+    };
+    assert_clean("quantized adc flat", adc_grid(&trio.flat));
+    assert_clean("quantized adc mutable", adc_grid(&trio.mutable));
 }
 
 /// What a non-finite query does if one ever reaches the traversal. Every
@@ -468,29 +607,53 @@ fn non_finite_queries_behave_identically() {
     let data = sample_vectors(400, 8, 0x77_09);
     let hnsw = build_raw(&data, 16, 48, L2Dist {});
     let parsed = parsed_topology(&hnsw, GraphKind::L2);
-    let (vendored, flat) = pair_from(parsed, L2Dist {}, L2Dist {});
+    let trio = trio_from(parsed, || L2Dist {});
 
     let infinite = vec![f32::INFINITY; 8];
     let mut outcome = CellOutcome::default();
     compare_one(
-        &vendored,
-        &flat,
+        &trio.vendored,
+        &trio.flat,
         &infinite,
         10,
         20,
         None,
-        "inf",
+        "inf flat",
+        &mut outcome,
+    );
+    compare_one(
+        &trio.vendored,
+        &trio.mutable,
+        &infinite,
+        10,
+        20,
+        None,
+        "inf mutable",
         &mut outcome,
     );
     assert_clean("infinite query", outcome);
 
     let nan = vec![f32::NAN; 8];
     let vendored_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        vendored.search_filter(&nan, 10, 20, None)
+        trio.vendored.search_filter(&nan, 10, 20, None)
+    }));
+    let mutable_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        trio.mutable.search(&nan, 10, 20, None::<&BoxedFilter>)
     }));
     let flat_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        flat.search(&nan, 10, 20, None::<&BoxedFilter>)
+        trio.flat.search(&nan, 10, 20, None::<&BoxedFilter>)
     }));
+    match mutable_panic {
+        Err(any) => {
+            let text = any
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| any.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            assert_eq!(text, "assertion failed: c.dist_to_ref <= 0.");
+        }
+        Ok(_) => panic!("a NaN query should panic on the mutable structure too"),
+    }
     let message = |any: Box<dyn std::any::Any + Send>| -> String {
         any.downcast_ref::<&str>()
             .map(|s| s.to_string())
@@ -692,6 +855,474 @@ fn the_flat_graph_is_send_and_sync() {
 }
 
 // ============================================================================
+// THE MUTABLE STRUCTURE
+// ============================================================================
+
+/// The parameters construction needs survive the load unchanged here too.
+#[test]
+fn the_mutable_graph_keeps_the_construction_parameters() {
+    let data = sample_vectors(300, 8, 0x78_0a);
+    let hnsw = build_raw(&data, 24, 80, CosineDist {});
+    let parsed = parsed_topology(&hnsw, GraphKind::Cosine);
+    let entry = parsed.entry;
+    let scale = parsed.level_scale;
+    let mutable = MutableGraph::from_loaded(
+        parsed.points_by_layer,
+        entry,
+        parsed.m,
+        parsed.ef_construction,
+        scale,
+        CosineDist {},
+    )
+    .unwrap();
+    assert_eq!(mutable.nb_points(), 300);
+    assert_eq!(mutable.m(), 24);
+    assert_eq!(mutable.ef_construction(), 80);
+    assert_eq!(mutable.level_scale(), scale);
+    assert_eq!(mutable.entry_point_id(), entry);
+    assert_eq!(mutable.dim(), 8);
+    // A loaded graph numbers its nodes in dump order, which is layer major, so
+    // every node's level is the layer it arrived in and the levels are
+    // non-decreasing across the arena.
+    let mut previous = 0u8;
+    for node in 0..mutable.nb_points() as u32 {
+        let level = mutable.level(node);
+        assert!(level >= previous);
+        previous = level;
+    }
+}
+
+/// Every rejection the other two constructors make, made here too, plus the
+/// one rule this layout adds and the residue rule it does not share.
+#[test]
+fn the_mutable_loader_refuses_malformed_topology() {
+    let point = |neighbours: Vec<Vec<LoadedEdge>>| LoadedPoint {
+        origin_id: 0,
+        data: vec![0.0f32, 1.0],
+        neighbours,
+    };
+    let refuse = |points: Vec<Vec<LoadedPoint<f32>>>, entry: PointId, needle: &str| {
+        let error = MutableGraph::from_loaded(points, entry, 16, 64, 0.36, CosineDist {})
+            .err()
+            .expect("a malformed topology must be refused");
+        assert!(error.contains(needle), "{}", error);
+    };
+
+    refuse(vec![], PointId(0, 0), "between 1 and");
+    refuse(vec![vec![]], PointId(0, 0), "no entry point");
+    refuse(
+        vec![vec![point(vec![])]],
+        PointId(0, 5),
+        "no point is there",
+    );
+    refuse(
+        vec![vec![point(vec![])]],
+        PointId(3, 0),
+        "no point is there",
+    );
+    refuse(
+        vec![vec![
+            point(vec![]),
+            LoadedPoint {
+                origin_id: 1,
+                data: vec![0.0f32; 3],
+                neighbours: vec![],
+            },
+        ]],
+        PointId(0, 0),
+        "holds 3 values",
+    );
+    refuse(
+        vec![vec![point(vec![vec![LoadedEdge {
+            target: PointId(9, 0),
+            distance: 0.5,
+        }]])]],
+        PointId(0, 0),
+        "that layer holds",
+    );
+    refuse(
+        vec![vec![point(vec![vec![LoadedEdge {
+            target: PointId(0, 7),
+            distance: 0.5,
+        }]])]],
+        PointId(0, 0),
+        "that layer holds",
+    );
+    refuse(
+        vec![vec![point(vec![vec![LoadedEdge {
+            target: PointId(0, 0),
+            distance: f32::NAN,
+        }]])]],
+        PointId(0, 0),
+        "carries a distance",
+    );
+
+    // The rule this layout adds: a list longer than its slab. The vendored
+    // builder never produces one, since it shrinks past the cap under the same
+    // guard that grew it, so this is a dump no ZeusDB save wrote.
+    let long: Vec<Vec<LoadedPoint<f32>>> = vec![vec![LoadedPoint {
+        origin_id: 0,
+        data: vec![0.0f32, 1.0],
+        neighbours: vec![(0..6)
+            .map(|_| LoadedEdge {
+                target: PointId(0, 0),
+                distance: 0.5,
+            })
+            .collect()],
+    }]];
+    let error = MutableGraph::from_loaded(long, PointId(0, 0), 2, 64, 0.36, CosineDist {})
+        .err()
+        .expect("a list longer than its slab must be refused");
+    assert!(error.contains("and a list holds 5"), "{}", error);
+
+    // And the overflow slot itself is representable, which is the state patch
+    // 3's guarded pop works in: `2 * m + 1` entries at layer zero.
+    let full: Vec<Vec<LoadedPoint<f32>>> = vec![vec![LoadedPoint {
+        origin_id: 0,
+        data: vec![0.0f32, 1.0],
+        neighbours: vec![(0..5)
+            .map(|_| LoadedEdge {
+                target: PointId(0, 0),
+                distance: 0.5,
+            })
+            .collect()],
+    }]];
+    let held = MutableGraph::from_loaded(full, PointId(0, 0), 2, 64, 0.36, CosineDist {}).unwrap();
+    assert_eq!(held.nb_edges(), 5);
+
+    // The descent residue is kept rather than dropped, which is the one place
+    // this constructor differs from the flat one.
+    let above = vec![vec![point(vec![
+        vec![],
+        vec![LoadedEdge {
+            target: PointId(0, 0),
+            distance: 0.5,
+        }],
+    ])]];
+    let mutable =
+        MutableGraph::from_loaded(above, PointId(0, 0), 16, 64, 0.36, CosineDist {}).unwrap();
+    assert_eq!(mutable.nb_edges(), 0);
+    assert_eq!(mutable.above_level_edges(), 1);
+
+    let ok = || vec![vec![point(vec![])]];
+    assert!(MutableGraph::from_loaded(ok(), PointId(0, 0), 0, 64, 0.36, CosineDist {}).is_err());
+    assert!(MutableGraph::from_loaded(ok(), PointId(0, 0), 300, 64, 0.36, CosineDist {}).is_err());
+    assert!(
+        MutableGraph::from_loaded(ok(), PointId(0, 0), 16, 64, f64::NAN, CosineDist {}).is_err()
+    );
+    assert!(MutableGraph::from_loaded(ok(), PointId(0, 0), 16, 64, -1.0, CosineDist {}).is_err());
+}
+
+/// The memory figure is exact arithmetic over the buffers here too, so the
+/// per-node arithmetic the relay states can be checked rather than believed.
+#[test]
+fn the_mutable_memory_figure_is_exact() {
+    const M: usize = 8;
+    const DIM: usize = 12;
+    let data = sample_vectors(500, DIM, 0x78_0b);
+    let hnsw = build_raw(&data, M, 32, CosineDist {});
+    let parsed = parsed_topology(&hnsw, GraphKind::Cosine);
+    let layer_lens: Vec<usize> = parsed.points_by_layer.iter().map(Vec::len).collect();
+    let mutable = MutableGraph::from_loaded(
+        parsed.points_by_layer,
+        parsed.entry,
+        parsed.m,
+        parsed.ef_construction,
+        parsed.level_scale,
+        CosineDist {},
+    )
+    .unwrap();
+
+    let nodes = mutable.nb_points();
+    let upper_lists: usize = layer_lens
+        .iter()
+        .enumerate()
+        .map(|(layer, len)| layer * len)
+        .sum();
+    let mut expected = std::mem::size_of_val(&mutable);
+    // Per node, beside the vector: the origin id, the level, the layer zero
+    // length, the upper base and the residue start.
+    expected += nodes * std::mem::size_of::<usize>();
+    expected += nodes;
+    expected += nodes * std::mem::size_of::<u16>();
+    expected += nodes * std::mem::size_of::<u32>();
+    expected += (nodes + 1) * std::mem::size_of::<u32>();
+    // The vectors.
+    expected += nodes * DIM * std::mem::size_of::<f32>();
+    // The layer zero slabs, `2 * m + 1` targets and distances each.
+    expected += nodes * (2 * M + 1) * 2 * std::mem::size_of::<u32>();
+    // The upper slabs, `m + 1` each, and one length per upper list.
+    expected += upper_lists * (M + 1) * 2 * std::mem::size_of::<u32>();
+    expected += upper_lists * std::mem::size_of::<u16>();
+    // The residue, nine bytes an edge.
+    expected += mutable.above_level_edges() * (1 + 2 * std::mem::size_of::<u32>());
+    assert_eq!(mutable.memory_bytes(), expected);
+
+    println!(
+        "mutable memory nodes {} edges {} residue {} bytes {} per_node {:.2}",
+        nodes,
+        mutable.nb_edges(),
+        mutable.above_level_edges(),
+        mutable.memory_bytes(),
+        (mutable.memory_bytes() - nodes * DIM * 4) as f64 / nodes as f64
+    );
+}
+
+/// The concurrency shape the design states, for the structure that will hold
+/// the graph after the cutover.
+#[test]
+fn the_mutable_graph_is_send_and_sync() {
+    fn assert_send_sync<X: Send + Sync>() {}
+    assert_send_sync::<MutableGraph<f32, CosineDist>>();
+    assert_send_sync::<MutableGraph<f32, L2Dist>>();
+    assert_send_sync::<MutableGraph<f32, L1Dist>>();
+    assert_send_sync::<MutableGraph<u8, DistPQ>>();
+}
+
+/// Write a graph out, load it into the mutable structure, write it out again,
+/// and compare the two files byte for byte.
+fn round_trip<T, D>(
+    built: &Hnsw<'static, T, D>,
+    kind: GraphKind,
+    dist: impl Fn() -> D,
+) -> (usize, usize)
+where
+    T: Clone + Send + Sync + DumpElement,
+    D: Distance<T> + Send + Sync,
+{
+    let first = tempfile::tempdir().unwrap();
+    write_dump(built, kind, first.path()).unwrap();
+    let expected = Expected {
+        kind,
+        dimension: built.get_point_indexation().get_data_dimension(),
+        m: built.get_max_nb_connection_full(),
+        ef_construction: built.get_ef_construction(),
+        min_nodes: 0,
+    };
+    let parsed = parse_dump::<T>(first.path(), &expected).unwrap();
+    let mutable = MutableGraph::from_loaded(
+        parsed.points_by_layer,
+        parsed.entry,
+        parsed.m,
+        parsed.ef_construction,
+        parsed.level_scale,
+        dist(),
+    )
+    .unwrap();
+    let second = tempfile::tempdir().unwrap();
+    write_dump(&mutable.dump_view(), kind, second.path()).unwrap();
+
+    let before = std::fs::read(first.path().join(super::dump::DUMP_FILENAME)).unwrap();
+    let after = std::fs::read(second.path().join(super::dump::DUMP_FILENAME)).unwrap();
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "the dump changed length, {} against {}",
+        before.len(),
+        after.len()
+    );
+    let differing = before
+        .iter()
+        .zip(after.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    let first_difference = before.iter().zip(after.iter()).position(|(a, b)| a != b);
+    assert_eq!(
+        differing, 0,
+        "{} bytes differ, first at offset {:?}",
+        differing, first_difference
+    );
+    (before.len(), mutable.above_level_edges())
+}
+
+/// A dump loaded into the mutable structure and written back out is the same
+/// file, byte for byte, on every configuration the small tests cover.
+///
+/// This is what makes the structure a lossless image of the file rather than a
+/// lossy one, and it is why the descent residue is stored. Without it the
+/// second file would be shorter by exactly the residue edges.
+#[test]
+fn a_dump_round_trips_through_the_mutable_graph() {
+    let cosine = build_raw(&sample_vectors(1500, 24, 0x78_01), 16, 64, CosineDist {});
+    let (bytes, residue) = round_trip(&cosine, GraphKind::Cosine, || CosineDist {});
+    println!("round trip cosine bytes {} residue {}", bytes, residue);
+    assert!(residue > 0, "the fixture must carry descent residue");
+
+    let l2 = build_raw(&sample_vectors(900, 16, 0x78_02), 16, 48, L2Dist {});
+    let (bytes, residue) = round_trip(&l2, GraphKind::L2, || L2Dist {});
+    println!("round trip l2 bytes {} residue {}", bytes, residue);
+
+    let l1 = build_raw(&sample_vectors(700, 12, 0x78_03), 8, 48, L1Dist {});
+    let (bytes, residue) = round_trip(&l1, GraphKind::L1, || L1Dist {});
+    println!("round trip l1 bytes {} residue {}", bytes, residue);
+
+    // Ties, where a list holds runs of equal stored distances and only a
+    // stable ordering reproduces the file.
+    let distinct = sample_vectors(25, 16, 0x78_04);
+    let repeated: Vec<Vec<f32>> = (0..600).map(|i| distinct[i % 25].clone()).collect();
+    let ties = build_raw(&repeated, 16, 48, CosineDist {});
+    let (bytes, residue) = round_trip(&ties, GraphKind::Cosine, || CosineDist {});
+    println!("round trip ties bytes {} residue {}", bytes, residue);
+
+    // The quantized graph, whose elements are `u8` codes.
+    const N: usize = 800;
+    const DIM: usize = 32;
+    const SUBVECTORS: usize = 8;
+    let all = crate::test_vectors::clustered(N, DIM, 0x78_05);
+    let pq = Arc::new(PQ::new(DIM, SUBVECTORS, 8, 500, None));
+    pq.train(&all).unwrap();
+    let refs: Vec<&[f32]> = all.iter().map(|v| v.as_slice()).collect();
+    let codes = pq.quantize_batch(&refs).unwrap();
+    let quantized: Hnsw<'static, u8, DistPQ> =
+        Hnsw::new(16, N, NB_LAYER_MAX as usize, 100, DistPQ::new(pq.clone()));
+    for (id, code) in codes.iter().enumerate() {
+        quantized.insert((code.as_slice(), id));
+    }
+    let (bytes, residue) = round_trip(&quantized, GraphKind::CosinePq, || DistPQ::new(pq.clone()));
+    println!("round trip quantized bytes {} residue {}", bytes, residue);
+}
+
+// ============================================================================
+// THE LEVEL GENERATOR
+// ============================================================================
+
+/// The vendored level stream, read out through the only public route to it.
+///
+/// `LayerGenerator::generate` is private to the crate, so the stream is read
+/// where it lands. `generate_new_point` draws exactly one level per insertion
+/// and files the point in the layer of that level, so the level of the point
+/// inserted under id `i` is the `i`th draw. The graph is started from a one
+/// point loaded topology rather than from `Hnsw::new`, because
+/// `from_loaded_points` is the constructor that takes the scale absolutely and
+/// so is the only one that can be given a scale that makes the cap bind.
+fn vendored_levels(scale: f64, draws: usize, warmup: usize, reseed: Option<u64>) -> Vec<u8> {
+    let seed_point = LoadedPoint {
+        origin_id: usize::MAX,
+        data: vec![0.0f32, 0.0],
+        neighbours: vec![],
+    };
+    let mut hnsw = Hnsw::<f32, L2Dist>::from_loaded_points(
+        vec![vec![seed_point]],
+        PointId(0, 0),
+        4,
+        4,
+        scale,
+        L2Dist {},
+    )
+    .unwrap();
+    // Distinct points, because a graph of identical vectors never satisfies the
+    // traversal's stopping bound and every insertion would walk the whole
+    // component.
+    let data = sample_vectors(warmup + draws, 2, 0x78_11);
+    for j in 0..warmup {
+        hnsw.insert((data[draws + j].as_slice(), draws + 1 + j));
+    }
+    if let Some(seed) = reseed {
+        hnsw.set_level_seed(seed);
+    }
+    for (id, vector) in data.iter().take(draws).enumerate() {
+        hnsw.insert((vector.as_slice(), id));
+    }
+
+    let mut levels = vec![u8::MAX; draws];
+    for layer in 0..NB_LAYER_MAX as usize {
+        for point in hnsw.get_point_indexation().get_layer_iterator(layer) {
+            let id = point.get_origin_id();
+            if id < draws {
+                levels[id] = layer as u8;
+            }
+        }
+    }
+    assert!(
+        levels.iter().all(|&l| l != u8::MAX),
+        "every inserted point must be found in some layer"
+    );
+    levels
+}
+
+/// The same stream from ZeusDB's own generator.
+fn own_levels(scale: f64, draws: usize, warmup: usize, reseed: Option<u64>) -> (Vec<u8>, usize) {
+    let mut generator = LevelGenerator::new(scale, NB_LAYER_MAX as usize);
+    assert_eq!(generator.scale(), scale, "the scale is installed as given");
+    for _ in 0..warmup {
+        generator.generate();
+    }
+    if let Some(seed) = reseed {
+        generator.set_seed(seed);
+    }
+    let before = generator.redraws();
+    let levels: Vec<u8> = (0..draws).map(|_| generator.generate() as u8).collect();
+    (levels, generator.redraws() - before)
+}
+
+/// Compare the two streams draw for draw and report.
+fn compare_streams(name: &str, scale: f64, draws: usize, warmup: usize, reseed: Option<u64>) {
+    let (own, redraws) = own_levels(scale, draws, warmup, reseed);
+    let vendored = vendored_levels(scale, draws, warmup, reseed);
+    assert_eq!(own.len(), vendored.len());
+    let differing = own
+        .iter()
+        .zip(vendored.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    let first = own.iter().zip(vendored.iter()).position(|(a, b)| a != b);
+    let mut histogram = [0usize; NB_LAYER_MAX as usize];
+    for &level in &own {
+        histogram[level as usize] += 1;
+    }
+    println!(
+        "levels {} scale {} draws {} warmup {} reseed {:?} differing {} redraws {} histogram {:?}",
+        name, scale, draws, warmup, reseed, differing, redraws, histogram
+    );
+    if let Some(at) = first {
+        panic!(
+            "the streams diverge at draw {}: own {} against vendored {}",
+            at, own[at], vendored[at]
+        );
+    }
+    assert_eq!(differing, 0);
+}
+
+/// The level streams are identical draw for draw, including where the cap
+/// binds and the redraw consumes a second value from the same stream.
+#[test]
+fn the_level_stream_matches_the_vendored_one() {
+    // The default scale at `m` 16, which is what every shipped index draws
+    // with. The cap never binds here: `P(level >= 16)` is `16^-16`.
+    compare_streams(
+        "default",
+        LevelGenerator::default_scale(16),
+        100_000,
+        0,
+        None,
+    );
+    // A scale where the cap binds. `P(level >= 16)` is `exp(-16 / 4)`, about
+    // one draw in fifty five, so the redraw path is exercised thousands of
+    // times and every draw after the first one has to have consumed the same
+    // amount of the stream.
+    compare_streams("capped", 4.0, 100_000, 0, None);
+}
+
+/// `set_level_seed` resets both generators to the same place, whatever either
+/// had drawn before.
+#[test]
+fn the_level_seed_resets_both_generators() {
+    // Reseeding to the default after a warm up reproduces the cold stream.
+    let (cold, _) = own_levels(LevelGenerator::default_scale(16), 2_000, 0, None);
+    let (warm, _) = own_levels(
+        LevelGenerator::default_scale(16),
+        2_000,
+        500,
+        Some(DEFAULT_LEVEL_SEED),
+    );
+    assert_eq!(cold, warm);
+
+    // And both generators agree after a reseed to a chosen value, with the
+    // stream advanced by a different amount first.
+    compare_streams("reseeded", 4.0, 5_000, 137, Some(0x0102_0304_0506_0708));
+}
+
+// ============================================================================
 // THE RELAY HARNESS OVER REAL DATA, RUN BY NAME WITH THE ARTIFACT DIRECTORY
 // ============================================================================
 
@@ -824,32 +1455,34 @@ fn load_raw_store(
 /// Self queries: stored vectors of evenly spaced nodes. On a raw graph they
 /// come straight out of the arena; on a quantized one the raw vector store
 /// supplies them, since the graph holds codes.
-fn self_queries_raw<D>(flat: &FlatGraph<f32, D>, count: usize) -> Vec<Vec<f32>>
+fn self_queries_raw<C>(candidate: &C, count: usize) -> Vec<Vec<f32>>
 where
-    D: Distance<f32> + Send + Sync,
+    C: Candidate<f32> + ?Sized,
 {
-    let nb = flat.nb_points();
+    let nb = candidate.nodes();
     (0..count)
-        .map(|i| flat.vector((i * nb / count) as u32).to_vec())
+        .map(|i| candidate.stored_vector((i * nb / count) as u32))
         .collect()
 }
 
 /// The grid body, shared by every raw space through monomorphisation.
-fn grid_over<D>(
+fn grid_over<D, C>(
     config: &ArtifactConfig,
     vendored: &Hnsw<'static, f32, D>,
-    flat: &FlatGraph<f32, D>,
+    flat: &C,
 ) -> CellOutcome
 where
     D: Distance<f32> + Send + Sync,
+    C: Candidate<f32> + ?Sized,
 {
     println!(
-        "structure {} nodes {} edges {} above_level_edges {} flat_bytes {}",
+        "structure {} {} nodes {} edges {} above_level_edges {} bytes {}",
         config.name,
-        flat.nb_points(),
-        flat.nb_edges(),
-        flat.above_level_edges(),
-        flat.memory_bytes()
+        flat.layout(),
+        flat.nodes(),
+        flat.stored_edges(),
+        flat.above_level(),
+        flat.bytes()
     );
     let queries = read_queries(&config.queries);
     let self_queries = self_queries_raw(flat, 50);
@@ -860,7 +1493,14 @@ where
             for kind in ["none", "all", "half"] {
                 let filter = predicate(kind);
                 let mut outcome = CellOutcome::default();
-                let label = format!("{} k{} ef{} {}", config.name, top_k, ef, kind);
+                let label = format!(
+                    "{} {} k{} ef{} {}",
+                    config.name,
+                    flat.layout(),
+                    top_k,
+                    ef,
+                    kind
+                );
                 for query in queries.iter().take(250).chain(self_queries.iter()) {
                     compare_one(
                         vendored,
@@ -889,7 +1529,14 @@ where
         let ef = default_ef(&config.space, top_k);
         let filter = predicate(kind);
         let mut outcome = CellOutcome::default();
-        let label = format!("{} k{} ef{} {}", config.name, top_k, ef, kind);
+        let label = format!(
+            "{} {} k{} ef{} {}",
+            config.name,
+            flat.layout(),
+            top_k,
+            ef,
+            kind
+        );
         for query in queries.iter().take(take).chain(self_queries.iter().take(5)) {
             compare_one(
                 vendored,
@@ -915,7 +1562,9 @@ where
 fn run_quantized_artifact(config: &ArtifactConfig) -> CellOutcome {
     let pq = load_pq(config);
     let parsed = parse_dump::<u8>(&config.index_dir, &expected_for(config)).unwrap();
-    let (vendored, flat) = pair_from(parsed, DistPQ::new(pq.clone()), DistPQ::new(pq.clone()));
+    let trio = trio_from(parsed, || DistPQ::new(pq.clone()));
+    let vendored = &trio.vendored;
+    let flat = &trio.flat;
     let (raw_vectors, rev_map) = load_raw_store(config);
 
     let queries = read_queries(&config.queries);
@@ -924,7 +1573,7 @@ fn run_quantized_artifact(config: &ArtifactConfig) -> CellOutcome {
     let self_queries: Vec<Vec<f32>> = (0..50)
         .map(|i| {
             let node = (i * flat.nb_points() / 50) as u32;
-            let internal = flat.origin_id(node);
+            let internal = Topology::origin_id(flat, node);
             let ext = rev_map.get(&internal).unwrap_or_else(|| {
                 panic!(
                     "internal id {} is not in rev_map ({} entries)",
@@ -947,15 +1596,23 @@ fn run_quantized_artifact(config: &ArtifactConfig) -> CellOutcome {
     let dummy = vec![0u8; config.subvectors];
     let mut total = CellOutcome::default();
     println!(
-        "structure {} nodes {} edges {} above_level_edges {} flat_bytes {}",
+        "structure {} flat nodes {} edges {} above_level_edges {} bytes {}",
         config.name,
         flat.nb_points(),
         flat.nb_edges(),
         flat.above_level_edges(),
         flat.memory_bytes()
     );
+    println!(
+        "structure {} mutable nodes {} edges {} above_level_edges {} bytes {}",
+        config.name,
+        trio.mutable.nb_points(),
+        trio.mutable.nb_edges(),
+        trio.mutable.above_level_edges(),
+        trio.mutable.memory_bytes()
+    );
 
-    // The ADC cells.
+    // The ADC cells, over both structures.
     for &top_k in &[1usize, 10, 100] {
         for &ef in &[default_ef(&config.space, top_k), 200, 50, 7] {
             for kind in ["none", "all", "half"] {
@@ -965,8 +1622,18 @@ fn run_quantized_artifact(config: &ArtifactConfig) -> CellOutcome {
                 for query in queries.iter().take(250).chain(self_queries.iter()) {
                     let _lut = vendored.get_distance().install_query_lut(query).unwrap();
                     compare_one(
-                        &vendored,
-                        &flat,
+                        vendored,
+                        flat,
+                        &dummy,
+                        top_k,
+                        ef,
+                        filter.as_ref(),
+                        &label,
+                        &mut outcome,
+                    );
+                    compare_one(
+                        vendored,
+                        &trio.mutable,
                         &dummy,
                         top_k,
                         ef,
@@ -995,8 +1662,18 @@ fn run_quantized_artifact(config: &ArtifactConfig) -> CellOutcome {
         for query in queries.iter().take(take) {
             let _lut = vendored.get_distance().install_query_lut(query).unwrap();
             compare_one(
-                &vendored,
-                &flat,
+                vendored,
+                flat,
+                &dummy,
+                top_k,
+                ef,
+                filter.as_ref(),
+                &label,
+                &mut outcome,
+            );
+            compare_one(
+                vendored,
+                &trio.mutable,
                 &dummy,
                 top_k,
                 ef,
@@ -1024,7 +1701,7 @@ fn run_quantized_artifact(config: &ArtifactConfig) -> CellOutcome {
                 let label = format!("{} rerank k{} f{} {}", config.name, top_k, factor, kind);
                 for query in queries.iter().take(100).chain(self_queries.iter().take(20)) {
                     let ef = default_ef(&config.space, top_k);
-                    let (vendored_page, flat_page) = {
+                    let (vendored_page, flat_page, mutable_page) = {
                         let _lut = vendored.get_distance().install_query_lut(query).unwrap();
                         (
                             vendored.search_filter(
@@ -1034,10 +1711,12 @@ fn run_quantized_artifact(config: &ArtifactConfig) -> CellOutcome {
                                 filter.as_ref().map(|f| f as &dyn FilterT),
                             ),
                             flat.search(&dummy, fetch, ef, filter.as_ref()),
+                            trio.mutable.search(&dummy, fetch, ef, filter.as_ref()),
                         )
                     };
                     let flat_hits = flat_page;
                     compare_pages(&label, &vendored_page, &flat_hits, &mut outcome);
+                    compare_pages(&label, &vendored_page, &mutable_page, &mut outcome);
 
                     // Rescore both pages exactly as `collect_hits` does and
                     // compare the final reranked results.
@@ -1104,16 +1783,22 @@ fn real_data_parity() {
             let parsed = parse_dump::<f32>(&config.index_dir, &expected_for(&config)).unwrap();
             match config.space.as_str() {
                 "l2" => {
-                    let (vendored, flat) = pair_from(parsed, L2Dist {}, L2Dist {});
-                    grid_over(&config, &vendored, &flat)
+                    let trio = trio_from(parsed, || L2Dist {});
+                    let mut outcome = grid_over(&config, &trio.vendored, &trio.flat);
+                    outcome.absorb(grid_over(&config, &trio.vendored, &trio.mutable));
+                    outcome
                 }
                 "l1" => {
-                    let (vendored, flat) = pair_from(parsed, L1Dist {}, L1Dist {});
-                    grid_over(&config, &vendored, &flat)
+                    let trio = trio_from(parsed, || L1Dist {});
+                    let mut outcome = grid_over(&config, &trio.vendored, &trio.flat);
+                    outcome.absorb(grid_over(&config, &trio.vendored, &trio.mutable));
+                    outcome
                 }
                 _ => {
-                    let (vendored, flat) = pair_from(parsed, CosineDist {}, CosineDist {});
-                    grid_over(&config, &vendored, &flat)
+                    let trio = trio_from(parsed, || CosineDist {});
+                    let mut outcome = grid_over(&config, &trio.vendored, &trio.flat);
+                    outcome.absorb(grid_over(&config, &trio.vendored, &trio.mutable));
+                    outcome
                 }
             }
         };
@@ -1170,9 +1855,9 @@ fn measure_search_latency() {
         }
         let parsed = parse_dump::<f32>(&config.index_dir, &expected_for(&config)).unwrap();
         match config.space.as_str() {
-            "l2" => latency_over(&config, pair_from(parsed, L2Dist {}, L2Dist {})),
-            "l1" => latency_over(&config, pair_from(parsed, L1Dist {}, L1Dist {})),
-            _ => latency_over(&config, pair_from(parsed, CosineDist {}, CosineDist {})),
+            "l2" => latency_over(&config, trio_from(parsed, || L2Dist {})),
+            "l1" => latency_over(&config, trio_from(parsed, || L1Dist {})),
+            _ => latency_over(&config, trio_from(parsed, || CosineDist {})),
         }
     }
 }
@@ -1182,7 +1867,9 @@ fn measure_search_latency() {
 fn latency_over_quantized(config: &ArtifactConfig) {
     let pq = load_pq(config);
     let parsed = parse_dump::<u8>(&config.index_dir, &expected_for(config)).unwrap();
-    let (vendored, flat) = pair_from(parsed, DistPQ::new(pq.clone()), DistPQ::new(pq.clone()));
+    let trio = trio_from(parsed, || DistPQ::new(pq.clone()));
+    let vendored = &trio.vendored;
+    let flat = &trio.flat;
     let queries: Vec<Vec<f32>> = read_queries(&config.queries)
         .into_iter()
         .take(250)
@@ -1196,10 +1883,11 @@ fn latency_over_quantized(config: &ArtifactConfig) {
         let _lut = vendored.get_distance().install_query_lut(query).unwrap();
         let _ = vendored.search_filter(&dummy, top_k, ef, Some(&live as &dyn FilterT));
         let _ = flat.search(&dummy, top_k, ef, Some(&live));
+        let _ = trio.mutable.search(&dummy, top_k, ef, Some(&live));
     }
 
     for repeat in 0..3 {
-        for which in ["vendored", "flat"] {
+        for which in ["vendored", "flat", "mutable"] {
             let mut per_query = Vec::with_capacity(queries.len());
             for query in &queries {
                 let (nanos, _hits) = match which {
@@ -1211,9 +1899,15 @@ fn latency_over_quantized(config: &ArtifactConfig) {
                                 .len(),
                         )
                     }),
-                    _ => nanos_of(|| {
+                    "flat" => nanos_of(|| {
                         let _lut = vendored.get_distance().install_query_lut(query).unwrap();
                         std::hint::black_box(flat.search(&dummy, top_k, ef, Some(&live)).len())
+                    }),
+                    _ => nanos_of(|| {
+                        let _lut = vendored.get_distance().install_query_lut(query).unwrap();
+                        std::hint::black_box(
+                            trio.mutable.search(&dummy, top_k, ef, Some(&live)).len(),
+                        )
                     }),
                 };
                 per_query.push(nanos);
@@ -1228,11 +1922,12 @@ fn latency_over_quantized(config: &ArtifactConfig) {
     }
 }
 
-fn latency_over<D>(config: &ArtifactConfig, pair: (Hnsw<'static, f32, D>, FlatGraph<f32, D>))
+fn latency_over<D>(config: &ArtifactConfig, trio: Trio<f32, D>)
 where
     D: Distance<f32> + Send + Sync,
 {
-    let (vendored, flat) = pair;
+    let vendored = &trio.vendored;
+    let flat = &trio.flat;
     let queries: Vec<Vec<f32>> = read_queries(&config.queries)
         .into_iter()
         .take(250)
@@ -1245,10 +1940,11 @@ where
     for query in queries.iter().take(20) {
         let _ = vendored.search_filter(query, top_k, ef, Some(&live as &dyn FilterT));
         let _ = flat.search(query, top_k, ef, Some(&live));
+        let _ = trio.mutable.search(query, top_k, ef, Some(&live));
     }
 
     for repeat in 0..3 {
-        for which in ["vendored", "flat"] {
+        for which in ["vendored", "flat", "mutable"] {
             let mut per_query = Vec::with_capacity(queries.len());
             for query in &queries {
                 let (nanos, _hits) = match which {
@@ -1259,8 +1955,13 @@ where
                                 .len(),
                         )
                     }),
-                    _ => nanos_of(|| {
+                    "flat" => nanos_of(|| {
                         std::hint::black_box(flat.search(query, top_k, ef, Some(&live)).len())
+                    }),
+                    _ => nanos_of(|| {
+                        std::hint::black_box(
+                            trio.mutable.search(query, top_k, ef, Some(&live)).len(),
+                        )
                     }),
                 };
                 per_query.push(nanos);

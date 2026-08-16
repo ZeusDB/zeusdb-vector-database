@@ -536,27 +536,156 @@ fn take8(raw: &[u8], at: usize) -> [u8; 8] {
 /// once at the end with `adjacency_bytes` and `file_bytes` filled in and the
 /// magic stamped. Nothing derives those two without a pass over the graph that
 /// this pass already makes.
-pub(crate) fn write_dump<T, D>(
-    hnsw: &Hnsw<'_, T, D>,
-    kind: GraphKind,
-    dir: &Path,
-) -> Result<(), String>
+/// The callback the adjacency pass hands each point's lists to.
+///
+/// Named rather than written out at both the trait and its implementations,
+/// because a nested `Vec` behind a `dyn FnMut` returning a `Result` is exactly
+/// the shape that reads as noise at a call site.
+pub(super) type EachNeighbourhood<'a> = &'a mut dyn FnMut(&[Vec<LoadedEdge>]) -> Result<(), String>;
+
+/// What the dump writer needs of a graph, in the order the file wants it.
+///
+/// Two structures answer this. The vendored `Hnsw` does, because it is what
+/// ships today, and [`super::mutable::MutableGraph`] does, because it is what
+/// will ship. Neither shape is visible to the writer: it asks for the points of
+/// a layer in rank order, three times, once per region of the file.
+///
+/// The regions are laid out one after another rather than interleaved per
+/// point, which is what lets the reader accept or reject the whole topology
+/// before it touches the vectors. That is why this is three streaming methods
+/// rather than one that hands over a point.
+pub(super) trait DumpSource<T> {
+    /// Points the graph holds.
+    fn nb_point(&self) -> usize;
+    /// Where the traversal starts, or `None` on an empty graph.
+    fn entry(&self) -> Option<PointId>;
+    /// Points whose top level is exactly `layer`.
+    fn layer_nb_point(&self, layer: usize) -> usize;
+    /// Values per stored vector.
+    fn dimension(&self) -> usize;
+    /// `max_nb_connection`, at full width rather than narrowed to a `u8`.
+    fn max_nb_connection(&self) -> usize;
+    /// Width the insertion traversal runs at.
+    fn ef_construction(&self) -> usize;
+    /// The level generator's scale.
+    fn level_scale(&self) -> f64;
+    /// Every point of `layer`, in rank order, as its origin id.
+    fn each_origin_id(
+        &self,
+        layer: usize,
+        f: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String>;
+    /// Every point of `layer`, in rank order, as its adjacency by layer.
+    ///
+    /// Trailing empty lists may be present and the writer trims them.
+    fn each_neighbourhood(&self, layer: usize, f: EachNeighbourhood<'_>) -> Result<(), String>;
+    /// Every point of `layer`, in rank order, as its stored values.
+    fn each_vector(
+        &self,
+        layer: usize,
+        f: &mut dyn FnMut(&[T]) -> Result<(), String>,
+    ) -> Result<(), String>;
+}
+
+impl<T, D> DumpSource<T> for Hnsw<'_, T, D>
 where
-    T: DumpElement,
+    T: Clone + Send + Sync,
     D: Distance<T> + Send + Sync,
 {
-    let indexation = hnsw.get_point_indexation();
-    let nb_point = indexation.get_nb_point();
+    fn nb_point(&self) -> usize {
+        self.get_point_indexation().get_nb_point()
+    }
+
+    fn entry(&self) -> Option<PointId> {
+        self.get_point_indexation().get_entry_point_id()
+    }
+
+    fn layer_nb_point(&self, layer: usize) -> usize {
+        self.get_point_indexation().get_layer_nb_point(layer)
+    }
+
+    fn dimension(&self) -> usize {
+        self.get_point_indexation().get_data_dimension()
+    }
+
+    fn max_nb_connection(&self) -> usize {
+        self.get_max_nb_connection_full()
+    }
+
+    fn ef_construction(&self) -> usize {
+        Hnsw::get_ef_construction(self)
+    }
+
+    fn level_scale(&self) -> f64 {
+        self.get_point_indexation().get_level_scale()
+    }
+
+    fn each_origin_id(
+        &self,
+        layer: usize,
+        f: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for point in self.get_point_indexation().get_layer_iterator(layer) {
+            f(point.get_origin_id())?;
+        }
+        Ok(())
+    }
+
+    fn each_neighbourhood(&self, layer: usize, f: EachNeighbourhood<'_>) -> Result<(), String> {
+        // `get_neighborhood_id` allocates a fresh vector per point, so the
+        // conversion into the writer's own edge type reuses one buffer rather
+        // than adding a second allocation per point.
+        let mut scratch: Vec<Vec<LoadedEdge>> = Vec::new();
+        for point in self.get_point_indexation().get_layer_iterator(layer) {
+            let neighbourhood = point.get_neighborhood_id();
+            while scratch.len() < neighbourhood.len() {
+                scratch.push(Vec::new());
+            }
+            for list in scratch.iter_mut() {
+                list.clear();
+            }
+            for (at, list) in neighbourhood.iter().enumerate() {
+                scratch[at].reserve(list.len());
+                for neighbour in list {
+                    scratch[at].push(LoadedEdge {
+                        target: neighbour.p_id,
+                        distance: neighbour.distance,
+                    });
+                }
+            }
+            f(&scratch[..neighbourhood.len()])?;
+        }
+        Ok(())
+    }
+
+    fn each_vector(
+        &self,
+        layer: usize,
+        f: &mut dyn FnMut(&[T]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for point in self.get_point_indexation().get_layer_iterator(layer) {
+            f(point.get_v())?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn write_dump<T, S>(source: &S, kind: GraphKind, dir: &Path) -> Result<(), String>
+where
+    T: DumpElement,
+    S: DumpSource<T> + ?Sized,
+{
+    let nb_point = source.nb_point();
     if nb_point == 0 {
         return Err("the graph holds no points".to_string());
     }
-    let entry = indexation
-        .get_entry_point_id()
+    let entry = source
+        .entry()
         .ok_or_else(|| "the graph holds points and no entry point".to_string())?;
 
     let nb_layer = NB_LAYER_MAX as usize;
     let layer_counts: Vec<usize> = (0..nb_layer)
-        .map(|layer| indexation.get_layer_nb_point(layer))
+        .map(|layer| source.layer_nb_point(layer))
         .collect();
     let counted: usize = layer_counts.iter().sum();
     if counted != nb_point {
@@ -566,7 +695,7 @@ where
         ));
     }
 
-    let dimension = indexation.get_data_dimension();
+    let dimension = source.dimension();
     if dimension == 0 {
         return Err("the graph holds points of no width".to_string());
     }
@@ -589,15 +718,12 @@ where
     }
 
     for layer in 0..nb_layer {
-        for point in indexation.get_layer_iterator(layer) {
-            out.put_u64(point.get_origin_id() as u64)?;
-        }
+        source.each_origin_id(layer, &mut |origin_id| out.put_u64(origin_id as u64))?;
     }
 
     let adjacency_start = out.written;
     for layer in 0..nb_layer {
-        for point in indexation.get_layer_iterator(layer) {
-            let neighbourhood = point.get_neighborhood_id();
+        source.each_neighbourhood(layer, &mut |neighbourhood| {
             // Trailing empty layers are trimmed rather than written. A point
             // drawn at level zero has one non-empty list and fifteen empty
             // ones, and it is the common case, so writing sixteen counts for
@@ -614,26 +740,26 @@ where
                 out.put_u32(u32::try_from(list.len()).map_err(|_| {
                     format!("a point carries {} neighbours at one layer", list.len())
                 })?)?;
-                for neighbour in list {
-                    if neighbour.p_id.1 < 0 {
+                for edge in list {
+                    if edge.target.1 < 0 {
                         return Err(format!(
                             "a neighbour sits at rank {} of layer {}",
-                            neighbour.p_id.1, neighbour.p_id.0
+                            edge.target.1, edge.target.0
                         ));
                     }
-                    out.put_u8(neighbour.p_id.0)?;
-                    out.put_u32(neighbour.p_id.1 as u32)?;
-                    out.put(&neighbour.distance.to_le_bytes())?;
+                    out.put_u8(edge.target.0)?;
+                    out.put_u32(edge.target.1 as u32)?;
+                    out.put(&edge.distance.to_le_bytes())?;
                 }
             }
-        }
+            Ok(())
+        })?;
     }
     let adjacency_bytes = out.written - adjacency_start;
 
     let mut buffer: Vec<u8> = Vec::with_capacity(dimension * T::BYTES);
     for layer in 0..nb_layer {
-        for point in indexation.get_layer_iterator(layer) {
-            let values = point.get_v();
+        source.each_vector(layer, &mut |values| {
             if values.len() != dimension {
                 return Err(format!(
                     "a point holds {} values where the graph holds {}",
@@ -643,8 +769,8 @@ where
             }
             buffer.clear();
             T::encode(values, &mut buffer);
-            out.put(&buffer)?;
-        }
+            out.put(&buffer)
+        })?;
     }
 
     let payload_checksum = out.sum.finish();
@@ -661,10 +787,10 @@ where
         nb_layer: NB_LAYER_MAX,
         dimension: u32::try_from(dimension)
             .map_err(|_| format!("the graph holds points of {} values", dimension))?,
-        m: hnsw.get_max_nb_connection_full() as u64,
-        ef_construction: hnsw.get_ef_construction() as u64,
+        m: source.max_nb_connection() as u64,
+        ef_construction: source.ef_construction() as u64,
         nb_point: nb_point as u64,
-        level_scale: indexation.get_level_scale(),
+        level_scale: source.level_scale(),
         entry_layer: entry.0 as u32,
         entry_rank: u32::try_from(entry.1)
             .map_err(|_| format!("the entry point sits at rank {}", entry.1))?,
