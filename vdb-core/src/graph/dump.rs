@@ -726,13 +726,34 @@ pub(crate) struct Expected {
     pub min_nodes: usize,
 }
 
+/// A dump parsed back into the topology a graph constructor takes, with the
+/// parameters the header carried.
+///
+/// Two consumers turn this into a graph. [`read_dump`] hands it to the vendored
+/// `Hnsw::from_loaded_points`, and the parity tests hand one parse to both that
+/// constructor and the flat structure in `flat.rs`, which is what lets the two
+/// be compared on a single topology rather than on two reads of one file.
+pub(super) struct ParsedDump<T> {
+    /// `points_by_layer[l][r]` is the point at rank `r` of layer `l`.
+    pub points_by_layer: Vec<Vec<LoadedPoint<T>>>,
+    /// Where the traversal starts.
+    pub entry: PointId,
+    /// `max_nb_connection`, which the header and `config.json` agree on by the
+    /// time the parse succeeds.
+    pub m: usize,
+    /// As the header carried it.
+    pub ef_construction: usize,
+    /// As the header carried it.
+    pub level_scale: f64,
+    /// Points the dump holds, which a constructor's answer is checked against.
+    pub nb_point: usize,
+}
+
 /// Read the graph back out of `dir`.
 ///
 /// Every failure is an error and none is a panic, an exit or an allocation from
-/// a length the file has not earned. The order is deliberate. The file's real
-/// length is established first, the header is checked against itself second,
-/// the header is checked against the index third, and only then does anything
-/// size a buffer from a field.
+/// a length the file has not earned. The parsing itself is [`parse_dump`], and
+/// this wraps it in the one construction call ZeusDB ships.
 pub(crate) fn read_dump<T, D>(
     dir: &Path,
     expected: &Expected,
@@ -741,6 +762,37 @@ pub(crate) fn read_dump<T, D>(
 where
     T: DumpElement,
     D: Distance<T> + Send + Sync,
+{
+    let parsed = parse_dump::<T>(dir, expected)?;
+    let nb_point = parsed.nb_point;
+    let hnsw = Hnsw::from_loaded_points(
+        parsed.points_by_layer,
+        parsed.entry,
+        parsed.m,
+        parsed.ef_construction,
+        parsed.level_scale,
+        dist,
+    )
+    .map_err(|e| format!("the graph dump could not be rebuilt: {}", e))?;
+
+    let restored = hnsw.get_nb_point();
+    if restored != nb_point {
+        return Err(format!(
+            "the graph dump declares {} nodes and yielded {}",
+            nb_point, restored
+        ));
+    }
+    Ok(hnsw)
+}
+
+/// Parse a dump into the topology and parameters it carries, building nothing.
+///
+/// The order is deliberate. The file's real length is established first, the
+/// header is checked against itself second, the header is checked against the
+/// index third, and only then does anything size a buffer from a field.
+pub(super) fn parse_dump<T>(dir: &Path, expected: &Expected) -> Result<ParsedDump<T>, String>
+where
+    T: DumpElement,
 {
     let path = dir.join(DUMP_FILENAME);
     let actual_bytes = match std::fs::metadata(&path) {
@@ -946,24 +998,14 @@ where
         return Err("the graph dump's contents are corrupt".to_string());
     }
 
-    let hnsw = Hnsw::from_loaded_points(
+    Ok(ParsedDump {
         points_by_layer,
-        PointId(header.entry_layer as u8, header.entry_rank as i32),
-        expected.m,
-        header.ef_construction as usize,
-        header.level_scale,
-        dist,
-    )
-    .map_err(|e| format!("the graph dump could not be rebuilt: {}", e))?;
-
-    let restored = hnsw.get_nb_point();
-    if restored != nb_point {
-        return Err(format!(
-            "the graph dump declares {} nodes and yielded {}",
-            nb_point, restored
-        ));
-    }
-    Ok(hnsw)
+        entry: PointId(header.entry_layer as u8, header.entry_rank as i32),
+        m: expected.m,
+        ef_construction: header.ef_construction as usize,
+        level_scale: header.level_scale,
+        nb_point,
+    })
 }
 
 /// Parse the adjacency region into one entry per point, in (layer, rank) order.
