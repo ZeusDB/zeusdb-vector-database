@@ -98,9 +98,9 @@
 //! are plain integers because the mutator is serialised.
 
 use super::dump::EachNeighbourhood;
+use super::dump::{LoadedEdge, LoadedPoint, PointId};
 use super::traverse::{self, Topology, LAYERS};
 use super::{Distance, GraphHit};
-use hnsw_rs::hnsw::{LoadedEdge, LoadedPoint, PointId};
 
 mod insert;
 
@@ -1198,9 +1198,8 @@ where
     }
 
     /// The overflow pop counters, as (overflows, saves, fallbacks). The same
-    /// three the vendored crate reports from `hnsw_rs::hnsw::guard_stats`, so
-    /// the two builds can be compared on how often the guard fired and how
-    /// often it changed the outcome.
+    /// three the vendored crate reported, so a fixture can be checked for
+    /// actually reaching the guard rather than assumed to.
     pub(super) fn guard_stats(&self) -> (u64, u64, u64) {
         (self.overflows, self.saves, self.fallbacks)
     }

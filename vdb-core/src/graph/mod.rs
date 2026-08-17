@@ -10,23 +10,20 @@
 //! # The graph is ZeusDB's own
 //!
 //! Every variant holds a [`mutable::MutableGraph`] with a
-//! [`levels::LevelGenerator`] beside it. Nothing on a shipped path calls the
-//! vendored crate any more: the structure, the traversal, the insert, the level
-//! stream and the dump are all in this module. What still arrives from
-//! `hnsw_rs` is four names and no behaviour, being [`Distance`], `PointId`,
-//! `LoadedPoint` and `LoadedEdge`, which the dump reader speaks in. The
-//! vendored crate itself remains only as the reference the parity tests build
-//! their comparison graphs with.
+//! [`levels::LevelGenerator`] beside it. The structure, the traversal, the
+//! insert, the level stream, the distance trait and the dump are all in this
+//! module, and nothing outside the crate is involved in any of them. The
+//! vendored graph crate the first six releases were built on is gone, source
+//! and dependency both.
 //!
 //! # What the seam does not cover
 //!
 //! One thing cannot be hidden, because ZeusDB implements it rather than calling
-//! it. [`Distance`] is the vendored crate's trait, `CosineDist`, `L1Dist`,
-//! `L2Dist` and `DistPQ` implement it, and a trait implemented for a foreign
-//! crate has to be nameable where the implementation is written. It is
-//! re-exported here so `distance.rs` and `hnsw_index.rs` import it from the
-//! seam and one line changes if the graph is ever replaced. The coupling is
-//! real and this re-export does not remove it.
+//! it. [`Distance`] is the trait `CosineDist`, `L1Dist`, `L2Dist`, `DotDist`
+//! and `DistPQ` implement, and a trait has to be nameable where the
+//! implementation is written. It is declared here so `distance.rs` and
+//! `hnsw_index.rs` import it from the seam and the set of implementors stays
+//! countable from one line.
 //!
 //! # The distance types are no longer pinned to their modules
 //!
@@ -51,16 +48,6 @@ use tracing::{debug, error, info, trace, warn};
 
 pub(crate) mod dump;
 
-// The read-only form of the same graph. It has no shipped caller: no ZeusDB
-// index is read-only, since `add` is available on every loaded one, so the load
-// path builds the mutable form and this one is never constructed outside
-// `cfg(test)`. It stays because it is the independent second implementation the
-// traversal was proved against in relay 77 and the mutable structure is
-// compared beside in the parity harness, and it retires with that harness when
-// the vendored crate goes. Being generic and instantiated only under
-// `cfg(test)`, it contributes nothing to the shipped extension.
-#[cfg_attr(not(test), allow(dead_code))]
-mod flat;
 // The level generator, which draws a new point's top level.
 #[cfg_attr(not(test), allow(dead_code))]
 mod levels;
@@ -68,7 +55,9 @@ mod levels;
 #[cfg_attr(not(test), allow(dead_code))]
 mod mutable;
 #[cfg(test)]
-mod parity;
+mod structure;
+#[cfg(test)]
+pub(crate) mod test_graph;
 // The traversal, written once against an accessor.
 #[cfg_attr(not(test), allow(dead_code))]
 mod traverse;
@@ -78,13 +67,79 @@ use levels::LevelGenerator;
 use mutable::{MutableGraph, Planned};
 use traverse::{Topology, LAYERS};
 
-/// The vendored crate's distance trait, re-exported at the seam.
+/// How far apart two points of type `T` are.
 ///
-/// ZeusDB implements this for its own distance types, so the name has to be
-/// visible where those implementations are written. Importing it from here
-/// rather than from `hnsw_rs::prelude` keeps the crate's name in one file and
-/// makes the set of implementors countable from this line.
-pub(crate) use hnsw_rs::prelude::Distance;
+/// One method, and every distance in the crate is one expression. It is
+/// declared here rather than in `distance.rs` because the graph is what calls
+/// it and `distance.rs` is one of the modules that implements it.
+///
+/// The implementors are `CosineDist`, `L2Dist`, `L1Dist` and `DotDist` in
+/// `distance.rs` and `DistPQ` in `hnsw_index`. Every one imports the name from
+/// this module, so the set is countable from the `use` sites of this line.
+///
+/// The shape is the one the trait it replaced had, unchanged, because changing
+/// it would have been a second edit landing at the same time as the deletion
+/// and there is nothing wrong with it.
+pub(crate) trait Distance<T> {
+    /// The distance from `va` to `vb`. Both slices are the graph's width.
+    fn eval(&self, va: &[T], vb: &[T]) -> f32;
+}
+
+/// How far `sum(x * x)` may sit from one before a vector is not unit length.
+///
+/// The quantity is the squared norm rather than the norm, because that is what
+/// the check computes and a square root would only add error to it.
+///
+/// The residual a correct normalisation leaves is the whole of what this has to
+/// absorb. `HNSWIndex::normalize_vector` divides by an `f32` norm accumulated in
+/// `f32`, and the worst `|sum(x * x) - 1|` that leaves, measured over the real
+/// 128, 768 and 1,536 dimensional sets and over adversarial input of four
+/// thousand values spanning eight orders of magnitude, is 3.576e-7, which is
+/// three `f32` steps at one. This is 1e-3, so it sits about 2,800 times above
+/// the worst residual observed and about 20 times below what a vector whose
+/// norm is wrong by one percent would produce. Nothing legitimate lands between
+/// those.
+const COSINE_UNIT_TOLERANCE: f32 = 1e-3;
+
+/// Assert, in debug builds only, that a vector reaching a cosine graph is unit
+/// length.
+///
+/// The check belongs here rather than in [`Distance::eval`] for two reasons.
+/// The seam sees a vector once per insertion and once per search where the
+/// kernel sees it several thousand times per search, so this costs one pass
+/// over the vector where the kernel would cost one per evaluation. And
+/// `rerank::rescore_candidate` hands `CosineDist` a PQ reconstruction, which is
+/// deliberately not unit length, so a kernel level assertion could not be
+/// written without a tolerance loose enough to admit an unnormalised vector.
+///
+/// A zero vector passes. `normalize_vector` returns it unchanged, since there
+/// is nothing to divide by, and `CosineDist` scores it one against everything,
+/// which the departure recorded on that type describes. It is a vector of no
+/// direction rather than a violated precondition.
+///
+/// **This compiles to nothing in release.** The body is behind
+/// `cfg(debug_assertions)` rather than inside `debug_assert!`, so the sum is
+/// not merely unevaluated but absent.
+#[inline]
+fn assert_unit_for_cosine(_vector: &[f32], _site: &str) {
+    #[cfg(debug_assertions)]
+    {
+        let squared: f32 = _vector.iter().map(|x| x * x).sum();
+        assert!(
+            squared == 0.0 || (squared - 1.0).abs() <= COSINE_UNIT_TOLERANCE,
+            "a vector reaching the cosine graph at {} is not unit length: \
+             sum(x * x) is {}, which is {} from one and past the {} tolerance. \
+             CosineDist is 1 - dot and assumes normalisation, so this page or \
+             this insertion would be scored on projection rather than on \
+             direction. Every path into a cosine graph must normalise first, \
+             which process_vector_for_space does.",
+            _site,
+            squared,
+            (squared - 1.0).abs(),
+            COSINE_UNIT_TOLERANCE
+        );
+    }
+}
 
 /// One result of a graph traversal, in ZeusDB's own terms.
 ///
@@ -363,7 +418,10 @@ impl VectorGraph {
     {
         match self {
             // Raw vector search
-            VectorGraph::Cosine(b) => Ok(b.graph.search(query, k, ef, filter)),
+            VectorGraph::Cosine(b) => {
+                assert_unit_for_cosine(query, "search");
+                Ok(b.graph.search(query, k, ef, filter))
+            }
             VectorGraph::L2(b) => Ok(b.graph.search(query, k, ef, filter)),
             VectorGraph::L1(b) => Ok(b.graph.search(query, k, ef, filter)),
 
@@ -465,7 +523,10 @@ impl VectorGraph {
     /// it planned against rather than trusting that.
     pub(crate) fn plan(&self, record: Record<'_>) -> Option<Planned> {
         match (self, record) {
-            (VectorGraph::Cosine(b), Record::Raw(v)) => Some(b.plan(v)),
+            (VectorGraph::Cosine(b), Record::Raw(v)) => {
+                assert_unit_for_cosine(v, "insert");
+                Some(b.plan(v))
+            }
             (VectorGraph::L2(b), Record::Raw(v)) => Some(b.plan(v)),
             (VectorGraph::L1(b), Record::Raw(v)) => Some(b.plan(v)),
             (VectorGraph::CosinePQ(b), Record::Codes(c))

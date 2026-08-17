@@ -337,7 +337,7 @@ pub fn is_logging_initialized() -> bool {
 fn create_env_filter(log_level: &str) -> EnvFilter {
     let base = format!(
         "zeusdb_vector_database={level},\
-         hnsw_rs=warn,rayon=warn,pyo3=warn,bincode=warn,serde_json=warn,\
+         rayon=warn,pyo3=warn,bincode=warn,serde_json=warn,\
          mio=warn,tokio=warn",
         level = log_level
     );
@@ -680,11 +680,11 @@ mod tests {
             // Dependency targets stay pinned at warn regardless of the level
             // asked for, which is the point of the noise-suppressing directives.
             assert!(!tracing::event_enabled!(
-                target: "hnsw_rs",
+                target: "rayon",
                 tracing::Level::INFO
             ));
             assert!(tracing::event_enabled!(
-                target: "hnsw_rs",
+                target: "rayon",
                 tracing::Level::WARN
             ));
         });

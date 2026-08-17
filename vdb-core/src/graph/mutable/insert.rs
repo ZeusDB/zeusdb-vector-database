@@ -4,7 +4,7 @@
 //! on the distribution of edges but not on the edges are two different graphs,
 //! and every reproducibility guarantee in the suite is a statement about the
 //! edges. So this is not a reimplementation of the idea. It is
-//! `vendor/hnsw_rs/src/hnsw.rs:1446-1705` written out again, calling the same
+//! the vendored `Hnsw::insert_data` written out again, calling the same
 //! traversal at the same widths in the same order, and it is proved by building
 //! both graphs from the same data and comparing them edge for edge rather than
 //! by comparing what they return.

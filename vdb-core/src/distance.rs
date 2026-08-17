@@ -1,6 +1,6 @@
 //! ZeusDB's own distance kernels for `f32` vectors.
 //!
-//! These replace the `anndists` implementations the `hnsw_rs` prelude supplies.
+//! These replaced the implementations the vendored graph crate supplied.
 //! The crate ZeusDB was using computes cosine in `f64` with three accumulators
 //! and no vectorisation at any feature setting, which is roughly three times the
 //! arithmetic the data needs once it is normalised.
@@ -9,7 +9,7 @@
 //!
 //! The graph orders by the returned value and `search` reports it to the caller
 //! as a score, so the quantity matters as much as the speed. Each function here
-//! returns the same quantity its `anndists` counterpart returned.
+//! returns the same quantity the implementation it replaced returned.
 //!
 //! | Metric | Returns | Range on normalised input |
 //! | --- | --- | --- |
@@ -18,7 +18,7 @@
 //! | [`L1Dist`] | The sum of absolute differences | `[0, 2 * sqrt(d)]` |
 //! | [`DotDist`] | `1 - dot`, unclamped | `[0, 2]` |
 //!
-//! Two deliberate departures from `anndists` are recorded at [`CosineDist`] and
+//! Two deliberate departures from those are recorded at [`CosineDist`] and
 //! at [`DotDist`]. Everything else agrees to within the tolerance the tests
 //! assert.
 //!
@@ -120,8 +120,9 @@ use core::arch::x86_64::{
 /// The quantized distance, re-exported so every call site imports its distances
 /// from one module.
 ///
-/// The declaration used to be unable to follow the name. `Hnsw::file_dump`
-/// wrote `std::any::type_name::<D>()` into the dump header and the load path
+/// The declaration used to be unable to follow the name. The dump format the
+/// first six releases wrote carried `std::any::type_name::<D>()` in its header
+/// and the load path
 /// compared it by exact equality, and `type_name` reports where a type is
 /// **declared**, so moving `DistPQ` out of `hnsw_index` would have changed what
 /// every save wrote and stopped every saved quantized index from loading.
@@ -437,7 +438,7 @@ pub fn l2(a: &[f32], b: &[f32]) -> f32 {
 /// ZeusDB holds the precondition by normalising in `process_vector_for_space`,
 /// which every insertion and every query on a cosine index passes through.
 ///
-/// # Two departures from `anndists`
+/// # Two departures from the implementation this replaced
 ///
 /// A zero vector was distance zero from everything under `DistCosine`, because
 /// the branch guarding the division returned zero when either norm was zero.
@@ -463,10 +464,47 @@ pub fn cosine_normalized(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Cosine distance on pre-normalised vectors.
+/// Cosine distance on vectors that are already unit length.
 ///
-/// See [`cosine_normalized`] for the precondition this carries and for the two
-/// places it departs from the `anndists` type it replaces.
+/// # The precondition
+///
+/// **Both arguments are assumed to be L2 normalised, and neither is checked
+/// here.** `eval` is `1 - dot` and nothing else, which is the arithmetic relay
+/// 40 arrived at by removing the two norm computations the implementation this
+/// replaced did per call. That is worth 6.14x on cosine and it runs once per
+/// distance evaluation, of which a single search at dimension 1,536 makes
+/// several thousand. Checking here would put the removed work back.
+///
+/// # Who satisfies it
+///
+/// Every path into a cosine graph normalises first, and
+/// `graph::assert_unit_for_cosine` asserts it at the seam in debug builds. The
+/// set of paths is closed and is enumerated in the relay 81 report. In outline,
+/// insertion normalises in `HNSWIndex::process_vector_for_space`, querying
+/// normalises in `HNSWIndex::validate_and_process_query_vector` or in
+/// `process_vector_for_space` on the two batch paths, and the three rebuild
+/// paths re-insert vectors that were normalised when they were first stored.
+///
+/// # What happens if it is violated
+///
+/// Nothing observable, which is the danger. On an unnormalised pair `1 - dot`
+/// is not a cosine distance and is not scale invariant, so the nearest point
+/// becomes the one with the largest projection, which length dominates rather
+/// than direction. It returns a number, the traversal completes, and the page
+/// is wrong. Measured on a fixture of unnormalised uniform vectors at dimension
+/// 32, **2,927 of 3,000 points could not find themselves by self query.**
+///
+/// # The one deliberate exception
+///
+/// `rerank::rescore_candidate` falls back to a PQ reconstruction when a record
+/// has no raw vector, and a reconstruction is the concatenation of the nearest
+/// centroid per subvector, so it is not unit length even when the vector it
+/// approximates was. Measured norms run from 0.88 at the shipped default to
+/// 0.41 at two subvectors and four bits. That is intended: the rescored score
+/// has to be the number a raw index holding that reconstruction would report,
+/// which `rerank_scores_come_from_the_raw_distances` pins. It is also why the
+/// assertion is at the seam and not here, since no tolerance separates a
+/// legitimate reconstruction from an unnormalised vector.
 #[derive(Default, Copy, Clone, Debug)]
 pub struct CosineDist;
 
@@ -477,7 +515,7 @@ impl Distance<f32> for CosineDist {
     }
 }
 
-/// Euclidean distance, square root taken, matching `anndists::DistL2`.
+/// Euclidean distance, square root taken.
 #[derive(Default, Copy, Clone, Debug)]
 pub struct L2Dist;
 
@@ -488,7 +526,7 @@ impl Distance<f32> for L2Dist {
     }
 }
 
-/// Sum of absolute differences, matching `anndists::DistL1`.
+/// Sum of absolute differences.
 #[derive(Default, Copy, Clone, Debug)]
 pub struct L1Dist;
 
@@ -506,7 +544,8 @@ impl Distance<f32> for L1Dist {
 /// clamp. It exists so an inner product space has an implementation ready, and
 /// no `space` string reaches it today.
 ///
-/// `anndists::DistDot` asserts that the dot product is at most one and aborts
+/// The implementation this replaced asserted that the dot product is at most
+/// one and aborted
 /// the process otherwise, which a self comparison of a normalised vector can
 /// trip by rounding. There is no assertion here.
 ///
@@ -527,7 +566,7 @@ impl Distance<f32> for DotDist {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hnsw_rs::prelude::{DistCosine, DistL1, DistL2, Hnsw};
+    use crate::graph::test_graph::TestGraph;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -801,8 +840,8 @@ mod tests {
     #[test]
     fn edge_cases() {
         // Zero vectors. L1 and L2 are zero, dot is zero, and cosine is one
-        // rather than the zero `DistCosine` returned. This is the departure the
-        // documentation on `cosine_normalized` records.
+        // rather than the zero the implementation this replaced returned. That
+        // is the departure the documentation on `cosine_normalized` records.
         for dim in DIMS {
             let z = vec![0.0f32; dim];
             assert_eq!(l1(&z, &z), 0.0);
@@ -816,7 +855,6 @@ mod tests {
         unit[3] = 1.0;
         let zero = vec![0.0f32; 768];
         assert_eq!(cosine_normalized(&zero, &unit), 1.0);
-        assert_eq!(DistCosine {}.eval(&zero, &unit), 0.0);
 
         // One non-zero element, at a position past the first block so the tail
         // and the block path both carry it.
@@ -899,41 +937,6 @@ mod tests {
         assert_eq!(cosine_normalized(&a, &b), 0.0);
     }
 
-    /// Agreement with the implementations these replace, at the value level.
-    ///
-    /// L1 and L2 must match closely, since the formula is unchanged and only the
-    /// summation order moved. Cosine is allowed to differ by the norm correction
-    /// it no longer applies, which on normalised input is the distance between
-    /// the recomputed norm and one.
-    #[test]
-    fn values_agree_with_anndists() {
-        let mut r = rng(4242);
-        let (mut worst_l1, mut worst_l2, mut worst_cos) = (0.0f64, 0.0f64, 0.0f64);
-
-        for dim in DIMS {
-            for _ in 0..200 {
-                let a = random_vector(&mut r, dim);
-                let b = random_vector(&mut r, dim);
-                let (na, nb) = (normalize(&a), normalize(&b));
-
-                worst_l1 = worst_l1.max(relative(l1(&a, &b), DistL1 {}.eval(&a, &b) as f64));
-                worst_l2 = worst_l2.max(relative(l2(&a, &b), DistL2 {}.eval(&a, &b) as f64));
-                worst_cos = worst_cos.max(absolute(
-                    cosine_normalized(&na, &nb),
-                    DistCosine {}.eval(&na, &nb) as f64,
-                ));
-            }
-        }
-
-        println!(
-            "worst deviation against anndists  l1 {worst_l1:.3e} rel  l2 {worst_l2:.3e} rel  \
-             cosine {worst_cos:.3e} abs"
-        );
-        assert!(worst_l1 < TOLERANCE, "l1 deviated by {worst_l1:.3e}");
-        assert!(worst_l2 < TOLERANCE, "l2 deviated by {worst_l2:.3e}");
-        assert!(worst_cos < TOLERANCE, "cosine deviated by {worst_cos:.3e}");
-    }
-
     /// The vector accumulator against the array accumulator, bit for bit.
     ///
     /// This is the assertion the relay 70 change rests on. Widening the
@@ -1011,66 +1014,6 @@ mod tests {
         println!("bit identity against the previous shape  compared {compared}  differing 0");
     }
 
-    /// The property the graph actually depends on.
-    ///
-    /// A distance that differs from the old one in the last bit but never
-    /// reorders a pair is safe to swap in. One that reorders is not, because the
-    /// neighbour selection heuristic and the search stopping condition both read
-    /// the order and nothing reads the magnitude.
-    ///
-    /// For each triple the old and new implementations are asked the same
-    /// question, being whether the query is closer to `b` than to `c`, and the
-    /// answers must match. Ties are counted separately, since a tie under one
-    /// implementation and a strict order under the other is not a reordering.
-    #[test]
-    fn ordering_matches_anndists() {
-        let mut r = rng(31337);
-        let mut compared = 0usize;
-        let mut disagreed = 0usize;
-        let mut ties = 0usize;
-
-        for dim in [8usize, 128, 768, 1536] {
-            for _ in 0..4000 {
-                let q = normalize(&random_vector(&mut r, dim));
-                let b = normalize(&random_vector(&mut r, dim));
-                let c = normalize(&random_vector(&mut r, dim));
-
-                for (new_qb, new_qc, old_qb, old_qc) in [
-                    (
-                        cosine_normalized(&q, &b),
-                        cosine_normalized(&q, &c),
-                        DistCosine {}.eval(&q, &b),
-                        DistCosine {}.eval(&q, &c),
-                    ),
-                    (
-                        l2(&q, &b),
-                        l2(&q, &c),
-                        DistL2 {}.eval(&q, &b),
-                        DistL2 {}.eval(&q, &c),
-                    ),
-                    (
-                        l1(&q, &b),
-                        l1(&q, &c),
-                        DistL1 {}.eval(&q, &b),
-                        DistL1 {}.eval(&q, &c),
-                    ),
-                ] {
-                    compared += 1;
-                    if new_qb == new_qc || old_qb == old_qc {
-                        ties += 1;
-                        continue;
-                    }
-                    if (new_qb < new_qc) != (old_qb < old_qc) {
-                        disagreed += 1;
-                    }
-                }
-            }
-        }
-
-        println!("ordering  compared {compared}  ties {ties}  disagreed {disagreed}");
-        assert_eq!(disagreed, 0, "{disagreed} of {compared} pairs reordered");
-    }
-
     /// Near ties, judged against the truth rather than against each other.
     ///
     /// The pass above asks whether the two implementations agree, and on
@@ -1116,7 +1059,10 @@ mod tests {
                 let gap = (true_b - true_c).abs();
 
                 let (new_b, new_c) = (cosine_normalized(&q, &b), cosine_normalized(&q, &c));
-                let (old_b, old_c) = (DistCosine {}.eval(&q, &b), DistCosine {}.eval(&q, &c));
+                let (old_b, old_c) = (
+                    previous::cosine_normalized(&q, &b),
+                    previous::cosine_normalized(&q, &c),
+                );
 
                 compared += 1;
                 if true_b == true_c {
@@ -1202,7 +1148,7 @@ mod tests {
             let near = normalize(&near);
 
             let new_d = cosine_normalized(&base, &near) as f64;
-            let old_d = DistCosine {}.eval(&base, &near) as f64;
+            let old_d = previous::cosine_normalized(&base, &near) as f64;
 
             if new_d > 0.0 {
                 new_floor = new_floor.min(new_d);
@@ -1231,22 +1177,6 @@ mod tests {
         );
     }
 
-    /// Per layer adjacency, keyed by the id the caller inserted under.
-    fn adjacency<D>(hnsw: &Hnsw<'_, f32, D>, n: usize) -> Vec<Vec<Vec<usize>>>
-    where
-        D: Distance<f32> + Send + Sync,
-    {
-        let mut adj = vec![Vec::new(); n];
-        for point in hnsw.get_point_indexation() {
-            adj[point.get_origin_id()] = point
-                .get_neighborhood_id()
-                .iter()
-                .map(|layer| layer.iter().map(|nb| nb.d_id).collect())
-                .collect();
-        }
-        adj
-    }
-
     /// Build one graph per distance on identical data and count the difference.
     ///
     /// Returns the number of nodes whose adjacency differs, the number of edges
@@ -1262,14 +1192,10 @@ mod tests {
         B: Distance<f32> + Send + Sync,
     {
         let n = data.len();
-        let old = Hnsw::new(16, n, 16, 200, old_dist);
-        let new = Hnsw::new(16, n, 16, 200, new_dist);
-        for (i, v) in data.iter().enumerate() {
-            old.insert((v.as_slice(), i));
-            new.insert((v.as_slice(), i));
-        }
+        let old = TestGraph::build(16, 200, data, old_dist);
+        let new = TestGraph::build(16, 200, data, new_dist);
 
-        let (old_adj, new_adj) = (adjacency(&old, n), adjacency(&new, n));
+        let (old_adj, new_adj) = (old.adjacency(), new.adjacency());
         let (mut differing_nodes, mut differing_edges, mut total_edges) = (0usize, 0usize, 0usize);
 
         for id in 0..n {
@@ -1298,8 +1224,8 @@ mod tests {
             .iter()
             .take(200)
             .filter(|q| {
-                let a: Vec<usize> = old.search(q, 10, 100).iter().map(|h| h.d_id).collect();
-                let b: Vec<usize> = new.search(q, 10, 100).iter().map(|h| h.d_id).collect();
+                let a: Vec<usize> = old.page(q, 10, 100).iter().map(|&(id, _)| id).collect();
+                let b: Vec<usize> = new.page(q, 10, 100).iter().map(|&(id, _)| id).collect();
                 a != b
             })
             .count();
@@ -1312,99 +1238,13 @@ mod tests {
         )
     }
 
-    /// The end to end check. Two graphs, identical data, identical level
-    /// assignment, one distance each.
-    ///
-    /// Ordering equivalence over sampled triples says the two distances rank
-    /// the same way. This says the graphs that result are the same object, which
-    /// is the stronger claim and the one that decides whether recall can move.
-    ///
-    /// The level assignment is already fixed. `LayerGenerator` seeds from
-    /// `DEFAULT_LEVEL_SEED`, which ZeusDB's patch 2 added, so two sequential
-    /// builds draw the same levels in the same order without anything being set
-    /// here. Insertion is sequential for the same reason the two graph guard
-    /// tests in `hnsw_index` are, being that `parallel_insert` draws levels in
-    /// thread arrival order and no seed makes that reproducible.
-    /// Cosine, where the two graphs come out identical.
-    #[test]
-    fn the_two_distances_build_the_same_cosine_graph() {
-        const N: usize = 3000;
-        const DIM: usize = 64;
-
-        let mut r = rng(2718);
-        let data: Vec<Vec<f32>> = (0..N)
-            .map(|_| normalize(&random_vector(&mut r, DIM)))
-            .collect();
-
-        let (nodes, edges, total, queries) = compare_graphs(DistCosine {}, CosineDist {}, &data);
-        println!(
-            "graph comparison cosine  nodes {N}  edges {total}  differing nodes {nodes}  \
-             differing edges {edges}  differing queries {queries} of 200"
-        );
-
-        assert_eq!(
-            nodes, 0,
-            "{nodes} of {N} nodes differ, {edges} of {total} edges"
-        );
-        assert_eq!(
-            queries, 0,
-            "{queries} of 200 queries returned a different page"
-        );
-    }
-
-    /// L1 and L2, where they do not.
-    ///
-    /// Cosine agrees exactly because the two implementations arrive at the same
-    /// `f32` value for a normalised pair often enough that no comparison in the
-    /// build ever flips. L1 and L2 keep the same formula and change only the
-    /// summation order, from one sequential chain to eight lanes, so their values
-    /// differ in the last bits on almost every pair. Where two candidates are
-    /// closer together than that difference, the graphs can pick different
-    /// neighbours.
-    ///
-    /// What is asserted is that the difference stays at the level of last bit
-    /// tie-breaking rather than becoming a different graph. The bound is one
-    /// percent of edges, which is roughly a hundred times the measured figure, so
-    /// it catches a real divergence without tracking noise. The measured numbers
-    /// are printed so a drift toward the bound is visible.
-    ///
-    /// This is the mechanism behind the L1 recall move in section 4.2 of the
-    /// relay 40 report, where recall at 10 went from 0.7775 to 0.7780 on 200
-    /// queries, being a single hit in two thousand.
-    #[test]
-    fn l1_and_l2_graphs_differ_only_by_last_bit_tie_breaking() {
-        const N: usize = 3000;
-        const DIM: usize = 64;
-
-        let mut r = rng(2718);
-        let data: Vec<Vec<f32>> = (0..N)
-            .map(|_| normalize(&random_vector(&mut r, DIM)))
-            .collect();
-
-        for (name, (nodes, edges, total, queries)) in [
-            ("l2", compare_graphs(DistL2 {}, L2Dist {}, &data)),
-            ("l1", compare_graphs(DistL1 {}, L1Dist {}, &data)),
-        ] {
-            let share = edges as f64 / total as f64;
-            println!(
-                "graph comparison {name}  nodes {N}  edges {total}  differing nodes {nodes}  \
-                 differing edges {edges} ({:.4} percent)  differing queries {queries} of 200",
-                share * 100.0
-            );
-            assert!(
-                share < 0.01,
-                "{name} graphs differ by {edges} of {total} edges, which is past last bit noise"
-            );
-        }
-    }
-
     /// The vector accumulator and the array accumulator build the same graph.
     ///
     /// Bit identity already implies this, since a comparison cannot separate two
     /// identical values. It is measured rather than inferred because the graph
     /// is what the change is actually risking, and a zero here is the statement
-    /// that matters. All three spaces, since L1 and L2 are the two that tie-break
-    /// against `anndists` and so are the two with anything to lose.
+    /// that matters. All three spaces, since L1 and L2 are the two whose
+    /// summation order moved and so the two with anything to lose.
     #[test]
     fn the_two_accumulator_shapes_build_the_same_graph() {
         const N: usize = 3000;
@@ -1437,8 +1277,8 @@ mod tests {
     /// Ordering equivalence against the previous shape, counted rather than
     /// assumed.
     ///
-    /// The same question the `anndists` pass asks, put to the shape this one
-    /// replaced. Near ties are built deliberately, by perturbing one component
+    /// Put to the shape this one replaced. Near ties are built deliberately,
+    /// by perturbing one component
     /// of the second candidate, because that is where a last bit difference
     /// would decide an order if there were one to find.
     #[test]
@@ -1761,8 +1601,7 @@ mod tests {
     /// `DEFAULT_LEVEL_SEED`, insertion is sequential, and the only thing that
     /// differs between the two builds is which of the two kernels computed
     /// every distance. All three spaces, since L1 and L2 are the two whose
-    /// values differ from `anndists` in the last bits and so the two with
-    /// anything to lose.
+    /// values move in the last bits and so the two with anything to lose.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn the_two_paths_build_the_same_graph() {
@@ -1825,24 +1664,20 @@ mod tests {
             .map(|_| normalize(&random_vector(&mut q, DIM)))
             .collect();
 
-        let base = Hnsw::new(16, N, 16, 200, paths::BaseCosine {});
-        let avx = Hnsw::new(16, N, 16, 200, paths::AvxCosine {});
-        for (i, v) in data.iter().enumerate() {
-            base.insert((v.as_slice(), i));
-            avx.insert((v.as_slice(), i));
-        }
+        let base = TestGraph::build(16, 200, &data, paths::BaseCosine {});
+        let avx = TestGraph::build(16, 200, &data, paths::AvxCosine {});
 
         let (mut compared, mut differing_ids, mut differing_scores) = (0usize, 0usize, 0usize);
         for query in &queries {
-            let a = base.search(query, 10, 100);
-            let b = avx.search(query, 10, 100);
+            let a = base.page(query, 10, 100);
+            let b = avx.page(query, 10, 100);
             compared += 1;
-            if a.iter().map(|h| h.d_id).ne(b.iter().map(|h| h.d_id)) {
+            if a.iter().map(|&(id, _)| id).ne(b.iter().map(|&(id, _)| id)) {
                 differing_ids += 1;
             }
             if a.iter()
-                .map(|h| h.distance.to_bits())
-                .ne(b.iter().map(|h| h.distance.to_bits()))
+                .map(|&(_, d)| d.to_bits())
+                .ne(b.iter().map(|&(_, d)| d.to_bits()))
             {
                 differing_scores += 1;
             }
@@ -1987,19 +1822,16 @@ mod tests {
         where
             D: Distance<f32> + Send + Sync + Clone,
         {
-            let hnsw = Hnsw::new(16, data.len(), 16, 200, dist);
             let t = Instant::now();
-            for (i, v) in data.iter().enumerate() {
-                hnsw.insert((v.as_slice(), i));
-            }
+            let graph = TestGraph::build(16, 200, data, dist);
             let build = t.elapsed().as_secs_f64();
 
             for q in queries.iter().take(25) {
-                black_box(hnsw.search(q, 10, 100));
+                black_box(graph.page(q, 10, 100));
             }
             let t = Instant::now();
             for q in queries {
-                black_box(hnsw.search(q, 10, 100));
+                black_box(graph.page(q, 10, 100));
             }
             let search = t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64;
             (build, search)
@@ -2035,94 +1867,5 @@ mod tests {
             bb / ab,
             bs / asr
         );
-    }
-
-    /// Nanoseconds per call, old against new, at the three measured dimensions.
-    ///
-    /// Ignored by default because it is a timing harness rather than an
-    /// assertion. Run it with
-    /// `cargo test --release --locked distance::tests::throughput -- --ignored --nocapture`.
-    ///
-    /// The working set is small enough to stay in cache on purpose. This
-    /// measures the kernel, not the memory system a traversal fights, and the
-    /// search latency figures in the relay report are what say how much of the
-    /// kernel gain survives contact with a real graph.
-    #[test]
-    #[ignore = "timing harness, run with --ignored --nocapture on a release build"]
-    fn throughput_old_against_new() {
-        use std::time::Instant;
-
-        const PAIRS: usize = 128;
-        const REPEATS: usize = 4000;
-
-        println!(
-            "\ndim  metric  anndists ns   blocked ns   wide ns   \
-             over blocked   over anndists"
-        );
-        for dim in [128usize, 768, 1536] {
-            let mut r = rng(555);
-            let a: Vec<Vec<f32>> = (0..PAIRS)
-                .map(|_| normalize(&random_vector(&mut r, dim)))
-                .collect();
-            let b: Vec<Vec<f32>> = (0..PAIRS)
-                .map(|_| normalize(&random_vector(&mut r, dim)))
-                .collect();
-
-            let calls = (PAIRS * REPEATS) as f64;
-
-            // Generic rather than a trait object, so each cell measures an
-            // inlined kernel rather than an indirect call through a vtable.
-            fn time<F: Fn(&[f32], &[f32]) -> f32>(
-                a: &[Vec<f32>],
-                b: &[Vec<f32>],
-                repeats: usize,
-                calls: f64,
-                f: F,
-            ) -> f64 {
-                use std::hint::black_box;
-                // One untimed pass, so the branch predictor and the caches are
-                // in the same state for every cell.
-                for i in 0..a.len() {
-                    black_box(f(black_box(&a[i]), black_box(&b[i])));
-                }
-                let t = Instant::now();
-                for _ in 0..repeats {
-                    for i in 0..a.len() {
-                        black_box(f(black_box(&a[i]), black_box(&b[i])));
-                    }
-                }
-                t.elapsed().as_secs_f64() * 1e9 / calls
-            }
-
-            let cells = [
-                (
-                    "cosine",
-                    time(&a, &b, REPEATS, calls, |x, y| DistCosine {}.eval(x, y)),
-                    time(&a, &b, REPEATS, calls, previous::cosine_normalized),
-                    time(&a, &b, REPEATS, calls, cosine_normalized),
-                ),
-                (
-                    "l2",
-                    time(&a, &b, REPEATS, calls, |x, y| DistL2 {}.eval(x, y)),
-                    time(&a, &b, REPEATS, calls, previous::l2),
-                    time(&a, &b, REPEATS, calls, l2),
-                ),
-                (
-                    "l1",
-                    time(&a, &b, REPEATS, calls, |x, y| DistL1 {}.eval(x, y)),
-                    time(&a, &b, REPEATS, calls, previous::l1),
-                    time(&a, &b, REPEATS, calls, l1),
-                ),
-            ];
-
-            for (name, anndists_ns, blocked_ns, wide_ns) in cells {
-                println!(
-                    "{dim:<5}{name:<8}{anndists_ns:>11.2}{blocked_ns:>13.2}{wide_ns:>10.2}\
-                     {:>13.2}x{:>13.2}x",
-                    blocked_ns / wide_ns,
-                    anndists_ns / wide_ns
-                );
-            }
-        }
     }
 }

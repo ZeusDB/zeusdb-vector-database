@@ -1,7 +1,9 @@
 """Layer capacity reservation.
 
-Regression tests for patch 5 in vendor/hnsw_rs/ZEUSDB-PATCH.md, which corrects
-the per-layer Vec::with_capacity reservation in PointIndexation::new.
+Regression tests for the creation-time reservation, which the graph takes
+against expected_size and caps in bytes. The vendored crate this replaced
+reserved every layer at the full declared size, which committed hundreds of
+times the memory an index needed.
 
 Memory is read as psutil memory_info().vms rather than rss. The reservation is
 committed but never written, so on Windows rss reports almost nothing and on

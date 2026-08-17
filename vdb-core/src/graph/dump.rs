@@ -1,30 +1,30 @@
 //! ZeusDB's own on-disk format for the graph.
 //!
 //! One file, `hnsw_index.zdbgraph`, holding everything a traversal needs and
-//! nothing else. It replaces the vendored crate's two file dump, which ZeusDB
-//! wrote through `Hnsw::file_dump` and read through `HnswIo`.
+//! nothing else. It replaced the two file dump the vendored graph crate wrote,
+//! which every release up to 0.6.0 saved.
 //!
 //! # Why it exists
 //!
 //! Five things came with the vendored format and all five leave with it.
 //!
-//! The vendored header carries `std::any::type_name::<D>()` and the vendored
-//! reload compares it by exact equality, so every distance type was pinned to
+//! The vendored header carried `std::any::type_name::<D>()` and the vendored
+//! reload compared it by exact equality, so every distance type was pinned to
 //! the module it was declared in and moving one stopped every saved index from
 //! loading. This header carries a [`GraphKind`] discriminant instead.
 //!
-//! The vendored reload returns a graph whose lifetime is tied to the `HnswIo`
+//! The vendored reload returned a graph whose lifetime was tied to the `HnswIo`
 //! that produced it, so reaching `'static` meant leaking the loader. The reader
-//! here owns no borrowed state and returns `Hnsw<'static, T, D>` outright.
+//! here owns no borrowed state and returns the graph outright.
 //!
-//! The vendored reader panics on a malformed header and reaches
+//! The vendored reader panicked on a malformed header and reached
 //! `std::process::exit(1)` on a short data file, so the caller wrapped it in two
 //! `catch_unwind` calls and measured the data file's length beforehand. Every
 //! malformed input here returns an error.
 //!
-//! `max_nb_connection` is a `u8` in the vendored header where `Hnsw::new`
-//! admits 256, so an index at `m` 256 declared 0 and rebuilt on every load. It
-//! is a `u64` here.
+//! `max_nb_connection` was a `u8` in the vendored header where the index admits
+//! 256, so an index at `m` 256 declared 0 and rebuilt on every load. It is a
+//! `u64` here.
 //!
 //! # Byte order and widths
 //!
@@ -94,18 +94,53 @@
 //! though it were whole.
 
 use super::mutable::MutableGraph;
-use hnsw_rs::hnsw::{LoadedEdge, LoadedPoint, PointId, NB_LAYER_MAX};
-use hnsw_rs::prelude::Distance;
-// The vendored graph is a dump source only for the parity tests, which write a
-// dump from one and read it into the other. Nothing on a shipped path writes a
-// vendored graph any more, so the implementation below is compiled only where
-// something calls it.
-#[cfg(test)]
-use hnsw_rs::prelude::Hnsw;
+use super::Distance;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use tracing::{info, warn};
+
+/// Layers a graph can hold, which is part of the on-disk contract.
+///
+/// It sits at header byte 18 and a dump declaring any other value is refused on
+/// load, so it is a number the format fixes rather than a tuning knob. Every
+/// per node array in the structure is sized by it and `super::traverse` walks
+/// down from it.
+pub(super) const NB_LAYER_MAX: u8 = 16;
+
+/// Where a point sits, being its layer and its rank within that layer.
+///
+/// This is the identity the file orders points by. A point's own `PointId` is
+/// not a field of anything the reader returns, because it is the point's
+/// position in what the reader hands back.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct PointId(pub u8, pub i32);
+
+/// One adjacency entry as the reader parses it.
+///
+/// The target is named by where it sits rather than by its origin id, because
+/// the origin id is a property of the target point and the position already
+/// names it. The format the first six releases wrote spent eight bytes per
+/// entry recording it anyway and its own reload ignored them.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LoadedEdge {
+    /// where the target sits, being its layer and its rank within that layer
+    pub target: PointId,
+    /// distance from the point holding this entry to the target
+    pub distance: f32,
+}
+
+/// One point as the reader parses it.
+#[derive(Clone, Debug)]
+pub(super) struct LoadedPoint<T> {
+    /// the id the client inserted this point under
+    pub origin_id: usize,
+    /// the point's own copy of its data
+    pub data: Vec<T>,
+    /// adjacency by layer, lowest layer first. Fewer entries than
+    /// [`NB_LAYER_MAX`] is allowed and the layers beyond are taken as empty.
+    pub neighbours: Vec<Vec<LoadedEdge>>,
+}
 
 /// The one file a dump writes, and the one the loader reads.
 pub(crate) const DUMP_FILENAME: &str = "hnsw_index.zdbgraph";
@@ -552,10 +587,9 @@ pub(super) type EachNeighbourhood<'a> = &'a mut dyn FnMut(&[Vec<LoadedEdge>]) ->
 
 /// What the dump writer needs of a graph, in the order the file wants it.
 ///
-/// Two structures answer this. The vendored `Hnsw` does, because it is what
-/// ships today, and [`super::mutable::MutableGraph`] does, because it is what
-/// will ship. Neither shape is visible to the writer: it asks for the points of
-/// a layer in rank order, three times, once per region of the file.
+/// [`super::mutable::MutableGraph`] answers it, through the `DumpView` it hands
+/// out. The shape is not visible to the writer: it asks for the points of a
+/// layer in rank order, three times, once per region of the file.
 ///
 /// The regions are laid out one after another rather than interleaved per
 /// point, which is what lets the reader accept or reject the whole topology
@@ -592,95 +626,6 @@ pub(super) trait DumpSource<T> {
         layer: usize,
         f: &mut dyn FnMut(&[T]) -> Result<(), String>,
     ) -> Result<(), String>;
-}
-
-/// The vendored graph as a dump source, for the parity tests alone.
-///
-/// It is what wrote every dump ZeusDB has saved up to 0.6.0, and the tests still
-/// write one from it so that a file the vendored builder produced is read into
-/// ZeusDB's structure and compared. No shipped path reaches it.
-#[cfg(test)]
-impl<T, D> DumpSource<T> for Hnsw<'_, T, D>
-where
-    T: Clone + Send + Sync,
-    D: Distance<T> + Send + Sync,
-{
-    fn nb_point(&self) -> usize {
-        self.get_point_indexation().get_nb_point()
-    }
-
-    fn entry(&self) -> Option<PointId> {
-        self.get_point_indexation().get_entry_point_id()
-    }
-
-    fn layer_nb_point(&self, layer: usize) -> usize {
-        self.get_point_indexation().get_layer_nb_point(layer)
-    }
-
-    fn dimension(&self) -> usize {
-        self.get_point_indexation().get_data_dimension()
-    }
-
-    fn max_nb_connection(&self) -> usize {
-        self.get_max_nb_connection_full()
-    }
-
-    fn ef_construction(&self) -> usize {
-        Hnsw::get_ef_construction(self)
-    }
-
-    fn level_scale(&self) -> f64 {
-        self.get_point_indexation().get_level_scale()
-    }
-
-    fn each_origin_id(
-        &self,
-        layer: usize,
-        f: &mut dyn FnMut(usize) -> Result<(), String>,
-    ) -> Result<(), String> {
-        for point in self.get_point_indexation().get_layer_iterator(layer) {
-            f(point.get_origin_id())?;
-        }
-        Ok(())
-    }
-
-    fn each_neighbourhood(&self, layer: usize, f: EachNeighbourhood<'_>) -> Result<(), String> {
-        // `get_neighborhood_id` allocates a fresh vector per point, so the
-        // conversion into the writer's own edge type reuses one buffer rather
-        // than adding a second allocation per point.
-        let mut scratch: Vec<Vec<LoadedEdge>> = Vec::new();
-        for point in self.get_point_indexation().get_layer_iterator(layer) {
-            let neighbourhood = point.get_neighborhood_id();
-            while scratch.len() < neighbourhood.len() {
-                scratch.push(Vec::new());
-            }
-            for list in scratch.iter_mut() {
-                list.clear();
-            }
-            for (at, list) in neighbourhood.iter().enumerate() {
-                scratch[at].reserve(list.len());
-                for neighbour in list {
-                    scratch[at].push(LoadedEdge {
-                        target: neighbour.p_id,
-                        distance: neighbour.distance,
-                    });
-                }
-            }
-            f(&scratch[..neighbourhood.len()])?;
-        }
-        Ok(())
-    }
-
-    fn each_vector(
-        &self,
-        layer: usize,
-        f: &mut dyn FnMut(&[T]) -> Result<(), String>,
-    ) -> Result<(), String> {
-        for point in self.get_point_indexation().get_layer_iterator(layer) {
-            f(point.get_v())?;
-        }
-        Ok(())
-    }
 }
 
 pub(super) fn write_dump<T, S>(source: &S, kind: GraphKind, dir: &Path) -> Result<(), String>
@@ -868,10 +813,10 @@ pub(crate) struct Expected {
 /// A dump parsed back into the topology a graph constructor takes, with the
 /// parameters the header carried.
 ///
-/// Two consumers turn this into a graph. [`read_dump`] hands it to the vendored
-/// `Hnsw::from_loaded_points`, and the parity tests hand one parse to both that
-/// constructor and the flat structure in `flat.rs`, which is what lets the two
-/// be compared on a single topology rather than on two reads of one file.
+/// [`read_dump`] hands it to [`MutableGraph::from_loaded`]. It is a separate
+/// step from the construction because parsing and validating the file is a
+/// different job from building a structure out of it, and because the tests
+/// hand a single parse to more than one constructor call.
 pub(super) struct ParsedDump<T> {
     /// `points_by_layer[l][r]` is the point at rank `r` of layer `l`.
     pub points_by_layer: Vec<Vec<LoadedPoint<T>>>,
@@ -1271,9 +1216,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// Build a small graph the tests can round trip.
-    fn sample_graph(records: usize, dim: usize, m: usize) -> Hnsw<'static, f32, CosineDist> {
-        let hnsw: Hnsw<'static, f32, CosineDist> =
-            Hnsw::new(m, records.max(1), NB_LAYER_MAX as usize, 64, CosineDist {});
+    fn sample_graph(records: usize, dim: usize, m: usize) -> MutableGraph<f32, CosineDist> {
+        let scale = super::super::levels::LevelGenerator::default_scale(m);
+        let mut levels = super::super::levels::LevelGenerator::new(scale, NB_LAYER_MAX as usize);
+        let mut graph =
+            MutableGraph::new(dim, m, 64, scale, records.max(1), CosineDist {}).unwrap();
         // A cheap deterministic spread. The graph's shape does not matter here,
         // only that it has one and that the same call makes the same one.
         let mut state = 0x2545_f491_4f6c_dd1du64;
@@ -1286,9 +1233,9 @@ mod tests {
                     (state >> 40) as f32 / 16_777_216.0 - 0.5
                 })
                 .collect();
-            hnsw.insert((&vector, id));
+            graph.insert(&vector, id, &mut levels);
         }
-        hnsw
+        graph
     }
 
     /// The whole graph as plain values, for comparing one against another.
@@ -1300,36 +1247,6 @@ mod tests {
     /// list order.
     #[allow(clippy::type_complexity)]
     fn topology<D: Distance<f32> + Send + Sync>(
-        hnsw: &Hnsw<'_, f32, D>,
-    ) -> BTreeMap<usize, (u8, i32, Vec<u32>, Vec<Vec<(usize, u32)>>)> {
-        let indexation = hnsw.get_point_indexation();
-        let mut out = BTreeMap::new();
-        for layer in 0..NB_LAYER_MAX as usize {
-            for point in indexation.get_layer_iterator(layer) {
-                let p_id = point.get_point_id();
-                let values = point.get_v().iter().map(|v| v.to_bits()).collect();
-                let adjacency = point
-                    .get_neighborhood_id()
-                    .iter()
-                    .map(|list| {
-                        list.iter()
-                            .map(|n| (n.d_id, n.distance.to_bits()))
-                            .collect()
-                    })
-                    .collect();
-                out.insert(point.get_origin_id(), (p_id.0, p_id.1, values, adjacency));
-            }
-        }
-        out
-    }
-
-    /// The whole graph as plain values, from the structure the reader builds.
-    ///
-    /// The same shape `topology` produces from a vendored graph, so a dump
-    /// written from one and read into the other is compared on where each point
-    /// landed, what it holds and every edge it carries.
-    #[allow(clippy::type_complexity)]
-    fn mutable_topology<D: Distance<f32> + Send + Sync>(
         graph: &MutableGraph<f32, D>,
     ) -> BTreeMap<usize, (u8, i32, Vec<u32>, Vec<Vec<(usize, u32)>>)> {
         let point_ids = graph.point_ids();
@@ -1367,12 +1284,12 @@ mod tests {
         }
     }
 
-    fn expected_for(hnsw: &Hnsw<'_, f32, CosineDist>, dim: usize, nodes: usize) -> Expected {
+    fn expected_for(graph: &MutableGraph<f32, CosineDist>, dim: usize, nodes: usize) -> Expected {
         Expected {
             kind: GraphKind::Cosine,
             dimension: dim,
-            m: hnsw.get_max_nb_connection_full(),
-            ef_construction: hnsw.get_ef_construction(),
+            m: graph.m(),
+            ef_construction: graph.ef_construction(),
             min_nodes: nodes,
         }
     }
@@ -1381,25 +1298,19 @@ mod tests {
     fn a_round_trip_reproduces_every_node_and_every_edge() {
         let dir = tempfile::tempdir().unwrap();
         let built = sample_graph(600, 12, 16);
-        write_dump(&built, GraphKind::Cosine, dir.path()).unwrap();
+        write_dump(&built.dump_view(), GraphKind::Cosine, dir.path()).unwrap();
         let expected = expected_for(&built, 12, 600);
         let read: MutableGraph<f32, CosineDist> =
             read_dump(dir.path(), &expected, CosineDist {}).unwrap();
 
-        assert_eq!(read.nb_points(), built.get_nb_point());
+        assert_eq!(read.nb_points(), built.nb_points());
         assert_eq!(read.m(), 16);
-        assert_eq!(read.ef_construction(), built.get_ef_construction());
-        assert_eq!(
-            read.level_scale(),
-            built.get_point_indexation().get_level_scale()
-        );
-        assert_eq!(
-            Some(read.entry_point_id()),
-            built.get_point_indexation().get_entry_point_id()
-        );
+        assert_eq!(read.ef_construction(), built.ef_construction());
+        assert_eq!(read.level_scale(), built.level_scale());
+        assert_eq!(read.entry_point_id(), built.entry_point_id());
 
         let before = topology(&built);
-        let after = mutable_topology(&read);
+        let after = topology(&read);
         assert_eq!(before.len(), after.len());
         let mut differing_nodes = 0;
         let mut differing_edges = 0;
@@ -1423,7 +1334,7 @@ mod tests {
         let one = tempfile::tempdir().unwrap();
         let two = tempfile::tempdir().unwrap();
         let built = sample_graph(300, 8, 16);
-        write_dump(&built, GraphKind::Cosine, one.path()).unwrap();
+        write_dump(&built.dump_view(), GraphKind::Cosine, one.path()).unwrap();
         let expected = expected_for(&built, 8, 300);
         let read: MutableGraph<f32, CosineDist> =
             read_dump(one.path(), &expected, CosineDist {}).unwrap();
@@ -1436,18 +1347,18 @@ mod tests {
 
     #[test]
     fn m_at_the_top_of_the_range_survives() {
-        // 256 is what `Hnsw::new` admits and what the vendored header, a u8,
+        // 256 is what the index admits and what the vendored header, a u8,
         // recorded as 0.
         for m in [2usize, 16, 255, 256] {
             let dir = tempfile::tempdir().unwrap();
             let built = sample_graph(120, 6, m);
-            assert_eq!(built.get_max_nb_connection_full(), m);
-            write_dump(&built, GraphKind::Cosine, dir.path()).unwrap();
+            assert_eq!(built.m(), m);
+            write_dump(&built.dump_view(), GraphKind::Cosine, dir.path()).unwrap();
             let expected = expected_for(&built, 6, 120);
             let read: MutableGraph<f32, CosineDist> =
                 read_dump(dir.path(), &expected, CosineDist {}).unwrap();
             assert_eq!(read.m(), m);
-            assert_eq!(topology(&built), mutable_topology(&read));
+            assert_eq!(topology(&built), topology(&read));
         }
     }
 
@@ -1455,7 +1366,7 @@ mod tests {
     fn damaged(mutate: impl FnOnce(Vec<u8>) -> Vec<u8>) -> String {
         let dir = tempfile::tempdir().unwrap();
         let built = sample_graph(200, 6, 16);
-        write_dump(&built, GraphKind::Cosine, dir.path()).unwrap();
+        write_dump(&built.dump_view(), GraphKind::Cosine, dir.path()).unwrap();
         let path = dir.path().join(DUMP_FILENAME);
         let blob = std::fs::read(&path).unwrap();
         std::fs::write(&path, mutate(blob)).unwrap();
@@ -1531,7 +1442,7 @@ mod tests {
             std::fs::write(dir.path().join(legacy), vec![7u8; 4096]).unwrap();
         }
         let built = sample_graph(100, 5, 16);
-        write_dump(&built, GraphKind::Cosine, dir.path()).unwrap();
+        write_dump(&built.dump_view(), GraphKind::Cosine, dir.path()).unwrap();
 
         let left: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -1541,7 +1452,7 @@ mod tests {
 
         // And a save into a directory that never held them is unbothered.
         let clean = tempfile::tempdir().unwrap();
-        write_dump(&built, GraphKind::Cosine, clean.path()).unwrap();
+        write_dump(&built.dump_view(), GraphKind::Cosine, clean.path()).unwrap();
         assert!(clean.path().join(DUMP_FILENAME).exists());
     }
 
@@ -1574,7 +1485,7 @@ mod tests {
     fn a_header_claiming_a_billion_points_allocates_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let built = sample_graph(80, 4, 16);
-        write_dump(&built, GraphKind::Cosine, dir.path()).unwrap();
+        write_dump(&built.dump_view(), GraphKind::Cosine, dir.path()).unwrap();
         let path = dir.path().join(DUMP_FILENAME);
         let blob = std::fs::read(&path).unwrap();
 
@@ -1617,7 +1528,7 @@ mod tests {
     fn a_dump_written_for_another_configuration_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let built = sample_graph(120, 6, 16);
-        write_dump(&built, GraphKind::Cosine, dir.path()).unwrap();
+        write_dump(&built.dump_view(), GraphKind::Cosine, dir.path()).unwrap();
 
         let refuse = |expected: &Expected| {
             refused(read_dump::<f32, CosineDist>(
