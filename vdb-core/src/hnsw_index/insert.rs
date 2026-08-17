@@ -7,7 +7,7 @@
 //! the graph nodes that removal and replacement leave behind.
 
 use super::{HNSWIndex, ParsedRecords, StorageMode, MAX_LAYER};
-use crate::graph::VectorGraph;
+use crate::graph::{Record, VectorGraph};
 use pyo3::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -86,6 +86,58 @@ impl HNSWIndex {
              recall matters. This warning fires once.",
             EXPECTED_SIZE_OVERGROWTH_FACTOR
         );
+    }
+
+    /// Put one record into the graph, in the two phases the graph splits an
+    /// insertion into.
+    ///
+    /// ```text
+    /// hnsw.read()   draw the level, descend, choose the neighbour lists
+    ///   drop
+    /// hnsw.write()  append the node, install its lists, update the reverse links
+    /// ```
+    ///
+    /// This is the only caller that takes the graph lock twice for one
+    /// operation, and it is the only one that needs to. The three rebuild paths
+    /// each fill a local graph nobody else can reach and swap it in under one
+    /// write guard, so they insert with no lock held at all.
+    ///
+    /// # Why the split
+    ///
+    /// Phase one is where an insertion spends its time. It runs the traversal at
+    /// `ef_construction` per layer, which is the same work a search does several
+    /// times over, and it writes nothing. Phase two is a fixed number of memory
+    /// operations, roughly `m * 2 * m`. Holding the write guard across both
+    /// would block every concurrent search for the whole of an insertion, which
+    /// at 50,000 records of dimension 1,536 is on the order of a millisecond
+    /// against a search mean near one. Holding it across phase two alone is what
+    /// keeps the concurrent search figure an earlier relay established.
+    ///
+    /// # Why it is sound
+    ///
+    /// Nothing can change the graph between the two phases. `writers` is taken
+    /// by every mutating Python entry point before any guard, and this runs
+    /// inside it, so the only thread that could append a node, replace the graph
+    /// or rebuild it is this one. Searches run in the gap and do not mutate.
+    /// What the plan carries is owned outright, so no borrow of the read guard
+    /// survives it, and `VectorGraph::install` asserts the node count the plan
+    /// was made against rather than taking that argument on trust.
+    ///
+    /// # The lock order
+    ///
+    /// Both guards are taken with no other guard held. The three storage maps
+    /// this record has already been written to were each taken and released in
+    /// their own block above, so `hnsw` is acquired alone, which satisfies the
+    /// order declared on `HNSWIndex` whichever way it is read.
+    fn insert_one(&self, record: Record<'_>, internal_id: usize) {
+        let planned = {
+            let hnsw_guard = self.hnsw.read().unwrap();
+            hnsw_guard.plan(record)
+        };
+        if let Some(planned) = planned {
+            let mut hnsw_guard = self.hnsw.write().unwrap();
+            hnsw_guard.install(record, internal_id, planned);
+        }
     }
 
     /// Get next available internal ID
@@ -211,7 +263,7 @@ impl HNSWIndex {
 
         let quantized = self.is_quantized();
 
-        let new_hnsw = if quantized {
+        let mut new_hnsw = if quantized {
             let pq = self.pq.as_ref().cloned().ok_or_else(|| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                     "Index reports a quantized graph but holds no product quantizer",
@@ -228,6 +280,7 @@ impl HNSWIndex {
         } else {
             VectorGraph::new_raw(
                 &self.space,
+                self.dim,
                 self.m,
                 self.expected_size,
                 MAX_LAYER,
@@ -348,8 +401,8 @@ impl HNSWIndex {
     ///   `rebuild_with_quantization_locked`
     /// - `PQ::is_trained`, `quantize`, `quantize_batch` and `train`, plus the
     ///   k-means below `train`
-    /// - `VectorGraph::insert`, `insert_pq_codes`, `insert_batch_pq`,
-    ///   `new_pq` and `nb_points`, and the vendored `hnsw_rs` graph below them
+    /// - `VectorGraph::plan`, `install`, `insert`, `insert_batch_pq`, `new_pq`
+    ///   and `nb_points`, and the graph structure in `graph::mutable` below them
     ///
     /// None of them takes a `Python` token, and none of them calls into the
     /// interpreter. `pq.rs`, `distance.rs` and the vendored crate name PyO3
@@ -596,11 +649,9 @@ impl HNSWIndex {
             vectors.insert(id.clone(), vector.clone()); // Already normalized
         }
 
-        // Insert processed vector into HNSW
-        {
-            let hnsw_guard = self.hnsw.read().unwrap();
-            hnsw_guard.insert(&vector, internal_id); // Already normalized
-        }
+        // Insert processed vector into HNSW, in the two phases the graph splits
+        // an insertion into. See `insert_one`.
+        self.insert_one(Record::Raw(&vector), internal_id); // Already normalized
 
         trace!(
             operation = "add_raw_vector_complete",
@@ -765,11 +816,9 @@ impl HNSWIndex {
             // If QuantizedOnly mode, we don't store raw vectors (saves memory)
         }
 
-        // Insert codes into quantized HNSW
-        {
-            let hnsw_guard = self.hnsw.read().unwrap();
-            hnsw_guard.insert_pq_codes(&codes, internal_id);
-        }
+        // Insert codes into quantized HNSW, in the two phases the graph splits
+        // an insertion into. See `insert_one`.
+        self.insert_one(Record::Codes(&codes), internal_id);
 
         trace!(
             operation = "add_quantized_vector_complete",

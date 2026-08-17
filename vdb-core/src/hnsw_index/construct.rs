@@ -360,6 +360,7 @@ impl HNSWIndex {
         // Create initial raw HNSW index (will be rebuilt as PQ after training)
         let hnsw = VectorGraph::new_raw(
             &space_normalized,
+            dim,
             m,
             expected_size,
             MAX_LAYER,
@@ -422,6 +423,7 @@ impl HNSWIndex {
         let space_normalized = space.to_lowercase();
         let hnsw = VectorGraph::new_raw(
             &space_normalized,
+            dim,
             m,
             expected_size,
             MAX_LAYER,

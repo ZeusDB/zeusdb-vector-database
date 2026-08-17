@@ -104,6 +104,10 @@ use hnsw_rs::hnsw::{LoadedEdge, LoadedPoint, PointId};
 
 mod insert;
 
+/// What phase one hands phase two, re-exported so the seam can name it without
+/// the arena's own module being visible outside `mutable`.
+pub(crate) use insert::Planned;
+
 /// Naming no upper list, which is every node whose span is zero.
 const NO_UPPER: u32 = u32::MAX;
 
@@ -113,6 +117,50 @@ const NO_UPPER: u32 = u32::MAX;
 /// hold exactly one entry for the life of the graph. The two that grow are
 /// widened to `m + 1` on the push that overflows them.
 const ABOVE_LEVEL_CAP: usize = 1;
+
+/// Bytes the creation-time reservation may ask the allocator for.
+///
+/// `Vec::with_capacity` aborts the process on allocation failure rather than
+/// unwinding, so a reservation too large for the machine cannot be turned into a
+/// Python exception after the fact. `expected_size` is a hint that bounds no
+/// behaviour, so capping what it reserves costs a caller nothing beyond the
+/// reallocations of a build larger than this budget. See [`MutableGraph::new`].
+///
+/// 128 mebibytes holds 20,557 records at dimension 1,536 and `m` 16, 149,796 at
+/// dimension 128, and 385,675 at the dimension 8 that
+/// `test_empty_index_at_a_large_declared_size_stays_under_the_bound` declares
+/// five million records at. That test is what fixes the order of magnitude: it
+/// requires an empty index to commit under 256 MB and under 64 bytes per
+/// declared record whatever it declares, and this budget is what keeps both true
+/// now that a declared record reserves the graph's own copy of its vector rather
+/// than one pointer.
+///
+/// What it costs is reallocation on a build past the budget. The arenas grow
+/// geometrically, so a 50,000 record build at dimension 1,536 crosses it twice
+/// and moves roughly 400 MB in total, against a build that takes 70 seconds.
+pub(super) const RESERVE_BYTES: usize = 1 << 27;
+
+/// Records the reservation is taken for, being `expected_size` or as many as
+/// [`RESERVE_BYTES`] holds, whichever is smaller.
+///
+/// The per record cost is the whole of what [`MutableGraph::new`] reserves, in
+/// step with what [`MutableGraph::memory_bytes`] prices: the six per node
+/// arrays, the graph's own copy of the vector, the layer zero slab at both its
+/// arrays, and one upper list descriptor and slot per expected span.
+pub(super) fn reserved_records<T>(
+    dim: usize,
+    base_cap: usize,
+    span: usize,
+    expected_size: usize,
+) -> usize {
+    const PER_NODE_ARRAYS: usize = 8 + 1 + 2 + 4 + 4 + 1;
+    const PER_UPPER_LIST: usize = 4 + 2 + 2 + 4 + 4 + 4;
+    let per_record = PER_NODE_ARRAYS
+        + dim * std::mem::size_of::<T>()
+        + base_cap * (std::mem::size_of::<u32>() + std::mem::size_of::<f32>())
+        + span * PER_UPPER_LIST;
+    expected_size.min((RESERVE_BYTES / per_record.max(1)).max(1))
+}
 
 /// Upper lists a node of a graph this size is expected to own, which is the
 /// entry level such a graph reaches rather than the expected level of one node.
@@ -523,9 +571,28 @@ where
     /// layer zero slab at `(2m + 1) * 8` is nearly all; the unpatched vendored
     /// reservation this replaces cost 3,025 bytes per unused record.
     ///
-    /// The upper arena is reserved at `1 / (m - 1)` lists per node, which is
-    /// the expected level count under the default scale rather than a bound, so
-    /// it is the one region a build routinely grows past.
+    /// The upper arena is reserved at one list per expected span per node,
+    /// which is the entry level a graph this size reaches rather than a bound,
+    /// so it is the one region a build routinely grows past.
+    ///
+    /// # The reservation is capped in bytes
+    ///
+    /// A declared record costs far more here than it did in the structure this
+    /// replaces, because the reservation covers the graph's own copy of the
+    /// vector and its layer zero slab where the vendored one covered a single
+    /// `Arc` slot. Relay 44 measured that at 8.02 bytes per declared record and
+    /// capped `expected_size` at 100 million on the strength of it, which put
+    /// the creation-time reservation at 764 MB. The same declaration here at
+    /// dimension 1,536 asks for 653 GB, and `Vec::with_capacity` aborts the
+    /// process on allocation failure rather than unwinding, so that is a
+    /// declaration a caller could make and never see an exception for.
+    ///
+    /// [`RESERVE_BYTES`] is what stops it. The reservation is taken for as many
+    /// records as fit in that budget and no more, and a build that passes the
+    /// budget grows geometrically from there exactly as one that passed
+    /// `expected_size` would. A caller cannot observe the difference except in
+    /// the reallocations of a build larger than the budget, which is the trade
+    /// made in place of aborting.
     pub(super) fn new(
         dim: usize,
         m: usize,
@@ -554,8 +621,11 @@ where
         // node ends up owning a list at every layer from one up to the entry
         // level, because the descent files one there, so the arena is sized by
         // the entry level a graph of `expected_size` points reaches rather than
-        // by the far smaller expected level.
-        let upper_lists = expected_size * expected_span(m, expected_size);
+        // by the far smaller expected level. It is a property of the declared
+        // size rather than of the reservation, so it is taken before the cap.
+        let span = expected_span(m, expected_size);
+        let reserved = reserved_records::<T>(dim, base_cap, span, expected_size);
+        let upper_lists = reserved * span;
         Ok(MutableGraph {
             dim,
             m,
@@ -564,15 +634,15 @@ where
             entry: 0,
             entry_level: 0,
             layer_counts: [0u32; LAYERS],
-            origin_ids: Vec::with_capacity(expected_size),
-            levels: Vec::with_capacity(expected_size),
-            data: Vec::with_capacity(expected_size * dim),
-            base_targets: Vec::with_capacity(expected_size * base_cap),
-            base_dists: Vec::with_capacity(expected_size * base_cap),
-            base_len: Vec::with_capacity(expected_size),
-            base_in_degree: Vec::with_capacity(expected_size),
-            upper_first: Vec::with_capacity(expected_size),
-            upper_span: Vec::with_capacity(expected_size),
+            origin_ids: Vec::with_capacity(reserved),
+            levels: Vec::with_capacity(reserved),
+            data: Vec::with_capacity(reserved * dim),
+            base_targets: Vec::with_capacity(reserved * base_cap),
+            base_dists: Vec::with_capacity(reserved * base_cap),
+            base_len: Vec::with_capacity(reserved),
+            base_in_degree: Vec::with_capacity(reserved),
+            upper_first: Vec::with_capacity(reserved),
+            upper_span: Vec::with_capacity(reserved),
             upper_at: Vec::with_capacity(upper_lists),
             upper_len: Vec::with_capacity(upper_lists),
             upper_cap: Vec::with_capacity(upper_lists),
@@ -687,11 +757,30 @@ where
         self.levels[node as usize]
     }
 
+    /// The id one node was inserted under, which is what two structures holding
+    /// the same graph agree on where their node indices do not.
+    pub(super) fn origin_id_of(&self, node: u32) -> usize {
+        self.origin_ids[node as usize]
+    }
+
     /// Where the traversal starts, as (layer, rank), which is what a dump
     /// records.
     pub(super) fn entry_point_id(&self) -> PointId {
         let order = DumpOrder::of(self);
         PointId(self.entry_level, order.rank[self.entry as usize] as i32)
+    }
+
+    /// Where every node sits, as a dump names it, in node order.
+    ///
+    /// The structure's own node order is the order nodes arrived, so this is
+    /// the one place the dump's positional identity is readable from outside a
+    /// save. It exists so a round trip can be compared on where each point
+    /// landed and not only on what each point holds.
+    pub(super) fn point_ids(&self) -> Vec<PointId> {
+        let order = DumpOrder::of(self);
+        (0..self.origin_ids.len() as u32)
+            .map(|node| order.point_id(self, node))
+            .collect()
     }
 
     /// The stored vector of one node.

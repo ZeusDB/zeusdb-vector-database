@@ -93,8 +93,15 @@
 //! unreadable by construction and reaches the rebuild rather than being read as
 //! though it were whole.
 
+use super::mutable::MutableGraph;
 use hnsw_rs::hnsw::{LoadedEdge, LoadedPoint, PointId, NB_LAYER_MAX};
-use hnsw_rs::prelude::{Distance, Hnsw};
+use hnsw_rs::prelude::Distance;
+// The vendored graph is a dump source only for the parity tests, which write a
+// dump from one and read it into the other. Nothing on a shipped path writes a
+// vendored graph any more, so the implementation below is compiled only where
+// something calls it.
+#[cfg(test)]
+use hnsw_rs::prelude::Hnsw;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -587,6 +594,12 @@ pub(super) trait DumpSource<T> {
     ) -> Result<(), String>;
 }
 
+/// The vendored graph as a dump source, for the parity tests alone.
+///
+/// It is what wrote every dump ZeusDB has saved up to 0.6.0, and the tests still
+/// write one from it so that a file the vendored builder produced is read into
+/// ZeusDB's structure and compared. No shipped path reaches it.
+#[cfg(test)]
 impl<T, D> DumpSource<T> for Hnsw<'_, T, D>
 where
     T: Clone + Send + Sync,
@@ -880,18 +893,18 @@ pub(super) struct ParsedDump<T> {
 /// Every failure is an error and none is a panic, an exit or an allocation from
 /// a length the file has not earned. The parsing itself is [`parse_dump`], and
 /// this wraps it in the one construction call ZeusDB ships.
-pub(crate) fn read_dump<T, D>(
+pub(super) fn read_dump<T, D>(
     dir: &Path,
     expected: &Expected,
     dist: D,
-) -> Result<Hnsw<'static, T, D>, String>
+) -> Result<MutableGraph<T, D>, String>
 where
     T: DumpElement,
     D: Distance<T> + Send + Sync,
 {
     let parsed = parse_dump::<T>(dir, expected)?;
     let nb_point = parsed.nb_point;
-    let hnsw = Hnsw::from_loaded_points(
+    let graph = MutableGraph::from_loaded(
         parsed.points_by_layer,
         parsed.entry,
         parsed.m,
@@ -901,14 +914,14 @@ where
     )
     .map_err(|e| format!("the graph dump could not be rebuilt: {}", e))?;
 
-    let restored = hnsw.get_nb_point();
+    let restored = graph.nb_points();
     if restored != nb_point {
         return Err(format!(
             "the graph dump declares {} nodes and yielded {}",
             nb_point, restored
         ));
     }
-    Ok(hnsw)
+    Ok(graph)
 }
 
 /// Parse a dump into the topology and parameters it carries, building nothing.
@@ -1310,9 +1323,40 @@ mod tests {
         out
     }
 
-    /// The reason a read was refused. `Hnsw` is not `Debug`, so `unwrap_err`
+    /// The whole graph as plain values, from the structure the reader builds.
+    ///
+    /// The same shape `topology` produces from a vendored graph, so a dump
+    /// written from one and read into the other is compared on where each point
+    /// landed, what it holds and every edge it carries.
+    #[allow(clippy::type_complexity)]
+    fn mutable_topology<D: Distance<f32> + Send + Sync>(
+        graph: &MutableGraph<f32, D>,
+    ) -> BTreeMap<usize, (u8, i32, Vec<u32>, Vec<Vec<(usize, u32)>>)> {
+        let point_ids = graph.point_ids();
+        let mut out = BTreeMap::new();
+        for node in 0..graph.nb_points() as u32 {
+            let p_id = point_ids[node as usize];
+            let values = graph.vector(node).iter().map(|v| v.to_bits()).collect();
+            let adjacency = graph
+                .neighbourhood_ids(node)
+                .iter()
+                .map(|list| {
+                    list.iter()
+                        .map(|&(id, distance)| (id, distance.to_bits()))
+                        .collect()
+                })
+                .collect();
+            out.insert(
+                graph.origin_id_of(node),
+                (p_id.0, p_id.1, values, adjacency),
+            );
+        }
+        out
+    }
+
+    /// The reason a read was refused. Neither graph is `Debug`, so `unwrap_err`
     /// and `expect_err` are both out of reach.
-    fn refused<T, D>(result: Result<Hnsw<'static, T, D>, String>) -> String
+    fn refused<T, D>(result: Result<MutableGraph<T, D>, String>) -> String
     where
         T: DumpElement,
         D: Distance<T> + Send + Sync,
@@ -1339,23 +1383,23 @@ mod tests {
         let built = sample_graph(600, 12, 16);
         write_dump(&built, GraphKind::Cosine, dir.path()).unwrap();
         let expected = expected_for(&built, 12, 600);
-        let read: Hnsw<'static, f32, CosineDist> =
+        let read: MutableGraph<f32, CosineDist> =
             read_dump(dir.path(), &expected, CosineDist {}).unwrap();
 
-        assert_eq!(read.get_nb_point(), built.get_nb_point());
-        assert_eq!(read.get_max_nb_connection_full(), 16);
-        assert_eq!(read.get_ef_construction(), built.get_ef_construction());
+        assert_eq!(read.nb_points(), built.get_nb_point());
+        assert_eq!(read.m(), 16);
+        assert_eq!(read.ef_construction(), built.get_ef_construction());
         assert_eq!(
-            read.get_point_indexation().get_level_scale(),
+            read.level_scale(),
             built.get_point_indexation().get_level_scale()
         );
         assert_eq!(
-            read.get_point_indexation().get_entry_point_id(),
+            Some(read.entry_point_id()),
             built.get_point_indexation().get_entry_point_id()
         );
 
         let before = topology(&built);
-        let after = topology(&read);
+        let after = mutable_topology(&read);
         assert_eq!(before.len(), after.len());
         let mut differing_nodes = 0;
         let mut differing_edges = 0;
@@ -1381,9 +1425,9 @@ mod tests {
         let built = sample_graph(300, 8, 16);
         write_dump(&built, GraphKind::Cosine, one.path()).unwrap();
         let expected = expected_for(&built, 8, 300);
-        let read: Hnsw<'static, f32, CosineDist> =
+        let read: MutableGraph<f32, CosineDist> =
             read_dump(one.path(), &expected, CosineDist {}).unwrap();
-        write_dump(&read, GraphKind::Cosine, two.path()).unwrap();
+        write_dump(&read.dump_view(), GraphKind::Cosine, two.path()).unwrap();
         assert_eq!(
             std::fs::read(one.path().join(DUMP_FILENAME)).unwrap(),
             std::fs::read(two.path().join(DUMP_FILENAME)).unwrap()
@@ -1400,10 +1444,10 @@ mod tests {
             assert_eq!(built.get_max_nb_connection_full(), m);
             write_dump(&built, GraphKind::Cosine, dir.path()).unwrap();
             let expected = expected_for(&built, 6, 120);
-            let read: Hnsw<'static, f32, CosineDist> =
+            let read: MutableGraph<f32, CosineDist> =
                 read_dump(dir.path(), &expected, CosineDist {}).unwrap();
-            assert_eq!(read.get_max_nb_connection_full(), m);
-            assert_eq!(topology(&built), topology(&read));
+            assert_eq!(read.m(), m);
+            assert_eq!(topology(&built), mutable_topology(&read));
         }
     }
 

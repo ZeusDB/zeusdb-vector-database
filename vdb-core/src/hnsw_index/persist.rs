@@ -226,7 +226,7 @@ impl HNSWIndex {
         // are handed in a fixed order rather than in hash map order.
         extra.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let new_hnsw = VectorGraph::new_pq(
+        let mut new_hnsw = VectorGraph::new_pq(
             &self.space,
             self.m,
             self.expected_size,

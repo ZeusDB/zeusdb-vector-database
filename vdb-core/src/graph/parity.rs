@@ -15,12 +15,14 @@
 //! holds. They are ignored because they need those artifacts, not because they
 //! are optional.
 
-use super::dump::{parse_dump, write_dump, DumpElement, Expected, GraphKind, ParsedDump};
+use super::dump::{
+    parse_dump, write_dump, DumpElement, Expected, GraphKind, ParsedDump, DUMP_FILENAME,
+};
 use super::flat::FlatGraph;
 use super::levels::{LevelGenerator, DEFAULT_LEVEL_SEED};
-use super::mutable::MutableGraph;
-use super::traverse::Topology;
-use super::{Distance, GraphHit};
+use super::mutable::{reserved_records, MutableGraph, RESERVE_BYTES};
+use super::traverse::{Topology, LAYERS};
+use super::{Distance, GraphHit, VectorGraph};
 use crate::distance::{CosineDist, L1Dist, L2Dist};
 use crate::hnsw_index::DistPQ;
 use crate::pq::PQ;
@@ -30,6 +32,162 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 type BoxedFilter = Box<dyn Fn(&usize) -> bool>;
+
+// ============================================================================
+// WHAT THE VENDORED STRUCTURE HOLDS
+// ============================================================================
+
+/// Bytes an `Arc<T>` allocation carries beyond `T`, being the strong and the
+/// weak count.
+const ARC_COUNTS_BYTES: usize = 2 * std::mem::size_of::<usize>();
+
+/// Bytes a `Vec<T>` header occupies, being a pointer, a capacity and a length.
+const VEC_HEADER_BYTES: usize = 3 * std::mem::size_of::<usize>();
+
+/// Bytes `parking_lot::RwLock<()>` occupies, being one `AtomicUsize`.
+const PARKING_LOT_LOCK_BYTES: usize = std::mem::size_of::<usize>();
+
+/// The capacity `Vec::push` gives a buffer it has just allocated for the first
+/// time. `RawVec::MIN_NON_ZERO_CAP` is 4 for an element of 8 bytes.
+const MIN_VEC_CAP: usize = 4;
+
+/// Points whose neighbour lists the vendored memory figure is measured over.
+///
+/// The adjacency count is a property of the data rather than of `m`, so it is
+/// sampled rather than derived. The sample is taken by striding the point
+/// enumeration, which is insertion order within a layer, because a prefix would
+/// be all early records and an early record has taken more reverse links than a
+/// late one.
+const GRAPH_SAMPLE_POINTS: usize = 4096;
+
+/// Layer indices the figure asks the graph about.
+///
+/// The vendored crate fixes the layer count at `NB_LAYER_MAX`, which is 16 and
+/// is `pub(crate)`, and `get_layer_nb_point` answers zero for an index it does
+/// not have. Probing past the end therefore costs one lock and no correctness.
+const GRAPH_LAYER_PROBE: usize = 32;
+
+/// Layer `Vec` headers a point carries when nothing was sampled to count them.
+const GRAPH_LAYERS_FALLBACK: usize = 16;
+
+/// What the vendored HNSW graph holds, in bytes it has asked the allocator for.
+///
+/// This priced the shipped graph until the cutover and now prices the reference
+/// one, which is why it lives here rather than at the seam. The shipped figure
+/// is `MutableGraph::memory_bytes`, which is exact arithmetic over known
+/// capacities where this has to sample.
+///
+/// # Per point
+///
+/// The graph owns a second copy of every point, separate from the storage map,
+/// and it is `dim * 4` bytes in a raw graph and `subvectors` bytes in a
+/// quantized one. That copy is one allocation. Around it the vendored crate
+/// carries five more, all of them fixed and none of them proportional to the
+/// dimension.
+///
+/// ```text
+///   Arc<Point<T>>                              16 + size_of::<Point<T>>()
+///   the point's own data vector                dim * 4, or subvectors
+///   Arc<RwLock<Vec<Vec<Arc<PointWithOrder>>>>>  16 + 8 + 24
+///   sixteen layer Vec headers                  16 * 24
+///   its Arc slot in points_by_layer            8
+/// ```
+///
+/// `Point` is 112 bytes on a 64 bit target, being a 24 byte `PointData` enum,
+/// a `DataId`, a `PointId`, the `Arc` to the neighbour lists and a 64 byte
+/// `[AtomicU32; 16]` of in-degree counters. `size_of` is taken rather than
+/// written down. The sixteen layer headers are allocated for every point
+/// whatever level it was drawn at, because `Point::new` fills the outer `Vec`
+/// to `NB_LAYER_MAX` before it knows anything about the point.
+///
+/// # Per adjacency entry
+///
+/// Every entry in a neighbour list is an `Arc<PointWithOrder>`, which is 16
+/// bytes of `Arc` counts around a pointer to the target and an `f32` distance,
+/// and a pointer slot in the list itself.
+///
+/// **The number of entries is a property of the data and not of `m`.** Layer
+/// zero caps a list at `2 * m` and the crate does fill it on data with no
+/// structure, measured at exactly 32.000 entries per point at `m` 16 and
+/// exactly 64.000 at `m` 32 over 40,000 uniform points on the sphere. Real
+/// embeddings do not fill it, because `select_neighbours` prunes a candidate
+/// that sits closer to an already chosen neighbour than to the query and
+/// clustered data gives it far more to prune. **A count derived from `m` alone
+/// is 2.03 times the truth** at 50,000 records of dimension 1,536. So the entry
+/// count is measured over `GRAPH_SAMPLE_POINTS` points and scaled.
+///
+/// A list holds more slots than entries. It is filled once by `clone_from`,
+/// which sizes it exactly, and grown afterwards by the reverse link updates,
+/// which double it.
+fn graph_memory_bytes<T, D>(hnsw: &Hnsw<'_, T, D>) -> usize
+where
+    T: Clone + Send + Sync + 'static,
+    D: Distance<T> + Send + Sync,
+{
+    let indexation = hnsw.get_point_indexation();
+    let nb_point = indexation.get_nb_point();
+    if nb_point == 0 {
+        return 0;
+    }
+
+    let element_bytes = indexation.get_data_dimension() * std::mem::size_of::<T>();
+    let point_bytes = ARC_COUNTS_BYTES + std::mem::size_of::<hnsw_rs::hnsw::Point<'static, T>>();
+    let neighbour_cell_bytes = ARC_COUNTS_BYTES + PARKING_LOT_LOCK_BYTES + VEC_HEADER_BYTES;
+    // `PointWithOrder` is a pointer to the target and an `f32` distance, and it
+    // is padded to the pointer's alignment, so it is two words rather than one
+    // and a half. It is `pub(crate)` in the vendored crate, so its size is
+    // written out rather than taken.
+    let entry_bytes = ARC_COUNTS_BYTES + 2 * std::mem::size_of::<usize>();
+    let slot_bytes = std::mem::size_of::<usize>();
+
+    // The adjacency, over a strided sample. `get_neighborhood_id` is the only
+    // way out of the crate and it reallocates, so it is not called on every
+    // point of a large graph. One layer at a time, and never two iterators at
+    // once, because each iterator holds a read guard on `points_by_layer` for
+    // its whole life.
+    let layer_counts: Vec<usize> = (0..GRAPH_LAYER_PROBE)
+        .map(|layer| indexation.get_layer_nb_point(layer))
+        .collect();
+
+    let stride = nb_point.div_ceil(GRAPH_SAMPLE_POINTS).max(1);
+    let mut seen = 0usize;
+    let mut sampled = 0usize;
+    let mut adjacency = 0usize;
+    let mut layers = 0usize;
+    for (index, count) in layer_counts.iter().enumerate() {
+        if *count == 0 {
+            continue;
+        }
+        for point in indexation.get_layer_iterator(index) {
+            let take = seen.is_multiple_of(stride);
+            seen += 1;
+            if !take {
+                continue;
+            }
+            let neighbourhood = point.get_neighborhood_id();
+            layers = layers.max(neighbourhood.len());
+            for list in &neighbourhood {
+                if list.is_empty() {
+                    continue;
+                }
+                let capacity = (2 * list.len()).max(MIN_VEC_CAP);
+                adjacency += capacity * slot_bytes + list.len() * entry_bytes;
+            }
+            sampled += 1;
+        }
+    }
+
+    if layers == 0 {
+        layers = GRAPH_LAYERS_FALLBACK;
+    }
+    let fixed =
+        point_bytes + element_bytes + neighbour_cell_bytes + layers * VEC_HEADER_BYTES + slot_bytes;
+    let mut total = nb_point * fixed;
+    if sampled > 0 {
+        total += ((adjacency as f64 / sampled as f64) * nb_point as f64).round() as usize;
+    }
+    total
+}
 
 // ============================================================================
 // COMPARISON CORE
@@ -1864,6 +2022,84 @@ fn the_level_seed_resets_both_generators() {
     compare_streams("reseeded", 4.0, 5_000, 137, Some(0x0102_0304_0506_0708));
 }
 
+/// The creation-time reservation is capped in bytes.
+///
+/// `Vec::with_capacity` aborts the process on allocation failure rather than
+/// unwinding, so the largest declaration `HNSWIndex::build` admits has to be
+/// bounded before it is reached rather than caught afterwards. Checked over the
+/// arithmetic rather than by taking the allocation, since taking it is the thing
+/// being prevented.
+#[test]
+fn the_reservation_is_capped_in_bytes() {
+    // What `MAX_EXPECTED_SIZE` admits, at the dimension the shipped indexes run
+    // at and the degree they run at, whose expected span is 5.
+    let declared = 100_000_000usize;
+    let per_record = 20 + 1536 * 4 + 33 * 8 + 5 * 20;
+    let reserved = reserved_records::<f32>(1536, 33, 5, declared);
+    let uncapped = declared * per_record;
+    let capped = reserved * per_record;
+    println!(
+        "expected_size {} would reserve {} bytes and reserves {} for {} records",
+        declared, uncapped, capped, reserved
+    );
+    assert!(
+        uncapped > 600 * (1usize << 30),
+        "the uncapped reservation is {} bytes, so there is nothing to cap",
+        uncapped
+    );
+    assert!(reserved < declared);
+    assert!(
+        capped <= RESERVE_BYTES,
+        "the capped reservation is {} bytes against a budget of {}",
+        capped,
+        RESERVE_BYTES
+    );
+
+    // A declaration inside the budget is reserved in full, so the cap bounds
+    // the hint rather than replacing it.
+    assert_eq!(reserved_records::<f32>(128, 33, 4, 10_000), 10_000);
+    assert_eq!(reserved_records::<u8>(96, 33, 5, 50_000), 50_000);
+}
+
+/// The seam's `set_level_seed` reaches the generator its graph draws from.
+///
+/// Built through the shipped seam rather than through the structure, so what is
+/// held is the wiring and not the generator, which the two tests above already
+/// hold. Three graphs over the same records: one left at the default, one
+/// reseeded to the default, and one reseeded to another value. Compared as the
+/// bytes each writes, which is the whole graph and its layer table.
+#[test]
+fn the_seam_reseeds_the_level_stream() {
+    let data = sample_vectors(600, 12, 4242);
+    let build = |seed: Option<u64>| {
+        let mut graph = VectorGraph::new_raw("cosine", 12, 16, data.len(), LAYERS, 64);
+        if let Some(seed) = seed {
+            graph.set_level_seed(seed);
+        }
+        for (id, vector) in data.iter().enumerate() {
+            graph.insert(vector, id);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        graph.dump(dir.path()).unwrap();
+        std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap()
+    };
+
+    let untouched = build(None);
+    let reseeded_to_default = build(Some(DEFAULT_LEVEL_SEED));
+    let reseeded_elsewhere = build(Some(0x0102_0304_0506_0708));
+
+    // A graph nobody reseeded draws from the default, so the setter and the
+    // constructor agree.
+    assert_eq!(untouched, reseeded_to_default);
+    // And the setter is doing the work rather than being a no-op.
+    assert_ne!(untouched, reseeded_elsewhere);
+    println!(
+        "seam reseed: default {} bytes, other seed {} bytes",
+        untouched.len(),
+        reseeded_elsewhere.len()
+    );
+}
+
 // ============================================================================
 // THE RELAY HARNESS OVER REAL DATA, RUN BY NAME WITH THE ARTIFACT DIRECTORY
 // ============================================================================
@@ -2817,7 +3053,7 @@ fn insertion_measurement() {
                 BuildRun {
                     nanos,
                     recall: hits as f64 / (K * NQ) as f64,
-                    graph_bytes: super::graph_memory_bytes(&hnsw),
+                    graph_bytes: graph_memory_bytes(&hnsw),
                     nodes: hnsw.get_nb_point(),
                     edges,
                 }
@@ -2846,7 +3082,7 @@ fn insertion_measurement() {
                 BuildRun {
                     nanos,
                     recall: hits as f64 / (K * NQ) as f64,
-                    graph_bytes: super::graph_memory_bytes(&hnsw),
+                    graph_bytes: graph_memory_bytes(&hnsw),
                     nodes: hnsw.get_nb_point(),
                     edges,
                 }
