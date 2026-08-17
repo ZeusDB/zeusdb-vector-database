@@ -188,16 +188,22 @@ def test_graph_memory_rises_with_the_graph_degree():
 #
 # Upward, the report names more than the process holds. Capacity that was
 # requested and never written never faults in, so it never enters the resident
-# set at all. The layer reservation `expected_size` makes at creation and the
-# slack in the neighbour list buffers are the largest of those, and their share
-# is fixed by the declared size rather than by the bytes the records occupy, so
-# it dominates at the 8,000 records this test builds and washes out by 50,000.
-# Measured on Linux at this size the report ran 1.196, 1.229 and 1.579 of the
-# resident delta across the three storage modes.
+# set at all. That mechanism is real and it is measurable: at 8,000 records of
+# dimension 256 declared as 100,000, the report reads 138.93 MB against 25.97
+# MiB of resident delta, a share of 5.35, and the creation itself adds 0.16 MiB
+# of resident set for 128 MB of reservation.
 #
-# The ceiling therefore sits well above one. It is 2.00 rather than just above
-# the 1.579 seen, so that a different allocator or a different kernel's fault-in
-# behaviour does not fail a test that is about neither.
+# **It does not fire here, because the probe declares what it builds.** At
+# `expected_size` equal to the record count the arenas are written by the
+# records that arrive: creation adds 0.12 MiB of resident set, and the report
+# then runs 0.935 of the delta. A declaration equal to the truth leaves nothing
+# untouched to diverge over.
+#
+# The ceiling therefore sits above one for the allocator's sake rather than for
+# the reservation's, and 2.00 is what it has been since relay 60. The Linux
+# figures of 1.196, 1.229 and 1.579 that used to be recorded here were measured
+# through a probe whose baseline was wrong; see `_RESIDENT_PROBE`. They are not
+# evidence of anything and they are not carried forward.
 #
 # The floor is unchanged. Under-reporting is the defect this test exists to
 # catch, and nothing about page accounting makes a report that misses half of
@@ -206,6 +212,29 @@ TOTAL_AGAINST_RESIDENT_FLOOR = 0.45
 TOTAL_AGAINST_RESIDENT_CEILING = 2.00
 
 
+# The corpus is generated at the width it is stored at and normalised in place,
+# which is what makes the baseline below mean anything.
+#
+# It used to draw `standard_normal` at its default float64 and narrow at the
+# end, so building 7.81 MiB of corpus allocated and freed 62.51 MiB of
+# temporaries first, being the picked centres, the noise, their sum and the
+# division's result. All of that was freed before the baseline was taken, and a
+# freed block is not necessarily a returned one: glibc raises its mmap threshold
+# as large mapped blocks are released, after which large allocations come from
+# the heap and freed heap stays resident. The index was then built into a pool
+# the process already held and the delta stopped measuring it.
+#
+# What that looked like: on CI the delta read 9.2 MiB for an unquantized index
+# of 8,000 records at dimension 256, whose raw vector store is 7.81 MiB and
+# whose graph holds a second copy of every vector at another 7.81 MiB. Every one
+# of those 15.62 MiB is written, so every page holding them is faulted in. A
+# delta below the bytes the index demonstrably wrote is a broken denominator
+# rather than an over-reporting numerator.
+#
+# Generating in blocks at float32 takes the allocated-and-freed figure from
+# 62.51 MiB to 0.65 MiB. The corpus keeps its shape, being 40 Gaussian centres
+# with unit-normalised points drawn around them, and its values move, which
+# nothing here depends on.
 _RESIDENT_PROBE = '''
 import gc, json, sys, warnings
 import numpy as np, psutil
@@ -213,10 +242,15 @@ from zeusdb_vector_database import VectorDatabase
 
 records, dim, storage_mode = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 rng = np.random.default_rng(20260811)
-centres = rng.standard_normal((40, dim))
-points = centres[rng.integers(0, 40, records)] + rng.standard_normal((records, dim))
-data = (points / np.linalg.norm(points, axis=1, keepdims=True)).astype(np.float32)
-del points, centres
+centres = rng.standard_normal((40, dim), dtype=np.float32)
+pick = rng.integers(0, 40, records)
+data = np.empty((records, dim), dtype=np.float32)
+for at in range(0, records, 512):
+    block = pick[at:at + 512]
+    data[at:at + 512] = centres[block]
+    data[at:at + 512] += rng.standard_normal((len(block), dim), dtype=np.float32)
+data /= np.linalg.norm(data, axis=1, keepdims=True)
+del centres, pick
 ids = [f"m_{i}" for i in range(records)]
 
 config = None
@@ -229,11 +263,16 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", UserWarning)
     index = VectorDatabase().create("hnsw", dim=dim, expected_size=records,
                                     quantization_config=config)
+created = psutil.Process().memory_info().rss
 assert index.add({"ids": ids, "embeddings": data}).is_success()
 gc.collect()
 after = psutil.Process().memory_info().rss
+stats = index.get_stats()
 print(json.dumps({"resident": after - before,
-                  "reported": float(index.get_stats()["total_memory_mb"])}))
+                  "resident_at_create": created - before,
+                  "written_floor": (float(stats["raw_vectors_memory_mb"])
+                                    + float(stats.get("quantized_codes_memory_mb", 0))),
+                  "reported": float(stats["total_memory_mb"])}))
 '''
 
 
@@ -269,6 +308,20 @@ def test_the_reported_total_tracks_the_resident_set(storage_mode):
     # runs where it is.
     if resident_mb < 8.0:
         pytest.skip(f"the build added only {resident_mb:.1f} MiB of resident set")
+
+    # The denominator has to be sound before the ratio means anything. The
+    # stored records are bytes the index wrote, so their pages are faulted in
+    # and resident, and a delta below them says the process was already holding
+    # pages the index then reused rather than saying the report is too large.
+    # That is a broken instrument and it is reported as one, because failing on
+    # the ratio would point at the wrong thing.
+    floor_mb = measured["written_floor"]
+    assert resident_mb >= floor_mb, (
+        f"at storage_mode {storage_mode} the process gained {resident_mb:.1f} "
+        f"MiB where the index wrote {floor_mb:.1f} MiB of stored records, so "
+        f"the baseline is measuring a pool the process already held rather than "
+        f"the index. Creation alone added "
+        f"{measured['resident_at_create'] / (1024 * 1024):.2f} MiB.")
 
     share = reported_mb / resident_mb
     assert TOTAL_AGAINST_RESIDENT_FLOOR <= share <= TOTAL_AGAINST_RESIDENT_CEILING, (
