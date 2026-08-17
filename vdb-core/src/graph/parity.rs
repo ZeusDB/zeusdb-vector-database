@@ -25,7 +25,7 @@ use crate::distance::{CosineDist, L1Dist, L2Dist};
 use crate::hnsw_index::DistPQ;
 use crate::pq::PQ;
 use hnsw_rs::hnsw::{LoadedEdge, LoadedPoint, PointId, NB_LAYER_MAX};
-use hnsw_rs::prelude::{FilterT, Hnsw, Neighbour};
+use hnsw_rs::prelude::{DistCosine, FilterT, Hnsw, Neighbour};
 use std::io::Write as _;
 use std::sync::Arc;
 
@@ -990,8 +990,8 @@ fn the_mutable_loader_refuses_malformed_topology() {
     let held = MutableGraph::from_loaded(full, PointId(0, 0), 2, 64, 0.36, CosineDist {}).unwrap();
     assert_eq!(held.nb_edges(), 5);
 
-    // The descent residue is kept rather than dropped, which is the one place
-    // this constructor differs from the flat one.
+    // A list above its owner's level is kept rather than dropped, which is the
+    // one place this constructor differs from the flat one.
     let above = vec![vec![point(vec![
         vec![],
         vec![LoadedEdge {
@@ -1034,35 +1034,47 @@ fn the_mutable_memory_figure_is_exact() {
     .unwrap();
 
     let nodes = mutable.nb_points();
-    let upper_lists: usize = layer_lens
-        .iter()
-        .enumerate()
-        .map(|(layer, len)| layer * len)
-        .sum();
     let mut expected = std::mem::size_of_val(&mutable);
     // Per node, beside the vector: the origin id, the level, the layer zero
-    // length, the upper base and the residue start.
+    // length, the layer zero inbound counter, the first upper list and the span.
     expected += nodes * std::mem::size_of::<usize>();
     expected += nodes;
     expected += nodes * std::mem::size_of::<u16>();
     expected += nodes * std::mem::size_of::<u32>();
-    expected += (nodes + 1) * std::mem::size_of::<u32>();
+    expected += nodes * std::mem::size_of::<u32>();
+    expected += nodes;
     // The vectors.
     expected += nodes * DIM * std::mem::size_of::<f32>();
     // The layer zero slabs, `2 * m + 1` targets and distances each.
     expected += nodes * (2 * M + 1) * 2 * std::mem::size_of::<u32>();
-    // The upper slabs, `m + 1` each, and one length per upper list.
-    expected += upper_lists * (M + 1) * 2 * std::mem::size_of::<u32>();
-    expected += upper_lists * std::mem::size_of::<u16>();
-    // The residue, nine bytes an edge.
-    expected += mutable.above_level_edges() * (1 + 2 * std::mem::size_of::<u32>());
+    // Per upper list: its offset, its length, its capacity and its inbound
+    // counter, being twelve bytes whatever the list holds.
+    let lists = mutable.nb_upper_lists();
+    expected += lists * std::mem::size_of::<u32>();
+    expected += lists * std::mem::size_of::<u16>();
+    expected += lists * std::mem::size_of::<u16>();
+    expected += lists * std::mem::size_of::<u32>();
+    // The upper slots, a target and a distance each.
+    expected += mutable.upper_slots() * 2 * std::mem::size_of::<u32>();
     assert_eq!(mutable.memory_bytes(), expected);
 
+    // Every layer holds the points drawn at exactly that level, and the span a
+    // node needs runs above it, so the list count exceeds what the levels alone
+    // predict. That gap is the correction relay 79 made to the layout.
+    let by_level: usize = layer_lens
+        .iter()
+        .enumerate()
+        .map(|(layer, len)| layer * len)
+        .sum();
     println!(
-        "mutable memory nodes {} edges {} residue {} bytes {} per_node {:.2}",
+        "mutable memory nodes {} edges {} above-level {} upper lists {} (levels alone \
+         predict {}) slots {} bytes {} per_node {:.2}",
         nodes,
         mutable.nb_edges(),
         mutable.above_level_edges(),
+        lists,
+        by_level,
+        mutable.upper_slots(),
         mutable.memory_bytes(),
         (mutable.memory_bytes() - nodes * DIM * 4) as f64 / nodes as f64
     );
@@ -1180,6 +1192,536 @@ fn a_dump_round_trips_through_the_mutable_graph() {
     }
     let (bytes, residue) = round_trip(&quantized, GraphKind::CosinePq, || DistPQ::new(pq.clone()));
     println!("round trip quantized bytes {} residue {}", bytes, residue);
+}
+
+// ============================================================================
+// INSERTION: THE SAME GRAPH, EDGE FOR EDGE
+// ============================================================================
+
+/// Both builders, fed the same data in the same order with the same seed.
+///
+/// The vendored side is `Hnsw::new` followed by one `insert` per record, which
+/// is the shipped build path. The ZeusDB side is `MutableGraph::new` followed
+/// by one `insert` per record, drawing from a generator started at the same
+/// scale and the same seed. `Hnsw::new` builds its own generator at
+/// `1 / ln(m)`, which is what `default_scale` names.
+struct BuiltPair<T, D>
+where
+    T: Clone + Send + Sync + 'static,
+    D: Distance<T> + Send + Sync,
+{
+    vendored: Hnsw<'static, T, D>,
+    mutable: MutableGraph<T, D>,
+    /// The vendored overflow pop counters over this build alone, as
+    /// (overflows, saves, fallbacks).
+    ///
+    /// `hnsw_rs::hnsw::guard_stats` reads three process wide statics, so this
+    /// delta is only this build's where nothing else is inserting at the same
+    /// time. It is printed and never asserted on, and the figures the relay
+    /// reports come from a run of these tests alone at `--test-threads=1`.
+    vendored_guard: (u64, u64, u64),
+}
+
+fn build_pair<T, D>(
+    data: &[Vec<T>],
+    m: usize,
+    ef_construction: usize,
+    dist: impl Fn() -> D,
+) -> BuiltPair<T, D>
+where
+    T: Clone + Send + Sync + 'static,
+    D: Distance<T> + Send + Sync,
+{
+    let dim = data.first().map_or(0, Vec::len);
+    let before = hnsw_rs::hnsw::guard_stats();
+    let vendored = Hnsw::new(
+        m,
+        data.len().max(1),
+        NB_LAYER_MAX as usize,
+        ef_construction,
+        dist(),
+    );
+    for (id, values) in data.iter().enumerate() {
+        vendored.insert((values.as_slice(), id));
+    }
+    let after = hnsw_rs::hnsw::guard_stats();
+    let vendored_guard = (after.0 - before.0, after.1 - before.1, after.2 - before.2);
+
+    let scale = LevelGenerator::default_scale(m);
+    let mut levels = LevelGenerator::new(scale, NB_LAYER_MAX as usize);
+    let mut mutable =
+        MutableGraph::new(dim, m, ef_construction, scale, data.len(), dist()).unwrap();
+    for (id, values) in data.iter().enumerate() {
+        mutable.insert(values.as_slice(), id, &mut levels);
+    }
+
+    BuiltPair {
+        vendored,
+        mutable,
+        vendored_guard,
+    }
+}
+
+/// What an edge for edge comparison of two graphs found.
+#[derive(Default)]
+struct GraphDiff {
+    nodes: usize,
+    edges: usize,
+    residue_edges: usize,
+    differing_nodes: usize,
+    differing_edges: usize,
+    overflows: u64,
+    saves: u64,
+    fallbacks: u64,
+    vendored_guard: (u64, u64, u64),
+    dump_bytes: usize,
+    differing_dump_bytes: usize,
+    /// The first disagreement, in full: the node, the layer and both lists.
+    first: Option<String>,
+}
+
+impl GraphDiff {
+    fn note(&mut self, detail: String) {
+        if self.first.is_none() {
+            self.first = Some(detail);
+        }
+    }
+}
+
+/// One point's level and its adjacency by layer, each entry naming the id its
+/// target was inserted under and the distance stored beside it. The shape both
+/// builders are compared in.
+type Adjacency = Vec<(u8, Vec<Vec<(usize, f32)>>)>;
+
+/// One vendored point's adjacency in the shape `neighbourhood_ids` reports,
+/// which is every layer the structure carries with the lists above a node's own
+/// level sitting where they were filed.
+fn vendored_neighbourhood<T, D>(hnsw: &Hnsw<'static, T, D>) -> Adjacency
+where
+    T: Clone + Send + Sync + 'static,
+    D: Distance<T> + Send + Sync,
+{
+    let indexation = hnsw.get_point_indexation();
+    let mut by_origin: Adjacency = vec![(0, Vec::new()); indexation.get_nb_point()];
+    for point in indexation {
+        let mut lists = vec![Vec::new(); NB_LAYER_MAX as usize];
+        for (layer, list) in point.get_neighborhood_id().into_iter().enumerate() {
+            lists[layer] = list.into_iter().map(|n| (n.d_id, n.distance)).collect();
+        }
+        by_origin[point.get_origin_id()] = (point.get_point_id().0, lists);
+    }
+    by_origin
+}
+
+/// Compare two graphs node by node, layer by layer and edge by edge, in list
+/// order, on the target and on the exact bits of the stored distance.
+///
+/// The level of every node, the entry point, and the dump each writes are
+/// compared as well, so the comparison covers everything the file records.
+fn compare_graphs<T, D>(name: &str, pair: &BuiltPair<T, D>, kind: GraphKind) -> GraphDiff
+where
+    T: Clone + Send + Sync + DumpElement,
+    D: Distance<T> + Send + Sync,
+{
+    let mut diff = GraphDiff::default();
+    let vendored = vendored_neighbourhood(&pair.vendored);
+    let nodes = pair.mutable.nb_points();
+    assert_eq!(
+        vendored.len(),
+        nodes,
+        "{}: the two builds hold {} and {} nodes",
+        name,
+        vendored.len(),
+        nodes
+    );
+    diff.nodes = nodes;
+    diff.residue_edges = pair.mutable.above_level_edges();
+
+    // A node index on the ZeusDB side is arrival order, and the fixtures insert
+    // record `i` under id `i`, so node `i` is the point the vendored side holds
+    // under origin id `i`. That is asserted rather than assumed.
+    for node in 0..nodes as u32 {
+        let origin = Topology::origin_id(&pair.mutable, node);
+        assert_eq!(
+            origin, node as usize,
+            "{}: node {} was inserted under id {}",
+            name, node, origin
+        );
+        let (their_level, their_lists) = &vendored[origin];
+        let our_level = pair.mutable.level(node);
+        let our_lists = pair.mutable.neighbourhood_ids(node);
+        let mut node_differs = false;
+
+        if *their_level != our_level {
+            node_differs = true;
+            diff.note(format!(
+                "{}: node {} sits at level {} in the vendored build and {} in the ZeusDB one",
+                name, node, their_level, our_level
+            ));
+        }
+
+        for layer in 0..NB_LAYER_MAX as usize {
+            let theirs = &their_lists[layer];
+            let ours = &our_lists[layer];
+            diff.edges += ours.len();
+            if theirs.len() != ours.len() {
+                node_differs = true;
+                diff.differing_edges += theirs.len().abs_diff(ours.len());
+                diff.note(format!(
+                    "{}: node {} at layer {} holds {} edges in the vendored build and {} in \
+                     the ZeusDB one\n  vendored {:?}\n  zeusdb   {:?}",
+                    name,
+                    node,
+                    layer,
+                    theirs.len(),
+                    ours.len(),
+                    theirs,
+                    ours
+                ));
+                continue;
+            }
+            for (slot, (theirs, ours)) in theirs.iter().zip(ours.iter()).enumerate() {
+                if theirs.0 != ours.0 || theirs.1.to_bits() != ours.1.to_bits() {
+                    node_differs = true;
+                    diff.differing_edges += 1;
+                    diff.note(format!(
+                        "{}: node {} at layer {} slot {} names {} at {:?} in the vendored \
+                         build and {} at {:?} in the ZeusDB one\n  vendored {:?}\n  \
+                         zeusdb   {:?}",
+                        name,
+                        node,
+                        layer,
+                        slot,
+                        theirs.0,
+                        theirs.1,
+                        ours.0,
+                        ours.1,
+                        their_lists[layer],
+                        our_lists[layer]
+                    ));
+                }
+            }
+        }
+        if node_differs {
+            diff.differing_nodes += 1;
+        }
+    }
+
+    let their_entry = pair.vendored.get_point_indexation().get_entry_point_id();
+    let our_entry = pair.mutable.entry_point_id();
+    if their_entry != Some(our_entry) {
+        diff.differing_nodes += 1;
+        diff.note(format!(
+            "{}: the entry point is {:?} in the vendored build and {:?} in the ZeusDB one",
+            name, their_entry, our_entry
+        ));
+    }
+
+    let theirs = tempfile::tempdir().unwrap();
+    let ours = tempfile::tempdir().unwrap();
+    write_dump(&pair.vendored, kind, theirs.path()).unwrap();
+    write_dump(&pair.mutable.dump_view(), kind, ours.path()).unwrap();
+    let their_bytes = std::fs::read(theirs.path().join(super::dump::DUMP_FILENAME)).unwrap();
+    let our_bytes = std::fs::read(ours.path().join(super::dump::DUMP_FILENAME)).unwrap();
+    diff.dump_bytes = their_bytes.len();
+    if their_bytes.len() != our_bytes.len() {
+        diff.differing_dump_bytes = their_bytes.len().abs_diff(our_bytes.len());
+        diff.note(format!(
+            "{}: the dumps are {} and {} bytes",
+            name,
+            their_bytes.len(),
+            our_bytes.len()
+        ));
+    } else {
+        diff.differing_dump_bytes = their_bytes
+            .iter()
+            .zip(our_bytes.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+    }
+
+    let (overflows, saves, fallbacks) = pair.mutable.guard_stats();
+    diff.overflows = overflows;
+    diff.saves = saves;
+    diff.fallbacks = fallbacks;
+    diff.vendored_guard = pair.vendored_guard;
+    diff
+}
+
+/// Build both graphs, compare them, and fail on the first disagreement.
+fn assert_same_graph<T, D>(name: &str, pair: &BuiltPair<T, D>, kind: GraphKind) -> GraphDiff
+where
+    T: Clone + Send + Sync + DumpElement,
+    D: Distance<T> + Send + Sync,
+{
+    let diff = compare_graphs(name, pair, kind);
+    println!(
+        "{:<26} nodes {:>6}  edges {:>8}  residue {:>6}  differing nodes {}  edges {}  \
+         dump {:>9} bytes differing {}  overflows {} saves {} fallbacks {}  vendored          guard {:?}",
+        name,
+        diff.nodes,
+        diff.edges,
+        diff.residue_edges,
+        diff.differing_nodes,
+        diff.differing_edges,
+        diff.dump_bytes,
+        diff.differing_dump_bytes,
+        diff.overflows,
+        diff.saves,
+        diff.fallbacks,
+        diff.vendored_guard
+    );
+    assert!(
+        diff.differing_nodes == 0 && diff.differing_edges == 0 && diff.differing_dump_bytes == 0,
+        "{} differing nodes, {} differing edges, {} differing dump bytes.\nFirst: {}",
+        diff.differing_nodes,
+        diff.differing_edges,
+        diff.differing_dump_bytes,
+        diff.first.as_deref().unwrap_or("none recorded")
+    );
+    diff
+}
+
+/// A ZeusDB-built graph is the vendored graph, edge for edge, on all three raw
+/// metrics.
+///
+/// The comparison is on the adjacency and not on what the two return. A graph
+/// that is close but not identical passes every test that counts results and
+/// fails nothing until recall moves, which is the outcome this exists to rule
+/// out.
+#[test]
+fn insertion_builds_the_vendored_graph_on_raw_metrics() {
+    let cosine = build_pair(&sample_vectors(2000, 24, 0x79_01), 16, 64, || CosineDist {});
+    let diff = assert_same_graph("cosine 2000 m16", &cosine, GraphKind::Cosine);
+    assert!(
+        diff.residue_edges > 0,
+        "the fixture must carry descent residue, or the residue is untested"
+    );
+    assert!(
+        diff.overflows > 0,
+        "the fixture must fire the overflow pop, or patch 3 is untested"
+    );
+
+    let l2 = build_pair(&sample_vectors(1500, 16, 0x79_02), 16, 48, || L2Dist {});
+    assert_same_graph("l2 1500 m16", &l2, GraphKind::L2);
+
+    let l1 = build_pair(&sample_vectors(1200, 12, 0x79_03), 8, 48, || L1Dist {});
+    assert_same_graph("l1 1200 m8", &l1, GraphKind::L1);
+}
+
+/// The same, on the quantized element type, where the distances tie constantly
+/// and the tie ordering of both sorts is what the comparison holds.
+#[test]
+fn insertion_builds_the_vendored_graph_on_quantized_codes() {
+    const N: usize = 1500;
+    const DIM: usize = 32;
+    const SUBVECTORS: usize = 8;
+
+    let all = crate::test_vectors::clustered(N, DIM, 0x79_04);
+    let pq = Arc::new(PQ::new(DIM, SUBVECTORS, 8, 500, None));
+    pq.train(&all).unwrap();
+    let refs: Vec<&[f32]> = all.iter().map(|v| v.as_slice()).collect();
+    let codes = pq.quantize_batch(&refs).unwrap();
+
+    let pair = build_pair(&codes, 16, 100, || DistPQ::new(pq.clone()));
+    let diff = assert_same_graph("quantized 1500 m16", &pair, GraphKind::CosinePq);
+    assert!(diff.overflows > 0, "the fixture must fire the overflow pop");
+}
+
+/// A small `m` fills lists early and makes the overflow pop frequent, which is
+/// the state patch 3 works in. This is the same shape `layer_zero_in_degree`
+/// uses and it is where an eviction that chose differently would show first.
+#[test]
+fn insertion_matches_where_the_overflow_pop_fires_often() {
+    let pair = build_pair(&sample_vectors(3000, 32, 0x79_05), 4, 200, || CosineDist {});
+    let diff = assert_same_graph("cosine 3000 m4 efc200", &pair, GraphKind::Cosine);
+    assert!(
+        diff.overflows > diff.nodes as u64,
+        "the overflow pop fired {} times over {} nodes, which is not often enough to \
+         exercise the guard",
+        diff.overflows,
+        diff.nodes
+    );
+    assert!(
+        diff.saves > 0,
+        "the guard never skipped the farthest entry, so patch 3 changed no outcome here \
+         and this fixture does not test it"
+    );
+
+    // Ties, where lists hold runs of equal stored distances. Only a sort that
+    // orders ties as the vendored one does reproduces the lists.
+    let distinct = sample_vectors(30, 16, 0x79_06);
+    let repeated: Vec<Vec<f32>> = (0..1200).map(|i| distinct[i % 30].clone()).collect();
+    let ties = build_pair(&repeated, 16, 64, || CosineDist {});
+    assert_same_graph("ties 1200 m16", &ties, GraphKind::Cosine);
+}
+
+/// The guard tests, run against a ZeusDB-built graph.
+///
+/// `self_query_reachability` and `layer_zero_in_degree` guard patches 1 and 3
+/// in `hnsw_index::graph_guard_tests`, and each carries an orphan count
+/// measured against the unpatched crate. These are their equivalents over the
+/// replacement builder, at the same sizes with the same seeds, so the two
+/// figures stand beside each other.
+#[test]
+fn insertion_reproduces_the_guard_tests() {
+    // `self_query_reachability`: 3,000 points, dimension 32, m 16,
+    // ef_construction 200. The unpatched crate fails one to two percent of
+    // self queries.
+    const N: usize = 3000;
+    let data = guard_vectors(N, 32);
+    let pair = build_pair(&data, 16, 200, || DistCosine {});
+    let diff = assert_same_graph("guard self-query 3000", &pair, GraphKind::Cosine);
+
+    let failures: Vec<usize> = (0..N)
+        .filter(|&i| {
+            pair.mutable
+                .search(&data[i], 1, 64, None::<&BoxedFilter>)
+                .first()
+                .map(|hit| hit.internal_id)
+                != Some(i)
+        })
+        .collect();
+    println!(
+        "guard self-query: {} of {} points cannot find themselves on the ZeusDB build",
+        failures.len(),
+        N
+    );
+    assert!(
+        failures.is_empty(),
+        "{} of {} points cannot find themselves by self-query (first: {:?})",
+        failures.len(),
+        N,
+        &failures[..failures.len().min(10)]
+    );
+    assert_eq!(diff.differing_edges, 0);
+
+    // `layer_zero_in_degree`: 5,000 points, dimension 128, m 4,
+    // ef_construction 200. The unpatched crate strands 24 of these 5,000.
+    const O: usize = 5000;
+    let data = guard_vectors(O, 128);
+    let pair = build_pair(&data, 4, 200, || DistCosine {});
+    let diff = assert_same_graph("guard in-degree 5000", &pair, GraphKind::Cosine);
+
+    let counted = pair.mutable.counted_in_degree(0);
+    assert_eq!(counted.len(), O);
+    let orphans: Vec<usize> = (0..O).filter(|&i| counted[i] == 0).collect();
+    println!(
+        "guard in-degree: {} of {} points have zero layer zero in-degree on the ZeusDB \
+         build, over {} overflow events of which {} were saves and {} fallbacks",
+        orphans.len(),
+        O,
+        diff.overflows,
+        diff.saves,
+        diff.fallbacks
+    );
+    assert!(
+        orphans.is_empty(),
+        "{} of {} points have zero layer-zero in-degree (first: {:?}); the overflow pop \
+         guard was not reproduced",
+        orphans.len(),
+        O,
+        &orphans[..orphans.len().min(10)]
+    );
+}
+
+/// The two guard fixtures' data, which is `StdRng` at seed 42 exactly as
+/// `graph_guard_tests` draws it, so the two sides compare like for like.
+fn guard_vectors(records: usize, dim: usize) -> Vec<Vec<f32>> {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(42);
+    (0..records)
+        .map(|_| (0..dim).map(|_| rng.random::<f32>() - 0.5).collect())
+        .collect()
+}
+
+/// The tie ordering of a list sort is a property of the element type, and this
+/// pins the one the graph depends on.
+///
+/// `sort_unstable` dispatches on the element, and the permutation it produces
+/// over equal keys differs between the dispatch paths. The vendored insert
+/// sorts `Vec<Arc<PointWithOrder>>`. A list here is a `Vec<Entry>`, and `Entry`
+/// reproduces that permutation only while it stays 8 bytes and not `Copy`. If a
+/// future toolchain moves the threshold, or a `derive` is added to `Entry`, the
+/// two builders stop agreeing on lists holding equal distances and this fails
+/// before the graph comparisons do.
+#[test]
+fn the_entry_sort_matches_the_vendored_tie_order() {
+    use std::cmp::Ordering;
+
+    struct Reference {
+        dist: f32,
+        tag: u32,
+    }
+    impl PartialEq for Reference {
+        fn eq(&self, other: &Self) -> bool {
+            self.dist == other.dist
+        }
+    }
+    impl Eq for Reference {}
+    impl PartialOrd for Reference {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Reference {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.dist.partial_cmp(&other.dist).unwrap()
+        }
+    }
+
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    let mut cases = 0usize;
+    let mut tie_bearing = 0usize;
+    // A layer zero list runs to `2 * m + 1`, which is 33 at the shipped `m` and
+    // 129 at the largest `m` the index accepts.
+    for len in 1..=130usize {
+        for _ in 0..40 {
+            let distinct = 1 + (next() % 6) as usize;
+            let dists: Vec<f32> = (0..len)
+                .map(|_| (next() % distinct as u64) as f32)
+                .collect();
+            if dists.len() > distinct {
+                tie_bearing += 1;
+            }
+
+            let mut reference: Vec<Arc<Reference>> = dists
+                .iter()
+                .enumerate()
+                .map(|(i, &dist)| {
+                    Arc::new(Reference {
+                        dist,
+                        tag: i as u32,
+                    })
+                })
+                .collect();
+            reference.sort_unstable();
+
+            let mut ours = super::mutable::entries_for_test(&dists);
+            super::mutable::sort_entries_for_test(&mut ours);
+
+            let theirs: Vec<u32> = reference.iter().map(|r| r.tag).collect();
+            let ours: Vec<u32> = ours.iter().map(|e| e.target).collect();
+            assert_eq!(
+                theirs, ours,
+                "the tie order diverges at length {} on {:?}",
+                len, dists
+            );
+            cases += 1;
+        }
+    }
+    println!(
+        "entry sort: {} cases compared, {} of them holding ties, 0 differing",
+        cases, tie_bearing
+    );
 }
 
 // ============================================================================
@@ -2135,4 +2677,288 @@ fn hold_structure_for_sampling() {
     std::io::stdout().flush().unwrap();
     std::thread::sleep(std::time::Duration::from_secs(40));
     println!("HOLD DONE");
+}
+
+// ============================================================================
+// INSERTION: THE MEASUREMENT
+// ============================================================================
+
+/// One build measured end to end.
+struct BuildRun {
+    nanos: u128,
+    recall: f64,
+    graph_bytes: usize,
+    nodes: usize,
+    edges: usize,
+}
+
+/// Read a flat `f32` file as `records` vectors of `dim`.
+///
+/// Only the prefix asked for. The dataset files hold 100,000 vectors and a
+/// dbpedia one is 614 MB, so reading the whole file would put more into the
+/// process than the graph does and the peak resident figure would be the read
+/// rather than the build.
+fn read_vectors(path: &std::path::Path, records: usize, dim: usize) -> Vec<Vec<f32>> {
+    use std::io::Read as _;
+    let wanted = records * dim * 4;
+    let mut file =
+        std::fs::File::open(path).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
+    let mut bytes = vec![0u8; wanted];
+    file.read_exact(&mut bytes)
+        .unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
+    (0..records)
+        .map(|record| {
+            (0..dim)
+                .map(|value| {
+                    let at = (record * dim + value) * 4;
+                    f32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Read a flat `i32` file as `rows` of `k`.
+fn read_truth(path: &std::path::Path, rows: usize, k: usize) -> Vec<Vec<usize>> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
+    (0..rows)
+        .map(|row| {
+            (0..k)
+                .map(|slot| {
+                    let at = (row * k + slot) * 4;
+                    i32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+                        as usize
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Recall at `k` of a page against the truth for that query.
+fn recall_of(page: &[usize], truth: &[usize]) -> usize {
+    page.iter().filter(|id| truth.contains(id)).count()
+}
+
+/// The whole relay 79 measurement. Needs `ZEUSDB_RELAY79_DIR`.
+///
+/// One configuration and one size per process, chosen by `ZEUSDB_CONFIG`,
+/// `ZEUSDB_SIZE` and `ZEUSDB_BUILDER`, so the peak resident memory the caller
+/// reads is one build's and not two. `ZEUSDB_REPEATS` sets the repeat count.
+#[test]
+#[ignore = "needs the relay 79 datasets; run by name with ZEUSDB_RELAY79_DIR set"]
+fn insertion_measurement() {
+    const K: usize = 10;
+    const NQ: usize = 500;
+    const M: usize = 16;
+    const EF_CONSTRUCTION: usize = 200;
+    const EF_SEARCH: usize = 100;
+
+    let root = std::path::PathBuf::from(
+        std::env::var("ZEUSDB_RELAY79_DIR").expect("set ZEUSDB_RELAY79_DIR to the dataset root"),
+    );
+    let config = std::env::var("ZEUSDB_CONFIG").expect("set ZEUSDB_CONFIG");
+    let size: usize = std::env::var("ZEUSDB_SIZE")
+        .expect("set ZEUSDB_SIZE")
+        .parse()
+        .unwrap();
+    let builder = std::env::var("ZEUSDB_BUILDER").expect("set ZEUSDB_BUILDER");
+    let repeats: usize = std::env::var("ZEUSDB_REPEATS")
+        .map(|v| v.parse().unwrap())
+        .unwrap_or(3);
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("manifest.json")).unwrap())
+            .unwrap();
+    let entry = manifest["configs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"].as_str().unwrap() == config)
+        .expect("no such configuration");
+    let space = entry["space"].as_str().unwrap().to_string();
+    let dim = entry["dim"].as_u64().unwrap() as usize;
+
+    let data = read_vectors(&root.join(format!("{}.vectors.bin", config)), size, dim);
+    let queries = read_vectors(&root.join(format!("{}.queries.bin", config)), NQ, dim);
+    let truth = read_truth(&root.join(format!("{}.truth.{}.bin", config, size)), NQ, K);
+
+    // One build, timed, then searched. The two builders are separate arms
+    // rather than a trait, because a trait object between the timer and the
+    // insert would be measured along with the insert.
+    let run_once = || -> BuildRun {
+        match (builder.as_str(), space.as_str()) {
+            ("vendored", "cosine") => {
+                let started = std::time::Instant::now();
+                let hnsw = Hnsw::new(
+                    M,
+                    size,
+                    NB_LAYER_MAX as usize,
+                    EF_CONSTRUCTION,
+                    CosineDist {},
+                );
+                for (id, v) in data.iter().enumerate() {
+                    hnsw.insert((v.as_slice(), id));
+                }
+                let nanos = started.elapsed().as_nanos();
+                let mut hits = 0usize;
+                for (q, want) in queries.iter().zip(truth.iter()) {
+                    let page: Vec<usize> = hnsw
+                        .search_filter(q, K, EF_SEARCH, None)
+                        .into_iter()
+                        .map(|n| n.d_id)
+                        .collect();
+                    hits += recall_of(&page, want);
+                }
+                let edges: usize = hnsw
+                    .get_point_indexation()
+                    .into_iter()
+                    .map(|p| p.get_neighborhood_id().iter().map(Vec::len).sum::<usize>())
+                    .sum();
+                BuildRun {
+                    nanos,
+                    recall: hits as f64 / (K * NQ) as f64,
+                    graph_bytes: super::graph_memory_bytes(&hnsw),
+                    nodes: hnsw.get_nb_point(),
+                    edges,
+                }
+            }
+            ("vendored", _) => {
+                let started = std::time::Instant::now();
+                let hnsw = Hnsw::new(M, size, NB_LAYER_MAX as usize, EF_CONSTRUCTION, L2Dist {});
+                for (id, v) in data.iter().enumerate() {
+                    hnsw.insert((v.as_slice(), id));
+                }
+                let nanos = started.elapsed().as_nanos();
+                let mut hits = 0usize;
+                for (q, want) in queries.iter().zip(truth.iter()) {
+                    let page: Vec<usize> = hnsw
+                        .search_filter(q, K, EF_SEARCH, None)
+                        .into_iter()
+                        .map(|n| n.d_id)
+                        .collect();
+                    hits += recall_of(&page, want);
+                }
+                let edges: usize = hnsw
+                    .get_point_indexation()
+                    .into_iter()
+                    .map(|p| p.get_neighborhood_id().iter().map(Vec::len).sum::<usize>())
+                    .sum();
+                BuildRun {
+                    nanos,
+                    recall: hits as f64 / (K * NQ) as f64,
+                    graph_bytes: super::graph_memory_bytes(&hnsw),
+                    nodes: hnsw.get_nb_point(),
+                    edges,
+                }
+            }
+            ("zeusdb", "cosine") => {
+                measure_zeusdb::<CosineDist>(&data, &queries, &truth, dim, size, || CosineDist {})
+            }
+            ("zeusdb", _) => {
+                measure_zeusdb::<L2Dist>(&data, &queries, &truth, dim, size, || L2Dist {})
+            }
+            _ => panic!("ZEUSDB_BUILDER is vendored or zeusdb"),
+        }
+    };
+
+    let mut runs: Vec<BuildRun> = Vec::new();
+    for _ in 0..repeats {
+        runs.push(run_once());
+    }
+    let millis: Vec<f64> = runs.iter().map(|r| r.nanos as f64 / 1e6).collect();
+    let best = millis.iter().cloned().fold(f64::INFINITY, f64::min);
+    let worst = millis.iter().cloned().fold(0.0f64, f64::max);
+    let mean = millis.iter().sum::<f64>() / millis.len() as f64;
+    println!(
+        "MEASURE config {} size {} builder {} nodes {} edges {} graph_bytes {} \
+         recall {:.4} build_ms mean {:.1} best {:.1} worst {:.1} spread {:.1}% runs {:?}",
+        config,
+        size,
+        builder,
+        runs[0].nodes,
+        runs[0].edges,
+        runs[0].graph_bytes,
+        runs[0].recall,
+        mean,
+        best,
+        worst,
+        (worst - best) / best * 100.0,
+        millis
+            .iter()
+            .map(|m| (m * 10.0).round() / 10.0)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// One ZeusDB build, timed, with the two phases timed separately.
+///
+/// The phase split is what the write lock duty cycle is measured from: phase
+/// one runs under a read guard and phase two under the write guard, so the
+/// fraction of an insertion spent in phase two is the fraction of wall clock a
+/// per record write lock would be held for.
+fn measure_zeusdb<D>(
+    data: &[Vec<f32>],
+    queries: &[Vec<f32>],
+    truth: &[Vec<usize>],
+    dim: usize,
+    size: usize,
+    dist: impl Fn() -> D,
+) -> BuildRun
+where
+    D: Distance<f32> + Send + Sync + 'static,
+{
+    const K: usize = 10;
+    const M: usize = 16;
+    const EF_CONSTRUCTION: usize = 200;
+    const EF_SEARCH: usize = 100;
+
+    let scale = LevelGenerator::default_scale(M);
+    let mut levels = LevelGenerator::new(scale, NB_LAYER_MAX as usize);
+    let mut graph = MutableGraph::new(dim, M, EF_CONSTRUCTION, scale, size, dist()).unwrap();
+
+    let mut plan_nanos = 0u128;
+    let mut install_nanos = 0u128;
+    let started = std::time::Instant::now();
+    for (id, v) in data.iter().enumerate() {
+        let level = levels.generate();
+        if graph.nb_points() == 0 {
+            graph.insert_first(v.as_slice(), id, level);
+            continue;
+        }
+        let at = std::time::Instant::now();
+        let plan = graph.plan(v.as_slice(), level);
+        plan_nanos += at.elapsed().as_nanos();
+        let at = std::time::Instant::now();
+        graph.install(v.as_slice(), id, plan);
+        install_nanos += at.elapsed().as_nanos();
+    }
+    let nanos = started.elapsed().as_nanos();
+
+    let mut hits = 0usize;
+    for (q, want) in queries.iter().zip(truth.iter()) {
+        let page: Vec<usize> = graph
+            .search(q, K, EF_SEARCH, None::<&BoxedFilter>)
+            .into_iter()
+            .map(|hit| hit.internal_id)
+            .collect();
+        hits += recall_of(&page, want);
+    }
+
+    println!(
+        "PHASES plan_ms {:.1} install_ms {:.1} duty_cycle {:.3}% timed_total_ms {:.1} \
+         wall_ms {:.1}",
+        plan_nanos as f64 / 1e6,
+        install_nanos as f64 / 1e6,
+        install_nanos as f64 / (plan_nanos + install_nanos) as f64 * 100.0,
+        (plan_nanos + install_nanos) as f64 / 1e6,
+        nanos as f64 / 1e6
+    );
+
+    BuildRun {
+        nanos,
+        recall: hits as f64 / (K * queries.len()) as f64,
+        graph_bytes: graph.memory_bytes() - size * dim * std::mem::size_of::<f32>(),
+        nodes: graph.nb_points(),
+        edges: graph.nb_edges() + graph.above_level_edges(),
+    }
 }
