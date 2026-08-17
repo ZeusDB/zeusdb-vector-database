@@ -82,9 +82,17 @@ const NO_FILTER: Option<&NoFilter> = None;
 /// Nothing here borrows the graph. That is the property that lets the read
 /// guard drop between the phases, and it is why the lists are node indices and
 /// distances rather than slices into the arenas.
-pub(in crate::graph) struct Insertion {
+pub(crate) struct Insertion {
     /// The level drawn for this point, before either phase ran.
     level: usize,
+    /// Nodes the graph held when the plan was made.
+    ///
+    /// Every node index the plan names was handed out against that arena, so a
+    /// plan installed into a graph holding a different number of nodes names
+    /// something other than what it chose. Nothing can put the graph in that
+    /// state, because the index's `writers` mutex holds the two phases together;
+    /// this is what says so at the moment it matters rather than in a comment.
+    nb_points: usize,
     /// The descent residue, as (layer, target, distance), at layers above
     /// `level`. See the module documentation of [`super`] for why it is kept.
     residue: Vec<(u8, u32, f32)>,
@@ -93,6 +101,20 @@ pub(in crate::graph) struct Insertion {
     /// contributes no entry, exactly as the vendored insert installs nothing
     /// there.
     lists: Vec<(usize, Vec<Entry>)>,
+}
+
+/// What phase one decided, whichever of the two shapes an insertion takes.
+///
+/// The first insertion into an empty graph has no phase one at all, because the
+/// vendored insert reads its entry point, finds `None` and returns before it
+/// descends. Which of the two an insertion is is therefore decided under the
+/// read guard along with everything else, and phase two carries it out.
+pub(crate) enum Planned {
+    /// The graph held no point, so the insertion files a node and takes no
+    /// edges.
+    First { level: usize },
+    /// The descent ran and chose the lists to install.
+    Descended(Insertion),
 }
 
 /// The graph as the vendored insert sees it partway through its own insertion.
@@ -173,12 +195,34 @@ where
         levels: &mut LevelGenerator,
     ) {
         let level = levels.generate();
+        let planned = self.plan_insertion(data, level);
+        self.install_insertion(data, origin_id, planned);
+    }
+
+    /// Phase one, whichever shape the insertion takes.
+    ///
+    /// The empty case is settled here rather than by the caller, because
+    /// whether the graph holds a point is itself something read under the read
+    /// guard, and the answer cannot change before phase two runs.
+    pub(in crate::graph) fn plan_insertion(&self, data: &[T], level: usize) -> Planned {
         if self.nb_points() == 0 {
-            self.insert_first(data, origin_id, level);
-            return;
+            Planned::First { level }
+        } else {
+            Planned::Descended(self.plan(data, level))
         }
-        let plan = self.plan(data, level);
-        self.install(data, origin_id, plan);
+    }
+
+    /// Phase two, whichever shape the insertion takes.
+    pub(in crate::graph) fn install_insertion(
+        &mut self,
+        data: &[T],
+        origin_id: usize,
+        planned: Planned,
+    ) {
+        match planned {
+            Planned::First { level } => self.insert_first(data, origin_id, level),
+            Planned::Descended(plan) => self.install(data, origin_id, plan),
+        }
     }
 
     /// The first insertion into an empty graph, which has no phase one.
@@ -275,6 +319,7 @@ where
 
         Insertion {
             level,
+            nb_points: self.nb_points(),
             residue,
             lists,
         }
@@ -347,9 +392,21 @@ where
     pub(in crate::graph) fn install(&mut self, data: &[T], origin_id: usize, plan: Insertion) {
         let Insertion {
             level,
+            nb_points,
             residue,
             lists,
         } = plan;
+
+        // Every node index the plan holds was handed out against the arena
+        // phase one read, so a graph that has taken or lost a node since is a
+        // graph this plan does not describe. See [`Insertion::nb_points`].
+        assert_eq!(
+            self.nb_points(),
+            nb_points,
+            "the graph held {} nodes when this insertion was planned and holds {} now",
+            nb_points,
+            self.nb_points()
+        );
 
         let node = self.append_node(data, origin_id, level, &residue);
 

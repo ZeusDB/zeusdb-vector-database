@@ -66,10 +66,30 @@ def test_graph_memory_is_reported_on_every_index():
         assert float(stats["total_memory_mb"]) >= graph
 
 
-def test_graph_memory_is_empty_before_any_record_arrives():
-    """A graph holding no point holds no memory."""
+def test_graph_memory_reports_the_reservation_before_any_record_arrives():
+    """A graph holding no point reports what its reservation asked for.
+
+    This used to read exactly zero, because the figure was derived from a
+    structure that allocated per point and reported nothing until a point
+    arrived. It hid a reservation that was real: `expected_size` sizes the
+    arenas at creation and those bytes are committed whether or not a record
+    ever lands in them, which is why `expected_size` is capped at all.
+
+    The figure is now the reservation, so it is small rather than zero on a
+    small declaration and it is bounded on a large one. What bounds it is a
+    byte budget rather than the declaration; see
+    `test_empty_index_at_a_large_declared_size_stays_under_the_bound`, which is
+    where that bound is held.
+    """
     index = VectorDatabase().create("hnsw", dim=32, expected_size=100)
-    assert float(index.get_stats()["graph_memory_mb"]) == 0.0
+    reported = float(index.get_stats()["graph_memory_mb"])
+    assert 0.0 < reported < 1.0, (
+        f"an empty index at expected_size 100 reports {reported} MB")
+
+    # And it rises with the declaration, since that is what it is reserving
+    # against.
+    larger = VectorDatabase().create("hnsw", dim=32, expected_size=100_000)
+    assert float(larger.get_stats()["graph_memory_mb"]) > reported
 
 
 def test_graph_memory_carries_a_copy_of_every_point():
@@ -120,9 +140,20 @@ def test_the_quantized_graph_is_smaller_than_the_raw_one():
     assert 0.5 * copy_mb <= saved <= 2.5 * copy_mb, (
         f"the quantized graph saved {saved:.2f} MB where the copy it replaced "
         f"is {copy_mb:.2f} MB")
-    assert modes[0] > copy_mb, (
-        "the quantized graph reads as smaller than the copy it dropped, so it "
-        "is not carrying the neighbour lists")
+    # The graph is more than the codes it holds. What it carries beside them is
+    # a fixed capacity neighbour slab per point at layer zero, which is
+    # `(2m + 1)` targets and the same number of distances, so the figure has to
+    # clear that whatever the element type. This used to be stated as clearing
+    # the raw copy it dropped, which held while a point cost roughly 2,000 bytes
+    # of structure around its vector. A point now costs about 400, so the
+    # quantized graph is genuinely smaller than the copy it replaced and the
+    # slab is the honest floor.
+    m = int(with_raw.get_stats()["m"])
+    slab_mb = records * (2 * m + 1) * (4 + 4) / (1024 * 1024)
+    assert modes[0] > slab_mb, (
+        f"the quantized graph reads as {modes[0]:.2f} MB where its layer zero "
+        f"slabs alone are {slab_mb:.2f} MB, so it is not carrying the "
+        f"neighbour lists")
 
 
 def test_graph_memory_rises_with_the_graph_degree():
@@ -296,6 +327,12 @@ def test_the_graph_figure_survives_a_save_and_a_load(tmp_path):
 
     loaded = VectorDatabase().load(directory)
     after = float(loaded.get_stats()["graph_memory_mb"])
-    assert after == pytest.approx(before, rel=0.02), (
+    # Close rather than equal, and the gap has a direction. A built graph
+    # reserves against `expected_size` and against an estimate of how many upper
+    # lists a graph that size will own, so it holds slack. A loaded one is sized
+    # from the file and trimmed to fit, so it holds none. Measured at 3.6
+    # percent on this fixture, with the loaded figure the smaller of the two.
+    assert after <= before
+    assert after == pytest.approx(before, rel=0.10), (
         f"the loaded graph reports {after:.2f} MB where the saved one reported "
         f"{before:.2f} MB")

@@ -377,10 +377,21 @@ pub struct HNSWIndex {
     id_counter: Mutex<usize>,
     vector_count: Mutex<usize>, // Track total vectors for training trigger
 
-    /// The graph. A read guard covers a traversal and a single record insertion,
-    /// because `hnsw_rs` takes `&self` on both and does its own interior locking.
-    /// A write guard covers replacing the whole backend, which `compact`,
+    /// The graph.
+    ///
+    /// A read guard covers a traversal and the compute phase of a single record
+    /// insertion. A write guard covers the install phase of that insertion, and
+    /// covers replacing the whole backend, which `compact`,
     /// `rebuild_with_quantization` and the persistence rebuild each do once.
+    ///
+    /// The insertion is what takes this lock twice for one operation, a read
+    /// guard for the phase that decides and a write guard for the phase that
+    /// writes. It used to take a read guard alone, because the vendored graph
+    /// took `&self` on an insert and did its own interior locking per neighbour
+    /// list. ZeusDB's structure is a set of slabs and a mutator takes `&mut`,
+    /// so the exclusion moved from inside the graph to this lock. See
+    /// `insert_one` for the sequence and for what makes the gap between the two
+    /// phases safe.
     hnsw: RwLock<VectorGraph>,
 
     /// Serialises the mutating operations against each other, not against reads.
@@ -1152,8 +1163,8 @@ impl HNSWIndex {
     ///
     /// The rebuild runs with the interpreter lock released. Every function it
     /// reaches is in the set `insert_parsed_records` verifies, plus
-    /// `VectorGraph::new_raw` and `insert_batch`, which are the same shape as
-    /// the quantized pair already listed there.
+    /// `VectorGraph::new_raw` and `VectorGraph::insert`, which are the same
+    /// shape as the quantized pair already listed there.
     pub fn compact(&self, py: Python<'_>) -> PyResult<usize> {
         py.detach(|| self.compact_locked())
     }

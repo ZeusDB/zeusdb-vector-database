@@ -473,7 +473,8 @@ impl HNSWIndex {
         //
         // This is a request count and not a commitment. The allocator's own
         // headers, its rounding and its fragmentation sit outside it, the same
-        // way they sit outside `graph_memory_mb`; see `graph_memory_bytes`.
+        // way they sit outside `graph_memory_mb`; see
+        // `VectorGraph::memory_bytes`.
         let bookkeeping_mb = bookkeeping as f64 / (1024.0 * 1024.0);
         total_memory_mb += bookkeeping_mb;
         stats.insert(

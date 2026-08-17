@@ -403,7 +403,7 @@ impl HNSWIndex {
         let mut batch_data = batch_data;
         batch_data.sort_unstable_by_key(|&(_, internal_id)| internal_id);
 
-        let new_hnsw = VectorGraph::new_pq(
+        let mut new_hnsw = VectorGraph::new_pq(
             &self.space,
             self.m,
             self.expected_size,

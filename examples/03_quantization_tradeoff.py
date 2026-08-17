@@ -173,8 +173,9 @@ def main():
     print()
     print("Both modes drop the graph's full width copy of every point, so both")
     print("save there. The graph column holds more than that copy. The neighbour")
-    print("lists, the sixteen layer headers every point carries and the counters")
-    print("around them do not shrink when the copy does, so the quantized graph")
+    print("list slabs, one per point at every layer it reaches, and the inbound")
+    print("counters beside them do not shrink when the copy does, so the")
+    print("quantized graph")
     print("is smaller rather than negligible. The fixed table is 1.06 MB at this")
     print("configuration and neither mode has repaid it at 3,000 records. The")
     print("fixed cost does not grow with the record count and the saving does, so")
@@ -245,14 +246,15 @@ compression ratio: 32x
 
 stored per mode
   mode                    raw  codes  raw MB  code MB  fixed MB  graph MB  total
-  no quantization        3000      0    0.73     0.00      0.00      5.14   6.71
-  quantized_only            0   3000    0.00     0.02      1.06      4...   6...
-  quantized_with_raw     3000   3000    0.73     0.02      1.06      4...   7...
+  no quantization        3000      0    0.73     0.00      0.00      1.79   3.36
+  quantized_only            0   3000    0.00     0.02      1.06      1...   3...
+  quantized_with_raw     3000   3000    0.73     0.02      1.06      1...   3...
 
 Both modes drop the graph's full width copy of every point, so both
 save there. The graph column holds more than that copy. The neighbour
-lists, the sixteen layer headers every point carries and the counters
-around them do not shrink when the copy does, so the quantized graph
+list slabs, one per point at every layer it reaches, and the inbound
+counters beside them do not shrink when the copy does, so the
+quantized graph
 is smaller rather than negligible. The fixed table is 1.06 MB at this
 configuration and neither mode has repaid it at 3,000 records. The
 fixed cost does not grow with the record count and the saving does, so
