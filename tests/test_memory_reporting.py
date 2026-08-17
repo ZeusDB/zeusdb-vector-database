@@ -5,15 +5,13 @@ and stop there. The graph is the largest thing an index holds and it was left
 out, so on a trained `quantized_only` index at 50,000 records of dimension 1,536
 the reported figure was 9.77 MB against 231 MiB resident, under five percent of
 the truth. These tests cover the graph figure being reported at all, its shape
-against the parameters that drive it, and the reported total against the
-resident set of a process that holds one index and nothing else.
+against the parameters that drive it, and the reported total against the bytes
+the structure cannot avoid holding.
 
-Memory is read as `psutil` `memory_info().rss`, which is the working set on
-Windows and the pages faulted in and still held on Linux. The figure is a delta
-across the build with the source array already allocated on both sides, so what
-it measures is the index. It is not the same quantity as the reported total and
-it does not bound it in either direction; see
-`TOTAL_AGAINST_RESIDENT_CEILING`.
+Nothing here reads the resident set. It was read until this relay, as a delta
+across a build in a process of its own, and it turned out to be confounded by
+more than it measured. What replaced it and what the two confounders came to
+are recorded above `_structure_floor_mb`.
 """
 
 import warnings
@@ -170,163 +168,100 @@ def test_graph_memory_rises_with_the_graph_degree():
 
 
 # ------------------------------------------------------------
-# The total against the resident set
+# The total against what the structure must hold
 # ------------------------------------------------------------
-# `total_memory_mb` and the resident set are not the same quantity, and neither
-# one bounds the other.
+# This used to compare `total_memory_mb` against the resident set delta of a
+# subprocess that built one index. That comparison is gone and the reason is
+# that the resident delta is not a usable denominator here. It is confounded in
+# both directions, each confounder is larger than the signal, and both were
+# measured rather than argued.
 #
-# The report counts bytes the index asked the allocator for. The resident set
-# counts pages the process has touched and still holds. They diverge in both
-# directions and the bounds below are asymmetric for that reason.
+# Downward, a build allocates and frees. On glibc a freed block is not a
+# returned one, so the transient stays resident and inflates the delta. At
+# 8,000 records of dimension 256 under `quantized_only`, the build peaks at
+# 21.87 MB of private commit and settles at 13.69, of which 8.18 MB is
+# decommitted and a further 6.65 MB is retained past what the index holds. The
+# index reports 7.53 MB. CI read a delta of 20.6 MB and a share of 0.365
+# against a floor of 0.45, and 20.6 is the peak of the build rather than the
+# footprint of the index.
 #
-# Downward, the process holds more than the report names. The allocator's own
-# block headers and its rounding, its fragmentation, and the id maps, the
-# metadata map and the hash table slots that `total_memory_mb` does not price
-# all sit outside the report. Measured on Windows over the relay 60 grid, being
-# three dimensions, two record counts and three storage modes over real
-# dbpedia-openai embeddings, the report ran 0.62 to 0.89 of the resident delta.
+# `quantized_only` is the cell that shows it because it is the cell that frees
+# most. Training rebuilds the graph, so the raw graph is dropped after the
+# quantized one is built, and the mode then releases every raw vector. The same
+# index loaded from a directory, which trains nothing, settles at 7.04 MB of
+# commit against a report of 7.21, a share of 1.024. The report tracks the
+# index. It is the measurement of the index that did not.
 #
-# Upward, the report names more than the process holds. Capacity that was
-# requested and never written never faults in, so it never enters the resident
-# set at all. That mechanism is real and it is measurable: at 8,000 records of
-# dimension 256 declared as 100,000, the report reads 138.93 MB against 25.97
-# MiB of resident delta, a share of 5.35, and the creation itself adds 0.16 MiB
-# of resident set for 128 MB of reservation.
+# Upward, capacity that is requested and never written never faults in. Declare
+# 8,000 records as 100,000 and the report reads 138.93 MB against 25.97 MB of
+# resident delta, a share of 5.35.
 #
-# **It does not fire here, because the probe declares what it builds.** At
-# `expected_size` equal to the record count the arenas are written by the
-# records that arrive: creation adds 0.12 MiB of resident set, and the report
-# then runs 0.935 of the delta. A declaration equal to the truth leaves nothing
-# untouched to diverge over.
+# So the report is compared against what the structure must hold, derived from
+# the record count, the dimension, the degree and the code width. Every term is
+# a fact about the layout rather than a measurement, so no allocator, kernel,
+# runner or corpus can move it.
 #
-# The ceiling therefore sits above one for the allocator's sake rather than for
-# the reservation's, and 2.00 is what it has been since relay 60. The Linux
-# figures of 1.196, 1.229 and 1.579 that used to be recorded here were measured
-# through a probe whose baseline was wrong; see `_RESIDENT_PROBE`. They are not
-# evidence of anything and they are not carried forward.
+# Three terms, all of them written and none of them optional.
 #
-# The floor is unchanged. Under-reporting is the defect this test exists to
-# catch, and nothing about page accounting makes a report that misses half of
-# what an index holds acceptable.
-TOTAL_AGAINST_RESIDENT_FLOOR = 0.45
-TOTAL_AGAINST_RESIDENT_CEILING = 2.00
+#   the raw vector store   `records * dim * 4`, where the mode keeps one
+#   the graph's own copy   `records * dim * 4` raw, `records * subvectors`
+#                          quantized, which the graph holds separately from
+#                          the store
+#   the layer zero slabs   `records * (2m + 1) * 8`, a fixed capacity
+#                          neighbour list per point at layer zero, being that
+#                          many targets and the same many distances
+#
+# What this catches is the defect the graph figure was added to fix. A trained
+# `quantized_only` index of 50,000 records at dimension 1,536 reported 9.77 MB
+# before the graph was priced, where these three terms name 17.2 MB, so it
+# fails here.
+#
+# What it does not catch is an omission nobody enumerated. That is covered
+# instead by `test_the_total_is_the_sum_of_the_parts`, which pins the total to
+# its six components, and by the test each component has of its own.
 
 
-# The corpus is generated at the width it is stored at and normalised in place,
-# which is what makes the baseline below mean anything.
-#
-# It used to draw `standard_normal` at its default float64 and narrow at the
-# end, so building 7.81 MiB of corpus allocated and freed 62.51 MiB of
-# temporaries first, being the picked centres, the noise, their sum and the
-# division's result. All of that was freed before the baseline was taken, and a
-# freed block is not necessarily a returned one: glibc raises its mmap threshold
-# as large mapped blocks are released, after which large allocations come from
-# the heap and freed heap stays resident. The index was then built into a pool
-# the process already held and the delta stopped measuring it.
-#
-# What that looked like: on CI the delta read 9.2 MiB for an unquantized index
-# of 8,000 records at dimension 256, whose raw vector store is 7.81 MiB and
-# whose graph holds a second copy of every vector at another 7.81 MiB. Every one
-# of those 15.62 MiB is written, so every page holding them is faulted in. A
-# delta below the bytes the index demonstrably wrote is a broken denominator
-# rather than an over-reporting numerator.
-#
-# Generating in blocks at float32 takes the allocated-and-freed figure from
-# 62.51 MiB to 0.65 MiB. The corpus keeps its shape, being 40 Gaussian centres
-# with unit-normalised points drawn around them, and its values move, which
-# nothing here depends on.
-_RESIDENT_PROBE = '''
-import gc, json, sys, warnings
-import numpy as np, psutil
-from zeusdb_vector_database import VectorDatabase
+def _structure_floor_mb(index, records, dim):
+    """What the index must hold, from its own parameters and the layout.
 
-records, dim, storage_mode = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
-rng = np.random.default_rng(20260811)
-centres = rng.standard_normal((40, dim), dtype=np.float32)
-pick = rng.integers(0, 40, records)
-data = np.empty((records, dim), dtype=np.float32)
-for at in range(0, records, 512):
-    block = pick[at:at + 512]
-    data[at:at + 512] = centres[block]
-    data[at:at + 512] += rng.standard_normal((len(block), dim), dtype=np.float32)
-data /= np.linalg.norm(data, axis=1, keepdims=True)
-del centres, pick
-ids = [f"m_{i}" for i in range(records)]
-
-config = None
-if storage_mode != "none":
-    config = {"type": "pq", "training_size": 1000, "storage_mode": storage_mode}
-
-gc.collect()
-before = psutil.Process().memory_info().rss
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore", UserWarning)
-    index = VectorDatabase().create("hnsw", dim=dim, expected_size=records,
-                                    quantization_config=config)
-created = psutil.Process().memory_info().rss
-assert index.add({"ids": ids, "embeddings": data}).is_success()
-gc.collect()
-after = psutil.Process().memory_info().rss
-stats = index.get_stats()
-print(json.dumps({"resident": after - before,
-                  "resident_at_create": created - before,
-                  "written_floor": (float(stats["raw_vectors_memory_mb"])
-                                    + float(stats.get("quantized_codes_memory_mb", 0))),
-                  "reported": float(stats["total_memory_mb"])}))
-'''
-
-
-@pytest.mark.parametrize("storage_mode", ["none", "quantized_with_raw", "quantized_only"])
-def test_the_reported_total_tracks_the_resident_set(storage_mode):
-    """What the index says it holds, against what the process gained.
-
-    The report can land either side of the resident delta, and the bounds are
-    asymmetric for reasons recorded on `TOTAL_AGAINST_RESIDENT_CEILING`. What
-    this test is for is the floor. A report that misses most of what an index
-    holds is the defect the graph figure was added to fix, and it would be
-    caught here whatever the pages say.
-
-    One index per process. In a shared process the second build reuses the
-    pages the first one freed, so the resident delta stops measuring the index
-    and the comparison stops meaning anything.
+    Derived and not measured. See the note above.
     """
-    import json
-    import subprocess
-    import sys
+    stats = index.get_stats()
+    m = int(stats["m"])
+    quantized = stats["storage_mode_description"] == "quantized_active"
+    if quantized:
+        ratio = float(stats["quantization_compression_ratio"].rstrip("x"))
+        element_bytes = round(dim * 4 / ratio)
+    else:
+        element_bytes = dim * 4
 
-    completed = subprocess.run(
-        [sys.executable, "-c", _RESIDENT_PROBE, "8000", "256", storage_mode],
-        capture_output=True, text=True, timeout=600)
-    assert completed.returncode == 0, completed.stderr[-2000:]
-    measured = json.loads(completed.stdout.strip().splitlines()[-1])
+    store = records * dim * 4 if int(stats["raw_vectors_stored"]) else 0
+    graph_copy = records * element_bytes
+    slabs = records * (2 * m + 1) * (4 + 4)
+    return (store + graph_copy + slabs) / (1024 * 1024)
 
-    resident_mb = measured["resident"] / (1024 * 1024)
-    reported_mb = measured["reported"]
 
-    # A process that gained nothing measurable cannot grade the report. Page
-    # accounting is not a clean instrument and this leaves the assertion to the
-    # runs where it is.
-    if resident_mb < 8.0:
-        pytest.skip(f"the build added only {resident_mb:.1f} MiB of resident set")
+@pytest.mark.parametrize("storage_mode", [None, "quantized_with_raw", "quantized_only"])
+def test_the_reported_total_covers_what_the_structure_holds(storage_mode):
+    """The report clears the bytes the index cannot avoid holding.
 
-    # The denominator has to be sound before the ratio means anything. The
-    # stored records are bytes the index wrote, so their pages are faulted in
-    # and resident, and a delta below them says the process was already holding
-    # pages the index then reused rather than saying the report is too large.
-    # That is a broken instrument and it is reported as one, because failing on
-    # the ratio would point at the wrong thing.
-    floor_mb = measured["written_floor"]
-    assert resident_mb >= floor_mb, (
-        f"at storage_mode {storage_mode} the process gained {resident_mb:.1f} "
-        f"MiB where the index wrote {floor_mb:.1f} MiB of stored records, so "
-        f"the baseline is measuring a pool the process already held rather than "
-        f"the index. Creation alone added "
-        f"{measured['resident_at_create'] / (1024 * 1024):.2f} MiB.")
+    A report that misses most of what an index holds is the defect the graph
+    figure was added to fix, and this is where that is caught. Measured on this
+    fixture the report clears the floor by 1.23, 1.63 and 3.63 times across the
+    three storage modes, and the margin is the structure the floor does not
+    enumerate, being the upper layer lists, the counters, the codebook, the
+    centroid distance table and the bookkeeping.
+    """
+    records, dim = 8000, 256
+    index, _ = _build(records, dim, storage_mode)
+    reported_mb = float(index.get_stats()["total_memory_mb"])
+    floor_mb = _structure_floor_mb(index, records, dim)
 
-    share = reported_mb / resident_mb
-    assert TOTAL_AGAINST_RESIDENT_FLOOR <= share <= TOTAL_AGAINST_RESIDENT_CEILING, (
-        f"at storage_mode {storage_mode} the index reports {reported_mb:.1f} MB "
-        f"against {resident_mb:.1f} MiB resident, a share of {share:.3f}")
+    assert reported_mb >= floor_mb, (
+        f"at storage_mode {storage_mode} the index reports {reported_mb:.2f} MB "
+        f"where its stored records, the graph's own copy of them and its layer "
+        f"zero slabs come to {floor_mb:.2f} MB, so the report is missing a "
+        f"structure the index cannot be without")
 
 
 def test_the_total_is_the_sum_of_the_parts():
