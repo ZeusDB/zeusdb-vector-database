@@ -5,7 +5,7 @@
 //! describe the same data. One definition rather than one per test module, for
 //! that reason.
 
-use rand::rngs::StdRng;
+use crate::rng::SeededRng;
 use rand::{Rng, SeedableRng};
 /// Clustered unit vectors. Fifty Gaussian centres, points drawn as a centre
 /// plus 0.15 times a Gaussian perturbation, then L2 normalised, with the
@@ -20,8 +20,8 @@ use rand::{Rng, SeedableRng};
 /// collapses for a reason that has nothing to do with what these tests
 /// assert.
 pub(crate) fn clustered(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let gauss = |rng: &mut StdRng| {
+    let mut rng = SeededRng::seed_from_u64(seed);
+    let gauss = |rng: &mut SeededRng| {
         let u: f32 = rng.random::<f32>().max(1e-12);
         let v: f32 = rng.random::<f32>();
         (-2.0 * u.ln()).sqrt() * (std::f32::consts::TAU * v).cos()

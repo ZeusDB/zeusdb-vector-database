@@ -8,6 +8,9 @@ mod logging;
 mod persistence;
 mod pq;
 mod rerank;
+// The generator every seeded draw runs on, named in one place so the pin is
+// auditable in one place.
+mod rng;
 // Test data two test modules measure against, so it is defined once.
 #[cfg(test)]
 mod test_vectors;

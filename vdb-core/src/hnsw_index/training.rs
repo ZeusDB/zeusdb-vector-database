@@ -11,6 +11,7 @@ use super::{HNSWIndex, StorageMode, MAX_LAYER};
 use crate::graph::VectorGraph;
 use crate::pq::PQ;
 use crate::rerank::{calibrate_rerank_from_sample, raw_distance_fn, RerankCalibration};
+use crate::rng::SeededRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use std::collections::HashMap;
@@ -150,7 +151,7 @@ impl HNSWIndex {
         // calibration fits over are random draws rather than slices of
         // insertion order. See `TRAINING_SAMPLE_SEED`.
         let mut training_vectors = training_vectors;
-        let mut sample_rng = rand::rngs::StdRng::seed_from_u64(TRAINING_SAMPLE_SEED);
+        let mut sample_rng = SeededRng::seed_from_u64(TRAINING_SAMPLE_SEED);
         training_vectors.shuffle(&mut sample_rng);
 
         // Respect max_training_vectors limit
@@ -479,6 +480,7 @@ mod tests {
     use super::TRAINING_SAMPLE_SEED;
     use crate::pq::PQ;
     use crate::rerank::{calibrate_rerank_from_sample, raw_distance_fn};
+    use crate::rng::SeededRng;
     use crate::test_vectors::clustered;
     use rand::seq::SliceRandom;
     use rand::SeedableRng;
@@ -492,7 +494,7 @@ mod tests {
 
         let shuffled = |seed: u64| {
             let mut copy = sample.clone();
-            copy.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed));
+            copy.shuffle(&mut SeededRng::seed_from_u64(seed));
             copy
         };
 

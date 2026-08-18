@@ -179,14 +179,24 @@ fn expected_span(m: usize, expected_size: usize) -> usize {
 
 /// One stored edge, as a list holds it and as the two sorts order it.
 ///
-/// **This type is deliberately not `Copy` and not `Clone`.** `sort_unstable`
-/// dispatches on the element type, and the permutation it produces over equal
-/// keys differs between the two dispatch paths. The vendored insert sorts
-/// `Vec<Arc<PointWithOrder>>`, which is 8 bytes and not `Copy`; a `Copy` pair of
-/// the same width takes the other path and orders ties differently from length
-/// 21 up. Layer zero lists run to `2 * m + 1`, which is 33 at the shipped `m`,
-/// and quantized codes tie constantly, so the difference is reachable rather
-/// than theoretical. `the_entry_sort_matches_the_vendored_tie_order` pins it.
+/// This type used to carry no derives at all, because the sorts were
+/// `sort_unstable` and that dispatches on the element type: a `Copy` pair of
+/// eight bytes takes a different path from a non-`Copy` one and orders equal
+/// keys differently from length 21 up. Reproducing the vendored builder's
+/// permutation meant matching its `Vec<Arc<PointWithOrder>>` on both counts.
+///
+/// The sorts are stable now, so the permutation over equal keys is the
+/// insertion order whatever the element is, and the constraint is gone with the
+/// sort that imposed it. `the_entry_sort_keeps_its_insertion_order` holds the
+/// property that replaced it.
+///
+/// The width still matters, for a different reason. A stable sort takes scratch
+/// space, and the standard library serves it from a 4 KiB stack buffer whenever
+/// the request fits, reaching the allocator only above that. At eight bytes a
+/// list would have to run past 512 entries to allocate, and the longest one the
+/// index can build is `2 * m + 1`, which is 129 at the largest `m` accepted.
+/// `an_entry_is_eight_bytes` holds the width so that argument stays checkable.
+#[derive(Clone, Copy)]
 pub(super) struct Entry {
     /// Distance from the list's owner to the target, as it is stored.
     pub(super) dist: f32,
@@ -220,7 +230,7 @@ pub(super) fn entries_for_test(dists: &[f32]) -> Vec<Entry> {
 /// The sort every list maintenance site runs, for the sort order test.
 #[cfg(test)]
 pub(super) fn sort_entries_for_test(entries: &mut [Entry]) {
-    entries.sort_unstable_by(by_distance);
+    entries.sort_by(by_distance);
 }
 
 /// The mutable graph: an arena of nodes, a vector slab, and slab adjacency.
@@ -1087,11 +1097,19 @@ where
     }
 
     /// Order one list by its stored distances, through the scratch buffer both
-    /// sorts share. See [`Entry`] for why the sort runs over a contiguous slice
-    /// of that type and not over the two arenas in place.
+    /// sorts share.
+    ///
+    /// The copy out and back is not avoidable. A list's targets and distances
+    /// live in two separate arenas, so there is no slice holding both to sort
+    /// in place, and sorting the distances alone would not carry the targets
+    /// with them. [`Entry`] is the pair the sort needs.
+    ///
+    /// The sort is stable, so two targets at an equal distance keep the order
+    /// they were filed in. This runs once per reverse link per layer, which is
+    /// the hottest sort in the insert.
     fn sort_list(&mut self, node: u32, layer: usize, scratch: &mut Vec<Entry>) {
         self.copy_list(node, layer, scratch);
-        scratch.sort_unstable_by(by_distance);
+        scratch.sort_by(by_distance);
         self.write_list(node, layer, scratch);
     }
 
