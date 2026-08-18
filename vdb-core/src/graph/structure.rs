@@ -484,42 +484,28 @@ fn a_dump_round_trips_through_the_mutable_graph() {
 // THE NEIGHBOUR LIST SORT
 // ============================================================================
 
-/// The tie ordering of a list sort is a property of the element type, and this
-/// pins the one the graph depends on.
+/// Two edges at an equal distance keep the order they were filed in.
 ///
-/// The reference is the standard library rather than anything ZeusDB replaced.
-/// `sort_unstable` dispatches on the element, and the permutation it produces
-/// over equal keys differs between the dispatch paths. The builder the graph
-/// reproduces sorted `Vec<Arc<PointWithOrder>>`, which is what the `Reference`
-/// here stands in for. A list is a `Vec<Entry>`, and `Entry` reproduces that
-/// permutation only while it stays 8 bytes and not `Copy`. If a future
-/// toolchain moves the threshold, or a `derive` is added to `Entry`, the two
-/// stop agreeing on lists holding equal distances and this fails.
+/// **This replaces a comparison against a live `Vec<Arc<_>>` sort, and the
+/// reference it held has no meaning now.** The sorts were `sort_unstable`, which
+/// dispatches on the element type and orders equal keys differently on the two
+/// paths, so reproducing the vendored builder's permutation meant matching the
+/// element it sorted as well as the order. That comparison said nothing about
+/// what the list ought to hold. It said only that two arbitrary permutations
+/// agreed, and it would have gone on agreeing if both were wrong.
+///
+/// The sorts are stable now, so the permutation over equal keys is a stated
+/// property rather than a coincidence of dispatch, and this holds the property.
+/// A list carries its entries in the order the reverse update filed them, and
+/// ties are common rather than exotic: quantized codes make whole clusters
+/// equidistant, and the fixture below ties on purpose.
+///
+/// The consequence is that a sort no longer depends on the element type, the
+/// toolchain's dispatch thresholds, or the width of [`Entry`]. What it does
+/// depend on is the comparator being consistent, which `by_distance` is because
+/// it panics on the one value that would break it.
 #[test]
-fn the_entry_sort_holds_its_tie_order() {
-    use std::cmp::Ordering;
-
-    struct Reference {
-        dist: f32,
-        tag: u32,
-    }
-    impl PartialEq for Reference {
-        fn eq(&self, other: &Self) -> bool {
-            self.dist == other.dist
-        }
-    }
-    impl Eq for Reference {}
-    impl PartialOrd for Reference {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-    impl Ord for Reference {
-        fn cmp(&self, other: &Self) -> Ordering {
-            self.dist.partial_cmp(&other.dist).unwrap()
-        }
-    }
-
+fn the_entry_sort_keeps_its_insertion_order() {
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let mut next = || {
         state ^= state << 13;
@@ -530,10 +516,14 @@ fn the_entry_sort_holds_its_tie_order() {
 
     let mut cases = 0usize;
     let mut tie_bearing = 0usize;
+    let mut tied_pairs = 0usize;
     // A layer zero list runs to `2 * m + 1`, which is 33 at the shipped `m` and
-    // 129 at the largest `m` the index accepts.
+    // 129 at the largest `m` the index accepts. Lengths above 20 are the ones
+    // that matter most, since that is where the standard library stops running
+    // a plain insertion sort and starts merging.
     for len in 1..=130usize {
         for _ in 0..40 {
+            // A small number of distinct distances, so ties are the rule.
             let distinct = 1 + (next() % 6) as usize;
             let dists: Vec<f32> = (0..len)
                 .map(|_| (next() % distinct as u64) as f32)
@@ -542,35 +532,65 @@ fn the_entry_sort_holds_its_tie_order() {
                 tie_bearing += 1;
             }
 
-            let mut reference: Vec<Arc<Reference>> = dists
-                .iter()
-                .enumerate()
-                .map(|(i, &dist)| {
-                    Arc::new(Reference {
-                        dist,
-                        tag: i as u32,
-                    })
-                })
-                .collect();
-            reference.sort_unstable();
+            // `entries_for_test` tags entry `i` with target `i`, so the target
+            // is the position it was filed at.
+            let mut entries = super::mutable::entries_for_test(&dists);
+            super::mutable::sort_entries_for_test(&mut entries);
+            assert_eq!(entries.len(), len);
 
-            let mut ours = super::mutable::entries_for_test(&dists);
-            super::mutable::sort_entries_for_test(&mut ours);
-
-            let theirs: Vec<u32> = reference.iter().map(|r| r.tag).collect();
-            let ours: Vec<u32> = ours.iter().map(|e| e.target).collect();
-            assert_eq!(
-                theirs, ours,
-                "the tie order diverges at length {} on {:?}",
-                len, dists
-            );
+            for pair in entries.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                assert!(
+                    a.dist <= b.dist,
+                    "the list came out unsorted at length {} on {:?}",
+                    len,
+                    dists
+                );
+                if a.dist == b.dist {
+                    tied_pairs += 1;
+                    assert!(
+                        a.target < b.target,
+                        "two entries at distance {} came out as {} then {} at \
+                         length {}, so the sort reordered a tie",
+                        a.dist,
+                        a.target,
+                        b.target,
+                        len
+                    );
+                }
+            }
             cases += 1;
         }
     }
-    println!(
-        "entry sort: {} cases compared, {} of them holding ties, 0 differing",
-        cases, tie_bearing
+    // The fixture has to reach the property, or this asserts only that the sort
+    // sorts. Roughly nine adjacent pairs in ten are tied at these widths.
+    assert!(
+        tied_pairs > 100_000,
+        "only {} tied pairs over {} lists, which is not enough to hold the \
+         property",
+        tied_pairs,
+        cases
     );
+    println!(
+        "entry sort: {} lists, {} of them holding ties, {} tied adjacent pairs, \
+         0 reordered",
+        cases, tie_bearing, tied_pairs
+    );
+}
+
+/// [`Entry`] is eight bytes, which is what keeps the stable sort off the
+/// allocator.
+///
+/// The standard library's stable sort serves its scratch space from a 4 KiB
+/// stack buffer whenever the request fits and calls the allocator only above
+/// that, so an eight byte element allocates only past 512 entries. The longest
+/// list the index can build is `2 * m + 1`, which is 129 at the largest `m`
+/// accepted and 33 at the shipped one. A wider `Entry` narrows that margin, and
+/// this is where it would be noticed.
+#[test]
+fn an_entry_is_eight_bytes() {
+    assert_eq!(std::mem::size_of::<super::mutable::Entry>(), 8);
+    assert_eq!(4096 / std::mem::size_of::<super::mutable::Entry>(), 512);
 }
 
 // ============================================================================
@@ -640,10 +660,14 @@ fn stream_signature(
 /// same `StdRng` moves with it and stays green while every graph a build
 /// produces changes. A recorded stream does not.
 ///
-/// So a failure here means one of three things. The `rand` version moved and
-/// `StdRng` is no longer ChaCha12, in which case every previously built graph
-/// is no longer reproducible and `rand_chacha` has to be pinned. The draw
-/// itself changed. Or the scale did.
+/// The recording was taken while the generator was `StdRng`, and it is
+/// unchanged. `crate::rng::SeededRng` names the algorithm `StdRng` was, so the
+/// pin moved no draw and this test is the evidence, since it holds a sequence
+/// recorded before the pin existed.
+///
+/// So a failure here means one of two things now. The draw itself changed, or
+/// the scale did. The third cause it used to have, being `rand` replacing
+/// `StdRng` underneath the generator, is what the pin removed.
 #[test]
 fn the_level_stream_matches_the_recorded_one() {
     // The default scale at `m` 16, which is what every shipped index draws

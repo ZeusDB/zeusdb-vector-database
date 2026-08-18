@@ -21,8 +21,8 @@ use super::DistPQ;
 use crate::distance::CosineDist;
 use crate::graph::test_graph::TestGraph;
 use crate::pq::PQ;
+use crate::rng::SeededRng;
 use crate::test_vectors::clustered;
-use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
@@ -85,7 +85,7 @@ fn fixture() -> &'static PqFixture {
 /// two raw guards below want a graph whose neighbour lists fill rather than one
 /// whose clusters let the diversity heuristic prune.
 fn unit_vectors(records: usize, dim: usize) -> Vec<Vec<f32>> {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = SeededRng::seed_from_u64(42);
     (0..records)
         .map(|_| {
             let mut v: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() - 0.5).collect();

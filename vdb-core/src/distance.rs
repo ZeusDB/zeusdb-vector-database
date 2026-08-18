@@ -567,7 +567,7 @@ impl Distance<f32> for DotDist {
 mod tests {
     use super::*;
     use crate::graph::test_graph::TestGraph;
-    use rand::rngs::StdRng;
+    use crate::rng::SeededRng;
     use rand::{Rng, SeedableRng};
 
     /// Dimensions the grid runs at. 128, 768 and 1536 are the measured ones,
@@ -576,11 +576,11 @@ mod tests {
     /// prime.
     const DIMS: [usize; 11] = [1, 2, 3, 7, 8, 9, 15, 17, 128, 768, 1536];
 
-    fn rng(seed: u64) -> StdRng {
-        StdRng::seed_from_u64(seed)
+    fn rng(seed: u64) -> SeededRng {
+        SeededRng::seed_from_u64(seed)
     }
 
-    fn random_vector(rng: &mut StdRng, dim: usize) -> Vec<f32> {
+    fn random_vector(rng: &mut SeededRng, dim: usize) -> Vec<f32> {
         (0..dim).map(|_| rng.random_range(-1.0f32..1.0)).collect()
     }
 

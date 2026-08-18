@@ -1,4 +1,5 @@
-use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
+use crate::rng::SeededRng;
+use rand::{seq::SliceRandom, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::sync::RwLock;
 
@@ -16,8 +17,9 @@ use std::sync::RwLock;
 /// nondeterminism the seed exists to remove. Each subvector therefore derives
 /// its own stream as `PQ_TRAINING_SEED ^ (s + 1)`, which no scheduling order
 /// can perturb, and the sampling shuffle in `train` takes the base stream.
-/// `seed_from_u64` expands the value through SplitMix64, so the nearby seeds
-/// produce unrelated streams.
+/// `seed_from_u64` expands the value through PCG32, so the nearby seeds
+/// produce unrelated streams. The generator itself is named in `crate::rng`
+/// rather than taken from `StdRng`, so a `rand` release cannot move a codebook.
 const PQ_TRAINING_SEED: u64 = 0x5A_EE_5D_B0_5E_ED_57_02;
 
 /// Product Quantization implementation for vector compression
@@ -298,7 +300,7 @@ impl PQ {
 
         // Sample training vectors if we have more than needed
         let training_vectors = if sample_size < vectors.len() {
-            let mut rng = StdRng::seed_from_u64(PQ_TRAINING_SEED);
+            let mut rng = SeededRng::seed_from_u64(PQ_TRAINING_SEED);
             let mut indices: Vec<usize> = (0..vectors.len()).collect();
             indices.shuffle(&mut rng);
             indices.truncate(sample_size);
@@ -327,7 +329,7 @@ impl PQ {
                     100
                 };
                 // This subvector's own stream; see `PQ_TRAINING_SEED`.
-                let mut rng = StdRng::seed_from_u64(PQ_TRAINING_SEED ^ (s as u64 + 1));
+                let mut rng = SeededRng::seed_from_u64(PQ_TRAINING_SEED ^ (s as u64 + 1));
                 self.kmeans(&subvectors, self.num_centroids, max_iter, &mut rng)
             })
             .collect();

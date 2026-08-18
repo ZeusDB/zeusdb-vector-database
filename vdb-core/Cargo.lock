@@ -1055,6 +1055,7 @@ dependencies = [
  "numpy",
  "pyo3",
  "rand",
+ "rand_chacha",
  "rayon",
  "serde",
  "serde_json",

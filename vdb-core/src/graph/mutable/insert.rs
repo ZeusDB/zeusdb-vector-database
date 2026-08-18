@@ -307,7 +307,7 @@ where
             let nb_conn = if l == 0 { 2 * self.m() } else { self.m() };
             neighbours.reserve(nb_conn);
             self.select_neighbours(&mut candidates, nb_conn, &mut neighbours);
-            neighbours.sort_unstable_by(by_distance);
+            neighbours.sort_by(by_distance);
             // The nearest chosen neighbour carries the descent into the next
             // layer down. The vendored insert reads it after installing the
             // list, which reads the same entry.

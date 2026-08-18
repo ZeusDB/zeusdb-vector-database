@@ -26,14 +26,16 @@
 //!
 //! # What `rand` promises
 //!
-//! Nothing, and that is worth writing down. `StdRng` is documented as
-//! non-portable: any future library version may replace the algorithm, and
-//! results may be platform dependent. Today it is ChaCha12 through
-//! `rand_chacha`, and the crate points a caller who needs a stable stream at
-//! `rand_chacha` directly. Calling the same `rand` the vendored crate calls is
-//! what makes this generator's stream identical to the vendored one, and it
-//! inherits the same absence of a guarantee. See the relay report.
+//! Nothing about `StdRng`, which is why this does not draw from it. `rand`
+//! documents `StdRng` as non-portable, meaning any future library version may
+//! replace the algorithm and results may be platform dependent, and it points a
+//! caller who needs a stable stream at `rand_chacha` directly. The stream this
+//! generator produces is the graph, so it draws from [`SeededRng`], which names
+//! ChaCha12 rather than accepting whatever `StdRng` is on the day. That is the
+//! same algorithm `StdRng` was when the recorded stream was taken, so the pin
+//! moved nothing. See `crate::rng` for what it does and does not cover.
 
+use crate::rng::SeededRng;
 use rand::distr::Uniform;
 use rand::prelude::*;
 
@@ -53,7 +55,7 @@ pub(super) const DEFAULT_LEVEL_SEED: u64 = 0x5A45_5553_4442_5F30;
 /// the structure it feeds is mutated under the index write lock and the mutator
 /// is serialised. The stream is the same either way; only the lock leaves.
 pub(super) struct LevelGenerator {
-    rng: rand::rngs::StdRng,
+    rng: SeededRng,
     unif: Uniform<f64>,
     /// Drives the number of levels generated.
     scale: f64,
@@ -75,7 +77,7 @@ impl LevelGenerator {
     /// scale a dump recorded, and both are values rather than factors.
     pub(super) fn new(scale: f64, maxlevel: usize) -> Self {
         LevelGenerator {
-            rng: StdRng::seed_from_u64(DEFAULT_LEVEL_SEED),
+            rng: SeededRng::seed_from_u64(DEFAULT_LEVEL_SEED),
             unif: Uniform::<f64>::new(0., 1.).expect("zero is below one"),
             scale,
             maxlevel,
@@ -92,7 +94,7 @@ impl LevelGenerator {
     /// Reseed the stream. Resets it rather than extending it, so a caller that
     /// wants a chosen seed calls this before the first insertion.
     pub(super) fn set_seed(&mut self, seed: u64) {
-        self.rng = StdRng::seed_from_u64(seed);
+        self.rng = SeededRng::seed_from_u64(seed);
     }
 
     /// The scale, which a dump records.
