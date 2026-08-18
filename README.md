@@ -441,7 +441,7 @@ doc_003 0.000988 {'author': 'Alice'}
 doc_005 0.001143 {'author': 'Alice'}
 ```
 
-**The filter is applied after the graph search, not during it.** The index finds the `top_k` nearest vectors first and then discards the ones the filter rejects, so a selective filter can return fewer than `top_k` results, or none at all. Raise `top_k` when you filter. See [Metadata Filtering](#️-metadata-filtering) for a worked example.
+**The filter decides which records are ranked, not which results survive.** A search asking for five results with a filter matching a hundred records returns the five nearest of those hundred. `top_k` is the page size and nothing else, so there is no need to raise it when you filter. See [Metadata Filtering](#️-metadata-filtering) for what that costs.
 
 #### 🔍 Search Example 3 - Search results include vectors
 
@@ -497,7 +497,7 @@ query 1: ['doc_002', 'doc_004']
 
 #### 🔍 Search Example 6 - Batch Search with metadata filter
 
-The same filter is applied to every query in the batch. The second query below returns nothing, because both of its two nearest neighbours are Bob's.
+The same filter is applied to every query in the batch. Each query gets the two nearest of Alice's documents, which for the second query are not among its two nearest documents overall.
 
 ```python
 results = index.search(batch, filter={"author": "Alice"}, top_k=2)
@@ -508,7 +508,7 @@ for q, hits in enumerate(results):
 *Output*
 ```
 query 0: ['doc_001', 'doc_003']
-query 1: []
+query 1: ['doc_005', 'doc_003']
 ```
 
 <br/>
@@ -1308,7 +1308,7 @@ print("all checks passed")
 ```
 records: 500
 index metadata fields: 3
-filtered hits: 5
+filtered hits: 20
 all checks passed
 ```
 
@@ -1373,6 +1373,51 @@ Three behaviours are worth knowing.
 
 <br/>
 
+### ⏱️ What a filtered search costs
+
+A filtered search is a great deal more expensive than an unfiltered one, and the
+reason is that the index has to find out which records match. There is no index
+on metadata fields, so finding out means reading every record's metadata.
+
+Two paths serve a filter and the index chooses between them per search, on the
+number of records that match.
+
+**At or below 5,000 matching records the index walks the whole metadata store,
+scores every record that matched and ranks them.** That answer is exact, so the
+page is the true nearest matching records and recall is 1.0 whatever the filter
+selects.
+
+**Above 5,000 the walk stops as soon as it has counted 5,001 matches, and the
+graph traversal runs instead** with the filter tested at every node it reaches. A
+node the filter rejects still routes the search but never takes a result slot.
+Recall there is the graph's own, measured at 0.96 and above on three real
+100,000 record sets.
+
+Measured on three real 100,000 record sets, milliseconds per query, minimum of
+several passes:
+
+| Records matched | Path | sift, 128d | glove, 100d | dbpedia, 1536d |
+| --- | --- | --- | --- | --- |
+| no filter | graph | 0.30 | 0.29 | 1.16 |
+| 50,000 | graph | 3.2 | 3.7 | 5.0 |
+| 10,000 | graph | 18.0 | 27.2 | 31.6 |
+| 1,000 | exact | 33.1 | 39.4 | 38.4 |
+| 100 | exact | 36.1 | 30.8 | 30.8 |
+| 1 | exact | 38.3 | 31.6 | 34.7 |
+
+The three exact rows cost about the same because the walk dominates, at roughly
+300 nanoseconds a record whatever matched. The 10,000 row is expensive for the
+same reason: the walk has to read 50,000 records before it has counted 5,001
+matches, and only then does the graph run. **Expect a filtered search over
+100,000 records to cost tens of milliseconds where an unfiltered one costs a
+fraction of one**, and expect it to grow in proportion to the record count.
+
+Two things reduce it. Filtering on a field that few records carry does not help,
+because the walk visits every record either way. Filtering less often does, and
+so does keeping separate indexes for partitions you always filter by.
+
+<br/>
+
 ### 💡 Practical Filter Examples
 
 The examples below all run against this index:
@@ -1399,23 +1444,26 @@ index.add([
 query_embedding = [0.1, 0.1, 0.1, 0.1]
 ```
 
-#### ✔️ Filtering happens after the search, so raise `top_k`
+#### ✔️ The filter chooses what is ranked, so `top_k` is just the page size
 
 ```python
 def matched(filter, top_k=10):
     return [hit["id"] for hit in index.search(vector=query_embedding, filter=filter, top_k=top_k)]
 
-# doc_3 is the furthest of the three from the query, so a top_k of 1 finds
-# nothing once the filter is applied
+# doc_3 is the furthest of the three from the query, and it is still the only
+# thing the filter admits, so it is what a page of one holds
 print(matched({"author": "Charlie"}, top_k=1))
 print(matched({"author": "Charlie"}, top_k=10))
 ```
 
 *Output*
 ```
-[]
+['doc_3']
 ['doc_3']
 ```
+
+A filter matching fewer records than `top_k` returns that many results, and one
+matching none returns an empty list. Neither is a truncation.
 
 #### ✔️ Common filters
 

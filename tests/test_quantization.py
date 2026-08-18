@@ -1822,14 +1822,15 @@ def test_rerank_factor_is_honoured(rerank_index):
 # Test 94: metadata filters still hold, and the pages get longer
 # ------------------------------------------------------------
 def test_rerank_with_metadata_filter(rerank_index):
-    """The filter runs on the over-fetched pool, before the rescore.
+    """A filtered page is full whether rerank is on or off.
 
-    That ordering costs nothing, because a candidate the filter drops never
-    needs a raw distance, and it fixes a shortfall that predates rerank. The
-    filter used to run on a page of exactly top_k candidates, so a selective
-    filter left a short page. Measured at 3,000 records of dimension 768 with a
-    filter admitting a quarter of them, a request for ten came back with 2.74
-    results on average without rerank and 10.00 with it.
+    This test used to assert the opposite, and it was right to. The filter ran
+    after the graph had cut to top_k, so a filter admitting a quarter of the
+    index left a page of 2.74 results out of ten, and over-fetching for rerank
+    was the only thing that refilled it. The filter now decides which records
+    are ranked, on both paths, so neither the page length nor the page contents
+    depend on whether rerank is in play. Rerank still reorders the page it is
+    given, which is what the other rerank tests measure.
     """
     index = rerank_index["index"]
 
@@ -1843,12 +1844,13 @@ def test_rerank_with_metadata_filter(rerank_index):
                 assert int(hit["id"].split("_")[1]) % 4 == 1
         lengths[factor] = sum(len(page) for page in pages) / len(pages)
 
-    assert lengths[20] > lengths[0], (
-        f"over-fetching did not lengthen the filtered pages: {lengths}"
+    assert lengths[0] == pytest.approx(10.0), (
+        f"a filter admitting a quarter of the index returned short pages with "
+        f"rerank off: mean {lengths[0]:.2f} of 10"
     )
     assert lengths[20] == pytest.approx(10.0), (
-        f"a filter admitting a quarter of the index still returns short pages "
-        f"with rerank on: mean {lengths[20]:.2f} of 10"
+        f"a filter admitting a quarter of the index returned short pages with "
+        f"rerank on: mean {lengths[20]:.2f} of 10"
     )
 
 # ------------------------------------------------------------

@@ -131,6 +131,117 @@ impl Visited {
     }
 }
 
+/// Bytes one cache line holds on every target this ships to.
+const CACHE_LINE: usize = 64;
+
+/// Leading cache lines of a neighbour's vector to hint before it is scored.
+///
+/// Relay 86 swept this on the three real sets at 100,000 records against a
+/// build with the hint absent, alternating the builds over six rounds and
+/// taking the minimum of every pass. The figure is the whole unfiltered search
+/// through the Python entry point, so it prices the traversal plus the fixed
+/// cost of the call around it rather than the traversal alone.
+///
+/// | Lines | Bytes hinted | sift-128 | glove-100 | dbpedia-1536 |
+/// |---:|---:|---:|---:|---:|
+/// | no hint at all | 0 | 376.9 us | 358.4 us | 1,154.5 us |
+/// | 0 | 0 | 382.0 us | 352.6 us | 1,160.1 us |
+/// | 2 | 128 | 316.5 us | 340.1 us | 1,158.0 us |
+/// | 4 | 256 | 324.8 us | 310.6 us | 1,159.1 us |
+/// | 8 | 512 | 304.1 us | 290.7 us | 1,155.4 us |
+/// | 16 | 1,024 | 299.4 us | 293.9 us | 1,174.3 us |
+/// | 32 | 2,048 | 293.5 us | 261.2 us | 1,204.9 us |
+///
+/// The zero row is this function compiled with the hint clamped away, which
+/// leaves the hoisted neighbour slice and a call that inlines to nothing. It
+/// lands within one percent of the no-hint build at all three dimensions, so
+/// the restructuring costs nothing and every difference below is the hint.
+///
+/// **Eight, sixteen and thirty-two are the same code at 128 and 100
+/// dimensions.** A sift vector is 512 bytes, being exactly eight lines, and a
+/// glove one is 400 bytes, being seven, so the clamp against the vector's own
+/// length makes all three issue an identical number of hints. Their measured
+/// figures differ by 3.5 percent on sift and 12.6 percent on glove, and that is
+/// this machine's noise floor on a minimum of sixty passes rather than an
+/// effect. Read against it, the hint is worth **1.24 times on sift and 1.23
+/// times on glove**, and two and four lines are worth less because they cover
+/// part of a row.
+///
+/// **At 1,536 dimensions no line count is worth anything.** A dbpedia vector is
+/// 6,144 bytes, being 96 lines, so two, four, eight, sixteen and thirty-two are
+/// five genuinely different amounts of hinting and all five land inside 4.4
+/// percent of the no-hint build. Relay 85 measured 1.01 to 1.08 times there and
+/// flagged that its null result might be an artefact of its own eight line cap.
+/// **It is not.** The cause is in relay 85's bandwidth measurement: at 1,536
+/// dimensions the hardware streamer has a 96 line run to work with once the
+/// first line lands and the search is already within 1.43 times the sequential
+/// floor, where at 128 dimensions a row is eight lines, there is no run to
+/// stream, and the search pays four times that floor.
+///
+/// Eight is the value chosen. It is the smallest count that covers a whole row
+/// at both dimensions the hint is worth anything at, and nothing above it can
+/// add there because the clamp discards it.
+const PREFETCH_LINES: usize = 8;
+
+/// Hint the memory system for the vectors a neighbour list is about to be
+/// scored against.
+///
+/// A prefetch is a hint and nothing else. It moves no data the program can
+/// observe, sets no flag, and the architecture defines it as unable to fault,
+/// so this cannot change which page `search_layer` returns and cannot fail. The
+/// proof is not left to that argument: relay 86 compared recall at 10 to four
+/// decimal places and a fixed query set's ids and score bits with the hint
+/// present and absent, on all three sets, and every figure is identical.
+///
+/// The `unsafe` is `_mm_prefetch`'s own, which `core::arch` marks unsafe
+/// because it is a target feature intrinsic rather than because the operation
+/// can go wrong. What this function has to get right is the pointer it forms,
+/// since `ptr::add` outside an allocation is undefined whatever the instruction
+/// does with the result. The line count is clamped to the lines the vector
+/// itself occupies, so the last offset is strictly inside the slice and every
+/// pointer formed here is in bounds of the arena the vector lives in.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[inline]
+fn prefetch_vectors<G>(graph: &G, neighbours: &[u32])
+where
+    G: Topology + ?Sized,
+{
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{_mm_prefetch, _MM_HINT_T0};
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+
+    for &node in neighbours {
+        let vector = graph.vector(node);
+        let bytes = std::mem::size_of_val(vector);
+        let base = vector.as_ptr() as *const i8;
+        let lines = bytes.div_ceil(CACHE_LINE).min(PREFETCH_LINES);
+        for line in 0..lines {
+            // SAFETY: `line` is below `bytes.div_ceil(CACHE_LINE)`, so
+            // `line * CACHE_LINE` is below `bytes` and the offset pointer is
+            // inside the vector's own bytes rather than one past them. The
+            // intrinsic is baseline on both of these targets, needs no runtime
+            // detection, and issues a hint that reads nothing.
+            unsafe { _mm_prefetch(base.add(line * CACHE_LINE), _MM_HINT_T0) };
+        }
+    }
+}
+
+/// The no-op every other target compiles.
+///
+/// `_mm_prefetch` is x86 only. There is no portable prefetch intrinsic on
+/// stable Rust, so aarch64 and everything else get an empty function that
+/// inlines away, and the traversal they run is the one that shipped before this
+/// hint existed. Nothing about the page depends on which of the two is
+/// compiled.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+#[inline]
+fn prefetch_vectors<G>(_graph: &G, _neighbours: &[u32])
+where
+    G: Topology + ?Sized,
+{
+}
+
 /// Search the graph: the vendored `Hnsw::search_filter` over node indices.
 ///
 /// The port is line for line, so that on identical topology this and the
@@ -287,7 +398,11 @@ where
         if -(c.dist_to_ref) > f_dist_to_ref {
             return return_points;
         }
-        for &e in graph.neighbours(c.node, layer) {
+        // The vectors this list is about to be scored against, hinted before
+        // the first of them is read. See `prefetch_vectors`.
+        let neighbours = graph.neighbours(c.node, layer);
+        prefetch_vectors(graph, neighbours);
+        for &e in neighbours {
             if !visited.test_and_set(e) {
                 let f_dist_to_p = match return_points.peek() {
                     Some(f) => f.dist_to_ref,

@@ -87,18 +87,17 @@ def main():
     show("nearest 3 documents", index.search(vector=query, top_k=3))
     print()
 
-    # Metadata filtering runs after the graph search, on the top_k the graph
-    # returned. A selective filter therefore needs a larger top_k than the
-    # number of results you want back, or it discards everything it was given.
-    # The two garden documents come back at distance 1.0000, which under cosine
-    # means they share no direction at all with the query.
+    # Metadata filtering decides which documents are ranked, not which results
+    # survive, so a page of three holds the three nearest garden documents and
+    # there are only two of those. Both come back at distance 1.0000, which
+    # under cosine means they share no direction at all with the query.
     show(
-        "filtered to garden, top_k=3 (nothing, no garden document is in the nearest 3)",
+        "filtered to garden, top_k=3 (both garden documents, since only two match)",
         index.search(vector=query, filter={"category": "garden"}, top_k=3),
     )
     print()
     show(
-        "filtered to garden, top_k=12",
+        "filtered to garden, top_k=12 (the same two, because top_k is the page size)",
         index.search(vector=query, filter={"category": "garden"}, top_k=12),
     )
     print()
@@ -144,9 +143,11 @@ nearest 3 documents
   0.0513  doc_08  Quantitative trading
   0.0617  doc_01  Training a classifier
 
-filtered to garden, top_k=3 (nothing, no garden document is in the nearest 3)
+filtered to garden, top_k=3 (both garden documents, since only two match)
+  1.0000  doc_09  Pruning fruit trees
+  1.0000  doc_10  Composting at home
 
-filtered to garden, top_k=12
+filtered to garden, top_k=12 (the same two, because top_k is the page size)
   1.0000  doc_09  Pruning fruit trees
   1.0000  doc_10  Composting at home
 
