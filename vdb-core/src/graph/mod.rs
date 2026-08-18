@@ -99,6 +99,13 @@ pub(crate) trait Distance<T> {
 /// the worst residual observed and about 20 times below what a vector whose
 /// norm is wrong by one percent would produce. Nothing legitimate lands between
 /// those.
+///
+/// Both uses sit inside `assert_unit_for_cosine`'s `cfg(debug_assertions)`
+/// block, so a release build reads this constant nowhere and `dead_code` fires
+/// on it. That warning was the only one a release build of this crate emitted.
+/// The allow is conditioned the same way the uses are, so a debug build still
+/// reports it if the assertion is ever deleted.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 const COSINE_UNIT_TOLERANCE: f32 = 1e-3;
 
 /// Assert, in debug builds only, that a vector reaching a cosine graph is unit

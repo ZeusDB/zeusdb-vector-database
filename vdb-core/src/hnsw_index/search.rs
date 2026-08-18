@@ -5,13 +5,56 @@
 //! how long they hold the storage guards, so what each does with a candidate is
 //! in `collect_hits` and what each hands back to Python is in `hits_to_python`.
 //!
+//! # A filter now decides the page rather than trimming it
+//!
+//! Until relay 86 the filter ran in `collect_hits`, which is after the graph
+//! has already cut to `top_k`. A filter matching one record in a hundred
+//! therefore discarded most of a ten result page and returned what was left,
+//! and one matching one record in a thousand returned nothing at all. Relay 85
+//! measured that as post-filter recall of 0.0090 at one match in a hundred and
+//! 0.0000 below it, on all three real sets.
+//!
+//! Two paths replace it, and [`HNSWIndex::search_candidates`] picks between
+//! them per search.
+//!
+//! [`HNSWIndex::scan_candidates`] walks the metadata once and scores every
+//! record that matches, which is exact and has no recall question. It gives up
+//! and returns `None` the moment the match count passes
+//! [`FULL_SCAN_THRESHOLD`], so a broad filter pays a bounded walk rather than a
+//! full one.
+//!
+//! Where the scan gives up, the traversal runs with the filter conjoined into
+//! the predicate it already carried for liveness. That is the correct answer
+//! for a broad filter and a latency pathology for a selective one, which is why
+//! the scan is not optional. A filter matching one record in 100,000 costs 128
+//! to 359 milliseconds through the traversal and 26 through the scan, both
+//! measured on this code.
+//!
+//! **A filtered search is now expensive, and that is the honest price of a
+//! correct one.** The scan's cost is one walk of the metadata store, being
+//! about 250 nanoseconds a record, so a selective filter over 100,000 records
+//! costs about 25 milliseconds where an unfiltered search costs 0.3 to 1.2.
+//! There is no cheaper way to find which records match without an index on the
+//! filterable fields, which relay 85 scoped and deferred. See
+//! [`FULL_SCAN_THRESHOLD`] for the measurements.
+//!
 //! **Lock order.** Every path takes `rev_map` before the graph and the storage
 //! maps after it, which is the order declared on `HNSWIndex` in the parent
 //! module. A search holds `rev_map` for its whole traversal, so a mutation
 //! taking `vectors` before `rev_map` deadlocks against it, and that is the
 //! inversion `remove_point_internal` used to carry.
+//!
+//! The filter predicate reads `vector_metadata`, so that guard is now held
+//! across the traversal too, and so are `vectors` and `pq_codes` because the
+//! scan runs before the traversal and scores against them. The declared order
+//! is `hnsw < vectors < pq_codes < vector_metadata`, so taking all four before
+//! traversing is in order rather than against it, and it is the shape
+//! `batch_search_sequential` already ran in. What it costs is duration. The
+//! window a writer waits on grows from the post-traversal phase to the whole
+//! search, and `std::sync::RwLock` queues readers behind a waiting writer, so a
+//! long read hold delays the next reader as well as the writer.
 
-use super::{HNSWIndex, StorageMode};
+use super::{HNSWIndex, StorageMode, VectorGraph};
 use crate::conversion::value_map_to_python;
 use crate::filter::matches_filter;
 use crate::graph::GraphHit;
@@ -23,6 +66,131 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{debug, error, instrument, trace};
+/// Records a filtered search may match before it stops scanning and traverses
+/// the graph instead.
+///
+/// # What the two paths actually cost
+///
+/// Relay 86 built the crate twice, once with this at zero so every filtered
+/// search traverses and once with it above the corpus so every one scans, and
+/// measured both at each selectivity on all three real sets at 100,000 records.
+/// Microseconds per query, minimum of two passes over thirty queries.
+///
+/// | Matched | Traversal, sift | Scan, sift | Traversal, glove | Scan, glove | Traversal, dbpedia | Scan, dbpedia |
+/// |---:|---:|---:|---:|---:|---:|---:|
+/// | 50,000 | 1,141 | 45,664 | 1,166 | 44,543 | 4,658 | 79,511 |
+/// | 10,000 | 4,514 | 31,782 | 4,786 | 30,406 | 15,726 | 37,801 |
+/// | 1,000 | 36,023 | 25,954 | 35,641 | 26,113 | 74,143 | 27,175 |
+/// | 100 | 182,224 | 25,121 | 235,577 | 25,760 | 384,844 | 25,738 |
+/// | 10 | 77,422 | 27,954 | 303,811 | 26,241 | 313,549 | 26,612 |
+/// | 1 | 128,110 | 26,509 | 296,585 | 26,117 | 358,556 | 26,333 |
+///
+/// **The crossover is between 1,000 and 10,000 matches, on all three sets.**
+/// Below it the scan wins by 1.4 to 15 times and is exact. Above it the
+/// traversal wins by 2.4 to 6.7 times. This sits inside that bracket.
+///
+/// # Why the upper half of the bracket
+///
+/// The scan's cost is the metadata walk and almost nothing else. Every scan row
+/// above sits at 25 to 28 milliseconds whatever matched, except the two broad
+/// ones where the matched records' own distances add to it, and 25 milliseconds
+/// is 100,000 records at about 250 nanoseconds each. **That walk, and not the
+/// distances, is what a filtered search pays for.** Relay 85 measured the same
+/// per-record figure and named the same cause.
+///
+/// A filter matching just over the threshold is therefore the worst case, since
+/// it walks the whole corpus, gives up, and then traverses as well. It pays the
+/// full walk plus `traversal(threshold)`, so the regret against having scanned
+/// is `traversal(threshold)` itself. At 5,000 that is roughly 9 milliseconds on
+/// top of 25. At 1,000 it would be 36 to 74 milliseconds on top of 25, because
+/// the traversal is far worse at 1,000 matches than at 5,000. **A lower
+/// threshold is worse, not safer**, which is the opposite of what the shape of
+/// the problem suggests.
+///
+/// Nothing above the bracket is chosen because a broad filter is where the
+/// give-up saves most. A filter matching half the corpus reaches 5,001 matches
+/// after about 10,000 records, being 2.5 milliseconds, and then traverses in
+/// another 1.1 to 4.7. Doubling the threshold doubles that walk.
+///
+/// # What this does not settle
+///
+/// Every figure above is at 100,000 records. The walk is linear in the corpus
+/// and the traversal is not, so the crossover moves with corpus size and this
+/// relay did not measure where. Relay 85 recommended 5,000 from the crossover
+/// between a scan and an **unfiltered** search, which is not the comparison
+/// that matters, and then said so itself. The number it named survives on this
+/// evidence rather than on that reasoning.
+///
+/// It is not settable per search. Nothing measured here wants a different
+/// number, and a knob nobody has a reason to turn is a knob that goes wrong.
+pub(super) const FULL_SCAN_THRESHOLD: usize = 5_000;
+
+/// One search's candidates, as borrowed external ids paired with the distance
+/// whichever path found them scored them at.
+///
+/// Both paths produce this. The traversal resolves each graph hit through
+/// `rev_map` and borrows the id it finds there, and the scan borrows the id
+/// from the metadata store's own key. Nothing is cloned until the page is cut,
+/// so an over-fetched page pays to clone the metadata and the vector of the
+/// results it returns rather than of every candidate it considered.
+type Candidates<'a> = Vec<(&'a String, f32)>;
+
+/// Everything a filtered search reads that an unfiltered one does not.
+///
+/// The conditions, the metadata store they are judged against, and the two
+/// stores the exact scan scores a matching record from. They travel together
+/// because a search carries either all four or none of them, and because that
+/// is what decides which guards a path has to take: `raw_search_no_gil` passes
+/// `None` and takes neither the metadata guard nor the two storage guards.
+#[derive(Clone, Copy)]
+struct Filtered<'a> {
+    conditions: &'a HashMap<String, Value>,
+    metadata: &'a HashMap<String, HashMap<String, Value>>,
+    vectors: &'a HashMap<String, Vec<f32>>,
+    pq_codes: &'a HashMap<String, Vec<u8>>,
+}
+
+impl<'a> Filtered<'a> {
+    /// Whether the record this external id names exists and matches.
+    ///
+    /// A record with no metadata entry does not match, which is the rule
+    /// `collect_hits` applied when the filter ran there.
+    #[inline]
+    fn admits(&self, ext_id: &String) -> bool {
+        match self.metadata.get(ext_id) {
+            Some(meta) => self.judge(meta),
+            None => false,
+        }
+    }
+
+    /// Whether one record's metadata matches, with no lookup.
+    ///
+    /// **There is no error channel and none is needed.** `matches_filter` fails
+    /// on exactly one thing, an operator name the engine does not implement,
+    /// and `validate_filter_conditions` runs once per search from the `search`
+    /// entry point before any record is examined and rejects that. Every
+    /// operator helper below the dispatch is total. So the `Err` arm is
+    /// unreachable from a search, and excluding the record is the conservative
+    /// answer if a future operator ever makes it reachable. The debug assertion
+    /// is what would find that in a test run rather than in production.
+    #[inline]
+    fn judge(&self, meta: &HashMap<String, Value>) -> bool {
+        match matches_filter(meta, self.conditions) {
+            Ok(admitted) => admitted,
+            Err(_) => {
+                debug_assert!(
+                    false,
+                    "matches_filter failed inside a search, which \
+                     validate_filter_conditions is supposed to have made \
+                     impossible. A new operator has an error path that \
+                     validation does not reject."
+                );
+                false
+            }
+        }
+    }
+}
+
 /// Search hits for one query vector, as (external id, distance, metadata,
 /// optional raw vector). The raw vector is present only when the caller asked
 /// for it and the index still holds one.
@@ -70,7 +238,186 @@ impl HNSWIndex {
 
     // 5. BATCH SEARCH METHODS (3 methods)
 
-    /// Resolve, filter, score and cut one query's candidates
+    /// The candidates a filtered search's exact scan found, or `None` where
+    /// there were too many of them
+    ///
+    /// One walk of the metadata store, evaluating the filter on each record and
+    /// keeping the ones that match. It gives up and returns `None` the moment
+    /// the match count passes [`FULL_SCAN_THRESHOLD`], so the walk **stops**
+    /// rather than completing: a filter matching half the corpus reaches the
+    /// give-up point after roughly twice the threshold in records examined,
+    /// whatever the corpus size, and the caller then traverses.
+    ///
+    /// **The distances are computed after the walk and not during it.** Every
+    /// distance a fused walk evaluated before giving up would be thrown away,
+    /// and at 1,536 dimensions that is thousands of six kilobyte reads charged
+    /// to every broad filtered search. Deferring them costs one extra pass over
+    /// a list of at most `FULL_SCAN_THRESHOLD` borrowed ids and makes the
+    /// give-up path free of distance work entirely. The relay that specified
+    /// this described one fused pass; the results are identical either way and
+    /// this is the cheaper of the two.
+    ///
+    /// **What it scores against.** The stored raw vector where the index holds
+    /// one and the reconstruction from the record's codes where it does not,
+    /// which is `rescore_candidate`'s rule and therefore the same scale a
+    /// reranked search orders on. Three cases follow. A raw index is scored on
+    /// its raw vectors, so the scan's scores are the numbers the traversal
+    /// would have reported. A `quantized_with_raw` index is scored on its raw
+    /// vectors, which is exact, and matches what rerank produces on the default
+    /// path; a caller who passed `rerank=0` asked for ADC scores and gets raw
+    /// ones, which is the more accurate of the two and is the one deliberate
+    /// difference here. A `quantized_only` index holds no raw vectors, so every
+    /// record is scored against its reconstruction, which carries exactly the
+    /// information the ADC distance uses. The scan is exact over what that
+    /// index retains rather than over the vectors it was given, and no path in
+    /// this crate can be exact over those once the raws are gone.
+    ///
+    /// **Fewer than `top_k` matches is a result and not a failure.** The scan
+    /// returns every record that matched, ranked, so a filter matching three
+    /// records returns three results to a caller who asked for ten, and a
+    /// filter matching none returns an empty page. That is what the search
+    /// already did and it is what an exact answer to the question is.
+    fn scan_candidates<'a>(
+        &self,
+        query: &[f32],
+        filter: Filtered<'a>,
+        fetch_k: usize,
+    ) -> Option<Candidates<'a>> {
+        let mut matched: Vec<&'a String> = Vec::new();
+        for (ext_id, meta) in filter.metadata.iter() {
+            if filter.judge(meta) {
+                if matched.len() == FULL_SCAN_THRESHOLD {
+                    // One past the threshold, so the walk stops here and the
+                    // caller traverses. Nothing has been scored yet.
+                    return None;
+                }
+                matched.push(ext_id);
+            }
+        }
+
+        let distance = raw_distance_fn(&self.space);
+        let mut scored: Candidates<'a> = Vec::with_capacity(matched.len());
+        for ext_id in matched {
+            let score = match filter.vectors.get(ext_id) {
+                Some(stored) => distance(query, stored),
+                None => match filter
+                    .pq_codes
+                    .get(ext_id)
+                    .and_then(|codes| self.pq.as_ref()?.reconstruct(codes).ok())
+                {
+                    Some(reconstructed) => distance(query, &reconstructed),
+                    // A record holding neither a raw vector nor codes cannot
+                    // exist, since every insertion writes one or the other.
+                    // Sorting it last is what `rescore_candidate`'s callers do
+                    // with the same impossibility.
+                    None => f32::INFINITY,
+                },
+            };
+            scored.push((ext_id, score));
+        }
+        // By distance, and by external id where two distances are equal.
+        //
+        // The tie break is what makes this page reproducible. The walk above
+        // takes the metadata store in `HashMap` iteration order, which
+        // `RandomState` seeds afresh in every process, so a stable sort on
+        // distance alone would hand back two equally distant records in an
+        // order that differed run to run. The graph path has no such problem
+        // because a traversal of a fixed graph is deterministic. Two exactly
+        // equal distances are unordered by distance, so ordering them by id is
+        // a choice rather than a correction, and it is the only one available
+        // that does not depend on where a hasher happened to put a key.
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+        scored.truncate(fetch_k);
+        Some(scored)
+    }
+
+    /// One query's candidates, by whichever of the two paths suits its filter
+    ///
+    /// An unfiltered search traverses with the liveness predicate it has always
+    /// carried, and nothing about it changes. A filtered search tries the exact
+    /// scan first and traverses with the filter conjoined into that predicate
+    /// where the scan gives up.
+    ///
+    /// **The combined predicate is the liveness check and `matches_filter`,
+    /// conjoined.** `rev_map.get` answering `Some` is the liveness check, since
+    /// a node stranded by a removal or an overwrite no longer resolves, and
+    /// `FilterView::admits` is the filter. A node either check rejects still
+    /// routes the search and never consumes a result slot, which is what the
+    /// traversal's predicate has always done.
+    ///
+    /// Both closures are monomorphised into the traversal by
+    /// `VectorGraph::search`'s generic parameter, so the filtered arm and the
+    /// unfiltered arm compile to two specialisations and neither pays for an
+    /// indirect call. That is why the branch is written out rather than folded
+    /// into one closure with an `Option` inside it.
+    fn search_candidates<'a>(
+        &self,
+        hnsw: &VectorGraph,
+        query: &[f32],
+        rev_map: &'a HashMap<usize, String>,
+        filter: Option<Filtered<'a>>,
+        fetch_k: usize,
+        ef: usize,
+    ) -> Candidates<'a> {
+        // Asked of the guard this function was handed, not of
+        // `HNSWIndex::is_quantized`, which takes the graph read lock itself.
+        // Calling that from here took `hnsw` a second time on a thread already
+        // holding it, which the lock order forbids for exactly the reason it
+        // then demonstrated: the standard library queues readers behind a
+        // waiting writer, so the second read blocked forever the moment a
+        // concurrent insert landed between the two. It deadlocked the
+        // concurrency suite on the first run.
+        let operation = if hnsw.is_quantized() {
+            "adc_search"
+        } else {
+            "raw_search"
+        };
+
+        let graph_hits = match filter {
+            Some(filter) => {
+                if let Some(scanned) = self.scan_candidates(query, filter, fetch_k) {
+                    trace!(
+                        operation = "filtered_scan",
+                        matched = scanned.len(),
+                        "Filtered search answered by the exact scan"
+                    );
+                    return scanned;
+                }
+                let admits = |internal_id: &usize| match rev_map.get(internal_id) {
+                    Some(ext_id) => filter.admits(ext_id),
+                    None => false,
+                };
+                hnsw.search(query, fetch_k, ef, Some(&admits))
+            }
+            None => {
+                let live = |internal_id: &usize| rev_map.contains_key(internal_id);
+                hnsw.search(query, fetch_k, ef, Some(&live))
+            }
+        }
+        .unwrap_or_else(|e| {
+            error!(operation = operation, error = %e, "Graph search failed");
+            Vec::new()
+        });
+
+        Self::resolve(graph_hits, rev_map)
+    }
+
+    /// Graph hits as candidates, dropping any whose node no longer resolves
+    ///
+    /// The traversal's predicate has already rejected those, so this drops
+    /// nothing in practice. It is kept because `rev_map` is what turns a node
+    /// into a record and the resolution has to happen somewhere.
+    fn resolve<'a>(hits: Vec<GraphHit>, rev_map: &'a HashMap<usize, String>) -> Candidates<'a> {
+        let mut out = Vec::with_capacity(hits.len());
+        for hit in hits {
+            if let Some(ext_id) = rev_map.get(&hit.internal_id) {
+                out.push((ext_id, hit.distance));
+            }
+        }
+        out
+    }
+
+    /// Score and cut one query's candidates
     ///
     /// The single query path and the two batch paths each held their own copy
     /// of this. The three copies agreed, and a rule that has to hold across
@@ -84,50 +431,27 @@ impl HNSWIndex {
     /// sequential batch path hold one set across every query, the parallel path
     /// takes its own per worker, and none of that is this function's business.
     ///
-    /// Only a borrowed id and a float are held per candidate until the page is
-    /// cut, so an over-fetched page pays to clone the metadata and the vector of
-    /// the results it returns rather than of every candidate it considered.
-    #[allow(clippy::too_many_arguments)]
+    /// **The filter is not applied here.** It used to be, which is what made a
+    /// selective filter return an empty page, and it now runs inside
+    /// `search_candidates` before the page is cut. Every candidate arriving
+    /// here has already been admitted by whichever path produced it.
     fn collect_hits(
         &self,
-        graph_hits: Vec<GraphHit>,
+        candidates: Candidates<'_>,
         query: &[f32],
-        rev_map: &HashMap<usize, String>,
         vectors: &HashMap<String, Vec<f32>>,
         pq_codes: &HashMap<String, Vec<u8>>,
         vector_metadata: &HashMap<String, HashMap<String, Value>>,
-        filter_conditions: Option<&HashMap<String, Value>>,
         params: SearchParams,
     ) -> PyResult<QueryHits> {
-        let mut scored: Vec<(&String, f32)> = Vec::with_capacity(graph_hits.len());
+        let mut scored = candidates;
 
-        for neighbor in graph_hits {
-            let internal_id = neighbor.internal_id;
-
-            if let Some(ext_id) = rev_map.get(&internal_id) {
-                if let Some(filter_conds) = filter_conditions {
-                    if let Some(meta) = vector_metadata.get(ext_id) {
-                        if !matches_filter(meta, filter_conds)? {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
-                }
-
-                let score = match params.rerank.as_ref() {
-                    Some(plan) => {
-                        rescore_candidate(plan, query, ext_id, vectors, self.pq.as_ref(), pq_codes)
-                            .unwrap_or(f32::INFINITY)
-                    }
-                    None => neighbor.distance,
-                };
-
-                scored.push((ext_id, score));
+        if let Some(plan) = params.rerank.as_ref() {
+            for entry in scored.iter_mut() {
+                entry.1 =
+                    rescore_candidate(plan, query, entry.0, vectors, self.pq.as_ref(), pq_codes)
+                        .unwrap_or(f32::INFINITY);
             }
-        }
-
-        if params.rerank.is_some() {
             take_best(&mut scored, params.top_k);
         }
 
@@ -195,61 +519,43 @@ impl HNSWIndex {
         py: Python<'_>,
     ) -> PyResult<Vec<Py<PyDict>>> {
         let search_results = py.detach(|| -> PyResult<QueryHits> {
-            // Check if we should use quantized search
-            let use_quantized = self.is_quantized();
-
-            trace!(
-                operation = "search_method",
-                use_quantized = use_quantized,
-                "Selected search method"
-            );
-
-            // One read guard for the whole search, taken before the graph lock
-            // and held across it. The predicate runs once per candidate the
-            // traversal visits, so acquiring the guard inside it would put a
-            // lock acquisition on the hot path. See the same pattern in the
-            // two batch paths.
+            // Five read guards, taken in the order declared on `HNSWIndex` and
+            // held for the whole search. `hnsw` used to be dropped before
+            // `vectors` was taken; it is held across them now because the
+            // filter predicate and the exact scan both read the storage maps
+            // while the traversal is in flight. The order is `rev_map < hnsw <
+            // vectors < pq_codes < vector_metadata`, so every pair here is in
+            // declared order, and it is the shape `batch_search_sequential`
+            // already ran in.
             let rev_map = self.rev_map.read().unwrap();
-            let live = |internal_id: &usize| rev_map.contains_key(internal_id);
-
-            let fetch_k = params.fetch_k(rev_map.len());
-
-            let hnsw_results = {
-                let hnsw_guard = self.hnsw.read().unwrap();
-
-                if use_quantized {
-                    // Use ADC search for quantized index
-                    hnsw_guard
-                        .search(processed_query, fetch_k, params.ef, Some(&live))
-                        .unwrap_or_else(|e| {
-                            error!(operation = "adc_search", error = %e, "ADC search failed");
-                            Vec::new()
-                        })
-                } else {
-                    // Use raw vector search
-                    match hnsw_guard.search(processed_query, fetch_k, params.ef, Some(&live)) {
-                        Ok(results) => results,
-                        Err(e) => {
-                            error!(operation = "raw_search", error = %e, "Raw search failed");
-                            Vec::new()
-                        }
-                    }
-                }
-            };
-
-            // Process results with enhanced vector retrieval
+            let hnsw_guard = self.hnsw.read().unwrap();
             let vectors = self.vectors.read().unwrap();
             let pq_codes = self.pq_codes.read().unwrap();
             let vector_metadata = self.vector_metadata.read().unwrap();
 
-            self.collect_hits(
-                hnsw_results,
+            let filter = filter_conditions.map(|conditions| Filtered {
+                conditions,
+                metadata: &vector_metadata,
+                vectors: &vectors,
+                pq_codes: &pq_codes,
+            });
+            let fetch_k = params.fetch_k(rev_map.len());
+
+            let candidates = self.search_candidates(
+                &hnsw_guard,
                 processed_query,
                 &rev_map,
+                filter,
+                fetch_k,
+                params.ef,
+            );
+
+            self.collect_hits(
+                candidates,
+                processed_query,
                 &vectors,
                 &pq_codes,
                 &vector_metadata,
-                filter_conditions,
                 params,
             )
         })?;
@@ -354,16 +660,22 @@ impl HNSWIndex {
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
         let rust_results = py.detach(|| -> PyResult<Vec<QueryHits>> {
-            // The read guard is taken before the graph lock and held across every
-            // query in the batch, so the traversal predicate below is a hash lookup
-            // rather than a lock acquisition.
+            // Five read guards, in declared order, held across every query in
+            // the batch. This path already ran in this shape before the filter
+            // moved into the traversal, which is why it needed no change beyond
+            // handing the metadata store to the predicate.
             let rev_map = self.rev_map.read().unwrap();
-            let live = |internal_id: &usize| rev_map.contains_key(internal_id);
-
             let hnsw_guard = self.hnsw.read().unwrap();
             let vector_store = self.vectors.read().unwrap();
             let code_store = self.pq_codes.read().unwrap();
             let metadata_store = self.vector_metadata.read().unwrap();
+
+            let filter = filter_conditions.map(|conditions| Filtered {
+                conditions,
+                metadata: &metadata_store,
+                vectors: &vector_store,
+                pq_codes: &code_store,
+            });
 
             // The same over-fetch the single query path applies, so a batch of
             // one query returns what that query returns on its own.
@@ -375,18 +687,21 @@ impl HNSWIndex {
                 // FIX: Process each query vector for space
                 let processed_query = self.process_vector_for_space(vector.clone());
 
-                let neighbors = hnsw_guard
-                    .search(&processed_query, fetch_k, params.ef, Some(&live))
-                    .unwrap_or_else(|_| Vec::new());
-
-                all_results.push(self.collect_hits(
-                    neighbors,
+                let candidates = self.search_candidates(
+                    &hnsw_guard,
                     &processed_query,
                     &rev_map,
+                    filter,
+                    fetch_k,
+                    params.ef,
+                );
+
+                all_results.push(self.collect_hits(
+                    candidates,
+                    &processed_query,
                     &vector_store,
                     &code_store,
                     &metadata_store,
-                    filter_conditions,
                     params,
                 )?);
             }
@@ -414,35 +729,46 @@ impl HNSWIndex {
                     // FIX: Process each query vector for space
                     let processed_query = self.process_vector_for_space(vector.clone());
 
-                    // Taken before the graph lock, as in the other two search paths,
-                    // so every path acquires these two locks in the same order.
+                    // Five read guards per worker, in declared order and held
+                    // across the traversal. This path used to drop `hnsw`
+                    // before taking `vectors`; it holds all five now because
+                    // the filter predicate and the exact scan read the storage
+                    // maps while the traversal is in flight. Every guard is a
+                    // read, so the rule that no path forks to rayon holding a
+                    // write guard is untouched. What the fork does change is
+                    // duration: each worker now holds four more guards for its
+                    // whole query rather than for the phase after it.
                     let rev_map = self.rev_map.read().unwrap();
-                    let live = |internal_id: &usize| rev_map.contains_key(internal_id);
-
-                    // The same over-fetch the other two search paths apply.
-                    let fetch_k = params.fetch_k(rev_map.len());
-
-                    // Brief HNSW search (individual lock per query)
-                    let neighbors = {
-                        let hnsw_guard = self.hnsw.read().unwrap();
-                        hnsw_guard
-                            .search(&processed_query, fetch_k, params.ef, Some(&live))
-                            .unwrap_or_else(|_| Vec::new())
-                    };
-
-                    // Concurrent data lookup
+                    let hnsw_guard = self.hnsw.read().unwrap();
                     let vector_store = self.vectors.read().unwrap();
                     let code_store = self.pq_codes.read().unwrap();
                     let metadata_store = self.vector_metadata.read().unwrap();
 
-                    self.collect_hits(
-                        neighbors,
+                    let filter = filter_conditions.map(|conditions| Filtered {
+                        conditions,
+                        metadata: &metadata_store,
+                        vectors: &vector_store,
+                        pq_codes: &code_store,
+                    });
+
+                    // The same over-fetch the other two search paths apply.
+                    let fetch_k = params.fetch_k(rev_map.len());
+
+                    let candidates = self.search_candidates(
+                        &hnsw_guard,
                         &processed_query,
                         &rev_map,
+                        filter,
+                        fetch_k,
+                        params.ef,
+                    );
+
+                    self.collect_hits(
+                        candidates,
+                        &processed_query,
                         &vector_store,
                         &code_store,
                         &metadata_store,
-                        filter_conditions,
                         params,
                     )
                 })
@@ -455,27 +781,19 @@ impl HNSWIndex {
     }
 
     /// Raw search without Python objects (for benchmarking)
+    ///
+    /// Two read guards in declared order, `rev_map` then `hnsw`, and the graph
+    /// guard is now held across the resolution as well as the traversal because
+    /// it is `search_candidates` that owns both. This path takes no filter, so
+    /// it takes no storage guards and its predicate is the liveness check
+    /// alone.
     pub(super) fn raw_search_no_gil(&self, query: &[f32]) -> Vec<(String, f32)> {
-        // Concurrent read access to ID mapping, taken before the graph lock so the
-        // traversal predicate can consult it without acquiring anything itself.
         let rev_map = self.rev_map.read().unwrap();
-        let live = |internal_id: &usize| rev_map.contains_key(internal_id);
+        let hnsw_guard = self.hnsw.read().unwrap();
 
-        // HNSW search with locking
-        let hnsw_results = {
-            let hnsw_guard = self.hnsw.read().unwrap();
-            hnsw_guard
-                .search(query, 10, 100, Some(&live))
-                .unwrap_or_else(|_| Vec::new())
-        }; // Lock released immediately
-
-        hnsw_results
+        self.search_candidates(&hnsw_guard, query, &rev_map, None, 10, 100)
             .into_iter()
-            .filter_map(|neighbor| {
-                rev_map
-                    .get(&neighbor.internal_id)
-                    .map(|id| (id.clone(), neighbor.distance))
-            })
+            .map(|(ext_id, distance)| (ext_id.clone(), distance))
             .collect()
     }
 }

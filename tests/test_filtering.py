@@ -1,5 +1,13 @@
 """Metadata filter evaluation on search."""
 
+import os
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+
+import numpy as np
 import pytest
 from zeusdb_vector_database import VectorDatabase
 
@@ -516,3 +524,321 @@ def test_filter_numeric_comparison_is_consistent_across_operators():
     assert ids({"count": {"eq": "10"}}) == []
     assert ids({"count": {"in": ["10", True]}}) == []
     assert ids({"count": {"gte": "10"}}) == []
+
+
+# ------------------------------------------------------------
+# The filtered page is the nearest matching records
+#
+# The filter used to run after the graph had cut to top_k, so a selective
+# filter returned whatever survived of a page it was never given a say in.
+# Measured on three real 100,000 record sets, post-filter recall tracked
+# selectivity exactly: 0.5010 at one match in two, 0.0090 at one in a hundred
+# and 0.0000 below that. It now decides which records are ranked, by one of two
+# paths.
+#
+# At or below FULL_SCAN_THRESHOLD matches the index walks the metadata, scores
+# every match and ranks them, which is exact. Above it the walk stops and the
+# graph traversal runs with the filter conjoined into the liveness predicate it
+# already carried, which is the graph's own recall. The tests below hold the
+# exact path to a brute force ranking and the graph path to a high overlap with
+# one.
+# ------------------------------------------------------------
+
+# Mirrors FULL_SCAN_THRESHOLD in vdb-core/src/hnsw_index/search.rs. The Rust
+# constant is the one that decides; this is what the boundary tests aim at.
+FULL_SCAN_THRESHOLD = 5000
+
+FILTER_CORPUS = 6000
+FILTER_DIM = 8
+
+
+def _filter_corpus(size=FILTER_CORPUS, dim=FILTER_DIM, seed=20260818):
+    """A corpus whose metadata makes any selectivity exactly expressible.
+
+    ``bucket`` names one record in ``n`` for each n in the powers of ten, and
+    ``rank`` is the record's own index so a range filter matches an exact count.
+    """
+    rng = np.random.default_rng(seed)
+    vectors = rng.standard_normal((size, dim)).astype(np.float32)
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+    ids = [f"r{i:05d}" for i in range(size)]
+    metadata = [
+        {
+            "s2": "y" if i % 2 == 0 else "n",
+            "s10": "y" if i % 10 == 0 else "n",
+            "s100": "y" if i % 100 == 0 else "n",
+            "s1000": "y" if i % 1000 == 0 else "n",
+            "one": "y" if i == 4321 else "n",
+            "rank": i,
+        }
+        for i in range(size)
+    ]
+    return ids, vectors, metadata
+
+
+def _filter_index(space="cosine", quantization_config=None, **kwargs):
+    ids, vectors, metadata = _filter_corpus(**kwargs)
+    index = VectorDatabase().create(
+        "hnsw", dim=FILTER_DIM, space=space, expected_size=len(ids),
+        quantization_config=quantization_config,
+    )
+    result = index.add({"ids": ids, "embeddings": vectors, "metadatas": metadata})
+    assert result.is_success(), result.errors
+    return index, vectors
+
+
+def _exact_page(vectors, matching, query, k):
+    """The k nearest of `matching` under cosine, computed exactly."""
+    subset = np.asarray(sorted(matching))
+    order = np.argsort(-(vectors[subset] @ query))[:k]
+    return [f"r{subset[i]:05d}" for i in order]
+
+
+def test_a_selective_filter_returns_the_exact_nearest_matching_records():
+    """The scan path is exact, so its page is the brute force page."""
+    index, vectors = _filter_index()
+    query = vectors[7]
+
+    for field, rate in (("s100", 100), ("s1000", 1000)):
+        matching = [i for i in range(FILTER_CORPUS) if i % rate == 0]
+        assert len(matching) <= FULL_SCAN_THRESHOLD
+        page = index.search(vector=query, filter={field: "y"}, top_k=10)
+        assert [hit["id"] for hit in page] == _exact_page(vectors, matching, query, 10), (
+            f"the exact path did not return the nearest matching records for {field}"
+        )
+        for hit in page:
+            assert hit["metadata"][field] == "y"
+
+
+def test_a_broad_filter_keeps_the_graph_recall():
+    """Above the threshold the traversal runs, and it is nearly exact."""
+    index, vectors = _filter_index()
+    query = vectors[11]
+
+    # Every record carries a rank, so this admits all of them and is well above
+    # the threshold. Half the corpus would not be, since the corpus is 6,000.
+    matching = list(range(FILTER_CORPUS))
+    assert len(matching) > FULL_SCAN_THRESHOLD
+    page = index.search(vector=query, filter={"rank": {"gte": 0}}, top_k=10)
+    assert len(page) == 10
+    for hit in page:
+        assert hit["metadata"]["rank"] >= 0, "a filtered page leaked a record"
+    exact = set(_exact_page(vectors, matching, query, 10))
+    overlap = len({hit["id"] for hit in page} & exact)
+    assert overlap >= 9, f"graph recall on a broad filter fell to {overlap} of 10"
+
+
+def test_a_filter_matching_one_record_returns_that_record():
+    """The case the exact path exists for.
+
+    Through the traversal alone this costs 128 to 359 milliseconds on a 100,000
+    record set, because the graph has to walk almost every node before it can
+    conclude there is nothing else to admit. Through the scan it is one walk of
+    the metadata.
+    """
+    index, _ = _filter_index()
+    page = index.search(vector=[1.0] * FILTER_DIM, filter={"one": "y"}, top_k=10)
+    assert [hit["id"] for hit in page] == ["r04321"]
+
+
+def test_top_k_is_the_page_size_and_not_the_pool():
+    """Raising top_k under a filter adds results rather than rescuing them."""
+    index, _ = _filter_index()
+    query = [1.0] + [0.0] * (FILTER_DIM - 1)
+
+    seen = {}
+    for top_k in (1, 5, 10, 50, 60, 100):
+        page = index.search(vector=query, filter={"s100": "y"}, top_k=top_k)
+        seen[top_k] = [hit["id"] for hit in page]
+        assert len(page) == min(top_k, 60), f"top_k={top_k} returned {len(page)}"
+    # Every shorter page is a prefix of every longer one.
+    for top_k in (1, 5, 10, 50):
+        assert seen[top_k] == seen[100][:top_k]
+
+
+def test_a_filter_matching_fewer_than_top_k_returns_what_matched():
+    index, _ = _filter_index()
+    query = [1.0] * FILTER_DIM
+    page = index.search(vector=query, filter={"rank": {"lt": 3}}, top_k=10)
+    assert sorted(hit["id"] for hit in page) == ["r00000", "r00001", "r00002"]
+    assert index.search(vector=query, filter={"rank": {"lt": 0}}, top_k=10) == []
+    assert index.search(vector=query, filter={"s2": "absent"}, top_k=10) == []
+
+
+def test_the_scan_threshold_boundary_returns_one_page():
+    """One below, on, and one above the threshold agree on the page.
+
+    The path changes between the second and the third of these, because the walk
+    gives up once it has counted one match more than the threshold. Both paths
+    are asked the same question and both answer it.
+    """
+    index, vectors = _filter_index()
+    query = vectors[3]
+
+    pages = {}
+    for matched in (FULL_SCAN_THRESHOLD - 1, FULL_SCAN_THRESHOLD, FULL_SCAN_THRESHOLD + 1):
+        page = index.search(vector=query, filter={"rank": {"lt": matched}}, top_k=10)
+        assert len(page) == 10
+        for hit in page:
+            assert hit["metadata"]["rank"] < matched
+        pages[matched] = [hit["id"] for hit in page]
+
+    # The three filters admit almost the same records, so the three pages should
+    # be the same page. The one above the threshold is served by the traversal.
+    assert pages[FULL_SCAN_THRESHOLD - 1] == pages[FULL_SCAN_THRESHOLD]
+    assert pages[FULL_SCAN_THRESHOLD] == pages[FULL_SCAN_THRESHOLD + 1]
+    assert pages[FULL_SCAN_THRESHOLD] == _exact_page(
+        vectors, range(FULL_SCAN_THRESHOLD), query, 10
+    )
+
+
+def test_the_filtered_page_does_not_depend_on_hash_order():
+    """A filtered page is the same in a fresh interpreter.
+
+    The scan walks the metadata store in ``HashMap`` order, which the standard
+    library seeds afresh in every process, so two equally distant records would
+    come back in an order that varied run to run without a tie break on the
+    external id. This runs the same query in three subprocesses.
+    """
+    script = textwrap.dedent(
+        """
+        import json
+        import numpy as np
+        from zeusdb_vector_database import VectorDatabase
+
+        rng = np.random.default_rng(4242)
+        # Deliberately duplicated vectors, so ties are guaranteed.
+        base = rng.standard_normal((20, 4)).astype(np.float32)
+        base /= np.linalg.norm(base, axis=1, keepdims=True)
+        vectors = np.repeat(base, 5, axis=0)
+        index = VectorDatabase().create("hnsw", dim=4, expected_size=100)
+        index.add({
+            "ids": [f"t{i:03d}" for i in range(100)],
+            "embeddings": vectors,
+            "metadatas": [{"keep": "y"} for _ in range(100)],
+        })
+        page = index.search(vector=base[0], filter={"keep": "y"}, top_k=25)
+        print(json.dumps([h["id"] for h in page]))
+        """
+    )
+    seen = set()
+    for _ in range(3):
+        out = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True,
+            env={**os.environ, "PYTHONHASHSEED": "0"},
+        )
+        assert out.returncode == 0, out.stderr
+        seen.add(out.stdout.strip().splitlines()[-1])
+    assert len(seen) == 1, f"the filtered page varied across processes: {seen}"
+
+
+def test_the_batch_paths_filter_the_same_way_as_the_single_path():
+    """Sequential batches, parallel batches and single queries agree.
+
+    The batch split is at five queries, so the two batches below take different
+    code paths through the guards.
+    """
+    index, vectors = _filter_index()
+    queries = [vectors[i].tolist() for i in range(7)]
+    filter_ = {"s100": "y"}
+
+    single = [
+        [hit["id"] for hit in index.search(vector=q, filter=filter_, top_k=10)]
+        for q in queries
+    ]
+    sequential = index.search(queries[:3], filter=filter_, top_k=10)
+    parallel = index.search(queries, filter=filter_, top_k=10)
+
+    assert [[hit["id"] for hit in page] for page in sequential] == single[:3]
+    assert [[hit["id"] for hit in page] for page in parallel] == single
+
+
+@pytest.mark.parametrize("storage_mode", ["quantized_with_raw", "quantized_only"])
+def test_a_quantized_index_filters_on_both_paths(storage_mode):
+    """The scan scores from raw vectors where there are any and codes otherwise.
+
+    Under ``quantized_only`` the raw vectors are gone once training completes, so
+    the scan scores each match against its reconstruction. That is exact over
+    what the index still holds rather than over the vectors it was given, which
+    is the same limit every other read of a ``quantized_only`` index carries.
+    """
+    index, _ = _filter_index(
+        quantization_config={
+            "type": "pq", "subvectors": 4, "bits": 4,
+            "training_size": 1000, "storage_mode": storage_mode,
+        },
+    )
+    assert index.is_quantized(), "the corpus should have trained the quantizer"
+
+    query = [1.0] + [0.0] * (FILTER_DIM - 1)
+    selective = index.search(vector=query, filter={"s100": "y"}, top_k=10)
+    assert len(selective) == 10
+    for hit in selective:
+        assert hit["metadata"]["s100"] == "y"
+
+    broad = index.search(vector=query, filter={"s2": "y"}, top_k=10)
+    assert len(broad) == 10
+    for hit in broad:
+        assert hit["metadata"]["s2"] == "y"
+
+    one = index.search(vector=query, filter={"one": "y"}, top_k=10)
+    assert [hit["id"] for hit in one] == ["r04321"]
+
+
+def test_a_filtered_search_survives_a_concurrent_insert():
+    """The guards are held longer now, so this is where a deadlock would show.
+
+    The filter predicate reads the metadata store, so a filtered search holds
+    ``vector_metadata`` across the whole traversal rather than only afterwards,
+    and it holds the graph guard beside it. Both paths are exercised here, since
+    the rank filter admits every record and so runs above the threshold, and
+    ``s1000`` admits six and so runs below it.
+    """
+    index, vectors = _filter_index()
+    errors = []
+    stop = threading.Event()
+
+    def search_forever(filter_):
+        try:
+            while not stop.is_set():
+                for i in range(0, 40):
+                    page = index.search(vector=vectors[i], filter=filter_, top_k=5)
+                    for hit in page:
+                        assert hit["metadata"], "a hit came back with no metadata"
+        except Exception as exc:  # pragma: no cover - only on a real failure
+            errors.append(exc)
+
+    def insert_forever():
+        try:
+            rng = np.random.default_rng(99)
+            i = 0
+            while not stop.is_set() and i < 400:
+                vector = rng.standard_normal(FILTER_DIM).astype(np.float32)
+                vector /= np.linalg.norm(vector)
+                index.add({
+                    "id": f"live_{i:04d}", "values": vector.tolist(),
+                    "metadata": {"s2": "n", "s10": "n", "s100": "n",
+                                 "s1000": "n", "one": "n", "rank": 900000 + i},
+                })
+                i += 1
+        except Exception as exc:  # pragma: no cover - only on a real failure
+            errors.append(exc)
+
+    workers = [
+        threading.Thread(target=search_forever, args=({"rank": {"gte": 0}},)),
+        threading.Thread(target=search_forever, args=({"s1000": "y"},)),
+        threading.Thread(target=search_forever, args=(None,)),
+        threading.Thread(target=insert_forever),
+    ]
+    for worker in workers:
+        worker.start()
+    time.sleep(2.0)
+    stop.set()
+    for worker in workers:
+        worker.join(timeout=60)
+        assert not worker.is_alive(), "a worker did not finish, which is a deadlock"
+    assert not errors, errors
+
+    # The inserted records carry s1000 "n", so the selective page is unchanged.
+    page = index.search(vector=vectors[0], filter={"one": "y"}, top_k=5)
+    assert [hit["id"] for hit in page] == ["r04321"]
