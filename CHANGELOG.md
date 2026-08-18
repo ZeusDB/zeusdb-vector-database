@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.0] - 2026-08-18
+
+The graph is ZeusDB's own. The structure, the traversal, the insert, the level stream, the distance trait and the on-disk format are all in this package, and the vendored `hnsw_rs` crate is gone. Builds, searches and searches taken while another thread inserts are all faster, a loaded index holds less memory, and the graph is saved in a new single file format. A directory saved by 0.6.0 or earlier still opens, rebuilds its graph once and writes the new file on the next save.
+
+### Breaking
+
+- **The saved graph is one file, `hnsw_index.zdbgraph`, in place of `hnsw_index.hnsw.graph` and `hnsw_index.hnsw.data`.** A directory saved by 0.6.0 or earlier opens without any action. Nothing reads the old pair, so the first load rebuilds the graph from the stored records and the next `save()` writes the single file. At 50,000 records of 1,536 dimensional embeddings that rebuild takes between two and three and a half minutes, against under two seconds for a restore, and it happens once per directory. A rebuilt graph is wired from the records rather than restored edge for edge, so exact result sets from such a directory can differ from the ones it returned before the upgrade. Code that lists the directory, copies named files or reads `files_included` in `manifest.json` needs the new name. `format_version` in the manifest is unchanged at 1.1.0.
+
+### Fixed
+
+- A directory saved at `m` 256 rebuilt its graph on every load, for ever. The old dump header held `m` in a single byte, so 256 was written as 0, the loader compared that against the 256 in `config.json` and fell back to the rebuild every time the directory was opened. The new header holds `m` in eight bytes and such a directory restores.
+- A damaged or truncated graph file raises instead of ending the process. The old reader panicked on a malformed header and called `std::process::exit(1)` on a short data file. The new reader validates every length before it allocates and returns an error, which the load path treats as a reason to rebuild from the stored records.
+- A graph file records the byte order and pointer width it was written with, and one written on a machine that disagrees is refused rather than read as noise. The old format recorded neither.
+- `benchmark_concurrent_reads()` built its queries without processing them for the index's space, so on a cosine index it measured the traversal an unnormalised query takes rather than the traversal a real query takes. Its queries are now processed exactly as a caller's query is, and the throughput and speedup figures it reports move accordingly.
+
+### Added
+
+- `index_bookkeeping_memory_mb` in `get_stats()`, on every index. It prices the hash tables that find a record rather than the ones that hold one, and it is folded into `total_memory_mb`. It is set by the record count and not by the dimension, running at 265 bytes per record with no quantization, 334 under `quantized_with_raw` and 265 under `quantized_only`.
+- A GitHub Release is created for each stable tag, titled `Version X.Y.Z`, with its body taken from the matching section of this file.
+
+### Changed
+
+- **The index runs on ZeusDB's graph.** Building, searching, saving, loading, `compact()`, `remove_point()` and overwrite all go through it. The replacement was compared against the vendored path over 155,790 cells of result ids, exact score bits, recall and re-saved dump bytes, with none differing, so an index already in use answers as it did.
+- Index building through `add()` is 1.60x to 4.16x faster, measured at 10,000 and 50,000 records on 1,536 dimensional embeddings and on 128 dimensional SIFT vectors.
+- Search is 1.46x to 3.11x faster on mean latency and 1.30x to 3.09x faster at p95, measured on four loaded 50,000 record indexes at `top_k` 10 across three metrics and all three storage modes.
+- A loaded 50,000 record index holds 100 to 107 MiB less. A `quantized_only` index of 1,536 dimensional embeddings is 2.42x smaller and an unquantized 128 dimensional one is 2.17x smaller.
+- Search under a concurrent insert is faster on both counts. Throughput rose by 1.44x to 2.61x and p95 latency fell by 1.46x to 2.48x, in every cell measured at 1, 4 and 16 searching threads. Throughput as a share of a no-insert baseline at the same thread count fell in five of those six cells, from a range of 73.3 to 94.2 percent to a range of 66.0 to 93.0 percent, because the baseline rose faster than the figure measured against it. The install phase of an insert takes the graph write guard, where the previous insert locked each neighbour list on its own and never blocked a search, so a search now waits briefly once per inserted record.
+- The saved graph is smaller and loads faster. At 50,000 records the file is 5.5 percent smaller on an unquantized index and 48.8 percent smaller on a quantized one, and a load is 1.5 to 2.7 times faster.
+- `graph_memory_mb` is exact arithmetic over the capacity of every buffer the graph holds rather than a sample of its adjacency, and `total_memory_mb` follows it. The new figure reads 370 bytes per node of structure across three metrics and both element types, where the sampled one varied from 1,261 to 2,085 bytes on those same four graphs. **An index holding no record no longer reports zero**, because the capacity `expected_size` reserves at creation is committed whether a record lands in it or not. A `dim` 32 index declaring 100 records reads 0.04 MB where it read 0.00.
+- The capacity reserved at creation is capped at 128 MiB whatever `expected_size` declares, and the graph grows geometrically past it. An index declaring the documented maximum of 100,000,000 records committed 764 MB at creation before.
+- Neighbour lists order equal distances by insertion order, because the list sorts are stable. On data where distances tie, which in practice means integer valued embeddings, a newly built index can differ from one built by 0.6.0 by a handful of edges. Measured recall is unchanged on three real datasets at 10,000 and 50,000 records, and a saved graph carries no sort, so a restored index is unaffected.
+- The level generator and both of the quantizer's draws name `rand_chacha` directly rather than reaching it through `rand`'s `StdRng`, which is documented as free to change algorithm in any release. A routine `rand` update can no longer change the graph a given set of records builds. The stream itself is unchanged, so no graph moved.
+- The distance kernels dispatch at run time to an AVX path on an x86-64 processor that offers one, and to the previous code on one that does not. Measured on their own the kernels are 1.20x to 1.55x faster and an index build 1.10x, and search latency did not move. Every distance the AVX path computes is bit-identical to the one the previous path computes, over 22,176 compared values, 24,000 orderings, three built graphs and 250 search pages.
+- The Rust dependency tree fell from 157 crates to 118, the source distribution is 29.8 percent smaller and no longer ships a vendored crate, and a clean release build of the extension is 1.14x faster.
+- The README records what `total_memory_mb` prices and what it leaves out, with the unpriced share measured against the resident set on all three storage modes, and its rerank calibration table is replaced by twelve measured cells covering three datasets at 50,000 and 100,000 records.
+
+---
+
 ## [0.6.0] - 2026-08-15
 
 This release changes which interpreters receive a wheel. The extension is built against CPython's stable ABI, so one wheel per platform serves every CPython from 3.10 up, and PyPy and the free-threaded builds install from the source distribution instead. A saved index is unaffected and a directory written by 0.5.0 loads unchanged.
