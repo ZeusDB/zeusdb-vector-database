@@ -36,15 +36,11 @@ python-source = "src"
 manifest-path = "vdb-core/Cargo.toml"
 module-name = "zeusdb_vector_database" # <-- matches Rust crate name
 bindings = "pyo3" # <-- explicitly state to maturin that it's a PyO3 project
-# vendor/** must ship in the sdist, or an sdist build cannot resolve the
-# patched hnsw_rs path dependency declared in vdb-core/Cargo.toml.
 include = [
     "LICENSE",
     "NOTICE",
     "README.md",
     "src/**",
-    { path = "vendor/**/*", format = "sdist" },
-    { path = "LICENSES/*", format = "sdist" },
 ]
 
 [project.optional-dependencies]

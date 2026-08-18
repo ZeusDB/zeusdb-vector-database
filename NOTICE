@@ -6,23 +6,15 @@ This product includes software developed by:
 - The Python Software Foundation (https://www.python.org/psf/)
 - The Rust Project Developers (https://www.rust-lang.org/)
 - The PyO3 Project (https://pyo3.rs/)
-- Jean-pierreBoth (https://crates.io/crates/hnsw_rs/)
 
-The hnsw_rs crate, version 0.3.4, is vendored in source form at vendor/hnsw_rs
-and carries eight ZeusDB patches, one to the reverse link layer assignment, one
-seeding level assignment so index builds are reproducible, one guarding the
-neighbour list overflow pop against stranding a point's last inbound link, one
-correcting the filtered search path so it cannot panic or return an empty
-result set, one correcting the per-layer capacity reservation so a declared
-index size does not commit hundreds of times the memory it needs, one
-correcting the level scale a reload installs, one putting three modules
-ZeusDB never reaches behind default-off cargo features, and one adding a public
-constructor that builds a graph from a topology the caller already holds, so
-ZeusDB can keep its own on-disk format. See
-vendor/hnsw_rs/ZEUSDB-PATCH.md for the patch record. hnsw_rs is dual licensed
-under MIT or Apache-2.0.
+Releases up to and including 0.6.0 were built on a vendored copy of a Rust HNSW
+crate by Jean-Pierre Both, dual licensed under MIT or Apache-2.0. From 0.7.0 the
+graph structure, its traversal, its insert, its level stream and its on-disk
+format are ZeusDB's own, and neither that crate nor its source is part of this
+package. ZeusDB's graph reproduces the behaviour of that implementation, and the
+acknowledgement is kept here for that reason.
 
-Third-party components may be licensed under their respective terms. See LICENSES/ for full license texts.
+Third-party components may be licensed under their respective terms.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

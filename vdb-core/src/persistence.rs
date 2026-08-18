@@ -21,7 +21,7 @@
 //! and the loader restores the graph from it rather than rebuilding it by
 //! re-inserting every record. See `HNSWIndex::restore_graph_from_dump`.
 //!
-//! It replaces the two files the vendored `hnsw_rs` crate wrote,
+//! It replaces the two files the vendored graph crate wrote,
 //! `hnsw_index.hnsw.graph` and `hnsw_index.hnsw.data`. A directory saved by
 //! 0.6.0 or earlier still holds those two, and opening it rebuilds the graph
 //! once and writes the new file on the next save. Nothing reads the old format.

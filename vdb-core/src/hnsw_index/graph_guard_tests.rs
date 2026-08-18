@@ -1,25 +1,27 @@
-//! Tests that guard the vendored `hnsw_rs` patches and the ADC distance.
+//! Tests that guard the graph the index builds, and the ADC distance.
 //!
 //! These build a graph directly rather than through an index, because what they
-//! assert is a property of the graph the vendored crate wires. Two of them,
-//! `self_query_reachability` and `layer_zero_in_degree`, fail if a patch
-//! recorded in `vendor/hnsw_rs/ZEUSDB-PATCH.md` is ever lost, most likely during
-//! an upgrade. The other five assert that a quantized graph is built on the
-//! codes at all, which no release before the symmetric distance existed managed.
+//! assert is a property of the graph rather than of anything around it. Two of
+//! them, `self_query_reachability` and `layer_zero_in_degree`, hold the two
+//! defects the vendored crate had and ZeusDB patched: reverse links filed at
+//! the wrong layer, and an overflow pop that could evict a point's last inbound
+//! link. Both patches are behaviour the ZeusDB insert reproduces, so these now
+//! guard the shipped builder rather than a reference. The other five assert
+//! that a quantized graph is built on the codes at all, which no release before
+//! the symmetric distance existed managed.
 //!
-//! They have their own file because they belong to `DistPQ` and to the vendored
-//! crate rather than to any one part of the index, and because `graph.rs` is a
-//! seam whose job is naming `hnsw_rs`, not holding index tests.
+//! They have their own file because they belong to `DistPQ`, which is declared
+//! beside them, rather than to any one part of the index.
+//!
+//! The graph is built through `crate::graph::test_graph`, which is the small
+//! `cfg(test)` surface the graph module offers a caller outside it. The seam
+//! takes a space by name and so cannot be handed a distance directly.
 
 use super::DistPQ;
+use crate::distance::CosineDist;
+use crate::graph::test_graph::TestGraph;
 use crate::pq::PQ;
 use crate::test_vectors::clustered;
-// `DistCosine` is the `anndists` implementation this crate's distances
-// replaced. The two graph guard tests keep it on purpose. They guard patches in
-// the vendored crate rather than anything about the distance, their data is
-// deliberately unnormalised, and holding the distance fixed keeps the orphan
-// counts their comments record comparable across relays.
-use hnsw_rs::prelude::{DistCosine, Hnsw};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashSet;
@@ -77,29 +79,29 @@ fn fixture() -> &'static PqFixture {
     })
 }
 
-/// Build the quantized graph exactly as `insert_pq_codes` does, one code
-/// vector at a time with no query table set.
-fn build_pq_graph(pq: Arc<PQ>, codes: &[Vec<u8>]) -> Hnsw<'static, u8, DistPQ> {
-    let hnsw = Hnsw::new(PQ_M, codes.len(), 16, PQ_EF_C, DistPQ::new(pq));
-    for (i, c) in codes.iter().enumerate() {
-        hnsw.insert((c.as_slice(), i));
-    }
-    hnsw
+/// Uniform vectors, unit normalised, which is what the cosine path holds.
+///
+/// The spread is deliberately structureless, unlike [`clustered`], because the
+/// two raw guards below want a graph whose neighbour lists fill rather than one
+/// whose clusters let the diversity heuristic prune.
+fn unit_vectors(records: usize, dim: usize) -> Vec<Vec<f32>> {
+    let mut rng = StdRng::seed_from_u64(42);
+    (0..records)
+        .map(|_| {
+            let mut v: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() - 0.5).collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+            v
+        })
+        .collect()
 }
 
-/// Layer zero adjacency keyed by origin id, each list sorted.
-fn layer_zero_adjacency(hnsw: &Hnsw<'static, u8, DistPQ>) -> Vec<(usize, Vec<usize>)> {
-    let mut adj: Vec<(usize, Vec<usize>)> = hnsw
-        .get_point_indexation()
-        .into_iter()
-        .map(|p| {
-            let mut v: Vec<usize> = p.get_neighborhood_id()[0].iter().map(|x| x.d_id).collect();
-            v.sort_unstable();
-            (p.get_origin_id(), v)
-        })
-        .collect();
-    adj.sort_unstable_by_key(|(id, _)| *id);
-    adj
+/// Build the quantized graph exactly as the insertion path does, one code
+/// vector at a time with no query table set.
+fn build_pq_graph(pq: Arc<PQ>, codes: &[Vec<u8>]) -> TestGraph<u8, DistPQ> {
+    TestGraph::build(PQ_M, PQ_EF_C, codes, DistPQ::new(pq))
 }
 
 /// The strongest assertion available about the quantized graph: that the
@@ -119,11 +121,11 @@ fn layer_zero_adjacency(hnsw: &Hnsw<'static, u8, DistPQ>) -> Vec<(usize, Vec<usi
 fn quantized_graph_depends_on_the_data() {
     let f = fixture();
 
-    let own = layer_zero_adjacency(&build_pq_graph(f.pq.clone(), &f.codes));
+    let own = build_pq_graph(f.pq.clone(), &f.codes).layer_zero_adjacency();
 
     let mut shuffled = f.codes.clone();
     shuffled.reverse();
-    let other = layer_zero_adjacency(&build_pq_graph(f.pq.clone(), &shuffled));
+    let other = build_pq_graph(f.pq.clone(), &shuffled).layer_zero_adjacency();
 
     assert_eq!(own.len(), PQ_N);
     assert_eq!(other.len(), PQ_N);
@@ -154,7 +156,7 @@ fn quantized_graph_depends_on_the_data() {
 #[test]
 fn quantized_graph_layer_zero_out_degree() {
     let f = fixture();
-    let adj = layer_zero_adjacency(&build_pq_graph(f.pq.clone(), &f.codes));
+    let adj = build_pq_graph(f.pq.clone(), &f.codes).layer_zero_adjacency();
 
     let degenerate = adj.iter().filter(|(_, n)| n.len() <= 1).count();
     assert!(
@@ -189,15 +191,16 @@ fn quantized_graph_recall_against_brute_force() {
 
     let f = fixture();
     let (data, queries) = (&f.data, &f.queries);
-    let hnsw = build_pq_graph(f.pq.clone(), &f.codes);
+    let dist = DistPQ::new(f.pq.clone());
+    let graph = build_pq_graph(f.pq.clone(), &f.codes);
 
     let mut hits = 0usize;
     let mut returned = usize::MAX;
     for q in queries.iter() {
         let found = {
-            let _lut = hnsw.get_distance().install_query_lut(q).expect("query lut");
+            let _lut = dist.install_query_lut(q).expect("query lut");
             let dummy = vec![0u8; PQ_SUBVECTORS];
-            hnsw.search(&dummy, K, 100)
+            graph.page(&dummy, K, 100)
         };
         returned = returned.min(found.len());
 
@@ -214,7 +217,7 @@ fn quantized_graph_recall_against_brute_force() {
         truth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         let truth: HashSet<usize> = truth[..K].iter().map(|x| x.1).collect();
 
-        hits += found.iter().filter(|n| truth.contains(&n.d_id)).count();
+        hits += found.iter().filter(|(id, _)| truth.contains(id)).count();
     }
 
     assert_eq!(returned, K, "a top {} request came back short", K);
@@ -234,15 +237,13 @@ fn quantized_graph_recall_against_brute_force() {
 #[test]
 fn quantized_graph_is_fully_reachable() {
     let f = fixture();
-    let hnsw = build_pq_graph(f.pq.clone(), &f.codes);
+    let dist = DistPQ::new(f.pq.clone());
+    let graph = build_pq_graph(f.pq.clone(), &f.codes);
 
     let found = {
-        let _lut = hnsw
-            .get_distance()
-            .install_query_lut(&f.data[0])
-            .expect("query lut");
+        let _lut = dist.install_query_lut(&f.data[0]).expect("query lut");
         let dummy = vec![0u8; PQ_SUBVECTORS];
-        hnsw.search(&dummy, PQ_N, PQ_N)
+        graph.page(&dummy, PQ_N, PQ_N)
     };
 
     assert_eq!(
@@ -261,7 +262,8 @@ fn quantized_graph_is_fully_reachable() {
 #[test]
 fn quantized_search_still_uses_the_query_table() {
     let f = fixture();
-    let hnsw = build_pq_graph(f.pq.clone(), &f.codes);
+    let dist = DistPQ::new(f.pq.clone());
+    let graph = build_pq_graph(f.pq.clone(), &f.codes);
 
     // The ADC distance from a query to a stored code, computed directly.
     let query = &f.data[7];
@@ -273,34 +275,31 @@ fn quantized_search_still_uses_the_query_table() {
         .sum();
 
     let found = {
-        let _lut = hnsw
-            .get_distance()
-            .install_query_lut(query)
-            .expect("query lut");
+        let _lut = dist.install_query_lut(query).expect("query lut");
         let dummy = vec![0u8; PQ_SUBVECTORS];
-        hnsw.search(&dummy, 10, 200)
+        graph.page(&dummy, 10, 200)
     };
 
     assert!(
-        found.iter().any(|n| n.d_id == 7),
+        found.iter().any(|&(id, _)| id == 7),
         "a record could not find itself"
     );
 
     // Every distance the search reports must be the asymmetric one. The
     // symmetric table would give a different number here, since it compares
     // the dummy query's all-zero codes rather than the query itself.
-    for n in found.iter() {
-        let adc: f32 = f.codes[n.d_id]
+    for &(id, distance) in found.iter() {
+        let adc: f32 = f.codes[id]
             .iter()
             .enumerate()
             .map(|(sv, &c)| lut[sv][c as usize])
             .sum();
         assert!(
-            (n.distance - adc).abs() <= 1e-4 * adc.max(1.0),
+            (distance - adc).abs() <= 1e-4 * adc.max(1.0),
             "search reported {} for record {} where its asymmetric distance is {}, \
              so the query path is no longer using the query table",
-            n.distance,
-            n.d_id,
+            distance,
+            id,
             adc
         );
     }
@@ -308,69 +307,65 @@ fn quantized_search_still_uses_the_query_table() {
     // The record's own ADC distance is the smallest of the ten returned,
     // which is what the ranking has to produce.
     assert!(
-        found[0].distance <= expected + 1e-4,
+        found[0].1 <= expected + 1e-4,
         "the top hit scored {} against the query's own record at {}",
-        found[0].distance,
+        found[0].1,
         expected
     );
 }
 
-/// Guards the vendored hnsw_rs patch that files reverse links at the
-/// layer being processed instead of at the inserting point's own top
-/// layer. Without the patch, points assigned a level above zero lose
-/// their layer-zero inbound adjacency and can become unreachable to
-/// similarity search, and at this index size roughly one to two
-/// percent of self-queries fail. A failure here means the patch was
-/// lost, most likely during an hnsw_rs upgrade. See
-/// vendor/hnsw_rs/ZEUSDB-PATCH.md.
+/// Holds the reverse link filing the graph depends on.
 ///
-/// Insertion is sequential on purpose. `parallel_insert` assigns levels
-/// in whatever order threads reach the level generator, so the graph
-/// varies between runs even under the fixed seed and the test was
-/// intermittently red. Building one vector at a time makes the graph a
-/// function of the data and the parameters alone, which is also the
-/// path every non-quantized index takes through `add()`. The defect
-/// this test guards is not specific to the parallel path.
+/// The crate ZeusDB was built on filed a reverse link at the inserting point's
+/// own top layer instead of at the layer being processed. Points assigned a
+/// level above zero then lost their layer-zero inbound adjacency and could
+/// become unreachable to similarity search, and at this index size roughly one
+/// to two percent of self-queries failed. ZeusDB patched that, and the insert
+/// that replaced it files reverse links the corrected way, so this now holds
+/// the shipped builder rather than a reference.
+///
+/// The distance is ZeusDB's `CosineDist` and the data is unit normalised, which
+/// is what `process_vector_for_space` hands every cosine insertion and every
+/// cosine query. `CosineDist` is `1 - dot` and carries normalisation as a
+/// precondition rather than applying it, so unnormalised data would make the
+/// nearest point the longest one rather than the closest and no point would
+/// find itself. Insertion is sequential, which is the path every index takes
+/// through `add()`.
 #[test]
 fn self_query_reachability() {
     const N: usize = 3000;
     const DIM: usize = 32;
 
-    let mut rng = StdRng::seed_from_u64(42);
-    let data: Vec<Vec<f32>> = (0..N)
-        .map(|_| (0..DIM).map(|_| rng.random::<f32>() - 0.5).collect())
-        .collect();
-
-    let hnsw = Hnsw::new(16, N, 16, 200, DistCosine {});
-    for (i, v) in data.iter().enumerate() {
-        hnsw.insert((v.as_slice(), i));
-    }
+    let data = unit_vectors(N, DIM);
+    let graph = TestGraph::build(16, 200, &data, CosineDist {});
+    assert_eq!(graph.nb_points(), N);
 
     let failures: Vec<usize> = (0..N)
-        .filter(|&i| hnsw.search(&data[i], 1, 64).first().map(|n| n.d_id) != Some(i))
+        .filter(|&i| graph.page(&data[i], 1, 64).first().map(|&(id, _)| id) != Some(i))
         .collect();
 
     assert!(
         failures.is_empty(),
         "{} of {} points cannot find themselves by self-query (first: {:?}); \
-         the hnsw_rs reverse link layer patch is missing",
+         reverse links are no longer filed at the layer being processed",
         failures.len(),
         N,
         &failures[..failures.len().min(10)]
     );
 }
 
-/// Guards the vendored hnsw_rs patch that stops the layer-zero overflow
-/// pop from evicting a point's last inbound link. Without the patch the
-/// pop always discards the farthest entry, so a point whose only inbound
-/// link happens to be that entry is left with no layer-zero in-edge and
-/// becomes an orphan that no search can reach through the graph. A
-/// failure here means the patch was lost, most likely during an hnsw_rs
-/// upgrade. See vendor/hnsw_rs/ZEUSDB-PATCH.md.
+/// Holds the guard on the layer-zero overflow pop.
 ///
-/// In-degree is counted from the adjacency lists rather than from the
-/// patch's own counters, so the assertion holds against the graph itself
-/// and stays meaningful if the counters are ever wrong.
+/// The crate ZeusDB was built on always discarded the farthest entry, so a
+/// point whose only inbound link happened to be that entry was left with no
+/// layer-zero in-edge and became an orphan no search could reach through the
+/// graph. The unpatched crate stranded 24 of these 5,000 points. ZeusDB
+/// patched it and the insert that replaced it carries the same guard, so this
+/// now holds the shipped builder rather than a reference.
+///
+/// In-degree is counted from the adjacency lists rather than from the guard's
+/// own counters, so the assertion holds against the graph itself and stays
+/// meaningful if the counters are ever wrong.
 ///
 /// `M` is 4 rather than the shipped 16 on purpose. The layer-zero
 /// neighbour cap is `2 * M`, so a small `M` fills lists early and makes
@@ -379,42 +374,44 @@ fn self_query_reachability() {
 /// data model rather than on index size. On uniform vectors like these
 /// it strands none up to 30,000 points, while on clustered data, 50
 /// Gaussian clusters at sigma 0.15 in 768 dimensions, it strands 6 of
-/// 10,000. A small `M` lets this uniform generator fail fast instead,
-/// and the unpatched crate strands 24 of these 5,000 points.
-///
-/// Insertion is sequential for the same reason as `self_query_reachability`.
+/// 10,000. A small `M` lets this uniform generator fail fast instead.
 #[test]
 fn layer_zero_in_degree() {
     const N: usize = 5000;
     const DIM: usize = 128;
     const M: usize = 4;
 
-    let mut rng = StdRng::seed_from_u64(42);
-    let data: Vec<Vec<f32>> = (0..N)
-        .map(|_| (0..DIM).map(|_| rng.random::<f32>() - 0.5).collect())
-        .collect();
+    let data = unit_vectors(N, DIM);
+    let graph = TestGraph::build(M, 200, &data, CosineDist {});
+    assert_eq!(graph.nb_points(), N);
 
-    let hnsw = Hnsw::new(M, N, 16, 200, DistCosine {});
-    for (i, v) in data.iter().enumerate() {
-        hnsw.insert((v.as_slice(), i));
-    }
+    // The fixture has to reach the guard, or this asserts nothing. A small `M`
+    // fills lists early, so the pop fires far more often than once per node and
+    // the guard skips the farthest entry thousands of times.
+    let (overflows, saves, fallbacks) = graph.guard_stats();
+    println!(
+        "overflow pop over {} nodes: {} events, {} saves, {} fallbacks",
+        N, overflows, saves, fallbacks
+    );
+    assert!(
+        overflows > N as u64,
+        "the overflow pop fired {} times over {} nodes, which is not often enough          to exercise the guard",
+        overflows,
+        N
+    );
+    assert!(
+        saves > 0,
+        "the guard never skipped the farthest entry, so it changed no outcome          here and this fixture does not test it"
+    );
 
-    let mut in_degree = vec![0usize; N];
-    let mut nb_seen = 0usize;
-    for point in hnsw.get_point_indexation() {
-        nb_seen += 1;
-        for neighbour in &point.get_neighborhood_id()[0] {
-            in_degree[neighbour.d_id] += 1;
-        }
-    }
-    assert_eq!(nb_seen, N, "walked {} points, expected {}", nb_seen, N);
-
+    let in_degree = graph.layer_zero_in_degree();
+    assert_eq!(in_degree.len(), N);
     let orphans: Vec<usize> = (0..N).filter(|&i| in_degree[i] == 0).collect();
 
     assert!(
         orphans.is_empty(),
         "{} of {} points have zero layer-zero in-degree (first: {:?}); \
-         the hnsw_rs overflow pop guard is missing",
+         the overflow pop guard is no longer saving a point's last inbound link",
         orphans.len(),
         N,
         &orphans[..orphans.len().min(10)]
@@ -434,12 +431,8 @@ fn layer_zero_in_degree() {
 ///
 /// So at `ef_construction == 2 * m` every node takes exactly `2 * m`
 /// neighbours and sits at the degree cap, and one above it the heuristic runs
-/// and prunes. Measured here, mean layer zero out-degree is 16.000 with 2,000
-/// of 2,000 nodes at the cap at `ef_construction` 16, and 7.170 with 129 of
-/// 2,000 at the cap at 17. The gap is what makes the threshold exact rather
-/// than approximate, and it is why the warning carries no margin.
-///
-/// Insertion is sequential for the reason `self_query_reachability` records.
+/// and prunes. The gap is what makes the threshold exact rather than
+/// approximate, and it is why the warning carries no margin.
 #[test]
 fn neighbour_selection_threshold_is_twice_m() {
     const N: usize = 2000;
@@ -449,14 +442,11 @@ fn neighbour_selection_threshold_is_twice_m() {
     let data = clustered(N, DIM, 7);
 
     let at_cap_fraction = |efc: usize| -> (f64, f64) {
-        let hnsw: Hnsw<'static, f32, DistCosine> = Hnsw::new(M, N, 16, efc, DistCosine {});
-        for (i, v) in data.iter().enumerate() {
-            hnsw.insert((v.as_slice(), i));
-        }
-        let degrees: Vec<usize> = hnsw
-            .get_point_indexation()
+        let graph = TestGraph::build(M, efc, &data, CosineDist {});
+        let degrees: Vec<usize> = graph
+            .layer_zero_adjacency()
             .into_iter()
-            .map(|p| p.get_neighborhood_id()[0].len())
+            .map(|(_, list)| list.len())
             .collect();
         assert_eq!(degrees.len(), N);
         let at_cap = degrees.iter().filter(|d| **d == 2 * M).count();

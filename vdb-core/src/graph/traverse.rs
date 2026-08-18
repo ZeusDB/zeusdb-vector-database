@@ -14,8 +14,8 @@
 //! vendored page still run, and the new ones differ only in which accessor is
 //! passed in.
 
+use super::dump::NB_LAYER_MAX;
 use super::{Distance, GraphHit};
-use hnsw_rs::hnsw::NB_LAYER_MAX;
 use std::collections::BinaryHeap;
 
 /// Layers every graph carries, which is the vendored crate's fixed count.
