@@ -152,7 +152,12 @@ pub(crate) const DUMP_FILENAME: &str = "hnsw_index.zdbgraph";
 /// again. Leaving them behind after that save would leave a 50,000 record raw
 /// index carrying 340 MB of a graph nothing will ever read, beside the 322 MB
 /// of the graph that replaced it.
-const LEGACY_DUMP_FILENAMES: [&str; 2] = ["hnsw_index.hnsw.graph", "hnsw_index.hnsw.data"];
+///
+/// The completeness check in `persistence` reads the same two names, because a
+/// directory saved by 0.6.0 or earlier lists them under `files_included` and
+/// neither is required to reopen it.
+pub(crate) const LEGACY_DUMP_FILENAMES: [&str; 2] =
+    ["hnsw_index.hnsw.graph", "hnsw_index.hnsw.data"];
 
 /// `b"ZDBGRAPH"` read little-endian.
 const MAGIC: u64 = u64::from_le_bytes(*b"ZDBGRAPH");

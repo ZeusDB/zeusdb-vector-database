@@ -733,26 +733,42 @@ def test_persistence_vector_count_matches_reality(tmp_path, quantized_only_saved
     plain.save(str(plain_dir))
     assert vdb.load(str(plain_dir)).get_vector_count() == 6
 
-    # Losing vectors.bin from a plain index used to load zero records while
-    # still reporting the saved count. It is now refused, and the message names
-    # both numbers.
+    # A file the manifest names and the directory lacks is refused before any
+    # artefact is read, so losing vectors.bin from a plain index is caught by
+    # the completeness check rather than by the count. Both files below are
+    # named under files_included, which is what makes the earlier check the one
+    # that fires.
     broken = tmp_path / "broken.zdb"
     shutil.copytree(plain_dir, broken)
     (broken / "vectors.bin").unlink()
-    with pytest.raises(RuntimeError, match=r"yields 0 records while config.json reports 6"):
+    with pytest.raises(FileNotFoundError,
+                       match=r"manifest.json names vectors.bin under files_included"):
         vdb.load(str(broken))
 
     # Losing pq_codes.bin from a quantized_only index loses every record,
-    # because the codes are the only copy the mode keeps, so that is refused
-    # too. The directory carries no vectors.bin to fall back on: a trained
-    # index in this mode saved none, having released the training records'
-    # raw vectors when training completed.
+    # because the codes are the only copy the mode keeps. The directory carries
+    # no vectors.bin to fall back on: a trained index in this mode saved none,
+    # having released the training records' raw vectors when training
+    # completed.
     assert not (quantized_only_saved["path"] / "vectors.bin").exists()
     no_codes = tmp_path / "no_codes.zdb"
     shutil.copytree(quantized_only_saved["path"], no_codes)
     (no_codes / "pq_codes.bin").unlink()
-    with pytest.raises(RuntimeError, match=r"yields 0 records while config.json reports 1010"):
+    with pytest.raises(FileNotFoundError,
+                       match=r"manifest.json names pq_codes.bin under files_included"):
         vdb.load(str(no_codes))
+
+    # The count check itself still stands behind that one. A directory whose
+    # files are all present and all parse, but whose config.json reports a
+    # count the records cannot produce, is refused with both numbers named.
+    miscounted = tmp_path / "miscounted.zdb"
+    shutil.copytree(plain_dir, miscounted)
+    config = json.loads((miscounted / "config.json").read_text(encoding="utf-8"))
+    config["vector_count"] = 9
+    (miscounted / "config.json").write_text(json.dumps(config, indent=2),
+                                            encoding="utf-8")
+    with pytest.raises(RuntimeError, match=r"yields 6 records while config.json reports 9"):
+        vdb.load(str(miscounted))
 
 # ------------------------------------------------------------
 # Test 79: Persistence: an unusable codebook fails the load
@@ -767,11 +783,14 @@ def test_persistence_rejects_unusable_codebook(tmp_path, quantized_only_saved):
     """
     vdb = VectorDatabase()
 
+    # Deleting it is caught by the completeness check, because the manifest
+    # names it. The message says what the codebook is for, so a reader knows
+    # the file cannot be rebuilt from the others.
     missing = tmp_path / "missing_codebook.zdb"
     shutil.copytree(quantized_only_saved["path"], missing)
     (missing / "pq_centroids.bin").unlink()
     with pytest.raises(FileNotFoundError,
-                       match=r"trained codebook but pq_centroids.bin is missing"):
+                       match=r"pq_centroids.bin holds the trained PQ codebook"):
         vdb.load(str(missing))
 
     # An all-zero codebook of the right shape is the signature of the second
@@ -995,14 +1014,25 @@ def test_persistence_load_failure_modes(tmp_path):
     with pytest.raises(RuntimeError, match="Failed to parse manifest.json.*zeusdb_version"):
         vdb.load(str(incomplete))
 
-    # A real save whose config.json has been removed gets past the manifest and
-    # fails on the next file the loader reaches.
+    # A real save whose config.json has been removed is refused by the
+    # completeness check, which runs on the manifest before any artefact is
+    # read. A file the manifest names and the directory lacks and a file that
+    # is there and does not parse are different failures with different
+    # messages.
     truncated = tmp_path / "truncated.zdb"
     index = vdb.create("hnsw", dim=4, expected_size=10)
     index.add({"id": "r1", "values": [0.1, 0.2, 0.3, 0.4], "metadata": {}})
     index.save(str(truncated))
-    (truncated / "config.json").unlink()
-    with pytest.raises(FileNotFoundError, match="Failed to read config.json"):
+    gone = tmp_path / "config_gone.zdb"
+    shutil.copytree(truncated, gone)
+    (gone / "config.json").unlink()
+    with pytest.raises(FileNotFoundError,
+                       match=r"manifest.json names config.json under files_included"):
+        vdb.load(str(gone))
+
+    # Present and unreadable is the other half, and it still names the parse.
+    (truncated / "config.json").write_text("not json at all {", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Failed to parse config.json"):
         vdb.load(str(truncated))
 
     # A regular file rather than a directory is not rejected by the directory
@@ -1831,16 +1861,18 @@ def damage(directory, name, kind):
 # Every artefact whose loss or truncation must be reported rather than absorbed,
 # per storage mode. The graph dump is deliberately absent from these lists: it is
 # derived data and the loader rebuilds it, which is covered separately below.
+#
+# These are now every file each mode's directory holds bar the graph. Three
+# entries in the quantized_with_raw row used to be missing, being vectors.bin,
+# quantization.json and pq_codes.bin, because deleting any of the three loaded
+# rather than raised. The loader now checks files_included against the
+# directory, so they are here.
 MUST_RAISE = {
     "raw": ["config.json", "mappings.bin", "metadata.json", "vectors.bin",
             "manifest.json"],
-    # quantization.json is absent from this row on purpose. Deleting it under
-    # quantized_with_raw does not raise, because the raw vectors alone support a
-    # complete unquantized index, which is the second face of the defect
-    # test_load_absorbs_a_missing_vectors_bin_under_quantized_with_raw pins.
-    # Truncating it does raise, since a file that is there has to parse.
     "quantized_with_raw": ["config.json", "mappings.bin", "metadata.json",
-                           "pq_centroids.bin", "manifest.json"],
+                           "quantization.json", "pq_centroids.bin",
+                           "pq_codes.bin", "vectors.bin", "manifest.json"],
     "quantized_only": ["config.json", "mappings.bin", "metadata.json",
                        "pq_centroids.bin", "pq_codes.bin", "quantization.json",
                        "manifest.json"],
@@ -1867,12 +1899,7 @@ def test_load_refuses_a_half_written_directory(tmp_path, mode, kind):
     want = [hit["id"] for hit in control.search(vectors[0], top_k=5)]
     assert len(control) == HALF_WRITTEN_N
 
-    artefacts = list(MUST_RAISE[mode])
-    if kind != "delete" and mode == "quantized_with_raw":
-        # A quantization.json that is present has to parse, whatever mode it is.
-        artefacts.append("quantization.json")
-
-    for name in artefacts:
+    for name in MUST_RAISE[mode]:
         work = tmp_path / f"work-{mode}-{kind}-{name}.zdb"
         shutil.copytree(pristine, work)
         assert damage(str(work), name, kind), f"{name} was not in the directory"
@@ -1921,75 +1948,201 @@ def test_load_rebuilds_a_damaged_graph_dump_rather_than_refusing(tmp_path, mode,
     assert rebuilt.get_records("r0", return_vector=False)[0]["metadata"]["n"] == 0
 
 
-def test_load_absorbs_a_missing_vectors_bin_under_quantized_with_raw(tmp_path):
-    """A known defect, pinned here so a fix trips this test and reads this note.
+def test_load_refuses_a_missing_vectors_bin_under_quantized_with_raw(tmp_path):
+    """The manifest inventory is checked against the directory, so this fails.
 
-    manifest.json lists every file the save wrote under files_included, and the
-    loader does not check that they are all present. Under
-    quantized_with_raw the codes alone yield the full record count, so a
-    directory whose vectors.bin never landed loads as a complete 1,200 record
-    index with no error and no warning. What it actually holds is a
-    reconstruction of every vector: get_records returns approximations where the
-    intact index returns the values supplied, rerank rescores against those
-    approximations, and the page moves.
+    Under quantized_with_raw the codes alone yield the full record count, so a
+    directory whose vectors.bin was lost used to load as a complete 1,200 record
+    index with no error and no warning. What it held was a reconstruction of
+    every vector. Measured on the directory this test builds, the worst
+    component error against the values supplied was 0.034680 where an intact
+    load returns 0.000000, the cosine between the two was 0.998447, and the
+    top-5 page moved. raw_vectors_stored read 0, and no caller reads it.
 
-    raw_vectors_stored reading 0 is the only trace, and no caller reads it.
-    The same gap absorbs a missing quantization.json under the same mode, which
-    loads as an unquantized index.
-
-    **The assertions below record what happens today, not what should happen.**
-    A loader that validated files_included against the directory would raise
-    here instead, which is the correct behaviour and is separate work. When that
-    lands, replace this test with one asserting the raise.
+    That is what the refusal prevents. The same check covers the second face,
+    a missing quantization.json under the same mode, which used to load as an
+    unquantized index, and a missing pq_codes.bin, which used to load as an
+    index reporting itself quantized while storing no codes.
     """
     index, vectors = half_written_source("quantized_with_raw")
-    pristine = tmp_path / "qraw-defect.zdb"
+    pristine = tmp_path / "qraw-refusal.zdb"
     index.save(str(pristine))
 
     manifest = json.loads((pristine / "manifest.json").read_text(encoding="utf-8"))
-    # The manifest carries enough to detect the loss, which is what makes this a
-    # defect rather than a limitation.
-    assert "vectors.bin" in manifest["files_included"]
+    for name in ("vectors.bin", "quantization.json", "pq_codes.bin"):
+        assert name in manifest["files_included"], name
 
+    # The intact directory is the control, and it returns what was supplied
+    # rather than a reconstruction of it.
     control = VectorDatabase().load(str(pristine))
+    assert len(control) == HALF_WRITTEN_N
     exact = np.asarray(control.get_records("r0", return_vector=True)[0]["vector"],
                        dtype=np.float64)
+    live = np.asarray(index.get_records("r0", return_vector=True)[0]["vector"],
+                      dtype=np.float64)
+    assert float(np.abs(exact - live).max()) == 0.0
+    # The stored vector is the supplied one normalized, this being a cosine
+    # index, so it points the same way.
+    supplied = np.asarray(vectors[0], dtype=np.float64)
+    assert float(exact @ supplied / (np.linalg.norm(exact) * np.linalg.norm(supplied))) > 0.999999
 
-    work = tmp_path / "qraw-defect-work.zdb"
+    # Each of the three names a different file and says what that file holds.
+    expected = {
+        "vectors.bin": "vectors.bin holds the raw vector of every record",
+        "quantization.json": ("quantization.json holds the product quantization "
+                              "configuration"),
+        "pq_codes.bin": "pq_codes.bin holds the quantized code of every record",
+    }
+    for name, phrase in expected.items():
+        work = tmp_path / f"qraw-refusal-{name}.zdb"
+        shutil.copytree(pristine, work)
+        os.remove(work / name)
+        with pytest.raises(FileNotFoundError) as excinfo:
+            VectorDatabase().load(str(work))
+        message = str(excinfo.value)
+        assert f"manifest.json names {name} under files_included" in message, message
+        assert phrase in message, message
+        # A missing file and an unparseable one are different failures.
+        assert "Failed to parse" not in message
+
+    # A directory missing two reports the first the manifest names rather than
+    # whichever one a partial load would have reached.
+    two = tmp_path / "qraw-refusal-two.zdb"
+    shutil.copytree(pristine, two)
+    os.remove(two / "vectors.bin")
+    os.remove(two / "metadata.json")
+    with pytest.raises(FileNotFoundError) as excinfo:
+        VectorDatabase().load(str(two))
+    message = str(excinfo.value)
+    assert "manifest.json names metadata.json under files_included" in message, message
+    assert "1 further file manifest.json names is also absent: vectors.bin." in message
+
+    # And the pristine directory is untouched by any of it.
+    again = VectorDatabase().load(str(pristine))
+    assert len(again) == HALF_WRITTEN_N
+    assert again.is_quantized()
+    assert int(again.get_stats()["raw_vectors_stored"]) == HALF_WRITTEN_N
+
+
+def test_load_exempts_every_graph_name_an_older_manifest_can_carry(tmp_path):
+    """A directory written by 0.6.0 or earlier names two graph files, not one.
+
+    The completeness check exempts the graph, and the exemption has to cover the
+    names every release wrote or a 0.5.0 and 0.6.0 directory would start
+    refusing to open. Those two releases listed hnsw_index.hnsw.graph and
+    hnsw_index.hnsw.data under files_included; 0.3.0 through 0.4.1 listed the
+    first and excluded the second. Neither pair is readable by this build, which
+    rebuilds from the records instead, so neither is required.
+    """
+    index, vectors = half_written_source("raw")
+    pristine = tmp_path / "legacy-graph.zdb"
+    index.save(str(pristine))
+
+    control = VectorDatabase().load(str(pristine))
+    want = [hit["id"] for hit in control.search(vectors[0], top_k=5)]
+
+    work = tmp_path / "legacy-graph-work.zdb"
     shutil.copytree(pristine, work)
-    os.remove(work / "vectors.bin")
+    manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
+    manifest["files_included"] = [
+        name for name in manifest["files_included"] if name != "hnsw_index.zdbgraph"
+    ] + ["hnsw_index.hnsw.graph", "hnsw_index.hnsw.data"]
+    (work / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    # Neither legacy file is on disk, and the new one is removed too, so the
+    # directory holds no graph at all under a manifest that names two.
+    os.remove(work / "hnsw_index.zdbgraph")
+    assert not (work / "hnsw_index.hnsw.graph").exists()
 
-    absorbed = VectorDatabase().load(str(work))
-    assert len(absorbed) == HALF_WRITTEN_N
-    assert absorbed.is_quantized()
-    # It still reports quantized_with_raw's mode while holding no raw vector.
-    assert int(absorbed.get_stats()["raw_vectors_stored"]) == 0
-    assert int(absorbed.get_stats()["quantized_codes_stored"]) == HALF_WRITTEN_N
+    rebuilt = VectorDatabase().load(str(work))
+    assert len(rebuilt) == HALF_WRITTEN_N
+    assert int(rebuilt.get_stats()["graph_nodes"]) == HALF_WRITTEN_N
+    assert [hit["id"] for hit in rebuilt.search(vectors[0], top_k=5)] == want
 
-    # And what it hands back is a reconstruction rather than what was stored.
-    approximate = np.asarray(
-        absorbed.get_records("r0", return_vector=True)[0]["vector"], dtype=np.float64
-    )
-    assert not np.array_equal(approximate, exact)
-    assert float(np.abs(approximate - exact).max()) > 1e-4
-    # Close enough that no caller would notice from the values alone, which is
-    # what makes the silence the problem.
-    cosine = float(approximate @ exact
-                   / (np.linalg.norm(approximate) * np.linalg.norm(exact)))
-    assert cosine > 0.99
 
-    # The same gap, second face. quantization.json is listed in the manifest
-    # too, and losing it turns a quantized index into an unquantized one with no
-    # error, because the raw vectors alone support a complete index. The records
-    # survive here, so this loses configuration rather than fidelity, but the
-    # silence is the same silence.
-    other = tmp_path / "qraw-defect-noquant.zdb"
-    shutil.copytree(pristine, other)
-    assert "quantization.json" in manifest["files_included"]
-    os.remove(other / "quantization.json")
+def test_load_treats_a_never_written_file_as_one_removed_afterwards(tmp_path):
+    """A manifest naming a file that was never written is the same state.
 
-    unquantized = VectorDatabase().load(str(other))
-    assert len(unquantized) == HALF_WRITTEN_N
-    assert not unquantized.is_quantized()
-    assert not unquantized.has_quantization()
-    assert unquantized.get_quantization_info() is None
+    A save writes manifest.json after every artefact it names except the graph
+    dump, so an interrupted save cannot leave a manifest naming a load bearing
+    file it never wrote. The only way to reach that state is to write the
+    manifest by hand, and the check cannot tell it from a file removed after a
+    completed save, because on disk the two are the same thing. This asserts
+    that equivalence rather than assuming it.
+    """
+    index, _ = half_written_source("raw")
+    pristine = tmp_path / "never-written.zdb"
+    index.save(str(pristine))
+
+    # A name the save never wrote, added to the inventory by hand.
+    invented = tmp_path / "invented.zdb"
+    shutil.copytree(pristine, invented)
+    manifest = json.loads((invented / "manifest.json").read_text(encoding="utf-8"))
+    assert "sidecar.bin" not in manifest["files_included"]
+    manifest["files_included"].append("sidecar.bin")
+    (invented / "manifest.json").write_text(json.dumps(manifest, indent=2),
+                                            encoding="utf-8")
+    with pytest.raises(FileNotFoundError) as excinfo:
+        VectorDatabase().load(str(invented))
+    message = str(excinfo.value)
+    assert "manifest.json names sidecar.bin under files_included" in message, message
+    # An unrecognised name is still load bearing, and the message says so.
+    assert "this build does not recognise" in message, message
+
+    # A file that was written and then removed produces the same shape of
+    # message, differing only in what the file holds.
+    removed = tmp_path / "removed.zdb"
+    shutil.copytree(pristine, removed)
+    os.remove(removed / "vectors.bin")
+    with pytest.raises(FileNotFoundError) as excinfo:
+        VectorDatabase().load(str(removed))
+    assert "manifest.json names vectors.bin under files_included" in str(excinfo.value)
+
+
+def test_load_ignores_an_artefact_the_manifest_does_not_name(tmp_path):
+    """Saving over a directory leaves files behind, and they are not read.
+
+    A save replaces files one at a time and removes none, so a raw index saved
+    over a quantized one leaves the earlier save quantization.json,
+    pq_centroids.bin and pq_codes.bin in place. The record counts agree, so
+    nothing caught it, and the directory reopened as a quantized index holding
+    the previous save codebook and codes. The manifest is the inventory in both
+    directions, so an artefact it does not name is not read.
+    """
+    quantized, _ = half_written_source("quantized_with_raw")
+    shared = tmp_path / "shared.zdb"
+    quantized.save(str(shared))
+    assert (shared / "pq_codes.bin").exists()
+
+    plain = VectorDatabase().create("hnsw", dim=HALF_WRITTEN_DIM, expected_size=5000)
+    rng = np.random.default_rng(77)
+    fresh = rng.standard_normal((HALF_WRITTEN_N, HALF_WRITTEN_DIM)).astype(np.float32)
+    assert plain.add({
+        "ids": [f"r{i}" for i in range(HALF_WRITTEN_N)],
+        "embeddings": fresh,
+        "metadatas": [{"tier": "gold", "n": i} for i in range(HALF_WRITTEN_N)],
+    }).is_success()
+    plain.save(str(shared))
+
+    # The quantization files are still on disk and the manifest does not name
+    # them, which is exactly the state that used to be read back.
+    manifest = json.loads((shared / "manifest.json").read_text(encoding="utf-8"))
+    for name in ("quantization.json", "pq_centroids.bin", "pq_codes.bin"):
+        assert (shared / name).exists(), name
+        assert name not in manifest["files_included"], name
+
+    reopened = VectorDatabase().load(str(shared))
+    assert not reopened.is_quantized()
+    assert not reopened.has_quantization()
+    assert len(reopened) == HALF_WRITTEN_N
+    assert int(reopened.get_stats()["quantized_codes_stored"]) == 0
+
+    # It answers as the raw index that wrote it last, exactly.
+    want = [(hit["id"], hit["score"]) for hit in plain.search(fresh[0], top_k=5)]
+    assert [(hit["id"], hit["score"]) for hit in reopened.search(fresh[0], top_k=5)] == want
+    stored = np.asarray(reopened.get_records("r0", return_vector=True)[0]["vector"],
+                        dtype=np.float64)
+    kept = np.asarray(plain.get_records("r0", return_vector=True)[0]["vector"],
+                      dtype=np.float64)
+    assert np.array_equal(stored, kept)
+    # Nothing of the quantized save survives into the reopened index.
+    assert reopened.get_quantization_info() is None
