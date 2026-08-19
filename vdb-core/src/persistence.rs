@@ -27,6 +27,7 @@
 //! once and writes the new file on the next save. Nothing reads the old format.
 
 use crate::graph::dump::DUMP_FILENAME as GRAPH_DUMP_FILENAME;
+use crate::graph::dump::LEGACY_DUMP_FILENAMES;
 use crate::hnsw_index::{HNSWIndex, QuantizationConfig, StorageMode};
 use crate::pq::PQ;
 use crate::rerank::RerankCalibration;
@@ -96,6 +97,131 @@ fn check_format_version(format_version: &str) -> PyResult<()> {
     }
 
     Ok(())
+}
+
+// ============================================================================
+// DIRECTORY COMPLETENESS
+// ============================================================================
+
+/// Whether an artefact is one the loader can produce again rather than read
+///
+/// The graph is the only one. Every record carries what the graph is built
+/// from, so a directory that lost its dump is rebuilt rather than refused, and
+/// that has always been the behaviour. The list holds the name this build
+/// writes and the pair 0.6.0 and earlier wrote, because a directory saved by
+/// one of those names both of them under `files_included` and neither is
+/// needed to reopen it.
+///
+/// The dump is also the one artefact written after `manifest.json`, so a save
+/// interrupted between the two leaves a manifest naming a dump that was never
+/// written. Refusing on that would refuse a directory the loader opens
+/// correctly today.
+fn is_derived_artefact(name: &str) -> bool {
+    name == GRAPH_DUMP_FILENAME || LEGACY_DUMP_FILENAMES.contains(&name)
+}
+
+/// What an artefact holds, for the message its absence produces
+///
+/// An unrecognised name is still load bearing. `files_included` has named only
+/// what the save wrote since the field appeared in 0.3.0, so a name this build
+/// does not know is a component a later release wrote, and absorbing its loss
+/// is the failure this check exists to stop.
+fn artefact_contents(name: &str) -> &'static str {
+    match name {
+        "config.json" => "the HNSW parameters, the saved record count and the index level metadata",
+        "mappings.bin" => "the mapping from every external record id to its internal graph id",
+        "metadata.json" => "the metadata of every record, which is what a filtered search reads",
+        "vectors.bin" => "the raw vector of every record",
+        "quantization.json" => "the product quantization configuration and the training state",
+        "pq_centroids.bin" => "the trained PQ codebook, which every stored code decodes through",
+        "pq_codes.bin" => "the quantized code of every record",
+        _ => "a component of the saved index that this build does not recognise",
+    }
+}
+
+/// Refuse a directory that does not hold what its manifest says it holds
+///
+/// `files_included` is written from what the save actually wrote. Every entry
+/// is pushed under the same condition the writer of that file tests, inside one
+/// save holding the mutation lock, so the list is an inventory rather than a
+/// statement about the storage mode. That has been true of every release that
+/// wrote the field, which is 0.3.0 onwards, and it is what makes a named file
+/// that is absent a directory that lost something rather than a directory this
+/// build is reading wrongly.
+///
+/// This runs before any artefact is read, so a directory missing two files
+/// names the first rather than failing on whichever one a partial load happens
+/// to reach.
+///
+/// `manifest.json` is written after every other artefact except the graph dump,
+/// so an interrupted save cannot produce this state for a load bearing file. A
+/// directory that reaches it lost the file after a save that finished, or was
+/// copied without it.
+///
+/// Without it a `quantized_with_raw` directory whose `vectors.bin` never landed
+/// opened as a complete index built entirely from PQ reconstructions, and one
+/// that lost `quantization.json` opened as an unquantized index. Both were
+/// silent.
+fn check_files_present(path: &Path, manifest: &IndexManifest) -> PyResult<()> {
+    let missing: Vec<&str> = manifest
+        .files_included
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !is_derived_artefact(name))
+        .filter(|name| !path.join(name).exists())
+        .collect();
+
+    let Some(&first) = missing.first() else {
+        println!(
+            "✅ Every file manifest.json names is present ({} checked)",
+            manifest.files_included.len()
+        );
+        return Ok(());
+    };
+
+    let others = if missing.len() > 1 {
+        format!(
+            " {} further file{} manifest.json names {} also absent: {}.",
+            missing.len() - 1,
+            if missing.len() == 2 { "" } else { "s" },
+            if missing.len() == 2 { "is" } else { "are" },
+            missing[1..].join(", ")
+        )
+    } else {
+        String::new()
+    };
+
+    Err(PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
+        format!(
+            "manifest.json names {} under files_included and the index directory does \
+             not hold it. {} holds {}. manifest.json is written after every file it \
+             names except the graph dump, so a directory in this state lost the file \
+             after the save that wrote it finished, or was copied without it. \
+             Refusing to load an index assembled from the files that survived, \
+             because it would not hold what was saved. Restore the directory from a \
+             copy.{}",
+            first,
+            first,
+            artefact_contents(first),
+            others
+        ),
+    ))
+}
+
+/// Whether the manifest's inventory names an artefact
+///
+/// The optional artefacts are read only when `files_included` names them, so a
+/// file left behind by an earlier save over the same directory is not picked
+/// up. Saving over a directory replaces files one at a time and removes none,
+/// so a raw index saved over a quantized one used to reopen as a quantized
+/// index holding the previous save's codebook and codes. The record count
+/// agreed, so nothing caught it.
+///
+/// The graph dump is not gated this way. It is derived, it carries its own
+/// checks on node count, distance kind and `m`, and it already falls back to
+/// the rebuild when any of them disagree.
+fn manifest_names(manifest: &IndexManifest, name: &str) -> bool {
+    manifest.files_included.iter().any(|entry| entry == name)
 }
 
 // ============================================================================
@@ -330,14 +456,17 @@ fn load_metadata(path: &Path) -> PyResult<HashMap<String, HashMap<String, Value>
 }
 
 /// Load raw vectors from vectors.bin
-fn load_vectors(path: &Path) -> PyResult<HashMap<String, Vec<f32>>> {
+///
+/// Read only when the manifest names it. A trained `quantized_only` index
+/// writes none, and a directory saved over one that did keeps the file the
+/// earlier save left. See `manifest_names`.
+fn load_vectors(path: &Path, manifest: &IndexManifest) -> PyResult<HashMap<String, Vec<f32>>> {
     println!("📊 Loading vectors.bin...");
 
     let vectors_path = path.join("vectors.bin");
 
-    // Check if vectors.bin exists (might not exist in quantized_only mode)
-    if !vectors_path.exists() {
-        println!("ℹ️  vectors.bin not found (quantized_only storage mode)");
+    if !manifest_names(manifest, "vectors.bin") {
+        println!("ℹ️  manifest.json does not list vectors.bin, so no raw vectors are read");
         return Ok(HashMap::new());
     }
 
@@ -427,9 +556,9 @@ fn load_manifest(path: &Path) -> PyResult<IndexManifest> {
 /// Absent means the index was saved before training completed, which is a
 /// legitimate state. A present but unreadable file is a hard failure, because
 /// the alternative is a codebook that decodes every code to the zero vector.
-fn load_pq_centroids(path: &Path) -> PyResult<Option<Centroids>> {
+fn load_pq_centroids(path: &Path, manifest: &IndexManifest) -> PyResult<Option<Centroids>> {
     let centroids_path = path.join("pq_centroids.bin");
-    if !centroids_path.exists() {
+    if !manifest_names(manifest, "pq_centroids.bin") {
         return Ok(None);
     }
 
@@ -461,9 +590,9 @@ fn load_pq_centroids(path: &Path) -> PyResult<Option<Centroids>> {
 ///
 /// Absent means no record has been quantized yet. In `quantized_only` these
 /// codes are the only copy of every record added after training completed.
-fn load_pq_codes(path: &Path) -> PyResult<HashMap<String, Vec<u8>>> {
+fn load_pq_codes(path: &Path, manifest: &IndexManifest) -> PyResult<HashMap<String, Vec<u8>>> {
     let codes_path = path.join("pq_codes.bin");
-    if !codes_path.exists() {
+    if !manifest_names(manifest, "pq_codes.bin") {
         return Ok(HashMap::new());
     }
 
@@ -489,12 +618,15 @@ fn load_pq_codes(path: &Path) -> PyResult<HashMap<String, Vec<u8>>> {
 }
 
 /// Load quantization configuration and the codebook that goes with it
-fn load_quantization(path: &Path) -> PyResult<Option<QuantizationArtefacts>> {
+fn load_quantization(
+    path: &Path,
+    manifest: &IndexManifest,
+) -> PyResult<Option<QuantizationArtefacts>> {
     println!("🔧 Loading quantization components...");
 
     let quant_path = path.join("quantization.json");
-    if !quant_path.exists() {
-        println!("ℹ️  No quantization.json found (non-quantized index)");
+    if !manifest_names(manifest, "quantization.json") {
+        println!("ℹ️  manifest.json does not list quantization.json (non-quantized index)");
         return Ok(None);
     }
 
@@ -514,8 +646,8 @@ fn load_quantization(path: &Path) -> PyResult<Option<QuantizationArtefacts>> {
 
     println!("✅ quantization.json loaded");
 
-    let centroids = load_pq_centroids(path)?;
-    let codes = load_pq_codes(path)?;
+    let centroids = load_pq_centroids(path, manifest)?;
+    let codes = load_pq_codes(path, manifest)?;
 
     Ok(Some(QuantizationArtefacts {
         config: quant_config,
@@ -1092,6 +1224,10 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
 
     let manifest = load_manifest(path_buf)?;
     check_format_version(&manifest.format_version)?;
+
+    // Before any artefact is read, so a directory missing two files names the
+    // first rather than failing on whichever one a partial load reaches.
+    check_files_present(path_buf, &manifest)?;
     println!(
         "✅ Manifest loaded: {} vectors, format v{}",
         manifest.total_vectors, manifest.format_version
@@ -1109,10 +1245,10 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
     let metadata = load_metadata(path_buf)?;
     println!("✅ Metadata loaded: {} records", metadata.len());
 
-    let vectors = load_vectors(path_buf)?;
+    let vectors = load_vectors(path_buf, &manifest)?;
     println!("✅ Vectors loaded: {} vectors", vectors.len());
 
-    let quantization = load_quantization(path_buf)?;
+    let quantization = load_quantization(path_buf, &manifest)?;
     if let Some(ref quant) = quantization {
         println!(
             "✅ Quantization loaded: {} subvectors, trained={}, codebook={}",

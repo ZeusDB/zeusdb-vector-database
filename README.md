@@ -1525,9 +1525,44 @@ my_index.zdb/
 └── hnsw_index.zdbgraph     # HNSW graph structure and payload
 ```
 
-`manifest.json` lists the graph file under `files_included`. The load path restores the saved graph rather than rebuilding it, so the file is required to reopen a directory holding records.
+`manifest.json` lists every file the save wrote under `files_included`, and it is written after all of them except the graph. It is the inventory of what the directory should hold.
 
-A directory saved by 0.6.0 or earlier holds `hnsw_index.hnsw.graph` and `hnsw_index.hnsw.data` instead. Opening it still works: the graph is rebuilt once from the stored records, and the next `.save()` writes the single file.
+A directory saved by 0.6.0 or earlier holds `hnsw_index.hnsw.graph` and `hnsw_index.hnsw.data` in place of `hnsw_index.zdbgraph`. Opening it still works: the graph is rebuilt once from the stored records, and the next `.save()` writes the single file.
+
+#### What `load()` requires
+
+`load()` checks `files_included` against the directory before it reads anything, and refuses a directory that does not hold what its manifest names. One artefact is exempt.
+
+| Artefact | Kind | A directory that lost it |
+| --- | --- | --- |
+| `config.json` | load bearing | refused |
+| `mappings.bin` | load bearing | refused |
+| `metadata.json` | load bearing | refused |
+| `vectors.bin` | load bearing | refused |
+| `quantization.json` | load bearing | refused |
+| `pq_centroids.bin` | load bearing | refused |
+| `pq_codes.bin` | load bearing | refused |
+| `hnsw_index.zdbgraph` | derived | opens, graph rebuilt from the records |
+
+The graph is derived because every record carries what the graph is built from. Nothing else in the directory can be produced again from what remains, so losing any of the other files means the index that opened would not be the index that was saved. Under `quantized_with_raw` a lost `vectors.bin` used to open as a complete index built entirely from PQ reconstructions, with no error and no warning, and a lost `quantization.json` used to open as an unquantized index. Both are refused now.
+
+The refusal names the file and says what it holds:
+
+```text
+manifest.json names vectors.bin under files_included and the index directory
+does not hold it. vectors.bin holds the raw vector of every record.
+manifest.json is written after every file it names except the graph dump, so a
+directory in this state lost the file after the save that wrote it finished, or
+was copied without it. Refusing to load an index assembled from the files that
+survived, because it would not hold what was saved. Restore the directory from
+a copy.
+```
+
+A file that is present and does not parse is a different failure with a different message, of the form `Failed to parse config.json` or `Failed to deserialize mappings.bin`.
+
+**What to do with a directory that refuses to open.** Restore it from a copy. The missing file cannot be rebuilt from the ones that remain, and there is no flag that opens the directory anyway, because an index assembled from the survivors would answer queries without saying that it is doing so. If you want a smaller directory, set `storage_mode` to `quantized_only` at create time rather than deleting `vectors.bin` from a saved one.
+
+An artefact the manifest does not name is left alone. `load()` reads only what `files_included` lists, so a file another save left behind in the same directory is neither read nor complained about.
 
 <br/>
 
@@ -1605,11 +1640,11 @@ all checks passed
 
 - **Not atomic.** Files are written one at a time into the target directory. An interrupted save leaves a partial directory behind, and a later `load()` of it fails rather than returning a truncated index. Save to a new path and move it into place if you need an atomic swap.
 
-- **Overwriting is not clean either.** Saving over an existing directory replaces files individually and does not remove ones that no longer apply. Save to a fresh directory.
+- **Overwriting is not clean either.** Saving over an existing directory replaces files individually and does not remove ones that no longer apply. The leftovers are inert, since `load()` reads only what `manifest.json` names, but they still occupy the disk. Save to a fresh directory.
 
 - **Version compatibility.** The manifest records a format version. This build writes 1.1.0 and reads any 1.x. A different major version is refused.
 
-- **Integrity check on load.** The restored record count is checked against the count in `config.json`. A missing or truncated data file fails the load with a message naming what disagreed.
+- **Integrity checks on load.** Three run, in this order. The format version is checked first. Then `files_included` is checked against the directory, and a load bearing file the manifest names and the directory lacks fails the load before anything is parsed. Then the restored record count is checked against the count in `config.json`, which catches a file that is present and short.
 
 <br />
 
