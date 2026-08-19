@@ -26,7 +26,6 @@
 //! 0.6.0 or earlier still holds those two, and opening it rebuilds the graph
 //! once and writes the new file on the next save. Nothing reads the old format.
 
-use crate::conversion::value_to_python_object;
 use crate::graph::dump::DUMP_FILENAME as GRAPH_DUMP_FILENAME;
 use crate::hnsw_index::{HNSWIndex, QuantizationConfig, StorageMode};
 use crate::pq::PQ;
@@ -1026,109 +1025,42 @@ fn rebuild_graph_from_data(
     // graphs that answered the same query differently. Internal ids are handed
     // out in arrival order, so sorting on them also puts the rebuild as close to
     // the original build as a rebuild can get.
+    //
+    // The sort is over the whole batch, so the records reconstructed from codes
+    // are still ordered against the ones replayed from raw vectors rather than
+    // appended after them. Zipping the three lists together first is what makes
+    // that one sort rather than three index permutations of three clones.
+    let mut records: Vec<(String, Vec<f32>, HashMap<String, Value>)> = batch_ids
+        .into_iter()
+        .zip(batch_vectors)
+        .zip(batch_metadatas)
+        .map(|((id, vector), metadata)| (id, vector, metadata))
+        .collect();
     {
         let id_map = index.get_id_map();
-        let mut order: Vec<usize> = (0..batch_ids.len()).collect();
-        order.sort_by_key(|&i| {
-            (
-                id_map.get(&batch_ids[i]).copied().unwrap_or(usize::MAX),
-                batch_ids[i].clone(),
-            )
+        records.sort_by(|a, b| {
+            let left = id_map.get(&a.0).copied().unwrap_or(usize::MAX);
+            let right = id_map.get(&b.0).copied().unwrap_or(usize::MAX);
+            left.cmp(&right).then_with(|| a.0.cmp(&b.0))
         });
-        batch_vectors = order.iter().map(|&i| batch_vectors[i].clone()).collect();
-        batch_metadatas = order.iter().map(|&i| batch_metadatas[i].clone()).collect();
-        batch_ids = order.iter().map(|&i| batch_ids[i].clone()).collect();
     }
 
     println!(
         "📦 Prepared {} records for batch insertion ({} replayed from raw vectors, {} reconstructed from PQ codes)",
-        batch_vectors.len(),
-        batch_vectors.len() - reconstructed,
+        records.len(),
+        records.len() - reconstructed,
         reconstructed
     );
+    println!("🔄 Rebuilding the graph from the restored records...");
 
-    // SET FLAG: Prevent training ID collection during rebuild
-    index.set_rebuilding_from_persistence(true);
+    // The records are owned Rust and go straight into the insertion phase. This
+    // used to build a PyDict holding three PyLists and call add(), which parsed
+    // them back into exactly this. `rebuild_from_records` holds the flag
+    // pairing, releases the interpreter lock and refuses a partial graph.
+    let inserted = index.rebuild_from_records(records)?;
 
-    // Use the existing add() method to rebuild the graph
-    let rebuilt = Python::attach(|py| {
-        rebuild_using_add_method(index, batch_vectors, batch_ids, batch_metadatas, py)
-    });
-
-    // 🔥 CLEAR FLAG: Resume normal operation
-    //
-    // Cleared before the rebuild's result is propagated rather than after, so
-    // the flag is not left set on the way out of a failed rebuild. Nothing
-    // observes that today, because a failed rebuild fails the whole load and
-    // the half-built index is dropped without ever reaching the caller. It
-    // holds the pairing together if that ever stops being true.
-    index.set_rebuilding_from_persistence(false);
-    rebuilt?;
-
-    Ok(())
-}
-
-/// Helper function to rebuild using the existing add() method
-fn rebuild_using_add_method(
-    index: &mut HNSWIndex,
-    batch_vectors: Vec<Vec<f32>>,
-    batch_ids: Vec<String>,
-    batch_metadatas: Vec<HashMap<String, Value>>,
-    py: Python<'_>,
-) -> PyResult<()> {
-    use pyo3::types::{PyDict, PyList};
-
-    // Convert to Python objects
-    let vectors_list = PyList::new(py, &batch_vectors)?;
-    let ids_list = PyList::new(py, &batch_ids)?;
-
-    // Convert metadata to Python objects
-    let metadatas_vec: PyResult<Vec<_>> = batch_metadatas
-        .iter()
-        .map(|m| {
-            let dict = PyDict::new(py);
-            for (k, v) in m {
-                dict.set_item(k, value_to_python_object(v, py)?)?;
-            }
-            Ok(dict)
-        })
-        .collect();
-    let metadatas_list = PyList::new(py, &metadatas_vec?)?;
-
-    // Create batch dictionary
-    let batch_dict = PyDict::new(py);
-    batch_dict.set_item("vectors", vectors_list)?;
-    batch_dict.set_item("ids", ids_list)?;
-    batch_dict.set_item("metadatas", metadatas_list)?;
-
-    println!("🔄 Calling add() method to rebuild graph...");
-
-    // Call the existing add method - this rebuilds the graph automatically
-    let result = index.add(batch_dict.into_any(), true)?; // overwrite=true
-
-    // add() reports per record and does not raise, so a record it refused
-    // would otherwise leave the graph short while the storage maps, which are
-    // written back afterwards, still report the full count. The load would
-    // succeed and every query would miss the records that never reached the
-    // graph. A saved directory holding a non-finite value is the case that
-    // reaches here, because add() has always refused those on the list path.
-    if result.total_errors > 0 {
-        let detail = result.errors.join("; ");
-        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Graph rebuild refused {} of {} records, so the loaded index would \
-             hold records that no query can reach. Refusing to load a partial \
-             graph. Rejected records: {}",
-            result.total_errors,
-            batch_ids.len(),
-            detail
-        )));
-    }
-
-    println!("✅ Graph rebuild completed: {}", result.summary());
-
-    // Verify the rebuild
-    let final_vector_count = index.get_vector_count();
-    println!("📊 Final vector count: {}", final_vector_count);
+    println!("✅ Graph rebuild completed: {} records inserted", inserted);
+    println!("📊 Final vector count: {}", index.get_vector_count());
 
     Ok(())
 }

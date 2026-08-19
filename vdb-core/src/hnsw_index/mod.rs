@@ -48,7 +48,7 @@ mod stats;
 mod training;
 
 use crate::conversion::{python_dict_to_value_map, value_map_to_python};
-use crate::filter::{matches_filter, validate_filter_conditions};
+use crate::filter::{compile_filter, matches_filter};
 // The graph and everything the graph crate supplies arrive through the seam.
 // `Distance` is the one name from that crate this file still needs, because
 // `DistPQ` below implements it. See the note at the top of `graph.rs`.
@@ -826,14 +826,18 @@ impl HNSWIndex {
             "Search parameters configured"
         );
 
-        let filter_conditions = filter.map(python_dict_to_value_map).transpose()?;
-
-        // Reject an unrecognised operator before the search runs. Checking it
-        // per record would make the error depend on the data, because a record
-        // that lacks the field never reaches the operator at all.
-        if let Some(conditions) = filter_conditions.as_ref() {
-            validate_filter_conditions(conditions)?;
-        }
+        // Compiled once per search, however many queries the call carries, and
+        // before any record is examined. Rejecting an unrecognised operator or a
+        // malformed group per record would make the error depend on the data,
+        // because a record that lacks the field never reaches the operator at
+        // all. What comes back cannot fail against any record, which is why the
+        // traversal predicate has no error channel.
+        let filter_conditions = filter
+            .map(python_dict_to_value_map)
+            .transpose()?
+            .as_ref()
+            .map(compile_filter)
+            .transpose()?;
 
         // Detect batch vs single query with comprehensive input support
         let result: Py<PyAny> = if let Ok(list_vec) = vector.extract::<Vec<Vec<f32>>>() {
@@ -1047,9 +1051,8 @@ impl HNSWIndex {
         let Some(filter) = filter else {
             return Ok(self.id_map.read().unwrap().len());
         };
-        let conditions = python_dict_to_value_map(filter)?;
-        validate_filter_conditions(&conditions)?;
-        if conditions.is_empty() {
+        let conditions = compile_filter(&python_dict_to_value_map(filter)?)?;
+        if conditions.matches_every_record() {
             return Ok(self.id_map.read().unwrap().len());
         }
 
@@ -1058,24 +1061,14 @@ impl HNSWIndex {
         // the lock for that would stall every Python thread in the process.
         //
         // There is no error channel inside and none is needed, which is the
-        // argument `Filtered::judge` makes for the search path.
-        // `validate_filter_conditions` has already rejected the one thing
-        // `matches_filter` can fail on, so the error arm is unreachable, and
-        // excluding the record is the conservative answer if a future operator
-        // ever makes it reachable.
+        // argument `Filtered::judge` makes for the search path. The filter is
+        // compiled, so `matches_filter` returns `bool` and there is no error
+        // arm to explain.
         Ok(py.detach(|| {
             let vector_metadata = self.vector_metadata.read().unwrap();
             vector_metadata
                 .values()
-                .filter(|meta| {
-                    matches_filter(meta, &conditions).unwrap_or_else(|_| {
-                        debug_assert!(
-                            false,
-                            "matches_filter failed inside count, which validate_filter_conditions is supposed to have made impossible"
-                        );
-                        false
-                    })
-                })
+                .filter(|meta| matches_filter(meta, &conditions))
                 .count()
         }))
     }
@@ -1410,13 +1403,17 @@ impl HNSWIndex {
     /// `remove_point` leaves them. This does not call `compact()` either; see
     /// `remove_points`.
     pub fn remove_where(&self, py: Python<'_>, filter: &Bound<PyDict>) -> PyResult<usize> {
-        let conditions = python_dict_to_value_map(filter)?;
-        if conditions.is_empty() {
+        let conditions = compile_filter(&python_dict_to_value_map(filter)?)?;
+        // Asked of the compiled tree rather than of the caller's mapping.
+        // Emptiness was the whole test while `{}` was the only way to write
+        // "everything", and boolean composition adds `{"$and": []}` and
+        // `{"$not": {"$or": []}}` to it. Both are refused here for the same
+        // reason the empty mapping is.
+        if conditions.matches_every_record() {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "remove_where requires a filter that selects records. An empty filter matches                  every record, so this would delete the whole index. Name the records with                  remove_points(ids) if that is what you want.",
             ));
         }
-        validate_filter_conditions(&conditions)?;
         Ok(py.detach(|| {
             let _writers = self.writers.lock().unwrap();
             self.remove_where_locked(&conditions)

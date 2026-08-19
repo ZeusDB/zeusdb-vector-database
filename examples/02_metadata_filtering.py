@@ -15,6 +15,11 @@ It also covers the three ways a filter surprises people, which are a record that
 lacks the field, a nested object written without `eq`, and an operator name the
 index does not recognise.
 
+Then it covers boolean composition, which is `$and`, `$or` and `$not`. Everything
+above that point is a conjunction, because a filter is a mapping and all of its
+keys must hold. The filters at the end could not be written at all before those
+three keys existed.
+
 Run it with:
 
     python 02_metadata_filtering.py
@@ -198,6 +203,76 @@ def main():
         hits({"price": {"less_than": 50}})
     except ValueError as exc:
         print("unknown operator:", exc)
+    print()
+
+    # ------------------------------------------------------------------
+    # Boolean composition
+    # ------------------------------------------------------------------
+    # Every filter above is a conjunction. These are not, and none of them has
+    # a flat form. A single field can already ask for one of several values
+    # through `in`, so what needs `$or` is a question spanning two fields.
+    bargains = {"$or": [{"rating": {"gte": 5.0}}, {"price": {"lt": 10.0}}]}
+    matching = matches(lambda m: m["rating"] >= 5.0 or m["price"] < 10.0)
+    page = hits(bargains)
+    print(f"top rated or under 10 matches {index.count(bargains)} products")
+    print(f"  below {FULL_SCAN_THRESHOLD}, so the exact path serves it")
+    print(f"  page equals the brute force ranking: "
+          f"{[h['id'] for h in page] == brute_force(vectors, matching, query, 10)}")
+    print()
+
+    # A group is one key of the mapping it sits in, so the fields beside it
+    # still have to hold. A branch is a whole filter, so the second one below
+    # conjoins two fields inside the disjunction.
+    nested = {
+        "in_stock": True,
+        "$or": [
+            {"tags": {"contains": "sale"}},
+            {"year": 2026, "rating": {"gte": 4.0}},
+        ],
+    }
+    matching = matches(
+        lambda m: m["in_stock"]
+        and ("sale" in m["tags"] or (m["year"] == 2026 and m["rating"] >= 4.0))
+    )
+    page = hits(nested)
+    print(f"in stock, and on sale or a highly rated 2026 model: "
+          f"{index.count(nested)} products")
+    print(f"  page equals the brute force ranking: "
+          f"{[h['id'] for h in page] == brute_force(vectors, matching, query, 10)}")
+    print()
+
+    # `$not` negates a whole filter, which is not what `ne` does. `ne` excludes
+    # a record that lacks the field and `$not` admits it, so these two answer
+    # differently about item_no_brand.
+    print("brand != acme finds item_no_brand:",
+          "item_no_brand" in [h["id"] for h in hits({"brand": {"ne": "acme"}}, top_k=5)])
+    print("not (brand == acme) finds it:",
+          "item_no_brand" in [h["id"] for h in hits({"$not": {"brand": "acme"}}, top_k=5)])
+
+    # And the filter for a missing field, which no operator can express.
+    # `{"all": []}` is the empty conjunction, so it holds for every value the
+    # field can carry and fails only where the field is absent.
+    no_brand = {"$not": {"brand": {"all": []}}}
+    print(f"records with no brand at all: "
+          f"{sorted(h['id'] for h in hits(no_brand, top_k=10))}")
+    print()
+
+    # Groups nest to ten levels, counting the filter itself as level one.
+    deep = {"category": "watch"}
+    for _ in range(10):
+        deep = {"$or": [deep]}
+    try:
+        hits(deep)
+    except ValueError as exc:
+        print("too deep:", exc)
+
+    # Three keys are reserved, and the dollar prefix is not. A field named
+    # `$or` cannot be filtered on, and saying so is better than selecting the
+    # wrong records.
+    try:
+        hits({"$or": "watch"})
+    except ValueError as exc:
+        print("reserved:", str(exc).split(".")[0] + ".")
 
 
 # The transcript this file prints.
@@ -235,6 +310,20 @@ nested object matched with eq: ['item_nested']
 written without eq: Unknown filter operation: kind
 
 unknown operator: Unknown filter operation: less_than
+
+top rated or under 10 matches 1440 products
+  below 5000, so the exact path serves it
+  page equals the brute force ranking: True
+
+in stock, and on sale or a highly rated 2026 model: 1600 products
+  page equals the brute force ranking: True
+
+brand != acme finds item_no_brand: False
+not (brand == acme) finds it: True
+records with no brand at all: ['item_nested', 'item_no_brand']
+
+too deep: Filter groups nest to 10 levels and "$or" would open level 11.
+reserved: "$or" is a reserved filter key and takes a list of filter mappings, for example {"$or": [{"lang": "en"}, {"lang": "es"}]}, but it was given a string.
 """
 
 if __name__ == "__main__":
