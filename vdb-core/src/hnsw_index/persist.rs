@@ -337,12 +337,120 @@ impl HNSWIndex {
 
     /// Suppress or resume training id collection (for persistence loading only)
     ///
-    /// Wraps the flag the graph rebuild sets while it replays every record
-    /// through `add`. Every id being replayed is already in the restored
-    /// collection, so collecting them again would double the list.
-    pub(crate) fn set_rebuilding_from_persistence(&self, value: bool) {
+    /// Wraps the flag the graph rebuild sets while it replays every record.
+    /// Every id being replayed is already in the restored collection, so
+    /// collecting them again would double the list. Private to this file now
+    /// that `rebuild_from_records` is the only thing that sets it, and it is
+    /// set and cleared in one place rather than around a call in the storage
+    /// layer.
+    fn set_rebuilding_from_persistence(&self, value: bool) {
         self.rebuilding_from_persistence
             .store(value, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Replay records read off disk into the graph.
+    ///
+    /// This is the load path's fallback, taken where the saved graph dump is
+    /// absent, damaged, or written by a release this build cannot read. The
+    /// records arrive as owned Rust, one per record the directory holds, in the
+    /// order the caller sorted them into.
+    ///
+    /// **It used to go through `add`.** The loader built a `PyDict` holding a
+    /// `PyList` of vectors, a `PyList` of ids and a `PyList` of per-record
+    /// metadata dicts, called `add`, and `add` parsed the whole thing straight
+    /// back into the `Vec<(String, Vec<f32>, HashMap<String, Value>)>` the
+    /// loader already had. Every record made a round trip through the
+    /// interpreter for nothing, and the interpreter lock was held for the whole
+    /// rebuild, which is the graph build itself and not a short window. Every
+    /// other Python thread in the process was stopped for the duration.
+    ///
+    /// What that round trip did do, and what is reproduced here exactly, is
+    /// `extract_single_vector`'s validation and its call to
+    /// `process_vector_for_space`. A stored vector is already normalized for a
+    /// cosine index, and normalizing it a second time is what `add` did, so it
+    /// is what this does. **The graph a rebuild produces is unchanged, bit for
+    /// bit, and that is the point.** Skipping the second normalization would be
+    /// defensible and would build a different graph, which on this path means
+    /// giving a user's index different answers.
+    ///
+    /// `overwrite` is true because the loader restores the id mappings before
+    /// the rebuild runs, so every record being replayed is already named in
+    /// `id_map` and has to be removed before it is inserted.
+    pub(crate) fn rebuild_from_records(
+        &self,
+        records: Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+    ) -> PyResult<usize> {
+        let total = records.len();
+
+        // The validation `extract_single_vector` ran on the way through Python.
+        // It fails the whole rebuild rather than dropping the record, which is
+        // what the round trip did: a refused record left the graph short while
+        // the storage maps, written back afterwards, still reported the full
+        // count, so every query missed it. A saved directory holding a
+        // non-finite value is the case that reaches here.
+        let mut validated = Vec::with_capacity(total);
+        for (id, vector, metadata) in records {
+            if vector.len() != self.dim {
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Graph rebuild refused record '{}': vector dimension mismatch, \
+                     expected {}, got {}. Refusing to load a partial graph.",
+                    id,
+                    self.dim,
+                    vector.len()
+                )));
+            }
+            if let Some((position, value)) = vector
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Graph rebuild refused record '{}': vector contains {} at index {}, \
+                     which is not finite. Refusing to load a partial graph.",
+                    id, value, position
+                )));
+            }
+            validated.push((id, self.process_vector_for_space(vector), metadata));
+        }
+
+        self.set_rebuilding_from_persistence(true);
+
+        // The interpreter lock is released across the whole rebuild, which is
+        // the k-means, the graph inserts and nothing else. There is no Python
+        // work left inside it to hold the lock for.
+        //
+        // The mutation guard is taken inside the released region rather than
+        // around it, which is the shape `add` uses, so a loader waiting on
+        // another writer waits without the lock.
+        let (inserted, errors) = Python::attach(|py| {
+            py.detach(|| {
+                let _writers = self.writers.lock().unwrap();
+                self.insert_parsed_records(validated, true)
+            })
+        });
+
+        // Cleared before the result is judged rather than after, so the flag is
+        // not left set on the way out of a failed rebuild.
+        self.set_rebuilding_from_persistence(false);
+
+        // A `PyErr`'s `Display` acquires the interpreter lock, so the messages
+        // are formatted here and not above.
+        let refused: Vec<String> = errors
+            .into_iter()
+            .filter_map(|error| error.into_counted_message())
+            .collect();
+        if !refused.is_empty() {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Graph rebuild refused {} of {} records, so the loaded index would \
+                 hold records that no query can reach. Refusing to load a partial \
+                 graph. Rejected records: {}",
+                refused.len(),
+                total,
+                refused.join("; ")
+            )));
+        }
+
+        Ok(inserted.len())
     }
 
     /// Set training IDs (for persistence loading only)

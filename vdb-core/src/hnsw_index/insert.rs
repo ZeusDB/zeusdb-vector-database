@@ -7,7 +7,7 @@
 //! the graph nodes that removal and replacement leave behind.
 
 use super::{HNSWIndex, ParsedRecords, StorageMode, MAX_LAYER};
-use crate::filter::matches_filter;
+use crate::filter::{matches_filter, Filter};
 use crate::graph::{Record, VectorGraph};
 use pyo3::prelude::*;
 use serde_json::Value;
@@ -38,6 +38,23 @@ pub(super) enum InsertError {
     /// A `PyErr` from one of the three insert paths, with the id it belongs to.
     /// Counted against `total_errors` once formatted
     Vector { id: String, err: PyErr },
+}
+
+impl InsertError {
+    /// The message this counts as a rejected record, or `None` where it does
+    /// not count as one.
+    ///
+    /// Formatting a `PyErr` acquires the interpreter lock, so this runs after
+    /// the insertion phase has reacquired it and never inside the released
+    /// region. `add` and the load path's rebuild both need the same split, and
+    /// disagreeing about which variants count is what this stops.
+    pub(super) fn into_counted_message(self) -> Option<String> {
+        match self {
+            InsertError::Counted(message) => Some(message),
+            InsertError::Training(_) => None,
+            InsertError::Vector { id, err } => Some(format!("Vector {}: {}", id, err)),
+        }
+    }
 }
 /// The five write guards a removal holds, taken in the order `HNSWIndex`
 /// declares.
@@ -321,17 +338,16 @@ impl HNSWIndex {
     /// give-up point, its distances or its ranking, none of which a deletion has
     /// a use for. So this walk is complete where the search's is bounded.
     ///
-    /// A filter carrying an operator the engine does not implement is rejected
-    /// by the caller before this runs, which is why the evaluation here has no
-    /// error channel. Excluding a record is the conservative answer if a future
-    /// operator ever makes the error reachable, since it leaves the record in
-    /// place.
-    pub(super) fn remove_where_locked(&self, filter: &HashMap<String, Value>) -> usize {
+    /// The filter arrives compiled, so nothing here can fail on it. The caller
+    /// built it from the mapping it was handed and every operator name and
+    /// group shape the engine cannot evaluate was rejected there, before any
+    /// record was read.
+    pub(super) fn remove_where_locked(&self, filter: &Filter) -> usize {
         let doomed: Vec<String> = {
             let vector_metadata = self.vector_metadata.read().unwrap();
             vector_metadata
                 .iter()
-                .filter(|(_, meta)| matches_filter(meta, filter).unwrap_or(false))
+                .filter(|(_, meta)| matches_filter(meta, filter))
                 .map(|(id, _)| id.clone())
                 .collect()
         };

@@ -542,7 +542,7 @@ The `search()` method retrieves the top-k most similar vectors from the index gi
 | Parameter         | Type                            | Default   | Description                                                                 |
 |------------------|----------------------------------|-----------|-----------------------------------------------------------------------------|
 | `vector`         | `List[float]`, `List[List[float]]`, or `np.ndarray`  | *required* | The query vector (single: `List[float]` or 1D `np.ndarray`) or batch of query vectors (`List[List[float]]` or 2D `np.ndarray`). Must match the index dimension and contain only finite values. |
-| `filter`         | `Dict[str, Any] \| None`         | `None`    | Optional metadata filter. Values may be a plain value for equality or a dict of operators. See [Filter Operators](#-filter-operators-reference). |
+| `filter`         | `Dict[str, Any] \| None`         | `None`    | Optional metadata filter. Values may be a plain value for equality or a dict of operators, and `$and`, `$or` and `$not` compose them. See [Filter Operators](#-filter-operators-reference) and [Boolean composition](#-boolean-composition). |
 | `top_k`          | `int`                            | `10`      | Number of nearest neighbors to return. |
 | `ef_search`      | `int \| None`                    | see below | Search complexity parameter. Higher values improve accuracy at the cost of speed. |
 | `return_vector`  | `bool`                           | `False`   | If `True`, each result includes the stored embedding vector under a `vector` key. |
@@ -1520,7 +1520,7 @@ Integers and floats compare by magnitude, so a stored integer `10` matches `{"eq
 
 ### 📘 Filter Operators Reference
 
-A filter is a dict of field names. A field maps either to a plain value, which means equality, or to a dict of operators, all of which must hold.
+A filter is a dict whose keys are field names, and all of them must hold. A field maps either to a plain value, which means equality, or to a dict of operators, all of which must hold. Three reserved keys, `$and`, `$or` and `$not`, compose whole filters rather than naming a field; see [Boolean composition](#-boolean-composition).
 
 | Operator | Usage | Example | Description |
 |----------|-------|---------|-------------|
@@ -1539,15 +1539,98 @@ A filter is a dict of field names. A field maps either to a plain value, which m
 | `any` | `{"any": [values]}` | `{"tags": {"any": ["ai", "ml"]}}` | Array field shares at least one element with the provided array |
 | `all` | `{"all": [values]}` | `{"tags": {"all": ["ai", "ml"]}}` | Array field holds every element of the provided array |
 
-`any` and `all` exist because the filter language has no disjunction and a field maps to one condition object, so it cannot carry `contains` twice. On a field holding a plain value rather than an array, both read it as an array of one.
+`any` and `all` exist because a field maps to one condition object, so it cannot carry `contains` twice. They ask their question of one field's array, where `$or` and `$and` compose whole filters across fields. On a field holding a plain value rather than an array, both read it as an array of one.
 
 Three behaviours are worth knowing.
 
-**A record that lacks the field never matches, whatever the operator.** That includes `ne` and `nin`. `{"lang": {"ne": "en"}}` and `{"lang": {"nin": ["en"]}}` do not match a record with no `lang` at all, and they agree because `nin` against a one-element array means what `ne` means. There is no filter that selects records missing a field.
+**A record that lacks the field never matches, whatever the operator.** That includes `ne` and `nin`. `{"lang": {"ne": "en"}}` and `{"lang": {"nin": ["en"]}}` do not match a record with no `lang` at all, and they agree because `nin` against a one-element array means what `ne` means. So an operator never selects a record missing a field, and `$not` is what does: `{"$not": {"lang": {"all": []}}}` selects exactly the records with no `lang`, because `{"all": []}` is the empty conjunction and holds for every value the field can carry.
 
 **A dict value is always read as operators.** Direct equality against a nested object has no plain form, because the two would be indistinguishable, so write it as `{"source": {"eq": {"kind": "web"}}}`. Writing `{"source": {"kind": "web"}}` raises `ValueError: Unknown filter operation: kind`.
 
 **An unrecognised operator raises `ValueError` before the search runs**, rather than quietly matching nothing.
+
+<br/>
+
+### 🧩 Boolean composition
+
+A filter is a conjunction of its keys. Three reserved keys compose whole filters
+instead of naming a field.
+
+| Key | Takes | Means |
+|-----|-------|-------|
+| `$and` | a list of filters | every one of them holds |
+| `$or` | a list of filters | at least one of them holds |
+| `$not` | one filter | that filter does not hold |
+
+**Precedence.** There is none to remember, because the structure is explicit. A
+mapping is an AND of everything in it, fields and groups alike, so
+`{"a": 1, "$or": [...]}` means `a == 1` AND the disjunction. A group's branches
+are each a whole filter, so a branch carrying two fields conjoins them.
+
+**Nesting.** Groups nest to 10 levels, counting the filter itself as level one.
+A filter deeper than that raises `ValueError` rather than being evaluated. The
+limit is far past anything written by hand or generated from a query, and it is
+stated so that a public API taking arbitrary input does not have "as deep as you
+like" in its contract.
+
+**Reserved keys.** Exactly `$and`, `$or` and `$not`. The `$` prefix is not
+reserved, so a field named `$price` still filters. A field literally named
+`$or`, `$and` or `$not` cannot be filtered on; it is still stored and still
+returned in results, and a filter naming it raises rather than quietly selecting
+the wrong records.
+
+**The empty cases.** `{"$and": []}` matches every record and `{"$or": []}`
+matches none, which is what `all` and `any` already do with an empty array.
+
+```python
+from zeusdb_vector_database import VectorDatabase
+
+vdb = VectorDatabase()
+index = vdb.create("hnsw", dim=4, space="l2")
+index.add([
+    {"id": "d1", "values": [0.1, 0.1, 0.1, 0.1],
+     "metadata": {"lang": "en", "tier": "gold", "year": 2024}},
+    {"id": "d2", "values": [0.2, 0.2, 0.2, 0.2],
+     "metadata": {"lang": "es", "tier": "free", "year": 2023}},
+    {"id": "d3", "values": [0.3, 0.3, 0.3, 0.3],
+     "metadata": {"lang": "fr", "tier": "gold", "year": 2026}},
+    {"id": "d4", "values": [0.4, 0.4, 0.4, 0.4],
+     "metadata": {"tier": "free", "year": 2025}},
+])
+q = [0.1, 0.1, 0.1, 0.1]
+
+
+def matched(filter):
+    return sorted(hit["id"] for hit in index.search(vector=q, filter=filter, top_k=10))
+
+
+# Either language. A flat filter cannot ask this, because one field maps to one
+# condition and two conditions on it are conjoined.
+print(matched({"$or": [{"lang": "en"}, {"lang": "es"}]}))
+
+# Gold tier, and either recent or English. A branch is a whole filter, so the
+# second one carries two fields and conjoins them.
+print(matched({"tier": "gold",
+               "$or": [{"year": {"gte": 2026}}, {"lang": "en"}]}))
+
+# Not free tier. This is what `ne` does here, since every record has a tier.
+print(matched({"$not": {"tier": "free"}}))
+
+# Records with no lang field at all, which no operator can select.
+print(matched({"$not": {"lang": {"all": []}}}))
+
+# None of these, which is Qdrant's must_not over a group.
+print(matched({"$not": {"$or": [{"lang": "es"}, {"tier": "gold"}]}}))
+```
+
+*Output*
+```
+['d1', 'd2']
+['d1', 'd3']
+['d1', 'd3']
+['d4']
+['d4']
+```
 
 <br/>
 
@@ -1669,6 +1752,16 @@ print(matched({"author": {"ne": "Alice"}}))
 
 # Match a whole array
 print(matched({"tags": ["ai"]}))
+
+# Either a top rating or a recent year, which needs a disjunction
+print(matched({"$or": [{"rating": {"gte": 5.0}}, {"year": {"gte": 2024}}]}))
+
+# Published, and either English or cheap
+print(matched({"published": True,
+               "$or": [{"lang": "en"}, {"price": {"lt": 26.0}}]}))
+
+# Everything except Bob's, including any record with no author at all
+print(matched({"$not": {"author": "Bob"}}))
 ```
 
 *Output*
@@ -1681,6 +1774,9 @@ print(matched({"tags": ["ai"]}))
 ['doc_1', 'doc_3']
 ['doc_2', 'doc_3']
 ['doc_3']
+['doc_1', 'doc_3']
+['doc_1', 'doc_3']
+['doc_1', 'doc_3']
 ```
 
 <br />

@@ -842,3 +842,326 @@ def test_a_filtered_search_survives_a_concurrent_insert():
     # The inserted records carry s1000 "n", so the selective page is unchanged.
     page = index.search(vector=vectors[0], filter={"one": "y"}, top_k=5)
     assert [hit["id"] for hit in page] == ["r04321"]
+
+
+# ------------------------------------------------------------
+# Boolean composition
+#
+# `$and`, `$or` and `$not` are the three reserved keys. A mapping is still a
+# conjunction of its entries, and a group is one entry of that conjunction, so
+# every filter written before this existed means what it always did.
+# ------------------------------------------------------------
+
+# Mirrors MAX_FILTER_DEPTH in vdb-core/src/filter.rs.
+MAX_FILTER_DEPTH = 10
+
+
+def _nest(depth):
+    """A filter whose groups nest exactly `depth` levels.
+
+    Depth 1 is the mapping itself, so depth 2 is one group and depth n is
+    n - 1 of them.
+    """
+    nested = {"count": 10}
+    for _ in range(depth - 1):
+        nested = {"$or": [nested]}
+    return nested
+
+
+def test_or_selects_the_union_of_its_branches(operator_index):
+    index = operator_index
+
+    # Neither branch alone selects both records, and the flat language could
+    # not ask for their union because a mapping is a conjunction and a field
+    # maps to one condition.
+    assert filtered_ids(index, {"name": "Alpha.pdf"}) == ["r01"]
+    assert filtered_ids(index, {"name": "Beta.txt"}) == ["r02"]
+    assert filtered_ids(
+        index, {"$or": [{"name": "Alpha.pdf"}, {"name": "Beta.txt"}]}
+    ) == ["r01", "r02"]
+
+    # A branch is a whole filter, so it may carry several fields, and they are
+    # conjoined inside it.
+    assert filtered_ids(
+        index,
+        {"$or": [{"name": "Alpha.pdf", "count": 20}, {"count": 30}]},
+    ) == ["r03"]
+
+    # An empty disjunction matches nothing, which is what `any` against an
+    # empty array already does.
+    assert filtered_ids(index, {"$or": []}) == []
+
+    # A group is one entry of the conjunction it sits in, so a field beside it
+    # narrows the union rather than widening it.
+    assert filtered_ids(
+        index,
+        {"flag": True, "$or": [{"count": 10}, {"count": 20}]},
+    ) == ["r01"]
+
+
+def test_and_is_explicit_as_well_as_implicit(operator_index):
+    index = operator_index
+
+    # The flat form is the conjunction and `$and` is the same conjunction
+    # written out, so the two select the same records.
+    assert filtered_ids(index, {"count": 10, "flag": True}) == ["r01"]
+    assert filtered_ids(index, {"$and": [{"count": 10}, {"flag": True}]}) == ["r01"]
+
+    # It earns its place where a disjunction has to sit inside a conjunction.
+    assert filtered_ids(
+        index,
+        {"$and": [{"count": {"gte": 10}}, {"$or": [{"flag": False}, {"count": 30}]}]},
+    ) == ["r02", "r03"]
+
+    # An empty conjunction matches every record, which is what `all` against an
+    # empty array already does and what an empty filter does.
+    assert filtered_ids(index, {"$and": []}) == OPERATOR_ALL_IDS
+
+
+def test_not_negates_a_whole_filter(operator_index):
+    index = operator_index
+
+    # `ne` is not negation. It excludes a record that lacks the field, so r04,
+    # which carries no flag at all, is in neither result set.
+    assert filtered_ids(index, {"flag": {"ne": True}}) == ["r02"]
+
+    # `$not` is negation, so the same question asked of the group admits r04.
+    assert filtered_ids(index, {"$not": {"flag": True}}) == ["r02", "r04"]
+
+    # Negating a disjunction is what Qdrant calls must_not, and it is written
+    # out rather than given a key of its own.
+    assert filtered_ids(
+        index, {"$not": {"$or": [{"count": 10}, {"count": 20}]}}
+    ) == ["r03"]
+
+    # Two negations cancel.
+    assert filtered_ids(index, {"$not": {"$not": {"count": 30}}}) == ["r03"]
+
+    # Negating a filter that matches everything matches nothing, and negating
+    # one that matches nothing matches everything.
+    assert filtered_ids(index, {"$not": {}}) == []
+    assert filtered_ids(index, {"$not": {"$or": []}}) == OPERATOR_ALL_IDS
+
+
+def test_not_makes_an_absent_field_expressible(operator_index):
+    index = operator_index
+
+    # `{"field": {"all": []}}` is the empty conjunction, so it holds for every
+    # value the field can carry and fails only where the field is missing.
+    # That makes it "the field is present", and its negation is the filter for
+    # a missing field, which the language had no way to write before.
+    assert filtered_ids(index, {"nested": {"all": []}}) == ["r01"]
+    assert filtered_ids(index, {"$not": {"nested": {"all": []}}}) == ["r02", "r03", "r04"]
+
+    # r03 carries tags as an empty array and r04 carries no tags at all, so the
+    # two questions have different answers and both are now askable.
+    assert filtered_ids(index, {"$not": {"tags": {"all": []}}}) == ["r04"]
+    assert filtered_ids(index, {"tags": []}) == ["r03"]
+
+
+def test_reserved_keys_are_three_names_and_not_the_dollar_namespace():
+    """A field whose name begins with a dollar still filters."""
+    index = VectorDatabase().create("hnsw", dim=4, expected_size=8)
+    index.add({
+        "ids": ["a", "b"],
+        "vectors": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+        "metadatas": [{"$price": 10, "$or": "kept"}, {"$price": 20, "$or": "other"}],
+    })
+
+    # Only $and, $or and $not are reserved. Every other dollar prefixed key is
+    # an ordinary field name and is unaffected.
+    hits = index.search(vector=[1.0, 0.0, 0.0, 0.0], filter={"$price": {"lt": 15}}, top_k=5)
+    assert [hit["id"] for hit in hits] == ["a"]
+
+    # A field genuinely named $or is no longer filterable, and it fails loudly
+    # rather than selecting the wrong records. The metadata itself is intact.
+    with pytest.raises(ValueError, match="reserved filter key"):
+        index.search(vector=[1.0, 0.0, 0.0, 0.0], filter={"$or": "kept"}, top_k=5)
+    assert index.get_records("a")[0]["metadata"]["$or"] == "kept"
+
+
+def test_a_malformed_group_is_refused_before_any_record_is_read(operator_index):
+    index = operator_index
+
+    # A group takes a list of filters, so anything else names the key and says
+    # what it takes.
+    with pytest.raises(ValueError, match="reserved filter key"):
+        filtered_ids(index, {"$or": {"count": 10}})
+    with pytest.raises(ValueError, match="reserved filter key"):
+        filtered_ids(index, {"$and": 3})
+
+    # A branch of a group is a filter mapping, not a bare value.
+    with pytest.raises(ValueError, match="must be a filter mapping"):
+        filtered_ids(index, {"$or": ["count", 10]})
+
+    # `$not` takes one filter mapping rather than a list, so there is no
+    # convention to guess about how a list under it would combine.
+    with pytest.raises(ValueError, match="reserved filter key"):
+        filtered_ids(index, {"$not": [{"count": 10}]})
+
+    # An unknown operator inside a group is rejected exactly as one at the top
+    # level is, and before any record is examined.
+    with pytest.raises(ValueError, match="Unknown filter operation: not_an_operator"):
+        filtered_ids(index, {"$or": [{"count": {"not_an_operator": 1}}]})
+    with pytest.raises(ValueError, match="Unknown filter operation: regex"):
+        filtered_ids(index, {"$not": {"$and": [{"name": {"regex": "Alpha"}}]}})
+
+
+def test_group_nesting_is_bounded(operator_index):
+    index = operator_index
+
+    # The limit counts the mapping itself as level one, so the deepest filter
+    # that compiles carries MAX_FILTER_DEPTH - 1 groups.
+    assert filtered_ids(index, _nest(MAX_FILTER_DEPTH)) == ["r01", "r04"]
+
+    with pytest.raises(ValueError, match="nest to 10 levels"):
+        filtered_ids(index, _nest(MAX_FILTER_DEPTH + 1))
+
+    # It is refused wherever a filter is accepted, not only on search.
+    with pytest.raises(ValueError, match="nest to 10 levels"):
+        index.count(_nest(MAX_FILTER_DEPTH + 1))
+    with pytest.raises(ValueError, match="nest to 10 levels"):
+        index.remove_where(_nest(MAX_FILTER_DEPTH + 1))
+
+
+def test_a_deeply_nested_value_is_refused_rather_than_overflowing_the_stack():
+    """A pathological filter raises where it used to kill the process.
+
+    Nesting is converted out of Python before any filter code sees it, and that
+    recursion had no bound. About four thousand levels overflowed the stack,
+    which takes the interpreter with it rather than raising.
+    """
+    index = VectorDatabase().create("hnsw", dim=4, expected_size=8)
+    index.add({"ids": ["a"], "vectors": [[1.0, 0.0, 0.0, 0.0]], "metadatas": [{"x": 1}]})
+
+    deep = {"x": 1}
+    for _ in range(5000):
+        deep = {"eq": deep}
+    with pytest.raises(ValueError, match="deeper than 128 levels"):
+        index.search(vector=[1.0, 0.0, 0.0, 0.0], filter={"x": deep}, top_k=1)
+
+    # Metadata arrives through the same conversion and is bounded the same way.
+    # `add` collects parse errors rather than raising them, which is what it
+    # already did for every other malformed record, so the depth shows up as a
+    # refused record and the index is left holding what it held.
+    result = index.add({"ids": ["b"], "vectors": [[0.0, 1.0, 0.0, 0.0]],
+                        "metadatas": [{"x": deep}]})
+    assert result.total_inserted == 0
+    assert result.total_errors == 1
+    assert "deeper than 128 levels" in result.errors[0]
+    assert "b" not in index
+    assert len(index) == 1
+
+    # And a value just inside the limit is accepted, so the guard bounds the
+    # recursion rather than refusing nesting.
+    ok = {"x": 1}
+    for _ in range(120):
+        ok = {"inner": ok}
+    assert index.add({"ids": ["c"], "vectors": [[0.0, 0.0, 1.0, 0.0]],
+                      "metadatas": [{"deep": ok}]}).is_success()
+
+
+def test_remove_where_refuses_a_composed_filter_that_matches_everything():
+    """The refusal is asked of the tree, not of the mapping being empty."""
+    index = VectorDatabase().create("hnsw", dim=4, expected_size=8)
+    index.add({
+        "ids": ["a", "b"],
+        "vectors": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+        "metadatas": [{"tier": "a"}, {"tier": "b"}],
+    })
+
+    unconditional = ({}, {"$and": []}, {"$not": {"$or": []}}, {"$and": [{"$and": []}]})
+    for filter in unconditional:
+        with pytest.raises(ValueError, match="empty filter"):
+            index.remove_where(filter)
+    assert len(index) == 2
+
+    # A composed filter that does select records is removed as any other is.
+    assert index.remove_where({"$or": [{"tier": "a"}, {"tier": "z"}]}) == 1
+    assert len(index) == 1
+
+
+def test_a_disjunction_crosses_the_scan_threshold_neither_branch_crosses():
+    """The path is chosen by what the whole filter matches, not by a branch.
+
+    Each branch here matches half the corpus, which is under the threshold, and
+    their union is the whole of it, which is over. The scan therefore gives up
+    on a filter whose branches would each have been answered exactly, and the
+    traversal returns the union rather than either half.
+    """
+    index, vectors = _filter_index()
+    query = vectors[13]
+
+    half = FILTER_CORPUS // 2
+    low = {"rank": {"lt": half}}
+    high = {"rank": {"gte": half}}
+    assert index.count(low) == half <= FULL_SCAN_THRESHOLD
+    assert index.count(high) == half <= FULL_SCAN_THRESHOLD
+
+    union = {"$or": [low, high]}
+    assert index.count(union) == FILTER_CORPUS > FULL_SCAN_THRESHOLD
+
+    page = index.search(vector=query, filter=union, top_k=10)
+    assert len(page) == 10
+    # The union admits every record, so the page is the one the traversal
+    # returns unfiltered, and not either branch's exact page.
+    unfiltered = index.search(vector=query, top_k=10)
+    assert [hit["id"] for hit in page] == [hit["id"] for hit in unfiltered]
+
+    exact = set(_exact_page(vectors, list(range(FILTER_CORPUS)), query, 10))
+    assert len({hit["id"] for hit in page} & exact) >= 9
+
+    # Below the threshold the disjunction is answered by the scan and is exact,
+    # so a union of two selective branches is the exact union.
+    selective = {"$or": [{"rank": {"lt": 700}}, {"rank": {"gte": FILTER_CORPUS - 700}}]}
+    matching = list(range(700)) + list(range(FILTER_CORPUS - 700, FILTER_CORPUS))
+    assert index.count(selective) == len(matching) <= FULL_SCAN_THRESHOLD
+    page = index.search(vector=query, filter=selective, top_k=10)
+    assert [hit["id"] for hit in page] == _exact_page(vectors, matching, query, 10)
+
+
+def test_every_filter_valid_before_composition_selects_the_same_records(operator_index):
+    """The regression set for the flat language, held against fixed answers.
+
+    Every shape below was valid before `$and`, `$or` and `$not` existed. The
+    expected ids were taken from the build immediately before the change and
+    are asserted rather than recomputed, so a change in evaluation shows up
+    here rather than being absorbed by a helper that changed with it.
+    """
+    index = operator_index
+
+    legacy = [
+        ({}, ["r01", "r02", "r03", "r04"]),
+        ({"name": "Alpha.pdf"}, ["r01"]),
+        ({"count": 10}, ["r01", "r04"]),
+        ({"count": 10.0}, ["r01", "r04"]),
+        ({"flag": True}, ["r01", "r03"]),
+        ({"nullable": None}, ["r01"]),
+        ({"tags": []}, ["r03"]),
+        ({"nested": {"eq": {"key": "value", "n": 1}}}, ["r01"]),
+        ({"count": {"eq": 20}}, ["r02"]),
+        ({"count": {"ne": 10}}, ["r02", "r03"]),
+        ({"count": {"gt": 10}}, ["r02", "r03"]),
+        ({"count": {"gte": 20}}, ["r02", "r03"]),
+        ({"count": {"lt": 20}}, ["r01", "r04"]),
+        ({"count": {"lte": 20}}, ["r01", "r02", "r04"]),
+        ({"count": {"gte": 10, "lte": 20}}, ["r01", "r02", "r04"]),
+        ({"ratio": {"gt": 1.5}}, ["r02", "r03"]),
+        ({"name": {"contains": "lph"}}, ["r01"]),
+        ({"tags": {"contains": "ai"}}, ["r01"]),
+        ({"name": {"startswith": "A"}}, ["r01"]),
+        ({"name": {"endswith": ".pdf"}}, ["r01", "r03"]),
+        ({"count": {"in": [10, 30]}}, ["r01", "r03", "r04"]),
+        ({"count": {"nin": [10, 30]}}, ["r02"]),
+        ({"count": {"nin": []}}, ["r01", "r02", "r03", "r04"]),
+        ({"tags": {"any": ["ai", "tech"]}}, ["r01", "r02"]),
+        ({"tags": {"any": []}}, []),
+        ({"tags": {"all": ["ai", "science"]}}, ["r01"]),
+        ({"tags": {"all": []}}, ["r01", "r02", "r03"]),
+        ({"missing_field": "x"}, []),
+        ({"name": {"endswith": ".pdf"}, "flag": True}, ["r01", "r03"]),
+        ({"count": {"gte": 10}, "ratio": {"lt": 3.0}, "flag": True}, ["r01"]),
+    ]
+    for filter, expected in legacy:
+        assert filtered_ids(index, filter) == expected, filter
+        assert index.count(filter) == len(expected), filter

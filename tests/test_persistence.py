@@ -1657,3 +1657,110 @@ def test_an_index_at_the_top_of_the_m_range_restores(tmp_path, m):
     loaded = VectorDatabase().load(str(save_dir))
     assert loaded.get_vector_count() == 300
     assert _pages(loaded, queries) == _pages(index, queries)
+
+
+# ------------------------------------------------------------
+# Test 112: the rebuild writes one graph, byte for byte
+# ------------------------------------------------------------
+def test_the_rebuild_is_byte_deterministic(tmp_path):
+    """The fallback stopped going through add(), and nothing about it moved.
+
+    The rebuild used to marshal every record into a PyDict holding three
+    PyLists and call add(), which parsed them straight back into the owned Rust
+    the loader already had. It now hands that data to the insertion phase
+    directly, with the interpreter lock released.
+
+    Two things had to survive, and this is what pins them. The vectors are
+    processed for the index space a second time, because a stored vector is
+    already normalised for a cosine index and add() applied that processing
+    again, and the records are inserted in ascending internal id, which is
+    arrival order. Either one changing would wire the graph differently, so
+    the dump the rebuild writes is compared byte for byte rather than by
+    recall.
+
+    **The rebuilt graph is not the graph the dump holds and never was.** The
+    original was built from the vectors as supplied and the rebuild builds from
+    the stored ones, processed once more, under internal ids that continue from
+    the saved counter. What has to hold is that the rebuild produces one answer
+    every time.
+    """
+    vectors = _clustered_unit_vectors(600, 16, 987654)
+    ids = [f"v_{i}" for i in range(len(vectors))]
+    index = VectorDatabase().create("hnsw", dim=16, expected_size=600)
+    assert index.add({"ids": ids, "embeddings": vectors}).is_success()
+
+    save_dir = tmp_path / "source.zdb"
+    index.save(str(save_dir))
+
+    os.environ["ZEUSDB_LOAD_REBUILD_GRAPH"] = "1"
+    try:
+        first = VectorDatabase().load(str(save_dir))
+        second = VectorDatabase().load(str(save_dir))
+    finally:
+        del os.environ["ZEUSDB_LOAD_REBUILD_GRAPH"]
+
+    dumps = []
+    for name, rebuilt in (("first", first), ("second", second)):
+        out = tmp_path / f"{name}.zdb"
+        rebuilt.save(str(out))
+        dumps.append((out / "hnsw_index.zdbgraph").read_bytes())
+
+    assert dumps[0] == dumps[1], (
+        "two rebuilds of one directory wired the graph differently"
+    )
+    assert first.get_vector_count() == second.get_vector_count() == 600
+    assert all(first.contains(i) for i in ids)
+
+    queries = _clustered_unit_vectors(20, 16, 24680)
+    assert _pages(first, queries) == _pages(second, queries)
+
+    # The rebuild carries the metadata through, so a filtered search over a
+    # rebuilt index answers as one over the index it was built from.
+    assert first.count({"any_field": "absent"}) == 0
+
+
+# ------------------------------------------------------------
+# Test 113: the rebuild answers what the records say, filters included
+# ------------------------------------------------------------
+def test_a_rebuilt_index_filters_on_its_restored_metadata(tmp_path):
+    """Metadata reaches the rebuilt index without a trip through Python.
+
+    The round trip through add() converted every metadata value into a Python
+    object and straight back. The storage maps are written back verbatim after
+    the rebuild either way, so this pins that the rebuilt index filters on the
+    values the directory holds and not on whatever the trip produced.
+    """
+    vectors = _clustered_unit_vectors(300, 16, 555)
+    ids = [f"v_{i}" for i in range(len(vectors))]
+    metadata = [
+        {
+            "tier": "abc"[i % 3],
+            "rank": i,
+            "big": 9007199254740993,  # wider than an f64 carries exactly
+            "tags": ["x"] if i % 2 else ["y", "z"],
+            "empty": None,
+        }
+        for i in range(len(vectors))
+    ]
+    index = VectorDatabase().create("hnsw", dim=16, expected_size=300)
+    assert index.add({"ids": ids, "embeddings": vectors, "metadatas": metadata}).is_success()
+
+    save_dir = tmp_path / "meta.zdb"
+    index.save(str(save_dir))
+
+    os.environ["ZEUSDB_LOAD_REBUILD_GRAPH"] = "1"
+    try:
+        rebuilt = VectorDatabase().load(str(save_dir))
+    finally:
+        del os.environ["ZEUSDB_LOAD_REBUILD_GRAPH"]
+
+    assert rebuilt.count({"tier": "a"}) == index.count({"tier": "a"})
+    assert rebuilt.count({"rank": {"lt": 50}}) == 50
+    assert rebuilt.count({"big": 9007199254740993}) == 300
+    assert rebuilt.count({"tags": {"any": ["z"]}}) == index.count({"tags": {"any": ["z"]}})
+    assert rebuilt.count({"empty": None}) == 300
+    assert rebuilt.get_records("v_7")[0]["metadata"] == index.get_records("v_7")[0]["metadata"]
+
+    # And the composed forms, which reach the rebuilt index like any other.
+    assert rebuilt.count({"$or": [{"tier": "a"}, {"tier": "b"}]}) == 200
+    assert rebuilt.count({"$not": {"tier": "c"}}) == 200

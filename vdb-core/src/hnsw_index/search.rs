@@ -56,7 +56,7 @@
 
 use super::{HNSWIndex, StorageMode, VectorGraph};
 use crate::conversion::value_map_to_python;
-use crate::filter::matches_filter;
+use crate::filter::{matches_filter, Filter};
 use crate::graph::GraphHit;
 use crate::rerank::{raw_distance_fn, rescore_candidate, take_best, RerankPlan, SearchParams};
 use pyo3::prelude::*;
@@ -144,7 +144,7 @@ type Candidates<'a> = Vec<(&'a String, f32)>;
 /// `None` and takes neither the metadata guard nor the two storage guards.
 #[derive(Clone, Copy)]
 struct Filtered<'a> {
-    conditions: &'a HashMap<String, Value>,
+    conditions: &'a Filter,
     metadata: &'a HashMap<String, HashMap<String, Value>>,
     vectors: &'a HashMap<String, Vec<f32>>,
     pq_codes: &'a HashMap<String, Vec<u8>>,
@@ -165,29 +165,16 @@ impl<'a> Filtered<'a> {
 
     /// Whether one record's metadata matches, with no lookup.
     ///
-    /// **There is no error channel and none is needed.** `matches_filter` fails
-    /// on exactly one thing, an operator name the engine does not implement,
-    /// and `validate_filter_conditions` runs once per search from the `search`
-    /// entry point before any record is examined and rejects that. Every
-    /// operator helper below the dispatch is total. So the `Err` arm is
-    /// unreachable from a search, and excluding the record is the conservative
-    /// answer if a future operator ever makes it reachable. The debug assertion
-    /// is what would find that in a test run rather than in production.
+    /// **There is no error channel and none is needed.** What reaches here is a
+    /// compiled [`Filter`], which `compile_filter` built from the caller's
+    /// mapping once per search and before any record was examined, rejecting
+    /// every operator name and every group shape the engine cannot evaluate.
+    /// Nothing below `matches_filter` can fail, so it returns `bool`. This was
+    /// a `match` on a `PyResult` whose `Err` arm carried a debug assertion
+    /// explaining why it could not fire.
     #[inline]
     fn judge(&self, meta: &HashMap<String, Value>) -> bool {
-        match matches_filter(meta, self.conditions) {
-            Ok(admitted) => admitted,
-            Err(_) => {
-                debug_assert!(
-                    false,
-                    "matches_filter failed inside a search, which \
-                     validate_filter_conditions is supposed to have made \
-                     impossible. A new operator has an error path that \
-                     validation does not reject."
-                );
-                false
-            }
-        }
+        matches_filter(meta, self.conditions)
     }
 }
 
@@ -514,7 +501,7 @@ impl HNSWIndex {
     pub(super) fn single_search_internal(
         &self,
         processed_query: &[f32],
-        filter_conditions: Option<&HashMap<String, Value>>,
+        filter_conditions: Option<&Filter>,
         params: SearchParams,
         py: Python<'_>,
     ) -> PyResult<Vec<Py<PyDict>>> {
@@ -575,7 +562,7 @@ impl HNSWIndex {
     pub(super) fn batch_search_internal(
         &self,
         vectors: &[Vec<f32>],
-        filter_conditions: Option<&HashMap<String, Value>>,
+        filter_conditions: Option<&Filter>,
         params: SearchParams,
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
@@ -655,7 +642,7 @@ impl HNSWIndex {
     fn batch_search_sequential(
         &self,
         vectors: &[Vec<f32>],
-        filter_conditions: Option<&HashMap<String, Value>>,
+        filter_conditions: Option<&Filter>,
         params: SearchParams,
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
@@ -716,7 +703,7 @@ impl HNSWIndex {
     fn batch_search_parallel(
         &self,
         vectors: &[Vec<f32>],
-        filter_conditions: Option<&HashMap<String, Value>>,
+        filter_conditions: Option<&Filter>,
         params: SearchParams,
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
