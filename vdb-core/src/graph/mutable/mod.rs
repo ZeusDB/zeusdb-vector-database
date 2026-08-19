@@ -1269,6 +1269,48 @@ where
         }
     }
 
+    /// Return every buffer's spare capacity to the allocator.
+    ///
+    /// A graph built by insertion grows its arenas geometrically from whatever
+    /// [`MutableGraph::new`] reserved, so the last growth leaves the largest of
+    /// them holding close to twice what it uses. A graph produced by
+    /// [`MutableGraph::from_loaded`] has no such slack, because the node count
+    /// is known before the first write, which is why the same index measures
+    /// smaller after a save and load round trip than it did when it was built.
+    ///
+    /// Fourteen reallocations, one per buffer, each copying the live bytes. No
+    /// node is touched, no edge is read and no distance is evaluated, so the
+    /// topology after this call is the topology before it and every search
+    /// returns exactly what it returned.
+    ///
+    /// **The graph stays mutable.** Every buffer is a `Vec` and a push past a
+    /// full `Vec` grows it, so the next insertion after this reallocates the
+    /// per node arenas once and then proceeds as before. Shrinking a graph that
+    /// is still being built therefore trades that one regrowth for the memory,
+    /// which is the caller's decision and is why nothing here is automatic.
+    ///
+    /// Returns the bytes released, being the drop in
+    /// [`MutableGraph::memory_bytes`].
+    pub(super) fn shrink_to_fit(&mut self) -> usize {
+        let before = self.memory_bytes();
+        self.origin_ids.shrink_to_fit();
+        self.levels.shrink_to_fit();
+        self.data.shrink_to_fit();
+        self.base_targets.shrink_to_fit();
+        self.base_dists.shrink_to_fit();
+        self.base_len.shrink_to_fit();
+        self.base_in_degree.shrink_to_fit();
+        self.upper_first.shrink_to_fit();
+        self.upper_span.shrink_to_fit();
+        self.upper_at.shrink_to_fit();
+        self.upper_len.shrink_to_fit();
+        self.upper_cap.shrink_to_fit();
+        self.upper_in_degree.shrink_to_fit();
+        self.upper_targets.shrink_to_fit();
+        self.upper_dists.shrink_to_fit();
+        before.saturating_sub(self.memory_bytes())
+    }
+
     /// Bytes the structure has asked the allocator for.
     ///
     /// Exact rather than sampled, for the same reason `FlatGraph`'s figure is:

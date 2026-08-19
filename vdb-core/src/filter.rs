@@ -33,6 +33,25 @@ pub(crate) fn matches_filter(
     Ok(true)
 }
 
+/// Judge one field of one record.
+///
+/// **A record that does not carry the field never reaches an operator.** The
+/// absence is answered here, once, for all thirteen of them, so `ne`, `nin` and
+/// `all` exclude such a record exactly as `eq`, `in` and `any` do. That is a
+/// rule about the record rather than about the operator: this engine holds that
+/// a field it has no value for cannot be judged, so nothing is asserted of it
+/// either way.
+///
+/// The alternative, where a negating operator admits a record the field is
+/// missing from, makes the language incoherent at its own boundary. `nin`
+/// against a one element list is `ne` against that element, and `ne` has
+/// answered false for an absent field since relay 44 fixed it there. Splitting
+/// them would mean `{"tag": {"ne": "x"}}` and `{"tag": {"nin": ["x"]}}` return
+/// different record sets while meaning the same thing.
+///
+/// What it costs is that "the field is absent" has no filter that expresses it.
+/// That is a real gap and it is the gap `is_empty` would fill, which is a change
+/// to this rule rather than another arm on the dispatch below.
 fn field_matches(
     metadata: &HashMap<String, Value>,
     field: &str,
@@ -96,6 +115,9 @@ fn evaluate_operator(field_value: &Value, op: &str, target_value: &Value) -> PyR
         "startswith" => value_starts_with(field_value, target_value),
         "endswith" => value_ends_with(field_value, target_value),
         "in" => value_in_array(field_value, target_value),
+        "nin" => value_in_array(field_value, target_value).map(|found| !found),
+        "any" => value_intersects_any(field_value, target_value),
+        "all" => value_contains_all(field_value, target_value),
         _ => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
             "Unknown filter operation: {}",
             op
@@ -223,4 +245,43 @@ fn value_in_array(field: &Value, target: &Value) -> PyResult<bool> {
         Value::Array(arr) => Ok(arr.iter().any(|item| values_equal(item, field))),
         _ => Ok(false),
     }
+}
+
+/// Whether an array field shares at least one element with the target array.
+///
+/// `contains` asks whether an array field holds one named value, and there is
+/// no disjunction in the filter language, so asking whether it holds any of
+/// several was not expressible. A non-array field is compared as a single
+/// element, which makes this the array-valued generalisation of `in` and keeps
+/// the two agreeing on a scalar field.
+///
+/// An empty target array matches nothing, which is what an empty disjunction
+/// is.
+fn value_intersects_any(field: &Value, target: &Value) -> PyResult<bool> {
+    let Value::Array(wanted) = target else {
+        return Ok(false);
+    };
+    Ok(wanted.iter().any(|want| match field {
+        Value::Array(held) => held.iter().any(|item| values_equal(item, want)),
+        _ => values_equal(field, want),
+    }))
+}
+
+/// Whether an array field holds every element of the target array.
+///
+/// A flat filter maps one field to one condition object, and a condition object
+/// cannot carry the same operator twice, so a conjunction of `contains` over
+/// one field had no syntax. This is that conjunction.
+///
+/// An empty target array matches every record, which is what an empty
+/// conjunction is, and is the only case where this admits a record whose field
+/// holds nothing.
+fn value_contains_all(field: &Value, target: &Value) -> PyResult<bool> {
+    let Value::Array(wanted) = target else {
+        return Ok(false);
+    };
+    Ok(wanted.iter().all(|want| match field {
+        Value::Array(held) => held.iter().any(|item| values_equal(item, want)),
+        _ => values_equal(field, want),
+    }))
 }

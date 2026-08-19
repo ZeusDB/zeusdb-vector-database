@@ -230,7 +230,7 @@ impl HNSWIndex {
             // field used to sit beside it, carrying 1 - 1/compression_ratio,
             // which is the same number in another form and was labelled as a
             // saving the index does not make.
-            let compression_ratio = (self.dim as f64 * 4.0) / pq.subvectors as f64;
+            let compression_ratio = (self.dim as f64 * 4.0) / pq.subvectors() as f64;
 
             let total_duration_ms = start_time.elapsed().as_millis();
             info!(
@@ -459,7 +459,7 @@ impl HNSWIndex {
 
         // ✅ ENTERPRISE: Add duration timing with fixed compression ratio calculation
         let duration_ms = start_time.elapsed().as_millis();
-        let compression_ratio = (pq.dim as f64 * 4.0) / pq.subvectors as f64;
+        let compression_ratio = (pq.dim() as f64 * 4.0) / pq.subvectors() as f64;
         info!(
             operation = "quantization_rebuild_complete",
             vector_count = vector_count,

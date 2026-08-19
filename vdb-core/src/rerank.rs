@@ -730,7 +730,7 @@ pub(crate) fn measure_rerank_fetches(
         return None;
     }
 
-    let subvectors = pq.subvectors;
+    let subvectors = pq.subvectors();
 
     // One rank list per query, in true neighbour order, so that the pool for a
     // page is a prefix of each of them.

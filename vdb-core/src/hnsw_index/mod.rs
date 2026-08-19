@@ -48,7 +48,7 @@ mod stats;
 mod training;
 
 use crate::conversion::{python_dict_to_value_map, value_map_to_python};
-use crate::filter::validate_filter_conditions;
+use crate::filter::{matches_filter, validate_filter_conditions};
 // The graph and everything the graph crate supplies arrive through the seam.
 // `Distance` is the one name from that crate this file still needs, because
 // `DistPQ` below implements it. See the note at the top of `graph.rs`.
@@ -181,7 +181,7 @@ impl DistPQ {
     /// seam hands the traversal. The codebook is private to this type, so the
     /// seam asks rather than reaching into it.
     pub(crate) fn subvectors(&self) -> usize {
-        self.pq.subvectors
+        self.pq.subvectors()
     }
 
     /// Compute this query's ADC table and install it for the calling thread.
@@ -231,7 +231,7 @@ impl Distance<u8> for DistPQ {
                 return self.pq.symmetric_distance(a, b);
             };
 
-            // b.len() should equal pq.subvectors
+            // b.len() should equal pq.subvectors()
             let mut sum = 0.0f32;
             for (sv, &code) in b.iter().enumerate() {
                 // lut[sv][code]
@@ -262,6 +262,28 @@ pub struct AddResult {
     pub errors: Vec<String>,
     #[pyo3(get)]
     pub vector_shape: Option<(usize, usize)>,
+
+    /// The id of every record this call put in the index, in insertion order.
+    ///
+    /// **It lines up with `total_inserted` and with nothing else.**
+    /// `len(ids) == total_inserted` on every result this crate produces. A
+    /// record rejected by parsing contributes no id, because none was ever
+    /// allocated for it, and a record rejected by insertion contributes none
+    /// either, because it is not in the index. So this is not positionally
+    /// aligned with the input, and a caller who needs that alignment reads
+    /// `errors`, which names each rejection by its id or by its position.
+    ///
+    /// Why it exists. An `add` that is given no ids generates them, as
+    /// `vec_{counter}`, and until this field the generated ids were
+    /// unreachable: the caller had to list the index and guess which entries
+    /// were new. The llama-index adapter probes for exactly this attribute and,
+    /// not finding it, returns the ids it supplied, which on a batch where any
+    /// node lacked an id is a shorter list of the wrong values.
+    ///
+    /// An overwrite reports the id it accepted, since a replacement is an
+    /// insertion as far as this counts.
+    #[pyo3(get)]
+    pub ids: Vec<String>,
 }
 #[pymethods]
 impl AddResult {
@@ -578,7 +600,6 @@ impl HNSWIndex {
         // Use error-collecting parsing
         let (parsed_data, parse_errors) = self.parse_input_data(&data);
 
-        let mut total_inserted = 0;
         let mut total_errors = 0;
         let mut errors = Vec::new();
 
@@ -599,6 +620,7 @@ impl HNSWIndex {
                 total_errors: 0,
                 errors: vec![],
                 vector_shape: Some((0, self.dim)),
+                ids: vec![],
             });
         }
 
@@ -628,11 +650,11 @@ impl HNSWIndex {
         // `insert_parsed_records` carries the proof that nothing inside touches
         // Python.
         let py = data.py();
-        let (inserted, insert_errors) = py.detach(|| {
+        let (inserted_ids, insert_errors) = py.detach(|| {
             let _writers = self.writers.lock().unwrap();
             self.insert_parsed_records(parsed_data, overwrite)
         });
-        total_inserted += inserted;
+        let total_inserted = inserted_ids.len();
 
         // The errors come back in the order they happened. Two of the three
         // variants carry a message Rust already built. The third carries a
@@ -683,6 +705,7 @@ impl HNSWIndex {
             total_errors,
             errors,
             vector_shape,
+            ids: inserted_ids,
         })
     }
 
@@ -952,6 +975,153 @@ impl HNSWIndex {
         self.dim
     }
 
+    /// Python property: `index.space`
+    ///
+    /// The same value `get_space()` returns, which stays. The two exist because
+    /// `dim` is a property and `space` was not, so anything reading the index's
+    /// configuration by attribute found half of it. The langchain adapter reads
+    /// `getattr(index, "space", None)` to choose how it normalises a distance
+    /// into a relevance score, and finding nothing it took the literal default
+    /// of cosine, so an L2 or L1 index was scored by the cosine rule.
+    ///
+    /// It is a property rather than a second method because the caller that
+    /// needed it probes for an attribute and calls it only if it turns out to be
+    /// callable, so a property satisfies it and a method reads as configuration
+    /// rather than as an action.
+    ///
+    /// `m`, `ef_construction` and `expected_size` are not here. They have a
+    /// different gap, being reachable only through `get_stats()` and only as
+    /// text, and no caller in either adapter reads them at all.
+    /// Named `space_property` in Rust because PyO3 derives the symbol it
+    /// generates from the Rust name, and a getter's symbol takes a `get_`
+    /// prefix, so a getter written as `space` collides with the existing
+    /// `get_space` method. `#[getter(space)]` names the Python property.
+    #[getter(space)]
+    pub fn space_property(&self) -> String {
+        self.space.clone()
+    }
+
+    /// `len(index)`, the number of live records.
+    ///
+    /// Reads `id_map`, which is the record set: every insertion path writes it,
+    /// removal keys on it, and `contains`, `list` and `count` all read the same
+    /// map, so none of them can disagree with this. It equals
+    /// `get_vector_count()` and `get_stats()["total_vectors"]`, which are
+    /// maintained separately as a counter.
+    ///
+    /// Zero on an empty index, which is the only edge case a length has.
+    pub fn __len__(&self) -> usize {
+        self.id_map.read().unwrap().len()
+    }
+
+    /// `id in index`, which is `contains(id)`.
+    ///
+    /// `contains()` stays, because removing it would break every caller using
+    /// it. This is the same read of the same map and cannot answer differently.
+    pub fn __contains__(&self, id: String) -> bool {
+        self.contains(id)
+    }
+
+    /// Live records matching a filter, or every live record when none is given.
+    ///
+    /// **Exact, and therefore a complete walk.** With a filter this evaluates
+    /// every record's metadata and counts the matches. It cannot stop early:
+    /// a count is a statement about the whole index, so the first record it
+    /// skipped would make the answer a lower bound rather than a count.
+    /// `scan_candidates` stops at `FULL_SCAN_THRESHOLD` because a search only
+    /// needs to know whether the matching set is small enough to rank directly,
+    /// which is a question an early exit answers and this one is not.
+    ///
+    /// What it reuses is `matches_filter` and `validate_filter_conditions`,
+    /// which are the whole of the filter language. What it does not reuse is
+    /// the scan's give-up point, its distance evaluation and its sort, none of
+    /// which a count reads.
+    ///
+    /// Without a filter it is `len(index)` and reads one map length.
+    ///
+    /// An unknown operator raises `ValueError` before any record is examined,
+    /// which is what a search does with the same filter. An empty index counts
+    /// zero, and a filter matching nothing counts zero.
+    #[pyo3(signature = (filter=None))]
+    pub fn count(&self, py: Python<'_>, filter: Option<&Bound<PyDict>>) -> PyResult<usize> {
+        let Some(filter) = filter else {
+            return Ok(self.id_map.read().unwrap().len());
+        };
+        let conditions = python_dict_to_value_map(filter)?;
+        validate_filter_conditions(&conditions)?;
+        if conditions.is_empty() {
+            return Ok(self.id_map.read().unwrap().len());
+        }
+
+        // The walk runs with the interpreter lock released. It reads every
+        // record, which at 100,000 records is tens of milliseconds, and holding
+        // the lock for that would stall every Python thread in the process.
+        //
+        // There is no error channel inside and none is needed, which is the
+        // argument `Filtered::judge` makes for the search path.
+        // `validate_filter_conditions` has already rejected the one thing
+        // `matches_filter` can fail on, so the error arm is unreachable, and
+        // excluding the record is the conservative answer if a future operator
+        // ever makes it reachable.
+        Ok(py.detach(|| {
+            let vector_metadata = self.vector_metadata.read().unwrap();
+            vector_metadata
+                .values()
+                .filter(|meta| {
+                    matches_filter(meta, &conditions).unwrap_or_else(|_| {
+                        debug_assert!(
+                            false,
+                            "matches_filter failed inside count, which validate_filter_conditions is supposed to have made impossible"
+                        );
+                        false
+                    })
+                })
+                .count()
+        }))
+    }
+
+    /// Return the graph's spare buffer capacity to the allocator.
+    ///
+    /// A graph built by insertion grows its arenas geometrically, so the last
+    /// growth leaves the largest of them holding close to twice what it uses. A
+    /// graph read back from a saved dump has none of that slack, because the
+    /// node count is known before the first write. That is the whole of why the
+    /// same index reports a smaller graph after a save and load round trip than
+    /// it did when it was built.
+    ///
+    /// `compact()` does not reclaim it. Compaction rebuilds by inserting, so the
+    /// replacement graph regrows exactly the same slack, which is why this is
+    /// its own operation. `compact()` calls it on the graph it built, so a
+    /// caller who runs compaction gets both.
+    ///
+    /// **No node, edge or distance is touched.** Fourteen buffers are
+    /// reallocated at their current lengths and their contents copied, so the
+    /// topology after the call is the topology before it and every search
+    /// returns the same page with the same scores.
+    ///
+    /// **The index stays writable.** Every buffer is a growable vector, so the
+    /// next `add()` reallocates the per node arenas once and then proceeds as
+    /// before. Shrinking an index that is still being written to therefore
+    /// trades one regrowth for the memory, which is why this is never automatic.
+    /// On an index that is finished, or one about to be searched for a long
+    /// time, there is nothing to trade.
+    ///
+    /// Returns the bytes released, which is zero only when the buffers are
+    /// already tight, in which case nothing is reallocated either.
+    ///
+    /// **On an empty index it releases the whole creation reservation**, which
+    /// is what `expected_size` bought. Calling it before inserting is therefore
+    /// not free: it hands back the pre-allocation and every subsequent
+    /// insertion regrows the arenas from nothing. Call it on an index that
+    /// holds its records, not on one about to receive them.
+    pub fn shrink_to_fit(&self, py: Python<'_>) -> usize {
+        py.detach(|| {
+            let _writers = self.writers.lock().unwrap();
+            let mut hnsw = self.hnsw.write().unwrap();
+            hnsw.shrink_to_fit()
+        })
+    }
+
     /// Get records by ID(s) with PQ reconstruction support and storage mode awareness
     ///
     /// Looks the ids up in the union of the raw vectors and the quantized codes,
@@ -1056,22 +1226,69 @@ impl HNSWIndex {
         self.collect_stats()
     }
 
-    /// List the first number of records in the index (ID and metadata)
+    /// One page of records, as (id, metadata), in the order they were added.
     ///
     /// Enumerates `id_map`, which holds every live record. It used to enumerate
     /// `vectors`, which under `quantized_only` holds only the records collected
     /// before training, so every record added afterwards was missing from the
     /// listing while search still returned it.
     ///
-    /// Iteration order is a hash map's and is not stable between calls, so
-    /// `number` takes an arbitrary N rather than a defined page.
-    #[pyo3(signature = (number=10))]
-    pub fn list(&self, py: Python<'_>, number: usize) -> PyResult<Vec<(String, Py<PyAny>)>> {
+    /// # The order, which is what makes `offset` mean anything
+    ///
+    /// **Ascending internal id, which is arrival order.** This used to hand back
+    /// `id_map.keys()` directly, and a `HashMap` iterates in an order its hasher
+    /// reseeds in every process, so two calls in one process agreed and two
+    /// processes did not. An offset over an order like that is not a page: it
+    /// can return a record twice and miss another entirely, which is worse than
+    /// having no paging at all. Relay 86 met the same problem on the scan path,
+    /// where two equally distant records came back in hasher order, and pinned a
+    /// tie break for it.
+    ///
+    /// Arrival order rather than the external id's own order, for two reasons.
+    /// A record added while a caller is paging appends at the end, so it cannot
+    /// push a record the caller has not reached yet across a page boundary,
+    /// which sorting by external id would do for any id that sorts low. And it
+    /// is the order `compact` already rebuilds in, for the same reason: a
+    /// property of the data rather than of where a hasher put a key. Internal
+    /// ids are unique and are never reissued, so the order is total, and they
+    /// survive a save and load, so it is the same order in the next process.
+    ///
+    /// **Deletion during paging still shifts a page**, since removing a record
+    /// ahead of the cursor moves everything behind it up by one. That is
+    /// inherent to paging by offset and no ordering fixes it. A caller who
+    /// cannot tolerate it pages by holding the last id it saw rather than a
+    /// count.
+    ///
+    /// An offset at or past the record count returns an empty list rather than
+    /// raising, and `number` of zero returns an empty list. Neither is an error.
+    #[pyo3(signature = (number=10, offset=0))]
+    pub fn list(
+        &self,
+        py: Python<'_>,
+        number: usize,
+        offset: usize,
+    ) -> PyResult<Vec<(String, Py<PyAny>)>> {
         let id_map = self.id_map.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
 
-        let mut results = Vec::new();
-        for id in id_map.keys().take(number) {
+        // Only the records up to the end of the requested page need ordering, so
+        // the tail is partitioned away in linear time and the sort runs over the
+        // prefix. Paging a large index reads small pages many times, and sorting
+        // the whole record set on each of them would be the dominant cost.
+        let mut ordered: Vec<(usize, &String)> = id_map
+            .iter()
+            .map(|(id, &internal)| (internal, id))
+            .collect();
+        let end = offset.saturating_add(number).min(ordered.len());
+        if end < ordered.len() {
+            ordered.select_nth_unstable_by_key(end, |&(internal, _)| internal);
+        }
+        let window = &mut ordered[..end];
+        window.sort_unstable_by_key(|&(internal, _)| internal);
+
+        let page = window.get(offset.min(end)..).unwrap_or(&[]);
+        let mut results = Vec::with_capacity(page.len());
+        for &(_, id) in page.iter() {
             let metadata = vector_metadata.get(id).cloned().unwrap_or_default();
             let py_metadata = value_map_to_python(&metadata, py)?;
             results.push((id.clone(), py_metadata));
@@ -1134,6 +1351,111 @@ impl HNSWIndex {
             self.remove_point_internal(id)
         })
         .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    /// Remove a batch of records, taking the mutation lock once.
+    ///
+    /// **Returns the ids that were not in the index**, in the order they were
+    /// given, so an empty list means every id was removed. That is what the
+    /// caller needs and a count is not: both shipped adapters loop
+    /// `remove_point` today precisely to learn which ids failed, and both then
+    /// throw away everything except a total.
+    ///
+    /// A repeated id is removed on its first occurrence and skipped afterwards,
+    /// so it is never reported missing. The caller asked for the record to be
+    /// gone and it is.
+    ///
+    /// An empty list of ids removes nothing and returns an empty list. Every id
+    /// being absent returns all of them, which is not an error: removing a
+    /// record that is not there is the state the caller asked for.
+    ///
+    /// What it saves against the loop is the locking. One acquisition of the
+    /// mutation guard and one of each of the five storage guards for the whole
+    /// batch, rather than one of each per id. It also makes the batch atomic
+    /// against every search, where the loop let a search land between any two
+    /// removals.
+    ///
+    /// Stranded graph nodes are left exactly as `remove_point` leaves them, one
+    /// per record removed. Search already excludes them. `compact()` reclaims
+    /// them and this does not call it, because compaction costs a full rebuild
+    /// and the caller is the one who knows whether the debris is worth it.
+    pub fn remove_points(&self, py: Python<'_>, ids: Vec<String>) -> Vec<String> {
+        py.detach(|| {
+            let _writers = self.writers.lock().unwrap();
+            self.remove_points_internal(&ids)
+        })
+    }
+
+    /// Remove every record whose metadata matches the filter, and report how
+    /// many were removed.
+    ///
+    /// The filter is the language `search` takes, evaluated by the same
+    /// function against the same metadata, so a filter that selects a set here
+    /// selects the same set there. An unknown operator raises `ValueError`
+    /// before any record is examined.
+    ///
+    /// A filter matching nothing removes nothing and returns zero, which is not
+    /// an error. An empty index returns zero.
+    ///
+    /// **An empty filter is refused.** Everywhere else in this language an empty
+    /// filter matches every record, and `search(filter={})` returns the whole
+    /// index for exactly that reason. This is the one method where following
+    /// that rule destroys every record, and an empty mapping reaches it far more
+    /// often from a caller that built its filter and got nothing than from a
+    /// caller that meant it. Consistency is worth less here than the failure it
+    /// would permit, because a search is repeatable and this is not. A caller
+    /// who does mean it names the records, through `remove_points`.
+    ///
+    /// Stranded graph nodes are left behind, one per record removed, exactly as
+    /// `remove_point` leaves them. This does not call `compact()` either; see
+    /// `remove_points`.
+    pub fn remove_where(&self, py: Python<'_>, filter: &Bound<PyDict>) -> PyResult<usize> {
+        let conditions = python_dict_to_value_map(filter)?;
+        if conditions.is_empty() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "remove_where requires a filter that selects records. An empty filter matches                  every record, so this would delete the whole index. Name the records with                  remove_points(ids) if that is what you want.",
+            ));
+        }
+        validate_filter_conditions(&conditions)?;
+        Ok(py.detach(|| {
+            let _writers = self.writers.lock().unwrap();
+            self.remove_where_locked(&conditions)
+        }))
+    }
+
+    /// Replace one record's metadata without resupplying its vector.
+    ///
+    /// **Wholesale, not a merge.** The supplied mapping becomes the record's
+    /// metadata and any key not in it is gone. That is what `add(overwrite=True)`
+    /// already does, since it removes the record outright before inserting the
+    /// replacement, so the two ways of re-tagging a record agree.
+    ///
+    /// Returns `false` for an id the index does not hold, and writes nothing in
+    /// that case. `true` when the metadata was replaced. Passing an empty
+    /// mapping clears the record's metadata, which is a write and returns
+    /// `true`.
+    ///
+    /// **It touches `vector_metadata` and nothing else.** No graph work, no
+    /// vector work, no id allocation, no training. The record keeps its internal
+    /// id, its graph node, its stored vector and its quantized codes.
+    ///
+    /// That is the reason it exists. Re-tagging a document used to mean reading
+    /// it back with `get_records` and adding it again with `overwrite=True`, and
+    /// under `quantized_only` `get_records` returns a reconstruction rather than
+    /// the vector supplied, so the round trip silently replaced the record's
+    /// vector with an approximation of itself. It also stranded a graph node and
+    /// re-ran the insertion. None of that happens here.
+    pub fn update_metadata(
+        &self,
+        py: Python<'_>,
+        id: String,
+        metadata: &Bound<PyDict>,
+    ) -> PyResult<bool> {
+        let fields = python_dict_to_value_map(metadata)?;
+        Ok(py.detach(|| {
+            let _writers = self.writers.lock().unwrap();
+            self.update_metadata_locked(&id, fields)
+        }))
     }
 
     /// Rebuild the graph in memory and reclaim the nodes removal and overwrite strand.

@@ -210,7 +210,7 @@ The upper bound of 100,000,000 exists because the graph reserves one slot per de
 
 **`ef_construction` governs insertion and nothing else.** It is the width of the candidate search each insertion runs, at the new point's own layer and at every layer below it. The descent above that layer runs at a width of 1 and ignores it. The candidates that search returns are the pool the neighbour selection draws from, so `ef_construction` sets the supply and `m` sets how much of it is kept.
 
-**It does not change search latency or index size.** A node holds at most `2 × m` neighbours at layer zero and `m` above it whatever width found them, so the finished graph is the same size at every `ef_construction`. Measured over 50,000 records, mean query latency moved between 0.89 ms and 2.85 ms across a sixteenfold range of `ef_construction` with no trend in it, and resident memory ran backwards on one of the three datasets. What it does change is build time, which is linear in it above 100. On OpenAI embeddings of 1,536 dimensions, 50,000 records built in 62.7 s, 131.2 s, 262.8 s and 464.9 s at `ef_construction` 100, 200, 400 and 800. On GloVe of 100 dimensions the same four are 37.7 s, 75.0 s, 140.4 s and 239.1 s. Below 100 the curve flattens, because the fixed per-insert work stops being dominated by the candidate search.
+**It does not change search latency or index size.** A node holds at most `2 × m` neighbours at layer zero and `m` above it whatever width found them, so the finished graph is the same size at every `ef_construction`. Measured over 50,000 records, mean query latency moved between 0.89 ms and 2.85 ms across a sixteenfold range of `ef_construction` with no trend in it, and resident memory ran backwards on one of the three datasets. What it does change is build time, which is linear in it above 100. On OpenAI embeddings of 1,536 dimensions, 50,000 records built in 32.1 s, 76.9 s, 140.7 s and 262.1 s at `ef_construction` 100, 200, 400 and 800. On GloVe of 100 dimensions the same four are 6.5 s, 13.5 s, 26.6 s and 49.8 s. Below 100 the curve flattens, because the fixed per-insert work stops being dominated by the candidate search.
 
 **Recall stops improving at or near the default.** Recall at 10 over 50,000 records at the default `m` of 32, 500 queries, at the default search width:
 
@@ -232,7 +232,7 @@ SIFT plateaus at 100 and OpenAI at 200. GloVe is the one dataset that keeps clim
 
 ZeusDB provides a flexible `.add(...)` method that supports multiple input formats for inserting or updating vectors in the index. Whether you're adding a single record, a list of documents, or structured arrays, the API is designed to be both intuitive and robust. Each record can include optional metadata for filtering or downstream use.
 
-All formats return an `AddResult` containing `total_inserted`, `total_errors`, `errors` and `vector_shape`.
+All formats return an `AddResult` containing `total_inserted`, `total_errors`, `errors`, `vector_shape` and `ids`.
 
 #### ✅ Format 1 – Single Object
 
@@ -389,8 +389,30 @@ The `add()` method inserts or replaces one or more vectors in the index.
 - `total_errors`: number of failed records
 - `errors`: list of error messages
 - `vector_shape`: the shape of the processed batch, as `(rows, dim)`
+- `ids`: the ID of every record that was inserted or replaced, in insertion order
 - `is_success()`: `True` when `total_errors` is zero
 - `summary()`: a one-line string of the two counts
+
+`ids` is how you learn the IDs the index generated for records you supplied without one. It lines up with `total_inserted` and with nothing else, so `len(add_result.ids) == add_result.total_inserted` always: a rejected record contributes no ID, because it is not in the index. `errors` is what names the rejections.
+
+```python
+index = vdb.create("hnsw", dim=2)
+generated = index.add({"vectors": [[0.1, 0.2], [0.3, 0.4]]})
+print(generated.ids)
+
+supplied = index.add({"ids": ["a", "b"], "embeddings": [[0.5, 0.6], [0.7, 0.8]]})
+print(supplied.ids)
+
+partial = index.add({"ids": ["ok", "bad"], "embeddings": [[0.1, 0.2], [0.1]]})
+print(partial.ids, partial.total_inserted, partial.total_errors)
+```
+
+*Output*
+```
+['vec_1', 'vec_2']
+['a', 'b']
+['ok'] 1 1
+```
 
 <br/>
 
@@ -548,7 +570,9 @@ HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=10000, v
 
 The `vectors=` field is the live record count, in every storage mode. `get_vector_count()` returns the same number. `get_stats()["raw_vectors_stored"]` is the one that counts raw vectors specifically, and on a trained `quantized_only` index it is zero.
 
-Other single-value accessors: `index.dim`, `index.get_space()`, `index.get_vector_count()`, `index.has_quantization()`, `index.can_use_quantization()`, and `VectorDatabase.available_index_types()`.
+Other single-value accessors: `index.dim`, `index.space`, `index.get_space()`, `len(index)`, `index.get_vector_count()`, `index.has_quantization()`, `index.can_use_quantization()`, and `VectorDatabase.available_index_types()`.
+
+`index.space` and `index.dim` are properties. `get_space()` is the same value as a method and is kept for callers already using it.
 
 <br/>
 
@@ -589,7 +613,7 @@ version: 0.1
 #### ☑️ List records in the index
 
 ```python
-for record_id, metadata in sorted(index.list(number=5)):
+for record_id, metadata in index.list(number=5):
     print(record_id, metadata)
 ```
 *Output*
@@ -601,7 +625,25 @@ doc_004 {'author': 'Bob'}
 doc_005 {'author': 'Alice'}
 ```
 
-`list()` returns `(id, metadata)` tuples in no particular order, so the example sorts them. It is not a paging API: `number` takes the first N in whatever order internal storage yields, and the same N are not guaranteed across calls. It lists every record, in every storage mode.
+`list()` returns `(id, metadata)` tuples **in the order the records were added**, and `offset` pages through them. It lists every record, in every storage mode.
+
+```python
+print(index.list(number=2, offset=0))
+print(index.list(number=2, offset=2))
+print(index.list(number=2, offset=4))
+print(index.list(number=2, offset=99))
+```
+*Output*
+```
+[('doc_001', {'author': 'Alice'}), ('doc_002', {'author': 'Bob'})]
+[('doc_003', {'author': 'Alice'}), ('doc_004', {'author': 'Bob'})]
+[('doc_005', {'author': 'Alice'})]
+[]
+```
+
+The order is arrival order rather than ID order, so a record added while you are paging appends at the end and cannot push an unread record across a page boundary. It survives `save()` and `load()`. An offset past the end returns an empty list rather than raising.
+
+**Deleting while you page still shifts the pages.** Removing a record ahead of your cursor moves everything behind it up by one, which is inherent to paging by an offset. If you cannot tolerate that, page by remembering the last ID you saw instead of a count.
 
 <br/>
 
@@ -624,9 +666,11 @@ storage_mode_description: raw_only
 
 It is also where the memory figures live, on every index rather than only on a quantized one. `graph_memory_mb` is the HNSW graph, `raw_vectors_memory_mb` is the raw vector store, `index_bookkeeping_memory_mb` is the hash tables that find a record, and `total_memory_mb` is the sum of everything below. On a quantized index `quantized_codes_memory_mb` scales with the record count, while `codebook_memory_mb` and `sdc_table_memory_mb` are fixed by `dim`, `subvectors` and `bits` and do not move as records arrive. `raw_vectors_retained` states the mode's policy: `none_once_trained` for `quantized_only`, whose raw vectors are released when training completes, and `all_records` for `quantized_with_raw`.
 
-**The graph is usually the largest of those figures, and on a memory optimized index it is nearly all of it.** It owns a second copy of every point on top of its neighbour lists, its sixteen per point layer headers and the counters around them. At 50,000 records of `dim=1536` a trained `quantized_only` index reports 98.1 MB of graph against 2.3 MB of codes and 7.5 MB of fixed tables.
+**The graph is usually the largest of those figures, and on a memory optimized index it is still the largest, at 58 percent of the total.** It owns a second copy of every point on top of its neighbour lists, its sixteen per point layer headers and the counters around them. At 50,000 records of `dim=1536` a settled, trained `quantized_only` index reports 31.20 MB of graph against 2.29 MB of codes and 7.5 MB of fixed tables.
 
-`index_bookkeeping_memory_mb` is what the index spends on finding a record rather than on holding one. Five hash tables carry a record, being `id_map`, `rev_map`, the metadata map, the raw vector store and the code store, and two of them carry a second copy of its id. It is proportional to the record count and independent of the dimension, at 265 bytes per record with no quantization, 334 under `quantized_with_raw` and 265 under `quantized_only` at 50,000 records.
+`index_bookkeeping_memory_mb` is what the index spends on finding a record rather than on holding one. Five hash tables carry a record, being `id_map`, `rev_map`, the metadata map, the raw vector store and the code store, and two of them carry a second copy of its id. It is proportional to the record count and independent of the dimension. It is **not** independent of the metadata, because the per-record metadata map is one of the five and both its keys and its string values are counted.
+
+Measured at 50,000 records. For records carrying **no metadata** it is 265.5 bytes per record with no quantization, 342.5 under `quantized_with_raw` and 273.5 under `quantized_only`. Give every record **three short string keys** and the same three read 545.5, 622.4 and 553.4. Budget from the figure that matches your own metadata, not from the first one. The dimension independence holds either way: at `dim=8` the unquantized figures are 265.5 and 545.5 bytes against 265.5 and 545.5 at `dim=1536`.
 
 **`total_memory_mb` is not the resident set and it does not claim to be.** It prices the six structures above, meaning the bytes the index asked the allocator for. What it leaves out is the allocator itself, being its own block headers, its rounding and its fragmentation, and that is a property of the platform rather than something the index holds. Measured on three loaded indexes of 50,000 real 1,536-dimensional embeddings, one process each, with the interpreter's own resident set subtracted:
 
@@ -663,6 +707,8 @@ records remaining: 4
 ```
 
 **⚠️ Please Note:** Due to the nature of HNSW, the underlying graph node remains in memory after a point is removed. Searches never return it, but it still occupies memory and edge slots. `compact()` reclaims those nodes.
+
+`remove_points(ids)` removes a batch under one lock rather than one lock per ID, and returns the IDs that were not in the index. `remove_where(filter)` removes every record matching a metadata filter and returns how many it removed. Both are below, at the end of this section.
 
 <br/>
 
@@ -714,6 +760,131 @@ print(sorted(record.keys()), len(record["vector"]))
 ```
 
 ⚠️ `get_records()` only returns results for IDs that exist in the index. Missing IDs are silently skipped, so a shorter list than you asked for is how a missing ID is reported.
+
+<br/>
+
+#### ☑️ Count and test membership
+
+`len(index)` is the live record count. `id in index` tests membership. `count(filter)` counts the records a metadata filter matches, and `count()` with no filter is `len(index)`.
+
+```python
+print(len(index))
+print("doc_002" in index, "doc_001" in index)
+print(index.count())
+print(index.count({"author": "Alice"}))
+print(index.count({"author": "Nobody"}))
+```
+*Output*
+```
+4
+True False
+4
+2
+0
+```
+
+`count()` is exact and therefore reads every record's metadata. It cannot stop early, because a count that stopped would be a lower bound rather than a count. `contains(id)` is the same test as `in` and is kept for callers already using it.
+
+<br/>
+
+#### ☑️ Change a record's metadata
+
+`update_metadata(id, metadata)` replaces one record's metadata without resupplying its vector. It touches the metadata and nothing else: the record keeps its vector, its quantized codes and its graph node, and no node is stranded.
+
+```python
+print(index.get_records("doc_002", return_vector=False)[0]["metadata"])
+print(index.update_metadata("doc_002", {"author": "Bob", "status": "reviewed"}))
+print(sorted(index.get_records("doc_002", return_vector=False)[0]["metadata"].items()))
+print(index.update_metadata("no_such_id", {"author": "Nobody"}))
+print(index.get_stats()["stranded_graph_nodes"])
+```
+*Output*
+```
+{'author': 'Bob'}
+True
+[('author', 'Bob'), ('status', 'reviewed')]
+False
+0
+```
+
+The example sorts the second result because a record's metadata comes back as a `dict` whose key order is not stable between processes, the same way `get_all_metadata()` is. Read metadata by key rather than by position.
+
+**The replacement is wholesale, not a merge.** Any key you leave out is gone. That is what `add(overwrite=True)` already does, so the two ways of re-tagging a record agree. It returns `False` for an ID the index does not hold, and writes nothing in that case.
+
+Use this rather than reading a record back with `get_records()` and adding it again. Measured at 20,000 records, the round trip costs 486.5 microseconds against 1.57 for this, and it strands one graph node per update that only `compact()` reclaims.
+
+<br/>
+
+#### ☑️ Remove several records at once
+
+`remove_points(ids)` takes the lock once for the whole batch instead of once per ID. It returns the IDs that were **not** in the index, so an empty list means every one was removed.
+
+```python
+print(index.remove_points(["doc_004", "no_such_id"]))
+print(len(index))
+```
+*Output*
+```
+['no_such_id']
+3
+```
+
+A repeated ID is removed on its first occurrence and is never reported missing.
+
+`remove_where(filter)` removes every record a metadata filter matches, using the same filter language as `search()`, and returns how many it removed.
+
+```python
+print(index.remove_where({"author": "Alice"}))
+print(len(index), index.count({"author": "Alice"}))
+print(index.remove_where({"author": "Nobody"}))
+```
+*Output*
+```
+2
+1 0
+0
+```
+
+An unrecognised operator raises `ValueError` before any record is removed. A filter matching nothing removes nothing and returns `0`.
+
+**An empty filter is refused.** Everywhere else in this language an empty filter matches every record, and `search(filter={})` returns the whole index for that reason. This is the one method where the same rule would destroy every record, and an empty dict reaches it far more often from a filter that was built and came out empty than from a caller who meant it. Name the records with `remove_points(ids)` if that is what you want.
+
+Both leave one stranded graph node per record removed, exactly as `remove_point()` does. Neither calls `compact()`, because compaction costs a full rebuild and only you know whether the debris is worth it yet.
+
+<br/>
+
+#### ♻️ Return the graph's spare capacity
+
+An index built by inserting grows its graph buffers geometrically, so the last growth leaves the largest of them holding close to twice what they use. `shrink_to_fit()` returns that slack to the allocator and reports the bytes it released.
+
+```python
+fresh = vdb.create("hnsw", dim=8, expected_size=300)
+fresh.add({
+    "ids": [f"v{i}" for i in range(500)],
+    "embeddings": [[float(i % 7) + j * 0.1 for j in range(8)] for i in range(500)],
+})
+
+before = float(fresh.get_stats()["graph_memory_mb"])
+freed = fresh.shrink_to_fit()
+after = float(fresh.get_stats()["graph_memory_mb"])
+print(freed > 0, after < before)
+print(fresh.shrink_to_fit())
+```
+*Output*
+```
+True True
+0
+```
+
+The index above declared 300 records and was given 500, so its graph grew and left slack behind. `index`, the index used throughout this section, returns `0` instead, because `compact()` was called on it earlier and compaction already shrinks the graph it rebuilds.
+
+**No node, edge or distance is touched**, so every search returns the same page with the same scores. Measured on 50,000 records of `dim=1536` at `m=32`, it released 188.28 MB in one millisecond, taking `graph_memory_mb` from 510.16 to 321.88 and the process commit charge down by the same amount. Search latency measured 1,101 microseconds after against 1,122 before, so the slack was buying nothing.
+
+That 321.88 MB is exactly what the same index reports after a `save()` and `load()` round trip, which is where this figure used to come from. `compact()` does not reclaim it on its own, because compaction rebuilds by inserting and regrows the same slack, so `compact()` now calls this on the graph it builds.
+
+**Call it on an index that holds its records, not on one about to receive them.** On an empty index it hands back the whole creation reservation that `expected_size` bought, so every later insertion regrows the arenas from nothing.
+
+**The index stays writable.** The buffers grow again on the next `add()`, which costs one reallocation: a 1,000-record batch straight after a shrink measured 2.009 s against 1.883 s for the next identical batch. That is why it is never automatic. On an index that is finished, or one about to be searched for a long time, there is nothing to trade.
 
 <br />
 
@@ -907,7 +1078,9 @@ Two consequences of `quantized_only` are worth knowing before you pick it.
 
 **Both modes hold less than an unquantized index once they clear the fixed cost, `quantized_with_raw` included.** The HNSW graph owns a second copy of every point, separate from the storage map, and that copy is `dim × 4` bytes in an unquantized index and `subvectors` bytes in a quantized one whichever storage mode is set. `quantized_only` drops both copies and `quantized_with_raw` drops the graph's, which at `dim=768` is 3,072 bytes per record. Measured resident against the same data unquantized at `dim=768`, `quantized_with_raw` holds 0.69x at 10,000 records and 0.59x at 100,000 at the default `subvectors`, and 0.60x and 0.47x at 8 subvectors. `quantized_only` holds 0.35x and 0.29x at the default `subvectors`. `get_stats()["graph_memory_mb"]` reports the graph for your own index and `total_memory_mb` includes it.
 
-**Quantization shrinks the graph's copy of the point and nothing else in the graph.** The neighbour lists, the sixteen layer headers every point carries and the counters around them are the same in all three configurations, so a quantized graph is smaller rather than negligible. Measured on 50,000 real 1,536-dimensional embeddings at `m=32`, `graph_memory_mb` reads 399.4 MB unquantized and 98.1 MB quantized, and 293.0 MB of that difference is the copy.
+**Quantization shrinks the graph's copy of the point and nothing else in the graph.** The neighbour lists, the sixteen layer headers every point carries and the counters around them are the same in all three configurations, so a quantized graph is smaller rather than negligible. Measured on 50,000 real 1,536-dimensional embeddings at `m=32`, `graph_memory_mb` reads 321.88 MB unquantized and 31.20 MB quantized. The whole 290.68 MB difference is the copy, which is 292.97 MB at full width and 2.29 MB as codes. What is left in both is the same 28.91 MB of neighbour lists, layer headers and counters.
+
+**Both figures describe a settled index**, meaning one after `save()` and `load()`, or one after `shrink_to_fit()`. Those two states agree exactly. A **freshly built** index reports 510.16 MB unquantized and 31.85 MB quantized, because a graph grown by insertion carries spare buffer capacity that a graph read from a dump never had. Read which of the two states any graph figure describes, your own included. `shrink_to_fit()` turns the first into the second.
 
 **How much quantization saves is set by the dimension, and below `dim=256` it is not much.** Quantization removes the graph's copy of the vector and puts a code in its place, so what it can save per record is `dim × 4 − 2 × subvectors` bytes against the `dim × 8` an unquantized index holds for its two copies plus about 2,740 bytes of graph neighbour lists, id maps and metadata that neither mode touches. Measured resident, one dimension per process, 25,000 records at `m=32`, an unquantized index and a `quantized_with_raw` one built over the same records:
 
@@ -1044,12 +1217,12 @@ The two tables below carry fetch figures measured before the codebook seeding th
 
 | records | calibrated fetch | unquantized | quantized, default rerank | ratio |
 |---:|---:|---:|---:|---:|
-| 10,000 | 277 | 1.97 ms | 1.89 ms | 0.96 |
-| 25,000 | 459 | 2.75 ms | 4.29 ms | 1.56 |
-| 50,000 | 561 | 3.44 ms | 5.30 ms | 1.54 |
-| 100,000 | 776 | 3.17 ms | 7.65 ms | 2.42 |
+| 10,000 | 277 | 0.75 ms | 0.71 ms | 0.95 |
+| 25,000 | 411 | 0.79 ms | 0.97 ms | 1.23 |
+| 50,000 | 554 | 1.17 ms | 1.54 ms | 1.32 |
+| 100,000 | 747 | 1.18 ms | 2.12 ms | 1.79 |
 
-Each row is one process building both indexes over the same records, so the ratio is the figure to read. The absolute times move between rows because each row is its own process, and the 100,000 row is unpaired, being the loaded index above against the unquantized figure from the grid.
+Each row is one process building both indexes over the same records, the 100,000 row included, so the ratio is the figure to read. The absolute times still move between rows because each row is its own process.
 
 The crossover is structural rather than a tuning accident. The traversal has to be as wide as the fetch because HNSW cannot return more results than its candidate list holds, an HNSW search costs roughly linear time in that width, and the fetch grows with the record count while an unquantized search grows with its logarithm, so the two cross once. What the calibration changes is where and how steeply. The fixed 2% of the corpus reached a ratio of 6.91 at 100,000 records on this dataset, and a fetch measured on the data reaches 2.42.
 
@@ -1362,10 +1535,15 @@ A filter is a dict of field names. A field maps either to a plain value, which m
 | `startswith` | `{"startswith": value}` | `{"title": {"startswith": "The"}}` | String starts with substring |
 | `endswith` | `{"endswith": value}` | `{"file": {"endswith": ".pdf"}}` | String ends with substring |
 | `in` | `{"in": [values]}` | `{"lang": {"in": ["en", "es"]}}` | Value is in the provided array |
+| `nin` | `{"nin": [values]}` | `{"lang": {"nin": ["en", "es"]}}` | Value is not in the provided array |
+| `any` | `{"any": [values]}` | `{"tags": {"any": ["ai", "ml"]}}` | Array field shares at least one element with the provided array |
+| `all` | `{"all": [values]}` | `{"tags": {"all": ["ai", "ml"]}}` | Array field holds every element of the provided array |
+
+`any` and `all` exist because the filter language has no disjunction and a field maps to one condition object, so it cannot carry `contains` twice. On a field holding a plain value rather than an array, both read it as an array of one.
 
 Three behaviours are worth knowing.
 
-**A record that lacks the field never matches, whatever the operator.** That includes `ne`. `{"lang": {"ne": "en"}}` does not match a record with no `lang` at all.
+**A record that lacks the field never matches, whatever the operator.** That includes `ne` and `nin`. `{"lang": {"ne": "en"}}` and `{"lang": {"nin": ["en"]}}` do not match a record with no `lang` at all, and they agree because `nin` against a one-element array means what `ne` means. There is no filter that selects records missing a field.
 
 **A dict value is always read as operators.** Direct equality against a nested object has no plain form, because the two would be indistinguishable, so write it as `{"source": {"eq": {"kind": "web"}}}`. Writing `{"source": {"kind": "web"}}` raises `ValueError: Unknown filter operation: kind`.
 

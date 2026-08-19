@@ -342,7 +342,7 @@ impl HNSWIndex {
                 stats.insert("sdc_table_memory_mb".to_string(), format!("{:.2}", sdc_mb));
 
                 if pq_trained {
-                    let compression_ratio = (pq.dim as f64 * 4.0) / pq.subvectors as f64;
+                    let compression_ratio = (pq.dim() as f64 * 4.0) / pq.subvectors() as f64;
                     stats.insert(
                         "quantization_compression_ratio".to_string(),
                         format!("{:.1}x", compression_ratio),
@@ -545,7 +545,7 @@ impl HNSWIndex {
             let compression_info = self
                 .pq
                 .as_ref()
-                .map(|pq| format!("{:.1}x", (pq.dim as f64 * 4.0) / pq.subvectors as f64))
+                .map(|pq| format!("{:.1}x", (pq.dim() as f64 * 4.0) / pq.subvectors() as f64))
                 .unwrap_or_else(|| "unknown".to_string());
 
             format!(
@@ -596,8 +596,8 @@ impl HNSWIndex {
                     .ok()?;
 
                     // Calculate compression ratio using cached values
-                    let original_bytes = pq.dim * 4; // f32
-                    let compressed_bytes = pq.subvectors; // u8 per subvector
+                    let original_bytes = pq.dim() * 4; // f32
+                    let compressed_bytes = pq.subvectors(); // u8 per subvector
                     let compression_ratio = original_bytes as f64 / compressed_bytes as f64;
                     dict.set_item("compression_ratio", compression_ratio).ok()?;
                 }

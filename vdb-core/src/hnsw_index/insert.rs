@@ -7,11 +7,13 @@
 //! the graph nodes that removal and replacement leave behind.
 
 use super::{HNSWIndex, ParsedRecords, StorageMode, MAX_LAYER};
+use crate::filter::matches_filter;
 use crate::graph::{Record, VectorGraph};
 use pyo3::prelude::*;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+use std::sync::RwLockWriteGuard;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
 /// Multiple of `expected_size` at which an index warns that it has outgrown its
@@ -37,6 +39,20 @@ pub(super) enum InsertError {
     /// Counted against `total_errors` once formatted
     Vector { id: String, err: PyErr },
 }
+/// The five write guards a removal holds, taken in the order `HNSWIndex`
+/// declares.
+///
+/// A struct rather than five locals so that a batch can take them once and lend
+/// them to the per record helper. They drop in field order, which is the
+/// acquisition order, and releasing may happen in any order.
+struct RemovalGuards<'a> {
+    id_map: RwLockWriteGuard<'a, HashMap<String, usize>>,
+    rev_map: RwLockWriteGuard<'a, HashMap<usize, String>>,
+    vectors: RwLockWriteGuard<'a, HashMap<String, Vec<f32>>>,
+    pq_codes: RwLockWriteGuard<'a, HashMap<String, Vec<u8>>>,
+    vector_metadata: RwLockWriteGuard<'a, HashMap<String, HashMap<String, Value>>>,
+}
+
 impl HNSWIndex {
     /// Warn once when the index holds materially more records than it declared
     ///
@@ -151,6 +167,108 @@ impl HNSWIndex {
         *counter
     }
 
+    /// Every write guard a removal takes, in the order `HNSWIndex` declares
+    /// them.
+    ///
+    /// A batch removal holds one set of these for the whole batch rather than
+    /// taking and releasing five guards per id, so the guards have to be a value
+    /// a helper can borrow. The order is the declared one, which matters because
+    /// a search holds `rev_map` for its whole traversal and takes `vectors`
+    /// afterwards.
+    fn removal_guards(&self) -> RemovalGuards<'_> {
+        RemovalGuards {
+            id_map: self.id_map.write().unwrap(),
+            rev_map: self.rev_map.write().unwrap(),
+            vectors: self.vectors.write().unwrap(),
+            pq_codes: self.pq_codes.write().unwrap(),
+            vector_metadata: self.vector_metadata.write().unwrap(),
+        }
+    }
+
+    /// Remove one record with the guards already held.
+    ///
+    /// `storage_mode` is passed in rather than read, because reading it reaches
+    /// the graph lock and the declared order puts the graph above every map the
+    /// caller is holding.
+    fn remove_under_guards(
+        &self,
+        guards: &mut RemovalGuards<'_>,
+        id: &str,
+        storage_mode: &str,
+    ) -> bool {
+        let Some(internal_id) = guards.id_map.remove(id) else {
+            trace!(
+                operation = "remove_point_internal",
+                vector_id = %id,
+                "Vector not found for removal"
+            );
+            return false;
+        };
+
+        // Track what we're removing for logging
+        let had_raw_vector = guards.vectors.contains_key(id);
+        let had_pq_codes = guards.pq_codes.contains_key(id);
+
+        // Remove from all data structures
+        guards.vectors.remove(id); // Remove raw vectors (if present)
+        guards.vector_metadata.remove(id); // Remove metadata
+        guards.pq_codes.remove(id); // Remove PQ codes (if present)
+        guards.rev_map.remove(&internal_id); // Remove ID mapping
+
+        // Enhanced training state cleanup for quantization
+        if self.has_quantization() {
+            // Remove from training IDs if present and not yet trained
+            if !self.can_use_quantization() {
+                let mut training_ids = self.training_ids.write().unwrap();
+                let original_len = training_ids.len();
+                training_ids.retain(|training_id| training_id != id);
+
+                if training_ids.len() != original_len {
+                    trace!(
+                        operation = "training_cleanup",
+                        vector_id = %id,
+                        remaining_training_vectors = training_ids.len(),
+                        "Removed vector from training set"
+                    );
+
+                    // Update threshold status if we dropped below training size
+                    if let Some(config) = &self.quantization_config {
+                        if training_ids.len() < config.training_size {
+                            self.training_threshold_reached
+                                .store(false, std::sync::atomic::Ordering::Release);
+                            debug!(
+                                operation = "training_threshold_reset",
+                                remaining_vectors = training_ids.len(),
+                                required = config.training_size,
+                                "Training threshold reset due to removal"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Decrement vector count since we removed a vector
+        {
+            let mut count = self.vector_count.lock().unwrap();
+            if *count > 0 {
+                *count -= 1;
+            }
+        }
+
+        debug!(
+            operation = "remove_point_internal",
+            vector_id = %id,
+            internal_id = internal_id,
+            had_raw_vector = had_raw_vector,
+            had_pq_codes = had_pq_codes,
+            storage_mode = storage_mode,
+            note = "hnsw_graph_entries_remain_unreachable",
+            "Vector completely removed from index (HNSW graph entries become unreachable)"
+        );
+        true
+    }
+
     /// Internal remove_point method that can be called without Python bindings
     /// This is the core method that properly removes all traces of a document
     /// Enhanced internal remove_point method with comprehensive PQ support
@@ -158,89 +276,112 @@ impl HNSWIndex {
         // Read before the guards are taken, because it reaches the graph lock and
         // the declared order puts the graph above every map held below.
         let storage_mode = self.get_storage_mode();
+        let mut guards = self.removal_guards();
+        Ok(self.remove_under_guards(&mut guards, &id, &storage_mode))
+    }
 
-        // Every write guard, in the order declared on `HNSWIndex`. This used to
-        // take `vectors` before `rev_map`, which is the reverse of what a search
-        // does, and a search holds `rev_map` for its whole traversal. That pair
-        // could not overlap while the receivers were exclusive. It can now.
-        let mut id_map = self.id_map.write().unwrap();
-        let mut rev_map = self.rev_map.write().unwrap();
-        let mut vectors = self.vectors.write().unwrap();
-        let mut pq_codes = self.pq_codes.write().unwrap();
-        let mut vector_metadata = self.vector_metadata.write().unwrap();
-
-        // Check if the document exists
-        if let Some(internal_id) = id_map.remove(&id) {
-            // Track what we're removing for logging
-            let had_raw_vector = vectors.contains_key(&id);
-            let had_pq_codes = pq_codes.contains_key(&id);
-
-            // Remove from all data structures
-            vectors.remove(&id); // Remove raw vectors (if present)
-            vector_metadata.remove(&id); // Remove metadata
-            pq_codes.remove(&id); // Remove PQ codes (if present)
-            rev_map.remove(&internal_id); // Remove ID mapping
-
-            // Enhanced training state cleanup for quantization
-            if self.has_quantization() {
-                // Remove from training IDs if present and not yet trained
-                if !self.can_use_quantization() {
-                    let mut training_ids = self.training_ids.write().unwrap();
-                    let original_len = training_ids.len();
-                    training_ids.retain(|training_id| training_id != &id);
-
-                    if training_ids.len() != original_len {
-                        trace!(
-                            operation = "training_cleanup",
-                            vector_id = %id,
-                            remaining_training_vectors = training_ids.len(),
-                            "Removed vector from training set"
-                        );
-
-                        // Update threshold status if we dropped below training size
-                        if let Some(config) = &self.quantization_config {
-                            if training_ids.len() < config.training_size {
-                                self.training_threshold_reached
-                                    .store(false, std::sync::atomic::Ordering::Release);
-                                debug!(
-                                    operation = "training_threshold_reset",
-                                    remaining_vectors = training_ids.len(),
-                                    required = config.training_size,
-                                    "Training threshold reset due to removal"
-                                );
-                            }
-                        }
-                    }
-                }
+    /// Remove a batch of records under one set of guards.
+    ///
+    /// Returns the ids that were not in the index, in the order they were given.
+    /// A repeated id is handled on its first occurrence and skipped afterwards,
+    /// so a batch naming one id twice removes it once and reports it missing
+    /// never. Reporting the second occurrence as missing would be a true
+    /// statement about the index at that instant and a useless one about the
+    /// request, since what the caller asked for is that the record be gone.
+    ///
+    /// The five guards are taken once for the batch rather than once per id,
+    /// which is the whole reason this exists beside `remove_point_internal`.
+    /// What that changes for a reader is that the batch is atomic against every
+    /// search: none of them sees the index part way through it.
+    pub(super) fn remove_points_internal(&self, ids: &[String]) -> Vec<String> {
+        let storage_mode = self.get_storage_mode();
+        let mut guards = self.removal_guards();
+        let mut handled: HashSet<&str> = HashSet::with_capacity(ids.len());
+        let mut missing = Vec::new();
+        for id in ids {
+            if !handled.insert(id.as_str()) {
+                continue;
             }
-
-            // Decrement vector count since we removed a vector
-            {
-                let mut count = self.vector_count.lock().unwrap();
-                if *count > 0 {
-                    *count -= 1;
-                }
+            if !self.remove_under_guards(&mut guards, id, &storage_mode) {
+                missing.push(id.clone());
             }
-
-            debug!(
-                operation = "remove_point_internal",
-                vector_id = %id,
-                internal_id = internal_id,
-                had_raw_vector = had_raw_vector,
-                had_pq_codes = had_pq_codes,
-                storage_mode = storage_mode,
-                note = "hnsw_graph_entries_remain_unreachable",
-                "Vector completely removed from index (HNSW graph entries become unreachable)"
-            );
-            Ok(true)
-        } else {
-            trace!(
-                operation = "remove_point_internal",
-                vector_id = %id,
-                "Vector not found for removal"
-            );
-            Ok(false)
         }
+        missing
+    }
+
+    /// Remove every record whose metadata matches, and report how many.
+    ///
+    /// Two phases, because the matching set is read from `vector_metadata` and
+    /// the removal writes it. The read guard is dropped before the write guards
+    /// are taken, and nothing can change the index in between because the caller
+    /// holds the mutation guard.
+    ///
+    /// The walk is the evaluation `scan_candidates` runs and it reuses
+    /// `matches_filter` unchanged. What it does not reuse is that function's
+    /// give-up point, its distances or its ranking, none of which a deletion has
+    /// a use for. So this walk is complete where the search's is bounded.
+    ///
+    /// A filter carrying an operator the engine does not implement is rejected
+    /// by the caller before this runs, which is why the evaluation here has no
+    /// error channel. Excluding a record is the conservative answer if a future
+    /// operator ever makes the error reachable, since it leaves the record in
+    /// place.
+    pub(super) fn remove_where_locked(&self, filter: &HashMap<String, Value>) -> usize {
+        let doomed: Vec<String> = {
+            let vector_metadata = self.vector_metadata.read().unwrap();
+            vector_metadata
+                .iter()
+                .filter(|(_, meta)| matches_filter(meta, filter).unwrap_or(false))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+
+        let total = doomed.len();
+        let missing = self.remove_points_internal(&doomed);
+        debug_assert!(
+            missing.is_empty(),
+            "every id came from the metadata store under the mutation guard, so none of them can have been absent by the time it was removed"
+        );
+        total - missing.len()
+    }
+
+    /// Replace one record's metadata, leaving its vector and the graph alone.
+    ///
+    /// Wholesale rather than a merge, which is what `add(overwrite=True)` does:
+    /// that path removes the record outright, dropping the old metadata with it,
+    /// and inserts the supplied metadata in its place. A merging update would
+    /// mean the two ways of re-tagging a record disagreed about a key the caller
+    /// left out, and no third way exists to express the other intent.
+    ///
+    /// `false` for an id the index does not hold, which is what `remove_point`
+    /// answers for the same question, and nothing is written in that case.
+    ///
+    /// Existence is decided by `id_map` rather than by the metadata store,
+    /// because `id_map` is the record set. Every insertion path writes a
+    /// metadata entry even for a record supplied without metadata, so the two
+    /// agree, and keying on the authoritative one means they cannot drift.
+    pub(super) fn update_metadata_locked(
+        &self,
+        id: &str,
+        metadata: HashMap<String, Value>,
+    ) -> bool {
+        let id_map = self.id_map.read().unwrap();
+        if !id_map.contains_key(id) {
+            trace!(
+                operation = "update_metadata",
+                vector_id = %id,
+                "Record not found, metadata not written"
+            );
+            return false;
+        }
+        let mut vector_metadata = self.vector_metadata.write().unwrap();
+        vector_metadata.insert(id.to_string(), metadata);
+        trace!(
+            operation = "update_metadata",
+            vector_id = %id,
+            "Metadata replaced"
+        );
+        true
     }
 
     /// The body of `compact`, with the interpreter lock already released
@@ -365,6 +506,13 @@ impl HNSWIndex {
         }
 
         let nodes_after = new_hnsw.nb_points();
+
+        // The replacement was built by insertion, so its arenas carry the same
+        // geometric slack the graph being replaced carried. Compaction exists to
+        // return memory, and returning it while still holding the graph outside
+        // the write guard costs one copy of the live bytes against a rebuild that
+        // has just re-inserted every record.
+        let bytes_shrunk = new_hnsw.shrink_to_fit();
         self.replace_graph(new_hnsw);
 
         let reclaimed = nodes_before - nodes_after;
@@ -373,6 +521,7 @@ impl HNSWIndex {
             nodes_before = nodes_before,
             nodes_after = nodes_after,
             nodes_reclaimed = reclaimed,
+            graph_bytes_shrunk = bytes_shrunk,
             live_records = live_count,
             quantized = quantized,
             duration_ms = start_time.elapsed().as_millis(),
@@ -428,8 +577,8 @@ impl HNSWIndex {
         &self,
         parsed_data: ParsedRecords,
         overwrite: bool,
-    ) -> (usize, Vec<InsertError>) {
-        let mut total_inserted = 0;
+    ) -> (Vec<String>, Vec<InsertError>) {
+        let mut inserted_ids: Vec<String> = Vec::with_capacity(parsed_data.len());
         let mut errors: Vec<InsertError> = Vec::new();
 
         // ENHANCED FIX: Handle overwrites properly for ALL paths (Raw, Training, PQ)
@@ -531,7 +680,10 @@ impl HNSWIndex {
             // The add_single_vector method will route to the correct path based on current PQ state
             match self.add_single_vector(id, vector, metadata, false) {
                 Ok(inserted_new) => {
-                    total_inserted += 1;
+                    // The id is recorded here rather than counted, because the
+                    // caller now needs to know which records landed and not only
+                    // how many. `total_inserted` is this list's length.
+                    inserted_ids.push(id_for_error.clone());
                     if inserted_new {
                         let mut count = self.vector_count.lock().unwrap();
                         *count += 1;
@@ -560,7 +712,7 @@ impl HNSWIndex {
             }
         }
 
-        (total_inserted, errors)
+        (inserted_ids, errors)
     }
 
     // 1. CORE VECTOR OPERATIONS (6 methods)

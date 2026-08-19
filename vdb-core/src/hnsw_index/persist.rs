@@ -359,9 +359,14 @@ impl HNSWIndex {
         self.dim
     }
 
-    /// Get the distance space (cosine, l2, l1) - changed to a more idiomatic getter
-    pub fn space(&self) -> &str {
-        // Changed from get_space to space
+    /// Get the distance space (cosine, l2, l1) without cloning it
+    ///
+    /// Named `space_str` rather than `space` because the Python property that
+    /// serves `index.space` is a `#[getter]` in the `#[pymethods]` block, and
+    /// PyO3 takes the property name from the Rust method name. Two methods of
+    /// one name on one type do not coexist across impl blocks, so the internal
+    /// accessor is the one that moves.
+    pub fn space_str(&self) -> &str {
         &self.space
     }
 

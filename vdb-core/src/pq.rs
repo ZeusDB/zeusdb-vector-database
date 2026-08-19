@@ -24,9 +24,14 @@ const PQ_TRAINING_SEED: u64 = 0x5A_EE_5D_B0_5E_ED_57_02;
 
 /// Product Quantization implementation for vector compression
 pub struct PQ {
-    pub dim: usize,
-    pub subvectors: usize,
-    pub bits: usize,
+    /// The five scalars below are written once, by `PQ::new`, and read
+    /// everywhere. They were `pub` on a struct whose interior state was already
+    /// behind accessors, so the type asked a reader to hold two rules at once
+    /// about what may be touched. They are private now and each has an accessor
+    /// of its own name.
+    dim: usize,
+    subvectors: usize,
+    bits: usize,
     pub training_size: usize,
     pub max_training_vectors: Option<usize>,
 
@@ -67,8 +72,8 @@ pub struct PQ {
     sdc_table: RwLock<Vec<f32>>,
 
     /// Cache computed values for performance
-    pub sub_dim: usize,
-    pub num_centroids: usize,
+    sub_dim: usize,
+    num_centroids: usize,
 }
 
 impl PQ {
@@ -101,6 +106,32 @@ impl PQ {
     }
 
     /// Check if PQ has been trained
+    /// Values in a vector this quantizer encodes.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Subvectors a vector is split into, which is also the byte length of a
+    /// code.
+    pub fn subvectors(&self) -> usize {
+        self.subvectors
+    }
+
+    /// Bits per subvector code, which fixes the centroid count.
+    pub fn bits(&self) -> usize {
+        self.bits
+    }
+
+    /// Values in one subvector, being `dim / subvectors`.
+    pub fn sub_dim(&self) -> usize {
+        self.sub_dim
+    }
+
+    /// Centroids per subvector, being `2 ^ bits`.
+    pub fn num_centroids(&self) -> usize {
+        self.num_centroids
+    }
+
     pub fn is_trained(&self) -> bool {
         *self.is_trained.read().unwrap()
     }
@@ -710,11 +741,11 @@ mod tests {
     #[test]
     fn test_pq_creation() {
         let pq = PQ::new(128, 8, 8, 10000, None);
-        assert_eq!(pq.dim, 128);
-        assert_eq!(pq.subvectors, 8);
-        assert_eq!(pq.bits, 8);
-        assert_eq!(pq.sub_dim, 16);
-        assert_eq!(pq.num_centroids, 256);
+        assert_eq!(pq.dim(), 128);
+        assert_eq!(pq.subvectors(), 8);
+        assert_eq!(pq.bits(), 8);
+        assert_eq!(pq.sub_dim(), 16);
+        assert_eq!(pq.num_centroids(), 256);
         assert!(!pq.is_trained());
     }
 
