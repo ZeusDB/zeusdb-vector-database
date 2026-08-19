@@ -8,6 +8,9 @@ Every method here has a case for an empty index, a case for the error it can
 raise or the falsehood it can report, and a case for ordinary use.
 """
 
+import os
+import tempfile
+
 import numpy as np
 import pytest
 from zeusdb_vector_database import VectorDatabase
@@ -387,7 +390,9 @@ def test_update_metadata_leaves_the_vector_and_the_graph_alone():
     before_nodes = int(index.get_stats()["graph_nodes"])
     before_page = [h["id"] for h in index.search([1, 0, 0, 0], top_k=5)]
     assert index.update_metadata("r2", {"tier": "new"}) is True
-    assert index.get_records("r2", return_vector=True)[0]["vector"] == before_vector
+    assert np.array_equal(
+        index.get_records("r2", return_vector=True)[0]["vector"], before_vector
+    )
     assert int(index.get_stats()["graph_nodes"]) == before_nodes
     assert int(index.get_stats()["stranded_graph_nodes"]) == 0
     assert [h["id"] for h in index.search([1, 0, 0, 0], top_k=5)] == before_page
@@ -645,7 +650,9 @@ def test_update_metadata_on_a_quantized_index_leaves_the_codes_alone():
     assert index.update_metadata("q5", {"tier": "c"}) is True
 
     assert index.get_stats()["quantized_codes_stored"] == codes_before
-    assert index.get_records("q5", return_vector=True)[0]["vector"] == vector_before
+    assert np.array_equal(
+        index.get_records("q5", return_vector=True)[0]["vector"], vector_before
+    )
     assert [h["id"] for h in index.search(query, top_k=10)] == page_before
     assert index.count({"tier": "c"}) == 1
 
@@ -658,3 +665,283 @@ def test_quantized_index_still_searches_after_a_shrink():
     index.shrink_to_fit()
     after = [[(h["id"], h["score"]) for h in index.search(q, top_k=10)] for q in queries]
     assert before == after
+
+
+def tiers(n):
+    """One metadata mapping per record, alternating tier."""
+    return [{"tier": "gold" if i % 2 == 0 else "silver"} for i in range(n)]
+
+
+# ------------------------------------------------------------
+# delete, the name four of five comparators use
+# ------------------------------------------------------------
+def test_delete_dispatches_to_the_two_existing_methods():
+    """An alias, and the existing names stay.
+
+    A caller arriving from hnswlib, ChromaDB, Qdrant or LanceDB reaches for
+    index.delete(...) and got an AttributeError.
+    """
+    index = build(6, metadatas=tiers(6))
+
+    # A single string, matching get_records, and a list of strings.
+    assert index.delete(ids="r1") == 1
+    assert index.delete(ids=["r2", "r3"]) == 2
+    assert not index.contains("r1")
+    assert len(index) == 3
+
+    # Absent ids count zero rather than raising. Removing a record that is not
+    # there is the state the caller asked for.
+    assert index.delete(ids=["nothing", "nowhere"]) == 0
+    assert len(index) == 3
+
+    # A repeated id names one record, so it counts once.
+    assert index.delete(ids=["r4", "r4", "r4"]) == 1
+    assert len(index) == 2
+
+    # r0 and r5 are left, being tier gold and tier silver.
+    assert sorted(record_id for record_id, _ in index.list(10)) == ["r0", "r5"]
+    assert index.delete(where={"tier": "gold"}) == 1
+    assert sorted(record_id for record_id, _ in index.list(10)) == ["r5"]
+
+
+def test_delete_refuses_both_arguments_and_neither():
+    """Two selections do not compose, and no selection is not everything."""
+    index = build(4, metadatas=tiers(4))
+
+    with pytest.raises(ValueError, match="not both"):
+        index.delete(ids=["r1"], where={"tier": "gold"})
+
+    with pytest.raises(ValueError, match="requires 'ids' or 'where'"):
+        index.delete()
+
+    # Neither call touched the index.
+    assert len(index) == 4
+
+    # A wrong type for ids says so rather than being read as a filter.
+    with pytest.raises(TypeError, match="string or a list of strings"):
+        index.delete(ids=17)
+
+    # An empty list is a delete of nothing, not a delete of everything.
+    assert index.delete(ids=[]) == 0
+    assert len(index) == 4
+
+    # An empty filter is refused by remove_where and delete inherits that.
+    with pytest.raises(ValueError, match="requires a filter that selects records"):
+        index.delete(where={})
+    assert len(index) == 4
+
+    # An empty index is not a special case for either argument.
+    empty = build(0)
+    assert empty.delete(ids=["absent"]) == 0
+    assert empty.delete(where={"tier": "gold"}) == 0
+
+
+def test_delete_agrees_with_the_methods_it_aliases():
+    """The same selection through either name leaves the same index."""
+    by_alias = build(8, metadatas=tiers(8))
+    by_method = build(8, metadatas=tiers(8))
+
+    assert by_alias.delete(ids=["r2", "r5"]) == 2
+    assert by_method.remove_points(["r2", "r5"]) == []
+    assert sorted(i for i, _ in by_alias.list(20)) == sorted(
+        i for i, _ in by_method.list(20)
+    )
+
+    assert by_alias.delete(where={"tier": "gold"}) == by_method.remove_where(
+        {"tier": "gold"}
+    )
+    assert sorted(i for i, _ in by_alias.list(20)) == sorted(
+        i for i, _ in by_method.list(20)
+    )
+
+    # remove_points still reports which ids were missing, which is the detail
+    # delete's count does not carry.
+    assert by_method.remove_points(["r1", "absent"]) == ["absent"]
+
+
+# ------------------------------------------------------------
+# clear, which llama-index probes for and did not find
+# ------------------------------------------------------------
+def test_clear_empties_the_index_and_reclaims_the_graph():
+    """A fresh graph rather than remove_points over every id.
+
+    Removing every record one at a time leaves one stranded node per record, so
+    an emptied index would report a graph full of dead nodes and no live ones.
+    """
+    index = build(6, metadatas=tiers(6))
+
+    # Some debris first, so there is something for the replacement to reclaim.
+    index.remove_points(["r1", "r2"])
+    assert int(index.get_stats()["stranded_graph_nodes"]) == 2
+
+    assert index.clear() == 4
+    assert len(index) == 0
+    assert index.get_vector_count() == 0
+    assert int(index.get_stats()["graph_nodes"]) == 0
+    assert int(index.get_stats()["stranded_graph_nodes"]) == 0
+    assert int(index.get_stats()["total_vectors"]) == 0
+    assert index.list(10) == []
+    assert index.count() == 0
+    assert not index.contains("r3")
+    assert index.get_records(["r3", "r4"]) == []
+
+    # A search on an emptied index is an empty page rather than an error.
+    assert index.search([1.0, 0.0, 0.0, 0.0], top_k=5) == []
+    assert index.count({"tier": "gold"}) == 0
+
+    # The configuration survived.
+    assert index.dim == 4
+    assert index.space == "cosine"
+    assert index.m == 16
+    assert index.ef_construction == 200
+
+    # And it is usable again, with the internal ids restarted so a generated id
+    # is vec_1 rather than continuing from where the cleared records stopped.
+    index.add({"embeddings": [[1.0, 0.0, 0.0, 0.0]]})
+    assert [record_id for record_id, _ in index.list(10)] == ["vec_1"]
+    assert index.search([1.0, 0.0, 0.0, 0.0], top_k=1)[0]["id"] == "vec_1"
+
+
+def test_clear_on_an_empty_index_is_not_an_error():
+    """Nothing to remove returns zero and still replaces the graph."""
+    index = build(0)
+    assert index.clear() == 0
+    assert len(index) == 0
+    assert index.clear() == 0
+
+    # Clearing twice in a row is the same as clearing once.
+    index.add({"ids": ["a"], "embeddings": [[1.0, 0.0, 0.0, 0.0]]})
+    assert index.clear() == 1
+    assert index.clear() == 0
+    assert len(index) == 0
+
+
+def test_clear_keeps_a_fitted_codebook_and_drops_the_records():
+    """Training is not undone, because it cannot be refitted from nothing.
+
+    A trained quantized index stays trained and its replacement graph is a
+    quantized graph. An untrained one returns to collecting, since what it had
+    collected is gone.
+    """
+    rng = np.random.default_rng(11)
+    vectors = rng.standard_normal((2000, 64)).astype(np.float32)
+    ids = [str(k) for k in range(2000)]
+
+    for mode in ("quantized_with_raw", "quantized_only"):
+        index = VectorDatabase().create(
+            "hnsw", dim=64, expected_size=20000,
+            quantization_config={"type": "pq", "subvectors": 8, "bits": 8,
+                                 "training_size": 2000, "storage_mode": mode},
+        )
+        assert index.add({"ids": ids, "embeddings": vectors}).is_success()
+        assert index.is_quantized()
+
+        assert index.clear() == 2000
+        assert len(index) == 0
+        # Still trained, and holding no records under either storage.
+        assert index.is_quantized()
+        assert int(index.get_stats()["quantized_codes_stored"]) == 0
+        assert int(index.get_stats()["raw_vectors_stored"]) == 0
+        assert int(index.get_stats()["graph_nodes"]) == 0
+
+        # The replacement graph is a quantized graph, so refilling and
+        # searching works without retraining.
+        index.add({"ids": ["x", "y"], "embeddings": vectors[:2]})
+        page = index.search(vectors[0], top_k=2)
+        assert [hit["id"] for hit in page] == ["x", "y"]
+
+    # An index still collecting starts collecting again.
+    index = VectorDatabase().create(
+        "hnsw", dim=64, expected_size=20000,
+        quantization_config={"type": "pq", "subvectors": 8, "bits": 8,
+                             "training_size": 2000, "storage_mode": "quantized_only"},
+    )
+    index.add({"ids": ids[:500], "embeddings": vectors[:500]})
+    assert not index.is_quantized()
+    assert index.training_vectors_needed() == 1500
+
+    assert index.clear() == 500
+    assert index.training_vectors_needed() == 2000
+    assert index.get_training_progress() == 0.0
+
+
+def test_clear_survives_a_save_and_load():
+    """An emptied index saves and loads as an empty index."""
+    index = build(5, metadatas=tiers(5))
+    assert index.clear() == 5
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "cleared.zdb")
+        index.save(path)
+        loaded = VectorDatabase().load(path)
+
+        assert len(loaded) == 0
+        assert loaded.dim == 4
+        assert loaded.m == 16
+        assert loaded.search([1.0, 0.0, 0.0, 0.0], top_k=3) == []
+
+        loaded.add({"ids": ["fresh"], "embeddings": [[1.0, 0.0, 0.0, 0.0]]})
+        assert loaded.search([1.0, 0.0, 0.0, 0.0], top_k=1)[0]["id"] == "fresh"
+
+
+# ------------------------------------------------------------
+# m, ef_construction and expected_size as typed properties
+# ------------------------------------------------------------
+def test_construction_parameters_are_typed_properties():
+    """int(index.get_stats()['m']) is what a caller wrote before this.
+
+    hnswlib exposes M, ef_construction and max_elements as read-only
+    properties, and every comparator exposes the equivalent typed.
+    """
+    index = VectorDatabase().create(
+        "hnsw", dim=8, space="l2", m=24, ef_construction=120, expected_size=777
+    )
+
+    assert index.m == 24
+    assert index.ef_construction == 120
+    assert index.expected_size == 777
+    assert isinstance(index.m, int)
+    assert isinstance(index.ef_construction, int)
+    assert isinstance(index.expected_size, int)
+
+    # They agree with the text get_stats reports, which is where they were only
+    # reachable before.
+    stats = index.get_stats()
+    assert int(stats["m"]) == index.m
+    assert int(stats["ef_construction"]) == index.ef_construction
+    assert int(stats["expected_size"]) == index.expected_size
+
+    # Read-only. They describe a graph already built, so assigning would name a
+    # graph that does not exist.
+    for name in ("m", "ef_construction", "expected_size"):
+        with pytest.raises(AttributeError):
+            setattr(index, name, 99)
+
+    # They hold on an empty index, since they are the declaration rather than a
+    # measurement, and expected_size is a hint that len may exceed.
+    assert len(index) == 0
+    assert index.expected_size == 777
+    index.add({"embeddings": [[1.0] + [0.0] * 7]})
+    assert index.expected_size == 777
+    assert len(index) == 1
+
+    # The defaults are reachable the same way, including the m ladder.
+    small = VectorDatabase().create("hnsw", dim=4)
+    assert small.m == 16
+    assert small.ef_construction == 200
+    assert small.expected_size == 10000
+    large = VectorDatabase().create("hnsw", dim=4, expected_size=50000)
+    assert large.m == 32
+
+    # A loaded index reports what it was built with.
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "props.zdb")
+        index.save(path)
+        loaded = VectorDatabase().load(path)
+        assert loaded.m == 24
+        assert loaded.ef_construction == 120
+        assert loaded.expected_size == 777
+
+    # Clearing the index does not change what it was built with.
+    index.clear()
+    assert (index.m, index.ef_construction, index.expected_size) == (24, 120, 777)

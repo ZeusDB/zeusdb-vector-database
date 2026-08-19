@@ -188,12 +188,28 @@ HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=5, vecto
 | Parameter        | Type   | Default   | Description                                                                 |
 |------------------|--------|-----------|-----------------------------------------------------------------------------|
 | `index_type`     | `str`  | `"hnsw"`  | The type of vector index to create. Currently only `"hnsw"` is supported. Case-insensitive. |
-| `dim`            | `int`  | `1536`    | Dimensionality of the vectors to be indexed. Each vector must have this length. Must be positive. The default of 1536 matches the output dimensionality of OpenAI's `text-embedding-3-small` and `text-embedding-ada-002` models. |
+| `dim`            | `int`  | *required* | Dimensionality of the vectors to be indexed. Each vector must have this length. Must be positive. **Required as of 0.8.0**, see below. |
 | `space`          | `str`  | `"cosine"`| Distance metric used for similarity search. One of `"cosine"`, `"l1"`, `"l2"`. Case-insensitive. |
 | `m`              | `int`  | `16` or `32`, see below | Number of bi-directional connections created for each new node, from 2 to 256. Higher `m` improves recall but increases index size and build time. |
 | `ef_construction`| `int`  | `200`     | Width of the candidate search each insertion runs. Must be positive. It costs build time and buys graph quality, and it changes neither search latency nor the size of the finished index. See below. |
 | `expected_size`  | `int`  | `10000`   | Estimated number of records to be inserted, from 1 to 100,000,000. Used for preallocating internal data structures and for choosing the default `m`. Not a hard limit, see below. |
 | `quantization_config` | `dict` | `None` | Product Quantization configuration for memory-efficient vector compression. See [Product Quantization](#️-product-quantization). |
+
+**`dim` is required.** It defaulted to 1536 up to 0.7.0, so `vdb.create("hnsw")` built a 1,536 wide index and then rejected every vector of any other width with a dimension mismatch, reporting the mistake at the `add()` rather than at the call that made it. No comparator defaults the dimension. Omitting it now raises `TypeError` naming the parameter.
+
+```python
+try:
+    vdb.create("hnsw")
+except TypeError as error:
+    print(error)
+```
+
+*Output*
+```
+create() requires 'dim', the width of the vectors this index will hold. There is no default because dim has to equal the width your embedding model produces, and an index built at any other width rejects every vector you add to it. Read it off one embedding with len(vector), or pass the width your model documents, for example dim=1536 for OpenAI text-embedding-3-small or dim=768 for most sentence-transformers models.
+```
+
+`space` still defaults, to `cosine`, which is right for every normalised text embedding. No single dimension is right for more than one model family, which is the difference.
 
 **The default `m` depends on `expected_size`.** It is 16 for an `expected_size` of 25,000 or less, and 32 above that. A graph too sparse for the number of records loses recall that no search width recovers, and `m` is fixed once the index is created, so declare `expected_size` honestly or set `m` yourself. Passing `m` explicitly always wins.
 
@@ -383,6 +399,29 @@ The `add()` method inserts or replaces one or more vectors in the index.
 | `data`    | `dict`, `list[dict]`, `dict` of arrays, or `np.ndarray` | *required* | Input records to upsert into the index. Supports the five formats above. |
 | `overwrite` | `bool`                            | `True`  | Whether an ID already in the index is replaced. With `False`, a colliding record is skipped and counted as an error. |
 
+**The parallel arrays must be the same length.** Formats 3 and 5 pair `ids[i]` with `vectors[i]` and `metadatas[i]` by position, so a disagreement in length is a caller error and raises `ValueError`. It named both lengths and which field is short.
+
+```python
+two_wide = vdb.create("hnsw", dim=2)
+try:
+    two_wide.add({"ids": ["c", "d", "e"], "embeddings": [[0.1, 0.2], [0.3, 0.4]]})
+except ValueError as error:
+    print(error)
+print(len(two_wide))
+```
+
+*Output*
+```
+add received 3 entries under 'ids' and 2 under 'embeddings'. A batch pairs them by position, so the two must be the same length, and 'embeddings' is the short one. Supply one id per vector, or omit 'ids' entirely.
+0
+```
+
+The rule covers `ids`, `metadatas` and `metadata`, under every spelling of the vector key, on both the list and the NumPy branch. Up to 0.7.0 the shorter of the two won silently: three IDs and two vectors returned `AddResult(inserted=2, errors=0)` and dropped the third ID, and two IDs and three vectors stored the third under a generated `vec_N` that no caller can look up. Nothing is inserted before the raise, so the call is safe to retry.
+
+Omitting `ids` entirely is not a disagreement and still generates one per record. A parallel array must be a `list`; a `tuple` or an `ndarray` raises `TypeError`, because only a list is read by position and any other type was discarded whole.
+
+This is a **breaking change** for code whose two lists had drifted out of step, which is exactly the code that was losing records.
+
 **Returns:**
 `AddResult` with:
 - `total_inserted`: number of records successfully inserted or replaced
@@ -469,10 +508,12 @@ doc_005 0.001143 {'author': 'Alice'}
 
 Set `return_vector=True` to get the stored embedding alongside the metadata and score. Under `cosine` this is the normalized vector, not the values you supplied.
 
+The vector comes back as a **`numpy.ndarray` of `float32`**, from both `search` and `get_records`. It was a list of Python floats up to 0.7.0, which at `top_k` 10 and dimension 1,536 built 15,360 float objects a page and nearly doubled the cost of a batch search. Anything that reads it by index or by iteration is unchanged. Anything that concatenates it with `+`, calls `.append` on it, tests it with `if vector:` or passes it to `json.dumps` needs `.tolist()` first.
+
 ```python
 results = index.search(vector=query_vector, top_k=1, return_vector=True)
 print(results[0]["id"], round(results[0]["score"], 6))
-print([round(v, 4) for v in results[0]["vector"]])
+print([round(float(v), 4) for v in results[0]["vector"]])
 ```
 
 *Output*
@@ -570,9 +611,19 @@ HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=10000, v
 
 The `vectors=` field is the live record count, in every storage mode. `get_vector_count()` returns the same number. `get_stats()["raw_vectors_stored"]` is the one that counts raw vectors specifically, and on a trained `quantized_only` index it is zero.
 
-Other single-value accessors: `index.dim`, `index.space`, `index.get_space()`, `len(index)`, `index.get_vector_count()`, `index.has_quantization()`, `index.can_use_quantization()`, and `VectorDatabase.available_index_types()`.
+Other single-value accessors: `index.dim`, `index.space`, `index.m`, `index.ef_construction`, `index.expected_size`, `index.get_space()`, `len(index)`, `index.get_vector_count()`, `index.has_quantization()`, `index.can_use_quantization()`, and `VectorDatabase.available_index_types()`.
 
-`index.space` and `index.dim` are properties. `get_space()` is the same value as a method and is kept for callers already using it.
+`index.dim`, `index.space`, `index.m`, `index.ef_construction` and `index.expected_size` are read-only properties. `get_space()` is the same value as a method and is kept for callers already using it.
+
+```python
+print(index.m, index.ef_construction, index.expected_size)
+```
+*Output*
+```
+16 200 10000
+```
+
+The last three are new in 0.8.0. They were reachable only as text through `get_stats()`, so reading the graph degree meant `int(index.get_stats()["m"])`. They are read-only because they describe a graph already built: `m` and `ef_construction` are fixed at construction, and `expected_size` is what was declared rather than what the index holds, so `len(index)` exceeding it is ordinary.
 
 <br/>
 
@@ -850,6 +901,70 @@ An unrecognised operator raises `ValueError` before any record is removed. A fil
 **An empty filter is refused.** Everywhere else in this language an empty filter matches every record, and `search(filter={})` returns the whole index for that reason. This is the one method where the same rule would destroy every record, and an empty dict reaches it far more often from a filter that was built and came out empty than from a caller who meant it. Name the records with `remove_points(ids)` if that is what you want.
 
 Both leave one stranded graph node per record removed, exactly as `remove_point()` does. Neither calls `compact()`, because compaction costs a full rebuild and only you know whether the debris is worth it yet.
+
+<br/>
+
+#### ☑️ `delete()`, the shorter name for both
+
+`delete(ids=...)` dispatches to `remove_points` and `delete(where=...)` to `remove_where`. Both of those stay. It exists because `delete` is what four of the five comparable libraries call the operation, so it is the name most people reach for first.
+
+```python
+deletable = vdb.create("hnsw", dim=2, expected_size=10)
+deletable.add({
+    "ids": ["doc_1", "doc_2", "doc_3", "doc_4"],
+    "embeddings": [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6], [0.7, 0.8]],
+    "metadatas": [{"author": "Alice"}, {"author": "Bob"},
+                  {"author": "Bob"}, {"author": "Alice"}],
+})
+
+print(deletable.delete(ids="doc_1"))
+print(deletable.delete(ids=["doc_2", "no_such_id"]))
+print(deletable.delete(where={"author": "Bob"}))
+print(len(deletable))
+```
+*Output*
+```
+1
+1
+1
+1
+```
+
+It returns **the number of records removed**, an `int`, whichever argument was given, so the return type does not depend on the call. `ids` takes a string or a list of strings. A repeated ID counts once. An ID that was not there counts zero rather than raising.
+
+`remove_points` still returns the IDs it could not find, which is more than a count, so keep calling it where you need that.
+
+**Passing both arguments raises, and so does passing neither.** Two selections do not compose into one without a rule, and either rule removes the wrong records. Passing neither would be a `delete()` that emptied the index, which is the hazard `remove_where({})` already refuses, reached by leaving two optional arguments unset. Use `clear()` when emptying the index is what you mean.
+
+<br/>
+
+#### ☑️ Empty the index with `clear()`
+
+```python
+clearable = vdb.create("hnsw", dim=4, expected_size=10)
+clearable.add({
+    "ids": ["a", "b", "c", "d", "e"],
+    "embeddings": [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0],
+                   [0, 0, 0, 1.0], [1.0, 1.0, 0, 0]],
+})
+clearable.remove_point("a")
+
+print(clearable.clear())
+print(len(clearable), clearable.get_stats()["stranded_graph_nodes"])
+print(clearable.clear())
+```
+*Output*
+```
+4
+0 0
+0
+```
+
+It returns how many records went, and it replaces the graph rather than removing every record one at a time. Removing them one at a time is linear in the record count and leaves one stranded node per record, so an emptied index would report a graph full of dead nodes; replacing it reclaims all of them at once, which is why `stranded_graph_nodes` reads `0` afterwards rather than the record count.
+
+**It keeps the index and drops the records.** `dim`, `space`, `m`, `ef_construction`, `expected_size`, the index level metadata and the quantization configuration all survive, and a fitted PQ codebook survives with them, because a codebook is fitted from data that is now gone and cannot be refitted from an empty index. A trained quantized index stays trained and can be refilled and searched without retraining. An index still collecting for training starts collecting again, since what it had collected is gone.
+
+Clearing an empty index returns `0` and is not an error. The internal ID counter restarts, so the first generated ID after a clear is `vec_1` again.
 
 <br/>
 

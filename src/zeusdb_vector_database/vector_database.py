@@ -6,7 +6,7 @@ Currently supports HNSW (Hierarchical Navigable Small World) with extensible des
 """
 from typing import Dict, Any, Optional
 from .zeusdb_vector_database import _create_hnsw_index
-# Future index types are registered in _index_types and dispatched in _build_index.
+# Index types are registered in _index_types and dispatched in _build_index.
 
 # A _MemoryInfo TypedDict used to sit here, describing a __memory_info__ entry
 # _check_memory_usage wrote into the config. Its only reader took the
@@ -24,10 +24,15 @@ class VectorDatabase:
     # a constructor. A registry that held one would hand a user a way to build
     # an index without the defaults create() applies, which is the second
     # construction path this factory exists to prevent.
+    # One entry, and the two commented placeholders that used to sit beside it
+    # are gone. A registry holding a commented line is a promise, and this one
+    # was not costed: everything except the graph seam is a method on
+    # HNSWIndex, so a second index type is a very large piece of work and
+    # nothing has established what it would buy. If one is ever built it can be
+    # added then, and a reader is better served by a registry that describes
+    # what exists.
     _index_types: Dict[str, str] = {
         "hnsw": "Hierarchical Navigable Small World graph",
-        # "ivf": "Inverted file index",    # Future support planned
-        # "lsh": "Locality sensitive hashing",  # Future support planned
     }
 
     @staticmethod
@@ -144,12 +149,17 @@ class VectorDatabase:
         Create a vector index of the specified type with optional quantization.
 
         Args:
-            index_type: The type of index to create (case-insensitive: "hnsw", "ivf", etc.)
+            index_type: The type of index to create. Case insensitive, and
+                "hnsw" is the only one, which available_index_types() reports.
             quantization_config: Optional quantization configuration dictionary
             **kwargs: Parameters specific to the chosen index type (validated by Rust backend)
 
             For "hnsw", supported parameters are:
-                - dim (int): Vector dimension (default: 1536)
+                - dim (int): Vector dimension. **Required**, and the only
+                  required parameter. It has to equal the width of the vectors
+                  you will add, since an index built at any other width rejects
+                  every one of them. It defaulted to 1536 up to 0.7.0, which
+                  silently built an index sized for one vendor's model family.
                 - space (str): Distance metric, one of 'cosine', 'l2', or 'l1' (default: 'cosine')
                 - m (int): Bidirectional links per node (min: 2, max: 256). Defaults
                   to 16 up to an expected_size of 25,000 and 32 above it. A graph
@@ -254,8 +264,32 @@ class VectorDatabase:
             available = ', '.join(sorted(self._index_types.keys()))
             raise ValueError(f"Unknown index type '{index_type}'. Available: {available}")
         
+        # dim is required, and it is the only parameter here that is.
+        #
+        # It defaulted to 1536 up to 0.7.0, so vdb.create("hnsw") built a
+        # 1,536 wide index and then rejected every vector of any other width
+        # with a dimension mismatch, reporting the mistake at the add rather
+        # than at the call that made it. No comparator defaults the dimension:
+        # hnswlib and Qdrant require it and ChromaDB infers it from the first
+        # batch.
+        #
+        # There is no value that could be right. Every other default here is
+        # either measured on this index's own data or right for the large
+        # majority of callers, and 1536 is right only for one vendor's one
+        # model family. TypeError rather than ValueError, because this is a
+        # missing argument and that is what Python raises for one.
+        if index_type == "hnsw" and 'dim' not in kwargs:
+            raise TypeError(
+                "create() requires 'dim', the width of the vectors this index will hold. "
+                "There is no default because dim has to equal the width your embedding "
+                "model produces, and an index built at any other width rejects every "
+                "vector you add to it. Read it off one embedding with len(vector), or "
+                "pass the width your model documents, for example dim=1536 for OpenAI "
+                "text-embedding-3-small or dim=768 for most sentence-transformers models."
+            )
+
         # Centralize dim early to ensure consistency
-        dim = kwargs.get('dim', 1536)
+        dim = kwargs['dim']
         
         # Apply index-specific defaults
         #
@@ -265,7 +299,10 @@ class VectorDatabase:
         # place by then, since an unset expected_size is the case where the
         # answer is most often no.
         if index_type == "hnsw":
-            kwargs.setdefault("dim", dim)
+            # No dim default here. It is required above, and `space` keeps its
+            # default because cosine is right for every normalised text
+            # embedding, which is the dominant case, where no single dimension
+            # is right for more than one model family.
             kwargs.setdefault("space", "cosine")
             kwargs.setdefault("ef_construction", 200)
             kwargs.setdefault("expected_size", 10000)

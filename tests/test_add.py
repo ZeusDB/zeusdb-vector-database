@@ -1,6 +1,7 @@
 """Vector insertion across the five input formats, overwrite, and add error handling."""
 
 import numpy as np
+import pytest
 from zeusdb_vector_database import VectorDatabase
 from helpers import assert_vectors_close
 
@@ -567,3 +568,185 @@ def test_rejected_numpy_row_keeps_generated_ids_contiguous():
     assert result.total_inserted == 2
     stored = sorted(record_id for record_id, _ in index.list(10))
     assert stored == ["vec_1", "vec_2"]
+
+
+# ------------------------------------------------------------
+# Test 100: a batch whose parallel arrays disagree in length raises
+# ------------------------------------------------------------
+def test_add_batch_length_disagreement_raises():
+    """Three ids and two vectors used to insert two records and drop an id.
+
+    add({"ids": ["c", "d", "e"], "embeddings": <two rows>}) returned
+    AddResult(inserted=2, errors=0). Nothing said the third id was gone, and
+    nothing could say which record the caller meant, so it raises rather than
+    rejecting a record. The reverse shape was worse: two ids and three vectors
+    stored the third under a generated vec_N, which no caller can look up.
+    """
+    vdb = VectorDatabase()
+
+    rows2 = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+    rows3 = rows2 + [[0.0, 0.0, 1.0, 0.0]]
+    np2 = np.array(rows2, dtype=np.float32)
+    np3 = np.array(rows3, dtype=np.float32)
+
+    # Surplus ids, on both the list and the NumPy branch and under every
+    # spelling of the vector key.
+    for payload in (
+        {"ids": ["c", "d", "e"], "embeddings": rows2},
+        {"ids": ["c", "d", "e"], "embeddings": np2},
+        {"ids": ["c", "d", "e"], "vectors": rows2},
+        {"ids": ["c", "d", "e"], "vectors": np2},
+        {"ids": ["c", "d", "e"], "values": rows2},
+    ):
+        index = vdb.create("hnsw", dim=4, expected_size=10)
+        with pytest.raises(ValueError) as excinfo:
+            index.add(payload)
+        message = str(excinfo.value)
+        # Both lengths and the short field are named.
+        assert "3 entries under 'ids'" in message
+        assert "2 under" in message
+        assert "is the short one" in message
+        # Nothing was inserted, so a caller can retry the whole call.
+        assert len(index) == 0
+
+    # Surplus vectors, where the short field is 'ids'.
+    for payload in (
+        {"ids": ["c", "d"], "embeddings": rows3},
+        {"ids": ["c", "d"], "embeddings": np3},
+    ):
+        index = vdb.create("hnsw", dim=4, expected_size=10)
+        with pytest.raises(ValueError) as excinfo:
+            index.add(payload)
+        assert "'ids' is the short one" in str(excinfo.value)
+        assert len(index) == 0
+
+
+# ------------------------------------------------------------
+# Test 101: the metadata arrays are held to the same length rule
+# ------------------------------------------------------------
+def test_add_batch_metadata_length_disagreement_raises():
+    """A short metadatas list silently gave the trailing records no metadata.
+
+    Both spellings are checked, and 'metadata' only where 'metadatas' is
+    absent, which is exactly when the parsers read it.
+    """
+    vdb = VectorDatabase()
+
+    rows3 = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+    np3 = np.array(rows3, dtype=np.float32)
+    ids = ["c", "d", "e"]
+
+    for rows in (rows3, np3):
+        for key in ("metadatas", "metadata"):
+            index = vdb.create("hnsw", dim=4, expected_size=10)
+            with pytest.raises(ValueError) as excinfo:
+                index.add({"ids": ids, "embeddings": rows, key: [{"a": 1}, {"a": 2}]})
+            message = str(excinfo.value)
+            assert f"2 entries under '{key}'" in message
+            assert f"'{key}' is the short one" in message
+            assert len(index) == 0
+
+            # A surplus metadata entry is the same disagreement the other way.
+            index = vdb.create("hnsw", dim=4, expected_size=10)
+            with pytest.raises(ValueError):
+                index.add({"ids": ids, "embeddings": rows,
+                           key: [{"a": 1}, {"a": 2}, {"a": 3}, {"a": 4}]})
+            assert len(index) == 0
+
+    # 'metadatas' wins where both are present, and the ignored 'metadata' is
+    # not held to the rule, because no parser reads it in that case.
+    index = vdb.create("hnsw", dim=4, expected_size=10)
+    result = index.add({
+        "ids": ids,
+        "embeddings": np3,
+        "metadatas": [{"a": 1}, {"a": 2}, {"a": 3}],
+        "metadata": [{"b": 9}],
+    })
+    assert result.total_inserted == 3
+    assert index.get_records("c", return_vector=False)[0]["metadata"] == {"a": 1}
+
+
+# ------------------------------------------------------------
+# Test 102: a parallel array that is not a list raises
+# ------------------------------------------------------------
+def test_add_batch_non_list_ids_raises():
+    """A tuple or an ndarray of ids was discarded whole on the NumPy branch.
+
+    parse_numpy_with_context resolved ids with cast::<PyList>().ok(), so any
+    other sequence type became None and every record took a generated id. The
+    list branch raised on the same input, so one mistake had two behaviours.
+    """
+    vdb = VectorDatabase()
+
+    rows3 = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+    np3 = np.array(rows3, dtype=np.float32)
+
+    for rows in (rows3, np3):
+        for ids in (("a", "b", "c"), np.array(["a", "b", "c"])):
+            index = vdb.create("hnsw", dim=4, expected_size=10)
+            with pytest.raises(TypeError) as excinfo:
+                index.add({"ids": ids, "embeddings": rows})
+            assert "'ids' to be a list" in str(excinfo.value)
+            assert len(index) == 0
+
+
+# ------------------------------------------------------------
+# Test 103: agreeing lengths and the other four input shapes are unchanged
+# ------------------------------------------------------------
+def test_add_batch_length_rule_leaves_valid_input_alone():
+    """The rule fires only on a disagreement, and only on the batch dict.
+
+    The empty case, the ordinary case and the four shapes that carry no
+    parallel arrays at all are all as they were.
+    """
+    vdb = VectorDatabase()
+
+    rows3 = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+    np3 = np.array(rows3, dtype=np.float32)
+    ids = ["c", "d", "e"]
+
+    # Equal lengths, both branches, with and without metadata.
+    for rows in (rows3, np3):
+        index = vdb.create("hnsw", dim=4, expected_size=10)
+        assert index.add({"ids": ids, "embeddings": rows}).total_inserted == 3
+        index = vdb.create("hnsw", dim=4, expected_size=10)
+        result = index.add({"ids": ids, "embeddings": rows,
+                            "metadatas": [{"a": 1}, {"a": 2}, {"a": 3}]})
+        assert result.total_inserted == 3
+        assert result.total_errors == 0
+
+    # No ids at all is not a disagreement. Every record takes a generated id,
+    # which is what a caller who omits them asked for.
+    index = vdb.create("hnsw", dim=4, expected_size=10)
+    assert index.add({"embeddings": np3}).total_inserted == 3
+    assert sorted(record_id for record_id, _ in index.list(10)) == ["vec_1", "vec_2", "vec_3"]
+
+    # An empty batch agrees with itself at zero.
+    index = vdb.create("hnsw", dim=4, expected_size=10)
+    empty = index.add({"ids": [], "embeddings": []})
+    assert empty.total_inserted == 0
+    assert empty.total_errors == 0
+
+    # A batch carrying no recognised vector field is still reported through
+    # AddResult rather than raised, because it names no records to lose.
+    index = vdb.create("hnsw", dim=4, expected_size=10)
+    missing = index.add({"ids": ["a"], "junk": 1})
+    assert missing.total_inserted == 0
+    assert missing.total_errors == 1
+    assert "Missing vector data" in missing.errors[0]
+
+    # The four shapes with no parallel arrays are untouched, including the
+    # per-record rejection a bad vector still gets inside a list batch.
+    index = vdb.create("hnsw", dim=4, expected_size=10)
+    assert index.add([{"id": "a", "values": rows3[0]},
+                      {"id": "b", "values": rows3[1]}]).total_inserted == 2
+    index = vdb.create("hnsw", dim=4, expected_size=10)
+    assert index.add(np3).total_inserted == 3
+    index = vdb.create("hnsw", dim=4, expected_size=10)
+    assert index.add({"id": "a", "values": rows3[0], "metadata": {"x": 1}}).total_inserted == 1
+    index = vdb.create("hnsw", dim=4, expected_size=10)
+    assert index.add(np.array(rows3[0], dtype=np.float32)).total_inserted == 1
+    index = vdb.create("hnsw", dim=4, expected_size=10)
+    mixed = index.add([{"id": "ok", "values": rows3[0]}, {"id": "bad", "values": [1.0, 2.0]}])
+    assert mixed.total_inserted == 1
+    assert mixed.total_errors == 1

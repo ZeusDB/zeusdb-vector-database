@@ -20,22 +20,16 @@
 //! | `stats` | what the index reports about itself |
 //! | `persist` | the accessors and setters `persistence.rs` speaks to |
 //!
-//! # Why `DistPQ` is declared here
+//! # Why this module is a directory rather than a rename
 //!
-//! It used to be unable to live anywhere else. `Hnsw::file_dump` wrote
-//! `std::any::type_name::<D>()` of the distance into the dump header, and both
-//! the loader and the vendored `load_hnsw_with_dist` compared it by exact
-//! equality. `type_name` is the full module path of the **declaration**, so
-//! declaring `DistPQ` anywhere else changed what every save wrote and stopped
-//! every saved quantized index from loading. That is also why this module is a
-//! directory rather than a rename.
-//!
-//! ZeusDB's format carries a `graph::dump::GraphKind` discriminant instead, so
-//! the pin is gone and the declaration is free to move. It stays here for now,
-//! since moving it is a change to make on its own.
-//!
-//! `distance.rs` re-exports the name so that every call site imports its
-//! distances from one place.
+//! `Hnsw::file_dump` wrote `std::any::type_name::<D>()` of the distance into
+//! the dump header, and both the loader and the vendored `load_hnsw_with_dist`
+//! compared it by exact equality. `type_name` is the full module path of the
+//! **declaration**, so while `DistPQ` was declared here, renaming this module
+//! changed what every save wrote and stopped every saved quantized index from
+//! loading. ZeusDB's format carries a `graph::dump::GraphKind` discriminant
+//! instead, and `DistPQ` now lives in `distance.rs` beside the other four
+//! implementors, so neither constraint remains.
 
 mod construct;
 #[cfg(test)]
@@ -50,9 +44,8 @@ mod training;
 use crate::conversion::{python_dict_to_value_map, value_map_to_python};
 use crate::filter::{compile_filter, matches_filter};
 // The graph and everything the graph crate supplies arrive through the seam.
-// `Distance` is the one name from that crate this file still needs, because
-// `DistPQ` below implements it. See the note at the top of `graph.rs`.
-use crate::graph::{Distance, VectorGraph};
+// See the note at the top of `graph.rs`.
+use crate::graph::VectorGraph;
 use crate::pq::PQ;
 use crate::rerank::{RerankCalibration, SearchParams};
 use insert::InsertError;
@@ -61,7 +54,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -123,128 +115,6 @@ pub struct QuantizationConfig {
     pub training_size: usize,
     pub max_training_vectors: Option<usize>,
     pub storage_mode: StorageMode,
-}
-thread_local! {
-    /// The ADC lookup table for the query the calling thread is running.
-    ///
-    /// The table belongs to a query, not to an index. It used to live on
-    /// `DistPQ`, one per index, which meant two searches overlapping would each
-    /// overwrite the other's table and score candidates against a query they
-    /// were never given. An exclusive lock on the graph was the only thing
-    /// preventing that, so the table had to move before the lock could be
-    /// relaxed.
-    ///
-    /// `Distance::eval` takes `&self` and has no parameter to carry per query
-    /// state, so the table cannot be threaded through as an argument. Thread
-    /// local storage is the way to give it to `eval` without giving it to the
-    /// index, and it needs no change to the vendored crate.
-    ///
-    /// The invariant this rests on is that one query's traversal runs entirely
-    /// on the thread that installed its table. `Hnsw::search` is sequential
-    /// within a single query, so that holds. `batch_search_parallel` splits
-    /// across queries rather than within one, and each query installs its own
-    /// table on the worker that runs it. Adopting `Hnsw::parallel_search`, which
-    /// would fan one query's distance evaluations out across the pool, would
-    /// break this and must not be done without replacing the mechanism.
-    static QUERY_LUT: RefCell<Option<Vec<Vec<f32>>>> = const { RefCell::new(None) };
-}
-/// Holds a query's ADC table on the calling thread and removes it on drop.
-///
-/// Drop rather than an explicit clear, so an early return or a panic inside the
-/// traversal cannot leave a stale table behind for the next query this thread
-/// runs. A leftover table would be read as if it belonged to that next query.
-pub(crate) struct QueryLut;
-impl Drop for QueryLut {
-    fn drop(&mut self) {
-        QUERY_LUT.with(|slot| *slot.borrow_mut() = None);
-    }
-}
-/// Custom distance function for Product Quantization using ADC
-///
-/// This lives here rather than beside the raw distances in `distance.rs`
-/// because `std::any::type_name::<DistPQ>()` used to be written into every
-/// saved graph dump and checked on load, so moving the type to another module
-/// changed that string and stopped every previously saved quantized index from
-/// loading. ZeusDB's format records a discriminant instead, so the constraint
-/// is gone and only the habit remains.
-#[derive(Clone)]
-pub struct DistPQ {
-    /// Reference to the PQ instance for accessing centroids
-    pq: Arc<PQ>,
-}
-impl DistPQ {
-    pub fn new(pq: Arc<PQ>) -> Self {
-        DistPQ { pq }
-    }
-
-    /// Bytes one code occupies, which is the length of the dummy query the
-    /// seam hands the traversal. The codebook is private to this type, so the
-    /// seam asks rather than reaching into it.
-    pub(crate) fn subvectors(&self) -> usize {
-        self.pq.subvectors()
-    }
-
-    /// Compute this query's ADC table and install it for the calling thread.
-    ///
-    /// The returned guard must be held for the whole traversal. Dropping it
-    /// early returns the thread to graph construction mode, where `eval` reads
-    /// the codebook's symmetric table instead.
-    pub(crate) fn install_query_lut(&self, query: &[f32]) -> Result<QueryLut, String> {
-        if !self.pq.is_trained() {
-            return Err("PQ must be trained before ADC computation".to_string());
-        }
-
-        let lut = self.pq.compute_adc_lut(query)?;
-        QUERY_LUT.with(|slot| *slot.borrow_mut() = Some(lut));
-        Ok(QueryLut)
-    }
-}
-impl Distance<u8> for DistPQ {
-    /// Distance between two points the graph holds, both of which are PQ codes
-    ///
-    /// A query table on this thread means a search is running. `a` is then the
-    /// dummy code vector `VectorGraph::search` passes, the real query lives in
-    /// the table, and the distance is asymmetric: query subvector against stored
-    /// centroid.
-    ///
-    /// No query table means graph construction, where there is no query and
-    /// both `a` and `b` are stored codes. The distance is then symmetric,
-    /// centroid against centroid, read from the table the codebook carries.
-    /// Returning infinity here, which is what this did until the symmetric
-    /// table existed, made every candidate tie in the neighbour selection
-    /// heuristic and left the graph with one edge per node.
-    ///
-    /// Both branches return a sum of squared L2 distances, so they are on the
-    /// same scale and neither takes a square root.
-    ///
-    /// Choosing the branch on the table rather than on `a` is deliberate. The
-    /// dummy query is a valid code slice and cannot be told apart from real
-    /// codes by inspection. It is sound because the table is thread local, so an
-    /// insertion can never observe a query table it did not install itself, no
-    /// matter what any other thread is doing at the time. That used to depend on
-    /// the graph mutex serialising searches against insertions, which is the
-    /// dependency this removes.
-    fn eval(&self, a: &[u8], b: &[u8]) -> f32 {
-        QUERY_LUT.with(|slot| {
-            let slot = slot.borrow();
-            let Some(lut) = slot.as_ref() else {
-                return self.pq.symmetric_distance(a, b);
-            };
-
-            // b.len() should equal pq.subvectors()
-            let mut sum = 0.0f32;
-            for (sv, &code) in b.iter().enumerate() {
-                // lut[sv][code]
-                let distance_component = lut
-                    .get(sv)
-                    .and_then(|row| row.get(code as usize))
-                    .copied()
-                    .unwrap_or(f32::INFINITY);
-                sum += distance_component;
-            }
-            sum
-        })
-    }
 }
 /// `skip_from_py_object` because nothing extracts an `AddResult`. It is the
 /// return type of `add` and appears in no argument position, in this crate or
@@ -500,6 +370,58 @@ impl HNSWIndex {
     ///
     /// Moving the old value out and dropping it after the guard is released
     /// keeps the swap to a pointer move under the guard.
+    /// The shape rule for a 2-D query array
+    ///
+    /// Shared by the `f32` and `f64` batch arms because a query is wrong in the
+    /// same way whatever it is made of. Both arms only became reachable when
+    /// `cast` was moved above `extract`, so until then the list arm below them
+    /// answered for every array and these messages were never seen. They are
+    /// worded to match it: an empty batch is refused in the same words, and a
+    /// row of the wrong width says "dimension mismatch" rather than describing
+    /// a shape, because that is what a caller who passed a list would read.
+    fn validate_batch_array_shape(shape: &[usize], dim: usize) -> PyResult<()> {
+        if shape.len() != 2 {
+            error!(
+                operation = "search",
+                error = "shape_mismatch",
+                expected_shape = format!("(N, {})", dim),
+                actual_shape = format!("{:?}", shape),
+                "NumPy array shape mismatch"
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "NumPy array must have shape (N, {}), got {:?}",
+                dim, shape
+            )));
+        }
+
+        if shape[0] == 0 {
+            error!(
+                operation = "search",
+                error = "empty_batch",
+                "Batch cannot be empty"
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Batch cannot be empty",
+            ));
+        }
+
+        if shape[1] != dim {
+            error!(
+                operation = "search",
+                error = "dimension_mismatch",
+                expected = dim,
+                actual = shape[1],
+                "NumPy batch row width does not match the index"
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Search vector dimension mismatch: expected {}, got {}",
+                dim, shape[1]
+            )));
+        }
+
+        Ok(())
+    }
+
     pub(super) fn replace_graph(&self, new_hnsw: VectorGraph) {
         let old = {
             let mut hnsw_guard = self.hnsw.write().unwrap();
@@ -598,7 +520,7 @@ impl HNSWIndex {
         }
 
         // Use error-collecting parsing
-        let (parsed_data, parse_errors) = self.parse_input_data(&data);
+        let (parsed_data, parse_errors) = self.parse_input_data(&data)?;
 
         let mut total_errors = 0;
         let mut errors = Vec::new();
@@ -839,8 +761,70 @@ impl HNSWIndex {
             .map(compile_filter)
             .transpose()?;
 
-        // Detect batch vs single query with comprehensive input support
-        let result: Py<PyAny> = if let Ok(list_vec) = vector.extract::<Vec<Vec<f32>>>() {
+        // Detect batch vs single query with comprehensive input support.
+        //
+        // # Why `cast` runs before `extract`
+        //
+        // `extract::<Vec<Vec<f32>>>` succeeds on a 2-D NumPy array, because an
+        // array satisfies the sequence protocol and each row satisfies it in
+        // turn. Tried first, it therefore consumed exactly the input the
+        // zero-copy arm below it was written for, and that arm was unreachable
+        // for every array of every dtype. Measured on a one record index at
+        // dimension 1,536 with a batch of 32, where the traversal is negligible
+        // and the marshalling is the whole cost, it took 101.96 microseconds a
+        // query against 21.54 for a list of lists, so the general path was
+        // paying 4.7 times the list path to read the one input it could read
+        // without copying at all.
+        //
+        // `cast` is a type check rather than a conversion attempt, so it
+        // cannot claim an input that is not an array of that dtype, and it is
+        // safe above `extract` in a way `extract` is not above it. `add`
+        // already dispatches this way at every arm.
+        //
+        // The `f64` arm sits between them. NumPy's default dtype is `f64`, so
+        // `np.random.rand(32, 1536)` is the common shape rather than an unusual
+        // one, and without an arm of its own it falls to `extract` and is read
+        // one Python float at a time. The conversion is the same rounding
+        // `extract::<f32>` performs per element, so the values are identical.
+        let result: Py<PyAny> = if let Ok(np_array) = vector.cast::<PyArray2<f32>>() {
+            // Format: NumPy 2-D array (N, dims), read without copying.
+            let readonly = np_array.readonly();
+            let shape = readonly.shape();
+
+            Self::validate_batch_array_shape(shape, self.dim)?;
+
+            let flat = readonly.as_slice()?;
+            let batch: Vec<Vec<f32>> = flat.chunks(self.dim).map(|chunk| chunk.to_vec()).collect();
+            debug!(
+                operation = "batch_search_numpy",
+                batch_size = batch.len(),
+                "Starting NumPy batch search"
+            );
+            let results =
+                self.batch_search_internal(&batch, filter_conditions.as_ref(), params, py)?;
+            PyList::new(py, results)?.into()
+        } else if let Ok(np_array) = vector.cast::<PyArray2<f64>>() {
+            // Format: NumPy 2-D array of f64, narrowed in one pass.
+            let readonly = np_array.readonly();
+            let shape = readonly.shape();
+
+            Self::validate_batch_array_shape(shape, self.dim)?;
+
+            let flat = readonly.as_slice()?;
+            let batch: Vec<Vec<f32>> = flat
+                .chunks(self.dim)
+                .map(|chunk| chunk.iter().map(|&value| value as f32).collect())
+                .collect();
+            debug!(
+                operation = "batch_search_numpy",
+                batch_size = batch.len(),
+                dtype = "f64",
+                "Starting NumPy batch search"
+            );
+            let results =
+                self.batch_search_internal(&batch, filter_conditions.as_ref(), params, py)?;
+            PyList::new(py, results)?.into()
+        } else if let Ok(list_vec) = vector.extract::<Vec<Vec<f32>>>() {
             // Format: List of vectors [[0.1, 0.2], [0.3, 0.4]]
 
             // Validation for empty batch or empty vectors in batch
@@ -879,39 +863,24 @@ impl HNSWIndex {
             let results =
                 self.batch_search_internal(&list_vec, filter_conditions.as_ref(), params, py)?;
             PyList::new(py, results)?.into()
-        } else if let Ok(np_array) = vector.cast::<PyArray2<f32>>() {
-            // Format: NumPy 2D array (N, dims)
-            let readonly = np_array.readonly();
-            let shape = readonly.shape();
-
-            if shape.len() != 2 || shape[1] != self.dim {
-                error!(
-                    operation = "search",
-                    error = "shape_mismatch",
-                    expected_shape = format!("(N, {})", self.dim),
-                    actual_shape = format!("{:?}", shape),
-                    "NumPy array shape mismatch"
-                );
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "NumPy array must have shape (N, {}), got {:?}",
-                    self.dim, shape
-                )));
-            }
-
-            let flat = readonly.as_slice()?;
-            let batch: Vec<Vec<f32>> = flat.chunks(self.dim).map(|chunk| chunk.to_vec()).collect();
-            debug!(
-                operation = "batch_search_numpy",
-                batch_size = batch.len(),
-                "Starting NumPy batch search"
-            );
-            let results =
-                self.batch_search_internal(&batch, filter_conditions.as_ref(), params, py)?;
-            PyList::new(py, results)?.into()
         } else {
-            // Single vector path - enhanced with NumPy 1D support
+            // Single vector path - enhanced with NumPy 1D support.
+            //
+            // Already `cast` before `extract`, so there is no reordering to
+            // make here. The `f64` arm is the same addition as on the batch
+            // path and for the same reason: without it a `float64` query, which
+            // is what NumPy hands back by default, was read one Python float at
+            // a time. Measured on a one record index at dimension 1,536 that
+            // was 84.41 microseconds a query against 8.43 for `float32`.
             let query_vector = if let Ok(array1d) = vector.cast::<PyArray1<f32>>() {
                 array1d.readonly().as_slice()?.to_vec()
+            } else if let Ok(array1d) = vector.cast::<PyArray1<f64>>() {
+                array1d
+                    .readonly()
+                    .as_slice()?
+                    .iter()
+                    .map(|&value| value as f32)
+                    .collect()
             } else {
                 vector.extract::<Vec<f32>>()?
             };
@@ -1003,6 +972,47 @@ impl HNSWIndex {
     #[getter(space)]
     pub fn space_property(&self) -> String {
         self.space.clone()
+    }
+
+    /// Python property: `index.m`
+    ///
+    /// The graph degree, fixed at construction and never written again.
+    ///
+    /// Reachable before this only as `int(index.get_stats()["m"])`, which is a
+    /// number formatted into a string and parsed back. hnswlib exposes `M`,
+    /// `ef_construction` and `max_elements` as read-only properties by those
+    /// names, and every other comparator exposes the equivalent typed.
+    ///
+    /// Read-only, because `m` is what the graph was built with. Assigning it
+    /// would describe a graph that does not exist, and changing it for real is
+    /// a rebuild rather than a setter.
+    #[getter]
+    pub fn m(&self) -> usize {
+        self.m
+    }
+
+    /// Python property: `index.ef_construction`
+    ///
+    /// The candidate width each insertion searched at. Read-only for the same
+    /// reason as `m`: it describes work already done. It has no effect on a
+    /// search, so a caller wanting a wider search passes `ef_search`.
+    #[getter]
+    pub fn ef_construction(&self) -> usize {
+        self.ef_construction
+    }
+
+    /// Python property: `index.expected_size`
+    ///
+    /// The record count declared at creation. A capacity hint rather than a
+    /// cap, unlike hnswlib's `max_elements`, so an index that grows past it
+    /// grows the graph rather than raising. It selected the default `m` and it
+    /// sized the initial reservation, which is why it is worth reading back.
+    ///
+    /// `len(index)` is the actual count and this is the declaration. The two
+    /// disagreeing is ordinary.
+    #[getter]
+    pub fn expected_size(&self) -> usize {
+        self.expected_size
     }
 
     /// `len(index)`, the number of live records.
@@ -1195,7 +1205,9 @@ impl HNSWIndex {
                     };
 
                     if let Some(vec) = vector_data {
-                        dict.set_item("vector", vec)?;
+                        // An array rather than a list, matching `search`. See
+                        // `hits_to_python` for why.
+                        dict.set_item("vector", PyArray1::from_vec(py, vec))?;
                     }
                 }
 
@@ -1379,6 +1391,80 @@ impl HNSWIndex {
         })
     }
 
+    /// Remove records by id or by filter, and report how many went.
+    ///
+    /// An alias. `delete(ids=...)` is `remove_points`, `delete(where=...)` is
+    /// `remove_where`, and both of those stay. It exists because `delete` is
+    /// what four of the five comparators call the operation, so a caller
+    /// arriving from any of them reaches for `index.delete(...)`, gets an
+    /// `AttributeError`, and has to go looking. The existing family compounds
+    /// that: `remove_point` and `remove_points` differ by one character.
+    ///
+    /// **Both arguments is an error.** Two selections do not compose into one
+    /// without a rule, and either rule is a guess. The union deletes records
+    /// the filter did not choose and the intersection deletes fewer records
+    /// than the ids name, so neither is what a caller writing both meant.
+    ///
+    /// **Neither argument is an error.** A `delete()` that deleted everything
+    /// is the hazard `remove_where({})` already refuses, arrived at by leaving
+    /// two optional arguments unset rather than by passing an empty mapping,
+    /// which is easier to do by accident and not harder.
+    ///
+    /// **Returns the number of records removed**, in both cases, so the return
+    /// type does not depend on which argument was given. `remove_points`
+    /// returns the ids it could not find, which is more than a count and is
+    /// what a caller needing that detail should keep calling. A repeated id
+    /// counts once, because one record was removed.
+    ///
+    /// `ids` takes a single string or a list of strings, matching
+    /// `get_records`. An empty list removes nothing and returns zero, which is
+    /// not an error: it is a delete of nothing, not a delete of everything.
+    #[pyo3(signature = (ids=None, r#where=None))]
+    pub fn delete(
+        &self,
+        py: Python<'_>,
+        ids: Option<&Bound<PyAny>>,
+        r#where: Option<&Bound<PyDict>>,
+    ) -> PyResult<usize> {
+        match (ids, r#where) {
+            (Some(_), Some(_)) => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "delete takes 'ids' or 'where', not both. Two selections do not compose \
+                 into one without a rule, and either rule deletes the wrong records. Call \
+                 it twice, or name the records you mean with delete(ids=...).",
+            )),
+            (None, None) => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "delete requires 'ids' or 'where'. It does not default to deleting every \
+                 record. Use delete(ids=[...]) to name records, delete(where={...}) to \
+                 select them by metadata, or clear() to empty the index.",
+            )),
+            (Some(ids), None) => {
+                let requested: Vec<String> = if let Ok(single) = ids.extract::<String>() {
+                    vec![single]
+                } else if let Ok(many) = ids.extract::<Vec<String>>() {
+                    many
+                } else {
+                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                        "delete(ids=) expects a string or a list of strings",
+                    ));
+                };
+
+                // A repeated id names one record, so it counts once whether or
+                // not it was there. `remove_points_internal` already skips a
+                // repeat rather than reporting it missing.
+                let distinct: std::collections::HashSet<&String> = requested.iter().collect();
+                let distinct_count = distinct.len();
+
+                let missing = py.detach(|| {
+                    let _writers = self.writers.lock().unwrap();
+                    self.remove_points_internal(&requested)
+                });
+
+                Ok(distinct_count - missing.len())
+            }
+            (None, Some(filter)) => self.remove_where(py, filter),
+        }
+    }
+
     /// Remove every record whose metadata matches the filter, and report how
     /// many were removed.
     ///
@@ -1418,6 +1504,118 @@ impl HNSWIndex {
             let _writers = self.writers.lock().unwrap();
             self.remove_where_locked(&conditions)
         }))
+    }
+
+    /// Empty the index, keeping its configuration, and report how many
+    /// records went.
+    ///
+    /// **A fresh graph and empty maps, not `remove_points` over every id.**
+    /// Both were considered. Removing every record one at a time is linear in
+    /// the record count and leaves one stranded graph node per record, so an
+    /// index of a million records would spend a long time producing a graph
+    /// holding a million dead nodes and no live ones, which `compact()` would
+    /// then have to walk again. Replacing the graph reclaims all of it at once
+    /// and leaves `get_stats()["stranded_graph_nodes"]` at zero, which is what
+    /// an empty index should report.
+    ///
+    /// What it keeps is the index: `dim`, `space`, `m`, `ef_construction`,
+    /// `expected_size`, the index-level metadata `add_metadata` wrote, and the
+    /// quantization configuration including a fitted codebook. **Training is
+    /// not undone.** A codebook is fitted from data that is now gone and cannot
+    /// be refitted from an empty index, so a trained quantized index stays
+    /// trained and its replacement graph is a quantized graph. An untrained one
+    /// returns to collecting, since the records it had collected are gone.
+    ///
+    /// The internal id counter restarts, because nothing is left for a reissued
+    /// id to collide with and restarting keeps the internal ids in step with
+    /// the fresh graph's node indices, which is the invariant `list()`'s
+    /// ordering and `compact()` both rest on.
+    ///
+    /// Clearing an index that is already empty is not an error and returns
+    /// zero. It still replaces the graph, so it also returns the arena.
+    ///
+    /// llama-index probes `hasattr(index, "clear")` and raised
+    /// `NotImplementedError` when it found nothing.
+    pub fn clear(&self, py: Python<'_>) -> PyResult<usize> {
+        let quantized = self.is_quantized();
+        let pq = self.pq.as_ref().cloned();
+
+        if quantized && pq.is_none() {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Index reports a quantized graph but holds no product quantizer",
+            ));
+        }
+
+        py.detach(|| {
+            let _writers = self.writers.lock().unwrap();
+
+            // Built before any guard is taken, so the allocation happens
+            // outside the write guard exactly as `compact` arranges it.
+            let fresh = if let (true, Some(pq)) = (quantized, pq) {
+                VectorGraph::new_pq(
+                    &self.space,
+                    self.m,
+                    self.expected_size,
+                    MAX_LAYER,
+                    self.ef_construction,
+                    pq,
+                )
+            } else {
+                VectorGraph::new_raw(
+                    &self.space,
+                    self.dim,
+                    self.m,
+                    self.expected_size,
+                    MAX_LAYER,
+                    self.ef_construction,
+                )
+            };
+
+            // The storage guards in the order declared on the struct, which is
+            // the order every other multi-guard path here takes them in.
+            let removed = {
+                let mut id_map = self.id_map.write().unwrap();
+                let mut rev_map = self.rev_map.write().unwrap();
+                let mut vectors = self.vectors.write().unwrap();
+                let mut pq_codes = self.pq_codes.write().unwrap();
+                let mut vector_metadata = self.vector_metadata.write().unwrap();
+                let mut training_ids = self.training_ids.write().unwrap();
+                let mut id_counter = self.id_counter.lock().unwrap();
+                let mut vector_count = self.vector_count.lock().unwrap();
+
+                let removed = id_map.len();
+                id_map.clear();
+                rev_map.clear();
+                vectors.clear();
+                pq_codes.clear();
+                vector_metadata.clear();
+                training_ids.clear();
+                *id_counter = 0;
+                *vector_count = 0;
+                removed
+            };
+
+            self.replace_graph(fresh);
+
+            // An index still collecting for training starts collecting again,
+            // since what it had collected is gone. A trained one is left alone,
+            // because the flag records that training happened and it did.
+            if !quantized {
+                self.training_threshold_reached
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.overgrowth_warned
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+
+            info!(
+                operation = "clear",
+                records_removed = removed,
+                quantized = quantized,
+                "Index cleared"
+            );
+
+            Ok(removed)
+        })
     }
 
     /// Replace one record's metadata without resupplying its vector.

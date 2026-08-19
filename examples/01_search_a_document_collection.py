@@ -129,7 +129,7 @@ def main():
     # back is the unit length form and not the numbers that were supplied.
     stored = reopened.get_records("doc_08")[0]
     print("doc_08 as supplied:", LIBRARY[7][2])
-    print("doc_08 as stored:  ", [round(v, 4) for v in stored["vector"]])
+    print("doc_08 as stored:  ", [round(float(v), 4) for v in stored["vector"]])
 
 
 # The transcript this file prints, with the progress banner save() and load()

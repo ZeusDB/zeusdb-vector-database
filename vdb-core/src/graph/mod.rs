@@ -38,7 +38,9 @@
 //! ZeusDB's header carries a [`dump::GraphKind`] discriminant instead, which is
 //! a number ZeusDB chose rather than a fact about where a type is declared. The
 //! four types can now be moved, renamed or replaced without a saved index
-//! becoming unreadable. None of them is moved here.
+//! becoming unreadable. `DistPQ` has been, and now sits in `distance.rs` with
+//! the other four, which is what removed this module's dependency on
+//! `hnsw_index`.
 
 use crate::distance::{CosineDist, DistPQ, L1Dist, L2Dist};
 use crate::pq::PQ;
@@ -73,9 +75,9 @@ use traverse::{Topology, LAYERS};
 /// declared here rather than in `distance.rs` because the graph is what calls
 /// it and `distance.rs` is one of the modules that implements it.
 ///
-/// The implementors are `CosineDist`, `L2Dist`, `L1Dist` and `DotDist` in
-/// `distance.rs` and `DistPQ` in `hnsw_index`. Every one imports the name from
-/// this module, so the set is countable from the `use` sites of this line.
+/// The implementors are `CosineDist`, `L2Dist`, `L1Dist`, `DotDist` and
+/// `DistPQ`, all five in `distance.rs`. Every one imports the name from this
+/// module, so the set is countable from the `use` sites of this line.
 ///
 /// The shape is the one the trait it replaced had, unchanged, because changing
 /// it would have been a second edit landing at the same time as the deletion

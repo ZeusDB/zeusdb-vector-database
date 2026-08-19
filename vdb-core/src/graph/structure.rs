@@ -25,8 +25,8 @@ use super::levels::{LevelGenerator, DEFAULT_LEVEL_SEED};
 use super::mutable::{reserved_records, MutableGraph, RESERVE_BYTES};
 use super::traverse::LAYERS;
 use super::{Distance, VectorGraph};
+use crate::distance::DistPQ;
 use crate::distance::{CosineDist, L1Dist, L2Dist};
-use crate::hnsw_index::DistPQ;
 use crate::pq::PQ;
 use std::sync::Arc;
 
