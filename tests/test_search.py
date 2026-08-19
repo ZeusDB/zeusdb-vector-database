@@ -1,6 +1,8 @@
 """Single vector and batch search, ranking, distance metrics and search edge cases."""
 
 import pytest
+import struct
+
 import numpy as np
 from zeusdb_vector_database import VectorDatabase
 
@@ -337,8 +339,11 @@ def test_batch_search_list_vectors():
             assert "vector" in result
             assert len(result["vector"]) == 4  # Dimension should match
             vector = result["vector"]
-            assert isinstance(vector, list)
-            assert all(isinstance(v, float) for v in vector)
+            # An ndarray of float32 rather than a list of Python floats. The
+            # values are the same and only the container is different, which
+            # is what a caller reading it by index or by iteration sees.
+            assert isinstance(vector, np.ndarray)
+            assert vector.dtype == np.float32
 
 # ------------------------------------------------------------
 # Test 28: Batch Search with 2D NumPy Array
@@ -754,3 +759,109 @@ def test_search_empty_index():
     # Input validation still applies on an empty index.
     with pytest.raises(ValueError, match="dimension mismatch: expected 4, got 2"):
         index.search([0.1, 0.2])
+
+
+# ------------------------------------------------------------
+# Test 104: return_vector hands back an array, not a list of Python floats
+# ------------------------------------------------------------
+def test_return_vector_is_a_float32_array():
+    """The container changed in 0.8.0 and the values did not.
+
+    set_item("vector", vec) on a Vec<f32> built a PyList and one Python float
+    per component, which at top_k 10 and dimension 1,536 is 15,360 allocations
+    a page. PyArray1::from_vec writes the same f32 values into one buffer.
+    """
+    index = build_validation_index()
+
+    hit = index.search([1.0, 0.0, 0.0, 0.0], top_k=1, return_vector=True)[0]
+    assert isinstance(hit["vector"], np.ndarray)
+    assert hit["vector"].dtype == np.float32
+    assert hit["vector"].shape == (4,)
+
+    # get_records agrees with search, so a caller does not have to remember
+    # which one hands back which.
+    record = index.get_records(hit["id"], return_vector=True)[0]
+    assert isinstance(record["vector"], np.ndarray)
+    assert record["vector"].dtype == np.float32
+    assert np.array_equal(record["vector"], hit["vector"])
+
+    # Every element is readable by index and by iteration, which is what an
+    # unchanged caller does. Under cosine the stored vector is the unit length
+    # form of what was supplied.
+    supplied = {"s1": [0.1, 0.2, 0.3, 0.4], "s2": [0.5, 0.6, 0.7, 0.8]}[hit["id"]]
+    expected = np.asarray(supplied) / np.linalg.norm(supplied)
+    assert len(hit["vector"]) == 4
+    assert float(hit["vector"][0]) == pytest.approx(expected[0], abs=1e-6)
+    assert [float(v) for v in hit["vector"]] == pytest.approx(list(expected), abs=1e-6)
+
+    # A batch page carries the same type in every hit.
+    batch = index.search([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+                         top_k=2, return_vector=True)
+    for page in batch:
+        for entry in page:
+            assert isinstance(entry["vector"], np.ndarray)
+            assert entry["vector"].dtype == np.float32
+
+    # return_vector=False still omits the key entirely.
+    assert "vector" not in index.search([1.0, 0.0, 0.0, 0.0], top_k=1)[0]
+
+    # An empty page carries no vectors and does not raise.
+    empty = VectorDatabase().create("hnsw", dim=4, expected_size=10)
+    assert empty.search([1.0, 0.0, 0.0, 0.0], top_k=5, return_vector=True) == []
+
+
+# ------------------------------------------------------------
+# Test 105: the batch dispatch reads an array through the array branch
+# ------------------------------------------------------------
+def test_batch_dispatch_reads_arrays_without_the_sequence_protocol():
+    """cast now runs before extract, so the zero copy branch is reachable.
+
+    extract::<Vec<Vec<f32>>> succeeds on a 2-D array through the sequence
+    protocol, so tried first it consumed exactly the input the array branch
+    below it was written for. What is asserted here is that the three input
+    shapes still answer identically, since a reordered dispatch reads the same
+    values through a different path.
+    """
+    index = build_validation_index()
+
+    queries = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], dtype=np.float32)
+
+    from_f32 = index.search(queries, top_k=3)
+    from_f64 = index.search(queries.astype(np.float64), top_k=3)
+    from_list = index.search(queries.tolist(), top_k=3)
+
+    def page_bits(batch):
+        return [[(h["id"], struct.pack("<f", h["score"])) for h in page] for page in batch]
+
+    assert page_bits(from_f32) == page_bits(from_list)
+    assert page_bits(from_f64) == page_bits(from_list)
+
+    # A 1-D float64 query, which is what NumPy hands back by default, agrees
+    # with the float32 form and with the list form.
+    single_bits = [
+        [(h["id"], struct.pack("<f", h["score"])) for h in index.search(q, top_k=3)]
+        for q in (queries[0], queries[0].astype(np.float64), queries[0].tolist())
+    ]
+    assert single_bits[0] == single_bits[1] == single_bits[2]
+
+    # The checks the list branch ran are still run on an array. An array with
+    # no rows is an empty batch, whatever its dtype.
+    for dtype in (np.float32, np.float64):
+        with pytest.raises(ValueError, match="Batch cannot be empty"):
+            index.search(np.empty((0, 4), dtype=dtype))
+
+        # A row of the wrong width is a dimension mismatch in the same words a
+        # list of lists gets.
+        with pytest.raises(ValueError, match="dimension mismatch: expected 4, got 2"):
+            index.search(np.zeros((3, 2), dtype=dtype))
+
+        # Three dimensions is not a batch of queries at all. It fails the
+        # array cast, which checks the rank as well as the dtype, and falls
+        # through every arm to the single vector one, exactly as before.
+        with pytest.raises(TypeError):
+            index.search(np.zeros((2, 2, 4), dtype=dtype))
+
+    # A filter applies the same way through the array branch.
+    filtered_array = index.search(queries, top_k=3, filter={"type": "test"})
+    filtered_list = index.search(queries.tolist(), top_k=3, filter={"type": "test"})
+    assert page_bits(filtered_array) == page_bits(filtered_list)

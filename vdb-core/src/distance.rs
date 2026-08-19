@@ -101,6 +101,9 @@
 // from the crate itself. ZeusDB implements it, so the name has to be visible
 // here; see the note at the top of `graph.rs`.
 use crate::graph::Distance;
+use crate::pq::PQ;
+use std::cell::RefCell;
+use std::sync::Arc;
 
 // The eight lane `f32` vector the kernels accumulate into. It is a compile time
 // selection over the target's registers rather than a run time one, so it adds
@@ -117,20 +120,134 @@ use core::arch::x86_64::{
     _mm256_set1_epi32, _mm256_setzero_ps, _mm256_storeu_ps, _mm256_sub_ps,
 };
 
-/// The quantized distance, re-exported so every call site imports its distances
-/// from one module.
+thread_local! {
+    /// The ADC lookup table for the query the calling thread is running.
+    ///
+    /// The table belongs to a query, not to an index. It used to live on
+    /// `DistPQ`, one per index, which meant two searches overlapping would each
+    /// overwrite the other's table and score candidates against a query they
+    /// were never given. An exclusive lock on the graph was the only thing
+    /// preventing that, so the table had to move before the lock could be
+    /// relaxed.
+    ///
+    /// `Distance::eval` takes `&self` and has no parameter to carry per query
+    /// state, so the table cannot be threaded through as an argument. Thread
+    /// local storage is the way to give it to `eval` without giving it to the
+    /// index, and it needs no change to the vendored crate.
+    ///
+    /// The invariant this rests on is that one query's traversal runs entirely
+    /// on the thread that installed its table. `Hnsw::search` is sequential
+    /// within a single query, so that holds. `batch_search_parallel` splits
+    /// across queries rather than within one, and each query installs its own
+    /// table on the worker that runs it. Adopting `Hnsw::parallel_search`, which
+    /// would fan one query's distance evaluations out across the pool, would
+    /// break this and must not be done without replacing the mechanism.
+    static QUERY_LUT: RefCell<Option<Vec<Vec<f32>>>> = const { RefCell::new(None) };
+}
+/// Holds a query's ADC table on the calling thread and removes it on drop.
 ///
-/// The declaration used to be unable to follow the name. The dump format the
-/// first six releases wrote carried `std::any::type_name::<D>()` in its header
-/// and the load path
-/// compared it by exact equality, and `type_name` reports where a type is
-/// **declared**, so moving `DistPQ` out of `hnsw_index` would have changed what
-/// every save wrote and stopped every saved quantized index from loading.
+/// Drop rather than an explicit clear, so an early return or a panic inside the
+/// traversal cannot leave a stale table behind for the next query this thread
+/// runs. A leftover table would be read as if it belonged to that next query.
+pub(crate) struct QueryLut;
+impl Drop for QueryLut {
+    fn drop(&mut self) {
+        QUERY_LUT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+/// Custom distance function for Product Quantization using ADC
 ///
-/// ZeusDB's format carries a discriminant instead, so the declaration is free
-/// to move now. It has not been moved here, because that is a change to make on
-/// its own rather than alongside a format change.
-pub(crate) use crate::hnsw_index::DistPQ;
+/// The fifth implementor of `graph::Distance`, beside the other four.
+///
+/// It was declared in `hnsw_index` for the first six releases because the dump
+/// format those releases wrote carried `std::any::type_name::<D>()` in its
+/// header and the load path compared it by exact equality. `type_name` reports
+/// where a type is **declared**, so moving it changed what every save wrote and
+/// stopped every saved quantized index from loading.
+///
+/// ZeusDB's own format carries a `graph::dump::GraphKind` discriminant instead,
+/// so the pin is gone. It was costing a dependency cycle: `graph` reached into
+/// `hnsw_index` for this one name, through a re-export in this file that hid
+/// the fact, while `hnsw_index` is built on `graph`.
+#[derive(Clone)]
+pub struct DistPQ {
+    /// Reference to the PQ instance for accessing centroids
+    pq: Arc<PQ>,
+}
+impl DistPQ {
+    pub fn new(pq: Arc<PQ>) -> Self {
+        DistPQ { pq }
+    }
+
+    /// Bytes one code occupies, which is the length of the dummy query the
+    /// seam hands the traversal. The codebook is private to this type, so the
+    /// seam asks rather than reaching into it.
+    pub(crate) fn subvectors(&self) -> usize {
+        self.pq.subvectors()
+    }
+
+    /// Compute this query's ADC table and install it for the calling thread.
+    ///
+    /// The returned guard must be held for the whole traversal. Dropping it
+    /// early returns the thread to graph construction mode, where `eval` reads
+    /// the codebook's symmetric table instead.
+    pub(crate) fn install_query_lut(&self, query: &[f32]) -> Result<QueryLut, String> {
+        if !self.pq.is_trained() {
+            return Err("PQ must be trained before ADC computation".to_string());
+        }
+
+        let lut = self.pq.compute_adc_lut(query)?;
+        QUERY_LUT.with(|slot| *slot.borrow_mut() = Some(lut));
+        Ok(QueryLut)
+    }
+}
+impl Distance<u8> for DistPQ {
+    /// Distance between two points the graph holds, both of which are PQ codes
+    ///
+    /// A query table on this thread means a search is running. `a` is then the
+    /// dummy code vector `VectorGraph::search` passes, the real query lives in
+    /// the table, and the distance is asymmetric: query subvector against stored
+    /// centroid.
+    ///
+    /// No query table means graph construction, where there is no query and
+    /// both `a` and `b` are stored codes. The distance is then symmetric,
+    /// centroid against centroid, read from the table the codebook carries.
+    /// Returning infinity here, which is what this did until the symmetric
+    /// table existed, made every candidate tie in the neighbour selection
+    /// heuristic and left the graph with one edge per node.
+    ///
+    /// Both branches return a sum of squared L2 distances, so they are on the
+    /// same scale and neither takes a square root.
+    ///
+    /// Choosing the branch on the table rather than on `a` is deliberate. The
+    /// dummy query is a valid code slice and cannot be told apart from real
+    /// codes by inspection. It is sound because the table is thread local, so an
+    /// insertion can never observe a query table it did not install itself, no
+    /// matter what any other thread is doing at the time. That used to depend on
+    /// the graph mutex serialising searches against insertions, which is the
+    /// dependency this removes.
+    fn eval(&self, a: &[u8], b: &[u8]) -> f32 {
+        QUERY_LUT.with(|slot| {
+            let slot = slot.borrow();
+            let Some(lut) = slot.as_ref() else {
+                return self.pq.symmetric_distance(a, b);
+            };
+
+            // b.len() should equal pq.subvectors()
+            let mut sum = 0.0f32;
+            for (sv, &code) in b.iter().enumerate() {
+                // lut[sv][code]
+                let distance_component = lut
+                    .get(sv)
+                    .and_then(|row| row.get(code as usize))
+                    .copied()
+                    .unwrap_or(f32::INFINITY);
+                sum += distance_component;
+            }
+            sum
+        })
+    }
+}
 
 /// Independent accumulators each kernel carries.
 ///

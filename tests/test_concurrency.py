@@ -26,6 +26,7 @@ afterwards that the write genuinely landed on top of a read. A run that failed t
 construct the overlap fails the test rather than passing on an empty exercise.
 """
 
+import os
 import subprocess
 import sys
 import threading
@@ -889,3 +890,293 @@ def test_get_stats_never_deadlocks_against_mutation(tmp_path, probe_mode):
     assert add_calls > 1, "the churn loop barely ran"
     if probe_mode == "removal":
         assert remove_calls > 10, "no removal pressure was generated"
+
+
+# ============================================================================
+# save() against concurrent mutation
+# ============================================================================
+#
+# Nothing in this file mentioned `save` at all, and a lock order inversion lived
+# in that path once: `save_manifest` held the `vectors` and `pq_codes` read
+# guards across a `get_storage_mode` call, which takes the graph's read guard,
+# acquiring the three in the reverse of the documented `hnsw < vectors <
+# pq_codes` order. It could not deadlock, because a save holds the mutation lock
+# and so does every path taking the graph's write guard, but that is the same
+# reasoning that failed for the three inversions found before it, and nothing in
+# the suite would have caught it if the mutation lock ever stopped covering one
+# of them.
+#
+# The shape is the get_stats probe's: a subprocess with a parent timeout, since
+# the failure mode is a frozen interpreter that no in-process assertion can
+# report. Saves run in a loop beside adds, removes and searches.
+#
+# # Why the assertions count overlaps rather than operations
+#
+# The three mutating loops share one mutex, so they cannot be given independent
+# throughput floors. Measured on one machine over 8 seconds at 9,600 records,
+# `save` costs 37.8 ms uncontended and `remove_point` costs 0.001 ms, so a round
+# of the mutation lock is dominated by the save and each round serves one save,
+# one add and one removal. The three counts come out at 190, 176 and 203 in raw
+# mode and 95, 94 and 124 in quantized mode, pinned to a 1:1:1 ratio, and a
+# contended `remove_point` measures 39.3 ms against 0.001 ms of work, so it is
+# 99.997 percent lock wait.
+#
+# A floor of 10 on removals was therefore a floor of 10 on **saves**, which is a
+# statement about how many rounds of that mutex the machine completes in 8
+# seconds and not about whether removal happened. A slower machine completing 5
+# rounds reads 5 removals, 5 saves and 5 adds, and only the removal floor fails,
+# because the other two were set at 1. The counts were consistent and the floor
+# was the wrong kind of assertion.
+#
+# What the test needs is that every loop ran and that the interleaving it exists
+# to create actually occurred. `save` holds the mutation lock for essentially the
+# whole run, so a removal requested during a save is a removal queued behind it,
+# which is the ordering an inversion between the two paths needs. The remove loop
+# waits for a save to be in flight before removing, so that this is deliberate
+# rather than left to how many rounds the machine got through, and a search
+# completing during a save is the assertion that a save takes the mutation lock
+# and no reader lock. Neither count scales with machine speed, and both go to
+# zero if their loop stops.
+
+SAVE_PROBE_SECONDS = 8.0
+SAVE_PROBE_TIMEOUT_S = 180.0
+
+SAVE_PROBE_SCRIPT = '''
+import os
+import sys
+import threading
+import time
+from collections import deque
+
+import numpy as np
+from zeusdb_vector_database import VectorDatabase
+
+mode = sys.argv[1]
+seconds = float(sys.argv[2])
+root = sys.argv[3]
+DIM = 16
+BATCH = 150
+rng = np.random.default_rng(23)
+
+quantization = None
+if mode == "quantized":
+    quantization = {
+        "type": "pq",
+        "subvectors": 8,
+        "bits": 8,
+        "training_size": 1000,
+        "storage_mode": "quantized_with_raw",
+    }
+
+index = VectorDatabase().create(
+    "hnsw", dim=DIM, expected_size=20000, quantization_config=quantization,
+)
+seed_count = 1400 if mode == "quantized" else 600
+seeds = rng.standard_normal((seed_count, DIM)).astype(np.float32)
+index.add({"ids": [f"seed_{i}" for i in range(seed_count)], "embeddings": seeds})
+assert index.is_quantized() == (mode == "quantized"), index.get_storage_mode()
+
+stop = threading.Event()
+counts = {"saves": 0, "adds": 0, "removes": 0, "searches": 0,
+          "removes_during_save": 0, "searches_during_save": 0}
+failures = []
+pending = deque()
+pending_lock = threading.Lock()
+queries = rng.standard_normal((32, DIM)).astype(np.float32)
+# Set while index.save() is running, which is how the other two loops learn
+# that their operation met one.
+save_active = threading.Event()
+
+
+def guarded(name, body):
+    def run():
+        try:
+            body()
+        except BaseException as exc:
+            failures.append(f"{name}: {type(exc).__name__}: {exc}")
+            stop.set()
+    return run
+
+
+def save_loop():
+    n = 0
+    while not stop.is_set():
+        # Alternating targets, so a save is never writing over the directory the
+        # previous one wrote and a directory a save is still filling is not
+        # mistaken afterwards for one it finished.
+        save_active.set()
+        try:
+            index.save(os.path.join(root, "snap_%d.zdb" % (n % 2)))
+        finally:
+            save_active.clear()
+        counts["saves"] += 1
+        n += 1
+
+
+def add_loop():
+    batch = rng.standard_normal((BATCH, DIM)).astype(np.float32)
+    n = 0
+    while not stop.is_set():
+        ids = [f"churn_{n}_{i}" for i in range(BATCH)]
+        index.add({"ids": ids, "embeddings": batch})
+        with pending_lock:
+            pending.extend(ids)
+        counts["adds"] += 1
+        n += 1
+
+
+def remove_loop():
+    while not stop.is_set():
+        with pending_lock:
+            rid = pending.popleft() if pending else None
+        if rid is None:
+            time.sleep(0.001)
+            continue
+        # Line the removal up behind a running save on purpose. The two share
+        # the mutation lock, so they never execute at the same instant, and what
+        # an inversion between them needs is one waiting on the other. The add
+        # loop keeps this queue oversupplied by two orders of magnitude, at
+        # 26,400 ids queued against 203 removed, so the wait here is on the save
+        # and never on the queue. Bounded, so a save loop that has died leaves
+        # this counting removals rather than spinning.
+        during = save_active.wait(timeout=1.0)
+        index.remove_point(rid)
+        counts["removes"] += 1
+        if during:
+            counts["removes_during_save"] += 1
+
+
+def search_loop():
+    # A save holds the mutation lock and no reader lock, so searches must keep
+    # answering throughout. This also puts a reader on the storage guards while
+    # the save is reading them.
+    n = 0
+    while not stop.is_set():
+        during = save_active.is_set()
+        page = index.search(queries[n % len(queries)], top_k=5)
+        assert isinstance(page, list)
+        counts["searches"] += 1
+        if during and save_active.is_set():
+            # Entered and left with a save still in flight, so this one was
+            # answered while a save held the mutation lock.
+            counts["searches_during_save"] += 1
+        n += 1
+
+
+threads = [
+    threading.Thread(target=guarded("save", save_loop), daemon=True),
+    threading.Thread(target=guarded("add", add_loop), daemon=True),
+    threading.Thread(target=guarded("remove", remove_loop), daemon=True),
+    threading.Thread(target=guarded("search", search_loop), daemon=True),
+]
+for t in threads:
+    t.start()
+deadline = time.monotonic() + seconds
+while time.monotonic() < deadline and not stop.is_set():
+    time.sleep(0.2)
+stop.set()
+for t in threads:
+    t.join(timeout=60)
+assert not any(t.is_alive() for t in threads), "a worker never came back"
+assert not failures, "; ".join(failures)
+
+# Every directory a save finished writing must load, and what it holds must be
+# one instant of the index rather than a mixture of two. A save takes the
+# mutation lock, so the mappings and the stores cannot come from either side of
+# an insertion.
+checked = 0
+for n in (0, 1):
+    path = os.path.join(root, "snap_%d.zdb" % n)
+    if not os.path.isdir(path):
+        continue
+    loaded = VectorDatabase().load(path)
+    assert len(loaded) > 0, path
+    page = loaded.search(queries[0], top_k=5)
+    assert isinstance(page, list), path
+    stats = loaded.get_stats()
+    assert int(stats["total_vectors"]) == len(loaded), (path, stats["total_vectors"])
+    # Every record the id map names has metadata and a vector or a code behind
+    # it, which is what a torn save would break.
+    listed = loaded.list(number=50)
+    fetched = loaded.get_records([rid for rid, _ in listed], return_vector=True)
+    assert len(fetched) == len(listed), (path, len(fetched), len(listed))
+    checked += 1
+assert checked > 0, "no snapshot was written"
+
+print("OK " + " ".join(str(counts[k]) for k in
+                       ("saves", "adds", "removes", "searches",
+                        "removes_during_save", "searches_during_save")))
+'''
+
+
+@pytest.mark.parametrize("probe_mode", ["raw", "quantized"])
+def test_save_never_deadlocks_or_tears_against_mutation(tmp_path, probe_mode):
+    """save loops beside adds, removes and searches without freezing or tearing.
+
+    Two failures are in scope. A lock order inversion in the save path would
+    hang the child, which the parent timeout detects. A save reading the
+    mappings and the stores at different instants would write a directory whose
+    id map names records the stores do not hold, which the child's reload
+    assertions detect.
+    """
+    script = tmp_path / "save_concurrency_probe.py"
+    script.write_text(SAVE_PROBE_SCRIPT, encoding="utf-8")
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir()
+    try:
+        # save() prints a progress banner carrying non-ASCII, and the default
+        # child encoding on Windows cannot decode it, so the stream is read as
+        # UTF-8 with replacement rather than left to the console codepage.
+        child_env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(script), probe_mode,
+             str(SAVE_PROBE_SECONDS), str(snapshots)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=child_env,
+            timeout=SAVE_PROBE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            f"save deadlocked against mutation in {probe_mode} mode: the probe "
+            f"froze and was killed after {SAVE_PROBE_TIMEOUT_S:.0f}s"
+        )
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
+
+    # The counts are on the one line beginning OK, since save writes a banner
+    # to the same stream.
+    summary = [line for line in result.stdout.splitlines() if line.startswith("OK ")]
+    assert len(summary) == 1, result.stdout[-2000:]
+    saves, adds, removes, searches, removes_during_save, searches_during_save = map(
+        int, summary[0].split()[1:7]
+    )
+    seen = (f"saves={saves} adds={adds} removes={removes} searches={searches} "
+            f"removes_during_save={removes_during_save} "
+            f"searches_during_save={searches_during_save}")
+
+    # Liveness. Every loop got at least one operation through. These are not
+    # throughput floors. The three mutating loops share one mutex and run at a
+    # 1:1:1 ratio, so any number above one would be a floor on how many rounds
+    # of that mutex the machine completes, which is what the note above the
+    # probe records.
+    assert saves >= 1, f"the save loop never completed a save. {seen}"
+    assert adds >= 1, f"the add loop never completed an add. {seen}"
+    assert removes >= 1, f"the remove loop never removed a record. {seen}"
+    assert searches >= 1, f"the search loop never completed a search. {seen}"
+
+    # The interleaving this test exists to create. A removal requested while a
+    # save held the mutation lock is a removal queued behind that save. Zero
+    # here means the two never met, so a clean run proved nothing about them.
+    assert removes_during_save >= 1, (
+        f"no removal overlapped a save, so the interleaving under test never "
+        f"occurred. {seen}"
+    )
+
+    # A save takes the mutation lock and no reader lock, so a search has to be
+    # answerable while one runs. Zero here means saves are excluding readers,
+    # which is a regression whatever the totals say.
+    assert searches_during_save >= 1, (
+        f"no search completed while a save held the mutation lock. {seen}"
+    )

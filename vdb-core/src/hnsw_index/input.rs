@@ -88,12 +88,22 @@ impl HNSWIndex {
     }
 
     /// Parse input data into (id, vector, metadata) tuples with error collection
-    pub(super) fn parse_input_data(&self, data: &Bound<PyAny>) -> (ParsedRecords, Vec<String>) {
+    ///
+    /// Two error channels, and which one a mistake takes is the distinction
+    /// this function exists to draw. A bad record is collected into `errors`
+    /// and reported through `AddResult`, because the other records in the batch
+    /// are still what the caller asked for. A malformed call raises, because
+    /// there is no record set to report against. The only mistakes in the
+    /// second class are the ones `check_batch_lengths` names.
+    pub(super) fn parse_input_data(
+        &self,
+        data: &Bound<PyAny>,
+    ) -> PyResult<(ParsedRecords, Vec<String>)> {
         let mut parsed_vectors = Vec::new();
         let mut errors = Vec::new();
 
         if let Ok(dict) = data.cast::<PyDict>() {
-            self.parse_dict_input_safe(dict, &mut parsed_vectors, &mut errors);
+            self.parse_dict_input_safe(dict, &mut parsed_vectors, &mut errors)?;
         } else if let Ok(list) = data.cast::<PyList>() {
             self.parse_list_input_safe(list, &mut parsed_vectors, &mut errors);
         } else if let Ok(np_array) = data.cast::<PyArray2<f32>>() {
@@ -114,16 +124,19 @@ impl HNSWIndex {
             }
         }
 
-        (parsed_vectors, errors)
+        Ok((parsed_vectors, errors))
     }
 
     /// Safe dictionary parsing that collects errors
+    ///
+    /// Returns `Err` only for the length and type rule on the parallel arrays.
+    /// Every other failure is collected.
     fn parse_dict_input_safe(
         &self,
         dict: &Bound<PyDict>,
         parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
         errors: &mut Vec<String>,
-    ) {
+    ) -> PyResult<()> {
         // Check for single object format
         if dict.contains("id").unwrap_or(false)
             && (dict.contains("values").unwrap_or(false)
@@ -172,11 +185,131 @@ impl HNSWIndex {
                 }
             }
         } else {
-            // Batch format - try the existing parse_batch_format
+            // Batch format. The parallel arrays are checked against the vector
+            // count before anything is parsed, and a disagreement raises rather
+            // than being collected. Everything else the batch can get wrong is
+            // a property of one record and is still reported per record.
+            self.check_batch_lengths(dict)?;
             if let Err(e) = self.parse_batch_format(dict, parsed_vectors, errors) {
                 errors.push(format!("Batch parsing error: {}", e));
             }
         }
+
+        Ok(())
+    }
+
+    /// How many vectors a batch dict carries, or `None` if it carries no
+    /// recognised vector field.
+    ///
+    /// Mirrors `parse_batch_format`'s dispatch exactly, key for key and cast
+    /// for cast, so the count checked here is the count that loop will run to.
+    /// An unrecognised or wrongly typed vector field returns `None` and is left
+    /// for `parse_batch_format` to report in its own words.
+    fn batch_vector_count(dict: &Bound<PyDict>) -> PyResult<Option<usize>> {
+        for key in ["vectors", "embeddings"] {
+            if let Some(item) = dict.get_item(key)? {
+                if let Ok(list) = item.cast::<PyList>() {
+                    return Ok(Some(list.len()));
+                } else if let Ok(np_array) = item.cast::<PyArray2<f32>>() {
+                    let count = np_array.readonly().shape().first().copied();
+                    return Ok(count);
+                }
+                return Ok(None);
+            }
+        }
+
+        if let Some(item) = dict.get_item("values")? {
+            if let Ok(list) = item.cast::<PyList>() {
+                return Ok(Some(list.len()));
+            }
+            return Ok(None);
+        }
+
+        Ok(None)
+    }
+
+    /// The one rule that raises rather than counting an error
+    ///
+    /// A batch dict pairs its arrays by position, so `ids[i]` names `vectors[i]`
+    /// and `metadatas[i]` describes it. Nothing in the shape says how long each
+    /// is, and until this check existed a disagreement was absorbed in both
+    /// directions. Three ids against two vectors inserted two records under the
+    /// first two ids and dropped the third, and two ids against three vectors
+    /// inserted the third under a generated `vec_N`. Both reported
+    /// `inserted=n, errors=0`.
+    ///
+    /// It raises rather than rejecting a record, because which record the caller
+    /// meant is unrecoverable. A short `ids` does not say whether the trailing
+    /// vectors were surplus or the ids were, and a per-record rejection would
+    /// have to guess. Every other mistake `add` reports is a property of one
+    /// record, and the surrounding records are still what the caller asked for.
+    ///
+    /// A parallel array that is not a list is the same loss by another route.
+    /// The NumPy branch resolved `ids` with `cast::<PyList>().ok()`, so a tuple
+    /// or an `ndarray` of ids was discarded whole and every record took a
+    /// generated id, while the list branch raised on the same input. Both now
+    /// say so.
+    fn check_batch_lengths(&self, dict: &Bound<PyDict>) -> PyResult<()> {
+        let Some(vector_count) = Self::batch_vector_count(dict)? else {
+            return Ok(());
+        };
+
+        let vector_field = ["vectors", "embeddings", "values"]
+            .into_iter()
+            .find(|key| dict.contains(key).unwrap_or(false))
+            .unwrap_or("vectors");
+
+        // 'metadata' is read as a spelling of 'metadatas' by both batch parsers,
+        // and only where 'metadatas' is absent, so it is checked under the same
+        // rule and only in the same case.
+        let metadata_field = if dict.get_item("metadatas")?.is_some() {
+            "metadatas"
+        } else {
+            "metadata"
+        };
+
+        for (field, singular) in [("ids", "id"), (metadata_field, "metadata mapping")] {
+            let Some(item) = dict.get_item(field)? else {
+                continue;
+            };
+            let Ok(list) = item.cast::<PyList>() else {
+                if field != "ids" {
+                    // A non-list under a metadata key is ignored by both
+                    // parsers today and carries no id, so it is left alone.
+                    continue;
+                }
+                return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                    "add expected '{}' to be a list, got {}. A batch pairs '{}' with \
+                     '{}' by position and reads only a list that way, so any other type \
+                     is discarded whole and every record takes a generated id.",
+                    field,
+                    item.get_type().name()?,
+                    field,
+                    vector_field
+                )));
+            };
+            if list.len() != vector_count {
+                let short = if list.len() < vector_count {
+                    field
+                } else {
+                    vector_field
+                };
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "add received {} entries under '{}' and {} under '{}'. A batch pairs \
+                     them by position, so the two must be the same length, and '{}' is \
+                     the short one. Supply one {} per vector, or omit '{}' entirely.",
+                    list.len(),
+                    field,
+                    vector_count,
+                    vector_field,
+                    short,
+                    singular,
+                    field
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Handle Format 3 & 5: Batch format - WORKING SOLUTION

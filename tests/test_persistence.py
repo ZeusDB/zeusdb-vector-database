@@ -282,7 +282,7 @@ def test_persistence_single_vector_index(tmp_path):
     assert results[0]["metadata"] == {"solo": True}
 
     record = loaded.get_records("only", return_vector=True)[0]
-    assert record["vector"] == [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert record["vector"].tolist() == [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 # ------------------------------------------------------------
 # Test 71: Persistence: per record metadata across a reload
@@ -1764,3 +1764,232 @@ def test_a_rebuilt_index_filters_on_its_restored_metadata(tmp_path):
     # And the composed forms, which reach the rebuilt index like any other.
     assert rebuilt.count({"$or": [{"tier": "a"}, {"tier": "b"}]}) == 200
     assert rebuilt.count({"$not": {"tier": "c"}}) == 200
+
+
+# ============================================================================
+# load() against a half-written directory
+# ============================================================================
+#
+# Every artefact is written with `fs::write` straight into the target directory
+# and `manifest.json` is written last, so a save that fails part way leaves a
+# mixture of files under no manifest, and a save whose last write failed leaves a
+# manifest describing files that are not all there. There is no temporary
+# directory and no atomic rename.
+#
+# What these assert is that such a directory produces an error rather than an
+# index that answers queries wrongly. Two damage kinds per artefact, a truncation
+# to nothing and a deletion, which are the two shapes an interrupted write
+# leaves.
+
+HALF_WRITTEN_N = 1200
+HALF_WRITTEN_DIM = 8
+
+
+def half_written_source(mode):
+    """An index of HALF_WRITTEN_N records in one of the three storage modes."""
+    quantization = None
+    if mode != "raw":
+        quantization = {
+            "type": "pq", "subvectors": 4, "bits": 8, "training_size": 1000,
+            "storage_mode": ("quantized_only" if mode == "quantized_only"
+                             else "quantized_with_raw"),
+        }
+    rng = np.random.default_rng(5)
+    vectors = rng.standard_normal((HALF_WRITTEN_N, HALF_WRITTEN_DIM)).astype(np.float32)
+    ids = [f"r{i}" for i in range(HALF_WRITTEN_N)]
+    metadatas = [{"tier": "gold" if i % 2 == 0 else "silver", "n": i}
+                 for i in range(HALF_WRITTEN_N)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        index = VectorDatabase().create(
+            "hnsw", dim=HALF_WRITTEN_DIM, expected_size=5000,
+            quantization_config=quantization,
+        )
+    assert index.add({"ids": ids, "embeddings": vectors,
+                      "metadatas": metadatas}).is_success()
+    assert index.is_quantized() == (mode != "raw"), index.get_storage_mode()
+    return index, vectors
+
+
+def damage(directory, name, kind):
+    """Truncate a file to nothing or delete it. False if it is not there."""
+    target = os.path.join(directory, name)
+    if not os.path.exists(target):
+        return False
+    if kind == "truncate":
+        with open(target, "r+b") as handle:
+            handle.truncate(0)
+    elif kind == "half":
+        size = os.path.getsize(target)
+        with open(target, "r+b") as handle:
+            handle.truncate(max(1, size // 2))
+    else:
+        os.remove(target)
+    return True
+
+
+# Every artefact whose loss or truncation must be reported rather than absorbed,
+# per storage mode. The graph dump is deliberately absent from these lists: it is
+# derived data and the loader rebuilds it, which is covered separately below.
+MUST_RAISE = {
+    "raw": ["config.json", "mappings.bin", "metadata.json", "vectors.bin",
+            "manifest.json"],
+    # quantization.json is absent from this row on purpose. Deleting it under
+    # quantized_with_raw does not raise, because the raw vectors alone support a
+    # complete unquantized index, which is the second face of the defect
+    # test_load_absorbs_a_missing_vectors_bin_under_quantized_with_raw pins.
+    # Truncating it does raise, since a file that is there has to parse.
+    "quantized_with_raw": ["config.json", "mappings.bin", "metadata.json",
+                           "pq_centroids.bin", "manifest.json"],
+    "quantized_only": ["config.json", "mappings.bin", "metadata.json",
+                       "pq_centroids.bin", "pq_codes.bin", "quantization.json",
+                       "manifest.json"],
+}
+
+
+@pytest.mark.parametrize("mode", ["raw", "quantized_with_raw", "quantized_only"])
+@pytest.mark.parametrize("kind", ["truncate", "half", "delete"])
+def test_load_refuses_a_half_written_directory(tmp_path, mode, kind):
+    """A damaged artefact is an error, not an index that answers wrongly.
+
+    A truncated file is what an interrupted write leaves and a missing file is
+    what a save that never reached that artefact leaves. Either way the
+    directory does not describe one index, and load has to say so rather than
+    building whatever the surviving files support.
+    """
+    index, vectors = half_written_source(mode)
+    pristine = tmp_path / f"pristine-{mode}.zdb"
+    index.save(str(pristine))
+
+    # The undamaged directory is the control. Every assertion below is against
+    # an index that loads and answers correctly from these same files.
+    control = VectorDatabase().load(str(pristine))
+    want = [hit["id"] for hit in control.search(vectors[0], top_k=5)]
+    assert len(control) == HALF_WRITTEN_N
+
+    artefacts = list(MUST_RAISE[mode])
+    if kind != "delete" and mode == "quantized_with_raw":
+        # A quantization.json that is present has to parse, whatever mode it is.
+        artefacts.append("quantization.json")
+
+    for name in artefacts:
+        work = tmp_path / f"work-{mode}-{kind}-{name}.zdb"
+        shutil.copytree(pristine, work)
+        assert damage(str(work), name, kind), f"{name} was not in the directory"
+
+        with pytest.raises(Exception) as excinfo:
+            VectorDatabase().load(str(work))
+        # An OSError for a file that is gone, a RuntimeError for one that is
+        # there and does not parse. Neither is a silent load.
+        assert isinstance(excinfo.value, (OSError, RuntimeError, ValueError)), (
+            name, kind, type(excinfo.value).__name__
+        )
+        message = str(excinfo.value)
+        assert message, f"{name} {kind} raised with no message"
+
+    # Nothing above touched the pristine directory, which still loads.
+    again = VectorDatabase().load(str(pristine))
+    assert [hit["id"] for hit in again.search(vectors[0], top_k=5)] == want
+
+
+@pytest.mark.parametrize("mode", ["raw", "quantized_with_raw", "quantized_only"])
+@pytest.mark.parametrize("kind", ["truncate", "half", "delete"])
+def test_load_rebuilds_a_damaged_graph_dump_rather_than_refusing(tmp_path, mode, kind):
+    """The graph is derived data, so a damaged dump is recoverable and recovered.
+
+    This is the one artefact whose loss is not an error. The records carry
+    everything the graph is built from, so the loader rebuilds rather than
+    refusing, and it says on stdout which of the three conditions it detected.
+    The page has to be the page the intact directory answers, since the records
+    are the same records.
+    """
+    index, vectors = half_written_source(mode)
+    pristine = tmp_path / f"graph-{mode}.zdb"
+    index.save(str(pristine))
+
+    control = VectorDatabase().load(str(pristine))
+    want = [hit["id"] for hit in control.search(vectors[0], top_k=5)]
+
+    work = tmp_path / f"graph-work-{mode}-{kind}.zdb"
+    shutil.copytree(pristine, work)
+    assert damage(str(work), "hnsw_index.zdbgraph", kind)
+
+    rebuilt = VectorDatabase().load(str(work))
+    assert len(rebuilt) == HALF_WRITTEN_N
+    assert int(rebuilt.get_stats()["graph_nodes"]) == HALF_WRITTEN_N
+    assert [hit["id"] for hit in rebuilt.search(vectors[0], top_k=5)] == want
+    assert rebuilt.get_records("r0", return_vector=False)[0]["metadata"]["n"] == 0
+
+
+def test_load_absorbs_a_missing_vectors_bin_under_quantized_with_raw(tmp_path):
+    """A known defect, pinned here so a fix trips this test and reads this note.
+
+    manifest.json lists every file the save wrote under files_included, and the
+    loader does not check that they are all present. Under
+    quantized_with_raw the codes alone yield the full record count, so a
+    directory whose vectors.bin never landed loads as a complete 1,200 record
+    index with no error and no warning. What it actually holds is a
+    reconstruction of every vector: get_records returns approximations where the
+    intact index returns the values supplied, rerank rescores against those
+    approximations, and the page moves.
+
+    raw_vectors_stored reading 0 is the only trace, and no caller reads it.
+    The same gap absorbs a missing quantization.json under the same mode, which
+    loads as an unquantized index.
+
+    **The assertions below record what happens today, not what should happen.**
+    A loader that validated files_included against the directory would raise
+    here instead, which is the correct behaviour and is separate work. When that
+    lands, replace this test with one asserting the raise.
+    """
+    index, vectors = half_written_source("quantized_with_raw")
+    pristine = tmp_path / "qraw-defect.zdb"
+    index.save(str(pristine))
+
+    manifest = json.loads((pristine / "manifest.json").read_text(encoding="utf-8"))
+    # The manifest carries enough to detect the loss, which is what makes this a
+    # defect rather than a limitation.
+    assert "vectors.bin" in manifest["files_included"]
+
+    control = VectorDatabase().load(str(pristine))
+    exact = np.asarray(control.get_records("r0", return_vector=True)[0]["vector"],
+                       dtype=np.float64)
+
+    work = tmp_path / "qraw-defect-work.zdb"
+    shutil.copytree(pristine, work)
+    os.remove(work / "vectors.bin")
+
+    absorbed = VectorDatabase().load(str(work))
+    assert len(absorbed) == HALF_WRITTEN_N
+    assert absorbed.is_quantized()
+    # It still reports quantized_with_raw's mode while holding no raw vector.
+    assert int(absorbed.get_stats()["raw_vectors_stored"]) == 0
+    assert int(absorbed.get_stats()["quantized_codes_stored"]) == HALF_WRITTEN_N
+
+    # And what it hands back is a reconstruction rather than what was stored.
+    approximate = np.asarray(
+        absorbed.get_records("r0", return_vector=True)[0]["vector"], dtype=np.float64
+    )
+    assert not np.array_equal(approximate, exact)
+    assert float(np.abs(approximate - exact).max()) > 1e-4
+    # Close enough that no caller would notice from the values alone, which is
+    # what makes the silence the problem.
+    cosine = float(approximate @ exact
+                   / (np.linalg.norm(approximate) * np.linalg.norm(exact)))
+    assert cosine > 0.99
+
+    # The same gap, second face. quantization.json is listed in the manifest
+    # too, and losing it turns a quantized index into an unquantized one with no
+    # error, because the raw vectors alone support a complete index. The records
+    # survive here, so this loses configuration rather than fidelity, but the
+    # silence is the same silence.
+    other = tmp_path / "qraw-defect-noquant.zdb"
+    shutil.copytree(pristine, other)
+    assert "quantization.json" in manifest["files_included"]
+    os.remove(other / "quantization.json")
+
+    unquantized = VectorDatabase().load(str(other))
+    assert len(unquantized) == HALF_WRITTEN_N
+    assert not unquantized.is_quantized()
+    assert not unquantized.has_quantization()
+    assert unquantized.get_quantization_info() is None

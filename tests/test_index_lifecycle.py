@@ -33,9 +33,11 @@ def _build_rust(dim=16, space="cosine", m=16, ef_construction=200,
 # ------------------------------------------------------------
 def test_create_index_hnsw_default():
     vdb = VectorDatabase()
-    index = vdb.create()  # Uses default index_type="hnsw"
+    # index_type still defaults to hnsw. dim does not default, so it is given.
+    index = vdb.create(dim=1536)
     assert index is not None
     assert index.info() is not None
+    assert index.dim == 1536
 
 # ------------------------------------------------------------
 # Test 2: Test the creation of an HNSW index with custom parameters
@@ -60,19 +62,19 @@ def test_index_creation_validation():
     
     # Test invalid ef_construction
     with pytest.raises(RuntimeError):
-        vdb.create("hnsw", ef_construction=0)
+        vdb.create("hnsw", dim=4, ef_construction=0)
     
     # Test invalid expected_size
     with pytest.raises(RuntimeError):
-        vdb.create("hnsw", expected_size=0)
+        vdb.create("hnsw", dim=4, expected_size=0)
     
     # Test invalid m
     with pytest.raises(RuntimeError):
-        vdb.create("hnsw", m=300)  # > 256
+        vdb.create("hnsw", dim=4, m=300)  # > 256
     
     # Test invalid space
     with pytest.raises(RuntimeError):
-        vdb.create("hnsw", space="invalid")
+        vdb.create("hnsw", dim=4, space="invalid")
 
 # ------------------------------------------------------------
 # Test 20: Test case insensitive distance metrics
@@ -99,7 +101,7 @@ def test_new_create_method():
     vdb = VectorDatabase()
     
     # Test default (should create HNSW)
-    index1 = vdb.create()
+    index1 = vdb.create(dim=1536)
     assert index1 is not None
     assert "hnsw" in index1.info().lower()
     
@@ -175,8 +177,28 @@ def test_dim_property():
     index.add({"id": "a", "values": [0.1] * 384, "metadata": {}})
     assert index.dim == 384
 
-    # The default dimension is 1536.
-    assert vdb.create().dim == 1536
+    # dim is required as of 0.8.0. It defaulted to 1536, so vdb.create()
+    # silently built an index for one vendor's model family and then rejected
+    # every vector of any other width.
+    with pytest.raises(TypeError, match="requires 'dim'"):
+        vdb.create()
+    with pytest.raises(TypeError, match="requires 'dim'"):
+        vdb.create("hnsw")
+    with pytest.raises(TypeError, match="requires 'dim'"):
+        vdb.create("hnsw", space="l2", m=16, expected_size=100)
+
+    # The message names the parameter and says why there is no default.
+    with pytest.raises(TypeError, match="no default because dim has to equal"):
+        vdb.create("hnsw")
+
+    # An unknown index type is still reported before dim is looked at, so the
+    # two mistakes do not mask each other.
+    with pytest.raises(ValueError, match="Unknown index type"):
+        vdb.create("ivf")
+
+    # Given, it is what the index reports.
+    assert vdb.create("hnsw", dim=1536).dim == 1536
+    assert vdb.create(dim=384).dim == 384
 
 # ------------------------------------------------------------
 # Test 89: version reporting
