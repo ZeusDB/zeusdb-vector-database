@@ -195,7 +195,7 @@ HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=5, vecto
 | `expected_size`  | `int`  | `10000`   | Estimated number of records to be inserted, from 1 to 100,000,000. Used for preallocating internal data structures and for choosing the default `m`. Not a hard limit, see below. |
 | `quantization_config` | `dict` | `None` | Product Quantization configuration for memory-efficient vector compression. See [Product Quantization](#️-product-quantization). |
 
-**`dim` is required.** It defaulted to 1536 up to 0.7.0, so `vdb.create("hnsw")` built a 1,536 wide index and then rejected every vector of any other width with a dimension mismatch, reporting the mistake at the `add()` rather than at the call that made it. No comparator defaults the dimension. Omitting it now raises `TypeError` naming the parameter.
+**`dim` is required.** There is no default, because `dim` has to equal the width your embedding model produces and an index built at any other width rejects every vector you add to it. Omitting it raises `TypeError`.
 
 ```python
 try:
@@ -209,38 +209,18 @@ except TypeError as error:
 create() requires 'dim', the width of the vectors this index will hold. There is no default because dim has to equal the width your embedding model produces, and an index built at any other width rejects every vector you add to it. Read it off one embedding with len(vector), or pass the width your model documents, for example dim=1536 for OpenAI text-embedding-3-small or dim=768 for most sentence-transformers models.
 ```
 
-`space` still defaults, to `cosine`, which is right for every normalised text embedding. No single dimension is right for more than one model family, which is the difference.
-
-**The default `m` depends on `expected_size`.** It is 16 for an `expected_size` of 25,000 or less, and 32 above that. A graph too sparse for the number of records loses recall that no search width recovers, and `m` is fixed once the index is created, so declare `expected_size` honestly or set `m` yourself. Passing `m` explicitly always wins.
+**The default `m` depends on `expected_size`.** It is 16 for an `expected_size` of 25,000 or less, and 32 above that. `m` is fixed once the index is created and a graph too sparse for the number of records loses recall that no search width recovers, so declare `expected_size` honestly or set `m` yourself. Passing `m` explicitly always wins.
 
 ```python
 vdb.create("hnsw", dim=8, expected_size=25_000).get_stats()["m"]   # '16'
 vdb.create("hnsw", dim=8, expected_size=25_001).get_stats()["m"]   # '32'
 ```
 
-**`expected_size` is a hint and not a limit.** An index accepts more records than it declared, and the graph grows to fit them. What it does not change is `m`, which is chosen at creation from the declaration and fixed there, so an index that has badly outgrown its `expected_size` is running at a degree meant for a smaller one. Passing twice the declared size logs a warning once, on the `add()` that crosses it.
+**`expected_size` is a hint and not a limit.** An index accepts more records than it declared and the graph grows to fit them. What it does not change is `m`. Passing twice the declared size logs a warning once, on the `add()` that crosses it.
 
-The upper bound of 100,000,000 exists because the graph reserves one slot per declared record at creation, 8 bytes each, and that allocation aborts the process rather than raising if it fails. The bound turns an abort into a `ValueError`. Declaring less than the truth is safe.
+**`ef_construction` costs build time and buys graph quality.** It changes neither search latency nor the size of the finished index. Build time is linear in it above 100, so 50,000 records of `dim=1536` build in 76.9 s at the default and 262.1 s at 800. Recall stops improving at or near the default on most data, and where it keeps climbing a larger `ef_search` buys more for less, so raise `ef_search` before raising this.
 
-**`m` starts at 2, not 1.** Layer assignment samples from a scale of `1 / ln(m)`, which is infinity at `m` of 1, so every point is redispatched uniformly across all 16 layers rather than following the exponential distribution the graph depends on. On 3,000 records of 32 dimensions, recall at 10 measured 0.0220 at `m` of 1 against 0.6880 at 2 and 1.0000 at 16.
-
-**`ef_construction` governs insertion and nothing else.** It is the width of the candidate search each insertion runs, at the new point's own layer and at every layer below it. The descent above that layer runs at a width of 1 and ignores it. The candidates that search returns are the pool the neighbour selection draws from, so `ef_construction` sets the supply and `m` sets how much of it is kept.
-
-**It does not change search latency or index size.** A node holds at most `2 × m` neighbours at layer zero and `m` above it whatever width found them, so the finished graph is the same size at every `ef_construction`. Measured over 50,000 records, mean query latency moved between 0.89 ms and 2.85 ms across a sixteenfold range of `ef_construction` with no trend in it, and resident memory ran backwards on one of the three datasets. What it does change is build time, which is linear in it above 100. On OpenAI embeddings of 1,536 dimensions, 50,000 records built in 32.1 s, 76.9 s, 140.7 s and 262.1 s at `ef_construction` 100, 200, 400 and 800. On GloVe of 100 dimensions the same four are 6.5 s, 13.5 s, 26.6 s and 49.8 s. Below 100 the curve flattens, because the fixed per-insert work stops being dominated by the candidate search.
-
-**Recall stops improving at or near the default.** Recall at 10 over 50,000 records at the default `m` of 32, 500 queries, at the default search width:
-
-| `ef_construction` | GloVe 100d | SIFT 128d | OpenAI 1536d |
-|-------------------|------------|-----------|--------------|
-| 50                | 0.9176     | 0.9982    | 0.9852       |
-| 100               | 0.9400     | 0.9992    | 0.9912       |
-| 200               | 0.9606     | 0.9996    | 0.9962       |
-| 400               | 0.9684     | 0.9998    | 0.9972       |
-| 800               | 0.9714     | 0.9996    | 0.9978       |
-
-SIFT plateaus at 100 and OpenAI at 200. GloVe is the one dataset that keeps climbing, and there the cheaper move is the search width rather than the build. At `ef_construction` 200 GloVe returns 0.9606 at the default width and 0.9984 at `ef_search=500`, so widening the search buys 0.0378 on the graph already built where doubling `ef_construction` buys 0.0078 for 1.9 times the build time. Raise `ef_search` before raising this.
-
-**Keep `ef_construction` above `2 × m`.** The neighbour selection heuristic runs only when the candidate list is longer than the neighbour budget, which is `2 × m` at layer zero, and the candidate list is exactly `ef_construction` long on any index holding more records than that. At or below the budget the graph keeps every candidate the search returned, in distance order, and prunes none of them. `create()` warns when the pair reaches that point. `m` is capped at 256, so `m=100` with the default `ef_construction` is enough to switch the heuristic off. The defaults are clear of it, 200 against a budget of 32 at `m` 16 and 64 at `m` 32.
+**Keep `ef_construction` above `2 × m`.** At or below the neighbour budget the graph keeps every candidate the insertion search returned and prunes none of them. `create()` warns when the pair reaches that point. The defaults are clear of it.
 
 <br/>
 
@@ -399,7 +379,7 @@ The `add()` method inserts or replaces one or more vectors in the index.
 | `data`    | `dict`, `list[dict]`, `dict` of arrays, or `np.ndarray` | *required* | Input records to upsert into the index. Supports the five formats above. |
 | `overwrite` | `bool`                            | `True`  | Whether an ID already in the index is replaced. With `False`, a colliding record is skipped and counted as an error. |
 
-**The parallel arrays must be the same length.** Formats 3 and 5 pair `ids[i]` with `vectors[i]` and `metadatas[i]` by position, so a disagreement in length is a caller error and raises `ValueError`. It named both lengths and which field is short.
+**The parallel arrays must be the same length.** Formats 3 and 5 pair `ids[i]` with `vectors[i]` and `metadatas[i]` by position, so a disagreement in length is a caller error and raises `ValueError` naming both lengths and which field is short. Nothing is inserted before the raise, so the call is safe to retry.
 
 ```python
 two_wide = vdb.create("hnsw", dim=2)
@@ -416,11 +396,7 @@ add received 3 entries under 'ids' and 2 under 'embeddings'. A batch pairs them 
 0
 ```
 
-The rule covers `ids`, `metadatas` and `metadata`, under every spelling of the vector key, on both the list and the NumPy branch. Up to 0.7.0 the shorter of the two won silently: three IDs and two vectors returned `AddResult(inserted=2, errors=0)` and dropped the third ID, and two IDs and three vectors stored the third under a generated `vec_N` that no caller can look up. Nothing is inserted before the raise, so the call is safe to retry.
-
-Omitting `ids` entirely is not a disagreement and still generates one per record. A parallel array must be a `list`; a `tuple` or an `ndarray` raises `TypeError`, because only a list is read by position and any other type was discarded whole.
-
-This is a **breaking change** for code whose two lists had drifted out of step, which is exactly the code that was losing records.
+The rule covers `ids`, `metadatas` and `metadata`, under every spelling of the vector key, on both the list and the NumPy branch. Omitting `ids` entirely is not a disagreement and still generates one per record. A parallel array must be a `list`; a `tuple` or an `ndarray` raises `TypeError`.
 
 **Returns:**
 `AddResult` with:
@@ -432,7 +408,7 @@ This is a **breaking change** for code whose two lists had drifted out of step, 
 - `is_success()`: `True` when `total_errors` is zero
 - `summary()`: a one-line string of the two counts
 
-`ids` is how you learn the IDs the index generated for records you supplied without one. It lines up with `total_inserted` and with nothing else, so `len(add_result.ids) == add_result.total_inserted` always: a rejected record contributes no ID, because it is not in the index. `errors` is what names the rejections.
+`ids` is how you learn the IDs the index generated for records you supplied without one. It lines up with `total_inserted` and with nothing else, so a rejected record contributes no ID and `errors` is what names it.
 
 ```python
 index = vdb.create("hnsw", dim=2)
@@ -508,7 +484,7 @@ doc_005 0.001143 {'author': 'Alice'}
 
 Set `return_vector=True` to get the stored embedding alongside the metadata and score. Under `cosine` this is the normalized vector, not the values you supplied.
 
-The vector comes back as a **`numpy.ndarray` of `float32`**, from both `search` and `get_records`. It was a list of Python floats up to 0.7.0, which at `top_k` 10 and dimension 1,536 built 15,360 float objects a page and nearly doubled the cost of a batch search. Anything that reads it by index or by iteration is unchanged. Anything that concatenates it with `+`, calls `.append` on it, tests it with `if vector:` or passes it to `json.dumps` needs `.tolist()` first.
+The vector comes back as a **`numpy.ndarray` of `float32`**, from both `search` and `get_records`. Anything that concatenates it with `+`, calls `.append` on it, tests it with `if vector:` or passes it to `json.dumps` needs `.tolist()` first.
 
 ```python
 results = index.search(vector=query_vector, top_k=1, return_vector=True)
@@ -623,8 +599,6 @@ print(index.m, index.ef_construction, index.expected_size)
 16 200 10000
 ```
 
-The last three are new in 0.8.0. They were reachable only as text through `get_stats()`, so reading the graph degree meant `int(index.get_stats()["m"])`. They are read-only because they describe a graph already built: `m` and `ef_construction` are fixed at construction, and `expected_size` is what was declared rather than what the index holds, so `len(index)` exceeding it is ordinary.
-
 <br/>
 
 #### ☑️ Add index level metadata
@@ -676,7 +650,7 @@ doc_004 {'author': 'Bob'}
 doc_005 {'author': 'Alice'}
 ```
 
-`list()` returns `(id, metadata)` tuples **in the order the records were added**, and `offset` pages through them. It lists every record, in every storage mode.
+`list()` returns `(id, metadata)` tuples **in the order the records were added**, and `offset` pages through them. It lists every record, in every storage mode, and the order survives `save()` and `load()`.
 
 ```python
 print(index.list(number=2, offset=0))
@@ -692,9 +666,9 @@ print(index.list(number=2, offset=99))
 []
 ```
 
-The order is arrival order rather than ID order, so a record added while you are paging appends at the end and cannot push an unread record across a page boundary. It survives `save()` and `load()`. An offset past the end returns an empty list rather than raising.
+An offset past the end returns an empty list rather than raising.
 
-**Deleting while you page still shifts the pages.** Removing a record ahead of your cursor moves everything behind it up by one, which is inherent to paging by an offset. If you cannot tolerate that, page by remembering the last ID you saw instead of a count.
+**Deleting while you page still shifts the pages.** Removing a record ahead of your cursor moves everything behind it up by one. If you cannot tolerate that, page by remembering the last ID you saw instead of a count.
 
 <br/>
 
@@ -713,29 +687,45 @@ stranded_graph_nodes: 0
 storage_mode_description: raw_only
 ```
 
-`get_stats()` returns a `str` to `str` map. It also carries `dimension`, `space`, `m`, `ef_construction`, `expected_size`, `index_type`, `raw_vectors_stored`, `quantized_codes_stored` and `storage_mode`, plus training and compression fields once quantization is configured.
+`get_stats()` returns a `str` to `str` map. Every key it carries:
 
-It is also where the memory figures live, on every index rather than only on a quantized one. `graph_memory_mb` is the HNSW graph, `raw_vectors_memory_mb` is the raw vector store, `index_bookkeeping_memory_mb` is the hash tables that find a record, and `total_memory_mb` is the sum of everything below. On a quantized index `quantized_codes_memory_mb` scales with the record count, while `codebook_memory_mb` and `sdc_table_memory_mb` are fixed by `dim`, `subvectors` and `bits` and do not move as records arrive. `raw_vectors_retained` states the mode's policy: `none_once_trained` for `quantized_only`, whose raw vectors are released when training completes, and `all_records` for `quantized_with_raw`.
+| Key | Holds |
+| --- | --- |
+| `dimension`, `space`, `m`, `ef_construction`, `expected_size`, `index_type` | The configuration the index was created with |
+| `total_vectors` | The live record count |
+| `graph_nodes`, `stranded_graph_nodes` | Nodes in the HNSW graph, and how many of them no record uses |
+| `raw_vectors_stored`, `quantized_codes_stored` | Records held at full width, and records held as codes |
+| `storage_mode`, `storage_mode_description`, `storage_strategy` | What the index is storing and serving |
+| `thread_safety` | The locking the index uses |
+| `graph_memory_mb` | The HNSW graph |
+| `raw_vectors_memory_mb` | The raw vector store |
+| `quantized_codes_memory_mb` | The codes, which grow with the record count |
+| `codebook_memory_mb`, `sdc_table_memory_mb` | The trained tables, fixed by `dim`, `subvectors` and `bits` |
+| `index_bookkeeping_memory_mb` | The hash tables that find a record |
+| `total_memory_mb` | The sum of the six figures above |
+| `quantization_type` | `pq`, or `none` on an unquantized index |
+| `raw_vectors_retained` | The storage mode's policy, `none_once_trained` or `all_records`. Quantized indexes only |
 
-**The graph is usually the largest of those figures, and on a memory optimized index it is still the largest, at 58 percent of the total.** It owns a second copy of every point on top of its neighbour lists, its sixteen per point layer headers and the counters around them. At 50,000 records of `dim=1536` a settled, trained `quantized_only` index reports 31.20 MB of graph against 2.29 MB of codes and 7.5 MB of fixed tables.
+On a quantized index it also carries `quantization_active`, `quantization_trained`, `quantization_compression_ratio`, `quantization_training_size`, `training_progress`, `training_threshold_reached`, `training_vectors_needed`, `raw_vectors_retained` and the rerank calibration keys below.
 
-`index_bookkeeping_memory_mb` is what the index spends on finding a record rather than on holding one. Five hash tables carry a record, being `id_map`, `rev_map`, the metadata map, the raw vector store and the code store, and two of them carry a second copy of its id. It is proportional to the record count and independent of the dimension. It is **not** independent of the metadata, because the per-record metadata map is one of the five and both its keys and its string values are counted.
+**`total_memory_mb` is not the resident set and it does not claim to be.** It prices the six structures the index asked the allocator for, and leaves out what the allocator takes to hold them. Measured on three loaded indexes of 50,000 real 1,536-dimensional embeddings, it accounts for 0.88 of resident memory with no quantization, 0.88 under `quantized_with_raw` and 0.66 under `quantized_only`. Size infrastructure from the resident figure rather than from this one.
 
-Measured at 50,000 records. For records carrying **no metadata** it is 265.5 bytes per record with no quantization, 342.5 under `quantized_with_raw` and 273.5 under `quantized_only`. Give every record **three short string keys** and the same three read 545.5, 622.4 and 553.4. Budget from the figure that matches your own metadata, not from the first one. The dimension independence holds either way: at `dim=8` the unquantized figures are 265.5 and 545.5 bytes against 265.5 and 545.5 at `dim=1536`.
+`index_bookkeeping_memory_mb` is proportional to the record count and independent of the dimension. It is not independent of the metadata, because the per-record metadata map is one of the tables it counts.
 
-**`total_memory_mb` is not the resident set and it does not claim to be.** It prices the six structures above, meaning the bytes the index asked the allocator for. What it leaves out is the allocator itself, being its own block headers, its rounding and its fragmentation, and that is a property of the platform rather than something the index holds. Measured on three loaded indexes of 50,000 real 1,536-dimensional embeddings, one process each, with the interpreter's own resident set subtracted:
+It also reports what a quantized search will fetch. `rerank_default_fetch` is the number of candidates a search at `top_k=10` fetches and rescores at the record count the index holds now, and a search at a larger `top_k` fetches more than it reports. `rerank_calibrated` is `true` on a trained `quantized_with_raw` index and `false` on every other one, including an index saved before the calibration existed. When it is `true`, these report what training measured:
 
-| storage mode | `total_memory_mb` | resident | share reported | unpriced |
-|---|---:|---:|---:|---:|
-| no quantization | 705.1 MB | 805.4 MiB | 0.88 | 2,103 B per record |
-| `quantized_with_raw` | 415.9 MB | 473.3 MiB | 0.88 | 1,202 B per record |
-| `quantized_only` | 119.7 MB | 181.0 MiB | 0.66 | 1,285 B per record |
-
-The unpriced share is almost all allocator overhead on the graph, which asks for six small blocks per point. It runs 1.25 times the graph figure with no quantization, where the per point data block is 6,144 bytes and rounding is a small share of it, and 1.63 and 1.67 times under the two quantized modes, where that block is 48 bytes. That is why `quantized_only` reports the smallest share of its resident set.
-
-Size infrastructure from the resident column rather than the reported one. The reported figure is what the index holds; the process holds that plus what the allocator takes to hold it.
-
-It is also where the rerank calibration is reported. `rerank_default_fetch` is the number of candidates a search at `top_k=10` will fetch and rescore at the record count the index holds now, and it is the figure to read if you want to know what a quantized search is paying for. `rerank_calibrated` is `true` on a trained `quantized_with_raw` index, and `false` on every other index, including one saved before the calibration existed. When it is `true`, `rerank_calibration_fetch`, `rerank_calibration_fit_fetches`, `rerank_calibration_exponent`, `rerank_calibration_records`, `rerank_calibration_queries`, `rerank_calibration_target_recall` and `rerank_calibration_ms` report what training measured, on how many records, and what it cost. `rerank_calibration_fit_fetches` is the fetch measured at each quarter of the training sample, comma separated, and it is what the exponent is fitted from. `rerank_calibration_pages` and `rerank_calibration_page_fetches` are the page sizes the fetch was measured at and the fetch at each, and a search interpolates between them for the page it was given, so a search at a `top_k` above ten fetches more than `rerank_default_fetch` reports.
+| Key | Holds |
+| --- | --- |
+| `rerank_calibration_fetch` | The fetch measured on the training sample |
+| `rerank_calibration_records` | The records it was measured over |
+| `rerank_calibration_queries` | The queries it used |
+| `rerank_calibration_target_recall` | The recall it was measured to reach |
+| `rerank_calibration_exponent` | How the fetch is scaled as the index grows |
+| `rerank_calibration_fit_fetches` | The fetches the exponent was fitted from, comma separated |
+| `rerank_calibration_pages` | The page sizes the fetch was measured at |
+| `rerank_calibration_page_fetches` | The fetch at each of those pages |
+| `rerank_calibration_page_exponent` | The slope through those pages |
+| `rerank_calibration_ms` | What the calibration cost |
 
 <br/>
 
@@ -759,13 +749,13 @@ records remaining: 4
 
 **⚠️ Please Note:** Due to the nature of HNSW, the underlying graph node remains in memory after a point is removed. Searches never return it, but it still occupies memory and edge slots. `compact()` reclaims those nodes.
 
-`remove_points(ids)` removes a batch under one lock rather than one lock per ID, and returns the IDs that were not in the index. `remove_where(filter)` removes every record matching a metadata filter and returns how many it removed. Both are below, at the end of this section.
+`remove_points(ids)` and `remove_where(filter)` remove a batch and a filtered set. Both are below, at the end of this section.
 
 <br/>
 
 #### ♻️ Reclaim space left by removals and overwrites
 
-Both `remove_point()` and an overwriting `add()` leave a node behind in the graph. `compact()` rebuilds the graph in memory and returns the number of nodes it reclaimed. Nothing else changes: IDs, metadata, stored vectors, quantized codes and PQ training state all survive, so every ID resolves to the same record before and after.
+Both `remove_point()` and an overwriting `add()` leave a node behind in the graph. `compact()` rebuilds the graph in memory and returns the number of nodes it reclaimed. IDs, metadata, stored vectors, quantized codes and PQ training state all survive.
 
 ```python
 print("stranded graph nodes:", index.get_stats()["stranded_graph_nodes"])
@@ -834,13 +824,13 @@ True False
 0
 ```
 
-`count()` is exact and therefore reads every record's metadata. It cannot stop early, because a count that stopped would be a lower bound rather than a count. `contains(id)` is the same test as `in` and is kept for callers already using it.
+`count()` is exact and therefore reads every record's metadata, so it costs what a filtered search costs. `contains(id)` is the same test as `in` and is kept for callers already using it.
 
 <br/>
 
 #### ☑️ Change a record's metadata
 
-`update_metadata(id, metadata)` replaces one record's metadata without resupplying its vector. It touches the metadata and nothing else: the record keeps its vector, its quantized codes and its graph node, and no node is stranded.
+`update_metadata(id, metadata)` replaces one record's metadata without resupplying its vector. The record keeps its vector, its quantized codes and its graph node, and no node is stranded.
 
 ```python
 print(index.get_records("doc_002", return_vector=False)[0]["metadata"])
@@ -858,17 +848,17 @@ False
 0
 ```
 
-The example sorts the second result because a record's metadata comes back as a `dict` whose key order is not stable between processes, the same way `get_all_metadata()` is. Read metadata by key rather than by position.
+The example sorts the second result because a record's metadata comes back as a `dict` whose key order is not stable between processes. Read metadata by key rather than by position.
 
-**The replacement is wholesale, not a merge.** Any key you leave out is gone. That is what `add(overwrite=True)` already does, so the two ways of re-tagging a record agree. It returns `False` for an ID the index does not hold, and writes nothing in that case.
+**The replacement is wholesale, not a merge.** Any key you leave out is gone, which is what `add(overwrite=True)` already does. It returns `False` for an ID the index does not hold, and writes nothing in that case.
 
-Use this rather than reading a record back with `get_records()` and adding it again. Measured at 20,000 records, the round trip costs 486.5 microseconds against 1.57 for this, and it strands one graph node per update that only `compact()` reclaims.
+Use this rather than reading a record back with `get_records()` and adding it again. Measured at 20,000 records the round trip costs 486.5 microseconds against 1.57 for this, and it strands one graph node per update.
 
 <br/>
 
 #### ☑️ Remove several records at once
 
-`remove_points(ids)` takes the lock once for the whole batch instead of once per ID. It returns the IDs that were **not** in the index, so an empty list means every one was removed.
+`remove_points(ids)` takes the lock once for the whole batch instead of once per ID. It returns the IDs that were **not** in the index, so an empty list means every one was removed. A repeated ID is removed on its first occurrence and is never reported missing.
 
 ```python
 print(index.remove_points(["doc_004", "no_such_id"]))
@@ -879,8 +869,6 @@ print(len(index))
 ['no_such_id']
 3
 ```
-
-A repeated ID is removed on its first occurrence and is never reported missing.
 
 `remove_where(filter)` removes every record a metadata filter matches, using the same filter language as `search()`, and returns how many it removed.
 
@@ -898,15 +886,15 @@ print(index.remove_where({"author": "Nobody"}))
 
 An unrecognised operator raises `ValueError` before any record is removed. A filter matching nothing removes nothing and returns `0`.
 
-**An empty filter is refused.** Everywhere else in this language an empty filter matches every record, and `search(filter={})` returns the whole index for that reason. This is the one method where the same rule would destroy every record, and an empty dict reaches it far more often from a filter that was built and came out empty than from a caller who meant it. Name the records with `remove_points(ids)` if that is what you want.
+**`remove_where({})` is refused.** An empty filter matches every record everywhere else in this language, and here that would destroy the index. Name the records with `remove_points(ids)` if that is what you want, or use `clear()`.
 
-Both leave one stranded graph node per record removed, exactly as `remove_point()` does. Neither calls `compact()`, because compaction costs a full rebuild and only you know whether the debris is worth it yet.
+Both leave one stranded graph node per record removed, exactly as `remove_point()` does, and neither calls `compact()`.
 
 <br/>
 
 #### ☑️ `delete()`, the shorter name for both
 
-`delete(ids=...)` dispatches to `remove_points` and `delete(where=...)` to `remove_where`. Both of those stay. It exists because `delete` is what four of the five comparable libraries call the operation, so it is the name most people reach for first.
+`delete(ids=...)` dispatches to `remove_points` and `delete(where=...)` to `remove_where`. Both of those stay.
 
 ```python
 deletable = vdb.create("hnsw", dim=2, expected_size=10)
@@ -930,15 +918,17 @@ print(len(deletable))
 1
 ```
 
-It returns **the number of records removed**, an `int`, whichever argument was given, so the return type does not depend on the call. `ids` takes a string or a list of strings. A repeated ID counts once. An ID that was not there counts zero rather than raising.
+It returns **the number of records removed**, an `int`, whichever argument was given. `ids` takes a string or a list of strings. A repeated ID counts once. An ID that was not there counts zero rather than raising.
 
 `remove_points` still returns the IDs it could not find, which is more than a count, so keep calling it where you need that.
 
-**Passing both arguments raises, and so does passing neither.** Two selections do not compose into one without a rule, and either rule removes the wrong records. Passing neither would be a `delete()` that emptied the index, which is the hazard `remove_where({})` already refuses, reached by leaving two optional arguments unset. Use `clear()` when emptying the index is what you mean.
+**Passing both arguments raises, and so does passing neither.** Use `clear()` when emptying the index is what you mean.
 
 <br/>
 
 #### ☑️ Empty the index with `clear()`
+
+`clear()` drops every record and returns how many went. It replaces the graph rather than removing records one at a time, so `stranded_graph_nodes` reads `0` afterwards.
 
 ```python
 clearable = vdb.create("hnsw", dim=4, expected_size=10)
@@ -960,9 +950,7 @@ print(clearable.clear())
 0
 ```
 
-It returns how many records went, and it replaces the graph rather than removing every record one at a time. Removing them one at a time is linear in the record count and leaves one stranded node per record, so an emptied index would report a graph full of dead nodes; replacing it reclaims all of them at once, which is why `stranded_graph_nodes` reads `0` afterwards rather than the record count.
-
-**It keeps the index and drops the records.** `dim`, `space`, `m`, `ef_construction`, `expected_size`, the index level metadata and the quantization configuration all survive, and a fitted PQ codebook survives with them, because a codebook is fitted from data that is now gone and cannot be refitted from an empty index. A trained quantized index stays trained and can be refilled and searched without retraining. An index still collecting for training starts collecting again, since what it had collected is gone.
+**It keeps the index and drops the records.** `dim`, `space`, `m`, `ef_construction`, `expected_size`, the index level metadata and the quantization configuration all survive, and a fitted PQ codebook survives with them, so a trained quantized index can be refilled and searched without retraining. An index still collecting for training starts collecting again.
 
 Clearing an empty index returns `0` and is not an error. The internal ID counter restarts, so the first generated ID after a clear is `vec_1` again.
 
@@ -993,13 +981,38 @@ True True
 
 The index above declared 300 records and was given 500, so its graph grew and left slack behind. `index`, the index used throughout this section, returns `0` instead, because `compact()` was called on it earlier and compaction already shrinks the graph it rebuilds.
 
-**No node, edge or distance is touched**, so every search returns the same page with the same scores. Measured on 50,000 records of `dim=1536` at `m=32`, it released 188.28 MB in one millisecond, taking `graph_memory_mb` from 510.16 to 321.88 and the process commit charge down by the same amount. Search latency measured 1,101 microseconds after against 1,122 before, so the slack was buying nothing.
-
-That 321.88 MB is exactly what the same index reports after a `save()` and `load()` round trip, which is where this figure used to come from. `compact()` does not reclaim it on its own, because compaction rebuilds by inserting and regrows the same slack, so `compact()` now calls this on the graph it builds.
+**No node, edge or distance is touched**, so every search returns the same page with the same scores. Measured on 50,000 records of `dim=1536` at `m=32`, it released 188.28 MB in one millisecond and search latency did not move, so the slack was buying nothing.
 
 **Call it on an index that holds its records, not on one about to receive them.** On an empty index it hands back the whole creation reservation that `expected_size` bought, so every later insertion regrows the arenas from nothing.
 
-**The index stays writable.** The buffers grow again on the next `add()`, which costs one reallocation: a 1,000-record batch straight after a shrink measured 2.009 s against 1.883 s for the next identical batch. That is why it is never automatic. On an index that is finished, or one about to be searched for a long time, there is nothing to trade.
+**The index stays writable.** The buffers grow again on the next `add()`, which costs one reallocation. That is why it is never automatic.
+
+<br/>
+
+#### ☑️ Quantization status and performance reporting
+
+Five further accessors report state that `get_stats()` also carries.
+
+| Method | Returns |
+| --- | --- |
+| `is_training_ready()` | Whether the training threshold has been reached. `False` on an index with no quantization configuration |
+| `training_vectors_needed()` | Records still to collect before training triggers. `0` on an index with no quantization configuration |
+| `rebuild_with_quantization()` | Rebuilds the graph against the quantized codes and returns whether it did. Training and `load()` already do this, so calling it is normally redundant |
+| `get_performance_info()` | A `str` to `str` map describing the search and insertion paths |
+| `benchmark_concurrent_reads(query_count, max_threads)` | Times sequential against threaded searches over random queries, returning `sequential_qps`, `parallel_qps`, `speedup`, `sequential_time`, `parallel_time` and `threads_used` |
+
+```python
+ready = vdb.create("hnsw", dim=8, expected_size=1200, quantization_config={
+    "type": "pq", "subvectors": 8, "bits": 8, "training_size": 1000,
+})
+print(ready.is_training_ready(), ready.training_vectors_needed())
+print(sorted(ready.get_performance_info()))
+```
+*Output*
+```
+False 1000
+['benefits', 'insertion_path', 'quantization_accuracy_impact', 'quantization_compression', 'search_bottleneck', 'search_speedup_expected']
+```
 
 <br />
 
@@ -1036,7 +1049,7 @@ To enable PQ, pass a `quantization_config` dictionary to the `.create()` index m
 
 **Compression ratio is `dim × 4 / subvectors`.** More subvectors means a longer code, so it lowers the compression ratio and raises accuracy. Fewer subvectors means the opposite. At `dim=1536`, 8 subvectors gives 768x and 16 subvectors gives 384x.
 
-**`subvectors` defaults to `dim / 32`, clamped to between 8 and 192, snapped to a divisor of `dim`.** That holds the compression ratio at 128x rather than holding the code length at 8 bytes, which is what a fixed default did. The ratio is the quantity accuracy follows, because `dim / subvectors` is the width of a subvector and the ratio is exactly four times that width. Measured on clustered data at 10,000 records, recall at 10 without reranking runs 0.187, 0.182 and 0.184 at 128x for `dim` 256, 768 and 1536, and 0.405 and 0.406 at 32x for 256 and 768. Two indexes at the same ratio return the same recall at different dimensions, and two at the same subvector count do not.
+**`subvectors` defaults to `dim / 32`, clamped to between 8 and 192, snapped to a divisor of `dim`.** That holds the compression ratio at 128x, which is the quantity accuracy follows.
 
 | `dim` | default `subvectors` | compression |
 |-------|----------------------|-------------|
@@ -1047,32 +1060,13 @@ To enable PQ, pass a `quantization_config` dictionary to the `.create()` index m
 | 1536 | 48 | 128x |
 | 3072 | 96 | 128x |
 
-128x is where the default sits because it is the highest ratio that returns recall at 10 above 0.99 at the fetch the default uses, at every corpus size measured on clustered data. At `dim=768` over 200 queries, recall at 10 at the default fetch reads 0.9800 at 384x, 0.9850 at 192x, 0.9925 at 128x and 0.9995 at 64x on 10,000 records, and 0.9935, 0.9980, 0.9980 and 1.0000 on 100,000. The binding size is the smaller one, because the fetch there is the rerank floor rather than 2% of the corpus, and 384x needs 208 candidates to reach 0.99. On data whose groups the codes cannot resolve, no ratio in this range returns 0.99 at any fetch. See [Quantized search accuracy](#-quantized-search-accuracy).
+Going lower than 128x costs memory and build time and buys nothing on recall until the ratio reaches about 16x, where the fetch collapses and query time falls instead. See [Quantized search accuracy](#-quantized-search-accuracy). Below `dim=256` the floor of 8 subvectors binds. Pass `subvectors` explicitly for a cheaper, less accurate setting.
 
-Going lower than 128x costs memory and build time and returns nothing on recall. At `dim=768` and 100,000 records, 32x holds 111 MB more resident memory and builds in 521 s against 170 for the same recall, and 16x holds 160 MB more and builds in 846 s. At 10,000 records 16x holds 94 MB where not quantizing at all holds 90, so quantization has stopped saving anything by then.
-
-**Query time is the one axis where a lower ratio can win, and only at the bottom of the range and at scale.** A lower ratio puts the true neighbours shallower in the code ordering, so the fetch that reaches them is smaller, and it lengthens the code, so each candidate costs more to score. Between 384x and 32x the two cancel. At 16x the fetch collapses and the first effect wins. See [Quantized search accuracy](#-quantized-search-accuracy) for the table and for when that trade is worth taking.
-
-The default is not free. At `dim=768` and 100,000 records it raises resident memory from 463 MB to 585 MB against the old fixed 8, and build time from 79 s to 170 s. Below `dim=256` the floor of 8 subvectors binds and the default is the old one, because a code is one byte per subvector and 2 subvectors would give the whole corpus only 65,536 distinct codes. Pass `subvectors` explicitly for the older, cheaper, less accurate setting.
-
-`bits` does not change the size of a record's code, which is always one byte per subvector at every value, so lowering it saves no memory per record. It sets the number of centroids per subvector to 2^bits, which sizes the codebook linearly and the centroid distance table quadratically. Both are fixed costs that grow with `subvectors`, so how much a lower `bits` saves depends on how many subvectors you have. At `dim=768` the two tables hold 3.7 MB at the default 24 subvectors and 12.7 MB at 96, and dropping `bits` to 6 takes those to 0.4 MB and 0.9 MB.
-
-What it costs is recall. Measured at `dim=768` and 10,000 records, dropping `bits` from 8 to 6 takes recall at 10 without reranking from 0.153 to 0.057 at 8 subvectors, and from 0.408 to 0.346 at 96, and it takes the build of 10,000 records at 96 subvectors from 40 s to 16 s. Leave `bits` at 8 unless the fixed cost or the build time is the constraint, and do not read a lower value as a per-record saving.
+`bits` does not change the size of a record's code, which is always one byte per subvector, so lowering it saves no memory per record. It sets the number of centroids per subvector to 2^bits, which sizes the codebook and the centroid distance table. Lowering it costs recall and shortens the build. Leave it at 8 unless the fixed cost or the build time is the constraint.
 
 `create()` emits a `UserWarning` when the configuration looks unbalanced, for example when the compression ratio exceeds 50x, and another when `storage_mode` is `quantized_with_raw`. The ratio warning does not fire on a `subvectors` the library derived, only on one you passed.
 
-It also warns when the configuration cannot repay its fixed memory at the `expected_size` you declared. The codebook and the centroid distance table are held whatever the record count. A record is held twice, once in a storage map and once inside the HNSW graph, and quantization replaces a copy of `dim × 4` bytes with a code of `subvectors` bytes. `quantized_only` replaces both copies and `quantized_with_raw` replaces the graph's, so quantization starts saving above
-
-```
-quantized_only       fixed bytes / (dim × 4 − subvectors)
-quantized_with_raw   fixed bytes / (dim × 4 − 2 × subvectors)
-```
-
-records. The warning names that figure. Raise `expected_size` if your estimate was low, or drop `quantization_config`.
-
-Both figures are analytic and describe the steady state. The `quantized_only` figure is deliberately conservative, because it counts only one of the two copies that mode replaces, so it warns above the true crossover rather than below it. The `quantized_with_raw` figure has no second copy to leave out, and measured against resident memory it runs low, because training leaves an allocator high water mark the arithmetic does not model. At `dim=768` with 8 subvectors of 8 bits it names 599 records where the measured crossover is near 1,700.
-
-A separate warning fires when `expected_size` is below `training_size`, because an index that never reaches its training threshold never trains, so quantization never engages at the size you declared.
+It also warns when the configuration cannot repay its fixed memory at the `expected_size` you declared, naming the record count above which quantization starts saving. Raise `expected_size` if your estimate was low, or drop `quantization_config`. A separate warning fires when `expected_size` is below `training_size`, because an index that never reaches its training threshold never trains.
 
 <br/>
 
@@ -1187,34 +1181,9 @@ index = vdb.create(
 
 Two consequences of `quantized_only` are worth knowing before you pick it.
 
-**The training records are held at full width only until training completes.** Records collected before the training threshold is reached are stored raw so the quantizer has something to train on. The moment training completes they are encoded to codes and their raw copies are released, so a trained index in this mode holds no raw vector for any record.
+**The training records are held at full width only until training completes.** Records collected before the threshold is reached are stored raw so the quantizer has something to train on. The moment training completes they are encoded and their raw copies are released, so a trained index in this mode holds no raw vector for any record.
 
-**The gap between the two modes is not the compression ratio.** `quantized_with_raw` holds every raw vector on top of every code, so on the vectors and codes alone it holds close to the compression ratio times more than a trained `quantized_only` index. The whole resident index differs far less, because the graph, the codebook and the centroid distance table are identical in both modes and at small record counts they dominate. `get_stats()` reports the figures for your own index.
-
-**Both modes hold less than an unquantized index once they clear the fixed cost, `quantized_with_raw` included.** The HNSW graph owns a second copy of every point, separate from the storage map, and that copy is `dim × 4` bytes in an unquantized index and `subvectors` bytes in a quantized one whichever storage mode is set. `quantized_only` drops both copies and `quantized_with_raw` drops the graph's, which at `dim=768` is 3,072 bytes per record. Measured resident against the same data unquantized at `dim=768`, `quantized_with_raw` holds 0.69x at 10,000 records and 0.59x at 100,000 at the default `subvectors`, and 0.60x and 0.47x at 8 subvectors. `quantized_only` holds 0.35x and 0.29x at the default `subvectors`. `get_stats()["graph_memory_mb"]` reports the graph for your own index and `total_memory_mb` includes it.
-
-**Quantization shrinks the graph's copy of the point and nothing else in the graph.** The neighbour lists, the sixteen layer headers every point carries and the counters around them are the same in all three configurations, so a quantized graph is smaller rather than negligible. Measured on 50,000 real 1,536-dimensional embeddings at `m=32`, `graph_memory_mb` reads 321.88 MB unquantized and 31.20 MB quantized. The whole 290.68 MB difference is the copy, which is 292.97 MB at full width and 2.29 MB as codes. What is left in both is the same 28.91 MB of neighbour lists, layer headers and counters.
-
-**Both figures describe a settled index**, meaning one after `save()` and `load()`, or one after `shrink_to_fit()`. Those two states agree exactly. A **freshly built** index reports 510.16 MB unquantized and 31.85 MB quantized, because a graph grown by insertion carries spare buffer capacity that a graph read from a dump never had. Read which of the two states any graph figure describes, your own included. `shrink_to_fit()` turns the first into the second.
-
-**How much quantization saves is set by the dimension, and below `dim=256` it is not much.** Quantization removes the graph's copy of the vector and puts a code in its place, so what it can save per record is `dim × 4 − 2 × subvectors` bytes against the `dim × 8` an unquantized index holds for its two copies plus about 2,740 bytes of graph neighbour lists, id maps and metadata that neither mode touches. Measured resident, one dimension per process, 25,000 records at `m=32`, an unquantized index and a `quantized_with_raw` one built over the same records:
-
-| dim | unquantized | `quantized_with_raw` | ratio | saving |
-|---:|---:|---:|---:|---:|
-| 64 | 75.7 MiB | 73.4 MiB | 0.97x | 3% |
-| 96 | 83.4 | 73.8 | 0.88x | 12% |
-| 128 | 89.7 | 75.0 | 0.84x | 16% |
-| 192 | 102.6 | 82.7 | 0.81x | 19% |
-| 256 | 115.5 | 88.2 | 0.76x | 24% |
-| 384 | 140.5 | 105.8 | 0.75x | 25% |
-| 768 | 216.1 | 151.5 | 0.70x | 30% |
-| 1,536 | 369.6 | 236.0 | 0.64x | 36% |
-
-`create()` warns when the saving falls below a fifth of what an unquantized index holds, which the arithmetic above puts at `dim=235` for `quantized_with_raw` and at `dim=88` for `quantized_only`. Below that a quantized search still fetches and rescores hundreds of candidates on every query, for a saving of under 20 percent. The measured column crosses a fifth between `dim=192` and `dim=256`.
-
-**Quantization can cost memory rather than save it.** The centroid distance table is `subvectors × 2^bits × (2^bits − 1) / 2 × 4` bytes, being the strict upper triangle of a symmetric matrix per subvector, and it is held whatever the record count. That is 1.0 MB at 8 subvectors of 8 bits and 12 MB at 96. Measured resident against the same data unquantized, `quantized_only` crosses from costing to saving at roughly 1,800 records at `dim=256` and below 1,000 at `dim=768`, and `quantized_with_raw` at roughly 2,600 and 1,700 for the same two dimensions, all at 8 subvectors of 8 bits. The crossover no longer depends on `training_size`, because the training records are released once training completes. Below the crossover quantization costs memory. `create()` warns when the configuration cannot repay the fixed cost at your `expected_size`.
-
-**Once training completes every record exists only as a code, so the vector you read back is an approximation.** Every accessor sees every record. `get_records(..., return_vector=True)` and `search(..., return_vector=True)` reconstruct the vector from its code, so what they hand back is close to the value supplied rather than equal to it, for the training records exactly as for the ones added later. Only `quantized_with_raw` reads back exactly. `get_stats()["raw_vectors_stored"]` reports zero once a `quantized_only` index has trained, which is how you can confirm the release happened.
+**Once training completes every record exists only as a code, so the vector you read back is an approximation.** Every accessor sees every record. `get_records(..., return_vector=True)` and `search(..., return_vector=True)` reconstruct the vector from its code. Only `quantized_with_raw` reads back exactly, and `get_stats()["raw_vectors_stored"]` reading zero is how you confirm the release happened.
 
 ```python
 only = vdb.create("hnsw", dim=1536, expected_size=2500, quantization_config={
@@ -1247,6 +1216,21 @@ contains doc_2000 (added after training): True
 get_records doc_2000 returns: 1 record
 ```
 
+**How much quantization saves is set by the dimension, and below `dim=256` it is not much.** Measured resident, one dimension per process, 25,000 records at `m=32`, an unquantized index and a `quantized_with_raw` one built over the same records:
+
+| dim | unquantized | `quantized_with_raw` | ratio | saving |
+|---:|---:|---:|---:|---:|
+| 64 | 75.7 MiB | 73.4 MiB | 0.97x | 3% |
+| 96 | 83.4 | 73.8 | 0.88x | 12% |
+| 128 | 89.7 | 75.0 | 0.84x | 16% |
+| 192 | 102.6 | 82.7 | 0.81x | 19% |
+| 256 | 115.5 | 88.2 | 0.76x | 24% |
+| 384 | 140.5 | 105.8 | 0.75x | 25% |
+| 768 | 216.1 | 151.5 | 0.70x | 30% |
+| 1,536 | 369.6 | 236.0 | 0.64x | 36% |
+
+`create()` warns when the saving falls below a fifth of what an unquantized index holds, which is `dim=235` for `quantized_with_raw` and `dim=88` for `quantized_only`. It also warns below the record count where quantization repays its fixed tables, which is a few thousand records at `dim=256` and under two thousand at `dim=768`. Below that, quantization costs memory rather than saving it.
+
 <br/>
 
 ### 🎯 Quantized search accuracy
@@ -1264,7 +1248,7 @@ Measured on 6,000 clustered 128-dimensional vectors with 8 subvectors and 8 bits
 
 The exact figures depend on your data, but the shape does not. If you need quantization and you need accuracy, use `quantized_with_raw` and leave rerank on.
 
-**What the fetch has to reach is the group of records the codes cannot tell apart from your query, and how large that group is depends on your data.** A 128x code resolves which cluster a record belongs to and very little inside it, so the fetch has to cover the query's own group. Measured on three real datasets at 100,000 records with the default `subvectors`, the fetch that reaches mean recall at 10 of 0.99:
+**How deep a search has to fetch to hold that recall depends on your data, not on the record count.** Measured on three real datasets at 100,000 records with the default `subvectors`, the fetch that reaches mean recall at 10 of 0.99:
 
 | dataset | dim | compression | fetch for 0.99 | share of corpus |
 |---|---:|---:|---:|---:|
@@ -1272,61 +1256,21 @@ The exact figures depend on your data, but the shape does not. If you need quant
 | sift-128 | 128 | 64x | 426 | 0.43% |
 | glove-100 | 100 | 40x | 5,143 | 5.14% |
 
-**No formula in the record count fits those three.** At the same corpus size one needs 426 candidates and another needs 5,143. That is why the fetch is not a formula.
+No formula in the record count fits those three, so ZeusDB measures the fetch on your data instead. A `quantized_with_raw` index measures it when training completes, and scales what it measured with the record count and with the page size you ask for. `get_stats()["rerank_default_fetch"]` reports what a search at `top_k=10` will fetch on the index as it stands.
 
-**ZeusDB measures it on your data instead.** When a `quantized_with_raw` index finishes training it holds `training_size` raw vectors and a codebook fitted to them, so it measures the fetch directly. It takes 512 of the training records as queries, finds their exact nearest neighbours over the training sample, locates each of those neighbours in the code ordering, and takes the 0.99 percentile of the ranks. A query is removed from its own corpus and from its own ordering, so the measurement is leave one out. The training sample is held in a seeded random order rather than the order your records arrived in, so the queries and every subset of it are random draws. `get_stats()` reports the result under `rerank_calibration_fetch` and the fetch it produces at your current record count under `rerank_default_fetch`.
+**On data with no resolvable structure no fetch works.** Once the group the codes cannot separate is smaller than `top_k`, the true top ten span groups and nothing reaches them. Measure recall on your own data before you rely on quantization.
 
-**The depth grows with the record count, and how fast it grows is also a property of your data**, so the calibration measures that too. It repeats the measurement over a quarter, a half and three quarters of the training sample and fits the exponent the fetch is scaled by as the least squares slope of the log fetch on the log record count. A corpus that keeps a fixed number of topics as it grows puts more records in each of them, and its depth grows linearly. A corpus that gains new topics as it grows puts its depth on a root of the record count. Measured over 10,000 to 100,000 records, the exponent reads 0.48 to 0.58 on sift-128, 0.27 to 0.32 on dbpedia-openai and 0.64 to 0.74 on glove-100, and 0.95 to 0.99 on generators holding a fixed number of clusters at every size.
+What `rerank` does:
 
-The result is clamped between 0.40 and 1.00, multiplied by a safety factor of 1.75, floored at 250 candidates and at `5 × top_k`, and capped at a quarter of the record count.
+| `rerank` | Effect |
+| --- | --- |
+| omitted | Uses the calibrated fetch. It is the only setting that holds recall across corpus sizes and across datasets |
+| `N` of 1 or more | Fetches `top_k × N` candidates, a fixed multiple of the page that does not move with the corpus. Use it to override the default deliberately |
+| `0` | Turns reranking off and returns the ADC scores and ordering |
 
-**A larger page needs a deeper fetch, and the calibration measures that too.** The fetch above is measured for a page of ten. A search asking for a hundred results needs the hundredth true neighbour to survive the code ordering rather than only the tenth, and the hundredth sits deeper. So the calibration measures the fetch at pages of 1, 10 and 100 in the same pass, which costs almost nothing because finding the exact neighbours once to the deepest page answers all three, and a search interpolates between those points for whatever page it was asked for. A page of ten is one of the points, so a search at the default `top_k` asks for exactly what the record scaling alone asked for.
+A page below ten fetches what a page of ten fetches, so pass `rerank` explicitly if you want a shallower page to cost less. `rerank` has no effect on an unquantized index or on a `quantized_only` one, and both ignore it. With rerank on the scores you get back are raw-vector distances, and with it off they are ADC estimates, which are not comparable.
 
-**The requirement is sublinear in the page.** The smallest fetch reaching mean recall 0.99 at each page, read off built `quantized_with_raw` indexes by sweeping the explicit `rerank` argument, 200 queries against exact ground truth to depth 1,000:
-
-| dataset | records | page 1 | page 10 | page 100 | page 1,000 |
-|---|---:|---:|---:|---:|---:|
-| dbpedia-openai | 50,000 | 150 | 660 | 2,962 | above 5,600 |
-| dbpedia-openai | 100,000 | 131 | 462 | 2,274 | above 4,000 |
-| sift-128 | 50,000 | 100 | 296 | 1,228 | 4,346 |
-| sift-128 | 100,000 | 150 | 365 | 1,704 | 5,909 |
-| glove-100 | 50,000 | 1,673 | 3,468 | above 8,000 | above 8,000 |
-| glove-100 | 100,000 | 1,400 | 4,576 | above 8,000 | above 8,000 |
-
-A page a hundred times larger needs between 2.4 and 20 times the fetch, never a hundred times. What buries a true neighbour in the code ordering is the number of records the codes cannot separate from your query, and that count does not move when you ask for more results. **A constant multiple of `top_k` is therefore the wrong shape**, which is why `5 × top_k` is a floor here rather than the page term.
-
-The relation is curved as well as sublinear. On dbpedia-openai the calibration measures 60, 162 and 777 candidates at the three pages, which is a slope of 0.43 over the first decade of page size and 0.68 over the second, and a single line through all three would under-fetch at a page of 100 by a third. That is why the pages are interpolated rather than fitted to one exponent.
-
-**The page term only ever deepens the fetch.** A page smaller than ten measures as needing less, and acting on that costs recall, because the ratio between two pages is measured on the training sample and does not carry the safety factor the reference measurement carries. On glove-100 at 50,000 records the sample's ratio between a page of 1 and a page of 10 is 0.382 where the built index needs 0.482, and scaling by the sample's ratio took recall at `top_k=1` from 1.000 to 0.988. So a page below ten fetches what a page of ten fetches. Pass `rerank` explicitly if you want a shallower page to cost less. `get_stats()` reports the pages under `rerank_calibration_pages`, the fetch at each under `rerank_calibration_page_fetches`, and the least squares slope through them under `rerank_calibration_page_exponent`, which is what an index calibrated before this release falls back to.
-
-What the calibration asks for at 100,000 records, against what the data needs and against the fixed 2%. Every figure is measured on a built index through the ordinary search path, 1,000 queries at `top_k=10` against exact ground truth. The requirement is the smallest fetch on that same index reaching recall at 10 of 0.99, read off a sweep of the explicit `rerank` argument:
-
-| dataset | records | calibrated fetch | measured requirement | ratio | recall at 10 | mean query |
-|---|---:|---:|---:|---:|---:|---:|
-| dbpedia-openai | 50,000 | 554 | 860 | 0.64 | 0.9883 | 3.33 ms |
-| glove-100 | 50,000 | 6,534 | 3,060 | 2.14 | 0.9982 | 35.79 ms |
-| sift-128 | 50,000 | 465 | 370 | 1.26 | 0.9953 | 1.88 ms |
-| dbpedia-openai | 100,000 | 747 | 620 | 1.20 | 0.9907 | 5.02 ms |
-| glove-100 | 100,000 | 11,439 | 4,620 | 2.48 | 0.9985 | 140.08 ms |
-| sift-128 | 100,000 | 656 | 450 | 1.46 | 0.9968 | 3.19 ms |
-
-**The margin is not the same on the three, and glove-100 carries most of it.** The rule is one measurement per index scaled by two constants that are the same everywhere, being a safety factor of 1.75 and a bias of 0.15 on the fitted exponent. Taking the fitted exponent alone with neither constant, the extrapolation to 100,000 records asks for 4,626 candidates on glove-100 against a requirement of 4,620, which is 1.001 times what that index needs. On the other two it asks for 0.49 and 0.59 times what they need. The constants exist for those two, and on glove-100 they are margin over a fetch that was already right.
-
-Neither constant can come down without costing recall elsewhere. The constant that would bring glove-100 to the 1.20 ratio dbpedia-openai has at 100,000 records takes the dbpedia-openai fetch from 747 to 359, and a sweep of that same index reads recall 0.9787 at 360 candidates. dbpedia-openai also sits under 0.99 at 10,000, 25,000 and 50,000 records, at 0.9878, 0.9800 and 0.9883, so it has nothing to give back. What separates the datasets is the ratio between the requirement on a built index and the depth the calibration measures in the code ordering over its training sample, and the training sample cannot measure that ratio because the graph does not exist yet when it runs.
-
-**If query time on glove-like data matters more to you than the last thousandth of recall, name `rerank` yourself.** On glove-100 at 50,000 records a fetch of 3,060 reads recall 0.9900 at 18.14 ms against 0.9982 at 35.79 ms, so half the query time buys back 0.008 of recall.
-
-The two tables below carry fetch figures measured before the codebook seeding this release ships, which moved the calibrated fetch upward on glove-100. Read their ratios as the shape rather than as current figures.
-
-**On data with no resolvable structure no fetch works.** Once the group the codes cannot separate is smaller than `top_k`, the true top ten span groups, the distances between groups differ in the fourth decimal, and nothing reaches them. At 5,000 clusters over 25,000 records, being five records to a cluster, recall at 10 reaches 0.917 at a fetch of half the corpus, and uniform points on the sphere reach 0.859. Measure recall on your own data before you rely on quantization.
-
-- `rerank` omitted uses the calibrated fetch above. It is the only setting that holds recall across corpus sizes and across datasets.
-- An index trained before the calibration existed, and any index loaded from a directory saved by one, carries no calibration. It falls back to the fixed fetch of 2% of the record count, floored at 250 candidates and at `5 × top_k`. `get_stats()` reports `rerank_calibrated: false` for it. Rebuild the index to calibrate it.
-- An index calibrated before the page term existed keeps its record scaling and takes a shipped page exponent of 0.49 in place of the pages it never measured, so a large page still deepens its fetch. `rerank_calibration_page_fetches` reads `0,0,0` for it, which is how you can tell. A page of ten is unaffected either way. Rebuild the index to measure its own pages.
-- `rerank=N` for N of 1 or more fetches `top_k × N` candidates, a fixed multiple of the page that does not move with the corpus. Use it to override the default deliberately, not as the normal path.
-- `rerank=0` turns reranking off and returns the ADC scores and ordering.
-- `rerank` has no effect on an unquantized index or on a `quantized_only` one. Both ignore it.
-- With rerank on, the scores you get back are raw-vector distances. With it off, they are ADC estimates. The two are not comparable.
+An index trained before the calibration existed, and any index loaded from a directory saved by one, carries no calibration and falls back to a fixed fetch of 2% of the record count. `get_stats()["rerank_calibrated"]` reads `false` for it. Rebuild the index to calibrate it.
 
 **Above roughly 10,000 records a reranked quantized search is slower than an unquantized one, and the gap widens as the index grows.** That is the price of the default holding recall. On dbpedia-openai at `dim=1,536`, paired against an unquantized index over the same records, 200 queries one each in turn:
 
@@ -1337,57 +1281,16 @@ The two tables below carry fetch figures measured before the codebook seeding th
 | 50,000 | 554 | 1.17 ms | 1.54 ms | 1.32 |
 | 100,000 | 747 | 1.18 ms | 2.12 ms | 1.79 |
 
-Each row is one process building both indexes over the same records, the 100,000 row included, so the ratio is the figure to read. The absolute times still move between rows because each row is its own process.
+Each row is one process building both indexes over the same records, so the ratio is the figure to read. Quantization remains a memory decision. At 100,000 records of `dim=768` the default holds 585 MB against 994 MB unquantized and answers in 13.4 ms against 3.05 ms. Lower `rerank` explicitly if query time matters more to you than recall, and measure what it costs you.
 
-The crossover is structural rather than a tuning accident. The traversal has to be as wide as the fetch because HNSW cannot return more results than its candidate list holds, an HNSW search costs roughly linear time in that width, and the fetch grows with the record count while an unquantized search grows with its logarithm, so the two cross once. What the calibration changes is where and how steeply. The fixed 2% of the corpus reached a ratio of 6.91 at 100,000 records on this dataset, and a fetch measured on the data reaches 2.42.
-
-**What the calibration costs and saves, measured on real data.** Both arms on the same loaded index at 100,000 records, in one process, 500 queries each. The before arm names `rerank` so it fetches exactly the 2,000 candidates the fixed 2% produced, and the after arm names nothing and takes the calibration:
-
-| dataset | fixed fetch | calibrated fetch | fixed | calibrated | ratio | fixed recall@10 | calibrated recall@10 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| sift-128 | 2,000 | 596 | 11.99 ms | 3.63 ms | 0.30 | 1.0000 | 0.9938 |
-| dbpedia-openai | 2,000 | 776 | 19.44 ms | 8.62 ms | 0.44 | 0.9958 | 0.9910 |
-| glove-100 | 2,000 | 7,744 | 26.22 ms | 82.70 ms | 3.15 | 0.9666 | 0.9960 |
-
-**Read that as three different answers, because the calibration gives each dataset the fetch its own data needs.** sift-128 and dbpedia-openai need far less than the fixed fetch gave them and get two thirds and over half of their query time back, for 0.006 and 0.005 of recall. glove-100 needs far more, and buys 0.029 of recall for 3.15 times the query time. If query time matters more to you than the last hundredth of recall, `rerank=N` overrides the calibration and `get_stats()["rerank_default_fetch"]` tells you what you are overriding.
-
-**Where they cross depends on your data.** The table above is 50 Gaussian clusters, where the crossover is between 10,000 and 15,000 records. On the anisotropic embedding-like corpus it is below 10,000, because an unquantized search converges faster on that data while the fetch does not shrink:
-
-| data model | records | unquantized | quantized, default rerank | ratio | quantized recall |
-|---|---:|---:|---:|---:|---:|
-| 50 clusters | 25,000 | 0.90 ms | 1.99 ms | 2.22 | 0.996 |
-| embedding-like | 10,000 | 0.57 ms | 1.03 ms | 1.80 | 0.988 |
-| embedding-like | 100,000 | 1.59 ms | 9.48 ms | 5.97 | 0.989 |
-
-Memory goes the other way and is not data dependent. On the embedding-like corpus at 100,000 records the quantized index holds 552 MB against 877 MB unquantized, being 0.63 times.
-
-**No `subvectors` value moves that crossing, and one gets close.** A lower compression ratio puts the true neighbours shallower in the code ordering, so the fetch that reaches them is smaller, but each candidate costs more to score because the code is longer. Measured at `dim=768` and 100,000 records, the smallest fetch each ratio needs to reach recall at 10 of 0.99 and what that fetch costs:
-
-| compression | `subvectors` | fetch for 0.99 | share of corpus | query | resident | build |
-|---:|---:|---:|---:|---:|---:|---:|
-| 384x | 8 | 1,995 | 1.99% | 9.40 ms | 463 MB | 79 s |
-| 192x | 16 | 1,945 | 1.94% | 10.89 ms | 576 MB | 131 s |
-| 128x | 24 | 1,921 | 1.92% | 13.08 ms | 585 MB | 170 s |
-| 64x | 48 | 1,522 | 1.52% | 11.46 ms | 617 MB | 281 s |
-| 32x | 96 | 960 | 0.96% | 9.34 ms | 696 MB | 521 s |
-| 16x | 192 | 222 | 0.22% | 4.32 ms | 745 MB | 846 s |
-
-An unquantized index over the same records holds 994 MB, builds in 313 s and answers in 3.05 ms.
-
-**If query time above the crossover is what matters to you, `subvectors = dim / 4` is the setting, and set `rerank` with it.** At 16x the fetch collapses and the query falls to 4.32 ms. You pay for it twice: the index holds 745 MB against 585 at the default, and it builds in 846 s against 170 and against 313 for no quantization at all. At 10,000 records that same setting holds 94 MB where not quantizing holds 90, so it is a choice for large indexes only. The fetch column above is the requirement rather than what the default asks for, and the default is measured on your data rather than derived from `subvectors`, so read `get_stats()["rerank_default_fetch"]` and pass `rerank` explicitly to take the benefit.
-
-Quantization remains a memory decision. At 100,000 records of `dim=768` the default holds 585 MB against 994 MB unquantized and answers in 13.4 ms against 3.05 ms. Lower `rerank` explicitly if query time matters more to you than recall, and measure what it costs you.
-
-**`ef_search` does nothing on a reranked quantized search.** The graph traversal widens to the number of candidates asked for, so a fetch of 2,000 already searches far wider than any `ef_search` a caller is likely to set, and setting it smaller is discarded. HNSW cannot return more results than its candidate list holds, so a fetch of 2,000 genuinely requires a traversal 2,000 wide. At the defaults the fetch is at least 250 and `ef_search` is 100, so raising `ef_search` alone changes nothing. Change `rerank` instead. On an unquantized search, and on a quantized search with `rerank=0`, `ef_search` applies normally.
-
-Setting `ef_search` *above* the fetch does not help either. Measured at `dim=768` over 200 queries, quadrupling `ef_search` at a fixed fetch moves recall at 10 by at most 0.008 and by nothing at all in fourteen of twenty configurations, because the candidates a fetch returns are limited by the code ordering rather than by the traversal. It costs query time in every case.
+**`ef_search` does nothing on a reranked quantized search.** The graph traversal widens to the number of candidates the fetch asks for, which is already wider than any `ef_search` a caller is likely to set, and setting it smaller is discarded. Change `rerank` instead. On an unquantized search, and on a quantized search with `rerank=0`, `ef_search` applies normally.
 
 ### 📊 Performance Characteristics
 
-- **Training**: happens once, on the `add()` call that reaches `training_size`. That call takes noticeably longer than the others. On `quantized_with_raw` it also calibrates the rerank fetch, which is reported in `get_stats()["rerank_calibration_ms"]` and measured at 3.3 s inside a 103 s training call at `dim=1536`, and at 0.21 s and 0.28 s at `dim=100` and `dim=128`. The calibration is linear in the dimension and it is paid once.
-- **Memory**: a record's code is `subvectors` bytes against `dim × 4` for a raw vector. The graph holds a second copy of every point and it shrinks by the same factor, which is why both storage modes hold less than an unquantized index above their break even. How much less is set by the dimension, and the table in Storage modes prices it from `dim=64` to `dim=1536`.
-- **Search speed**: an unreranked quantized search is faster than a raw search. A reranked one is slower, and the table above prices it.
-- **Build speed**: a quantized build is faster than an unquantized one, because the graph compares codes rather than vectors. At 100,000 records of `dim=768` it is 137 s against 231 s at the default `subvectors`, and it slows as `subvectors` rises.
+- **Training**: happens once, on the `add()` call that reaches `training_size`. That call takes noticeably longer than the others. On `quantized_with_raw` it also calibrates the rerank fetch, which `get_stats()["rerank_calibration_ms"]` prices.
+- **Memory**: a record's code is `subvectors` bytes against `dim × 4` for a raw vector, and the graph holds a second copy of every point that shrinks by the same factor. How much that saves is set by the dimension, and the table in Storage modes prices it from `dim=64` to `dim=1536`.
+- **Search speed**: an unreranked quantized search is faster than a raw search. A reranked one is slower above roughly 10,000 records, and the table above prices it.
+- **Build speed**: a quantized build is faster than an unquantized one, and it slows as `subvectors` rises. At 100,000 records of `dim=768` it is 137 s against 231 s at the default `subvectors`.
 - **Accuracy**: see the tables above. Treat quantization as a memory decision that costs accuracy and query time, not as a free win.
 
 <br/>
@@ -1529,40 +1432,9 @@ my_index.zdb/
 
 A directory saved by 0.6.0 or earlier holds `hnsw_index.hnsw.graph` and `hnsw_index.hnsw.data` in place of `hnsw_index.zdbgraph`. Opening it still works: the graph is rebuilt once from the stored records, and the next `.save()` writes the single file.
 
-#### What `load()` requires
-
-`load()` checks `files_included` against the directory before it reads anything, and refuses a directory that does not hold what its manifest names. One artefact is exempt.
-
-| Artefact | Kind | A directory that lost it |
-| --- | --- | --- |
-| `config.json` | load bearing | refused |
-| `mappings.bin` | load bearing | refused |
-| `metadata.json` | load bearing | refused |
-| `vectors.bin` | load bearing | refused |
-| `quantization.json` | load bearing | refused |
-| `pq_centroids.bin` | load bearing | refused |
-| `pq_codes.bin` | load bearing | refused |
-| `hnsw_index.zdbgraph` | derived | opens, graph rebuilt from the records |
-
-The graph is derived because every record carries what the graph is built from. Nothing else in the directory can be produced again from what remains, so losing any of the other files means the index that opened would not be the index that was saved. Under `quantized_with_raw` a lost `vectors.bin` used to open as a complete index built entirely from PQ reconstructions, with no error and no warning, and a lost `quantization.json` used to open as an unquantized index. Both are refused now.
-
-The refusal names the file and says what it holds:
-
-```text
-manifest.json names vectors.bin under files_included and the index directory
-does not hold it. vectors.bin holds the raw vector of every record.
-manifest.json is written after every file it names except the graph dump, so a
-directory in this state lost the file after the save that wrote it finished, or
-was copied without it. Refusing to load an index assembled from the files that
-survived, because it would not hold what was saved. Restore the directory from
-a copy.
-```
+**`load()` refuses a directory that does not hold what its manifest names.** It checks `files_included` before it reads anything, and the graph dump is the one exempt artefact, because every record carries what the graph is built from. A directory missing any other file will not open, and the refusal names the file and says what it held. Restore it from a copy; the missing file cannot be rebuilt from the ones that remain. A file the manifest does not name is neither read nor complained about.
 
 A file that is present and does not parse is a different failure with a different message, of the form `Failed to parse config.json` or `Failed to deserialize mappings.bin`.
-
-**What to do with a directory that refuses to open.** Restore it from a copy. The missing file cannot be rebuilt from the ones that remain, and there is no flag that opens the directory anyway, because an index assembled from the survivors would answer queries without saying that it is doing so. If you want a smaller directory, set `storage_mode` to `quantized_only` at create time rather than deleting `vectors.bin` from a saved one.
-
-An artefact the manifest does not name is left alone. `load()` reads only what `files_included` lists, so a file another save left behind in the same directory is neither read nor complained about.
 
 <br/>
 
@@ -1636,15 +1508,16 @@ all checks passed
 ```
 
 ### ⚠️ Important Notes on Persistence
+
 - **Directory, not a file.** `.save()` creates a directory. You need write permission for the target location.
 
 - **Not atomic.** Files are written one at a time into the target directory. An interrupted save leaves a partial directory behind, and a later `load()` of it fails rather than returning a truncated index. Save to a new path and move it into place if you need an atomic swap.
 
-- **Overwriting is not clean either.** Saving over an existing directory replaces files individually and does not remove ones that no longer apply. The leftovers are inert, since `load()` reads only what `manifest.json` names, but they still occupy the disk. Save to a fresh directory.
+- **Overwriting is not clean either.** Saving over an existing directory replaces files individually and does not remove ones that no longer apply. The leftovers are inert but still occupy the disk. Save to a fresh directory.
 
 - **Version compatibility.** The manifest records a format version. This build writes 1.1.0 and reads any 1.x. A different major version is refused.
 
-- **Integrity checks on load.** Three run, in this order. The format version is checked first. Then `files_included` is checked against the directory, and a load bearing file the manifest names and the directory lacks fails the load before anything is parsed. Then the restored record count is checked against the count in `config.json`, which catches a file that is present and short.
+- **Integrity checks on load.** Three run, in this order: the format version, then `files_included` against the directory, then the restored record count against the count in `config.json`.
 
 <br />
 
@@ -1703,8 +1576,7 @@ Three behaviours are worth knowing.
 
 ### 🧩 Boolean composition
 
-A filter is a conjunction of its keys. Three reserved keys compose whole filters
-instead of naming a field.
+A filter is a conjunction of its keys. Three reserved keys compose whole filters instead of naming a field.
 
 | Key | Takes | Means |
 |-----|-------|-------|
@@ -1712,25 +1584,13 @@ instead of naming a field.
 | `$or` | a list of filters | at least one of them holds |
 | `$not` | one filter | that filter does not hold |
 
-**Precedence.** There is none to remember, because the structure is explicit. A
-mapping is an AND of everything in it, fields and groups alike, so
-`{"a": 1, "$or": [...]}` means `a == 1` AND the disjunction. A group's branches
-are each a whole filter, so a branch carrying two fields conjoins them.
+**Precedence.** There is none to remember, because the structure is explicit. A mapping is an AND of everything in it, fields and groups alike, so `{"a": 1, "$or": [...]}` means `a == 1` AND the disjunction. A group's branches are each a whole filter, so a branch carrying two fields conjoins them.
 
-**Nesting.** Groups nest to 10 levels, counting the filter itself as level one.
-A filter deeper than that raises `ValueError` rather than being evaluated. The
-limit is far past anything written by hand or generated from a query, and it is
-stated so that a public API taking arbitrary input does not have "as deep as you
-like" in its contract.
+**Nesting.** Groups nest to 10 levels, counting the filter itself as level one. A filter deeper than that raises `ValueError`.
 
-**Reserved keys.** Exactly `$and`, `$or` and `$not`. The `$` prefix is not
-reserved, so a field named `$price` still filters. A field literally named
-`$or`, `$and` or `$not` cannot be filtered on; it is still stored and still
-returned in results, and a filter naming it raises rather than quietly selecting
-the wrong records.
+**Reserved keys.** Exactly `$and`, `$or` and `$not`. The `$` prefix is not reserved, so a field named `$price` still filters. A field literally named `$or`, `$and` or `$not` cannot be filtered on, and a filter naming it raises.
 
-**The empty cases.** `{"$and": []}` matches every record and `{"$or": []}`
-matches none, which is what `all` and `any` already do with an empty array.
+**The empty cases.** `{"$and": []}` matches every record and `{"$or": []}` matches none, which is what `all` and `any` already do with an empty array.
 
 ```python
 from zeusdb_vector_database import VectorDatabase
@@ -1786,26 +1646,11 @@ print(matched({"$not": {"$or": [{"lang": "es"}, {"tier": "gold"}]}}))
 
 ### ⏱️ What a filtered search costs
 
-A filtered search is a great deal more expensive than an unfiltered one, and the
-reason is that the index has to find out which records match. There is no index
-on metadata fields, so finding out means reading every record's metadata.
+A filtered search costs a great deal more than an unfiltered one. There is no index on metadata fields, so finding out which records match means reading every record's metadata.
 
-Two paths serve a filter and the index chooses between them per search, on the
-number of records that match.
+Two paths serve a filter and the index chooses between them per search. At or below 5,000 matching records it walks the whole metadata store, scores every record that matched and ranks them, which is exact. Above 5,000 the graph traversal runs instead with the filter tested at every node it reaches, and recall there is the graph's own, measured at 0.96 and above on three real 100,000 record sets.
 
-**At or below 5,000 matching records the index walks the whole metadata store,
-scores every record that matched and ranks them.** That answer is exact, so the
-page is the true nearest matching records and recall is 1.0 whatever the filter
-selects.
-
-**Above 5,000 the walk stops as soon as it has counted 5,001 matches, and the
-graph traversal runs instead** with the filter tested at every node it reaches. A
-node the filter rejects still routes the search but never takes a result slot.
-Recall there is the graph's own, measured at 0.96 and above on three real
-100,000 record sets.
-
-Measured on three real 100,000 record sets, milliseconds per query, minimum of
-several passes:
+Measured on three real 100,000 record sets, milliseconds per query, minimum of several passes:
 
 | Records matched | Path | sift, 128d | glove, 100d | dbpedia, 1536d |
 | --- | --- | --- | --- | --- |
@@ -1816,16 +1661,7 @@ several passes:
 | 100 | exact | 36.1 | 30.8 | 30.8 |
 | 1 | exact | 38.3 | 31.6 | 34.7 |
 
-The three exact rows cost about the same because the walk dominates, at roughly
-300 nanoseconds a record whatever matched. The 10,000 row is expensive for the
-same reason: the walk has to read 50,000 records before it has counted 5,001
-matches, and only then does the graph run. **Expect a filtered search over
-100,000 records to cost tens of milliseconds where an unfiltered one costs a
-fraction of one**, and expect it to grow in proportion to the record count.
-
-Two things reduce it. Filtering on a field that few records carry does not help,
-because the walk visits every record either way. Filtering less often does, and
-so does keeping separate indexes for partitions you always filter by.
+**Expect a filtered search over 100,000 records to cost tens of milliseconds where an unfiltered one costs a fraction of one**, and expect it to grow in proportion to the record count. Filtering on a field that few records carry does not reduce it, because the walk visits every record either way. Filtering less often does, and so does keeping separate indexes for partitions you always filter by.
 
 <br/>
 
@@ -1873,8 +1709,7 @@ print(matched({"author": "Charlie"}, top_k=10))
 ['doc_3']
 ```
 
-A filter matching fewer records than `top_k` returns that many results, and one
-matching none returns an empty list. Neither is a truncation.
+A filter matching fewer records than `top_k` returns that many results, and one matching none returns an empty list. Neither is a truncation.
 
 #### ✔️ Common filters
 
