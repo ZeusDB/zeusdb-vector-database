@@ -1,0 +1,660 @@
+"""The verbs added in the 0.8 surface pass.
+
+`space` as a property, `AddResult.ids`, `__len__`, `__contains__`, `count`,
+`list` with an offset, `remove_points`, `remove_where`, `update_metadata`,
+`shrink_to_fit`, and the three filter operators `nin`, `any` and `all`.
+
+Every method here has a case for an empty index, a case for the error it can
+raise or the falsehood it can report, and a case for ordinary use.
+"""
+
+import numpy as np
+import pytest
+from zeusdb_vector_database import VectorDatabase
+
+
+def build(n=0, dim=4, space="cosine", expected_size=100, metadatas=None):
+    """An index holding `n` records, ids `r0` upward, orthogonal-ish vectors."""
+    index = VectorDatabase().create(
+        "hnsw", dim=dim, space=space, expected_size=expected_size
+    )
+    if n:
+        rng = np.random.default_rng(11)
+        vectors = rng.standard_normal((n, dim)).astype(np.float32)
+        payload = {"ids": [f"r{i}" for i in range(n)], "embeddings": vectors}
+        if metadatas is not None:
+            payload["metadatas"] = metadatas
+        assert index.add(payload).is_success()
+    return index
+
+
+# ------------------------------------------------------------
+# space, as a property beside dim
+# ------------------------------------------------------------
+@pytest.mark.parametrize("space", ["cosine", "l2", "l1"])
+def test_space_property_matches_get_space(space):
+    index = build(space=space)
+    assert index.space == space
+    assert index.space == index.get_space()
+    assert index.get_stats()["space"] == space
+
+
+def test_space_property_is_present_on_an_empty_index():
+    # The langchain adapter reads getattr(index, "space", None) before any
+    # record exists, so an empty index has to answer.
+    index = build()
+    assert getattr(index, "space", None) == "cosine"
+
+
+def test_space_property_is_read_only():
+    index = build()
+    with pytest.raises(AttributeError):
+        index.space = "l2"
+
+
+# ------------------------------------------------------------
+# AddResult.ids
+# ------------------------------------------------------------
+def test_add_result_ids_are_empty_for_an_empty_input():
+    index = build()
+    result = index.add({"ids": [], "embeddings": []})
+    assert result.ids == []
+    assert result.total_inserted == 0
+
+
+def test_add_result_ids_carry_the_supplied_ids_in_order():
+    index = build()
+    result = index.add(
+        {"ids": ["a", "b", "c"], "embeddings": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]]}
+    )
+    assert result.ids == ["a", "b", "c"]
+    assert len(result.ids) == result.total_inserted
+
+
+def test_add_result_ids_carry_the_generated_ids():
+    # Without this the generated ids were unreachable to the caller.
+    index = build()
+    result = index.add({"vectors": [[1, 0, 0, 0], [0, 1, 0, 0]]})
+    assert len(result.ids) == 2
+    assert all(i.startswith("vec_") for i in result.ids)
+    for generated in result.ids:
+        assert generated in index
+
+
+def test_add_result_ids_omit_a_rejected_record():
+    index = build()
+    result = index.add(
+        {
+            "ids": ["good", "wrong_width"],
+            "embeddings": [[1, 0, 0, 0], [1, 0]],
+        }
+    )
+    assert result.total_errors == 1
+    assert "good" in result.ids
+    assert "wrong_width" not in result.ids
+    # The list lines up with the count and with nothing else.
+    assert len(result.ids) == result.total_inserted
+
+
+def test_add_result_ids_report_an_overwrite():
+    index = build()
+    index.add({"ids": ["a"], "embeddings": [[1, 0, 0, 0]]})
+    result = index.add({"ids": ["a"], "embeddings": [[0, 1, 0, 0]]}, overwrite=True)
+    assert result.ids == ["a"]
+
+
+# ------------------------------------------------------------
+# __len__ and __contains__
+# ------------------------------------------------------------
+def test_len_is_zero_on_an_empty_index():
+    assert len(build()) == 0
+
+
+def test_len_tracks_the_live_record_count():
+    index = build(12)
+    assert len(index) == 12
+    assert len(index) == index.get_vector_count()
+    assert len(index) == int(index.get_stats()["total_vectors"])
+    index.remove_point("r0")
+    assert len(index) == 11
+    assert len(index) == index.get_vector_count()
+
+
+def test_contains_on_an_empty_index_is_false():
+    index = build()
+    assert "anything" not in index
+
+
+def test_contains_agrees_with_the_contains_method():
+    index = build(5)
+    assert "r3" in index
+    assert index.contains("r3")
+    assert "missing" not in index
+    assert not index.contains("missing")
+    index.remove_point("r3")
+    assert "r3" not in index
+
+
+def test_contains_rejects_a_non_string_key():
+    index = build(2)
+    with pytest.raises(TypeError):
+        3 in index  # noqa: B015
+
+
+# ------------------------------------------------------------
+# count
+# ------------------------------------------------------------
+def test_count_on_an_empty_index_is_zero():
+    index = build()
+    assert index.count() == 0
+    assert index.count({"tier": "a"}) == 0
+
+
+def test_count_without_a_filter_is_the_record_count():
+    index = build(9)
+    assert index.count() == 9
+    assert index.count() == len(index)
+
+
+def test_count_with_a_filter_is_exact():
+    metas = [{"tier": "a" if i % 3 == 0 else "b", "n": i} for i in range(30)]
+    index = build(30, metadatas=metas)
+    assert index.count({"tier": "a"}) == 10
+    assert index.count({"tier": "b"}) == 20
+    assert index.count({"n": {"gte": 25}}) == 5
+    assert index.count({"tier": "a", "n": {"lt": 10}}) == 4
+    assert index.count({"tier": "nobody"}) == 0
+
+
+def test_count_counts_past_the_scan_threshold():
+    # The search path gives up at FULL_SCAN_THRESHOLD matches and traverses
+    # instead. A count cannot give up, so a filter matching more than a search
+    # would scan still returns the true total.
+    n = 6000
+    metas = [{"tier": "a"} for _ in range(n)]
+    index = build(n, expected_size=n, metadatas=metas)
+    assert index.count({"tier": "a"}) == n
+    assert len(index.search([1, 0, 0, 0], filter={"tier": "a"}, top_k=5)) == 5
+
+
+def test_count_rejects_an_unknown_operator():
+    index = build(3, metadatas=[{"tier": "a"} for _ in range(3)])
+    with pytest.raises(ValueError, match="Unknown filter operation"):
+        index.count({"tier": {"nonsense": 1}})
+
+
+# ------------------------------------------------------------
+# list, and the paging order
+# ------------------------------------------------------------
+def test_list_on_an_empty_index_is_empty():
+    index = build()
+    assert index.list() == []
+    assert index.list(number=5, offset=3) == []
+
+
+def test_list_is_in_arrival_order():
+    index = build(20)
+    got = [i for i, _ in index.list(number=20)]
+    assert got == [f"r{i}" for i in range(20)]
+
+
+def test_list_pages_do_not_overlap_or_skip():
+    index = build(37)
+    seen = []
+    offset = 0
+    while True:
+        page = index.list(number=7, offset=offset)
+        if not page:
+            break
+        seen.extend(i for i, _ in page)
+        offset += 7
+    assert seen == [f"r{i}" for i in range(37)]
+    assert len(set(seen)) == 37
+
+
+def test_list_offset_past_the_end_is_empty_rather_than_an_error():
+    index = build(4)
+    assert index.list(number=10, offset=4) == []
+    assert index.list(number=10, offset=1000) == []
+    assert index.list(number=0) == []
+
+
+def test_list_carries_the_metadata():
+    metas = [{"tier": chr(ord("a") + i)} for i in range(5)]
+    index = build(5, metadatas=metas)
+    page = index.list(number=5)
+    assert [m["tier"] for _, m in page] == ["a", "b", "c", "d", "e"]
+
+
+def test_list_order_survives_a_save_and_load(tmp_path):
+    index = build(15)
+    before = [i for i, _ in index.list(number=15)]
+    path = str(tmp_path / "ordered.zdb")
+    index.save(path)
+    loaded = VectorDatabase().load(path)
+    assert [i for i, _ in loaded.list(number=15)] == before
+
+
+def test_list_keeps_its_single_argument_call():
+    # The langchain adapter calls list(number=k * 2) positionally by keyword.
+    index = build(6)
+    assert len(index.list(number=3)) == 3
+
+
+# ------------------------------------------------------------
+# remove_points
+# ------------------------------------------------------------
+def test_remove_points_on_an_empty_index_reports_every_id_missing():
+    index = build()
+    assert index.remove_points(["a", "b"]) == ["a", "b"]
+    assert index.remove_points([]) == []
+
+
+def test_remove_points_removes_a_batch_and_reports_the_misses():
+    index = build(6)
+    missing = index.remove_points(["r1", "nope", "r4"])
+    assert missing == ["nope"]
+    assert len(index) == 4
+    assert "r1" not in index
+    assert "r4" not in index
+    assert "r0" in index
+
+
+def test_remove_points_handles_a_repeated_id_once():
+    index = build(3)
+    assert index.remove_points(["r0", "r0"]) == []
+    assert len(index) == 2
+
+
+def test_remove_points_matches_the_loop_it_replaces():
+    one = build(8)
+    many = build(8)
+    ids = ["r2", "r5", "absent"]
+    looped = [i for i in ids if not one.remove_point(i)]
+    assert many.remove_points(ids) == looped
+    assert len(one) == len(many)
+    assert sorted(i for i, _ in one.list(number=99)) == sorted(
+        i for i, _ in many.list(number=99)
+    )
+
+
+def test_remove_points_strands_one_graph_node_per_record():
+    index = build(6)
+    before = int(index.get_stats()["graph_nodes"])
+    index.remove_points(["r0", "r1"])
+    assert int(index.get_stats()["graph_nodes"]) == before
+    assert int(index.get_stats()["stranded_graph_nodes"]) == 2
+    assert index.compact() == 2
+
+
+# ------------------------------------------------------------
+# remove_where
+# ------------------------------------------------------------
+def test_remove_where_on_an_empty_index_removes_nothing():
+    index = build()
+    assert index.remove_where({"tier": "a"}) == 0
+
+
+def test_remove_where_removes_the_matching_set():
+    metas = [{"tier": "a" if i % 2 else "b", "n": i} for i in range(10)]
+    index = build(10, metadatas=metas)
+    assert index.remove_where({"tier": "a"}) == 5
+    assert len(index) == 5
+    assert index.count({"tier": "a"}) == 0
+    assert index.count({"tier": "b"}) == 5
+
+
+def test_remove_where_matching_nothing_returns_zero():
+    index = build(4, metadatas=[{"tier": "a"} for _ in range(4)])
+    assert index.remove_where({"tier": "z"}) == 0
+    assert len(index) == 4
+
+
+def test_remove_where_refuses_an_empty_filter():
+    # Everywhere else an empty filter matches every record. This is the one
+    # method where following that rule destroys the index, so it is refused.
+    index = build(5, metadatas=[{"tier": "a"} for _ in range(5)])
+    with pytest.raises(ValueError, match="empty filter"):
+        index.remove_where({})
+    assert len(index) == 5
+    # The rule itself is unchanged everywhere it is safe.
+    assert index.count({}) == 5
+    assert len(index.search([1, 0, 0, 0], filter={}, top_k=5)) == 5
+
+
+def test_remove_where_rejects_an_unknown_operator():
+    index = build(3, metadatas=[{"tier": "a"} for _ in range(3)])
+    with pytest.raises(ValueError, match="Unknown filter operation"):
+        index.remove_where({"tier": {"nonsense": 1}})
+    assert len(index) == 3
+
+
+def test_remove_where_selects_what_search_selects():
+    metas = [{"tier": "a" if i % 3 == 0 else "b"} for i in range(12)]
+    index = build(12, metadatas=metas)
+    matched = {h["id"] for h in index.search([1, 0, 0, 0], filter={"tier": "a"}, top_k=99)}
+    assert index.remove_where({"tier": "a"}) == len(matched)
+    for gone in matched:
+        assert gone not in index
+
+
+def test_remove_where_by_a_reference_key_is_what_the_adapter_needs():
+    # llama-index writes ref_doc_id into every record's metadata and raised
+    # NotImplementedError for delete(ref_doc_id).
+    metas = [{"ref_doc_id": "doc1" if i < 4 else "doc2"} for i in range(10)]
+    index = build(10, metadatas=metas)
+    assert index.remove_where({"ref_doc_id": "doc1"}) == 4
+    assert index.count({"ref_doc_id": "doc2"}) == 6
+
+
+# ------------------------------------------------------------
+# update_metadata
+# ------------------------------------------------------------
+def test_update_metadata_on_an_empty_index_is_false():
+    index = build()
+    assert index.update_metadata("nobody", {"tier": "a"}) is False
+
+
+def test_update_metadata_for_an_unknown_id_writes_nothing():
+    index = build(3, metadatas=[{"tier": "a"} for _ in range(3)])
+    assert index.update_metadata("missing", {"tier": "z"}) is False
+    assert index.count({"tier": "a"}) == 3
+    assert index.count({"tier": "z"}) == 0
+
+
+def test_update_metadata_replaces_wholesale():
+    index = build(2, metadatas=[{"tier": "a", "keep": 1}, {"tier": "b"}])
+    assert index.update_metadata("r0", {"tier": "c"}) is True
+    record = index.get_records("r0", return_vector=False)[0]
+    assert record["metadata"] == {"tier": "c"}
+    assert "keep" not in record["metadata"]
+
+
+def test_update_metadata_agrees_with_add_overwrite():
+    one = build(2, metadatas=[{"tier": "a", "keep": 1}, {"tier": "b"}])
+    two = build(2, metadatas=[{"tier": "a", "keep": 1}, {"tier": "b"}])
+    one.update_metadata("r0", {"tier": "c"})
+    vector = two.get_records("r0", return_vector=True)[0]["vector"]
+    two.add({"ids": ["r0"], "embeddings": [vector], "metadatas": [{"tier": "c"}]},
+            overwrite=True)
+    assert (one.get_records("r0", return_vector=False)[0]["metadata"]
+            == two.get_records("r0", return_vector=False)[0]["metadata"])
+
+
+def test_update_metadata_leaves_the_vector_and_the_graph_alone():
+    index = build(5)
+    before_vector = index.get_records("r2", return_vector=True)[0]["vector"]
+    before_nodes = int(index.get_stats()["graph_nodes"])
+    before_page = [h["id"] for h in index.search([1, 0, 0, 0], top_k=5)]
+    assert index.update_metadata("r2", {"tier": "new"}) is True
+    assert index.get_records("r2", return_vector=True)[0]["vector"] == before_vector
+    assert int(index.get_stats()["graph_nodes"]) == before_nodes
+    assert int(index.get_stats()["stranded_graph_nodes"]) == 0
+    assert [h["id"] for h in index.search([1, 0, 0, 0], top_k=5)] == before_page
+    assert len(index) == 5
+
+
+def test_update_metadata_to_an_empty_mapping_clears_it():
+    index = build(1, metadatas=[{"tier": "a"}])
+    assert index.update_metadata("r0", {}) is True
+    assert index.get_records("r0", return_vector=False)[0]["metadata"] == {}
+
+
+def test_update_metadata_is_visible_to_the_filter():
+    metas = [{"tier": "a"} for _ in range(4)]
+    index = build(4, metadatas=metas)
+    index.update_metadata("r1", {"tier": "b"})
+    assert index.count({"tier": "a"}) == 3
+    assert index.count({"tier": "b"}) == 1
+    hits = index.search([1, 0, 0, 0], filter={"tier": "b"}, top_k=4)
+    assert [h["id"] for h in hits] == ["r1"]
+
+
+def test_update_metadata_survives_a_save_and_load(tmp_path):
+    index = build(3, metadatas=[{"tier": "a"} for _ in range(3)])
+    index.update_metadata("r1", {"tier": "b"})
+    path = str(tmp_path / "updated.zdb")
+    index.save(path)
+    loaded = VectorDatabase().load(path)
+    assert loaded.count({"tier": "b"}) == 1
+    assert loaded.get_records("r1", return_vector=False)[0]["metadata"] == {"tier": "b"}
+
+
+# ------------------------------------------------------------
+# shrink_to_fit
+# ------------------------------------------------------------
+def test_shrink_to_fit_on_an_empty_index_releases_the_reservation():
+    # An empty index is not an index with nothing to release. It holds the
+    # creation reservation that expected_size bought, and this hands it back.
+    index = build(expected_size=1000)
+    before = float(index.get_stats()["graph_memory_mb"])
+    freed = index.shrink_to_fit()
+    assert freed > 0
+    assert float(index.get_stats()["graph_memory_mb"]) < before
+    assert index.shrink_to_fit() == 0
+    # It stays usable. It simply regrows from nothing.
+    assert index.add({"ids": ["a"], "embeddings": [[1.0, 0.0, 0.0, 0.0]]}).is_success()
+    assert len(index) == 1
+    assert "a" in index
+
+
+def test_shrink_to_fit_is_idempotent():
+    index = build(400, expected_size=10, dim=32)
+    index.shrink_to_fit()
+    assert index.shrink_to_fit() == 0
+
+
+def test_shrink_to_fit_reduces_the_reported_graph_memory():
+    index = build(400, expected_size=10, dim=32)
+    before = float(index.get_stats()["graph_memory_mb"])
+    freed = index.shrink_to_fit()
+    after = float(index.get_stats()["graph_memory_mb"])
+    assert freed > 0
+    assert after < before
+
+
+def test_shrink_to_fit_returns_the_same_page():
+    index = build(400, expected_size=10, dim=32)
+    rng = np.random.default_rng(3)
+    queries = rng.standard_normal((10, 32)).astype(np.float32)
+    before = [[(h["id"], h["score"]) for h in index.search(q, top_k=10)] for q in queries]
+    index.shrink_to_fit()
+    after = [[(h["id"], h["score"]) for h in index.search(q, top_k=10)] for q in queries]
+    assert before == after
+
+
+def test_the_index_is_still_writable_after_a_shrink():
+    index = build(200, expected_size=10, dim=16)
+    index.shrink_to_fit()
+    assert index.add({"ids": ["later"], "embeddings": [[1.0] * 16]}).is_success()
+    assert "later" in index
+    assert len(index) == 201
+    assert [h["id"] for h in index.search([1.0] * 16, top_k=1)] == ["later"]
+
+
+def test_compact_shrinks_the_graph_it_rebuilds():
+    index = build(300, expected_size=10, dim=32)
+    index.remove_points([f"r{i}" for i in range(50)])
+    before = float(index.get_stats()["graph_memory_mb"])
+    assert index.compact() == 50
+    after = float(index.get_stats()["graph_memory_mb"])
+    assert after < before
+    assert index.shrink_to_fit() == 0
+
+
+# ------------------------------------------------------------
+# nin, any and all
+# ------------------------------------------------------------
+def tagged():
+    metas = [
+        {"tier": "a", "tags": ["x", "y"]},
+        {"tier": "b", "tags": ["y", "z"]},
+        {"tier": "c", "tags": ["z"]},
+        {"tier": "a", "tags": []},
+    ]
+    return build(4, metadatas=metas)
+
+
+def test_nin_on_an_empty_index_matches_nothing():
+    index = build()
+    assert index.count({"tier": {"nin": ["a"]}}) == 0
+
+
+def test_nin_excludes_the_listed_values():
+    index = tagged()
+    assert index.count({"tier": {"nin": ["a"]}}) == 2
+    assert index.count({"tier": {"nin": ["a", "b", "c"]}}) == 0
+    assert index.count({"tier": {"nin": []}}) == 4
+
+
+def test_nin_and_ne_agree_on_an_absent_field():
+    # relay 44 fixed `ne` to answer false where the field is missing. `nin`
+    # against a one element list means the same thing, so it answers the same.
+    index = build(2, metadatas=[{"tier": "a"}, {"other": 1}])
+    assert index.count({"tier": {"ne": "a"}}) == 0
+    assert index.count({"tier": {"nin": ["a"]}}) == 0
+    assert index.count({"tier": {"nin": ["zzz"]}}) == 1
+
+
+def test_nin_is_the_negation_of_in_over_present_fields():
+    index = tagged()
+    assert index.count({"tier": {"in": ["a", "b"]}}) == 3
+    assert index.count({"tier": {"nin": ["a", "b"]}}) == 1
+
+
+def test_nin_on_search_returns_the_complement():
+    index = tagged()
+    hits = index.search([1, 0, 0, 0], filter={"tier": {"nin": ["a"]}}, top_k=4)
+    assert sorted(h["id"] for h in hits) == ["r1", "r2"]
+
+
+def test_any_matches_an_intersection():
+    index = tagged()
+    assert index.count({"tags": {"any": ["x"]}}) == 1
+    assert index.count({"tags": {"any": ["x", "z"]}}) == 3
+    assert index.count({"tags": {"any": []}}) == 0
+    assert index.count({"tags": {"any": ["nothing"]}}) == 0
+
+
+def test_all_matches_a_conjunction():
+    index = tagged()
+    assert index.count({"tags": {"all": ["y", "z"]}}) == 1
+    assert index.count({"tags": {"all": ["x", "y"]}}) == 1
+    assert index.count({"tags": {"all": ["x", "z"]}}) == 0
+    # An empty conjunction holds of every record carrying the field.
+    assert index.count({"tags": {"all": []}}) == 4
+
+
+def test_any_and_all_on_a_scalar_field_read_it_as_one_element():
+    index = tagged()
+    assert index.count({"tier": {"any": ["a", "c"]}}) == 3
+    assert index.count({"tier": {"all": ["a"]}}) == 2
+    assert index.count({"tier": {"all": ["a", "b"]}}) == 0
+
+
+def test_any_and_all_reject_a_non_array_target():
+    index = tagged()
+    assert index.count({"tags": {"any": "x"}}) == 0
+    assert index.count({"tags": {"all": "x"}}) == 0
+
+
+def test_the_new_operators_are_validated_like_the_others():
+    index = tagged()
+    for op in ("nin", "any", "all"):
+        assert index.count({"tags": {op: ["x"]}}) >= 0
+    with pytest.raises(ValueError, match="Unknown filter operation"):
+        index.count({"tags": {"nin_typo": ["x"]}})
+
+
+def test_text_match_still_raises_and_contains_is_what_it_wants():
+    # llama-index maps TEXT_MATCH onto "text_match", which this engine does not
+    # implement. `contains` is the substring operator it is asking for.
+    index = build(2, metadatas=[{"body": "hello world"}, {"body": "goodbye"}])
+    with pytest.raises(ValueError, match="Unknown filter operation"):
+        index.count({"body": {"text_match": "world"}})
+    assert index.count({"body": {"contains": "world"}}) == 1
+
+
+# ------------------------------------------------------------
+# The absent field, under the two new array operators
+# ------------------------------------------------------------
+def test_any_and_all_exclude_a_record_missing_the_field():
+    # field_matches answers absence once, before dispatch, for every operator.
+    index = build(2, metadatas=[{"tags": ["x"]}, {"other": 1}])
+    assert index.count({"tags": {"any": ["x"]}}) == 1
+    assert index.count({"tags": {"any": ["zzz"]}}) == 0
+    assert index.count({"tags": {"all": []}}) == 1
+
+
+# ------------------------------------------------------------
+# The quantized paths, which is where the guard hoist could break
+# ------------------------------------------------------------
+def quantized(n=1600, dim=16, mode="quantized_only"):
+    index = VectorDatabase().create(
+        "hnsw",
+        dim=dim,
+        space="cosine",
+        expected_size=n,
+        quantization_config={
+            "type": "pq",
+            "storage_mode": mode,
+            "training_size": 1000,
+            "subvectors": 4,
+        },
+    )
+    rng = np.random.default_rng(23)
+    vectors = rng.standard_normal((n, dim)).astype(np.float32)
+    assert index.add(
+        {
+            "ids": [f"q{i}" for i in range(n)],
+            "embeddings": vectors,
+            "metadatas": [{"tier": "a" if i % 2 else "b"} for i in range(n)],
+        }
+    ).is_success()
+    assert index.is_quantized()
+    return index
+
+
+def test_remove_points_on_a_quantized_index_clears_the_codes():
+    index = quantized()
+    before = int(index.get_stats()["quantized_codes_stored"])
+    missing = index.remove_points(["q0", "q1", "absent"])
+    assert missing == ["absent"]
+    assert len(index) == 1598
+    assert int(index.get_stats()["quantized_codes_stored"]) == before - 2
+    assert "q0" not in index
+    assert index.get_records(["q0", "q1"], return_vector=False) == []
+
+
+def test_remove_where_on_a_quantized_index():
+    index = quantized()
+    assert index.count({"tier": "a"}) == 800
+    assert index.remove_where({"tier": "a"}) == 800
+    assert len(index) == 800
+    assert index.count({"tier": "a"}) == 0
+    assert int(index.get_stats()["quantized_codes_stored"]) == 800
+
+
+def test_update_metadata_on_a_quantized_index_leaves_the_codes_alone():
+    index = quantized()
+    codes_before = index.get_stats()["quantized_codes_stored"]
+    vector_before = index.get_records("q5", return_vector=True)[0]["vector"]
+    query = index.get_records("q5", return_vector=True)[0]["vector"]
+    page_before = [h["id"] for h in index.search(query, top_k=10)]
+
+    assert index.update_metadata("q5", {"tier": "c"}) is True
+
+    assert index.get_stats()["quantized_codes_stored"] == codes_before
+    assert index.get_records("q5", return_vector=True)[0]["vector"] == vector_before
+    assert [h["id"] for h in index.search(query, top_k=10)] == page_before
+    assert index.count({"tier": "c"}) == 1
+
+
+def test_quantized_index_still_searches_after_a_shrink():
+    index = quantized()
+    rng = np.random.default_rng(77)
+    queries = rng.standard_normal((5, 16)).astype(np.float32)
+    before = [[(h["id"], h["score"]) for h in index.search(q, top_k=10)] for q in queries]
+    index.shrink_to_fit()
+    after = [[(h["id"], h["score"]) for h in index.search(q, top_k=10)] for q in queries]
+    assert before == after

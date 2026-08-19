@@ -769,7 +769,7 @@ fn restore_data_fields(
 /// `PQ::new` starts with. Both fail the load rather than let the index come
 /// back reporting itself trained while decoding every code to zeros.
 fn install_centroids(pq: &PQ, centroids: Centroids) -> PyResult<()> {
-    let expected = (pq.subvectors, pq.num_centroids, pq.sub_dim);
+    let expected = (pq.subvectors(), pq.num_centroids(), pq.sub_dim());
     let actual = (
         centroids.len(),
         centroids.first().map(|s| s.len()).unwrap_or(0),
@@ -794,8 +794,8 @@ fn install_centroids(pq: &PQ, centroids: Centroids) -> PyResult<()> {
             expected.0,
             expected.1,
             expected.2,
-            pq.subvectors,
-            pq.bits
+            pq.subvectors(),
+            pq.bits()
         )));
     }
 
@@ -1217,7 +1217,7 @@ fn save_config(index: &HNSWIndex, path: &Path) -> PyResult<()> {
     let config = IndexConfig {
         dim: index.get_dim(),
         //space: index.get_space().to_string(),
-        space: index.space().to_string(), // Changed from get_space()
+        space: index.space_str().to_string(),
         m: index.get_m(),
         ef_construction: index.get_ef_construction(),
         expected_size: index.get_expected_size(),
@@ -1334,15 +1334,15 @@ fn save_quantization_config(index: &HNSWIndex, path: &Path) -> PyResult<()> {
 
             let memory_stats = MemoryStats {
                 centroid_storage_mb: memory_mb,
-                compression_ratio: (pq.dim * 4) as f64 / pq.subvectors as f64,
-                centroids_per_subvector: pq.num_centroids,
+                compression_ratio: (pq.dim() * 4) as f64 / pq.subvectors() as f64,
+                centroids_per_subvector: pq.num_centroids(),
                 total_centroids,
             };
 
             let pq_config = PQConfig {
-                dim: pq.dim,
-                sub_dim: pq.sub_dim,
-                num_centroids: pq.num_centroids,
+                dim: pq.dim(),
+                sub_dim: pq.sub_dim(),
+                num_centroids: pq.num_centroids(),
             };
 
             (Some(memory_stats), pq_config)

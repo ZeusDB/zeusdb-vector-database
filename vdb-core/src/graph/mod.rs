@@ -354,7 +354,7 @@ impl VectorGraph {
     ) -> Self {
         // A quantized graph holds one byte per subvector, so the codebook is
         // what states its width rather than the index's declared dimension.
-        let dim = pq.subvectors;
+        let dim = pq.subvectors();
         info!(
             operation = "hnsw_creation",
             space = space,
@@ -363,8 +363,8 @@ impl VectorGraph {
             max_layer = max_layer,
             ef_construction = ef_construction,
             variant = "quantized",
-            subvectors = pq.subvectors,
-            bits = pq.bits,
+            subvectors = pq.subvectors(),
+            bits = pq.bits(),
             "Creating PQ-enabled HNSW index"
         );
 
@@ -483,6 +483,22 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) => b.graph.memory_bytes(),
             VectorGraph::L2PQ(b) => b.graph.memory_bytes(),
             VectorGraph::L1PQ(b) => b.graph.memory_bytes(),
+        }
+    }
+
+    /// Return every buffer's spare capacity to the allocator, and report the
+    /// bytes released.
+    ///
+    /// What the slack is and why a built graph carries it where a loaded one
+    /// does not is on `MutableGraph::shrink_to_fit`.
+    pub(crate) fn shrink_to_fit(&mut self) -> usize {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.shrink_to_fit(),
+            VectorGraph::L2(b) => b.graph.shrink_to_fit(),
+            VectorGraph::L1(b) => b.graph.shrink_to_fit(),
+            VectorGraph::CosinePQ(b) => b.graph.shrink_to_fit(),
+            VectorGraph::L2PQ(b) => b.graph.shrink_to_fit(),
+            VectorGraph::L1PQ(b) => b.graph.shrink_to_fit(),
         }
     }
 
@@ -716,7 +732,7 @@ pub(crate) fn restore_graph(
             };
             let expected = Expected {
                 kind,
-                dimension: pq.subvectors,
+                dimension: pq.subvectors(),
                 m,
                 ef_construction,
                 min_nodes,
