@@ -61,6 +61,14 @@ const FORMAT_VERSION: &str = "1.1.0";
 /// suffered once.
 const SUPPORTED_FORMAT_MAJOR: u32 = 1;
 
+/// Name the corrected manifest is written under before it is renamed into place
+///
+/// A save that dies between the write and the rename leaves this behind. It is
+/// harmless: `check_files_present` only asks that every name the manifest lists
+/// is present, and `manifest_names` means a file the manifest does not list is
+/// never read. The next successful save overwrites it and renames it away.
+const MANIFEST_STAGING_FILENAME: &str = "manifest.json.tmp";
+
 /// Refuse a directory this build cannot interpret
 fn check_format_version(format_version: &str) -> PyResult<()> {
     let major = format_version
@@ -115,7 +123,10 @@ fn check_format_version(format_version: &str) -> PyResult<()> {
 /// The dump is also the one artefact written after `manifest.json`, so a save
 /// interrupted between the two leaves a manifest naming a dump that was never
 /// written. Refusing on that would refuse a directory the loader opens
-/// correctly today.
+/// correctly today. The manifest is then rewritten once more to record the
+/// directory size the dump changed, and a save interrupted between the dump and
+/// that rewrite leaves a complete directory whose `total_size_mb` is short by
+/// the size of the dump. See `update_manifest_size`.
 fn is_derived_artefact(name: &str) -> bool {
     name == GRAPH_DUMP_FILENAME || LEGACY_DUMP_FILENAMES.contains(&name)
 }
@@ -981,6 +992,12 @@ fn restore_quantization_state_simple(
     // falls back to the corpus terms. See `RerankCalibration`.
     index.set_rerank_calibration(quant_data.rerank_calibration);
 
+    // Carried rather than restamped, so a load and a save do not move it. On a
+    // directory written before the index held the value this is the save time
+    // the old code wrote, which cannot be recovered but does at least stop
+    // drifting from here on.
+    index.set_training_completed_at(quant_data.training_completed_at);
+
     // The training ids and the threshold flag are applied after the graph
     // rebuild, which would otherwise strip them. See TrainingState.
 
@@ -1267,8 +1284,14 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
 
     // Phase 2: Create empty index and restore state
     println!("🔧 Phase 2: Creating empty index and restoring state...");
-    let restored_index =
+    let mut restored_index =
         reconstruct_index_simple(path_buf, config, mappings, metadata, vectors, quantization)?;
+
+    // `new_empty` stamps the load time, because it has nothing better to start
+    // from. Until this ran, a save of a loaded index wrote that load time to
+    // manifest.json as the creation, so a directory that had been through one
+    // load and save claimed to have been created then.
+    restored_index.set_created_at(manifest.created_at);
 
     println!("✅ Index reconstruction completed successfully!");
     Ok(restored_index)
@@ -1387,11 +1410,13 @@ fn save_quantization_config(index: &HNSWIndex, path: &Path) -> PyResult<()> {
     if let Some(config) = index.get_quantization_config() {
         println!("🔧 Saving quantization.json...");
 
-        let training_completed_at = if index.can_use_quantization() {
-            Some(Utc::now().to_rfc3339()) // TODO: Get actual training completion time
-        } else {
-            None
-        };
+        // When the codebook was fitted, taken from the index rather than from
+        // the clock. This used to be `Utc::now()`, so the field recorded the
+        // save and moved every time a trained index was saved again. `None` on
+        // an index that never trained, and also on one loaded from a directory
+        // written before the index carried the value; see the field on
+        // `HNSWIndex`.
+        let training_completed_at = index.get_training_completed_at();
 
         // CAPTURE TRAINING STATE:
         let training_ids = index.get_training_ids().clone();
@@ -1660,13 +1685,15 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
             None
         };
 
-    // Calculate total directory size
+    // What the directory holds so far, which is everything except the graph
+    // dump. `update_manifest_size` writes the true total once the dump has
+    // landed; see that function for why the figure is taken twice.
     let total_size_mb = calculate_directory_size(path).unwrap_or(0.0);
 
     let manifest = IndexManifest {
         format_version: FORMAT_VERSION.to_string(),
         zeusdb_version: env!("CARGO_PKG_VERSION").to_string(),
-        created_at: index.get_created_at().to_string(),
+        created_at: index.get_created_at(),
         saved_at: Utc::now().to_rfc3339(),
         total_vectors: vector_count,
         index_type: "HNSW".to_string(),
@@ -1695,6 +1722,89 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
     })?;
 
     println!("✅ manifest.json saved");
+    Ok(())
+}
+
+/// Write the true directory size into the manifest, once the graph dump exists
+///
+/// `save_manifest` runs before `save_hnsw_graph`, so the size it takes misses
+/// the largest file in the directory. At 50,000 records of dimension 1,536 the
+/// dump is roughly 320 MB of a roughly 630 MB directory, so the figure
+/// understated by about half, and on a save over an existing directory it
+/// counted the previous save's dump instead, which was a different wrong
+/// number.
+///
+/// The order is not reversed to fix it. `manifest.json` is written before the
+/// dump on purpose: the dump is the one artefact the loader can produce again,
+/// so a save whose dump fails still leaves a directory that opens through the
+/// rebuild. See `is_derived_artefact`. Writing the manifest last would leave
+/// that save with no manifest at all, and a save over an existing directory
+/// would leave the previous manifest describing the new data files, which
+/// `manifest_names` would then read as an inventory and open as the wrong
+/// index.
+///
+/// So the manifest is written twice and only `total_size_mb` differs between
+/// the two. Every other field is read back and written out unchanged, `saved_at`
+/// included, so the second write does not restamp the save time.
+///
+/// The rewrite goes to a temporary file and is renamed over the target, so a
+/// reader sees one complete manifest or the other and never a half written one.
+/// A failure here leaves the first manifest in place and the directory
+/// loadable, and it is still reported, because a save that returns success has
+/// written everything it meant to write.
+///
+/// The figure counts the directory as it stood when the size was taken, and
+/// writing the corrected number changes the manifest's own length by a few
+/// bytes. The recorded total is short by that difference, which is under twenty
+/// bytes against a directory measured in megabytes.
+pub fn update_manifest_size(path: &Path) -> PyResult<()> {
+    let manifest_path = path.join("manifest.json");
+
+    let manifest_json = fs::read_to_string(&manifest_path).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to re-read manifest.json to record the directory size: {}",
+            e
+        ))
+    })?;
+
+    let mut manifest: IndexManifest = serde_json::from_str(&manifest_json).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to parse the manifest.json this save just wrote: {}",
+            e
+        ))
+    })?;
+
+    manifest.total_size_mb = calculate_directory_size(path).unwrap_or(0.0);
+
+    let updated = serde_json::to_string_pretty(&manifest).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to serialize manifest: {}",
+            e
+        ))
+    })?;
+
+    let staged = path.join(MANIFEST_STAGING_FILENAME);
+    fs::write(&staged, updated).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to write {}: {}",
+            MANIFEST_STAGING_FILENAME, e
+        ))
+    })?;
+
+    fs::rename(&staged, &manifest_path).map_err(|e| {
+        // The staged file is removed on a failed rename so the directory is not
+        // left holding a manifest under a second name.
+        let _ = fs::remove_file(&staged);
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to replace manifest.json with the one carrying the directory size: {}",
+            e
+        ))
+    })?;
+
+    println!(
+        "✅ manifest.json total_size_mb recorded ({:.2} MB)",
+        manifest.total_size_mb
+    );
     Ok(())
 }
 

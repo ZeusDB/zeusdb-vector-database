@@ -12,6 +12,7 @@ use crate::graph::VectorGraph;
 use crate::pq::PQ;
 use crate::rerank::{calibrate_rerank_from_sample, raw_distance_fn, RerankCalibration};
 use crate::rng::SeededRng;
+use chrono::Utc;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use std::collections::HashMap;
@@ -183,6 +184,11 @@ impl HNSWIndex {
         let training_start = Instant::now();
         pq.train(&final_training_set)?;
         let training_duration = training_start.elapsed();
+
+        // The one point where the codebook goes from absent to fitted, so it is
+        // the one point that can stamp when that happened. `quantization.json`
+        // used to write the save time under this name. See the field.
+        *self.training_completed_at.write().unwrap() = Some(Utc::now().to_rfc3339());
 
         info!(
             operation = "pq_training_complete",

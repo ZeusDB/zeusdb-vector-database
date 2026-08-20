@@ -2,6 +2,12 @@
 name = "zeusdb-vector-database"
 version = "0.7.0"
 edition = "2021"
+# The same licence pyproject.toml declares, LICENSE holds and NOTICE restates.
+# The crate is not published to crates.io, so nothing read this field until
+# cargo-deny did, and it reported the crate that owns the tree as the one
+# unlicensed thing in it. The wheel's metadata is unaffected, because maturin
+# takes it from pyproject.toml.
+license = "Apache-2.0"
 resolver = "2" # <-- Avoid compiling unnecessary features from dependencies.
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

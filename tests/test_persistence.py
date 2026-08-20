@@ -2146,3 +2146,149 @@ def test_load_ignores_an_artefact_the_manifest_does_not_name(tmp_path):
     assert np.array_equal(stored, kept)
     # Nothing of the quantized save survives into the reopened index.
     assert reopened.get_quantization_info() is None
+
+
+# ------------------------------------------------------------
+# The manifest's descriptive fields
+# ------------------------------------------------------------
+def _directory_bytes(path):
+    return sum(os.path.getsize(os.path.join(path, name)) for name in os.listdir(path))
+
+
+def _read_manifest(path):
+    return json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+
+
+def test_total_size_mb_counts_the_graph_dump(tmp_path):
+    """The figure is the directory, graph included.
+
+    manifest.json is written before the graph dump, so the size taken there
+    misses the largest file in the directory. At 50,000 records of dimension
+    1,536 that is roughly 320 MB of a roughly 630 MB directory. On a save over
+    an existing directory it counted the previous save's dump, which was a
+    different wrong number. The manifest is now written a second time after the
+    dump, carrying nothing new but this field.
+    """
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=32, expected_size=1200)
+    rng = np.random.default_rng(20260820)
+    saved = tmp_path / "sized.zdb"
+
+    assert index.add({"ids": [f"a{i}" for i in range(800)],
+                      "embeddings": rng.random((800, 32)).astype(np.float32)}).is_success()
+    index.save(str(saved))
+
+    manifest = _read_manifest(saved)
+    on_disk_mb = _directory_bytes(str(saved)) / (1024 * 1024)
+    # The graph dump is the file the old figure missed, and it is the largest
+    # thing in the directory, so this is not a rounding argument.
+    graph_mb = os.path.getsize(saved / "hnsw_index.zdbgraph") / (1024 * 1024)
+    assert graph_mb > 0.25 * on_disk_mb
+    # Writing the corrected number changes manifest.json's own length by a few
+    # bytes, and the figure was taken before that write, so it is short by that
+    # difference and by nothing else.
+    assert abs(manifest["total_size_mb"] - on_disk_mb) * 1024 * 1024 < 64
+
+    # Saving over the directory records the new size rather than the old one.
+    assert index.add({"ids": [f"b{i}" for i in range(400)],
+                      "embeddings": rng.random((400, 32)).astype(np.float32)}).is_success()
+    index.save(str(saved))
+    resaved = _read_manifest(saved)
+    on_disk_mb = _directory_bytes(str(saved)) / (1024 * 1024)
+    assert resaved["total_size_mb"] > manifest["total_size_mb"]
+    assert abs(resaved["total_size_mb"] - on_disk_mb) * 1024 * 1024 < 64
+
+    # The staging file the rewrite goes through is renamed away, so a finished
+    # save leaves exactly the artefacts it always left.
+    assert sorted(p.name for p in saved.glob("*")) == [
+        "config.json",
+        "hnsw_index.zdbgraph",
+        "manifest.json",
+        "mappings.bin",
+        "metadata.json",
+        "vectors.bin",
+    ]
+
+    # And the directory still opens.
+    reopened = VectorDatabase().load(str(saved))
+    assert len(reopened) == 1200
+
+
+def test_total_size_mb_on_an_empty_index(tmp_path):
+    """An index with no records writes no graph, and the figure still holds."""
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=8, expected_size=10)
+    saved = tmp_path / "empty.zdb"
+    index.save(str(saved))
+
+    manifest = _read_manifest(saved)
+    assert "hnsw_index.zdbgraph" in manifest["files_excluded"]
+    on_disk_mb = _directory_bytes(str(saved)) / (1024 * 1024)
+    assert abs(manifest["total_size_mb"] - on_disk_mb) * 1024 * 1024 < 64
+    assert manifest["total_size_mb"] > 0
+
+
+def test_created_at_is_the_creation_not_the_load(tmp_path):
+    """A load used to restamp it, so a save afterwards recorded the load."""
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=8, expected_size=20)
+    index.add({"ids": ["a"], "embeddings": np.full((1, 8), 0.25, dtype=np.float32)})
+
+    first = tmp_path / "c1.zdb"
+    index.save(str(first))
+    created = _read_manifest(first)["created_at"]
+
+    # Two saves of the same live index have always agreed.
+    second = tmp_path / "c2.zdb"
+    index.save(str(second))
+    assert _read_manifest(second)["created_at"] == created
+
+    # A save of a loaded index now agrees with them.
+    loaded = VectorDatabase().load(str(first))
+    third = tmp_path / "c3.zdb"
+    loaded.save(str(third))
+    assert _read_manifest(third)["created_at"] == created
+
+    # saved_at is the one that is meant to move.
+    assert _read_manifest(third)["saved_at"] != _read_manifest(first)["saved_at"]
+
+
+def test_training_completed_at_is_the_training_not_the_save(tmp_path):
+    """It carried Utc::now() at save time, so it moved on every save."""
+    vdb = VectorDatabase()
+    config = {"type": "pq", "subvectors": 4, "bits": 8,
+              "training_size": 1000, "storage_mode": "quantized_only"}
+    index = vdb.create("hnsw", dim=8, quantization_config=config, expected_size=2000)
+    rng = np.random.default_rng(20260820)
+
+    # Untrained, so there is no completion to report.
+    early = tmp_path / "t0.zdb"
+    index.save(str(early))
+    quant = json.loads((early / "quantization.json").read_text(encoding="utf-8"))
+    assert quant["is_trained"] is False
+    assert quant["training_completed_at"] is None
+
+    assert index.add({"ids": [f"t{i}" for i in range(1000)],
+                      "embeddings": rng.random((1000, 8)).astype(np.float32)}).is_success()
+    assert index.is_quantized()
+
+    first = tmp_path / "t1.zdb"
+    index.save(str(first))
+    completed = json.loads((first / "quantization.json").read_text(encoding="utf-8"))
+    assert completed["is_trained"] is True
+    stamp = completed["training_completed_at"]
+    assert stamp is not None
+
+    # A second save of the same trained index does not retrain, so the stamp
+    # does not move.
+    second = tmp_path / "t2.zdb"
+    index.save(str(second))
+    again = json.loads((second / "quantization.json").read_text(encoding="utf-8"))
+    assert again["training_completed_at"] == stamp
+
+    # Nor does a load and a save.
+    loaded = VectorDatabase().load(str(first))
+    third = tmp_path / "t3.zdb"
+    loaded.save(str(third))
+    carried = json.loads((third / "quantization.json").read_text(encoding="utf-8"))
+    assert carried["training_completed_at"] == stamp
