@@ -675,8 +675,8 @@ def test_storage_mode_configuration():
     # this asserts the fact it does state.
     warning_messages = [str(w.message) for w in warning_info.list]
     assert any("Very high compression ratio" in msg for msg in warning_messages)
-    assert any("storage_mode='quantized_with_raw' keeps a raw vector for every record"
-               in msg for msg in warning_messages)
+    assert any("storage_mode='quantized_with_raw' is the accuracy mode rather than "
+               "the memory mode" in msg for msg in warning_messages)
     assert not any("x more memory" in msg for msg in warning_messages)
     
     # Add identical training data to both indexes.
@@ -951,8 +951,8 @@ def _make_trained_pq_index(storage_mode, seed=20260802):
     vdb = VectorDatabase()
     if storage_mode == "quantized_with_raw":
         with pytest.warns(UserWarning,
-                          match=r"storage_mode='quantized_with_raw' keeps a raw vector "
-                                r"for every record"):
+                          match=r"storage_mode='quantized_with_raw' is the accuracy "
+                                r"mode rather than the memory mode"):
             index = vdb.create("hnsw", dim=PQ_DIM,
                                quantization_config=_overwrite_pq_config(storage_mode),
                                expected_size=2000)
@@ -2008,10 +2008,13 @@ def test_recall_survives_the_triangular_table(quantized_graph):
 def test_fixed_memory_warning_fires_when_quantization_cannot_pay():
     """Below the break even record count the warning fires, above it it does not.
 
-    Break even is fixed bytes / (dim * 4 - subvectors), independent of
+    Break even is fixed bytes / (dim * 4 - 2 * subvectors), independent of
     training_size now that the training records are released at training
-    completion. At dim 64 with 8 subvectors of 8 bits the fixed cost is
-    1,110,016 bytes and each record saves 248, so the figure is 4,476.
+    completion. A record is held once, and a quantized index holds two codes
+    for it, one in the store the graph is handed and one in the map keyed by
+    external id. At dim 64 with 8 subvectors of 8 bits the fixed cost is
+    1,110,016 bytes and each record saves 240, so the figure is 4,626. It read
+    4,476 while the arithmetic counted one code.
     """
     vdb = VectorDatabase()
     config = {"type": "pq", "subvectors": 8, "bits": 8, "training_size": 1000}
@@ -2030,7 +2033,7 @@ def test_fixed_memory_warning_fires_when_quantization_cannot_pay():
     )
 
     # The message carries the break even figure, so a caller can act on it.
-    with pytest.warns(UserWarning, match=r"starts saving above 4476 records"):
+    with pytest.warns(UserWarning, match=r"starts saving above 4626 records"):
         vdb.create("hnsw", dim=64, expected_size=3000,
                    quantization_config=dict(config))
 
@@ -2043,30 +2046,25 @@ def test_fixed_memory_warning_fires_when_quantization_cannot_pay():
     assert not [w for w in caught
                 if "unquantized index at expected_size" in str(w.message)]
 
-    # quantized_with_raw has a break even too, and it used to be excluded here
-    # on the claim that it drops no raw vector and so can never pay. It drops
-    # the graph's copy of every point, which is dim * 4 bytes, and it pays for
-    # two codes rather than one, so its per record saving is
-    # dim * 4 - 2 * subvectors. At dim 64 with 8 subvectors that is 240 bytes
-    # against the other mode's 248, and the figure is 4,626 against 4,476.
-    with pytest.warns(UserWarning, match=r"starts saving above 4626 records"):
-        vdb.create("hnsw", dim=64, expected_size=3000,
-                   quantization_config=dict(config, storage_mode="quantized_with_raw"))
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        vdb.create("hnsw", dim=64, expected_size=3000,
-                   quantization_config=dict(config, storage_mode="quantized_with_raw"))
-    messages = [str(w.message) for w in caught]
-    assert [m for m in messages if "keeps a raw vector for every record" in m]
-
-    # And above its own break even it does not warn.
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        vdb.create("hnsw", dim=64, expected_size=50000,
-                   quantization_config=dict(config, storage_mode="quantized_with_raw"))
-    assert not [w for w in caught
-                if "unquantized index at expected_size" in str(w.message)]
+    # quantized_with_raw has no break even and never reaches this warning. It
+    # keeps the raw vector and adds two codes and both tables to it, so every
+    # term is an addition and no record count turns the sum negative. It was
+    # excluded here on the claim that it drops nothing, then admitted on the
+    # claim that it drops the graph's own copy of every point. The graph holds
+    # no copy of its own: a raw vector lives in a store the graph is handed.
+    # The warning that names the mode carries the cost instead.
+    for declared in (3000, 50000):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            vdb.create("hnsw", dim=64, expected_size=declared,
+                       quantization_config=dict(config,
+                                                storage_mode="quantized_with_raw"))
+        messages = [str(w.message) for w in caught]
+        assert not [m for m in messages
+                    if "unquantized index at expected_size" in m], (
+            f"quantized_with_raw claimed a break even at expected_size={declared}")
+        assert [m for m in messages if "keeps a raw vector for every record" in m]
+        assert [m for m in messages if "No record count reverses that" in m]
 
 # ------------------------------------------------------------
 # Test 109: the default configuration saves memory once trained
@@ -3184,78 +3182,124 @@ def test_the_calibration_holds_recall_on_records_that_arrive_in_order():
 # ------------------------------------------------------------
 # Test 119: the low dimension warning
 # ------------------------------------------------------------
-def test_quantization_warns_where_the_dimension_cannot_repay():
-    """The warning fires where the saving is below a fifth and not above it.
+def test_no_creation_warning_claims_a_saving_for_quantized_with_raw():
+    """Nothing create() says credits quantized_with_raw with saving memory.
 
-    The bar is the share, so the dimension it fires below differs by storage
-    mode. quantized_with_raw replaces one copy of the vector and crosses a
-    fifth at dim 235. quantized_only replaces both and crosses at dim 88.
+    Two warnings used to. The low dimension warning quoted a modelled share and
+    a five dimension table, all of it measured while an unquantized index held
+    every vector twice, and the break even warning named a record count above
+    which the mode started saving. There is one copy of a raw vector now, held
+    in a store the graph is handed, so the mode adds two codes and two tables to
+    what an unquantized index holds and takes nothing away. Measured resident on
+    50,000 real embeddings, it holds 1.08 times an unquantized index at dim 1536
+    and 1.14 times at dim 128.
+
+    The low dimension warning is gone rather than corrected. Its gate needed the
+    graph's neighbour lists in the denominator, and those measured 823 bytes a
+    record on sift-128 against 1,152 on dbpedia-openai at the same record count
+    and the same degree, so no constant fits them.
     """
     vdb = VectorDatabase()
-    phrase = "less memory than an unquantized index over the same records"
+    forbidden = ("less memory than an unquantized index",
+                 "times an unquantized index",
+                 "holds about")
 
-    with pytest.warns(UserWarning, match=r"At dim=128 a trained "
-                                         r"quantized_with_raw index holds about"):
-        vdb.create("hnsw", dim=128, expected_size=100_000,
-                   quantization_config={"type": "pq",
-                                        "storage_mode": "quantized_with_raw"})
+    for dim in (64, 128, 256, 768, 1536):
+        for declared in (20_000, 100_000):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                vdb.create("hnsw", dim=dim, expected_size=declared,
+                           quantization_config={"type": "pq",
+                                                "storage_mode": "quantized_with_raw"})
+            messages = [str(w.message) for w in caught]
+            for phrase in forbidden:
+                assert not [m for m in messages if phrase in m], (
+                    f"dim {dim}, expected_size {declared}: a warning still "
+                    f"claims a saving, containing {phrase!r}")
+            assert [m for m in messages
+                    if "is the accuracy mode rather than the memory mode" in m], (
+                f"dim {dim}, expected_size {declared}: the mode warning is missing")
 
-    # Above the crossing the same mode is silent.
+    # The removed model is gone from the class rather than merely unused.
+    assert not hasattr(vdb, "_memory_saving_share")
+    assert not hasattr(vdb, "MEASURED_RECORD_OVERHEAD_BYTES")
+    assert not hasattr(vdb, "QUANTIZATION_REPAYS_SAVING_SHARE")
+
+
+def test_every_creation_warning_names_the_callers_own_line():
+    """A UserWarning points at the create() the caller wrote.
+
+    Every quantization warning carried stacklevel=2 and none of them reached
+    the caller. The mode warning is raised inside
+    `_validate_quantization_config`, so 2 named `create`'s own body, and the
+    four in `_check_memory_usage` are a frame deeper still, so 2 named the line
+    inside `_validate_quantization_config` that calls it. A warning attributed
+    to library internals tells a caller nothing about which of their calls
+    caused it. `_warn_if_selection_disabled` had this right already.
+    """
+    vdb = VectorDatabase()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        vdb.create("hnsw", dim=256, expected_size=100_000,
-                   quantization_config={"type": "pq",
-                                        "storage_mode": "quantized_with_raw"})
-    assert not [w for w in caught if phrase in str(w.message)]
-
-    # quantized_only saves more at the same dimension, so it clears the bar at
-    # 128 where quantized_with_raw does not, and it still warns at 64.
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        vdb.create("hnsw", dim=128, expected_size=100_000,
-                   quantization_config={"type": "pq",
-                                        "storage_mode": "quantized_only"})
-    assert not [w for w in caught if phrase in str(w.message)]
-
-    with pytest.warns(UserWarning, match=r"At dim=64 a trained quantized_only"):
-        vdb.create("hnsw", dim=64, expected_size=100_000,
-                   quantization_config={"type": "pq",
-                                        "storage_mode": "quantized_only"})
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
+        vdb.create("hnsw", dim=64, expected_size=3000,                     # noqa: E501
+                   quantization_config={"type": "pq", "training_size": 1000})
+        vdb.create("hnsw", dim=64, expected_size=100,
+                   quantization_config={"type": "pq", "training_size": 1000})
         vdb.create("hnsw", dim=1536, expected_size=100_000,
-                   quantization_config={"type": "pq",
-                                        "storage_mode": "quantized_only"})
-    assert not [w for w in caught if phrase in str(w.message)]
+                   quantization_config={"type": "pq", "subvectors": 512,
+                                        "training_size": 1000})
+        vdb.create("hnsw", dim=1536, expected_size=100_000,
+                   quantization_config={"type": "pq", "subvectors": 8,
+                                        "training_size": 1000})
+        vdb.create("hnsw", dim=64, expected_size=100_000,
+                   quantization_config={"type": "pq", "training_size": 1000,
+                                        "storage_mode": "quantized_with_raw"})
+        vdb.create("hnsw", dim=64, m=16, ef_construction=20)
+
+    fired = {str(w.message).split(":")[0].split(",")[0]: w for w in caught}
+    assert len(caught) == 6, [str(w.message)[:60] for w in caught]
+    for w in caught:
+        assert w.filename == __file__, (
+            f"a warning was attributed to {w.filename} rather than to the "
+            f"caller: {str(w.message)[:80]}")
+    assert fired, "no warning fired, so nothing was checked"
 
 
-def test_the_memory_saving_share_matches_the_measured_sweep():
-    """The arithmetic the threshold is derived from reproduces the sweep.
+def test_the_break_even_counts_both_codes_and_both_tables():
+    """The one surviving memory model, checked against its own arithmetic.
 
-    Measured at 25,000 records and m 32, one dimension per process. The bound
-    is loose because a resident set reading carries a few MiB of allocator
-    slack either way, and the arithmetic is a per record model with no term
-    for that.
+    It needs no fitted constant. The fixed bytes are the codebook and the
+    centroid distance table, both exact from dim, subvectors and bits, and the
+    per record saving is the vector less the two codes that replace it.
+
+    It counts the codes and the tables and nothing else, so it names a record
+    count at or below the true one. Measured resident against the same three
+    terms, the unmodelled remainder came to 135 bytes a record on sift-128 at
+    50,000 records, 327 on dbpedia-openai at 50,000 and 851 on dbpedia-openai
+    at 12,500, all of them positive, so the true crossing is above this figure
+    rather than below it.
     """
     vdb = VectorDatabase()
-    measured = {64: 0.0301, 96: 0.1151, 128: 0.1647, 192: 0.1934,
-                256: 0.2363, 384: 0.2469, 768: 0.2988, 1536: 0.3614}
 
-    for dim, saving in measured.items():
+    for dim in (64, 128, 256, 768, 1536):
         subvectors = vdb._default_subvectors(dim)
-        modelled = vdb._memory_saving_share(dim, subvectors, "quantized_with_raw")
-        assert abs(modelled - saving) < 0.07, (
-            f"dim {dim}: modelled {modelled:.4f} against measured {saving:.4f}")
+        fixed = vdb._fixed_quantization_bytes(dim, subvectors, 8)
+        assert fixed == 256 * dim * 4 + subvectors * (256 * 255 // 2) * 4
 
-    # The bar is where the model crosses one fifth, which the measured column
-    # brackets between dim 192 and dim 256 for quantized_with_raw.
-    assert vdb._memory_saving_share(192, 8, "quantized_with_raw") < 0.20
-    assert vdb._memory_saving_share(256, 8, "quantized_with_raw") > 0.20
+        expected = -(-fixed // (dim * 4 - 2 * subvectors))
+        with pytest.warns(UserWarning,
+                          match=rf"starts saving above {expected} records"):
+            vdb.create("hnsw", dim=dim, expected_size=expected - 1,
+                       quantization_config={"type": "pq", "training_size": 1000,
+                                            "storage_mode": "quantized_only"})
 
-    # quantized_only replaces both copies, so it crosses far lower.
-    assert vdb._memory_saving_share(64, 8, "quantized_only") < 0.20
-    assert vdb._memory_saving_share(128, 8, "quantized_only") > 0.20
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            vdb.create("hnsw", dim=dim, expected_size=expected,
+                       quantization_config={"type": "pq", "training_size": 1000,
+                                            "storage_mode": "quantized_only"})
+        assert not [w for w in caught
+                    if "unquantized index at expected_size" in str(w.message)], (
+            f"dim {dim}: the warning fired at its own break even of {expected}")
 
 
 # ------------------------------------------------------------
@@ -3360,8 +3404,8 @@ def test_training_progress_halves_agree_in_every_state(storage_mode):
     vdb = VectorDatabase()
     if storage_mode == "quantized_with_raw":
         with pytest.warns(UserWarning,
-                          match=r"storage_mode='quantized_with_raw' keeps a raw vector "
-                                r"for every record"):
+                          match=r"storage_mode='quantized_with_raw' is the accuracy "
+                                r"mode rather than the memory mode"):
             index = vdb.create("hnsw", dim=PQ_DIM,
                                quantization_config=_overwrite_pq_config(storage_mode),
                                expected_size=2000)

@@ -28,7 +28,7 @@
 
 use crate::graph::dump::DUMP_FILENAME as GRAPH_DUMP_FILENAME;
 use crate::graph::dump::LEGACY_DUMP_FILENAMES;
-use crate::hnsw_index::{HNSWIndex, QuantizationConfig, StorageMode};
+use crate::hnsw_index::{validate_index_parameters, HNSWIndex, QuantizationConfig, StorageMode};
 use crate::pq::PQ;
 use crate::rerank::RerankCalibration;
 use chrono::Utc;
@@ -413,6 +413,29 @@ fn load_config(path: &Path) -> PyResult<IndexConfig> {
             e
         ))
     })?;
+
+    // The five values `build` validates, validated here too.
+    //
+    // Parsing proves the file is JSON of the right shape and nothing more. Until
+    // this ran, `dim`, `m`, `ef_construction`, `expected_size` and `space` went
+    // straight from the file into `new_empty`, which validates none of them, and
+    // then into `Backend::sized`, which clamps `dim` up to 1, `m` into 2 to 256
+    // and `expected_size` up to 1 without saying so. A config naming `m: 0` came
+    // back as an index at `m: 2`, and one naming an unknown `space` came back
+    // scoring cosine whatever it had been saved with. A zero `dim` was refused,
+    // but by a later check comparing a record against the declared width, so the
+    // message named the record rather than the config.
+    //
+    // The file is named in the message because a caller reading `dim must be
+    // positive` off a `load()` has no argument of their own to look at.
+    validate_index_parameters(
+        config.dim,
+        &config.space,
+        config.m,
+        config.ef_construction,
+        config.expected_size,
+        &format!("{}: ", config_path.display()),
+    )?;
 
     println!("✅ config.json loaded");
     Ok(config)

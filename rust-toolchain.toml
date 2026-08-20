@@ -1,0 +1,45 @@
+# The compiler this checkout builds with.
+#
+# Why the file exists
+#
+# A rustup directory override pinned this checkout to 1.94.0 while the runner
+# used dtolnay/rust-toolchain@stable, which is 1.97.1. An override lives in
+# rustup's own state under ~/.rustup, not in the tree, so it was invisible to
+# CI, to every other checkout and to the second machine. A clean local clippy
+# run therefore proved nothing, and one landed on main having failed the lint
+# gate on clippy::manual_checked_ops, which is new in 1.97.
+#
+# This file is in the tree, so every checkout reads the same version and a
+# local run means what a CI run means.
+#
+# Why 1.97.1
+#
+# It is what dtolnay/rust-toolchain@stable resolves to today, so pinning it
+# changes nothing about the compiler CI already uses. It is also the release
+# whose clippy carries manual_checked_ops, the lint the gap was found on, so
+# pinning any lower would silence a lint the crate has already been corrected
+# for. The crate declares no rust-version and needs nothing newer.
+#
+# How to bump it
+#
+# When a new stable lands, raise the version here, run
+#   cargo fmt --all -- --check
+#   cargo clippy --workspace --all-targets --locked -- -D warnings
+#   cargo test --workspace --locked
+# from vdb-core, fix whatever the new lints find, and commit the bump with
+# those fixes in the same change. Do it deliberately rather than on a schedule:
+# the point of a pin is that the compiler moves when someone decides it should,
+# and the cost of a stale pin is only the lints not yet seen.
+#
+# What it does not do
+#
+# rustup's precedence is +toolchain, then RUSTUP_TOOLCHAIN, then a directory
+# override, then this file. A directory override on a checkout therefore still
+# wins, and has to be removed with `rustup override unset` in that directory.
+[toolchain]
+channel = "1.97.1"
+# The lint gate installs these through the action today. Declaring them here
+# means a bare `rustup toolchain install` in this directory gets a toolchain
+# that can run the gate.
+components = ["clippy", "rustfmt"]
+profile = "minimal"

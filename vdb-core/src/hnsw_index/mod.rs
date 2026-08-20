@@ -32,6 +32,9 @@
 //! implementors, so neither constraint remains.
 
 mod construct;
+// The declaration rules, so that `persistence::load_config` applies the same
+// ones to `config.json` that `build` applies to a caller's arguments.
+pub(crate) use construct::validate_index_parameters;
 #[cfg(test)]
 mod graph_guard_tests;
 mod input;
