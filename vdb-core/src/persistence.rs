@@ -26,6 +26,7 @@
 //! 0.6.0 or earlier still holds those two, and opening it rebuilds the graph
 //! once and writes the new file on the next save. Nothing reads the old format.
 
+use crate::columns::validate_indexed_fields;
 use crate::graph::dump::DUMP_FILENAME as GRAPH_DUMP_FILENAME;
 use crate::graph::dump::LEGACY_DUMP_FILENAMES;
 use crate::hnsw_index::{validate_index_parameters, HNSWIndex, QuantizationConfig, StorageMode};
@@ -282,6 +283,21 @@ pub struct IndexConfig {
     /// existed loads with an empty map instead of failing to parse.
     #[serde(default)]
     pub metadata: HashMap<String, String>,
+
+    /// The filterable fields declared at `create()`, in declaration order.
+    ///
+    /// **The columns themselves are not saved.** They are derived from
+    /// `metadata.json`, which is written whole and read whole, so rebuilding
+    /// them at load costs one pass over the records and keeps the directory
+    /// format to the files it already had. What has to survive a round trip is
+    /// the declaration, because nothing else records which fields a user chose.
+    ///
+    /// Defaulted, so a directory written before this field existed loads with
+    /// no declaration and behaves exactly as it did. `serde` ignores fields it
+    /// does not know, so a directory written with one also opens in a build
+    /// that predates it, at the cost of the columns rather than of the load.
+    #[serde(default)]
+    pub indexed_fields: Vec<String>,
 }
 
 /// Complete quantization configuration and state
@@ -434,6 +450,13 @@ fn load_config(path: &Path) -> PyResult<IndexConfig> {
         config.m,
         config.ef_construction,
         config.expected_size,
+        &format!("{}: ", config_path.display()),
+    )?;
+    // The declaration too, for the same reason. A config naming a field twice,
+    // or naming a reserved filter key, would build a store the index could not
+    // use, and the failure would surface as a filter that quietly walked.
+    validate_indexed_fields(
+        &config.indexed_fields,
         &format!("{}: ", config_path.display()),
     )?;
 
@@ -754,6 +777,7 @@ fn reconstruct_index_simple(
         config.m,
         config.ef_construction,
         config.expected_size,
+        config.indexed_fields.clone(),
     );
 
     println!("📝 Restoring data fields...");
@@ -1352,6 +1376,7 @@ fn save_config(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         id_counter: index.get_id_counter(),
         vector_count: index.get_vector_count(),
         metadata: index.get_all_metadata(),
+        indexed_fields: index.indexed_fields(),
     };
 
     let config_path = path.join("config.json");

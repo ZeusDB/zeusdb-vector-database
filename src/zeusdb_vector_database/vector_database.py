@@ -144,6 +144,36 @@ class VectorDatabase:
         """Initialize the vector database factory."""
         pass
 
+    @staticmethod
+    def _validate_indexed_fields(fields: Any) -> list:
+        """Every rule a declared field list has to satisfy, checked here first.
+
+        The Rust constructor enforces the same rules and raises the same kind of
+        error, because a directory loaded from disk has to be held to them too.
+        This exists so that a mistake in a create() call is reported against the
+        argument the caller wrote rather than wrapped in the RuntimeError
+        create() raises for a backend failure.
+        """
+        if isinstance(fields, str):
+            raise ValueError(
+                f"indexed_fields must be a list of field names, not a single string. "
+                f"Pass indexed_fields=['{fields}'] to declare one field."
+            )
+        try:
+            names = list(fields)
+        except TypeError:
+            raise ValueError(
+                f"indexed_fields must be a list of metadata field names, got "
+                f"{type(fields).__name__}."
+            ) from None
+        for name in names:
+            if not isinstance(name, str):
+                raise ValueError(
+                    f"indexed_fields must hold field names as strings, but it holds "
+                    f"{name!r}, which is a {type(name).__name__}."
+                )
+        return names
+
     def create(self, index_type: str = "hnsw", quantization_config: Optional[Dict[str, Any]] = None, **kwargs) -> Any:
         """
         Create a vector index of the specified type with optional quantization.
@@ -183,6 +213,24 @@ class VectorDatabase:
                   max: 100,000,000). Also selects the default m, see above. It is
                   a capacity hint rather than a limit, and an index that grows
                   past twice its declaration logs a warning once.
+                - indexed_fields (list[str]): Metadata fields this index builds a
+                  column for, so that a search filtering on them does not have to
+                  read every record. Empty by default, which is what every index
+                  did before this existed. Up to 32 names, each a metadata field
+                  name, no duplicates, and none of "$and", "$or" or "$not", which
+                  are filter keys rather than fields.
+
+                  A filter naming only declared fields is answered from the
+                  columns. A filter naming anything else returns exactly the same
+                  records and reads every record's metadata to do it, which costs
+                  about 250 nanoseconds a record, and the index logs one warning
+                  naming the field. Declaring a field is not required and nothing
+                  becomes unfilterable by being left out.
+
+                  What it costs is four bytes a record for a field with few
+                  distinct values. A field whose value differs on nearly every
+                  record is held a second time in full, so declare the fields you
+                  filter on rather than every field you store.
 
             Quantization config format:
                 {
@@ -294,6 +342,14 @@ class VectorDatabase:
 
         # Centralize dim early to ensure consistency
         dim = kwargs['dim']
+
+        # The declared filterable fields, checked against the caller's argument
+        # before anything else runs. Absent and None both mean no declaration,
+        # which is what an index carried before this parameter existed.
+        if kwargs.get("indexed_fields") is None:
+            kwargs.pop("indexed_fields", None)
+        else:
+            kwargs["indexed_fields"] = self._validate_indexed_fields(kwargs["indexed_fields"])
         
         # Apply index-specific defaults
         #

@@ -1,4 +1,7 @@
 // lib.rs
+// A column per declared filterable field, which is what a filtered search
+// reads instead of walking every record's metadata.
+mod columns;
 mod conversion;
 mod distance;
 mod filter;

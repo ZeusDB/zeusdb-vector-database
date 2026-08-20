@@ -449,6 +449,47 @@ impl HNSWIndex {
     ) {
         *self.pq_codes.write().unwrap() = pq_codes;
         *self.vector_metadata.write().unwrap() = vector_metadata;
+        self.rebuild_columns();
+    }
+
+    /// Build every declared column from the restored metadata.
+    ///
+    /// **Nothing on disk holds a column.** The declaration comes back from
+    /// `config.json` and the values come back from `metadata.json`, so the
+    /// columns are derived here in one pass over the records rather than read.
+    /// That is what keeps the directory format unchanged, keeps a directory
+    /// written by this build readable by an older one, and means a directory
+    /// written before the declaration existed simply loads with no columns.
+    ///
+    /// Runs after the graph is restored and after `restore_storage_maps` has
+    /// written the metadata back, so `id_map` holds the internal id every
+    /// column entry is addressed by. It is a no-op on an index that declared
+    /// nothing, which is every directory saved before this existed.
+    /// It clears before it writes. The graph rebuild path routes every record
+    /// through `add`, which writes a column entry under whatever internal id it
+    /// allocated, and those are not the ids the restored mappings carry. Wiping
+    /// first is what makes this the one authority on what the columns hold
+    /// rather than a second writer over the first one's leftovers.
+    ///
+    /// The guards are taken in the declared order, `id_map` then
+    /// `vector_metadata` then `columns`, even though the loader holds `&mut
+    /// self` and nothing else can be running.
+    fn rebuild_columns(&mut self) {
+        let id_map = self.id_map.read().unwrap();
+        let vector_metadata = self.vector_metadata.read().unwrap();
+        let mut columns = self.columns.write().unwrap();
+        if !columns.is_declared() {
+            return;
+        }
+        columns.clear(self.expected_size);
+        let empty = HashMap::new();
+        for (ext_id, &internal_id) in id_map.iter() {
+            columns.write(internal_id, vector_metadata.get(ext_id).unwrap_or(&empty));
+        }
+        debug_assert!(
+            columns.tracks(id_map.len()),
+            "the rebuild writes one column entry per record in id_map"
+        );
     }
 
     /// Set quantization config (for persistence loading only)

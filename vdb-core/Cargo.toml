@@ -15,6 +15,36 @@ resolver = "2" # <-- Avoid compiling unnecessary features from dependencies.
 name = "zeusdb_vector_database" # <-- This is the name of the compiled Python module
 crate-type = ["cdylib"]
 
+# On by default, so every ordinary cargo command and the wheel build compile
+# the same thing, and off for `cargo test` alone.
+#
+# `pyo3/extension-module` tells PyO3 that the output is a module a Python
+# interpreter will load, so on Unix its build script deliberately emits no
+# `-lpython`: the interpreter already holds those symbols and a shared object
+# is allowed to leave them undefined. **An executable is not.** `cargo test`
+# builds the lib target as a test executable, so with the feature on that
+# executable links with every libpython symbol it references unresolved, and
+# on Linux the link fails.
+#
+# It did not fail while no unit test reached PyO3. `--gc-sections` discarded
+# every section that referenced libpython and the executable linked with none
+# of it live. `columns::tests::the_declaration_is_validated` is the first test
+# to construct a `PyErr`, which makes PyO3's exception and reference-count
+# paths live, and the latent breakage became a failure. Removing that one test
+# takes the undefined symbol count from eight back to zero, measured.
+#
+# Windows was never affected, because there every symbol must resolve at link
+# time and PyO3 emits the import library whatever this feature says. That is
+# why `cargo test` passed locally and failed in CI.
+#
+# **On Linux, run the tests as `cargo test --no-default-features`**, which is
+# what the CI gate does. Turning the feature off makes PyO3 emit `-lpython3.x`,
+# so the link needs a libpython the linker can resolve, which on Debian and
+# Ubuntu means the python3-dev package rather than the interpreter alone.
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
 # abi3-py310 builds against CPython's stable ABI, so one wheel per platform
 # loads on every CPython from 3.10 up, including versions that do not exist
@@ -25,7 +55,11 @@ crate-type = ["cdylib"]
 # The cost is PyPy and the free-threaded builds. Neither is expressible in the
 # stable ABI, and the abi3t feature that PEP 803 adds for free-threading is
 # 3.15 only, so it buys nothing at a 3.10 floor.
-pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py310"] }
+#
+# `extension-module` is no longer here. It is this crate's own feature above,
+# on by default, so `cargo build`, `cargo clippy` and the wheel are unchanged
+# and only `cargo test --no-default-features` differs.
+pyo3 = { version = "0.29.0", features = ["abi3-py310"] }
 numpy = "0.29.0"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }

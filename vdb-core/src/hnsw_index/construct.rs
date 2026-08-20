@@ -6,6 +6,7 @@
 //! nothing, because its configuration comes from a directory this crate wrote.
 
 use super::{HNSWIndex, QuantizationConfig, StorageMode, MAX_LAYER};
+use crate::columns::{validate_indexed_fields, ColumnStore};
 use crate::graph::VectorGraph;
 use crate::pq::PQ;
 use chrono::Utc;
@@ -180,6 +181,7 @@ impl HNSWIndex {
         ef_construction: usize,
         expected_size: usize,
         quantization_config: Option<&Bound<PyDict>>,
+        indexed_fields: Vec<String>,
     ) -> PyResult<Self> {
         let start_time = Instant::now();
 
@@ -188,6 +190,9 @@ impl HNSWIndex {
         // five values it reads out of `config.json`.
         let space_normalized =
             validate_index_parameters(dim, &space, m, ef_construction, expected_size, "")?;
+        // The declaration is checked here for the same reason, and the loader
+        // checks what `config.json` carried against the same rules.
+        validate_indexed_fields(&indexed_fields, "")?;
 
         // Extract quantization configuration
         let (quantization_params, pq_instance) = if let Some(config) = quantization_config {
@@ -401,6 +406,7 @@ impl HNSWIndex {
             ef_construction = ef_construction,
             expected_size = expected_size,
             has_quantization = quantization_params.is_some(),
+            indexed_fields = indexed_fields.len(),
             duration_ms = duration_ms,
             "HNSW index created successfully"
         );
@@ -418,6 +424,8 @@ impl HNSWIndex {
             rerank_calibration: RwLock::new(None),
             metadata: Mutex::new(HashMap::new()),
             vector_metadata: RwLock::new(HashMap::new()),
+            columns: RwLock::new(ColumnStore::new(indexed_fields, expected_size)),
+            undeclared_filter_warned: AtomicBool::new(false),
             id_map: RwLock::new(HashMap::new()),
             rev_map: RwLock::new(HashMap::new()),
             id_counter: Mutex::new(0),
@@ -444,6 +452,7 @@ impl HNSWIndex {
         m: usize,
         ef_construction: usize,
         expected_size: usize,
+        indexed_fields: Vec<String>,
     ) -> Self {
         let space_normalized = space.to_lowercase();
         let hnsw = VectorGraph::new_raw(
@@ -467,6 +476,8 @@ impl HNSWIndex {
             rerank_calibration: RwLock::new(None),
             metadata: Mutex::new(HashMap::new()),
             vector_metadata: RwLock::new(HashMap::new()),
+            columns: RwLock::new(ColumnStore::new(indexed_fields, expected_size)),
+            undeclared_filter_warned: AtomicBool::new(false),
             id_map: RwLock::new(HashMap::new()),
             rev_map: RwLock::new(HashMap::new()),
             id_counter: Mutex::new(0),

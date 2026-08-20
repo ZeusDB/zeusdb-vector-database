@@ -7,6 +7,7 @@
 //! the graph nodes that removal and replacement leave behind.
 
 use super::{HNSWIndex, ParsedRecords, StorageMode, MAX_LAYER};
+use crate::columns::ColumnStore;
 use crate::filter::{matches_filter, Filter};
 use crate::graph::{Record, VectorGraph};
 use crate::rerank::RawVectors;
@@ -57,8 +58,7 @@ impl InsertError {
         }
     }
 }
-/// The five write guards a removal holds, taken in the order `HNSWIndex`
-/// declares.
+/// The write guards a removal holds, taken in the order `HNSWIndex` declares.
 ///
 /// A struct rather than five locals so that a batch can take them once and lend
 /// them to the per record helper. They drop in field order, which is the
@@ -68,6 +68,7 @@ struct RemovalGuards<'a> {
     rev_map: RwLockWriteGuard<'a, HashMap<usize, String>>,
     pq_codes: RwLockWriteGuard<'a, HashMap<String, Vec<u8>>>,
     vector_metadata: RwLockWriteGuard<'a, HashMap<String, HashMap<String, Value>>>,
+    columns: RwLockWriteGuard<'a, ColumnStore>,
 }
 
 impl HNSWIndex {
@@ -198,6 +199,7 @@ impl HNSWIndex {
             rev_map: self.rev_map.write().unwrap(),
             pq_codes: self.pq_codes.write().unwrap(),
             vector_metadata: self.vector_metadata.write().unwrap(),
+            columns: self.columns.write().unwrap(),
         }
     }
 
@@ -242,8 +244,18 @@ impl HNSWIndex {
         // the vector goes with the node when `compact` rebuilds the graph
         // without it. That is what removal already did to the node itself.
         guards.vector_metadata.remove(id); // Remove metadata
+                                           //
+                                           // The columns are addressed by internal id, so the slot is cleared
+                                           // rather than reclaimed. Internal ids are never reused, which is what
+                                           // the graph's own node arena already assumes, so a removed record
+                                           // leaves a hole in every column exactly as it leaves a stranded node.
+        guards.columns.erase(internal_id);
         guards.pq_codes.remove(id); // Remove PQ codes (if present)
         guards.rev_map.remove(&internal_id); // Remove ID mapping
+        debug_assert!(
+            guards.columns.tracks(guards.id_map.len()),
+            "a column store holds one entry per live record, and a removal writes both"
+        );
 
         // Enhanced training state cleanup for quantization
         if self.has_quantization() {
@@ -341,28 +353,49 @@ impl HNSWIndex {
 
     /// Remove every record whose metadata matches, and report how many.
     ///
-    /// Two phases, because the matching set is read from `vector_metadata` and
-    /// the removal writes it. The read guard is dropped before the write guards
-    /// are taken, and nothing can change the index in between because the caller
-    /// holds the mutation guard.
+    /// Two phases, because the matching set is read before the removal writes
+    /// it. The read guards are dropped before the write guards are taken, and
+    /// nothing can change the index in between because the caller holds the
+    /// mutation guard.
     ///
-    /// The walk is the evaluation `scan_candidates` runs and it reuses
-    /// `matches_filter` unchanged. What it does not reuse is that function's
-    /// give-up point, its distances or its ranking, none of which a deletion has
-    /// a use for. So this walk is complete where the search's is bounded.
+    /// The columns answer the first phase where every field the filter names is
+    /// declared, and the metadata walk answers it otherwise. **The walk is
+    /// complete where the search's is bounded**, since a deletion has no use for
+    /// a give-up point, and the columns are complete for the same reason: the
+    /// bitmap holds every matching record whether there are ten of them or
+    /// ten thousand.
     ///
     /// The filter arrives compiled, so nothing here can fail on it. The caller
     /// built it from the mapping it was handed and every operator name and
     /// group shape the engine cannot evaluate was rejected there, before any
     /// record was read.
     pub(super) fn remove_where_locked(&self, filter: &Filter) -> usize {
-        let doomed: Vec<String> = {
-            let vector_metadata = self.vector_metadata.read().unwrap();
-            vector_metadata
-                .iter()
-                .filter(|(_, meta)| matches_filter(meta, filter))
-                .map(|(id, _)| id.clone())
-                .collect()
+        // `rev_map` before `columns`, which is the declared order, because the
+        // bitmap holds internal ids and a removal names external ones.
+        let from_columns: Option<Vec<String>> = {
+            let rev_map = self.rev_map.read().unwrap();
+            let columns = self.columns.read().unwrap();
+            columns.select(filter).ok().map(|selected| {
+                let mut ids = Vec::with_capacity(selected.count());
+                selected.for_each(|slot| {
+                    if let Some(id) = rev_map.get(&slot) {
+                        ids.push(id.clone());
+                    }
+                });
+                ids
+            })
+        };
+
+        let doomed: Vec<String> = match from_columns {
+            Some(ids) => ids,
+            None => {
+                let vector_metadata = self.vector_metadata.read().unwrap();
+                vector_metadata
+                    .iter()
+                    .filter(|(_, meta)| matches_filter(meta, filter))
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            }
         };
 
         let total = doomed.len();
@@ -395,15 +428,24 @@ impl HNSWIndex {
         metadata: HashMap<String, Value>,
     ) -> bool {
         let id_map = self.id_map.read().unwrap();
-        if !id_map.contains_key(id) {
+        let Some(&internal_id) = id_map.get(id) else {
             trace!(
                 operation = "update_metadata",
                 vector_id = %id,
                 "Record not found, metadata not written"
             );
             return false;
-        }
+        };
         let mut vector_metadata = self.vector_metadata.write().unwrap();
+        let mut columns = self.columns.write().unwrap();
+        // Wholesale here too. Every declared field is rewritten, so a key the
+        // caller left out is cleared from its column rather than left holding
+        // the value the record used to carry.
+        columns.write(internal_id, &metadata);
+        debug_assert!(
+            columns.agrees_with(internal_id, &metadata),
+            "every declared field's column holds what the record's metadata holds"
+        );
         vector_metadata.insert(id.to_string(), metadata);
         trace!(
             operation = "update_metadata",
@@ -832,9 +874,19 @@ impl HNSWIndex {
     ) -> PyResult<()> {
         let internal_id = self.get_next_id();
 
-        // Store metadata
+        // Store metadata, and the declared fields of it in their columns.
+        //
+        // One block and one order, because the two are the same write seen from
+        // two directions and a search that saw one without the other would
+        // return a record the filter had not admitted.
         {
             let mut vector_metadata = self.vector_metadata.write().unwrap();
+            let mut columns = self.columns.write().unwrap();
+            columns.write(internal_id, &metadata);
+            debug_assert!(
+                columns.agrees_with(internal_id, &metadata),
+                "every declared field's column holds what the record's metadata holds"
+            );
             vector_metadata.insert(id.clone(), metadata);
         }
 
@@ -971,9 +1023,19 @@ impl HNSWIndex {
     ) -> PyResult<()> {
         let internal_id = self.get_next_id();
 
-        // Store metadata
+        // Store metadata, and the declared fields of it in their columns.
+        //
+        // One block and one order, because the two are the same write seen from
+        // two directions and a search that saw one without the other would
+        // return a record the filter had not admitted.
         {
             let mut vector_metadata = self.vector_metadata.write().unwrap();
+            let mut columns = self.columns.write().unwrap();
+            columns.write(internal_id, &metadata);
+            debug_assert!(
+                columns.agrees_with(internal_id, &metadata),
+                "every declared field's column holds what the record's metadata holds"
+            );
             vector_metadata.insert(id.clone(), metadata);
         }
 
