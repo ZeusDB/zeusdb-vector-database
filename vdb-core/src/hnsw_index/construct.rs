@@ -402,7 +402,8 @@ impl HNSWIndex {
             writers: Mutex::new(()),
             training_ids: RwLock::new(Vec::new()),
             training_threshold_reached: AtomicBool::new(false),
-            created_at: Utc::now().to_rfc3339(),
+            training_completed_at: RwLock::new(None),
+            created_at: RwLock::new(Utc::now().to_rfc3339()),
             rebuilding_from_persistence: AtomicBool::new(false),
             overgrowth_warned: AtomicBool::new(false),
         })
@@ -451,7 +452,11 @@ impl HNSWIndex {
             writers: Mutex::new(()),
             training_ids: RwLock::new(Vec::new()),
             training_threshold_reached: AtomicBool::new(false),
-            created_at: chrono::Utc::now().to_rfc3339(),
+            // Both are overwritten by the loader from the saved directory, and
+            // this is the only path that reaches here. See `set_created_at` and
+            // `set_training_completed_at`.
+            training_completed_at: RwLock::new(None),
+            created_at: RwLock::new(chrono::Utc::now().to_rfc3339()),
             rebuilding_from_persistence: AtomicBool::new(false),
             overgrowth_warned: AtomicBool::new(false),
         }

@@ -292,17 +292,30 @@ impl HNSWIndex {
             // What `get_training_progress` and `training_vectors_needed`
             // compute, from the captured count rather than from a second read
             // of the guard those helpers take themselves.
-            let progress = if pq_trained {
-                100.0
+            //
+            // Both halves come from one number. They used to come from two:
+            // the fraction was printed from `training_ids`, which training
+            // empties the moment the codebook is fitted, while the percentage
+            // was taken from whether the quantizer is trained. Every trained
+            // index therefore read `0/1000 (100.0%)`, in either storage mode,
+            // saying in one breath that nothing had been collected and that
+            // collection was complete.
+            //
+            // The key describes progress towards the training threshold, and a
+            // trained index has reached it, so the numerator on a trained index
+            // is the threshold rather than a count of ids the index no longer
+            // keeps. Collection stops at `training_size` and training fires on
+            // the record that reaches it, so the threshold is also what was
+            // collected.
+            let collected = if pq_trained {
+                config.training_size
             } else {
-                (training_id_count as f32 / config.training_size as f32 * 100.0).min(100.0)
+                training_id_count
             };
+            let progress = (collected as f32 / config.training_size as f32 * 100.0).min(100.0);
             stats.insert(
                 "training_progress".to_string(),
-                format!(
-                    "{}/{} ({:.1}%)",
-                    training_id_count, config.training_size, progress
-                ),
+                format!("{}/{} ({:.1}%)", collected, config.training_size, progress),
             );
 
             let vectors_needed = if threshold_reached {

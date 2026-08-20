@@ -214,11 +214,11 @@ impl AddResult {
 /// blocked by that one writer, and a fork under a write guard is exactly the
 /// case where the pool's workers can all end up waiting on the forking thread.
 ///
-/// Two locks sit outside the order. `writers` is taken by the mutating Python
+/// Three locks sit outside the order. `writers` is taken by the mutating Python
 /// entry points before any guard and never by an internal helper; see the
-/// field. `rerank_calibration` is never held together with any other guard:
-/// training and the loader write it with nothing held, and both readers take
-/// it alone. The locks inside `PQ` are leaves, since nothing in `pq.rs` can
+/// field. `rerank_calibration` and `training_completed_at` are never held
+/// together with any other guard: training and the loader write both with
+/// nothing held, and every reader takes them alone. The locks inside `PQ` are leaves, since nothing in `pq.rs` can
 /// name an index guard, so they may be taken under any of the above but no
 /// index guard may be taken under them, which no path does.
 ///
@@ -305,8 +305,28 @@ pub struct HNSWIndex {
     training_ids: RwLock<Vec<String>>,      // Just IDs, not vectors
     training_threshold_reached: AtomicBool, // Atomic flag for safety
 
-    // Timestamp when the index was created
-    created_at: String,
+    /// When the codebook was fitted, in RFC 3339, or `None` on an index that
+    /// has never trained.
+    ///
+    /// Stamped once, by the `add` that reaches `training_size`, and carried
+    /// through a save and a load unchanged. `quantization.json` used to write
+    /// `Utc::now()` under this name at save time with a TODO admitting it, so
+    /// the field held the last save rather than the training and moved every
+    /// time a trained index was saved again.
+    ///
+    /// A directory written before this existed carries a save time under the
+    /// name, and there is no way to recover the real one. The loader restores
+    /// what is there rather than restamping it, so the wrong value stops
+    /// moving instead of being replaced by a newer wrong value.
+    training_completed_at: RwLock<Option<String>>,
+
+    /// Timestamp when the index was created, in RFC 3339.
+    ///
+    /// Restored from `manifest.json` by the loader. `new_empty` stamps
+    /// `Utc::now()` because it has nothing better to start from, and until the
+    /// loader wrote the saved value back over it a load reset the field, so a
+    /// save of a loaded index recorded the load as the creation.
+    created_at: RwLock<String>,
 
     /// Set while a load rebuilds the graph, so the rebuild does not refill the
     /// training collection with the ids it is replaying.
@@ -932,7 +952,9 @@ impl HNSWIndex {
     /// `serde_json`, `bincode` and `std::fs`. Every Python token in
     /// `persistence.rs` sits in the load path, in `rebuild_using_add_method` and
     /// the `conversion` module it calls. `save_hnsw_graph` reaches
-    /// `graph::dump::write_dump`, which names PyO3 nowhere.
+    /// `graph::dump::write_dump`, which names PyO3 nowhere, and
+    /// `update_manifest_size` after it speaks only to `serde_json` and
+    /// `std::fs`.
     #[instrument(level = "info", skip(self, py), fields(
         vector_count = self.get_vector_count(),
         has_quantization = self.has_quantization(),

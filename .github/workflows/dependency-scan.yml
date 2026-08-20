@@ -1,0 +1,163 @@
+# Checks the Rust dependency tree the wheel ships, with cargo-deny.
+#
+# The wheel is one compiled object holding 118 crates. A user who installs it
+# cannot list them, cannot run an advisory check against them and cannot read
+# their licences, so the check has to happen here. What each pass allows, and
+# why, is in vdb-core/deny.toml.
+#
+# OSV-Scanner was the alternative. It covers many ecosystems, which buys almost
+# nothing here, because the Python surface is one runtime dependency and the
+# other 118 crates are Rust. It also has no licence check, and licences are the
+# half of this that matters for a published package shipping NOTICE and
+# ATTRIBUTION.md.
+#
+# THE TWO PASSES ARE NOT EQUALLY BINDING.
+#
+# Advisories are reported, not enforced. The pass writes SARIF, the report goes
+# to code scanning, and a finding lands in the Security tab where it can be
+# triaged, assigned and dismissed with a recorded reason. It does not redden a
+# build. An advisory is somebody else's risk assessment, it can appear with no
+# commit here, and whether it matters depends on how the crate is used, so a
+# red build is the wrong instrument for it.
+#
+# Licences, bans and sources block. A crate under a licence the package cannot
+# ship is a fact about the package rather than a judgement about it, and it is
+# actionable the moment it appears. So are a wildcard version requirement and a
+# crate arriving from somewhere that is not crates.io. None of the three can
+# change without Cargo.lock changing, so blocking on them never fires out of
+# the blue.
+#
+# continue-on-error sits on the advisory STEP and not on the job. On the job it
+# would swallow the licence failure too, which is the one thing here that is
+# meant to stop a merge.
+#
+# Separate from ci.yml on purpose. It is the one workflow whose result can
+# change with no change to the repository, so it must not read as a broken
+# build, and ci.yml's paths-ignore must not silence it.
+name: Dependency scan
+
+on:
+  push:
+    branches: [main, development]
+    paths:
+      - 'vdb-core/Cargo.toml'
+      - 'vdb-core/Cargo.lock'
+      - 'vdb-core/deny.toml'
+      - '.github/workflows/dependency-scan.yml'
+  pull_request:
+    branches: [main, development]
+    paths:
+      - 'vdb-core/Cargo.toml'
+      - 'vdb-core/Cargo.lock'
+      - 'vdb-core/deny.toml'
+      - '.github/workflows/dependency-scan.yml'
+  schedule:
+    # 02:15 UTC daily. An off-the-hour minute, because the top of the hour is
+    # the busiest slot on the shared scheduler and a queued cron run is a
+    # delayed one.
+    #
+    # This is the trigger that earns the advisory pass. A new advisory against
+    # a crate the tree already had arrives with no commit, so nothing else in
+    # this repository would ever notice it.
+    - cron: '15 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Writing the SARIF report to code scanning. This is the whole reason the
+      # job needs anything beyond read.
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # A prebuilt binary from cargo-deny's own GitHub releases, onto
+      # $CARGO_HOME/bin. EmbarkStudios/cargo-deny-action is not used, because it
+      # is a Docker action: it composes one command line and sends its output to
+      # the workflow log, so there is no way to capture SARIF from it into a
+      # file. Two plain run steps give the redirection and the exit code
+      # handling this needs.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Scan for advisories
+        continue-on-error: true
+        # --format sarif already makes cargo-deny exit 0 on a finding, verified
+        # against 0.20.2: the same scan exits 1 in human format and 0 in SARIF.
+        # continue-on-error is here anyway, so that a future version changing
+        # that cannot turn a finding into a failed merge. The next step is what
+        # catches the case this hides, being cargo-deny not running at all.
+        #
+        # --locked for the reason every other cargo step in this project passes
+        # it: the scan fails rather than reading a tree that differs from the
+        # one a release would build.
+        run: |
+          set -o pipefail
+          cargo deny \
+            --all-features \
+            --locked \
+            --manifest-path vdb-core/Cargo.toml \
+            --format sarif \
+            check advisories > "$RUNNER_TEMP/cargo-deny.sarif"
+
+      - name: Confirm the scan produced a report
+        # continue-on-error above cannot tell a finding from a crash, since both
+        # exit 1 in the formats that fail at all. This can: a scan that ran
+        # leaves valid SARIF whatever it found, and a scan that could not reach
+        # the advisory database leaves nothing or leaves noise. A missing report
+        # fails the job, because a Security tab quietly showing last week's
+        # results is worse than a red build.
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/cargo-deny.sarif"
+          if [ ! -s "$report" ]; then
+            echo "::error::cargo-deny produced no SARIF report. The advisory scan did not run, so the Security tab still holds the previous results."
+            exit 1
+          fi
+          count=$(python3 -c '
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              report = json.load(handle)
+          print(sum(len(run.get("results", [])) for run in report["runs"]))
+          ' "$report")
+          echo "::notice::cargo-deny reported ${count} advisory finding(s). See the Security tab under code scanning."
+
+      - name: Upload the report to code scanning
+        # Skipped for a pull request opened from a fork, which is not granted
+        # security-events: write and could only fail here. Every other trigger
+        # uploads, and the step is left blocking so a malformed report is caught
+        # rather than silently dropped.
+        if: >-
+          github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ runner.temp }}/cargo-deny.sarif
+          # Names this analysis, so a second SARIF source added later reports
+          # alongside it rather than replacing its results.
+          category: cargo-deny-advisories
+
+      - name: Check licences, bans and sources
+        # The blocking half, and the last step so that the report above reaches
+        # the Security tab whatever this does.
+        #
+        # Human format on purpose. --format sarif exits 0 on a finding, which is
+        # exactly what is wanted above and exactly wrong here, so this pass
+        # keeps the format that still fails.
+        run: |
+          cargo deny \
+            --all-features \
+            --locked \
+            --manifest-path vdb-core/Cargo.toml \
+            check licenses bans sources

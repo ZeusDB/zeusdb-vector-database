@@ -72,6 +72,13 @@ impl HNSWIndex {
         debug!(operation = "save_phase2", "Saving HNSW graph");
         self.save_hnsw_graph(path_buf)?;
 
+        // Phase 3: Record the directory size the dump has just changed. The
+        // manifest is deliberately written before the dump, so the size it
+        // carries misses the largest file in the directory until this runs.
+        // See `persistence::update_manifest_size`.
+        debug!(operation = "save_phase3", "Recording the directory size");
+        crate::persistence::update_manifest_size(path_buf)?;
+
         let duration_ms = start_time.elapsed().as_millis();
         info!(
             operation = "save_complete",
@@ -458,6 +465,22 @@ impl HNSWIndex {
         *self.training_ids.write().unwrap() = ids;
     }
 
+    /// Restore the creation timestamp from the saved manifest
+    ///
+    /// For persistence loading only. `new_empty` stamps the load time, which is
+    /// what `manifest.json` used to record as `created_at` on the next save.
+    pub(crate) fn set_created_at(&mut self, created_at: String) {
+        *self.created_at.write().unwrap() = created_at;
+    }
+
+    /// Restore when the codebook was fitted, from the saved directory
+    ///
+    /// For persistence loading only. See the field for why the value is carried
+    /// rather than restamped.
+    pub(crate) fn set_training_completed_at(&mut self, completed_at: Option<String>) {
+        *self.training_completed_at.write().unwrap() = completed_at;
+    }
+
     // ============================================================================
     // PERSISTENCE GETTERS - For accessing private fields from persistence module
     // ============================================================================
@@ -544,8 +567,13 @@ impl HNSWIndex {
     }
 
     /// Get the index creation timestamp
-    pub fn get_created_at(&self) -> &str {
-        &self.created_at
+    pub fn get_created_at(&self) -> String {
+        self.created_at.read().unwrap().clone()
+    }
+
+    /// When the codebook was fitted, or `None` on an index that never trained
+    pub fn get_training_completed_at(&self) -> Option<String> {
+        self.training_completed_at.read().unwrap().clone()
     }
 
     /// Get read access to training IDs (for persistence)

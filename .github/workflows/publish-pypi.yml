@@ -420,7 +420,63 @@ jobs:
       # Checks out the tag, so CHANGELOG.md is the file the release was cut
       # from rather than whatever main holds now.
       - uses: actions/checkout@v7
+
+      # A re-run of the workflow on the same tag must not go red because the
+      # release is already there, and it must not overwrite a body that was
+      # edited by hand after the first run. It is its own step so the steps
+      # below can be skipped rather than exited from, which is what keeps a
+      # re-run from paying to build the SBOM a second time.
+      - name: Check whether the release already exists
+        id: existing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG already exists. Leaving it untouched."
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the dependency SBOM
+        if: steps.existing.outputs.found == 'false'
+        # A CycloneDX listing of every crate the wheel links, read from
+        # vdb-core/Cargo.lock and attached to the release beside the notes.
+        # The wheel is one compiled object, so a user who installs it cannot
+        # enumerate what is inside it, and this is the file that answers that.
+        #
+        # Nothing here publishes to crates.io. cargo-cyclonedx reads the
+        # lockfile and writes JSON, and that is the whole of it.
+        #
+        # --target all covers every platform the wheel matrix builds, so the
+        # listing is not the runner's own dependency graph. Dev dependencies
+        # are excluded by construction, so tempfile and the seven crates it
+        # brings in are absent, because cargo test compiles them and no wheel
+        # ships them. That gives 109 components against the 118 entries in
+        # Cargo.lock, the last of which is the crate the SBOM describes.
+        #
+        # cargo is already on the runner image, so only cargo-cyclonedx is
+        # installed. Compiling it is the whole cost of this step, measured at
+        # 1 minute 10 seconds locally and expected to be a few minutes here.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-cyclonedx
+          cargo cyclonedx \
+            --manifest-path vdb-core/Cargo.toml \
+            --format json \
+            --describe crate \
+            --target all \
+            --spec-version 1.5
+          mv vdb-core/zeusdb-vector-database.cdx.json \
+             "$RUNNER_TEMP/zeusdb-vector-database-${TAG#v}.cdx.json"
+          ls -lh "$RUNNER_TEMP"/*.cdx.json
+
       - name: Create the release from the changelog section for this tag
+        if: steps.existing.outputs.found == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
@@ -429,14 +485,7 @@ jobs:
 
           version="${TAG#v}"
           notes="$RUNNER_TEMP/release-notes.md"
-
-          # A re-run of the workflow on the same tag must not go red because
-          # the release is already there, and it must not overwrite a body
-          # that was edited by hand after the first run.
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::notice::Release $TAG already exists. Leaving it untouched."
-            exit 0
-          fi
+          sbom="$RUNNER_TEMP/zeusdb-vector-database-${version}.cdx.json"
 
           # Prints the section for this version, from the line after its
           # heading to the line before the next one. Leading blank lines, and
@@ -472,9 +521,13 @@ jobs:
           # --latest is deliberately absent. Its default is automatic, by date
           # and version, which marks the newest release latest and leaves an
           # older tag alone. Passing --latest would mark any tag latest.
-          # No artifacts are attached, because PyPI serves the wheels and the
-          # sdist and GitHub attaches the source archives on its own.
+          #
+          # The SBOM is the only artifact attached. PyPI serves the wheels and
+          # the sdist and GitHub attaches the source archives on its own, but
+          # nothing else publishes the crate listing, and a release is where
+          # someone auditing a version would look for it.
           gh release create "$TAG" \
             --verify-tag \
             --title "Version ${version}" \
-            --notes-file "$notes"
+            --notes-file "$notes" \
+            "${sbom}#Software Bill of Materials (CycloneDX 1.5)"

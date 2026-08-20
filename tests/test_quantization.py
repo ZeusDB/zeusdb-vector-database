@@ -3328,3 +3328,101 @@ def test_different_data_trains_a_different_codebook(tmp_path):
     a = (first / "pq_centroids.bin").read_bytes()
     b = (second / "pq_centroids.bin").read_bytes()
     assert a != b, "a fixed seed must not mean a fixed codebook"
+
+
+def _parse_training_progress(text):
+    """Split "400/1000 (40.0%)" into its three parts."""
+    fraction, percent = text.split(" (")
+    collected, target = fraction.split("/")
+    return int(collected), int(target), float(percent.rstrip("%)"))
+
+
+@pytest.mark.parametrize("storage_mode", ["quantized_only", "quantized_with_raw"])
+def test_training_progress_halves_agree_in_every_state(storage_mode):
+    """The fraction and the percentage are one number, not two.
+
+    The fraction used to be printed from the collected id list, which training
+    empties the moment the codebook is fitted, while the percentage came from
+    whether the quantizer is trained. Every trained index therefore read
+    "0/1000 (100.0%)", saying in one breath that nothing had been collected and
+    that collection was complete.
+    """
+    def check(index, expected_collected):
+        collected, target, percent = _parse_training_progress(
+            index.get_stats()["training_progress"])
+        assert target == PQ_TRAINING_SIZE
+        assert collected == expected_collected
+        # The two halves are one number, so the percentage is the fraction.
+        assert percent == pytest.approx(collected / target * 100.0, abs=0.05)
+        # And the helper that answers the same question separately agrees.
+        assert index.get_training_progress() == pytest.approx(percent, abs=0.05)
+
+    vdb = VectorDatabase()
+    if storage_mode == "quantized_with_raw":
+        with pytest.warns(UserWarning,
+                          match=r"storage_mode='quantized_with_raw' keeps a raw vector "
+                                r"for every record"):
+            index = vdb.create("hnsw", dim=PQ_DIM,
+                               quantization_config=_overwrite_pq_config(storage_mode),
+                               expected_size=2000)
+    else:
+        index = vdb.create("hnsw", dim=PQ_DIM,
+                           quantization_config=_overwrite_pq_config(storage_mode),
+                           expected_size=2000)
+    rng = np.random.default_rng(20260820)
+
+    # Untrained and empty.
+    check(index, 0)
+
+    # Collecting, part way to the threshold.
+    part = PQ_TRAINING_SIZE // 4
+    assert index.add({"ids": [f"pre_{i}" for i in range(part)],
+                      "embeddings": rng.random((part, PQ_DIM)).astype(np.float32)}).is_success()
+    check(index, part)
+
+    # Trained. The collection is gone, so the numerator is the threshold the
+    # index reached rather than a count of ids it no longer keeps.
+    assert index.add({
+        "ids": [f"post_{i}" for i in range(PQ_TRAINING_SIZE - part)],
+        "embeddings": rng.random((PQ_TRAINING_SIZE - part, PQ_DIM)).astype(np.float32),
+    }).is_success()
+    assert index.is_quantized()
+    check(index, PQ_TRAINING_SIZE)
+
+    # And it stays put through everything that follows training.
+    assert index.add({"ids": [f"after_{i}" for i in range(20)],
+                      "embeddings": rng.random((20, PQ_DIM)).astype(np.float32)}).is_success()
+    check(index, PQ_TRAINING_SIZE)
+    index.rebuild_with_quantization()
+    check(index, PQ_TRAINING_SIZE)
+    index.remove_point("after_0")
+    index.compact()
+    check(index, PQ_TRAINING_SIZE)
+    # clear() empties the records and leaves the codebook fitted, so the
+    # training question is still answered the same way.
+    index.clear()
+    check(index, PQ_TRAINING_SIZE)
+
+
+def test_training_progress_key_is_absent_without_quantization():
+    """An index with no quantization has no training to report progress on."""
+    vdb = VectorDatabase()
+    index = vdb.create("hnsw", dim=PQ_DIM, expected_size=200)
+    index.add({"ids": ["a", "b"],
+               "embeddings": np.zeros((2, PQ_DIM), dtype=np.float32) + 0.5})
+    stats = index.get_stats()
+    assert "training_progress" not in stats
+    assert stats["quantization_type"] == "none"
+    assert index.get_training_progress() == 0.0
+    assert index.training_vectors_needed() == 0
+
+
+@pytest.mark.parametrize("storage_mode", ["quantized_only", "quantized_with_raw"])
+def test_training_progress_survives_a_save_and_load(storage_mode, tmp_path):
+    """A loaded trained index reports what the index it came from reported."""
+    index = _make_trained_pq_index(storage_mode)
+    before = index.get_stats()["training_progress"]
+    index.save(str(tmp_path / "progress.zdb"))
+    loaded = VectorDatabase().load(str(tmp_path / "progress.zdb"))
+    assert loaded.get_stats()["training_progress"] == before
+    assert _parse_training_progress(before) == (PQ_TRAINING_SIZE, PQ_TRAINING_SIZE, 100.0)
