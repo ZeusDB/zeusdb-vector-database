@@ -147,11 +147,11 @@ def main():
     # a raw vector and a code carries one more table than the other two. The
     # graph
     # owns a second copy of every point on top of its neighbour lists, and that
-    # copy is dim * 4 bytes in an unquantized index and subvectors bytes in a
-    # quantized one, in both storage modes. It used to be left out of this
-    # table, which is what made an earlier version of this file claim that
-    # quantized_with_raw stores more than an unquantized index. It does not,
-    # once the graph is counted and the record count clears the fixed cost.
+    # copy used to be a second one: the index held a map of raw vectors and
+    # the graph held its own arena of the same bytes. Relay 95 removed the map,
+    # so there is one copy, the raw column prices it, and the graph column
+    # prices what the graph holds apart from it. That is why the graph column
+    # is close to equal across the three modes and the total is not.
     print("stored per mode")
     print(f"  {'mode':<20s} {'raw':>6s} {'codes':>6s} {'raw MB':>7s} {'code MB':>8s} "
           f"{'fixed MB':>9s} {'graph MB':>9s} {'total':>6s}")
@@ -171,16 +171,17 @@ def main():
             f"{megabytes(stats, 'total_memory_mb'):>6.2f}"
         )
     print()
-    print("Both modes drop the graph's full width copy of every point, so both")
-    print("save there. The graph column holds more than that copy. The neighbour")
-    print("list slabs, one per point at every layer it reaches, and the inbound")
-    print("counters beside them do not shrink when the copy does, so the")
-    print("quantized graph")
-    print("is smaller rather than negligible. The fixed table is 1.06 MB at this")
-    print("configuration and neither mode has repaid it at 3,000 records. The")
-    print("fixed cost does not grow with the record count and the saving does, so")
-    print("both cross into saving as the index grows, quantized_only first")
-    print("because it drops the raw vectors as well.")
+    print("The raw column is the vectors and the graph column is everything")
+    print("else the graph holds, being the neighbour lists, the layer headers,")
+    print("the counters and, on a quantized index, the codes it scores")
+    print("against. There is one copy of every raw vector and it is priced in")
+    print("the raw column alone, so the graph column barely moves between the")
+    print("modes: what quantization buys is that the raw column can go to zero")
+    print("rather than that the graph shrinks. The fixed table is 1.06 MB at")
+    print("this configuration and neither mode has repaid it at 3,000 records.")
+    print("The fixed cost does not grow with the record count and the saving")
+    print("does, so both cross into saving as the index grows, quantized_only")
+    print("first because it drops the raw vectors as well.")
     print()
     print("total_memory_mb is what the index asked the allocator for, and it")
     print("adds the hash tables that find a record to the columns above. The")
@@ -246,20 +247,21 @@ compression ratio: 32x
 
 stored per mode
   mode                    raw  codes  raw MB  code MB  fixed MB  graph MB  total
-  no quantization        3000      0    0.73     0.00      0.00      1.79   3.36
+  no quantization        3000      0    0.73     0.00      0.00      1.06   2.42
   quantized_only            0   3000    0.00     0.02      1.06      1...   3...
   quantized_with_raw     3000   3000    0.73     0.02      1.06      1...   3...
 
-Both modes drop the graph's full width copy of every point, so both
-save there. The graph column holds more than that copy. The neighbour
-list slabs, one per point at every layer it reaches, and the inbound
-counters beside them do not shrink when the copy does, so the
-quantized graph
-is smaller rather than negligible. The fixed table is 1.06 MB at this
-configuration and neither mode has repaid it at 3,000 records. The
-fixed cost does not grow with the record count and the saving does, so
-both cross into saving as the index grows, quantized_only first
-because it drops the raw vectors as well.
+The raw column is the vectors and the graph column is everything
+else the graph holds, being the neighbour lists, the layer headers,
+the counters and, on a quantized index, the codes it scores
+against. There is one copy of every raw vector and it is priced in
+the raw column alone, so the graph column barely moves between the
+modes: what quantization buys is that the raw column can go to zero
+rather than that the graph shrinks. The fixed table is 1.06 MB at
+this configuration and neither mode has repaid it at 3,000 records.
+The fixed cost does not grow with the record count and the saving
+does, so both cross into saving as the index grows, quantized_only
+first because it drops the raw vectors as well.
 
 total_memory_mb is what the index asked the allocator for, and it
 adds the hash tables that find a record to the columns above. The

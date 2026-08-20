@@ -63,6 +63,7 @@
 
 use super::{by_distance, Entry, MutableGraph};
 use crate::graph::levels::LevelGenerator;
+use crate::graph::store::VectorStore;
 use crate::graph::traverse::{self, OrderedNode, Topology};
 use crate::graph::Distance;
 use std::collections::BinaryHeap;
@@ -127,6 +128,7 @@ pub(crate) enum Planned {
 /// starts from is passed in rather than looked up.
 struct Pending<'a, T, D> {
     graph: &'a MutableGraph<T, D>,
+    store: &'a VectorStore<T>,
     level: usize,
 }
 
@@ -145,7 +147,7 @@ where
     fn nb_points(&self) -> usize {
         // The new point is not reachable, so no traversal can name it and the
         // visited set does not need a bit for it.
-        Topology::nb_points(self.graph)
+        self.graph.nb_points()
     }
 
     fn entry(&self) -> u32 {
@@ -163,17 +165,17 @@ where
 
     #[inline]
     fn vector(&self, node: u32) -> &[T] {
-        Topology::vector(self.graph, node)
+        self.store.get(node)
     }
 
     #[inline]
     fn origin_id(&self, node: u32) -> usize {
-        self.graph.origin_id(node)
+        self.graph.origin_id_of(node)
     }
 
     #[inline]
     fn neighbours(&self, node: u32, layer: usize) -> &[u32] {
-        self.graph.neighbours(node, layer)
+        self.graph.neighbours_at(node, layer)
     }
 }
 
@@ -190,13 +192,14 @@ where
     /// build with and what the measurement times.
     pub(in crate::graph) fn insert(
         &mut self,
+        store: &mut VectorStore<T>,
         data: &[T],
         origin_id: usize,
         levels: &mut LevelGenerator,
     ) {
         let level = levels.generate();
-        let planned = self.plan_insertion(data, level);
-        self.install_insertion(data, origin_id, planned);
+        let planned = self.plan_insertion(store, data, level);
+        self.install_insertion(store, data, origin_id, planned);
     }
 
     /// Phase one, whichever shape the insertion takes.
@@ -204,24 +207,30 @@ where
     /// The empty case is settled here rather than by the caller, because
     /// whether the graph holds a point is itself something read under the read
     /// guard, and the answer cannot change before phase two runs.
-    pub(in crate::graph) fn plan_insertion(&self, data: &[T], level: usize) -> Planned {
+    pub(in crate::graph) fn plan_insertion(
+        &self,
+        store: &VectorStore<T>,
+        data: &[T],
+        level: usize,
+    ) -> Planned {
         if self.nb_points() == 0 {
             Planned::First { level }
         } else {
-            Planned::Descended(self.plan(data, level))
+            Planned::Descended(self.plan(store, data, level))
         }
     }
 
     /// Phase two, whichever shape the insertion takes.
     pub(in crate::graph) fn install_insertion(
         &mut self,
+        store: &mut VectorStore<T>,
         data: &[T],
         origin_id: usize,
         planned: Planned,
     ) {
         match planned {
-            Planned::First { level } => self.insert_first(data, origin_id, level),
-            Planned::Descended(plan) => self.install(data, origin_id, plan),
+            Planned::First { level } => self.insert_first(store, data, origin_id, level),
+            Planned::Descended(plan) => self.install(store, data, origin_id, plan),
         }
     }
 
@@ -235,13 +244,19 @@ where
     /// It fires only where the entry point is already set as the first point
     /// arrives, and the two constructors that set one both start from a
     /// non-empty topology.
-    pub(in crate::graph) fn insert_first(&mut self, data: &[T], origin_id: usize, level: usize) {
+    pub(in crate::graph) fn insert_first(
+        &mut self,
+        store: &mut VectorStore<T>,
+        data: &[T],
+        origin_id: usize,
+        level: usize,
+    ) {
         assert_eq!(
             self.nb_points(),
             0,
             "the first insertion is into an empty graph"
         );
-        let node = self.append_node(data, origin_id, level, &[]);
+        let node = self.append_node(store, data, origin_id, level, &[]);
         self.set_entry(node, level);
     }
 
@@ -250,15 +265,24 @@ where
     /// The graph must hold at least one point, which [`Self::insert`] settles
     /// before it gets here. The vendored equivalent settles it by reading
     /// `entry_point` and taking the `None` arm.
-    pub(in crate::graph) fn plan(&self, data: &[T], level: usize) -> Insertion {
+    pub(in crate::graph) fn plan(
+        &self,
+        store: &VectorStore<T>,
+        data: &[T],
+        level: usize,
+    ) -> Insertion {
         debug_assert!(
             self.nb_points() > 0,
             "phase one descends from an entry point, so the graph holds one"
         );
-        let view = Pending { graph: self, level };
+        let view = Pending {
+            graph: self,
+            store,
+            level,
+        };
         let dist_f = self.distance();
         let mut pivot = self.entry();
-        let mut dist_to_entry = dist_f.eval(data, Topology::vector(self, pivot));
+        let mut dist_to_entry = dist_f.eval(data, store.get(pivot));
         let max_level_observed = self.entry_level() as usize;
 
         // The descent. From the entry level down to the point's own level plus
@@ -306,7 +330,7 @@ where
             let mut candidates = negated(&sorted_points);
             let nb_conn = if l == 0 { 2 * self.m() } else { self.m() };
             neighbours.reserve(nb_conn);
-            self.select_neighbours(&mut candidates, nb_conn, &mut neighbours);
+            self.select_neighbours(store, &mut candidates, nb_conn, &mut neighbours);
             neighbours.sort_by(by_distance);
             // The nearest chosen neighbour carries the descent into the next
             // layer down. The vendored insert reads it after installing the
@@ -350,6 +374,7 @@ where
     /// computed on the candidate heap.
     fn select_neighbours(
         &self,
+        store: &VectorStore<T>,
         candidates: &mut BinaryHeap<OrderedNode>,
         nb_neighbours_asked: usize,
         neighbours_vec: &mut Vec<Entry>,
@@ -371,12 +396,12 @@ where
         while !candidates.is_empty() && neighbours_vec.len() < nb_neighbours_asked {
             if let Some(e_p) = candidates.pop() {
                 let mut e_to_insert = true;
-                let e_point_v = Topology::vector(self, e_p.node);
+                let e_point_v = store.get(e_p.node);
                 assert!(e_p.dist_to_ref <= 0.);
                 if !neighbours_vec.is_empty() {
-                    e_to_insert = !neighbours_vec.iter().any(|d| {
-                        dist_f.eval(e_point_v, Topology::vector(self, d.target)) <= -e_p.dist_to_ref
-                    });
+                    e_to_insert = !neighbours_vec
+                        .iter()
+                        .any(|d| dist_f.eval(e_point_v, store.get(d.target)) <= -e_p.dist_to_ref);
                 }
                 if e_to_insert {
                     neighbours_vec.push(Entry {
@@ -389,7 +414,13 @@ where
     }
 
     /// Phase two. Everything the insertion writes, under the write guard.
-    pub(in crate::graph) fn install(&mut self, data: &[T], origin_id: usize, plan: Insertion) {
+    pub(in crate::graph) fn install(
+        &mut self,
+        store: &mut VectorStore<T>,
+        data: &[T],
+        origin_id: usize,
+        plan: Insertion,
+    ) {
         let Insertion {
             level,
             nb_points,
@@ -408,7 +439,7 @@ where
             self.nb_points()
         );
 
-        let node = self.append_node(data, origin_id, level, &residue);
+        let node = self.append_node(store, data, origin_id, level, &residue);
 
         // Install site 1's bookkeeping. The edges themselves went in with the
         // node, because the residue region is append only and this is the one

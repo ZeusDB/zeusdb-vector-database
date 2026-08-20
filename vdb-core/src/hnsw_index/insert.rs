@@ -9,6 +9,7 @@
 use super::{HNSWIndex, ParsedRecords, StorageMode, MAX_LAYER};
 use crate::filter::{matches_filter, Filter};
 use crate::graph::{Record, VectorGraph};
+use crate::rerank::RawVectors;
 use pyo3::prelude::*;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -65,7 +66,6 @@ impl InsertError {
 struct RemovalGuards<'a> {
     id_map: RwLockWriteGuard<'a, HashMap<String, usize>>,
     rev_map: RwLockWriteGuard<'a, HashMap<usize, String>>,
-    vectors: RwLockWriteGuard<'a, HashMap<String, Vec<f32>>>,
     pq_codes: RwLockWriteGuard<'a, HashMap<String, Vec<u8>>>,
     vector_metadata: RwLockWriteGuard<'a, HashMap<String, HashMap<String, Value>>>,
 }
@@ -196,7 +196,6 @@ impl HNSWIndex {
         RemovalGuards {
             id_map: self.id_map.write().unwrap(),
             rev_map: self.rev_map.write().unwrap(),
-            vectors: self.vectors.write().unwrap(),
             pq_codes: self.pq_codes.write().unwrap(),
             vector_metadata: self.vector_metadata.write().unwrap(),
         }
@@ -222,12 +221,26 @@ impl HNSWIndex {
             return false;
         };
 
-        // Track what we're removing for logging
-        let had_raw_vector = guards.vectors.contains_key(id);
+        // Track what we're removing for logging.
+        //
+        // Whether the record had a raw vector is read off the storage mode
+        // rather than off a map, because the raw vectors now live in the graph
+        // and the graph lock cannot be taken here: every guard this function
+        // holds sits above it in the order the crate takes them. The mode
+        // answers the question exactly. Every mode except a trained
+        // `quantized_only` one keeps a raw vector for every record, and that
+        // one keeps none.
+        let had_raw_vector = !(storage_mode == "quantized_active"
+            && self
+                .quantization_config
+                .as_ref()
+                .is_some_and(|config| config.storage_mode == StorageMode::QuantizedOnly));
         let had_pq_codes = guards.pq_codes.contains_key(id);
 
-        // Remove from all data structures
-        guards.vectors.remove(id); // Remove raw vectors (if present)
+        // Remove from all data structures. The raw vector is not removed here:
+        // removal strands the record's graph node rather than deleting it, and
+        // the vector goes with the node when `compact` rebuilds the graph
+        // without it. That is what removal already did to the node itself.
         guards.vector_metadata.remove(id); // Remove metadata
         guards.pq_codes.remove(id); // Remove PQ codes (if present)
         guards.rev_map.remove(&internal_id); // Remove ID mapping
@@ -451,6 +464,10 @@ impl HNSWIndex {
         // it from the index silently.
         let missing: Vec<String> = {
             let id_map = self.id_map.read().unwrap();
+            // The graph being replaced, which is where the vectors live. Taken
+            // after `id_map` and released with it, before `replace_graph`
+            // takes the write guard below.
+            let old_hnsw = self.hnsw.read().unwrap();
 
             // Internal id order, which is arrival order, rather than the order a
             // hash map hands its entries out. Two compactions of the same index
@@ -484,13 +501,28 @@ impl HNSWIndex {
                     })?;
                 }
 
+                // The raw vectors a `quantized_with_raw` index keeps beside its
+                // codes are carried over rather than rebuilt, since nothing
+                // else holds them. The replacement numbers its nodes its own
+                // way, so they are re-addressed node by node.
+                if missing.is_empty() && old_hnsw.holds_raw() {
+                    if let Some(dim) = old_hnsw.raw_dim() {
+                        new_hnsw.adopt_raw_from(&old_hnsw, dim).map_err(|e| {
+                            error!(operation = "compact", error = %e, "Failed to carry the raw vectors over");
+                            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                                "Failed to carry the raw vectors over during compact: {}",
+                                e
+                            ))
+                        })?;
+                    }
+                }
+
                 missing
             } else {
-                let vectors = self.vectors.read().unwrap();
                 let mut missing = Vec::new();
 
                 for (ext_id, internal_id) in live {
-                    match vectors.get(ext_id) {
+                    match old_hnsw.raw_vector(internal_id) {
                         Some(vector) => new_hnsw.insert(vector, internal_id),
                         None => missing.push(ext_id.clone()),
                     }
@@ -602,8 +634,12 @@ impl HNSWIndex {
             // Phase 1: Batch identify and remove existing documents
             let (ids_to_remove, storage_analysis) = {
                 let id_map = self.id_map.read().unwrap();
-                let vectors = self.vectors.read().unwrap();
+                let hnsw = self.hnsw.read().unwrap();
                 let pq_codes = self.pq_codes.read().unwrap();
+                let raws = RawVectors {
+                    id_map: &id_map,
+                    graph: &hnsw,
+                };
 
                 let mut ids_to_remove = Vec::new();
                 let mut has_raw = 0;
@@ -615,7 +651,7 @@ impl HNSWIndex {
                         ids_to_remove.push(id.clone());
 
                         // Analyze what's being replaced for logging
-                        let has_raw_vector = vectors.contains_key(id);
+                        let has_raw_vector = raws.contains(id);
                         let has_pq_codes = pq_codes.contains_key(id);
 
                         match (has_raw_vector, has_pq_codes) {
@@ -811,14 +847,10 @@ impl HNSWIndex {
             rev_map.insert(internal_id, id.clone());
         }
 
-        // Store processed vector directly (no additional processing)
-        {
-            let mut vectors = self.vectors.write().unwrap();
-            vectors.insert(id.clone(), vector.clone()); // Already normalized
-        }
-
-        // Insert processed vector into HNSW, in the two phases the graph splits
-        // an insertion into. See `insert_one`.
+        // Insert the processed vector into the graph, in the two phases the
+        // graph splits an insertion into. See `insert_one`. This is the only
+        // copy of the vector the index keeps: the store the graph is addressed
+        // against holds it, and there is no second map to write.
         self.insert_one(Record::Raw(&vector), internal_id); // Already normalized
 
         trace!(
@@ -975,18 +1007,23 @@ impl HNSWIndex {
             pq_codes.insert(id.clone(), codes.clone());
         }
 
-        // Store raw vector only if configured to keep them
-        if let Some(config) = &self.quantization_config {
-            if config.storage_mode == StorageMode::QuantizedWithRaw {
-                let mut vectors = self.vectors.write().unwrap();
-                vectors.insert(id.clone(), vector.clone());
-            }
-            // If QuantizedOnly mode, we don't store raw vectors (saves memory)
-        }
+        // The raw vector travels with the codes, because the node the codes
+        // are installed at is the node the raw has to sit at. Under
+        // QuantizedOnly nothing travels and no raw vector is kept.
+        let keeps_raw = self
+            .quantization_config
+            .as_ref()
+            .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw);
 
         // Insert codes into quantized HNSW, in the two phases the graph splits
         // an insertion into. See `insert_one`.
-        self.insert_one(Record::Codes(&codes), internal_id);
+        self.insert_one(
+            Record::Codes {
+                codes: &codes,
+                raw: keeps_raw.then_some(vector.as_slice()),
+            },
+            internal_id,
+        );
 
         trace!(
             operation = "add_quantized_vector_complete",

@@ -847,14 +847,14 @@ pub(super) fn read_dump<T, D>(
     dir: &Path,
     expected: &Expected,
     dist: D,
-) -> Result<MutableGraph<T, D>, String>
+) -> Result<(MutableGraph<T, D>, super::store::VectorStore<T>), String>
 where
     T: DumpElement,
     D: Distance<T> + Send + Sync,
 {
     let parsed = parse_dump::<T>(dir, expected)?;
     let nb_point = parsed.nb_point;
-    let graph = MutableGraph::from_loaded(
+    let (graph, store) = MutableGraph::from_loaded(
         parsed.points_by_layer,
         parsed.entry,
         parsed.m,
@@ -871,7 +871,7 @@ where
             nb_point, restored
         ));
     }
-    Ok(graph)
+    Ok((graph, store))
 }
 
 /// Parse a dump into the topology and parameters it carries, building nothing.
@@ -1221,10 +1221,17 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// Build a small graph the tests can round trip.
-    fn sample_graph(records: usize, dim: usize, m: usize) -> MutableGraph<f32, CosineDist> {
+    fn sample_graph(
+        records: usize,
+        dim: usize,
+        m: usize,
+    ) -> (
+        MutableGraph<f32, CosineDist>,
+        super::super::store::VectorStore<f32>,
+    ) {
         let scale = super::super::levels::LevelGenerator::default_scale(m);
         let mut levels = super::super::levels::LevelGenerator::new(scale, NB_LAYER_MAX as usize);
-        let mut graph =
+        let (mut graph, mut store) =
             MutableGraph::new(dim, m, 64, scale, records.max(1), CosineDist {}).unwrap();
         // A cheap deterministic spread. The graph's shape does not matter here,
         // only that it has one and that the same call makes the same one.
@@ -1238,9 +1245,9 @@ mod tests {
                     (state >> 40) as f32 / 16_777_216.0 - 0.5
                 })
                 .collect();
-            graph.insert(&vector, id, &mut levels);
+            graph.insert(&mut store, &vector, id, &mut levels);
         }
-        graph
+        (graph, store)
     }
 
     /// The whole graph as plain values, for comparing one against another.
@@ -1253,12 +1260,13 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn topology<D: Distance<f32> + Send + Sync>(
         graph: &MutableGraph<f32, D>,
+        store: &super::super::store::VectorStore<f32>,
     ) -> BTreeMap<usize, (u8, i32, Vec<u32>, Vec<Vec<(usize, u32)>>)> {
         let point_ids = graph.point_ids();
         let mut out = BTreeMap::new();
         for node in 0..graph.nb_points() as u32 {
             let p_id = point_ids[node as usize];
-            let values = graph.vector(node).iter().map(|v| v.to_bits()).collect();
+            let values = store.get(node).iter().map(|v| v.to_bits()).collect();
             let adjacency = graph
                 .neighbourhood_ids(node)
                 .iter()
@@ -1278,7 +1286,9 @@ mod tests {
 
     /// The reason a read was refused. Neither graph is `Debug`, so `unwrap_err`
     /// and `expect_err` are both out of reach.
-    fn refused<T, D>(result: Result<MutableGraph<T, D>, String>) -> String
+    fn refused<T, D>(
+        result: Result<(MutableGraph<T, D>, super::super::store::VectorStore<T>), String>,
+    ) -> String
     where
         T: DumpElement,
         D: Distance<T> + Send + Sync,
@@ -1302,10 +1312,15 @@ mod tests {
     #[test]
     fn a_round_trip_reproduces_every_node_and_every_edge() {
         let dir = tempfile::tempdir().unwrap();
-        let built = sample_graph(600, 12, 16);
-        write_dump(&built.dump_view(), GraphKind::Cosine, dir.path()).unwrap();
+        let (built, built_store) = sample_graph(600, 12, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            dir.path(),
+        )
+        .unwrap();
         let expected = expected_for(&built, 12, 600);
-        let read: MutableGraph<f32, CosineDist> =
+        let (read, _read_store): (MutableGraph<f32, CosineDist>, _) =
             read_dump(dir.path(), &expected, CosineDist {}).unwrap();
 
         assert_eq!(read.nb_points(), built.nb_points());
@@ -1314,8 +1329,8 @@ mod tests {
         assert_eq!(read.level_scale(), built.level_scale());
         assert_eq!(read.entry_point_id(), built.entry_point_id());
 
-        let before = topology(&built);
-        let after = topology(&read);
+        let before = topology(&built, &built_store);
+        let after = topology(&read, &_read_store);
         assert_eq!(before.len(), after.len());
         let mut differing_nodes = 0;
         let mut differing_edges = 0;
@@ -1338,12 +1353,17 @@ mod tests {
     fn writing_the_same_graph_twice_gives_the_same_bytes() {
         let one = tempfile::tempdir().unwrap();
         let two = tempfile::tempdir().unwrap();
-        let built = sample_graph(300, 8, 16);
-        write_dump(&built.dump_view(), GraphKind::Cosine, one.path()).unwrap();
+        let (built, built_store) = sample_graph(300, 8, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            one.path(),
+        )
+        .unwrap();
         let expected = expected_for(&built, 8, 300);
-        let read: MutableGraph<f32, CosineDist> =
+        let (read, read_store): (MutableGraph<f32, CosineDist>, _) =
             read_dump(one.path(), &expected, CosineDist {}).unwrap();
-        write_dump(&read.dump_view(), GraphKind::Cosine, two.path()).unwrap();
+        write_dump(&read.dump_view(&read_store), GraphKind::Cosine, two.path()).unwrap();
         assert_eq!(
             std::fs::read(one.path().join(DUMP_FILENAME)).unwrap(),
             std::fs::read(two.path().join(DUMP_FILENAME)).unwrap()
@@ -1356,22 +1376,32 @@ mod tests {
         // recorded as 0.
         for m in [2usize, 16, 255, 256] {
             let dir = tempfile::tempdir().unwrap();
-            let built = sample_graph(120, 6, m);
+            let (built, built_store) = sample_graph(120, 6, m);
             assert_eq!(built.m(), m);
-            write_dump(&built.dump_view(), GraphKind::Cosine, dir.path()).unwrap();
+            write_dump(
+                &built.dump_view(&built_store),
+                GraphKind::Cosine,
+                dir.path(),
+            )
+            .unwrap();
             let expected = expected_for(&built, 6, 120);
-            let read: MutableGraph<f32, CosineDist> =
+            let (read, read_store): (MutableGraph<f32, CosineDist>, _) =
                 read_dump(dir.path(), &expected, CosineDist {}).unwrap();
             assert_eq!(read.m(), m);
-            assert_eq!(topology(&built), topology(&read));
+            assert_eq!(topology(&built, &built_store), topology(&read, &read_store));
         }
     }
 
     /// Round trip one damaged file and report what the reader said.
     fn damaged(mutate: impl FnOnce(Vec<u8>) -> Vec<u8>) -> String {
         let dir = tempfile::tempdir().unwrap();
-        let built = sample_graph(200, 6, 16);
-        write_dump(&built.dump_view(), GraphKind::Cosine, dir.path()).unwrap();
+        let (built, built_store) = sample_graph(200, 6, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            dir.path(),
+        )
+        .unwrap();
         let path = dir.path().join(DUMP_FILENAME);
         let blob = std::fs::read(&path).unwrap();
         std::fs::write(&path, mutate(blob)).unwrap();
@@ -1430,7 +1460,7 @@ mod tests {
     #[test]
     fn an_absent_file_is_an_error_rather_than_a_panic() {
         let dir = tempfile::tempdir().unwrap();
-        let built = sample_graph(50, 4, 16);
+        let (built, _built_store) = sample_graph(50, 4, 16);
         let expected = expected_for(&built, 4, 50);
         let reason = refused(read_dump::<f32, CosineDist>(
             dir.path(),
@@ -1446,8 +1476,13 @@ mod tests {
         for legacy in LEGACY_DUMP_FILENAMES {
             std::fs::write(dir.path().join(legacy), vec![7u8; 4096]).unwrap();
         }
-        let built = sample_graph(100, 5, 16);
-        write_dump(&built.dump_view(), GraphKind::Cosine, dir.path()).unwrap();
+        let (built, built_store) = sample_graph(100, 5, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            dir.path(),
+        )
+        .unwrap();
 
         let left: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -1457,7 +1492,12 @@ mod tests {
 
         // And a save into a directory that never held them is unbothered.
         let clean = tempfile::tempdir().unwrap();
-        write_dump(&built.dump_view(), GraphKind::Cosine, clean.path()).unwrap();
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            clean.path(),
+        )
+        .unwrap();
         assert!(clean.path().join(DUMP_FILENAME).exists());
     }
 
@@ -1467,7 +1507,7 @@ mod tests {
         // reader for it and there is deliberately not going to be one, so the
         // only thing that has to hold is that it is rejected cleanly.
         let dir = tempfile::tempdir().unwrap();
-        let built = sample_graph(50, 4, 16);
+        let (built, _built_store) = sample_graph(50, 4, 16);
         let mut blob = 0x002a_6779u32.to_le_bytes().to_vec();
         blob.extend_from_slice(&[0u8; 4096]);
         std::fs::write(dir.path().join(DUMP_FILENAME), &blob).unwrap();
@@ -1489,8 +1529,13 @@ mod tests {
     #[test]
     fn a_header_claiming_a_billion_points_allocates_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let built = sample_graph(80, 4, 16);
-        write_dump(&built.dump_view(), GraphKind::Cosine, dir.path()).unwrap();
+        let (built, built_store) = sample_graph(80, 4, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            dir.path(),
+        )
+        .unwrap();
         let path = dir.path().join(DUMP_FILENAME);
         let blob = std::fs::read(&path).unwrap();
 
@@ -1532,8 +1577,13 @@ mod tests {
     #[test]
     fn a_dump_written_for_another_configuration_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let built = sample_graph(120, 6, 16);
-        write_dump(&built.dump_view(), GraphKind::Cosine, dir.path()).unwrap();
+        let (built, built_store) = sample_graph(120, 6, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            dir.path(),
+        )
+        .unwrap();
 
         let refuse = |expected: &Expected| {
             refused(read_dump::<f32, CosineDist>(

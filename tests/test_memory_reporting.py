@@ -90,33 +90,50 @@ def test_graph_memory_reports_the_reservation_before_any_record_arrives():
     assert float(larger.get_stats()["graph_memory_mb"]) > reported
 
 
-def test_graph_memory_carries_a_copy_of_every_point():
-    """Raising the dimension adds `records * dim * 4` bytes to the graph.
+def test_the_dimension_moves_the_vector_store_and_not_the_graph():
+    """Raising the dimension adds `records * dim * 4` bytes, once.
 
-    The graph owns a second copy of every point, separate from the storage map.
-    Everything else it holds is set by `m`, the record count and how hard the
-    data prunes, and only the last of those moves with the dimension, so the
-    jump below is eightfold to put the copy well above that drift.
+    There used to be two copies of every raw vector, one in a map keyed by
+    external id and one in the graph, and `graph_memory_mb` carried the second
+    while `raw_vectors_memory_mb` carried the first. There is one copy now and
+    it is priced under `raw_vectors_memory_mb` alone, so an eightfold dimension
+    moves that key by the vectors and leaves the graph figure where it was.
+
+    What `graph_memory_mb` still holds is set by `m`, the record count and how
+    hard the data prunes, and only the last of those moves with the dimension,
+    so it drifts rather than staying fixed.
     """
     records = 3000
     small, _ = _build(records, 64, None, seed=7)
     large, _ = _build(records, 512, None, seed=7)
 
-    grew = (float(large.get_stats()["graph_memory_mb"])
-            - float(small.get_stats()["graph_memory_mb"]))
     expected = records * (512 - 64) * 4 / (1024 * 1024)
-    assert grew == pytest.approx(expected, rel=0.15), (
-        f"the graph grew by {grew:.3f} MB where the second copy of every point "
-        f"is {expected:.3f} MB")
+    vectors_grew = (float(large.get_stats()["raw_vectors_memory_mb"])
+                    - float(small.get_stats()["raw_vectors_memory_mb"]))
+    assert vectors_grew == pytest.approx(expected, rel=0.15), (
+        f"the vector store grew by {vectors_grew:.3f} MB where the vectors "
+        f"themselves are {expected:.3f} MB")
+
+    graph_grew = (float(large.get_stats()["graph_memory_mb"])
+                  - float(small.get_stats()["graph_memory_mb"]))
+    assert abs(graph_grew) < 0.25 * expected, (
+        f"the graph figure moved by {graph_grew:.3f} MB on a dimension change, "
+        f"so it is still carrying a copy of the vectors")
 
 
-def test_the_quantized_graph_is_smaller_than_the_raw_one():
-    """Quantization replaces the graph's copy with a code, in both storage modes.
+def test_the_quantized_graph_scores_against_codes_rather_than_vectors():
+    """Quantization replaces what the graph scores against with a code.
 
-    It does not make the graph negligible. The neighbour lists, the sixteen
-    layer headers and the counters around them are there either way, and the
-    adjacency itself moves because the codes prune differently from the vectors,
-    so the saving is bounded rather than pinned.
+    `graph_memory_mb` is everything the graph holds apart from the raw vectors,
+    which on a quantized graph includes the codes it is addressed against and on
+    a raw one includes nothing of the sort, because there the raw vectors are
+    reported under their own key. So the quantized figure is the raw one plus
+    one byte per subvector per record rather than less than it, and the saving
+    the mode buys shows up in the total.
+
+    It does not make the graph negligible either way. The neighbour lists, the
+    sixteen layer headers and the counters around them are there whatever the
+    element type.
     """
     records, dim = 3000, 256
     raw, _ = _build(records, dim, None)
@@ -125,27 +142,27 @@ def test_the_quantized_graph_is_smaller_than_the_raw_one():
 
     raw_mb = float(raw.get_stats()["graph_memory_mb"])
     modes = [float(i.get_stats()["graph_memory_mb"]) for i in (with_raw, only)]
-    assert all(m < raw_mb for m in modes), (
-        f"the quantized graph is {modes} MB against {raw_mb:.2f} unquantized")
     assert modes[0] == pytest.approx(modes[1], rel=0.15), (
         "the two storage modes build the same graph, so they hold the same one")
 
-    # The saving is at least the copy it replaced and it can be more, because
-    # the codes prune harder than the vectors at this compression so the
-    # adjacency shrinks as well. It is not the whole graph.
+    # A raw index reports no vector inside the graph figure, so the two differ
+    # by the codes and the adjacency drift alone rather than by a vector copy.
     copy_mb = records * dim * 4 / (1024 * 1024)
-    saved = raw_mb - modes[0]
-    assert 0.5 * copy_mb <= saved <= 2.5 * copy_mb, (
-        f"the quantized graph saved {saved:.2f} MB where the copy it replaced "
-        f"is {copy_mb:.2f} MB")
+    assert abs(modes[0] - raw_mb) < 0.5 * copy_mb, (
+        f"the quantized graph is {modes[0]:.2f} MB against {raw_mb:.2f} raw, "
+        f"and neither should carry a raw vector copy of {copy_mb:.2f} MB")
+
+    # What the mode actually buys is in the total, where a quantized index no
+    # longer holds a vector per record on the search path.
+    raw_total = float(raw.get_stats()["total_memory_mb"])
+    only_total = float(only.get_stats()["total_memory_mb"])
+    assert only_total < raw_total, (
+        f"quantized_only reports {only_total:.2f} MB against {raw_total:.2f} raw")
+
     # The graph is more than the codes it holds. What it carries beside them is
     # a fixed capacity neighbour slab per point at layer zero, which is
     # `(2m + 1)` targets and the same number of distances, so the figure has to
-    # clear that whatever the element type. This used to be stated as clearing
-    # the raw copy it dropped, which held while a point cost roughly 2,000 bytes
-    # of structure around its vector. A point now costs about 400, so the
-    # quantized graph is genuinely smaller than the copy it replaced and the
-    # slab is the honest floor.
+    # clear that whatever the element type.
     m = int(with_raw.get_stats()["m"])
     slab_mb = records * (2 * m + 1) * (4 + 4) / (1024 * 1024)
     assert modes[0] > slab_mb, (
@@ -235,8 +252,13 @@ def _structure_floor_mb(index, records, dim):
     else:
         element_bytes = dim * 4
 
+    # One copy of every raw vector, not two. The index used to hold a map of
+    # them beside the graph's own arena; relay 95 removed the map, so the floor
+    # counts the store once. The graph's own element is a code on a quantized
+    # index and is the store itself on a raw one, so it is only added where the
+    # two are different things.
     store = records * dim * 4 if int(stats["raw_vectors_stored"]) else 0
-    graph_copy = records * element_bytes
+    graph_copy = records * element_bytes if quantized else 0
     slabs = records * (2 * m + 1) * (4 + 4)
     return (store + graph_copy + slabs) / (1024 * 1024)
 

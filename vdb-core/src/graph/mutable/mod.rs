@@ -99,6 +99,7 @@
 
 use super::dump::EachNeighbourhood;
 use super::dump::{LoadedEdge, LoadedPoint, PointId};
+use super::store::VectorStore;
 use super::traverse::{self, Topology, LAYERS};
 use super::{Distance, GraphHit};
 
@@ -110,6 +111,9 @@ pub(crate) use insert::Planned;
 
 /// Naming no upper list, which is every node whose span is zero.
 const NO_UPPER: u32 = u32::MAX;
+
+/// Naming no node, which is every internal id this graph never took.
+const NO_NODE: u32 = u32::MAX;
 
 /// Slots a list above its owner's level opens with.
 ///
@@ -258,8 +262,16 @@ pub(super) struct MutableGraph<T, D> {
     origin_ids: Vec<usize>,
     /// Each node's top level.
     levels: Vec<u8>,
-    /// Every vector, node `n` at `[n * dim, (n + 1) * dim)`.
-    data: Vec<T>,
+    /// The node each internal id sits at, indexed by that id, and
+    /// [`NO_NODE`] where the graph never took one.
+    ///
+    /// The inverse of [`Self::origin_ids`], written by the same append that
+    /// writes it, so the two cannot drift. It is what turns the external id a
+    /// caller asks about into the node index the store is addressed by. Held
+    /// here rather than beside the index because it changes exactly when the
+    /// graph changes, which means it is covered by the graph's own lock and
+    /// there is no second structure to keep in step.
+    node_of: Vec<u32>,
 
     /// Layer zero targets, node `n` at `[n * base_cap, ..)`.
     base_targets: Vec<u32>,
@@ -310,6 +322,14 @@ pub(super) struct MutableGraph<T, D> {
 
     /// The distance, evaluated between the query and a stored vector.
     dist_f: D,
+
+    /// The element type the store beside this graph holds.
+    ///
+    /// The graph itself holds no vector, so nothing else here mentions `T`.
+    /// Keeping the parameter is what stops a graph of one element type being
+    /// bound to a store of another, which is the mistake the type system was
+    /// catching before the vectors moved out.
+    _elem: std::marker::PhantomData<T>,
 }
 
 impl<T, D> MutableGraph<T, D>
@@ -336,7 +356,7 @@ where
         ef_construction: usize,
         level_scale: f64,
         dist_f: D,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, VectorStore<T>), String> {
         let nb_layer = points_by_layer.len();
         if nb_layer == 0 || nb_layer > LAYERS {
             return Err(format!(
@@ -403,7 +423,7 @@ where
             layer_counts,
             origin_ids: Vec::with_capacity(nb_point),
             levels: Vec::with_capacity(nb_point),
-            data: Vec::with_capacity(nb_point * dim),
+            node_of: Vec::new(),
             base_targets: vec![0u32; nb_point * base_cap],
             base_dists: vec![0f32; nb_point * base_cap],
             base_len: vec![0u16; nb_point],
@@ -420,8 +440,10 @@ where
             saves: 0,
             fallbacks: 0,
             dist_f,
+            _elem: std::marker::PhantomData,
         };
 
+        let mut store = VectorStore::with_capacity(dim, nb_point);
         let mut lists: Vec<Vec<(f32, u32)>> = Vec::new();
         for (layer, points) in points_by_layer.into_iter().enumerate() {
             for (rank, point) in points.into_iter().enumerate() {
@@ -447,7 +469,8 @@ where
                 }
                 graph.origin_ids.push(point.origin_id);
                 graph.levels.push(layer as u8);
-                graph.data.extend(point.data);
+                graph.note_origin(point.origin_id, node);
+                store.append(point.data);
 
                 // Every edge is checked wherever it sits, and each list is
                 // ordered by its stored distances with the same stable sort the
@@ -523,6 +546,7 @@ where
         // `memory_bytes` be checked against the counts rather than believed. The
         // upper regions are the ones whose size is not known before the walk,
         // because a span is a property of the file.
+        graph.node_of.shrink_to_fit();
         graph.upper_at.shrink_to_fit();
         graph.upper_len.shrink_to_fit();
         graph.upper_cap.shrink_to_fit();
@@ -569,7 +593,7 @@ where
         graph.entry = layer_offsets[entry_layer] + entry_point.1 as u32;
         graph.entry_level = entry_point.0;
 
-        Ok(graph)
+        Ok((graph, store))
     }
 
     /// An empty graph, ready to be built by insertion.
@@ -610,7 +634,7 @@ where
         level_scale: f64,
         expected_size: usize,
         dist_f: D,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, VectorStore<T>), String> {
         if dim == 0 {
             return Err("a graph holds vectors of at least one value".to_string());
         }
@@ -636,34 +660,66 @@ where
         let span = expected_span(m, expected_size);
         let reserved = reserved_records::<T>(dim, base_cap, span, expected_size);
         let upper_lists = reserved * span;
-        Ok(MutableGraph {
-            dim,
-            m,
-            ef_construction,
-            level_scale,
-            entry: 0,
-            entry_level: 0,
-            layer_counts: [0u32; LAYERS],
-            origin_ids: Vec::with_capacity(reserved),
-            levels: Vec::with_capacity(reserved),
-            data: Vec::with_capacity(reserved * dim),
-            base_targets: Vec::with_capacity(reserved * base_cap),
-            base_dists: Vec::with_capacity(reserved * base_cap),
-            base_len: Vec::with_capacity(reserved),
-            base_in_degree: Vec::with_capacity(reserved),
-            upper_first: Vec::with_capacity(reserved),
-            upper_span: Vec::with_capacity(reserved),
-            upper_at: Vec::with_capacity(upper_lists),
-            upper_len: Vec::with_capacity(upper_lists),
-            upper_cap: Vec::with_capacity(upper_lists),
-            upper_in_degree: Vec::with_capacity(upper_lists),
-            upper_targets: Vec::with_capacity(upper_lists),
-            upper_dists: Vec::with_capacity(upper_lists),
-            overflows: 0,
-            saves: 0,
-            fallbacks: 0,
-            dist_f,
-        })
+        let store = VectorStore::with_capacity(dim, reserved);
+        Ok((
+            MutableGraph {
+                dim,
+                m,
+                ef_construction,
+                level_scale,
+                entry: 0,
+                entry_level: 0,
+                layer_counts: [0u32; LAYERS],
+                origin_ids: Vec::with_capacity(reserved),
+                levels: Vec::with_capacity(reserved),
+                node_of: Vec::with_capacity(reserved + 1),
+                base_targets: Vec::with_capacity(reserved * base_cap),
+                base_dists: Vec::with_capacity(reserved * base_cap),
+                base_len: Vec::with_capacity(reserved),
+                base_in_degree: Vec::with_capacity(reserved),
+                upper_first: Vec::with_capacity(reserved),
+                upper_span: Vec::with_capacity(reserved),
+                upper_at: Vec::with_capacity(upper_lists),
+                upper_len: Vec::with_capacity(upper_lists),
+                upper_cap: Vec::with_capacity(upper_lists),
+                upper_in_degree: Vec::with_capacity(upper_lists),
+                upper_targets: Vec::with_capacity(upper_lists),
+                upper_dists: Vec::with_capacity(upper_lists),
+                overflows: 0,
+                saves: 0,
+                fallbacks: 0,
+                dist_f,
+                _elem: std::marker::PhantomData,
+            },
+            store,
+        ))
+    }
+
+    /// Record where an internal id landed.
+    ///
+    /// Written by the same append that pushes to `origin_ids`, so the map and
+    /// its inverse are one operation and cannot disagree. Indexed by the id
+    /// itself rather than by the id less one, which costs one slot and spares
+    /// every caller an off-by-one about an id space that starts at one.
+    fn note_origin(&mut self, origin_id: usize, node: u32) {
+        if self.node_of.len() <= origin_id {
+            self.node_of.resize(origin_id + 1, NO_NODE);
+        }
+        self.node_of[origin_id] = node;
+    }
+
+    /// The node one internal id sits at, or `None` where this graph never took
+    /// that id.
+    ///
+    /// A removed record keeps its entry until the graph is replaced, because
+    /// removal strands a node rather than deleting it. `id_map` is the record
+    /// set and every caller consults it first, so a stranded entry is
+    /// unreachable rather than wrong.
+    pub(super) fn node_of(&self, origin_id: usize) -> Option<u32> {
+        match self.node_of.get(origin_id) {
+            None | Some(&NO_NODE) => None,
+            Some(&node) => Some(node),
+        }
     }
 
     /// Slots one layer zero list holds, being the vendored threshold plus the
@@ -698,6 +754,43 @@ where
     /// Nodes the graph holds.
     pub(super) fn nb_points(&self) -> usize {
         self.origin_ids.len()
+    }
+
+    /// The distance this graph was built with.
+    #[inline]
+    pub(super) fn distance(&self) -> &D {
+        &self.dist_f
+    }
+
+    /// Where the traversal starts.
+    #[inline]
+    pub(super) fn entry(&self) -> u32 {
+        self.entry
+    }
+
+    /// The entry node's top level, which is the highest occupied layer.
+    #[inline]
+    pub(super) fn entry_level(&self) -> u8 {
+        self.entry_level
+    }
+
+    /// Nodes whose top level is exactly `layer`.
+    #[inline]
+    pub(super) fn layer_len(&self, layer: usize) -> usize {
+        self.layer_counts[layer] as usize
+    }
+
+    /// One node's neighbour list at one layer, empty where it has none.
+    ///
+    /// Named apart from the trait method because the trait is implemented on
+    /// [`Bound`] rather than here, and the traversal reaches this through that.
+    #[inline]
+    pub(super) fn neighbours_at(&self, node: u32, layer: usize) -> &[u32] {
+        match self.slice_of(node, layer) {
+            Some((at, len, false)) => &self.base_targets[at..at + len],
+            Some((at, len, true)) => &self.upper_targets[at..at + len],
+            None => &[],
+        }
     }
 
     /// Edges the graph holds in its slabs, over every layer. The descent
@@ -791,13 +884,6 @@ where
         (0..self.origin_ids.len() as u32)
             .map(|node| order.point_id(self, node))
             .collect()
-    }
-
-    /// The stored vector of one node.
-    #[inline]
-    pub(super) fn vector(&self, node: u32) -> &[T] {
-        let at = node as usize * self.dim;
-        &self.data[at..at + self.dim]
     }
 
     /// The stored distances of one node's list, in step with its targets.
@@ -1021,13 +1107,13 @@ where
     /// Whether one list already names a node, which the reverse update asks
     /// before it pushes.
     fn list_names(&self, node: u32, layer: usize, target: u32) -> bool {
-        self.neighbours(node, layer).contains(&target)
+        self.neighbours_at(node, layer).contains(&target)
     }
 
     /// One list as a vector of entries, which is how both sorts see it.
     fn copy_list(&self, node: u32, layer: usize, out: &mut Vec<Entry>) {
         out.clear();
-        let targets = self.neighbours(node, layer);
+        let targets = self.neighbours_at(node, layer);
         let dists = self.distances(node, layer);
         out.reserve(targets.len());
         for (&target, &dist) in targets.iter().zip(dists) {
@@ -1149,6 +1235,7 @@ where
     /// growth past it is possible and rare; see [`Self::grow_span`].
     fn append_node(
         &mut self,
+        store: &mut VectorStore<T>,
         data: &[T],
         origin_id: usize,
         level: usize,
@@ -1174,9 +1261,15 @@ where
             "the graph holds as many nodes as a u32 counts"
         );
 
+        debug_assert_eq!(
+            store.len(),
+            self.origin_ids.len(),
+            "the store is addressed by node index, so it holds one vector per node"
+        );
         self.origin_ids.push(origin_id);
         self.levels.push(level as u8);
-        self.data.extend_from_slice(data);
+        self.note_origin(origin_id, node);
+        store.push(data);
         self.base_len.push(0);
         self.base_in_degree.push(0);
         self.base_targets
@@ -1234,7 +1327,7 @@ where
     pub(super) fn neighbourhood_ids(&self, node: u32) -> Vec<Vec<(usize, f32)>> {
         let mut out = vec![Vec::new(); LAYERS];
         for (layer, list) in out.iter_mut().enumerate().take(self.span(node) + 1) {
-            let targets = self.neighbours(node, layer);
+            let targets = self.neighbours_at(node, layer);
             let dists = self.distances(node, layer);
             for (&target, &dist) in targets.iter().zip(dists) {
                 list.push((self.origin_ids[target as usize], dist));
@@ -1249,7 +1342,7 @@ where
     pub(super) fn counted_in_degree(&self, layer: usize) -> Vec<u32> {
         let mut counts = vec![0u32; self.origin_ids.len()];
         for node in 0..self.origin_ids.len() as u32 {
-            for &target in self.neighbours(node, layer) {
+            for &target in self.neighbours_at(node, layer) {
                 counts[target as usize] += 1;
             }
         }
@@ -1295,7 +1388,7 @@ where
         let before = self.memory_bytes();
         self.origin_ids.shrink_to_fit();
         self.levels.shrink_to_fit();
-        self.data.shrink_to_fit();
+        self.node_of.shrink_to_fit();
         self.base_targets.shrink_to_fit();
         self.base_dists.shrink_to_fit();
         self.base_len.shrink_to_fit();
@@ -1320,7 +1413,7 @@ where
         let mut total = std::mem::size_of::<Self>();
         total += self.origin_ids.capacity() * std::mem::size_of::<usize>();
         total += self.levels.capacity();
-        total += self.data.capacity() * std::mem::size_of::<T>();
+        total += self.node_of.capacity() * std::mem::size_of::<u32>();
         total += self.base_targets.capacity() * std::mem::size_of::<u32>();
         total += self.base_dists.capacity() * std::mem::size_of::<f32>();
         total += self.base_len.capacity() * std::mem::size_of::<u16>();
@@ -1345,6 +1438,7 @@ where
     /// question the same way.
     pub(super) fn search<F>(
         &self,
+        store: &VectorStore<T>,
         data: &[T],
         knbn: usize,
         ef_arg: usize,
@@ -1356,7 +1450,13 @@ where
         if self.origin_ids.is_empty() {
             return Vec::new();
         }
-        traverse::search(self, data, knbn, ef_arg, filter)
+        traverse::search(&self.bound(store), data, knbn, ef_arg, filter)
+    }
+
+    /// This graph with its store, which is what a traversal reads.
+    #[inline]
+    pub(in crate::graph) fn bound<'a>(&'a self, store: &'a VectorStore<T>) -> Bound<'a, T, D> {
+        Bound { graph: self, store }
     }
 
     /// One node's adjacency as a dump records it, being every list from layer
@@ -1374,7 +1474,7 @@ where
         }
         let lists = self.span(node) + 1;
         for (layer, list) in out.iter_mut().enumerate().take(lists) {
-            let targets = self.neighbours(node, layer);
+            let targets = self.neighbours_at(node, layer);
             let dists = self.distances(node, layer);
             list.reserve(targets.len());
             for (&target, &distance) in targets.iter().zip(dists) {
@@ -1387,7 +1487,19 @@ where
     }
 }
 
-impl<T, D> Topology for MutableGraph<T, D>
+/// The graph together with the store it is addressed against.
+///
+/// The graph holds links, levels and origin ids and no vectors at all, so a
+/// traversal needs both. This pairs them for the length of one operation, which
+/// is the whole of what design B costs at a distance evaluation: one load of
+/// the store's base pointer, which the optimiser hoists out of the neighbour
+/// loop, and then the same multiply and slice the arena used.
+pub(in crate::graph) struct Bound<'a, T, D> {
+    pub(in crate::graph) graph: &'a MutableGraph<T, D>,
+    pub(in crate::graph) store: &'a VectorStore<T>,
+}
+
+impl<T, D> Topology for Bound<'_, T, D>
 where
     T: Clone + Send + Sync,
     D: Distance<T> + Send + Sync,
@@ -1396,35 +1508,34 @@ where
     type Dist = D;
 
     fn distance(&self) -> &D {
-        &self.dist_f
+        self.graph.distance()
     }
 
     fn nb_points(&self) -> usize {
-        self.origin_ids.len()
+        self.graph.nb_points()
     }
 
     fn entry(&self) -> u32 {
-        self.entry
+        self.graph.entry()
     }
 
     fn entry_level(&self) -> u8 {
-        self.entry_level
+        self.graph.entry_level()
     }
 
     #[inline]
     fn layer_len(&self, layer: usize) -> usize {
-        self.layer_counts[layer] as usize
+        self.graph.layer_len(layer)
     }
 
     #[inline]
     fn vector(&self, node: u32) -> &[T] {
-        let at = node as usize * self.dim;
-        &self.data[at..at + self.dim]
+        self.store.get(node)
     }
 
     #[inline]
     fn origin_id(&self, node: u32) -> usize {
-        self.origin_ids[node as usize]
+        self.graph.origin_ids[node as usize]
     }
 
     /// The neighbour list of one node at one layer.
@@ -1443,11 +1554,7 @@ where
     /// read them here.
     #[inline]
     fn neighbours(&self, node: u32, layer: usize) -> &[u32] {
-        match self.slice_of(node, layer) {
-            Some((at, len, false)) => &self.base_targets[at..at + len],
-            Some((at, len, true)) => &self.upper_targets[at..at + len],
-            None => &[],
-        }
+        self.graph.neighbours_at(node, layer)
     }
 }
 
@@ -1516,6 +1623,7 @@ impl DumpOrder {
 /// makes share one counting sort rather than repeating it.
 pub(super) struct DumpView<'a, T, D> {
     graph: &'a MutableGraph<T, D>,
+    store: &'a VectorStore<T>,
     order: DumpOrder,
 }
 
@@ -1525,10 +1633,11 @@ where
     D: Distance<T> + Send + Sync,
 {
     /// This graph as a dump source.
-    pub(super) fn dump_view(&self) -> DumpView<'_, T, D> {
+    pub(super) fn dump_view<'a>(&'a self, store: &'a VectorStore<T>) -> DumpView<'a, T, D> {
         DumpView {
             order: DumpOrder::of(self),
             graph: self,
+            store,
         }
     }
 }
@@ -1599,7 +1708,7 @@ where
         f: &mut dyn FnMut(&[T]) -> Result<(), String>,
     ) -> Result<(), String> {
         for &node in self.order.layer(layer) {
-            f(self.graph.vector(node))?;
+            f(self.store.get(node))?;
         }
         Ok(())
     }

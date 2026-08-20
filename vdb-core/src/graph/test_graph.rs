@@ -16,12 +16,14 @@
 
 use super::levels::LevelGenerator;
 use super::mutable::MutableGraph;
+use super::store::VectorStore;
 use super::traverse::LAYERS;
 use super::Distance;
 
 /// One built graph, and the level stream it was built from.
 pub(crate) struct TestGraph<T, D> {
     graph: MutableGraph<T, D>,
+    store: VectorStore<T>,
 }
 
 impl<T, D> TestGraph<T, D>
@@ -38,12 +40,13 @@ where
         let dim = data.first().map_or(1, Vec::len);
         let scale = LevelGenerator::default_scale(m);
         let mut levels = LevelGenerator::new(scale, LAYERS);
-        let mut graph = MutableGraph::new(dim, m, ef_construction, scale, data.len().max(1), dist)
-            .expect("the test parameters are inside the range MutableGraph::new accepts");
+        let (mut graph, mut store) =
+            MutableGraph::new(dim, m, ef_construction, scale, data.len().max(1), dist)
+                .expect("the test parameters are inside the range MutableGraph::new accepts");
         for (id, values) in data.iter().enumerate() {
-            graph.insert(values.as_slice(), id, &mut levels);
+            graph.insert(&mut store, values.as_slice(), id, &mut levels);
         }
-        TestGraph { graph }
+        TestGraph { graph, store }
     }
 
     /// Points in the graph.
@@ -55,7 +58,7 @@ where
     /// returned them.
     pub(crate) fn page(&self, query: &[T], knbn: usize, ef: usize) -> Vec<(usize, f32)> {
         self.graph
-            .search(query, knbn, ef, None::<&fn(&usize) -> bool>)
+            .search(&self.store, query, knbn, ef, None::<&fn(&usize) -> bool>)
             .into_iter()
             .map(|hit| (hit.internal_id, hit.distance))
             .collect()
