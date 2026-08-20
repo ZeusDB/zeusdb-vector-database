@@ -697,8 +697,8 @@ storage_mode_description: raw_only
 | `raw_vectors_stored`, `quantized_codes_stored` | Records held at full width, and records held as codes |
 | `storage_mode`, `storage_mode_description`, `storage_strategy` | What the index is storing and serving |
 | `thread_safety` | The locking the index uses |
-| `graph_memory_mb` | The HNSW graph |
-| `raw_vectors_memory_mb` | The raw vector store |
+| `graph_memory_mb` | The HNSW graph, being the neighbour lists and, on a quantized index, the codes it scores against. It holds no raw vector |
+| `raw_vectors_memory_mb` | The raw vectors, which are held once |
 | `quantized_codes_memory_mb` | The codes, which grow with the record count |
 | `codebook_memory_mb`, `sdc_table_memory_mb` | The trained tables, fixed by `dim`, `subvectors` and `bits` |
 | `index_bookkeeping_memory_mb` | The hash tables that find a record |
@@ -708,7 +708,15 @@ storage_mode_description: raw_only
 
 On a quantized index it also carries `quantization_active`, `quantization_trained`, `quantization_compression_ratio`, `quantization_training_size`, `training_progress`, `training_threshold_reached`, `training_vectors_needed`, `raw_vectors_retained` and the rerank calibration keys below.
 
-**`total_memory_mb` is not the resident set and it does not claim to be.** It prices the six structures the index asked the allocator for, and leaves out what the allocator takes to hold them. Measured on three loaded indexes of 50,000 real 1,536-dimensional embeddings, it accounts for 0.88 of resident memory with no quantization, 0.88 under `quantized_with_raw` and 0.66 under `quantized_only`. Size infrastructure from the resident figure rather than from this one.
+**`total_memory_mb` is what the index asked the allocator for, not what the process holds.** Either can be the larger. An arena reserved and not yet written is asked for and not resident, and the allocator's own bookkeeping is resident and not asked for. Measured on 50,000 real 1,536-dimensional embeddings, one index per interpreter, against the resident set delta across the build:
+
+| mode | reported | resident | reported / resident |
+|---|---:|---:|---:|
+| no quantization | 347.90 MiB | 334.43 MiB | 1.04 |
+| `quantized_with_raw` | 348.01 | 361.70 | 0.96 |
+| `quantized_only` | 55.04 | 69.12 | 0.80 |
+
+**Size infrastructure from the resident figure rather than from this one.** The gap is widest under `quantized_only`, where the fixed tables and the hash tables that find a record are most of what is left.
 
 `index_bookkeeping_memory_mb` is proportional to the record count and independent of the dimension. It is not independent of the metadata, because the per-record metadata map is one of the tables it counts.
 
@@ -1066,7 +1074,7 @@ Going lower than 128x costs memory and build time and buys nothing on recall unt
 
 `create()` emits a `UserWarning` when the configuration looks unbalanced, for example when the compression ratio exceeds 50x, and another when `storage_mode` is `quantized_with_raw`. The ratio warning does not fire on a `subvectors` the library derived, only on one you passed.
 
-It also warns when the configuration cannot repay its fixed memory at the `expected_size` you declared, naming the record count above which quantization starts saving. Raise `expected_size` if your estimate was low, or drop `quantization_config`. A separate warning fires when `expected_size` is below `training_size`, because an index that never reaches its training threshold never trains.
+It also warns when `quantized_only` cannot repay its fixed memory at the `expected_size` you declared, naming the record count above which it starts saving. Raise `expected_size` if your estimate was low, or drop `quantization_config`. `quantized_with_raw` has no such record count, because it holds more than an unquantized index at every one, and the warning that names the mode says so. A separate warning fires when `expected_size` is below `training_size`, because an index that never reaches its training threshold never trains.
 
 <br/>
 
@@ -1177,7 +1185,7 @@ index = vdb.create(
 | Mode | What it stores | Rerank available | Memory |
 |------|----------------|------------------|--------|
 | `quantized_only` | Codes for every record; the raw vectors collected for training are released when training completes | No | Lowest of the three |
-| `quantized_with_raw` | Codes and raw vectors for every record | Yes | Between the two. Measured at 0.69x an unquantized index at 10,000 records of `dim=768` and 0.59x at 100,000, at the default `subvectors` |
+| `quantized_with_raw` | Codes and raw vectors for every record | Yes | Highest of the three. It adds the codes and the trained tables to everything an unquantized index holds |
 
 Two consequences of `quantized_only` are worth knowing before you pick it.
 
@@ -1216,20 +1224,18 @@ contains doc_2000 (added after training): True
 get_records doc_2000 returns: 1 record
 ```
 
-**How much quantization saves is set by the dimension, and below `dim=256` it is not much.** Measured resident, one dimension per process, 25,000 records at `m=32`, an unquantized index and a `quantized_with_raw` one built over the same records:
+**`quantized_only` is the memory mode and `quantized_with_raw` is the accuracy mode.** A raw vector is held once, in a store the graph is handed. `quantized_only` replaces it with a code and holds a second code in the map that finds a record by id, so it saves `dim × 4 - 2 × subvectors` bytes per record against a codebook and a centroid distance table it holds whatever the record count. `quantized_with_raw` keeps the raw vector and adds both codes and both tables to it, so it holds more than an unquantized index at every record count.
 
-| dim | unquantized | `quantized_with_raw` | ratio | saving |
-|---:|---:|---:|---:|---:|
-| 64 | 75.7 MiB | 73.4 MiB | 0.97x | 3% |
-| 96 | 83.4 | 73.8 | 0.88x | 12% |
-| 128 | 89.7 | 75.0 | 0.84x | 16% |
-| 192 | 102.6 | 82.7 | 0.81x | 19% |
-| 256 | 115.5 | 88.2 | 0.76x | 24% |
-| 384 | 140.5 | 105.8 | 0.75x | 25% |
-| 768 | 216.1 | 151.5 | 0.70x | 30% |
-| 1,536 | 369.6 | 236.0 | 0.64x | 36% |
+Measured resident, one index per interpreter, 50,000 records of real embeddings in each mode over the same data:
 
-`create()` warns when the saving falls below a fifth of what an unquantized index holds, which is `dim=235` for `quantized_with_raw` and `dim=88` for `quantized_only`. It also warns below the record count where quantization repays its fixed tables, which is a few thousand records at `dim=256` and under two thousand at `dim=768`. Below that, quantization costs memory rather than saving it.
+| dataset | dim | unquantized | `quantized_only` | `quantized_with_raw` |
+|---|---:|---:|---:|---:|
+| dbpedia-openai | 1,536 | 334.4 MiB | 69.1 MiB, 0.21x | 361.7 MiB, 1.08x |
+| sift-128 | 128 | 66.6 MiB | 50.5 MiB, 0.76x | 76.1 MiB, 1.14x |
+
+**Pick `quantized_only` when memory is the constraint and `quantized_with_raw` when accuracy is.** What `quantized_only` saves is set by the share of a record that is the vector, and that share falls with the dimension: 37% at `dim=128` and 88% at `dim=1,536` on the rows above. `get_stats()` prices your own index on your own records, which is the figure to size against.
+
+`create()` warns when `quantized_only` cannot repay its fixed tables at the `expected_size` you declared, naming the record count above which it starts saving. Raise `expected_size` if your estimate was low, or drop `quantization_config`. `quantized_with_raw` never repays them, so it gets the warning that names the mode instead.
 
 <br/>
 
@@ -1281,14 +1287,14 @@ An index trained before the calibration existed, and any index loaded from a dir
 | 50,000 | 554 | 1.17 ms | 1.54 ms | 1.32 |
 | 100,000 | 747 | 1.18 ms | 2.12 ms | 1.79 |
 
-Each row is one process building both indexes over the same records, so the ratio is the figure to read. Quantization remains a memory decision. At 100,000 records of `dim=768` the default holds 585 MB against 994 MB unquantized and answers in 13.4 ms against 3.05 ms. Lower `rerank` explicitly if query time matters more to you than recall, and measure what it costs you.
+Each row is one process building both indexes over the same records, so the ratio is the figure to read. Quantization remains a memory decision that costs query time. Lower `rerank` explicitly if query time matters more to you than recall, and measure what it costs you.
 
 **`ef_search` does nothing on a reranked quantized search.** The graph traversal widens to the number of candidates the fetch asks for, which is already wider than any `ef_search` a caller is likely to set, and setting it smaller is discarded. Change `rerank` instead. On an unquantized search, and on a quantized search with `rerank=0`, `ef_search` applies normally.
 
 ### 📊 Performance Characteristics
 
 - **Training**: happens once, on the `add()` call that reaches `training_size`. That call takes noticeably longer than the others. On `quantized_with_raw` it also calibrates the rerank fetch, which `get_stats()["rerank_calibration_ms"]` prices.
-- **Memory**: a record's code is `subvectors` bytes against `dim × 4` for a raw vector, and the graph holds a second copy of every point that shrinks by the same factor. How much that saves is set by the dimension, and the table in Storage modes prices it from `dim=64` to `dim=1536`.
+- **Memory**: a record's code is `subvectors` bytes against `dim × 4` for a raw vector, and a raw vector is held once. `quantized_only` saves and `quantized_with_raw` costs. The table in Storage modes prices both at `dim=128` and `dim=1,536`.
 - **Search speed**: an unreranked quantized search is faster than a raw search. A reranked one is slower above roughly 10,000 records, and the table above prices it.
 - **Build speed**: a quantized build is faster than an unquantized one, and it slows as `subvectors` rises. At 100,000 records of `dim=768` it is 137 s against 231 s at the default `subvectors`.
 - **Accuracy**: see the tables above. Treat quantization as a memory decision that costs accuracy and query time, not as a free win.

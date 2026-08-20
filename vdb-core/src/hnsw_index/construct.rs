@@ -43,6 +43,127 @@ use tracing::{debug, error, info, instrument, trace};
 /// The bound is not a guarantee. A machine whose commit limit is below the
 /// reservation can still abort at a declaration under it.
 const MAX_EXPECTED_SIZE: usize = 100_000_000;
+
+/// Every rule a valid index declaration has to satisfy, returning the
+/// normalised space.
+///
+/// Extracted from `build` so that the loader enforces the same rules on the
+/// same values rather than a copy of them. `build` takes its declaration from
+/// a caller and `load_config` takes it from `config.json`, and a directory is
+/// only trusted to the extent that something checked it: a config naming a
+/// zero `dim` or a zero `m` used to reach `Backend::sized`, which clamps both
+/// silently, so the index came back at a width or a degree the directory never
+/// held. The messages are the ones `build` raised, because the invalid value is
+/// the same value whichever door it came through.
+///
+/// `source` prefixes every message and is empty for `build`, whose caller is
+/// looking at the argument they passed. The loader passes the path of the file
+/// the value came out of, because a caller reading `dim must be positive` off a
+/// `load()` has no argument of their own to look at.
+pub(crate) fn validate_index_parameters(
+    dim: usize,
+    space: &str,
+    m: usize,
+    ef_construction: usize,
+    expected_size: usize,
+    source: &str,
+) -> PyResult<String> {
+    if dim == 0 {
+        error!(
+            operation = "validation",
+            field = "dim",
+            value = dim,
+            "Invalid dimension"
+        );
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "{}dim must be positive, got {}",
+            source, dim
+        )));
+    }
+    if ef_construction == 0 {
+        error!(
+            operation = "validation",
+            field = "ef_construction",
+            value = ef_construction,
+            "Invalid ef_construction"
+        );
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "{}ef_construction must be positive, got {}",
+            source, ef_construction
+        )));
+    }
+    if expected_size == 0 {
+        error!(
+            operation = "validation",
+            field = "expected_size",
+            value = expected_size,
+            "Invalid expected_size"
+        );
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "{}expected_size must be positive, got {}",
+            source, expected_size
+        )));
+    }
+    if expected_size > MAX_EXPECTED_SIZE {
+        error!(
+            operation = "validation",
+            field = "expected_size",
+            value = expected_size,
+            max_allowed = MAX_EXPECTED_SIZE,
+            "expected_size exceeds maximum"
+        );
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "{}expected_size must be at most {}, got {}. The graph reserves one \n             slot per declared record at creation, 8 bytes each, so this \n             declaration would ask for {:.1} GB before a single record is \n             added. That allocation is not fallible: above this bound the \n             process aborts rather than raising. expected_size is a capacity \n             hint and not a limit, and under-declaring only costs some \n             reallocation, so declare what you expect to hold.",
+            source,
+            MAX_EXPECTED_SIZE,
+            expected_size,
+            (expected_size as f64 * 8.0) / 1_000_000_000.0
+        )));
+    }
+    if m < 2 {
+        error!(
+            operation = "validation",
+            field = "m",
+            value = m,
+            min_allowed = 2,
+            "m below minimum"
+        );
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "{}m must be at least 2, got {}. Layer assignment samples from a \n             scale of 1 / ln(m), which is infinity at m 1, so every point \n             overflows the layer cap and is redispatched uniformly across all \n             16 layers instead of following the exponential distribution the \n             graph depends on. Measured on 3,000 records of 32 dimensions, \n             recall at 10 was 0.0220 at m 1 against 0.6880 at m 2 and 1.0000 \n             at m 16.",
+            source, m
+        )));
+    }
+    if m > 256 {
+        error!(
+            operation = "validation",
+            field = "m",
+            value = m,
+            max_allowed = 256,
+            "m exceeds maximum"
+        );
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "{}m must be less than or equal to 256, got {}",
+            source, m
+        )));
+    }
+
+    // Early space validation with user-friendly error
+    let space_normalized = space.to_lowercase();
+    match space_normalized.as_str() {
+        "cosine" | "l2" | "l1" => {
+            debug!(operation = "validation", space = %space_normalized, "Distance space validated");
+        }
+        _ => {
+            error!(operation = "validation", field = "space", value = %space, "Unsupported distance space");
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "{}Unsupported space: '{}'. Supported spaces: 'cosine', 'l2', 'l1'",
+                source, space
+            )));
+        }
+    }
+    Ok(space_normalized)
+}
+
 impl HNSWIndex {
     #[instrument(level = "info", skip(quantization_config), fields(
         dim = dim,
@@ -62,107 +183,11 @@ impl HNSWIndex {
     ) -> PyResult<Self> {
         let start_time = Instant::now();
 
-        // Validation of parameters
-        if dim == 0 {
-            error!(
-                operation = "validation",
-                field = "dim",
-                value = dim,
-                "Invalid dimension"
-            );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "dim must be positive",
-            ));
-        }
-        if ef_construction == 0 {
-            error!(
-                operation = "validation",
-                field = "ef_construction",
-                value = ef_construction,
-                "Invalid ef_construction"
-            );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "ef_construction must be positive",
-            ));
-        }
-        if expected_size == 0 {
-            error!(
-                operation = "validation",
-                field = "expected_size",
-                value = expected_size,
-                "Invalid expected_size"
-            );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "expected_size must be positive",
-            ));
-        }
-        if expected_size > MAX_EXPECTED_SIZE {
-            error!(
-                operation = "validation",
-                field = "expected_size",
-                value = expected_size,
-                max_allowed = MAX_EXPECTED_SIZE,
-                "expected_size exceeds maximum"
-            );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "expected_size must be at most {}, got {}. The graph reserves one \
-                 slot per declared record at creation, 8 bytes each, so this \
-                 declaration would ask for {:.1} GB before a single record is \
-                 added. That allocation is not fallible: above this bound the \
-                 process aborts rather than raising. expected_size is a capacity \
-                 hint and not a limit, and under-declaring only costs some \
-                 reallocation, so declare what you expect to hold.",
-                MAX_EXPECTED_SIZE,
-                expected_size,
-                (expected_size as f64 * 8.0) / 1_000_000_000.0
-            )));
-        }
-        if m < 2 {
-            error!(
-                operation = "validation",
-                field = "m",
-                value = m,
-                min_allowed = 2,
-                "m below minimum"
-            );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "m must be at least 2, got {}. Layer assignment samples from a \
-                 scale of 1 / ln(m), which is infinity at m 1, so every point \
-                 overflows the layer cap and is redispatched uniformly across all \
-                 16 layers instead of following the exponential distribution the \
-                 graph depends on. Measured on 3,000 records of 32 dimensions, \
-                 recall at 10 was 0.0220 at m 1 against 0.6880 at m 2 and 1.0000 \
-                 at m 16.",
-                m
-            )));
-        }
-        if m > 256 {
-            error!(
-                operation = "validation",
-                field = "m",
-                value = m,
-                max_allowed = 256,
-                "m exceeds maximum"
-            );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "m must be less than or equal to 256",
-            ));
-        }
-
-        // Early space validation with user-friendly error
-        let space_normalized = space.to_lowercase();
-        match space_normalized.as_str() {
-            "cosine" | "l2" | "l1" => {
-                debug!(operation = "validation", space = %space_normalized, "Distance space validated");
-            }
-            _ => {
-                error!(operation = "validation", field = "space", value = %space, "Unsupported distance space");
-                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Unsupported space: '{}'. Supported spaces: 'cosine', 'l2', 'l1'",
-                    space
-                )));
-            }
-        }
+        // Validation of parameters. The rules live in
+        // `validate_index_parameters`, which the loader calls on the same
+        // five values it reads out of `config.json`.
+        let space_normalized =
+            validate_index_parameters(dim, &space, m, ef_construction, expected_size, "")?;
 
         // Extract quantization configuration
         let (quantization_params, pq_instance) = if let Some(config) = quantization_config {

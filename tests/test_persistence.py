@@ -460,10 +460,10 @@ def test_persistence_quantized_with_raw_round_trip(tmp_path):
     # The warning used to quote the compression ratio as a memory multiplier,
     # and this asserted the 8.0x it printed. The ratio between the two storage
     # modes is a different quantity that depends on the record count, so the
-    # warning no longer quotes one.
+    # warning no longer quotes one. It now opens by naming what the mode is for.
     with pytest.warns(UserWarning,
-                      match=r"storage_mode='quantized_with_raw' keeps a raw vector "
-                            r"for every record"):
+                      match=r"storage_mode='quantized_with_raw' is the accuracy "
+                            r"mode rather than the memory mode"):
         index = vdb.create("hnsw", dim=8,
                            quantization_config=_pq_config("quantized_with_raw"),
                            expected_size=2000)
@@ -1041,6 +1041,86 @@ def test_persistence_load_failure_modes(tmp_path):
     not_a_dir.write_text("x", encoding="utf-8")
     with pytest.raises(FileNotFoundError, match="Failed to read manifest.json"):
         vdb.load(str(not_a_dir))
+
+# ------------------------------------------------------------
+# Test 120: config.json is validated at the load
+# ------------------------------------------------------------
+def test_load_validates_the_declaration_in_config_json(tmp_path):
+    """The five values create() validates are validated on the way back in too.
+
+    Parsing proved config.json was JSON of the right shape and stopped there.
+    dim, m, ef_construction, expected_size and space went from the file into
+    new_empty, which validates nothing, and on into Backend::sized, which
+    clamps dim up to 1, m into 2 to 256 and expected_size up to 1 in silence.
+    A directory naming m 0 came back as an index at m 2, and one naming an
+    unknown space came back scoring cosine whatever it was saved with. A zero
+    dim was refused, but by a later check comparing a record against the
+    declared width, so the message named a record rather than the config.
+
+    Every message is the one create() raises for the same value, with the path
+    of the file in front of it.
+    """
+    vdb = VectorDatabase()
+    good = tmp_path / "good.zdb"
+    index = vdb.create("hnsw", dim=4, space="l2", m=8, ef_construction=64,
+                       expected_size=100)
+    for i in range(5):
+        index.add({"id": f"r{i}", "values": [float(i), 0.5, 0.25, 0.125],
+                   "metadata": {}})
+    index.save(str(good))
+
+    # The directory as written still opens, and opens as what it was saved as.
+    reopened = vdb.load(str(good))
+    stats = reopened.get_stats()
+    assert (int(stats["dimension"]), stats["space"], int(stats["m"]),
+            int(stats["ef_construction"]), int(stats["expected_size"])) == (
+        4, "l2", 8, 64, 100)
+    assert reopened.get_vector_count() == 5
+
+    def corrupted(name, field, value):
+        target = tmp_path / name
+        shutil.copytree(good, target)
+        config = json.loads((target / "config.json").read_text(encoding="utf-8"))
+        config[field] = value
+        (target / "config.json").write_text(json.dumps(config, indent=2),
+                                            encoding="utf-8")
+        return str(target)
+
+    # A zero in any of the three that must be positive.
+    with pytest.raises(ValueError, match=r"config\.json: dim must be positive, got 0"):
+        vdb.load(corrupted("dim0.zdb", "dim", 0))
+    with pytest.raises(ValueError,
+                       match=r"config\.json: ef_construction must be positive, got 0"):
+        vdb.load(corrupted("ef0.zdb", "ef_construction", 0))
+    with pytest.raises(ValueError,
+                       match=r"config\.json: expected_size must be positive, got 0"):
+        vdb.load(corrupted("es0.zdb", "expected_size", 0))
+
+    # m outside the range the graph accepts, at both ends. Backend::sized
+    # clamped both without saying so.
+    with pytest.raises(ValueError, match=r"config\.json: m must be at least 2, got 1"):
+        vdb.load(corrupted("m1.zdb", "m", 1))
+    with pytest.raises(ValueError,
+                       match=r"config\.json: m must be less than or equal to 256, got 300"):
+        vdb.load(corrupted("m300.zdb", "m", 300))
+
+    # An expected_size above the cap, which create() refuses because the layer
+    # reservation is not fallible.
+    with pytest.raises(ValueError,
+                       match=r"config\.json: expected_size must be at most 100000000"):
+        vdb.load(corrupted("esbig.zdb", "expected_size", 200_000_000))
+
+    # A space this build does not know. new_raw fell back to cosine and logged
+    # it, so an l2 index came back answering cosine distances.
+    with pytest.raises(RuntimeError,
+                       match=r"config\.json: Unsupported space: 'euclidean'"):
+        vdb.load(corrupted("space.zdb", "space", "euclidean"))
+
+    # A valid value that merely differs still opens, so the check refuses bad
+    # declarations rather than unfamiliar ones.
+    reopened = vdb.load(corrupted("l1.zdb", "space", "l1"))
+    assert reopened.get_stats()["space"] == "l1"
+    assert reopened.get_vector_count() == 5
 
 # ------------------------------------------------------------
 # Test 100: a saved directory holding a non-finite value fails loudly

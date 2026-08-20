@@ -193,24 +193,28 @@ class VectorDatabase:
                     'bits': 8,                 # Bits per subvector (1-8, controls centroids, default: 8)
                     'training_size': None,     # Auto-calculated based on subvectors & bits (or specify manually)
                     'max_training_vectors': None,  # Optional limit on training vectors used
-                    'storage_mode': 'quantized_only' # Storage mode for quantized vectors (or 'quantized_with_raw')  
+                    'storage_mode': 'quantized_only' # 'quantized_only' for memory, 'quantized_with_raw' for accuracy
                 }
 
             Note: Quantization replaces each vector with a code of one byte per
             subvector, so the code is dim * 4 / subvectors smaller than the vector.
-            The memory an index saves is smaller than that, because the codebook
-            and the centroid distance table are held whatever the record count.
-            A record is held twice, once in a storage map and once inside the
-            graph, and both storage modes replace the graph's copy, so both hold
-            less than an unquantized index above their break even record count.
+            'quantized_only' is the memory mode and 'quantized_with_raw' is the
+            accuracy mode. A raw vector is held once, in a store the graph is
+            handed rather than owns. 'quantized_only' replaces it with a code and
+            holds a second code in the map keyed by external id, saving
+            dim * 4 - 2 * subvectors bytes a record against a codebook and a
+            centroid distance table held whatever the record count.
+            'quantized_with_raw' keeps the raw vector and adds both codes and
+            both tables to it, so it holds more than an unquantized index at
+            every record count and has no break even.
             Under 'quantized_only' the records collected for training are held at
             full width only until training completes, then released. get_stats()
             reports the codes, the raw vectors, the codebook, the centroid
             distance table, the graph and the hash tables that find a record,
             and sums them under total_memory_mb. That sum is what the index
-            asked the allocator for rather than what the process holds, since
-            the allocator's own headers and its rounding sit outside it at
-            between 1,200 and 2,100 bytes a record. Recall falls sharply,
+            asked the allocator for rather than what the process holds, and
+            either can be the larger, since an arena reserved and not yet written
+            is asked for and not resident. Recall falls sharply,
             not slightly. Only 'quantized_with_raw' can recover it, by reranking
             against the raw vectors it keeps. Training triggers automatically on
             the first .add() call that reaches the training_size threshold, and
@@ -442,46 +446,56 @@ class VectorDatabase:
         
         validated_config['storage_mode'] = storage_mode
 
-        # Calculate and warn about memory usage
-        self._check_memory_usage(validated_config, dim, expected_size,
-                                 subvectors_was_derived)
+        # Calculate and warn about memory usage. It returns whether this
+        # configuration will ever train at its declared size, which the storage
+        # mode warning below needs, because a mode warning describing what a
+        # trained index holds describes a state an untrained one never reaches.
+        never_trains = self._check_memory_usage(validated_config, dim, expected_size,
+                                                subvectors_was_derived)
 
-        # Warn about the memory cost of keeping raw vectors.
+        # Say what the mode is for, and what it costs.
         #
-        # This used to quote the compression ratio as a memory multiplier. The
-        # two are different quantities. The compression ratio is the size of a
-        # code against the size of the vector it replaces, while the ratio
-        # between the modes also depends on the codebook, on the centroid
-        # distance table and on the graph, which both modes hold identically.
-        # It moves with the record count, which is not known here.
+        # Three earlier versions of this warning each got the memory wrong in a
+        # different way. It quoted the compression ratio as a memory multiplier,
+        # which is a different quantity. Then it said the mode drops nothing.
+        # Then it said the mode drops the graph's own copy of every point, and
+        # quoted 0.69 times an unquantized index at 10,000 records of dimension
+        # 768 and 0.59 times at 100,000.
         #
-        # The mode does not remove nothing. The HNSW graph owns its own copy of
-        # every point, and under quantization that copy is subvectors bytes
-        # where an unquantized graph holds dim * 4. quantized_with_raw drops
-        # that copy exactly as quantized_only does, and keeps only the vectors
-        # map at full width, so above its break even it holds less than an
-        # unquantized index rather than more. Measured at dimension 768 and the
-        # derived subvectors it is 0.69 times an unquantized index at 10,000
-        # records and 0.59 times at 100,000, and at 8 subvectors 0.60 and 0.47.
-        # _check_memory_usage now runs the break even arithmetic for both modes.
-        if storage_mode == 'quantized_with_raw':
+        # The graph has no copy of its own. A raw vector is held once, in a
+        # store the graph is handed, and quantized_with_raw keeps that store and
+        # adds the codes and the trained tables to it. Every term is an
+        # addition, so the mode holds more than an unquantized index at every
+        # record count and there is no break even to name.
+        #
+        # The figures below are exact from this configuration rather than
+        # measured on somebody else's corpus, which is what every superseded
+        # version quoted. A ratio needs the graph's neighbour lists in the
+        # denominator and those are data dependent; these two terms are not.
+        #
+        # Suppressed where the configuration never trains, because then no
+        # codebook is built, no code is stored and the index holds exactly what
+        # an unquantized one holds. _check_memory_usage has already said so, and
+        # that is the problem to fix first.
+        if storage_mode == 'quantized_with_raw' and not never_trains:
             import warnings
+            fixed_mb = (self._fixed_quantization_bytes(dim, subvectors, bits)
+                        / (1024 * 1024))
             warnings.warn(
-                "storage_mode='quantized_with_raw' keeps a raw vector for every record "
-                "as well as its code, so it uses more memory than 'quantized_only'. It "
-                "uses less than an unquantized index above the break even record count, "
-                "because the graph holds a code of "
-                f"{subvectors} bytes per record where an unquantized graph holds "
-                f"{dim * 4}. Measured at dimension 768 and the derived subvectors it "
-                "holds 0.69 times an unquantized index at 10,000 records and 0.59 "
-                "times at 100,000. "
-                "get_stats() reports the memory the codes, the raw vectors, the codebook, "
-                "the centroid distance table, the graph and the index bookkeeping hold "
-                "once records are loaded, "
-                "and sums them under total_memory_mb. This mode is required for rerank "
-                "and for exact vector reconstruction.",
+                "storage_mode='quantized_with_raw' is the accuracy mode rather than "
+                "the memory mode. It keeps a raw vector for every record as well as "
+                "its code, so it holds everything an unquantized index holds and adds "
+                f"to it: {2 * subvectors} bytes a record for the two copies of the "
+                f"code, and {fixed_mb:.2f}MB of codebook and centroid distance table "
+                "whatever the record count. No record count reverses that. What it "
+                "buys is accuracy. It is the only mode that rescores candidates "
+                "against true vectors, the only one where get_records() returns what "
+                "you inserted, and the only route to 'quantized_only' without "
+                "re-adding every record. Use 'quantized_only' where memory is the "
+                "constraint. get_stats() reports what your own index holds, under "
+                "total_memory_mb.",
                 UserWarning,
-                stacklevel=2
+                stacklevel=3
             )
         
         # Final safety check: ensure all expected keys are present
@@ -610,70 +624,54 @@ class VectorDatabase:
     # the subvector count. It binds above dim 6,144.
     DEFAULT_SUBVECTOR_CEILING = 192
 
-    # Bytes a record costs an index beyond the two copies of its vector
+    # MEASURED_RECORD_OVERHEAD_BYTES, QUANTIZATION_REPAYS_SAVING_SHARE and
+    # _memory_saving_share used to sit here, modelling the share of an
+    # unquantized index that quantization removes. All three are gone, and the
+    # low dimension warning they drove is gone with them.
     #
-    # Fitted from a controlled sweep, one dimension per process, 25,000 records
-    # of clustered data at m 32, an unquantized index and a quantized_with_raw
-    # one built over the same records in the same process, resident set delta
-    # for each. An unquantized index holds every vector twice, once in the
-    # storage map and once inside the graph, so the rest is what this names.
+    # The model had an unquantized record at two copies of its vector, one in a
+    # storage map and one inside the graph, and credited quantized_with_raw
+    # with replacing the graph's copy. There is one copy now, held in a store
+    # the graph is handed rather than owns, so the first half was wrong by a
+    # factor of two and the second half described a saving that does not
+    # happen.
     #
-    #   dim    unquantized  quantized_with_raw  ratio   bytes/record  less 8*dim
-    #    64       75.71 MiB          73.44 MiB  0.970          3,176       2,664
-    #    96       83.36              73.77      0.885          3,496       2,728
-    #   128       89.74              74.96      0.835          3,764       2,740
-    #   192      102.57              82.73      0.807          4,302       2,766
-    #   256      115.47              88.19      0.764          4,843       2,795
-    #   384      140.53             105.82      0.753          5,894       2,822
-    #   768      216.10             151.54      0.701          9,064       2,920
-    # 1,536      369.59             236.02      0.639         15,502       3,214
+    # It was not replaced by a corrected version, because the quantity it
+    # returned cannot be computed from the configuration. The share is
+    # `dim * 4 - 2 * subvectors` over what a record costs in total, and that
+    # total carries the graph's neighbour lists, which are data dependent. On
+    # 50,000 records at m 32 the links and the bookkeeping came to 823 bytes a
+    # record on sift-128 and 1,152 on dbpedia-openai, a spread of 40 percent
+    # between two real corpora at the same record count and the same degree.
+    # The old constant of 2,740 was fitted as the residual after subtracting
+    # two copies of the vector, so it absorbed that spread into a figure that
+    # looked flat.
     #
-    # The last column is flat across a 24 fold range in the dimension, which is
-    # what makes it a per record constant rather than a fit with a slope in it.
-    # It is the graph's neighbour lists at m 32, the two id maps, the metadata
-    # map and the hash map keys.
-    MEASURED_RECORD_OVERHEAD_BYTES = 2740
+    # Under any overhead in that range the share crosses one fifth below dim 64
+    # for quantized_only, which is under every embedding model in use, and it
+    # is negative at every dimension for quantized_with_raw. A gate that cannot
+    # fire on real data and a gate that is meaningless are not worth a fitted
+    # constant, so what survives is the break even arithmetic in
+    # _check_memory_usage. That needs no fitting, because the fixed bytes and
+    # the per record saving are both exact from the configuration alone.
 
-    # The dimension below which quantization does not repay
-    #
-    # Quantization removes the graph's copy of the vector and adds a code in its
-    # place, so under quantized_with_raw the memory it saves per record is
-    # `dim * 4 - 2 * subvectors` bytes against the `dim * 8 + 2,740` an
-    # unquantized index holds. That share is what the table above measures and
-    # it is the whole of what quantization buys at this storage mode.
-    #
-    # The bar is one fifth. Below it a caller pays a rerank fetch of several
-    # hundred candidates on every search for less than a fifth of the memory.
-    #
-    #   saving share = (4 * dim - 2 * subvectors) / (8 * dim + 2,740)
-    #
-    # At the derived subvectors of 8, that reaches one fifth at dim 235.
-    # Interpolating the measured column instead, between 19.34 percent at dim
-    # 192 and 23.63 percent at dim 256, puts it at dim 202. Both sit between
-    # two measured points rather than inside one, which is what makes the
-    # threshold a reading of the sweep rather than a round number.
-    #
-    # quantized_only replaces both copies of the vector rather than one, so its
-    # share is `(8 * dim - 2 * subvectors) / (8 * dim + 2,740)` and it reaches
-    # one fifth at dim 88. The warning is therefore driven by the share and not
-    # by the dimension, and the dimension it fires below is 235 for
-    # quantized_with_raw and 88 for quantized_only.
-    QUANTIZATION_REPAYS_SAVING_SHARE = 0.20
+    @staticmethod
+    def _fixed_quantization_bytes(dim: int, subvectors: int, bits: int) -> int:
+        """Bytes a trained quantizer holds whatever the record count.
 
-    def _memory_saving_share(self, dim: int, subvectors: int,
-                             storage_mode: str) -> float:
-        """The share of an unquantized index's memory quantization removes.
+        The codebook is one centroid set per subvector, each of `2 ** bits`
+        centroids of `dim // subvectors` float32, so `subvectors` cancels and
+        the codebook is `2 ** bits * dim * 4`. The centroid distance table is
+        the strict upper triangle of the pairwise distances within a subvector,
+        being `subvectors * k * (k - 1) / 2` float32 for `k` centroids, because
+        the matrix is symmetric with a zero diagonal.
 
-        From `MEASURED_RECORD_OVERHEAD_BYTES` and the arithmetic recorded on
-        `LOW_DIMENSION_QUANTIZATION_THRESHOLD`. `quantized_only` drops both
-        copies of the vector rather than one, so it saves `dim * 8 - 2 *
-        subvectors` where `quantized_with_raw` saves `dim * 4 - 2 * subvectors`.
-        Neither figure counts the codebook or the centroid distance table,
-        which are fixed and which `_check_memory_usage` prices separately.
+        Both `_check_memory_usage` and the `quantized_with_raw` warning price
+        this, which is why it is a method rather than two copies of the same
+        arithmetic.
         """
-        held = dim * 8 + self.MEASURED_RECORD_OVERHEAD_BYTES
-        replaced = dim * 8 if storage_mode == 'quantized_only' else dim * 4
-        return (replaced - 2 * subvectors) / held
+        k = 2 ** bits
+        return k * dim * 4 + subvectors * (k * (k - 1) // 2) * 4
 
     def _default_subvectors(self, dim: int) -> int:
         """The subvector count an unset `subvectors` resolves to.
@@ -712,9 +710,12 @@ class VectorDatabase:
 
     def _check_memory_usage(self, config: Dict[str, Any], dim: int,
                             expected_size: Any = None,
-                            subvectors_was_derived: bool = False) -> None:
+                            subvectors_was_derived: bool = False) -> bool:
         """
         Warn about the fixed memory and the compression the configuration implies.
+
+        Returns whether the declared size is below `training_size`, so that the
+        caller can suppress a warning describing a trained index.
 
         Every figure here is fixed by the configuration and by the declared
         expected_size. Nothing that depends on the record count the index
@@ -726,6 +727,14 @@ class VectorDatabase:
             dim: Vector dimension
             expected_size: The declared record count, or None to skip the break
                 even check
+
+        Every warning here carries stacklevel=4, because it is raised four
+        frames below the caller: this method, `_validate_quantization_config`,
+        `create` and then the user. It carried 2 until this relay, which
+        attributed every quantization warning to the line inside
+        `_validate_quantization_config` that calls this rather than to the
+        `create()` the caller wrote. `_warn_if_selection_disabled` had the
+        pattern right already, at 3 from one frame higher.
         """
         import warnings
 
@@ -754,7 +763,8 @@ class VectorDatabase:
         k = num_centroids_per_subvector
         sdc_bytes = subvectors * (k * (k - 1) // 2) * 4
         sdc_memory_mb = sdc_bytes / (1024 * 1024)
-        fixed_bytes = centroid_bytes + sdc_bytes
+        fixed_bytes = self._fixed_quantization_bytes(dim, subvectors, bits)
+        assert fixed_bytes == centroid_bytes + sdc_bytes
         fixed_memory_mb = fixed_bytes / (1024 * 1024)
 
         # A code is one byte per subvector whatever bits is, so this is the size
@@ -785,45 +795,38 @@ class VectorDatabase:
                 f"expected_size if the estimate is low, lower training_size, or "
                 f"drop quantization_config.",
                 UserWarning,
-                stacklevel=2
+                stacklevel=4
             )
 
         # Whether the configuration can repay its fixed cost at the size the
         # caller declared.
         #
-        # Both modes hold a record twice, once in a storage map and once inside
-        # the HNSW graph, which owns its own copy of every point. Quantization
-        # replaces a copy of dim * 4 bytes with a code of subvectors bytes, and
-        # the two modes differ in how many of the two copies they replace.
+        # A raw vector is held once, in a store the graph is handed rather than
+        # owns. An unquantized record therefore costs dim * 4 bytes of vector,
+        # and both quantized modes hold two codes of subvectors bytes each, one
+        # in that store and one in the map keyed by external id.
         #
-        # Under quantized_only both copies become codes, because the raw
-        # vectors collected for training are released the moment their codes
-        # are stored. Counting one of the two, and the code it pays for:
-        #
-        #   saved(N) = N * (dim * 4 - subvectors) - fixed_bytes
-        #
-        # That is deliberately conservative. It ignores the second copy the
-        # mode also drops, so it names a record count above the true one and
-        # warns where it need not rather than failing to warn.
-        #
-        # Under quantized_with_raw the storage map keeps every raw vector and
-        # only the graph's copy becomes a code, and the mode pays for two codes
-        # while dropping one copy:
+        # Under quantized_only the vector goes. The records collected for
+        # training are released the moment their codes are stored, so a trained
+        # index holds no vector for any record:
         #
         #   saved(N) = N * (dim * 4 - 2 * subvectors) - fixed_bytes
         #
-        # There is no second copy to leave out of that one, so it is the steady
-        # state figure rather than a conservative one. This mode used to be
-        # excluded here on the claim that it drops nothing and is above an
-        # unquantized index at every record count. It drops the graph's copy,
-        # which at dim 768 is 3,072 bytes per record, and it has a break even
-        # like the other mode.
+        # That is the steady state figure rather than a conservative one. It
+        # read `dim * 4 - subvectors` until this relay, counting one code where
+        # the mode pays for two, which named a record count below the true one.
+        #
+        # quantized_with_raw keeps the vector and adds the codes to it, so its
+        # per record delta is plus 2 * subvectors and its fixed delta is plus
+        # the tables. Both terms are positive and no N turns the sum negative,
+        # so the mode has no break even and does not reach this arithmetic. The
+        # warning that names the mode says so directly instead. It was excluded
+        # here until recently on the claim that it drops nothing, then admitted
+        # on the claim that it drops the graph's own copy of every point. The
+        # graph has no copy of its own to drop.
         break_even = None
-        if storage_mode == 'quantized_only':
-            per_record = original_bytes_per_vector - subvectors
-        else:
-            per_record = original_bytes_per_vector - 2 * subvectors
-        if per_record > 0:
+        per_record = original_bytes_per_vector - 2 * subvectors
+        if storage_mode == 'quantized_only' and per_record > 0:
             break_even = -(-fixed_bytes // per_record)
 
         cannot_pay = (
@@ -842,7 +845,7 @@ class VectorDatabase:
                 f"records. Raise expected_size if the estimate is low, or drop "
                 f"quantization_config.",
                 UserWarning,
-                stacklevel=2
+                stacklevel=4
             )
 
         # Warn about large fixed memory, but only where the configuration does
@@ -862,29 +865,16 @@ class VectorDatabase:
                 f"Reduce bits ({bits}) to lower both, or subvectors ({subvectors}) to "
                 f"lower the table.",
                 UserWarning,
-                stacklevel=2
+                stacklevel=4
             )
 
-        # Warn where the dimension is too low for quantization to repay. The
-        # bar and the arithmetic are on QUANTIZATION_REPAYS_SAVING_SHARE. This
-        # fires alongside the compression warning below rather than instead of
-        # it, because they describe different things, and it is suppressed
-        # where the configuration never trains or cannot pay its fixed cost at
-        # all, both of which are already stated above.
-        saving_share = self._memory_saving_share(dim, subvectors, storage_mode)
-        if (saving_share < self.QUANTIZATION_REPAYS_SAVING_SHARE
-                and not cannot_pay and not never_trains):
-            warnings.warn(
-                f"At dim={dim} a trained {storage_mode} index holds about "
-                f"{saving_share * 100:.0f}% less memory than an unquantized index "
-                f"over the same records, and every search on it fetches and "
-                f"rescores hundreds of candidates. Measured at 25,000 records and "
-                f"m=32, quantized_with_raw holds 0.97 times an unquantized index "
-                f"at dim=64, 0.84 at dim=128, 0.81 at dim=192, 0.76 at dim=256 "
-                f"and 0.64 at dim=1536.",
-                UserWarning,
-                stacklevel=2
-            )
+        # A low dimension warning used to sit here, firing where a model put the
+        # saving below a fifth of what an unquantized index holds. The model is
+        # gone and this went with it; the note where it stood says why. Both
+        # halves of what it was for are still covered. quantized_with_raw is
+        # described by the warning that names the mode, and quantized_only is
+        # covered by the break even warning above, which is exact rather than
+        # modelled.
 
         # A `compression_ratio < 4` branch used to sit here, advising a larger
         # subvectors count for better compression. It could not fire and the
@@ -906,8 +896,10 @@ class VectorDatabase:
                 f"Very high compression ratio: {compression_ratio:.1f}x may significantly impact recall quality. "
                 f"Increase subvectors ({subvectors}) to lower it, at the cost of memory and build time.",
                 UserWarning,
-                stacklevel=2
+                stacklevel=4
             )
+
+        return never_trains
 
     @classmethod
     def available_index_types(cls) -> list[str]:
