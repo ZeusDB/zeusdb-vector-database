@@ -23,6 +23,7 @@ use super::dump::{
 use super::dump::{LoadedEdge, LoadedPoint, PointId, NB_LAYER_MAX};
 use super::levels::{LevelGenerator, DEFAULT_LEVEL_SEED};
 use super::mutable::{reserved_records, MutableGraph, RESERVE_BYTES};
+use super::store::VectorStore;
 use super::traverse::LAYERS;
 use super::{Distance, VectorGraph};
 use crate::distance::DistPQ;
@@ -68,7 +69,12 @@ fn unit_sample_vectors(records: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
 }
 
 /// Build a graph by sequential insertion, which is the shipped build path.
-fn build<T, D>(data: &[Vec<T>], m: usize, ef_construction: usize, dist: D) -> MutableGraph<T, D>
+fn build<T, D>(
+    data: &[Vec<T>],
+    m: usize,
+    ef_construction: usize,
+    dist: D,
+) -> (MutableGraph<T, D>, VectorStore<T>)
 where
     T: Clone + Send + Sync,
     D: Distance<T> + Send + Sync,
@@ -76,23 +82,28 @@ where
     let dim = data.first().map_or(1, Vec::len);
     let scale = LevelGenerator::default_scale(m);
     let mut levels = LevelGenerator::new(scale, LAYERS);
-    let mut graph = MutableGraph::new(dim, m, ef_construction, scale, data.len().max(1), dist)
-        .expect("the fixture parameters are inside the accepted range");
+    let (mut graph, mut store) =
+        MutableGraph::new(dim, m, ef_construction, scale, data.len().max(1), dist)
+            .expect("the fixture parameters are inside the accepted range");
     for (id, values) in data.iter().enumerate() {
-        graph.insert(values.as_slice(), id, &mut levels);
+        graph.insert(&mut store, values.as_slice(), id, &mut levels);
     }
-    graph
+    (graph, store)
 }
 
 /// Round a built graph through the dump writer and reader, which is the
 /// topology source the production loader uses, and hand the parse back.
-fn parsed_topology<T, D>(graph: &MutableGraph<T, D>, kind: GraphKind) -> ParsedDump<T>
+fn parsed_topology<T, D>(
+    graph: &MutableGraph<T, D>,
+    store: &VectorStore<T>,
+    kind: GraphKind,
+) -> ParsedDump<T>
 where
     T: Clone + Send + Sync + DumpElement,
     D: Distance<T> + Send + Sync,
 {
     let dir = tempfile::tempdir().unwrap();
-    write_dump(&graph.dump_view(), kind, dir.path()).unwrap();
+    write_dump(&graph.dump_view(store), kind, dir.path()).unwrap();
     let expected = Expected {
         kind,
         dimension: graph.dim(),
@@ -111,8 +122,8 @@ where
 #[test]
 fn the_mutable_graph_keeps_the_construction_parameters() {
     let data = sample_vectors(300, 8, 0x78_0a);
-    let built = build(&data, 24, 80, CosineDist {});
-    let parsed = parsed_topology(&built, GraphKind::Cosine);
+    let (built, built_store) = build(&data, 24, 80, CosineDist {});
+    let parsed = parsed_topology(&built, &built_store, GraphKind::Cosine);
     let entry = parsed.entry;
     let scale = parsed.level_scale;
     let mutable = MutableGraph::from_loaded(
@@ -123,7 +134,8 @@ fn the_mutable_graph_keeps_the_construction_parameters() {
         scale,
         CosineDist {},
     )
-    .unwrap();
+    .unwrap()
+    .0;
     assert_eq!(mutable.nb_points(), 300);
     assert_eq!(mutable.m(), 24);
     assert_eq!(mutable.ef_construction(), 80);
@@ -236,7 +248,9 @@ fn the_mutable_loader_refuses_malformed_topology() {
             })
             .collect()],
     }]];
-    let held = MutableGraph::from_loaded(full, PointId(0, 0), 2, 64, 0.36, CosineDist {}).unwrap();
+    let held = MutableGraph::from_loaded(full, PointId(0, 0), 2, 64, 0.36, CosineDist {})
+        .unwrap()
+        .0;
     assert_eq!(held.nb_edges(), 5);
 
     // A list above its owner's level is kept rather than dropped, which is what
@@ -248,8 +262,9 @@ fn the_mutable_loader_refuses_malformed_topology() {
             distance: 0.5,
         }],
     ])]];
-    let mutable =
-        MutableGraph::from_loaded(above, PointId(0, 0), 16, 64, 0.36, CosineDist {}).unwrap();
+    let mutable = MutableGraph::from_loaded(above, PointId(0, 0), 16, 64, 0.36, CosineDist {})
+        .unwrap()
+        .0;
     assert_eq!(mutable.nb_edges(), 0);
     assert_eq!(mutable.above_level_edges(), 1);
 
@@ -269,8 +284,8 @@ fn the_mutable_memory_figure_is_exact() {
     const M: usize = 8;
     const DIM: usize = 12;
     let data = sample_vectors(500, DIM, 0x78_0b);
-    let built = build(&data, M, 32, CosineDist {});
-    let parsed = parsed_topology(&built, GraphKind::Cosine);
+    let (built, built_store) = build(&data, M, 32, CosineDist {});
+    let parsed = parsed_topology(&built, &built_store, GraphKind::Cosine);
     let layer_lens: Vec<usize> = parsed.points_by_layer.iter().map(Vec::len).collect();
     let mutable = MutableGraph::from_loaded(
         parsed.points_by_layer,
@@ -280,7 +295,8 @@ fn the_mutable_memory_figure_is_exact() {
         parsed.level_scale,
         CosineDist {},
     )
-    .unwrap();
+    .unwrap()
+    .0;
 
     let nodes = mutable.nb_points();
     let mut expected = std::mem::size_of_val(&mutable);
@@ -292,8 +308,11 @@ fn the_mutable_memory_figure_is_exact() {
     expected += nodes * std::mem::size_of::<u32>();
     expected += nodes * std::mem::size_of::<u32>();
     expected += nodes;
-    // The vectors.
-    expected += nodes * DIM * std::mem::size_of::<f32>();
+    // The inverse of the origin ids, one node index per internal id. The
+    // fixture inserts under ids zero upward, so it holds one slot per node.
+    expected += nodes * std::mem::size_of::<u32>();
+    // No vector. The store is a separate object and its bytes are its own; see
+    // `VectorStore::memory_bytes`.
     // The layer zero slabs, `2 * m + 1` targets and distances each.
     expected += nodes * (2 * M + 1) * 2 * std::mem::size_of::<u32>();
     // Per upper list: its offset, its length, its capacity and its inbound
@@ -350,10 +369,10 @@ fn the_mutable_graph_is_send_and_sync() {
 #[test]
 fn a_non_finite_query_traverses_or_panics_at_the_candidate_assertion() {
     let data = sample_vectors(400, 8, 0x77_09);
-    let graph = build(&data, 16, 48, L2Dist {});
+    let (graph, store) = build(&data, 16, 48, L2Dist {});
 
     let infinite = vec![f32::INFINITY; 8];
-    let page = graph.search(&infinite, 10, 20, None::<&BoxedFilter>);
+    let page = graph.search(&store, &infinite, 10, 20, None::<&BoxedFilter>);
     assert_eq!(page.len(), 10, "an infinite query still returns a page");
     assert!(
         page.iter().all(|hit| hit.distance.is_infinite()),
@@ -362,7 +381,7 @@ fn a_non_finite_query_traverses_or_panics_at_the_candidate_assertion() {
 
     let nan = vec![f32::NAN; 8];
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        graph.search(&nan, 10, 20, None::<&BoxedFilter>)
+        graph.search(&store, &nan, 10, 20, None::<&BoxedFilter>)
     }));
     match panicked {
         Err(any) => {
@@ -385,6 +404,7 @@ fn a_non_finite_query_traverses_or_panics_at_the_candidate_assertion() {
 /// compare the two files byte for byte.
 fn round_trip<T, D>(
     built: &MutableGraph<T, D>,
+    built_store: &VectorStore<T>,
     kind: GraphKind,
     dist: impl Fn() -> D,
 ) -> (usize, usize)
@@ -393,7 +413,7 @@ where
     D: Distance<T> + Send + Sync,
 {
     let first = tempfile::tempdir().unwrap();
-    write_dump(&built.dump_view(), kind, first.path()).unwrap();
+    write_dump(&built.dump_view(built_store), kind, first.path()).unwrap();
     let expected = Expected {
         kind,
         dimension: built.dim(),
@@ -402,7 +422,7 @@ where
         min_nodes: 0,
     };
     let parsed = parse_dump::<T>(first.path(), &expected).unwrap();
-    let mutable = MutableGraph::from_loaded(
+    let (mutable, mutable_store) = MutableGraph::from_loaded(
         parsed.points_by_layer,
         parsed.entry,
         parsed.m,
@@ -412,7 +432,7 @@ where
     )
     .unwrap();
     let second = tempfile::tempdir().unwrap();
-    write_dump(&mutable.dump_view(), kind, second.path()).unwrap();
+    write_dump(&mutable.dump_view(&mutable_store), kind, second.path()).unwrap();
 
     let before = std::fs::read(first.path().join(DUMP_FILENAME)).unwrap();
     let after = std::fs::read(second.path().join(DUMP_FILENAME)).unwrap();
@@ -445,25 +465,25 @@ where
 /// second file would be shorter by exactly the residue edges.
 #[test]
 fn a_dump_round_trips_through_the_mutable_graph() {
-    let cosine = build(&sample_vectors(1500, 24, 0x78_01), 16, 64, CosineDist {});
-    let (bytes, residue) = round_trip(&cosine, GraphKind::Cosine, || CosineDist {});
+    let (cosine, cosine_store) = build(&sample_vectors(1500, 24, 0x78_01), 16, 64, CosineDist {});
+    let (bytes, residue) = round_trip(&cosine, &cosine_store, GraphKind::Cosine, || CosineDist {});
     println!("round trip cosine bytes {} residue {}", bytes, residue);
     assert!(residue > 0, "the fixture must carry descent residue");
 
-    let l2 = build(&sample_vectors(900, 16, 0x78_02), 16, 48, L2Dist {});
-    let (bytes, residue) = round_trip(&l2, GraphKind::L2, || L2Dist {});
+    let (l2, l2_store) = build(&sample_vectors(900, 16, 0x78_02), 16, 48, L2Dist {});
+    let (bytes, residue) = round_trip(&l2, &l2_store, GraphKind::L2, || L2Dist {});
     println!("round trip l2 bytes {} residue {}", bytes, residue);
 
-    let l1 = build(&sample_vectors(700, 12, 0x78_03), 8, 48, L1Dist {});
-    let (bytes, residue) = round_trip(&l1, GraphKind::L1, || L1Dist {});
+    let (l1, l1_store) = build(&sample_vectors(700, 12, 0x78_03), 8, 48, L1Dist {});
+    let (bytes, residue) = round_trip(&l1, &l1_store, GraphKind::L1, || L1Dist {});
     println!("round trip l1 bytes {} residue {}", bytes, residue);
 
     // Ties, where a list holds runs of equal stored distances and only a stable
     // ordering reproduces the file.
     let distinct = sample_vectors(25, 16, 0x78_04);
     let repeated: Vec<Vec<f32>> = (0..600).map(|i| distinct[i % 25].clone()).collect();
-    let ties = build(&repeated, 16, 48, CosineDist {});
-    let (bytes, residue) = round_trip(&ties, GraphKind::Cosine, || CosineDist {});
+    let (ties, ties_store) = build(&repeated, 16, 48, CosineDist {});
+    let (bytes, residue) = round_trip(&ties, &ties_store, GraphKind::Cosine, || CosineDist {});
     println!("round trip ties bytes {} residue {}", bytes, residue);
 
     // The quantized graph, whose elements are `u8` codes.
@@ -475,8 +495,10 @@ fn a_dump_round_trips_through_the_mutable_graph() {
     pq.train(&all).unwrap();
     let refs: Vec<&[f32]> = all.iter().map(|v| v.as_slice()).collect();
     let codes = pq.quantize_batch(&refs).unwrap();
-    let quantized = build(&codes, 16, 100, DistPQ::new(pq.clone()));
-    let (bytes, residue) = round_trip(&quantized, GraphKind::CosinePq, || DistPQ::new(pq.clone()));
+    let (quantized, quantized_store) = build(&codes, 16, 100, DistPQ::new(pq.clone()));
+    let (bytes, residue) = round_trip(&quantized, &quantized_store, GraphKind::CosinePq, || {
+        DistPQ::new(pq.clone())
+    });
     println!("round trip quantized bytes {} residue {}", bytes, residue);
 }
 

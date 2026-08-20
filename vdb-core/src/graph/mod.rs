@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, trace, warn};
 
 pub(crate) mod dump;
+pub(crate) mod store;
 
 // The level generator, which draws a new point's top level.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -67,7 +68,8 @@ mod traverse;
 use dump::{Expected, GraphKind};
 use levels::LevelGenerator;
 use mutable::{MutableGraph, Planned};
-use traverse::{Topology, LAYERS};
+use store::VectorStore;
+use traverse::LAYERS;
 
 /// How far apart two points of type `T` are.
 ///
@@ -178,6 +180,20 @@ pub(crate) struct GraphHit {
 /// uncontended, since the index's `writers` mutex admits one mutator at a time.
 pub(crate) struct Backend<T, D> {
     graph: MutableGraph<T, D>,
+    /// The vectors this graph scores against, addressed by node index.
+    ///
+    /// `f32` on a raw graph and one `u8` per subvector on a quantized one. The
+    /// graph itself holds links, levels and origin ids and no vectors at all.
+    store: VectorStore<T>,
+    /// The raw vectors a quantized graph keeps beside its codes, where the
+    /// storage mode keeps them.
+    ///
+    /// `None` on every raw graph, where the store above already is the raw
+    /// vectors, and on a `quantized_only` graph, which holds none. `Some` on a
+    /// `quantized_with_raw` graph, addressed by the same node index the codes
+    /// are, so rerank and `get_records` reach a raw vector with one
+    /// multiplication and no hashing.
+    raw: Option<VectorStore<f32>>,
     levels: Mutex<LevelGenerator>,
 }
 
@@ -209,10 +225,13 @@ where
         let expected_size = expected_size.max(1);
         let maxlevel = max_layer.clamp(1, LAYERS);
         let scale = LevelGenerator::default_scale(m);
-        let graph = MutableGraph::new(dim, m, ef_construction, scale, expected_size, dist_f)
-            .expect("the arguments were clamped into the range MutableGraph::new accepts");
+        let (graph, store) =
+            MutableGraph::new(dim, m, ef_construction, scale, expected_size, dist_f)
+                .expect("the arguments were clamped into the range MutableGraph::new accepts");
         Backend {
             graph,
+            store,
+            raw: None,
             levels: Mutex::new(LevelGenerator::new(scale, maxlevel)),
         }
     }
@@ -224,10 +243,13 @@ where
     /// keeps inserting starts the level stream over. That is what
     /// `Hnsw::from_loaded_points` does through `new_with_absolute_scale`, so it
     /// is the behaviour this restores rather than a new one.
-    fn restored(graph: MutableGraph<T, D>) -> Self {
+    fn restored(loaded: (MutableGraph<T, D>, VectorStore<T>)) -> Self {
+        let (graph, store) = loaded;
         let scale = graph.level_scale();
         Backend {
             graph,
+            store,
+            raw: None,
             levels: Mutex::new(LevelGenerator::new(scale, LAYERS)),
         }
     }
@@ -239,12 +261,46 @@ where
             .lock()
             .expect("the level generator is a leaf and no path panics holding it")
             .generate();
-        self.graph.plan_insertion(data, level)
+        self.graph.plan_insertion(&self.store, data, level)
     }
 
     /// Phase two. Writes what phase one decided.
     fn install(&mut self, data: &[T], origin_id: usize, planned: Planned) {
-        self.graph.install_insertion(data, origin_id, planned);
+        self.graph
+            .install_insertion(&mut self.store, data, origin_id, planned);
+    }
+
+    /// Append one raw vector to the side store a `quantized_with_raw` graph
+    /// keeps, so it stays in step with the node just installed.
+    ///
+    /// A caller that hands nothing where the store exists, or something where
+    /// it does not, has a record the mode does not describe. Both are treated
+    /// the same way the rest of the seam treats an element type mismatch, being
+    /// a logged refusal rather than a panic, and the invariant that follows is
+    /// asserted in debug builds.
+    fn push_raw(&mut self, raw: Option<&[f32]>) {
+        match (self.raw.as_mut(), raw) {
+            (Some(store), Some(values)) => store.push(values),
+            (None, None) => {}
+            (Some(_), None) => error!(
+                operation = "vector_insert",
+                error = "invalid_operation",
+                reason = "quantized_with_raw_insert_carried_no_raw_vector",
+                "A quantized graph keeping raw vectors was handed a record without one"
+            ),
+            (None, Some(_)) => error!(
+                operation = "vector_insert",
+                error = "invalid_operation",
+                reason = "graph_keeps_no_raw_vectors",
+                "A raw vector was offered to a graph that keeps none beside its codes"
+            ),
+        }
+        debug_assert!(
+            self.raw
+                .as_ref()
+                .is_none_or(|store| store.len() == self.graph.nb_points()),
+            "the raw side store is addressed by node index, so it holds one vector per node"
+        );
     }
 
     /// Both phases, for a caller holding the graph outright.
@@ -283,8 +339,17 @@ pub(crate) enum VectorGraph {
 pub(crate) enum Record<'a> {
     /// A raw vector, already normalized for the index space.
     Raw(&'a [f32]),
-    /// The quantized codes of one record, one byte per subvector.
-    Codes(&'a [u8]),
+    /// The quantized codes of one record, one byte per subvector, and the raw
+    /// vector where the storage mode keeps one.
+    ///
+    /// The raw travels with the codes because the node the codes are installed
+    /// at is the node the raw has to sit at, and that node is decided by the
+    /// install. Passing it separately would mean a second call that could be
+    /// skipped, and a skipped call is a raw store one short of its graph.
+    Codes {
+        codes: &'a [u8],
+        raw: Option<&'a [f32]>,
+    },
 }
 
 impl VectorGraph {
@@ -429,10 +494,10 @@ impl VectorGraph {
             // Raw vector search
             VectorGraph::Cosine(b) => {
                 assert_unit_for_cosine(query, "search");
-                Ok(b.graph.search(query, k, ef, filter))
+                Ok(b.graph.search(&b.store, query, k, ef, filter))
             }
-            VectorGraph::L2(b) => Ok(b.graph.search(query, k, ef, filter)),
-            VectorGraph::L1(b) => Ok(b.graph.search(query, k, ef, filter)),
+            VectorGraph::L2(b) => Ok(b.graph.search(&b.store, query, k, ef, filter)),
+            VectorGraph::L1(b) => Ok(b.graph.search(&b.store, query, k, ef, filter)),
 
             // PQ-based search with ADC
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
@@ -445,7 +510,7 @@ impl VectorGraph {
                 // Create dummy query vector for HNSW traversal (flat u8 codes)
                 let dummy_query = vec![0u8; b.graph.distance().subvectors()];
 
-                Ok(b.graph.search(&dummy_query, k, ef, filter))
+                Ok(b.graph.search(&b.store, &dummy_query, k, ef, filter))
             }
         }
     }
@@ -477,7 +542,9 @@ impl VectorGraph {
     /// It is a request count and not a commitment. The allocator's headers, its
     /// rounding and its fragmentation sit outside it, and a process holding this
     /// graph commits more than this names.
-    pub(crate) fn memory_bytes(&self) -> usize {
+    /// Bytes the adjacency, the levels, the origin ids and their inverse ask
+    /// for, with no vector counted.
+    pub(crate) fn links_memory_bytes(&self) -> usize {
         match self {
             VectorGraph::Cosine(b) => b.graph.memory_bytes(),
             VectorGraph::L2(b) => b.graph.memory_bytes(),
@@ -488,20 +555,230 @@ impl VectorGraph {
         }
     }
 
+    /// Bytes the store the graph scores against asks for, being the raw vectors
+    /// on a raw graph and the codes on a quantized one.
+    pub(crate) fn store_memory_bytes(&self) -> usize {
+        match self {
+            VectorGraph::Cosine(b) => b.store.memory_bytes(),
+            VectorGraph::L2(b) => b.store.memory_bytes(),
+            VectorGraph::L1(b) => b.store.memory_bytes(),
+            VectorGraph::CosinePQ(b) => b.store.memory_bytes(),
+            VectorGraph::L2PQ(b) => b.store.memory_bytes(),
+            VectorGraph::L1PQ(b) => b.store.memory_bytes(),
+        }
+    }
+
+    /// Bytes the raw side store asks for, which is zero unless this is a
+    /// `quantized_with_raw` graph.
+    pub(crate) fn raw_memory_bytes(&self) -> usize {
+        self.raw_store().map_or(0, VectorStore::memory_bytes)
+    }
+
+    /// The raw side store, where this graph keeps one.
+    fn raw_store(&self) -> Option<&VectorStore<f32>> {
+        match self {
+            VectorGraph::Cosine(_) | VectorGraph::L2(_) | VectorGraph::L1(_) => None,
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                b.raw.as_ref()
+            }
+        }
+    }
+
+    /// The node one internal id sits at, or `None` where this graph never took
+    /// it.
+    pub(crate) fn node_of(&self, internal_id: usize) -> Option<u32> {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.node_of(internal_id),
+            VectorGraph::L2(b) => b.graph.node_of(internal_id),
+            VectorGraph::L1(b) => b.graph.node_of(internal_id),
+            VectorGraph::CosinePQ(b) => b.graph.node_of(internal_id),
+            VectorGraph::L2PQ(b) => b.graph.node_of(internal_id),
+            VectorGraph::L1PQ(b) => b.graph.node_of(internal_id),
+        }
+    }
+
+    /// The internal id one node was inserted under.
+    pub(crate) fn origin_id_at(&self, node: u32) -> usize {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.origin_id_of(node),
+            VectorGraph::L2(b) => b.graph.origin_id_of(node),
+            VectorGraph::L1(b) => b.graph.origin_id_of(node),
+            VectorGraph::CosinePQ(b) => b.graph.origin_id_of(node),
+            VectorGraph::L2PQ(b) => b.graph.origin_id_of(node),
+            VectorGraph::L1PQ(b) => b.graph.origin_id_of(node),
+        }
+    }
+
+    /// One record's raw vector, by the internal id `id_map` hands out.
+    ///
+    /// This is the whole of what replaced the raw vector map. It is two array
+    /// reads, being the id to node inverse and then the store, and no hashing
+    /// at all. `None` where the index keeps no raw vector for that record,
+    /// which is every record of a trained `quantized_only` index and any id
+    /// this graph never took.
+    pub(crate) fn raw_vector(&self, internal_id: usize) -> Option<&[f32]> {
+        let node = self.node_of(internal_id)?;
+        match self {
+            VectorGraph::Cosine(b) => b.store.try_get(node),
+            VectorGraph::L2(b) => b.store.try_get(node),
+            VectorGraph::L1(b) => b.store.try_get(node),
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                b.raw.as_ref()?.try_get(node)
+            }
+        }
+    }
+
+    /// Whether this graph holds a raw vector for every node it carries.
+    pub(crate) fn holds_raw(&self) -> bool {
+        match self {
+            VectorGraph::Cosine(_) | VectorGraph::L2(_) | VectorGraph::L1(_) => true,
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                b.raw.is_some()
+            }
+        }
+    }
+
+    /// Open a raw side store on a quantized graph, sized for `records`.
+    ///
+    /// A raw graph refuses, because its own store already is the raw vectors
+    /// and a second one would be the duplication this replaced.
+    pub(crate) fn open_raw_store(&mut self, dim: usize, records: usize) -> Result<(), String> {
+        // The one construction site of a store that does not clamp its width,
+        // because the two graph constructors do and this takes the index's
+        // declared dimension instead. That dimension is validated where an
+        // index is created and is not validated where one is loaded, so a
+        // config.json naming a zero reaches here rather than being stopped
+        // earlier. Every such directory is refused before this by the checks
+        // that compare the dump header and the codebook against the declared
+        // dimension, so this is the belt rather than the braces, and it is
+        // here because a refusal costs nothing and a store of no width can
+        // address no node.
+        if dim == 0 {
+            return Err("a raw store holds vectors of at least one value".to_string());
+        }
+        match self {
+            VectorGraph::Cosine(_) | VectorGraph::L2(_) | VectorGraph::L1(_) => {
+                Err("a raw graph already holds its raw vectors".to_string())
+            }
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                b.raw = Some(VectorStore::with_capacity(dim, records));
+                Ok(())
+            }
+        }
+    }
+
+    /// Carry every raw vector `source` holds into this graph, in this graph's
+    /// node order.
+    ///
+    /// This is the training transition and the compaction of a
+    /// `quantized_with_raw` index, both of which build a replacement graph
+    /// whose node numbering is its own. The raws are re-addressed rather than
+    /// re-derived, so nothing is quantized, reconstructed or lost, and a record
+    /// the source cannot supply is an error rather than a gap.
+    pub(crate) fn adopt_raw_from(
+        &mut self,
+        source: &VectorGraph,
+        dim: usize,
+    ) -> Result<usize, String> {
+        let nodes = self.nb_points();
+        self.open_raw_store(dim, nodes)?;
+        for node in 0..nodes as u32 {
+            let internal_id = self.origin_id_at(node);
+            let vector = source.raw_vector(internal_id).ok_or_else(|| {
+                format!(
+                    "record with internal id {} has no raw vector to carry over",
+                    internal_id
+                )
+            })?;
+            match self {
+                VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                    b.raw
+                        .as_mut()
+                        .expect("the store was opened above")
+                        .push(vector);
+                }
+                _ => unreachable!("open_raw_store refused every raw graph"),
+            }
+        }
+        Ok(nodes)
+    }
+
+    /// Append one raw vector to the side store, which becomes the next node's.
+    ///
+    /// For the loader, which fills the store in node order after the graph has
+    /// come back from its dump. A raw graph refuses, for the reason
+    /// `open_raw_store` refuses.
+    pub(crate) fn push_raw_vector(&mut self, values: &[f32]) -> Result<(), String> {
+        match self {
+            VectorGraph::Cosine(_) | VectorGraph::L2(_) | VectorGraph::L1(_) => {
+                Err("a raw graph already holds its raw vectors".to_string())
+            }
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                match b.raw.as_mut() {
+                    Some(store) => {
+                        store.push(values);
+                        Ok(())
+                    }
+                    None => Err("this graph keeps no raw vectors".to_string()),
+                }
+            }
+        }
+    }
+
+    /// Raw vectors this graph holds, which is its node count where it holds
+    /// them at all.
+    pub(crate) fn raw_count(&self) -> usize {
+        match self {
+            VectorGraph::Cosine(b) => b.store.len(),
+            VectorGraph::L2(b) => b.store.len(),
+            VectorGraph::L1(b) => b.store.len(),
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                b.raw.as_ref().map_or(0, VectorStore::len)
+            }
+        }
+    }
+
+    /// Values a stored raw vector holds, where this graph holds any.
+    pub(crate) fn raw_dim(&self) -> Option<usize> {
+        match self {
+            VectorGraph::Cosine(b) => Some(b.store.dim()),
+            VectorGraph::L2(b) => Some(b.store.dim()),
+            VectorGraph::L1(b) => Some(b.store.dim()),
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                b.raw.as_ref().map(VectorStore::dim)
+            }
+        }
+    }
+
     /// Return every buffer's spare capacity to the allocator, and report the
     /// bytes released.
     ///
     /// What the slack is and why a built graph carries it where a loaded one
     /// does not is on `MutableGraph::shrink_to_fit`.
     pub(crate) fn shrink_to_fit(&mut self) -> usize {
-        match self {
-            VectorGraph::Cosine(b) => b.graph.shrink_to_fit(),
-            VectorGraph::L2(b) => b.graph.shrink_to_fit(),
-            VectorGraph::L1(b) => b.graph.shrink_to_fit(),
-            VectorGraph::CosinePQ(b) => b.graph.shrink_to_fit(),
-            VectorGraph::L2PQ(b) => b.graph.shrink_to_fit(),
-            VectorGraph::L1PQ(b) => b.graph.shrink_to_fit(),
-        }
+        let before = self.store_memory_bytes() + self.raw_memory_bytes();
+        let links = match self {
+            VectorGraph::Cosine(b) => {
+                b.store.shrink_to_fit();
+                b.graph.shrink_to_fit()
+            }
+            VectorGraph::L2(b) => {
+                b.store.shrink_to_fit();
+                b.graph.shrink_to_fit()
+            }
+            VectorGraph::L1(b) => {
+                b.store.shrink_to_fit();
+                b.graph.shrink_to_fit()
+            }
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                b.store.shrink_to_fit();
+                if let Some(raw) = b.raw.as_mut() {
+                    raw.shrink_to_fit();
+                }
+                b.graph.shrink_to_fit()
+            }
+        };
+        links + before.saturating_sub(self.store_memory_bytes() + self.raw_memory_bytes())
     }
 
     pub(crate) fn is_quantized(&self) -> bool {
@@ -554,9 +831,9 @@ impl VectorGraph {
             }
             (VectorGraph::L2(b), Record::Raw(v)) => Some(b.plan(v)),
             (VectorGraph::L1(b), Record::Raw(v)) => Some(b.plan(v)),
-            (VectorGraph::CosinePQ(b), Record::Codes(c))
-            | (VectorGraph::L2PQ(b), Record::Codes(c))
-            | (VectorGraph::L1PQ(b), Record::Codes(c)) => Some(b.plan(c)),
+            (VectorGraph::CosinePQ(b), Record::Codes { codes, .. })
+            | (VectorGraph::L2PQ(b), Record::Codes { codes, .. })
+            | (VectorGraph::L1PQ(b), Record::Codes { codes, .. }) => Some(b.plan(codes)),
             (_, Record::Raw(_)) => {
                 error!(
                     operation = "vector_insert",
@@ -566,7 +843,7 @@ impl VectorGraph {
                 );
                 None
             }
-            (_, Record::Codes(_)) => {
+            (_, Record::Codes { .. }) => {
                 error!(
                     operation = "pq_codes_insert",
                     error = "invalid_operation",
@@ -587,9 +864,12 @@ impl VectorGraph {
             (VectorGraph::Cosine(b), Record::Raw(v)) => b.install(v, id, planned),
             (VectorGraph::L2(b), Record::Raw(v)) => b.install(v, id, planned),
             (VectorGraph::L1(b), Record::Raw(v)) => b.install(v, id, planned),
-            (VectorGraph::CosinePQ(b), Record::Codes(c))
-            | (VectorGraph::L2PQ(b), Record::Codes(c))
-            | (VectorGraph::L1PQ(b), Record::Codes(c)) => b.install(c, id, planned),
+            (VectorGraph::CosinePQ(b), Record::Codes { codes, raw })
+            | (VectorGraph::L2PQ(b), Record::Codes { codes, raw })
+            | (VectorGraph::L1PQ(b), Record::Codes { codes, raw }) => {
+                b.install(codes, id, planned);
+                b.push_raw(raw);
+            }
             // Unreachable, because a plan the element type refused is `None`
             // and the caller then installs nothing.
             _ => error!(
@@ -664,12 +944,12 @@ impl VectorGraph {
             "Writing the graph dump"
         );
         match self {
-            VectorGraph::Cosine(b) => dump::write_dump(&b.graph.dump_view(), kind, dir),
-            VectorGraph::L2(b) => dump::write_dump(&b.graph.dump_view(), kind, dir),
-            VectorGraph::L1(b) => dump::write_dump(&b.graph.dump_view(), kind, dir),
-            VectorGraph::CosinePQ(b) => dump::write_dump(&b.graph.dump_view(), kind, dir),
-            VectorGraph::L2PQ(b) => dump::write_dump(&b.graph.dump_view(), kind, dir),
-            VectorGraph::L1PQ(b) => dump::write_dump(&b.graph.dump_view(), kind, dir),
+            VectorGraph::Cosine(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
+            VectorGraph::L2(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
+            VectorGraph::L1(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
+            VectorGraph::CosinePQ(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
+            VectorGraph::L2PQ(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
+            VectorGraph::L1PQ(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
         }?;
         Ok(dump::DUMP_FILENAME.to_string())
     }

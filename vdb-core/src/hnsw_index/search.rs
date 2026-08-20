@@ -58,7 +58,9 @@ use super::{HNSWIndex, StorageMode, VectorGraph};
 use crate::conversion::value_map_to_python;
 use crate::filter::{matches_filter, Filter};
 use crate::graph::GraphHit;
-use crate::rerank::{raw_distance_fn, rescore_candidate, take_best, RerankPlan, SearchParams};
+use crate::rerank::{
+    raw_distance_fn, rescore_candidate, take_best, RawVectors, RerankPlan, SearchParams,
+};
 use numpy::PyArray1;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -147,7 +149,7 @@ type Candidates<'a> = Vec<(&'a String, f32)>;
 struct Filtered<'a> {
     conditions: &'a Filter,
     metadata: &'a HashMap<String, HashMap<String, Value>>,
-    vectors: &'a HashMap<String, Vec<f32>>,
+    vectors: RawVectors<'a>,
     pq_codes: &'a HashMap<String, Vec<u8>>,
 }
 
@@ -286,7 +288,7 @@ impl HNSWIndex {
         let distance = raw_distance_fn(&self.space);
         let mut scored: Candidates<'a> = Vec::with_capacity(matched.len());
         for ext_id in matched {
-            let score = match filter.vectors.get(ext_id) {
+            let score = match filter.vectors.get(ext_id.as_str()) {
                 Some(stored) => distance(query, stored),
                 None => match filter
                     .pq_codes
@@ -427,7 +429,7 @@ impl HNSWIndex {
         &self,
         candidates: Candidates<'_>,
         query: &[f32],
-        vectors: &HashMap<String, Vec<f32>>,
+        vectors: RawVectors<'_>,
         pq_codes: &HashMap<String, Vec<u8>>,
         vector_metadata: &HashMap<String, HashMap<String, Value>>,
         params: SearchParams,
@@ -451,10 +453,13 @@ impl HNSWIndex {
             // code held once training completes, so without the fallback a
             // search returns no vectors at all.
             let vector_data = if params.return_vector {
-                vectors.get(ext_id).cloned().or_else(|| {
-                    let codes = pq_codes.get(ext_id)?;
-                    self.pq.as_ref()?.reconstruct(codes).ok()
-                })
+                vectors
+                    .get(ext_id.as_str())
+                    .map(<[f32]>::to_vec)
+                    .or_else(|| {
+                        let codes = pq_codes.get(ext_id)?;
+                        self.pq.as_ref()?.reconstruct(codes).ok()
+                    })
             } else {
                 None
             };
@@ -520,24 +525,28 @@ impl HNSWIndex {
         py: Python<'_>,
     ) -> PyResult<Vec<Py<PyDict>>> {
         let search_results = py.detach(|| -> PyResult<QueryHits> {
-            // Five read guards, taken in the order declared on `HNSWIndex` and
-            // held for the whole search. `hnsw` used to be dropped before
-            // `vectors` was taken; it is held across them now because the
-            // filter predicate and the exact scan both read the storage maps
-            // while the traversal is in flight. The order is `rev_map < hnsw <
-            // vectors < pq_codes < vector_metadata`, so every pair here is in
-            // declared order, and it is the shape `batch_search_sequential`
-            // already ran in.
+            // Five read guards, held for the whole search, in the order every
+            // path in the crate takes them: `id_map < rev_map < hnsw <
+            // pq_codes < vector_metadata`. `id_map` is here because the raw
+            // vectors are addressed by node index now and it is what turns an
+            // external id into one; it is taken before `rev_map` because a
+            // removal holds `id_map` and then takes `rev_map`, and the reverse
+            // order here would deadlock against it. The raw vector map that
+            // used to sit between `hnsw` and `pq_codes` is gone.
+            let id_map = self.id_map.read().unwrap();
             let rev_map = self.rev_map.read().unwrap();
             let hnsw_guard = self.hnsw.read().unwrap();
-            let vectors = self.vectors.read().unwrap();
             let pq_codes = self.pq_codes.read().unwrap();
             let vector_metadata = self.vector_metadata.read().unwrap();
+            let vectors = RawVectors {
+                id_map: &id_map,
+                graph: &hnsw_guard,
+            };
 
             let filter = filter_conditions.map(|conditions| Filtered {
                 conditions,
                 metadata: &vector_metadata,
-                vectors: &vectors,
+                vectors,
                 pq_codes: &pq_codes,
             });
             let fetch_k = params.fetch_k(rev_map.len());
@@ -554,7 +563,7 @@ impl HNSWIndex {
             self.collect_hits(
                 candidates,
                 processed_query,
-                &vectors,
+                vectors,
                 &pq_codes,
                 &vector_metadata,
                 params,
@@ -661,20 +670,23 @@ impl HNSWIndex {
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
         let rust_results = py.detach(|| -> PyResult<Vec<QueryHits>> {
-            // Five read guards, in declared order, held across every query in
-            // the batch. This path already ran in this shape before the filter
-            // moved into the traversal, which is why it needed no change beyond
-            // handing the metadata store to the predicate.
+            // Five read guards, in the one documented order, held across every
+            // query in the batch. See `single_search_internal` for why `id_map`
+            // is first and where the raw vector map went.
+            let id_map = self.id_map.read().unwrap();
             let rev_map = self.rev_map.read().unwrap();
             let hnsw_guard = self.hnsw.read().unwrap();
-            let vector_store = self.vectors.read().unwrap();
             let code_store = self.pq_codes.read().unwrap();
             let metadata_store = self.vector_metadata.read().unwrap();
+            let vector_store = RawVectors {
+                id_map: &id_map,
+                graph: &hnsw_guard,
+            };
 
             let filter = filter_conditions.map(|conditions| Filtered {
                 conditions,
                 metadata: &metadata_store,
-                vectors: &vector_store,
+                vectors: vector_store,
                 pq_codes: &code_store,
             });
 
@@ -700,7 +712,7 @@ impl HNSWIndex {
                 all_results.push(self.collect_hits(
                     candidates,
                     &processed_query,
-                    &vector_store,
+                    vector_store,
                     &code_store,
                     &metadata_store,
                     params,
@@ -730,25 +742,25 @@ impl HNSWIndex {
                     // FIX: Process each query vector for space
                     let processed_query = self.process_vector_for_space(vector.clone());
 
-                    // Five read guards per worker, in declared order and held
-                    // across the traversal. This path used to drop `hnsw`
-                    // before taking `vectors`; it holds all five now because
-                    // the filter predicate and the exact scan read the storage
-                    // maps while the traversal is in flight. Every guard is a
-                    // read, so the rule that no path forks to rayon holding a
-                    // write guard is untouched. What the fork does change is
-                    // duration: each worker now holds four more guards for its
-                    // whole query rather than for the phase after it.
+                    // Five read guards per worker, in the one documented order
+                    // and held across the traversal. Every guard is a read, so
+                    // the rule that no path forks to rayon holding a write
+                    // guard is untouched. See `single_search_internal` for why
+                    // `id_map` is first and where the raw vector map went.
+                    let id_map = self.id_map.read().unwrap();
                     let rev_map = self.rev_map.read().unwrap();
                     let hnsw_guard = self.hnsw.read().unwrap();
-                    let vector_store = self.vectors.read().unwrap();
                     let code_store = self.pq_codes.read().unwrap();
                     let metadata_store = self.vector_metadata.read().unwrap();
+                    let vector_store = RawVectors {
+                        id_map: &id_map,
+                        graph: &hnsw_guard,
+                    };
 
                     let filter = filter_conditions.map(|conditions| Filtered {
                         conditions,
                         metadata: &metadata_store,
-                        vectors: &vector_store,
+                        vectors: vector_store,
                         pq_codes: &code_store,
                     });
 
@@ -767,7 +779,7 @@ impl HNSWIndex {
                     self.collect_hits(
                         candidates,
                         &processed_query,
-                        &vector_store,
+                        vector_store,
                         &code_store,
                         &metadata_store,
                         params,

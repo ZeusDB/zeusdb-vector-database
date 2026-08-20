@@ -6,8 +6,9 @@
 //! field of `HNSWIndex` and cannot leave one in a state the index did not
 //! choose.
 
-use super::{HNSWIndex, QuantizationConfig, MAX_LAYER};
+use super::{HNSWIndex, QuantizationConfig, StorageMode, MAX_LAYER};
 use crate::graph::{restore_graph, VectorGraph};
+use crate::rerank::RawVectors;
 use pyo3::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -40,13 +41,139 @@ impl HNSWIndex {
     /// counter is checked against after a load. Not exposed to Python, since
     /// the only caller is the load path in `persistence`.
     pub fn count_stored_records(&self) -> usize {
-        let vectors = self.vectors.read().unwrap();
+        let id_map = self.id_map.read().unwrap();
+        let hnsw = self.hnsw.read().unwrap();
         let pq_codes = self.pq_codes.read().unwrap();
+        let raws = RawVectors {
+            id_map: &id_map,
+            graph: &hnsw,
+        };
+        let with_raw = id_map
+            .keys()
+            .filter(|id| raws.contains(id.as_str()))
+            .count();
         let code_only = pq_codes
             .keys()
-            .filter(|id| !vectors.contains_key(*id))
+            .filter(|id| !raws.contains(id.as_str()))
             .count();
-        vectors.len() + code_only
+        with_raw + code_only
+    }
+
+    /// Every raw vector the index holds, keyed by external id.
+    ///
+    /// Built rather than held, because there is no map of raw vectors any more.
+    /// The one caller is the save of a quantized index that keeps its raws:
+    /// a raw index writes no `vectors.bin` at all, since the graph dump already
+    /// carries its store.
+    pub(crate) fn collect_raw_vectors(&self) -> HashMap<String, Vec<f32>> {
+        let id_map = self.id_map.read().unwrap();
+        let hnsw = self.hnsw.read().unwrap();
+        let mut out = HashMap::with_capacity(id_map.len());
+        for (ext_id, &internal_id) in id_map.iter() {
+            if let Some(vector) = hnsw.raw_vector(internal_id) {
+                out.insert(ext_id.clone(), vector.to_vec());
+            }
+        }
+        out
+    }
+
+    /// Whether this index should hold a raw store beside its codes.
+    ///
+    /// Asked by the loader after the graph is back and before the vectors are
+    /// placed, which is the one moment the graph is quantized and the store is
+    /// still empty, so `raws_need_their_own_file` would answer no.
+    pub(crate) fn raw_store_is_expected(&self) -> bool {
+        let quantized = self.hnsw.read().unwrap().is_quantized();
+        quantized
+            && self
+                .quantization_config
+                .as_ref()
+                .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw)
+    }
+
+    /// Whether the index holds a raw vector for every record it holds.
+    ///
+    /// True on every raw graph and on a `quantized_with_raw` one, false on a
+    /// trained `quantized_only` one. It is what decides whether a save writes
+    /// `vectors.bin`.
+    ///
+    /// **The saved directory still holds two copies of every raw vector on a
+    /// raw index**, one in `vectors.bin` and one in the graph dump's vector
+    /// region. Removing the map did not remove that, and the reason is the
+    /// rebuild fallback: `vectors.bin` is keyed by external id and a damaged
+    /// graph dump is exactly the case where the node ordering that addresses
+    /// the store is unavailable. Dropping the file would make a raw index with
+    /// a damaged dump unloadable, which is a recovery path the loader
+    /// documents and thirty-three tests hold. See the relay 95 report for what
+    /// removing the on-disk copy would take.
+    pub(crate) fn holds_raw_vectors(&self) -> bool {
+        self.hnsw.read().unwrap().holds_raw()
+    }
+
+    /// Rebuild the raw side store of a loaded quantized graph.
+    ///
+    /// The graph comes back from its dump with its own node numbering, which is
+    /// the dump's layer major order rather than the order the records arrived
+    /// in, so the vectors read from `vectors.bin` are placed by internal id
+    /// rather than by position. A live record the file does not name is an
+    /// error, because a `quantized_with_raw` index whose raws are partly
+    /// missing would rerank some records and not others.
+    ///
+    /// **A stranded node takes a zero vector.** Removal and overwrite leave the
+    /// node in the graph and take the record out of `id_map`, and the save
+    /// writes the live records alone, so the file names fewer records than the
+    /// graph has nodes. The store is addressed by node, so those nodes need a
+    /// slot; nothing can reach it, because every reader resolves an external id
+    /// through `id_map` first and a stranded node has none. `compact` drops the
+    /// node and its slot together.
+    pub(crate) fn restore_raw_store(
+        &mut self,
+        vectors: &HashMap<String, Vec<f32>>,
+    ) -> Result<usize, String> {
+        let id_map = self.id_map.read().unwrap();
+        let mut hnsw = self.hnsw.write().unwrap();
+        if !hnsw.is_quantized() {
+            return Ok(0);
+        }
+        let nodes = hnsw.nb_points();
+        hnsw.open_raw_store(self.dim, nodes)?;
+        let mut by_internal: HashMap<usize, &Vec<f32>> = HashMap::with_capacity(vectors.len());
+        for (ext_id, vector) in vectors {
+            if let Some(&internal_id) = id_map.get(ext_id) {
+                by_internal.insert(internal_id, vector);
+            }
+        }
+        let live: std::collections::HashSet<usize> = id_map.values().copied().collect();
+        let stranded_fill = vec![0f32; self.dim];
+        let mut placed = 0usize;
+        let mut stranded = 0usize;
+        for node in 0..nodes as u32 {
+            let internal_id = hnsw.origin_id_at(node);
+            match by_internal.get(&internal_id) {
+                Some(vector) => {
+                    hnsw.push_raw_vector(vector)?;
+                    placed += 1;
+                }
+                None if !live.contains(&internal_id) => {
+                    hnsw.push_raw_vector(&stranded_fill)?;
+                    stranded += 1;
+                }
+                None => {
+                    return Err(format!(
+                        "live record with internal id {} has no raw vector in vectors.bin",
+                        internal_id
+                    ))
+                }
+            }
+        }
+        if stranded > 0 {
+            debug!(
+                operation = "restore_raw_store",
+                stranded_nodes = stranded,
+                "Stranded graph nodes took a zero vector no reader can reach"
+            );
+        }
+        Ok(placed)
     }
 
     /// The body of `save`, with the interpreter lock already released
@@ -317,11 +444,9 @@ impl HNSWIndex {
     /// loaded index holding exactly what was saved.
     pub(crate) fn restore_storage_maps(
         &mut self,
-        vectors: HashMap<String, Vec<f32>>,
         pq_codes: HashMap<String, Vec<u8>>,
         vector_metadata: HashMap<String, HashMap<String, Value>>,
     ) {
-        *self.vectors.write().unwrap() = vectors;
         *self.pq_codes.write().unwrap() = pq_codes;
         *self.vector_metadata.write().unwrap() = vector_metadata;
     }
@@ -519,11 +644,6 @@ impl HNSWIndex {
     /// Get the current ID counter value (thread-safe)
     pub fn get_id_counter(&self) -> usize {
         *self.id_counter.lock().unwrap()
-    }
-
-    /// Get read access to the vectors HashMap (thread-safe)
-    pub fn get_vectors(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Vec<f32>>> {
-        self.vectors.read().unwrap()
     }
 
     /// Get read access to the PQ codes HashMap (thread-safe)

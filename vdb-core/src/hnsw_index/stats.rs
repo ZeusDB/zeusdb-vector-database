@@ -108,19 +108,32 @@ impl HNSWIndex {
         // number of nodes removal and overwrite have stranded. `compact` reclaims the
         // difference. The quantized flag rides along so nothing below has to go
         // back to the graph lock for it.
-        let (graph_nodes, graph_memory_mb, graph_quantized) = {
+        // The raw vector store is inside the graph now, so its size, its
+        // record count and the graph's own size all come from one guard. The
+        // figure `raw_vectors_memory_mb` reports is the store alone and
+        // `graph_memory_mb` is the links alone, which is what the two names
+        // said and what the sum of them was before.
+        // `graph_memory_mb` is everything the graph holds apart from the raw
+        // vectors, being the adjacency, the levels, the origin ids, their
+        // inverse and, on a quantized graph, the codes it scores against. The
+        // raw vectors are reported under their own key wherever they sit, which
+        // is the graph's own store on a raw index and the store beside the
+        // codes on a `quantized_with_raw` one.
+        let (graph_nodes, graph_memory_mb, graph_quantized, keeps_raw) = {
             let hnsw = self.hnsw.read().unwrap();
+            let quantized = hnsw.is_quantized();
+            let graph_bytes = hnsw.links_memory_bytes()
+                + if quantized {
+                    hnsw.store_memory_bytes()
+                } else {
+                    0
+                };
             (
                 hnsw.nb_points(),
-                hnsw.memory_bytes() as f64 / (1024.0 * 1024.0),
-                hnsw.is_quantized(),
+                graph_bytes as f64 / (1024.0 * 1024.0),
+                quantized,
+                hnsw.holds_raw(),
             )
-        };
-
-        let raw_vector_count = {
-            let vectors = self.vectors.read().unwrap();
-            bookkeeping += table_bytes(&vectors) + key_text_bytes(&vectors);
-            vectors.len()
         };
         let pq_code_count = {
             let pq_codes = self.pq_codes.read().unwrap();
@@ -208,6 +221,18 @@ impl HNSWIndex {
         // this call already returned sees a different value, which matters
         // because the langchain adapter forwards `memory_mb` from
         // `get_quantization_info` verbatim and that key is untouched.
+        // `graph_memory_mb` used to include the graph's copy of every raw
+        // vector, which was counted a second time under
+        // `raw_vectors_memory_mb` because the index also held a map of them, so
+        // `total_memory_mb` charged every raw vector twice. There is one copy
+        // now, it is priced once, and it is priced under the key that names it.
+        //
+        // The raw figure is the payload of the live records, which is the
+        // formula this key always used. The store's own capacity is larger,
+        // because a growing arena carries slack and a node that removal has
+        // stranded keeps its slot until `compact` runs, and neither is charged
+        // here for the same reason the codes are charged at their payload.
+        let raw_vector_count = if keeps_raw { live } else { 0 };
         let raw_memory_mb = (raw_vector_count * self.dim * 4) as f64 / (1024.0 * 1024.0);
         let mut total_memory_mb = graph_memory_mb + raw_memory_mb;
         stats.insert(
@@ -246,6 +271,11 @@ impl HNSWIndex {
             // Calculate actual memory usage based on storage mode. The raw
             // vector figure is reported above, on every index rather than only
             // on this branch.
+            // The codes are still held twice, once in the map keyed by
+            // external id and once in the store the quantized graph is
+            // addressed against. This key prices the map, as it always did, and
+            // `graph_memory_mb` prices the store. Relay 95 removed the second
+            // copy of the raw vectors and left this one alone.
             let quantized_memory_mb =
                 (pq_code_count * config.subvectors) as f64 / (1024.0 * 1024.0);
             total_memory_mb += quantized_memory_mb;

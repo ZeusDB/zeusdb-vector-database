@@ -10,7 +10,7 @@
 //! `hnsw_index::training::calibrate_rerank`.
 
 use crate::distance::{CosineDist, L1Dist, L2Dist};
-use crate::graph::Distance;
+use crate::graph::{Distance, VectorGraph};
 use crate::pq::PQ;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1062,6 +1062,38 @@ pub(crate) fn default_rerank_fetch(
     wanted.min(live_records.max(top_k))
 }
 
+/// Where a raw vector is reached, now that there is no map of them.
+///
+/// Two array reads and no hashing beyond the one `id_map` lookup every caller
+/// here was already doing: the external id gives the internal id, the graph
+/// turns that into a node index, and the store is addressed by node. It is a
+/// borrow of both rather than a copy of either, so a caller holds the two read
+/// guards it already held and passes this down.
+///
+/// The two are always taken `id_map` first and the graph second, which is the
+/// order every path in the crate takes them in.
+#[derive(Clone, Copy)]
+pub(crate) struct RawVectors<'a> {
+    /// The external id to internal id map, which is the record set.
+    pub(crate) id_map: &'a HashMap<String, usize>,
+    /// The graph, which owns the store the vectors live in.
+    pub(crate) graph: &'a VectorGraph,
+}
+
+impl RawVectors<'_> {
+    /// One record's raw vector, or `None` where the index keeps none for it.
+    #[inline]
+    pub(crate) fn get(&self, ext_id: &str) -> Option<&[f32]> {
+        self.graph.raw_vector(*self.id_map.get(ext_id)?)
+    }
+
+    /// Whether the index keeps a raw vector for this record.
+    #[inline]
+    pub(crate) fn contains(&self, ext_id: &str) -> bool {
+        self.get(ext_id).is_some()
+    }
+}
+
 /// Score one candidate against the query on the raw vector scale
 ///
 /// The stored raw vector where the index holds one, which under
@@ -1076,7 +1108,7 @@ pub(crate) fn rescore_candidate(
     plan: &RerankPlan,
     query: &[f32],
     ext_id: &str,
-    vectors: &HashMap<String, Vec<f32>>,
+    vectors: RawVectors<'_>,
     pq: Option<&Arc<PQ>>,
     pq_codes: &HashMap<String, Vec<u8>>,
 ) -> Option<f32> {
@@ -1671,27 +1703,39 @@ mod tests {
         let stored = data[7].clone();
         let codes = pq.quantize(&stored).unwrap();
 
-        let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+        // The raw vectors live in the graph now, so the fixture is a real one
+        // holding the one record that keeps its vector. "coded" has an internal
+        // id and no node, which is the shape of a record a quantized_only index
+        // holds, and "absent" has no id at all.
+        let mut id_map: HashMap<String, usize> = HashMap::new();
+        id_map.insert("kept".to_string(), 1);
+        id_map.insert("coded".to_string(), 2);
+        let mut graph = VectorGraph::new_raw("cosine", 8, 16, 4, 16, 64);
+        graph.insert(&stored, 1);
+        let vectors = RawVectors {
+            id_map: &id_map,
+            graph: &graph,
+        };
+
         let mut pq_codes: HashMap<String, Vec<u8>> = HashMap::new();
-        vectors.insert("kept".to_string(), stored.clone());
         pq_codes.insert("kept".to_string(), codes.clone());
         pq_codes.insert("coded".to_string(), codes.clone());
 
         let p = plan(1);
 
         // The raw vector wins where there is one, so the score is exact.
-        let exact = rescore_candidate(&p, &query, "kept", &vectors, Some(&pq), &pq_codes);
+        let exact = rescore_candidate(&p, &query, "kept", vectors, Some(&pq), &pq_codes);
         assert_eq!(exact, Some(CosineDist {}.eval(&query, &stored)));
 
         // Codes alone still score, against the reconstruction.
         let approximate =
-            rescore_candidate(&p, &query, "coded", &vectors, Some(&pq), &pq_codes).unwrap();
+            rescore_candidate(&p, &query, "coded", vectors, Some(&pq), &pq_codes).unwrap();
         let reconstructed = pq.reconstruct(&codes).unwrap();
         assert_eq!(approximate, CosineDist {}.eval(&query, &reconstructed));
 
         // Neither is unscoreable rather than silently zero, which is what keeps
         // an unscored candidate from displacing a scored one.
-        assert!(rescore_candidate(&p, &query, "absent", &vectors, Some(&pq), &pq_codes).is_none());
-        assert!(rescore_candidate(&p, &query, "coded", &vectors, None, &pq_codes).is_none());
+        assert!(rescore_candidate(&p, &query, "absent", vectors, Some(&pq), &pq_codes).is_none());
+        assert!(rescore_candidate(&p, &query, "coded", vectors, None, &pq_codes).is_none());
     }
 }

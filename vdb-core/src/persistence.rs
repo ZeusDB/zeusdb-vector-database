@@ -815,7 +815,21 @@ fn reconstruct_index_simple(
     } else {
         vectors
     };
-    index.restore_storage_maps(vectors, pq_codes, metadata);
+    index.restore_storage_maps(pq_codes, metadata);
+
+    // The raw vectors of a `quantized_with_raw` index go back into the store
+    // beside the codes, addressed by the node numbering the restored graph
+    // carries. A raw index needs none of this: its raw vectors came back with
+    // the graph dump, which is the only place they were written.
+    if index.raw_store_is_expected() && !vectors.is_empty() {
+        let placed = index.restore_raw_store(&vectors).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to restore the raw vectors of a quantized_with_raw index: {}",
+                e
+            ))
+        })?;
+        println!("✅ {} raw vectors restored beside the codes", placed);
+    }
 
     // Step 5: Put back the training collection the rebuild stripped
     if let Some(state) = training_state {
@@ -1559,16 +1573,26 @@ fn save_pq_codes(index: &HNSWIndex, path: &Path) -> PyResult<()> {
 }
 
 /// Save raw vectors based on storage mode configuration
+///
+/// The file is what it always was, a `HashMap` keyed by external id, so a
+/// directory this release writes loads on the reader that read the old ones.
+/// What changed is where the vectors come from: there is no raw vector map any
+/// more, so they are read out of the store the graph is addressed against.
+///
+/// A trained `quantized_only` index writes none, as before, because it holds
+/// none.
 fn save_vectors(index: &HNSWIndex, path: &Path) -> PyResult<()> {
-    // The guard ends with the serialize, as in `save_pq_codes`.
+    if !index.holds_raw_vectors() {
+        return Ok(());
+    }
     let (vectors_data, vector_count) = {
-        let vectors = index.get_vectors();
+        let vectors = index.collect_raw_vectors();
         if vectors.is_empty() {
             return Ok(());
         }
         println!("📊 Saving vectors.bin...");
         (
-            bincode::encode_to_vec(&*vectors, bincode::config::standard()),
+            bincode::encode_to_vec(&vectors, bincode::config::standard()),
             vectors.len(),
         )
     };
@@ -1606,7 +1630,7 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
     // holds the mutation lock and every path that takes the graph's write guard
     // holds it too, so no counterparty could be in flight. That is the same
     // reasoning that failed the three inversions found before this one.
-    let has_raw_vectors = !index.get_vectors().is_empty();
+    let has_raw_vectors = index.holds_raw_vectors() && index.get_vector_count() > 0;
     let code_count = index.get_pq_codes().len();
 
     // Determine what files are included based on what we actually saved

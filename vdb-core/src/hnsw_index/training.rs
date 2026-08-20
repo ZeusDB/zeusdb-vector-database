@@ -10,12 +10,11 @@
 use super::{HNSWIndex, StorageMode, MAX_LAYER};
 use crate::graph::VectorGraph;
 use crate::pq::PQ;
-use crate::rerank::{calibrate_rerank_from_sample, raw_distance_fn, RerankCalibration};
+use crate::rerank::{calibrate_rerank_from_sample, raw_distance_fn, RawVectors, RerankCalibration};
 use crate::rng::SeededRng;
 use chrono::Utc;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
-use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -82,11 +81,17 @@ impl HNSWIndex {
             .ok_or("Config not available")?
             .clone();
 
-        // Get consistent training set using collected IDs. `vectors` is taken
-        // first because the declared lock order puts it above `training_ids`,
-        // and every reader that holds both takes them that way round.
+        // Get consistent training set using collected IDs. The record set and
+        // the graph the vectors live in are taken first and in that order, and
+        // `training_ids` after both, which is the order every reader that holds
+        // them takes them in.
         let training_vectors = {
-            let vectors = self.vectors.read().unwrap();
+            let id_map = self.id_map.read().unwrap();
+            let hnsw = self.hnsw.read().unwrap();
+            let vectors = RawVectors {
+                id_map: &id_map,
+                graph: &hnsw,
+            };
             let training_ids = self.training_ids.read().unwrap();
 
             // ADD EARLY CHECK:
@@ -106,8 +111,8 @@ impl HNSWIndex {
             let mut missing_vectors = 0;
 
             for id in training_ids.iter() {
-                if let Some(vector) = vectors.get(id) {
-                    training_data.push(vector.clone());
+                if let Some(vector) = vectors.get(id.as_str()) {
+                    training_data.push(vector.to_vec());
                 } else {
                     missing_vectors += 1;
                 }
@@ -328,8 +333,30 @@ impl HNSWIndex {
         // those stored codes exactly as `compact` does. Only an index with
         // neither raw vectors nor codes has nothing to rebuild from.
         let (vector_count, retained) = {
-            let vectors = self.vectors.read().unwrap();
-            if vectors.is_empty() {
+            let id_map = self.id_map.read().unwrap();
+            let hnsw = self.hnsw.read().unwrap();
+            let vectors = RawVectors {
+                id_map: &id_map,
+                graph: &hnsw,
+            };
+
+            // Every live record that still has a raw vector, in internal id
+            // order. The order is fixed rather than a hash map's, because the
+            // codes are written back under it and a rebuild has to be a
+            // function of the data alone.
+            let mut live: Vec<(&String, usize)> = id_map
+                .iter()
+                .map(|(id, &internal)| (id, internal))
+                .collect();
+            live.sort_unstable_by_key(|&(_, internal_id)| internal_id);
+            let with_raw: Vec<(&String, &[f32])> = live
+                .iter()
+                .filter_map(|&(id, internal_id)| {
+                    hnsw.raw_vector(internal_id).map(|vector| (id, vector))
+                })
+                .collect();
+
+            if with_raw.is_empty() {
                 let code_count = self.pq_codes.read().unwrap().len();
                 if code_count == 0 {
                     warn!(
@@ -349,11 +376,11 @@ impl HNSWIndex {
             } else {
                 info!(
                     operation = "quantization_rebuild_start",
-                    vector_count = vectors.len(),
+                    vector_count = with_raw.len(),
                     "Starting quantization rebuild"
                 );
 
-                let vector_refs: Vec<&[f32]> = vectors.values().map(|v| v.as_slice()).collect();
+                let vector_refs: Vec<&[f32]> = with_raw.iter().map(|&(_, vector)| vector).collect();
                 let quantized_codes = pq.quantize_batch(&vector_refs).map_err(|e| {
                     error!(operation = "quantization_rebuild", error = %e, "Failed to quantize vectors");
                     format!("Failed to quantize vectors: {}", e)
@@ -368,12 +395,12 @@ impl HNSWIndex {
                 let mut pq_codes = self.pq_codes.write().unwrap();
                 let retained = pq_codes
                     .keys()
-                    .filter(|id| !vectors.contains_key(*id))
+                    .filter(|id| !vectors.contains(id.as_str()))
                     .count();
 
-                for (i, (id, _)) in vectors.iter().enumerate() {
+                for (i, (id, _)) in with_raw.iter().enumerate() {
                     if i < quantized_codes.len() {
-                        pq_codes.insert(id.clone(), quantized_codes[i].clone());
+                        pq_codes.insert((*id).clone(), quantized_codes[i].clone());
                     }
                 }
                 debug!(
@@ -382,7 +409,7 @@ impl HNSWIndex {
                     codes_retained = retained,
                     "Quantized codes stored"
                 );
-                (vectors.len(), retained)
+                (with_raw.len(), retained)
             }
         };
 
@@ -431,6 +458,35 @@ impl HNSWIndex {
                 })?;
         }
 
+        // The raw vectors survive the transition, where the storage mode keeps
+        // them. This is the hardest thing the change to a node addressed store
+        // has to do. The graph being replaced is a raw graph, so its store is
+        // the only copy of every raw vector the index holds; the replacement is
+        // a quantized graph, whose own store holds one byte per subvector. So
+        // the raws are carried into a second store beside the codes, addressed
+        // by the replacement's node numbering rather than the old one, before
+        // the old graph is dropped.
+        //
+        // Under QuantizedOnly nothing is carried, and that is the whole of how
+        // the mode sheds its training records: the raws go when the graph that
+        // held them goes. It used to be an explicit clear of a separate map.
+        let keeps_raw = self
+            .quantization_config
+            .as_ref()
+            .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw);
+        let released = {
+            let old_hnsw = self.hnsw.read().unwrap();
+            let held = old_hnsw.raw_count();
+            if keeps_raw && old_hnsw.holds_raw() {
+                new_hnsw
+                    .adopt_raw_from(&old_hnsw, self.dim)
+                    .map_err(|e| format!("Failed to carry the raw vectors over: {}", e))?;
+                0
+            } else {
+                held
+            }
+        };
+
         // The replacement is built in full before it is installed, so a search
         // running alongside this sees the old graph or the new one and never a
         // partly filled one. It used to see the empty new graph for as long as
@@ -439,25 +495,7 @@ impl HNSWIndex {
         // The old graph is moved out and dropped after the guard is released.
         // See `replace_graph`.
         self.replace_graph(new_hnsw);
-
-        // Release the raw vectors QuantizedOnly no longer needs. Every one of
-        // them was encoded above and its codes stored before the graph was
-        // built, so from here the codes are the record and the raw copies are
-        // dead weight. This runs only after the new graph is installed, so a
-        // failed rebuild leaves the raw store untouched. The map is replaced
-        // rather than cleared so its allocation is returned as well. Training
-        // completion is the only path that reaches here with a populated raw
-        // store under QuantizedOnly, which is what makes this the single point
-        // where the mode sheds its training records.
-        let released = if vector_count > 0
-            && self
-                .quantization_config
-                .as_ref()
-                .is_some_and(|config| config.storage_mode == StorageMode::QuantizedOnly)
-        {
-            let mut vectors = self.vectors.write().unwrap();
-            let released = vectors.len();
-            *vectors = HashMap::new();
+        let released = if vector_count > 0 && !keeps_raw {
             released
         } else {
             0

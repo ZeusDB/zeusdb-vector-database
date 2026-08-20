@@ -47,7 +47,7 @@ use crate::filter::{compile_filter, matches_filter};
 // See the note at the top of `graph.rs`.
 use crate::graph::VectorGraph;
 use crate::pq::PQ;
-use crate::rerank::{RerankCalibration, SearchParams};
+use crate::rerank::{RawVectors, RerankCalibration, SearchParams};
 use insert::InsertError;
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
@@ -252,15 +252,6 @@ pub struct HNSWIndex {
     // Index-level metadata (simple, infrequently accessed)
     metadata: Mutex<HashMap<String, String>>,
 
-    /// The raw vector store.
-    ///
-    /// Holds every record for an unquantized index and under
-    /// `quantized_with_raw`. Under `quantized_only` it holds the records
-    /// collected before training and nothing after: the quantization rebuild
-    /// releases them once their codes are stored, and the loader drops them
-    /// from a directory written before that was true. A trained
-    /// `quantized_only` index therefore holds no raw vector anywhere.
-    vectors: RwLock<HashMap<String, Vec<f32>>>,
     vector_metadata: RwLock<HashMap<String, HashMap<String, Value>>>,
     id_map: RwLock<HashMap<String, usize>>,
     rev_map: RwLock<HashMap<usize, String>>,
@@ -284,6 +275,20 @@ pub struct HNSWIndex {
     /// so the exclusion moved from inside the graph to this lock. See
     /// `insert_one` for the sequence and for what makes the gap between the two
     /// phases safe.
+    /// The graph, and the raw vector store addressed by its node indices.
+    ///
+    /// **There is one copy of every raw vector and it is in here.** The index
+    /// used to hold a second, in a `HashMap<String, Vec<f32>>` keyed by
+    /// external id, written from the same local on the same insertion as the
+    /// graph's. That map is gone. A raw vector is reached by
+    /// `id_map[ext] -> VectorGraph::raw_vector`, which is one hash lookup the
+    /// caller was already making and then two array reads.
+    ///
+    /// Which store holds the raws depends on the graph. On a raw graph they
+    /// are the store the traversal scores against. On a `quantized_with_raw`
+    /// graph they are a second store beside the codes, carried over node by
+    /// node when training replaced the graph. On a trained `quantized_only`
+    /// graph there are none.
     hnsw: RwLock<VectorGraph>,
 
     /// Serialises the mutating operations against each other, not against reads.
@@ -1191,14 +1196,21 @@ impl HNSWIndex {
 
         let mut records = Vec::with_capacity(ids.len());
 
-        // Use read locks for concurrent access
-        let vectors = self.vectors.read().unwrap();
+        // Use read locks for concurrent access. `id_map` is the record set,
+        // and the graph is where the raw vectors live, so both are taken here
+        // and in that order.
+        let id_map = self.id_map.read().unwrap();
+        let hnsw = self.hnsw.read().unwrap();
         let pq_codes = self.pq_codes.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
+        let raws = RawVectors {
+            id_map: &id_map,
+            graph: &hnsw,
+        };
 
         for id in ids {
             // Check if this ID exists in either storage
-            let exists = vectors.contains_key(&id) || pq_codes.contains_key(&id);
+            let exists = id_map.contains_key(&id) || pq_codes.contains_key(&id);
 
             if exists {
                 let metadata = vector_metadata.get(&id).cloned().unwrap_or_default();
@@ -1209,9 +1221,9 @@ impl HNSWIndex {
 
                 if return_vector {
                     // Priority: raw vector > PQ reconstruction
-                    let vector_data = if let Some(raw_vector) = vectors.get(&id) {
+                    let vector_data = if let Some(raw_vector) = raws.get(&id) {
                         // Case 1: Raw vector available (QuantizedWithRaw mode or non-quantized)
-                        Some(raw_vector.clone())
+                        Some(raw_vector.to_vec())
                     } else if let (Some(pq), Some(codes)) = (&self.pq, pq_codes.get(&id)) {
                         // Case 2: Only quantized codes available (QuantizedOnly mode)
                         match pq.reconstruct(codes) {
@@ -1574,14 +1586,28 @@ impl HNSWIndex {
             // Built before any guard is taken, so the allocation happens
             // outside the write guard exactly as `compact` arranges it.
             let fresh = if let (true, Some(pq)) = (quantized, pq) {
-                VectorGraph::new_pq(
+                let mut graph = VectorGraph::new_pq(
                     &self.space,
                     self.m,
                     self.expected_size,
                     MAX_LAYER,
                     self.ef_construction,
                     pq,
-                )
+                );
+                // A cleared `quantized_with_raw` index goes on keeping raw
+                // vectors, so its replacement graph opens the store the next
+                // insertion writes into. Without this the store is absent and
+                // every record added after a clear would lose its raw vector.
+                if self
+                    .quantization_config
+                    .as_ref()
+                    .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw)
+                {
+                    graph
+                        .open_raw_store(self.dim, self.expected_size)
+                        .expect("a quantized graph accepts a raw side store");
+                }
+                graph
             } else {
                 VectorGraph::new_raw(
                     &self.space,
@@ -1598,7 +1624,6 @@ impl HNSWIndex {
             let removed = {
                 let mut id_map = self.id_map.write().unwrap();
                 let mut rev_map = self.rev_map.write().unwrap();
-                let mut vectors = self.vectors.write().unwrap();
                 let mut pq_codes = self.pq_codes.write().unwrap();
                 let mut vector_metadata = self.vector_metadata.write().unwrap();
                 let mut training_ids = self.training_ids.write().unwrap();
@@ -1608,7 +1633,6 @@ impl HNSWIndex {
                 let removed = id_map.len();
                 id_map.clear();
                 rev_map.clear();
-                vectors.clear();
                 pq_codes.clear();
                 vector_metadata.clear();
                 training_ids.clear();
