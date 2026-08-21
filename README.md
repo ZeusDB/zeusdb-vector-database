@@ -989,7 +989,7 @@ True True
 
 The index above declared 300 records and was given 500, so its graph grew and left slack behind. `index`, the index used throughout this section, returns `0` instead, because `compact()` was called on it earlier and compaction already shrinks the graph it rebuilds.
 
-**No node, edge or distance is touched**, so every search returns the same page with the same scores. Measured on 50,000 records of `dim=1536` at `m=32`, it released 188.28 MB in one millisecond and search latency did not move, so the slack was buying nothing.
+**No node, edge or distance is touched**, so every search returns the same page with the same scores.
 
 **Call it on an index that holds its records, not on one about to receive them.** On an empty index it hands back the whole creation reservation that `expected_size` bought, so every later insertion regrows the arenas from nothing.
 

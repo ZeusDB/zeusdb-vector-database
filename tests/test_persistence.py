@@ -352,7 +352,12 @@ def test_persistence_preserves_index_level_metadata(tmp_path):
     config = json.loads((save_dir / "config.json").read_text(encoding="utf-8"))
     assert config["metadata"] == {"owner": "relay24", "dataset": "docs_v2"}
     assert sorted(config) == ["dim", "ef_construction", "expected_size", "id_counter",
-                              "m", "metadata", "space", "vector_count"]
+                              "indexed_fields", "m", "metadata", "space", "vector_count"]
+    # The declared filterable fields ride here too, for the same reason. The
+    # columns themselves are derived from metadata.json on load, so nothing else
+    # in the directory records which fields a user chose. This index declared
+    # none, which is what an empty list means.
+    assert config["indexed_fields"] == []
 
     loaded = vdb.load(str(save_dir))
     assert loaded.get_all_metadata() == {"owner": "relay24", "dataset": "docs_v2"}

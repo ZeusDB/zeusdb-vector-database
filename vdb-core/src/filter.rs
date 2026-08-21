@@ -372,7 +372,22 @@ fn field_matches(metadata: &HashMap<String, Value>, field: &str, test: &FieldTes
     let Some(field_value) = metadata.get(field) else {
         return false;
     };
+    field_test_matches(field_value, test)
+}
 
+/// Judge one value against one field's condition.
+///
+/// **This is the whole of what an operator decides, and it is called from
+/// exactly two places.** [`field_matches`] calls it with the value it found in
+/// a record's metadata, and [`crate::columns::ColumnStore::select`] calls it
+/// with the value a column holds. A column and the metadata walk therefore
+/// cannot disagree about whether a value matches, because there is one function
+/// and not two.
+///
+/// It takes the value rather than the record, so the absence rule stays where
+/// it was. A record that does not carry the field never reaches here, and a
+/// column that holds no value for a slot never calls it.
+pub(crate) fn field_test_matches(field_value: &Value, test: &FieldTest) -> bool {
     match test {
         FieldTest::Equals(target) => values_equal(field_value, target),
         FieldTest::Operators(operations) => operations

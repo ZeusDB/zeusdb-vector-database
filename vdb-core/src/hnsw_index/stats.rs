@@ -161,6 +161,12 @@ impl HNSWIndex {
             bytes
         };
 
+        // The declared columns. Four bytes a record per field where the field
+        // has few distinct values, and the value itself a second time where
+        // nearly every record holds a different one. Zero on an index created
+        // without `indexed_fields`.
+        bookkeeping += self.columns.read().unwrap().heap_bytes();
+
         let training_id_count = {
             let training_ids = self.training_ids.read().unwrap();
             bookkeeping += training_ids.capacity() * std::mem::size_of::<String>()

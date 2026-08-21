@@ -57,9 +57,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      # The toolchain comes from rust-toolchain.toml and from nowhere else.
+      #
+      # This was dtolnay/rust-toolchain@stable, which installs whatever stable
+      # resolves to on the day and sets it as the default. rust-toolchain.toml
+      # then overrode it for every cargo invocation inside the checkout, so the
+      # action's channel decided nothing and its components list applied to a
+      # toolchain the gate never ran. Which of the two won was never
+      # established, and the two agreed only by coincidence.
+      #
+      # `rustup toolchain install` with no argument reads the channel and the
+      # components out of the file, so the version installed is the version
+      # that runs. Raising the pin is now the whole of a toolchain bump.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: vdb-core
@@ -82,7 +93,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # From rust-toolchain.toml, as in the lint job. See the note there.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: vdb-core
@@ -100,6 +113,22 @@ jobs:
         # Scoped to tests, because seven scripts under benchmarks end in
         # _test.py and start with a digit, which pytest cannot import.
         run: uv run --no-sync pytest tests
+      # The Rust tests link an executable, and an executable has to resolve
+      # every libpython symbol it references. `cargo test` below turns
+      # `extension-module` off so that PyO3 emits the `-lpython` line, and that
+      # line needs `libpython3.x.so`, which lives in python3-dev. The runner
+      # image ships the interpreter and `libpython3.12.so.1.0` but not the
+      # symlink a linker resolves `-l` against, so this is not a no-op.
+      #
+      # Nothing else in the job needs it. Building the extension does not,
+      # because that is the case where PyO3 emits no link line at all.
+      - name: Install libpython so the Rust tests can link
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-dev
       - name: Run the Rust test suite
         working-directory: vdb-core
-        run: cargo test --workspace --locked
+        # --no-default-features turns off this crate's `extension-module`
+        # feature, which is on for every other cargo command and for the wheel.
+        # See the comment on it in vdb-core/Cargo.toml.
+        run: cargo test --workspace --locked --no-default-features

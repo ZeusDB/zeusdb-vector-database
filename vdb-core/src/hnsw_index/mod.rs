@@ -44,6 +44,7 @@ mod search;
 mod stats;
 mod training;
 
+use crate::columns::ColumnStore;
 use crate::conversion::{python_dict_to_value_map, value_map_to_python};
 use crate::filter::{compile_filter, matches_filter};
 // The graph and everything the graph crate supplies arrive through the seam.
@@ -199,9 +200,13 @@ impl AddResult {
 /// order, top to bottom. Releasing may happen in any order.
 ///
 /// ```text
-/// id_map < rev_map < hnsw < vectors < pq_codes < vector_metadata
+/// id_map < rev_map < hnsw < vectors < pq_codes < vector_metadata < columns
 ///        < training_ids < metadata < id_counter < vector_count
 /// ```
+///
+/// `columns` sits directly below `vector_metadata` because every path that
+/// writes one writes the other, and a filtered search holds both: the columns
+/// to decide which records match and the metadata to fill the page it returns.
 ///
 /// This exists because search and mutation now overlap. Until the receivers
 /// were relaxed, PyO3's exclusive borrow kept every mutating method away from
@@ -256,6 +261,34 @@ pub struct HNSWIndex {
     metadata: Mutex<HashMap<String, String>>,
 
     vector_metadata: RwLock<HashMap<String, HashMap<String, Value>>>,
+
+    /// One column per field declared at `create()`, addressed by internal id.
+    ///
+    /// **This is what a filtered search reads instead of walking every
+    /// record.** A filter naming only declared fields compiles to a bitmap over
+    /// internal ids, which both the exact scan and the graph traversal consume,
+    /// and `vector_metadata` is then read only for the records the page
+    /// returns. A filter naming an undeclared field cannot be answered here and
+    /// falls back to the walk, which is what every index did before this
+    /// existed and what an index with no declaration still does.
+    ///
+    /// It supplements the metadata map rather than replacing it. `get_records`,
+    /// `list`, the result page and the saver all read the map, and a column
+    /// store is the wrong shape to reassemble a record from. What the columns
+    /// hold is a code per record and one copy of each distinct value, so a
+    /// declared field with few distinct values costs four bytes a record. A
+    /// declared field whose value differs on every record is held in full a
+    /// second time; see `columns::Column`.
+    columns: RwLock<ColumnStore>,
+
+    /// Set once a filtered search has warned that it named a field this index
+    /// did not declare, so the warning fires once rather than per search.
+    ///
+    /// Silent on an index that declared nothing, because there the walk is not
+    /// a surprise: it is what the index has always done and what its
+    /// declaration asked for.
+    undeclared_filter_warned: AtomicBool,
+
     id_map: RwLock<HashMap<String, usize>>,
     rev_map: RwLock<HashMap<usize, String>>,
 
@@ -359,7 +392,7 @@ pub struct HNSWIndex {
 /// is what makes the Python factory and this function agree.
 #[pyfunction]
 #[pyo3(name = "_create_hnsw_index")]
-#[pyo3(signature = (dim, space, m, ef_construction, expected_size, quantization_config = None))]
+#[pyo3(signature = (dim, space, m, ef_construction, expected_size, quantization_config = None, indexed_fields = None))]
 pub fn create_hnsw_index(
     dim: usize,
     space: String,
@@ -367,6 +400,7 @@ pub fn create_hnsw_index(
     ef_construction: usize,
     expected_size: usize,
     quantization_config: Option<&Bound<PyDict>>,
+    indexed_fields: Option<Vec<String>>,
 ) -> PyResult<HNSWIndex> {
     HNSWIndex::build(
         dim,
@@ -375,6 +409,7 @@ pub fn create_hnsw_index(
         ef_construction,
         expected_size,
         quantization_config,
+        indexed_fields.unwrap_or_default(),
     )
 }
 impl HNSWIndex {
@@ -1105,12 +1140,34 @@ impl HNSWIndex {
         // compiled, so `matches_filter` returns `bool` and there is no error
         // arm to explain.
         Ok(py.detach(|| {
+            // The columns answer this outright where every field is declared,
+            // as a population count over the bitmap rather than a walk. The two
+            // guards are never held together, so the fall back below is in
+            // order rather than against it.
+            {
+                let columns = self.columns.read().unwrap();
+                if let Ok(selected) = columns.select(&conditions) {
+                    return selected.count();
+                }
+            }
             let vector_metadata = self.vector_metadata.read().unwrap();
             vector_metadata
                 .values()
                 .filter(|meta| matches_filter(meta, &conditions))
                 .count()
         }))
+    }
+
+    /// The metadata fields this index built a column for, in the order they
+    /// were declared.
+    ///
+    /// Empty on an index created without `indexed_fields` and on every
+    /// directory saved before the declaration existed. A filter naming a field
+    /// not in this list still works and still returns the same records; what it
+    /// costs is a walk of every record's metadata.
+    #[getter]
+    pub fn indexed_fields(&self) -> Vec<String> {
+        self.columns.read().unwrap().declared().to_vec()
     }
 
     /// Return the graph's spare buffer capacity to the allocator.
@@ -1629,6 +1686,7 @@ impl HNSWIndex {
                 let mut rev_map = self.rev_map.write().unwrap();
                 let mut pq_codes = self.pq_codes.write().unwrap();
                 let mut vector_metadata = self.vector_metadata.write().unwrap();
+                let mut columns = self.columns.write().unwrap();
                 let mut training_ids = self.training_ids.write().unwrap();
                 let mut id_counter = self.id_counter.lock().unwrap();
                 let mut vector_count = self.vector_count.lock().unwrap();
@@ -1638,6 +1696,10 @@ impl HNSWIndex {
                 rev_map.clear();
                 pq_codes.clear();
                 vector_metadata.clear();
+                // Keeps the declaration and drops every record, which is what
+                // `clear` does to the index itself. The reservation comes back
+                // too, since a cleared index is about to be filled again.
+                columns.clear(self.expected_size);
                 training_ids.clear();
                 *id_counter = 0;
                 *vector_count = 0;
