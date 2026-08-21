@@ -6,6 +6,7 @@
 //! collecting for training. Removal is logical, and `compact_locked` reclaims
 //! the graph nodes that removal and replacement leave behind.
 
+use super::locks::{order, WriteGuard};
 use super::{HNSWIndex, ParsedRecords, StorageMode, MAX_LAYER};
 use crate::columns::{Bitmap, ColumnStore, Selection};
 use crate::filter::{matches_filter, Filter};
@@ -15,7 +16,6 @@ use pyo3::prelude::*;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use std::sync::RwLockWriteGuard;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
 /// Multiple of `expected_size` at which an index warns that it has outgrown its
@@ -64,11 +64,12 @@ impl InsertError {
 /// them to the per record helper. They drop in field order, which is the
 /// acquisition order, and releasing may happen in any order.
 struct RemovalGuards<'a> {
-    id_map: RwLockWriteGuard<'a, HashMap<String, usize>>,
-    rev_map: RwLockWriteGuard<'a, HashMap<usize, String>>,
-    pq_codes: RwLockWriteGuard<'a, HashMap<String, Vec<u8>>>,
-    vector_metadata: RwLockWriteGuard<'a, HashMap<String, HashMap<String, Value>>>,
-    columns: RwLockWriteGuard<'a, ColumnStore>,
+    id_map: WriteGuard<'a, { order::ID_MAP }, HashMap<String, usize>>,
+    rev_map: WriteGuard<'a, { order::REV_MAP }, HashMap<usize, String>>,
+    pq_codes: WriteGuard<'a, { order::PQ_CODES }, HashMap<String, Vec<u8>>>,
+    vector_metadata:
+        WriteGuard<'a, { order::VECTOR_METADATA }, HashMap<String, HashMap<String, Value>>>,
+    columns: WriteGuard<'a, { order::COLUMNS }, ColumnStore>,
 }
 
 impl HNSWIndex {

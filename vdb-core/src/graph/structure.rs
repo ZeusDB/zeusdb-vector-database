@@ -110,6 +110,9 @@ where
         m: graph.m(),
         ef_construction: graph.ef_construction(),
         min_nodes: 0,
+        // Every test graph here inserts under ids 0 to n - 1, so the node count
+        // is a ceiling every one of them clears.
+        max_origin_id: graph.nb_points(),
     };
     parse_dump::<T>(dir.path(), &expected).unwrap()
 }
@@ -420,6 +423,7 @@ where
         m: built.m(),
         ef_construction: built.ef_construction(),
         min_nodes: 0,
+        max_origin_id: built.nb_points(),
     };
     let parsed = parse_dump::<T>(first.path(), &expected).unwrap();
     let (mutable, mutable_store) = MutableGraph::from_loaded(

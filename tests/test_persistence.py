@@ -1121,6 +1121,21 @@ def test_load_validates_the_declaration_in_config_json(tmp_path):
                        match=r"config\.json: Unsupported space: 'euclidean'"):
         vdb.load(corrupted("space.zdb", "space", "euclidean"))
 
+    # id_counter above what a node index can name. This one is not a behaviour
+    # that came back wrong: the internal id is the index into the graph's
+    # id-to-node array, so a config declaring 2^40 loaded and then **aborted the
+    # process** on the next add, asking the allocator for 4.4 TB. An allocation
+    # failure does not unwind, so nothing catches it and the interpreter dies
+    # with no traceback.
+    with pytest.raises(ValueError, match=r"config\.json: id_counter is 1099511627776"):
+        vdb.load(corrupted("idbig.zdb", "id_counter", 1 << 40))
+
+    # And the add that used to abort now runs, on a directory whose id_counter
+    # is merely larger than the ids it holds rather than impossible.
+    grown = vdb.load(corrupted("idgrown.zdb", "id_counter", 4_000_000))
+    grown.add({"id": "extra", "values": [1.0, 0.5, 0.25, 0.125], "metadata": {}})
+    assert grown.get_vector_count() == 6
+
     # A valid value that merely differs still opens, so the check refuses bad
     # declarations rather than unfamiliar ones.
     reopened = vdb.load(corrupted("l1.zdb", "space", "l1"))

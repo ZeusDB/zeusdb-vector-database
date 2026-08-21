@@ -39,6 +39,9 @@ pub(crate) use construct::{validate_index_parameters, warn_if_selection_disabled
 mod graph_guard_tests;
 mod input;
 mod insert;
+/// Every lock on this type, with its place in the declared acquisition order
+/// asserted on a debug build.
+pub(crate) mod locks;
 mod persist;
 mod search;
 mod stats;
@@ -53,6 +56,7 @@ use crate::graph::VectorGraph;
 use crate::pq::PQ;
 use crate::rerank::{RawVectors, RerankCalibration, SearchParams};
 use insert::InsertError;
+use locks::{order, MutexAt, RwLockAt};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -60,7 +64,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 // ✅ ENTERPRISE: Structured logging imports
@@ -200,9 +204,16 @@ impl AddResult {
 /// order, top to bottom. Releasing may happen in any order.
 ///
 /// ```text
-/// id_map < rev_map < hnsw < vectors < pq_codes < vector_metadata < columns
+/// id_map < rev_map < hnsw < pq_codes < vector_metadata < columns
 ///        < training_ids < metadata < id_counter < vector_count
 /// ```
+///
+/// **This order is checked rather than believed.** Every field below is a
+/// [`locks::RwLockAt`] or a [`locks::MutexAt`] carrying its rank as a const
+/// generic, and on a debug build each acquisition asserts that the thread holds
+/// none of the same lock and nothing ranked above it. See [`locks`] for what
+/// that catches, what it costs and what it misses. In release the wrappers are
+/// the standard types by another name.
 ///
 /// `columns` sits directly below `vector_metadata` because every path that
 /// writes one writes the other, and a filtered search holds both: the columns
@@ -212,9 +223,13 @@ impl AddResult {
 /// were relaxed, PyO3's exclusive borrow kept every mutating method away from
 /// every search, so no reader and no writer were ever in flight together and
 /// the acquisition order could not matter. It matters now. A search holds
-/// `rev_map` for its whole traversal and takes `vectors` afterwards, so a
-/// removal taking `vectors` before `rev_map`, which is what it used to do,
-/// deadlocks against it on the first interleaving that lands.
+/// `rev_map` for its whole traversal and reads the graph under it, so a removal
+/// taking the graph before `rev_map`, which is what it used to do, deadlocks
+/// against it on the first interleaving that lands.
+///
+/// `vectors` used to sit between `hnsw` and `pq_codes` here. The lock went with
+/// the field when the raw vectors moved into the graph's own store, which the
+/// graph guard already covers, so the order is one shorter than it was.
 ///
 /// One further rule, which the order alone does not express. No path forks to
 /// rayon while holding a write guard. Mutations are serialised against each
@@ -222,19 +237,24 @@ impl AddResult {
 /// blocked by that one writer, and a fork under a write guard is exactly the
 /// case where the pool's workers can all end up waiting on the forking thread.
 ///
-/// Three locks sit outside the order. `writers` is taken by the mutating Python
+/// Four locks sit outside the order. `writers` is taken by the mutating Python
 /// entry points before any guard and never by an internal helper; see the
-/// field. `rerank_calibration` and `training_completed_at` are never held
-/// together with any other guard: training and the loader write both with
-/// nothing held, and every reader takes them alone. The locks inside `PQ` are leaves, since nothing in `pq.rs` can
-/// name an index guard, so they may be taken under any of the above but no
-/// index guard may be taken under them, which no path does.
+/// field. `rerank_calibration`, `training_completed_at` and `created_at` are
+/// never held together with any other guard: training and the loader write them
+/// with nothing held, and every reader takes them alone. The registry ranks
+/// `writers` above everything and the other three below everything, which is
+/// the half of that claim a rank can state. The locks inside `PQ` are leaves,
+/// since nothing in `pq.rs` can name an index guard, so they may be taken under
+/// any of the above but no index guard may be taken under them, which no path
+/// does.
 ///
 /// Taking the same guard twice on one thread is forbidden even for reads.
 /// The standard library queues readers behind a waiting writer, so a second
 /// read on the thread already holding one deadlocks the moment a writer lands
 /// between them, which is how `get_stats` used to hang against training id
-/// collection.
+/// collection. The registry asserts this on every acquisition in a debug build,
+/// so it fires in an ordinary single threaded test rather than waiting for a
+/// writer to land in the window.
 #[pyclass]
 pub struct HNSWIndex {
     dim: usize,
@@ -253,7 +273,7 @@ pub struct HNSWIndex {
     // Quantization configuration and PQ instance
     quantization_config: Option<QuantizationConfig>,
     pq: Option<Arc<PQ>>,
-    pq_codes: RwLock<HashMap<String, Vec<u8>>>, // PQ codes storage
+    pq_codes: RwLockAt<{ order::PQ_CODES }, HashMap<String, Vec<u8>>>, // PQ codes storage
 
     /// What training measured about how deep this index's codes bury a true
     /// neighbour, which is what the default rerank fetch is derived from.
@@ -262,12 +282,12 @@ pub struct HNSWIndex {
     /// loader from `quantization.json`. `None` on an unquantized index, on a
     /// `quantized_only` one, before training, and on an index trained before
     /// the calibration existed. See `RerankCalibration`.
-    rerank_calibration: RwLock<Option<RerankCalibration>>,
+    rerank_calibration: RwLockAt<{ order::RERANK_CALIBRATION }, Option<RerankCalibration>>,
 
     // Index-level metadata (simple, infrequently accessed)
-    metadata: Mutex<HashMap<String, String>>,
+    metadata: MutexAt<{ order::METADATA }, HashMap<String, String>>,
 
-    vector_metadata: RwLock<HashMap<String, HashMap<String, Value>>>,
+    vector_metadata: RwLockAt<{ order::VECTOR_METADATA }, HashMap<String, HashMap<String, Value>>>,
 
     /// One column per field declared at `create()`, addressed by internal id.
     ///
@@ -288,7 +308,7 @@ pub struct HNSWIndex {
     /// declared field with few distinct values costs four bytes a record. A
     /// declared field whose value differs on every record is held in full a
     /// second time; see `columns::Column`.
-    columns: RwLock<ColumnStore>,
+    columns: RwLockAt<{ order::COLUMNS }, ColumnStore>,
 
     /// Set once a filtered search has warned that it named a field this index
     /// did not declare, so the warning fires once rather than per search.
@@ -298,12 +318,12 @@ pub struct HNSWIndex {
     /// declaration asked for.
     undeclared_filter_warned: AtomicBool,
 
-    id_map: RwLock<HashMap<String, usize>>,
-    rev_map: RwLock<HashMap<usize, String>>,
+    id_map: RwLockAt<{ order::ID_MAP }, HashMap<String, usize>>,
+    rev_map: RwLockAt<{ order::REV_MAP }, HashMap<usize, String>>,
 
     // Mutex for write-only fields
-    id_counter: Mutex<usize>,
-    vector_count: Mutex<usize>, // Track total vectors for training trigger
+    id_counter: MutexAt<{ order::ID_COUNTER }, usize>,
+    vector_count: MutexAt<{ order::VECTOR_COUNT }, usize>, // Track total vectors for training trigger
 
     /// The graph.
     ///
@@ -334,7 +354,7 @@ pub struct HNSWIndex {
     /// graph they are a second store beside the codes, carried over node by
     /// node when training replaced the graph. On a trained `quantized_only`
     /// graph there are none.
-    hnsw: RwLock<VectorGraph>,
+    hnsw: RwLockAt<{ order::HNSW }, VectorGraph>,
 
     /// Serialises the mutating operations against each other, not against reads.
     ///
@@ -349,11 +369,11 @@ pub struct HNSWIndex {
     /// Held by the Python entry points only. An internal caller reaching a
     /// mutating helper is already inside the guard, so the helpers never take
     /// it and cannot deadlock against the caller that owns it.
-    writers: Mutex<()>,
+    writers: MutexAt<{ order::WRITERS }, ()>,
 
     // ID-based training collection
-    training_ids: RwLock<Vec<String>>,      // Just IDs, not vectors
-    training_threshold_reached: AtomicBool, // Atomic flag for safety
+    training_ids: RwLockAt<{ order::TRAINING_IDS }, Vec<String>>, // Just IDs, not vectors
+    training_threshold_reached: AtomicBool,                       // Atomic flag for safety
 
     /// When the codebook was fitted, in RFC 3339, or `None` on an index that
     /// has never trained.
@@ -368,7 +388,7 @@ pub struct HNSWIndex {
     /// name, and there is no way to recover the real one. The loader restores
     /// what is there rather than restamping it, so the wrong value stops
     /// moving instead of being replaced by a newer wrong value.
-    training_completed_at: RwLock<Option<String>>,
+    training_completed_at: RwLockAt<{ order::TRAINING_COMPLETED_AT }, Option<String>>,
 
     /// Timestamp when the index was created, in RFC 3339.
     ///
@@ -376,7 +396,7 @@ pub struct HNSWIndex {
     /// `Utc::now()` because it has nothing better to start from, and until the
     /// loader wrote the saved value back over it a load reset the field, so a
     /// save of a loaded index recorded the load as the creation.
-    created_at: RwLock<String>,
+    created_at: RwLockAt<{ order::CREATED_AT }, String>,
 
     /// Set while a load rebuilds the graph, so the rebuild does not refill the
     /// training collection with the ids it is replaying.

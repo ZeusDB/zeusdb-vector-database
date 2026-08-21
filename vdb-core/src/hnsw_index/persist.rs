@@ -6,8 +6,9 @@
 //! field of `HNSWIndex` and cannot leave one in a state the index did not
 //! choose.
 
+use super::locks::{order, ReadGuard};
 use super::{HNSWIndex, QuantizationConfig, StorageMode, MAX_LAYER};
-use crate::graph::{restore_graph, VectorGraph};
+use crate::graph::{restore_graph, DumpBounds, VectorGraph};
 use crate::rerank::RawVectors;
 use pyo3::prelude::*;
 use serde_json::Value;
@@ -280,7 +281,11 @@ impl HNSWIndex {
     /// caller rebuilds instead, so a directory whose dump is absent, was written
     /// by a release whose distance types were named differently, or is damaged
     /// still loads.
-    pub(crate) fn restore_graph_from_dump(&mut self, dir: &Path) -> Result<usize, String> {
+    pub(crate) fn restore_graph_from_dump(
+        &mut self,
+        dir: &Path,
+        max_origin_id: usize,
+    ) -> Result<usize, String> {
         if rebuild_requested() {
             return Err(format!("{} asked for the rebuild", REBUILD_ENV));
         }
@@ -307,7 +312,10 @@ impl HNSWIndex {
             self.get_ef_construction(),
             self.dim,
             pq,
-            live,
+            DumpBounds {
+                min_nodes: live,
+                max_origin_id,
+            },
         )?;
 
         self.replace_graph(graph);
@@ -696,24 +704,32 @@ impl HNSWIndex {
     }
 
     /// Get read access to the PQ codes HashMap (thread-safe)
-    pub fn get_pq_codes(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Vec<u8>>> {
+    ///
+    /// `pub(crate)` rather than `pub`, as are the four accessors below that
+    /// also hand out a guard. They return a [`super::locks::ReadGuard`], which
+    /// is a crate type, and a `pub` item returning one is a private type in a
+    /// public interface. Nothing outside the crate could call them in any case,
+    /// since `hnsw_index` is a private module.
+    pub(crate) fn get_pq_codes(
+        &self,
+    ) -> ReadGuard<'_, { order::PQ_CODES }, HashMap<String, Vec<u8>>> {
         self.pq_codes.read().unwrap()
     }
 
     /// Get read access to the vector metadata HashMap (thread-safe)
-    pub fn get_vector_metadata(
+    pub(crate) fn get_vector_metadata(
         &self,
-    ) -> std::sync::RwLockReadGuard<'_, HashMap<String, HashMap<String, Value>>> {
+    ) -> ReadGuard<'_, { order::VECTOR_METADATA }, HashMap<String, HashMap<String, Value>>> {
         self.vector_metadata.read().unwrap()
     }
 
     /// Get read access to the ID map (external ID -> internal ID)
-    pub fn get_id_map(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, usize>> {
+    pub(crate) fn get_id_map(&self) -> ReadGuard<'_, { order::ID_MAP }, HashMap<String, usize>> {
         self.id_map.read().unwrap()
     }
 
     /// Get read access to the reverse ID map (internal ID -> external ID)
-    pub fn get_rev_map(&self) -> std::sync::RwLockReadGuard<'_, HashMap<usize, String>> {
+    pub(crate) fn get_rev_map(&self) -> ReadGuard<'_, { order::REV_MAP }, HashMap<usize, String>> {
         self.rev_map.read().unwrap()
     }
 
@@ -746,7 +762,7 @@ impl HNSWIndex {
     }
 
     /// Get read access to training IDs (for persistence)
-    pub fn get_training_ids(&self) -> std::sync::RwLockReadGuard<'_, Vec<String>> {
+    pub(crate) fn get_training_ids(&self) -> ReadGuard<'_, { order::TRAINING_IDS }, Vec<String>> {
         self.training_ids.read().unwrap()
     }
 

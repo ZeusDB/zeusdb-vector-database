@@ -393,6 +393,18 @@ fn checksum_of(bytes: &[u8]) -> u64 {
     sum.finish()
 }
 
+/// The same checksum, reachable from the fuzz mutator so that it can repair a
+/// header or a payload after touching it.
+///
+/// A mutator that cannot repair a checksum never gets past `Header::decode`, so
+/// it proves the checksum works and reaches no parsing code. See
+/// [`super::fuzz`]. Compiled only under `cfg(test)`, so the release build gains
+/// nothing.
+#[cfg(test)]
+pub(super) fn checksum_for_tests(bytes: &[u8]) -> u64 {
+    checksum_of(bytes)
+}
+
 // ============================================================================
 // A CURSOR OVER THE BYTES ALREADY READ
 // ============================================================================
@@ -813,6 +825,23 @@ pub(crate) struct Expected {
     /// The live record count. The graph holds at least this many nodes and
     /// holds more whenever a removal or an overwrite has stranded one.
     pub min_nodes: usize,
+    /// The largest internal id the index has ever issued, from `config.json`.
+    ///
+    /// **This is what bounds the loaded graph's memory.** A point's origin id
+    /// is the internal id it was inserted under, and the structure the reader
+    /// builds holds the inverse of that map as an array indexed by the id. The
+    /// origin id region costs eight bytes per point on disk and the array costs
+    /// four bytes per *slot*, so without a ceiling a single point declaring an
+    /// id of 2^59 asks for two exabytes and the process aborts on the
+    /// allocation rather than returning an error.
+    ///
+    /// `id_counter` is exact rather than a margin. A save takes the mutation
+    /// lock for its whole run, so the counter `config.json` records and the
+    /// graph the same save dumped come from one instant, and every id in the
+    /// dump was issued by the counter before it was read. It is a required
+    /// field of `IndexConfig`, so every directory this build can open carries
+    /// one.
+    pub max_origin_id: usize,
 }
 
 /// A dump parsed back into the topology a graph constructor takes, with the
@@ -1038,6 +1067,18 @@ where
         let mut word = [0u8; 8];
         word.copy_from_slice(entry);
         let id = u64::from_le_bytes(word);
+        // The ceiling, and the last allocation in the load that a field could
+        // otherwise size without the file having earned it. The graph keys its
+        // id-to-node array by the id, so one point naming 2^59 asks for two
+        // exabytes and aborts the process on the allocation. Everything above
+        // is bounded by the size agreement; this one is bounded by the counter
+        // the same save wrote. See [`Expected::max_origin_id`].
+        if id > expected.max_origin_id as u64 {
+            return Err(format!(
+                "the graph dump names origin id {} and config.json counted {}",
+                id, expected.max_origin_id
+            ));
+        }
         origin_ids.push(usize::try_from(id).map_err(|_| {
             format!(
                 "the graph dump names origin id {}, which this target cannot hold",
@@ -1306,6 +1347,9 @@ mod tests {
             m: graph.m(),
             ef_construction: graph.ef_construction(),
             min_nodes: nodes,
+            // `sample_graph` inserts under ids 0 to records - 1, so the largest
+            // one it ever issues is the last.
+            max_origin_id: nodes.saturating_sub(1),
         }
     }
 
@@ -1572,6 +1616,73 @@ mod tests {
             CosineDist {},
         ));
         assert!(reason.contains("no file could hold"), "{}", reason);
+    }
+
+    /// An origin id above what `config.json` counted is refused.
+    ///
+    /// Found by [`super::fuzz`] on its first run, as a splice that dropped 46
+    /// bytes of vector data over the origin id region with both checksums
+    /// repaired. The structure keys its id-to-node array by the origin id, so
+    /// one point declaring 2^59 asked for 3.4 exabytes and **the process
+    /// aborted on the allocation**, which no `catch_unwind` can see and which in
+    /// a Python process kills the interpreter with no traceback. That is the
+    /// failure mode the vendored reader's `std::process::exit(1)` was replaced
+    /// to remove.
+    ///
+    /// The ceiling is `config.json`'s `id_counter`, which is exact: a save holds
+    /// the mutation lock for its whole run, so the counter and the graph come
+    /// from one instant and every id in the dump was issued before the counter
+    /// was read.
+    #[test]
+    fn an_origin_id_above_what_config_counted_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (built, built_store) = sample_graph(80, 4, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            dir.path(),
+        )
+        .unwrap();
+        let path = dir.path().join(DUMP_FILENAME);
+        let blob = std::fs::read(&path).unwrap();
+
+        // The origin id region opens straight after the header and the layer
+        // table, so this rewrites the first point's id and leaves every length
+        // in the file unchanged.
+        let at = HEADER_BYTES + NB_LAYER_MAX as usize * LAYER_TABLE_ENTRY_BYTES;
+        let repaired = |id: u64| {
+            let mut damaged = blob.clone();
+            damaged[at..at + ORIGIN_ID_BYTES].copy_from_slice(&id.to_le_bytes());
+            // The payload checksum, recomputed, which is what a random
+            // corruption cannot do and what makes this a reader question rather
+            // than a checksum question.
+            let end = damaged.len() - TRAILER_BYTES;
+            let sum = checksum_of(&damaged[HEADER_BYTES..end]);
+            damaged[end..end + 8].copy_from_slice(&sum.to_le_bytes());
+            std::fs::write(&path, &damaged).unwrap();
+            let expected = expected_for(&built, 4, 80);
+            refused(read_dump::<f32, CosineDist>(
+                dir.path(),
+                &expected,
+                CosineDist {},
+            ))
+        };
+
+        assert!(
+            repaired(1 << 59).contains("names origin id 576460752303423488"),
+            "{}",
+            repaired(1 << 59)
+        );
+        assert!(repaired(u64::MAX).contains("names origin id"));
+        // One past the ceiling is refused as well, so the bound is the counter
+        // rather than a margin around it.
+        assert!(repaired(80).contains("config.json counted 79"));
+
+        // And the largest id the index really issued is accepted, so the check
+        // refuses nothing a save wrote.
+        std::fs::write(&path, &blob).unwrap();
+        let expected = expected_for(&built, 4, 80);
+        assert!(read_dump::<f32, CosineDist>(dir.path(), &expected, CosineDist {}).is_ok());
     }
 
     #[test]

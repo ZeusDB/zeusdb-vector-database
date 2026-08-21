@@ -42,6 +42,13 @@
 //! the other four, which is what removed this module's dependency on
 //! `hnsw_index`.
 
+// `levels: Mutex<LevelGenerator>` is not a field of `HNSWIndex`, so it is
+// outside the registry in `hnsw_index::locks` and outside the order it
+// enforces. Every path that draws a level already holds the graph's own write
+// guard, so the generator is reached under one lock and never held across
+// another. See `clippy.toml`.
+#![allow(clippy::disallowed_types)]
+
 use crate::distance::{CosineDist, DistPQ, L1Dist, L2Dist};
 use crate::pq::PQ;
 use std::path::Path;
@@ -61,6 +68,10 @@ mod mutable;
 mod structure;
 #[cfg(test)]
 pub(crate) mod test_graph;
+// A seeded mutator over a valid dump, driving the reader with generated input
+// rather than with the enumerated damage cases three relays wrote by hand.
+#[cfg(test)]
+mod fuzz;
 // The traversal, written once against an accessor.
 #[cfg_attr(not(test), allow(dead_code))]
 mod traverse;
@@ -959,6 +970,26 @@ impl VectorGraph {
 // RESTORING THE SAVED GRAPH
 // ============================================================================
 
+/// What the directory says the dump has to sit within.
+///
+/// Two numbers, both read from the directory rather than from the dump, and
+/// both checked before the reader allocates from anything the file declares.
+/// They travel together because they are the same kind of claim, and because
+/// splitting them into two parameters put `restore_graph` over clippy's
+/// argument count.
+#[derive(Clone, Copy)]
+pub(crate) struct DumpBounds {
+    /// The live record count. The graph holds at least this many nodes and
+    /// holds more whenever a removal or an overwrite has stranded one.
+    pub min_nodes: usize,
+    /// `config.json`'s `id_counter`, being the largest internal id the index
+    /// has ever issued.
+    ///
+    /// **This is what bounds the loaded graph's memory.** See
+    /// `dump::Expected::max_origin_id`, which is where it is checked and why.
+    pub max_origin_id: usize,
+}
+
 /// Restore the saved graph for one index configuration
 ///
 /// `pq` present means the saved graph was a quantized one, which is exactly the
@@ -987,6 +1018,11 @@ impl VectorGraph {
 /// a flag, since the branches those two parameters guarded are absent rather
 /// than present behind a setter nothing calls.
 ///
+/// # The bounds
+///
+/// [`DumpBounds`] carries the two numbers the directory declares that the dump
+/// has to sit within. Both are checked before anything is built.
+///
 /// # The level scale comes from the dump
 ///
 /// A restored graph keeps drawing levels if the index goes on inserting, and it
@@ -1001,8 +1037,12 @@ pub(crate) fn restore_graph(
     ef_construction: usize,
     dim: usize,
     pq: Option<Arc<PQ>>,
-    min_nodes: usize,
+    bounds: DumpBounds,
 ) -> Result<(VectorGraph, usize), String> {
+    let DumpBounds {
+        min_nodes,
+        max_origin_id,
+    } = bounds;
     let graph = match pq {
         Some(pq) => {
             let kind = match space {
@@ -1018,6 +1058,7 @@ pub(crate) fn restore_graph(
                 m,
                 ef_construction,
                 min_nodes,
+                max_origin_id,
             };
             let restored = Backend::restored(dump::read_dump::<u8, DistPQ>(
                 dir,
@@ -1042,6 +1083,7 @@ pub(crate) fn restore_graph(
                         m,
                         ef_construction,
                         min_nodes,
+                        max_origin_id,
                     };
                     VectorGraph::$variant(Backend::restored(dump::read_dump::<f32, $dist>(
                         dir, &expected, $value,
