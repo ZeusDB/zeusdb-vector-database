@@ -202,14 +202,17 @@ impl HNSWIndex {
         // Basic stats
         stats.insert("total_vectors".to_string(), vector_count.to_string());
         stats.insert("dimension".to_string(), self.dim.to_string());
-        stats.insert("expected_size".to_string(), self.expected_size.to_string());
+        stats.insert(
+            "expected_size".to_string(),
+            self.get_expected_size().to_string(),
+        );
         stats.insert("space".to_string(), self.space.clone());
         stats.insert("index_type".to_string(), "HNSW".to_string());
 
-        stats.insert("m".to_string(), self.m.to_string());
+        stats.insert("m".to_string(), self.get_m().to_string());
         stats.insert(
             "ef_construction".to_string(),
-            self.ef_construction.to_string(),
+            self.get_ef_construction().to_string(),
         );
         stats.insert("thread_safety".to_string(), "RwLock+Mutex".to_string());
 
@@ -568,7 +571,12 @@ impl HNSWIndex {
         let record_count = self.id_map.read().unwrap().len();
         let base_info = format!(
             "HNSWIndex(dim={}, space={}, m={}, ef_construction={}, expected_size={}, vectors={}",
-            self.dim, self.space, self.m, self.ef_construction, self.expected_size, record_count
+            self.dim,
+            self.space,
+            self.get_m(),
+            self.get_ef_construction(),
+            self.get_expected_size(),
+            record_count
         );
 
         if let Some(config) = &self.quantization_config {

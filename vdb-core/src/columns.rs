@@ -31,12 +31,23 @@
 //! `$or` is nothing, which is what `matches_filter` answers for the same two
 //! shapes.
 //!
-//! # What a column cannot serve
+//! # What a column cannot serve, and what it can still bound
 //!
 //! A field that was not declared at `create()`. There is no column to read, so
-//! [`ColumnStore::select`] returns the field's name and the caller walks the
-//! metadata store exactly as it did before. That is the only case, and it is a
-//! property of the declaration rather than of the filter language.
+//! the filter cannot be answered here, and that is a property of the
+//! declaration rather than of the filter language.
+//!
+//! It does not follow that the declared fields are useless to such a filter. A
+//! record has to satisfy every branch of a conjunction, so a conjunction naming
+//! one declared field and one undeclared one matches a subset of what the
+//! declared branch matches, and that subset is a candidate set the caller reads
+//! instead of reading every record. [`ColumnStore::bound`] computes it, and it
+//! carries a lower bound as well as an upper one because a negation needs the
+//! two swapped. What comes back is [`Selection`], which says whether the answer
+//! is the matching set, a superset of it, or nothing better than every record.
+//!
+//! A disjunction with an undeclared branch is the last of those, since that
+//! branch could match anything and a union with the live set is the live set.
 
 use crate::filter::{field_test_matches, FieldTest, Filter};
 use pyo3::prelude::*;
@@ -144,9 +155,23 @@ impl Bitmap {
 
     /// Every internal id in the set, in increasing order.
     pub(crate) fn for_each<F: FnMut(usize)>(&self, mut visit: F) {
+        self.for_each_while(|slot| {
+            visit(slot);
+            true
+        });
+    }
+
+    /// The same walk, stopping at the first slot the visitor declines.
+    ///
+    /// The bounded scan needs it. That scan gives up once too many records have
+    /// matched, and a bound holding every slot in the store would otherwise be
+    /// walked to the end after the give-up had already been decided.
+    pub(crate) fn for_each_while<F: FnMut(usize) -> bool>(&self, mut visit: F) {
         for (index, mut word) in self.words.iter().copied().enumerate() {
             while word != 0 {
-                visit(index * 64 + word.trailing_zeros() as usize);
+                if !visit(index * 64 + word.trailing_zeros() as usize) {
+                    return;
+                }
                 word &= word - 1;
             }
         }
@@ -370,19 +395,6 @@ impl Column {
     }
 }
 
-/// The first field a filter tree names, in evaluation order.
-///
-/// Used only to say which declaration is missing. A tree that names no field at
-/// all is `{}` or a nest of empty groups, and there is nothing to report about
-/// those.
-fn first_field_name(filter: &Filter) -> Option<&str> {
-    match filter {
-        Filter::Field { name, .. } => Some(name.as_str()),
-        Filter::All(branches) | Filter::Any(branches) => branches.iter().find_map(first_field_name),
-        Filter::Not(inner) => first_field_name(inner),
-    }
-}
-
 /// What a value owns on the heap beyond the 32 bytes of the `Value` itself.
 fn value_payload(value: &Value) -> usize {
     match value {
@@ -396,6 +408,167 @@ fn value_payload(value: &Value) -> usize {
             .map(|(key, value)| key.capacity() + 48 + value_payload(value))
             .sum(),
         _ => 0,
+    }
+}
+
+/// How much of the corpus a bound has to remove before it is worth reporting.
+///
+/// # Why a bound that reads fewer records can still be slower
+///
+/// The walk iterates `vector_metadata` in the map's own layout and reads each
+/// entry where it lies. A caller reading a bound takes a slot, looks it up in
+/// `rev_map` to get an external id, and looks that id up in `vector_metadata`,
+/// so it pays two hash lookups a candidate and an access pattern the map's
+/// layout has nothing to do with. Measured at 100,000 records on sift-128, the
+/// walk costs 0.345 microseconds a record and the bounded read 0.4 to 1.1 a
+/// candidate.
+///
+/// A bound holding four fifths of the corpus therefore reads a fifth fewer
+/// records at up to three times the cost each. Measured, a mixed filter whose
+/// bound held 80,000 of 100,000 records cost 4.12 milliseconds through the
+/// bound against 3.66 through the walk, which is 12 percent worse.
+///
+/// # Why one third
+///
+/// The upper end of that per-record ratio is 3.1, so a bound that removes two
+/// thirds of the corpus breaks even in the worst case measured and wins in
+/// every other. The filters this actually pays for are far below the line,
+/// their bounds holding 1 to 20,000 records out of 100,000.
+///
+/// Between one third and the whole corpus the two are within a factor the
+/// machine's own load moves them by. Two runs of the same cell put a bound of
+/// half the corpus at 0.9 and 1.7 times the walk, so this relay does not claim
+/// a direction there and reports no bound, which leaves those filters costing
+/// exactly what they cost before.
+///
+/// # What it costs to decide
+///
+/// One pass of each declared column the filter names, thrown away where the
+/// bound turns out not to pay. That is about 4 bytes a record a column, which
+/// at 100,000 records is a tenth of a millisecond against a walk of 30.
+const BOUND_PAYS_BELOW: usize = 3;
+
+/// Whether reading the bound beats walking the metadata store. See
+/// [`BOUND_PAYS_BELOW`].
+fn bound_pays(candidates: usize, live: usize) -> bool {
+    candidates.saturating_mul(BOUND_PAYS_BELOW) <= live
+}
+
+// ============================================================================
+// WHAT THE COLUMNS CAN SAY ABOUT A FILTER
+// ============================================================================
+
+/// The answer [`ColumnStore::select`] gives, in three arms.
+///
+/// A filter every field of which is declared is answered outright. A filter
+/// naming one field with no column is answered as far as the declared ones
+/// reach, which for a conjunction is a candidate set the caller narrows and for
+/// a disjunction is usually nothing at all. See [`ColumnStore::bound`] for
+/// which shapes yield which.
+pub(crate) enum Selection<'f> {
+    /// Exactly the records the filter matches. Nothing else has to be read.
+    Exact(Bitmap),
+    /// A superset of the records the filter matches, and the first field it
+    /// names that has no column. The caller reads each candidate's metadata and
+    /// judges the whole filter on it, which is the same work the walk does over
+    /// fewer records. **At most a third of the store**, since a bound that
+    /// removes less than that is reported as `Whole` instead; see
+    /// [`BOUND_PAYS_BELOW`].
+    Narrowed(Bitmap, &'f str),
+    /// The declared fields bound nothing, so the caller reads every record.
+    /// Carries the first field with no column, for the warning.
+    Whole(&'f str),
+}
+
+/// A matching set bracketed from both sides.
+///
+/// `Exact` is the two sides having met, which is every node of a fully declared
+/// tree, and it is kept as its own arm so that such a tree allocates one bitmap
+/// per node rather than two.
+enum Bounds {
+    Exact(Bitmap),
+    /// `lower ⊆ matches ⊆ upper`.
+    Range {
+        lower: Bitmap,
+        upper: Bitmap,
+    },
+}
+
+impl Bounds {
+    fn upper(&self) -> &Bitmap {
+        match self {
+            Bounds::Exact(bits) => bits,
+            Bounds::Range { upper, .. } => upper,
+        }
+    }
+
+    /// The two sides as owned bitmaps, which for `Exact` costs one clone.
+    ///
+    /// Paid once per combining step that has an inexact side, and never on a
+    /// fully declared tree.
+    fn split(self) -> (Bitmap, Bitmap) {
+        match self {
+            Bounds::Exact(bits) => (bits.clone(), bits),
+            Bounds::Range { lower, upper } => (lower, upper),
+        }
+    }
+
+    /// An empty upper bound means nothing matches, which is exact however it
+    /// was arrived at. It is what lets a conjunction whose declared branch
+    /// matches no record answer without a walk.
+    fn normalised(self) -> Bounds {
+        match self {
+            Bounds::Range { upper, .. } if upper.is_empty() => Bounds::Exact(upper),
+            other => other,
+        }
+    }
+
+    fn intersected(self, other: Bounds) -> Bounds {
+        match (self, other) {
+            (Bounds::Exact(mut mine), Bounds::Exact(theirs)) => {
+                mine.intersect(&theirs);
+                Bounds::Exact(mine)
+            }
+            (mine, theirs) => {
+                let (mut lower, mut upper) = mine.split();
+                let (their_lower, their_upper) = theirs.split();
+                lower.intersect(&their_lower);
+                upper.intersect(&their_upper);
+                Bounds::Range { lower, upper }.normalised()
+            }
+        }
+    }
+
+    fn united(self, other: Bounds) -> Bounds {
+        match (self, other) {
+            (Bounds::Exact(mut mine), Bounds::Exact(theirs)) => {
+                mine.union(&theirs);
+                Bounds::Exact(mine)
+            }
+            (mine, theirs) => {
+                let (mut lower, mut upper) = mine.split();
+                let (their_lower, their_upper) = theirs.split();
+                lower.union(&their_lower);
+                upper.union(&their_upper);
+                Bounds::Range { lower, upper }.normalised()
+            }
+        }
+    }
+
+    /// `live` without this, which swaps the two sides.
+    ///
+    /// **The swap is the whole reason both sides are carried.** Complementing
+    /// an upper bound gives a lower one, so a rule that propagated only upper
+    /// bounds would hand a negation a subset of its matches and drop the rest.
+    fn complemented(self, live: &Bitmap) -> Bounds {
+        match self {
+            Bounds::Exact(bits) => Bounds::Exact(bits.complement_within(live)),
+            Bounds::Range { lower, upper } => Bounds::Range {
+                lower: upper.complement_within(live),
+                upper: lower.complement_within(live),
+            }
+            .normalised(),
+        }
     }
 }
 
@@ -509,63 +682,155 @@ impl ColumnStore {
         }
     }
 
-    /// The internal ids a filter selects, or the first field it names that has
-    /// no column.
+    /// What a filter's declared fields can say about which records match.
     ///
-    /// The error is the field name so that the caller can say which declaration
-    /// is missing. It is deliberately the first one found rather than all of
-    /// them, because one is enough to send the whole filter down the walk.
-    pub(crate) fn select<'f>(&self, filter: &'f Filter) -> Result<Bitmap, &'f str> {
-        // An index that declared nothing answers nothing, whatever the filter.
-        //
-        // Without this a filter carrying no field leaf at all is served from an
-        // empty store and comes back empty. `{}` compiles to an empty
-        // conjunction, which holds for every record, and an empty store has no
-        // records to hold it, so `search(filter={})` returned no results and
-        // `remove_where` had nothing to refuse. The name is what the tree
-        // carries, or the empty string where it names no field, which the
-        // warning already declines to print on an index with no declaration.
+    /// Three answers, and the caller does different work for each. See
+    /// [`Selection`].
+    ///
+    /// **An index that declared nothing answers nothing, whatever the filter.**
+    /// Its live bitmap is empty and its slot count is zero, so the bound below
+    /// would compute an empty upper bound and drop every record. It is also
+    /// what makes a filter carrying no field leaf at all behave: `{}` compiles
+    /// to an empty conjunction, which holds for every record, and an empty
+    /// store has no records to hold it, so answering it here returned no
+    /// results for `search(filter={})` and gave `remove_where` nothing to
+    /// refuse. The name is what the tree carries, or the empty string where it
+    /// names no field, which the warning already declines to print on an index
+    /// with no declaration.
+    pub(crate) fn select<'f>(&self, filter: &'f Filter) -> Selection<'f> {
         if self.names.is_empty() {
-            return Err(first_field_name(filter).unwrap_or(""));
+            return Selection::Whole(self.first_undeclared(filter).unwrap_or(""));
         }
-        match filter {
-            Filter::Field { name, test } => {
-                let position = *self.index_of.get(name).ok_or(name.as_str())?;
-                Ok(self.columns[position].select(test, self.slots))
+        match self.bound(filter) {
+            Bounds::Exact(selected) => Selection::Exact(selected),
+            Bounds::Range { upper, .. } => {
+                let undeclared = self.first_undeclared(filter).unwrap_or("");
+                // Every bitmap in the algebra above is a subset of the live
+                // set, so a bound holding as many records as the store holds is
+                // the live set and says nothing. One that says a little is not
+                // worth reading either; see [`BOUND_PAYS_BELOW`].
+                if bound_pays(upper.count(), self.records) {
+                    Selection::Narrowed(upper, undeclared)
+                } else {
+                    Selection::Whole(undeclared)
+                }
             }
+        }
+    }
+
+    /// The first field the tree names that has no column, in evaluation order.
+    ///
+    /// Used only to say which declaration is missing, so it is deliberately the
+    /// first one found rather than all of them. A tree that names no undeclared
+    /// field at all is `{}`, a nest of empty groups, or a fully declared filter,
+    /// and there is nothing to report about any of those.
+    fn first_undeclared<'f>(&self, filter: &'f Filter) -> Option<&'f str> {
+        match filter {
+            Filter::Field { name, .. } => {
+                (!self.index_of.contains_key(name)).then_some(name.as_str())
+            }
+            Filter::All(branches) | Filter::Any(branches) => branches
+                .iter()
+                .find_map(|branch| self.first_undeclared(branch)),
+            Filter::Not(inner) => self.first_undeclared(inner),
+        }
+    }
+
+    /// Bracket the matching set between what the columns prove matches and what
+    /// they leave possible.
+    ///
+    /// # Why both sides
+    ///
+    /// An upper bound alone is enough for `$and` and `$or` and wrong for
+    /// `$not`. A negation matches `live` without what its inner matches, so
+    /// bounding it above needs a bound **below** the inner: from an upper bound
+    /// on the inner, all that follows is `live \ upper ⊆ matches`, which is a
+    /// subset and would drop matching records. Carrying both sides makes the
+    /// complement a swap, which is what the `Not` arm does.
+    ///
+    /// # Why it is sound
+    ///
+    /// A structural induction on the tree, with `L ⊆ M ⊆ U` at every node.
+    ///
+    /// A declared leaf is exact, because [`Column::select`] and
+    /// `crate::filter::field_matches` both end in `field_test_matches`, a
+    /// record that does not carry the field holds [`ABSENT`] and never matches,
+    /// and a slot holding no record holds `ABSENT` in every column.
+    ///
+    /// An undeclared leaf is bracketed by nothing and by the live set, which
+    /// holds for any filter whatever.
+    ///
+    /// A conjunction intersects and a disjunction unions, and both preserve
+    /// containment in both directions. A negation complements within the live
+    /// set and swaps the sides, which turns `L ⊆ M` into `live \ M ⊆ live \ L`
+    /// and the same for the other side.
+    ///
+    /// # What it costs
+    ///
+    /// A fully declared tree never leaves the `Exact` arm, so it allocates one
+    /// bitmap per node exactly as it did before this existed. A tree with an
+    /// undeclared leaf carries two bitmaps from that leaf upwards, which at
+    /// 100,000 records is 12.5 kilobytes each.
+    fn bound(&self, filter: &Filter) -> Bounds {
+        match filter {
+            Filter::Field { name, test } => match self.index_of.get(name) {
+                Some(&position) => Bounds::Exact(self.columns[position].select(test, self.slots)),
+                None => Bounds::Range {
+                    lower: Bitmap::zeros(self.slots),
+                    upper: self.live_set(),
+                },
+            },
             Filter::All(branches) => {
-                let mut accumulated: Option<Bitmap> = None;
+                let mut accumulated: Option<Bounds> = None;
                 for branch in branches {
-                    let selected = self.select(branch)?;
+                    let bounded = self.bound(branch);
                     accumulated = Some(match accumulated {
-                        None => selected,
-                        Some(mut running) => {
-                            running.intersect(&selected);
-                            running
-                        }
+                        None => bounded,
+                        Some(running) => running.intersected(bounded),
                     });
                     // Nothing below can put a bit back, but every remaining
                     // branch would still walk its whole column to find that
                     // out.
-                    if accumulated.as_ref().is_some_and(Bitmap::is_empty) {
+                    if accumulated
+                        .as_ref()
+                        .is_some_and(|bounds| bounds.upper().is_empty())
+                    {
                         break;
                     }
                 }
                 // An empty conjunction holds for every record, which is what
                 // `Iterator::all` answers over no branches.
-                Ok(accumulated.unwrap_or_else(|| self.live_set()))
+                accumulated.unwrap_or_else(|| Bounds::Exact(self.live_set()))
             }
             Filter::Any(branches) => {
                 // An empty disjunction holds for no record, which is what
                 // `Iterator::any` answers over no branches.
-                let mut accumulated = Bitmap::zeros(self.slots);
+                let mut accumulated = Bounds::Exact(Bitmap::zeros(self.slots));
                 for branch in branches {
-                    let selected = self.select(branch)?;
-                    accumulated.union(&selected);
+                    accumulated = accumulated.united(self.bound(branch));
                 }
-                Ok(accumulated)
+                accumulated
             }
-            Filter::Not(inner) => Ok(self.select(inner)?.complement_within(&self.live_set())),
+            Filter::Not(inner) => self.bound(inner).complemented(&self.live_set()),
+        }
+    }
+
+    /// The bound the tree's shape yields, with the payment rule not applied.
+    ///
+    /// **The two rules are separate and are tested separately.** [`Self::bound`]
+    /// answers the soundness question, which is about the shape of the tree,
+    /// and [`bound_pays`] answers the cost question, which is about how many
+    /// records the bound turned out to hold. Testing them through `select`
+    /// alone would mean every shape case had to be built on a corpus the cost
+    /// rule happens to accept, and a change to the constant would rewrite tests
+    /// about soundness.
+    ///
+    /// `None` where the tree is answered exactly.
+    #[cfg(test)]
+    fn shape_bound(&self, filter: &Filter) -> Option<Bitmap> {
+        match self.bound(filter) {
+            Bounds::Exact(_) => None,
+            Bounds::Range { upper, .. } => Some(upper),
         }
     }
 
@@ -695,6 +960,10 @@ mod tests {
             .collect()
     }
 
+    /// Slots paired with the metadata written to them, which every helper here
+    /// takes and the bound sweep walks.
+    type Records = Vec<(usize, HashMap<String, Value>)>;
+
     fn store_of(names: &[&str], records: &[(usize, HashMap<String, Value>)]) -> ColumnStore {
         let mut store = ColumnStore::new(
             names.iter().map(|name| name.to_string()).collect(),
@@ -706,13 +975,58 @@ mod tests {
         store
     }
 
-    fn selected(store: &ColumnStore, filter: &Filter) -> Vec<usize> {
+    fn bits(bitmap: &Bitmap) -> Vec<usize> {
         let mut out = Vec::new();
-        store
-            .select(filter)
-            .unwrap()
-            .for_each(|slot| out.push(slot));
+        bitmap.for_each(|slot| out.push(slot));
         out
+    }
+
+    /// The records an exactly answered filter selects, failing the test where
+    /// the filter was not answered exactly.
+    fn selected(store: &ColumnStore, filter: &Filter) -> Vec<usize> {
+        match store.select(filter) {
+            Selection::Exact(bitmap) => bits(&bitmap),
+            Selection::Narrowed(_, name) => {
+                panic!("expected an exact answer, got a bound on {name}")
+            }
+            Selection::Whole(name) => panic!("expected an exact answer, got no bound on {name}"),
+        }
+    }
+
+    /// The field with no column, and the records the tree's shape bounds the
+    /// search to, or `None` where the shape bounds nothing.
+    ///
+    /// The cost rule is not applied, so these cases are about soundness alone.
+    /// `answered` below is what a caller actually gets.
+    fn partial(store: &ColumnStore, filter: &Filter) -> (String, Option<Vec<usize>>) {
+        let name = store.first_undeclared(filter).unwrap_or("").to_string();
+        match store.shape_bound(filter) {
+            None => panic!("expected a partial answer, got an exact one"),
+            // A bound holding every live record is no bound.
+            Some(bitmap) if bitmap.count() == store.records => (name, None),
+            Some(bitmap) => (name, Some(bits(&bitmap))),
+        }
+    }
+
+    /// Which arm `select` returns, which is the shape rule and the cost rule
+    /// together.
+    fn answered(store: &ColumnStore, filter: &Filter) -> &'static str {
+        match store.select(filter) {
+            Selection::Exact(_) => "exact",
+            Selection::Narrowed(..) => "narrowed",
+            Selection::Whole(_) => "whole",
+        }
+    }
+
+    /// Every live record the filter matches, by the walk rather than by a
+    /// column, which is the answer a bound has to be a superset of.
+    fn walked(store: &ColumnStore, records: &Records, filter: &Filter) -> Vec<usize> {
+        records
+            .iter()
+            .filter(|(slot, _)| store.live.contains(*slot))
+            .filter(|(_, metadata)| crate::filter::matches_filter(metadata, filter))
+            .map(|(slot, _)| *slot)
+            .collect()
     }
 
     fn field(name: &str, test: FieldTest) -> Filter {
@@ -726,19 +1040,25 @@ mod tests {
     fn an_undeclared_field_names_itself() {
         let store = store_of(&["cat"], &[(1, record(&[("cat", json!("a"))]))]);
         let filter = field("lang", FieldTest::Equals(json!("en")));
-        assert_eq!(store.select(&filter).err(), Some("lang"));
+        assert!(matches!(store.select(&filter), Selection::Whole("lang")));
     }
 
     #[test]
     fn a_store_with_no_declaration_serves_nothing() {
         let store = ColumnStore::new(Vec::new(), 4);
         let filter = field("cat", FieldTest::Equals(json!("a")));
-        assert_eq!(store.select(&filter).err(), Some("cat"));
+        assert!(matches!(store.select(&filter), Selection::Whole("cat")));
         // Including a filter that names no field. An empty conjunction holds
         // for every record and an undeclared store knows of none, so answering
         // it here would return an empty page for `search(filter={})`.
-        assert_eq!(store.select(&Filter::All(Vec::new())).err(), Some(""));
-        assert_eq!(store.select(&Filter::Any(Vec::new())).err(), Some(""));
+        assert!(matches!(
+            store.select(&Filter::All(Vec::new())),
+            Selection::Whole("")
+        ));
+        assert!(matches!(
+            store.select(&Filter::Any(Vec::new())),
+            Selection::Whole("")
+        ));
     }
 
     #[test]
@@ -873,6 +1193,244 @@ mod tests {
         assert!(validate_indexed_fields(&["cat".into(), "cat".into()], "").is_err());
         let too_many: Vec<String> = (0..=MAX_INDEXED_FIELDS).map(|i| i.to_string()).collect();
         assert!(validate_indexed_fields(&too_many, "").is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // A FILTER MIXING A DECLARED FIELD WITH ONE THAT HAS NO COLUMN
+    // ------------------------------------------------------------------
+
+    /// Four records over two fields, one declared and one not.
+    ///
+    /// `cat` is declared and splits them two and two. `price` is not declared
+    /// and splits them differently, so no bound derived from `cat` alone can be
+    /// the matching set and every assertion below is about containment rather
+    /// than equality.
+    fn mixed() -> (ColumnStore, Records) {
+        let records = vec![
+            (1, record(&[("cat", json!("a")), ("price", json!(10))])),
+            (2, record(&[("cat", json!("a")), ("price", json!(30))])),
+            (3, record(&[("cat", json!("b")), ("price", json!(10))])),
+            (4, record(&[("cat", json!("b")), ("price", json!(30))])),
+        ];
+        (store_of(&["cat"], &records), records)
+    }
+
+    fn cat(value: &str) -> Filter {
+        field("cat", FieldTest::Equals(json!(value)))
+    }
+
+    fn cheap() -> Filter {
+        field(
+            "price",
+            FieldTest::Operators(vec![(crate::filter::Op::Lt, json!(20))]),
+        )
+    }
+
+    /// The one shape that pays. A conjunction bounds by its declared branch,
+    /// because a record has to satisfy every branch.
+    #[test]
+    fn a_conjunction_is_bounded_by_its_declared_branch() {
+        let (store, records) = mixed();
+        let filter = Filter::All(vec![cat("a"), cheap()]);
+        let (name, bound) = partial(&store, &filter);
+        assert_eq!(name, "price");
+        assert_eq!(bound, Some(vec![1, 2]));
+        // The bound is a superset of what the walk answers, which is the whole
+        // requirement.
+        assert_eq!(walked(&store, &records, &filter), vec![1]);
+    }
+
+    /// A disjunction bounds nothing, because the undeclared branch could match
+    /// any record and a union with the live set is the live set.
+    #[test]
+    fn a_disjunction_with_an_undeclared_branch_bounds_nothing() {
+        let (store, _) = mixed();
+        let filter = Filter::Any(vec![cat("a"), cheap()]);
+        assert_eq!(partial(&store, &filter), ("price".to_string(), None));
+    }
+
+    /// A negation of an undeclared leaf bounds nothing, for the same reason
+    /// read the other way round.
+    #[test]
+    fn a_negated_undeclared_leaf_bounds_nothing() {
+        let (store, _) = mixed();
+        let filter = Filter::Not(Box::new(cheap()));
+        assert_eq!(partial(&store, &filter), ("price".to_string(), None));
+    }
+
+    /// A negated disjunction bounds, because it distributes into a conjunction
+    /// of negations and the declared one of those still holds.
+    #[test]
+    fn a_negated_disjunction_is_bounded_by_its_declared_branch() {
+        let (store, records) = mixed();
+        let filter = Filter::Not(Box::new(Filter::Any(vec![cat("a"), cheap()])));
+        let (name, bound) = partial(&store, &filter);
+        assert_eq!(name, "price");
+        // Not cat a, which is the complement of the declared branch.
+        assert_eq!(bound, Some(vec![3, 4]));
+        assert_eq!(walked(&store, &records, &filter), vec![4]);
+    }
+
+    /// A negated conjunction bounds nothing, because it distributes into a
+    /// disjunction of negations and one of those is unbounded.
+    #[test]
+    fn a_negated_conjunction_mixing_the_two_bounds_nothing() {
+        let (store, _) = mixed();
+        let filter = Filter::Not(Box::new(Filter::All(vec![cat("a"), cheap()])));
+        assert_eq!(partial(&store, &filter), ("price".to_string(), None));
+    }
+
+    /// A conjunction carrying a negated undeclared leaf still bounds, since the
+    /// negation contributes the live set and the intersection keeps the
+    /// declared branch.
+    #[test]
+    fn a_conjunction_with_a_negated_undeclared_branch_still_bounds() {
+        let (store, records) = mixed();
+        let filter = Filter::All(vec![cat("b"), Filter::Not(Box::new(cheap()))]);
+        let (name, bound) = partial(&store, &filter);
+        assert_eq!(name, "price");
+        assert_eq!(bound, Some(vec![3, 4]));
+        assert_eq!(walked(&store, &records, &filter), vec![4]);
+    }
+
+    /// A conjunction whose declared branch matches nothing is answered
+    /// outright, because an empty upper bound proves the matching set is empty.
+    #[test]
+    fn an_empty_bound_is_an_exact_answer() {
+        let (store, _) = mixed();
+        let filter = Filter::All(vec![cat("nothing"), cheap()]);
+        assert_eq!(selected(&store, &filter), Vec::<usize>::new());
+    }
+
+    /// A conjunction of undeclared leaves bounds nothing, which is what the
+    /// index did before any of this existed.
+    #[test]
+    fn a_conjunction_of_undeclared_leaves_bounds_nothing() {
+        let (store, _) = mixed();
+        let filter = Filter::All(vec![cheap(), field("lang", FieldTest::Equals(json!("en")))]);
+        assert_eq!(partial(&store, &filter), ("price".to_string(), None));
+    }
+
+    /// A bound that turns out to hold every live record bounds nothing, since
+    /// reading it would cost a pass and save nothing.
+    #[test]
+    fn a_bound_holding_every_record_is_reported_as_none() {
+        let (store, _) = mixed();
+        let unconditional = field(
+            "cat",
+            FieldTest::Operators(vec![(crate::filter::Op::All, json!([]))]),
+        );
+        let filter = Filter::All(vec![unconditional, cheap()]);
+        assert_eq!(partial(&store, &filter), ("price".to_string(), None));
+    }
+
+    // ------------------------------------------------------------------
+    // THE COST RULE, WHICH IS NOT THE SOUNDNESS RULE
+    // ------------------------------------------------------------------
+
+    /// A bound is only reported where reading it beats the walk.
+    ///
+    /// Twelve records over a declared `cat` that splits them four ways. Three
+    /// records is a quarter of the store, which pays; six is a half, which does
+    /// not. The shape is the same conjunction in both cases, so what differs
+    /// here is nothing but how many records the declared branch matched.
+    #[test]
+    fn a_bound_that_removes_too_little_is_not_reported() {
+        let records: Records = (0..12)
+            .map(|i| {
+                (
+                    i + 1,
+                    record(&[("cat", json!(format!("c{}", i % 4))), ("price", json!(i))]),
+                )
+            })
+            .collect();
+        let store = store_of(&["cat"], &records);
+
+        // One category in four, which is three of twelve.
+        let narrow = Filter::All(vec![cat("c0"), cheap()]);
+        assert_eq!(answered(&store, &narrow), "narrowed");
+
+        // Two categories in four, which is six of twelve.
+        let wide = Filter::All(vec![Filter::Any(vec![cat("c0"), cat("c1")]), cheap()]);
+        assert_eq!(answered(&store, &wide), "whole");
+        // And the shape still bounds it, which is what says the two rules are
+        // separate rather than one rule stated twice.
+        assert_eq!(
+            partial(&store, &wide),
+            ("price".to_string(), Some(vec![1, 2, 5, 6, 9, 10]))
+        );
+    }
+
+    /// An empty bound is exact whatever its size rule says, because nothing
+    /// matching is an answer rather than a bound.
+    #[test]
+    fn an_empty_bound_is_never_traded_for_the_walk() {
+        let records: Records = (0..12)
+            .map(|i| (i + 1, record(&[("cat", json!("c0")), ("price", json!(i))])))
+            .collect();
+        let store = store_of(&["cat"], &records);
+        let filter = Filter::All(vec![cat("nothing"), cheap()]);
+        assert_eq!(answered(&store, &filter), "exact");
+    }
+
+    /// **The containment property itself**, over every shape above and both of
+    /// the two fields' conditions.
+    ///
+    /// A bound that dropped one matching record would make a filtered search
+    /// return a short page, so this asserts the one thing the whole design
+    /// rests on rather than trusting the shape by shape cases to cover it.
+    #[test]
+    fn every_bound_contains_every_record_the_walk_finds() {
+        let (store, records) = mixed();
+        let declared = [cat("a"), cat("b"), Filter::Not(Box::new(cat("a")))];
+        let undeclared = [cheap(), Filter::Not(Box::new(cheap()))];
+        for left in &declared {
+            for right in &undeclared {
+                let shapes = [
+                    Filter::All(vec![clone_filter(left), clone_filter(right)]),
+                    Filter::Any(vec![clone_filter(left), clone_filter(right)]),
+                    Filter::Not(Box::new(Filter::All(vec![
+                        clone_filter(left),
+                        clone_filter(right),
+                    ]))),
+                    Filter::Not(Box::new(Filter::Any(vec![
+                        clone_filter(left),
+                        clone_filter(right),
+                    ]))),
+                ];
+                for shape in shapes {
+                    let expected = walked(&store, &records, &shape);
+                    let bound = match store.select(&shape) {
+                        Selection::Exact(bitmap) => bits(&bitmap),
+                        Selection::Narrowed(bitmap, _) => bits(&bitmap),
+                        // No bound is the live set, which contains everything.
+                        Selection::Whole(_) => vec![1, 2, 3, 4],
+                    };
+                    for slot in expected {
+                        assert!(
+                            bound.contains(&slot),
+                            "bound {bound:?} dropped record {slot}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `Filter` is not `Clone`, and the sweep above needs one tree per shape.
+    fn clone_filter(filter: &Filter) -> Filter {
+        match filter {
+            Filter::Field { name, test } => Filter::Field {
+                name: name.clone(),
+                test: match test {
+                    FieldTest::Equals(value) => FieldTest::Equals(value.clone()),
+                    FieldTest::Operators(operations) => FieldTest::Operators(operations.clone()),
+                },
+            },
+            Filter::All(branches) => Filter::All(branches.iter().map(clone_filter).collect()),
+            Filter::Any(branches) => Filter::Any(branches.iter().map(clone_filter).collect()),
+            Filter::Not(inner) => Filter::Not(Box::new(clone_filter(inner))),
+        }
     }
 
     #[test]

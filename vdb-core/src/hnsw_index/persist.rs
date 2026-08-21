@@ -13,6 +13,7 @@ use pyo3::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
@@ -302,8 +303,8 @@ impl HNSWIndex {
         let (graph, nodes) = restore_graph(
             dir,
             &self.space,
-            self.m,
-            self.ef_construction,
+            self.get_m(),
+            self.get_ef_construction(),
             self.dim,
             pq,
             live,
@@ -362,10 +363,10 @@ impl HNSWIndex {
 
         let mut new_hnsw = VectorGraph::new_pq(
             &self.space,
-            self.m,
-            self.expected_size,
+            self.get_m(),
+            self.get_expected_size(),
             MAX_LAYER,
-            self.ef_construction,
+            self.get_ef_construction(),
             pq,
         );
 
@@ -481,7 +482,7 @@ impl HNSWIndex {
         if !columns.is_declared() {
             return;
         }
-        columns.clear(self.expected_size);
+        columns.clear(self.get_expected_size());
         let empty = HashMap::new();
         for (ext_id, &internal_id) in id_map.iter() {
             columns.write(internal_id, vector_metadata.get(ext_id).unwrap_or(&empty));
@@ -668,18 +669,25 @@ impl HNSWIndex {
     }
 
     /// Get the maximum number of bidirectional links per node
+    ///
+    /// **The one read of `m` in the crate**, so that `rebuild` writing it has a
+    /// single place to be seen from. Acquire against the release the write
+    /// makes, though every writer also holds `writers` and every reader that
+    /// matters runs after it.
     pub fn get_m(&self) -> usize {
-        self.m
+        self.m.load(Ordering::Acquire)
     }
 
-    /// Get the construction parameter ef_construction
+    /// Get the construction parameter ef_construction. The one read of it, for
+    /// the reason `get_m` gives.
     pub fn get_ef_construction(&self) -> usize {
-        self.ef_construction
+        self.ef_construction.load(Ordering::Acquire)
     }
 
-    /// Get the expected size parameter
+    /// Get the expected size parameter. The one read of it, for the reason
+    /// `get_m` gives.
     pub fn get_expected_size(&self) -> usize {
-        self.expected_size
+        self.expected_size.load(Ordering::Acquire)
     }
 
     /// Get the current ID counter value (thread-safe)

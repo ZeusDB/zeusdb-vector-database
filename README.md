@@ -194,6 +194,7 @@ HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=5, vecto
 | `ef_construction`| `int`  | `200`     | Width of the candidate search each insertion runs. Must be positive. It costs build time and buys graph quality, and it changes neither search latency nor the size of the finished index. See below. |
 | `expected_size`  | `int`  | `10000`   | Estimated number of records to be inserted, from 1 to 100,000,000. Used for preallocating internal data structures and for choosing the default `m`. Not a hard limit, see below. |
 | `quantization_config` | `dict` | `None` | Product Quantization configuration for memory-efficient vector compression. See [Product Quantization](#️-product-quantization). |
+| `indexed_fields` | `list[str]` | `None` | Metadata fields to build a column for, so that a filter naming only those fields does not read every record. Up to 32 names, no duplicates, none of `$and`, `$or` or `$not`. See [Declaring the fields you filter on](#-declaring-the-fields-you-filter-on). |
 
 **`dim` is required.** There is no default, because `dim` has to equal the width your embedding model produces and an index built at any other width rejects every vector you add to it. Omitting it raises `TypeError`.
 
@@ -209,18 +210,18 @@ except TypeError as error:
 create() requires 'dim', the width of the vectors this index will hold. There is no default because dim has to equal the width your embedding model produces, and an index built at any other width rejects every vector you add to it. Read it off one embedding with len(vector), or pass the width your model documents, for example dim=1536 for OpenAI text-embedding-3-small or dim=768 for most sentence-transformers models.
 ```
 
-**The default `m` depends on `expected_size`.** It is 16 for an `expected_size` of 25,000 or less, and 32 above that. `m` is fixed once the index is created and a graph too sparse for the number of records loses recall that no search width recovers, so declare `expected_size` honestly or set `m` yourself. Passing `m` explicitly always wins.
+**The default `m` depends on `expected_size`.** It is 16 for an `expected_size` of 25,000 or less, and 32 above that. A graph too sparse for the number of records loses recall that no search width recovers, so declare `expected_size` honestly or set `m` yourself. Passing `m` explicitly always wins, and [`rebuild()`](#-change-m-after-the-fact-with-rebuild) changes it afterwards.
 
 ```python
 vdb.create("hnsw", dim=8, expected_size=25_000).get_stats()["m"]   # '16'
 vdb.create("hnsw", dim=8, expected_size=25_001).get_stats()["m"]   # '32'
 ```
 
-**`expected_size` is a hint and not a limit.** An index accepts more records than it declared and the graph grows to fit them. What it does not change is `m`. Passing twice the declared size logs a warning once, on the `add()` that crosses it.
+**`expected_size` is a hint and not a limit.** An index accepts more records than it declared and the graph grows to fit them. What it does not change is `m`, which [`rebuild()`](#-change-m-after-the-fact-with-rebuild) does. Passing twice the declared size logs a warning once, on the `add()` that crosses it.
 
 **`ef_construction` costs build time and buys graph quality.** It changes neither search latency nor the size of the finished index. Build time is linear in it above 100, so 50,000 records of `dim=1536` build in 76.9 s at the default and 262.1 s at 800. Recall stops improving at or near the default on most data, and where it keeps climbing a larger `ef_search` buys more for less, so raise `ef_search` before raising this.
 
-**Keep `ef_construction` above `2 × m`.** At or below the neighbour budget the graph keeps every candidate the insertion search returned and prunes none of them. `create()` warns when the pair reaches that point. The defaults are clear of it.
+**Keep `ef_construction` above `2 × m`.** At or below the neighbour budget the graph keeps every candidate the insertion search returned and prunes none of them. `create()` and [`rebuild()`](#-change-m-after-the-fact-with-rebuild) both warn when the pair reaches that point, and both take the pair, so either remedy the warning names can be taken. The defaults are clear of it.
 
 <br/>
 
@@ -778,6 +779,34 @@ stranded graph nodes: 0
 ```
 
 `compact()` costs a full rebuild, proportional to the number of live records rather than to the amount of debris, and it holds both graphs in memory while it runs. It returns 0 and does nothing when there is nothing to reclaim. It is never automatic, so schedule it when your workload has accumulated deletions.
+
+<br/>
+
+#### ♻️ Change `m` after the fact with `rebuild()`
+
+`m` is chosen from `expected_size` when the index is created, so an index declared for far fewer records than it received runs at a degree meant for the smaller one. `rebuild(m=..., expected_size=..., ef_construction=...)` builds the graph again at a new configuration, in place, and every record keeps its vector, its metadata and its id. Pass any of the three.
+
+```python
+sized_wrong = vdb.create("hnsw", dim=8, expected_size=100, m=4)
+sized_wrong.add({
+    "ids": [f"v{i}" for i in range(400)],
+    "embeddings": [[float(i % 7) + j * 0.1 for j in range(8)] for i in range(400)],
+})
+print(sized_wrong.m, sized_wrong.expected_size, len(sized_wrong))
+print(sized_wrong.rebuild(m=16, expected_size=400))
+print(sized_wrong.m, sized_wrong.expected_size, len(sized_wrong))
+```
+
+*Output*
+```
+4 100 400
+400
+16 400 400
+```
+
+It returns the node count of the graph it built, which is the live record count. Passing none of the three raises, because rebuilding the graph as it stands is `compact()`. An invalid value raises the message `create()` raises for it.
+
+**Raise `m` where an index outgrew its declaration, and schedule it.** It costs a full rebuild, 27.0 seconds at 100,000 real 128 dimensional vectors, and it holds both graphs in memory while it runs. Nothing outside the graph is touched, so every filter returns what it returned and a save afterwards carries the new `m`.
 
 <br/>
 
@@ -1652,11 +1681,11 @@ print(matched({"$not": {"$or": [{"lang": "es"}, {"tier": "gold"}]}}))
 
 ### ⏱️ What a filtered search costs
 
-A filtered search costs a great deal more than an unfiltered one. There is no index on metadata fields, so finding out which records match means reading every record's metadata.
+**A filter over a field left out of `indexed_fields` reads every record's metadata**, so it costs a great deal more than an unfiltered search. Declaring the field builds a column and removes that cost, which the next section measures.
 
-Two paths serve a filter and the index chooses between them per search. At or below 5,000 matching records it walks the whole metadata store, scores every record that matched and ranks them, which is exact. Above 5,000 the graph traversal runs instead with the filter tested at every node it reaches, and recall there is the graph's own, measured at 0.96 and above on three real 100,000 record sets.
+Two paths serve a filter and the index chooses between them per search. At or below 5,000 matching records it scores every record that matched and ranks them, which is exact. Above 5,000 the graph traversal runs instead with the filter tested at every node it reaches, and recall there is the graph's own, measured at 0.96 and above on three real 100,000 record sets.
 
-Measured on three real 100,000 record sets, milliseconds per query, minimum of several passes:
+Measured on three real 100,000 record sets with no field declared, milliseconds per query, minimum of several passes:
 
 | Records matched | Path | sift, 128d | glove, 100d | dbpedia, 1536d |
 | --- | --- | --- | --- | --- |
@@ -1667,7 +1696,56 @@ Measured on three real 100,000 record sets, milliseconds per query, minimum of s
 | 100 | exact | 36.1 | 30.8 | 30.8 |
 | 1 | exact | 38.3 | 31.6 | 34.7 |
 
-**Expect a filtered search over 100,000 records to cost tens of milliseconds where an unfiltered one costs a fraction of one**, and expect it to grow in proportion to the record count. Filtering on a field that few records carry does not reduce it, because the walk visits every record either way. Filtering less often does, and so does keeping separate indexes for partitions you always filter by.
+**Declare the fields you filter on**, because undeclared a filtered search over 100,000 records costs tens of milliseconds where an unfiltered one costs a fraction of one, and it grows in proportion to the record count. Filtering on a field that few records carry does not reduce it, since the walk visits every record either way.
+
+<br/>
+
+### 🚀 Declaring the fields you filter on
+
+`create(indexed_fields=[...])` builds a column for each field named, so a filter naming only declared fields is answered from those columns rather than by reading every record's metadata. It changes which records come back in no way, only what finding them costs.
+
+```python
+from zeusdb_vector_database import VectorDatabase
+
+catalogue = VectorDatabase().create(
+    "hnsw", dim=4, space="l2", indexed_fields=["lang", "tier"]
+)
+catalogue.add([
+    {"id": "c1", "values": [0.1, 0.1, 0.1, 0.1],
+     "metadata": {"lang": "en", "tier": "gold", "year": 2024}},
+    {"id": "c2", "values": [0.2, 0.2, 0.2, 0.2],
+     "metadata": {"lang": "es", "tier": "free", "year": 2023}},
+])
+query = [0.1, 0.1, 0.1, 0.1]
+
+print(catalogue.indexed_fields)
+
+# Answered from the columns, because every field the filter names is declared.
+print([hit["id"] for hit in catalogue.search(vector=query, filter={"tier": "gold"})])
+
+# The same record, found by reading metadata, because year was not declared.
+print([hit["id"] for hit in catalogue.search(vector=query, filter={"year": 2023})])
+```
+
+*Output*
+```
+['lang', 'tier']
+['c1']
+['c2']
+```
+
+The same filter answered both ways, on three real 100,000 record sets, milliseconds per query, minimum of three passes over thirty queries:
+
+| Records matched | Declared | Not declared |
+| --- | --- | --- |
+| 1 | 0.09 to 0.15 | 28.1 to 73.9 |
+| 1,000 | 0.37 to 0.48 | 31.2 to 57.2 |
+| 10,000 | 3.5 to 12.6 | 20.5 to 36.9 |
+| 50,000 | 0.82 to 4.1 | 3.9 to 15.7 |
+
+**Declare the fields you filter on and leave the rest out.** Eight declared fields over 100,000 records cost 6.69 MB, which is 6 percent of what the metadata already costs. A field carrying a distinct value on nearly every record costs 42 bytes a record instead of 4, so declare a document id only if you filter on it.
+
+**A filter naming an undeclared field returns the same records**, finds them by reading metadata rather than from a column, and logs one warning naming the field. `index.indexed_fields` reads the declaration back and is empty on an index created without it.
 
 <br/>
 
