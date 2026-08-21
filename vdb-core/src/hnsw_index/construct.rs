@@ -13,7 +13,7 @@ use chrono::Utc;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace};
@@ -163,6 +163,62 @@ pub(crate) fn validate_index_parameters(
         }
     }
     Ok(space_normalized)
+}
+
+/// Warn where `ef_construction` switches the neighbour selection heuristic off.
+///
+/// **The message is the one `VectorDatabase.create()` raises, word for word.**
+/// The Python factory checks the pair a caller passes to `create()` and this
+/// checks the pair a caller passes to `rebuild()`, so the same misconfiguration
+/// reads the same either way.
+/// `the_two_warnings_are_the_same_sentence` in `tests/test_index_lifecycle.py`
+/// holds the two texts equal, which is what stops one drifting from the other.
+///
+/// The reasoning behind the threshold is in `_warn_if_selection_disabled` in
+/// `vector_database.py` and is not repeated here. In short, `select_neighbours`
+/// keeps every candidate rather than pruning once the candidate list is no
+/// longer than the neighbour budget, that budget is `2 * m` at layer zero, and
+/// the candidate list is `ef_construction` long, so the flip lands exactly on
+/// `ef_construction <= 2 * m` and the warning carries no slack.
+///
+/// A pair the validation is going to reject returns without warning, so an
+/// invalid `m` produces its real validation error and nothing else.
+pub(crate) fn warn_if_selection_disabled(
+    py: Python<'_>,
+    m: usize,
+    ef_construction: usize,
+) -> PyResult<()> {
+    if !(2..=256).contains(&m) || ef_construction < 1 || ef_construction > 2 * m {
+        return Ok(());
+    }
+    let budget = 2 * m;
+    // The largest m that leaves the heuristic running at this ef_construction.
+    // Below the floor of 2 there is no such m, so the message offers the one
+    // remedy that exists.
+    let largest_m = (ef_construction - 1) / 2;
+    let remedy = if largest_m >= 2 {
+        format!(
+            "Raise ef_construction above {}, or lower m to {} or below",
+            budget, largest_m
+        )
+    } else {
+        format!("Raise ef_construction above {}", budget)
+    };
+    let message = format!(
+        "ef_construction={} is not greater than 2*m={}, so the neighbour selection \
+         heuristic does not run. Layer zero insertion keeps every candidate the \
+         construction search returns, in distance order, and prunes none of them. \
+         {}, to run it.",
+        ef_construction, budget, remedy
+    );
+    let text = std::ffi::CString::new(message)
+        .expect("the message is built here from integers and carries no interior nul");
+    PyErr::warn(
+        py,
+        &py.get_type::<pyo3::exceptions::PyUserWarning>(),
+        &text,
+        1,
+    )
 }
 
 impl HNSWIndex {
@@ -415,9 +471,9 @@ impl HNSWIndex {
         Ok(HNSWIndex {
             dim,
             space: space_normalized,
-            m,
-            ef_construction,
-            expected_size,
+            m: AtomicUsize::new(m),
+            ef_construction: AtomicUsize::new(ef_construction),
+            expected_size: AtomicUsize::new(expected_size),
             quantization_config: quantization_params,
             pq: pq_instance,
             pq_codes: RwLock::new(HashMap::new()),
@@ -467,9 +523,9 @@ impl HNSWIndex {
         HNSWIndex {
             dim,
             space: space_normalized,
-            m,
-            ef_construction,
-            expected_size,
+            m: AtomicUsize::new(m),
+            ef_construction: AtomicUsize::new(ef_construction),
+            expected_size: AtomicUsize::new(expected_size),
             quantization_config: None,
             pq: None,
             pq_codes: RwLock::new(HashMap::new()),

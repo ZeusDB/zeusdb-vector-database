@@ -34,7 +34,7 @@
 mod construct;
 // The declaration rules, so that `persistence::load_config` applies the same
 // ones to `config.json` that `build` applies to a caller's arguments.
-pub(crate) use construct::validate_index_parameters;
+pub(crate) use construct::{validate_index_parameters, warn_if_selection_disabled};
 #[cfg(test)]
 mod graph_guard_tests;
 mod input;
@@ -44,7 +44,7 @@ mod search;
 mod stats;
 mod training;
 
-use crate::columns::ColumnStore;
+use crate::columns::{ColumnStore, Selection};
 use crate::conversion::{python_dict_to_value_map, value_map_to_python};
 use crate::filter::{compile_filter, matches_filter};
 // The graph and everything the graph crate supplies arrive through the seam.
@@ -59,7 +59,7 @@ use pyo3::types::{PyDict, PyList};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -239,9 +239,16 @@ impl AddResult {
 pub struct HNSWIndex {
     dim: usize,
     space: String,
-    m: usize,
-    ef_construction: usize,
-    expected_size: usize,
+    /// The graph degree, written by `rebuild` and read everywhere else.
+    ///
+    /// An atomic rather than a plain field because `rebuild` takes `&self`, as
+    /// every other mutating entry point on this type does. It is written only
+    /// under `writers`, which every mutating entry point takes first, and read
+    /// by the saver, the stats and the three rebuild paths. A search never
+    /// reads it. `expected_size` is the same for the same reason.
+    m: AtomicUsize,
+    ef_construction: AtomicUsize,
+    expected_size: AtomicUsize,
 
     // Quantization configuration and PQ instance
     quantization_config: Option<QuantizationConfig>,
@@ -268,9 +275,11 @@ pub struct HNSWIndex {
     /// record.** A filter naming only declared fields compiles to a bitmap over
     /// internal ids, which both the exact scan and the graph traversal consume,
     /// and `vector_metadata` is then read only for the records the page
-    /// returns. A filter naming an undeclared field cannot be answered here and
-    /// falls back to the walk, which is what every index did before this
-    /// existed and what an index with no declaration still does.
+    /// returns. A filter naming an undeclared field cannot be answered here.
+    /// Where the declared fields still bound which records could match, the
+    /// metadata is read for those alone; where they bound nothing, and on an
+    /// index with no declaration, it falls back to the walk, which is what
+    /// every index did before this existed.
     ///
     /// It supplements the metadata map rather than replacing it. `get_records`,
     /// `list`, the result page and the saver all read the map, and a column
@@ -1041,7 +1050,7 @@ impl HNSWIndex {
 
     /// Python property: `index.m`
     ///
-    /// The graph degree, fixed at construction and never written again.
+    /// The graph degree, and the one creation parameter `rebuild` can change.
     ///
     /// Reachable before this only as `int(index.get_stats()["m"])`, which is a
     /// number formatted into a string and parsed back. hnswlib exposes `M`,
@@ -1049,21 +1058,24 @@ impl HNSWIndex {
     /// names, and every other comparator exposes the equivalent typed.
     ///
     /// Read-only, because `m` is what the graph was built with. Assigning it
-    /// would describe a graph that does not exist, and changing it for real is
-    /// a rebuild rather than a setter.
+    /// would describe a graph that does not exist. Changing it for real is
+    /// `rebuild(m=...)`, which builds the graph again at the new degree.
     #[getter]
     pub fn m(&self) -> usize {
-        self.m
+        self.get_m()
     }
 
     /// Python property: `index.ef_construction`
     ///
-    /// The candidate width each insertion searched at. Read-only for the same
-    /// reason as `m`: it describes work already done. It has no effect on a
+    /// The candidate width each insertion searched at. It has no effect on a
     /// search, so a caller wanting a wider search passes `ef_search`.
+    ///
+    /// Read-only, because it describes work already done. Changing it for real
+    /// is `rebuild(ef_construction=...)`, which re-inserts every record at the
+    /// new width and so makes the number true again.
     #[getter]
     pub fn ef_construction(&self) -> usize {
-        self.ef_construction
+        self.get_ef_construction()
     }
 
     /// Python property: `index.expected_size`
@@ -1077,7 +1089,7 @@ impl HNSWIndex {
     /// disagreeing is ordinary.
     #[getter]
     pub fn expected_size(&self) -> usize {
-        self.expected_size
+        self.get_expected_size()
     }
 
     /// `len(index)`, the number of live records.
@@ -1141,20 +1153,42 @@ impl HNSWIndex {
         // arm to explain.
         Ok(py.detach(|| {
             // The columns answer this outright where every field is declared,
-            // as a population count over the bitmap rather than a walk. The two
-            // guards are never held together, so the fall back below is in
-            // order rather than against it.
-            {
+            // as a population count over the bitmap rather than a walk. Where
+            // one field has no column the declared ones bound the candidates
+            // and the metadata decides among them, which is the same count over
+            // fewer reads. The guards below are taken in the declared order,
+            // and the columns guard is released before the other two, since the
+            // selection owns its bitmap.
+            let selection = {
                 let columns = self.columns.read().unwrap();
-                if let Ok(selected) = columns.select(&conditions) {
-                    return selected.count();
+                columns.select(&conditions)
+            };
+            let rev_map = self.rev_map.read().unwrap();
+            match selection {
+                Selection::Exact(selected) => selected.count(),
+                Selection::Narrowed(bound, _) => {
+                    let vector_metadata = self.vector_metadata.read().unwrap();
+                    let mut counted = 0;
+                    bound.for_each(|slot| {
+                        if let Some(id) = rev_map.get(&slot) {
+                            if vector_metadata
+                                .get(id)
+                                .is_some_and(|meta| matches_filter(meta, &conditions))
+                            {
+                                counted += 1;
+                            }
+                        }
+                    });
+                    counted
+                }
+                Selection::Whole(_) => {
+                    let vector_metadata = self.vector_metadata.read().unwrap();
+                    vector_metadata
+                        .values()
+                        .filter(|meta| matches_filter(meta, &conditions))
+                        .count()
                 }
             }
-            let vector_metadata = self.vector_metadata.read().unwrap();
-            vector_metadata
-                .values()
-                .filter(|meta| matches_filter(meta, &conditions))
-                .count()
         }))
     }
 
@@ -1648,10 +1682,10 @@ impl HNSWIndex {
             let fresh = if let (true, Some(pq)) = (quantized, pq) {
                 let mut graph = VectorGraph::new_pq(
                     &self.space,
-                    self.m,
-                    self.expected_size,
+                    self.get_m(),
+                    self.get_expected_size(),
                     MAX_LAYER,
-                    self.ef_construction,
+                    self.get_ef_construction(),
                     pq,
                 );
                 // A cleared `quantized_with_raw` index goes on keeping raw
@@ -1664,7 +1698,7 @@ impl HNSWIndex {
                     .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw)
                 {
                     graph
-                        .open_raw_store(self.dim, self.expected_size)
+                        .open_raw_store(self.dim, self.get_expected_size())
                         .expect("a quantized graph accepts a raw side store");
                 }
                 graph
@@ -1672,10 +1706,10 @@ impl HNSWIndex {
                 VectorGraph::new_raw(
                     &self.space,
                     self.dim,
-                    self.m,
-                    self.expected_size,
+                    self.get_m(),
+                    self.get_expected_size(),
                     MAX_LAYER,
-                    self.ef_construction,
+                    self.get_ef_construction(),
                 )
             };
 
@@ -1699,7 +1733,7 @@ impl HNSWIndex {
                 // Keeps the declaration and drops every record, which is what
                 // `clear` does to the index itself. The reservation comes back
                 // too, since a cleared index is about to be filled again.
-                columns.clear(self.expected_size);
+                columns.clear(self.get_expected_size());
                 training_ids.clear();
                 *id_counter = 0;
                 *vector_count = 0;
@@ -1762,6 +1796,97 @@ impl HNSWIndex {
             let _writers = self.writers.lock().unwrap();
             self.update_metadata_locked(&id, fields)
         }))
+    }
+
+    /// Rebuild the graph at a new degree, in place.
+    ///
+    /// **`m` is the one creation parameter nothing else can correct.** It is
+    /// chosen from `expected_size` at `create()` and fixed there, so an index
+    /// declared for 10,000 records and given a million runs at a degree meant
+    /// for the smaller one, and no search width recovers the recall that costs.
+    /// `dim` and `space` cannot be wrong that way, since an index at the wrong
+    /// width or the wrong metric rejects or misranks its records outright, and
+    /// `ef_construction` describes work already done.
+    ///
+    /// At least one of the three has to be given. Rebuilding the graph as it
+    /// stands is `compact()`, which reclaims the nodes removals and overwrites
+    /// leave behind.
+    ///
+    /// `expected_size` moves with `m` because the two are related. It selects
+    /// the default `m`, it sizes the replacement graph's reservation, and it is
+    /// what the overgrowth warning compares against, so a caller correcting one
+    /// usually wants the other. Passing it also re-arms that warning.
+    ///
+    /// `ef_construction` moves with them because **the warning below names it as
+    /// one of two remedies and a caller has to be able to take either.** Raising
+    /// `m` past half of `ef_construction` switches the neighbour selection
+    /// heuristic off, and the message says to raise `ef_construction` or lower
+    /// `m`. It is honest to report afterwards for the same reason the rebuild is
+    /// honest at all: every record really was re-inserted at the new width.
+    ///
+    /// **Everything except the graph survives untouched.** Each record is
+    /// re-inserted under the internal id it already holds, so `id_map`,
+    /// `rev_map`, the metadata store and every declared field's column stay
+    /// correct without being rewritten, and the record any given id resolves to
+    /// is the same before and after. A quantized index is rebuilt from its
+    /// stored codes rather than re-encoded, so the codebook is not retrained and
+    /// no record's code changes; a `quantized_with_raw` index carries its raw
+    /// store over node by node.
+    ///
+    /// The three are held to the rules `create()` applies, on the same five
+    /// values, and an invalid one raises the message `create()` raises for it.
+    /// The `ef_construction` against `2 * m` pair is checked too, and warns where
+    /// the pair puts the neighbour selection heuristic out of reach.
+    ///
+    /// Returns the node count of the graph it built, which equals the live
+    /// record count.
+    ///
+    /// **The cost is a full rebuild by insertion**, the same cost as
+    /// `compact()`, proportional to the live record count. The replacement is
+    /// built in full before the old graph is dropped, so peak memory holds both
+    /// and a failure part way through leaves the index exactly as it was.
+    #[pyo3(signature = (m=None, expected_size=None, ef_construction=None))]
+    pub fn rebuild(
+        &self,
+        py: Python<'_>,
+        m: Option<usize>,
+        expected_size: Option<usize>,
+        ef_construction: Option<usize>,
+    ) -> PyResult<usize> {
+        if m.is_none() && expected_size.is_none() && ef_construction.is_none() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "rebuild() changes m, expected_size, ef_construction or any combination \
+                 of them, and was given none. Rebuilding the graph as it stands is \
+                 compact(), which reclaims the nodes that removals and overwrites leave \
+                 behind.",
+            ));
+        }
+        let new_m = m.unwrap_or_else(|| self.get_m());
+        let new_expected_size = expected_size.unwrap_or_else(|| self.get_expected_size());
+        let new_ef_construction = ef_construction.unwrap_or_else(|| self.get_ef_construction());
+        // The rules `create()` applies, on the same five values, so a degree
+        // this build would refuse at creation is refused here with the message
+        // creation raises for it.
+        validate_index_parameters(
+            self.dim,
+            &self.space,
+            new_m,
+            new_ef_construction,
+            new_expected_size,
+            "",
+        )?;
+        // Before the interpreter lock is released, because a Python warning
+        // needs it. The pair is what decides it, exactly as at `create()`, and
+        // **both of the remedies it names are reachable from here**: this takes
+        // `ef_construction` as well as `m`, so a caller told to raise one or
+        // lower the other can do either.
+        warn_if_selection_disabled(py, new_m, new_ef_construction)?;
+        if expected_size.is_some() {
+            // A raised declaration is a new bar for the overgrowth warning, and
+            // the old one has already been claimed if it fired.
+            self.overgrowth_warned.store(false, Ordering::Release);
+        }
+        py.detach(|| self.rebuild_locked(new_m, new_expected_size, new_ef_construction))
     }
 
     /// Rebuild the graph in memory and reclaim the nodes removal and overwrite strand.

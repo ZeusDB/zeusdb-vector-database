@@ -268,13 +268,152 @@ def test_a_filter_on_an_undeclared_field_returns_the_same_records():
     assert ids_of(plain, filter) == expected
 
     # And a filter mixing a declared field with an undeclared one, which is the
-    # shape a partial declaration produces. The whole filter takes the walk.
+    # shape a partial declaration produces. The declared branch bounds which
+    # records are read and the metadata decides among them.
     mixed = {"cat": "gamma", "name": {"endswith": "3.pdf"}}
     expected_mixed = sorted(
         rid for rid, meta in zip(ids, metadata)
         if meta["cat"] == "gamma" and meta["name"].endswith("3.pdf"))
     assert ids_of(declared, mixed) == expected_mixed
     assert ids_of(plain, mixed) == expected_mixed
+
+
+# ---------------------------------------------------------------------------
+# A filter mixing a declared field with one that has no column
+# ---------------------------------------------------------------------------
+#
+# The declared fields cannot answer such a filter, and for some tree shapes they
+# can still say which records could possibly match. Every test below compares
+# the partly declared index against the undeclared one, which walks, so a bound
+# that dropped a record shows up as a short page rather than as a slow one.
+
+# Two fields of the seven, chosen so that every filter in FILTERS naming
+# anything else becomes mixed.
+PARTIAL = ["cat", "flag"]
+
+
+@pytest.fixture(scope="module")
+def partly_declared():
+    """The same corpus again, declaring two of its seven fields."""
+    index, _, _ = build(PARTIAL)
+    return index
+
+
+@pytest.mark.parametrize("label,filter,predicate", FILTERS, ids=[f[0] for f in FILTERS])
+def test_a_partial_declaration_answers_what_the_walk_answers(
+        pair, partly_declared, label, filter, predicate):
+    """Every filter in the suite again, over an index declaring two fields.
+
+    Most of them are now mixed, since they name a field with no column beside
+    one that has. The page has to be identical to the walk's in ids, in order
+    and in score bits.
+    """
+    _, without_columns, _, _ = pair
+    assert page(partly_declared, filter) == page(without_columns, filter), label
+    assert ids_of(partly_declared, filter) == ids_of(without_columns, filter), label
+    assert partly_declared.count(filter) == without_columns.count(filter), label
+
+
+# One filter per tree shape a mixed declaration can produce, with the shape
+# named. `cat` and `flag` have columns; `rank`, `name` and `tags` do not.
+MIXED_SHAPES = [
+    ("conjunction, flat",
+     {"cat": "beta", "rank": {"lt": 300}},
+     lambda m: m["cat"] == "beta" and m["rank"] < 300),
+    ("conjunction, explicit",
+     {"$and": [{"cat": "beta"}, {"name": {"endswith": "3.pdf"}}]},
+     lambda m: m["cat"] == "beta" and m["name"].endswith("3.pdf")),
+    ("conjunction of three, two declared",
+     {"cat": "beta", "flag": True, "rank": {"gte": 100}},
+     lambda m: m["cat"] == "beta" and m["flag"] is True and m["rank"] >= 100),
+    ("disjunction",
+     {"$or": [{"cat": "beta"}, {"rank": {"lt": 20}}]},
+     lambda m: m["cat"] == "beta" or m["rank"] < 20),
+    ("negation of an undeclared leaf",
+     {"$not": {"rank": {"lt": 300}}},
+     lambda m: not m["rank"] < 300),
+    ("negation of a mixed conjunction",
+     {"$not": {"$and": [{"cat": "beta"}, {"rank": {"lt": 300}}]}},
+     lambda m: not (m["cat"] == "beta" and m["rank"] < 300)),
+    ("negation of a mixed disjunction",
+     {"$not": {"$or": [{"cat": "beta"}, {"rank": {"lt": 300}}]}},
+     lambda m: not (m["cat"] == "beta" or m["rank"] < 300)),
+    ("conjunction carrying a negated undeclared branch",
+     {"cat": "gamma", "$not": {"rank": {"lt": 300}}},
+     lambda m: m["cat"] == "gamma" and not m["rank"] < 300),
+    ("conjunction whose declared branch matches nothing",
+     {"cat": "nosuchvalue", "rank": {"lt": 300}},
+     lambda m: False),
+    ("conjunction whose declared branch matches everything",
+     {"$and": [{"cat": {"nin": []}}, {"rank": {"lt": 20}}]},
+     lambda m: m["rank"] < 20),
+    ("disjunction inside a conjunction",
+     {"$and": [{"$or": [{"cat": "beta"}, {"cat": "delta"}]},
+               {"name": {"endswith": "4.pdf"}}]},
+     lambda m: m["cat"] in ("beta", "delta") and m["name"].endswith("4.pdf")),
+    ("conjunction inside a disjunction",
+     {"$or": [{"$and": [{"cat": "beta"}, {"flag": True}]},
+              {"rank": {"lt": 5}}]},
+     lambda m: (m["cat"] == "beta" and m["flag"] is True) or m["rank"] < 5),
+    ("four deep, mixed at the bottom",
+     {"$not": {"$or": [{"$and": [{"cat": "beta"}, {"$not": {"rank": {"lt": 300}}}]}]}},
+     lambda m: not (m["cat"] == "beta" and not m["rank"] < 300)),
+    ("array operator undeclared beside a declared field",
+     {"cat": "alpha", "tags": {"any": ["ai", "tech"]}},
+     lambda m: m["cat"] == "alpha" and bool(set(m["tags"]) & {"ai", "tech"})),
+    ("undeclared field absent from a tenth of the records",
+     {"flag": True, "sometimes": "here"},
+     lambda m: m["flag"] is True and m.get("sometimes") == "here"),
+]
+
+
+@pytest.mark.parametrize("label,filter,predicate", MIXED_SHAPES,
+                         ids=[s[0] for s in MIXED_SHAPES])
+def test_every_mixed_tree_shape_returns_the_records_the_walk_returns(
+        pair, partly_declared, label, filter, predicate):
+    """The bar for the bound: the same records, in the same order, per shape.
+
+    The Python predicate is the third answer, computed from the corpus itself,
+    so a bound and a walk that agreed with each other and not with the data
+    would still fail here.
+    """
+    _, without_columns, _, metadata = pair
+    ids, _, _ = corpus()
+
+    expected = sorted(rid for rid, meta in zip(ids, metadata) if predicate(meta))
+    assert ids_of(without_columns, filter) == expected, f"{label}: the walk disagrees"
+    assert ids_of(partly_declared, filter) == expected, f"{label}: the bound disagrees"
+    assert page(partly_declared, filter) == page(without_columns, filter), label
+    assert partly_declared.count(filter) == len(expected), label
+
+
+def test_a_mixed_filter_agrees_across_the_scan_threshold():
+    """A corpus larger than the threshold, so the bounded traversal runs too."""
+    size = 12000
+    partial, _, _ = build(["cat"], size=size)
+    plain, _, _ = build(None, size=size)
+
+    for filter in [
+        {"cat": "beta", "rank": {"lt": 10}},        # bounded scan, few matches
+        {"cat": "beta", "rank": {"lt": 4999}},      # bounded scan, just under
+        {"cat": "beta", "rank": {"gte": 0}},        # 2,400 matches, bounded scan
+        {"rank": {"lt": 8000}, "$not": {"cat": "nosuchvalue"}},  # 8,000, traversal
+        {"$or": [{"cat": "beta"}, {"rank": {"lt": 8000}}]},      # no bound, traversal
+    ]:
+        assert page(partial, filter, top_k=10) == page(
+            plain, filter, top_k=10), filter
+        assert partial.count(filter) == plain.count(filter), filter
+
+
+def test_remove_where_on_a_mixed_filter_removes_the_same_records():
+    def mutate(index):
+        assert index.remove_where({"cat": "beta", "rank": {"lt": 100}}) == 20
+
+    declared, plain = _pair_after(mutate, declaration=PARTIAL)
+
+    assert len(declared) == len(plain) == 180
+    assert ids_of(declared, {"cat": "beta"}) == ids_of(plain, {"cat": "beta"})
+    assert ids_of(declared, {"rank": {"lt": 100}}) == ids_of(plain, {"rank": {"lt": 100}})
 
 
 # ---------------------------------------------------------------------------

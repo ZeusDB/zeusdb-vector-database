@@ -439,10 +439,10 @@ impl HNSWIndex {
 
         let mut new_hnsw = VectorGraph::new_pq(
             &self.space,
-            self.m,
-            self.expected_size,
+            self.get_m(),
+            self.get_expected_size(),
             MAX_LAYER,
-            self.ef_construction,
+            self.get_ef_construction(),
             pq.clone(),
         );
 

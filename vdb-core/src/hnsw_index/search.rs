@@ -33,10 +33,17 @@
 //! **A filter over declared fields does not walk anything.** The fields named
 //! at `create(indexed_fields=[...])` each carry a column addressed by internal
 //! id, so a filter over them compiles to a bitmap and both paths read it: the
-//! exact scan takes the set bits and the traversal tests one bit per node. A
-//! filter naming a field that was not declared has no column to read and takes
-//! the walk described below, which is what every filtered search did before the
-//! columns existed.
+//! exact scan takes the set bits and the traversal tests one bit per node.
+//!
+//! **A filter mixing a declared field with one that was not declared walks the
+//! candidates the declared fields leave.** The columns bound the matching set
+//! from above, the scan reads the metadata of the records inside that bound
+//! rather than of every record, and the traversal tests the bound before it
+//! reaches for any metadata at all. A filter naming no declared field, and one
+//! whose shape leaves no usable bound, take the walk described below, which is
+//! what every filtered search did before the columns existed. See
+//! [`crate::columns::ColumnStore::bound`] for which shapes bound and which do
+//! not.
 //!
 //! **The walk is what made a filtered search expensive.** It costs about 250
 //! nanoseconds a record, so a selective filter over 100,000 records cost about
@@ -61,7 +68,7 @@
 //! long read hold delays the next reader as well as the writer.
 
 use super::{HNSWIndex, StorageMode, VectorGraph};
-use crate::columns::{Bitmap, ColumnStore};
+use crate::columns::{Bitmap, ColumnStore, Selection};
 use crate::conversion::value_map_to_python;
 use crate::filter::{matches_filter, Filter};
 use crate::graph::GraphHit;
@@ -380,6 +387,61 @@ impl HNSWIndex {
         Some(scored)
     }
 
+    /// The candidates inside a bound, judged and scored, or `None` where too
+    /// many of them matched.
+    ///
+    /// The counterpart of [`Self::scan_candidates`] for a filter mixing a
+    /// declared field with one that has no column. The bound is a superset of
+    /// the matching set, so every candidate it names still has its metadata
+    /// read and the whole filter judged on it. What changes is how many
+    /// candidates there are: a conjunction whose declared branch matches a
+    /// hundred records reads a hundred metadata entries where the walk read
+    /// every one in the index.
+    ///
+    /// **The page is the one the walk returns.** This produces its candidates
+    /// in increasing internal id order and the walk produces them in hash
+    /// order, and [`Self::score_matched`] sorts both by distance then external
+    /// id, which is total over a set of unique ids.
+    ///
+    /// The give-up point is [`FULL_SCAN_THRESHOLD`] matches, as it is for the
+    /// walk, and the caller traverses where it fires. A slot the bound holds
+    /// that no longer resolves is skipped, which is the liveness rule every
+    /// other path applies.
+    fn scan_bounded<'a>(
+        &self,
+        query: &[f32],
+        bound: &Bitmap,
+        rev_map: &'a HashMap<usize, String>,
+        filter: Filtered<'a>,
+        fetch_k: usize,
+    ) -> Option<Candidates<'a>> {
+        let mut matched: Vec<&'a String> = Vec::new();
+        let mut gave_up = false;
+        bound.for_each_while(|slot| {
+            let Some(ext_id) = rev_map.get(&slot) else {
+                return true;
+            };
+            let Some(meta) = filter.metadata.get(ext_id) else {
+                return true;
+            };
+            if filter.judge(meta) {
+                if matched.len() == FULL_SCAN_THRESHOLD {
+                    // One past the threshold, so the walk stops here and the
+                    // caller traverses. Nothing has been scored yet.
+                    gave_up = true;
+                    return false;
+                }
+                matched.push(ext_id);
+            }
+            true
+        });
+        if gave_up {
+            return None;
+        }
+
+        self.score_matched(query, matched, filter, fetch_k)
+    }
+
     /// One query's candidates, by whichever of the two paths suits its filter
     ///
     /// An unfiltered search traverses with the liveness predicate it has always
@@ -424,7 +486,7 @@ impl HNSWIndex {
 
         let graph_hits = match filter {
             Some(filter) => match filter.columns.select(filter.conditions) {
-                Ok(selected) => {
+                Selection::Exact(selected) => {
                     let matched = selected.count();
                     if matched <= FULL_SCAN_THRESHOLD {
                         trace!(
@@ -447,8 +509,45 @@ impl HNSWIndex {
                     let admits = |internal_id: &usize| selected.contains(*internal_id);
                     hnsw.search(query, fetch_k, ef, Some(&admits))
                 }
-                Err(undeclared) => {
-                    self.warn_undeclared_filter_field(filter.columns, undeclared);
+                // A filter mixing a declared field with one that has no column.
+                // The declared fields bound the candidates and the metadata
+                // decides among them, so both paths below read the records the
+                // bound names rather than all of them.
+                Selection::Narrowed(bound, undeclared) => {
+                    let candidates = bound.count();
+                    self.warn_undeclared_filter_field(filter.columns, undeclared, Some(candidates));
+                    if let Some(scanned) =
+                        self.scan_bounded(query, &bound, rev_map, filter, fetch_k)
+                    {
+                        trace!(
+                            operation = "filtered_bounded_scan",
+                            candidates = candidates,
+                            matched = scanned.len(),
+                            "Filtered search answered by a bounded scan"
+                        );
+                        return scanned;
+                    }
+                    // The bit test comes first, so a node outside the bound
+                    // costs one word read rather than a `rev_map` lookup, a
+                    // metadata lookup and a field walk. It admits exactly what
+                    // the metadata predicate alone admits, because a record the
+                    // filter matches is inside the bound by construction.
+                    trace!(
+                        operation = "filtered_bounded_traversal",
+                        candidates = candidates,
+                        "Filtered search traverses inside a bitmap bound"
+                    );
+                    let admits = |internal_id: &usize| {
+                        bound.contains(*internal_id)
+                            && match rev_map.get(internal_id) {
+                                Some(ext_id) => filter.admits(ext_id),
+                                None => false,
+                            }
+                    };
+                    hnsw.search(query, fetch_k, ef, Some(&admits))
+                }
+                Selection::Whole(undeclared) => {
+                    self.warn_undeclared_filter_field(filter.columns, undeclared, None);
                     if let Some(scanned) = self.scan_candidates(query, filter, fetch_k) {
                         trace!(
                             operation = "filtered_scan",
@@ -479,6 +578,12 @@ impl HNSWIndex {
 
     /// Say once that a filter named a field this index did not declare.
     ///
+    /// `narrowed_to` is the number of records the declared fields bounded the
+    /// search to, and `None` where they bounded nothing. The two cases cost
+    /// different amounts and the message says which one happened, because a
+    /// filter reading a hundred metadata entries and one reading a hundred
+    /// thousand are not the same report.
+    ///
     /// Silent on an index that declared nothing, because there the walk is what
     /// the index has always done and a warning on every filtered search would
     /// be noise for every user who never asked for columns. On an index that
@@ -497,7 +602,12 @@ impl HNSWIndex {
     /// between the two. That is the deadlock relay 86 found when
     /// `search_candidates` called `HNSWIndex::is_quantized`, and the first
     /// version of this function reintroduced it.
-    fn warn_undeclared_filter_field(&self, columns: &ColumnStore, field: &str) {
+    fn warn_undeclared_filter_field(
+        &self,
+        columns: &ColumnStore,
+        field: &str,
+        narrowed_to: Option<usize>,
+    ) {
         if !columns.is_declared() || self.undeclared_filter_warned.load(Ordering::Acquire) {
             return;
         }
@@ -508,16 +618,30 @@ impl HNSWIndex {
         {
             return;
         }
-        warn!(
-            operation = "filter_field_not_indexed",
-            field = %field,
-            "Filter names \"{}\", which this index did not declare in indexed_fields, so \
-             the search walks every record's metadata to find the matches. The answer is \
-             the same either way; what differs is that the walk costs about 250 \
-             nanoseconds a record. Add the field to indexed_fields at create() if you \
-             filter on it. This warning fires once.",
-            field
-        );
+        match narrowed_to {
+            Some(candidates) => warn!(
+                operation = "filter_field_not_indexed",
+                field = %field,
+                candidates = candidates,
+                "Filter names \"{}\", which this index did not declare in indexed_fields. \
+                 The fields it did declare narrowed the search to {} records, and it read \
+                 the metadata of those to finish the answer. A filter naming only declared \
+                 fields reads none. Add the field to indexed_fields at create() if you \
+                 filter on it. This warning fires once.",
+                field,
+                candidates
+            ),
+            None => warn!(
+                operation = "filter_field_not_indexed",
+                field = %field,
+                "Filter names \"{}\", which this index did not declare in indexed_fields, so \
+                 the search walks every record's metadata to find the matches. The answer is \
+                 the same either way; what differs is that the walk costs about 250 \
+                 nanoseconds a record. Add the field to indexed_fields at create() if you \
+                 filter on it. This warning fires once.",
+                field
+            ),
+        }
     }
 
     /// Graph hits as candidates, dropping any whose node no longer resolves

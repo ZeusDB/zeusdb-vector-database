@@ -7,7 +7,7 @@
 //! the graph nodes that removal and replacement leave behind.
 
 use super::{HNSWIndex, ParsedRecords, StorageMode, MAX_LAYER};
-use crate::columns::ColumnStore;
+use crate::columns::{Bitmap, ColumnStore, Selection};
 use crate::filter::{matches_filter, Filter};
 use crate::graph::{Record, VectorGraph};
 use crate::rerank::RawVectors;
@@ -77,13 +77,14 @@ impl HNSWIndex {
     /// `expected_size` is a capacity hint rather than a limit, so exceeding it is
     /// legal and the index keeps working. What it costs is not the reservation,
     /// which grows through the ordinary `Vec::push` path, but the graph degree.
-    /// The Python factory derives the default `m` from `expected_size`, and `m`
-    /// is fixed at construction, so an index that has outgrown its declaration by
-    /// a wide margin is running at a degree chosen for a smaller index and no
-    /// later `add` revises it. Nothing else tells a caller that.
+    /// The Python factory derives the default `m` from `expected_size`, and no
+    /// `add` revises it, so an index that has outgrown its declaration by a wide
+    /// margin is running at a degree chosen for a smaller index. Nothing else
+    /// tells a caller that.
     ///
-    /// A warning rather than an error, because the index is correct and the only
-    /// remedy is to rebuild at an honest declaration, which is the caller's call.
+    /// A warning rather than an error, because the index is correct and the
+    /// remedy is `rebuild`, which is a full pass over every record and therefore
+    /// the caller's call rather than something an `add` should do to them.
     ///
     /// Fires once per index. The flag is claimed with a compare and exchange, so
     /// two writers crossing the threshold together produce one line and not two.
@@ -93,7 +94,7 @@ impl HNSWIndex {
         }
 
         let threshold = self
-            .expected_size
+            .get_expected_size()
             .saturating_mul(EXPECTED_SIZE_OVERGROWTH_FACTOR);
         let live_records = self.id_map.read().unwrap().len();
         if live_records <= threshold {
@@ -111,13 +112,13 @@ impl HNSWIndex {
         warn!(
             operation = "expected_size_exceeded",
             live_records = live_records,
-            expected_size = self.expected_size,
-            m = self.m,
+            expected_size = self.get_expected_size(),
+            m = self.get_m(),
             "Index holds more than {}x the records its expected_size declared. \
              expected_size is a hint and not a limit, so nothing is broken, but m \
-             is fixed at construction and was sized for the declaration. Recreate \
-             the index with an expected_size matching what it actually holds if \
-             recall matters. This warning fires once.",
+             was sized for the declaration. Call rebuild(m=..., expected_size=...) \
+             to build the graph again at a degree matching what the index actually \
+             holds, if recall matters. This warning fires once.",
             EXPECTED_SIZE_OVERGROWTH_FACTOR
         );
     }
@@ -359,36 +360,58 @@ impl HNSWIndex {
     /// mutation guard.
     ///
     /// The columns answer the first phase where every field the filter names is
-    /// declared, and the metadata walk answers it otherwise. **The walk is
-    /// complete where the search's is bounded**, since a deletion has no use for
-    /// a give-up point, and the columns are complete for the same reason: the
-    /// bitmap holds every matching record whether there are ten of them or
-    /// ten thousand.
+    /// declared. Where one field has no column they bound the candidates and
+    /// the metadata decides among them, and where they bound nothing the walk
+    /// answers it alone. **The walk is complete where the search's is
+    /// bounded**, since a deletion has no use for a give-up point, and the
+    /// columns are complete for the same reason: the bitmap holds every
+    /// matching record whether there are ten of them or ten thousand.
     ///
     /// The filter arrives compiled, so nothing here can fail on it. The caller
     /// built it from the mapping it was handed and every operator name and
     /// group shape the engine cannot evaluate was rejected there, before any
     /// record was read.
     pub(super) fn remove_where_locked(&self, filter: &Filter) -> usize {
-        // `rev_map` before `columns`, which is the declared order, because the
-        // bitmap holds internal ids and a removal names external ones.
-        let from_columns: Option<Vec<String>> = {
-            let rev_map = self.rev_map.read().unwrap();
+        // `rev_map` before `vector_metadata` before `columns`, which is the
+        // declared order, because the bitmap holds internal ids and a removal
+        // names external ones. The columns guard is dropped before the metadata
+        // one is taken, since the selection owns its bitmap and borrows only the
+        // filter.
+        let rev_map = self.rev_map.read().unwrap();
+        let selection = {
             let columns = self.columns.read().unwrap();
-            columns.select(filter).ok().map(|selected| {
-                let mut ids = Vec::with_capacity(selected.count());
-                selected.for_each(|slot| {
+            columns.select(filter)
+        };
+        let resolve = |selected: &Bitmap| {
+            let mut ids = Vec::with_capacity(selected.count());
+            selected.for_each(|slot| {
+                if let Some(id) = rev_map.get(&slot) {
+                    ids.push(id.clone());
+                }
+            });
+            ids
+        };
+        let doomed: Vec<String> = match selection {
+            Selection::Exact(selected) => resolve(&selected),
+            // A filter mixing a declared field with one that has no column. The
+            // bound is a superset, so each candidate's metadata still decides,
+            // and what the columns bought is how few candidates there are.
+            Selection::Narrowed(bound, _) => {
+                let vector_metadata = self.vector_metadata.read().unwrap();
+                let mut ids = Vec::new();
+                bound.for_each(|slot| {
                     if let Some(id) = rev_map.get(&slot) {
-                        ids.push(id.clone());
+                        if vector_metadata
+                            .get(id)
+                            .is_some_and(|meta| matches_filter(meta, filter))
+                        {
+                            ids.push(id.clone());
+                        }
                     }
                 });
                 ids
-            })
-        };
-
-        let doomed: Vec<String> = match from_columns {
-            Some(ids) => ids,
-            None => {
+            }
+            Selection::Whole(_) => {
                 let vector_metadata = self.vector_metadata.read().unwrap();
                 vector_metadata
                     .iter()
@@ -397,6 +420,7 @@ impl HNSWIndex {
                     .collect()
             }
         };
+        drop(rev_map);
 
         let total = doomed.len();
         let missing = self.remove_points_internal(&doomed);
@@ -474,6 +498,116 @@ impl HNSWIndex {
         }
 
         let quantized = self.is_quantized();
+        let nodes_after = self.rebuild_graph(
+            self.get_m(),
+            self.get_expected_size(),
+            self.get_ef_construction(),
+        )?;
+        let reclaimed = nodes_before - nodes_after;
+        info!(
+            operation = "compact_complete",
+            nodes_before = nodes_before,
+            nodes_after = nodes_after,
+            nodes_reclaimed = reclaimed,
+            live_records = live_count,
+            quantized = quantized,
+            duration_ms = start_time.elapsed().as_millis(),
+            "Graph compacted"
+        );
+
+        Ok(reclaimed)
+    }
+
+    /// The body of `rebuild`, with the interpreter lock already released.
+    ///
+    /// **`m` is the one creation parameter a caller cannot correct any other
+    /// way.** It is chosen from `expected_size` at `create()` and fixed there,
+    /// so an index declared for 10,000 records and given a million runs at a
+    /// degree meant for the smaller one, and no search width recovers the recall
+    /// that costs. This rebuilds the graph at a new degree, in place.
+    ///
+    /// **Everything except the graph survives untouched.** Each record is
+    /// re-inserted under the internal id it already holds, which is what
+    /// `compact` does, so `id_map`, `rev_map`, the metadata store and every
+    /// column stay correct without being rewritten. A quantized index is
+    /// rebuilt from its stored codes rather than re-encoded, so the codebook is
+    /// not retrained and no record's code changes; a `quantized_with_raw` index
+    /// carries its raw store over node by node.
+    ///
+    /// `expected_size` and `ef_construction` move with it. The first selects
+    /// the default `m` at `create()`, sizes the replacement graph's reservation
+    /// and is what the overgrowth warning compares against. The second is one of
+    /// the two remedies the neighbour selection warning names, so a caller told
+    /// to raise it has to be able to.
+    ///
+    /// **The three are written after the rebuild has succeeded**, so an index
+    /// whose records could not be rebuilt from still reports the configuration
+    /// its graph actually has.
+    ///
+    /// Returns the live record count the replacement holds.
+    pub(super) fn rebuild_locked(
+        &self,
+        m: usize,
+        expected_size: usize,
+        ef_construction: usize,
+    ) -> PyResult<usize> {
+        let _writers = self.writers.lock().unwrap();
+        let start_time = Instant::now();
+
+        let previous_m = self.get_m();
+        let previous_expected_size = self.get_expected_size();
+        let previous_ef_construction = self.get_ef_construction();
+        let live_count = self.id_map.read().unwrap().len();
+        let nodes_before = self.hnsw.read().unwrap().nb_points();
+
+        let nodes_after = self.rebuild_graph(m, expected_size, ef_construction)?;
+
+        self.m.store(m, Ordering::Release);
+        self.expected_size.store(expected_size, Ordering::Release);
+        self.ef_construction
+            .store(ef_construction, Ordering::Release);
+
+        info!(
+            operation = "rebuild_complete",
+            m_before = previous_m,
+            m_after = m,
+            expected_size_before = previous_expected_size,
+            expected_size_after = expected_size,
+            ef_construction_before = previous_ef_construction,
+            ef_construction_after = ef_construction,
+            nodes_before = nodes_before,
+            nodes_after = nodes_after,
+            live_records = live_count,
+            quantized = self.is_quantized(),
+            duration_ms = start_time.elapsed().as_millis(),
+            "Graph rebuilt"
+        );
+
+        Ok(nodes_after)
+    }
+
+    /// Build a replacement graph at one degree and install it, returning its
+    /// node count.
+    ///
+    /// The shared body of `compact` and `rebuild`. Compaction is this at the
+    /// degree the index already has, which is why the two are one function: a
+    /// second copy that rebuilt by insertion would be a second place for the
+    /// insertion order, the quantized branch and the raw carry-over to drift.
+    ///
+    /// **The three parameters are passed rather than read off the index**, so
+    /// that `rebuild_locked` can write them after the rebuild has succeeded. An
+    /// index whose records cannot be rebuilt from therefore still reports the
+    /// configuration its graph actually has.
+    ///
+    /// The caller holds `writers`.
+    fn rebuild_graph(
+        &self,
+        m: usize,
+        expected_size: usize,
+        ef_construction: usize,
+    ) -> PyResult<usize> {
+        let live_count = self.id_map.read().unwrap().len();
+        let quantized = self.is_quantized();
 
         let mut new_hnsw = if quantized {
             let pq = self.pq.as_ref().cloned().ok_or_else(|| {
@@ -483,20 +617,20 @@ impl HNSWIndex {
             })?;
             VectorGraph::new_pq(
                 &self.space,
-                self.m,
-                self.expected_size,
+                m,
+                expected_size,
                 MAX_LAYER,
-                self.ef_construction,
+                ef_construction,
                 pq,
             )
         } else {
             VectorGraph::new_raw(
                 &self.space,
                 self.dim,
-                self.m,
-                self.expected_size,
+                m,
+                expected_size,
                 MAX_LAYER,
-                self.ef_construction,
+                ef_construction,
             )
         };
 
@@ -535,7 +669,7 @@ impl HNSWIndex {
 
                 if missing.is_empty() && !batch.is_empty() {
                     new_hnsw.insert_batch_pq(&batch).map_err(|e| {
-                        error!(operation = "compact", error = %e, "Failed to re-insert quantized codes");
+                        error!(operation = "rebuild_graph", error = %e, "Failed to re-insert quantized codes");
                         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                             "Failed to re-insert quantized codes during compact: {}",
                             e
@@ -550,7 +684,7 @@ impl HNSWIndex {
                 if missing.is_empty() && old_hnsw.holds_raw() {
                     if let Some(dim) = old_hnsw.raw_dim() {
                         new_hnsw.adopt_raw_from(&old_hnsw, dim).map_err(|e| {
-                            error!(operation = "compact", error = %e, "Failed to carry the raw vectors over");
+                            error!(operation = "rebuild_graph", error = %e, "Failed to carry the raw vectors over");
                             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                                 "Failed to carry the raw vectors over during compact: {}",
                                 e
@@ -576,11 +710,11 @@ impl HNSWIndex {
 
         if !missing.is_empty() {
             error!(
-                operation = "compact",
+                operation = "rebuild_graph",
                 missing_records = missing.len(),
                 live_records = live_count,
                 quantized = quantized,
-                "Refusing to compact, some live records have no source data to rebuild from"
+                "Refusing to rebuild, some live records have no source data to rebuild from"
             );
             return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                 "Refusing to compact: {} of {} live records have no stored {} to rebuild \
@@ -602,23 +736,10 @@ impl HNSWIndex {
         // return memory, and returning it while still holding the graph outside
         // the write guard costs one copy of the live bytes against a rebuild that
         // has just re-inserted every record.
-        let bytes_shrunk = new_hnsw.shrink_to_fit();
+        new_hnsw.shrink_to_fit();
         self.replace_graph(new_hnsw);
 
-        let reclaimed = nodes_before - nodes_after;
-        info!(
-            operation = "compact_complete",
-            nodes_before = nodes_before,
-            nodes_after = nodes_after,
-            nodes_reclaimed = reclaimed,
-            graph_bytes_shrunk = bytes_shrunk,
-            live_records = live_count,
-            quantized = quantized,
-            duration_ms = start_time.elapsed().as_millis(),
-            "Graph compacted"
-        );
-
-        Ok(reclaimed)
+        Ok(nodes_after)
     }
 
     /// The insertion phase of `add`, run with the interpreter lock released

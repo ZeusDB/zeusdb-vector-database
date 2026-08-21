@@ -65,7 +65,7 @@ class VectorDatabase:
 
         expected_size is a declaration rather than a limit, so understating it
         leaves the graph under-provisioned for the data that actually arrives.
-        m is fixed at construction and no later add() revises it.
+        No add() revises m; index.rebuild(m=...) is what changes it.
 
         A non-integer expected_size returns 16 so that the Rust layer reports
         the real validation error instead of this function raising a worse one.
@@ -194,8 +194,9 @@ class VectorDatabase:
                 - m (int): Bidirectional links per node (min: 2, max: 256). Defaults
                   to 16 up to an expected_size of 25,000 and 32 above it. A graph
                   too sparse for the record count loses recall that no search
-                  width recovers, and m is fixed at construction, so set
-                  expected_size honestly or set m directly. The floor is 2
+                  width recovers and no add() revises m, so set expected_size
+                  honestly or set m directly. index.rebuild(m=...) changes it
+                  afterwards, at the cost of a full rebuild. The floor is 2
                   because at 1 the layer scale is infinite and the graph is
                   degenerate.
                 - ef_construction (int): Width of the candidate search each
@@ -209,6 +210,8 @@ class VectorDatabase:
                   ef_search on the graph already built buys more than raising
                   this. The neighbour selection heuristic runs only while this
                   is above 2 * m, and create() warns where it is not.
+                  index.rebuild(ef_construction=...) changes it afterwards, at
+                  the cost of a full rebuild.
                 - expected_size (int): Expected number of vectors (default: 10000,
                   max: 100,000,000). Also selects the default m, see above. It is
                   a capacity hint rather than a limit, and an index that grows
