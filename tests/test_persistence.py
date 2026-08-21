@@ -2392,3 +2392,88 @@ def test_training_completed_at_is_the_training_not_the_save(tmp_path):
     loaded.save(str(third))
     carried = json.loads((third / "quantization.json").read_text(encoding="utf-8"))
     assert carried["training_completed_at"] == stamp
+
+
+# ------------------------------------------------------------
+# The raw side store of an empty quantized_with_raw index
+# ------------------------------------------------------------
+
+
+def _trained_with_raw(dim=8, records=1050, seed=3):
+    """A trained `quantized_with_raw` index, which is the only mode with a store."""
+    index = VectorDatabase().create(
+        "hnsw", dim=dim, expected_size=4000,
+        quantization_config={
+            "type": "pq", "subvectors": 4, "bits": 4,
+            "training_size": 1000, "storage_mode": "quantized_with_raw",
+        },
+    )
+    vectors = np.random.default_rng(seed).standard_normal((records, dim)).astype(np.float32)
+    index.add({"ids": [f"r{i}" for i in range(records)], "embeddings": vectors})
+    assert index.is_quantized(), "the fixture must train, or there is no store to lose"
+    return index
+
+
+def _added_vector_comes_back_exactly(index, dim=8):
+    """Add one record and report the largest error `get_records` returns on it.
+
+    Zero under `quantized_with_raw`, because the mode keeps a raw vector for
+    every record and that is what `get_records` is documented to return. A PQ
+    reconstruction of a random vector is wrong in the second decimal place, so
+    the two outcomes are not close to each other.
+    """
+    supplied = np.arange(1.0, dim + 1.0, dtype=np.float32)
+    index.add({"ids": ["probe"], "embeddings": [supplied.tolist()]})
+    returned = np.asarray(index.get_records("probe")[0]["vector"], dtype=np.float32)
+    expected = supplied / np.linalg.norm(supplied)
+    return float(np.max(np.abs(returned - expected)))
+
+
+@pytest.mark.parametrize("emptied_by", ["clear", "remove_points"])
+def test_a_quantized_with_raw_index_saved_empty_reopens_with_its_raw_store(
+    tmp_path, emptied_by
+):
+    """A load has to open the raw store whether or not it has anything to put in it.
+
+    The store was opened only when `vectors.bin` had records in it, so a trained
+    `quantized_with_raw` index holding nothing at save time came back without a
+    store at all. It still reported `quantized_with_raw` and `quantized_active`,
+    and every record added after the load lost its raw vector permanently:
+    `get_records` fell through to the PQ reconstruction and the rescoring the
+    mode exists for had nothing true to rescore against. Nothing raised, and the
+    record count was right, so nothing in the suite noticed.
+
+    Two ordinary sequences reach it, and both are checked. `clear()` already
+    opened the store on its own replacement graph for exactly this reason, which
+    is why the same index emptied and not saved was always correct.
+
+    Found by the random operation sequence in `test_model.py`, at
+    `quantized_with_raw` sequence 8 step 278, on `clear` then `save` then `load`
+    then `add`.
+    """
+    index = _trained_with_raw()
+    if emptied_by == "clear":
+        index.clear()
+    else:
+        index.remove_points([f"r{i}" for i in range(1050)])
+    assert index.get_vector_count() == 0
+
+    path = tmp_path / "emptied"
+    index.save(str(path))
+    reopened = VectorDatabase().load(str(path))
+
+    assert reopened.get_storage_mode() == "quantized_active"
+    assert _added_vector_comes_back_exactly(reopened) < 1e-6, (
+        "the reopened index returned a reconstruction, so it came back without "
+        "the raw store quantized_with_raw is defined by"
+    )
+
+
+def test_a_quantized_with_raw_index_saved_with_records_keeps_its_store(tmp_path):
+    """The case that always worked, held so the fix is not the only thing tested."""
+    index = _trained_with_raw()
+    path = tmp_path / "populated"
+    index.save(str(path))
+    reopened = VectorDatabase().load(str(path))
+    assert reopened.get_vector_count() == 1050
+    assert _added_vector_comes_back_exactly(reopened) < 1e-6
