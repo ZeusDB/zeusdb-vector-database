@@ -452,6 +452,35 @@ fn load_config(path: &Path) -> PyResult<IndexConfig> {
         config.expected_size,
         &format!("{}: ", config_path.display()),
     )?;
+    // `id_counter` too, which those five do not cover and which sizes an
+    // allocation rather than a behaviour.
+    //
+    // The internal id a record is inserted under is the index into the graph's
+    // id-to-node array, so that array is `id_counter + 1` slots of four bytes.
+    // A hand edited config declaring 2^40 loaded without complaint, and the
+    // next `add` asked the allocator for 4,398,046,511,112 bytes and **aborted
+    // the process**. An allocation failure does not unwind, so no `catch_unwind`
+    // sees one and a Python caller gets a dead interpreter with no traceback.
+    //
+    // It is the same root cause as the graph dump's origin id, seen from the
+    // other side: one dense array, two unvalidated sources for its index. The
+    // dump's side is checked in `graph::dump::parse_dump` against this same
+    // field, so bounding it here bounds both.
+    //
+    // The ceiling is `u32::MAX` because a node index is a `u32` and both graph
+    // constructors refuse a graph holding more points than that. Every id was
+    // issued to a record the graph then held a node for, so an index that
+    // issued more ids than a node index can name has a graph it could not have
+    // built. The check refuses nothing that can exist.
+    if config.id_counter > u32::MAX as usize {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "{}: id_counter is {}, and an internal id is a graph node index, \
+             which is a u32. No index could have issued that many, so this file \
+             does not describe an index this build can rebuild.",
+            config_path.display(),
+            config.id_counter
+        )));
+    }
     // The declaration too, for the same reason. A config naming a field twice,
     // or naming a reserved filter key, would build a store the index could not
     // use, and the failure would surface as a filter that quietly walked.
@@ -807,7 +836,7 @@ fn reconstruct_index_simple(
     // by a release this build cannot interpret falls back to the rebuild, which
     // is the path that also upgrades a graph carrying a defect the vendored
     // patches have since fixed. See `restore_graph_from_dump`.
-    match index.restore_graph_from_dump(path) {
+    match index.restore_graph_from_dump(path, config.id_counter) {
         Ok(nodes) => {
             println!(
                 "✅ HNSW graph restored from the saved dump ({} nodes)",

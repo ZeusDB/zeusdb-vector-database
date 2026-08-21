@@ -5,6 +5,7 @@
 //! Rust constructor agree. `new_empty` is the loader's constructor and validates
 //! nothing, because its configuration comes from a directory this crate wrote.
 
+use super::locks::{MutexAt, RwLockAt};
 use super::{HNSWIndex, QuantizationConfig, StorageMode, MAX_LAYER};
 use crate::columns::{validate_indexed_fields, ColumnStore};
 use crate::graph::VectorGraph;
@@ -14,7 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace};
 /// Largest `expected_size` a caller may declare.
@@ -476,22 +477,22 @@ impl HNSWIndex {
             expected_size: AtomicUsize::new(expected_size),
             quantization_config: quantization_params,
             pq: pq_instance,
-            pq_codes: RwLock::new(HashMap::new()),
-            rerank_calibration: RwLock::new(None),
-            metadata: Mutex::new(HashMap::new()),
-            vector_metadata: RwLock::new(HashMap::new()),
-            columns: RwLock::new(ColumnStore::new(indexed_fields, expected_size)),
+            pq_codes: RwLockAt::new(HashMap::new()),
+            rerank_calibration: RwLockAt::new(None),
+            metadata: MutexAt::new(HashMap::new()),
+            vector_metadata: RwLockAt::new(HashMap::new()),
+            columns: RwLockAt::new(ColumnStore::new(indexed_fields, expected_size)),
             undeclared_filter_warned: AtomicBool::new(false),
-            id_map: RwLock::new(HashMap::new()),
-            rev_map: RwLock::new(HashMap::new()),
-            id_counter: Mutex::new(0),
-            vector_count: Mutex::new(0),
-            hnsw: RwLock::new(hnsw),
-            writers: Mutex::new(()),
-            training_ids: RwLock::new(Vec::new()),
+            id_map: RwLockAt::new(HashMap::new()),
+            rev_map: RwLockAt::new(HashMap::new()),
+            id_counter: MutexAt::new(0),
+            vector_count: MutexAt::new(0),
+            hnsw: RwLockAt::new(hnsw),
+            writers: MutexAt::new(()),
+            training_ids: RwLockAt::new(Vec::new()),
             training_threshold_reached: AtomicBool::new(false),
-            training_completed_at: RwLock::new(None),
-            created_at: RwLock::new(Utc::now().to_rfc3339()),
+            training_completed_at: RwLockAt::new(None),
+            created_at: RwLockAt::new(Utc::now().to_rfc3339()),
             rebuilding_from_persistence: AtomicBool::new(false),
             overgrowth_warned: AtomicBool::new(false),
         })
@@ -528,25 +529,25 @@ impl HNSWIndex {
             expected_size: AtomicUsize::new(expected_size),
             quantization_config: None,
             pq: None,
-            pq_codes: RwLock::new(HashMap::new()),
-            rerank_calibration: RwLock::new(None),
-            metadata: Mutex::new(HashMap::new()),
-            vector_metadata: RwLock::new(HashMap::new()),
-            columns: RwLock::new(ColumnStore::new(indexed_fields, expected_size)),
+            pq_codes: RwLockAt::new(HashMap::new()),
+            rerank_calibration: RwLockAt::new(None),
+            metadata: MutexAt::new(HashMap::new()),
+            vector_metadata: RwLockAt::new(HashMap::new()),
+            columns: RwLockAt::new(ColumnStore::new(indexed_fields, expected_size)),
             undeclared_filter_warned: AtomicBool::new(false),
-            id_map: RwLock::new(HashMap::new()),
-            rev_map: RwLock::new(HashMap::new()),
-            id_counter: Mutex::new(0),
-            vector_count: Mutex::new(0),
-            hnsw: RwLock::new(hnsw),
-            writers: Mutex::new(()),
-            training_ids: RwLock::new(Vec::new()),
+            id_map: RwLockAt::new(HashMap::new()),
+            rev_map: RwLockAt::new(HashMap::new()),
+            id_counter: MutexAt::new(0),
+            vector_count: MutexAt::new(0),
+            hnsw: RwLockAt::new(hnsw),
+            writers: MutexAt::new(()),
+            training_ids: RwLockAt::new(Vec::new()),
             training_threshold_reached: AtomicBool::new(false),
             // Both are overwritten by the loader from the saved directory, and
             // this is the only path that reaches here. See `set_created_at` and
             // `set_training_completed_at`.
-            training_completed_at: RwLock::new(None),
-            created_at: RwLock::new(chrono::Utc::now().to_rfc3339()),
+            training_completed_at: RwLockAt::new(None),
+            created_at: RwLockAt::new(chrono::Utc::now().to_rfc3339()),
             rebuilding_from_persistence: AtomicBool::new(false),
             overgrowth_warned: AtomicBool::new(false),
         }

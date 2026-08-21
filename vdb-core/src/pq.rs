@@ -1,3 +1,10 @@
+// The locks in this file are not fields of `HNSWIndex`, so they are outside the
+// registry in `hnsw_index::locks` and outside the order it enforces. The
+// declared order already places them: they are leaves, since nothing here can
+// name an index guard, so any of them may be taken under any index guard and no
+// index guard is ever taken under one. See `clippy.toml`.
+#![allow(clippy::disallowed_types)]
+
 use crate::rng::SeededRng;
 use rand::{seq::SliceRandom, Rng, SeedableRng};
 use rayon::prelude::*;

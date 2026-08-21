@@ -1180,3 +1180,289 @@ def test_save_never_deadlocks_or_tears_against_mutation(tmp_path, probe_mode):
     assert searches_during_save >= 1, (
         f"no search completed while a save held the mutation lock. {seen}"
     )
+
+
+# ============================================================================
+# The columns and the bound, against a concurrent writer
+# ============================================================================
+#
+# Nothing above this line declares `indexed_fields`, so every probe in this file
+# ran against an index whose column store holds nothing and whose filtered
+# search takes the metadata walk. That put the whole column and bound machinery
+# outside the suite.
+#
+# It matters because of what happened on that machinery. Relay 97 added the
+# columns and put a second read of `self.columns` inside
+# `warn_undeclared_filter_field`, on a thread whose caller already held that
+# guard, which is the recursive acquisition the declared lock order forbids and
+# which deadlocks the moment a writer queues between the two reads. Relay 86 had
+# the identical shape on the graph guard eleven relays earlier, and **the
+# concurrency suite caught that one by hanging on its first run.** It could not
+# have caught relay 97's, because no probe here declared a field, and it did not.
+#
+# So these four probes take the three selection paths and the rebuild, each
+# against a writer.
+#
+# | Probe | Filter | What the search takes |
+# | --- | --- | --- |
+# | `declared` | every field declared | the exact bitmap, no metadata read |
+# | `bounded` | one declared, one not | the declared bound, then the metadata of what it names |
+# | `undeclared` | no declared field | the warning path, then the whole metadata walk |
+# | `rebuild` | every field declared | the same as `declared`, while the graph is replaced under it |
+#
+# The shape is the `get_stats` probe's, for the same reason: a recursive read
+# freezes the interpreter, and no assertion can run inside a frozen one, so the
+# parent's timeout is the detector and a hang is reported with a location rather
+# than as a bare timeout.
+#
+# # Why the assertions are invariants rather than an exact page
+#
+# The index is being written throughout, so no fixed reference page exists. What
+# does hold at every instant is that **every record a filtered search returns
+# matches the filter**, whichever of the three paths answered it. The three paths
+# are three different pieces of code deciding the same predicate, so a bound that
+# admitted a record the metadata rejects, or a bitmap that went stale against a
+# concurrent insert, shows up here as a returned record whose own metadata fails
+# the test. A record removed between the search and the fetch simply does not
+# come back, which is not a failure.
+#
+# Overlap is measured rather than assumed. The writer sets a flag around each
+# mutation and the search loop counts the searches that both began and ended
+# inside one, so a run where the two never met fails rather than passing on an
+# exercise that did not happen.
+
+COLUMN_PROBE_SECONDS = 8.0
+COLUMN_PROBE_TIMEOUT_S = 180.0
+
+COLUMN_PROBE_SCRIPT = '''
+import sys
+import threading
+import time
+from collections import deque
+
+import numpy as np
+from zeusdb_vector_database import VectorDatabase
+
+mode = sys.argv[1]
+seconds = float(sys.argv[2])
+DIM = 16
+BATCH = 120
+SEED_COUNT = 1200
+CATS = ["alpha", "beta", "gamma"]
+rng = np.random.default_rng(9799)
+
+# Two fields declared and one left out, which is what makes all three selection
+# paths reachable on one index.
+index = VectorDatabase().create(
+    "hnsw", dim=DIM, expected_size=40000, indexed_fields=["cat", "flag"],
+)
+assert list(index.indexed_fields) == ["cat", "flag"], index.indexed_fields
+
+
+def meta(n):
+    return {"cat": CATS[n % 3], "flag": (n % 2 == 0), "rank": n % 500}
+
+
+seeds = rng.standard_normal((SEED_COUNT, DIM)).astype(np.float32)
+index.add({
+    "ids": ["seed_%d" % i for i in range(SEED_COUNT)],
+    "embeddings": seeds,
+    "metadatas": [meta(i) for i in range(SEED_COUNT)],
+})
+
+FILTERS = {
+    # Selection::Exact. Both fields have a column, so the answer comes from the
+    # bitmaps and no record's metadata is read to decide it.
+    "declared": {"cat": "beta", "flag": True},
+    # Selection::Narrowed. `cat` bounds the candidates and `rank`, which has no
+    # column, decides among them.
+    "bounded": {"cat": "beta", "rank": {"lt": 100}},
+    # Selection::Whole. No field in the filter has a column, so this is the
+    # warning path and the walk.
+    "undeclared": {"rank": {"lt": 100}},
+    "rebuild": {"cat": "beta", "flag": True},
+}
+
+
+def admits(record):
+    if mode == "bounded":
+        return record.get("cat") == "beta" and record.get("rank", 10**9) < 100
+    if mode == "undeclared":
+        return record.get("rank", 10**9) < 100
+    return record.get("cat") == "beta" and record.get("flag") is True
+
+
+stop = threading.Event()
+write_active = threading.Event()
+counts = {"searches": 0, "pages": 0, "hits": 0, "adds": 0, "removes": 0,
+          "rebuilds": 0, "searches_during_write": 0}
+failures = []
+pending = deque()
+pending_lock = threading.Lock()
+queries = rng.standard_normal((32, DIM)).astype(np.float32)
+
+
+def guarded(name, body):
+    def run():
+        try:
+            body()
+        except BaseException as exc:
+            failures.append("%s: %s: %s" % (name, type(exc).__name__, exc))
+            stop.set()
+    return run
+
+
+def search_loop():
+    n = 0
+    while not stop.is_set():
+        query = queries[n % len(queries)]
+        n += 1
+        during = write_active.is_set()
+        page = index.search(query, top_k=10, filter=FILTERS[mode])
+        counts["searches"] += 1
+        if during and write_active.is_set():
+            counts["searches_during_write"] += 1
+        if not page:
+            continue
+        counts["pages"] += 1
+        ids = [hit["id"] for hit in page]
+        # A record a concurrent removal took between the search and this fetch
+        # is simply absent, which is not a failure. What would be one is a
+        # record that is still here and does not match the filter that named it.
+        for record in index.get_records(ids, return_vector=False):
+            counts["hits"] += 1
+            if not admits(record["metadata"]):
+                failures.append(
+                    "%s returned %s with %r" % (mode, record["id"], record["metadata"])
+                )
+                stop.set()
+                return
+
+
+def add_loop():
+    n = 0
+    while not stop.is_set():
+        base = SEED_COUNT + n * BATCH
+        ids = ["churn_%d" % (base + i) for i in range(BATCH)]
+        vectors = rng.standard_normal((BATCH, DIM)).astype(np.float32)
+        write_active.set()
+        index.add({
+            "ids": ids,
+            "embeddings": vectors,
+            "metadatas": [meta(base + i) for i in range(BATCH)],
+        })
+        write_active.clear()
+        with pending_lock:
+            pending.extend(ids)
+        counts["adds"] += 1
+        n += 1
+
+
+def remove_loop():
+    # `remove_point` writes the columns under the same guard that writes
+    # `vector_metadata`, so this is the write side of what the search reads.
+    while not stop.is_set():
+        with pending_lock:
+            rid = pending.popleft() if pending else None
+        if rid is None:
+            time.sleep(0.001)
+            continue
+        write_active.set()
+        index.remove_point(rid)
+        write_active.clear()
+        counts["removes"] += 1
+
+
+def rebuild_loop():
+    # Replaces the graph outright under the mutation lock while searches read
+    # it. Relay 98 added `rebuild` and measured no concurrency on it at all.
+    degree = 12
+    while not stop.is_set():
+        degree = 16 if degree == 12 else 12
+        write_active.set()
+        index.rebuild(m=degree)
+        write_active.clear()
+        counts["rebuilds"] += 1
+
+
+threads = [threading.Thread(target=guarded("search", search_loop), daemon=True)]
+if mode == "rebuild":
+    threads.append(threading.Thread(target=guarded("rebuild", rebuild_loop), daemon=True))
+else:
+    threads.append(threading.Thread(target=guarded("add", add_loop), daemon=True))
+    threads.append(threading.Thread(target=guarded("remove", remove_loop), daemon=True))
+for t in threads:
+    t.start()
+deadline = time.monotonic() + seconds
+while time.monotonic() < deadline and not stop.is_set():
+    time.sleep(0.2)
+stop.set()
+for t in threads:
+    t.join(timeout=30)
+assert not any(t.is_alive() for t in threads), "a worker never came back"
+assert not failures, failures[:4]
+
+print("OK " + " ".join(str(counts[k]) for k in
+                       ("searches", "pages", "hits", "adds", "removes",
+                        "rebuilds", "searches_during_write")))
+'''
+
+
+@pytest.mark.parametrize(
+    "probe_mode", ["declared", "bounded", "undeclared", "rebuild"]
+)
+def test_a_filtered_search_never_deadlocks_against_a_writer(tmp_path, probe_mode):
+    """Each selection path loops beside a writer without freezing or lying.
+
+    Two failures are in scope. A recursive read on the columns guard, or an
+    inversion between it and the guards around it, hangs the child, which the
+    parent timeout detects. A bound or a bitmap that goes stale against a
+    concurrent insert returns a record the filter does not match, which the
+    child's own invariant detects.
+    """
+    script = tmp_path / "column_concurrency_probe.py"
+    script.write_text(COLUMN_PROBE_SCRIPT, encoding="utf-8")
+    try:
+        child_env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(script), probe_mode, str(COLUMN_PROBE_SECONDS)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=child_env,
+            timeout=COLUMN_PROBE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            f"a {probe_mode} filtered search deadlocked against a writer: the "
+            f"probe froze and was killed after {COLUMN_PROBE_TIMEOUT_S:.0f}s"
+        )
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
+
+    summary = [line for line in result.stdout.splitlines() if line.startswith("OK ")]
+    assert len(summary) == 1, result.stdout[-2000:]
+    searches, pages, hits, adds, removes, rebuilds, during = map(
+        int, summary[0].split()[1:8]
+    )
+    seen = (f"searches={searches} pages={pages} hits={hits} adds={adds} "
+            f"removes={removes} rebuilds={rebuilds} during={during}")
+
+    # Liveness. Not throughput floors: the writer holds one mutex and the search
+    # loop runs beside it, so any number above one would be a statement about
+    # the machine.
+    assert searches >= 1, f"the search loop never completed a search. {seen}"
+    assert pages >= 1, f"no filtered search returned anything. {seen}"
+    assert hits >= 1, f"no returned record was checked against the filter. {seen}"
+    if probe_mode == "rebuild":
+        assert rebuilds >= 1, f"the rebuild loop never rebuilt. {seen}"
+    else:
+        assert adds >= 1, f"the add loop never completed an add. {seen}"
+        assert removes >= 1, f"the remove loop never removed a record. {seen}"
+
+    # The interleaving the probe exists to create. Zero here means the search
+    # and the writer never met, so a clean run proved nothing about them.
+    assert during >= 1, (
+        f"no filtered search overlapped a write, so the interleaving under test "
+        f"never occurred. {seen}"
+    )
