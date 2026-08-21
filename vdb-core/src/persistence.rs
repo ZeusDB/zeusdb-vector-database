@@ -62,6 +62,103 @@ const FORMAT_VERSION: &str = "1.1.0";
 /// suffered once.
 const SUPPORTED_FORMAT_MAJOR: u32 = 1;
 
+// ============================================================================
+// THE BINCODE CLAIM BUDGET
+// ============================================================================
+
+/// The widest vector this build will rebuild an index at
+///
+/// `dim` had no upper bound. It is the width of one vector buffer, so a
+/// config.json naming 2^40 made the loader ask the allocator for
+/// 4,398,046,511,104 bytes and **abort the process**, which does not unwind, so
+/// no `catch_unwind` sees it and a Python caller gets a dead interpreter with no
+/// traceback. It is the same shape as the `id_counter` defect and is bounded
+/// here for the same reason, in the loader rather than in
+/// `validate_index_parameters`, so `create()`'s documented contract is
+/// unchanged.
+///
+/// The ceiling is derived rather than measured. One vector at this width is
+/// 262,144 bytes, and the widest embedding any published model produces is an
+/// order of magnitude below it, so the bound refuses nothing an embedding model
+/// can generate. What it costs at the ceiling is that width per record: a
+/// thousand records at 65,536 values is 262 MB, which is an allocation the
+/// process can refuse rather than one it dies on.
+const MAX_LOADED_DIM: usize = 65_536;
+
+/// The claim budget one wire byte earns, and why it is 64
+///
+/// `bincode::config::standard()` carries no byte limit, so `claim_container_read`
+/// compiles to nothing and every container length in a decoded file goes
+/// straight to the allocator. A 14 byte `mappings.bin` declaring 2^40 entries
+/// asked for tens of terabytes and **aborted the process**. Measured on this
+/// build, ten of the twelve container lengths across `mappings.bin`,
+/// `vectors.bin`, `pq_codes.bin` and `pq_centroids.bin` abort at 2^40 and none
+/// of them is bounded by anything the file has earned.
+///
+/// The bound has to come from the file's own length, which is the line
+/// `parse_dump` draws: a header's fields are checked against the bytes the file
+/// really holds, and after that every allocation is bounded by a file that
+/// really is that long. Here the file is already in memory, so its length is
+/// known outright.
+///
+/// bincode counts claimed bytes, being `len * size_of::<T>()` per container,
+/// and unclaims each element as it decodes. The widest ratio of claimed bytes
+/// to wire bytes across the four artefacts this build decodes is
+/// `pq_centroids.bin`, a `Vec<Vec<Vec<f32>>>` whose outer container claims 24
+/// bytes for an entry that costs one byte on the wire. The three maps claim 48
+/// bytes for an entry that costs two. 64 is the next power of two above both,
+/// so it admits every file this build writes with margin.
+const CLAIM_PER_WIRE_BYTE: usize = 64;
+
+/// Decode a bincode artefact under a budget the file's own length sets
+///
+/// bincode takes its limit as a const generic, so the derived budget picks a
+/// rung rather than being passed. The rungs are a factor of 256 apart, so the
+/// effective budget is at most 256 times the derived one. That is still a
+/// multiple of the file's length rather than a free hand, and it still refuses
+/// a hostile length by many orders of magnitude: the 2^40 cases above claim at
+/// least a terabyte from files of a few tens of bytes.
+///
+/// A file long enough to need more than the top rung is one `fs::read` could
+/// not have returned, so the top rung is the last arm rather than a special
+/// case.
+fn decode_bounded<T>(data: &[u8], file: &str) -> PyResult<T>
+where
+    T: bincode::Decode<()>,
+{
+    use bincode::config::standard;
+
+    let budget = data.len().saturating_mul(CLAIM_PER_WIRE_BYTE);
+    let decoded = if budget <= 1 << 20 {
+        bincode::decode_from_slice::<T, _>(data, standard().with_limit::<{ 1 << 20 }>())
+    } else if budget <= 1 << 28 {
+        bincode::decode_from_slice::<T, _>(data, standard().with_limit::<{ 1 << 28 }>())
+    } else if budget <= 1 << 36 {
+        bincode::decode_from_slice::<T, _>(data, standard().with_limit::<{ 1 << 36 }>())
+    } else {
+        bincode::decode_from_slice::<T, _>(data, standard().with_limit::<{ 1 << 44 }>())
+    };
+
+    match decoded {
+        Ok((value, _)) => Ok(value),
+        Err(bincode::error::DecodeError::LimitExceeded) => {
+            Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "{} declares a length its own {} bytes could not hold. A container in \
+                 this file names more entries than the file has bytes to carry, so \
+                 reading it would ask the allocator for memory the file never earned, \
+                 and that allocation is not fallible: the process aborts rather than \
+                 raising. Refusing to read it. Restore the directory from a copy.",
+                file,
+                data.len()
+            )))
+        }
+        Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to deserialize {}: {}",
+            file, e
+        ))),
+    }
+}
+
 /// Name the corrected manifest is written under before it is renamed into place
 ///
 /// A save that dies between the write and the rename leaves this behind. It is
@@ -481,6 +578,26 @@ fn load_config(path: &Path) -> PyResult<IndexConfig> {
             config.id_counter
         )));
     }
+    // `dim` too, which `validate_index_parameters` checks only for zero. It is
+    // the width of one vector buffer, so a config naming 2^40 asked for four
+    // terabytes and aborted before any record was examined. See
+    // `MAX_LOADED_DIM`. A width the file cannot support is still caught later
+    // by the record width check, which is what refuses a merely large one; this
+    // refuses the ones that never reach it.
+    if config.dim > MAX_LOADED_DIM {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "{}: dim is {}, and this build rebuilds an index at up to {} values a \
+             vector. One vector at that width is {} bytes, which is an order of \
+             magnitude above the widest embedding any published model produces. \
+             Reading this file would size a vector buffer from the declared width \
+             before any record was examined, and that allocation is not fallible: \
+             above this bound the process aborts rather than raising.",
+            config_path.display(),
+            config.dim,
+            MAX_LOADED_DIM,
+            MAX_LOADED_DIM * 4
+        )));
+    }
     // The declaration too, for the same reason. A config naming a field twice,
     // or naming a reserved filter key, would build a store the index could not
     // use, and the failure would surface as a filter that quietly walked.
@@ -505,13 +622,7 @@ fn load_mappings(path: &Path) -> PyResult<IdMappings> {
         ))
     })?;
 
-    let (mappings, _): (IdMappings, usize) =
-        bincode::decode_from_slice(&mappings_data, bincode::config::standard()).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to deserialize mappings.bin: {}",
-                e
-            ))
-        })?;
+    let mappings: IdMappings = decode_bounded(&mappings_data, "mappings.bin")?;
 
     println!("✅ mappings.bin loaded");
     Ok(mappings)
@@ -563,13 +674,7 @@ fn load_vectors(path: &Path, manifest: &IndexManifest) -> PyResult<HashMap<Strin
         ))
     })?;
 
-    let (vectors, _): (HashMap<String, Vec<f32>>, usize) =
-        bincode::decode_from_slice(&vectors_data, bincode::config::standard()).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to deserialize vectors.bin: {}",
-                e
-            ))
-        })?;
+    let vectors: HashMap<String, Vec<f32>> = decode_bounded(&vectors_data, "vectors.bin")?;
 
     check_vectors_are_finite(&vectors)?;
 
@@ -657,13 +762,7 @@ fn load_pq_centroids(path: &Path, manifest: &IndexManifest) -> PyResult<Option<C
         ))
     })?;
 
-    let (centroids, _): (Centroids, usize) =
-        bincode::decode_from_slice(&centroids_data, bincode::config::standard()).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to deserialize pq_centroids.bin: {}",
-                e
-            ))
-        })?;
+    let centroids: Centroids = decode_bounded(&centroids_data, "pq_centroids.bin")?;
 
     println!(
         "✅ pq_centroids.bin loaded ({} subvectors)",
@@ -691,22 +790,57 @@ fn load_pq_codes(path: &Path, manifest: &IndexManifest) -> PyResult<HashMap<Stri
         ))
     })?;
 
-    let (codes, _): (HashMap<String, Vec<u8>>, usize) =
-        bincode::decode_from_slice(&codes_data, bincode::config::standard()).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to deserialize pq_codes.bin: {}",
-                e
-            ))
-        })?;
+    let codes: HashMap<String, Vec<u8>> = decode_bounded(&codes_data, "pq_codes.bin")?;
 
     println!("✅ pq_codes.bin loaded ({} records)", codes.len());
     Ok(codes)
+}
+
+/// Hold quantization.json's two sizing fields to the rules `create()` applies
+///
+/// `bits` fixes the centroid count at `2^bits` and `subvectors` fixes both the
+/// outer dimension of the codebook and the divisor `sub_dim` comes from, so the
+/// pair sizes every allocation `PQ::new` makes. The Python layer validates both
+/// at `create()` and nothing revalidated them on the way back in.
+///
+/// The bounds are the ones `create()` already applies, so this refuses exactly
+/// the configurations `create()` refuses and no more. `bits` is 1 to 8 because
+/// a code is one byte a subvector. `subvectors` must be positive, must divide
+/// `dim` and must not exceed it, because `sub_dim` is `dim / subvectors` and a
+/// subvector of no values encodes nothing.
+fn validate_quantization_fields(
+    file: &str,
+    config: &QuantizationPersistence,
+    dim: usize,
+) -> PyResult<()> {
+    if config.bits < 1 || config.bits > 8 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "{}: bits is {}, and bits must be an integer between 1 and 8. The centroid              count is 2 to the bits, so the codebook this names would be {} times the              size of the largest one this build can build, and sizing it is not a              fallible allocation: the process aborts rather than raising.",
+            file,
+            config.bits,
+            1u128 << config.bits.min(96)
+        )));
+    }
+    if config.subvectors == 0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "{}: subvectors is 0. Every subvector holds dim / subvectors values, so a              count of zero divides by zero.",
+            file
+        )));
+    }
+    if config.subvectors > dim || !dim.is_multiple_of(config.subvectors) {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "{}: subvectors is {} and config.json declares dim {}. subvectors must              divide the dimension evenly and cannot exceed it, which is the rule              create() applies, so this file does not describe an index this build can              rebuild.",
+            file, config.subvectors, dim
+        )));
+    }
+    Ok(())
 }
 
 /// Load quantization configuration and the codebook that goes with it
 fn load_quantization(
     path: &Path,
     manifest: &IndexManifest,
+    dim: usize,
 ) -> PyResult<Option<QuantizationArtefacts>> {
     println!("🔧 Loading quantization components...");
 
@@ -729,6 +863,18 @@ fn load_quantization(
             e
         ))
     })?;
+
+    // The two fields that size the codebook, held to the rules `create()`
+    // applies to them.
+    //
+    // `PQ::new` allocates `subvectors * 2^bits * (dim / subvectors)` floats
+    // from these two values and nothing checked either. `bits: 40` asked for
+    // 2^40 centroids and **aborted the process**, `subvectors: 2^40` aborted on
+    // the outer vector, and `subvectors: 0` divided by zero. `create()` refuses
+    // all three, so a directory carrying one was hand edited or written by a
+    // release that did not validate its own input, and either way the file does
+    // not describe an index this build can rebuild.
+    validate_quantization_fields(&quant_path.display().to_string(), &quant_config, dim)?;
 
     println!("✅ quantization.json loaded");
 
@@ -897,7 +1043,24 @@ fn reconstruct_index_simple(
     // beside the codes, addressed by the node numbering the restored graph
     // carries. A raw index needs none of this: its raw vectors came back with
     // the graph dump, which is the only place they were written.
-    if index.raw_store_is_expected() && !vectors.is_empty() {
+    //
+    // **Opening the store is not conditional on there being anything to put in
+    // it.** This used to also require `!vectors.is_empty()`, so a trained
+    // `quantized_with_raw` index holding no records at save time came back
+    // without a store at all. It still reported `quantized_with_raw` and
+    // `quantized_active`, and every record added after the load lost its raw
+    // vector permanently: `get_records` fell through to the PQ reconstruction
+    // and the rescoring the mode exists for had nothing true to rescore
+    // against. Two ordinary sequences reach it, `clear()` before a save and
+    // removing every record before a save.
+    //
+    // `clear()` already gets this right and opens the store on the replacement
+    // graph for exactly this reason. This is the same rule on the load path.
+    //
+    // `restore_raw_store` handles the empty case itself: it sizes the store
+    // from the graph's node count and pushes one vector per node, so at zero
+    // nodes it opens an empty store and places nothing.
+    if index.raw_store_is_expected() {
         let placed = index.restore_raw_store(&vectors).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                 "Failed to restore the raw vectors of a quantized_with_raw index: {}",
@@ -1355,7 +1518,7 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
     let vectors = load_vectors(path_buf, &manifest)?;
     println!("✅ Vectors loaded: {} vectors", vectors.len());
 
-    let quantization = load_quantization(path_buf, &manifest)?;
+    let quantization = load_quantization(path_buf, &manifest, config.dim)?;
     if let Some(ref quant) = quantization {
         println!(
             "✅ Quantization loaded: {} subvectors, trained={}, codebook={}",
