@@ -515,8 +515,8 @@ def test_nin_excludes_the_listed_values():
 
 
 def test_nin_and_ne_agree_on_an_absent_field():
-    # relay 44 fixed `ne` to answer false where the field is missing. `nin`
-    # against a one element list means the same thing, so it answers the same.
+    # `ne` answers false where the field is missing. `nin` against a one element
+    # list means the same thing, so it answers the same.
     index = build(2, metadatas=[{"tier": "a"}, {"other": 1}])
     assert index.count({"tier": {"ne": "a"}}) == 0
     assert index.count({"tier": {"nin": ["a"]}}) == 0
@@ -950,7 +950,7 @@ def test_construction_parameters_are_typed_properties():
 
 
 # ============================================================================
-# THE SURFACE GAPS RELAY 102 CLOSED
+# THE REMAINING SURFACE GAPS
 # ============================================================================
 
 

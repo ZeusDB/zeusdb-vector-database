@@ -147,7 +147,7 @@ impl HNSWIndex {
     /// would block every concurrent search for the whole of an insertion, which
     /// at 50,000 records of dimension 1,536 is on the order of a millisecond
     /// against a search mean near one. Holding it across phase two alone is what
-    /// keeps the concurrent search figure an earlier relay established.
+    /// keeps the concurrent search figure this project measures.
     ///
     /// # Why it is sound
     ///

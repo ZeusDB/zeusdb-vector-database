@@ -96,8 +96,8 @@ def test_search_after_deletes_returns_full_top_k():
     returned = set(ids_of(results))
     assert returned.isdisjoint({f"doc_{i}" for i in doomed})
 
-    # The same claim at half the index removed, which is where relay 29 measured
-    # 4.83 results of 10.
+    # The same claim at half the index removed, where a page of 10 was measured
+    # returning 4.83 results before the live-record predicate.
     for i in range(N // 2, N):
         index.remove_point(f"doc_{i}")
     for probe in range(20):
@@ -145,8 +145,8 @@ def test_overwrite_does_not_shorten_results():
 
 
 def test_repeatedly_overwritten_record_still_returns():
-    """Relay 29 isolated this case. Twelve tight overwrites stack twelve stranded
-    copies on one location, and a query at that location returned nothing at all."""
+    """Twelve tight overwrites stack twelve stranded copies on one location, and a
+    query at that location must still return the live record."""
     index, vectors = build_raw()
     rng = np.random.default_rng(13)
     original = vectors[7].copy()
@@ -347,8 +347,8 @@ def test_quantized_compact_reclaims_and_preserves():
     stranded = graph_nodes(index) - live
     assert stranded == 200
 
-    # Quantization survives the rebuild. Relay 24 found the other rebuild path
-    # cleared the codes it depends on.
+    # Quantization survives the rebuild. The other rebuild path clears the codes
+    # this depends on, so the two are asserted separately.
     assert index.compact() == stranded
     assert index.is_quantized()
     assert graph_nodes(index) == live

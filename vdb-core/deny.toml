@@ -1,39 +1,20 @@
 # cargo-deny configuration for the Rust dependency tree the wheel ships.
 #
-# The wheel is one compiled object. A user who installs it cannot see the 118
-# crates inside it, cannot run cargo audit against it and cannot read their
-# licences. This file is how that tree is checked on the maintainer's side.
+# The wheel is one compiled object. A user who installs it cannot enumerate the
+# crates inside it, run an advisory check against them or read their licences,
+# so the check runs here.
 #
 # It lives beside Cargo.toml rather than at the repository root, because
 # cargo-deny reads the manifest directory and every cargo step in this project
 # already sets working-directory to vdb-core.
 #
-# THE TWO PASSES ARE NOT EQUALLY BINDING. dependency-scan.yml runs this config
-# twice and treats the halves differently.
-#
-#   advisories        non-blocking. The result is written as SARIF and uploaded
-#                     to code scanning, so a finding appears in the Security tab
-#                     rather than reddening a build. An advisory is a risk
-#                     assessment published by someone else, it can appear with
-#                     no commit here, and whether it matters depends on how the
-#                     crate is used.
-#
-#   licenses          blocking. A crate under a licence the package cannot ship
-#   bans              is a fact about the package rather than a judgement about
-#   sources           it, and it is actionable the moment it appears. So are a
-#                     wildcard version requirement and a crate arriving from a
-#                     registry that is not crates.io.
-#
-# The practical consequence is that the ignore list below is no longer
-# load-bearing. Suppressing an advisory here now means it appears nowhere at
-# all, which is the opposite of what the split is for.
+# dependency-scan.yml runs this config in two passes, one over advisories and
+# one over licences, bans and sources.
 
 [graph]
-# The targets the wheels are actually built for, from the publish-pypi.yml
-# matrix plus the two the sdist reaches. Without this, cargo-deny walks every
-# target's dependencies, which pulls in crates no wheel ever links, and an
-# advisory against one of those would be reported against a build that never
-# compiled it.
+# The targets the wheels are built for, from the publish-pypi.yml matrix plus
+# the two the sdist reaches. Without this, cargo-deny walks every target's
+# dependencies, which pulls in crates no wheel links.
 targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
@@ -45,52 +26,23 @@ targets = [
 all-features = false
 
 [advisories]
-# The RustSec database, checked against Cargo.lock. This pass is reported
-# rather than enforced; see the note at the top of the file.
+# The RustSec database, checked against Cargo.lock.
 version = 2
-# A yanked release is reported the same way. It does not stop a build, since a
-# yanked version stays downloadable and --locked still resolves it, so it is a
-# signal to act on rather than a fact that blocks.
+# A yanked release is a finding. A yanked version stays downloadable and
+# --locked still resolves it.
 yanked = "deny"
 
-# Deliberately empty.
-#
-# RUSTSEC-2025-0141, bincode unmaintained, was listed here and has been taken
-# out. It was added when this pass blocked merges and there is no fixed version
-# to upgrade to, so without it every merge failed. Now that the pass only
-# reports, the entry stopped suppressing a failure and started suppressing the
-# finding itself: with it in place the SARIF report came back with an empty
-# results array, so the one standing advisory in the tree appeared nowhere.
-#
-# What is known about it is worth keeping even though the entry is gone. The
-# bincode team ceased development permanently after a harassment incident and
-# considers 1.3.3 complete, so no upgrade resolves it. It is an unmaintained
-# notice rather than a vulnerability: no memory safety or correctness defect is
-# claimed, and the crate encodes and decodes two artefacts this package writes
-# and reads itself, being mappings.bin and pq_codes.bin, never input arriving
-# from anywhere else. Replacing it means a new on-disk encoder, a format
-# version bump and a reader for the old files, which is a piece of work rather
-# than a version bump. The advisory names wincode, postcard, bitcode and rkyv.
-#
-# The alert it raises is dismissed in the Security tab rather than here, so the
-# suppression is visible next to the finding and carries a recorded reason.
-#
-# An entry added here in future must state why it is ignored and what would let
-# it be removed, and it must be justified by more than noise, because it hides
-# the finding completely.
+# Deliberately empty. An entry here removes the finding from the SARIF report
+# altogether rather than downgrading it, so an entry must state why it is
+# ignored and what would let it be removed.
 ignore = []
 
 [licenses]
 version = 2
-# Every licence present in the tree today, and nothing else. A dependency
-# arriving under a licence not listed here fails the run, which is the point:
-# the package is published under Apache-2.0 and ships NOTICE and
-# ATTRIBUTION.md, so a copyleft crate entering the tree has to be a decision
-# rather than a lockfile update nobody read.
-#
-# The tree is 118 crates and holds no copyleft-only licence. Two crates offer
-# LGPL-2.1-or-later as one option of three, and MIT is taken instead, which is
-# what an OR expression allows.
+# Every licence the tree carries, and nothing else. A dependency arriving under
+# a licence not listed here fails the run. The package is published under
+# Apache-2.0 and ships NOTICE and ATTRIBUTION.md, so a copyleft crate entering
+# the tree has to be a decision rather than a lockfile update nobody read.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -101,16 +53,13 @@ allow = [
     "Zlib",
 ]
 # A crate offering several licences is satisfied by any allowed one, and this
-# is the threshold at which cargo-deny stops asking. 0.8 accepts a clear
-# winner and still reports an expression where no option is clearly allowed.
+# is the threshold at which cargo-deny stops asking.
 confidence-threshold = 0.8
 
 [bans]
-# A second copy of a crate is a lockfile that resolved two incompatible
-# semver ranges. It is a warning rather than an error because the resolution
-# is usually not this project's to make, and the duplicate the tree carries
-# today is two versions of syn pulled in by different proc-macro crates. This
-# pass blocks, so the setting is what keeps that duplicate from failing it.
+# A second copy of a crate is a lockfile that resolved two incompatible semver
+# ranges. It is a warning rather than an error because the resolution is
+# usually not this project's to make.
 multiple-versions = "warn"
 wildcards = "deny"
 # The build must not silently gain a crate from a git URL or a local path.

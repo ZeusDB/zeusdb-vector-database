@@ -6,11 +6,10 @@
 //!
 //! # Why it is not inside the graph
 //!
-//! Relay 90 measured the graph's own arena against a `Vec<Vec<T>>` of separate
-//! allocations and against a hash map keyed by external id, and concluded the
-//! arena wins. Relay 95 measured the case relay 90 did not build, being a
-//! single contiguous block the graph reaches through a pointer, and found it
-//! costs nothing measurable at any of three dimensions.
+//! The graph's own arena was measured against a `Vec<Vec<T>>` of separate
+//! allocations and against a hash map keyed by external id, and the arena wins.
+//! A single contiguous block the graph reaches through a pointer was measured
+//! too, and costs nothing measurable at any of three dimensions.
 //!
 //! What separating it buys is that the block is addressable, dumpable and
 //! replaceable on its own. A vector can be fetched by an integer without the

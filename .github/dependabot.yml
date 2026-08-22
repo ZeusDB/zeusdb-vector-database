@@ -1,0 +1,44 @@
+# Dependabot. Three ecosystems, all weekly on the same morning.
+#
+# github-actions raises the pinned commit SHA and the version comment beside it
+# for every action under .github/workflows, grouped into one pull request.
+#
+# cargo watches vdb-core/Cargo.toml and vdb-core/Cargo.lock.
+#
+# uv watches pyproject.toml and uv.lock.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Australia/Sydney
+    groups:
+      actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: cargo
+    directory: /vdb-core
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Australia/Sydney
+    groups:
+      cargo:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Australia/Sydney
+    open-pull-requests-limit: 5

@@ -2388,10 +2388,10 @@ fn calculate_directory_size(path: &Path) -> Result<f64, std::io::Error> {
 }
 
 // ============================================================================
-// VALIDATION HELPERS (for Phase 3)
+// VALIDATION HELPERS
 // ============================================================================
 
-/// Check if a path contains a valid ZeusDB index (Phase 3)
+/// Check if a path contains a valid ZeusDB index
 ///
 /// Reserved surface. The body is a placeholder that reports every path invalid
 /// and must be implemented before any caller is wired up, including the module
@@ -2399,16 +2399,14 @@ fn calculate_directory_size(path: &Path) -> Result<f64, std::io::Error> {
 /// silencing dead code across the module.
 #[allow(dead_code)]
 pub fn is_valid_index(_path: &str) -> bool {
-    // TODO: Implement in Phase 3
     false
 }
 
-/// Get index information without full loading (Phase 3)
+/// Get index information without full loading
 ///
 /// Reserved surface. The body is a placeholder that reports no manifest for
 /// every path and must be implemented before any caller is wired up.
 #[allow(dead_code)]
 pub fn get_index_info(_path: &str) -> Option<IndexManifest> {
-    // TODO: Implement in Phase 3
     None
 }

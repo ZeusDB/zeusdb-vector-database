@@ -89,6 +89,31 @@ pub(crate) type ParsedRecords = Vec<(String, Vec<f32>, HashMap<String, Value>)>;
 /// other layer count is refused on load, so this is part of the on-disk contract
 /// rather than a tuning knob; see `DUMP_LAYERS` in `graph.rs`.
 const MAX_LAYER: usize = 16;
+
+/// Largest `top_k` a search may ask for.
+///
+/// `top_k` sizes the candidate search through the default `ef_search` of
+/// twice `top_k`, and `search_layer` sizes its two candidate heaps from that
+/// width, 8 bytes a slot, before it visits a node. The allocation is not
+/// fallible, so `search(top_k=2**40)` asked for 17,592,186,044,416 bytes and
+/// **aborted the process** with exit status 3221226505, and `top_k=2**33`
+/// died the same way asking for 137 GB. Nothing checked either argument.
+///
+/// The ceiling is four times the largest page any comparable engine serves,
+/// Milvus at 16,384, and six times Elasticsearch's 10,000, so no real caller
+/// is refused. At the ceiling the heaps are 2 MiB and the result list is
+/// 65,536 Python dicts, which is slow and is what was asked for.
+const MAX_TOP_K: usize = 65_536;
+
+/// Largest `ef_search` a search may pass, being the default `ef_search` at
+/// the largest `top_k`.
+///
+/// The same two heaps as `MAX_TOP_K`, reached directly. `search(ef_search=2**40)`
+/// asked for 8,796,093,022,208 bytes and aborted. At the ceiling the heaps are
+/// 2 MiB, and a search at that width on a corpus smaller than it is an
+/// exhaustive scan, which is the slowest thing a search can be and is bounded
+/// by the corpus.
+const MAX_EF_SEARCH: usize = 2 * MAX_TOP_K;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageMode {
     #[default]
@@ -403,15 +428,13 @@ pub struct HNSWIndex {
     /// has never trained.
     ///
     /// Stamped once, by the `add` that reaches `training_size`, and carried
-    /// through a save and a load unchanged. `quantization.json` used to write
-    /// `Utc::now()` under this name at save time with a TODO admitting it, so
-    /// the field held the last save rather than the training and moved every
-    /// time a trained index was saved again.
+    /// through a save and a load unchanged.
     ///
-    /// A directory written before this existed carries a save time under the
-    /// name, and there is no way to recover the real one. The loader restores
-    /// what is there rather than restamping it, so the wrong value stops
-    /// moving instead of being replaced by a newer wrong value.
+    /// A directory written by a release that stamped this at save time instead
+    /// carries a save time under the name, and there is no way to recover the
+    /// real one. The loader restores what is there rather than restamping it,
+    /// so the wrong value stops moving instead of being replaced by a newer
+    /// wrong value.
     training_completed_at: RwLockAt<{ order::TRAINING_COMPLETED_AT }, Option<String>>,
 
     /// Timestamp when the index was created, in RFC 3339.
@@ -480,8 +503,8 @@ impl HNSWIndex {
     /// than five queries across the pool and each task takes a read guard, so
     /// once a writer is queued every worker blocks behind it. The fork then has
     /// no worker to run on and the writer never reaches the point of releasing.
-    /// Relay 36 wrote the rule that no path forks to rayon while holding a write
-    /// guard, and this is the fork that rule missed, because it is hidden inside
+    /// The rule is that no path forks to rayon while holding a write guard, and
+    /// this is a fork that rule is easy to miss on, because it is hidden inside
     /// an assignment rather than written as a call.
     ///
     /// Moving the old value out and dropping it after the guard is released
@@ -840,6 +863,36 @@ impl HNSWIndex {
         rerank: Option<usize>,
     ) -> PyResult<Py<PyAny>> {
         let start_time = Instant::now();
+
+        // Both arguments size the candidate heaps the traversal allocates
+        // before it visits a node, and neither allocation is fallible; see
+        // `MAX_TOP_K`. Checked first, so a bad argument is a ValueError and
+        // not a dead interpreter, and before `ef` is derived so the derivation
+        // cannot overflow on a value the check would have refused.
+        if top_k > MAX_TOP_K {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "top_k must be at most {}, got {}. top_k sizes the candidate search \
+                 through the default ef_search of twice top_k, and the graph sizes two \
+                 candidate heaps from that width, 8 bytes a slot, before it visits a \
+                 node. That allocation is not fallible: a top_k of 2^40 asks for 16 TB \
+                 and the process aborts rather than raising. The ceiling is four times \
+                 the largest page any comparable engine serves.",
+                MAX_TOP_K, top_k
+            )));
+        }
+        if let Some(requested) = ef_search {
+            if requested > MAX_EF_SEARCH {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "ef_search must be at most {}, got {}. ef_search is the width of the \
+                     candidate search, and the graph sizes two candidate heaps from it, 8 \
+                     bytes a slot, before it visits a node. That allocation is not \
+                     fallible: an ef_search of 2^40 asks for 8 TB and the process aborts \
+                     rather than raising. The ceiling is twice the top_k ceiling, which is \
+                     the default ef_search at the largest page.",
+                    MAX_EF_SEARCH, requested
+                )));
+            }
+        }
 
         let ef = ef_search.unwrap_or_else(|| match self.space.to_lowercase().as_str() {
             "l1" | "l2" => std::cmp::max(2 * top_k, 150),
@@ -1451,9 +1504,9 @@ impl HNSWIndex {
     /// reseeds in every process, so two calls in one process agreed and two
     /// processes did not. An offset over an order like that is not a page: it
     /// can return a record twice and miss another entirely, which is worse than
-    /// having no paging at all. Relay 86 met the same problem on the scan path,
-    /// where two equally distant records came back in hasher order, and pinned a
-    /// tie break for it.
+    /// having no paging at all. The scan path meets the same problem, where two
+    /// equally distant records come back in hasher order, and pins a tie break
+    /// for it.
     ///
     /// Arrival order rather than the external id's own order, for two reasons.
     /// A record added while a caller is paging appends at the end, so it cannot

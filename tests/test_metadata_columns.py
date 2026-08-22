@@ -86,7 +86,7 @@ def ids_of(index, filter, top_k=1000):
 
 
 # ---------------------------------------------------------------------------
-# Every filter this relay could think of, evaluated three ways
+# Every filter the language admits, evaluated three ways
 # ---------------------------------------------------------------------------
 
 # Each entry is (label, filter, predicate over one record's metadata dict).
@@ -165,7 +165,7 @@ FILTERS = [
 
 @pytest.mark.parametrize("label,filter,predicate", FILTERS, ids=[f[0] for f in FILTERS])
 def test_the_columns_and_the_walk_return_the_same_records(pair, label, filter, predicate):
-    """The whole bar this relay is held to, one filter at a time."""
+    """The whole bar the column store is held to, one filter at a time."""
     with_columns, without_columns, _, metadata = pair
     ids, _, _ = corpus()
 

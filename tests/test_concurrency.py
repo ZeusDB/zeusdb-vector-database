@@ -65,8 +65,8 @@ MIN_ADD_WINDOW_S = 0.10
 # A share rather than a count, so the bound is a fraction of what this machine
 # actually does rather than a number tuned to one machine.
 #
-# Relay 36 measured 2.2 to 2.4 percent for a build where `add` never released
-# the lock. Releasing it puts the two threads in ordinary competition for the
+# A build where `add` never released the lock was measured at 2.2 to 2.4
+# percent. Releasing it puts the two threads in ordinary competition for the
 # CPU, which is a half share on a single core and close to a full share on
 # anything wider. A fifth sits an order of magnitude above the first and well
 # below the second.
@@ -496,9 +496,9 @@ def test_search_keeps_its_rate_while_one_insert_runs():
     """A search thread keeps running at a real rate through a long insert.
 
     `add` used to hold the interpreter lock for its whole duration, so no other
-    Python thread could start a search at all while one ran. Relay 36 measured
-    the collapse at 97.6 to 98.4 percent of the solo rate, and the cause was the
-    lock rather than any lock inside the index.
+    Python thread could start a search at all while one ran. That collapse was
+    measured at 97.6 to 98.4 percent of the solo rate, and the cause was the
+    interpreter lock rather than any lock inside the index.
 
     The bound is a share of the rate this same thread reaches with no insert
     running, sampled seconds earlier in the same process, so it does not depend
@@ -1191,14 +1191,9 @@ def test_save_never_deadlocks_or_tears_against_mutation(tmp_path, probe_mode):
 # search takes the metadata walk. That put the whole column and bound machinery
 # outside the suite.
 #
-# It matters because of what happened on that machinery. Relay 97 added the
-# columns and put a second read of `self.columns` inside
-# `warn_undeclared_filter_field`, on a thread whose caller already held that
-# guard, which is the recursive acquisition the declared lock order forbids and
-# which deadlocks the moment a writer queues between the two reads. Relay 86 had
-# the identical shape on the graph guard eleven relays earlier, and **the
-# concurrency suite caught that one by hanging on its first run.** It could not
-# have caught relay 97's, because no probe here declared a field, and it did not.
+# A filtered search on a declared field takes the columns guard, and a second
+# acquisition of that guard on the same thread is the recursive acquisition the
+# declared lock order forbids. A probe that declares no field never reaches it.
 #
 # So these four probes take the three selection paths and the rebuild, each
 # against a writer.
@@ -1375,7 +1370,7 @@ def remove_loop():
 
 def rebuild_loop():
     # Replaces the graph outright under the mutation lock while searches read
-    # it. Relay 98 added `rebuild` and measured no concurrency on it at all.
+    # it. `rebuild` offers no concurrency of its own, by construction.
     degree = 12
     while not stop.is_set():
         degree = 16 if degree == 12 else 12

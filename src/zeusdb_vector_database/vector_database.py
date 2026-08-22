@@ -204,7 +204,7 @@ class VectorDatabase:
                   because at 1 the layer scale is infinite and the graph is
                   degenerate.
                 - ef_construction (int): Width of the candidate search each
-                  insertion runs (default: 200). It sets the supply the
+                  insertion runs (default: 200, max: 4,096). It sets the supply the
                   neighbour selection draws from, and m sets how much of it is
                   kept, so it changes neither search latency nor the size of
                   the finished index. Build time is linear in it above 100: at
@@ -793,11 +793,10 @@ class VectorDatabase:
 
         Every warning here carries stacklevel=4, because it is raised four
         frames below the caller: this method, `_validate_quantization_config`,
-        `create` and then the user. It carried 2 until this relay, which
-        attributed every quantization warning to the line inside
-        `_validate_quantization_config` that calls this rather than to the
-        `create()` the caller wrote. `_warn_if_selection_disabled` had the
-        pattern right already, at 3 from one frame higher.
+        `create` and then the user. That is what attributes the warning to the
+        `create()` the caller wrote rather than to the line inside
+        `_validate_quantization_config` that calls this.
+        `_warn_if_selection_disabled` carries 3, from one frame higher.
         """
         import warnings
 
@@ -875,9 +874,9 @@ class VectorDatabase:
         #
         #   saved(N) = N * (dim * 4 - 2 * subvectors) - fixed_bytes
         #
-        # That is the steady state figure rather than a conservative one. It
-        # read `dim * 4 - subvectors` until this relay, counting one code where
-        # the mode pays for two, which named a record count below the true one.
+        # That is the steady state figure rather than a conservative one. The
+        # mode pays for two codes a record, so the per record term subtracts
+        # `2 * subvectors` rather than `subvectors`.
         #
         # quantized_with_raw keeps the vector and adds the codes to it, so its
         # per record delta is plus 2 * subvectors and its fixed delta is plus

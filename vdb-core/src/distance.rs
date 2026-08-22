@@ -31,7 +31,7 @@
 //! reduction associative enough to widen, while keeping the result determined
 //! by the source rather than by the compiler.
 //!
-//! The accumulator was an ordinary `[f32; 8]` until relay 70, on the reasoning
+//! The accumulator was an ordinary `[f32; 8]` before this, on the reasoning
 //! that the auto-vectoriser would widen a loop shaped that way. It did widen it,
 //! and it stopped at half the register. The emitted inner loop loaded with
 //! `movsd`, being two `f32`, and issued four `mulps` and four `addps` per eight
@@ -586,9 +586,8 @@ pub fn cosine_normalized(a: &[f32], b: &[f32]) -> f32 {
 /// # The precondition
 ///
 /// **Both arguments are assumed to be L2 normalised, and neither is checked
-/// here.** `eval` is `1 - dot` and nothing else, which is the arithmetic relay
-/// 40 arrived at by removing the two norm computations the implementation this
-/// replaced did per call. That is worth 6.14x on cosine and it runs once per
+/// here.** `eval` is `1 - dot` and nothing else, which is what removing the two
+/// norm computations the implementation this replaced did per call leaves. That is worth 6.14x on cosine and it runs once per
 /// distance evaluation, of which a single search at dimension 1,536 makes
 /// several thousand. Checking here would put the removed work back.
 ///
@@ -596,7 +595,7 @@ pub fn cosine_normalized(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Every path into a cosine graph normalises first, and
 /// `graph::assert_unit_for_cosine` asserts it at the seam in debug builds. The
-/// set of paths is closed and is enumerated in the relay 81 report. In outline,
+/// set of paths is closed. In outline,
 /// insertion normalises in `HNSWIndex::process_vector_for_space`, querying
 /// normalises in `HNSWIndex::validate_and_process_query_vector` or in
 /// `process_vector_for_space` on the two batch paths, and the three rebuild
@@ -784,7 +783,8 @@ mod tests {
     /// visible rather than absorbed.
     const TOLERANCE: f64 = 2e-6;
 
-    /// The kernel shape that shipped before relay 70, kept verbatim.
+    /// The kernel shape that shipped before the accumulator was widened, kept
+    /// verbatim.
     ///
     /// It is the same arithmetic in the same order over the same eight lanes,
     /// written with an `[f32; 8]` accumulator instead of an `f32x8`. It exists
@@ -891,7 +891,7 @@ mod tests {
     /// Every kernel against its `f64` reference, over the dimension grid.
     ///
     /// Unit input throughout, which is what the index holds on the cosine space
-    /// and what the relay measurements use on the other two.
+    /// and what the measurements use on the other two.
     #[test]
     fn kernels_agree_with_the_f64_reference() {
         let mut r = rng(20260805);
@@ -1066,7 +1066,7 @@ mod tests {
 
     /// The vector accumulator against the array accumulator, bit for bit.
     ///
-    /// This is the assertion the relay 70 change rests on. Widening the
+    /// This is the assertion the widened accumulator rests on. Widening the
     /// accumulator from four lanes of a register to eight was a change of
     /// instruction selection and not of arithmetic, so every kernel must return
     /// the identical `f32`, not a close one. Compared as bit patterns rather

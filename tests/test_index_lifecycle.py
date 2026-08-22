@@ -633,3 +633,27 @@ def test_neighbour_selection_heuristic_warning():
     with pytest.warns(UserWarning) as caught:
         vdb.create("hnsw", dim=4, m=100)
     assert caught[0].filename == __file__
+
+
+def test_ef_construction_has_a_ceiling_and_the_ceiling_is_inclusive():
+    """`ef_construction` was the last creation parameter with no upper bound.
+
+    It sizes the two candidate heaps every insertion allocates, 8 bytes a slot,
+    so create(ef_construction=2**40) succeeded and the first add() asked for
+    8 TB and killed the interpreter with exit status 3221226505. The bound
+    lives in the validator dim, m and expected_size share, so create(),
+    rebuild() and load() refuse the same value with the same message.
+
+    No subprocess here, unlike the dim case in test_hostile_files.py. create()
+    never allocated from this value, so a broken bound creates an index rather
+    than dying, and the raises below fail in-process.
+    """
+    vdb = VectorDatabase()
+    with pytest.raises(RuntimeError, match="ef_construction must be at most 4096, got 4097"):
+        vdb.create("hnsw", dim=4, ef_construction=4097)
+    with pytest.raises(RuntimeError, match="ef_construction must be at most 4096, got 1099511627776"):
+        vdb.create("hnsw", dim=4, ef_construction=1 << 40)
+    index = vdb.create("hnsw", dim=4, ef_construction=4096, expected_size=4)
+    assert index.ef_construction == 4096
+    index.add({"ids": ["a"], "embeddings": [[1.0, 0.0, 0.0, 0.0]]})
+    assert len(index) == 1

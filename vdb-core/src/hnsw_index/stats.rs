@@ -283,8 +283,8 @@ impl HNSWIndex {
             // The codes are still held twice, once in the map keyed by
             // external id and once in the store the quantized graph is
             // addressed against. This key prices the map, as it always did, and
-            // `graph_memory_mb` prices the store. Relay 95 removed the second
-            // copy of the raw vectors and left this one alone.
+            // `graph_memory_mb` prices the store. The second copy of the raw
+            // vectors is gone and this one is not.
             let quantized_memory_mb =
                 (pq_code_count * config.subvectors) as f64 / (1024.0 * 1024.0);
             total_memory_mb += quantized_memory_mb;

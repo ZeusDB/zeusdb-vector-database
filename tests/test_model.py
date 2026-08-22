@@ -1,10 +1,9 @@
 """A random operation sequence against a model that says what the index holds.
 
-Every defect this project has found in the mutation paths was found one at a
-time. A record stored under a generated id, a stranded node per removal, a stale
-column, a timestamp reset by a load. The general form of all of them is a random
-sequence of operations checked against an independent statement of what the
-index should contain, which is what this file is.
+A mutation path defect is a disagreement between what the index holds and what
+the operations performed on it say it should hold. The general form of the check
+is a random sequence of operations against an independent statement of the
+expected contents, which is what this file is.
 
 The model is a plain Python dictionary and a list. It holds the record set, each
 record's vector, each record's metadata, the index level metadata, the ordering
@@ -41,20 +40,15 @@ MODEL_SEED = 0x5EED_0100_C0DE_1CAF
 # Sequences per configuration, and steps per sequence.
 #
 # A budget rather than a target. This runs in the ordinary gate on every commit,
-# and a gate nobody can afford to run finds nothing. Measured on the machine it
-# was written on, the four configurations at these numbers cost about five
-# seconds, most of it in the two quantized configurations, which have to carry
-# more than a thousand records to reach the training threshold at all.
+# and a gate nobody can afford to run finds nothing. The four configurations at
+# these numbers cost about five seconds, most of it in the two quantized
+# configurations, which have to carry more than a thousand records to reach the
+# training threshold at all.
 #
-# **This budget is not what found the defect this harness was written for.** The
-# lost raw store took `quantized_with_raw` sequence 8 step 278, which is a soak
-# run of ten sequences of three hundred steps costing thirty seconds, and the
-# committed budget passed over it. That is the honest position: the gate budget
-# is a regression net and the soak is the search. The defect it found has its
-# own named test in test_persistence.py, so the net does not depend on the draw
-# reaching it again.
-#
-# The soak is `ZEUSDB_MODEL_SEQUENCES=10 ZEUSDB_MODEL_STEPS=300` and upwards.
+# **The committed budget is a regression net rather than a search.** Anything it
+# finds gets its own named test, so the net does not depend on a later draw
+# reaching the same sequence again. Deeper draws are the search, and the soak is
+# `ZEUSDB_MODEL_SEQUENCES=10 ZEUSDB_MODEL_STEPS=300` and upwards.
 SEQUENCES = int(os.environ.get("ZEUSDB_MODEL_SEQUENCES", "2"))
 STEPS = int(os.environ.get("ZEUSDB_MODEL_STEPS", "120"))
 

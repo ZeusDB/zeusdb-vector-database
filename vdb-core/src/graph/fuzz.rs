@@ -2,10 +2,10 @@
 //!
 //! # What it is for
 //!
-//! [`super::dump`] had been damaged by hand in 43 enumerated cases across three
-//! relays, every one of them a specific offset with a specific expectation. The
-//! general form of all of them is an arbitrary mutation of a valid dump, and
-//! that is what this drives.
+//! [`super::dump`] is also damaged by hand in 43 enumerated cases, every one of
+//! them a specific offset with a specific expectation. The general form of all
+//! of them is an arbitrary mutation of a valid dump, and that is what this
+//! drives.
 //!
 //! The property is one sentence. **For every input, `read_dump` returns `Ok` or
 //! `Err` and never panics, never reads out of bounds and never sizes an
@@ -72,14 +72,14 @@ const SEED: u64 = 0x5eed_0099_d00d_face;
 /// Cases the committed test runs, per corpus entry.
 ///
 /// A budget rather than a target, because this runs on every commit and a gate
-/// nobody can afford to run finds nothing. Measured on the machine it was
-/// written on, a case costs about 6.3 ms, nearly all of it writing the mutated
-/// dump and reading it back, so six entries at this budget is about forty
-/// seconds against a `cargo test` that already takes two minutes.
+/// nobody can afford to run finds nothing. A case costs about 6.3 ms, nearly all
+/// of it writing the mutated dump and reading it back, so six entries at this
+/// budget is about forty seconds against a `cargo test` that already takes two
+/// minutes.
 ///
-/// It is not the number that finds things. The origin id defect was case 248 of
-/// the first entry, and the deep runs are the soak: `ZEUSDB_FUZZ_CASES=20000`
-/// takes eleven minutes and covers 120,000 cases.
+/// The committed budget is a regression net rather than a search. The deep runs
+/// are the search: `ZEUSDB_FUZZ_CASES=20000` takes eleven minutes and covers
+/// 120,000 cases.
 const CASES_PER_ENTRY: usize = 1_000;
 
 /// Mutations applied to one case, at most, before the repairs.
