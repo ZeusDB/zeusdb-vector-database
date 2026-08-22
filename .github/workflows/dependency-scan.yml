@@ -108,7 +108,7 @@ jobs:
         if: >-
           github.event_name != 'pull_request'
           || github.event.pull_request.head.repo.full_name == github.repository
-        uses: github/codeql-action/upload-sarif@42947a340483f03ba47bb1a039b2c519aab3df85 # v3.37.8
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           sarif_file: ${{ runner.temp }}/cargo-deny.sarif
           # Names this analysis, so a second SARIF source added later reports
