@@ -483,7 +483,7 @@ impl Filter {
 /// The alternative, where a negating operator admits a record the field is
 /// missing from, makes the language incoherent at its own boundary. `nin`
 /// against a one element list is `ne` against that element, and `ne` has
-/// answered false for an absent field since relay 44 fixed it there. Splitting
+/// answered false for an absent field. Splitting
 /// them would mean `{"tag": {"ne": "x"}}` and `{"tag": {"nin": ["x"]}}` return
 /// different record sets while meaning the same thing.
 ///

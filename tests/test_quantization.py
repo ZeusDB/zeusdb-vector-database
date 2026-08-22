@@ -1600,10 +1600,10 @@ def test_quantized_symmetric_table_memory(quantized_graph):
 # ------------------------------------------------------------
 # Shared setup for the rerank coverage
 # ------------------------------------------------------------
-# Relay 33 left the quantized graph sound and the codes lossy. Recall at top_k
-# 10 was 0.1235 against 0.9995 for the raw path on the same data, and the graph
-# was measured returning exactly what an exhaustive scan of every code returns,
-# so the shortfall was the 64x compression rather than the traversal.
+# A sound quantized graph over lossy codes still loses recall. At top_k 10 it
+# was measured at 0.1235 against 0.9995 for the raw path on the same data, with
+# the graph returning exactly what an exhaustive scan of every code returns, so
+# the shortfall is the 64x compression rather than the traversal.
 #
 # Rerank closes it by over-fetching candidates with the codes and rescoring
 # them against the raw vectors the index kept. It applies to
@@ -1613,9 +1613,9 @@ def test_quantized_symmetric_table_memory(quantized_graph):
 # nothing, because the reconstruction carries exactly the information the ADC
 # distance already used.
 #
-# Dimension 64 over 4 subvectors is 64x compression, the ratio every relay 33
-# and relay 34 measurement used, which puts recall without rerank near 0.35 and
-# leaves the bounds below a wide margin. Twenty clusters and the same 0.15
+# Dimension 64 over 4 subvectors is 64x compression, the ratio every rerank
+# measurement here uses, which puts recall without rerank near 0.35 and leaves
+# the bounds below a wide margin. Twenty clusters and the same 0.15
 # perturbation as the graph fixture above.
 RERANK_DIM = 64
 RERANK_SUBVECTORS = 4
@@ -1918,8 +1918,8 @@ def test_rerank_leaves_the_raw_path_alone():
 def test_rerank_excludes_removed_records(rerank_index):
     """The live record predicate runs inside the traversal, ahead of everything.
 
-    Relay 31 added it so a stranded graph node routes the search without
-    consuming a result slot. Over-fetching multiplies the slots, so a leak here
+    It exists so a stranded graph node routes the search without consuming a
+    result slot. Over-fetching multiplies the slots, so a leak here
     would be twenty times as visible as it was.
 
     This test removes records from the shared index, so it is last in the module
@@ -2073,11 +2073,10 @@ def test_fixed_memory_warning_fires_when_quantization_cannot_pay():
 def test_default_quantized_only_saves_memory_at_the_default_expected_size():
     """A default quantized index holds less than an unquantized one at 10,000.
 
-    The default training_size and expected_size are both 10,000, and until
-    this relay quantized_only kept the 10,000 training records at full width
-    forever, so the default configuration held strictly more than an
-    unquantized index at its own declared size and warned about itself at
-    creation. Releasing the training records at training completion is what
+    The default training_size and expected_size are both 10,000. A
+    quantized_only index that kept the 10,000 training records at full width
+    forever would hold strictly more than an unquantized index at its own
+    declared size. Releasing the training records at training completion is what
     this asserts: the storage the index reports must come in below the raw
     store an unquantized index holds for the same data, fixed costs included.
     The graph is excluded from both sides, which biases against the quantized
@@ -2176,12 +2175,11 @@ def test_recall_holds_after_the_training_records_are_released(quantized_graph):
 def test_creation_warning_is_silent_at_the_default_configuration():
     """The default index does not warn that it cannot pay, at any dimension.
 
-    Until this relay the default configuration warned about itself: break even
-    sat above the default expected_size at every dimension, because the
-    training records stayed at full width and the default training_size equals
-    the default expected_size. With the records released at training, break
-    even is fixed_bytes / (dim * 4 - subvectors), which the default
-    expected_size of 10,000 clears at every dimension from 64 up.
+    The default training_size equals the default expected_size, so training
+    records held at full width would put break even above the declared size at
+    every dimension. With the records released at training, break even is
+    fixed_bytes / (dim * 4 - subvectors), which the default expected_size of
+    10,000 clears at every dimension from 64 up.
     """
     vdb = VectorDatabase()
 
@@ -2953,8 +2951,9 @@ def test_the_calibration_reports_the_pages_it_fitted(calibrated_index):
 # cluster of 160, and a fetch sized for a page of ten already covers that
 # cluster, so recall at 100 reads 1.0000 either way and the corpus cannot tell
 # the two behaviours apart. This one has no cluster structure and a power law
-# covariance spectrum, which is the model relay 57 used for embedding-like data,
-# and on it the hundredth true neighbour really does sit deeper than the tenth.
+# covariance spectrum, which is the model this project uses for embedding-like
+# data, and on it the hundredth true neighbour really does sit deeper than the
+# tenth.
 PAGE_DIM = 256
 PAGE_RECORDS = 10000
 PAGE_TRAINING = 2000

@@ -1,8 +1,8 @@
 //! Test data shared by the modules that measure against it.
 //!
 //! `clustered` is the specification every quantized measurement in this project
-//! uses, so the figures in the relay reports and the thresholds in the tests
-//! describe the same data. One definition rather than one per test module, for
+//! uses, so the recorded figures and the thresholds in the tests describe the
+//! same data. One definition rather than one per test module, for
 //! that reason.
 
 use crate::rng::SeededRng;
@@ -11,8 +11,8 @@ use rand::{Rng, SeedableRng};
 /// plus 0.15 times a Gaussian perturbation, then L2 normalised, with the
 /// centres deliberately left unnormalised. This is the shape real
 /// embeddings have and the specification every quantized measurement in
-/// this project uses, so the figures in the relay reports and the
-/// thresholds below describe the same data.
+/// this project uses, so the recorded figures and the thresholds below
+/// describe the same data.
 ///
 /// Uniform noise was tried and rejected. Its spread is too small relative
 /// to the centre separation, so records within a cluster quantize to the

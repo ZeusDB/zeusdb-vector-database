@@ -7,14 +7,14 @@
 //! `vector_metadata`, which is a `HashMap<String, HashMap<String, Value>>`.
 //! That walk costs about 250 nanoseconds a record, so a filter matching ten
 //! records over 100,000 cost 26 to 39 milliseconds where an unfiltered search
-//! cost 0.3 to 1.2. Relay 90 measured the walk at 73 to 100 percent of a
-//! filtered search and measured a column per field walking 224 times faster.
+//! cost 0.3 to 1.2. The walk is 73 to 100 percent of a filtered search, and a
+//! column per field was measured walking 224 times faster.
 //!
 //! A column here is addressed by internal id, so the same bitmap answers both
 //! paths a filtered search can take. The exact scan reads the set bits and
 //! scores those records. The graph traversal tests one bit per node it reaches,
 //! in place of the node, `rev_map`, `vector_metadata`, field lookup chain that
-//! relay 90 measured at 154 nanoseconds a probe.
+//! measured at 154 nanoseconds a probe.
 //!
 //! # Every operator is served, because the leaf is the same function
 //!
@@ -463,9 +463,9 @@ fn value_payload(value: &Value) -> usize {
 ///
 /// Between one third and the whole corpus the two are within a factor the
 /// machine's own load moves them by. Two runs of the same cell put a bound of
-/// half the corpus at 0.9 and 1.7 times the walk, so this relay does not claim
-/// a direction there and reports no bound, which leaves those filters costing
-/// exactly what they cost before.
+/// half the corpus at 0.9 and 1.7 times the walk, so no direction is claimed
+/// there and no bound is reported, which leaves those filters costing exactly
+/// what they cost before.
 ///
 /// # What it costs to decide
 ///

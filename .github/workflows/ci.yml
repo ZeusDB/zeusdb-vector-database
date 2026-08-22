@@ -56,22 +56,14 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The toolchain comes from rust-toolchain.toml and from nowhere else.
-      #
-      # This was dtolnay/rust-toolchain@stable, which installs whatever stable
-      # resolves to on the day and sets it as the default. rust-toolchain.toml
-      # then overrode it for every cargo invocation inside the checkout, so the
-      # action's channel decided nothing and its components list applied to a
-      # toolchain the gate never ran. Which of the two won was never
-      # established, and the two agreed only by coincidence.
-      #
       # `rustup toolchain install` with no argument reads the channel and the
       # components out of the file, so the version installed is the version
-      # that runs. Raising the pin is now the whole of a toolchain bump.
+      # that runs. Raising the pin there is the whole of a toolchain bump.
       - name: Install the pinned toolchain
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: vdb-core
           # Shared with the test job, which compiles the same dependencies.
@@ -92,11 +84,11 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # From rust-toolchain.toml, as in the lint job. See the note there.
       - name: Install the pinned toolchain
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: vdb-core
           shared-key: vdb-core
@@ -110,8 +102,7 @@ jobs:
         # how the extension is built for development.
         run: uv sync --locked --extra dev
       - name: Run the Python test suite
-        # Scoped to tests, because seven scripts under benchmarks end in
-        # _test.py and start with a digit, which pytest cannot import.
+        # Scoped to the tests directory, as testpaths in pyproject.toml is.
         run: uv run --no-sync pytest tests
       # The Rust tests link an executable, and an executable has to resolve
       # every libpython symbol it references. `cargo test` below turns

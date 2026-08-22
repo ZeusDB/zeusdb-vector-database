@@ -3,10 +3,8 @@ name = "zeusdb-vector-database"
 version = "0.7.0"
 edition = "2021"
 # The same licence pyproject.toml declares, LICENSE holds and NOTICE restates.
-# The crate is not published to crates.io, so nothing read this field until
-# cargo-deny did, and it reported the crate that owns the tree as the one
-# unlicensed thing in it. The wheel's metadata is unaffected, because maturin
-# takes it from pyproject.toml.
+# cargo-deny reads this field. The wheel's metadata is unaffected, because
+# maturin takes it from pyproject.toml.
 license = "Apache-2.0"
 resolver = "2" # <-- Avoid compiling unnecessary features from dependencies.
 
@@ -26,16 +24,8 @@ crate-type = ["cdylib"]
 # executable links with every libpython symbol it references unresolved, and
 # on Linux the link fails.
 #
-# It did not fail while no unit test reached PyO3. `--gc-sections` discarded
-# every section that referenced libpython and the executable linked with none
-# of it live. `columns::tests::the_declaration_is_validated` is the first test
-# to construct a `PyErr`, which makes PyO3's exception and reference-count
-# paths live, and the latent breakage became a failure. Removing that one test
-# takes the undefined symbol count from eight back to zero, measured.
-#
-# Windows was never affected, because there every symbol must resolve at link
-# time and PyO3 emits the import library whatever this feature says. That is
-# why `cargo test` passed locally and failed in CI.
+# Windows is unaffected, because there every symbol must resolve at link time
+# and PyO3 emits the import library whatever this feature says.
 #
 # **On Linux, run the tests as `cargo test --no-default-features`**, which is
 # what the CI gate does. Turning the feature off makes PyO3 emit `-lpython3.x`,
@@ -70,16 +60,13 @@ rand = "0.9.1"
 # release. Every seeded draw in the crate runs on it, being the level stream a
 # graph is built from and both of the product quantizer's. See src/rng.rs.
 #
-# No crate. `rand`'s default features already pull `rand_chacha` in to build
-# `StdRng` at all, so this names a dependency that was there rather than adding
-# one, and the lock is unchanged at 118.
+# `rand`'s default features already pull `rand_chacha` in to build `StdRng` at
+# all, so this names a dependency the lock already held rather than adding one.
 rand_chacha = "0.9"
 # The distance kernels' vector type. See the "How they are compiled" section of
-# src/distance.rs for what it buys and why the auto-vectoriser could not.
-# Three crates, being wide, safe_arch and bytemuck, taking the lock from 154 to
-# 157. It is a build-time abstraction over the target's own vector registers
-# with no run time component, so it adds nothing to the wheel beyond the code
-# it generates.
+# src/distance.rs. It pulls in safe_arch and bytemuck, and it is a build-time
+# abstraction over the target's own vector registers with no run time
+# component, so it adds nothing to the wheel beyond the code it generates.
 wide = "1"
 bincode = "2.0.1"
 chrono = { version = "0.4.41", features = ["serde"] } # <-- For timestamps
@@ -102,22 +89,13 @@ opt-level = 3       # Full optimization
 #
 # The lock rank registry in src/hnsw_index/locks.rs is gated on
 # `cfg(debug_assertions)` and on nothing else, so it is live in any profile
-# that leaves them on. It had never run against tests/test_quantization.py or
-# tests/test_metadata_columns.py, which is 282 of the suite, because the only
-# build with the assertions on was the unoptimised one and the k-means and
-# insertion paths those two files exercise are far slower without
-# optimisation. The pair takes 131.8 s on a release build and the debug build
-# was measured at more than forty minutes.
-#
-# This profile is the release profile with the assertions turned back on, so
-# the registry runs at release speed and the gap closes with no scheduled job
-# and no faster machine. Build it with
+# that leaves them on. This profile is the release profile with the assertions
+# turned back on, so the registry runs at release speed. Build it with
 #
 #   maturin develop --profile checked
 #
 # and run the suite as usual. Turn `lto` off here rather than inheriting it if
-# the build time matters more than the run time; it is on so that the timing
-# is comparable with the release build the figures above were taken on.
+# the build time matters more than the run time.
 [profile.checked]
 inherits = "release"
 debug-assertions = true

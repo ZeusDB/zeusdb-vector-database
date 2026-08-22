@@ -69,7 +69,7 @@ mod structure;
 #[cfg(test)]
 pub(crate) mod test_graph;
 // A seeded mutator over a valid dump, driving the reader with generated input
-// rather than with the enumerated damage cases three relays wrote by hand.
+// rather than with the enumerated damage cases written by hand.
 #[cfg(test)]
 mod fuzz;
 // The traversal, written once against an accessor.

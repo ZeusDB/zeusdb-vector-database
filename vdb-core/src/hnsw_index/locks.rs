@@ -3,27 +3,18 @@
 //! # What this is for
 //!
 //! The type declares an acquisition order and one further rule, that the same
-//! guard is never taken twice on one thread. Both were enforced by reading.
-//! Three separate relays broke one of them, and each was found by a person
-//! reading the code after the tests were green.
-//!
-//! | Relay | Site | Shape |
-//! | --- | --- | --- |
-//! | 69 | `get_stats` re-read `training_ids` inside its own hold | nested, same lock |
-//! | 86 | `search_candidates` called `is_quantized`, which takes `hnsw` again | nested, same lock, through a call |
-//! | 97 | `warn_undeclared_filter_field` read `columns` while the caller held it | nested, same lock, through a call |
+//! guard is never taken twice on one thread. This module makes both a debug
+//! assertion rather than a convention.
 //!
 //! A recursive read is not a deadlock on its own. It becomes one when a writer
 //! queues between the two acquisitions, because the standard library queues
-//! readers behind a waiting writer. So a single threaded test passes on a build
-//! carrying the defect, and the concurrency suite hangs only if it happens to
-//! schedule a writer into the window. **That is what this file changes.** The
-//! assertion fires on the second acquisition itself, with no writer and no
-//! scheduling, so an ordinary `pytest tests` on a debug build finds it.
+//! readers behind a waiting writer, so a single threaded test passes on a build
+//! that carries one. The assertion fires on the second acquisition itself, with
+//! no writer and no scheduling, so an ordinary `pytest tests` on a debug build
+//! reaches it.
 //!
-//! It catches order inversion too, which reading catches least reliably,
-//! because an inversion is a property of two call paths rather than of one
-//! function.
+//! It catches order inversion too, which is a property of two call paths rather
+//! than of one function.
 //!
 //! # What it costs
 //!
@@ -32,10 +23,8 @@
 //! of their own, and every registry call is behind `#[cfg(debug_assertions)]`.
 //! [`tests::a_tracked_lock_is_the_size_of_the_lock_it_wraps`] asserts the sizes,
 //! and it is the one test here that is not itself gated on
-//! `debug_assertions`, so it runs on a release build too. Measured beyond that:
-//! the three assertion messages below appear once each in
-//! `target/debug/zeusdb_vector_database.dll` and zero times in
-//! `target/release/zeusdb_vector_database.dll`, so the whole body is gone
+//! `debug_assertions`, so it runs on a release build too. The three assertion
+//! messages below are absent from a release artefact, so the whole body is gone
 //! rather than merely unreachable.
 //!
 //! In debug, one thread local access, a scan of at most fourteen entries and a
@@ -50,18 +39,16 @@
 //! `graph`, carry a module level allow that says why. This file carries one
 //! because it is where the wrapping happens.
 //!
-//! # What it does not catch
+//! # What it tracks
 //!
-//! A guard already dropped. Relay 98's `count` read `rev_map` in a match guard
-//! and again in the arm, which is two sequential acquisitions rather than a
-//! nested hold, because a match guard is its own temporary scope. The registry
-//! sees the first release before the second acquisition and says nothing. That
-//! occurrence was a staleness defect rather than a hang, and it is out of this
-//! mechanism's reach by construction.
+//! Guards currently held, on the thread that holds them. Two sequential
+//! acquisitions are not a nested hold, so a read taken inside a match guard and
+//! again in the arm is two acquisitions rather than one, because a match guard
+//! is its own temporary scope.
 //!
-//! Nor does it see across threads. The held set is per thread, so a guard held
-//! across a rayon fork is invisible to the workers, which is correct: the rule
-//! the order encodes is about one thread's own acquisitions.
+//! The held set is per thread, so a guard held across a rayon fork is invisible
+//! to the workers, which is correct: the rule the order encodes is about one
+//! thread's own acquisitions.
 
 #![allow(clippy::disallowed_types)]
 

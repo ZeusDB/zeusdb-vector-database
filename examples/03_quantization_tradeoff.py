@@ -148,7 +148,7 @@ def main():
     # graph
     # owns a second copy of every point on top of its neighbour lists, and that
     # copy used to be a second one: the index held a map of raw vectors and
-    # the graph held its own arena of the same bytes. Relay 95 removed the map,
+    # the graph held its own arena of the same bytes. The map is gone,
     # so there is one copy, the raw column prices it, and the graph column
     # prices what the graph holds apart from it. That is why the graph column
     # is close to equal across the three modes and the total is not.

@@ -69,7 +69,7 @@ def test_index_metadata():
     
     # Add index metadata
     metadata = {
-        "creator": "Ross Armstrong",
+        "creator": "data-platform-team",
         "version": "0.1",
         "created_at": "2024-01-28T11:35:55Z",
         "index_type": "HNSW",
@@ -84,14 +84,14 @@ def test_index_metadata():
     index.add_metadata(metadata)
     
     # Test individual metadata retrieval
-    assert index.get_metadata("creator") == "Ross Armstrong"
+    assert index.get_metadata("creator") == "data-platform-team"
     assert index.get_metadata("version") == "0.1"
     assert index.get_metadata("nonexistent") is None
     
     # Test all metadata retrieval
     all_meta = index.get_all_metadata()
     assert len(all_meta) == len(metadata)
-    assert all_meta["creator"] == "Ross Armstrong"
+    assert all_meta["creator"] == "data-platform-team"
     assert all_meta["embedding_model"] == "openai/text-embedding-ada-002"
 
 # ------------------------------------------------------------
@@ -165,7 +165,7 @@ def test_remove_point_removes_from_search_results():
     # adjacency, but search now passes a live-record predicate into the
     # traversal, so that node routes the search without consuming a result
     # slot. A search over 199 remaining records returns a full page of 10.
-    # This assertion read 9 until relay 31.
+    # Without that predicate the page would come back one short.
     assert len(after) == 9 + 1
     assert len(index.search(query, top_k=5)) == 5
     assert len(index.search(query, top_k=20)) == 20
@@ -201,7 +201,7 @@ def test_remove_point_removes_from_search_results():
     # A wider removal is not visible in a wider search either, and now it is not
     # visible because nothing is lost rather than because the loss is hidden.
     # The dead nodes inside the candidate window no longer take slots, so the
-    # page is full. This assertion read `0 < len(wide) < 50` until relay 31.
+    # page is full. Without that, the page was merely non-empty.
     assert len(wide) == 50
 
     # The batch path agrees with the single path.

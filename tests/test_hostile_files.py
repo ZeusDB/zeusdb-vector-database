@@ -4,12 +4,11 @@ An allocation sized from a field the file has not earned does not raise. It
 aborts, and an abort does not unwind, so no `catch_unwind` sees it and a Python
 caller gets a dead interpreter with no traceback. That is why every case here
 runs the load in a **subprocess** and asserts on the child's exit status as well
-as on its message: an in-process test cannot tell a refusal from a death, and
-before these bounds existed every case in this file killed the child.
+as on its message, because an in-process test cannot tell a refusal from a death.
 
 The rule these tests hold is the one `parse_dump` already draws. A length the
 file's own bytes could carry is a limit, and a length nothing bounds is a
-defect. Fourteen fields across five files were the second kind.
+defect.
 
 The forged files are written by hand rather than by the library, because the
 library cannot write them. `mappings.bin`, `vectors.bin`, `pq_codes.bin` and
@@ -364,15 +363,22 @@ def test_a_hostile_quantization_field_is_refused(quantized_index, tmp_path, fiel
         ({"dim": HUGE}, "dim must be at most 65536, got 1099511627776"),
         ({"dim": 1 << 31}, "dim must be at most 65536, got 2147483648"),
         ({"id_counter": HUGE}, "id_counter is 1099511627776"),
+        ({"ef_construction": HUGE}, "ef_construction must be at most 4096, got 1099511627776"),
     ],
-    ids=["dim-huge", "dim-2^31", "id_counter-huge"],
+    ids=["dim-huge", "dim-2^31", "id_counter-huge", "ef_construction-huge"],
 )
 def test_a_hostile_config_field_is_refused(raw_index, tmp_path, fields, naming):
     """`dim` sizes one vector buffer and had no upper bound at all.
 
-    `id_counter` was bounded by an earlier relay and is held here so the pair
-    stays together: they are the two fields of config.json that size an
-    allocation rather than describe a behaviour.
+    `id_counter` was bounded earlier and is held here so the pair stays
+    together: they are the two fields of config.json that size an
+    allocation rather than describe a behaviour. `ef_construction` joined
+    them last. It sizes the candidate heaps of every insertion rather than
+    anything the loader allocates, so a directory naming 2**40 would load,
+    restore its graph from the dump, and kill the process on the first add()
+    after the load. The loader is the third door to the validator that
+    bounds it, and the case sits here with the other two config.json fields
+    because the subprocess costs nothing and keeps the file uniform.
     """
     path = forged(raw_index, tmp_path, "config.json", edit_json(**fields))
     assert_refused(path, tmp_path, naming=naming)

@@ -67,6 +67,37 @@ pub(crate) const MAX_DIM: usize = 65_536;
 /// reservation can still abort at a declaration under it.
 const MAX_EXPECTED_SIZE: usize = 100_000_000;
 
+/// Largest `ef_construction` a caller may declare, and the largest a saved
+/// index may name.
+///
+/// `ef_construction` is the width of the candidate search every insertion
+/// runs, and `search_layer` in `graph/traverse.rs` sizes its two candidate
+/// heaps from that width before it visits a node, 8 bytes a slot. The
+/// allocation is not fallible and it happens on the first `add()` rather than
+/// at creation, so `create(ef_construction=2**40)` succeeded and the first
+/// insertion asked for 8,796,093,022,208 bytes and **aborted the process**
+/// with exit status 3221226505. The same width is reached by `rebuild()` and
+/// by a `config.json` naming it, which is why the bound lives in
+/// `validate_index_parameters` with the other three rather than in `build`.
+///
+/// The ceiling is reasoned from `m` rather than invented. The neighbour
+/// selection heuristic runs only while `ef_construction` is above the
+/// neighbour budget of `2 * m`, that budget is 512 at the largest `m` of 256,
+/// and the default of 200 sits 6.25 times above the budget at the default
+/// `m` of 16. Carrying that margin to the largest `m` is 3,200, and 4,096 is
+/// the first power of two above it, so every `m` the index allows has the
+/// default's headroom available and nothing a real build asks for is
+/// refused. The highest comparable ceiling in the field is Lucene's beam
+/// width of 3,200, and pgvector stops at 1,000.
+///
+/// What it costs at the ceiling, measured on 20,000 records of 64
+/// dimensions. 2.28 s to build at 200 and 30.0 s at 4,096, thirteen times the
+/// default, against 47.4 s at 8,192. The README's 50,000 record build of
+/// 1,536 dimensions, linear above 100 at 0.31 s per unit of width, would run
+/// about 21 minutes at the ceiling. At the ceiling the two heaps are 64 KiB,
+/// which is an allocation the process can refuse rather than one it dies on.
+pub(crate) const MAX_EF_CONSTRUCTION: usize = 4_096;
+
 /// Every rule a valid index declaration has to satisfy, returning the
 /// normalised space.
 ///
@@ -112,12 +143,12 @@ pub(crate) fn validate_index_parameters(
             "dim exceeds maximum"
         );
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}dim must be at most {}, got {}. dim is the width of one vector 
-             buffer, so sizing that buffer from the declared width is the 
-             first allocation this index makes. That allocation is not 
-             fallible: above this bound the process aborts rather than 
-             raising. One vector at the ceiling is {} bytes, an order of 
-             magnitude above the widest embedding any published model 
+            "{}dim must be at most {}, got {}. dim is the width of one vector \
+             buffer, so sizing that buffer from the declared width is the \
+             first allocation this index makes. That allocation is not \
+             fallible: above this bound the process aborts rather than \
+             raising. One vector at the ceiling is {} bytes, an order of \
+             magnitude above the widest embedding any published model \
              produces.",
             source,
             MAX_DIM,
@@ -135,6 +166,27 @@ pub(crate) fn validate_index_parameters(
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
             "{}ef_construction must be positive, got {}",
             source, ef_construction
+        )));
+    }
+    if ef_construction > MAX_EF_CONSTRUCTION {
+        error!(
+            operation = "validation",
+            field = "ef_construction",
+            value = ef_construction,
+            max_allowed = MAX_EF_CONSTRUCTION,
+            "ef_construction exceeds maximum"
+        );
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "{}ef_construction must be at most {}, got {}. It is the width of the \
+             candidate search every insertion runs, and the graph sizes two \
+             candidate heaps from it, 8 bytes a slot, before each insertion visits \
+             a node. That allocation is not fallible: a value of 2^40 asks for 8 TB \
+             on the first add() and the process aborts rather than raising. The \
+             ceiling is eight times the neighbour budget at the largest m, being \
+             2 * 256, so the default's margin over that budget is available at \
+             every m the index allows, and a build at the ceiling runs about \
+             thirteen times longer than one at the default.",
+            source, MAX_EF_CONSTRUCTION, ef_construction
         )));
     }
     if expected_size == 0 {

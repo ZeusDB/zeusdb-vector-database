@@ -279,8 +279,8 @@ pub const DEFAULT_RERANK_PAGE_FACTOR: usize = 5;
 /// guard against a fit that collapses, not a term that should govern.
 ///
 /// A subset that measures a deeper fetch than the whole sample sits below the
-/// size at which the codes resolve the data at all, which is relay 54's case
-/// of a group smaller than the page. The fit carries no signal there, its
+/// size at which the codes resolve the data at all, which is the case of a
+/// group smaller than the page. The fit carries no signal there, its
 /// slope is not positive, and the exponent takes the maximum. That fires on
 /// fifty clusters at a `training_size` of 1,000, where a quarter of the sample
 /// holds five records to a cluster.
@@ -375,9 +375,9 @@ pub const DEFAULT_RERANK_PAGE_FACTOR: usize = 5;
 /// `RERANK_CALIBRATION_CAP_DIVISOR` is the cap, at one quarter of the live
 /// record count. The deepest calibrated fetch measured is 17.8 percent of its
 /// corpus, on a fifty cluster generator trained on 1,000 records, so the cap
-/// sits above every measured cell and below a full scan. It exists for the data
-/// relay 54 recorded, where the codes resolve nothing and the depth the
-/// calibration measures is most of the sample. It bounds that case rather than
+/// sits above every measured cell and below a full scan. It exists for the case
+/// where the codes resolve nothing and the depth the calibration measures is
+/// most of the sample. It bounds that case rather than
 /// repairing it, and no fetch repairs it.
 ///
 /// # What it costs and where it is absent
@@ -1185,8 +1185,8 @@ mod tests {
     /// The plan a caller who named no factor gets on a calibrated index.
     ///
     /// No page was measured and the page exponent is zero, so the page term is
-    /// exactly one at every page. That is the behaviour this relay changed, and
-    /// keeping it here is what lets the tests below compare against it.
+    /// exactly one at every page. That is the behaviour before the page term,
+    /// and keeping it here is what lets the tests below compare against it.
     fn calibrated_plan(fetch: usize, sample_records: usize, exponent: f64) -> RerankPlan {
         RerankPlan {
             factor: None,

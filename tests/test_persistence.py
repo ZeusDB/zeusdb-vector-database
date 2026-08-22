@@ -144,7 +144,7 @@ def quantized_only_saved(tmp_path_factory):
     ids = [f"v_{i}" for i in range(QO_COUNT)]
     assert index.add({"ids": ids, "embeddings": vectors,
                       "metadatas": [{"i": i} for i in range(QO_COUNT)]}).is_success()
-    index.add_metadata({"owner": "relay24"})
+    index.add_metadata({"owner": "search-platform"})
     assert index.is_quantized()
 
     # What the live index returns for the code-only records, which is the
@@ -342,16 +342,16 @@ def test_persistence_preserves_index_level_metadata(tmp_path):
     """
     vdb = VectorDatabase()
     index = vdb.create("hnsw", dim=4, expected_size=10)
-    index.add_metadata({"owner": "relay24", "dataset": "docs_v2"})
+    index.add_metadata({"owner": "search-platform", "dataset": "docs_v2"})
     index.add({"id": "r1", "values": [0.1, 0.2, 0.3, 0.4], "metadata": {"kept": "yes"}})
 
-    assert index.get_all_metadata() == {"owner": "relay24", "dataset": "docs_v2"}
+    assert index.get_all_metadata() == {"owner": "search-platform", "dataset": "docs_v2"}
 
     save_dir = tmp_path / "indexmeta.zdb"
     index.save(str(save_dir))
 
     config = json.loads((save_dir / "config.json").read_text(encoding="utf-8"))
-    assert config["metadata"] == {"owner": "relay24", "dataset": "docs_v2"}
+    assert config["metadata"] == {"owner": "search-platform", "dataset": "docs_v2"}
     assert sorted(config) == ["dim", "ef_construction", "expected_size", "generated_ids",
                               "id_counter", "indexed_fields", "m", "metadata", "space",
                               "vector_count"]
@@ -362,8 +362,8 @@ def test_persistence_preserves_index_level_metadata(tmp_path):
     assert config["indexed_fields"] == []
 
     loaded = vdb.load(str(save_dir))
-    assert loaded.get_all_metadata() == {"owner": "relay24", "dataset": "docs_v2"}
-    assert loaded.get_metadata("owner") == "relay24"
+    assert loaded.get_all_metadata() == {"owner": "search-platform", "dataset": "docs_v2"}
+    assert loaded.get_metadata("owner") == "search-platform"
     assert loaded.get_metadata("absent") is None
 
     # Per record metadata is unaffected.
@@ -373,7 +373,7 @@ def test_persistence_preserves_index_level_metadata(tmp_path):
     # rather than only copied from file to file.
     second = tmp_path / "indexmeta2.zdb"
     loaded.save(str(second))
-    assert vdb.load(str(second)).get_all_metadata() == {"owner": "relay24",
+    assert vdb.load(str(second)).get_all_metadata() == {"owner": "search-platform",
                                                         "dataset": "docs_v2"}
 
     # An index that never called add_metadata writes an empty map, not a
@@ -859,7 +859,7 @@ def test_persistence_reads_previous_format(tmp_path, quantized_only_saved):
 
     config = json.loads((legacy / "config.json").read_text(encoding="utf-8"))
     had_metadata = config.pop("metadata")
-    assert had_metadata == {"owner": "relay24"}
+    assert had_metadata == {"owner": "search-platform"}
     (legacy / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     manifest = json.loads((legacy / "manifest.json").read_text(encoding="utf-8"))
@@ -1364,8 +1364,8 @@ def test_quantized_reload_raw_store_holds_only_what_was_saved(quantized_reload):
     For quantized_only that is empty, since training releases the collected
     raw vectors the moment their codes are stored, and for quantized_with_raw
     it is every record. No code-only record may be materialised at full width
-    on load; before relay 35's fix the loader reconstructed them into the
-    graph, which is where the mode's memory saving went to die.
+    on load. A loader that reconstructed them into the graph would spend the
+    whole of the mode's memory saving.
     """
     fixture = quantized_reload
     loaded = VectorDatabase().load(str(fixture["path"]))

@@ -106,8 +106,7 @@ impl HNSWIndex {
     /// graph dump is exactly the case where the node ordering that addresses
     /// the store is unavailable. Dropping the file would make a raw index with
     /// a damaged dump unloadable, which is a recovery path the loader
-    /// documents and thirty-three tests hold. See the relay 95 report for what
-    /// removing the on-disk copy would take.
+    /// documents and thirty-three tests hold.
     pub(crate) fn holds_raw_vectors(&self) -> bool {
         self.hnsw.read().unwrap().holds_raw()
     }

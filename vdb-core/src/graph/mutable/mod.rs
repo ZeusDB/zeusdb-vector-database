@@ -50,17 +50,17 @@
 //! # Lists above a node's own level
 //!
 //! **A node owns a list at every layer up to its span, and its span can exceed
-//! its level.** This is the correction relay 79 made to the layout, and it is
-//! what the vendored structure has always done: `Point::new` gives every point
+//! its level.** This is what the vendored structure has always done, and what
+//! the layout here reproduces: `Point::new` gives every point
 //! sixteen layer vectors whatever level it was drawn at, and the builder writes
 //! into the ones above the level from two directions.
 //!
 //! The descent writes there. Install site 1 records the entry point it passed at
 //! each layer above the new point's own level into the new point's list there,
-//! so a level zero point carries entries at layer five. Relay 77 called this the
-//! descent residue and dropped it; relay 78 kept it in an append-only region.
+//! so a level zero point carries entries at layer five. That is the descent
+//! residue.
 //!
-//! The reverse update writes there too, and that is what the append-only region
+//! The reverse update writes there too, and that is what an append-only region
 //! could not hold. `search_layer` seeds its result heap with the point it is
 //! entered at whatever that point's level, so a search at layer `l` can return a
 //! point of level below `l`. Every time a new point draws a level above every
@@ -79,7 +79,7 @@
 //! a reverse push overflows it. That is why an upper list carries its own offset
 //! rather than being addressed by multiplication.
 //!
-//! Keeping these lists is not a choice the way relay 78 framed it. The vendored
+//! Keeping these lists is not a choice. The vendored
 //! descent increments the pivot's inbound counter at the layer it files the edge
 //! at, and the overflow pop guard reads that counter, so a build that skips them
 //! evicts different entries. And the traversal reads them, so a build that
@@ -614,8 +614,8 @@ where
     /// A declared record costs far more here than it did in the structure this
     /// replaces, because the reservation covers the graph's own copy of the
     /// vector and its layer zero slab where the vendored one covered a single
-    /// `Arc` slot. Relay 44 measured that at 8.02 bytes per declared record and
-    /// capped `expected_size` at 100 million on the strength of it, which put
+    /// `Arc` slot. That was measured at 8.02 bytes per declared record, and
+    /// `expected_size` is capped at 100 million on the strength of it, which put
     /// the creation-time reservation at 764 MB. The same declaration here at
     /// dimension 1,536 asks for 653 GB, and `Vec::with_capacity` aborts the
     /// process on allocation failure rather than unwinding, so that is a
@@ -1544,10 +1544,10 @@ where
     /// vendored `Point::neighbours[layer]` returns. That includes the layers
     /// above the node's own level.
     ///
-    /// Relay 77 dropped those edges from `FlatGraph` and relay 78 held them out
-    /// of this accessor, both on the reasoning that no traversal reaches a node
-    /// at a layer above its level. That reasoning has a hole, which relay 79
-    /// found while porting the insert: `search_layer` seeds its result heap with
+    /// An earlier layout dropped those edges from `FlatGraph` and held them out
+    /// of this accessor, on the reasoning that no traversal reaches a node at a
+    /// layer above its level. That reasoning has a hole, which porting the
+    /// insert found: `search_layer` seeds its result heap with
     /// the point it was entered at whatever that point's level, so a point below
     /// the layer can enter a list there and be reached from it afterwards. The
     /// insertion traversal reads these lists on the vendored path, so it has to

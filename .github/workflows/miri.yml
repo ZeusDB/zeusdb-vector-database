@@ -1,0 +1,90 @@
+# Miri over the two unsafe sites in vdb-core, on a pull request that touches
+# either of them, weekly, and by hand.
+#
+# The crate has ten `unsafe` expressions in two files. distance.rs holds three
+# AVX kernels and the six call sites that dispatch to them, and
+# graph/traverse.rs holds one prefetch. Miri interprets the tests that reach
+# them under a memory model and reports the out-of-bounds pointer arithmetic
+# and the aliasing violations the compiler cannot see.
+#
+# THREE CONDITIONS. Dropping any one of them produces a job that is either
+# permanently red or green having checked nothing.
+#
+# 1. MIRIFLAGS=-Zmiri-tree-borrows. Under the default Stacked Borrows model,
+#    crossbeam-epoch, reached through rayon from the k-means training in
+#    pq.rs, reports undefined behaviour in its own epoch collector. That is the
+#    long-standing disagreement between that crate and the stricter model, not
+#    a defect here, and nothing in this repository can fix it.
+#
+# 2. RUSTFLAGS=-C target-feature=+avx. Under Miri's default target
+#    `is_x86_feature_detected!("avx")` is false, every kernel takes the
+#    baseline, and the three AVX `unsafe` blocks are never entered. Forcing the
+#    feature on at compile time makes Miri take the AVX branch, which it can
+#    interpret. Without this flag the run is green and has checked none of the
+#    unsafe in distance.rs.
+#
+# 3. An explicit test filter. The tests that write a directory cannot run
+#    under Miri's filesystem shims, and the distance grid at its committed size
+#    does not finish. The filter names the set that completes and reaches both
+#    unsafe sites: rng::, locks::, filter::, distance::tests::edge_cases and
+#    the 16 node graph search added so the prefetch is reachable at all. Run
+#    natively with --list, the filter selects 25 tests. Naming them also means
+#    a new test Miri cannot finish does not silently turn the job into a
+#    timeout.
+#
+# The job is path-triggered on the two files that hold the unsafe rather than
+# on every change, because a Miri run compiles under Miri's own rustc before
+# the first test. The timeout is well above the expected run time and well
+# below the six hour default.
+#
+# The toolchain. Miri is nightly only. rust-toolchain.toml pins the compiler
+# for every other job; `rustup run nightly` sets RUSTUP_TOOLCHAIN, which sits
+# above the file in rustup's precedence, so the pin is untouched. The nightly
+# is whatever is current on the day, so a Miri report can appear with no change
+# here, and that is a reason to read the report rather than to pin the nightly.
+name: Miri
+
+on:
+  pull_request:
+    branches: [main, development]
+    paths:
+      - 'vdb-core/src/distance.rs'
+      - 'vdb-core/src/graph/traverse.rs'
+      - '.github/workflows/miri.yml'
+  schedule:
+    # 05:23 UTC on Mondays, an hour after the lock order run, off the hour.
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  miri:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install a nightly toolchain with Miri
+        # --profile minimal and the one component. `cargo miri setup` builds
+        # the interpreter's own sysroot, which is the slow part of the install,
+        # and doing it here keeps it out of the test step's timing.
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri
+          rustup run nightly cargo miri setup
+      - name: Run Miri over the tests that reach the unsafe
+        working-directory: vdb-core
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows
+          RUSTFLAGS: -C target-feature=+avx
+        # --no-default-features for the reason ci.yml gives on cargo test, and
+        # --locked for the reason every cargo step here passes it. The filter
+        # is the third condition above; keep it in step with the header.
+        run: |
+          rustup run nightly cargo miri test --no-default-features --locked -- \
+            rng:: locks:: filter:: distance::tests::edge_cases \
+            graph::structure::a_graph_small_enough_for_an_interpreter_searches_on_every_metric

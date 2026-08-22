@@ -2,14 +2,14 @@
 //!
 //! Until 0.7.0 this file was `parity.rs` and every test in it compared a ZeusDB
 //! structure against the vendored `Hnsw` on one topology, over the traversal in
-//! relay 77, the insert in relay 79 and the real data harness in both. That
+//! the traversal, the insert and the real data harness. That
 //! comparison is gone with the crate it compared against, and what is left is
 //! the part that never needed a second implementation.
 //!
-//! **The strongest evidence in the 0.7.0 arc does not survive here.** Relay 79
-//! compared the two builders edge for edge over 18,400 nodes and 352,323 edges,
-//! and relay 77 compared the two traversals over 45,465 pages of real data.
-//! Neither can be written without a reference. What holds the graph now is the
+//! **The strongest evidence for the port does not survive here.** The two
+//! builders were compared edge for edge over 18,400 nodes and 352,323 edges, and
+//! the two traversals over 45,465 pages of real data. Neither comparison can be
+//! written without a reference. What holds the graph now is the
 //! round trip, the loader's rejections, the memory arithmetic, the sort tie
 //! order, the level stream against a recorded golden vector, the reservation
 //! cap, the seam wiring, the eight graph guards in `hnsw_index`, and the
@@ -280,8 +280,8 @@ fn the_mutable_loader_refuses_malformed_topology() {
     assert!(MutableGraph::from_loaded(ok(), PointId(0, 0), 16, 64, -1.0, CosineDist {}).is_err());
 }
 
-/// The memory figure is exact arithmetic over the buffers, so the per-node
-/// arithmetic the relays state can be checked rather than believed.
+/// The memory figure is exact arithmetic over the buffers, so the documented
+/// per-node arithmetic can be checked rather than believed.
 #[test]
 fn the_mutable_memory_figure_is_exact() {
     const M: usize = 8;
@@ -331,7 +331,7 @@ fn the_mutable_memory_figure_is_exact() {
 
     // Every layer holds the points drawn at exactly that level, and the span a
     // node needs runs above it, so the list count exceeds what the levels alone
-    // predict. That gap is the correction relay 79 made to the layout.
+    // predict. That gap is what the layout accounts for.
     let by_level: usize = layer_lens
         .iter()
         .enumerate()

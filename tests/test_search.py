@@ -190,11 +190,10 @@ def test_distance_metrics():
     result_cos = index_cos.add(records)
     assert result_cos.is_success()
     results_cos = index_cos.search(query_vector, top_k=2)
-    # Two records and top_k of 2, so both come back. This was the assertion relay
-    # 08 relaxed after it failed with 1 == 2 against an unseeded parallel build.
-    # The build is sequential and the level generator is seeded, and the vendored
-    # reverse link fix files layer zero adjacency for both points, so neither
-    # point can be unreachable.
+    # Two records and top_k of 2, so both come back. An unseeded parallel build
+    # could return one. The build is sequential and the level generator is
+    # seeded, and the reverse link fix files layer zero adjacency for both
+    # points, so neither point can be unreachable.
     assert len(results_cos) == 2
     assert {r["id"] for r in results_cos} == expected_ids
     assert all(np.isfinite(r["score"]) for r in results_cos)
@@ -1047,3 +1046,35 @@ def test_dot_and_cosine_agree_on_normalised_input():
     assert [i for i, _ in pages["cosine"]] == [i for i, _ in pages["dot"]]
     for (_, a), (_, b) in zip(pages["cosine"], pages["dot"]):
         assert abs(a - b) < 1e-5, (a, b)
+
+
+# ------------------------------------------------------------
+# top_k and ef_search ceilings
+# ------------------------------------------------------------
+def test_top_k_and_ef_search_have_ceilings():
+    """Both sized the candidate heaps with no upper bound, and 2**40 killed the interpreter.
+
+    The traversal allocates two heaps of 8 bytes a slot from the search width
+    before it visits a node, and top_k reaches the same width through the
+    default ef_search of twice top_k. search(top_k=2**40) asked for 16 TB,
+    search(ef_search=2**40) for 8 TB, and top_k=2**33 for 137 GB, each ending
+    the process with exit status 3221226505 on a healthy index. No subprocess:
+    the bound is checked before anything is allocated, so a broken bound would
+    return results or die rather than raise, and either fails the assertions.
+    """
+    index = VectorDatabase().create("hnsw", dim=4, expected_size=4)
+    index.add({"ids": ["a", "b"], "embeddings": [[1.0, 0, 0, 0], [0, 1.0, 0, 0]]})
+    query = np.array([1.0, 0, 0, 0], dtype=np.float32)
+    with pytest.raises(ValueError, match="top_k must be at most 65536, got 65537"):
+        index.search(query, top_k=65_537)
+    with pytest.raises(ValueError, match="top_k must be at most 65536, got 1099511627776"):
+        index.search(query, top_k=1 << 40)
+    with pytest.raises(ValueError, match="ef_search must be at most 131072, got 131073"):
+        index.search(query, top_k=2, ef_search=131_073)
+    with pytest.raises(ValueError, match="ef_search must be at most 131072, got 1099511627776"):
+        index.search(query, top_k=2, ef_search=1 << 40)
+    # The ceilings are inclusive, and a page wider than the index is a result.
+    assert len(index.search(query, top_k=65_536)) == 2
+    assert len(index.search(query, top_k=2, ef_search=131_072)) == 2
+    # Zero stays accepted, as test_compaction.py already holds.
+    assert index.search(query, top_k=0, ef_search=0) == []

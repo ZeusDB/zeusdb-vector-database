@@ -7,12 +7,12 @@
 //!
 //! # A filter now decides the page rather than trimming it
 //!
-//! Until relay 86 the filter ran in `collect_hits`, which is after the graph
+//! The filter used to run in `collect_hits`, which is after the graph
 //! has already cut to `top_k`. A filter matching one record in a hundred
 //! therefore discarded most of a ten result page and returned what was left,
-//! and one matching one record in a thousand returned nothing at all. Relay 85
-//! measured that as post-filter recall of 0.0090 at one match in a hundred and
-//! 0.0000 below it, on all three real sets.
+//! and one matching one record in a thousand returned nothing at all. That
+//! measured as post-filter recall of 0.0090 at one match in a hundred and 0.0000
+//! below it, on all three real sets.
 //!
 //! Two paths replace it, and [`HNSWIndex::search_candidates`] picks between
 //! them per search.
@@ -89,7 +89,7 @@ use tracing::{debug, error, instrument, trace, warn};
 ///
 /// # What the two paths actually cost
 ///
-/// Relay 86 built the crate twice, once with this at zero so every filtered
+/// The crate was built twice, once with this at zero so every filtered
 /// search traverses and once with it above the corpus so every one scans, and
 /// measured both at each selectivity on all three real sets at 100,000 records.
 /// Microseconds per query, minimum of two passes over thirty queries.
@@ -113,8 +113,7 @@ use tracing::{debug, error, instrument, trace, warn};
 /// above sits at 25 to 28 milliseconds whatever matched, except the two broad
 /// ones where the matched records' own distances add to it, and 25 milliseconds
 /// is 100,000 records at about 250 nanoseconds each. **That walk, and not the
-/// distances, is what a filtered search pays for.** Relay 85 measured the same
-/// per-record figure and named the same cause.
+/// distances, is what a filtered search pays for.**
 ///
 /// A filter matching just over the threshold is therefore the worst case, since
 /// it walks the whole corpus, gives up, and then traverses as well. It pays the
@@ -133,11 +132,11 @@ use tracing::{debug, error, instrument, trace, warn};
 /// # What this does not settle
 ///
 /// Every figure above is at 100,000 records. The walk is linear in the corpus
-/// and the traversal is not, so the crossover moves with corpus size and this
-/// relay did not measure where. Relay 85 recommended 5,000 from the crossover
-/// between a scan and an **unfiltered** search, which is not the comparison
-/// that matters, and then said so itself. The number it named survives on this
-/// evidence rather than on that reasoning.
+/// and the traversal is not, so the crossover moves with corpus size and where
+/// it moves to is not measured here. The threshold's value was first derived
+/// from the crossover between a scan and an **unfiltered** search, which is not
+/// the comparison that matters. It survives on the evidence above rather than on
+/// that derivation.
 ///
 /// It is not settable per search. Nothing measured here wants a different
 /// number, and a knob nobody has a reason to turn is a knob that goes wrong.
@@ -260,9 +259,8 @@ impl HNSWIndex {
     /// and at 1,536 dimensions that is thousands of six kilobyte reads charged
     /// to every broad filtered search. Deferring them costs one extra pass over
     /// a list of at most `FULL_SCAN_THRESHOLD` borrowed ids and makes the
-    /// give-up path free of distance work entirely. The relay that specified
-    /// this described one fused pass; the results are identical either way and
-    /// this is the cheaper of the two.
+    /// give-up path free of distance work entirely. A single fused pass gives
+    /// identical results, and this is the cheaper of the two.
     ///
     /// **What it scores against.** The stored raw vector where the index holds
     /// one and the reconstruction from the record's codes where it does not,
@@ -599,9 +597,7 @@ impl HNSWIndex {
     /// reading the lock again on the same thread is the second acquisition the
     /// declared lock order forbids: the standard library queues readers behind a
     /// waiting writer, so it blocks forever the moment a concurrent insert lands
-    /// between the two. That is the deadlock relay 86 found when
-    /// `search_candidates` called `HNSWIndex::is_quantized`, and the first
-    /// version of this function reintroduced it.
+    /// between the two.
     fn warn_undeclared_filter_field(
         &self,
         columns: &ColumnStore,
@@ -663,10 +659,7 @@ impl HNSWIndex {
     ///
     /// The single query path and the two batch paths each held their own copy
     /// of this. The three copies agreed, and a rule that has to hold across
-    /// every search path is one that must not be stated three times: the
-    /// reconstruction fallback for `return_vector` was added to the batch
-    /// copies in a later relay than the single one, and for a while the three
-    /// disagreed about what a `quantized_only` index hands back.
+    /// every search path is one that must not be stated three times.
     ///
     /// The guards are taken by the caller and passed in, because each path
     /// holds them for a different span. The single query path and the

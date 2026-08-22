@@ -8,8 +8,8 @@
 //! construction needs. Both return the same page from the same topology,
 //! because both run this code.
 //!
-//! Relay 77 proved the port against the vendored traversal over 45,465 pages on
-//! real data. Lifting it out of `flat.rs` unchanged is what carries that proof
+//! The port was proved against the vendored traversal over 45,465 pages of real
+//! data. Lifting it out of `flat.rs` unchanged is what carries that proof
 //! onto the second structure: the parity tests that held the CSR to the
 //! vendored page still run, and the new ones differ only in which accessor is
 //! passed in.
@@ -136,8 +136,8 @@ const CACHE_LINE: usize = 64;
 
 /// Leading cache lines of a neighbour's vector to hint before it is scored.
 ///
-/// Relay 86 swept this on the three real sets at 100,000 records against a
-/// build with the hint absent, alternating the builds over six rounds and
+/// This was swept on the three real sets at 100,000 records against a build
+/// with the hint absent, alternating the builds over six rounds and
 /// taking the minimum of every pass. The figure is the whole unfiltered search
 /// through the Python entry point, so it prices the traversal plus the fixed
 /// cost of the call around it rather than the traversal alone.
@@ -170,9 +170,9 @@ const CACHE_LINE: usize = 64;
 /// **At 1,536 dimensions no line count is worth anything.** A dbpedia vector is
 /// 6,144 bytes, being 96 lines, so two, four, eight, sixteen and thirty-two are
 /// five genuinely different amounts of hinting and all five land inside 4.4
-/// percent of the no-hint build. Relay 85 measured 1.01 to 1.08 times there and
-/// flagged that its null result might be an artefact of its own eight line cap.
-/// **It is not.** The cause is in relay 85's bandwidth measurement: at 1,536
+/// percent of the no-hint build. An earlier sweep measured 1.01 to 1.08 times
+/// there and flagged that its null result might be an artefact of its own eight
+/// line cap. **It is not.** The cause is in the bandwidth: at 1,536
 /// dimensions the hardware streamer has a 96 line run to work with once the
 /// first line lands and the search is already within 1.43 times the sequential
 /// floor, where at 128 dimensions a row is eight lines, there is no run to
@@ -189,9 +189,9 @@ const PREFETCH_LINES: usize = 8;
 /// A prefetch is a hint and nothing else. It moves no data the program can
 /// observe, sets no flag, and the architecture defines it as unable to fault,
 /// so this cannot change which page `search_layer` returns and cannot fail. The
-/// proof is not left to that argument: relay 86 compared recall at 10 to four
-/// decimal places and a fixed query set's ids and score bits with the hint
-/// present and absent, on all three sets, and every figure is identical.
+/// proof is not left to that argument: recall at 10 was compared to four decimal
+/// places, and a fixed query set's ids and score bits with the hint present and
+/// absent, on all three sets, and every figure is identical.
 ///
 /// The `unsafe` is `_mm_prefetch`'s own, which `core::arch` marks unsafe
 /// because it is a target feature intrinsic rather than because the operation

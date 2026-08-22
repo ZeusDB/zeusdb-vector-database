@@ -8,10 +8,9 @@ the truth. These tests cover the graph figure being reported at all, its shape
 against the parameters that drive it, and the reported total against the bytes
 the structure cannot avoid holding.
 
-Nothing here reads the resident set. It was read until this relay, as a delta
-across a build in a process of its own, and it turned out to be confounded by
-more than it measured. What replaced it and what the two confounders came to
-are recorded above `_structure_floor_mb`.
+Nothing here reads the resident set. Reading it as a delta across a build in a
+process of its own is confounded by more than it measures. What replaces it, and
+what the two confounders come to, are recorded above `_structure_floor_mb`.
 """
 
 import warnings
@@ -253,8 +252,8 @@ def _structure_floor_mb(index, records, dim):
         element_bytes = dim * 4
 
     # One copy of every raw vector, not two. The index used to hold a map of
-    # them beside the graph's own arena; relay 95 removed the map, so the floor
-    # counts the store once. The graph's own element is a code on a quantized
+    # them beside the graph's own arena; the map is gone, so the floor counts
+    # the store once. The graph's own element is a code on a quantized
     # index and is the store itself on a raw one, so it is only added where the
     # two are different things.
     store = records * dim * 4 if int(stats["raw_vectors_stored"]) else 0
