@@ -188,7 +188,7 @@ HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=5, vecto
 | Parameter        | Type   | Default   | Description                                                                 |
 |------------------|--------|-----------|-----------------------------------------------------------------------------|
 | `index_type`     | `str`  | `"hnsw"`  | The type of vector index to create. Currently only `"hnsw"` is supported. Case-insensitive. |
-| `dim`            | `int`  | *required* | Dimensionality of the vectors to be indexed. Each vector must have this length. Must be positive. **Required as of 0.8.0**, see below. |
+| `dim`            | `int`  | *required* | Dimensionality of the vectors to be indexed, from 1 to 65,536. Each vector must have this length. **Required as of 0.8.0**, see below. |
 | `space`          | `str`  | `"cosine"`| Distance metric used for similarity search. One of `"cosine"`, `"l1"`, `"l2"`. Case-insensitive. |
 | `m`              | `int`  | `16` or `32`, see below | Number of bi-directional connections created for each new node, from 2 to 256. Higher `m` improves recall but increases index size and build time. |
 | `ef_construction`| `int`  | `200`     | Width of the candidate search each insertion runs. Must be positive. It costs build time and buys graph quality, and it changes neither search latency nor the size of the finished index. See below. |

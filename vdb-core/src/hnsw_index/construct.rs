@@ -18,6 +18,27 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace};
+/// Widest `dim` a caller may declare, and the widest a saved index may name.
+///
+/// `dim` is the width of one vector buffer, so sizing that buffer from the
+/// declared width is the first allocation either creation or loading makes.
+/// `create(dim=2**40)` asked the allocator for 4,398,046,511,104 bytes and
+/// **aborted the process** with exit status 3221226505. An allocation failure
+/// does not unwind, so no `catch_unwind` sees one and a Python caller gets a
+/// dead interpreter with no traceback.
+///
+/// The loader carried this bound first, on the reasoning that bounding it here
+/// would change `create()`'s documented contract. It changes it, and the README
+/// row now says so, which is what makes the two doors refuse the same values.
+///
+/// The ceiling is derived rather than measured. One vector at this width is
+/// 262,144 bytes, and the widest embedding any published model produces is an
+/// order of magnitude below it, so the bound refuses nothing an embedding model
+/// can generate. What it costs at the ceiling is that width per record: a
+/// thousand records at 65,536 values is 262 MB, which is an allocation the
+/// process can refuse rather than one it dies on.
+pub(crate) const MAX_DIM: usize = 65_536;
+
 /// Largest `expected_size` a caller may declare.
 ///
 /// `expected_size` reaches `PointIndexation::new` in the vendored graph crate,
@@ -80,6 +101,28 @@ pub(crate) fn validate_index_parameters(
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
             "{}dim must be positive, got {}",
             source, dim
+        )));
+    }
+    if dim > MAX_DIM {
+        error!(
+            operation = "validation",
+            field = "dim",
+            value = dim,
+            max_allowed = MAX_DIM,
+            "dim exceeds maximum"
+        );
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "{}dim must be at most {}, got {}. dim is the width of one vector 
+             buffer, so sizing that buffer from the declared width is the 
+             first allocation this index makes. That allocation is not 
+             fallible: above this bound the process aborts rather than 
+             raising. One vector at the ceiling is {} bytes, an order of 
+             magnitude above the widest embedding any published model 
+             produces.",
+            source,
+            MAX_DIM,
+            dim,
+            MAX_DIM * 4
         )));
     }
     if ef_construction == 0 {

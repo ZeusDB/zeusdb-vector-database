@@ -66,24 +66,13 @@ const SUPPORTED_FORMAT_MAJOR: u32 = 1;
 // THE BINCODE CLAIM BUDGET
 // ============================================================================
 
-/// The widest vector this build will rebuild an index at
-///
-/// `dim` had no upper bound. It is the width of one vector buffer, so a
-/// config.json naming 2^40 made the loader ask the allocator for
-/// 4,398,046,511,104 bytes and **abort the process**, which does not unwind, so
-/// no `catch_unwind` sees it and a Python caller gets a dead interpreter with no
-/// traceback. It is the same shape as the `id_counter` defect and is bounded
-/// here for the same reason, in the loader rather than in
-/// `validate_index_parameters`, so `create()`'s documented contract is
-/// unchanged.
-///
-/// The ceiling is derived rather than measured. One vector at this width is
-/// 262,144 bytes, and the widest embedding any published model produces is an
-/// order of magnitude below it, so the bound refuses nothing an embedding model
-/// can generate. What it costs at the ceiling is that width per record: a
-/// thousand records at 65,536 values is 262 MB, which is an allocation the
-/// process can refuse rather than one it dies on.
-const MAX_LOADED_DIM: usize = 65_536;
+// `dim` was bounded here first, at 65,536, on the reasoning that bounding it
+// in `validate_index_parameters` would change `create()`'s documented
+// contract. `create(dim=2**40)` aborted the process for the same reason a
+// config naming it did, so the bound moved to `validate_index_parameters` as
+// `MAX_DIM` and the README row changed with it. `load_config` calls that
+// function, so the loader still refuses every width it refused, at the same
+// number, with config.json named in the message.
 
 /// The claim budget one wire byte earns, and why it is 64
 ///
@@ -576,26 +565,6 @@ fn load_config(path: &Path) -> PyResult<IndexConfig> {
              does not describe an index this build can rebuild.",
             config_path.display(),
             config.id_counter
-        )));
-    }
-    // `dim` too, which `validate_index_parameters` checks only for zero. It is
-    // the width of one vector buffer, so a config naming 2^40 asked for four
-    // terabytes and aborted before any record was examined. See
-    // `MAX_LOADED_DIM`. A width the file cannot support is still caught later
-    // by the record width check, which is what refuses a merely large one; this
-    // refuses the ones that never reach it.
-    if config.dim > MAX_LOADED_DIM {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}: dim is {}, and this build rebuilds an index at up to {} values a \
-             vector. One vector at that width is {} bytes, which is an order of \
-             magnitude above the widest embedding any published model produces. \
-             Reading this file would size a vector buffer from the declared width \
-             before any record was examined, and that allocation is not fallible: \
-             above this bound the process aborts rather than raising.",
-            config_path.display(),
-            config.dim,
-            MAX_LOADED_DIM,
-            MAX_LOADED_DIM * 4
         )));
     }
     // The declaration too, for the same reason. A config naming a field twice,

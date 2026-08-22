@@ -307,8 +307,8 @@ def test_a_hostile_quantization_field_is_refused(quantized_index, tmp_path, fiel
 @pytest.mark.parametrize(
     "fields,naming",
     [
-        ({"dim": HUGE}, "dim is 1099511627776"),
-        ({"dim": 1 << 31}, "dim is 2147483648"),
+        ({"dim": HUGE}, "dim must be at most 65536, got 1099511627776"),
+        ({"dim": 1 << 31}, "dim must be at most 65536, got 2147483648"),
         ({"id_counter": HUGE}, "id_counter is 1099511627776"),
     ],
     ids=["dim-huge", "dim-2^31", "id_counter-huge"],
@@ -322,6 +322,70 @@ def test_a_hostile_config_field_is_refused(raw_index, tmp_path, fields, naming):
     """
     path = forged(raw_index, tmp_path, "config.json", edit_json(**fields))
     assert_refused(path, tmp_path, naming=naming)
+
+
+CREATE_CHILD = """
+import sys, warnings
+warnings.simplefilter("ignore")
+from zeusdb_vector_database import VectorDatabase
+try:
+    index = VectorDatabase().create("hnsw", dim=int(sys.argv[1]), expected_size=4)
+    print("CREATED", index.dim)
+except BaseException as exc:
+    print("REFUSED", type(exc).__name__, str(exc).replace(chr(10), " "))
+"""
+
+
+def create_in_child(dim, tmp_path):
+    """Create an index in a subprocess and report how the child ended."""
+    script = tmp_path / "create_probe.py"
+    script.write_text(CREATE_CHILD, encoding="utf-8")
+    child_env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(script), str(dim)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=child_env, timeout=LOAD_TIMEOUT_S,
+    )
+    verdicts = [
+        line for line in result.stdout.splitlines()
+        if line.startswith(("CREATED", "REFUSED"))
+    ]
+    return result.returncode, (verdicts[-1] if verdicts else ""), result
+
+
+@pytest.mark.parametrize(
+    "dim",
+    [HUGE, 1 << 31, 65_537],
+    ids=["dim-huge", "dim-2^31", "dim-one-over"],
+)
+def test_creating_at_a_hostile_dim_is_refused(dim, tmp_path):
+    """`create()` had no upper bound on `dim` at all.
+
+    `dim` sizes one vector buffer, which is the first allocation creation makes,
+    so `create(dim=2**40)` asked the allocator for 4,398,046,511,104 bytes and
+    killed the interpreter with exit status 3221226505. Every other creation
+    parameter that sizes an allocation was already bounded, and the loader
+    bounded this one, so creation was the last door that admitted it.
+
+    It runs in a subprocess for the reason every case in this file does: an
+    abort is not an exception, and an in-process test cannot tell a refusal from
+    a death.
+    """
+    status, verdict, result = create_in_child(dim, tmp_path)
+    assert status == 0, (
+        "the child did not survive the create, which is what an allocation "
+        f"sized from an unbounded dim does. Exit status {status}." \
+        + result.stdout[-2000:] + result.stderr[-2000:]
+    )
+    assert verdict.startswith("REFUSED"), f"the create was not refused: {verdict}"
+    assert f"dim must be at most 65536, got {dim}" in verdict, verdict
+
+
+def test_creating_at_the_dim_ceiling_still_works(tmp_path):
+    """The bound admits the value it names, so the ceiling is inclusive."""
+    status, verdict, _ = create_in_child(65_536, tmp_path)
+    assert status == 0
+    assert verdict == "CREATED 65536", verdict
 
 
 def test_the_dim_ceiling_admits_the_widest_real_embedding(tmp_path):

@@ -97,3 +97,27 @@ tempfile = "3"
 lto = true          # Fat link-time optimization
 codegen-units = 1   # Single compilation unit
 opt-level = 3       # Full optimization
+
+# An optimised build that keeps `debug_assertions` on.
+#
+# The lock rank registry in src/hnsw_index/locks.rs is gated on
+# `cfg(debug_assertions)` and on nothing else, so it is live in any profile
+# that leaves them on. It had never run against tests/test_quantization.py or
+# tests/test_metadata_columns.py, which is 282 of the suite, because the only
+# build with the assertions on was the unoptimised one and the k-means and
+# insertion paths those two files exercise are far slower without
+# optimisation. The pair takes 131.8 s on a release build and the debug build
+# was measured at more than forty minutes.
+#
+# This profile is the release profile with the assertions turned back on, so
+# the registry runs at release speed and the gap closes with no scheduled job
+# and no faster machine. Build it with
+#
+#   maturin develop --profile checked
+#
+# and run the suite as usual. Turn `lto` off here rather than inheriting it if
+# the build time matters more than the run time; it is on so that the timing
+# is comparable with the release build the figures above were taken on.
+[profile.checked]
+inherits = "release"
+debug-assertions = true

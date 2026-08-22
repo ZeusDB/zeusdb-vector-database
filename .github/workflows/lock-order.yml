@@ -1,0 +1,95 @@
+# The whole Python suite with the lock rank registry live.
+#
+# Why it is not in ci.yml
+#
+# The registry in vdb-core/src/hnsw_index/locks.rs is gated on
+# `cfg(debug_assertions)` and on nothing else. Every gate in ci.yml builds the
+# extension the way the wheel is built, which is a release build with the
+# assertions off, so the registry has never run against a single Python test on
+# a runner. Locally it had never run against tests/test_quantization.py or
+# tests/test_metadata_columns.py either, which is 282 of the 766, because the
+# only build with the assertions on was the unoptimised one and those two files
+# were measured at more than forty minutes on it.
+#
+# The `checked` profile in vdb-core/Cargo.toml is the release profile with the
+# assertions turned back on, which is what makes this affordable. Measured on
+# Windows, the 282 take 297 s against 131.8 s on a release build, and the whole
+# suite takes 387 s against 256 s. That is 1.5x, not the 20x the unoptimised
+# build cost.
+#
+# It is scheduled rather than per push because it doubles the test job for a
+# property that changes only when a lock is added, a guard is nested or an
+# acquisition order is altered. A weekly run and a button is the right cadence
+# for that. Run it by hand from the Actions tab after any change to a lock.
+#
+# What it proves
+#
+# That no code path any Python test reaches takes the same guard twice on one
+# thread, and that none inverts the declared order. Three relays shipped a
+# nested read that a person found by reading, and each was a hang waiting for a
+# writer to land in the window. The assertion fires on the acquisition itself,
+# with no writer and no scheduling, so this finds that class deterministically.
+#
+# What it does not prove
+#
+# Anything across threads. The held set is per thread, so a guard held across a
+# rayon fork is invisible to the workers, which is correct: the rule the order
+# encodes is about one thread's own acquisitions.
+name: Lock order
+
+on:
+  schedule:
+    # 04:17 UTC on Mondays. Off the hour, because the scheduler queues runs
+    # filed on the hour behind everyone else's.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lock-order:
+    runs-on: ubuntu-latest
+    # The suite is roughly six and a half minutes locally with the assertions
+    # on. This is a long way above that so a slow runner does not fail the run,
+    # and far enough below the six hour default to be a real bound.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      # From rust-toolchain.toml, as in ci.yml. See the note there.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vdb-core
+          # Its own key. The `checked` profile is a different profile from the
+          # one ci.yml builds, so sharing the key would evict that cache on
+          # every run of this one.
+          shared-key: vdb-core-checked
+          cache-on-failure: true
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install the project without building the extension
+        # --no-install-project installs the dependencies and skips the package
+        # itself, so the build below is the only one and there is no release
+        # extension for it to overwrite.
+        run: uv sync --locked --extra dev --no-install-project
+      - name: Build the extension with debug assertions on
+        run: uv run --no-sync maturin develop --profile checked
+      - name: Confirm the registry is actually in the built module
+        # The gate is worthless if the profile silently stopped carrying the
+        # assertions, and a passing suite looks the same either way. The
+        # assertion text is in the binary or it is not.
+        run: |
+          module=$(uv run --no-sync python -c "import zeusdb_vector_database as z, pathlib; print(next(pathlib.Path(z.__file__).parent.glob('*.so')))")
+          echo "checking $module"
+          grep -q "inverts the declared" "$module"
+          grep -q "taking the same guard twice" "$module"
+      - name: Run the Python test suite
+        run: uv run --no-sync pytest tests
