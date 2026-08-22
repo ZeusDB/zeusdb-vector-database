@@ -49,7 +49,7 @@
 //! A disjunction with an undeclared branch is the last of those, since that
 //! branch could match anything and a union with the live set is the live set.
 
-use crate::filter::{field_test_matches, FieldTest, Filter};
+use crate::filter::{field_test_matches, FieldTest, Filter, Presence};
 use pyo3::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -361,6 +361,32 @@ impl Column {
                 }
                 for (slot, &code) in codes.iter().enumerate().take(slots) {
                     if code != ABSENT && matching[code as usize] {
+                        out.set(slot);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every slot this column holds a value for, whatever that value is
+    ///
+    /// This is what answers `exists` and `is_missing`. It reports a slot no
+    /// record occupies as absent too, which is why the caller intersects with
+    /// the live set rather than trusting it alone.
+    fn present(&self, slots: usize) -> Bitmap {
+        let mut out = Bitmap::zeros(slots);
+        match self {
+            Column::Plain { values } => {
+                for (slot, value) in values.iter().enumerate().take(slots) {
+                    if value.is_some() {
+                        out.set(slot);
+                    }
+                }
+            }
+            Column::Dictionary { codes, .. } => {
+                for (slot, &code) in codes.iter().enumerate().take(slots) {
+                    if code != ABSENT {
                         out.set(slot);
                     }
                 }
@@ -726,7 +752,7 @@ impl ColumnStore {
     /// and there is nothing to report about any of those.
     fn first_undeclared<'f>(&self, filter: &'f Filter) -> Option<&'f str> {
         match filter {
-            Filter::Field { name, .. } => {
+            Filter::Field { name, .. } | Filter::Presence { name, .. } => {
                 (!self.index_of.contains_key(name)).then_some(name.as_str())
             }
             Filter::All(branches) | Filter::Any(branches) => branches
@@ -775,6 +801,32 @@ impl ColumnStore {
         match filter {
             Filter::Field { name, test } => match self.index_of.get(name) {
                 Some(&position) => Bounds::Exact(self.columns[position].select(test, self.slots)),
+                None => Bounds::Range {
+                    lower: Bitmap::zeros(self.slots),
+                    upper: self.live_set(),
+                },
+            },
+            // A declared column answers presence exactly, because it holds a
+            // value for a slot exactly when that record carries the field. Both
+            // answers are taken inside the live set, so a slot no record
+            // occupies never appears in either.
+            Filter::Presence { name, want } => match self.index_of.get(name) {
+                Some(&position) => {
+                    let live = self.live_set();
+                    let held = match want {
+                        Presence::Present | Presence::Absent => {
+                            self.columns[position].present(self.slots)
+                        }
+                        Presence::Null | Presence::NotNull => self.columns[position]
+                            .select(&FieldTest::Equals(Value::Null), self.slots),
+                    };
+                    let mut out = live;
+                    match want {
+                        Presence::Present | Presence::Null => out.intersect(&held),
+                        Presence::Absent | Presence::NotNull => out = held.complement_within(&out),
+                    }
+                    Bounds::Exact(out)
+                }
                 None => Bounds::Range {
                     lower: Bitmap::zeros(self.slots),
                     upper: self.live_set(),
@@ -1430,6 +1482,10 @@ mod tests {
             Filter::All(branches) => Filter::All(branches.iter().map(clone_filter).collect()),
             Filter::Any(branches) => Filter::Any(branches.iter().map(clone_filter).collect()),
             Filter::Not(inner) => Filter::Not(Box::new(clone_filter(inner))),
+            Filter::Presence { name, want } => Filter::Presence {
+                name: name.clone(),
+                want: *want,
+            },
         }
     }
 

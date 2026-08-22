@@ -1,5 +1,7 @@
 """Single vector and batch search, ranking, distance metrics and search edge cases."""
 
+import json
+
 import pytest
 import struct
 
@@ -865,3 +867,183 @@ def test_batch_dispatch_reads_arrays_without_the_sequence_protocol():
     filtered_array = index.search(queries, top_k=3, filter={"type": "test"})
     filtered_list = index.search(queries.tolist(), top_k=3, filter={"type": "test"})
     assert page_bits(filtered_array) == page_bits(filtered_list)
+
+
+# ============================================================================
+# THE INNER PRODUCT SPACE
+# ============================================================================
+#
+# `space="dot"` is the fourth metric. It is the only one whose score can be
+# negative, because it returns `1 - dot` and an inner product above one gives
+# one, and the only one that does not normalise what it is given.
+
+
+def _dot_corpus(seed=31, n=240, dim=16, scale=3.0):
+    rng = np.random.default_rng(seed)
+    return (rng.standard_normal((n, dim)).astype(np.float32) * scale)
+
+
+def _dot_index(corpus, **kwargs):
+    n, dim = corpus.shape
+    index = VectorDatabase().create("hnsw", dim=dim, space="dot",
+                                    expected_size=max(n, 100), **kwargs)
+    assert index.add({
+        "ids": [f"d{i}" for i in range(n)],
+        "embeddings": corpus,
+        "metadatas": [{"g": i % 3} for i in range(n)],
+    }).is_success()
+    return index
+
+
+def test_dot_is_accepted_and_reported_the_way_the_other_three_are():
+    corpus = _dot_corpus()
+    index = _dot_index(corpus)
+    assert index.space == "dot"
+    assert index.get_space() == "dot"
+    assert "space=dot" in index.info()
+    assert index.get_stats()["space"] == "dot"
+    # Case insensitive, as every other space name is.
+    assert VectorDatabase().create("hnsw", dim=4, space="DOT").space == "dot"
+
+
+def test_an_unsupported_space_names_dot_among_the_four():
+    with pytest.raises(RuntimeError, match=r"'cosine', 'l2', 'l1', 'dot'"):
+        VectorDatabase().create("hnsw", dim=4, space="inner_product")
+
+
+def test_dot_does_not_normalise_what_it_stores():
+    """The one difference between this space and cosine, and it is the point.
+
+    Under cosine a stored vector comes back as the unit vector, so the length a
+    caller supplied is gone. Under dot the length is part of the score, so it is
+    kept and `get_records` returns what was inserted.
+    """
+    corpus = _dot_corpus(n=40)
+    index = _dot_index(corpus)
+    back = np.asarray(index.get_records("d0", return_vector=True)[0]["vector"],
+                      dtype=np.float32)
+    assert np.allclose(back, corpus[0], atol=0, rtol=0)
+    assert np.linalg.norm(back) > 2.0, "the corpus is scaled, so this is not a unit vector"
+
+
+def test_a_dot_score_is_one_minus_the_inner_product():
+    """What the score field means, which is what the README has to say."""
+    corpus = _dot_corpus(n=120)
+    index = _dot_index(corpus)
+    query = corpus[7]
+    page = index.search(query.tolist(), top_k=8, ef_search=120)
+    truth = 1.0 - (corpus.astype(np.float64) @ query.astype(np.float64))
+    for hit in page:
+        want = truth[int(hit["id"][1:])]
+        assert abs(hit["score"] - want) <= 1e-4 + 1e-5 * abs(want), hit
+
+    # Negative scores are ordinary here and are ordered like any other.
+    assert min(hit["score"] for hit in page) < 0.0
+    scores = [hit["score"] for hit in page]
+    assert scores == sorted(scores)
+
+
+def test_a_dot_index_round_trips_through_a_save_and_a_load(tmp_path):
+    corpus = _dot_corpus(n=200)
+    index = _dot_index(corpus)
+    rng = np.random.default_rng(99)
+    queries = rng.standard_normal((5, corpus.shape[1])).astype(np.float32)
+    before = [[(h["id"], h["score"]) for h in index.search(q.tolist(), top_k=10,
+                                                           ef_search=200)]
+              for q in queries]
+
+    path = tmp_path / "dot.zdb"
+    index.save(str(path))
+    assert json.loads((path / "config.json").read_text(encoding="utf-8"))["space"] == "dot"
+
+    loaded = VectorDatabase().load(str(path))
+    assert loaded.space == "dot"
+    after = [[(h["id"], h["score"]) for h in loaded.search(q.tolist(), top_k=10,
+                                                           ef_search=200)]
+             for q in queries]
+    assert after == before
+
+    # The graph came back from the dump rather than being rebuilt, which is what
+    # a new GraphKind discriminant has to get right.
+    assert np.allclose(
+        np.asarray(loaded.get_records("d0", return_vector=True)[0]["vector"]),
+        corpus[0], atol=0, rtol=0)
+
+
+def test_a_filtered_dot_search_scores_with_the_inner_product():
+    """The exact scan path, which reads `raw_distance_fn` rather than the graph.
+
+    Without a `dot` arm there it scored with cosine, so a filtered search and an
+    unfiltered one on the same index ranked by two different quantities.
+    """
+    corpus = _dot_corpus(n=180)
+    index = _dot_index(corpus)
+    query = corpus[3]
+    page = index.search(query.tolist(), filter={"g": 0}, top_k=6)
+    truth = 1.0 - (corpus.astype(np.float64) @ query.astype(np.float64))
+    matching = [i for i in range(len(corpus)) if i % 3 == 0]
+    want = sorted(matching, key=lambda i: (truth[i], f"d{i}"))[:6]
+    assert [h["id"] for h in page] == [f"d{i}" for i in want]
+    for hit in page:
+        expected = truth[int(hit["id"][1:])]
+        assert abs(hit["score"] - expected) <= 1e-4 + 1e-5 * abs(expected)
+
+
+def test_dot_cannot_be_quantized():
+    """Named rather than served wrongly.
+
+    A quantized graph scores against a table of squared L2 distances to the
+    codebook whatever the space. For cosine that orders identically, because
+    every vector is a unit vector. For an inner product it does not, because the
+    stored vector's own length enters the L2 and not the inner product.
+    """
+    with pytest.raises(RuntimeError, match=r"space='dot' cannot be quantized"):
+        VectorDatabase().create(
+            "hnsw", dim=16, space="dot", expected_size=20000,
+            quantization_config={"type": "pq", "subvectors": 4, "bits": 8,
+                                 "training_size": 1000},
+        )
+
+
+def test_a_hand_assembled_dot_directory_claiming_quantization_is_refused(tmp_path):
+    """The same rule at load, because a config.json is not a caller."""
+    corpus = _dot_corpus(n=60)
+    index = _dot_index(corpus)
+    path = tmp_path / "forged.zdb"
+    index.save(str(path))
+
+    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    manifest["files_included"].append("quantization.json")
+    (path / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (path / "quantization.json").write_text(json.dumps({
+        "type": "pq", "subvectors": 4, "bits": 8, "training_size": 1000,
+        "max_training_vectors": None, "storage_mode": "quantized_only",
+        "is_trained": False, "training_completed_at": None, "memory_stats": None,
+        "pq_config": {"dim": 16, "sub_dim": 4, "num_centroids": 256},
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"space='dot' cannot be quantized"):
+        VectorDatabase().load(str(path))
+
+
+def test_dot_and_cosine_agree_on_normalised_input():
+    """`1 - dot` is the cosine distance once the input is a unit vector.
+
+    This is why the constant is there rather than plain negation: a caller who
+    has already normalised sees the same number under either space.
+    """
+    rng = np.random.default_rng(17)
+    raw = rng.standard_normal((150, 24)).astype(np.float32)
+    unit = (raw / np.linalg.norm(raw, axis=1, keepdims=True)).astype(np.float32)
+
+    pages = {}
+    for space in ("cosine", "dot"):
+        index = VectorDatabase().create("hnsw", dim=24, space=space, expected_size=300)
+        assert index.add({"ids": [f"u{i}" for i in range(150)],
+                          "embeddings": unit}).is_success()
+        pages[space] = [(h["id"], h["score"])
+                        for h in index.search(unit[5].tolist(), top_k=10, ef_search=150)]
+
+    assert [i for i, _ in pages["cosine"]] == [i for i, _ in pages["dot"]]
+    for (_, a), (_, b) in zip(pages["cosine"], pages["dot"]):
+        assert abs(a - b) < 1e-5, (a, b)

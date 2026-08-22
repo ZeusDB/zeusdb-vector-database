@@ -53,8 +53,8 @@
 //! budget for a soak run by hand and is absent in CI.
 
 use super::dump::{
-    checksum_for_tests, read_dump, write_dump, DumpElement, Expected, GraphKind, DUMP_FILENAME,
-    LEGACY_DUMP_FILENAMES, NB_LAYER_MAX,
+    read_dump, write_dump, DumpElement, Expected, GraphKind, DUMP_FILENAME, LEGACY_DUMP_FILENAMES,
+    NB_LAYER_MAX,
 };
 use super::levels::LevelGenerator;
 use super::mutable::MutableGraph;
@@ -269,14 +269,14 @@ impl Op {
             }
             Op::RepairHeader => {
                 if blob.len() >= HEADER {
-                    let sum = checksum_for_tests(&blob[..88]);
+                    let sum = crate::checksum::checksum_of(&blob[..88]);
                     blob[88..96].copy_from_slice(&sum.to_le_bytes());
                 }
             }
             Op::RepairPayload => {
                 if blob.len() >= HEADER + TRAILER {
                     let end = blob.len() - TRAILER;
-                    let sum = checksum_for_tests(&blob[HEADER..end]);
+                    let sum = crate::checksum::checksum_of(&blob[HEADER..end]);
                     blob[end..end + 8].copy_from_slice(&sum.to_le_bytes());
                     blob[end + 8..].copy_from_slice(&END_MAGIC.to_le_bytes());
                 }
@@ -845,7 +845,8 @@ fn the_repairs_carry_mutations_past_the_checksums() {
     );
     assert!(
         with * 6 > TRIALS,
-        "only {} of {} repaired mutations were accepted whole, so the fuzzer is          testing the checksum rather than the parser",
+        "only {} of {} repaired mutations were accepted whole, so the fuzzer is testing the \
+         checksum rather than the parser",
         with,
         TRIALS
     );

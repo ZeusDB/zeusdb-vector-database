@@ -95,6 +95,7 @@
 
 use super::mutable::MutableGraph;
 use super::Distance;
+use crate::checksum::{checksum_of, Checksum};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -208,6 +209,12 @@ pub(crate) enum GraphKind {
     CosinePq = 4,
     L2Pq = 5,
     L1Pq = 6,
+    /// Inner product. There is no quantized counterpart, because the ADC table
+    /// a quantized graph scores against is a squared L2 distance whatever the
+    /// space, and ordering by that is not ordering by an inner product once the
+    /// stored vectors differ in length. `create()` refuses the pair, so no dump
+    /// can carry one.
+    Dot = 7,
 }
 
 impl GraphKind {
@@ -224,6 +231,7 @@ impl GraphKind {
             GraphKind::CosinePq => "quantized cosine",
             GraphKind::L2Pq => "quantized l2",
             GraphKind::L1Pq => "quantized l1",
+            GraphKind::Dot => "dot",
         }
     }
 
@@ -235,6 +243,7 @@ impl GraphKind {
             4 => Some(GraphKind::CosinePq),
             5 => Some(GraphKind::L2Pq),
             6 => Some(GraphKind::L1Pq),
+            7 => Some(GraphKind::Dot),
             _ => None,
         }
     }
@@ -289,120 +298,6 @@ impl DumpElement for u8 {
     fn decode(bytes: &[u8]) -> Vec<Self> {
         bytes.to_vec()
     }
-}
-
-// ============================================================================
-// CHECKSUM
-// ============================================================================
-
-/// A 64 bit checksum over a byte stream, consuming eight bytes per step.
-///
-/// FNV-1a's constants over whole words rather than single bytes, with a shift
-/// mixed in so that a word landing in the high bits still reaches the low ones,
-/// the total length folded in at the end so that appended zeros change the
-/// answer, and a final avalanche. It detects corruption. It is not a signature
-/// and nothing here treats it as one.
-///
-/// Whole words rather than bytes because the vector region of a 50,000 record
-/// dump at dimension 1,536 is 307 MB and a byte at a time would cost more than
-/// the read it is protecting.
-///
-/// A carry buffer holds a partial word between calls, so the answer depends on
-/// the bytes alone and not on how they were split across writes.
-struct Checksum {
-    state: u64,
-    carry: [u8; 8],
-    carry_len: usize,
-    len: u64,
-}
-
-/// FNV-1a's 64 bit offset basis.
-const CHECKSUM_SEED: u64 = 0xcbf2_9ce4_8422_2325;
-
-/// FNV-1a's 64 bit prime.
-const CHECKSUM_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-/// The multiplier of the final avalanche, taken from `splitmix64`.
-const CHECKSUM_AVALANCHE: u64 = 0xff51_afd7_ed55_8ccd;
-
-impl Checksum {
-    fn new() -> Self {
-        Checksum {
-            state: CHECKSUM_SEED,
-            carry: [0; 8],
-            carry_len: 0,
-            len: 0,
-        }
-    }
-
-    fn word(&mut self, word: u64) {
-        self.state ^= word;
-        self.state = self.state.wrapping_mul(CHECKSUM_PRIME);
-        self.state ^= self.state >> 29;
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        self.len = self.len.wrapping_add(bytes.len() as u64);
-        let mut rest = bytes;
-        if self.carry_len > 0 {
-            let take = (8 - self.carry_len).min(rest.len());
-            self.carry[self.carry_len..self.carry_len + take].copy_from_slice(&rest[..take]);
-            self.carry_len += take;
-            rest = &rest[take..];
-            if self.carry_len < 8 {
-                return;
-            }
-            let word = u64::from_le_bytes(self.carry);
-            self.word(word);
-            self.carry_len = 0;
-        }
-        let mut chunks = rest.chunks_exact(8);
-        for chunk in &mut chunks {
-            let mut word = [0u8; 8];
-            word.copy_from_slice(chunk);
-            self.word(u64::from_le_bytes(word));
-        }
-        let tail = chunks.remainder();
-        if !tail.is_empty() {
-            self.carry = [0; 8];
-            self.carry[..tail.len()].copy_from_slice(tail);
-            self.carry_len = tail.len();
-        }
-    }
-
-    fn finish(mut self) -> u64 {
-        if self.carry_len > 0 {
-            let mut word = [0u8; 8];
-            word[..self.carry_len].copy_from_slice(&self.carry[..self.carry_len]);
-            self.word(u64::from_le_bytes(word));
-        }
-        let len = self.len;
-        self.word(len);
-        let mut hash = self.state;
-        hash ^= hash >> 33;
-        hash = hash.wrapping_mul(CHECKSUM_AVALANCHE);
-        hash ^= hash >> 33;
-        hash
-    }
-}
-
-/// Checksum a slice that is already in memory, being the header.
-fn checksum_of(bytes: &[u8]) -> u64 {
-    let mut sum = Checksum::new();
-    sum.write(bytes);
-    sum.finish()
-}
-
-/// The same checksum, reachable from the fuzz mutator so that it can repair a
-/// header or a payload after touching it.
-///
-/// A mutator that cannot repair a checksum never gets past `Header::decode`, so
-/// it proves the checksum works and reaches no parsing code. See
-/// [`super::fuzz`]. Compiled only under `cfg(test)`, so the release build gains
-/// nothing.
-#[cfg(test)]
-pub(super) fn checksum_for_tests(bytes: &[u8]) -> u64 {
-    checksum_of(bytes)
 }
 
 // ============================================================================

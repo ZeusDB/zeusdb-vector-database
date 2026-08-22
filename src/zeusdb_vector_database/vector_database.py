@@ -190,7 +190,11 @@ class VectorDatabase:
                   you will add, since an index built at any other width rejects
                   every one of them. It defaulted to 1536 up to 0.7.0, which
                   silently built an index sized for one vendor's model family.
-                - space (str): Distance metric, one of 'cosine', 'l2', or 'l1' (default: 'cosine')
+                - space (str): Distance metric, one of 'cosine', 'l2', 'l1' or
+                  'dot' (default: 'cosine'). 'dot' is the inner product, and
+                  search() reports it as 1 - dot so that lower stays better;
+                  see the README. It does not normalise what you add, and it
+                  cannot be combined with quantization_config.
                 - m (int): Bidirectional links per node (min: 2, max: 256). Defaults
                   to 16 up to an expected_size of 25,000 and 32 above it. A graph
                   too sparse for the record count loses recall that no search

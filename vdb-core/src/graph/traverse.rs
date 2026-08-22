@@ -387,10 +387,26 @@ where
     }
 
     while let Some(c) = candidate_points.pop() {
-        assert!(c.dist_to_ref <= 0.);
+        // `!is_nan` where the vendored assertion was `<= 0.`, and the one below
+        // where it was `>= 0.`.
+        //
+        // Both were the same claim written two ways, that the distance function
+        // never returns a negative number. `DotDist` does: it returns
+        // `1 - dot`, and any inner product above one gives one, which
+        // unnormalised input reaches routinely. Nothing in the traversal needs
+        // the sign. The candidate heap is ordered by the negated distance and
+        // the result heap by the distance, `-(c.dist_to_ref) > f_dist_to_ref`
+        // is a comparison between two of them, and none of that reads a sign
+        // bit.
+        //
+        // **What the assertions really catch is a NaN**, because every
+        // comparison against a NaN is false, and that is kept exactly. A NaN
+        // query still stops here rather than reaching the heap, which is what
+        // `an_infinite_query_still_answers_and_a_nan_query_stops` asserts.
+        assert!(!c.dist_to_ref.is_nan());
         let f_dist_to_ref = match return_points.peek() {
             Some(f) => {
-                assert!(f.dist_to_ref >= 0.);
+                assert!(!f.dist_to_ref.is_nan());
                 f.dist_to_ref
             }
             None => f32::INFINITY,

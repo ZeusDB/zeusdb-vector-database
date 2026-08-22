@@ -8,11 +8,13 @@ Every method here has a case for an empty index, a case for the error it can
 raise or the falsehood it can report, and a case for ordinary use.
 """
 
+import json
 import os
 import tempfile
 
 import numpy as np
 import pytest
+from helpers import repair_manifest
 from zeusdb_vector_database import VectorDatabase
 
 
@@ -945,3 +947,242 @@ def test_construction_parameters_are_typed_properties():
     # Clearing the index does not change what it was built with.
     index.clear()
     assert (index.m, index.ef_construction, index.expected_size) == (24, 120, 777)
+
+
+# ============================================================================
+# THE SURFACE GAPS RELAY 102 CLOSED
+# ============================================================================
+
+
+def _presence_index(declared):
+    """Three records: one with a value, one with a stored null, one with no key."""
+    index = VectorDatabase().create(
+        "hnsw", dim=4, space="l2", expected_size=50,
+        indexed_fields=["lang"] if declared else [],
+    )
+    assert index.add([
+        {"id": "has", "vector": [1.0, 0, 0, 0], "metadata": {"lang": "en", "n": 1}},
+        {"id": "null", "vector": [0, 1.0, 0, 0], "metadata": {"lang": None, "n": 2}},
+        {"id": "none", "vector": [0, 0, 1.0, 0], "metadata": {"n": 3}},
+    ]).is_success()
+    return index
+
+
+@pytest.mark.parametrize("declared", [False, True],
+                         ids=["undeclared", "declared"])
+@pytest.mark.parametrize("condition,expected", [
+    ({"lang": {"exists": True}}, ["has", "null"]),
+    ({"lang": {"exists": False}}, ["none"]),
+    ({"lang": {"is_missing": True}}, ["none"]),
+    ({"lang": {"is_missing": False}}, ["has", "null"]),
+    ({"lang": {"is_null": True}}, ["null"]),
+    ({"lang": {"is_null": False}}, ["has", "none"]),
+    ({"lang": {"exists": True, "is_null": False}}, ["has"]),
+    ({"lang": {"exists": True, "eq": "en"}}, ["has"]),
+    ({"$not": {"lang": {"exists": True}}}, ["none"]),
+    ({"$or": [{"lang": {"is_null": True}}, {"lang": {"is_missing": True}}]},
+     ["none", "null"]),
+    ({"lang": {"is_missing": True}, "n": {"gt": 2}}, ["none"]),
+    ({"lang": {"is_missing": True}, "n": {"lt": 2}}, []),
+])
+def test_the_presence_operators_agree_on_both_filter_paths(declared, condition, expected):
+    """A declared column and the metadata walk answer these identically.
+
+    The column path is a bitmap of the slots that hold a value, taken inside the
+    live set. The walk asks the record. Declaring the field is what decides
+    which runs, so both are parametrized here rather than trusted to agree.
+    """
+    index = _presence_index(declared)
+    page = index.search([1.0, 0, 0, 0], filter=condition, top_k=9)
+    assert sorted(hit["id"] for hit in page) == expected
+    assert index.count(condition) == len(expected)
+
+
+def test_a_stored_null_and_a_missing_field_are_different_things():
+    """They are distinct in the storage format, which is what these rest on."""
+    index = _presence_index(False)
+    stored = {r["id"]: r["metadata"] for r in index.get_records(["has", "null", "none"])}
+    assert stored["null"]["lang"] is None
+    assert "lang" in stored["null"]
+    assert "lang" not in stored["none"]
+    # `eq` against null was already the way to ask, and `is_null` agrees with it.
+    assert index.count({"lang": None}) == index.count({"lang": {"is_null": True}}) == 1
+
+
+@pytest.mark.parametrize("operator", ["exists", "is_missing", "is_null"])
+def test_a_presence_operator_takes_a_boolean_and_nothing_else(operator):
+    index = _presence_index(False)
+    with pytest.raises(ValueError, match=rf'"{operator}" takes true or false'):
+        index.count({"lang": {operator: "yes"}})
+
+
+def test_a_presence_filter_does_not_delete_the_whole_index():
+    """`remove_where` refuses an unconditional filter, and these are not one."""
+    index = _presence_index(False)
+    assert index.remove_where({"lang": {"is_missing": True}}) == 1
+    assert len(index) == 2
+
+
+# ---------------------------------------------------------------- get_records
+
+
+def test_get_records_is_lenient_by_default_and_strict_on_request():
+    index = _presence_index(False)
+    present = index.get_records(["has", "gone", "also_gone"], return_vector=False)
+    assert [r["id"] for r in present] == ["has"]
+
+    with pytest.raises(KeyError) as raised:
+        index.get_records(["has", "gone", "also_gone"], return_vector=False, strict=True)
+    message = str(raised.value)
+    # Every absent id, sorted, so the message does not depend on the ask order.
+    assert "also_gone, gone" in message
+    assert "2 ids" in message
+    assert "  " not in message, "the message carries a run of spaces"
+
+
+def test_get_records_strict_returns_normally_when_every_id_is_present():
+    index = _presence_index(False)
+    got = index.get_records(["none", "has"], return_vector=False, strict=True)
+    assert sorted(r["id"] for r in got) == ["has", "none"]
+
+
+# ---------------------------------------------------------------- generated ids
+
+
+def test_a_generated_id_is_issued_once_in_the_life_of_an_index(tmp_path):
+    """`clear` used to reset the counter, so `vec_1` was handed out again.
+
+    An external reference to the first record then named a different one and
+    nothing said so. The counter behind a generated id is now separate from the
+    internal id counter, which still resets, because that one sizes a dense
+    array the graph indexes by.
+    """
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=50)
+    index.add({"vectors": [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0]]})
+    assert sorted(rid for rid, _ in index.list(10)) == ["vec_1", "vec_2", "vec_3"]
+
+    index.clear()
+    index.add({"vectors": [[0, 0, 0, 1.0]]})
+    assert [rid for rid, _ in index.list(10)] == ["vec_4"]
+
+    # And it survives a save and load, so the next process does not reissue.
+    path = tmp_path / "generated.zdb"
+    index.save(str(path))
+    loaded = VectorDatabase().load(str(path))
+    loaded.add({"vectors": [[1.0, 1.0, 0, 0]]})
+    assert sorted(rid for rid, _ in loaded.list(10)) == ["vec_4", "vec_5"]
+
+
+def test_a_generated_id_is_dense_rather_than_burning_internal_ids():
+    """It used to draw from the internal id counter, which insertion also drew
+    from, so three records with no ids of their own left the fourth at `vec_7`."""
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=50)
+    first = index.add({"vectors": [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0]]})
+    assert first.ids == ["vec_1", "vec_2", "vec_3"]
+    assert index.add({"vectors": [[0, 0, 0, 1.0]]}).ids == ["vec_4"]
+
+
+def test_a_directory_with_no_generated_counter_takes_its_floor_from_the_records(tmp_path):
+    """An old directory carries no counter, so the records supply one."""
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=50)
+    index.add({"vectors": [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0]]})
+    path = tmp_path / "old.zdb"
+    index.save(str(path))
+
+    config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    assert config.pop("generated_ids") == 3
+    (path / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    repair_manifest(path, "config.json")
+
+    loaded = VectorDatabase().load(str(path))
+    assert loaded.add({"vectors": [[0, 0, 0, 1.0]]}).ids == ["vec_4"]
+
+
+def test_an_id_a_caller_chose_still_raises_the_floor(tmp_path):
+    """A record called `vec_9` is counted, so nothing generated collides with it."""
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=50)
+    index.add({"ids": ["vec_9"], "embeddings": [[1.0, 0, 0, 0]]})
+    path = tmp_path / "chosen.zdb"
+    index.save(str(path))
+    loaded = VectorDatabase().load(str(path))
+    assert loaded.add({"vectors": [[0, 1.0, 0, 0]]}).ids == ["vec_10"]
+
+
+# ---------------------------------------------------------------- list cursor
+
+
+def _paged(n=8):
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=50)
+    assert index.add({
+        "ids": [f"k{i}" for i in range(n)],
+        "embeddings": [[float(i), 0, 0, 0] for i in range(n)],
+    }).is_success()
+    return index
+
+
+def test_a_cursor_page_is_stable_under_a_deletion_and_an_offset_page_is_not():
+    index = _paged()
+    first = [rid for rid, _ in index.list(3)]
+    assert first == ["k0", "k1", "k2"]
+
+    index.remove_point("k0")
+
+    assert [rid for rid, _ in index.list(3, after="k2")] == ["k3", "k4", "k5"]
+    # The same page by offset skips one, because a record ahead of it is gone.
+    assert [rid for rid, _ in index.list(3, offset=3)] == ["k4", "k5", "k6"]
+
+
+def test_a_cursor_pages_the_whole_index_exactly_once():
+    index = _paged(11)
+    seen, cursor = [], None
+    while True:
+        page = index.list(3, after=cursor) if cursor else index.list(3)
+        if not page:
+            break
+        seen.extend(rid for rid, _ in page)
+        cursor = page[-1][0]
+    assert seen == [f"k{i}" for i in range(11)]
+
+
+def test_a_cursor_survives_a_save_and_a_load(tmp_path):
+    """Internal ids are what the order rests on and they survive the round trip."""
+    index = _paged()
+    path = tmp_path / "cursor.zdb"
+    index.save(str(path))
+    loaded = VectorDatabase().load(str(path))
+    assert [rid for rid, _ in loaded.list(3, after="k2")] == ["k3", "k4", "k5"]
+
+
+def test_a_cursor_naming_a_removed_record_raises():
+    index = _paged()
+    index.remove_point("k4")
+    with pytest.raises(KeyError, match=r"list\(after='k4'\) names a record"):
+        index.list(3, after="k4")
+
+
+def test_a_cursor_and_an_offset_together_raise():
+    index = _paged()
+    with pytest.raises(ValueError, match=r"takes after or offset, not both"):
+        index.list(3, offset=2, after="k1")
+
+
+def test_a_cursor_at_the_last_record_returns_an_empty_page():
+    index = _paged()
+    assert index.list(3, after="k7") == []
+
+
+# ---------------------------------------------------------------- stdout
+
+
+def test_a_save_and_a_load_write_nothing_to_stdout(tmp_path, capfd):
+    """A library should not write unsolicited progress to stdout.
+
+    Every line the two used to print is a `debug` record now, and the default
+    level is `warn`, so nothing appears unless it is asked for.
+    """
+    index = _paged()
+    path = tmp_path / "quiet.zdb"
+    index.save(str(path))
+    VectorDatabase().load(str(path))
+    captured = capfd.readouterr()
+    assert captured.out == "", captured.out[:400]

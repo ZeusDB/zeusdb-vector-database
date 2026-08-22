@@ -384,7 +384,9 @@ where
 
         if candidates.len() <= nb_neighbours_asked {
             while let Some(p) = candidates.pop() {
-                assert!(-p.dist_to_ref >= 0.);
+                // See the note in `traverse.rs`: the sign half of this is
+                // dropped for `DotDist` and the NaN half is what it caught.
+                assert!(!p.dist_to_ref.is_nan());
                 neighbours_vec.push(Entry {
                     dist: -p.dist_to_ref,
                     target: p.node,
@@ -397,7 +399,7 @@ where
             if let Some(e_p) = candidates.pop() {
                 let mut e_to_insert = true;
                 let e_point_v = store.get(e_p.node);
-                assert!(e_p.dist_to_ref <= 0.);
+                assert!(!e_p.dist_to_ref.is_nan());
                 if !neighbours_vec.is_empty() {
                     e_to_insert = !neighbours_vec
                         .iter()
@@ -559,7 +561,7 @@ where
 fn negated(positive_heap: &BinaryHeap<OrderedNode>) -> BinaryHeap<OrderedNode> {
     let mut negative_heap = BinaryHeap::with_capacity(positive_heap.len());
     for p in positive_heap.iter() {
-        assert!(p.dist_to_ref >= 0.);
+        assert!(!p.dist_to_ref.is_nan());
         negative_heap.push(OrderedNode {
             dist_to_ref: -p.dist_to_ref,
             node: p.node,

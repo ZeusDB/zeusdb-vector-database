@@ -231,10 +231,12 @@ class Model:
     because an overwrite is a removal followed by a fresh insertion, and
     `compact`, `rebuild` and a save and load round trip leave it alone.
 
-    `counter` mirrors the index's own id counter, which mints both generated
-    external ids and internal ids from the same sequence and increments before
-    returning. Holding it is what lets the model name a record added without an
-    id of its own.
+    `generated` mirrors the counter behind a generated external id. It is one
+    per generated id, and it does not reset on `clear`, so `vec_1` is issued once
+    in the life of an index. It used to be the internal id counter, which minted
+    both and reset on `clear`, so a generated id was reissued after one and a
+    record added without an id of its own could take a name an earlier record
+    still held elsewhere.
 
     `vectors_exact` goes false when a `quantized_only` index trains, because the
     raw vectors are released at that point and `get_records` returns a
@@ -249,7 +251,7 @@ class Model:
         self.vectors = {}
         self.metadata = {}
         self.order = []
-        self.counter = 0
+        self.generated = 0
         self.index_metadata = {}
         self.vectors_exact = True
         # The three `rebuild` can move, held because a load has to bring back
@@ -265,12 +267,9 @@ class Model:
         # crosses the same threshold and keeps its vectors.
         self.vectors_exact_threshold_crossed = False
 
-    def tick(self):
-        self.counter += 1
-        return self.counter
-
     def generated_id(self):
-        return f"vec_{self.tick()}"
+        self.generated += 1
+        return f"vec_{self.generated}"
 
     def put(self, record_id, vector, metadata):
         if record_id in self.vectors:
@@ -278,7 +277,6 @@ class Model:
         self.vectors[record_id] = normalize(vector, self.space)
         self.metadata[record_id] = dict(metadata)
         self.order.append(record_id)
-        self.tick()
 
     def drop(self, record_id):
         if record_id not in self.vectors:
@@ -293,7 +291,8 @@ class Model:
         self.vectors.clear()
         self.metadata.clear()
         self.order.clear()
-        self.counter = 0
+        # `generated` is deliberately not reset. The index's internal id counter
+        # is, and the two were one counter until they had to differ here.
         return removed
 
     def selected(self, condition):

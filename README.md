@@ -62,6 +62,33 @@ ZeusDB Vector Database supports the following metrics for vector similarity sear
 | cosine | Cosine Distance (1 - Cosine Similarity) | "cosine", "COSINE", "Cosine" |
 | l1     | Manhattan distance                   | "l1", "L1" |
 | l2     | Euclidean distance                 | "l2", "L2" |
+| dot    | Inner product, reported as 1 - dot | "dot", "DOT" |
+
+### 🎯 When to use `dot`
+
+Use `dot` when the length of a vector should count towards the ranking, which is what a recommender's item and user embeddings usually do and what a model trained with an inner product objective produces. Use `cosine` when only direction matters.
+
+```python
+from zeusdb_vector_database import VectorDatabase
+
+index = VectorDatabase().create("hnsw", dim=4, space="dot")
+index.add({"id": "long", "values": [3.0, 0.0, 0.0, 0.0]})
+index.add({"id": "unit", "values": [1.0, 0.0, 0.0, 0.0]})
+print([(r["id"], round(r["score"], 2)) for r in index.search([1.0, 0.0, 0.0, 0.0], top_k=2)])
+```
+
+*Output*
+```
+[('long', -2.0), ('unit', 0.0)]
+```
+
+Three things follow from `dot` being an inner product rather than a metric.
+
+- **The score is `1 - dot`, so lower is still better.** Recover the inner product as `1 - score`.
+- **Scores can be negative**, whenever the inner product is above one. No other metric here produces one.
+- **A vector need not be its own nearest neighbour**, because a longer vector pointing much the same way scores lower.
+
+`dot` cannot be combined with `quantization_config` and `create()` refuses the pair. A quantized graph ranks by a squared distance to the codebook, and for an inner product that ordering depends on how long each stored vector is, so the index would return the wrong records. Use `cosine` with normalised vectors, which quantizes correctly and ranks identically to an inner product on normalised input.
 
 ### 📏 Scores vs Distances
 
@@ -70,9 +97,9 @@ All distance metrics in ZeusDB Vector Database return distance values, not simil
  - Lower values = more similar
  - A vector identical to the query scores 0.0, or a value within floating point error of it
 
-This applies to all distance types, including cosine.
+This applies to all distance types, including cosine. `dot` is the one exception to the zero, and the section below says why.
 
-Under `cosine`, vectors are normalized to unit length when they are stored. A vector you read back with `return_vector=True` or `get_records()` is therefore the normalized form, not the values you supplied. Under `l1` and `l2` the values are stored unchanged.
+Under `cosine`, vectors are normalized to unit length when they are stored. A vector you read back with `return_vector=True` or `get_records()` is therefore the normalized form, not the values you supplied. Under `l1`, `l2` and `dot` the values are stored unchanged.
 
 A zero vector has no direction, so under `cosine` it sits at distance 1.0 from everything, including itself.
 
@@ -189,7 +216,7 @@ HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=5, vecto
 |------------------|--------|-----------|-----------------------------------------------------------------------------|
 | `index_type`     | `str`  | `"hnsw"`  | The type of vector index to create. Currently only `"hnsw"` is supported. Case-insensitive. |
 | `dim`            | `int`  | *required* | Dimensionality of the vectors to be indexed, from 1 to 65,536. Each vector must have this length. **Required as of 0.8.0**, see below. |
-| `space`          | `str`  | `"cosine"`| Distance metric used for similarity search. One of `"cosine"`, `"l1"`, `"l2"`. Case-insensitive. |
+| `space`          | `str`  | `"cosine"`| Distance metric used for similarity search. One of `"cosine"`, `"l1"`, `"l2"`, `"dot"`. Case-insensitive. `"dot"` cannot be combined with `quantization_config`. |
 | `m`              | `int`  | `16` or `32`, see below | Number of bi-directional connections created for each new node, from 2 to 256. Higher `m` improves recall but increases index size and build time. |
 | `ef_construction`| `int`  | `200`     | Width of the candidate search each insertion runs. Must be positive. It costs build time and buys graph quality, and it changes neither search latency nor the size of the finished index. See below. |
 | `expected_size`  | `int`  | `10000`   | Estimated number of records to be inserted, from 1 to 100,000,000. Used for preallocating internal data structures and for choosing the default `m`. Not a hard limit, see below. |
@@ -398,6 +425,8 @@ add received 3 entries under 'ids' and 2 under 'embeddings'. A batch pairs them 
 ```
 
 The rule covers `ids`, `metadatas` and `metadata`, under every spelling of the vector key, on both the list and the NumPy branch. Omitting `ids` entirely is not a disagreement and still generates one per record. A parallel array must be a `list`; a `tuple` or an `ndarray` raises `TypeError`.
+
+**A batch is not atomic, and which failures raise is deliberate.** A malformed *batch* raises before anything is inserted, so the call is safe to retry: that covers parallel arrays of different lengths, a parallel array of the wrong type, and an input that is not one of the five formats. A malformed *record* inside a well formed batch does not raise. It is counted in `total_errors`, described in `errors`, and the records around it are inserted: that covers a vector of the wrong width, a non-finite value, and a collision under `overwrite=False`. Check `is_success()` rather than assuming the call either inserted everything or nothing.
 
 **Returns:**
 `AddResult` with:
@@ -669,7 +698,29 @@ print(index.list(number=2, offset=99))
 
 An offset past the end returns an empty list rather than raising.
 
-**Deleting while you page still shifts the pages.** Removing a record ahead of your cursor moves everything behind it up by one. If you cannot tolerate that, page by remembering the last ID you saw instead of a count.
+**Deleting while you page shifts the pages under `offset`.** Removing a record ahead of your cursor moves everything behind it up by one, so the next page skips one. Page with `after` instead, which names the last ID you saw.
+
+```python
+paged = vdb.create("hnsw", dim=2)
+paged.add({"ids": [f"p{n}" for n in range(5)], "embeddings": [[n, 0.0] for n in range(5)]})
+
+first = paged.list(number=2)
+print([record_id for record_id, _ in first])
+paged.remove_point("p0")
+print([record_id for record_id, _ in paged.list(number=2, after=first[-1][0])])
+print([record_id for record_id, _ in paged.list(number=2, offset=2)])
+```
+
+*Output*
+```
+['p0', 'p1']
+['p2', 'p3']
+['p3', 'p4']
+```
+
+`offset` skipped `p2` because a record ahead of it was removed. `after` did not, because it names a position rather than a count.
+
+`after` and `offset` cannot both be given. If the record `after` names has itself been removed there is no position to resume from, and the call raises `KeyError` rather than returning a page from somewhere else.
 
 <br/>
 
@@ -837,7 +888,25 @@ print(sorted(record.keys()), len(record["vector"]))
 ['id', 'metadata', 'vector'] 8
 ```
 
-⚠️ `get_records()` only returns results for IDs that exist in the index. Missing IDs are silently skipped, so a shorter list than you asked for is how a missing ID is reported.
+⚠️ `get_records()` only returns results for IDs that exist in the index. Missing IDs are skipped by default, so a shorter list than you asked for is how a missing ID is reported, and the result does not say which one.
+
+`strict=True` raises `KeyError` instead, naming every ID the index does not hold.
+
+```python
+try:
+    index.get_records(["doc_002", "missing_id"], strict=True)
+except KeyError as error:
+    print(error)
+```
+
+*Output*
+```
+'get_records(strict=True) was asked for 1 id the index does not hold: missing_id. Call it without strict=True to receive the records that are present, or test an id with contains(id) first.'
+```
+
+**Under `cosine` the vector returned is the normalized one**, not the values you supplied, because that is what the index stores. Under `l1`, `l2` and `dot` it is what you supplied. There is no flag for this and no way to recover the original: the index keeps one copy of each vector and under `cosine` that copy is the unit vector. Keep your own copy if you need the values back.
+
+**Under `quantized_only` the vector returned is a reconstruction from the record's code**, under the same `vector` key and with no marker saying so. Measured on 16 dimensional data with 4 subvectors and 8 bits, a reconstructed vector differed from the stored unit vector by 0.066 at the worst component. `get_stats()["raw_vectors_stored"]` is zero on such an index, which is how to tell. `quantized_with_raw` returns the stored vector exactly.
 
 <br/>
 
@@ -1341,8 +1410,8 @@ The persistence system supports:
 ✅ **Quantization support**, both raw and quantized storage modes, including the trained codebook
 ✅ **Training state recovery**, so an index saved mid-collection resumes collecting
 ✅ **Format versioning**, so a directory this build cannot interpret is refused rather than misread
-
-**`save()` and `load()` print progress to stdout.** Every step writes a line. This is not configurable, so redirect stdout if it is a problem in your application.
+✅ **Atomic saves**, so a reader sees the whole previous index or the whole new one
+✅ **A digest per artefact**, checked on load, so a file that has changed since it was written is refused
 
 <br/>
 
@@ -1370,7 +1439,7 @@ index.save("my_index.zdb")
 print("saved:", sorted(os.listdir("my_index.zdb")))
 ```
 
-*Output, with the progress lines omitted*
+*Output*
 ```
 saved: ['config.json', 'hnsw_index.zdbgraph', 'manifest.json', 'mappings.bin', 'metadata.json', 'vectors.bin']
 ```
@@ -1392,7 +1461,7 @@ results = loaded_index.search(vectors[0].tolist(), top_k=3)
 print("top hit:", results[0]["id"])
 ```
 
-*Output, with the progress lines omitted*
+*Output*
 ```
 vectors: 1000
 HNSWIndex(dim=1536, space=cosine, m=16, ef_construction=200, expected_size=1000, vectors=1000, quantization=none)
@@ -1437,7 +1506,7 @@ print("storage mode after load:", loaded_index.get_storage_mode())
 print("saved:", sorted(os.listdir("quantized_index.zdb")))
 ```
 
-*Output, with the progress lines omitted*
+*Output*
 ```
 quantization active: True
 quantization active after load: True
@@ -1463,11 +1532,15 @@ my_index.zdb/
 └── hnsw_index.zdbgraph     # HNSW graph structure and payload
 ```
 
-`manifest.json` lists every file the save wrote under `files_included`, and it is written after all of them except the graph. It is the inventory of what the directory should hold.
+`manifest.json` lists every file the save wrote under `files_included` and is the last file written, so it is the inventory of what the directory does hold. Beside the list, `file_digests` records each artefact's length and a digest of its contents.
 
 A directory saved by 0.6.0 or earlier holds `hnsw_index.hnsw.graph` and `hnsw_index.hnsw.data` in place of `hnsw_index.zdbgraph`. Opening it still works: the graph is rebuilt once from the stored records, and the next `.save()` writes the single file.
 
 **`load()` refuses a directory that does not hold what its manifest names.** It checks `files_included` before it reads anything, and the graph dump is the one exempt artefact, because every record carries what the graph is built from. A directory missing any other file will not open, and the refusal names the file and says what it held. Restore it from a copy; the missing file cannot be rebuilt from the ones that remain. A file the manifest does not name is neither read nor complained about.
+
+**It also refuses a file that is present and has changed.** Each artefact is checked against the length and digest `file_digests` records for it, before anything parses it, so a file edited in place is refused with its name and both digests in the message. The graph dump carries its own header and payload checksums instead, so the manifest records only its length; a dump that disagrees is rebuilt rather than refused.
+
+A directory saved before 0.8.0 carries no digests, so nothing is verified and it loads exactly as it did.
 
 A file that is present and does not parse is a different failure with a different message, of the form `Failed to parse config.json` or `Failed to deserialize mappings.bin`.
 
@@ -1534,7 +1607,7 @@ print("filtered hits:", len(filtered))
 print("all checks passed")
 ```
 
-*Output, with the progress lines omitted*
+*Output*
 ```
 records: 500
 index metadata fields: 3
@@ -1546,13 +1619,19 @@ all checks passed
 
 - **Directory, not a file.** `.save()` creates a directory. You need write permission for the target location.
 
-- **Not atomic.** Files are written one at a time into the target directory. An interrupted save leaves a partial directory behind, and a later `load()` of it fails rather than returning a truncated index. Save to a new path and move it into place if you need an atomic swap.
+- **Atomic.** A save writes `<name>.zdbtmp` beside the target and renames it into place, so a reader sees the previous index or the new one and never a mixture. An interrupted save leaves the previous directory intact and loadable, and the staging directory is removed.
 
-- **Overwriting is not clean either.** Saving over an existing directory replaces files individually and does not remove ones that no longer apply. The leftovers are inert but still occupy the disk. Save to a fresh directory.
+  Replacing an existing directory takes two renames rather than one, because neither Windows nor POSIX can rename a directory over a non-empty one: the target moves to `<name>.zdbold`, the new directory moves in, then `<name>.zdbold` is removed. Between the two renames the target does not exist. A process killed in that window leaves the whole previous index at `<name>.zdbold`, and the next save moves it back.
+
+- **Overwriting is clean.** The new directory is built from nothing, so an artefact from an earlier save cannot survive. Saving a plain index over a quantized one leaves no `quantization.json`, `pq_centroids.bin` or `pq_codes.bin` behind.
+
+- **Same volume.** The staging directory is a sibling of the target, so both are on the target's volume and the move is a rename rather than a copy.
 
 - **Version compatibility.** The manifest records a format version. This build writes 1.1.0 and reads any 1.x. A different major version is refused.
 
-- **Integrity checks on load.** Three run, in this order: the format version, then `files_included` against the directory, then the restored record count against the count in `config.json`.
+- **Integrity checks on load.** Four run, in this order: the format version, then `files_included` against the directory, then each artefact against its recorded length and digest, then the restored record count against the count in `config.json`.
+
+- **`save()` and `load()` are silent.** Every step they used to print to stdout is a `debug` log line instead, so a library caller sees nothing on stdout. Set `ZEUSDB_LOG_LEVEL=debug` to see the steps.
 
 <br />
 
@@ -1596,12 +1675,43 @@ A filter is a dict whose keys are field names, and all of them must hold. A fiel
 | `nin` | `{"nin": [values]}` | `{"lang": {"nin": ["en", "es"]}}` | Value is not in the provided array |
 | `any` | `{"any": [values]}` | `{"tags": {"any": ["ai", "ml"]}}` | Array field shares at least one element with the provided array |
 | `all` | `{"all": [values]}` | `{"tags": {"all": ["ai", "ml"]}}` | Array field holds every element of the provided array |
+| `exists` | `{"exists": bool}` | `{"lang": {"exists": False}}` | Whether the record carries the field at all |
+| `is_missing` | `{"is_missing": bool}` | `{"lang": {"is_missing": True}}` | The complement of `exists` |
+| `is_null` | `{"is_null": bool}` | `{"lang": {"is_null": True}}` | The record carries the field and its value is null |
 
 `any` and `all` exist because a field maps to one condition object, so it cannot carry `contains` twice. They ask their question of one field's array, where `$or` and `$and` compose whole filters across fields. On a field holding a plain value rather than an array, both read it as an array of one.
 
 Three behaviours are worth knowing.
 
-**A record that lacks the field never matches, whatever the operator.** That includes `ne` and `nin`. `{"lang": {"ne": "en"}}` and `{"lang": {"nin": ["en"]}}` do not match a record with no `lang` at all, and they agree because `nin` against a one-element array means what `ne` means. So an operator never selects a record missing a field, and `$not` is what does: `{"$not": {"lang": {"all": []}}}` selects exactly the records with no `lang`, because `{"all": []}` is the empty conjunction and holds for every value the field can carry.
+**A record that lacks the field never matches, whatever the operator.** That includes `ne` and `nin`. `{"lang": {"ne": "en"}}` and `{"lang": {"nin": ["en"]}}` do not match a record with no `lang` at all, and they agree because `nin` against a one-element array means what `ne` means.
+
+**`exists`, `is_missing` and `is_null` are the three that ask about the field itself**, so they are the exception to the rule above and each is decided before the value is looked up. A missing field and a stored null are different: `{"lang": None}` stores a null and `{"lang": {"exists": False}}` matches only a record with no `lang` key.
+
+```python
+from zeusdb_vector_database import VectorDatabase
+
+selector = VectorDatabase().create("hnsw", dim=2)
+selector.add([
+    {"id": "has", "values": [1.0, 0.0], "metadata": {"lang": "en"}},
+    {"id": "null", "values": [0.0, 1.0], "metadata": {"lang": None}},
+    {"id": "none", "values": [1.0, 1.0], "metadata": {}},
+])
+found = lambda f: sorted(r["id"] for r in selector.search([1.0, 0.0], filter=f, top_k=9))
+print(found({"lang": {"exists": True}}))
+print(found({"lang": {"is_missing": True}}))
+print(found({"lang": {"is_null": True}}))
+print(found({"lang": {"exists": True, "is_null": False}}))
+```
+
+*Output*
+```
+['has', 'null']
+['none']
+['null']
+['has']
+```
+
+Each takes `True` or `False` and anything else raises. `is_null: False` is the complement of `is_null: True`, so it matches a record with no field at all; write "present and not null" as the conjunction above.
 
 **A dict value is always read as operators.** Direct equality against a nested object has no plain form, because the two would be indistinguishable, so write it as `{"source": {"eq": {"kind": "web"}}}`. Writing `{"source": {"kind": "web"}}` raises `ValueError: Unknown filter operation: kind`.
 
@@ -1879,7 +1989,7 @@ results = index.search(query_vector, top_k=5)
 - ✅ **Operation timing** on index creation, additions, searches and saves
 - ✅ **Cross-platform compatibility**
 
-Note that `save()` and `load()` print progress directly to stdout. That output is not part of the logging system and is not affected by any of the settings below.
+`save()` and `load()` write their progress here too, at `debug`, so they print nothing on stdout. They used to print it directly and it was not affected by any of the settings below.
 
 ### ⚙️ Intermediate Usage (Environment Variables)
 
@@ -1904,7 +2014,7 @@ python your_app.py
 
 | Variable | Options | Default | Description |
 |----------|---------|---------|-------------|
-| `ZEUSDB_LOG_LEVEL` | `trace`, `debug`, `info`, `error` | `warning` (dev), `error` (prod) | Controls log verbosity |
+| `ZEUSDB_LOG_LEVEL` | `trace`, `debug`, `info`, `warn`, `error` | `warn` (dev), `error` (prod) | Controls log verbosity. `warning` and `warn` are the same level, as are `critical`, `fatal` and `error`. An unrecognised name falls back to the default. |
 | `ZEUSDB_LOG_FORMAT` | `human`, `json` | `human` (dev), `json` (prod) | Output format |
 | `ZEUSDB_LOG_TARGET` | `stdout`, `stderr`, `file` | `stderr` | Where logs go |
 | `ZEUSDB_LOG_FILE` | `/path/to/file.log` | `zeusdb.log` | Log file path, written exactly as given (if target=file) |

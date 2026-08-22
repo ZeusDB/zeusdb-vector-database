@@ -110,6 +110,21 @@ pub(crate) mod order {
     pub(crate) const TRAINING_COMPLETED_AT: u8 = 12;
     /// A leaf.
     pub(crate) const CREATED_AT: u8 = 13;
+    /// A leaf, taken by `generate_id` alone and held across nothing.
+    pub(crate) const GENERATED_IDS: u8 = 14;
+
+    /// The largest rank declared above.
+    ///
+    /// `every_declared_rank_is_named` walks up to this and checks that one past
+    /// it is unnamed, so adding a rank without naming it fails there rather than
+    /// silently reporting the fallback. It named `CREATED_AT` directly until a
+    /// rank was added after it, which made the test fail for the one reason it
+    /// was not looking for.
+    ///
+    /// Compiled under `cfg(test)` alone, because the test is its only reader and
+    /// a release build otherwise warns that it is never used.
+    #[cfg(test)]
+    pub(crate) const HIGHEST: u8 = GENERATED_IDS;
 }
 
 /// How a rank names itself in an assertion a developer reads.
@@ -130,6 +145,7 @@ const fn name_of(rank: u8) -> &'static str {
         order::TRAINING_IDS => "training_ids",
         order::METADATA => "metadata",
         order::ID_COUNTER => "id_counter",
+        order::GENERATED_IDS => "generated_ids",
         order::VECTOR_COUNT => "vector_count",
         order::RERANK_CALIBRATION => "rerank_calibration",
         order::TRAINING_COMPLETED_AT => "training_completed_at",
@@ -472,7 +488,7 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn every_declared_rank_is_named() {
-        for rank in 0..=order::CREATED_AT {
+        for rank in 0..=order::HIGHEST {
             assert_ne!(
                 name_of(rank),
                 "a lock with no declared place in the order",
@@ -481,7 +497,7 @@ mod tests {
             );
         }
         assert_eq!(
-            name_of(order::CREATED_AT + 1),
+            name_of(order::HIGHEST + 1),
             "a lock with no declared place in the order"
         );
     }

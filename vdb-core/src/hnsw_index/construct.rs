@@ -158,7 +158,18 @@ pub(crate) fn validate_index_parameters(
             "expected_size exceeds maximum"
         );
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}expected_size must be at most {}, got {}. The graph reserves one \n             slot per declared record at creation, 8 bytes each, so this \n             declaration would ask for {:.1} GB before a single record is \n             added. That allocation is not fallible: above this bound the \n             process aborts rather than raising. expected_size is a capacity \n             hint and not a limit, and under-declaring only costs some \n             reallocation, so declare what you expect to hold.",
+            "{}expected_size must be at most {}, got {}. The graph reserves one \
+ slot per \
+             declared record at creation, 8 bytes each, so this \
+ declaration would ask for \
+             {:.1} GB before a single record is \
+ added. That allocation is not fallible: \
+             above this bound the \
+ process aborts rather than raising. expected_size is a \
+             capacity \
+ hint and not a limit, and under-declaring only costs some \
+ \
+             reallocation, so declare what you expect to hold.",
             source,
             MAX_EXPECTED_SIZE,
             expected_size,
@@ -174,7 +185,18 @@ pub(crate) fn validate_index_parameters(
             "m below minimum"
         );
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}m must be at least 2, got {}. Layer assignment samples from a \n             scale of 1 / ln(m), which is infinity at m 1, so every point \n             overflows the layer cap and is redispatched uniformly across all \n             16 layers instead of following the exponential distribution the \n             graph depends on. Measured on 3,000 records of 32 dimensions, \n             recall at 10 was 0.0220 at m 1 against 0.6880 at m 2 and 1.0000 \n             at m 16.",
+            "{}m must be at least 2, got {}. Layer assignment samples from a \
+ scale of 1 / \
+             ln(m), which is infinity at m 1, so every point \
+ overflows the layer cap and \
+             is redispatched uniformly across all \
+ 16 layers instead of following the \
+             exponential distribution the \
+ graph depends on. Measured on 3,000 records of \
+             32 dimensions, \
+ recall at 10 was 0.0220 at m 1 against 0.6880 at m 2 and \
+             1.0000 \
+ at m 16.",
             source, m
         )));
     }
@@ -195,18 +217,63 @@ pub(crate) fn validate_index_parameters(
     // Early space validation with user-friendly error
     let space_normalized = space.to_lowercase();
     match space_normalized.as_str() {
-        "cosine" | "l2" | "l1" => {
+        "cosine" | "l2" | "l1" | "dot" => {
             debug!(operation = "validation", space = %space_normalized, "Distance space validated");
         }
         _ => {
             error!(operation = "validation", field = "space", value = %space, "Unsupported distance space");
             return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "{}Unsupported space: '{}'. Supported spaces: 'cosine', 'l2', 'l1'",
+                "{}Unsupported space: '{}'. Supported spaces: 'cosine', 'l2', 'l1', 'dot'",
                 source, space
             )));
         }
     }
     Ok(space_normalized)
+}
+
+/// Refuse the one pair of a space and a storage choice this build cannot serve
+///
+/// A quantized graph scores every candidate against a lookup table of squared
+/// L2 distances between the query's subvectors and the codebook's centroids,
+/// and that table is the same table whatever the space. For cosine it is exact
+/// in the only sense that matters, because `add` normalises every vector and
+/// the squared L2 between two unit vectors is `2 - 2 * dot`, which orders the
+/// same way `1 - dot` does. For l2 it is the distance itself before the root.
+///
+/// For an inner product it is neither. The squared L2 between a query and a
+/// stored vector is the query's squared length plus the stored vector's squared
+/// length less twice their inner product, and a dot index does not normalise,
+/// so the middle term varies from record to record and the ordering it produces
+/// is not the ordering by inner product. A short vector pointing the right way
+/// would outrank a long one pointing further the same way.
+///
+/// Supporting it means an inner product ADC table, which is a change to
+/// `PQ::compute_adc_lut` and to the symmetric table graph construction reads,
+/// and both are shared by the three spaces that already work. That is a
+/// separate change with its own measurement. Until it exists the pair is
+/// refused rather than served wrongly.
+///
+/// Called at `create()` and again at load, because a hand edited `config.json`
+/// reaches the same constructors.
+pub(crate) fn validate_space_supports_quantization(space: &str, source: &str) -> PyResult<()> {
+    if space != "dot" {
+        return Ok(());
+    }
+    error!(
+        operation = "validation",
+        field = "space",
+        value = space,
+        "Quantization is not available for the inner product space"
+    );
+    Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+        "{}space='dot' cannot be quantized. A quantized graph ranks candidates by a squared \
+         L2 distance to the codebook, and for an inner product that ordering depends on how \
+         long each stored vector is rather than on the inner product alone, so the index \
+         would return the wrong records. Use space='cosine' with normalised vectors, which \
+         quantizes correctly and ranks identically to an inner product on normalised input, \
+         or drop quantization_config.",
+        source
+    )))
 }
 
 /// Warn where `ef_construction` switches the neighbour selection heuristic off.
@@ -296,6 +363,9 @@ impl HNSWIndex {
 
         // Extract quantization configuration
         let (quantization_params, pq_instance) = if let Some(config) = quantization_config {
+            // Before any of the config is read, so the message names the pair
+            // rather than whichever PQ field happens to be checked first.
+            validate_space_supports_quantization(&space_normalized, "")?;
             let qtype = config
                 .get_item("type")?
                 .ok_or_else(|| {
@@ -529,6 +599,7 @@ impl HNSWIndex {
             id_map: RwLockAt::new(HashMap::new()),
             rev_map: RwLockAt::new(HashMap::new()),
             id_counter: MutexAt::new(0),
+            generated_ids: MutexAt::new(0),
             vector_count: MutexAt::new(0),
             hnsw: RwLockAt::new(hnsw),
             writers: MutexAt::new(()),
@@ -581,6 +652,7 @@ impl HNSWIndex {
             id_map: RwLockAt::new(HashMap::new()),
             rev_map: RwLockAt::new(HashMap::new()),
             id_counter: MutexAt::new(0),
+            generated_ids: MutexAt::new(0),
             vector_count: MutexAt::new(0),
             hnsw: RwLockAt::new(hnsw),
             writers: MutexAt::new(()),
