@@ -9,7 +9,7 @@
 //! calibration; see `hnsw_index::search::rerank_plan` and
 //! `hnsw_index::training::calibrate_rerank`.
 
-use crate::distance::{CosineDist, L1Dist, L2Dist};
+use crate::distance::{CosineDist, DotDist, L1Dist, L2Dist};
 use crate::graph::{Distance, VectorGraph};
 use crate::pq::PQ;
 use rayon::prelude::*;
@@ -678,6 +678,11 @@ pub(crate) fn raw_distance_fn(space: &str) -> fn(&[f32], &[f32]) -> f32 {
     match space {
         "l2" => |a: &[f32], b: &[f32]| L2Dist {}.eval(a, b),
         "l1" => |a: &[f32], b: &[f32]| L1Dist {}.eval(a, b),
+        // A dot index is never quantized, so nothing rescores against this. The
+        // filtered exact scan does score with it, and scoring that page with
+        // cosine while the traversal scored with the inner product would have
+        // been two different orderings from one query.
+        "dot" => |a: &[f32], b: &[f32]| DotDist {}.eval(a, b),
         _ => |a: &[f32], b: &[f32]| CosineDist {}.eval(a, b),
     }
 }

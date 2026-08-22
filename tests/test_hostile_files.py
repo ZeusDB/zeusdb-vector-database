@@ -27,6 +27,7 @@ import sys
 
 import numpy as np
 import pytest
+from helpers import artefact_digest, repair_manifest
 from zeusdb_vector_database import VectorDatabase
 
 # A length no file could carry and every unbounded container aborted on.
@@ -132,11 +133,29 @@ def load_in_child(path, tmp_path):
     return result.returncode, (verdicts[-1] if verdicts else ""), result
 
 
+# ============================================================================
+# REPAIRING THE MANIFEST DIGEST
+# ============================================================================
+#
+# manifest.json records a length and a digest for every artefact it names, and
+# the loader checks both before anything parses the file. A forged artefact
+# therefore stops at the digest and never reaches the field validator the case
+# is about, so every forge below repairs the entry it broke.
+#
+# This is the same rule the graph dump fuzzer follows. A mutator that cannot
+# repair a digest proves the digest works and reaches no parsing code.
+#
+# The repair lives in `helpers.py` and computes the digest from the format
+# rather than calling the library, and the test below holds it against every
+# digest a real save wrote. Two implementations agreeing is what makes the
+# repair trustworthy.
+
 def forged(source, tmp_path, name, mutate):
     """A copy of a saved directory with one file replaced or edited."""
     target = tmp_path / "forged"
     shutil.copytree(source, target)
     mutate(target / name)
+    repair_manifest(target, name)
     return target
 
 
@@ -168,6 +187,41 @@ def assert_refused(path, tmp_path, *, naming):
 # ============================================================================
 # THE BASELINE
 # ============================================================================
+
+
+def test_the_digest_repairer_agrees_with_the_saved_manifest(raw_index, quantized_index):
+    """Every digest a real save wrote, recomputed here from the file.
+
+    Without this the repair above could be silently wrong, and every case in
+    this file would then be asserting that a wrong digest is refused rather than
+    that the field validator it names does its job.
+    """
+    checked = 0
+    for directory in (raw_index, quantized_index):
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        digests = manifest["file_digests"]
+        assert digests, "a save records a digest per artefact"
+        for name, entry in digests.items():
+            data = (directory / name).read_bytes()
+            assert entry["bytes"] == len(data), name
+            if "checksum" in entry:
+                assert entry["checksum"] == artefact_digest(data), name
+                checked += 1
+    assert checked >= 8, f"only {checked} digests were compared"
+
+
+def test_a_forged_file_whose_digest_is_not_repaired_is_refused(raw_index, tmp_path):
+    """The digest check itself, which every other case here has to get past."""
+    target = tmp_path / "unrepaired"
+    shutil.copytree(raw_index, target)
+    raw = bytearray((target / "vectors.bin").read_bytes())
+    raw[-4] ^= 0x40
+    (target / "vectors.bin").write_bytes(bytes(raw))
+
+    status, verdict, _ = load_in_child(target, tmp_path)
+    assert status == 0
+    assert verdict.startswith("REFUSED"), verdict
+    assert "vectors.bin" in verdict and "digest" in verdict, verdict
 
 
 def test_an_untouched_directory_still_loads(raw_index, tmp_path):

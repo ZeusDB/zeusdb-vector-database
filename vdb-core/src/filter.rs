@@ -68,7 +68,54 @@ pub(crate) enum Filter {
     All(Vec<Filter>),
     Any(Vec<Filter>),
     Not(Box<Filter>),
-    Field { name: String, test: FieldTest },
+    Field {
+        name: String,
+        test: FieldTest,
+    },
+    /// A question about whether a field is there at all, rather than about the
+    /// value it holds. See [`Presence`].
+    Presence {
+        name: String,
+        want: Presence,
+    },
+}
+
+/// What `exists`, `is_missing` and `is_null` ask of one field.
+///
+/// # Why these are their own node rather than operators
+///
+/// Every other operator is judged against a value, and `field_matches` answers
+/// the absent case before any of them runs: a record that does not carry the
+/// field matches nothing, so `ne`, `nin` and `all` exclude it exactly as `eq`,
+/// `in` and `any` do. That rule is what makes the language coherent, and it is
+/// also what left absence with no way to say it. Until this existed the only
+/// spelling was `{"$not": {"field": {"all": []}}}`, which nobody finds.
+///
+/// So these three are decided before the value is looked up rather than after,
+/// which is a different kind of question and gets a different node.
+///
+/// # Each one is total, and each one has a complement
+///
+/// `exists: false` matches a record the field is absent from, and `is_null:
+/// false` matches a record the field is absent from as well, because it is the
+/// complement of `is_null: true` rather than a claim that a value is present
+/// and not null. Anything else would repeat the trap `ne` fell into, where the
+/// operator and its negation are not complements and a user has to know which
+/// of the two rules they are under.
+///
+/// Write "present and not null" as `{"field": {"exists": true, "is_null":
+/// false}}`, which is the conjunction it looks like.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Presence {
+    /// The record carries the field, whatever value it holds.
+    Present,
+    /// The record does not carry the field.
+    Absent,
+    /// The record carries the field and the value is null.
+    Null,
+    /// Anything else, which is the complement of `Null` and therefore includes
+    /// a record the field is absent from.
+    NotNull,
 }
 
 /// What one field is asked.
@@ -141,10 +188,7 @@ fn compile_entries<'a>(
             GROUP_AND => Filter::All(compile_group(GROUP_AND, condition, depth)?),
             GROUP_OR => Filter::Any(compile_group(GROUP_OR, condition, depth)?),
             GROUP_NOT => Filter::Not(Box::new(compile_negation(condition, depth)?)),
-            _ => Filter::Field {
-                name: key.clone(),
-                test: compile_field(condition)?,
-            },
+            _ => compile_field(key, condition)?,
         });
     }
 
@@ -192,22 +236,77 @@ fn compile_negation(condition: &Value, depth: usize) -> PyResult<Filter> {
     compile_entries(map.iter(), depth + 1)
 }
 
-/// One field's condition.
+/// One field's condition, as one node or as a conjunction of several.
 ///
 /// A mapping is always the operator form. Direct equality against a nested
 /// object has no syntax of its own, because the two forms would be
 /// indistinguishable, so it is written `{"eq": {...}}`.
-fn compile_field(condition: &Value) -> PyResult<FieldTest> {
-    match condition {
-        Value::Object(operations) => {
-            let mut tests = Vec::with_capacity(operations.len());
-            for (op, target) in operations {
-                tests.push((parse_op(op)?, target.clone()));
-            }
-            Ok(FieldTest::Operators(tests))
+///
+/// The three presence operators are split out here rather than carried through
+/// as operators, because they are answered before the value is looked up and
+/// every other operator is answered after. A mapping holding both kinds
+/// compiles to a conjunction of a `Presence` node per presence operator and one
+/// `Field` node carrying the rest, which is what the mapping already meant.
+fn compile_field(name: &str, condition: &Value) -> PyResult<Filter> {
+    let Value::Object(operations) = condition else {
+        return Ok(Filter::Field {
+            name: name.to_string(),
+            test: FieldTest::Equals(condition.clone()),
+        });
+    };
+
+    let mut nodes: Vec<Filter> = Vec::new();
+    let mut tests = Vec::with_capacity(operations.len());
+    for (op, target) in operations {
+        match presence_op(op) {
+            Some(kinds) => nodes.push(Filter::Presence {
+                name: name.to_string(),
+                want: kinds[usize::from(!presence_target(name, op, target)?)],
+            }),
+            None => tests.push((parse_op(op)?, target.clone())),
         }
-        plain => Ok(FieldTest::Equals(plain.clone())),
     }
+
+    if !tests.is_empty() {
+        nodes.push(Filter::Field {
+            name: name.to_string(),
+            test: FieldTest::Operators(tests),
+        });
+    }
+    // An operator mapping is a conjunction of its entries, which is what the
+    // single `Field` node meant when it held all of them.
+    Ok(if nodes.len() == 1 {
+        nodes.pop().expect("just checked the length")
+    } else {
+        Filter::All(nodes)
+    })
+}
+
+/// The pair one presence operator selects between, true first
+fn presence_op(op: &str) -> Option<[Presence; 2]> {
+    match op {
+        "exists" => Some([Presence::Present, Presence::Absent]),
+        "is_missing" => Some([Presence::Absent, Presence::Present]),
+        "is_null" => Some([Presence::Null, Presence::NotNull]),
+        _ => None,
+    }
+}
+
+/// The boolean a presence operator takes, and nothing else
+///
+/// A string or a number here is a filter that means nothing, and reading it as
+/// truthy would silently pick one of the two answers. The three operators are
+/// new, so refusing is free.
+fn presence_target(name: &str, op: &str, target: &Value) -> PyResult<bool> {
+    target.as_bool().ok_or_else(|| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "\"{}\" takes true or false, and {{\"{}\": {{\"{}\": ...}}}} was given {}.",
+            op,
+            name,
+            op,
+            describe(target)
+        ))
+    })
 }
 
 /// An operator name as an [`Op`].
@@ -305,6 +404,25 @@ pub(crate) fn matches_filter(metadata: &HashMap<String, Value>, filter: &Filter)
             .any(|branch| matches_filter(metadata, branch)),
         Filter::Not(inner) => !matches_filter(metadata, inner),
         Filter::Field { name, test } => field_matches(metadata, name, test),
+        Filter::Presence { name, want } => want.holds(metadata.get(name)),
+    }
+}
+
+impl Presence {
+    /// Judge one field's presence, given whatever the record holds for it
+    ///
+    /// `None` is a record that does not carry the field. `Some(Value::Null)` is
+    /// a record that carries it and holds a null, which is what a Python `None`
+    /// in a metadata mapping becomes and what a null in `metadata.json` reads
+    /// back as. The two are distinct in the storage format and this is what
+    /// tells them apart.
+    pub(crate) fn holds(self, found: Option<&Value>) -> bool {
+        match self {
+            Presence::Present => found.is_some(),
+            Presence::Absent => found.is_none(),
+            Presence::Null => matches!(found, Some(Value::Null)),
+            Presence::NotNull => !matches!(found, Some(Value::Null)),
+        }
     }
 }
 
@@ -326,6 +444,11 @@ impl Filter {
             Filter::Any(branches) => branches.iter().any(Filter::matches_every_record),
             Filter::Not(inner) => inner.matches_no_record(),
             Filter::Field { .. } => false,
+            // Conservative in the safe direction, as the field leaf is.
+            // `{"x": {"is_null": false}}` does hold for every record with no
+            // `x`, and answering false here only means a delete that would have
+            // been refused runs instead.
+            Filter::Presence { .. } => false,
         }
     }
 
@@ -343,6 +466,7 @@ impl Filter {
             Filter::Any(branches) => branches.iter().all(Filter::matches_no_record),
             Filter::Not(inner) => inner.matches_every_record(),
             Filter::Field { .. } => false,
+            Filter::Presence { .. } => false,
         }
     }
 }

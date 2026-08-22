@@ -15,6 +15,7 @@ import struct
 
 import numpy as np
 import pytest
+from helpers import repair_manifest
 from zeusdb_vector_database import VectorDatabase
 
 DIM = 8
@@ -561,6 +562,7 @@ def test_a_directory_saved_without_a_declaration_still_opens(tmp_path):
     # release actually holds.
     del config["indexed_fields"]
     (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    repair_manifest(directory, "config.json")
 
     loaded = VectorDatabase().load(str(directory))
     assert loaded.indexed_fields == []
@@ -577,6 +579,7 @@ def test_a_saved_declaration_that_this_build_would_refuse_fails_the_load(tmp_pat
     config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
     config["indexed_fields"] = ["cat", "cat"]
     (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    repair_manifest(directory, "config.json")
 
     with pytest.raises(ValueError, match="twice"):
         VectorDatabase().load(str(directory))

@@ -102,6 +102,40 @@ def _detect_environment() -> str:
         # Default to development for interactive use
         return 'development'
 
+# Every spelling of a level, resolved to the one name this module works in.
+#
+# The two layers disagreed. Python's `logging` calls it WARNING and CRITICAL,
+# and Rust's tracing filter calls it warn and has no critical at all, so
+# ZEUSDB_LOG_LEVEL=warn was rejected here and accepted there, and
+# ZEUSDB_LOG_LEVEL=warning was accepted here and rejected there with an
+# `ignoring zeusdb_vector_database=warning` line on stderr and no filtering.
+#
+# This is the Python half of the table. `canonical_level` in vdb-core/src/
+# logging.rs is the Rust half, and it accepts the same spellings, so the Rust
+# side is right on its own for a caller who has disabled the auto-configuration.
+_LEVEL_ALIASES = {
+    'WARN': 'WARNING',
+    'WARNING': 'WARNING',
+    'ERR': 'ERROR',
+    'ERROR': 'ERROR',
+    'FATAL': 'CRITICAL',
+    'CRITICAL': 'CRITICAL',
+    'DEBUG': 'DEBUG',
+    'INFO': 'INFO',
+    'TRACE': 'TRACE',
+}
+
+
+def _canonical_level(level: str) -> str:
+    """One level name from any spelling of it, or the name as given if unknown.
+
+    An unknown name is returned unchanged so the caller's validation reports the
+    name the user actually typed rather than a substitute for it.
+    """
+    upper = level.strip().upper()
+    return _LEVEL_ALIASES.get(upper, upper)
+
+
 def _get_smart_defaults(env_context: str) -> Dict[str, Any]:
     """
     Get smart defaults based on environment context.
@@ -149,7 +183,7 @@ def _get_smart_defaults(env_context: str) -> Dict[str, Any]:
     config = defaults.get(env_context, defaults['development']).copy()
     
     # Environment variable overrides with validation
-    env_level = os.getenv('ZEUSDB_LOG_LEVEL', config['level']).upper()
+    env_level = _canonical_level(os.getenv('ZEUSDB_LOG_LEVEL', config['level']))
     
     # ENHANCEMENT: Validate log level
     valid_levels = {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', 'TRACE'}
@@ -238,6 +272,17 @@ def _configure_rust_logging(config: Dict[str, Any]) -> None:
         rust_level = config['_rust_level'].lower()
     else:
         rust_level = py2rs.get(config['level'], "warn")
+    # Defaulted rather than assigned, so a value the user set is the value the
+    # Rust side reads. That spelling need not be one `EnvFilter` accepts, and
+    # `warning` is exactly the case that used to break: the filter refused it,
+    # printed `ignoring zeusdb_vector_database=warning` and then filtered
+    # nothing. `canonical_level` in vdb-core/src/logging.rs resolves it there
+    # instead, which also covers a caller who has disabled this module.
+    #
+    # Overwriting it here would work for that case and break another: this
+    # function is idempotent only if what it writes is what it would read back,
+    # and `critical` written back as `error` reads back as ERROR rather than
+    # CRITICAL.
     os.environ.setdefault("ZEUSDB_LOG_LEVEL", rust_level)
     os.environ.setdefault("ZEUSDB_LOG_FORMAT", config['format'])
     

@@ -656,20 +656,30 @@ impl Distance<f32> for L1Dist {
 
 /// Inner product turned into a distance, as `1 - dot`.
 ///
-/// Definitionally the same computation as [`CosineDist`] once the input is
-/// normalised, and kept separate because it carries no such precondition and no
-/// clamp. It exists so an inner product space has an implementation ready, and
-/// no `space` string reaches it today.
+/// This is what `space="dot"` scores with. Definitionally the same computation
+/// as [`CosineDist`] once the input is normalised, and separate because it
+/// carries no such precondition and no clamp: `add` does not normalise for this
+/// space, so the length of a stored vector counts towards its score exactly as
+/// the caller supplied it.
+///
+/// # Why `1 - dot` rather than `-dot`
+///
+/// Every ranking path in the crate orders ascending and treats the value as a
+/// distance, so an inner product has to be negated to be usable at all. The
+/// constant makes no difference to any ordering, and it makes the value equal
+/// to the cosine distance for input that happens to be normalised, so the same
+/// pair of vectors scores the same under both spaces. Without it a caller
+/// switching from cosine to dot on normalised vectors would see every score
+/// move by one.
+///
+/// **The value can be negative**, which no other space here produces. Any dot
+/// product above one gives one, which unnormalised input reaches routinely.
+/// Nothing orders on the sign; the graph, the exact scan and the result page
+/// all compare the values against each other.
 ///
 /// The implementation this replaced asserted that the dot product is at most
-/// one and aborted
-/// the process otherwise, which a self comparison of a normalised vector can
-/// trip by rounding. There is no assertion here.
-///
-/// Constructed only by its own tests today, which is what the allow records.
-/// Adding an inner product space is a separate change with its own validation
-/// and documentation surface, and this is the part of it that belongs here.
-#[allow(dead_code)]
+/// one and aborted the process otherwise, which a self comparison of a
+/// normalised vector can trip by rounding. There is no assertion here.
 #[derive(Default, Copy, Clone, Debug)]
 pub struct DotDist;
 
@@ -1863,7 +1873,7 @@ mod tests {
                 .collect();
             let calls = (PAIRS * REPEATS) as f64;
 
-            for metric in ["cosine", "l2", "l1"] {
+            for metric in ["cosine", "l2", "l1", "dot"] {
                 let mut cells: Vec<[f64; 3]> = Vec::with_capacity(ROUNDS);
                 for _ in 0..ROUNDS {
                     cells.push(match metric {
@@ -1877,10 +1887,19 @@ mod tests {
                             time(&a, &b, calls, paths::avx_l2),
                             time(&a, &b, calls, l2),
                         ],
-                        _ => [
+                        "l1" => [
                             time(&a, &b, calls, paths::base_l1),
                             time(&a, &b, calls, paths::avx_l1),
                             time(&a, &b, calls, l1),
+                        ],
+                        // The third column is `DotDist::eval` rather than `dot`
+                        // itself, so it is the whole of what a dot index pays
+                        // per comparison and is comparable with the other three
+                        // rows. The subtraction is the only difference.
+                        _ => [
+                            time(&a, &b, calls, paths::base_dot),
+                            time(&a, &b, calls, paths::avx_dot),
+                            time(&a, &b, calls, |x: &[f32], y: &[f32]| DotDist {}.eval(x, y)),
                         ],
                     });
                 }

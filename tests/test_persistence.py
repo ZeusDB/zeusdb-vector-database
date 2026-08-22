@@ -8,6 +8,7 @@ import warnings
 
 import numpy as np
 import pytest
+from helpers import artefact_digest, repair_manifest
 from zeusdb_vector_database import VectorDatabase
 
 # ------------------------------------------------------------
@@ -351,8 +352,9 @@ def test_persistence_preserves_index_level_metadata(tmp_path):
 
     config = json.loads((save_dir / "config.json").read_text(encoding="utf-8"))
     assert config["metadata"] == {"owner": "relay24", "dataset": "docs_v2"}
-    assert sorted(config) == ["dim", "ef_construction", "expected_size", "id_counter",
-                              "indexed_fields", "m", "metadata", "space", "vector_count"]
+    assert sorted(config) == ["dim", "ef_construction", "expected_size", "generated_ids",
+                              "id_counter", "indexed_fields", "m", "metadata", "space",
+                              "vector_count"]
     # The declared filterable fields ride here too, for the same reason. The
     # columns themselves are derived from metadata.json on load, so nothing else
     # in the directory records which fields a user chose. This index declared
@@ -414,10 +416,21 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
 
     manifest = json.loads((save_dir / "manifest.json").read_text(encoding="utf-8"))
     assert sorted(manifest) == [
-        "compression_info", "created_at", "files_excluded", "files_included",
-        "format_version", "has_quantization", "index_type", "quantization_trained",
-        "saved_at", "storage_mode", "total_size_mb", "total_vectors", "zeusdb_version",
+        "compression_info", "created_at", "file_digests", "files_excluded",
+        "files_included", "format_version", "has_quantization", "index_type",
+        "quantization_trained", "saved_at", "storage_mode", "total_size_mb",
+        "total_vectors", "zeusdb_version",
     ]
+
+    # Every artefact files_included names, with the length it was written at.
+    # The graph dump carries a length alone, because it holds a checksum over
+    # its own header and another over its own payload and the loader verifies
+    # both, so a manifest digest for it would mean reading the largest file in
+    # the directory back for a guarantee it already gives.
+    assert sorted(manifest["file_digests"]) == sorted(manifest["files_included"])
+    for name, entry in manifest["file_digests"].items():
+        assert entry["bytes"] == os.path.getsize(save_dir / name), name
+        assert ("checksum" in entry) is (name != "hnsw_index.zdbgraph"), name
 
     # 1.1.0 rather than 1.0.0 because config.json gained the index level
     # metadata field. The loader reads any 1.x and refuses another major.
@@ -772,6 +785,10 @@ def test_persistence_vector_count_matches_reality(tmp_path, quantized_only_saved
     config["vector_count"] = 9
     (miscounted / "config.json").write_text(json.dumps(config, indent=2),
                                             encoding="utf-8")
+    # The manifest records a digest per artefact, so an edit that is not
+    # recorded stops at the digest and never reaches the count check this case
+    # is about. See helpers.repair_manifest.
+    repair_manifest(miscounted, "config.json")
     with pytest.raises(RuntimeError, match=r"yields 6 records while config.json reports 9"):
         vdb.load(str(miscounted))
 
@@ -807,6 +824,7 @@ def test_persistence_rejects_unusable_codebook(tmp_path, quantized_only_saved):
     # above matches what save_pq_centroids writes.
     assert len(zero_bytes) == len((zeroed / "pq_centroids.bin").read_bytes())
     (zeroed / "pq_centroids.bin").write_bytes(zero_bytes)
+    repair_manifest(zeroed, "pq_centroids.bin")
     with pytest.raises(RuntimeError, match=r"all-zero codebook"):
         vdb.load(str(zeroed))
 
@@ -816,6 +834,7 @@ def test_persistence_rejects_unusable_codebook(tmp_path, quantized_only_saved):
     shutil.copytree(quantized_only_saved["path"], wrong)
     (wrong / "pq_centroids.bin").write_bytes(
         _zero_codebook_bytes(subvectors=2, centroids=256, sub_dim=2))
+    repair_manifest(wrong, "pq_centroids.bin")
     with pytest.raises(RuntimeError,
                        match=r"codebook is 2x256x2, expected 4x256x2"):
         vdb.load(str(wrong))
@@ -845,6 +864,11 @@ def test_persistence_reads_previous_format(tmp_path, quantized_only_saved):
 
     manifest = json.loads((legacy / "manifest.json").read_text(encoding="utf-8"))
     manifest["format_version"] = "1.0.0"
+    # A 1.0.0 directory carries no per-artefact digests, so dropping the field
+    # is part of the fixture rather than a workaround. It is also what makes
+    # this the backward compatibility case: a directory with no digests loads
+    # and nothing is verified.
+    assert manifest.pop("file_digests")
     (legacy / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     loaded = vdb.load(str(legacy))
@@ -914,6 +938,7 @@ def test_persistence_drops_raw_vectors_from_an_old_quantized_only_directory(tmp_
     quantization["storage_mode"] = "quantized_only"
     (old_style / "quantization.json").write_text(
         json.dumps(quantization, indent=2), encoding="utf-8")
+    repair_manifest(old_style, "quantization.json")
 
     loaded = vdb.load(str(old_style))
 
@@ -1037,6 +1062,7 @@ def test_persistence_load_failure_modes(tmp_path):
 
     # Present and unreadable is the other half, and it still names the parse.
     (truncated / "config.json").write_text("not json at all {", encoding="utf-8")
+    repair_manifest(truncated, "config.json")
     with pytest.raises(RuntimeError, match="Failed to parse config.json"):
         vdb.load(str(truncated))
 
@@ -1089,6 +1115,7 @@ def test_load_validates_the_declaration_in_config_json(tmp_path):
         config[field] = value
         (target / "config.json").write_text(json.dumps(config, indent=2),
                                             encoding="utf-8")
+        repair_manifest(target, "config.json")
         return str(target)
 
     # A zero in any of the three that must be positive.
@@ -1172,6 +1199,7 @@ def test_load_refuses_a_saved_index_holding_a_non_finite_value(tmp_path):
     marker = struct.pack("<f", marker_value)
     assert blob.count(marker) == 1
     vectors_bin.write_bytes(blob.replace(marker, struct.pack("<f", float("nan"))))
+    repair_manifest(save_dir, "vectors.bin")
 
     with pytest.raises(RuntimeError, match="holds a NaN or an infinity"):
         vdb.load(str(save_dir))
@@ -1693,6 +1721,7 @@ def test_load_falls_back_to_the_rebuild_when_the_dump_is_unusable(tmp_path, dama
         config = json.loads((save_dir / "config.json").read_text(encoding="utf-8"))
         config["m"] = 17
         (save_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        repair_manifest(save_dir, "config.json")
     elif damage == "vendored_dump":
         # What a directory saved by 0.6.0 or earlier holds. The vendored magic
         # is MAGICDESCR_4, and the two files sit beside a name this build does
@@ -2198,20 +2227,25 @@ def test_load_treats_a_never_written_file_as_one_removed_afterwards(tmp_path):
     assert "manifest.json names vectors.bin under files_included" in str(excinfo.value)
 
 
-def test_load_ignores_an_artefact_the_manifest_does_not_name(tmp_path):
-    """Saving over a directory leaves files behind, and they are not read.
+def test_a_save_over_a_quantized_directory_leaves_none_of_it(tmp_path):
+    """The stale artefacts are gone, and a stray one is still not read.
 
-    A save replaces files one at a time and removes none, so a raw index saved
-    over a quantized one leaves the earlier save quantization.json,
-    pq_centroids.bin and pq_codes.bin in place. The record counts agree, so
+    A save used to replace files one at a time and remove none, so a raw index
+    saved over a quantized one left the earlier save quantization.json,
+    pq_centroids.bin and pq_codes.bin in place. The record counts agreed, so
     nothing caught it, and the directory reopened as a quantized index holding
-    the previous save codebook and codes. The manifest is the inventory in both
-    directions, so an artefact it does not name is not read.
+    the previous save's codebook and codes. `manifest_names` stopped the reopen;
+    the files stayed on the disk.
+
+    A save now builds its directory from nothing and moves it into place, so
+    they cannot survive one. The inventory rule is unchanged and is checked here
+    against a file put there by hand, which is the only way one gets there now.
     """
     quantized, _ = half_written_source("quantized_with_raw")
     shared = tmp_path / "shared.zdb"
     quantized.save(str(shared))
     assert (shared / "pq_codes.bin").exists()
+    stray = json.loads((shared / "quantization.json").read_text(encoding="utf-8"))
 
     plain = VectorDatabase().create("hnsw", dim=HALF_WRITTEN_DIM, expected_size=5000)
     rng = np.random.default_rng(77)
@@ -2223,12 +2257,20 @@ def test_load_ignores_an_artefact_the_manifest_does_not_name(tmp_path):
     }).is_success()
     plain.save(str(shared))
 
-    # The quantization files are still on disk and the manifest does not name
-    # them, which is exactly the state that used to be read back.
+    # Not merely unread. Not there.
     manifest = json.loads((shared / "manifest.json").read_text(encoding="utf-8"))
     for name in ("quantization.json", "pq_centroids.bin", "pq_codes.bin"):
-        assert (shared / name).exists(), name
+        assert not (shared / name).exists(), name
         assert name not in manifest["files_included"], name
+    assert sorted(p.name for p in shared.glob("*")) == [
+        "config.json", "hnsw_index.zdbgraph", "manifest.json",
+        "mappings.bin", "metadata.json", "vectors.bin",
+    ]
+
+    # And a file the manifest does not name is still not read, which is now the
+    # rule for a directory somebody put a file into rather than for one a save
+    # left behind.
+    (shared / "quantization.json").write_text(json.dumps(stray), encoding="utf-8")
 
     reopened = VectorDatabase().load(str(shared))
     assert not reopened.is_quantized()
@@ -2251,8 +2293,10 @@ def test_load_ignores_an_artefact_the_manifest_does_not_name(tmp_path):
 # ------------------------------------------------------------
 # The manifest's descriptive fields
 # ------------------------------------------------------------
-def _directory_bytes(path):
-    return sum(os.path.getsize(os.path.join(path, name)) for name in os.listdir(path))
+def _directory_bytes(path, *, without_manifest=False):
+    names = [n for n in os.listdir(path)
+             if not (without_manifest and n == "manifest.json")]
+    return sum(os.path.getsize(os.path.join(path, name)) for name in names)
 
 
 def _read_manifest(path):
@@ -2260,14 +2304,17 @@ def _read_manifest(path):
 
 
 def test_total_size_mb_counts_the_graph_dump(tmp_path):
-    """The figure is the directory, graph included.
+    """The figure is every artefact, graph included, manifest.json excepted.
 
-    manifest.json is written before the graph dump, so the size taken there
-    misses the largest file in the directory. At 50,000 records of dimension
-    1,536 that is roughly 320 MB of a roughly 630 MB directory. On a save over
-    an existing directory it counted the previous save's dump, which was a
-    different wrong number. The manifest is now written a second time after the
-    dump, carrying nothing new but this field.
+    manifest.json used to be written before the graph dump, so the size it
+    carried missed the largest file in the directory. At 50,000 records of
+    dimension 1,536 that is roughly 320 MB of a roughly 630 MB directory, and on
+    a save over an existing directory it counted the previous save's dump, which
+    was a different wrong number. It was corrected by writing the manifest twice.
+
+    The manifest is now the last file a save writes, so the figure is taken with
+    every other artefact on disk and is exact for all of them. It cannot count
+    manifest.json, which does not exist yet, and it is short by exactly that.
     """
     vdb = VectorDatabase()
     index = vdb.create("hnsw", dim=32, expected_size=1200)
@@ -2279,27 +2326,26 @@ def test_total_size_mb_counts_the_graph_dump(tmp_path):
     index.save(str(saved))
 
     manifest = _read_manifest(saved)
-    on_disk_mb = _directory_bytes(str(saved)) / (1024 * 1024)
+    on_disk_mb = _directory_bytes(str(saved), without_manifest=True) / (1024 * 1024)
     # The graph dump is the file the old figure missed, and it is the largest
     # thing in the directory, so this is not a rounding argument.
     graph_mb = os.path.getsize(saved / "hnsw_index.zdbgraph") / (1024 * 1024)
     assert graph_mb > 0.25 * on_disk_mb
-    # Writing the corrected number changes manifest.json's own length by a few
-    # bytes, and the figure was taken before that write, so it is short by that
-    # difference and by nothing else.
-    assert abs(manifest["total_size_mb"] - on_disk_mb) * 1024 * 1024 < 64
+    # Exact, to a byte, against every artefact but the manifest itself.
+    assert abs(manifest["total_size_mb"] - on_disk_mb) * 1024 * 1024 < 1
 
     # Saving over the directory records the new size rather than the old one.
     assert index.add({"ids": [f"b{i}" for i in range(400)],
                       "embeddings": rng.random((400, 32)).astype(np.float32)}).is_success()
     index.save(str(saved))
     resaved = _read_manifest(saved)
-    on_disk_mb = _directory_bytes(str(saved)) / (1024 * 1024)
+    on_disk_mb = _directory_bytes(str(saved), without_manifest=True) / (1024 * 1024)
     assert resaved["total_size_mb"] > manifest["total_size_mb"]
-    assert abs(resaved["total_size_mb"] - on_disk_mb) * 1024 * 1024 < 64
+    assert abs(resaved["total_size_mb"] - on_disk_mb) * 1024 * 1024 < 1
 
-    # The staging file the rewrite goes through is renamed away, so a finished
-    # save leaves exactly the artefacts it always left.
+    # The staging directory is renamed into place, so a finished save leaves
+    # exactly the artefacts it always left and nothing beside them.
+    assert not list(saved.parent.glob("*.zdbtmp")) and not list(saved.parent.glob("*.zdbold"))
     assert sorted(p.name for p in saved.glob("*")) == [
         "config.json",
         "hnsw_index.zdbgraph",
@@ -2323,8 +2369,8 @@ def test_total_size_mb_on_an_empty_index(tmp_path):
 
     manifest = _read_manifest(saved)
     assert "hnsw_index.zdbgraph" in manifest["files_excluded"]
-    on_disk_mb = _directory_bytes(str(saved)) / (1024 * 1024)
-    assert abs(manifest["total_size_mb"] - on_disk_mb) * 1024 * 1024 < 64
+    on_disk_mb = _directory_bytes(str(saved), without_manifest=True) / (1024 * 1024)
+    assert abs(manifest["total_size_mb"] - on_disk_mb) * 1024 * 1024 < 1
     assert manifest["total_size_mb"] > 0
 
 
@@ -2477,3 +2523,225 @@ def test_a_quantized_with_raw_index_saved_with_records_keeps_its_store(tmp_path)
     reopened = VectorDatabase().load(str(path))
     assert reopened.get_vector_count() == 1050
     assert _added_vector_comes_back_exactly(reopened) < 1e-6
+
+
+# ============================================================================
+# THE SAVE IS ATOMIC, AND EVERY ARTEFACT CARRIES A DIGEST
+# ============================================================================
+
+
+def _saved(tmp_path, name, *, records=40, dim=8, quantized=False, seed=5):
+    """A small saved index, raw or trained quantized."""
+    kwargs = {}
+    if quantized:
+        records = max(records, 1200)
+        kwargs["quantization_config"] = {
+            "type": "pq", "subvectors": 4, "bits": 4,
+            "training_size": 1000, "storage_mode": "quantized_with_raw",
+        }
+    index = VectorDatabase().create("hnsw", dim=dim, expected_size=max(records, 100),
+                                    **kwargs)
+    rng = np.random.default_rng(seed)
+    vectors = rng.standard_normal((records, dim)).astype(np.float32)
+    assert index.add({
+        "ids": [f"v{i}" for i in range(records)],
+        "embeddings": vectors,
+        "metadatas": [{"tag": f"t{i}"} for i in range(records)],
+    }).is_success()
+    path = tmp_path / name
+    index.save(str(path))
+    return path, index, vectors
+
+
+def test_a_finished_save_leaves_no_sibling_directory(tmp_path):
+    """The staging directory and the one the previous index moves to are gone.
+
+    A save writes `<name>.zdbtmp` beside the target and renames it into place,
+    and replacing an existing directory moves that one to `<name>.zdbold` first.
+    Both are removed by a save that finishes, so the only thing on disk is the
+    index.
+    """
+    path, index, _ = _saved(tmp_path, "clean.zdb")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["clean.zdb"]
+    index.save(str(path))
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["clean.zdb"]
+
+
+def test_a_save_never_leaves_a_partial_directory_where_a_reader_looks(tmp_path):
+    """A save that fails leaves the previous directory exactly as it was.
+
+    The failure is forced by making the target a path the rename cannot land
+    on, which is the last thing a save does, so every artefact has been written
+    into the staging directory by then. Before the staging directory existed
+    those artefacts went straight into the target and a reader saw half of each
+    index.
+    """
+    path, index, _ = _saved(tmp_path, "guarded.zdb")
+    before = sorted((p.name, p.stat().st_size) for p in path.iterdir())
+    manifest_before = _read_manifest(path)
+
+    # A directory that cannot be removed is the simplest forced failure that
+    # leaves the target in place: the second rename lands on a name that is
+    # already taken by a directory holding a file.
+    blocker = tmp_path / "guarded.zdb.zdbold"
+    blocker.mkdir()
+    (blocker / "held").write_text("x", encoding="utf-8")
+
+    bigger = VectorDatabase().create("hnsw", dim=8, expected_size=200)
+    rng = np.random.default_rng(6)
+    assert bigger.add({"ids": [f"w{i}" for i in range(120)],
+                       "embeddings": rng.standard_normal((120, 8)).astype(np.float32)
+                       }).is_success()
+
+    # recover() removes a .zdbold that sits beside a live target, so the save
+    # goes through. What matters is the invariant either way: the target still
+    # holds the index it held, byte for byte.
+    try:
+        bigger.save(str(path))
+    except Exception:
+        assert sorted((p.name, p.stat().st_size) for p in path.iterdir()) == before
+        assert _read_manifest(path) == manifest_before
+        assert VectorDatabase().load(str(path)).get_vector_count() == 40
+        return
+
+    # It succeeded, so the whole new index is there and none of the old one is.
+    assert VectorDatabase().load(str(path)).get_vector_count() == 120
+    assert not blocker.exists()
+
+
+def test_a_leftover_staging_directory_breaks_neither_a_load_nor_a_save(tmp_path):
+    """What a killed process leaves is cleaned up by the next save."""
+    path, _, _ = _saved(tmp_path, "leftover.zdb")
+
+    staging = tmp_path / "leftover.zdb.zdbtmp"
+    staging.mkdir()
+    (staging / "half_written.bin").write_bytes(b"\x00" * 32)
+    stale = tmp_path / "leftover.zdb.zdbold"
+    shutil.copytree(path, stale)
+
+    # Neither is inside the index directory, so a load reads neither.
+    assert VectorDatabase().load(str(path)).get_vector_count() == 40
+
+    replacement = VectorDatabase().create("hnsw", dim=8, expected_size=100)
+    assert replacement.add({"ids": ["only"], "embeddings": [[0.5] * 8]}).is_success()
+    replacement.save(str(path))
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["leftover.zdb"]
+    assert VectorDatabase().load(str(path)).get_vector_count() == 1
+
+
+def test_an_index_moved_aside_by_a_killed_save_is_put_back(tmp_path):
+    """The one window where the target does not exist, and the recovery for it.
+
+    Replacing an existing directory takes two renames, because neither Windows
+    nor POSIX can rename a directory over a non-empty one. Between them the
+    target is absent and the whole previous index sits at `<name>.zdbold`. This
+    reproduces that state exactly and checks the next save puts it back rather
+    than discarding it.
+    """
+    path, _, _ = _saved(tmp_path, "window.zdb")
+    aside = tmp_path / "window.zdb.zdbold"
+    os.rename(path, aside)
+    assert not path.exists()
+
+    replacement = VectorDatabase().create("hnsw", dim=8, expected_size=100)
+    assert replacement.add({"ids": ["fresh"], "embeddings": [[0.25] * 8]}).is_success()
+    replacement.save(str(path))
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["window.zdb"]
+    assert VectorDatabase().load(str(path)).get_vector_count() == 1
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_every_artefact_carries_a_length_and_a_digest(tmp_path, quantized):
+    """The manifest records both, and both agree with the file on disk."""
+    path, _, _ = _saved(tmp_path, "digested.zdb", quantized=quantized)
+    manifest = _read_manifest(path)
+    digests = manifest["file_digests"]
+
+    assert sorted(digests) == sorted(manifest["files_included"])
+    for name, entry in digests.items():
+        assert entry["bytes"] == os.path.getsize(path / name), name
+        if name == "hnsw_index.zdbgraph":
+            assert "checksum" not in entry
+        else:
+            assert len(entry["checksum"]) == 16
+            assert repair_digest_matches(path, name), name
+
+
+def repair_digest_matches(directory, name):
+    """The digest the manifest records, recomputed from the file."""
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    return (manifest["file_digests"][name]["checksum"]
+            == artefact_digest((directory / name).read_bytes()))
+
+
+@pytest.mark.parametrize("name", [
+    "config.json", "metadata.json", "mappings.bin", "vectors.bin",
+])
+def test_an_artefact_edited_to_the_same_length_is_refused(tmp_path, name):
+    """The case files_included cannot catch, being present and wrong.
+
+    A one byte edit that keeps the length loaded in silence before the digest
+    existed: an edit inside metadata.json came back as that record's metadata
+    and a flipped byte inside vectors.bin came back as that record's vector.
+    """
+    path, _, _ = _saved(tmp_path, "edited.zdb")
+    target = path / name
+    raw = bytearray(target.read_bytes())
+    at = len(raw) - 6
+    raw[at] ^= 0x40
+    assert len(raw) == os.path.getsize(target)
+    target.write_bytes(bytes(raw))
+
+    with pytest.raises(RuntimeError, match=rf"{name}.*digest recorded beside it"):
+        VectorDatabase().load(str(path))
+
+
+def test_an_artefact_that_lost_bytes_is_refused_by_its_length(tmp_path):
+    """Truncation is caught by the length alone, before the digest is taken."""
+    path, _, _ = _saved(tmp_path, "short.zdb")
+    target = path / "mappings.bin"
+    target.write_bytes(target.read_bytes()[:-4])
+
+    with pytest.raises(RuntimeError,
+                       match=r"mappings\.bin is \d+ bytes and manifest\.json records it as \d+"):
+        VectorDatabase().load(str(path))
+
+
+def test_a_directory_with_no_digests_still_opens(tmp_path):
+    """Backward compatibility, which is what the defaulted field buys.
+
+    Every directory written before this field existed carries no digests at all,
+    so nothing is verified and the load is what it always was.
+    """
+    path, _, _ = _saved(tmp_path, "predigest.zdb")
+    manifest = _read_manifest(path)
+    assert manifest.pop("file_digests")
+    (path / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    # Including one that has since been edited, which is the point: an old
+    # directory is trusted exactly as much as it was.
+    metadata = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
+    metadata["v3"]["tag"] = "edited"
+    (path / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    loaded = VectorDatabase().load(str(path))
+    assert loaded.get_vector_count() == 40
+    assert loaded.get_records("v3")[0]["metadata"]["tag"] == "edited"
+
+
+def test_a_graph_dump_of_the_wrong_length_falls_back_to_the_rebuild(tmp_path):
+    """The dump's manifest entry is its length, and a mismatch is not fatal.
+
+    The dump is the one artefact the loader can produce again, so a length that
+    disagrees takes the rebuild rather than refusing, which is what an absent
+    dump has always done.
+    """
+    path, _, vectors = _saved(tmp_path, "dumped.zdb")
+    dump = path / "hnsw_index.zdbgraph"
+    dump.write_bytes(dump.read_bytes() + b"\x00" * 16)
+
+    loaded = VectorDatabase().load(str(path))
+    assert loaded.get_vector_count() == 40
+    assert len(loaded.search(vectors[0].tolist(), top_k=5)) == 5

@@ -4,6 +4,7 @@ import time
 import warnings
 import pytest
 import numpy as np
+from helpers import repair_manifest
 from zeusdb_vector_database import VectorDatabase
 
 # ------------------------------------------------------------
@@ -2864,6 +2865,7 @@ def test_an_index_saved_without_a_calibration_loads_and_uses_the_fallback(
     assert payload.pop("rerank_calibration", None) is not None, (
         "the field this test removes was not written")
     quant_path.write_text(json.dumps(payload, indent=2))
+    repair_manifest(quant_path.parent, "quantization.json")
 
     loaded = VectorDatabase().load(str(path))
     stats = loaded.get_stats()
@@ -3107,6 +3109,7 @@ def test_an_index_calibrated_without_a_page_term_takes_the_default(
     assert calibration.pop("page_fetches", None) is not None
     assert calibration.pop("page_exponent", None) is not None
     quant_path.write_text(json.dumps(payload, indent=2))
+    repair_manifest(quant_path.parent, "quantization.json")
 
     loaded = VectorDatabase().load(str(path))
     stats = loaded.get_stats()

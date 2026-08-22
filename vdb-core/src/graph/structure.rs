@@ -458,7 +458,7 @@ fn a_non_finite_query_traverses_or_panics_at_the_candidate_assertion() {
                 .map(|s| s.to_string())
                 .or_else(|| any.downcast_ref::<String>().cloned())
                 .unwrap_or_default();
-            assert_eq!(text, "assertion failed: c.dist_to_ref <= 0.");
+            assert_eq!(text, "assertion failed: !c.dist_to_ref.is_nan()");
         }
         Ok(_) => panic!("a NaN query should panic on the traversal"),
     }

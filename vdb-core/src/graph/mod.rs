@@ -49,7 +49,7 @@
 // another. See `clippy.toml`.
 #![allow(clippy::disallowed_types)]
 
-use crate::distance::{CosineDist, DistPQ, L1Dist, L2Dist};
+use crate::distance::{CosineDist, DistPQ, DotDist, L1Dist, L2Dist};
 use crate::pq::PQ;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -332,6 +332,7 @@ pub(crate) enum VectorGraph {
     Cosine(Backend<f32, CosineDist>),
     L2(Backend<f32, L2Dist>),
     L1(Backend<f32, L1Dist>),
+    Dot(Backend<f32, DotDist>),
 
     // PQ variants, holding one `u8` per subvector
     CosinePQ(Backend<u8, DistPQ>),
@@ -400,6 +401,7 @@ impl VectorGraph {
             "cosine" => raw!(Cosine, CosineDist {}),
             "l2" => raw!(L2, L2Dist {}),
             "l1" => raw!(L1, L1Dist {}),
+            "dot" => raw!(Dot, DotDist {}),
             _ => {
                 error!(
                     operation = "hnsw_creation",
@@ -462,6 +464,11 @@ impl VectorGraph {
             "cosine" => quantized!(CosinePQ),
             "l2" => quantized!(L2PQ),
             "l1" => quantized!(L1PQ),
+            // "dot" is not here and cannot reach here. See
+            // `validate_index_parameters`, which refuses the pair at create()
+            // and at load, because the ADC table every quantized graph scores
+            // against is a squared L2 distance and ordering by it is not
+            // ordering by an inner product.
             _ => {
                 error!(
                     operation = "hnsw_creation",
@@ -509,6 +516,7 @@ impl VectorGraph {
             }
             VectorGraph::L2(b) => Ok(b.graph.search(&b.store, query, k, ef, filter)),
             VectorGraph::L1(b) => Ok(b.graph.search(&b.store, query, k, ef, filter)),
+            VectorGraph::Dot(b) => Ok(b.graph.search(&b.store, query, k, ef, filter)),
 
             // PQ-based search with ADC
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
@@ -534,6 +542,7 @@ impl VectorGraph {
             VectorGraph::Cosine(b) => b.graph.nb_points(),
             VectorGraph::L2(b) => b.graph.nb_points(),
             VectorGraph::L1(b) => b.graph.nb_points(),
+            VectorGraph::Dot(b) => b.graph.nb_points(),
             VectorGraph::CosinePQ(b) => b.graph.nb_points(),
             VectorGraph::L2PQ(b) => b.graph.nb_points(),
             VectorGraph::L1PQ(b) => b.graph.nb_points(),
@@ -560,6 +569,7 @@ impl VectorGraph {
             VectorGraph::Cosine(b) => b.graph.memory_bytes(),
             VectorGraph::L2(b) => b.graph.memory_bytes(),
             VectorGraph::L1(b) => b.graph.memory_bytes(),
+            VectorGraph::Dot(b) => b.graph.memory_bytes(),
             VectorGraph::CosinePQ(b) => b.graph.memory_bytes(),
             VectorGraph::L2PQ(b) => b.graph.memory_bytes(),
             VectorGraph::L1PQ(b) => b.graph.memory_bytes(),
@@ -573,6 +583,7 @@ impl VectorGraph {
             VectorGraph::Cosine(b) => b.store.memory_bytes(),
             VectorGraph::L2(b) => b.store.memory_bytes(),
             VectorGraph::L1(b) => b.store.memory_bytes(),
+            VectorGraph::Dot(b) => b.store.memory_bytes(),
             VectorGraph::CosinePQ(b) => b.store.memory_bytes(),
             VectorGraph::L2PQ(b) => b.store.memory_bytes(),
             VectorGraph::L1PQ(b) => b.store.memory_bytes(),
@@ -588,7 +599,10 @@ impl VectorGraph {
     /// The raw side store, where this graph keeps one.
     fn raw_store(&self) -> Option<&VectorStore<f32>> {
         match self {
-            VectorGraph::Cosine(_) | VectorGraph::L2(_) | VectorGraph::L1(_) => None,
+            VectorGraph::Cosine(_)
+            | VectorGraph::L2(_)
+            | VectorGraph::L1(_)
+            | VectorGraph::Dot(_) => None,
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 b.raw.as_ref()
             }
@@ -602,6 +616,7 @@ impl VectorGraph {
             VectorGraph::Cosine(b) => b.graph.node_of(internal_id),
             VectorGraph::L2(b) => b.graph.node_of(internal_id),
             VectorGraph::L1(b) => b.graph.node_of(internal_id),
+            VectorGraph::Dot(b) => b.graph.node_of(internal_id),
             VectorGraph::CosinePQ(b) => b.graph.node_of(internal_id),
             VectorGraph::L2PQ(b) => b.graph.node_of(internal_id),
             VectorGraph::L1PQ(b) => b.graph.node_of(internal_id),
@@ -614,6 +629,7 @@ impl VectorGraph {
             VectorGraph::Cosine(b) => b.graph.origin_id_of(node),
             VectorGraph::L2(b) => b.graph.origin_id_of(node),
             VectorGraph::L1(b) => b.graph.origin_id_of(node),
+            VectorGraph::Dot(b) => b.graph.origin_id_of(node),
             VectorGraph::CosinePQ(b) => b.graph.origin_id_of(node),
             VectorGraph::L2PQ(b) => b.graph.origin_id_of(node),
             VectorGraph::L1PQ(b) => b.graph.origin_id_of(node),
@@ -633,6 +649,7 @@ impl VectorGraph {
             VectorGraph::Cosine(b) => b.store.try_get(node),
             VectorGraph::L2(b) => b.store.try_get(node),
             VectorGraph::L1(b) => b.store.try_get(node),
+            VectorGraph::Dot(b) => b.store.try_get(node),
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 b.raw.as_ref()?.try_get(node)
             }
@@ -642,7 +659,10 @@ impl VectorGraph {
     /// Whether this graph holds a raw vector for every node it carries.
     pub(crate) fn holds_raw(&self) -> bool {
         match self {
-            VectorGraph::Cosine(_) | VectorGraph::L2(_) | VectorGraph::L1(_) => true,
+            VectorGraph::Cosine(_)
+            | VectorGraph::L2(_)
+            | VectorGraph::L1(_)
+            | VectorGraph::Dot(_) => true,
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 b.raw.is_some()
             }
@@ -668,9 +688,10 @@ impl VectorGraph {
             return Err("a raw store holds vectors of at least one value".to_string());
         }
         match self {
-            VectorGraph::Cosine(_) | VectorGraph::L2(_) | VectorGraph::L1(_) => {
-                Err("a raw graph already holds its raw vectors".to_string())
-            }
+            VectorGraph::Cosine(_)
+            | VectorGraph::L2(_)
+            | VectorGraph::L1(_)
+            | VectorGraph::Dot(_) => Err("a raw graph already holds its raw vectors".to_string()),
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 b.raw = Some(VectorStore::with_capacity(dim, records));
                 Ok(())
@@ -721,9 +742,10 @@ impl VectorGraph {
     /// `open_raw_store` refuses.
     pub(crate) fn push_raw_vector(&mut self, values: &[f32]) -> Result<(), String> {
         match self {
-            VectorGraph::Cosine(_) | VectorGraph::L2(_) | VectorGraph::L1(_) => {
-                Err("a raw graph already holds its raw vectors".to_string())
-            }
+            VectorGraph::Cosine(_)
+            | VectorGraph::L2(_)
+            | VectorGraph::L1(_)
+            | VectorGraph::Dot(_) => Err("a raw graph already holds its raw vectors".to_string()),
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 match b.raw.as_mut() {
                     Some(store) => {
@@ -743,6 +765,7 @@ impl VectorGraph {
             VectorGraph::Cosine(b) => b.store.len(),
             VectorGraph::L2(b) => b.store.len(),
             VectorGraph::L1(b) => b.store.len(),
+            VectorGraph::Dot(b) => b.store.len(),
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 b.raw.as_ref().map_or(0, VectorStore::len)
             }
@@ -755,6 +778,7 @@ impl VectorGraph {
             VectorGraph::Cosine(b) => Some(b.store.dim()),
             VectorGraph::L2(b) => Some(b.store.dim()),
             VectorGraph::L1(b) => Some(b.store.dim()),
+            VectorGraph::Dot(b) => Some(b.store.dim()),
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 b.raw.as_ref().map(VectorStore::dim)
             }
@@ -778,6 +802,10 @@ impl VectorGraph {
                 b.graph.shrink_to_fit()
             }
             VectorGraph::L1(b) => {
+                b.store.shrink_to_fit();
+                b.graph.shrink_to_fit()
+            }
+            VectorGraph::Dot(b) => {
                 b.store.shrink_to_fit();
                 b.graph.shrink_to_fit()
             }
@@ -816,6 +844,7 @@ impl VectorGraph {
             VectorGraph::Cosine(b) => reseed(&b.levels),
             VectorGraph::L2(b) => reseed(&b.levels),
             VectorGraph::L1(b) => reseed(&b.levels),
+            VectorGraph::Dot(b) => reseed(&b.levels),
             VectorGraph::CosinePQ(b) => reseed(&b.levels),
             VectorGraph::L2PQ(b) => reseed(&b.levels),
             VectorGraph::L1PQ(b) => reseed(&b.levels),
@@ -842,6 +871,7 @@ impl VectorGraph {
             }
             (VectorGraph::L2(b), Record::Raw(v)) => Some(b.plan(v)),
             (VectorGraph::L1(b), Record::Raw(v)) => Some(b.plan(v)),
+            (VectorGraph::Dot(b), Record::Raw(v)) => Some(b.plan(v)),
             (VectorGraph::CosinePQ(b), Record::Codes { codes, .. })
             | (VectorGraph::L2PQ(b), Record::Codes { codes, .. })
             | (VectorGraph::L1PQ(b), Record::Codes { codes, .. }) => Some(b.plan(codes)),
@@ -875,6 +905,7 @@ impl VectorGraph {
             (VectorGraph::Cosine(b), Record::Raw(v)) => b.install(v, id, planned),
             (VectorGraph::L2(b), Record::Raw(v)) => b.install(v, id, planned),
             (VectorGraph::L1(b), Record::Raw(v)) => b.install(v, id, planned),
+            (VectorGraph::Dot(b), Record::Raw(v)) => b.install(v, id, planned),
             (VectorGraph::CosinePQ(b), Record::Codes { codes, raw })
             | (VectorGraph::L2PQ(b), Record::Codes { codes, raw })
             | (VectorGraph::L1PQ(b), Record::Codes { codes, raw }) => {
@@ -928,12 +959,13 @@ impl VectorGraph {
         }
     }
 
-    /// Which of the six graphs this is, as the dump header records it.
+    /// Which of the seven graphs this is, as the dump header records it.
     fn kind(&self) -> GraphKind {
         match self {
             VectorGraph::Cosine(_) => GraphKind::Cosine,
             VectorGraph::L2(_) => GraphKind::L2,
             VectorGraph::L1(_) => GraphKind::L1,
+            VectorGraph::Dot(_) => GraphKind::Dot,
             VectorGraph::CosinePQ(_) => GraphKind::CosinePq,
             VectorGraph::L2PQ(_) => GraphKind::L2Pq,
             VectorGraph::L1PQ(_) => GraphKind::L1Pq,
@@ -958,6 +990,7 @@ impl VectorGraph {
             VectorGraph::Cosine(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
             VectorGraph::L2(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
             VectorGraph::L1(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
+            VectorGraph::Dot(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
             VectorGraph::CosinePQ(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
             VectorGraph::L2PQ(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
             VectorGraph::L1PQ(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
@@ -1093,6 +1126,7 @@ pub(crate) fn restore_graph(
             match space {
                 "l2" => raw!(GraphKind::L2, L2Dist, L2Dist {}, L2),
                 "l1" => raw!(GraphKind::L1, L1Dist, L1Dist {}, L1),
+                "dot" => raw!(GraphKind::Dot, DotDist, DotDist {}, Dot),
                 // `new_raw` also falls back to cosine on an unrecognised space,
                 // so the two construction paths agree on what a bad space means.
                 _ => raw!(GraphKind::Cosine, CosineDist, CosineDist {}, Cosine),

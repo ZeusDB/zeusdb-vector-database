@@ -86,7 +86,11 @@ def tolerance(value):
     return 1e-6 + 1e-6 * abs(value)
 
 
-SPACES = ("cosine", "l2", "l1")
+# `dot` is here on the same terms as the other three. It is the one space whose
+# distance can be negative, since it returns `1 - dot` and an inner product
+# above one gives one, so it is also the one that exercises the ordering with a
+# sign the vendored traversal used to assert against.
+SPACES = ("cosine", "l2", "l1", "dot")
 
 
 def brute_force(space, corpus, query):
@@ -99,6 +103,11 @@ def brute_force(space, corpus, query):
         return np.linalg.norm(c - q, axis=1)
     if space == "l1":
         return np.abs(c - q).sum(axis=1)
+    if space == "dot":
+        # What `DotDist` computes, and deliberately not a normalised one: this
+        # space does not normalise what it is given, so brute force must not
+        # either.
+        return 1.0 - (c @ q)
     raise AssertionError(space)
 
 
@@ -230,15 +239,31 @@ def test_the_traversal_matches_brute_force_inside_the_regime(space, dim, m):
 
 
 @pytest.mark.parametrize("space", SPACES)
-def test_a_query_that_is_a_record_returns_that_record_first(space):
-    """The nearest neighbour of a stored vector is itself, at distance zero."""
+def test_a_query_that_is_a_record_returns_the_record_brute_force_names(space):
+    """A stored vector as the query, against what brute force says is nearest.
+
+    Under cosine, l1 and l2 that is the record itself at distance zero, because
+    all three are metrics. **Under dot it need not be.** An inner product is not
+    a metric and has no zero: a stored vector scores `1 - v.v` against itself,
+    and a longer vector pointing much the same way scores lower still, so the
+    nearest neighbour of a record can be a different record. That is a property
+    of inner product search rather than a defect, and asserting the metric rule
+    here would have asserted something untrue.
+    """
     n, dim = 120, 16
     corpus = corpus_for(4, n, dim)
     index = build(space, dim, 16, n, corpus)
     for i in range(0, n, 7):
         page = index.search(vector=corpus[i].tolist(), top_k=1, ef_search=n)
-        assert page[0]["id"] == f"r{i}", f"{space}: r{i} found {page[0]['id']}"
-        assert abs(page[0]["score"]) <= tolerance(1.0), page[0]["score"]
+        truth = brute_force(space, corpus, corpus[i])
+        nearest = int(np.argmin(truth))
+        assert page[0]["id"] == f"r{nearest}", (
+            f"{space}: query r{i} found {page[0]['id']} where brute force says r{nearest}"
+        )
+        assert abs(page[0]["score"] - truth[nearest]) <= tolerance(truth[nearest])
+        if space != "dot":
+            assert nearest == i, f"{space}: r{i} is not its own nearest neighbour"
+            assert abs(page[0]["score"]) <= tolerance(1.0), page[0]["score"]
 
 
 @pytest.mark.parametrize("space", SPACES)

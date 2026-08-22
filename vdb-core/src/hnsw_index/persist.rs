@@ -191,22 +191,34 @@ impl HNSWIndex {
         let start_time = Instant::now();
         info!(operation = "save_start", path = path, "Starting index save");
 
-        let path_buf = Path::new(path);
+        let target = Path::new(path);
+
+        // Every artefact goes into a directory of its own that is moved into
+        // place at the end, so a reader sees the previous index or this one and
+        // never a mixture of the two, and a stale artefact from an earlier save
+        // cannot survive. See `persistence::StagingDir`.
+        let staging = crate::persistence::StagingDir::open(target)?;
 
         // Phase 1: Save all ZeusDB components (already tested to work)
         debug!(operation = "save_phase1", "Saving ZeusDB components");
-        crate::persistence::save_index(self, path)?;
+        let mut ledger = crate::persistence::save_index(self, staging.path())?;
 
-        // Phase 2: Save HNSW graph using hnsw-rs native dump
+        // Phase 2: Save the HNSW graph in ZeusDB's own format
         debug!(operation = "save_phase2", "Saving HNSW graph");
-        self.save_hnsw_graph(path_buf)?;
+        self.save_hnsw_graph(staging.path(), &mut ledger)?;
 
-        // Phase 3: Record the directory size the dump has just changed. The
-        // manifest is deliberately written before the dump, so the size it
-        // carries misses the largest file in the directory until this runs.
-        // See `persistence::update_manifest_size`.
-        debug!(operation = "save_phase3", "Recording the directory size");
-        crate::persistence::update_manifest_size(path_buf)?;
+        // Phase 3: The manifest, last, because it records a length and a digest
+        // for every artefact above and the directory size all of them add up
+        // to.
+        debug!(operation = "save_phase3", "Writing the manifest");
+        crate::persistence::save_manifest(self, staging.path(), ledger)?;
+
+        // Phase 4: Two renames, or one where nothing is there yet.
+        debug!(
+            operation = "save_phase4",
+            "Moving the saved index into place"
+        );
+        staging.commit()?;
 
         let duration_ms = start_time.elapsed().as_millis();
         info!(
@@ -219,11 +231,15 @@ impl HNSWIndex {
     }
 
     /// Write the HNSW graph in ZeusDB's own format. See `graph::dump`.
-    #[instrument(level = "info", skip(self), fields(
+    #[instrument(level = "info", skip(self, ledger), fields(
         vector_count = self.get_vector_count(),
         path = %path.display()
     ))]
-    fn save_hnsw_graph(&self, path: &Path) -> PyResult<()> {
+    fn save_hnsw_graph(
+        &self,
+        path: &Path,
+        ledger: &mut crate::persistence::SaveLedger,
+    ) -> PyResult<()> {
         debug!(
             operation = "save_hnsw_graph_start",
             "Starting HNSW graph save"
@@ -246,9 +262,24 @@ impl HNSWIndex {
 
         match dump_result {
             Ok(filename) => {
+                // Its length rather than a digest, for the reason
+                // `persistence::ArtefactDigest` gives: the dump streams itself
+                // and seeks back to write its header, so hashing it whole would
+                // mean reading the largest artefact in the directory back off
+                // the disk for a guarantee its own two checksums already give.
+                let bytes = std::fs::metadata(path.join(&filename))
+                    .map(|meta| meta.len())
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                            "The graph dump was written and its length could not be read: {}",
+                            e
+                        ))
+                    })?;
+                ledger.record_length(&filename, bytes);
                 debug!(
                     operation = "save_hnsw_graph_complete",
                     file_created = %filename,
+                    file_bytes = bytes,
                     "HNSW graph saved successfully"
                 );
                 Ok(())
@@ -285,9 +316,28 @@ impl HNSWIndex {
         &mut self,
         dir: &Path,
         max_origin_id: usize,
+        recorded_bytes: Option<u64>,
     ) -> Result<usize, String> {
         if rebuild_requested() {
             return Err(format!("{} asked for the rebuild", REBUILD_ENV));
+        }
+
+        // The dump's own header and payload checksums say the file is
+        // internally consistent. The length manifest.json recorded says it is
+        // the file this directory's save wrote, which a self-consistent dump
+        // from a different save of an index of the same shape would otherwise
+        // pass. A directory written before the manifest carried lengths records
+        // none, and nothing is checked.
+        if let Some(expected) = recorded_bytes {
+            let found = std::fs::metadata(dir.join(crate::graph::dump::DUMP_FILENAME))
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            if found != expected {
+                return Err(format!(
+                    "the graph dump is {} bytes and manifest.json records it as {}",
+                    found, expected
+                ));
+            }
         }
 
         // A save skips the graph dump entirely when the index holds nothing, so
@@ -696,6 +746,37 @@ impl HNSWIndex {
     /// `get_m` gives.
     pub fn get_expected_size(&self) -> usize {
         self.expected_size.load(Ordering::Acquire)
+    }
+
+    /// How many generated ids this index has issued, for `config.json`
+    pub(crate) fn get_generated_ids(&self) -> usize {
+        *self.generated_ids.lock().unwrap()
+    }
+
+    /// Restore the generated id counter, never below what the records need
+    ///
+    /// `floor` is the highest N among the ids of the form `vec_N` the directory
+    /// actually holds. A directory written before this field existed carries a
+    /// zero and would otherwise reissue every generated id it holds, so the
+    /// records themselves supply the floor. A directory that carries the field
+    /// is at or above its own floor already and the max changes nothing.
+    pub(crate) fn set_generated_ids(&mut self, saved: usize, floor: usize) {
+        *self.generated_ids.lock().unwrap() = saved.max(floor);
+    }
+
+    /// The highest N among ids of the form `vec_N`, or zero where there is none
+    ///
+    /// A user is free to add a record called `vec_9` by hand, and this counts
+    /// it, so the next generated id is above it. That is the point: the counter
+    /// exists to stop an id being handed out twice.
+    pub(crate) fn highest_generated_id(ids: impl Iterator<Item = impl AsRef<str>>) -> usize {
+        ids.filter_map(|id| {
+            id.as_ref()
+                .strip_prefix("vec_")
+                .and_then(|rest| rest.parse::<usize>().ok())
+        })
+        .max()
+        .unwrap_or(0)
     }
 
     /// Get the current ID counter value (thread-safe)

@@ -339,9 +339,38 @@ fn create_env_filter(log_level: &str) -> EnvFilter {
         "zeusdb_vector_database={level},\
          rayon=warn,pyo3=warn,bincode=warn,serde_json=warn,\
          mio=warn,tokio=warn",
-        level = log_level
+        level = canonical_level(log_level)
     );
     EnvFilter::new(base)
+}
+
+/// The one place a level name becomes a level, for both layers
+///
+/// The two layers used to disagree about the spelling. Python's `logging` names
+/// the level `WARNING` and `CRITICAL`, and `tracing`'s `EnvFilter` names it
+/// `warn` and has no critical at all. So `ZEUSDB_LOG_LEVEL=warning` was accepted
+/// by the Python side and rejected by this one, which printed
+/// `ignoring zeusdb_vector_database=warning` to stderr and then filtered nothing
+/// through the directive, and `ZEUSDB_LOG_LEVEL=warn` was the reverse: accepted
+/// here and recorded as invalid by the Python side, which fell back to its own
+/// default.
+///
+/// Both spellings of each level are now one level, resolved here and by
+/// `_LEVEL_ALIASES` in `logging_config.py`, which is the Python half of the same
+/// table.
+///
+/// An unrecognised name falls back to `warn`, which is the default this module
+/// already used, rather than being passed through for `EnvFilter` to reject.
+fn canonical_level(log_level: &str) -> &'static str {
+    match log_level.trim().to_lowercase().as_str() {
+        "trace" => "trace",
+        "debug" => "debug",
+        "info" => "info",
+        "warn" | "warning" => "warn",
+        "error" | "critical" | "fatal" => "error",
+        "off" | "none" | "silent" => "off",
+        _ => "warn",
+    }
 }
 
 /// Create JSON formatter for stdout output

@@ -34,7 +34,9 @@
 mod construct;
 // The declaration rules, so that `persistence::load_config` applies the same
 // ones to `config.json` that `build` applies to a caller's arguments.
-pub(crate) use construct::{validate_index_parameters, warn_if_selection_disabled};
+pub(crate) use construct::{
+    validate_index_parameters, validate_space_supports_quantization, warn_if_selection_disabled,
+};
 #[cfg(test)]
 mod graph_guard_tests;
 mod input;
@@ -323,6 +325,28 @@ pub struct HNSWIndex {
 
     // Mutex for write-only fields
     id_counter: MutexAt<{ order::ID_COUNTER }, usize>,
+
+    /// The counter behind a generated external id, being `vec_N`.
+    ///
+    /// **Separate from `id_counter`, and it is not reset by `clear`.** It used
+    /// to be the same counter, which meant two things at once. `clear` resets
+    /// `id_counter` deliberately, because the graph's id-to-node array is one
+    /// dense slot per internal id issued and an index cleared and refilled
+    /// repeatedly would grow it without bound. That reset handed out `vec_1` a
+    /// second time, so an external reference to the first record now named a
+    /// different one and nothing said so.
+    ///
+    /// Splitting them lets each keep the property it needs. `id_counter` still
+    /// resets, so the dense array still shrinks. This one never goes backwards,
+    /// so a generated id is issued once in the life of an index and survives a
+    /// save and load. See `config.json`'s `generated_ids`.
+    ///
+    /// It also stops a generated id burning an internal one. `generate_id` used
+    /// to call `get_next_id`, so a batch of three records with no ids of their
+    /// own consumed six internal ids and the fourth record added afterwards was
+    /// `vec_7`. `list`'s ordering is unaffected either way, since it reads the
+    /// internal ids the records actually hold.
+    generated_ids: MutexAt<{ order::GENERATED_IDS }, usize>,
     vector_count: MutexAt<{ order::VECTOR_COUNT }, usize>, // Track total vectors for training trigger
 
     /// The graph.
@@ -1019,14 +1043,13 @@ impl HNSWIndex {
     ///
     /// The whole save runs with the interpreter lock released. `save_index`
     /// reaches `save_config`, `save_mappings`, `save_metadata`,
-    /// `save_quantization_config`, `save_pq_centroids`, `save_pq_codes`,
-    /// `save_vectors` and `save_manifest`, and every one of them speaks only to
-    /// `serde_json`, `bincode` and `std::fs`. Every Python token in
-    /// `persistence.rs` sits in the load path, in `rebuild_using_add_method` and
-    /// the `conversion` module it calls. `save_hnsw_graph` reaches
-    /// `graph::dump::write_dump`, which names PyO3 nowhere, and
-    /// `update_manifest_size` after it speaks only to `serde_json` and
-    /// `std::fs`.
+    /// `save_quantization_config`, `save_pq_centroids`, `save_pq_codes` and
+    /// `save_vectors`, and every one of them speaks only to `serde_json`,
+    /// `bincode` and `std::fs`. Every Python token in `persistence.rs` sits in
+    /// the load path, in `rebuild_using_add_method` and the `conversion` module
+    /// it calls. `save_hnsw_graph` reaches `graph::dump::write_dump`, which
+    /// names PyO3 nowhere, and `save_manifest` and `StagingDir::commit` after it
+    /// speak only to `serde_json` and `std::fs`.
     #[instrument(level = "info", skip(self, py), fields(
         vector_count = self.get_vector_count(),
         has_quantization = self.has_quantization(),
@@ -1269,9 +1292,19 @@ impl HNSWIndex {
     /// Get records by ID(s) with PQ reconstruction support and storage mode awareness
     ///
     /// Looks the ids up in the union of the raw vectors and the quantized codes,
-    /// so it already saw every record before the other accessors did. An id that
-    /// resolves to no record is dropped from the result rather than reported, so
-    /// the returned list can be shorter than the list of ids asked for.
+    /// so it already saw every record before the other accessors did.
+    ///
+    /// **An absent id is dropped by default and raised with `strict=True`.** The
+    /// default is silence because that is what every existing caller is written
+    /// against: asking for ten ids and receiving nine has always been how this
+    /// reports an id the index does not hold, and changing the return shape
+    /// would break every one of them. What the default cannot do is say *which*
+    /// nine, since the result is not aligned with the input. `strict=True`
+    /// raises a `KeyError` naming the absent ids, which is the form a caller who
+    /// cares can act on, and it is recommended over the alternative of returning
+    /// a structure carrying the misses: a caller who passes ids it believes are
+    /// present wants the failure, and one who does not can filter with
+    /// `contains`.
     ///
     /// `return_vector` is served from the raw vector where one exists and from a
     /// reconstruction of the code where one does not. Under `quantized_only`
@@ -1284,12 +1317,13 @@ impl HNSWIndex {
     /// 0.991 to it. Under `quantized_with_raw` every record keeps its raw
     /// vector and returns exactly. `get_stats()["raw_vectors_stored"]` is what
     /// tells the two apart in aggregate.
-    #[pyo3(signature = (input, return_vector = true))]
+    #[pyo3(signature = (input, return_vector = true, strict = false))]
     pub fn get_records(
         &self,
         py: Python<'_>,
         input: &Bound<PyAny>,
         return_vector: bool,
+        strict: bool,
     ) -> PyResult<Vec<Py<PyDict>>> {
         let ids: Vec<String> = if let Ok(id_str) = input.extract::<String>() {
             vec![id_str]
@@ -1309,6 +1343,7 @@ impl HNSWIndex {
         );
 
         let mut records = Vec::with_capacity(ids.len());
+        let mut absent: Vec<String> = Vec::new();
 
         // Use read locks for concurrent access. `id_map` is the record set,
         // and the graph is where the raw vectors live, so both are taken here
@@ -1360,7 +1395,30 @@ impl HNSWIndex {
                 }
 
                 records.push(dict.into());
+            } else if strict {
+                absent.push(id);
             }
+        }
+
+        if !absent.is_empty() {
+            // Every absent id rather than the first, because a caller correcting
+            // a list wants the whole list. Sorted so the message does not depend
+            // on the order the ids were asked in.
+            absent.sort();
+            let named: Vec<&str> = absent.iter().take(10).map(String::as_str).collect();
+            return Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "get_records(strict=True) was asked for {} id{} the index does not hold: \
+                 {}{}. Call it without strict=True to receive the records that are present, \
+                 or test an id with contains(id) first.",
+                absent.len(),
+                if absent.len() == 1 { "" } else { "s" },
+                named.join(", "),
+                if absent.len() > named.len() {
+                    format!(", and {} more", absent.len() - named.len())
+                } else {
+                    String::new()
+                }
+            )));
         }
 
         trace!(
@@ -1406,23 +1464,64 @@ impl HNSWIndex {
     /// ids are unique and are never reissued, so the order is total, and they
     /// survive a save and load, so it is the same order in the next process.
     ///
-    /// **Deletion during paging still shifts a page**, since removing a record
-    /// ahead of the cursor moves everything behind it up by one. That is
-    /// inherent to paging by offset and no ordering fixes it. A caller who
-    /// cannot tolerate it pages by holding the last id it saw rather than a
-    /// count.
+    /// # Paging by cursor rather than by count
+    ///
+    /// **`offset` shifts under deletion and `after` does not.** Removing a
+    /// record ahead of an offset moves everything behind it up by one, so the
+    /// next page skips a record, and no ordering fixes that: it is what paging
+    /// by a count means. `after` names the last record the caller saw, and the
+    /// next page is every record whose internal id is above that one's, so a
+    /// deletion anywhere ahead of the cursor changes nothing about where the
+    /// page starts.
+    ///
+    /// It is cheap because internal ids are what the order already rests on.
+    /// They are unique, never reissued, and survive `compact`, `rebuild` and a
+    /// save and load, so a cursor taken in one process is a cursor in the next.
+    ///
+    /// The one case it cannot absorb is the cursor record itself being removed,
+    /// since its internal id goes with it. That raises, naming the id, rather
+    /// than silently returning a page from somewhere else.
+    ///
+    /// `offset` stays as a convenience and the two are not combined: passing
+    /// both raises, because a caller mixing them has two ideas about where the
+    /// page starts.
     ///
     /// An offset at or past the record count returns an empty list rather than
     /// raising, and `number` of zero returns an empty list. Neither is an error.
-    #[pyo3(signature = (number=10, offset=0))]
+    #[pyo3(signature = (number=10, offset=0, after=None))]
     pub fn list(
         &self,
         py: Python<'_>,
         number: usize,
         offset: usize,
+        after: Option<String>,
     ) -> PyResult<Vec<(String, Py<PyAny>)>> {
         let id_map = self.id_map.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
+
+        let cursor = match after {
+            None => None,
+            Some(ref id) => {
+                if offset != 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "list() takes after or offset, not both, and it was given after='{}' \
+                         with offset={}. after names the last record of the previous page \
+                         and offset counts from the start, so the two name different places.",
+                        id, offset
+                    )));
+                }
+                let Some(&internal) = id_map.get(id.as_str()) else {
+                    return Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                        "list(after='{}') names a record the index does not hold, so there \
+                         is no position to resume from. The cursor record was removed while \
+                         the caller was paging. Resume from an id the index still holds, or \
+                         start again from offset 0.",
+                        id
+                    )));
+                };
+                Some(internal)
+            }
+        };
 
         // Only the records up to the end of the requested page need ordering, so
         // the tail is partitioned away in linear time and the sort runs over the
@@ -1431,6 +1530,7 @@ impl HNSWIndex {
         let mut ordered: Vec<(usize, &String)> = id_map
             .iter()
             .map(|(id, &internal)| (internal, id))
+            .filter(|&(internal, _)| cursor.is_none_or(|from| internal > from))
             .collect();
         let end = offset.saturating_add(number).min(ordered.len());
         if end < ordered.len() {
@@ -1645,7 +1745,9 @@ impl HNSWIndex {
         // reason the empty mapping is.
         if conditions.matches_every_record() {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "remove_where requires a filter that selects records. An empty filter matches                  every record, so this would delete the whole index. Name the records with                  remove_points(ids) if that is what you want.",
+                "remove_where requires a filter that selects records. An empty filter \
+                 matches every record, so this would delete the whole index. Name the \
+                 records with remove_points(ids) if that is what you want.",
             ));
         }
         Ok(py.detach(|| {

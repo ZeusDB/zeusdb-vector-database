@@ -732,9 +732,14 @@ impl HNSWIndex {
     }
 
     /// Generate a unique ID for a vector
+    ///
+    /// From a counter of its own rather than from the internal id counter. See
+    /// `HNSWIndex::generated_ids` for what each of the two has to guarantee and
+    /// why one counter could not do both.
     fn generate_id(&self) -> String {
-        let id = self.get_next_id();
-        format!("vec_{}", id)
+        let mut counter = self.generated_ids.lock().unwrap();
+        *counter += 1;
+        format!("vec_{}", *counter)
     }
 
     /// Safe version of extract_single_vector that returns String errors instead of PyErr

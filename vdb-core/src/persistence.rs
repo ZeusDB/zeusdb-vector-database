@@ -17,6 +17,19 @@
 //! └── hnsw_index.zdbgraph     # HNSW graph topology and the point each node holds
 //! ```
 //!
+//! ## How a save lands
+//!
+//! Every artefact goes into `<name>.zdbtmp` beside the target and the whole
+//! directory is renamed into place at the end, so a reader sees the previous
+//! index or this one and never a mixture. Replacing an existing directory needs
+//! two renames rather than one, with `<name>.zdbold` holding the previous index
+//! between them. See `StagingDir` for what that means on each platform and what
+//! a killed process leaves behind.
+//!
+//! `manifest.json` records a length and a digest for every artefact it names
+//! and the loader checks both before anything parses them. See
+//! `ArtefactDigest`.
+//!
 //! The graph file is ZeusDB's own format, written and read by `graph::dump`,
 //! and the loader restores the graph from it rather than rebuilding it by
 //! re-inserting every record. See `HNSWIndex::restore_graph_from_dump`.
@@ -26,10 +39,14 @@
 //! 0.6.0 or earlier still holds those two, and opening it rebuilds the graph
 //! once and writes the new file on the next save. Nothing reads the old format.
 
+use crate::checksum::checksum_of;
 use crate::columns::validate_indexed_fields;
 use crate::graph::dump::DUMP_FILENAME as GRAPH_DUMP_FILENAME;
 use crate::graph::dump::LEGACY_DUMP_FILENAMES;
-use crate::hnsw_index::{validate_index_parameters, HNSWIndex, QuantizationConfig, StorageMode};
+use crate::hnsw_index::{
+    validate_index_parameters, validate_space_supports_quantization, HNSWIndex, QuantizationConfig,
+    StorageMode,
+};
 use crate::pq::PQ;
 use crate::rerank::RerankCalibration;
 use chrono::Utc;
@@ -38,8 +55,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing::{debug, info};
 
 // ============================================================================
 // FORMAT VERSION
@@ -148,13 +166,422 @@ where
     }
 }
 
-/// Name the corrected manifest is written under before it is renamed into place
+// ============================================================================
+// AN ATOMIC SAVE
+// ============================================================================
+
+/// Suffix of the directory a save builds before it is moved into place.
+const STAGING_SUFFIX: &str = ".zdbtmp";
+
+/// Suffix the directory being replaced is moved aside under.
+const REPLACED_SUFFIX: &str = ".zdbold";
+
+/// A sibling of `target` carrying `suffix`, so both live on the target's volume
 ///
-/// A save that dies between the write and the rename leaves this behind. It is
-/// harmless: `check_files_present` only asks that every name the manifest lists
-/// is present, and `manifest_names` means a file the manifest does not list is
-/// never read. The next successful save overwrites it and renames it away.
-const MANIFEST_STAGING_FILENAME: &str = "manifest.json.tmp";
+/// A rename is only cheap, and only atomic, within one volume. Staging under
+/// the system temporary directory would put the new index on whichever volume
+/// that is, and the move into place would then be a copy of every byte.
+fn sibling(target: &Path, suffix: &str) -> PyResult<PathBuf> {
+    let name = target.file_name().ok_or_else(|| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "'{}' does not name a directory this build can save into. A save writes a \
+             sibling directory beside the target and moves it into place, so the target \
+             has to have a name of its own.",
+            target.display()
+        ))
+    })?;
+    let mut name = name.to_os_string();
+    name.push(suffix);
+    Ok(target.parent().unwrap_or_else(|| Path::new("")).join(name))
+}
+
+/// The directory a save builds, and the move that puts it in place
+///
+/// # What this buys
+///
+/// Every artefact used to be written straight into the target directory, one
+/// `fs::write` at a time. A save interrupted part way left a directory holding
+/// some of the new index and some of the old, and a save over an existing
+/// directory replaced files one at a time and removed none, so a raw index
+/// saved over a quantized one left `quantization.json`, `pq_centroids.bin` and
+/// `pq_codes.bin` behind for ever. Only `manifest_names` kept those three from
+/// being read back as part of the new index.
+///
+/// Here the save builds a directory from nothing and moves it in, so a stale
+/// artefact cannot survive and a reader sees one whole index or the other.
+///
+/// # What "moves it into place" means
+///
+/// **It is one rename where the target does not exist, and two where it does.**
+/// Neither Windows nor POSIX can rename a directory over an existing non-empty
+/// directory. `rename(2)` requires the destination to be an empty directory and
+/// `MoveFileExW` refuses `MOVEFILE_REPLACE_EXISTING` for directories outright,
+/// so `fs::rename` fails on both platforms and there is no call in the standard
+/// library that swaps two directories in one step. Linux has
+/// `renameat2(RENAME_EXCHANGE)`, which std does not expose and which Windows
+/// has no counterpart for.
+///
+/// So a save over an existing directory does this:
+///
+/// 1. rename the target aside to `<name>.zdbold`
+/// 2. rename the staging directory to the target
+/// 3. remove `<name>.zdbold`
+///
+/// Steps 1 and 2 are each atomic on both platforms. Between them the target
+/// does not exist, which is a window of two filesystem calls with no I/O
+/// between them. **A reader in that window sees no directory rather than a
+/// partial one**, which is the property that matters, and a process killed in
+/// it leaves the whole previous index at `<name>.zdbold`. `recover` puts that
+/// back on the next save. A save to a path that holds nothing yet is step 2
+/// alone, which is atomic outright.
+///
+/// If step 2 fails the target is renamed back from `<name>.zdbold`, so a failed
+/// save leaves the previous directory where it was.
+///
+/// # What a killed process leaves
+///
+/// A leftover `<name>.zdbtmp` from a save that died before the move, and a
+/// leftover `<name>.zdbold` from one that died inside the window. `recover`
+/// deals with both at the start of the next save, and neither is inside the
+/// index directory, so a load reads neither.
+///
+/// Dropping this without committing removes the staging directory, so a save
+/// that fails part way cleans up after itself inside the process that started
+/// it.
+pub(crate) struct StagingDir {
+    target: PathBuf,
+    staging: PathBuf,
+    replaced: PathBuf,
+    committed: bool,
+}
+
+impl StagingDir {
+    /// Clear what an earlier save left behind and open an empty staging
+    /// directory
+    pub(crate) fn open(target: &Path) -> PyResult<Self> {
+        let staging = sibling(target, STAGING_SUFFIX)?;
+        let replaced = sibling(target, REPLACED_SUFFIX)?;
+
+        Self::recover(target, &staging, &replaced)?;
+
+        fs::create_dir_all(&staging).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to create the staging directory {}: {}",
+                staging.display(),
+                e
+            ))
+        })?;
+
+        Ok(StagingDir {
+            target: target.to_path_buf(),
+            staging,
+            replaced,
+            committed: false,
+        })
+    }
+
+    /// Put right whatever a killed save left behind
+    ///
+    /// `<name>.zdbold` present with no target is the one case that holds data:
+    /// the previous save died between the two renames and that directory is the
+    /// only copy of the index. It is renamed back rather than removed.
+    ///
+    /// `<name>.zdbold` present beside a target is the previous index after a
+    /// save that finished, so it is removed.
+    fn recover(target: &Path, staging: &Path, replaced: &Path) -> PyResult<()> {
+        if replaced.exists() {
+            if target.exists() {
+                remove_tree(replaced, "the previous index a finished save left aside")?;
+            } else {
+                fs::rename(replaced, target).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "An earlier save was interrupted while replacing {}, and the index \
+                         it was replacing is at {}. Moving it back failed: {}. Rename that \
+                         directory to {} by hand before saving again.",
+                        target.display(),
+                        replaced.display(),
+                        e,
+                        target.display()
+                    ))
+                })?;
+                info!(
+                    operation = "save_recover",
+                    restored = %target.display(),
+                    "An interrupted save had moved the index aside; it is back in place"
+                );
+            }
+        }
+        if staging.exists() {
+            remove_tree(
+                staging,
+                "a staging directory an interrupted save left behind",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Where the save writes
+    pub(crate) fn path(&self) -> &Path {
+        &self.staging
+    }
+
+    /// Move the staged directory into place
+    pub(crate) fn commit(mut self) -> PyResult<()> {
+        sync_directory(&self.staging);
+
+        if self.target.exists() {
+            fs::rename(&self.target, &self.replaced).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Failed to move the existing index at {} aside: {}. Nothing was changed \
+                     and the directory is as it was.",
+                    self.target.display(),
+                    e
+                ))
+            })?;
+
+            if let Err(e) = fs::rename(&self.staging, &self.target) {
+                // The target is empty at this point, so putting the previous
+                // index back is the same rename in reverse.
+                let restored = fs::rename(&self.replaced, &self.target).is_ok();
+                self.committed = true;
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Failed to move the newly saved index into {}: {}. {}",
+                    self.target.display(),
+                    e,
+                    if restored {
+                        "The index that was there is back in place and nothing was lost."
+                    } else {
+                        "The index that was there could not be put back and is in the \
+                         directory named .zdbold beside it. Rename it back by hand."
+                    }
+                )));
+            }
+
+            remove_tree(&self.replaced, "the index this save replaced").ok();
+        } else {
+            fs::rename(&self.staging, &self.target).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Failed to move the newly saved index into {}: {}",
+                    self.target.display(),
+                    e
+                ))
+            })?;
+        }
+
+        sync_directory(self.target.parent().unwrap_or_else(|| Path::new(".")));
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_dir_all(&self.staging);
+        }
+    }
+}
+
+/// Remove a directory tree, naming what it was in the failure
+fn remove_tree(path: &Path, what: &str) -> PyResult<()> {
+    fs::remove_dir_all(path).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to remove {}, which is {}: {}",
+            path.display(),
+            what,
+            e
+        ))
+    })
+}
+
+/// Persist a directory's own entries, where the platform has a call for it
+///
+/// A file's bytes reaching the disk does not put its name in its directory. On
+/// POSIX that needs the directory's own descriptor fsynced, which is what this
+/// does, and without it a power loss can leave the renamed directory holding
+/// entries that were never recorded.
+///
+/// **Windows has no equivalent through the standard library.** `File::open`
+/// refuses a directory there, so this is a no-op, and the durability claim on
+/// Windows rests on NTFS journalling the rename rather than on anything this
+/// crate does. That difference is not observable from a gate that runs on
+/// Windows.
+///
+/// Best effort on both. A filesystem that refuses the fsync is not a reason to
+/// fail a save whose bytes are already written.
+#[cfg(unix)]
+fn sync_directory(path: &Path) {
+    if let Ok(dir) = fs::File::open(path) {
+        let _ = dir.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) {}
+
+// ============================================================================
+// A DIGEST PER ARTEFACT
+// ============================================================================
+
+/// What the manifest records about one artefact it names
+///
+/// `bytes` is the file's length and `checksum` is
+/// [`crate::checksum::checksum_of`] over its contents, written as sixteen hex
+/// digits. Both are taken from the buffer as it is written, so neither costs a
+/// read.
+///
+/// `checksum` is absent for the graph dump alone. The dump is written by
+/// `graph::dump::write_dump`, which streams it and then seeks back to fill the
+/// header in, so there is no single buffer to hash and a digest would mean
+/// reading the largest artefact in the directory back off the disk. It carries
+/// a checksum over its own header and another over its own payload, both
+/// verified by `parse_dump` on every load, so a manifest digest would duplicate
+/// a check the loader already makes. Its length is recorded and checked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtefactDigest {
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
+}
+
+/// The length and digest of every artefact a save has written so far
+///
+/// Filled as each file lands and handed to `save_manifest`, which is written
+/// last and therefore names what really is on disk rather than what the save
+/// intended to write.
+#[derive(Default)]
+pub(crate) struct SaveLedger {
+    digests: HashMap<String, ArtefactDigest>,
+}
+
+impl SaveLedger {
+    fn record(&mut self, name: &str, bytes: u64, checksum: Option<u64>) {
+        self.digests.insert(
+            name.to_string(),
+            ArtefactDigest {
+                bytes,
+                checksum: checksum.map(|sum| format!("{:016x}", sum)),
+            },
+        );
+    }
+
+    /// Record an artefact this module did not write, being the graph dump
+    pub(crate) fn record_length(&mut self, name: &str, bytes: u64) {
+        self.record(name, bytes, None);
+    }
+}
+
+/// Write one artefact into the staging directory and record what went in
+///
+/// The file is fsynced before this returns. Without it the rename that moves
+/// the staging directory into place can be recorded while the bytes it names
+/// are still in the page cache, so a power loss leaves an index directory whose
+/// manifest is complete and whose artefacts are empty. Every byte is already in
+/// memory, so the fsync is the whole cost of that durability and it is measured
+/// rather than assumed.
+fn write_artefact(dir: &Path, name: &str, bytes: &[u8], ledger: &mut SaveLedger) -> PyResult<()> {
+    use std::io::Write;
+
+    let path = dir.join(name);
+    let mut file = fs::File::create(&path).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to create {}: {}",
+            name, e
+        ))
+    })?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to write {}: {}",
+                name, e
+            ))
+        })?;
+
+    ledger.record(name, bytes.len() as u64, Some(checksum_of(bytes)));
+    Ok(())
+}
+
+/// Hold an artefact to the length and digest the manifest recorded for it
+///
+/// `files_included` says a file should be there and `check_files_present` says
+/// it is. Neither says it holds what was written. A file that is present, the
+/// right length and wrong in its contents used to load in silence: an edit to
+/// one byte of `metadata.json` came back as that record's metadata, and a
+/// flipped byte inside `vectors.bin` came back as that record's vector.
+///
+/// A directory written before this field existed carries no digests, so nothing
+/// is checked and it loads exactly as it did.
+fn verify_artefact(name: &str, bytes: &[u8], manifest: &IndexManifest) -> PyResult<()> {
+    let Some(recorded) = manifest.file_digests.get(name) else {
+        return Ok(());
+    };
+
+    if bytes.len() as u64 != recorded.bytes {
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "{} is {} bytes and manifest.json records it as {}. {} holds {}. The file is \
+             not the one this save wrote, so the index it describes is not the index that \
+             was saved. Refusing to load it. Restore the directory from a copy.",
+            name,
+            bytes.len(),
+            recorded.bytes,
+            name,
+            artefact_contents(name)
+        )));
+    }
+
+    let Some(expected) = recorded.checksum.as_deref() else {
+        return Ok(());
+    };
+    let actual = format!("{:016x}", checksum_of(bytes));
+    if actual != expected {
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "{} is the length manifest.json records and its contents do not match the \
+             digest recorded beside it, which is {} against {}. {} holds {}. The file has \
+             changed since it was written, so the index it describes is not the index that \
+             was saved. Refusing to load it. Restore the directory from a copy.",
+            name,
+            actual,
+            expected,
+            name,
+            artefact_contents(name)
+        )));
+    }
+
+    Ok(())
+}
+
+/// Read an artefact and verify it before anything parses it
+fn read_artefact(path: &Path, name: &str, manifest: &IndexManifest) -> PyResult<Vec<u8>> {
+    let bytes = fs::read(path.join(name)).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
+            "Failed to read {}: {}",
+            name, e
+        ))
+    })?;
+    verify_artefact(name, &bytes, manifest)?;
+    Ok(bytes)
+}
+
+/// The same, for the artefacts that are JSON
+fn read_artefact_string(path: &Path, name: &str, manifest: &IndexManifest) -> PyResult<String> {
+    let bytes = read_artefact(path, name, manifest)?;
+    String::from_utf8(bytes).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "{} is not valid UTF-8: {}",
+            name, e
+        ))
+    })
+}
+
+/// The length manifest.json records for the graph dump, where it records one
+///
+/// The dump is read by `graph::dump::parse_dump` rather than through
+/// `read_artefact`, because it is streamed rather than held whole in memory.
+/// This is the part of the digest check that still applies to it.
+pub(crate) fn recorded_dump_length(manifest: &IndexManifest, name: &str) -> Option<u64> {
+    manifest.file_digests.get(name).map(|entry| entry.bytes)
+}
 
 /// Refuse a directory this build cannot interpret
 fn check_format_version(format_version: &str) -> PyResult<()> {
@@ -207,13 +634,12 @@ fn check_format_version(format_version: &str) -> PyResult<()> {
 /// one of those names both of them under `files_included` and neither is
 /// needed to reopen it.
 ///
-/// The dump is also the one artefact written after `manifest.json`, so a save
-/// interrupted between the two leaves a manifest naming a dump that was never
-/// written. Refusing on that would refuse a directory the loader opens
-/// correctly today. The manifest is then rewritten once more to record the
-/// directory size the dump changed, and a save interrupted between the dump and
-/// that rewrite leaves a complete directory whose `total_size_mb` is short by
-/// the size of the dump. See `update_manifest_size`.
+/// A save now writes the dump before the manifest and moves the whole
+/// directory into place afterwards, so a directory this build wrote and a
+/// reader can see always holds the dump its manifest names. The exemption
+/// stays for the directories that came before it, where the manifest was
+/// written first and a save interrupted between the two left a manifest naming
+/// a dump that was never written.
 fn is_derived_artefact(name: &str) -> bool {
     name == GRAPH_DUMP_FILENAME || LEGACY_DUMP_FILENAMES.contains(&name)
 }
@@ -251,8 +677,8 @@ fn artefact_contents(name: &str) -> &'static str {
 /// names the first rather than failing on whichever one a partial load happens
 /// to reach.
 ///
-/// `manifest.json` is written after every other artefact except the graph dump,
-/// so an interrupted save cannot produce this state for a load bearing file. A
+/// `manifest.json` is the last file a save writes and the directory is moved
+/// into place whole, so an interrupted save cannot produce this state at all. A
 /// directory that reaches it lost the file after a save that finished, or was
 /// copied without it.
 ///
@@ -270,8 +696,8 @@ fn check_files_present(path: &Path, manifest: &IndexManifest) -> PyResult<()> {
         .collect();
 
     let Some(&first) = missing.first() else {
-        println!(
-            "✅ Every file manifest.json names is present ({} checked)",
+        debug!(
+            "Every file manifest.json names is present ({} checked)",
             manifest.files_included.len()
         );
         return Ok(());
@@ -308,12 +734,14 @@ fn check_files_present(path: &Path, manifest: &IndexManifest) -> PyResult<()> {
 
 /// Whether the manifest's inventory names an artefact
 ///
-/// The optional artefacts are read only when `files_included` names them, so a
-/// file left behind by an earlier save over the same directory is not picked
-/// up. Saving over a directory replaces files one at a time and removes none,
-/// so a raw index saved over a quantized one used to reopen as a quantized
-/// index holding the previous save's codebook and codes. The record count
-/// agreed, so nothing caught it.
+/// The optional artefacts are read only when `files_included` names them. A
+/// save used to replace files one at a time and remove none, so a raw index
+/// saved over a quantized one reopened as a quantized index holding the
+/// previous save's codebook and codes, and the record count agreed so nothing
+/// caught it. A save now builds its directory from nothing, so no artefact of
+/// an earlier save survives one and this check no longer has anything to
+/// exclude. It stays because a directory written by an earlier release can
+/// still hold those files.
 ///
 /// The graph dump is not gated this way. It is derived, it carries its own
 /// checks on node count, distance kind and `m`, and it already falls back to
@@ -340,6 +768,29 @@ pub struct IndexManifest {
     pub storage_mode: String,
     pub files_included: Vec<String>,
     pub files_excluded: Vec<String>,
+
+    /// The length and digest of every artefact `files_included` names
+    ///
+    /// A map beside the list rather than a change to the list, because
+    /// `files_included` is a `Vec<String>` in every release that has read this
+    /// file and turning it into a list of objects would stop those releases
+    /// parsing a directory this one wrote. serde ignores a field it does not
+    /// know, so an older build reads a directory written here and this build
+    /// reads one written there, where the map defaults to empty and nothing is
+    /// verified.
+    ///
+    /// See `ArtefactDigest` for what is recorded and why the graph dump carries
+    /// a length alone.
+    #[serde(default)]
+    pub file_digests: HashMap<String, ArtefactDigest>,
+
+    /// Every byte the directory holds except `manifest.json` itself
+    ///
+    /// The manifest is now the last file a save writes, so it does not exist
+    /// when the figure is taken and cannot count itself. It used to be written
+    /// before the graph dump and then rewritten through a temporary file to
+    /// record a total it had missed the largest artefact of, which is a second
+    /// write this ordering removes.
     pub total_size_mb: f64,
     pub compression_info: Option<CompressionInfo>,
 }
@@ -362,6 +813,15 @@ pub struct IndexConfig {
     pub expected_size: usize,
     pub id_counter: usize,
     pub vector_count: usize,
+
+    /// How many generated ids the index had issued, being the `N` of `vec_N`
+    ///
+    /// Separate from `id_counter`, which `clear` resets and this does not. See
+    /// `HNSWIndex::generated_ids`. Defaulted, so a directory written before the
+    /// field existed loads with a zero and takes its floor from the records it
+    /// holds instead.
+    #[serde(default)]
+    pub generated_ids: usize,
 
     /// Index level metadata set through `add_metadata`
     ///
@@ -486,8 +946,8 @@ impl TrainingState {
         };
         index.set_training_threshold_reached(reached);
 
-        println!(
-            "✅ Training state restored ({} collected ids, threshold reached: {})",
+        debug!(
+            "Training state restored ({} collected ids, threshold reached: {})",
             collected, reached
         );
     }
@@ -498,16 +958,11 @@ impl TrainingState {
 // ============================================================================
 
 /// Load index configuration from config.json
-fn load_config(path: &Path) -> PyResult<IndexConfig> {
-    println!("⚙️  Loading config.json...");
+fn load_config(path: &Path, manifest: &IndexManifest) -> PyResult<IndexConfig> {
+    debug!("Loading config.json...");
 
     let config_path = path.join("config.json");
-    let config_data = fs::read_to_string(&config_path).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
-            "Failed to read config.json: {}",
-            e
-        ))
-    })?;
+    let config_data = read_artefact_string(path, "config.json", manifest)?;
 
     let config: IndexConfig = serde_json::from_str(&config_data).map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -575,39 +1030,30 @@ fn load_config(path: &Path) -> PyResult<IndexConfig> {
         &format!("{}: ", config_path.display()),
     )?;
 
-    println!("✅ config.json loaded");
+    debug!("config.json loaded");
     Ok(config)
 }
 
 /// Load ID mappings from mappings.bin
-fn load_mappings(path: &Path) -> PyResult<IdMappings> {
-    println!("🗂️  Loading mappings.bin...");
+fn load_mappings(path: &Path, manifest: &IndexManifest) -> PyResult<IdMappings> {
+    debug!("Loading mappings.bin...");
 
-    let mappings_path = path.join("mappings.bin");
-    let mappings_data = fs::read(&mappings_path).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
-            "Failed to read mappings.bin: {}",
-            e
-        ))
-    })?;
+    let mappings_data = read_artefact(path, "mappings.bin", manifest)?;
 
     let mappings: IdMappings = decode_bounded(&mappings_data, "mappings.bin")?;
 
-    println!("✅ mappings.bin loaded");
+    debug!("mappings.bin loaded");
     Ok(mappings)
 }
 
 /// Load vector metadata from metadata.json
-fn load_metadata(path: &Path) -> PyResult<HashMap<String, HashMap<String, Value>>> {
-    println!("📋 Loading metadata.json...");
+fn load_metadata(
+    path: &Path,
+    manifest: &IndexManifest,
+) -> PyResult<HashMap<String, HashMap<String, Value>>> {
+    debug!("Loading metadata.json...");
 
-    let metadata_path = path.join("metadata.json");
-    let metadata_data = fs::read_to_string(&metadata_path).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
-            "Failed to read metadata.json: {}",
-            e
-        ))
-    })?;
+    let metadata_data = read_artefact_string(path, "metadata.json", manifest)?;
 
     let metadata: HashMap<String, HashMap<String, Value>> = serde_json::from_str(&metadata_data)
         .map_err(|e| {
@@ -617,7 +1063,7 @@ fn load_metadata(path: &Path) -> PyResult<HashMap<String, HashMap<String, Value>
             ))
         })?;
 
-    println!("✅ metadata.json loaded");
+    debug!("metadata.json loaded");
     Ok(metadata)
 }
 
@@ -627,27 +1073,20 @@ fn load_metadata(path: &Path) -> PyResult<HashMap<String, HashMap<String, Value>
 /// writes none, and a directory saved over one that did keeps the file the
 /// earlier save left. See `manifest_names`.
 fn load_vectors(path: &Path, manifest: &IndexManifest) -> PyResult<HashMap<String, Vec<f32>>> {
-    println!("📊 Loading vectors.bin...");
-
-    let vectors_path = path.join("vectors.bin");
+    debug!("Loading vectors.bin...");
 
     if !manifest_names(manifest, "vectors.bin") {
-        println!("ℹ️  manifest.json does not list vectors.bin, so no raw vectors are read");
+        debug!("manifest.json does not list vectors.bin, so no raw vectors are read");
         return Ok(HashMap::new());
     }
 
-    let vectors_data = fs::read(&vectors_path).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
-            "Failed to read vectors.bin: {}",
-            e
-        ))
-    })?;
+    let vectors_data = read_artefact(path, "vectors.bin", manifest)?;
 
     let vectors: HashMap<String, Vec<f32>> = decode_bounded(&vectors_data, "vectors.bin")?;
 
     check_vectors_are_finite(&vectors)?;
 
-    println!("✅ vectors.bin loaded");
+    debug!("vectors.bin loaded");
     Ok(vectors)
 }
 
@@ -690,7 +1129,7 @@ fn check_vectors_are_finite(vectors: &HashMap<String, Vec<f32>>) -> PyResult<()>
 
 /// Load manifest for validation and metadata
 fn load_manifest(path: &Path) -> PyResult<IndexManifest> {
-    println!("📝 Loading manifest.json...");
+    debug!("Loading manifest.json...");
 
     let manifest_path = path.join("manifest.json");
     let manifest_data = fs::read_to_string(&manifest_path).map_err(|e| {
@@ -707,7 +1146,7 @@ fn load_manifest(path: &Path) -> PyResult<IndexManifest> {
         ))
     })?;
 
-    println!("✅ manifest.json loaded");
+    debug!("manifest.json loaded");
     Ok(manifest)
 }
 
@@ -717,26 +1156,17 @@ fn load_manifest(path: &Path) -> PyResult<IndexManifest> {
 /// legitimate state. A present but unreadable file is a hard failure, because
 /// the alternative is a codebook that decodes every code to the zero vector.
 fn load_pq_centroids(path: &Path, manifest: &IndexManifest) -> PyResult<Option<Centroids>> {
-    let centroids_path = path.join("pq_centroids.bin");
     if !manifest_names(manifest, "pq_centroids.bin") {
         return Ok(None);
     }
 
-    println!("🎯 Loading pq_centroids.bin...");
+    debug!("Loading pq_centroids.bin...");
 
-    let centroids_data = fs::read(&centroids_path).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
-            "Failed to read pq_centroids.bin: {}",
-            e
-        ))
-    })?;
+    let centroids_data = read_artefact(path, "pq_centroids.bin", manifest)?;
 
     let centroids: Centroids = decode_bounded(&centroids_data, "pq_centroids.bin")?;
 
-    println!(
-        "✅ pq_centroids.bin loaded ({} subvectors)",
-        centroids.len()
-    );
+    debug!("pq_centroids.bin loaded ({} subvectors)", centroids.len());
     Ok(Some(centroids))
 }
 
@@ -745,23 +1175,17 @@ fn load_pq_centroids(path: &Path, manifest: &IndexManifest) -> PyResult<Option<C
 /// Absent means no record has been quantized yet. In `quantized_only` these
 /// codes are the only copy of every record added after training completed.
 fn load_pq_codes(path: &Path, manifest: &IndexManifest) -> PyResult<HashMap<String, Vec<u8>>> {
-    let codes_path = path.join("pq_codes.bin");
     if !manifest_names(manifest, "pq_codes.bin") {
         return Ok(HashMap::new());
     }
 
-    println!("📦 Loading pq_codes.bin...");
+    debug!("Loading pq_codes.bin...");
 
-    let codes_data = fs::read(&codes_path).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
-            "Failed to read pq_codes.bin: {}",
-            e
-        ))
-    })?;
+    let codes_data = read_artefact(path, "pq_codes.bin", manifest)?;
 
     let codes: HashMap<String, Vec<u8>> = decode_bounded(&codes_data, "pq_codes.bin")?;
 
-    println!("✅ pq_codes.bin loaded ({} records)", codes.len());
+    debug!("pq_codes.bin loaded ({} records)", codes.len());
     Ok(codes)
 }
 
@@ -784,7 +1208,10 @@ fn validate_quantization_fields(
 ) -> PyResult<()> {
     if config.bits < 1 || config.bits > 8 {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}: bits is {}, and bits must be an integer between 1 and 8. The centroid              count is 2 to the bits, so the codebook this names would be {} times the              size of the largest one this build can build, and sizing it is not a              fallible allocation: the process aborts rather than raising.",
+            "{}: bits is {}, and bits must be an integer between 1 and 8. The centroid count \
+             is 2 to the bits, so the codebook this names would be {} times the size of the \
+             largest one this build can build, and sizing it is not a fallible allocation: \
+             the process aborts rather than raising.",
             file,
             config.bits,
             1u128 << config.bits.min(96)
@@ -792,13 +1219,16 @@ fn validate_quantization_fields(
     }
     if config.subvectors == 0 {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}: subvectors is 0. Every subvector holds dim / subvectors values, so a              count of zero divides by zero.",
+            "{}: subvectors is 0. Every subvector holds dim / subvectors values, so a count \
+             of zero divides by zero.",
             file
         )));
     }
     if config.subvectors > dim || !dim.is_multiple_of(config.subvectors) {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}: subvectors is {} and config.json declares dim {}. subvectors must              divide the dimension evenly and cannot exceed it, which is the rule              create() applies, so this file does not describe an index this build can              rebuild.",
+            "{}: subvectors is {} and config.json declares dim {}. subvectors must divide \
+             the dimension evenly and cannot exceed it, which is the rule create() applies, \
+             so this file does not describe an index this build can rebuild.",
             file, config.subvectors, dim
         )));
     }
@@ -810,21 +1240,23 @@ fn load_quantization(
     path: &Path,
     manifest: &IndexManifest,
     dim: usize,
+    space: &str,
 ) -> PyResult<Option<QuantizationArtefacts>> {
-    println!("🔧 Loading quantization components...");
+    debug!("Loading quantization components...");
 
     let quant_path = path.join("quantization.json");
     if !manifest_names(manifest, "quantization.json") {
-        println!("ℹ️  manifest.json does not list quantization.json (non-quantized index)");
+        debug!("manifest.json does not list quantization.json (non-quantized index)");
         return Ok(None);
     }
 
-    let quant_data = fs::read_to_string(&quant_path).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
-            "Failed to read quantization.json: {}",
-            e
-        ))
-    })?;
+    // A directory whose config.json names the inner product space and whose
+    // manifest names quantization.json describes an index `create()` refuses.
+    // No save this build makes can produce one, so it was hand assembled, and
+    // building it would give an index ranking by the wrong quantity.
+    validate_space_supports_quantization(space, &format!("{}: ", path.display()))?;
+
+    let quant_data = read_artefact_string(path, "quantization.json", manifest)?;
 
     let quant_config: QuantizationPersistence = serde_json::from_str(&quant_data).map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -845,7 +1277,7 @@ fn load_quantization(
     // not describe an index this build can rebuild.
     validate_quantization_fields(&quant_path.display().to_string(), &quant_config, dim)?;
 
-    println!("✅ quantization.json loaded");
+    debug!("quantization.json loaded");
 
     let centroids = load_pq_centroids(path, manifest)?;
     let codes = load_pq_codes(path, manifest)?;
@@ -861,42 +1293,40 @@ fn load_quantization(
 // MAIN PERSISTENCE INTERFACE
 // ============================================================================
 
-/// Save an HNSWIndex to a directory structure
-pub fn save_index(index: &HNSWIndex, path: &str) -> PyResult<()> {
-    println!("🚀 Starting index save to: {}", path);
-
-    // Create the directory structure
-    let path_buf = Path::new(path);
-    fs::create_dir_all(path_buf).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to create directory {}: {}",
-            path, e
-        ))
-    })?;
+/// Write every artefact except the graph dump and the manifest into `dir`
+///
+/// `dir` is the staging directory `StagingDir` opened, never the target, so
+/// nothing here can leave a half written file where a reader will find it.
+///
+/// The manifest is no longer written here. It is written last of all, after the
+/// graph dump, because it now records a length and a digest per artefact and
+/// cannot do that for a file that does not exist yet. That ordering used to be
+/// impossible: a save that failed at the dump would have left a directory with
+/// no manifest at all. Staging makes it safe, because a save that fails at any
+/// point leaves the previous directory untouched and the staging directory
+/// removed.
+pub fn save_index(index: &HNSWIndex, dir: &Path) -> PyResult<SaveLedger> {
+    let mut ledger = SaveLedger::default();
 
     // Save components in order of complexity (simple -> complex)
-    save_config(index, path_buf)?;
-    save_mappings(index, path_buf)?;
-    save_metadata(index, path_buf)?;
+    save_config(index, dir, &mut ledger)?;
+    save_mappings(index, dir, &mut ledger)?;
+    save_metadata(index, dir, &mut ledger)?;
 
     // Save quantization components if enabled
     if index.has_quantization() {
-        save_quantization_config(index, path_buf)?;
+        save_quantization_config(index, dir, &mut ledger)?;
 
         if index.can_use_quantization() {
-            save_pq_centroids(index, path_buf)?;
-            save_pq_codes(index, path_buf)?;
+            save_pq_centroids(index, dir, &mut ledger)?;
+            save_pq_codes(index, dir, &mut ledger)?;
         }
     }
 
     // Save vectors based on storage mode
-    save_vectors(index, path_buf)?;
+    save_vectors(index, dir, &mut ledger)?;
 
-    // Save manifest last (references all other files)
-    save_manifest(index, path_buf)?;
-
-    println!("✅ Index save completed successfully!");
-    Ok(())
+    Ok(ledger)
 }
 
 // ============================================================================
@@ -911,8 +1341,9 @@ fn reconstruct_index_simple(
     metadata: HashMap<String, HashMap<String, Value>>,
     vectors: HashMap<String, Vec<f32>>,
     quantization: Option<QuantizationArtefacts>,
+    dump_bytes: Option<u64>,
 ) -> PyResult<HNSWIndex> {
-    println!("🔧 Creating empty index with loaded configuration...");
+    debug!("Creating empty index with loaded configuration...");
 
     // Step 1: Create empty index with loaded config
     let mut index = HNSWIndex::new_empty(
@@ -924,7 +1355,7 @@ fn reconstruct_index_simple(
         config.indexed_fields.clone(),
     );
 
-    println!("📝 Restoring data fields...");
+    debug!("Restoring data fields...");
 
     // The codes are needed twice, once to rebuild the graph for records that
     // have no raw vector and once to restore the stored codes afterwards.
@@ -951,20 +1382,17 @@ fn reconstruct_index_simple(
     // by a release this build cannot interpret falls back to the rebuild, which
     // is the path that also upgrades a graph carrying a defect the vendored
     // patches have since fixed. See `restore_graph_from_dump`.
-    match index.restore_graph_from_dump(path, config.id_counter) {
+    match index.restore_graph_from_dump(path, config.id_counter, dump_bytes) {
         Ok(nodes) => {
-            println!(
-                "✅ HNSW graph restored from the saved dump ({} nodes)",
-                nodes
-            );
+            debug!("HNSW graph restored from the saved dump ({} nodes)", nodes);
         }
         Err(reason) => {
-            println!("ℹ️  Rebuilding the HNSW graph, because {}", reason);
+            debug!("Rebuilding the HNSW graph, because {}", reason);
             if index.can_use_quantization() {
-                println!("🔄 Rebuilding quantized HNSW graph from stored PQ codes...");
+                debug!("Rebuilding quantized HNSW graph from stored PQ codes...");
                 rebuild_graph_from_codes(&mut index, &pq_codes, &vectors)?;
             } else {
-                println!("🔄 Rebuilding HNSW graph from vectors...");
+                debug!("Rebuilding HNSW graph from vectors...");
                 rebuild_graph_from_data(&mut index, &vectors, &pq_codes, &metadata)?;
             }
         }
@@ -997,8 +1425,8 @@ fn reconstruct_index_simple(
             .into_iter()
             .partition(|(id, _)| !pq_codes.contains_key(id));
         if !dropped.is_empty() {
-            println!(
-                "📉 Released {} raw training vectors quantized_only no longer keeps",
+            debug!(
+                "Released {} raw training vectors quantized_only no longer keeps",
                 dropped.len()
             );
         }
@@ -1036,7 +1464,7 @@ fn reconstruct_index_simple(
                 e
             ))
         })?;
-        println!("✅ {} raw vectors restored beside the codes", placed);
+        debug!("{} raw vectors restored beside the codes", placed);
     }
 
     // Step 5: Put back the training collection the rebuild stripped
@@ -1047,7 +1475,7 @@ fn reconstruct_index_simple(
     // Step 6: Check the saved count against the index that was actually built
     check_restored_count(&mut index, &config, raw_count, code_count)?;
 
-    println!("✅ Reconstruction completed!");
+    debug!("Reconstruction completed!");
     Ok(index)
 }
 
@@ -1079,8 +1507,8 @@ fn check_restored_count(
     }
 
     index.set_vector_count(restored);
-    println!(
-        "✅ Vector count verified against restored records: {}",
+    debug!(
+        "Vector count verified against restored records: {}",
         restored
     );
     Ok(())
@@ -1095,6 +1523,9 @@ fn restore_data_fields(
     config: &IndexConfig,
     quantization: Option<QuantizationArtefacts>,
 ) -> PyResult<()> {
+    // Before the mappings move, because this reads their keys. The floor is
+    // what stops an old directory reissuing a generated id it already holds.
+    let generated_floor = HNSWIndex::highest_generated_id(mappings.id_map.keys());
     index.set_id_mappings(mappings.id_map, mappings.rev_map);
 
     // The add() method will properly:
@@ -1105,13 +1536,14 @@ fn restore_data_fields(
 
     // Restore counters
     index.set_counters(config.id_counter, config.vector_count);
+    index.set_generated_ids(config.generated_ids, generated_floor);
 
     // Restore index level metadata. Empty for a directory written before
     // config.json carried the field, which is what those directories held.
     if !config.metadata.is_empty() {
         index.add_metadata(config.metadata.clone());
-        println!(
-            "✅ Index level metadata restored ({} entries)",
+        debug!(
+            "Index level metadata restored ({} entries)",
             config.metadata.len()
         );
     }
@@ -1121,7 +1553,7 @@ fn restore_data_fields(
         restore_quantization_state_simple(index, artefacts.config, artefacts.centroids)?;
     }
 
-    println!("✅ All data fields restored successfully");
+    debug!("All data fields restored successfully");
     Ok(())
 }
 
@@ -1192,7 +1624,7 @@ fn restore_quantization_state_simple(
     quant_data: QuantizationPersistence,
     centroids: Option<Centroids>,
 ) -> PyResult<()> {
-    println!("🔧 Restoring quantization state...");
+    debug!("Restoring quantization state...");
 
     // Convert QuantizationPersistence back to QuantizationConfig
     let storage_mode = StorageMode::from_string(&quant_data.storage_mode)
@@ -1237,8 +1669,8 @@ fn restore_quantization_state_simple(
     if !quant_data.is_trained {
         index.set_pq(Some(pq));
 
-        println!(
-            "✅ Quantization state restored (untrained, {} collected training IDs)",
+        debug!(
+            "Quantization state restored (untrained, {} collected training IDs)",
             quant_data.training_ids.len()
         );
     } else {
@@ -1258,8 +1690,8 @@ fn restore_quantization_state_simple(
         pq.set_trained(true);
         index.set_pq(Some(pq));
 
-        println!(
-            "✅ Quantization state restored (trained, codebook loaded, {} training IDs)",
+        debug!(
+            "Quantization state restored (trained, codebook loaded, {} training IDs)",
             quant_data.training_ids.len()
         );
     }
@@ -1286,21 +1718,21 @@ fn rebuild_graph_from_codes(
         .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
     if quantized_from_raw > 0 {
-        println!(
-            "⚠️  {} records had a raw vector and no stored PQ codes and were quantized \
+        debug!(
+            "{} records had a raw vector and no stored PQ codes and were quantized \
              through the loaded codebook",
             quantized_from_raw
         );
     }
     if remapped > 0 {
-        println!(
-            "⚠️  {} records were missing from mappings.bin and were assigned fresh \
+        debug!(
+            "{} records were missing from mappings.bin and were assigned fresh \
              internal ids",
             remapped
         );
     }
-    println!(
-        "✅ Quantized graph rebuilt ({} records inserted from stored PQ codes)",
+    debug!(
+        "Quantized graph rebuilt ({} records inserted from stored PQ codes)",
         inserted
     );
     Ok(())
@@ -1323,7 +1755,7 @@ fn rebuild_graph_from_data(
     metadata: &HashMap<String, HashMap<String, Value>>,
 ) -> PyResult<()> {
     if vectors.is_empty() && pq_codes.is_empty() {
-        println!("ℹ️  No records to rebuild (empty index)");
+        debug!("No records to rebuild (empty index)");
         return Ok(());
     }
 
@@ -1384,8 +1816,8 @@ fn rebuild_graph_from_data(
     }
 
     if missing_metadata > 0 {
-        println!(
-            "⚠️  {} records have no entry in metadata.json and are restored with empty metadata",
+        debug!(
+            "{} records have no entry in metadata.json and are restored with empty metadata",
             missing_metadata
         );
     }
@@ -1416,13 +1848,13 @@ fn rebuild_graph_from_data(
         });
     }
 
-    println!(
-        "📦 Prepared {} records for batch insertion ({} replayed from raw vectors, {} reconstructed from PQ codes)",
+    debug!(
+        "Prepared {} records for batch insertion ({} replayed from raw vectors, {} reconstructed from PQ codes)",
         records.len(),
         records.len() - reconstructed,
         reconstructed
     );
-    println!("🔄 Rebuilding the graph from the restored records...");
+    debug!("Rebuilding the graph from the restored records...");
 
     // The records are owned Rust and go straight into the insertion phase. This
     // used to build a PyDict holding three PyLists and call add(), which parsed
@@ -1430,8 +1862,8 @@ fn rebuild_graph_from_data(
     // pairing, releases the interpreter lock and refuses a partial graph.
     let inserted = index.rebuild_from_records(records)?;
 
-    println!("✅ Graph rebuild completed: {} records inserted", inserted);
-    println!("📊 Final vector count: {}", index.get_vector_count());
+    debug!("Graph rebuild completed: {} records inserted", inserted);
+    debug!("Final vector count: {}", index.get_vector_count());
 
     Ok(())
 }
@@ -1447,7 +1879,7 @@ fn rebuild_graph_from_data(
 #[pyfunction]
 #[pyo3(name = "_load_index")]
 pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
-    println!("🚀 Starting index load with reconstruction from: {}", path);
+    debug!("Starting index load with reconstruction from: {}", path);
 
     let path_buf = Path::new(path);
 
@@ -1459,7 +1891,7 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
     }
 
     // Phase 1: Load all ZeusDB components
-    println!("📋 Phase 1: Loading ZeusDB components...");
+    debug!("Phase 1: Loading ZeusDB components...");
 
     let manifest = load_manifest(path_buf)?;
     check_format_version(&manifest.format_version)?;
@@ -1467,30 +1899,27 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
     // Before any artefact is read, so a directory missing two files names the
     // first rather than failing on whichever one a partial load reaches.
     check_files_present(path_buf, &manifest)?;
-    println!(
-        "✅ Manifest loaded: {} vectors, format v{}",
+    debug!(
+        "Manifest loaded: {} vectors, format v{}",
         manifest.total_vectors, manifest.format_version
     );
 
-    let config = load_config(path_buf)?;
-    println!(
-        "✅ Config loaded: dim={}, space={}",
-        config.dim, config.space
-    );
+    let config = load_config(path_buf, &manifest)?;
+    debug!("Config loaded: dim={}, space={}", config.dim, config.space);
 
-    let mappings = load_mappings(path_buf)?;
-    println!("✅ Mappings loaded: {} ID mappings", mappings.id_map.len());
+    let mappings = load_mappings(path_buf, &manifest)?;
+    debug!("Mappings loaded: {} ID mappings", mappings.id_map.len());
 
-    let metadata = load_metadata(path_buf)?;
-    println!("✅ Metadata loaded: {} records", metadata.len());
+    let metadata = load_metadata(path_buf, &manifest)?;
+    debug!("Metadata loaded: {} records", metadata.len());
 
     let vectors = load_vectors(path_buf, &manifest)?;
-    println!("✅ Vectors loaded: {} vectors", vectors.len());
+    debug!("Vectors loaded: {} vectors", vectors.len());
 
-    let quantization = load_quantization(path_buf, &manifest, config.dim)?;
+    let quantization = load_quantization(path_buf, &manifest, config.dim, &config.space)?;
     if let Some(ref quant) = quantization {
-        println!(
-            "✅ Quantization loaded: {} subvectors, trained={}, codebook={}",
+        debug!(
+            "Quantization loaded: {} subvectors, trained={}, codebook={}",
             quant.config.subvectors,
             quant.config.is_trained,
             if quant.centroids.is_some() {
@@ -1505,9 +1934,16 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
     // mappings and the codebook first to judge it against.
 
     // Phase 2: Create empty index and restore state
-    println!("🔧 Phase 2: Creating empty index and restoring state...");
-    let mut restored_index =
-        reconstruct_index_simple(path_buf, config, mappings, metadata, vectors, quantization)?;
+    debug!("Phase 2: Creating empty index and restoring state...");
+    let mut restored_index = reconstruct_index_simple(
+        path_buf,
+        config,
+        mappings,
+        metadata,
+        vectors,
+        quantization,
+        recorded_dump_length(&manifest, GRAPH_DUMP_FILENAME),
+    )?;
 
     // `new_empty` stamps the load time, because it has nothing better to start
     // from. Until this ran, a save of a loaded index wrote that load time to
@@ -1515,7 +1951,7 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
     // load and save claimed to have been created then.
     restored_index.set_created_at(manifest.created_at);
 
-    println!("✅ Index reconstruction completed successfully!");
+    debug!("Index reconstruction completed successfully!");
     Ok(restored_index)
 }
 
@@ -1524,8 +1960,8 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
 // ============================================================================
 
 /// Save index configuration as JSON
-fn save_config(index: &HNSWIndex, path: &Path) -> PyResult<()> {
-    println!("⚙️  Saving config.json...");
+fn save_config(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyResult<()> {
+    debug!("Saving config.json...");
 
     let config = IndexConfig {
         dim: index.get_dim(),
@@ -1536,11 +1972,11 @@ fn save_config(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         expected_size: index.get_expected_size(),
         id_counter: index.get_id_counter(),
         vector_count: index.get_vector_count(),
+        generated_ids: index.get_generated_ids(),
         metadata: index.get_all_metadata(),
         indexed_fields: index.indexed_fields(),
     };
 
-    let config_path = path.join("config.json");
     let config_json = serde_json::to_string_pretty(&config).map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
             "Failed to serialize config: {}",
@@ -1548,20 +1984,15 @@ fn save_config(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         ))
     })?;
 
-    fs::write(&config_path, config_json).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to write config.json: {}",
-            e
-        ))
-    })?;
+    write_artefact(path, "config.json", config_json.as_bytes(), ledger)?;
 
-    println!("✅ config.json saved");
+    debug!("config.json saved");
     Ok(())
 }
 
 /// Save ID mappings using efficient binary format
-fn save_mappings(index: &HNSWIndex, path: &Path) -> PyResult<()> {
-    println!("🗂️  Saving mappings.bin...");
+fn save_mappings(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyResult<()> {
+    debug!("Saving mappings.bin...");
 
     // Both guards end with this block. They are taken in the documented order,
     // id_map before rev_map, and the copy they were already making is what the
@@ -1584,21 +2015,15 @@ fn save_mappings(index: &HNSWIndex, path: &Path) -> PyResult<()> {
             ))
         })?;
 
-    let mappings_path = path.join("mappings.bin");
-    fs::write(&mappings_path, mappings_data).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to write mappings.bin: {}",
-            e
-        ))
-    })?;
+    write_artefact(path, "mappings.bin", &mappings_data, ledger)?;
 
-    println!("✅ mappings.bin saved ({} mappings)", mapping_count);
+    debug!("mappings.bin saved ({} mappings)", mapping_count);
     Ok(())
 }
 
 /// Save vector metadata as JSON for external tool compatibility
-fn save_metadata(index: &HNSWIndex, path: &Path) -> PyResult<()> {
-    println!("📋 Saving metadata.json...");
+fn save_metadata(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyResult<()> {
+    debug!("Saving metadata.json...");
 
     // The guard ends with the serialize. `to_string_pretty` returns an owned
     // String, so the file is written with nothing held and nothing is copied
@@ -1615,23 +2040,20 @@ fn save_metadata(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         ))
     })?;
 
-    let metadata_path = path.join("metadata.json");
+    write_artefact(path, "metadata.json", metadata_json.as_bytes(), ledger)?;
 
-    fs::write(&metadata_path, metadata_json).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to write metadata.json: {}",
-            e
-        ))
-    })?;
-
-    println!("✅ metadata.json saved ({} records)", record_count);
+    debug!("metadata.json saved ({} records)", record_count);
     Ok(())
 }
 
 /// Save quantization configuration and training state
-fn save_quantization_config(index: &HNSWIndex, path: &Path) -> PyResult<()> {
+fn save_quantization_config(
+    index: &HNSWIndex,
+    path: &Path,
+    ledger: &mut SaveLedger,
+) -> PyResult<()> {
     if let Some(config) = index.get_quantization_config() {
-        println!("🔧 Saving quantization.json...");
+        debug!("Saving quantization.json...");
 
         // When the codebook was fitted, taken from the index rather than from
         // the clock. This used to be `Utc::now()`, so the field recorded the
@@ -1687,7 +2109,6 @@ fn save_quantization_config(index: &HNSWIndex, path: &Path) -> PyResult<()> {
             rerank_calibration: index.get_rerank_calibration(),
         };
 
-        let quant_path = path.join("quantization.json");
         let quant_json = serde_json::to_string_pretty(&quant_persistence).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                 "Failed to serialize quantization config: {}",
@@ -1695,16 +2116,11 @@ fn save_quantization_config(index: &HNSWIndex, path: &Path) -> PyResult<()> {
             ))
         })?;
 
-        fs::write(&quant_path, quant_json).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to write quantization.json: {}",
-                e
-            ))
-        })?;
+        write_artefact(path, "quantization.json", quant_json.as_bytes(), ledger)?;
 
-        //println!("✅ quantization.json saved");
-        println!(
-            "✅ quantization.json saved with {} training IDs",
+        //debug!("quantization.json saved");
+        debug!(
+            "quantization.json saved with {} training IDs",
             quant_persistence.training_ids.len()
         );
     }
@@ -1712,10 +2128,10 @@ fn save_quantization_config(index: &HNSWIndex, path: &Path) -> PyResult<()> {
 }
 
 /// Save PQ centroids for vector reconstruction
-fn save_pq_centroids(index: &HNSWIndex, path: &Path) -> PyResult<()> {
+fn save_pq_centroids(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyResult<()> {
     if let Some(pq) = index.get_pq() {
         if pq.is_trained() {
-            println!("🎯 Saving pq_centroids.bin...");
+            debug!("Saving pq_centroids.bin...");
 
             // The codebook is serialized inside the closure and written outside
             // it, so the lock is held for the encode alone. `bincode` returns an
@@ -1731,22 +2147,16 @@ fn save_pq_centroids(index: &HNSWIndex, path: &Path) -> PyResult<()> {
                     ))
                 })?;
 
-            let centroids_path = path.join("pq_centroids.bin");
-            fs::write(&centroids_path, centroids_data).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to write pq_centroids.bin: {}",
-                    e
-                ))
-            })?;
+            write_artefact(path, "pq_centroids.bin", &centroids_data, ledger)?;
 
-            println!("✅ pq_centroids.bin saved");
+            debug!("pq_centroids.bin saved");
         }
     }
     Ok(())
 }
 
 /// Save quantized vector codes
-fn save_pq_codes(index: &HNSWIndex, path: &Path) -> PyResult<()> {
+fn save_pq_codes(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyResult<()> {
     // The guard ends with the serialize, so the file is written with nothing
     // held. `encode_to_vec` was already producing an owned buffer, so this
     // narrows the guard rather than adding a copy.
@@ -1755,7 +2165,7 @@ fn save_pq_codes(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         if pq_codes.is_empty() {
             return Ok(());
         }
-        println!("📦 Saving pq_codes.bin...");
+        debug!("Saving pq_codes.bin...");
         (
             bincode::encode_to_vec(&*pq_codes, bincode::config::standard()),
             pq_codes.len(),
@@ -1769,15 +2179,9 @@ fn save_pq_codes(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         ))
     })?;
 
-    let codes_path = path.join("pq_codes.bin");
-    fs::write(&codes_path, codes_data).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to write pq_codes.bin: {}",
-            e
-        ))
-    })?;
+    write_artefact(path, "pq_codes.bin", &codes_data, ledger)?;
 
-    println!("✅ pq_codes.bin saved ({} vectors)", code_count);
+    debug!("pq_codes.bin saved ({} vectors)", code_count);
     Ok(())
 }
 
@@ -1790,7 +2194,7 @@ fn save_pq_codes(index: &HNSWIndex, path: &Path) -> PyResult<()> {
 ///
 /// A trained `quantized_only` index writes none, as before, because it holds
 /// none.
-fn save_vectors(index: &HNSWIndex, path: &Path) -> PyResult<()> {
+fn save_vectors(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyResult<()> {
     if !index.holds_raw_vectors() {
         return Ok(());
     }
@@ -1799,7 +2203,7 @@ fn save_vectors(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         if vectors.is_empty() {
             return Ok(());
         }
-        println!("📊 Saving vectors.bin...");
+        debug!("Saving vectors.bin...");
         (
             bincode::encode_to_vec(&vectors, bincode::config::standard()),
             vectors.len(),
@@ -1813,21 +2217,20 @@ fn save_vectors(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         ))
     })?;
 
-    let vectors_path = path.join("vectors.bin");
-    fs::write(&vectors_path, vectors_data).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to write vectors.bin: {}",
-            e
-        ))
-    })?;
+    write_artefact(path, "vectors.bin", &vectors_data, ledger)?;
 
-    println!("✅ vectors.bin saved ({} vectors)", vector_count);
+    debug!("vectors.bin saved ({} vectors)", vector_count);
     Ok(())
 }
 
-/// Save manifest file (must be last - references all other files)
-fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
-    println!("📝 Saving manifest.json...");
+/// Write manifest.json, which is the last file a save writes
+///
+/// It names every other artefact, records the length and digest of each, and
+/// records the directory size. All three are facts about files that are already
+/// on disk, which is why it is written last and why there is no second pass to
+/// correct any of them.
+pub(crate) fn save_manifest(index: &HNSWIndex, path: &Path, ledger: SaveLedger) -> PyResult<()> {
+    debug!("Saving manifest.json...");
 
     // The manifest needs two facts about the stores rather than the stores
     // themselves, so it takes those two facts and releases both guards here.
@@ -1880,11 +2283,11 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
     let vector_count = index.get_vector_count();
     if vector_count > 0 {
         files_included.push(GRAPH_DUMP_FILENAME.to_string());
-        println!("📋 Graph file in manifest:");
-        println!("   ✅ Included: {}", GRAPH_DUMP_FILENAME);
+        debug!("Graph file in manifest:");
+        debug!("Included: {}", GRAPH_DUMP_FILENAME);
     } else {
         files_excluded.push(GRAPH_DUMP_FILENAME.to_string());
-        println!("ℹ️  No graph file (empty index)");
+        debug!("No graph file (empty index)");
     }
 
     // Calculate compression info for quantized indexes
@@ -1918,9 +2321,9 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
             None
         };
 
-    // What the directory holds so far, which is everything except the graph
-    // dump. `update_manifest_size` writes the true total once the dump has
-    // landed; see that function for why the figure is taken twice.
+    // Every artefact, the graph dump included, because they are all on disk by
+    // the time this runs. manifest.json itself is not, so the figure counts the
+    // directory without it, which the field's own comment states.
     let total_size_mb = calculate_directory_size(path).unwrap_or(0.0);
 
     let manifest = IndexManifest {
@@ -1935,11 +2338,11 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         storage_mode: index.get_storage_mode(),
         files_included,
         files_excluded,
+        file_digests: ledger.digests,
         total_size_mb,
         compression_info,
     };
 
-    let manifest_path = path.join("manifest.json");
     let manifest_json = serde_json::to_string_pretty(&manifest).map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
             "Failed to serialize manifest: {}",
@@ -1947,97 +2350,18 @@ fn save_manifest(index: &HNSWIndex, path: &Path) -> PyResult<()> {
         ))
     })?;
 
-    fs::write(&manifest_path, manifest_json).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to write manifest.json: {}",
-            e
-        ))
-    })?;
+    // Through the same writer every other artefact took, so it is fsynced
+    // before the staging directory is moved into place. Its own digest is
+    // discarded, since nothing can verify the file that carries the digests.
+    let mut discard = SaveLedger::default();
+    write_artefact(
+        path,
+        "manifest.json",
+        manifest_json.as_bytes(),
+        &mut discard,
+    )?;
 
-    println!("✅ manifest.json saved");
-    Ok(())
-}
-
-/// Write the true directory size into the manifest, once the graph dump exists
-///
-/// `save_manifest` runs before `save_hnsw_graph`, so the size it takes misses
-/// the largest file in the directory. At 50,000 records of dimension 1,536 the
-/// dump is roughly 320 MB of a roughly 630 MB directory, so the figure
-/// understated by about half, and on a save over an existing directory it
-/// counted the previous save's dump instead, which was a different wrong
-/// number.
-///
-/// The order is not reversed to fix it. `manifest.json` is written before the
-/// dump on purpose: the dump is the one artefact the loader can produce again,
-/// so a save whose dump fails still leaves a directory that opens through the
-/// rebuild. See `is_derived_artefact`. Writing the manifest last would leave
-/// that save with no manifest at all, and a save over an existing directory
-/// would leave the previous manifest describing the new data files, which
-/// `manifest_names` would then read as an inventory and open as the wrong
-/// index.
-///
-/// So the manifest is written twice and only `total_size_mb` differs between
-/// the two. Every other field is read back and written out unchanged, `saved_at`
-/// included, so the second write does not restamp the save time.
-///
-/// The rewrite goes to a temporary file and is renamed over the target, so a
-/// reader sees one complete manifest or the other and never a half written one.
-/// A failure here leaves the first manifest in place and the directory
-/// loadable, and it is still reported, because a save that returns success has
-/// written everything it meant to write.
-///
-/// The figure counts the directory as it stood when the size was taken, and
-/// writing the corrected number changes the manifest's own length by a few
-/// bytes. The recorded total is short by that difference, which is under twenty
-/// bytes against a directory measured in megabytes.
-pub fn update_manifest_size(path: &Path) -> PyResult<()> {
-    let manifest_path = path.join("manifest.json");
-
-    let manifest_json = fs::read_to_string(&manifest_path).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to re-read manifest.json to record the directory size: {}",
-            e
-        ))
-    })?;
-
-    let mut manifest: IndexManifest = serde_json::from_str(&manifest_json).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to parse the manifest.json this save just wrote: {}",
-            e
-        ))
-    })?;
-
-    manifest.total_size_mb = calculate_directory_size(path).unwrap_or(0.0);
-
-    let updated = serde_json::to_string_pretty(&manifest).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to serialize manifest: {}",
-            e
-        ))
-    })?;
-
-    let staged = path.join(MANIFEST_STAGING_FILENAME);
-    fs::write(&staged, updated).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to write {}: {}",
-            MANIFEST_STAGING_FILENAME, e
-        ))
-    })?;
-
-    fs::rename(&staged, &manifest_path).map_err(|e| {
-        // The staged file is removed on a failed rename so the directory is not
-        // left holding a manifest under a second name.
-        let _ = fs::remove_file(&staged);
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to replace manifest.json with the one carrying the directory size: {}",
-            e
-        ))
-    })?;
-
-    println!(
-        "✅ manifest.json total_size_mb recorded ({:.2} MB)",
-        manifest.total_size_mb
-    );
+    debug!("manifest.json saved");
     Ok(())
 }
 
