@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "zeusdb-vector-database"
 version = "0.7.0"
 edition = "2021"
@@ -54,7 +54,7 @@ numpy = "0.29.0"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 rayon = "1.10"
-rand = "0.9.1"
+rand = "0.10.2"
 # The generator itself, named rather than taken from `rand::rngs::StdRng`,
 # which `rand` documents as non-portable and free to change algorithm in any
 # release. Every seeded draw in the crate runs on it, being the level stream a
@@ -62,13 +62,13 @@ rand = "0.9.1"
 #
 # `rand`'s default features already pull `rand_chacha` in to build `StdRng` at
 # all, so this names a dependency the lock already held rather than adding one.
-rand_chacha = "0.9"
+rand_chacha = "0.10"
 # The distance kernels' vector type. See the "How they are compiled" section of
 # src/distance.rs. It pulls in safe_arch and bytemuck, and it is a build-time
 # abstraction over the target's own vector registers with no run time
 # component, so it adds nothing to the wheel beyond the code it generates.
 wide = "1"
-bincode = "2.0.1"
+bincode = "3.0.0"
 chrono = { version = "0.4.41", features = ["serde"] } # <-- For timestamps
 # Modern structured logging
 tracing = "0.1"
