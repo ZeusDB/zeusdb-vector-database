@@ -362,6 +362,71 @@ fn the_mutable_graph_is_send_and_sync() {
     assert_send_sync::<MutableGraph<u8, DistPQ>>();
 }
 
+/// A graph small enough for an interpreter to run, searched down every metric.
+///
+/// # Why it is this small
+///
+/// [`super::traverse::prefetch_vectors`] is one of the two places in this crate
+/// that holds an `unsafe` block, and the only way to reach it is a search. The
+/// smallest graph any other test builds is 300 records, which Miri could not
+/// finish. Sixteen records at four dimensions runs under Miri in seconds, so
+/// the pointer arithmetic in that block is checkable rather than only argued
+/// for in its own comment.
+///
+/// # What it asserts
+///
+/// A page of the right length, in ascending distance, holding no record twice,
+/// and each record finding itself first. On a graph this small every node is a
+/// neighbour of every other, so exactness here is a property of the scoring
+/// rather than of the traversal, and it is asserted for all three metrics.
+#[test]
+fn a_graph_small_enough_for_an_interpreter_searches_on_every_metric() {
+    const N: usize = 16;
+    const DIM: usize = 4;
+
+    let data = unit_sample_vectors(N, DIM, 0x71_11);
+    let (cosine, cosine_store) = build(&data, 8, 16, CosineDist {});
+    let (l2, l2_store) = build(&data, 8, 16, L2Dist {});
+    let (l1, l1_store) = build(&data, 8, 16, L1Dist {});
+
+    for (name, page) in [
+        (
+            "cosine",
+            cosine.search(&cosine_store, &data[0], 5, N, None::<&BoxedFilter>),
+        ),
+        (
+            "l2",
+            l2.search(&l2_store, &data[0], 5, N, None::<&BoxedFilter>),
+        ),
+        (
+            "l1",
+            l1.search(&l1_store, &data[0], 5, N, None::<&BoxedFilter>),
+        ),
+    ] {
+        assert_eq!(page.len(), 5, "{name} returned {} hits", page.len());
+        assert_eq!(
+            page[0].internal_id, 0,
+            "{name} did not find the query itself"
+        );
+        assert!(
+            page[0].distance.abs() < 1e-5,
+            "{name} scored the query against itself at {}",
+            page[0].distance
+        );
+        for pair in page.windows(2) {
+            assert!(
+                pair[0].distance <= pair[1].distance,
+                "{name} page is not ascending: {:?}",
+                page.iter().map(|hit| hit.distance).collect::<Vec<_>>()
+            );
+        }
+        let mut ids: Vec<usize> = page.iter().map(|hit| hit.internal_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), page.len(), "{name} returned a record twice");
+    }
+}
+
 /// What a non-finite query does if one ever reaches the traversal.
 ///
 /// Every ZeusDB entry point rejects it first, so this documents the behaviour
