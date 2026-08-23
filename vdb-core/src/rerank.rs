@@ -668,6 +668,53 @@ impl RerankCalibration {
     }
 }
 
+/// Whether this space's raw distance requires a unit vector
+///
+/// One place decides it, so the exact scan, which has the space in hand, and
+/// the rerank plan, which carries the answer past it, cannot disagree about
+/// which spaces are in the set.
+pub(crate) fn reconstruction_needs_unit(space: &str) -> bool {
+    space == "cosine"
+}
+
+/// Put a reconstruction on the footing the space's raw distance expects
+///
+/// A reconstruction is the concatenation of the nearest centroid per subvector
+/// and nothing renormalises it, so it is not a unit vector even where the
+/// record it approximates was. Measured norms run 0.85 to 0.96 at the shipped
+/// dbpedia default and down to 0.41 at two subvectors and four bits.
+///
+/// `CosineDist::eval` is `1 - dot` and assumes both arguments are unit, so
+/// handing it a raw reconstruction returns neither a cosine distance nor a
+/// squared L2. On one `quantized_only` cosine index at 25,000 records that put
+/// the same record at 0.19118 through a narrow filter's exact scan and 0.19678
+/// through the traversal, with a true cosine distance of 0.10381, and the ratio
+/// between the two paths ran with the distance rather than being a constant.
+///
+/// Normalising here is what `add` would have done to the same vector. The
+/// doctrine `rescore_candidate` states is that a rescored score is the number a
+/// raw index holding that vector would report, and a raw cosine index
+/// normalises on the way in, so this is that doctrine applied rather than an
+/// exception to it.
+///
+/// Every other space takes the vector as it is. `l2` and `l1` are defined on
+/// unnormalised input and a `dot` index is never quantized, so nothing else
+/// reaches here with a reconstruction at all.
+pub(crate) fn prepare_reconstruction(needs_unit: bool, mut reconstructed: Vec<f32>) -> Vec<f32> {
+    if !needs_unit {
+        return reconstructed;
+    }
+    let norm: f32 = reconstructed.iter().map(|x| x * x).sum::<f32>().sqrt();
+    // A zero reconstruction stays zero, which `cosine_normalized` answers as
+    // distance one, and dividing by zero would answer it as NaN.
+    if norm > 0.0 {
+        for x in reconstructed.iter_mut() {
+            *x /= norm;
+        }
+    }
+    reconstructed
+}
+
 /// The raw vector distance for a space
 ///
 /// These are the same `crate::distance` implementations `VectorGraph::new_raw`
@@ -995,6 +1042,9 @@ pub(crate) struct RerankPlan {
     pub(crate) calibration: Option<RerankCalibration>,
     /// The space's raw vector distance.
     pub(crate) distance: fn(&[f32], &[f32]) -> f32,
+    /// Whether `distance` requires a unit vector, which decides what happens to
+    /// a reconstruction before it is scored. See `prepare_reconstruction`.
+    pub(crate) unit_reconstruction: bool,
 }
 
 /// The settings a search carries once its input has been parsed
@@ -1121,6 +1171,7 @@ pub(crate) fn rescore_candidate(
         return Some((plan.distance)(query, stored));
     }
     let reconstructed = pq?.reconstruct(pq_codes.get(ext_id)?).ok()?;
+    let reconstructed = prepare_reconstruction(plan.unit_reconstruction, reconstructed);
     Some((plan.distance)(query, &reconstructed))
 }
 
@@ -1169,6 +1220,7 @@ mod tests {
             factor: Some(factor),
             calibration: None,
             distance: raw_distance_fn("cosine"),
+            unit_reconstruction: reconstruction_needs_unit("cosine"),
         }
     }
 
@@ -1179,6 +1231,7 @@ mod tests {
             factor: None,
             calibration: None,
             distance: raw_distance_fn("cosine"),
+            unit_reconstruction: reconstruction_needs_unit("cosine"),
         }
     }
 
@@ -1202,6 +1255,7 @@ mod tests {
                 millis: 0,
             }),
             distance: raw_distance_fn("cosine"),
+            unit_reconstruction: reconstruction_needs_unit("cosine"),
         }
     }
 
@@ -1484,6 +1538,7 @@ mod tests {
             factor: None,
             calibration: Some(restored),
             distance: raw_distance_fn("cosine"),
+            unit_reconstruction: reconstruction_needs_unit("cosine"),
         };
         let flat = calibrated_plan(164, 10_000, 0.432);
         assert_eq!(
@@ -1732,11 +1787,23 @@ mod tests {
         let exact = rescore_candidate(&p, &query, "kept", vectors, Some(&pq), &pq_codes);
         assert_eq!(exact, Some(CosineDist {}.eval(&query, &stored)));
 
-        // Codes alone still score, against the reconstruction.
+        // Codes alone still score, against the reconstruction, and under cosine
+        // the reconstruction is normalised first. It arrives from the codebook
+        // at whatever length the centroids give it, and `CosineDist` is
+        // `1 - dot` on a pair assumed to be unit, so handing it the raw
+        // reconstruction returned a third quantity that was neither a cosine
+        // distance nor a squared L2. See `prepare_reconstruction`.
         let approximate =
             rescore_candidate(&p, &query, "coded", vectors, Some(&pq), &pq_codes).unwrap();
         let reconstructed = pq.reconstruct(&codes).unwrap();
-        assert_eq!(approximate, CosineDist {}.eval(&query, &reconstructed));
+        let length: f32 = reconstructed.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (length - 1.0).abs() > 1e-3,
+            "the fixture must produce a reconstruction that is not unit, got {length}"
+        );
+        let unit: Vec<f32> = reconstructed.iter().map(|x| x / length).collect();
+        assert_eq!(approximate, CosineDist {}.eval(&query, &unit));
+        assert_ne!(approximate, CosineDist {}.eval(&query, &reconstructed));
 
         // Neither is unscoreable rather than silently zero, which is what keeps
         // an unscored candidate from displacing a scored one.

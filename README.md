@@ -57,12 +57,14 @@ ZeusDB leverages the HNSW (Hierarchical Navigable Small World) algorithm for spe
 
 ZeusDB Vector Database supports the following metrics for vector similarity search. All metric names are case-insensitive, so "cosine", "COSINE", and "Cosine" are treated identically.
 
-| Metric | Description                          | Accepted Values (case-insensitive)  |
-|--------|--------------------------------------|--------|
-| cosine | Cosine Distance (1 - Cosine Similarity) | "cosine", "COSINE", "Cosine" |
-| l1     | Manhattan distance                   | "l1", "L1" |
-| l2     | Euclidean distance                 | "l2", "L2" |
-| dot    | Inner product, reported as 1 - dot | "dot", "DOT" |
+| Metric | Description                          | Accepted Values (case-insensitive)  | Quantization |
+|--------|--------------------------------------|--------|--------|
+| cosine | Cosine Distance (1 - Cosine Similarity) | "cosine", "COSINE", "Cosine" | supported |
+| l1     | Manhattan distance                   | "l1", "L1" | refused |
+| l2     | Euclidean distance                 | "l2", "L2" | supported |
+| dot    | Inner product, reported as 1 - dot | "dot", "DOT" | refused |
+
+`create()` raises on a refused pair rather than building an index that ranks by the wrong quantity. See [Metrics that cannot be quantized](#-metrics-that-cannot-be-quantized).
 
 ### 🎯 When to use `dot`
 
@@ -88,7 +90,33 @@ Three things follow from `dot` being an inner product rather than a metric.
 - **Scores can be negative**, whenever the inner product is above one. No other metric here produces one.
 - **A vector need not be its own nearest neighbour**, because a longer vector pointing much the same way scores lower.
 
-`dot` cannot be combined with `quantization_config` and `create()` refuses the pair. A quantized graph ranks by a squared distance to the codebook, and for an inner product that ordering depends on how long each stored vector is, so the index would return the wrong records. Use `cosine` with normalised vectors, which quantizes correctly and ranks identically to an inner product on normalised input.
+`dot` cannot be combined with `quantization_config`. See below.
+
+### 🚫 Metrics that cannot be quantized
+
+`create()` refuses `space="l1"` and `space="dot"` together with `quantization_config`, and `load()` refuses a saved directory that pairs them.
+
+```python
+try:
+    VectorDatabase().create(
+        "hnsw", dim=16, space="l1", expected_size=20000,
+        quantization_config={"type": "pq", "subvectors": 4, "bits": 8, "training_size": 1000},
+    )
+except RuntimeError as exc:
+    print(str(exc).split(".")[0])
+```
+
+*Output*
+```
+Failed to create HNSW index: space='l1' cannot be quantized
+```
+
+A quantized graph works from tables of squared L2 distances to the codebook. `l2` and `cosine` can both be recovered from those, using the codebook's own centroid norms where the conversion needs them. The two below cannot.
+
+- **`l1`.** Against the query `[0, 0]`, the point `[2, 0]` is at L1 2.0 and squared L2 4.0, while `[1.1, 1.1]` is at L1 2.2 and squared L2 2.42. The two rank that pair in opposite orders. Use `l2` if squared distance suits your data, or drop `quantization_config`.
+- **`dot`.** The squared L2 carries each stored vector's own length, which an inner product does not, so a short vector pointing the right way outranks a long one pointing further the same way. No inner product scorer over the codes exists in this build. Use `cosine` with normalised vectors, which ranks identically to an inner product on normalised input.
+
+**A directory saved by 0.7.0 or earlier that pairs `l1` with quantization no longer loads.** Rebuild it from the vectors it was given, as `l1` without `quantization_config` or as `l2` with it.
 
 ### 📏 Scores vs Distances
 
@@ -102,6 +130,19 @@ This applies to all distance types, including cosine. `dot` is the one exception
 Under `cosine`, vectors are normalized to unit length when they are stored. A vector you read back with `return_vector=True` or `get_records()` is therefore the normalized form, not the values you supplied. Under `l1`, `l2` and `dot` the values are stored unchanged.
 
 A zero vector has no direction, so under `cosine` it sits at distance 1.0 from everything, including itself.
+
+**On a quantized index the score is a distance to the record's reconstruction, not to the vector you inserted.** Under `l2` it is the euclidean distance to that reconstruction and under `cosine` it is the cosine distance to it, so either way the number is on the scale a raw index of the same space reports and the two are comparable. It is not equal to the raw score, because the index no longer holds the vector you gave it, and the difference is the quantization error. Rerank replaces it with an exact distance to the raw vector, and it is on by default for `quantized_with_raw`.
+
+```python
+index = VectorDatabase().create("hnsw", dim=4, space="cosine")
+index.add({"id": "a", "values": [1.0, 0.0, 0.0, 0.0]})
+print(round(index.search([1.0, 0.0, 0.0, 0.0], top_k=1)[0]["score"], 6))
+```
+
+*Output*
+```
+0.0
+```
 
 <br/>
 
@@ -216,7 +257,7 @@ HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=5, vecto
 |------------------|--------|-----------|-----------------------------------------------------------------------------|
 | `index_type`     | `str`  | `"hnsw"`  | The type of vector index to create. Currently only `"hnsw"` is supported. Case-insensitive. |
 | `dim`            | `int`  | *required* | Dimensionality of the vectors to be indexed, from 1 to 65,536. Each vector must have this length. **Required as of 0.8.0**, see below. |
-| `space`          | `str`  | `"cosine"`| Distance metric used for similarity search. One of `"cosine"`, `"l1"`, `"l2"`, `"dot"`. Case-insensitive. `"dot"` cannot be combined with `quantization_config`. |
+| `space`          | `str`  | `"cosine"`| Distance metric used for similarity search. One of `"cosine"`, `"l1"`, `"l2"`, `"dot"`. Case-insensitive. `"l1"` and `"dot"` cannot be combined with `quantization_config`. |
 | `m`              | `int`  | `16` or `32`, see below | Number of bi-directional connections created for each new node, from 2 to 256. Higher `m` improves recall but increases index size and build time. |
 | `ef_construction`| `int`  | `200`     | Width of the candidate search each insertion runs, from 1 to 4,096. It costs build time and buys graph quality, and it changes neither search latency nor the size of the finished index. See below. |
 | `expected_size`  | `int`  | `10000`   | Estimated number of records to be inserted, from 1 to 100,000,000. Used for preallocating internal data structures and for choosing the default `m`. Not a hard limit, see below. |
@@ -752,9 +793,9 @@ storage_mode_description: raw_only
 | `graph_memory_mb` | The HNSW graph, being the neighbour lists and, on a quantized index, the codes it scores against. It holds no raw vector |
 | `raw_vectors_memory_mb` | The raw vectors, which are held once |
 | `quantized_codes_memory_mb` | The codes, which grow with the record count |
-| `codebook_memory_mb`, `sdc_table_memory_mb` | The trained tables, fixed by `dim`, `subvectors` and `bits` |
+| `codebook_memory_mb`, `sdc_table_memory_mb`, `centroid_norm_memory_mb` | The trained tables, fixed by `dim`, `subvectors` and `bits` |
 | `index_bookkeeping_memory_mb` | The hash tables that find a record |
-| `total_memory_mb` | The sum of the six figures above |
+| `total_memory_mb` | The sum of the seven figures above |
 | `quantization_type` | `pq`, or `none` on an unquantized index |
 | `raw_vectors_retained` | The storage mode's policy, `none_once_trained` or `all_records`. Quantized indexes only |
 
@@ -1352,6 +1393,10 @@ Measured on 6,000 clustered 128-dimensional vectors with 8 subvectors and 8 bits
 
 The exact figures depend on your data, but the shape does not. If you need quantization and you need accuracy, use `quantized_with_raw` and leave rerank on.
 
+**A quantized `cosine` index ranks by the cosine distance to the reconstruction, and reports it.** A reconstruction is assembled from independently trained per-subspace centroids and nothing renormalises it, so it is not a unit vector even where the record it stands for was. Measured on 25,000 OpenAI `text-embedding-ada-002` vectors at `dim=1,536` with 48 subvectors and 8 bits, reconstructed norms ran 0.85 to 0.96 against a stored norm of 1.0.
+
+That matters because a quantized graph works from a table of squared L2 distances, and on those reconstructions the squared L2 ran at about 1.86 times the cosine distance rather than at exactly twice it. The gap is each record's own reconstruction length, which the index recovers from the codes, so the score you get back is the cosine distance and not a multiple of it. Ranking by cosine rather than by squared L2 also moves the page, and it measured better on every corpus and subvector count tried, by 0.0015 to 0.0518 of recall at 10 over 40,000 held-out queries each.
+
 **How deep a search has to fetch to hold that recall depends on your data, not on the record count.** Measured on three real datasets at 100,000 records with the default `subvectors`, the fetch that reaches mean recall at 10 of 0.99:
 
 | dataset | dim | compression | fetch for 0.99 | share of corpus |
@@ -1372,7 +1417,7 @@ What `rerank` does:
 | `N` of 1 or more | Fetches `top_k × N` candidates, a fixed multiple of the page that does not move with the corpus. Use it to override the default deliberately |
 | `0` | Turns reranking off and returns the ADC scores and ordering |
 
-A page below ten fetches what a page of ten fetches, so pass `rerank` explicitly if you want a shallower page to cost less. `rerank` has no effect on an unquantized index or on a `quantized_only` one, and both ignore it. With rerank on the scores you get back are raw-vector distances, and with it off they are ADC estimates, which are not comparable.
+A page below ten fetches what a page of ten fetches, so pass `rerank` explicitly if you want a shallower page to cost less. `rerank` has no effect on an unquantized index or on a `quantized_only` one, and both ignore it. With rerank on the scores you get back are raw-vector distances, and with it off they are distances to the reconstruction. Both are on the scale the index's own space reports, so a page is on one scale whichever you asked for.
 
 An index trained before the calibration existed, and any index loaded from a directory saved by one, carries no calibration and falls back to a fixed fetch of 2% of the record count. `get_stats()["rerank_calibrated"]` reads `false` for it. Rebuild the index to calibrate it.
 

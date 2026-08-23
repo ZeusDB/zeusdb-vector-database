@@ -193,8 +193,13 @@ class VectorDatabase:
                 - space (str): Distance metric, one of 'cosine', 'l2', 'l1' or
                   'dot' (default: 'cosine'). 'dot' is the inner product, and
                   search() reports it as 1 - dot so that lower stays better;
-                  see the README. It does not normalise what you add, and it
-                  cannot be combined with quantization_config.
+                  see the README. It does not normalise what you add. Neither
+                  'dot' nor 'l1' can be combined with quantization_config,
+                  because a quantized graph works from tables of squared L2
+                  distances to the codebook, and neither of those two can be
+                  recovered from them. 'cosine' and 'l2' both can, so a
+                  quantized index of either reports a score on the same scale a
+                  raw index of that space reports.
                 - m (int): Bidirectional links per node (min: 2, max: 256). Defaults
                   to 16 up to an expected_size of 25,000 and 32 above it. A graph
                   too sparse for the record count loses recall that no search

@@ -283,48 +283,99 @@ pub(crate) fn validate_index_parameters(
     Ok(space_normalized)
 }
 
-/// Refuse the one pair of a space and a storage choice this build cannot serve
+/// Refuse the pairs of a space and quantization this build cannot serve
 ///
 /// A quantized graph scores every candidate against a lookup table of squared
 /// L2 distances between the query's subvectors and the codebook's centroids,
-/// and that table is the same table whatever the space. For cosine it is exact
-/// in the only sense that matters, because `add` normalises every vector and
-/// the squared L2 between two unit vectors is `2 - 2 * dot`, which orders the
-/// same way `1 - dot` does. For l2 it is the distance itself before the root.
+/// and that table is the same table whatever the space is declared to be.
+/// `DistPQ::eval` sums it on the search path and reads the codebook's symmetric
+/// table of the same quantity on the construction path.
 ///
-/// For an inner product it is neither. The squared L2 between a query and a
-/// stored vector is the query's squared length plus the stored vector's squared
-/// length less twice their inner product, and a dot index does not normalise,
-/// so the middle term varies from record to record and the ordering it produces
-/// is not the ordering by inner product. A short vector pointing the right way
-/// would outrank a long one pointing further the same way.
+/// **Two spaces can be served from that sum and two cannot.** What separates
+/// them is whether the sum can be turned into the declared distance using only
+/// what the codes already carry.
 ///
-/// Supporting it means an inner product ADC table, which is a change to
-/// `PQ::compute_adc_lut` and to the symmetric table graph construction reads,
-/// and both are shared by the three spaces that already work. That is a
-/// separate change with its own measurement. Until it exists the pair is
-/// refused rather than served wrongly.
+/// For l2 the sum is the distance itself before the root, so the ordering is
+/// the declared one and only the reported number needs converting;
+/// `sqrt_adc_page` does that. For cosine the conversion needs each record's own
+/// reconstruction length, which is a second sum over the same codes against a
+/// table of squared centroid norms, so `PqMetric::Cosine` accumulates both and
+/// returns the cosine distance from the scorer. That moves the ordering as well
+/// as the number, which it has to, since dividing by a length that varies from
+/// record to record is not a monotone map of the sum.
+///
+/// For the two spaces below no such scorer exists in this build.
+///
+/// **The inner product.** The squared L2 between a query and a stored vector is
+/// the query's squared length plus the stored vector's squared length less
+/// twice their inner product, and a dot index does not normalise, so the middle
+/// term varies from record to record and the ordering it produces is not the
+/// ordering by inner product. A short vector pointing the right way would
+/// outrank a long one pointing further the same way.
+///
+/// The norm table `PqMetric::Cosine` reads makes that middle term recoverable,
+/// so the arithmetic is no longer the obstacle it was. What is missing is a
+/// scorer, a decision about what a quantized inner product should report, and a
+/// measurement of how a codebook trained by squared L2 behaves on vectors whose
+/// lengths vary by orders of magnitude, which is what a dot corpus can carry and
+/// a cosine one cannot. That is a change with its own measurement, and until it
+/// exists the pair is refused rather than served by a scorer that ranks the
+/// wrong quantity.
+///
+/// **Manhattan distance.** L1 and squared L2 do not induce the same order, and
+/// the counterexample needs no approximation to reach. Against the query
+/// `[0, 0]`, the point `[2, 0]` is at L1 2.0 and squared L2 4.0 while
+/// `[1.1, 1.1]` is at L1 2.2 and squared L2 2.42, so the two rank the pair in
+/// opposite orders. `the_l1_counterexample_is_ordered_by_squared_l2` in
+/// `distance.rs` holds that arithmetic against the live scorer. A quantized l1
+/// index therefore ranked by a quantity it never declared and reported a score
+/// on it as well, and an l1 and an l2 index over one corpus returned the same
+/// page as each other.
+///
+/// Serving it properly means an L1 codebook, and that is more than an L1 table.
+/// Lloyd's algorithm assigns by squared L2 and takes a mean, which is the
+/// minimiser of squared L2 and not of L1, so an L1 quantizer needs k-medians
+/// rather than a second distance in the same loop. That is a training change
+/// with its own measurement. Until it exists the pair is refused rather than
+/// served wrongly.
+///
+/// Refusing costs a configuration that measures well. Measured on
+/// SIFT-128 at 25,000 records, `quantized_with_raw` with the default rerank
+/// reached recall at 10 of 0.9885 against an exact L1 ranking, because rerank
+/// rescores against the raw vectors and hides the graph's ordering. The pair is
+/// still refused, because the graph underneath it is ordered by the wrong
+/// quantity and `rerank=0` exposes that at any time.
 ///
 /// Called at `create()` and again at load, because a hand edited `config.json`
 /// reaches the same constructors.
 pub(crate) fn validate_space_supports_quantization(space: &str, source: &str) -> PyResult<()> {
-    if space != "dot" {
-        return Ok(());
-    }
+    // The remedy differs by space, so each pair carries its own middle clause.
+    // The opening sentence and the closing offer are shared, because the reason
+    // is one reason and the way out of it is the same way out.
+    let reason = match space {
+        "dot" => "no inner product scorer over those tables exists in this build, and the one that does rank by a quantity carrying each stored vector's own length rather than by the inner product alone, so the index would return the wrong records. Use space='cosine' with normalised vectors, which quantizes correctly and ranks identically to an inner product on normalised input",
+        "l1" => "Manhattan distance is not one of the two those tables can be turned into, so the index would return the wrong records and report a score on a quantity it never declared. Use space='l2', which the same codebook quantizes correctly, if squared distance suits your data",
+        _ => return Ok(()),
+    };
     error!(
         operation = "validation",
         field = "space",
         value = space,
-        "Quantization is not available for the inner product space"
+        "Quantization is not available for this distance space"
     );
+    // At load the caller is a directory rather than a keyword argument, so the
+    // offer above is advice for the next index rather than for this one. The
+    // extra sentence says what became of the directory in hand. `source` is
+    // empty at `create()` and carries the path at load, which is the only thing
+    // that tells the two doors apart, and one check still decides both.
+    let recovery = if source.is_empty() {
+        ""
+    } else {
+        " A directory saved with this pair by an earlier release cannot be opened by this build and has to be rebuilt from the vectors it was given."
+    };
     Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-        "{}space='dot' cannot be quantized. A quantized graph ranks candidates by a squared \
-         L2 distance to the codebook, and for an inner product that ordering depends on how \
-         long each stored vector is rather than on the inner product alone, so the index \
-         would return the wrong records. Use space='cosine' with normalised vectors, which \
-         quantizes correctly and ranks identically to an inner product on normalised input, \
-         or drop quantization_config.",
-        source
+        "{}space='{}' cannot be quantized. A quantized graph scores every candidate from tables of squared L2 distances to the codebook, and {}, or drop quantization_config.{}",
+        source, space, reason, recovery
     )))
 }
 

@@ -73,7 +73,8 @@ use crate::conversion::value_map_to_python;
 use crate::filter::{matches_filter, Filter};
 use crate::graph::GraphHit;
 use crate::rerank::{
-    raw_distance_fn, rescore_candidate, take_best, RawVectors, RerankPlan, SearchParams,
+    prepare_reconstruction, raw_distance_fn, reconstruction_needs_unit, rescore_candidate,
+    take_best, RawVectors, RerankPlan, SearchParams,
 };
 use numpy::PyArray1;
 use pyo3::prelude::*;
@@ -239,6 +240,7 @@ impl HNSWIndex {
             factor: rerank.map(|factor| factor.max(1)),
             calibration: self.get_rerank_calibration(),
             distance: raw_distance_fn(&self.space),
+            unit_reconstruction: reconstruction_needs_unit(&self.space),
         })
     }
 
@@ -276,6 +278,14 @@ impl HNSWIndex {
     /// information the ADC distance uses. The scan is exact over what that
     /// index retains rather than over the vectors it was given, and no path in
     /// this crate can be exact over those once the raws are gone.
+    ///
+    /// **A reconstruction is normalised first where the space requires it.**
+    /// `prepare_reconstruction` says which spaces those are and why. Without it
+    /// a `quantized_only` cosine index answered a narrow filter with `1 - dot`
+    /// on a vector of length 0.90, which is neither the cosine distance the
+    /// traversal now returns nor the squared L2 it used to, and the gap between
+    /// the two paths ran with the distance rather than being a constant a
+    /// caller could allow for.
     ///
     /// **Fewer than `top_k` matches is a result and not a failure.** The scan
     /// returns every record that matched, ranked, so a filter matching three
@@ -345,6 +355,7 @@ impl HNSWIndex {
         fetch_k: usize,
     ) -> Option<Candidates<'a>> {
         let distance = raw_distance_fn(&self.space);
+        let needs_unit = reconstruction_needs_unit(&self.space);
         let mut scored: Candidates<'a> = Vec::with_capacity(matched.len());
         for ext_id in matched {
             let score = match filter.vectors.get(ext_id.as_str()) {
@@ -354,7 +365,9 @@ impl HNSWIndex {
                     .get(ext_id)
                     .and_then(|codes| self.pq.as_ref()?.reconstruct(codes).ok())
                 {
-                    Some(reconstructed) => distance(query, &reconstructed),
+                    Some(reconstructed) => {
+                        distance(query, &prepare_reconstruction(needs_unit, reconstructed))
+                    }
                     // A record holding neither a raw vector nor codes cannot
                     // exist, since every insertion writes one or the other.
                     // Sorting it last is what `rescore_candidate`'s callers do
@@ -476,7 +489,8 @@ impl HNSWIndex {
         // waiting writer, so the second read blocked forever the moment a
         // concurrent insert landed between the two. It deadlocked the
         // concurrency suite on the first run.
-        let operation = if hnsw.is_quantized() {
+        let quantized = hnsw.is_quantized();
+        let operation = if quantized {
             "adc_search"
         } else {
             "raw_search"
@@ -571,7 +585,51 @@ impl HNSWIndex {
             Vec::new()
         });
 
-        Self::resolve(graph_hits, rev_map)
+        let mut candidates = Self::resolve(graph_hits, rev_map);
+        Self::sqrt_adc_page(&mut candidates, quantized, &self.space);
+        candidates
+    }
+
+    /// Put an l2 index's approximate scores back on the scale it reports
+    ///
+    /// `DistPQ::eval` sums a table of squared L2 distances and takes no root,
+    /// because the graph orders by the value and a root is a monotone map that
+    /// would cost one square root per distance evaluation to change nothing.
+    /// `L2Dist` does take the root, so the same index reported two scales.
+    ///
+    /// One `quantized_only` l2 index over 3,000 records returned one record at
+    /// 159.416 from the traversal and at 12.626 from the exact scan a narrow
+    /// filter takes, on one query, and 12.626 is the square root of 159.416.
+    /// Which number a caller saw depended on how selective their filter was,
+    /// which is not a thing a caller should have to know about.
+    ///
+    /// **On the page rather than in the hot loop.** The traversal evaluates a
+    /// distance per node visited and this touches `fetch_k` of them, so the
+    /// ordering work stays on squared distance and the root is paid once per
+    /// returned candidate. The order cannot move, because the square root is
+    /// monotone on the non-negative values a sum of squares produces.
+    ///
+    /// **Only the traversal's own scores reach here.** Every path that answers
+    /// from the exact scan returns before `resolve`, and those already score
+    /// with `raw_distance_fn`, so nothing is rooted twice. Rerank overwrites
+    /// every entry afterwards with a raw distance, so a reranked page is
+    /// unaffected either way.
+    ///
+    /// **Only l2, and only l2 needs a page pass at all.** A cosine index does
+    /// not arrive here needing one, because `DistPQ` under `PqMetric::Cosine`
+    /// returns the cosine distance from the traversal itself. It has to. The
+    /// conversion divides by the reconstruction's own length, which varies from
+    /// record to record, so it is not monotone in the ADC sum and a page pass
+    /// would leave the scores out of order. l2's conversion is a square root,
+    /// which is monotone, which is the whole reason it can be done here and the
+    /// cosine one cannot. l1 is refused outright.
+    fn sqrt_adc_page(candidates: &mut Candidates<'_>, quantized: bool, space: &str) {
+        if !quantized || space != "l2" {
+            return;
+        }
+        for entry in candidates.iter_mut() {
+            entry.1 = entry.1.max(0.0).sqrt();
+        }
     }
 
     /// Say once that a filter named a field this index did not declare.
