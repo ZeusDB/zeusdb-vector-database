@@ -386,12 +386,22 @@ impl HNSWIndex {
                 // reading the storage breakdown above would not look.
                 let (centroid_mb, _) = pq.get_memory_stats();
                 let sdc_mb = pq.sdc_memory_bytes() as f64 / (1024.0 * 1024.0);
-                total_memory_mb += centroid_mb + sdc_mb;
+                let norm_mb = pq.centroid_norm_memory_bytes() as f64 / (1024.0 * 1024.0);
+                total_memory_mb += centroid_mb + sdc_mb + norm_mb;
                 stats.insert(
                     "codebook_memory_mb".to_string(),
                     format!("{:.2}", centroid_mb),
                 );
                 stats.insert("sdc_table_memory_mb".to_string(), format!("{:.2}", sdc_mb));
+                // The third derived table, which the cosine scorer reads and
+                // which `total_memory_mb` therefore has to carry. It is one
+                // entry per centroid per subvector against the symmetric
+                // table's strict upper triangle, so it is the smallest of the
+                // three by two orders of magnitude and is still real memory.
+                stats.insert(
+                    "centroid_norm_memory_mb".to_string(),
+                    format!("{:.2}", norm_mb),
+                );
 
                 if pq_trained {
                     let compression_ratio = (pq.dim() as f64 * 4.0) / pq.subvectors() as f64;
@@ -649,6 +659,14 @@ impl HNSWIndex {
                     dict.set_item(
                         "sdc_memory_mb",
                         pq.sdc_memory_bytes() as f64 / (1024.0 * 1024.0),
+                    )
+                    .ok()?;
+
+                    // The centroid norm table the cosine scorer reads, on the
+                    // same footing and for the same reason.
+                    dict.set_item(
+                        "centroid_norm_memory_mb",
+                        pq.centroid_norm_memory_bytes() as f64 / (1024.0 * 1024.0),
                     )
                     .ok()?;
 

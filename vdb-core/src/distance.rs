@@ -142,7 +142,60 @@ thread_local! {
     /// table on the worker that runs it. Adopting `Hnsw::parallel_search`, which
     /// would fan one query's distance evaluations out across the pool, would
     /// break this and must not be done without replacing the mechanism.
-    static QUERY_LUT: RefCell<Option<Vec<Vec<f32>>>> = const { RefCell::new(None) };
+    static QUERY_LUT: RefCell<Option<QueryTable>> = const { RefCell::new(None) };
+}
+
+/// The metric a quantized graph orders and scores by
+///
+/// A quantized graph used to have one scorer whatever space the index declared,
+/// which is why `l1` and `dot` are refused. `l2` and `cosine` both survive that
+/// refusal but they do not want the same number, so the scorer takes which one
+/// it is serving rather than inferring it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PqMetric {
+    /// Squared L2 from the query to the reconstruction.
+    ///
+    /// What the ADC table sums directly. `HNSWIndex::sqrt_adc_page` roots the
+    /// page on the way out, because the ordering is the same before and after
+    /// and the root is worth one call per returned candidate rather than one
+    /// per distance evaluation.
+    SquaredL2,
+    /// Cosine distance from the query to the reconstruction.
+    ///
+    /// Not a monotone map of the squared L2, because the conversion divides by
+    /// the reconstruction's own length and that varies from record to record.
+    /// So this changes the ordering as well as the number, which is the point
+    /// of it. Measured reconstruction norms run 0.85 to 0.96 at the shipped
+    /// dbpedia default against a stored norm of 1.0.
+    Cosine,
+}
+
+/// A query's tables, in the shape the metric being served needs
+///
+/// The variant is chosen by `DistPQ::install_query_lut` from the `DistPQ` doing
+/// the installing, and the guard it returns is held for the whole traversal, so
+/// the table `eval` finds is always the one its own metric installed. `eval`
+/// matches on the table rather than on the metric, which means the two can
+/// never be read against each other.
+enum QueryTable {
+    /// The ADC table, one row per subvector, indexed by centroid.
+    SquaredL2(Vec<Vec<f32>>),
+    /// The ADC table with each centroid's squared norm interleaved beside it,
+    /// flat, plus what the query itself contributes to a cosine distance.
+    ///
+    /// `q_norm_sq` and `inv_q_norm` are taken from the query rather than
+    /// assumed to be one. Every path into a cosine index normalises, so they
+    /// are one in practice, but taking them costs one pass over the query per
+    /// search and makes the scorer right for a caller that reaches it another
+    /// way. `inv_q_norm` is zero for a zero query, which puts a vector of no
+    /// direction at distance one from everything, where `cosine_normalized`
+    /// puts it too.
+    Cosine {
+        lut: Vec<f32>,
+        k: usize,
+        q_norm_sq: f32,
+        inv_q_norm: f32,
+    },
 }
 /// Holds a query's ADC table on the calling thread and removes it on drop.
 ///
@@ -173,10 +226,15 @@ impl Drop for QueryLut {
 pub struct DistPQ {
     /// Reference to the PQ instance for accessing centroids
     pq: Arc<PQ>,
+    /// Which distance this graph declared, which decides both the number `eval`
+    /// returns and the order it induces. Fixed when the graph is built and read
+    /// back from the graph's own variant at load, so a saved index scores the
+    /// way it was built.
+    metric: PqMetric,
 }
 impl DistPQ {
-    pub fn new(pq: Arc<PQ>) -> Self {
-        DistPQ { pq }
+    pub fn new(pq: Arc<PQ>, metric: PqMetric) -> Self {
+        DistPQ { pq, metric }
     }
 
     /// Bytes one code occupies, which is the length of the dummy query the
@@ -196,8 +254,25 @@ impl DistPQ {
             return Err("PQ must be trained before ADC computation".to_string());
         }
 
-        let lut = self.pq.compute_adc_lut(query)?;
-        QUERY_LUT.with(|slot| *slot.borrow_mut() = Some(lut));
+        let table = match self.metric {
+            PqMetric::SquaredL2 => QueryTable::SquaredL2(self.pq.compute_adc_lut(query)?),
+            PqMetric::Cosine => {
+                let lut = self.pq.compute_adc_lut_with_norms(query)?;
+                let q_norm_sq: f32 = query.iter().map(|x| x * x).sum();
+                let inv_q_norm = if q_norm_sq > 0.0 {
+                    q_norm_sq.sqrt().recip()
+                } else {
+                    0.0
+                };
+                QueryTable::Cosine {
+                    lut,
+                    k: self.pq.num_centroids(),
+                    q_norm_sq,
+                    inv_q_norm,
+                }
+            }
+        };
+        QUERY_LUT.with(|slot| *slot.borrow_mut() = Some(table));
         Ok(QueryLut)
     }
 }
@@ -216,8 +291,18 @@ impl Distance<u8> for DistPQ {
     /// table existed, made every candidate tie in the neighbour selection
     /// heuristic and left the graph with one edge per node.
     ///
-    /// Both branches return a sum of squared L2 distances, so they are on the
-    /// same scale and neither takes a square root.
+    /// **Both branches answer on the metric the graph declared.** Under
+    /// [`PqMetric::SquaredL2`] that is a sum of squared L2 distances in both
+    /// cases, so they are on one scale and neither takes a square root. Under
+    /// [`PqMetric::Cosine`] both are cosine distances to the reconstruction,
+    /// which is what the index reports, and both need a second sum the ADC
+    /// table alone cannot give. The search branch reads that sum from the
+    /// norms interleaved into the query table and the construction branch
+    /// reads it from the codebook's own norm table.
+    ///
+    /// The two metrics do not induce the same order, so a graph must be built
+    /// and searched on one of them and not on both. That is why the metric sits
+    /// on the scorer rather than being applied to the page afterwards.
     ///
     /// Choosing the branch on the table rather than on `a` is deliberate. The
     /// dummy query is a valid code slice and cannot be told apart from real
@@ -229,22 +314,72 @@ impl Distance<u8> for DistPQ {
     fn eval(&self, a: &[u8], b: &[u8]) -> f32 {
         QUERY_LUT.with(|slot| {
             let slot = slot.borrow();
-            let Some(lut) = slot.as_ref() else {
-                return self.pq.symmetric_distance(a, b);
-            };
-
-            // b.len() should equal pq.subvectors()
-            let mut sum = 0.0f32;
-            for (sv, &code) in b.iter().enumerate() {
-                // lut[sv][code]
-                let distance_component = lut
-                    .get(sv)
-                    .and_then(|row| row.get(code as usize))
-                    .copied()
-                    .unwrap_or(f32::INFINITY);
-                sum += distance_component;
+            match slot.as_ref() {
+                None => match self.metric {
+                    PqMetric::SquaredL2 => self.pq.symmetric_distance(a, b),
+                    PqMetric::Cosine => self.pq.symmetric_cosine_distance(a, b),
+                },
+                Some(QueryTable::SquaredL2(lut)) => {
+                    // b.len() should equal pq.subvectors()
+                    let mut sum = 0.0f32;
+                    for (sv, &code) in b.iter().enumerate() {
+                        // lut[sv][code]
+                        let distance_component = lut
+                            .get(sv)
+                            .and_then(|row| row.get(code as usize))
+                            .copied()
+                            .unwrap_or(f32::INFINITY);
+                        sum += distance_component;
+                    }
+                    sum
+                }
+                Some(QueryTable::Cosine {
+                    lut,
+                    k,
+                    q_norm_sq,
+                    inv_q_norm,
+                }) => {
+                    let (k, q_norm_sq, inv_q_norm) = (*k, *q_norm_sq, *inv_q_norm);
+                    // The ADC sum and the squared norm of the reconstruction,
+                    // accumulated together. The pair for one subvector is
+                    // adjacent, so a candidate still costs one lookup per
+                    // subvector and one bounds check for both halves.
+                    let mut adc = 0.0f32;
+                    let mut norm_sq = 0.0f32;
+                    for (sv, &code) in b.iter().enumerate() {
+                        let at = 2 * (sv * k + code as usize);
+                        match lut.get(at..at + 2) {
+                            Some(pair) => {
+                                adc += pair[0];
+                                norm_sq += pair[1];
+                            }
+                            // Out of range is what the branch above answers
+                            // with infinity, and it sorts a malformed code
+                            // last rather than nearest.
+                            None => return f32::INFINITY,
+                        }
+                    }
+                    if norm_sq <= 0.0 {
+                        // A reconstruction of length zero has no direction, so
+                        // it sits at distance one from everything.
+                        return 1.0;
+                    }
+                    // dot(q, c) = (|q|^2 + |c|^2 - adc) / 2, exactly, because
+                    // adc is |q - c|^2. Task-measured against the directly
+                    // computed inner product over 25,000 reconstructions, the
+                    // largest relative error was 2.1e-15 in float64.
+                    let dot = (q_norm_sq + norm_sq - adc) * 0.5;
+                    let d = 1.0 - dot * inv_q_norm / norm_sq.sqrt();
+                    // Not `d.max(0.0)`, which would swallow a NaN, and matching
+                    // what `cosine_normalized` does with a dot product landing
+                    // just above one.
+                    if d < 0.0 {
+                        0.0
+                    } else {
+                        d
+                    }
+                }
             }
-            sum
         })
     }
 }
@@ -2003,5 +2138,302 @@ mod tests {
             bb / ab,
             bs / asr
         );
+    }
+
+    /// The arithmetic behind refusing quantization on an l1 index
+    ///
+    /// Against the query `[0, 0]`, the point `[2, 0]` is at L1 2.0 and squared
+    /// L2 4.0 while `[1.1, 1.1]` is at L1 2.2 and squared L2 2.42. L1 ranks the
+    /// first ahead of the second and squared L2 ranks them the other way round,
+    /// so the two are not the same order and no rescaling makes them one.
+    ///
+    /// The codebook is installed rather than trained, and each of the two
+    /// points is a centroid, so every reconstruction is exact and the test
+    /// isolates the metric from every quantization error. What it pins is that
+    /// `DistPQ::eval` answers on squared L2 whatever space the index declared,
+    /// which is why `validate_space_supports_quantization` refuses the pair.
+    #[test]
+    fn the_l1_counterexample_is_ordered_by_squared_l2() {
+        let query = [0.0f32, 0.0];
+        let a = [2.0f32, 0.0];
+        let b = [1.1f32, 1.1];
+
+        // The two candidates, held as the only two centroids of a single
+        // subvector, so code 0 reconstructs to `a` exactly and code 1 to `b`.
+        let pq = Arc::new(PQ::new(2, 1, 1, 2, None));
+        pq.set_centroids(vec![vec![a.to_vec(), b.to_vec()]])
+            .expect("codebook installs");
+        pq.set_trained(true);
+        assert_eq!(pq.reconstruct(&[0]).unwrap(), a.to_vec());
+        assert_eq!(pq.reconstruct(&[1]).unwrap(), b.to_vec());
+
+        // What the index declares it ranks by.
+        let l1_a = L1Dist {}.eval(&query, &a);
+        let l1_b = L1Dist {}.eval(&query, &b);
+        assert_eq!(l1_a, 2.0);
+        assert_eq!(l1_b, 2.2);
+        assert!(l1_a < l1_b, "L1 puts a first");
+
+        // What the quantized search path actually ranks by. The guard installs
+        // this query's table and the dummy first argument is what
+        // `VectorGraph::search` passes.
+        let dist = DistPQ::new(pq, PqMetric::SquaredL2);
+        let _lut = dist.install_query_lut(&query).expect("query lut");
+        let dummy = vec![0u8; dist.subvectors()];
+        let adc_a = dist.eval(&dummy, &[0]);
+        let adc_b = dist.eval(&dummy, &[1]);
+
+        // Squared L2 and not L1, and not rooted.
+        assert_eq!(adc_a, 4.0);
+        assert!(
+            (adc_b - 2.42).abs() < 1e-6,
+            "expected the squared L2 2.42, got {adc_b}"
+        );
+
+        // The orders are opposite, which is the whole of the argument.
+        assert!(adc_b < adc_a, "squared L2 puts b first");
+        assert!(
+            (l1_a < l1_b) != (adc_a < adc_b),
+            "L1 and the quantized scorer must disagree on this pair"
+        );
+    }
+
+    /// Graph construction reads the same quantity the search path does
+    ///
+    /// With no query table installed, `eval` takes the codebook's symmetric
+    /// table, and that table holds squared L2 between centroids. So the
+    /// construction branch orders by squared L2 as well, and a quantized l1
+    /// graph is wired by the wrong metric before any query arrives.
+    ///
+    /// The separating pair is `[2, 0]` against the origin, where squared L2 is
+    /// 4.0 and L1 is 2.0. The counterexample's own pair is 2.02 against 2.0,
+    /// which is too close to tell the two quantities apart.
+    #[test]
+    fn the_construction_branch_is_squared_l2_too() {
+        let a = [2.0f32, 0.0];
+        let b = [1.1f32, 1.1];
+        let origin = [0.0f32, 0.0];
+
+        let pq = Arc::new(PQ::new(2, 1, 2, 4, None));
+        pq.set_centroids(vec![vec![
+            a.to_vec(),
+            b.to_vec(),
+            origin.to_vec(),
+            vec![9.0, 9.0],
+        ]])
+        .expect("codebook installs");
+        pq.set_trained(true);
+
+        let dist = DistPQ::new(pq, PqMetric::SquaredL2);
+        // No `install_query_lut`, so every call below is the construction
+        // branch reading the symmetric table.
+        let squared = |x: &[f32; 2], y: &[f32; 2]| -> f32 {
+            x.iter().zip(y.iter()).map(|(p, q)| (p - q) * (p - q)).sum()
+        };
+        for (i, j, x, y) in [(0u8, 1u8, &a, &b), (0, 2, &a, &origin)] {
+            let got = dist.eval(&[i], &[j]);
+            let want = squared(x, y);
+            assert!(
+                (got - want).abs() < 1e-6,
+                "centroids {i} and {j}: expected squared L2 {want}, got {got}"
+            );
+        }
+
+        // And on the separating pair it is not the declared metric.
+        assert_eq!(dist.eval(&[0], &[2]), 4.0);
+        assert_eq!(L1Dist {}.eval(&a, &origin), 2.0);
+    }
+
+    /// A codebook whose two centroids per subvector differ in length
+    ///
+    /// The point of the fixture is that the reconstructions it produces are not
+    /// unit vectors and not even of equal length, which is the whole reason the
+    /// cosine distance and the squared L2 to the reconstruction part company.
+    ///
+    /// Against the query `[1, 0, 0, 0]` the four reconstructions are
+    ///
+    /// | codes | reconstruction | squared L2 | cosine |
+    /// |---|---|---:|---:|
+    /// | `[0, 0]` | `[0.2, 0, 0, 0]` | 0.64 | 0.0000 |
+    /// | `[1, 0]` | `[0.5, 0.5, 0, 0]` | 0.50 | 0.2929 |
+    /// | `[1, 1]` | `[0.5, 0.5, 0.5, 0.5]` | 1.00 | 0.5000 |
+    /// | `[0, 1]` | `[0.2, 0, 0.5, 0.5]` | 1.14 | 0.7278 |
+    ///
+    /// The first two swap. `[0, 0]` points exactly where the query does and is
+    /// far too short, so cosine calls it a perfect match and squared L2 charges
+    /// it for the missing length.
+    fn uneven_codebook() -> Arc<PQ> {
+        // Two subvectors of two values, two centroids each.
+        let pq = Arc::new(PQ::new(4, 2, 1, 2, None));
+        pq.set_centroids(vec![
+            vec![vec![0.2, 0.0], vec![0.5, 0.5]],
+            vec![vec![0.0, 0.0], vec![0.5, 0.5]],
+        ])
+        .expect("codebook installs");
+        pq.set_trained(true);
+        pq
+    }
+
+    fn cosine_to(query: &[f32], point: &[f32]) -> f32 {
+        let dot: f32 = query.iter().zip(point).map(|(a, b)| a * b).sum();
+        let qn: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let pn: f32 = point.iter().map(|x| x * x).sum::<f32>().sqrt();
+        1.0 - dot / (qn * pn)
+    }
+
+    /// The cosine scorer returns the cosine distance to the reconstruction
+    ///
+    /// Checked against the reconstruction itself rather than against a second
+    /// formula over the tables, so the test would fail if the recovery identity
+    /// the scorer rests on were wrong rather than only if the code were.
+    #[test]
+    fn the_cosine_scorer_returns_the_cosine_distance_to_the_reconstruction() {
+        let pq = uneven_codebook();
+        let dist = DistPQ::new(pq.clone(), PqMetric::Cosine);
+        let query = [0.6f32, 0.8, 0.0, 0.0];
+        let _lut = dist.install_query_lut(&query).expect("query lut");
+        let dummy = vec![0u8; dist.subvectors()];
+
+        for codes in [[0u8, 0], [0, 1], [1, 0], [1, 1]] {
+            let recon = pq.reconstruct(&codes).expect("reconstruct");
+            let want = cosine_to(&query, &recon);
+            let got = dist.eval(&dummy, &codes);
+            assert!(
+                (got - want).abs() < 1e-6,
+                "codes {codes:?}: expected {want}, got {got}"
+            );
+        }
+    }
+
+    /// The query's own length is taken rather than assumed to be one
+    ///
+    /// Every path into a cosine index normalises, so the assumption would hold
+    /// today. Taking it costs one pass over the query per search and makes the
+    /// scorer right for a caller that reaches it another way, which is a
+    /// cheaper guarantee than a precondition nobody can check at the seam.
+    #[test]
+    fn the_cosine_scorer_takes_the_query_length_rather_than_assuming_it() {
+        let pq = uneven_codebook();
+        let dist = DistPQ::new(pq.clone(), PqMetric::Cosine);
+        let unit = [0.6f32, 0.8, 0.0, 0.0];
+        let long = [3.0f32, 4.0, 0.0, 0.0];
+        let codes = [1u8, 1];
+        let dummy = vec![0u8; dist.subvectors()];
+
+        let a = {
+            let _lut = dist.install_query_lut(&unit).expect("query lut");
+            dist.eval(&dummy, &codes)
+        };
+        let b = {
+            let _lut = dist.install_query_lut(&long).expect("query lut");
+            dist.eval(&dummy, &codes)
+        };
+        assert!(
+            (a - b).abs() < 1e-6,
+            "a cosine distance is scale invariant in the query: {a} against {b}"
+        );
+    }
+
+    /// The two metrics do not induce the same order
+    ///
+    /// Which is why the conversion cannot be applied to a finished page. A page
+    /// ordered by squared L2 and scored by cosine would show hit two at a higher
+    /// score than hit three.
+    #[test]
+    fn the_two_pq_metrics_rank_a_pair_in_opposite_orders() {
+        let pq = uneven_codebook();
+        // The query the table on `uneven_codebook` is worked out against.
+        let query = [1.0f32, 0.0, 0.0, 0.0];
+        let dummy = vec![0u8; pq.subvectors()];
+        let all = [[0u8, 0], [0, 1], [1, 0], [1, 1]];
+
+        let sq = DistPQ::new(pq.clone(), PqMetric::SquaredL2);
+        let sq_scores: Vec<f32> = {
+            let _lut = sq.install_query_lut(&query).expect("query lut");
+            all.iter().map(|c| sq.eval(&dummy, c)).collect()
+        };
+        let cos = DistPQ::new(pq.clone(), PqMetric::Cosine);
+        let cos_scores: Vec<f32> = {
+            let _lut = cos.install_query_lut(&query).expect("query lut");
+            all.iter().map(|c| cos.eval(&dummy, c)).collect()
+        };
+
+        // Every cosine value is the one its own reconstruction carries.
+        for (i, codes) in all.iter().enumerate() {
+            let recon = pq.reconstruct(codes).expect("reconstruct");
+            assert!((cos_scores[i] - cosine_to(&query, &recon)).abs() < 1e-6);
+        }
+
+        // And somewhere among the four the two orders part company. Searched
+        // rather than named, because which pair swaps is a property of this
+        // codebook and naming one would pin the fixture instead of the claim.
+        let swapped = (0..all.len())
+            .flat_map(|i| (i + 1..all.len()).map(move |j| (i, j)))
+            .filter(|&(i, j)| (sq_scores[i] < sq_scores[j]) != (cos_scores[i] < cos_scores[j]))
+            .count();
+        assert!(
+            swapped > 0,
+            "no pair swapped: squared L2 {sq_scores:?}, cosine {cos_scores:?}"
+        );
+    }
+
+    /// Graph construction reads the same metric the search path does
+    ///
+    /// With no query table installed, `eval` takes the symmetric branch, and
+    /// under `PqMetric::Cosine` that has to be the cosine distance between the
+    /// two reconstructions rather than the squared L2 between them. A graph
+    /// wired by one metric and searched by another is a graph whose neighbour
+    /// lists answer a different question from the traversal that reads them.
+    #[test]
+    fn the_cosine_construction_branch_is_cosine_too() {
+        let pq = uneven_codebook();
+        let dist = DistPQ::new(pq.clone(), PqMetric::Cosine);
+        // No `install_query_lut`, so every call below is the construction branch.
+        for a in [[0u8, 0], [0, 1], [1, 0], [1, 1]] {
+            for b in [[0u8, 0], [0, 1], [1, 0], [1, 1]] {
+                let ra = pq.reconstruct(&a).expect("reconstruct");
+                let rb = pq.reconstruct(&b).expect("reconstruct");
+                let want = cosine_to(&ra, &rb);
+                let got = dist.eval(&a, &b);
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "codes {a:?} against {b:?}: expected {want}, got {got}"
+                );
+            }
+        }
+        // And a code is at distance zero from itself, which the strict upper
+        // triangle answers without reading anything.
+        assert_eq!(dist.eval(&[1, 1], &[1, 1]), 0.0);
+    }
+
+    /// A reconstruction of no length is at distance one from everything
+    ///
+    /// Where `cosine_normalized` puts a zero vector too. The alternative is a
+    /// division by zero, and a NaN in the neighbour selection heuristic is what
+    /// left the graph with one edge per node when this branch returned infinity.
+    #[test]
+    fn a_zero_reconstruction_is_at_cosine_distance_one() {
+        let pq = Arc::new(PQ::new(4, 2, 1, 2, None));
+        pq.set_centroids(vec![
+            vec![vec![0.0, 0.0], vec![1.0, 0.0]],
+            vec![vec![0.0, 0.0], vec![0.0, 1.0]],
+        ])
+        .expect("codebook installs");
+        pq.set_trained(true);
+
+        let dist = DistPQ::new(pq.clone(), PqMetric::Cosine);
+        let query = [1.0f32, 0.0, 0.0, 0.0];
+        let zero = [0u8, 0];
+        assert_eq!(pq.reconstruct(&zero).unwrap(), vec![0.0; 4]);
+
+        // The construction branch.
+        assert_eq!(dist.eval(&zero, &[1, 1]), 1.0);
+        assert_eq!(dist.eval(&zero, &zero), 1.0);
+        // And the search branch.
+        let _lut = dist.install_query_lut(&query).expect("query lut");
+        assert_eq!(dist.eval(&[0u8; 2], &zero), 1.0);
+        // A zero query has no direction either.
+        let _lut2 = dist.install_query_lut(&[0.0f32; 4]).expect("query lut");
+        assert_eq!(dist.eval(&[0u8; 2], &[1, 1]), 1.0);
     }
 }

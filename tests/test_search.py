@@ -1025,6 +1025,81 @@ def test_a_hand_assembled_dot_directory_claiming_quantization_is_refused(tmp_pat
         VectorDatabase().load(str(path))
 
 
+def test_l1_cannot_be_quantized():
+    """Refused for the same reason `dot` is, and measured rather than argued.
+
+    A quantized graph ranks by a squared L2 distance to the codebook whatever
+    space is declared. Against the query `[0, 0]` the point `[2, 0]` is at L1
+    2.0 and squared L2 4.0 while `[1.1, 1.1]` is at L1 2.2 and squared L2 2.42,
+    so the two rank that pair in opposite orders and no rescaling joins them.
+    `the_l1_counterexample_is_ordered_by_squared_l2` in `distance.rs` holds the
+    arithmetic against the live scorer.
+    """
+    with pytest.raises(RuntimeError, match=r"space='l1' cannot be quantized"):
+        VectorDatabase().create(
+            "hnsw", dim=16, space="l1", expected_size=20000,
+            quantization_config={"type": "pq", "subvectors": 4, "bits": 8,
+                                 "training_size": 1000},
+        )
+
+
+def test_a_hand_assembled_l1_directory_claiming_quantization_is_refused(tmp_path):
+    """The same rule at load, because a config.json is not a caller.
+
+    A directory saved by a release that allowed the pair reaches this too, and
+    the message names the remedy rather than only the refusal.
+    """
+    rng = np.random.default_rng(1105)
+    corpus = rng.normal(size=(60, 16)).astype(np.float32)
+    index = VectorDatabase().create("hnsw", dim=16, space="l1", expected_size=100)
+    index.add({"ids": [f"d{i}" for i in range(len(corpus))],
+               "vectors": corpus.tolist()})
+    path = tmp_path / "forged.zdb"
+    index.save(str(path))
+
+    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    manifest["files_included"].append("quantization.json")
+    (path / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (path / "quantization.json").write_text(json.dumps({
+        "type": "pq", "subvectors": 4, "bits": 8, "training_size": 1000,
+        "max_training_vectors": None, "storage_mode": "quantized_only",
+        "is_trained": False, "training_completed_at": None, "memory_stats": None,
+        "pq_config": {"dim": 16, "sub_dim": 4, "num_centroids": 256},
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"space='l1' cannot be quantized"):
+        VectorDatabase().load(str(path))
+
+
+def test_the_refusal_message_names_the_remedy():
+    """Both refused pairs say what to do instead, not only what is refused."""
+    for space, remedy in (("dot", "space='cosine'"), ("l1", "space='l2'")):
+        with pytest.raises((RuntimeError, ValueError)) as excinfo:
+            VectorDatabase().create(
+                "hnsw", dim=16, space=space, expected_size=20000,
+                quantization_config={"type": "pq", "subvectors": 4, "bits": 8,
+                                     "training_size": 1000},
+            )
+        text = str(excinfo.value)
+        assert remedy in text
+        assert "drop quantization_config" in text
+
+
+def test_an_unquantized_l1_index_is_untouched():
+    """Only the pair is refused. l1 on its own is unchanged."""
+    rng = np.random.default_rng(4)
+    corpus = rng.normal(size=(200, 16)).astype(np.float32)
+    index = VectorDatabase().create("hnsw", dim=16, space="l1", expected_size=200)
+    index.add({"ids": [f"d{i}" for i in range(len(corpus))],
+               "vectors": corpus.tolist()})
+    query = corpus[7]
+    page = index.search(query.tolist(), top_k=5)
+    truth = np.abs(corpus - query).sum(axis=1)
+    assert [h["id"] for h in page] == [f"d{i}" for i in np.argsort(truth)[:5]]
+    for hit in page:
+        assert abs(hit["score"] - truth[int(hit["id"][1:])]) <= 1e-3
+
+
 def test_dot_and_cosine_agree_on_normalised_input():
     """`1 - dot` is the cosine distance once the input is a unit vector.
 

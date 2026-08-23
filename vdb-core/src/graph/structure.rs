@@ -26,8 +26,8 @@ use super::mutable::{reserved_records, MutableGraph, RESERVE_BYTES};
 use super::store::VectorStore;
 use super::traverse::LAYERS;
 use super::{Distance, VectorGraph};
-use crate::distance::DistPQ;
 use crate::distance::{CosineDist, L1Dist, L2Dist};
+use crate::distance::{DistPQ, PqMetric};
 use crate::pq::PQ;
 use std::sync::Arc;
 
@@ -564,9 +564,14 @@ fn a_dump_round_trips_through_the_mutable_graph() {
     pq.train(&all).unwrap();
     let refs: Vec<&[f32]> = all.iter().map(|v| v.as_slice()).collect();
     let codes = pq.quantize_batch(&refs).unwrap();
-    let (quantized, quantized_store) = build(&codes, 16, 100, DistPQ::new(pq.clone()));
+    let (quantized, quantized_store) = build(
+        &codes,
+        16,
+        100,
+        DistPQ::new(pq.clone(), PqMetric::SquaredL2),
+    );
     let (bytes, residue) = round_trip(&quantized, &quantized_store, GraphKind::CosinePq, || {
-        DistPQ::new(pq.clone())
+        DistPQ::new(pq.clone(), PqMetric::SquaredL2)
     });
     println!("round trip quantized bytes {} residue {}", bytes, residue);
 }

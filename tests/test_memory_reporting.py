@@ -286,12 +286,13 @@ def test_the_reported_total_covers_what_the_structure_holds(storage_mode):
 
 
 def test_the_total_is_the_sum_of_the_parts():
-    """`total_memory_mb` adds up the six figures beside it and nothing else."""
+    """`total_memory_mb` adds up the seven figures beside it and nothing else."""
     index, _ = _build(3000, 128, "quantized_with_raw")
     stats = index.get_stats()
     parts = sum(float(stats[k]) for k in (
         "graph_memory_mb", "raw_vectors_memory_mb", "quantized_codes_memory_mb",
-        "codebook_memory_mb", "sdc_table_memory_mb", "index_bookkeeping_memory_mb"))
+        "codebook_memory_mb", "sdc_table_memory_mb", "centroid_norm_memory_mb",
+        "index_bookkeeping_memory_mb"))
     assert float(stats["total_memory_mb"]) == pytest.approx(parts, abs=0.05)
 
 

@@ -49,7 +49,7 @@
 // another. See `clippy.toml`.
 #![allow(clippy::disallowed_types)]
 
-use crate::distance::{CosineDist, DistPQ, DotDist, L1Dist, L2Dist};
+use crate::distance::{CosineDist, DistPQ, DotDist, L1Dist, L2Dist, PqMetric};
 use crate::pq::PQ;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -448,22 +448,26 @@ impl VectorGraph {
             "Creating PQ-enabled HNSW index"
         );
 
+        // The metric travels with the variant, because the two are the same
+        // choice. A quantized graph orders and scores by what its space
+        // declared, and `DistPQ` is told which rather than inferring it.
         macro_rules! quantized {
-            ($variant:ident) => {
+            ($variant:ident, $metric:expr) => {
                 VectorGraph::$variant(Backend::sized(
                     dim,
                     m,
                     max_layer,
                     ef_construction,
                     expected_size,
-                    DistPQ::new(pq),
+                    DistPQ::new(pq, $metric),
                 ))
             };
         }
         match space {
-            "cosine" => quantized!(CosinePQ),
-            "l2" => quantized!(L2PQ),
-            "l1" => quantized!(L1PQ),
+            "cosine" => quantized!(CosinePQ, PqMetric::Cosine),
+            "l2" => quantized!(L2PQ, PqMetric::SquaredL2),
+            // Unreachable, see below. Squared L2 is what it was built with.
+            "l1" => quantized!(L1PQ, PqMetric::SquaredL2),
             // "dot" is not here and cannot reach here. See
             // `validate_index_parameters`, which refuses the pair at create()
             // and at load, because the ADC table every quantized graph scores
@@ -482,7 +486,7 @@ impl VectorGraph {
                     fallback = "cosine",
                     "Defaulting to cosine distance due to invalid space"
                 );
-                quantized!(CosinePQ)
+                quantized!(CosinePQ, PqMetric::Cosine)
             }
         }
     }
@@ -1093,10 +1097,16 @@ pub(crate) fn restore_graph(
                 min_nodes,
                 max_origin_id,
             };
+            // The metric follows the discriminant the dump carries, so a
+            // directory scores the way the graph inside it was wired.
+            let metric = match kind {
+                GraphKind::CosinePq => PqMetric::Cosine,
+                _ => PqMetric::SquaredL2,
+            };
             let restored = Backend::restored(dump::read_dump::<u8, DistPQ>(
                 dir,
                 &expected,
-                DistPQ::new(pq),
+                DistPQ::new(pq, metric),
             )?);
             match kind {
                 GraphKind::L2Pq => VectorGraph::L2PQ(restored),

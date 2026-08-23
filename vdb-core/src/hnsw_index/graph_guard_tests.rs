@@ -18,7 +18,7 @@
 //! takes a space by name and so cannot be handed a distance directly.
 
 use crate::distance::CosineDist;
-use crate::distance::DistPQ;
+use crate::distance::{DistPQ, PqMetric};
 use crate::graph::test_graph::TestGraph;
 use crate::pq::PQ;
 use crate::rng::SeededRng;
@@ -101,7 +101,7 @@ fn unit_vectors(records: usize, dim: usize) -> Vec<Vec<f32>> {
 /// Build the quantized graph exactly as the insertion path does, one code
 /// vector at a time with no query table set.
 fn build_pq_graph(pq: Arc<PQ>, codes: &[Vec<u8>]) -> TestGraph<u8, DistPQ> {
-    TestGraph::build(PQ_M, PQ_EF_C, codes, DistPQ::new(pq))
+    TestGraph::build(PQ_M, PQ_EF_C, codes, DistPQ::new(pq, PqMetric::SquaredL2))
 }
 
 /// The strongest assertion available about the quantized graph: that the
@@ -191,7 +191,7 @@ fn quantized_graph_recall_against_brute_force() {
 
     let f = fixture();
     let (data, queries) = (&f.data, &f.queries);
-    let dist = DistPQ::new(f.pq.clone());
+    let dist = DistPQ::new(f.pq.clone(), PqMetric::SquaredL2);
     let graph = build_pq_graph(f.pq.clone(), &f.codes);
 
     let mut hits = 0usize;
@@ -237,7 +237,7 @@ fn quantized_graph_recall_against_brute_force() {
 #[test]
 fn quantized_graph_is_fully_reachable() {
     let f = fixture();
-    let dist = DistPQ::new(f.pq.clone());
+    let dist = DistPQ::new(f.pq.clone(), PqMetric::SquaredL2);
     let graph = build_pq_graph(f.pq.clone(), &f.codes);
 
     let found = {
@@ -262,7 +262,7 @@ fn quantized_graph_is_fully_reachable() {
 #[test]
 fn quantized_search_still_uses_the_query_table() {
     let f = fixture();
-    let dist = DistPQ::new(f.pq.clone());
+    let dist = DistPQ::new(f.pq.clone(), PqMetric::SquaredL2);
     let graph = build_pq_graph(f.pq.clone(), &f.codes);
 
     // The ADC distance from a query to a stored code, computed directly.

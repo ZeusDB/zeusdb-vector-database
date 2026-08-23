@@ -2104,7 +2104,8 @@ def test_default_quantized_only_saves_memory_at_the_default_expected_size():
     quantized_total_mb = (float(stats["raw_vectors_memory_mb"])
                           + float(stats["quantized_codes_memory_mb"])
                           + float(stats["codebook_memory_mb"])
-                          + float(stats["sdc_table_memory_mb"]))
+                          + float(stats["sdc_table_memory_mb"])
+                          + float(stats["centroid_norm_memory_mb"]))
     unquantized_mb = records * 64 * 4 / (1024 * 1024)
     assert quantized_total_mb < unquantized_mb, (
         f"the default quantized_only index holds {quantized_total_mb:.2f}MB "
@@ -3472,3 +3473,442 @@ def test_training_progress_survives_a_save_and_load(storage_mode, tmp_path):
     loaded = VectorDatabase().load(str(tmp_path / "progress.zdb"))
     assert loaded.get_stats()["training_progress"] == before
     assert _parse_training_progress(before) == (PQ_TRAINING_SIZE, PQ_TRAINING_SIZE, 100.0)
+
+
+# ------------------------------------------------------------
+# The metric a quantized index scores on, and the scale it reports
+# ------------------------------------------------------------
+
+def _pq_corpus(n=3000, dim=32, seed=1105, scale=3.0):
+    rng = np.random.default_rng(seed)
+    return (rng.normal(size=(n, dim)).astype(np.float32) * scale)
+
+
+def _pq_index(space, storage_mode, corpus, subvectors=8, metadatas=None):
+    index = VectorDatabase().create(
+        "hnsw", dim=corpus.shape[1], space=space, m=16, ef_construction=200,
+        expected_size=len(corpus),
+        quantization_config={"type": "pq", "subvectors": subvectors, "bits": 8,
+                             "training_size": 1000, "storage_mode": storage_mode},
+    )
+    payload = {"ids": [f"r{i}" for i in range(len(corpus))],
+               "vectors": corpus.tolist()}
+    if metadatas is not None:
+        payload["metadatas"] = metadatas
+    index.add(payload)
+    assert index.is_quantized(), "the corpus must be large enough to train"
+    return index
+
+
+def test_quantized_l2_reports_the_same_scale_as_raw_l2():
+    """The property the square root restores.
+
+    `DistPQ::eval` sums a table of squared L2 distances and takes no root,
+    while `L2Dist` does, so one index reported two scales. A quantized score is
+    a distance to the record's reconstruction rather than to the vector that was
+    inserted, so it does not equal the raw score; what it must do is live on the
+    same scale, which a squared quantity does not.
+    """
+    corpus = _pq_corpus()
+    # Held out rather than a corpus member, so neither page's top score is the
+    # exact zero a record matching itself produces.
+    query = np.random.default_rng(77).normal(size=corpus.shape[1]).astype(np.float32) * 3.0
+
+    raw = VectorDatabase().create("hnsw", dim=corpus.shape[1], space="l2",
+                                  m=16, ef_construction=200, expected_size=len(corpus))
+    raw.add({"ids": [f"r{i}" for i in range(len(corpus))], "vectors": corpus.tolist()})
+    raw_page = raw.search(query.tolist(), top_k=5, ef_search=200)
+
+    quantized = _pq_index("l2", "quantized_only", corpus)
+    q_page = quantized.search(query.tolist(), top_k=5, ef_search=200)
+
+    # Every quantized score is the rooted L2 to that record's own
+    # reconstruction, which is what a raw index would report if the
+    # reconstruction were the stored vector.
+    got = quantized.get_records([h["id"] for h in q_page], return_vector=True)
+    recon = {r["id"]: np.asarray(r["vector"], dtype=np.float32) for r in got}
+    for hit in q_page:
+        expected = float(np.linalg.norm(query - recon[hit["id"]]))
+        assert abs(hit["score"] - expected) <= 1e-3 + 1e-4 * expected, (
+            f"{hit['id']} reported {hit['score']} against a rooted L2 of {expected}"
+        )
+
+    # And the two pages are within a factor of each other rather than a square
+    # apart. Before the root the quantized top score was 159.416 where the scan
+    # reported 12.626 on one index.
+    assert 0.2 <= q_page[0]["score"] / raw_page[0]["score"] <= 5.0
+
+
+def test_one_l2_index_reports_one_scale_whatever_the_filter():
+    """The traversal and the exact scan a narrow filter takes must agree.
+
+    The scan scores with `raw_distance_fn`, which roots, and the traversal
+    scores with the ADC sum, which did not. Which number a caller saw therefore
+    depended on how selective their filter was.
+    """
+    corpus = _pq_corpus()
+    metadatas = [{"tag": "rare" if i < 30 else "common"} for i in range(len(corpus))]
+    index = _pq_index("l2", "quantized_only", corpus, metadatas=metadatas)
+    query = corpus[0]
+
+    plain = index.search(query.tolist(), top_k=5, ef_search=200)
+    narrow = index.search(query.tolist(), filter={"tag": "rare"}, top_k=5, ef_search=200)
+
+    # r0 is in the corpus and carries the rare tag, so both paths return it.
+    plain_r0 = next(h["score"] for h in plain if h["id"] == "r0")
+    narrow_r0 = next(h["score"] for h in narrow if h["id"] == "r0")
+    assert abs(plain_r0 - narrow_r0) <= 1e-3 + 1e-4 * abs(narrow_r0), (
+        f"traversal reported {plain_r0} and the exact scan {narrow_r0}"
+    )
+
+
+def test_the_root_does_not_move_the_quantized_l2_ordering():
+    """A square root is monotone, so the page it reorders is no page at all."""
+    corpus = _pq_corpus()
+    index = _pq_index("l2", "quantized_only", corpus)
+    for qi in (0, 5, 19):
+        page = index.search(corpus[qi].tolist(), top_k=10, ef_search=200)
+        scores = [h["score"] for h in page]
+        assert scores == sorted(scores)
+        assert all(s >= 0.0 for s in scores)
+
+
+def test_an_unquantized_index_is_untouched_by_the_root():
+    """Nothing here may move a raw page."""
+    corpus = _pq_corpus(n=500)
+    query = corpus[3]
+    for space in ("cosine", "l2", "l1", "dot"):
+        index = VectorDatabase().create("hnsw", dim=corpus.shape[1], space=space,
+                                        m=16, ef_construction=200, expected_size=500)
+        index.add({"ids": [f"r{i}" for i in range(len(corpus))],
+                   "vectors": corpus.tolist()})
+        page = index.search(query.tolist(), top_k=5, ef_search=200)
+        if space == "l2":
+            truth = np.linalg.norm(corpus - query, axis=1)
+        elif space == "l1":
+            truth = np.abs(corpus - query).sum(axis=1)
+        elif space == "dot":
+            truth = 1.0 - corpus.astype(np.float64) @ query.astype(np.float64)
+        else:
+            cn = corpus / np.linalg.norm(corpus, axis=1, keepdims=True)
+            truth = 1.0 - cn @ (query / np.linalg.norm(query))
+        for hit in page:
+            expected = float(truth[int(hit["id"][1:])])
+            assert abs(hit["score"] - expected) <= 1e-3 + 1e-4 * abs(expected), (
+                f"{space} moved: {hit['id']} reported {hit['score']} against {expected}"
+            )
+
+
+# ------------------------------------------------------------
+# Recall floors against exact rankings
+# ------------------------------------------------------------
+
+_FLOOR_N, _FLOOR_D, _FLOOR_NQ, _FLOOR_K = 3000, 32, 40, 10
+
+
+def _floor_corpus():
+    rng = np.random.default_rng(1105)
+    return rng.normal(size=(_FLOOR_N, _FLOOR_D)).astype(np.float32) * 3.0
+
+
+def _exact_top_k(corpus, queries, space, k):
+    if space == "l2":
+        dd = np.linalg.norm(corpus[None, :, :] - queries[:, None, :], axis=2)
+    elif space == "l1":
+        dd = np.abs(corpus[None, :, :] - queries[:, None, :]).sum(axis=2)
+    elif space == "dot":
+        dd = 1.0 - queries.astype(np.float64) @ corpus.astype(np.float64).T
+    else:
+        cn = corpus / np.linalg.norm(corpus, axis=1, keepdims=True)
+        qn = queries / np.linalg.norm(queries, axis=1, keepdims=True)
+        dd = 1.0 - qn @ cn.T
+    return [set(row.tolist()) for row in np.argsort(dd, axis=1)[:, :k]]
+
+
+def _measure_recall(index, corpus, queries, truth, k, rerank=None):
+    hit = 0
+    for qi in range(len(queries)):
+        kwargs = dict(vector=queries[qi].tolist(), top_k=k, ef_search=200)
+        if rerank is not None:
+            kwargs["rerank"] = rerank
+        got = {int(h["id"][1:]) for h in index.search(**kwargs)}
+        hit += len(got & truth[qi])
+    return hit / (len(queries) * k)
+
+
+# space, storage mode, rerank, floor. The floors are what this configuration
+# measured on this corpus, less a margin, and not a figure anyone hoped for.
+# Corpus: 3,000 Gaussian records of dimension 32, subvectors 8, bits 8,
+# training_size 1,000, 40 queries drawn from the corpus, ef_search 200,
+# top_k 10. Measured: cosine 1.0000 / 0.6425 / 1.0000 / 0.6425, l2 1.0000 /
+# 0.5800 / 1.0000 / 0.5800, l1 raw 1.0000, dot raw 1.0000.
+#
+# The two quantized cosine rows measured 0.6175 while the scorer ranked by
+# squared L2 to the reconstruction and 0.6425 since it ranks by cosine. The
+# floors below are not set between those two, because a floor that tight would
+# fail on float differences that are not a regression. What catches a return to
+# the old ordering is
+# `test_quantized_cosine_reports_the_cosine_distance_to_the_reconstruction`
+# and `test_quantized_cosine_ranks_by_cosine_and_not_by_squared_l2`, which pin
+# the scorer against the reconstructions themselves. These catch a collapse.
+_RECALL_FLOORS = [
+    ("cosine", None, None, 0.99),
+    ("cosine", "quantized_only", None, 0.58),
+    ("cosine", "quantized_with_raw", None, 0.99),
+    ("cosine", "quantized_with_raw", 0, 0.58),
+    ("l2", None, None, 0.99),
+    ("l2", "quantized_only", None, 0.52),
+    ("l2", "quantized_with_raw", None, 0.99),
+    ("l2", "quantized_with_raw", 0, 0.52),
+    ("l1", None, None, 0.99),
+    ("dot", None, None, 0.99),
+]
+
+
+@pytest.mark.parametrize("space,storage_mode,rerank,floor", _RECALL_FLOORS)
+def test_recall_against_an_exact_ranking(space, storage_mode, rerank, floor):
+    """Every metric and storage mode that survives, held to what it measured.
+
+    `l1` appears unquantized only, because `create()` refuses the quantized
+    pair. A quantized graph ranks by squared L2 whatever the space, and squared
+    L2 does not order the same points L1 does.
+    """
+    corpus = _floor_corpus()
+    queries = corpus[:_FLOOR_NQ]
+    truth = _exact_top_k(corpus, queries, space, _FLOOR_K)
+
+    kwargs = dict(index_type="hnsw", dim=_FLOOR_D, space=space, m=16,
+                  ef_construction=200, expected_size=_FLOOR_N)
+    if storage_mode:
+        kwargs["quantization_config"] = {
+            "type": "pq", "subvectors": 8, "bits": 8, "training_size": 1000,
+            "storage_mode": storage_mode,
+        }
+    index = VectorDatabase().create(**kwargs)
+    index.add({"ids": [f"r{i}" for i in range(_FLOOR_N)], "vectors": corpus.tolist()})
+    if storage_mode:
+        assert index.is_quantized()
+
+    recall = _measure_recall(index, corpus, queries, truth, _FLOOR_K, rerank)
+    assert recall >= floor, (
+        f"{space} {storage_mode} rerank={rerank} recall@{_FLOOR_K} "
+        f"{recall:.4f} below the floor {floor}"
+    )
+
+
+def test_candidate_recall_is_measured_before_rerank():
+    """Rerank must not be able to hide a broken candidate generator.
+
+    Rescoring against raw vectors is exact, so a reranked page can read well
+    while the graph underneath it returns the wrong candidates. `rerank=0`
+    reports the page the traversal actually produced, and that is the number
+    held here. It has to be well below the reranked figure, otherwise this test
+    is measuring the rescoring it exists to see past.
+    """
+    corpus = _floor_corpus()
+    queries = corpus[:_FLOOR_NQ]
+    truth = _exact_top_k(corpus, queries, "l2", _FLOOR_K)
+
+    index = VectorDatabase().create(
+        "hnsw", dim=_FLOOR_D, space="l2", m=16, ef_construction=200,
+        expected_size=_FLOOR_N,
+        quantization_config={"type": "pq", "subvectors": 8, "bits": 8,
+                             "training_size": 1000,
+                             "storage_mode": "quantized_with_raw"},
+    )
+    index.add({"ids": [f"r{i}" for i in range(_FLOOR_N)], "vectors": corpus.tolist()})
+    assert index.is_quantized()
+
+    candidates = _measure_recall(index, corpus, queries, truth, _FLOOR_K, rerank=0)
+    reranked = _measure_recall(index, corpus, queries, truth, _FLOOR_K)
+
+    # Measured 0.5800 and 1.0000 on this corpus.
+    assert candidates >= 0.52, f"candidate recall {candidates:.4f} below its floor"
+    assert reranked >= 0.99, f"reranked recall {reranked:.4f} below its floor"
+    assert reranked - candidates >= 0.15, (
+        "rerank is not moving the page, so this is not measuring candidates"
+    )
+
+
+def test_quantized_only_ignores_rerank_entirely():
+    """It holds no raw vectors, so there is nothing exact to rescore against.
+
+    Pinned because the blast radius of a wrong candidate ordering depends on it:
+    a mode that always reranks is exposed only through `rerank=0`, and this one
+    is exposed always.
+    """
+    corpus = _floor_corpus()
+    queries = corpus[:_FLOOR_NQ]
+    truth = _exact_top_k(corpus, queries, "l2", _FLOOR_K)
+    index = _pq_index("l2", "quantized_only", corpus)
+
+    assert _measure_recall(index, corpus, queries, truth, _FLOOR_K) == pytest.approx(
+        _measure_recall(index, corpus, queries, truth, _FLOOR_K, rerank=0)
+    )
+
+
+# ------------------------------------------------------------
+# The metric a quantized cosine index scores on
+# ------------------------------------------------------------
+
+
+def _reconstructions(index, ids):
+    """What a `quantized_only` index holds for each record.
+
+    `get_records(return_vector=True)` returns the reconstruction where no raw
+    vector survives, which is the vector both scorers see.
+    """
+    out = {}
+    for r in index.get_records(ids, return_vector=True):
+        out[r["id"]] = np.asarray(r["vector"], dtype=np.float64)
+    return out
+
+
+def test_quantized_cosine_reports_the_cosine_distance_to_the_reconstruction():
+    """The score is on the scale a raw cosine index reports.
+
+    A quantized graph sums a table of squared L2 distances, and under cosine
+    that is `1 + norm(c)^2 - 2 dot(q, c)` against a reconstruction whose norm is
+    not one. It used to be reported as it stood, which ran at about 1.86 times
+    the cosine distance on 25,000 dbpedia records and could not be converted by
+    the caller, because the conversion needs that record's own `norm(c)`.
+
+    `DistPQ` under `PqMetric::Cosine` does the conversion inside the scorer,
+    where `norm(c)` is available as a sum over the codes.
+    """
+    corpus = _pq_corpus(n=3000, dim=32)
+    query = np.random.default_rng(78).normal(size=corpus.shape[1]).astype(np.float32)
+    index = _pq_index("cosine", "quantized_only", corpus)
+
+    page = index.search(query.tolist(), top_k=8, ef_search=200)
+    recon = _reconstructions(index, [h["id"] for h in page])
+    qn = query.astype(np.float64) / np.linalg.norm(query)
+
+    for hit in page:
+        c = recon[hit["id"]]
+        expected = 1.0 - float(qn @ c) / float(np.linalg.norm(c))
+        assert abs(hit["score"] - expected) <= 2e-4 + 1e-4 * abs(expected), (
+            f"{hit['id']} reported {hit['score']} against a cosine distance of {expected}"
+        )
+
+
+def test_quantized_cosine_ranks_by_cosine_and_not_by_squared_l2():
+    """The two orderings differ, and the page is the cosine one.
+
+    Squared L2 to the reconstruction carries `norm(c)^2`, which varies from
+    record to record, so it is not a monotone function of the cosine distance
+    and the two do not rank the same records the same way. That is why the score
+    could not be converted on the page and the scorer had to move.
+    """
+    corpus = _pq_corpus(n=3000, dim=32)
+    index = _pq_index("cosine", "quantized_only", corpus)
+    ids = [f"r{i}" for i in range(len(corpus))]
+    recon = _reconstructions(index, ids)
+    stack = np.stack([recon[i] for i in ids])
+    norms = np.linalg.norm(stack, axis=1)
+
+    rng = np.random.default_rng(79)
+    disagreements = 0
+    for _ in range(25):
+        q = rng.normal(size=corpus.shape[1])
+        q = q / np.linalg.norm(q)
+        sim = stack @ q
+        by_cosine = np.argsort(-(sim / norms))[:10]
+        by_sq_l2 = np.argsort(norms**2 - 2.0 * sim)[:10]
+        page = [int(h["id"][1:]) for h in
+                index.search(q.astype(np.float32).tolist(), top_k=10, ef_search=800)]
+        if list(by_cosine) != list(by_sq_l2):
+            disagreements += 1
+        assert page == list(by_cosine), (
+            f"page {page} is not the exhaustive cosine order {list(by_cosine)}"
+        )
+    assert disagreements > 0, (
+        "the two orderings never disagreed on this corpus, so this test proves nothing"
+    )
+
+
+def test_one_cosine_index_reports_one_scale_whatever_the_filter():
+    """The traversal and the exact scan a narrow filter takes must agree.
+
+    The scan scores a reconstruction with the space's raw distance, and
+    `CosineDist` is `1 - dot` on a pair assumed to be unit. A reconstruction is
+    not unit, so the scan answered a third quantity, neither the squared L2 the
+    traversal returned nor the cosine distance either of them should have. On
+    25,000 dbpedia records one record read 0.19678 from the traversal and
+    0.19118 from the scan against a true cosine distance of 0.10381, and the
+    gap between the two paths ran with the distance rather than being constant.
+    """
+    corpus = _pq_corpus(n=3000, dim=32)
+    metadatas = [{"tag": "rare" if i < 30 else "common"} for i in range(len(corpus))]
+    index = _pq_index("cosine", "quantized_only", corpus, metadatas=metadatas)
+
+    checked = 0
+    for qi in (0, 7, 13):
+        query = corpus[qi].tolist()
+        plain = {h["id"]: h["score"] for h in index.search(query, top_k=30, ef_search=400)}
+        narrow = {h["id"]: h["score"] for h in
+                  index.search(query, filter={"tag": "rare"}, top_k=30, ef_search=400)}
+        for ext_id, scanned in narrow.items():
+            if ext_id not in plain:
+                continue
+            checked += 1
+            assert abs(plain[ext_id] - scanned) <= 1e-4 + 1e-4 * abs(scanned), (
+                f"{ext_id}: traversal reported {plain[ext_id]} and the scan {scanned}"
+            )
+    assert checked >= 3, "no record was returned by both paths, so nothing was compared"
+
+
+def test_a_quantized_cosine_score_is_comparable_with_a_raw_cosine_score():
+    """Two indexes over one corpus, one raw and one quantized, one scale.
+
+    Not equal, because a quantized index scores against the reconstruction and
+    a raw one against the vector it was given. On one scale, because the
+    difference between them is the quantization error rather than a factor of
+    two.
+    """
+    corpus = _pq_corpus(n=3000, dim=32)
+    query = np.random.default_rng(80).normal(size=corpus.shape[1]).astype(np.float32)
+
+    raw = VectorDatabase().create("hnsw", dim=corpus.shape[1], space="cosine",
+                                  m=16, ef_construction=200, expected_size=len(corpus))
+    raw.add({"ids": [f"r{i}" for i in range(len(corpus))], "vectors": corpus.tolist()})
+    raw_scores = {h["id"]: h["score"] for h in raw.search(query.tolist(), top_k=20,
+                                                          ef_search=400)}
+
+    quantized = _pq_index("cosine", "quantized_only", corpus)
+    q_page = quantized.search(query.tolist(), top_k=20, ef_search=400)
+
+    shared = [h for h in q_page if h["id"] in raw_scores]
+    assert len(shared) >= 5, "the two pages barely overlap, so there is nothing to compare"
+    for hit in shared:
+        gap = abs(hit["score"] - raw_scores[hit["id"]])
+        assert gap <= 0.25, (
+            f"{hit['id']}: quantized {hit['score']} against raw "
+            f"{raw_scores[hit['id']]}, a gap of {gap}"
+        )
+
+
+@pytest.mark.parametrize("storage_mode", ["quantized_only", "quantized_with_raw"])
+def test_a_quantized_cosine_page_survives_a_save_and_load(storage_mode, tmp_path):
+    """The scorer follows the graph through a directory.
+
+    The metric is chosen from the space at `create()` and from the dump's own
+    discriminant at load, so a saved directory scores the way the graph inside
+    it was wired. Nothing about the format moved, so the codebook, the codes and
+    the graph are the same bytes as before.
+    """
+    corpus = _pq_corpus(n=3000, dim=32)
+    query = np.random.default_rng(81).normal(size=corpus.shape[1]).astype(np.float32)
+    index = _pq_index("cosine", storage_mode, corpus)
+    before = [(h["id"], h["score"]) for h in
+              index.search(query.tolist(), top_k=10, ef_search=200)]
+
+    path = tmp_path / f"cosine-{storage_mode}.zdb"
+    index.save(str(path))
+    loaded = VectorDatabase().load(str(path))
+    after = [(h["id"], h["score"]) for h in
+             loaded.search(query.tolist(), top_k=10, ef_search=200)]
+
+    assert [a for a, _ in before] == [a for a, _ in after]
+    for (_, b), (_, a) in zip(before, after):
+        assert abs(b - a) <= 1e-5

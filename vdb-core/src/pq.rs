@@ -29,6 +29,48 @@ use std::sync::RwLock;
 /// rather than taken from `StdRng`, so a `rand` release cannot move a codebook.
 const PQ_TRAINING_SEED: u64 = 0x5A_EE_5D_B0_5E_ED_57_02;
 
+/// The tables a codebook implies, rebuilt whenever the codebook is installed
+///
+/// Both are derived from the same centroids and both are read by
+/// [`PQ::symmetric_cosine_distance`], so they live under one guard and are
+/// written in one place.
+#[derive(Default)]
+struct Derived {
+    /// Symmetric distance table, holding the squared L2 distance between every
+    /// pair of distinct centroids within a subvector.
+    ///
+    /// Graph construction compares two stored points, and under quantization
+    /// both of those are codes rather than vectors, so there is no query to
+    /// build an ADC table from. This table answers that comparison in
+    /// `subvectors` lookups, which is the same cost as an ADC lookup.
+    ///
+    /// Only the strict upper triangle is held. The distance from centroid `i`
+    /// to centroid `j` equals the distance from `j` to `i`, so a full square
+    /// stores every value twice, and the diagonal is zero because a centroid is
+    /// at distance zero from itself. That takes the table from
+    /// `subvectors * k * k` entries to `subvectors * k * (k - 1) / 2`, which is
+    /// 2.00 MiB down to 0.996 MiB at the default eight subvectors of eight
+    /// bits and 24.0 MiB down to 12.0 MiB at 96 subvectors. The values are
+    /// unchanged, so the graph and the recall are unchanged with them.
+    ///
+    /// Flat, one plane of `k * (k - 1) / 2` entries per subvector, the pair
+    /// `(i, j)` with `i < j` at `s * plane + sdc_offset(k, i, j)`. Written in
+    /// exactly that order, so the build needs no offset arithmetic.
+    sdc: Vec<f32>,
+
+    /// Squared norm of every centroid, flat, subvector `s` centroid `c` at
+    /// `s * num_centroids + c`.
+    ///
+    /// A reconstruction is the concatenation of one centroid per subvector, so
+    /// the squared norm of the whole is the sum of `subvectors` entries of this
+    /// table. That is the quantity a cosine distance needs and cannot get from
+    /// the ADC table, which carries only the distance to the query.
+    ///
+    /// `subvectors * k` entries, which is 48 KiB at 48 subvectors of eight
+    /// bits, or 0.8% of what the symmetric table above already holds.
+    norms: Vec<f32>,
+}
+
 /// Product Quantization implementation for vector compression
 pub struct PQ {
     /// The five scalars below are written once, by `PQ::new`, and read
@@ -52,31 +94,18 @@ pub struct PQ {
     /// Training status to track whether PQ has been trained
     pub is_trained: RwLock<bool>,
 
-    /// Symmetric distance table, holding the squared L2 distance between every
-    /// pair of distinct centroids within a subvector.
-    ///
-    /// Graph construction compares two stored points, and under quantization
-    /// both of those are codes rather than vectors, so there is no query to
-    /// build an ADC table from. This table answers that comparison in
-    /// `subvectors` lookups, which is the same cost as an ADC lookup.
-    ///
-    /// Only the strict upper triangle is held. The distance from centroid `i`
-    /// to centroid `j` equals the distance from `j` to `i`, so a full square
-    /// stores every value twice, and the diagonal is zero because a centroid is
-    /// at distance zero from itself. That takes the table from
-    /// `subvectors * k * k` entries to `subvectors * k * (k - 1) / 2`, which is
-    /// 2.00 MiB down to 0.996 MiB at the default eight subvectors of eight
-    /// bits and 24.0 MiB down to 12.0 MiB at 96 subvectors. The values are
-    /// unchanged, so the graph and the recall are unchanged with them.
-    ///
-    /// Flat, one plane of `k * (k - 1) / 2` entries per subvector, the pair
-    /// `(i, j)` with `i < j` at `s * plane + sdc_offset(k, i, j)`. Written in
-    /// exactly that order, so the build needs no offset arithmetic.
+    /// Everything `set_centroids` derives from the codebook.
     ///
     /// Empty until the codebook exists. `set_centroids` is the only way to
-    /// install a codebook and it always fills this, so a trained PQ always
-    /// carries a table that matches its centroids.
-    sdc_table: RwLock<Vec<f32>>,
+    /// install a codebook and it always fills both tables, so a trained PQ
+    /// always carries tables that match its centroids.
+    ///
+    /// One lock over both rather than one lock each. A cosine distance needs
+    /// the pair together, and a single guard says so without adding a second
+    /// bare lock to this module that would then have to be ordered against the
+    /// first. `hnsw_index::locks` ranks the index's own guards and does not
+    /// reach in here.
+    derived: RwLock<Derived>,
 
     /// Cache computed values for performance
     sub_dim: usize,
@@ -106,7 +135,7 @@ impl PQ {
             max_training_vectors,
             centroids: RwLock::new(centroids),
             is_trained: RwLock::new(false),
-            sdc_table: RwLock::new(Vec::new()),
+            derived: RwLock::new(Derived::default()),
             sub_dim,
             num_centroids,
         }
@@ -195,15 +224,18 @@ impl PQ {
             }
         }
 
-        let table = Self::compute_sdc_table(&centroids, self.num_centroids);
+        let derived = Derived {
+            sdc: Self::compute_sdc_table(&centroids, self.num_centroids),
+            norms: Self::compute_centroid_norms(&centroids),
+        };
 
         {
             let mut guard = self.centroids.write().unwrap();
             *guard = centroids;
         }
         {
-            let mut guard = self.sdc_table.write().unwrap();
-            *guard = table;
+            let mut guard = self.derived.write().unwrap();
+            *guard = derived;
         }
 
         Ok(())
@@ -254,6 +286,51 @@ impl PQ {
             .collect()
     }
 
+    /// Compute the squared norm of every centroid
+    ///
+    /// Subvector major and in centroid order, so subvector `s` centroid `c`
+    /// lands at `s * num_centroids + c` and the build needs no offset
+    /// arithmetic, the same way the symmetric table above is written.
+    ///
+    /// Squared rather than rooted. The sum over a code's subvectors is the
+    /// squared norm of the reconstruction, and summing roots would not be.
+    fn compute_centroid_norms(centroids: &[Vec<Vec<f32>>]) -> Vec<f32> {
+        centroids
+            .iter()
+            .flat_map(|sub| sub.iter().map(|c| c.iter().map(|x| x * x).sum::<f32>()))
+            .collect()
+    }
+
+    /// Squared norm of the reconstruction a code addresses
+    ///
+    /// `PQ::reconstruct` copies `centroids[s][code[s]]` into the block at
+    /// `s * sub_dim` and does nothing else, so the squared norm of the whole is
+    /// the sum of the squared norms of the blocks. This reads that sum out of
+    /// the table instead of building the vector.
+    ///
+    /// Zero when no codebook has been installed, which is the same answer
+    /// `symmetric_distance` gives on the same unreachable state.
+    pub fn code_norm_sq(&self, codes: &[u8]) -> f32 {
+        let derived = self.derived.read().unwrap();
+        Self::norm_sum(&derived.norms, self.num_centroids, codes)
+    }
+
+    /// The squared reconstruction norm a code implies, given the table
+    ///
+    /// Split out because `symmetric_cosine_distance` needs it twice under one
+    /// guard.
+    #[inline]
+    fn norm_sum(norms: &[f32], k: usize, codes: &[u8]) -> f32 {
+        if norms.is_empty() {
+            return 0.0;
+        }
+        let mut sum = 0.0f32;
+        for (s, &code) in codes.iter().enumerate() {
+            sum += norms.get(s * k + code as usize).copied().unwrap_or(0.0);
+        }
+        sum
+    }
+
     /// Distance between two stored points, both held as codes
     ///
     /// Graph construction has no query, so it cannot use an ADC table. This
@@ -271,27 +348,104 @@ impl PQ {
     /// 15.6 ns for one eight subvector distance in isolation, and 7.2 percent
     /// on the whole graph build at 10,000 records of 64 dimensions.
     pub fn symmetric_distance(&self, a: &[u8], b: &[u8]) -> f32 {
-        let table = self.sdc_table.read().unwrap();
+        let derived = self.derived.read().unwrap();
+        Self::sdc_sum(&derived.sdc, self.num_centroids, a, b)
+    }
+
+    /// Cosine distance between the two reconstructions two codes address
+    ///
+    /// The construction counterpart of the cosine ADC scorer. Graph
+    /// construction has no query, so this is the symmetric case, and the
+    /// quantity it needs is the same one the search path needs, being the
+    /// squared norm of each reconstruction.
+    ///
+    /// The inner product follows from what the two tables already hold. For one
+    /// subvector, `dot(a, b) = (|a|^2 + |b|^2 - |a - b|^2) / 2`, and summing
+    /// that over the subvectors gives the inner product of the two
+    /// reconstructions in terms of the symmetric table and the norm table. So
+    ///
+    /// ```text
+    /// 1 - (N_a + N_b - sdc) / (2 * sqrt(N_a) * sqrt(N_b))
+    /// ```
+    ///
+    /// No third table and no reconstruction. It costs one norm lookup per
+    /// subvector per code on top of the symmetric lookup the squared L2 branch
+    /// already does, and two square roots per call.
+    ///
+    /// **A reconstruction of length zero is at distance one from everything.**
+    /// It has no direction, which is where `cosine_normalized` puts a zero
+    /// vector too, and it keeps the value finite rather than returning the
+    /// infinity that once collapsed neighbour selection. The same answer covers
+    /// the unreachable state where no codebook has been installed.
+    pub fn symmetric_cosine_distance(&self, a: &[u8], b: &[u8]) -> f32 {
+        let derived = self.derived.read().unwrap();
+        let k = self.num_centroids;
+        if derived.norms.is_empty() {
+            return 1.0;
+        }
+        // One walk of the codes rather than three. The three lookups a
+        // subvector needs are made together, so the loop is entered once and
+        // the two norm reads land in a 48 KiB table while the symmetric read
+        // walks a table three orders of magnitude larger.
+        let plane = Self::sdc_plane(k);
+        let (mut n_a, mut n_b, mut sdc) = (0.0f32, 0.0f32, 0.0f32);
+        for (s, (&code_a, &code_b)) in a.iter().zip(b.iter()).enumerate() {
+            let (ia, ib) = (code_a as usize, code_b as usize);
+            n_a += derived.norms.get(s * k + ia).copied().unwrap_or(0.0);
+            n_b += derived.norms.get(s * k + ib).copied().unwrap_or(0.0);
+            // The diagonal is not stored, and i < j below bounds both.
+            if ia == ib {
+                continue;
+            }
+            let (i, j) = if ia < ib { (ia, ib) } else { (ib, ia) };
+            if j >= k {
+                continue;
+            }
+            sdc += derived
+                .sdc
+                .get(s * plane + Self::sdc_offset(k, i, j))
+                .copied()
+                .unwrap_or(0.0);
+        }
+        if n_a <= 0.0 || n_b <= 0.0 {
+            return 1.0;
+        }
+        let dot = (n_a + n_b - sdc) * 0.5;
+        // One square root rather than two, since sqrt(x) * sqrt(y) is
+        // sqrt(x * y) and both operands are positive here.
+        let d = 1.0 - dot / (n_a * n_b).sqrt();
+        // Not `d.max(0.0)`, which would swallow a NaN, and matching what
+        // `cosine_normalized` does with a dot product that lands just above one.
+        if d < 0.0 {
+            0.0
+        } else {
+            d
+        }
+    }
+
+    /// The symmetric table sum for a pair of codes, given the table
+    ///
+    /// The body of [`Self::symmetric_distance`] with the guard lifted out, so
+    /// the cosine branch reads both tables under one guard rather than two.
+    #[inline]
+    fn sdc_sum(table: &[f32], k: usize, a: &[u8], b: &[u8]) -> f32 {
         if table.is_empty() {
             return 0.0;
         }
-
-        let k = self.num_centroids;
         let plane = Self::sdc_plane(k);
         let mut sum = 0.0f32;
-
         for (s, (&code_a, &code_b)) in a.iter().zip(b.iter()).enumerate() {
             // The diagonal is not stored. A centroid is at distance zero from
             // itself, which is exact rather than an approximation.
             if code_a == code_b {
                 continue;
             }
+            // i < j holds below, so bounding j bounds both.
             let (i, j) = if code_a < code_b {
                 (code_a as usize, code_b as usize)
             } else {
                 (code_b as usize, code_a as usize)
             };
-            // i < j holds, so bounding j bounds both.
             if j >= k {
                 continue;
             }
@@ -300,13 +454,17 @@ impl PQ {
                 .copied()
                 .unwrap_or(0.0);
         }
-
         sum
     }
 
     /// Bytes held by the symmetric distance table
     pub fn sdc_memory_bytes(&self) -> usize {
-        self.sdc_table.read().unwrap().len() * std::mem::size_of::<f32>()
+        self.derived.read().unwrap().sdc.len() * std::mem::size_of::<f32>()
+    }
+
+    /// Bytes held by the centroid norm table
+    pub fn centroid_norm_memory_bytes(&self) -> usize {
+        self.derived.read().unwrap().norms.len() * std::mem::size_of::<f32>()
     }
 
     /// Train the PQ codebook using k-means clustering
@@ -546,6 +704,63 @@ impl PQ {
 
             for (centroid_idx, centroid) in centroids[s].iter().enumerate() {
                 lut[s][centroid_idx] = l2_distance_squared(query_subvector, centroid);
+            }
+        }
+
+        Ok(lut)
+    }
+
+    /// The ADC table with each centroid's squared norm interleaved beside it
+    ///
+    /// The cosine scorer needs two sums per candidate, the ADC sum and the
+    /// squared norm of the reconstruction, and neither follows from the other.
+    /// Two separate tables would mean two random reads per subvector into two
+    /// arrays. Interleaving puts the pair in adjacent words, so a candidate
+    /// still takes one lookup per subvector and the second value arrives in the
+    /// same cache line as the first.
+    ///
+    /// Flat, `2 * subvectors * num_centroids` entries, the ADC for subvector
+    /// `s` centroid `c` at `2 * (s * num_centroids + c)` and its squared norm
+    /// at the word after it.
+    ///
+    /// The norms are copied from the table the codebook carries rather than
+    /// recomputed. Recomputing would double the work of building a query table,
+    /// which at 1,536 dimensions is 256 centroid distances per subvector and is
+    /// paid once per query.
+    ///
+    /// Separate from `compute_adc_lut` rather than replacing it, so the squared
+    /// L2 scorer keeps the table it has and pays nothing for a value it never
+    /// reads.
+    pub fn compute_adc_lut_with_norms(&self, query: &[f32]) -> Result<Vec<f32>, String> {
+        if !self.is_trained() {
+            return Err("PQ must be trained before ADC computation".to_string());
+        }
+
+        if query.len() != self.dim {
+            return Err(format!(
+                "Query dimension mismatch: expected {}, got {}",
+                self.dim,
+                query.len()
+            ));
+        }
+
+        let k = self.num_centroids;
+        let centroids = self.centroids.read().unwrap();
+        let derived = self.derived.read().unwrap();
+        let mut lut = vec![0.0f32; 2 * self.subvectors * k];
+
+        for s in 0..self.subvectors {
+            let start_idx = s * self.sub_dim;
+            let query_subvector = &query[start_idx..start_idx + self.sub_dim];
+
+            for (centroid_idx, centroid) in centroids[s].iter().enumerate() {
+                let at = 2 * (s * k + centroid_idx);
+                lut[at] = l2_distance_squared(query_subvector, centroid);
+                lut[at + 1] = derived
+                    .norms
+                    .get(s * k + centroid_idx)
+                    .copied()
+                    .unwrap_or(0.0);
             }
         }
 
@@ -1021,5 +1236,113 @@ mod tests {
         for codes in batch_codes {
             assert_eq!(codes.len(), 2);
         }
+    }
+
+    /// The norm table answers what the reconstruction would
+    ///
+    /// The whole point of the table is that a cosine distance needs
+    /// `norm(c)^2` per candidate and building `c` to get it would cost the
+    /// reconstruction the ADC table exists to avoid. So the table has to give
+    /// the same answer the reconstruction does, and this checks it against the
+    /// reconstruction rather than against a second sum over the same table.
+    #[test]
+    fn the_norm_table_matches_the_reconstruction() {
+        let pq = PQ::new(4, 2, 2, 4, None);
+
+        // No codebook yet, so no table and a defined answer rather than a panic.
+        assert_eq!(pq.centroid_norm_memory_bytes(), 0);
+        assert_eq!(pq.code_norm_sq(&[0, 0]), 0.0);
+
+        let vectors = vec![
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![2.0, 3.0, 4.0, 5.0],
+            vec![3.0, 4.0, 5.0, 6.0],
+            vec![4.0, 5.0, 6.0, 7.0],
+        ];
+        pq.train(&vectors).unwrap();
+
+        // One entry per centroid per subvector, which is far less than the
+        // strict upper triangle the symmetric table holds.
+        assert_eq!(pq.centroid_norm_memory_bytes(), 2 * 4 * 4);
+        assert!(pq.centroid_norm_memory_bytes() < pq.sdc_memory_bytes());
+
+        for a in 0..4u8 {
+            for b in 0..4u8 {
+                let codes = [a, b];
+                let recon = pq.reconstruct(&codes).expect("reconstruct");
+                let want: f32 = recon.iter().map(|x| x * x).sum();
+                let got = pq.code_norm_sq(&codes);
+                assert!(
+                    (got - want).abs() < 1e-5,
+                    "codes {codes:?}: expected {want}, got {got}"
+                );
+            }
+        }
+    }
+
+    /// The interleaved query table carries the plain one unchanged
+    ///
+    /// The cosine scorer reads a table of `(adc, norm)` pairs and the squared L2
+    /// scorer reads the plain ADC table, and the two must not drift apart. A
+    /// difference here would be a cosine index and an l2 index over one corpus
+    /// disagreeing about the distance from the query to the same reconstruction.
+    #[test]
+    fn the_interleaved_table_carries_the_plain_adc_table() {
+        let pq = PQ::new(4, 2, 2, 4, None);
+        let vectors = vec![
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![2.0, 3.0, 4.0, 5.0],
+            vec![3.0, 4.0, 5.0, 6.0],
+            vec![4.0, 5.0, 6.0, 7.0],
+        ];
+        pq.train(&vectors).unwrap();
+
+        let query = [1.5f32, 2.5, 3.5, 4.5];
+        let plain = pq.compute_adc_lut(&query).expect("plain table");
+        let interleaved = pq.compute_adc_lut_with_norms(&query).expect("interleaved");
+        let k = pq.num_centroids();
+        assert_eq!(interleaved.len(), 2 * pq.subvectors() * k);
+
+        for (s, row) in plain.iter().enumerate() {
+            for (c, &want) in row.iter().enumerate() {
+                let at = 2 * (s * k + c);
+                assert_eq!(
+                    interleaved[at], want,
+                    "subvector {s} centroid {c}: the two tables disagree"
+                );
+                // And the odd word is the norm the codebook holds, which
+                // `code_norm_sq` sums for a whole code.
+                let mut codes = vec![0u8; pq.subvectors()];
+                codes[s] = c as u8;
+                let others: f32 = (0..pq.subvectors())
+                    .filter(|&o| o != s)
+                    .map(|o| interleaved[2 * (o * k) + 1])
+                    .sum();
+                assert!((pq.code_norm_sq(&codes) - (interleaved[at + 1] + others)).abs() < 1e-5);
+            }
+        }
+    }
+
+    /// Retraining rebuilds both derived tables together
+    ///
+    /// They sit under one guard and are written in one place, so a codebook can
+    /// never be installed with only one of them refreshed. The check is that
+    /// each moves when the codebook moves, since a stale norm table would show
+    /// up as a cosine distance to the previous codebook's reconstructions.
+    #[test]
+    fn retraining_rebuilds_the_norm_table_with_the_codebook() {
+        let pq = PQ::new(2, 1, 1, 2, None);
+        pq.set_centroids(vec![vec![vec![3.0, 4.0], vec![0.0, 1.0]]])
+            .expect("codebook installs");
+        pq.set_trained(true);
+        assert_eq!(pq.code_norm_sq(&[0]), 25.0);
+        assert_eq!(pq.code_norm_sq(&[1]), 1.0);
+
+        pq.set_centroids(vec![vec![vec![6.0, 8.0], vec![0.0, 2.0]]])
+            .expect("codebook reinstalls");
+        assert_eq!(pq.code_norm_sq(&[0]), 100.0);
+        assert_eq!(pq.code_norm_sq(&[1]), 4.0);
+        // And the symmetric table moved with it.
+        assert_eq!(pq.symmetric_distance(&[0], &[1]), 36.0 + 36.0);
     }
 }
