@@ -77,6 +77,8 @@ jobs:
   check-version:
     name: Check the four declared versions agree
     runs-on: ubuntu-latest
+    # A hung step fails the job here instead of at GitHub's six hour default.
+    timeout-minutes: 15
     # Every build job needs this, so a mis-tagged release fails here in well
     # under a minute instead of after the wheel matrix has run. Its outputs are
     # what route the publish jobs.
@@ -164,6 +166,9 @@ jobs:
   linux:
     needs: check-version
     runs-on: ${{ matrix.platform.runner }}
+    # 30 rather than the 15 elsewhere, as on every wheel build. The emulated
+    # aarch64 and the Windows builds run past 12 minutes.
+    timeout-minutes: 30
     strategy:
       fail-fast: true  # A partial wheel set is worse than no release
       matrix:
@@ -251,6 +256,9 @@ jobs:
   musllinux:
     needs: check-version
     runs-on: ${{ matrix.platform.runner }}
+    # 30 rather than the 15 elsewhere, as on every wheel build. The emulated
+    # aarch64 and the Windows builds run past 12 minutes.
+    timeout-minutes: 30
     strategy:
       fail-fast: true  # A partial wheel set is worse than no release
       matrix:
@@ -321,6 +329,9 @@ jobs:
   windows:
     needs: check-version
     runs-on: ${{ matrix.platform.runner }}
+    # 30 rather than the 15 elsewhere, as on every wheel build. The emulated
+    # aarch64 and the Windows builds run past 12 minutes.
+    timeout-minutes: 30
     strategy:
       fail-fast: true  # A partial wheel set is worse than no release
       matrix:
@@ -405,6 +416,9 @@ jobs:
   macos:
     needs: check-version
     runs-on: ${{ matrix.platform.runner }}
+    # 30 rather than the 15 elsewhere, as on every wheel build. The emulated
+    # aarch64 and the Windows builds run past 12 minutes.
+    timeout-minutes: 30
     strategy:
       fail-fast: true  # A partial wheel set is worse than no release
       matrix:
@@ -476,6 +490,7 @@ jobs:
   sdist:
     needs: check-version
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -534,6 +549,7 @@ jobs:
   publish-testpypi:
     name: Publish to TestPyPI
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Prerelease tags, as check-version parsed them, and dispatch runs with
     # the publish box ticked.
     if: >-
@@ -610,6 +626,7 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Stable tags only, as check-version parsed them. A dispatch run never
     # reaches production. The comparison is against the string 'false' rather
     # than a negation, so an output that was never written skips this job
@@ -687,6 +704,7 @@ jobs:
   github-release:
     name: Create the GitHub Release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # No condition of its own. A job whose needs were skipped is skipped in
     # turn, so this runs exactly when publish-pypi ran and succeeded, which is
     # a stable tag push that reached production PyPI. A dispatch run skips

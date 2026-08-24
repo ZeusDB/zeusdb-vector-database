@@ -62,6 +62,8 @@ permissions:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    # A hung step fails the job here instead of at GitHub's six hour default.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The toolchain comes from rust-toolchain.toml and from nowhere else.
@@ -89,6 +91,7 @@ jobs:
 
   test-python:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # From rust-toolchain.toml, as in the lint job. See the note there.
@@ -121,6 +124,7 @@ jobs:
 
   test-rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # From rust-toolchain.toml, as in the lint job. See the note there.
