@@ -12,9 +12,10 @@
 # is the set of source files that construct, take or hold one of the tracked
 # guards, or are read under one. hnsw_index/** and graph/** hold the locks,
 # pq.rs holds its own, persistence.rs takes the index's guards to save and to
-# load, and columns.rs and filter.rs are read under the columns guard. The
-# weekly run stays because a path trigger fires only on a commit here, and the
-# runner image or a dependency can move without one.
+# load, columns.rs and filter.rs are read under the columns guard, and
+# rerank.rs rescores under the storage and metadata guards. The weekly run
+# stays because a path trigger fires only on a commit here, and the runner
+# image or a dependency can move without one.
 #
 # What it proves. That no code path any Python test reaches takes the same
 # guard twice on one thread, and that none inverts the declared order. The
@@ -33,6 +34,7 @@ on:
       - 'vdb-core/src/filter.rs'
       - 'vdb-core/src/persistence.rs'
       - 'vdb-core/src/pq.rs'
+      - 'vdb-core/src/rerank.rs'
       - '.github/workflows/lock-order.yml'
   schedule:
     # 04:17 UTC on Mondays, off the hour because the scheduler queues runs
