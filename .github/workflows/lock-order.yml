@@ -61,9 +61,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: vdb-core
-          # Its own key. The `checked` profile is a different profile from the
-          # one ci.yml builds, so sharing the key would evict that cache on
-          # every run of this one.
+          # Its own key. The `checked` profile is a third profile, beside the
+          # debug one ci.yml's lint and test-rust jobs share and the release one
+          # its test-python job keeps, so sharing either key would evict that
+          # cache on every run of this one.
           shared-key: vdb-core-checked
           cache-on-failure: true
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -87,4 +88,7 @@ jobs:
           grep -q "inverts the declared" "$module"
           grep -q "taking the same guard twice" "$module"
       - name: Run the Python test suite
+        # Four workers, from addopts in pyproject.toml. The registry is per
+        # thread and each worker is its own process, so a worker sees only the
+        # guards its own threads take, which is what the rule is about.
         run: uv run --no-sync pytest tests

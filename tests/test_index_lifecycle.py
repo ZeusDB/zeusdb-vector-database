@@ -341,6 +341,7 @@ def test_public_exports():
         "init_file_logging",
         "init_logging",
         "is_logging_initialized",
+        "shutdown_logging",
     ]
 
     for name in zeusdb_vector_database.__all__:
@@ -351,7 +352,8 @@ def test_public_exports():
     assert isinstance(zeusdb_vector_database.VectorDatabase, type)
     assert isinstance(zeusdb_vector_database.__version__, str)
 
-    for name in ("init_logging", "init_file_logging", "is_logging_initialized"):
+    for name in ("init_logging", "init_file_logging", "is_logging_initialized",
+                 "shutdown_logging"):
         assert callable(getattr(zeusdb_vector_database, name)), name
 
     # The types are the ones the API really hands back.

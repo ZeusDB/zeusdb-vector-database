@@ -147,6 +147,7 @@ def test_no_em_dashes():
 
 def test_readme_names_only_entry_points_that_exist():
     """Catch a method named in prose that the extension no longer exposes."""
+    import zeusdb_vector_database
     from zeusdb_vector_database import VectorDatabase, AddResult, HNSWIndex
 
     text = README.read_text(encoding="utf-8")
@@ -155,9 +156,13 @@ def test_readme_names_only_entry_points_that_exist():
         set(dir(HNSWIndex))
         | set(dir(AddResult))
         | set(dir(VectorDatabase))
+        # The package's own exports, read rather than listed, so a function
+        # added to __all__ and documented does not also have to be named here.
+        # The three logging initializers used to be in the literal below.
+        | set(dir(zeusdb_vector_database))
         | {
-            "create", "load", "search", "add", "init_logging", "init_file_logging",
-            "is_logging_initialized", "print", "len", "sorted", "matched", "range",
+            "create", "load", "search", "add",
+            "print", "len", "sorted", "matched", "range",
             "enumerate", "round", "compile", "getLogger", "setLevel", "basicConfig",
             "default_rng", "random", "tolist", "keys", "items", "listdir",
         }

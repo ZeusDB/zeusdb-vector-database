@@ -5,12 +5,13 @@
 #
 # ON A PULL REQUEST THERE IS NO PATH FILTER, AND ONE MUST NOT BE ADDED.
 #
-# `lint` and `test` are the two required status checks on main. A workflow that
-# a path filter skips does not report its checks as skipped, it never reports
-# them at all, and a required check that never reports leaves the pull request
-# waiting for a status that cannot arrive. A pull request touching only
-# CHANGELOG.md would therefore be unmergeable rather than cheap. The push
-# trigger below keeps its ignore list, because no branch rule reads a push.
+# `lint`, `test-python` and `test-rust` are the three required status checks on
+# main. A workflow that a path filter skips does not report its checks as
+# skipped, it never reports them at all, and a required check that never reports
+# leaves the pull request waiting for a status that cannot arrive. A pull request
+# touching only CHANGELOG.md would therefore be unmergeable rather than cheap.
+# The push trigger below keeps its ignore list, because no branch rule reads a
+# push.
 #
 # README.md and examples/ are deliberately NOT in the push ignore list either,
 # and must not be added to it. tests/test_readme_examples.py executes every
@@ -30,6 +31,12 @@
 # Cargo steps pass --locked, which fails the run when vdb-core/Cargo.lock is
 # out of date instead of silently updating it. Keep the flag on every cargo
 # step that accepts it.
+#
+# The three jobs declare no needs, so they start together. Nothing one of them
+# produces is read by another. The Python suite runs on the extension that job
+# builds for itself, and the Rust suite compiles its own test binaries with
+# `extension-module` off, which is a different feature set from the one the
+# other two build.
 name: CI
 
 on:
@@ -66,7 +73,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: vdb-core
-          # Shared with the test job, which compiles the same dependencies.
+          # Shared with test-rust, which compiles the same debug profile from
+          # the same lockfile. test-python does not share it, because a release
+          # build has nothing in common with a debug one and the two would take
+          # turns evicting each other under one key.
           shared-key: vdb-core
           # Save the cache on a failed run too, so a red gate still warms it.
           cache-on-failure: true
@@ -77,11 +87,39 @@ jobs:
         working-directory: vdb-core
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-  test:
-    needs: lint
-    # Runs whether lint passed or failed, and does not run when the run is
-    # cancelled. needs alone would skip this job when lint fails.
-    if: ${{ !cancelled() }}
+  test-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # From rust-toolchain.toml, as in the lint job. See the note there.
+      # uv sync builds the extension with cargo, so this job needs a toolchain
+      # even though it runs no cargo command of its own.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: vdb-core
+          # Its own key. This is the only job that builds the release profile,
+          # which is what the wheel is and what maturin produces through the
+          # build backend. Under the shared key it restored the lint job's debug
+          # artefacts, which a release build cannot use, and then declined to
+          # save its own because the key was already taken.
+          shared-key: vdb-core-release
+          cache-on-failure: true
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Build the extension and install the project
+        # uv sync installs the project through the maturin backend, which is
+        # how the extension is built for development.
+        run: uv sync --locked --extra dev
+      - name: Run the Python test suite
+        # Scoped to the tests directory, as testpaths in pyproject.toml is, and
+        # spread over four workers, as addopts there is.
+        run: uv run --no-sync pytest tests
+
+  test-rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -93,17 +131,6 @@ jobs:
           workspaces: vdb-core
           shared-key: vdb-core
           cache-on-failure: true
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-        with:
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-      - name: Build the extension and install the project
-        # uv sync installs the project through the maturin backend, which is
-        # how the extension is built for development.
-        run: uv sync --locked --extra dev
-      - name: Run the Python test suite
-        # Scoped to the tests directory, as testpaths in pyproject.toml is.
-        run: uv run --no-sync pytest tests
       # The Rust tests link an executable, and an executable has to resolve
       # every libpython symbol it references. `cargo test` below turns
       # `extension-module` off so that PyO3 emits the `-lpython` line, and that
@@ -111,8 +138,8 @@ jobs:
       # image ships the interpreter and `libpython3.12.so.1.0` but not the
       # symlink a linker resolves `-l` against, so this is not a no-op.
       #
-      # Nothing else in the job needs it. Building the extension does not,
-      # because that is the case where PyO3 emits no link line at all.
+      # Nothing else in the job needs it. This job neither builds the extension
+      # nor installs the project, because the Rust tests read neither.
       - name: Install libpython so the Rust tests can link
         run: |
           sudo apt-get update
