@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     # Well above the expected run time so a slow runner does not fail the run,
     # and far enough below the six hour default to be a real bound.
-    timeout-minutes: 60
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # From rust-toolchain.toml, as in ci.yml. See the note there.

@@ -96,7 +96,7 @@ def _pq_config(storage_mode):
     # _check_memory_usage, so no compression warning is emitted. The
     # quantized_with_raw mode warns unconditionally and that is asserted where
     # it is used. quantized_only warns that it cannot repay its fixed cost at
-    # these sizes, which is true and is asserted in test_quantization.py.
+    # these sizes, which is true and is asserted in test_quantization_training.py.
     return {
         "type": "pq",
         "subvectors": 4,
@@ -1228,7 +1228,7 @@ def _clustered_unit_vectors(n, dim, seed):
 
     Clustered rather than uniform, because uniform vectors are close to
     equidistant and recall saturates on them, which would hide a regression.
-    Same specification as the graph quality fixtures in test_quantization.py.
+    Same specification as the graph quality fixtures in test_quantization_training.py.
     """
     rng = np.random.default_rng(seed)
     centres = rng.standard_normal((20, dim))

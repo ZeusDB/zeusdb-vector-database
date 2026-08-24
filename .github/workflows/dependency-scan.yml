@@ -48,6 +48,8 @@ jobs:
   cargo-deny:
     name: cargo-deny
     runs-on: ubuntu-latest
+    # A hung step fails the job here instead of at GitHub's six hour default.
+    timeout-minutes: 15
     permissions:
       contents: read
       # Writing the SARIF report to code scanning. This is the whole reason the

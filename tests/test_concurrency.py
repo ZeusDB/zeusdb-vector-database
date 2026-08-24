@@ -398,10 +398,16 @@ def test_concurrent_searches_during_add_stay_correct(build):
 
     writing = threading.Event()
     writing.set()
+    # Every reader and the writer meet here before the first add, so the adds
+    # cannot all complete before a reader has been scheduled. On a machine
+    # where the writer wins the start, forty batches finished before the first
+    # search and the test failed for having proved nothing.
+    readers_up = threading.Barrier(THREADS + 1)
 
     def read(worker):
         query = queries[worker]
         seen = 0
+        readers_up.wait(timeout=30)
         while writing.is_set():
             results = index.search(query, top_k=TOP_K)
             assert len(results) <= TOP_K
@@ -419,6 +425,7 @@ def test_concurrent_searches_during_add_stay_correct(build):
         # The flag is cleared in a finally, so a writer that raises releases the
         # readers rather than leaving them spinning on an event nobody will clear.
         try:
+            readers_up.wait(timeout=30)
             for batch in batches:
                 index.add(batch)
         except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
