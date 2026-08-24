@@ -362,25 +362,28 @@ fn the_mutable_graph_is_send_and_sync() {
     assert_send_sync::<MutableGraph<u8, DistPQ>>();
 }
 
-/// A graph small enough for an interpreter to run, searched down every metric.
+/// A complete graph, searched down every metric.
 ///
 /// # Why it is this small
 ///
-/// [`super::traverse::prefetch_vectors`] is one of the two places in this crate
-/// that holds an `unsafe` block, and the only way to reach it is a search. The
-/// smallest graph any other test builds is 300 records, which Miri could not
-/// finish. Sixteen records at four dimensions runs under Miri in seconds, so
-/// the pointer arithmetic in that block is checkable rather than only argued
-/// for in its own comment.
+/// Sixteen records at four dimensions with `m` at eight is small enough that
+/// every node is a neighbour of every other, so the traversal reaches the whole
+/// record set whatever order it walks. That makes the page a statement about
+/// the scoring alone, which the 300 record graphs elsewhere in this module
+/// cannot isolate, because there a wrong page is equally consistent with a
+/// scorer that is wrong and with a traversal that did not reach the record.
+///
+/// The search is also the only way to reach
+/// [`super::traverse::prefetch_vectors`], which holds one of this crate's two
+/// `unsafe` blocks, so the pointer arithmetic in that block runs here.
 ///
 /// # What it asserts
 ///
 /// A page of the right length, in ascending distance, holding no record twice,
-/// and each record finding itself first. On a graph this small every node is a
-/// neighbour of every other, so exactness here is a property of the scoring
-/// rather than of the traversal, and it is asserted for all three metrics.
+/// and the query finding itself first at distance zero. Asserted for all three
+/// metrics against the one record set.
 #[test]
-fn a_graph_small_enough_for_an_interpreter_searches_on_every_metric() {
+fn a_complete_graph_returns_an_exact_page_on_every_metric() {
     const N: usize = 16;
     const DIM: usize = 4;
 
