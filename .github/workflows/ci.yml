@@ -3,15 +3,24 @@
 # Linux only and cached, so the gate stays fast. The cross-platform build is
 # covered by the wheel matrix in publish-pypi.yml.
 #
-# README.md and examples/ are deliberately NOT in paths-ignore, and must not be
-# added to it. tests/test_readme_examples.py executes every fenced python block
-# in README.md and compares the captured stdout against the output the document
-# claims, and tests/test_examples.py runs every file under examples/ the same
-# way. A commit touching only README.md therefore can and does break this gate,
-# which is the whole reason both modules exist. The ignore list holds the files
-# no test reads.
+# ON A PULL REQUEST THERE IS NO PATH FILTER, AND ONE MUST NOT BE ADDED.
 #
-# A change matching every entry in the list runs nothing. A change touching one
+# `lint` and `test` are the two required status checks on main. A workflow that
+# a path filter skips does not report its checks as skipped, it never reports
+# them at all, and a required check that never reports leaves the pull request
+# waiting for a status that cannot arrive. A pull request touching only
+# CHANGELOG.md would therefore be unmergeable rather than cheap. The push
+# trigger below keeps its ignore list, because no branch rule reads a push.
+#
+# README.md and examples/ are deliberately NOT in the push ignore list either,
+# and must not be added to it. tests/test_readme_examples.py executes every
+# fenced python block in README.md and compares the captured stdout against the
+# output the document claims, and tests/test_examples.py runs every file under
+# examples/ the same way. A commit touching only README.md therefore can and
+# does break this gate, which is the whole reason both modules exist. The
+# ignore list holds the files no test reads.
+#
+# A push matching every entry in the list runs nothing. A push touching one
 # ignored file and one other file runs everything, because paths-ignore skips a
 # run only when every changed path matches.
 #
@@ -26,8 +35,6 @@ name: CI
 on:
   push:
     branches: [main, development]
-    # Spelled out twice rather than shared through a YAML anchor, because the
-    # workflow parser does not resolve aliases. Keep the two lists identical.
     paths-ignore:
       - 'CHANGELOG.md'
       - 'LICENSE'
@@ -37,13 +44,6 @@ on:
       - '.gitattributes'
   pull_request:
     branches: [main, development]
-    paths-ignore:
-      - 'CHANGELOG.md'
-      - 'LICENSE'
-      - 'NOTICE'
-      - 'ATTRIBUTION.md'
-      - '.gitignore'
-      - '.gitattributes'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

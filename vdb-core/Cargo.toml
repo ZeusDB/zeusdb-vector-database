@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "zeusdb-vector-database"
 version = "0.7.0"
 edition = "2021"
