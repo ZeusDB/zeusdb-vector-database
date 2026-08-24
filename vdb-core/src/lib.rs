@@ -26,7 +26,7 @@ use pyo3::prelude::*;
 /// Automatically initializes structured logging on import.
 /// Logs are controlled by environment variables or optional Python functions.
 #[pymodule]
-fn zeusdb_vector_database(_py: Python, m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
+fn zeusdb_vector_database(py: Python, m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
     // Auto-initialize logging on module import
     // Respects ZEUSDB_DISABLE_AUTOLOG for power users
     logging::init_logging();
@@ -49,6 +49,23 @@ fn zeusdb_vector_database(_py: Python, m: &Bound<pyo3::types::PyModule>) -> PyRe
     m.add_function(wrap_pyfunction!(logging::py_init_logging, m)?)?;
     m.add_function(wrap_pyfunction!(logging::py_init_file_logging, m)?)?;
     m.add_function(wrap_pyfunction!(logging::is_logging_initialized, m)?)?;
+    m.add_function(wrap_pyfunction!(logging::py_shutdown_logging, m)?)?;
+
+    // Drain the file appender before the process exits.
+    //
+    // The `file` target writes from a worker thread fed by a channel, and a
+    // worker thread is killed at process exit wherever it happens to be, so
+    // without this whatever is still queued is never written. The hook is
+    // registered here rather than in the Python package because this is the
+    // import that starts the worker, so no other entry point can bypass it.
+    //
+    // `atexit` runs its callbacks last-in-first-out during interpreter
+    // finalization, before any module is torn down. Registering at import time
+    // therefore puts this behind every hook the application registers later,
+    // which is what a drain wants. It does not run on `os._exit` or on an
+    // abort, and nothing can run there.
+    let shutdown = m.getattr("shutdown_logging")?;
+    py.import("atexit")?.call_method1("register", (shutdown,))?;
 
     Ok(())
 }

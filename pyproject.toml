@@ -47,12 +47,32 @@ include = [
 dev = [
     "maturin >=1.9.3",
     "pytest >=8.4.0",
+    "pytest-xdist >=3.8.0",
     "psutil >=7.0.0",
 ]
 
 [tool.pytest.ini_options]
 # Scopes collection to the tests directory.
 testpaths = ["tests"]
+# Four worker processes, always four rather than `auto`.
+#
+# `auto` reads the machine, so a developer machine and a runner would be
+# different configurations and a result measured on one would say nothing about
+# the other. Four is the vCPU count GitHub publishes for the standard
+# ubuntu runner, which is what the gate runs on.
+#
+# It lives here rather than in a workflow because three call sites run this
+# suite, ci.yml, lock-order.yml and the gate in CLAUDE.md, and one setting
+# reaches all three without any of them repeating a flag.
+#
+# `--dist loadfile` keeps every test from one file on one worker. The
+# alternative distributes test by test, which rebuilds each module scoped
+# fixture on every worker that draws a test from that module, and this suite
+# has sixteen of them.
+#
+# Pass `-n 0` to run in one process, which is what a debugger and a live `-s`
+# want.
+addopts = "-n 4 --dist loadfile"
 
 [project.urls]
 "Repository" = "https://github.com/zeusdb/zeusdb-vector-database"

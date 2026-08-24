@@ -176,12 +176,17 @@ def _run_with_logging_env(**overrides):
     PYTEST_CURRENT_TEST is dropped for the same reason, since it drives
     _detect_environment.
     """
+    return _run_script_with_logging_env(_WORKLOAD, **overrides)
+
+
+def _run_script_with_logging_env(script, **overrides):
+    """The body of _run_with_logging_env, for a workload other than the default."""
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("ZEUSDB_") and k != "PYTEST_CURRENT_TEST"}
     env.update(overrides)
 
     proc = subprocess.run(
-        [sys.executable, "-c", _WORKLOAD],
+        [sys.executable, "-c", script],
         env=env, check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
@@ -491,3 +496,110 @@ def test_disable_flag_requires_a_truthy_value(tmp_path):
 
     assert log_file.exists()
     assert log_file.stat().st_size > 0
+
+
+# The burst the drain tests measure.
+#
+# Each search emits a span enter, a span exit and three records between them at
+# trace level, so one Python call produces five. The appender's worker writes
+# one record per call to the operating system, so a producer at that ratio
+# outruns it and the backlog grows for the whole run. That is what makes the
+# loss large and the measurement deterministic rather than a race on the last
+# line.
+_BURST_SEARCHES = 2000
+_BURST_WORKLOAD = f"""
+import zeusdb_vector_database as zdb
+v = zdb.VectorDatabase()
+idx = v.create('hnsw', dim=4)
+idx.add({{'vectors': [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]]}})
+q = [0.1, 0.2, 0.3, 0.4]
+for _ in range({_BURST_SEARCHES}):
+    idx.search(q, top_k=1)
+"""
+
+
+# ------------------------------------------------------------
+# Test 104: the file appender is drained before the process exits
+# ------------------------------------------------------------
+def test_file_logging_is_drained_at_exit(tmp_path):
+    """Everything queued reaches the file, not merely what the worker got to.
+
+    The file target hands each formatted record to a worker thread over a
+    channel and returns. A worker thread is killed at process exit wherever it
+    happens to be, and dropping the appender's guard is the only drain that
+    channel has, so a guard parked in a static that is never dropped loses the
+    whole backlog rather than a last line. Importing the module now registers
+    the drain with atexit.
+
+    Counting the span enters against the span exits is what makes this
+    self-checking. A truncated log has fewer of both than the number of
+    searches, and its final record is an enter with no matching exit.
+    """
+    log_file = tmp_path / "zeus.log"
+
+    _run_script_with_logging_env(
+        _BURST_WORKLOAD,
+        ZEUSDB_LOG_LEVEL="trace",
+        ZEUSDB_LOG_FORMAT="human",
+        ZEUSDB_LOG_TARGET="file",
+        ZEUSDB_LOG_FILE=str(log_file),
+    )
+
+    text = log_file.read_text(encoding="utf-8", errors="ignore")
+    assert text.count("search: enter") == _BURST_SEARCHES
+    assert text.count("search: exit") == _BURST_SEARCHES
+
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    assert "search: exit" in lines[-1], lines[-1]
+
+
+# ------------------------------------------------------------
+# Test 105: the drain is callable, and calling it twice is harmless
+# ------------------------------------------------------------
+_DRAIN_PROBE = """
+import atexit, json
+before = atexit._ncallbacks()
+import zeusdb_vector_database as zdb
+after = atexit._ncallbacks()
+
+v = zdb.VectorDatabase()
+idx = v.create('hnsw', dim=4)
+idx.add({'vectors': [[0.1, 0.2, 0.3, 0.4]]})
+
+print(json.dumps({
+    'hooks_added_on_import': after - before,
+    'first': zdb.shutdown_logging(),
+    'second': zdb.shutdown_logging(),
+}))
+"""
+
+
+def test_shutdown_logging_drains_on_demand_and_is_idempotent(tmp_path):
+    """The drain is exposed, not only wired to exit.
+
+    It returns True when it took a guard and dropped it, and False when there
+    was nothing to drain, which is the second call and every target other than
+    file. The atexit hook runs it again at exit, so the second-call answer is
+    the one that keeps that harmless.
+    """
+    log_file = tmp_path / "zeus.log"
+
+    stdout, _ = _run_script_with_logging_env(
+        _DRAIN_PROBE,
+        ZEUSDB_LOG_LEVEL="debug",
+        ZEUSDB_LOG_FORMAT="json",
+        ZEUSDB_LOG_TARGET="file",
+        ZEUSDB_LOG_FILE=str(log_file),
+    )
+
+    result = json.loads(stdout.strip().splitlines()[-1])
+    assert result["hooks_added_on_import"] >= 1
+    assert result["first"] is True
+    assert result["second"] is False
+
+    # The records the probe emitted before its first call are on disk, which is
+    # what the call is for.
+    entries = _json_lines(log_file.read_text(encoding="utf-8", errors="ignore"))
+    messages = [entry["fields"]["message"] for entry in entries]
+    assert any("HNSW index created successfully" in m for m in messages)
+    assert any("Vector addition completed" in m for m in messages)

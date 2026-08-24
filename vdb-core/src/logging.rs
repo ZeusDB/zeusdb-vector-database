@@ -16,6 +16,12 @@
 //!   prefix by name and by behaviour.
 //! - **Programmatic control**: To take control programmatically, set
 //!   `ZEUSDB_DISABLE_AUTO_LOGGING=1` before import, then call Python `init_*` functions.
+//! - **Drained at exit**: the `file` target writes from a worker thread fed by
+//!   a channel, so a record emitted just before the process ends is still in
+//!   flight when it ends. Importing the module registers `shutdown_logging`
+//!   with `atexit`, which drains it. `os._exit` and an abort run no hook, and
+//!   records still queued at either are lost. `stdout` and `stderr` do not go
+//!   through the appender and are unaffected.
 //!
 //! ## Environment Variables
 //!
@@ -65,7 +71,7 @@
 use pyo3::prelude::*;
 use std::io;
 use std::io::IsTerminal;
-use std::sync::{Once, OnceLock};
+use std::sync::Once;
 use tracing::Subscriber;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::registry::LookupSpan;
@@ -79,7 +85,91 @@ use tracing_subscriber::{
 use tracing_subscriber::fmt::format::FmtSpan;
 
 static INIT: Once = Once::new();
-static WORKER_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+
+/// The `tracing_appender` worker guard for the `file` target
+///
+/// The non-blocking appender hands each formatted record to a worker thread
+/// over a channel and returns. Dropping this guard is the only drain that
+/// channel has. The drop sends the worker a shutdown message behind whatever is
+/// already queued and then waits for the acknowledgement, so everything queued
+/// is written before the drop returns. `NonBlocking::flush` is a no-op, so
+/// there is no other way to empty it.
+///
+/// It is a `Mutex<Option<_>>` rather than a `OnceLock` because a value held in
+/// a `static` is never dropped, and the drop is the whole point. The guard has
+/// to be taken back out to be dropped, and `OnceLock` hands out a mutable
+/// borrow only through `&mut self`, which a `static` cannot give.
+/// `shutdown_logging` takes it out and drops it, and the module registers that
+/// with `atexit` so a normally exiting process needs no call.
+///
+/// `clippy.toml` disallows the standard `Mutex` so that a lock added to
+/// `HNSWIndex` cannot bypass the rank registry in `hnsw_index::locks`. This is
+/// not a lock on `HNSWIndex` and is not reachable from one. It is taken twice
+/// in the life of a process, once at import and once at exit, and no index
+/// guard is held at either point, so it has no place in the declared order.
+/// `pq` and `graph` carry the same exemption at module scope for the same
+/// reason; this one is on the item, because the rest of this module holds no
+/// lock at all.
+#[allow(clippy::disallowed_types)]
+static WORKER_GUARD: std::sync::Mutex<Option<WorkerGuard>> = std::sync::Mutex::new(None);
+
+/// Hold the worker guard for the life of the process
+///
+/// The first guard wins, which is what `OnceLock::set` did. Only one can ever
+/// arrive, because every initialization path runs inside `INIT.call_once` and
+/// installs exactly one subscriber.
+fn store_worker_guard(guard: WorkerGuard) {
+    let mut slot = WORKER_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_none() {
+        *slot = Some(guard);
+    }
+    // Release the lock before `guard` goes out of scope, because in the
+    // already-set case dropping it blocks on that appender's worker.
+    drop(slot);
+}
+
+/// Drain the file appender and stop its worker
+///
+/// A worker thread is killed at process exit wherever it happens to be, so
+/// without this whatever is still in the appender's channel is never written.
+/// The loss is a tail, and it is as long as the backlog: a process that logs
+/// faster than the worker writes loses most of its log, not its last line.
+///
+/// Registered with `atexit` when the module is imported. It is exposed as well,
+/// for a caller that wants the file complete at a point of its own choosing.
+///
+/// After this returns the file appender is closed. A record emitted later is
+/// still formatted and still handed to a channel with no reader, so it is
+/// discarded. That is the right trade at exit, and it is why this is named a
+/// shutdown rather than a flush. The `stdout` and `stderr` targets are
+/// unaffected either way, because neither goes through the appender.
+///
+/// Returns true if a guard was taken and dropped, and false when there was
+/// nothing to drain, which is every target other than `file`.
+pub fn shutdown_logging() -> bool {
+    // The temporary lock guard is released at the end of this statement, so the
+    // blocking drop below happens with the mutex free.
+    let guard = WORKER_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let had_guard = guard.is_some();
+    drop(guard);
+    had_guard
+}
+
+/// Python-exposed shutdown, registered with `atexit` on import
+///
+/// Returns true if there was a file appender to drain.
+#[pyfunction(name = "shutdown_logging")]
+pub fn py_shutdown_logging(py: Python<'_>) -> bool {
+    // The drop blocks on the appender's worker for as long as the backlog
+    // takes. Nothing below touches a Python object, so the GIL is released for
+    // it rather than held across a wait.
+    py.detach(shutdown_logging)
+}
 
 /// Names of the auto-logging disable flag
 ///
@@ -301,7 +391,7 @@ pub fn py_init_file_logging(
             file_prefix.unwrap_or_else(|| "zeusdb".to_string()),
         );
         let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-        let _ = WORKER_GUARD.set(guard);
+        store_worker_guard(guard);
 
         let registry = Registry::default().with(filter).with(
             fmt::layer()
@@ -469,7 +559,7 @@ where
     let log_file = std::env::var("ZEUSDB_LOG_FILE").unwrap_or_else(|_| "zeusdb.log".to_string());
 
     create_file_appender(&log_file).map(|(non_blocking, guard)| {
-        let _ = WORKER_GUARD.set(guard);
+        store_worker_guard(guard);
         Box::new(
             fmt::layer()
                 .json()
@@ -496,7 +586,7 @@ where
     let log_file = std::env::var("ZEUSDB_LOG_FILE").unwrap_or_else(|_| "zeusdb.log".to_string());
 
     create_file_appender(&log_file).map(|(non_blocking, guard)| {
-        let _ = WORKER_GUARD.set(guard);
+        store_worker_guard(guard);
         Box::new(
             fmt::layer()
                 .compact()

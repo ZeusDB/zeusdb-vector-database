@@ -2125,6 +2125,8 @@ vdb = zeusdb_vector_database.VectorDatabase()
 
 **Only the first initializer to run takes effect.** Both functions return `True` if they installed the subscriber and `False` if one was already installed, so calling both leaves the second with no effect and a `False` return. `zeusdb_vector_database.is_logging_initialized()` reports whether either has run.
 
+**The file target is drained at exit.** Records reach the file through a background writer, so a record emitted immediately before the process ends is still in flight when it ends. Importing the package registers the drain with `atexit`, which covers a normal exit and needs no call. `zeusdb_vector_database.shutdown_logging()` runs the same drain on demand and returns `True` if it drained a file appender, or `False` if there was nothing to drain, which is the answer for the `stdout` and `stderr` targets and for a second call. It closes the file, so records emitted after it are discarded. Nothing runs on `os._exit` or on a crash, and records still in flight at either are lost.
+
 #### Option 3: Custom Logger Integration
 <!-- zeusdb:skip -->
 ```python
@@ -2202,6 +2204,8 @@ ls -la /path/to/log/directory
 ZEUSDB_LOG_TARGET=stderr ZEUSDB_LOG_LEVEL=info python your_app.py
 ```
 
+A process that ends through `os._exit` or a crash skips the exit drain, so its final records never reach the file. Call `zeusdb_vector_database.shutdown_logging()` before such an exit.
+
 **Want to see Rust logs specifically?**
 ```bash
 # Enable trace level to see all Rust operations
@@ -2209,7 +2213,7 @@ ZEUSDB_LOG_LEVEL=trace python your_app.py
 ```
 
 #### Performance Notes
-- File logging is non-blocking: records are handed to a background writer rather than written on the calling thread.
+- File logging is non-blocking: records are handed to a background writer rather than written on the calling thread. The exit drain waits for that writer to finish, for up to about a second.
 - `trace` and `debug` are verbose enough to dominate runtime on a hot loop. Leave production at `error`.
 
 ### 🎯 Best Practices
