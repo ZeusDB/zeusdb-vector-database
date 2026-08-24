@@ -1132,9 +1132,11 @@ impl HNSWIndex {
     /// callable, so a property satisfies it and a method reads as configuration
     /// rather than as an action.
     ///
-    /// `m`, `ef_construction` and `expected_size` are not here. They have a
-    /// different gap, being reachable only through `get_stats()` and only as
-    /// text, and no caller in either adapter reads them at all.
+    /// `m`, `ef_construction` and `expected_size` are properties too, added
+    /// after this one and for a different reason. Neither adapter reads them;
+    /// their gap was that a caller wanting them had to parse `get_stats()`,
+    /// which returns them as text.
+    ///
     /// Named `space_property` in Rust because PyO3 derives the symbol it
     /// generates from the Rust name, and a getter's symbol takes a `get_`
     /// prefix, so a getter written as `space` collides with the existing
