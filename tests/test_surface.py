@@ -36,7 +36,7 @@ def build(n=0, dim=4, space="cosine", expected_size=100, metadatas=None):
 # ------------------------------------------------------------
 # space, as a property beside dim
 # ------------------------------------------------------------
-@pytest.mark.parametrize("space", ["cosine", "l2", "l1"])
+@pytest.mark.parametrize("space", ["cosine", "l2", "l1", "dot"])
 def test_space_property_matches_get_space(space):
     index = build(space=space)
     assert index.space == space

@@ -631,8 +631,8 @@ The `search()` method retrieves the top-k most similar vectors from the index gi
 |------------------|----------------------------------|-----------|-----------------------------------------------------------------------------|
 | `vector`         | `List[float]`, `List[List[float]]`, or `np.ndarray`  | *required* | The query vector (single: `List[float]` or 1D `np.ndarray`) or batch of query vectors (`List[List[float]]` or 2D `np.ndarray`). Must match the index dimension and contain only finite values. |
 | `filter`         | `Dict[str, Any] \| None`         | `None`    | Optional metadata filter. Values may be a plain value for equality or a dict of operators, and `$and`, `$or` and `$not` compose them. See [Filter Operators](#-filter-operators-reference) and [Boolean composition](#-boolean-composition). |
-| `top_k`          | `int`                            | `10`      | Number of nearest neighbors to return. |
-| `ef_search`      | `int \| None`                    | see below | Search complexity parameter. Higher values improve accuracy at the cost of speed. |
+| `top_k`          | `int`                            | `10`      | Number of nearest neighbors to return, from 0 to 65,536. |
+| `ef_search`      | `int \| None`                    | see below | Search complexity parameter, from 0 to 131,072. Higher values improve accuracy at the cost of speed. |
 | `return_vector`  | `bool`                           | `False`   | If `True`, each result includes the stored embedding vector under a `vector` key. |
 | `rerank`         | `int \| None`                    | derived from the record count | Candidates fetched per requested result before rescoring against raw vectors. Only applies to a quantized index whose `storage_mode` is `quantized_with_raw`. See [Quantized search accuracy](#-quantized-search-accuracy). |
 
