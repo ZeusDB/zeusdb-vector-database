@@ -59,7 +59,7 @@ use super::dump::{
 use super::levels::LevelGenerator;
 use super::mutable::MutableGraph;
 use super::Distance;
-use crate::distance::{CosineDist, L1Dist, L2Dist};
+use crate::distance::{CosineDist, DotDist, L1Dist, L2Dist};
 use std::path::Path;
 
 // ============================================================================
@@ -73,9 +73,9 @@ const SEED: u64 = 0x5eed_0099_d00d_face;
 ///
 /// A budget rather than a target, because this runs on every commit and a gate
 /// nobody can afford to run finds nothing. A case costs about 6.3 ms, nearly all
-/// of it writing the mutated dump and reading it back, so six entries at this
-/// budget is about forty seconds against a `cargo test` that already takes two
-/// minutes.
+/// of it writing the mutated dump and reading it back, so seven entries at this
+/// budget is about forty-five seconds against a `cargo test` that already takes
+/// two minutes.
 ///
 /// The committed budget is a regression net rather than a search. The deep runs
 /// are the search: `ZEUSDB_FUZZ_CASES=20000` takes eleven minutes and covers
@@ -477,7 +477,7 @@ where
     }
 }
 
-/// Every graph the crate writes, at six shapes.
+/// Every graph the crate writes, at seven shapes.
 ///
 /// `min_nodes` is zero throughout, which is the loosest the reader accepts, so
 /// a case is refused on the file rather than on a record count this file chose.
@@ -493,6 +493,16 @@ fn corpus() -> Vec<Entry> {
             6,
             16,
             CosineDist {},
+            |v| v,
+        ),
+        entry(
+            "dot-raw-m8",
+            GraphKind::Dot,
+            Element::Raw,
+            110,
+            5,
+            8,
+            DotDist {},
             |v| v,
         ),
         entry(
@@ -978,7 +988,7 @@ fn the_mutator_expresses_the_hand_written_cases() {
 /// Every corpus entry survives the round trip it was built from.
 ///
 /// Cheap, and it means a failure above is the reader's rather than one of the
-/// six graphs this file builds.
+/// seven graphs this file builds.
 #[test]
 fn every_corpus_entry_round_trips() {
     let dir = tempfile::tempdir().unwrap();

@@ -212,7 +212,7 @@ pub(crate) enum GraphKind {
     /// Inner product. There is no quantized counterpart. `create()` and
     /// `load()` refuse the pair, so no dump can carry one, and
     /// `validate_space_supports_quantization` in `hnsw_index/construct.rs`
-    /// records what serving it would take.
+    /// records the measurement that keeps it refused.
     Dot = 7,
 }
 

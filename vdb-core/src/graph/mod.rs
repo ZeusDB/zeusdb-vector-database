@@ -470,7 +470,8 @@ impl VectorGraph {
             "l1" => quantized!(L1PQ, PqMetric::SquaredL2),
             // "dot" is not here and cannot reach here. See
             // `validate_space_supports_quantization`, which refuses the pair
-            // at create() and at load and records what serving it would take.
+            // at create() and at load and records the measurement behind the
+            // refusal.
             _ => {
                 error!(
                     operation = "hnsw_creation",

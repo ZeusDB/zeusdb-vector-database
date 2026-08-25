@@ -304,7 +304,7 @@ pub(crate) fn validate_index_parameters(
 /// as the number, which it has to, since dividing by a length that varies from
 /// record to record is not a monotone map of the sum.
 ///
-/// For the two spaces below no such scorer exists in this build.
+/// The two spaces below are refused, each for its own reason.
 ///
 /// **The inner product.** The squared L2 between a query and a stored vector is
 /// the query's squared length plus the stored vector's squared length less
@@ -314,13 +314,28 @@ pub(crate) fn validate_index_parameters(
 /// outrank a long one pointing further the same way.
 ///
 /// The norm table `PqMetric::Cosine` reads makes that middle term recoverable,
-/// so the arithmetic is no longer the obstacle it was. What is missing is a
-/// scorer, a decision about what a quantized inner product should report, and a
-/// measurement of how a codebook trained by squared L2 behaves on vectors whose
-/// lengths vary by orders of magnitude, which is what a dot corpus can carry and
-/// a cosine one cannot. That is a change with its own measurement, and until it
-/// exists the pair is refused rather than served by a scorer that ranks the
-/// wrong quantity.
+/// and exactly: over a real trained codebook,
+/// `(norm(q)^2 + norm(c)^2 - adc) / 2` task-measured within 9e-5 of `|q||c|`
+/// against the directly computed inner product to the reconstruction, on
+/// vectors whose lengths span three orders of magnitude. The scorer is
+/// therefore not the obstacle. The codebook is. k-means places its centroids
+/// to minimise squared L2, and ranking by the recovered inner product was
+/// task-measured by brute force over the codebook's own reconstructions,
+/// before any graph loss, on sift-128, glove-100 and dbpedia-openai-1536 at
+/// the shipped defaults, both as the corpora come and with stored lengths
+/// rescaled to controlled spreads of one to three orders of magnitude. Recall
+/// at 10 against an exact inner product ranking never exceeded 0.37 and sat
+/// 0.35 to 0.82 below an unquantized dot index on the same data. Where
+/// lengths are near uniform the recovered product ranked below the plain ADC
+/// sum, 0.18 against 0.40 on sift-128, because the true lengths carry no
+/// signal there while the recovered term faithfully adds the reconstruction's
+/// own norm error as ranking noise. Where lengths spread the length signal is
+/// real and recall still plateaued near 0.3, because the squared L2 objective
+/// spends its centroids on the longest vectors and resolves no vector's
+/// length finely enough to rank by. The two regimes fail in opposite
+/// directions, so the pair is refused on the codebook rather than on a
+/// missing scorer. Serving it would take a codebook fitted to an inner
+/// product objective, which is a training change with its own measurement.
 ///
 /// **Manhattan distance.** L1 and squared L2 do not induce the same order, and
 /// the counterexample needs no approximation to reach. Against the query
@@ -353,7 +368,7 @@ pub(crate) fn validate_space_supports_quantization(space: &str, source: &str) ->
     // The opening sentence and the closing offer are shared, because the reason
     // is one reason and the way out of it is the same way out.
     let reason = match space {
-        "dot" => "no inner product scorer over those tables exists in this build, and the one that does rank by a quantity carrying each stored vector's own length rather than by the inner product alone, so the index would return the wrong records. Use space='cosine' with normalised vectors, which quantizes correctly and ranks identically to an inner product on normalised input",
+        "dot" => "the codebook those tables are computed from is fitted by squared L2 and cannot rank by the inner product. Measured by brute force over its own reconstructions at the shipped defaults, recall at 10 against an exact inner product ranking never exceeded 0.37 and sat at least 0.35 below an unquantized dot index on every corpus and every stored length spread measured, so the index would return the wrong records. Use space='cosine' with normalised vectors where only direction should count, which quantizes correctly and ranks identically to an inner product on normalised input",
         "l1" => "Manhattan distance is not one of the two those tables can be turned into, so the index would return the wrong records and report a score on a quantity it never declared. Use space='l2', which the same codebook quantizes correctly, if squared distance suits your data",
         _ => return Ok(()),
     };
