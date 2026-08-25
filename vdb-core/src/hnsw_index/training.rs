@@ -35,8 +35,9 @@ use tracing::{debug, error, info, instrument, trace, warn};
 ///
 /// It is a fixed seed rather than an entropy draw, so two builds over the same
 /// records in the same order produce the same shuffle and the same calibration.
-/// The k-means the codebook is fitted with is unseeded and remains the source
-/// of run to run variation.
+/// The k-means the codebook is fitted with draws from its own fixed seed, see
+/// `PQ_TRAINING_SEED` in `pq.rs`, so the codebook is a function of the sample
+/// as well and two builds over the same records produce one codebook.
 const TRAINING_SAMPLE_SEED: u64 = 0x5A_EE_5D_B0_5E_ED_57_01;
 impl HNSWIndex {
     /// TRAINING TRIGGER: Uses threshold flag for race condition safety

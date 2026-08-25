@@ -404,9 +404,12 @@ def test_an_untrained_index_reports_no_calibration():
     assert stats["rerank_calibrated"] == "false"
     assert "rerank_calibration_fetch" not in stats
 
-    # The fallback is the largest of the corpus term, the floor and the page
-    # term, which at 500 records is the floor.
-    assert int(stats["rerank_default_fetch"]) == 250
+    # An untrained index searches its raw graph and reranks nothing, so a
+    # search at top_k=10 fetches 10 and the stat says so. It used to report
+    # the fallback of 250, which no search on this index performed. The
+    # fallback itself is pinned on a trained index without a calibration in
+    # test_an_index_saved_without_a_calibration_loads_and_uses_the_fallback.
+    assert int(stats["rerank_default_fetch"]) == 10
 
 
 def test_quantized_only_is_not_calibrated():
@@ -418,6 +421,9 @@ def test_quantized_only_is_not_calibrated():
     stats = index.get_stats()
     assert stats["rerank_calibrated"] == "false"
     assert "rerank_calibration_ms" not in stats
+    # It fetches the page and nothing more, and reports exactly that rather
+    # than the 2 percent fallback it used to report and never fetched.
+    assert int(stats["rerank_default_fetch"]) == 10
 
 
 def test_the_calibration_survives_a_save_and_load(tmp_path, calibrated_index):

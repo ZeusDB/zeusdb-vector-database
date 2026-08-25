@@ -345,21 +345,41 @@ pub(crate) fn validate_index_parameters(
 /// `distance.rs` holds that arithmetic against the live scorer. A quantized l1
 /// index therefore ranked by a quantity it never declared and reported a score
 /// on it as well, and an l1 and an l2 index over one corpus returned the same
-/// page as each other.
+/// page as each other, 1,000 of 1,000 pages identical on SIFT-128 at 25,000
+/// and at 100,000 records.
 ///
-/// Serving it properly means an L1 codebook, and that is more than an L1 table.
-/// Lloyd's algorithm assigns by squared L2 and takes a mean, which is the
-/// minimiser of squared L2 and not of L1, so an L1 quantizer needs k-medians
-/// rather than a second distance in the same loop. That is a training change
-/// with its own measurement. Until it exists the pair is refused rather than
-/// served wrongly.
+/// The tables are not the obstacle. L1 is separable across subvectors exactly
+/// as squared L2 is, so an L1 query table and an L1 symmetric table are the
+/// same shape as the ones this build fills. The codebook is not the obstacle
+/// either. Lloyd's algorithm assigns by squared L2 and takes a mean, which
+/// minimises squared error, and the k-medians that minimises absolute error,
+/// assigning by L1 and updating to the per dimension median under the same
+/// seeded initialisation, was task-measured beside it. By brute force over
+/// each codebook's own reconstructions, on sift-128, glove-100 and
+/// dbpedia-openai-1536 at 100,000 records, at the default `subvectors` and at
+/// twice it, ranking by L1 to a k-medians reconstruction reached recall at 10
+/// against an exact L1 ranking of 0.17 to 0.65, which is 0.03 to 0.08 below
+/// what the shipped quantized l2 mode reaches against exact L2 on the same
+/// records and code length, and at the default `subvectors` it ranked below
+/// the squared L2 ordering it would replace on every corpus, by 0.007, 0.014
+/// and 0.025. The codebook objective moved recall by under 0.01 against L1
+/// tables over the shipped k-means codebook at every cell, although the two
+/// codebooks differ, the k-medians centroids sitting 0.5 to 0.8 of a centroid
+/// spacing from their nearest k-means centroid and lowering L1 distortion by
+/// 3 to 7 percent. An L1 table over a reconstruction estimates the L1
+/// distance to the record with a bias the squared L2 table does not carry,
+/// and in the grid the L1 ordering won only at subvectors of 5 and 8 values
+/// and lost at 10, 16 and 32. So the pair stays refused on the measured
+/// ordering rather than on a missing table.
 ///
-/// Refusing costs a configuration that measures well. Measured on
-/// SIFT-128 at 25,000 records, `quantized_with_raw` with the default rerank
-/// reached recall at 10 of 0.9885 against an exact L1 ranking, because rerank
-/// rescores against the raw vectors and hides the graph's ordering. The pair is
-/// still refused, because the graph underneath it is ordered by the wrong
-/// quantity and `rerank=0` exposes that at any time.
+/// Refusing costs a configuration that measures well. Measured on SIFT-128 at
+/// 25,000 records, `quantized_with_raw` with the default rerank reached recall
+/// at 10 of 0.9924 against an exact L1 ranking over 1,000 held-out queries,
+/// because rerank rescores against the raw vectors and hides the graph's
+/// ordering. The pair is still refused, because the graph underneath it is
+/// ordered by the wrong quantity and `rerank=0` exposes that at any time, and
+/// because holding that recall on glove-100 at 100,000 records took a
+/// calibrated fetch of 12,336 candidates, 12 percent of the corpus.
 ///
 /// Called at `create()` and again at load, because a hand edited `config.json`
 /// reaches the same constructors.
@@ -369,7 +389,7 @@ pub(crate) fn validate_space_supports_quantization(space: &str, source: &str) ->
     // is one reason and the way out of it is the same way out.
     let reason = match space {
         "dot" => "the codebook those tables are computed from is fitted by squared L2 and cannot rank by the inner product. Measured by brute force over its own reconstructions at the shipped defaults, recall at 10 against an exact inner product ranking never exceeded 0.37 and sat at least 0.35 below an unquantized dot index on every corpus and every stored length spread measured, so the index would return the wrong records. Use space='cosine' with normalised vectors where only direction should count, which quantizes correctly and ranks identically to an inner product on normalised input",
-        "l1" => "Manhattan distance is not one of the two those tables can be turned into, so the index would return the wrong records and report a score on a quantity it never declared. Use space='l2', which the same codebook quantizes correctly, if squared distance suits your data",
+        "l1" => "Manhattan distance does not order the same way. L1 tables are buildable, since L1 is separable across subvectors, and were measured over that codebook and over a k-medians codebook fitted to absolute error. By brute force over their own reconstructions at 100,000 records on three corpora, recall at 10 against an exact L1 ranking sat 0.03 to 0.08 below what quantized l2 reaches against exact L2 on the same records and code length, and at the default subvectors below the squared L2 ordering it would replace, so the index would return the wrong records. Use space='l2', which the same codebook quantizes correctly, if squared distance suits your data",
         _ => return Ok(()),
     };
     error!(

@@ -208,6 +208,11 @@ pub(crate) enum GraphKind {
     L1 = 3,
     CosinePq = 4,
     L2Pq = 5,
+    /// Quantized l1. Written by 0.7.0 and earlier and refused at load since,
+    /// so no directory this build writes carries one. The number stays
+    /// reserved. `validate_space_supports_quantization` in
+    /// `hnsw_index/construct.rs` records the measurement that keeps the pair
+    /// refused.
     L1Pq = 6,
     /// Inner product. There is no quantized counterpart. `create()` and
     /// `load()` refuse the pair, so no dump can carry one, and

@@ -1031,14 +1031,18 @@ def test_a_hand_assembled_dot_directory_claiming_quantization_is_refused(tmp_pat
 
 
 def test_l1_cannot_be_quantized():
-    """Refused for the same reason `dot` is, and measured rather than argued.
+    """Refused on measurement, and the arithmetic says why the measurement was needed.
 
     A quantized graph ranks by a squared L2 distance to the codebook whatever
     space is declared. Against the query `[0, 0]` the point `[2, 0]` is at L1
     2.0 and squared L2 4.0 while `[1.1, 1.1]` is at L1 2.2 and squared L2 2.42,
     so the two rank that pair in opposite orders and no rescaling joins them.
     `the_l1_counterexample_is_ordered_by_squared_l2` in `distance.rs` holds the
-    arithmetic against the live scorer.
+    arithmetic against the live scorer. L1 tables over the shipped codebook and
+    over a k-medians codebook were then measured by brute force on three corpora
+    and ranked 0.03 to 0.08 below what quantized l2 reaches at its own game, so
+    the pair stays refused. `validate_space_supports_quantization` records the
+    figures.
     """
     with pytest.raises(RuntimeError, match=r"space='l1' cannot be quantized"):
         VectorDatabase().create(
