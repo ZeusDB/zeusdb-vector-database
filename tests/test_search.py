@@ -340,11 +340,8 @@ def test_batch_search_list_vectors():
             assert "vector" in result
             assert len(result["vector"]) == 4  # Dimension should match
             vector = result["vector"]
-            # An ndarray of float32 rather than a list of Python floats. The
-            # values are the same and only the container is different, which
-            # is what a caller reading it by index or by iteration sees.
-            assert isinstance(vector, np.ndarray)
-            assert vector.dtype == np.float32
+            assert isinstance(vector, list)
+            assert all(isinstance(v, float) for v in vector)
 
 # ------------------------------------------------------------
 # Test 28: Batch Search with 2D NumPy Array
@@ -763,45 +760,53 @@ def test_search_empty_index():
 
 
 # ------------------------------------------------------------
-# Test 104: return_vector hands back an array, not a list of Python floats
+# Test 104: return_vector hands back a list of Python floats, not an array
 # ------------------------------------------------------------
-def test_return_vector_is_a_float32_array():
-    """The container changed in 0.8.0 and the values did not.
+def test_return_vector_is_a_list_of_floats():
+    """The container is a list, from search and from get_records alike.
 
-    set_item("vector", vec) on a Vec<f32> built a PyList and one Python float
-    per component, which at top_k 10 and dimension 1,536 is 15,360 allocations
-    a page. PyArray1::from_vec writes the same f32 values into one buffer.
+    An unreleased change returned a float32 ndarray instead. Both adapters
+    read the vector as a list, and one of them tests isinstance(v, list) and
+    silently falls back to a plain top-k page when that fails, so the array
+    was a different answer rather than a faster one. The values are the
+    stored f32 components, widened to Python floats.
     """
     index = build_validation_index()
 
     hit = index.search([1.0, 0.0, 0.0, 0.0], top_k=1, return_vector=True)[0]
-    assert isinstance(hit["vector"], np.ndarray)
-    assert hit["vector"].dtype == np.float32
-    assert hit["vector"].shape == (4,)
+    assert type(hit["vector"]) is list
+    assert len(hit["vector"]) == 4
+    assert all(type(v) is float for v in hit["vector"])
 
     # get_records agrees with search, so a caller does not have to remember
     # which one hands back which.
     record = index.get_records(hit["id"], return_vector=True)[0]
-    assert isinstance(record["vector"], np.ndarray)
-    assert record["vector"].dtype == np.float32
-    assert np.array_equal(record["vector"], hit["vector"])
+    assert type(record["vector"]) is list
+    assert all(type(v) is float for v in record["vector"])
+    assert record["vector"] == hit["vector"]
 
-    # Every element is readable by index and by iteration, which is what an
-    # unchanged caller does. Under cosine the stored vector is the unit length
-    # form of what was supplied.
+    # Every element is readable by index and by iteration. Under cosine the
+    # stored vector is the unit length form of what was supplied.
     supplied = {"s1": [0.1, 0.2, 0.3, 0.4], "s2": [0.5, 0.6, 0.7, 0.8]}[hit["id"]]
     expected = np.asarray(supplied) / np.linalg.norm(supplied)
-    assert len(hit["vector"]) == 4
-    assert float(hit["vector"][0]) == pytest.approx(expected[0], abs=1e-6)
-    assert [float(v) for v in hit["vector"]] == pytest.approx(list(expected), abs=1e-6)
+    assert hit["vector"][0] == pytest.approx(expected[0], abs=1e-6)
+    assert hit["vector"] == pytest.approx(list(expected), abs=1e-6)
+
+    # Each element is an f32 widened to a Python float, so narrowing it back
+    # to float32 loses nothing.
+    assert np.asarray(hit["vector"], dtype=np.float32).tolist() == hit["vector"]
+
+    # A list serialises and concatenates as one, which an array does not.
+    assert json.loads(json.dumps(hit["vector"])) == hit["vector"]
+    assert len(hit["vector"] + [0.0]) == 5
 
     # A batch page carries the same type in every hit.
     batch = index.search([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
                          top_k=2, return_vector=True)
     for page in batch:
         for entry in page:
-            assert isinstance(entry["vector"], np.ndarray)
-            assert entry["vector"].dtype == np.float32
+            assert type(entry["vector"]) is list
+            assert all(type(v) is float for v in entry["vector"])
 
     # return_vector=False still omits the key entirely.
     assert "vector" not in index.search([1.0, 0.0, 0.0, 0.0], top_k=1)[0]

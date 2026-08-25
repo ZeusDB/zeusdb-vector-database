@@ -283,7 +283,7 @@ def test_persistence_single_vector_index(tmp_path):
     assert results[0]["metadata"] == {"solo": True}
 
     record = loaded.get_records("only", return_vector=True)[0]
-    assert record["vector"].tolist() == [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert record["vector"] == [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 # ------------------------------------------------------------
 # Test 71: Persistence: per record metadata across a reload

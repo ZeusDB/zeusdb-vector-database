@@ -76,7 +76,6 @@ use crate::rerank::{
     prepare_reconstruction, raw_distance_fn, reconstruction_needs_unit, rescore_candidate,
     take_best, RawVectors, RerankPlan, SearchParams,
 };
-use numpy::PyArray1;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rayon::prelude::*;
@@ -782,20 +781,9 @@ impl HNSWIndex {
             dict.set_item("score", score)?;
             dict.set_item("metadata", value_map_to_python(&metadata, py)?)?;
             if let Some(vec) = vector_data {
-                // A NumPy array rather than a list of Python floats.
-                //
-                // `set_item("vector", vec)` on a `Vec<f32>` builds a `PyList`
-                // and one Python float object per component. At `top_k` 10 and
-                // dimension 1,536 that is 15,360 allocations a page, and on a
-                // batch of 32 it is 491,520. Measured at dimension 1,536 it
-                // nearly doubled the per query cost of a batch search.
-                //
-                // `PyArray1::from_vec` writes the same `f32` values into one
-                // buffer, so the values are unchanged and only their container
-                // is different. Both adapters ask for the vector on every MMR
-                // query and then run pure Python cosine loops over what comes
-                // back, which an array lets them do in NumPy instead.
-                dict.set_item("vector", PyArray1::from_vec(py, vec))?;
+                // A list of Python floats, as every release has returned. Both
+                // adapters read it as a list, and one of them tests for it.
+                dict.set_item("vector", vec)?;
             }
             output.push(dict.into());
         }
