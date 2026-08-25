@@ -64,59 +64,7 @@ ZeusDB Vector Database supports the following metrics for vector similarity sear
 | l2     | Euclidean distance                 | "l2", "L2" | supported |
 | dot    | Inner product, reported as 1 - dot | "dot", "DOT" | refused |
 
-`create()` raises on a refused pair rather than building an index that ranks by the wrong quantity. See [Metrics that cannot be quantized](#-metrics-that-cannot-be-quantized).
-
-### 🎯 When to use `dot`
-
-Use `dot` when the length of a vector should count towards the ranking, which is what a recommender's item and user embeddings usually do and what a model trained with an inner product objective produces. Use `cosine` when only direction matters.
-
-```python
-from zeusdb_vector_database import VectorDatabase
-
-index = VectorDatabase().create("hnsw", dim=4, space="dot")
-index.add({"id": "long", "values": [3.0, 0.0, 0.0, 0.0]})
-index.add({"id": "unit", "values": [1.0, 0.0, 0.0, 0.0]})
-print([(r["id"], round(r["score"], 2)) for r in index.search([1.0, 0.0, 0.0, 0.0], top_k=2)])
-```
-
-*Output*
-```
-[('long', -2.0), ('unit', 0.0)]
-```
-
-Three things follow from `dot` being an inner product rather than a metric.
-
-- **The score is `1 - dot`, so lower is still better.** Recover the inner product as `1 - score`.
-- **Scores can be negative**, whenever the inner product is above one. No other metric here produces one.
-- **A vector need not be its own nearest neighbour**, because a longer vector pointing much the same way scores lower.
-
-`dot` cannot be combined with `quantization_config`. See below.
-
-### 🚫 Metrics that cannot be quantized
-
-`create()` refuses `space="l1"` and `space="dot"` together with `quantization_config`, and `load()` refuses a saved directory that pairs them.
-
-```python
-try:
-    VectorDatabase().create(
-        "hnsw", dim=16, space="l1", expected_size=20000,
-        quantization_config={"type": "pq", "subvectors": 4, "bits": 8, "training_size": 1000},
-    )
-except RuntimeError as exc:
-    print(str(exc).split(".")[0])
-```
-
-*Output*
-```
-Failed to create HNSW index: space='l1' cannot be quantized
-```
-
-A quantized graph works from tables of squared L2 distances to the codebook. `l2` and `cosine` can both be recovered from those, using the codebook's own centroid norms where the conversion needs them. The two below are refused, each for its own reason.
-
-- **`l1`.** Against the query `[0, 0]`, the point `[2, 0]` is at L1 2.0 and squared L2 4.0, while `[1.1, 1.1]` is at L1 2.2 and squared L2 2.42. The two rank that pair in opposite orders. L1 tables over the codebook are buildable, since Manhattan distance is separable across subvectors, and were measured over the shipped codebook and over a k-medians codebook fitted to absolute error. By brute force over their own reconstructions at 100,000 records on three corpora, ranking by L1 to a k-medians reconstruction reached recall at 10 of 0.17 to 0.65 against an exact L1 ranking, 0.03 to 0.08 below what quantized `l2` reaches against exact L2 on the same records and code length, and at the default `subvectors` below the squared L2 ordering it would replace on every corpus. The codebook objective moved recall by under 0.01 anywhere. Use `l2` if squared distance suits your data, or drop `quantization_config`.
-- **`dot`.** The codebook is fitted by squared L2, and a codebook fitted that way cannot rank by the inner product. Measured by brute force over its own reconstructions at the default configuration, recall at 10 against an exact inner product ranking never exceeded 0.37, at least 0.35 below an unquantized `dot` index on the same data, across three corpora and stored length spreads up to three orders of magnitude. Use `cosine` with normalised vectors where only direction should count, or `dot` without `quantization_config` where length must count.
-
-**A directory saved by 0.7.0 or earlier that pairs `l1` with quantization no longer loads.** Rebuild it from the vectors it was given, as `l1` without `quantization_config` or as `l2` with it.
+`create()` raises on a refused pair rather than building an index that ranks by the wrong quantity, and `load()` refuses a saved directory that pairs them.
 
 ### 📏 Scores vs Distances
 
@@ -125,7 +73,7 @@ All distance metrics in ZeusDB Vector Database return distance values, not simil
  - Lower values = more similar
  - A vector identical to the query scores 0.0, or a value within floating point error of it
 
-This applies to all distance types, including cosine. `dot` is the one exception to the zero, and the section below says why.
+This applies to all distance types, including cosine. `dot` is the one exception to the zero, because its score is `1 - dot` and an inner product above one takes it below zero.
 
 Under `cosine`, vectors are normalized to unit length when they are stored. A vector you read back with `return_vector=True` or `get_records()` is therefore the normalized form, not the values you supplied. Under `l1`, `l2` and `dot` the values are stored unchanged.
 
@@ -134,6 +82,8 @@ A zero vector has no direction, so under `cosine` it sits at distance 1.0 from e
 **On a quantized index the score is a distance to the record's reconstruction, not to the vector you inserted.** Under `l2` it is the euclidean distance to that reconstruction and under `cosine` it is the cosine distance to it, so either way the number is on the scale a raw index of the same space reports and the two are comparable. It is not equal to the raw score, because the index no longer holds the vector you gave it, and the difference is the quantization error. Rerank replaces it with an exact distance to the raw vector, and it is on by default for `quantized_with_raw`.
 
 ```python
+from zeusdb_vector_database import VectorDatabase
+
 index = VectorDatabase().create("hnsw", dim=4, space="cosine")
 index.add({"id": "a", "values": [1.0, 0.0, 0.0, 0.0]})
 print(round(index.search([1.0, 0.0, 0.0, 0.0], top_k=1)[0]["score"], 6))
