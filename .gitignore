@@ -193,3 +193,6 @@ cython_debug/
 # Ignore .cargo for local build artifacts
 .cargo/
 src/zeusdb_vector_database/*.pdb
+
+# Ignore local files for Claude
+CLAUDE.local.md
