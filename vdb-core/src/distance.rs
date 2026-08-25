@@ -148,9 +148,10 @@ thread_local! {
 /// The metric a quantized graph orders and scores by
 ///
 /// A quantized graph used to have one scorer whatever space the index declared,
-/// which is why `l1` and `dot` are refused. `l2` and `cosine` both survive that
-/// refusal but they do not want the same number, so the scorer takes which one
-/// it is serving rather than inferring it.
+/// which is why `l1` and `dot` were refused, and the measurements recorded on
+/// `validate_space_supports_quantization` keep both refused. `l2` and `cosine`
+/// both survive that refusal but they do not want the same number, so the
+/// scorer takes which one it is serving rather than inferring it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PqMetric {
     /// Squared L2 from the query to the reconstruction.

@@ -466,12 +466,14 @@ impl VectorGraph {
         match space {
             "cosine" => quantized!(CosinePQ, PqMetric::Cosine),
             "l2" => quantized!(L2PQ, PqMetric::SquaredL2),
-            // Unreachable, see below. Squared L2 is what it was built with.
+            // Unreachable. `validate_space_supports_quantization` refuses the
+            // pair at create() and at load, and records the L1 tables and the
+            // k-medians codebook that were measured before keeping it refused.
+            // Squared L2 is what it was built with while the pair was served.
             "l1" => quantized!(L1PQ, PqMetric::SquaredL2),
-            // "dot" is not here and cannot reach here. See
-            // `validate_space_supports_quantization`, which refuses the pair
-            // at create() and at load and records the measurement behind the
-            // refusal.
+            // "dot" is not here and cannot reach here. The same function
+            // refuses that pair at both doors and records the measurement
+            // behind the refusal.
             _ => {
                 error!(
                     operation = "hnsw_creation",

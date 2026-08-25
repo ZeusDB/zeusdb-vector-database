@@ -483,9 +483,21 @@ impl HNSWIndex {
                 // The figure a search at the default page will actually fetch,
                 // read from the same rule the search reads rather than restated
                 // here. See `default_rerank_fetch`.
+                //
+                // Only a trained `quantized_with_raw` index reranks, so only it
+                // over-fetches. `rerank_plan` resolves every other index to no
+                // plan and `SearchParams::fetch_k` then asks for the page
+                // itself, so those report the page rather than the fallback
+                // they used to report and never fetched.
+                let default_fetch = match config.storage_mode {
+                    StorageMode::QuantizedWithRaw if quantization_active => {
+                        default_rerank_fetch(calibration, live, RERANK_CALIBRATION_TOP_K)
+                    }
+                    _ => RERANK_CALIBRATION_TOP_K,
+                };
                 stats.insert(
                     "rerank_default_fetch".to_string(),
-                    default_rerank_fetch(calibration, live, RERANK_CALIBRATION_TOP_K).to_string(),
+                    default_fetch.to_string(),
                 );
             }
         } else {
