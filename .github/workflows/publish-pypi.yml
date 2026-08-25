@@ -28,6 +28,13 @@
 # disagrees or is missing. That catches a later step or the artifact store
 # altering a wheel.
 #
+# Both publish jobs upload through pypa/gh-action-pypi-publish, which
+# exchanges the job's OIDC token for an index credential and mints a PEP 740
+# attestation for every file from that same identity, so PyPI verifies each
+# file against this workflow and shows the provenance on the file's page. The
+# GitHub artifact attestation generated the step before is a separate record
+# in this repository's attestation store, and both are kept.
+#
 # Every action is pinned to a full commit SHA, with the release it corresponds
 # to in the trailing comment. Dependabot raises the pins; see
 # .github/dependabot.yml.
@@ -618,10 +625,18 @@ jobs:
         with:
           subject-path: 'dist/*'
       - name: Publish to TestPyPI
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        # Trusted Publishing against TestPyPI, which is what repository-url
+        # selects. The action exchanges the job's OIDC token for a TestPyPI
+        # credential, runs twine check over dist, mints a PEP 740 attestation
+        # for every file from that same identity and uploads the files with
+        # their attestations. skip-existing keeps the behaviour of the
+        # previous upload step, so a rerun does not fail on a file an earlier
+        # run already uploaded.
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
-          command: upload
-          args: --non-interactive --skip-existing --repository testpypi dist/*
+          repository-url: https://test.pypi.org/legacy/
+          attestations: true
+          skip-existing: true
 
   publish-pypi:
     name: Publish to PyPI
@@ -696,10 +711,17 @@ jobs:
         with:
           subject-path: 'dist/*'
       - name: Publish to PyPI
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        # Trusted Publishing against production PyPI, which is the action's
+        # default index, so no repository-url here. The action exchanges the
+        # job's OIDC token for a PyPI credential, runs twine check over dist,
+        # mints a PEP 740 attestation for every file from that same identity
+        # and uploads the files with their attestations. skip-existing keeps
+        # the behaviour of the previous upload step, so a rerun does not fail
+        # on a file an earlier run already uploaded.
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
-          command: upload
-          args: --non-interactive --skip-existing dist/*
+          attestations: true
+          skip-existing: true
 
   github-release:
     name: Create the GitHub Release

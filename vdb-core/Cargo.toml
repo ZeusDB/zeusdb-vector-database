@@ -1,6 +1,6 @@
 [package]
 name = "zeusdb-vector-database"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 # The same licence pyproject.toml declares, LICENSE holds and NOTICE restates.
 # cargo-deny reads this field. The wheel's metadata is unaffected, because
