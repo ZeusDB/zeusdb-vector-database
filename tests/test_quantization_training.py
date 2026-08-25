@@ -580,11 +580,11 @@ def test_pq_vector_reconstruction():
     for record in records:
         assert "vector" in record
         assert len(record["vector"]) == 128
-        assert isinstance(record["vector"], np.ndarray)
+        assert isinstance(record["vector"], list)
         
         # Vectors should be approximately reconstructed (not exact due to quantization)
         vector = record["vector"]
-        assert vector.dtype == np.float32
+        assert all(isinstance(v, float) for v in vector)
     
     # Test get_records without vectors
     records_no_vec = index.get_records(["test_1", "test_2"], return_vector=False)

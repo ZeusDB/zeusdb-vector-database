@@ -555,12 +555,12 @@ doc_005 0.001143 {'author': 'Alice'}
 
 Set `return_vector=True` to get the stored embedding alongside the metadata and score. Under `cosine` this is the normalized vector, not the values you supplied.
 
-The vector comes back as a **`numpy.ndarray` of `float32`**, from both `search` and `get_records`. Anything that concatenates it with `+`, calls `.append` on it, tests it with `if vector:` or passes it to `json.dumps` needs `.tolist()` first.
+The vector is a `list` of Python floats, from both `search` and `get_records`.
 
 ```python
 results = index.search(vector=query_vector, top_k=1, return_vector=True)
 print(results[0]["id"], round(results[0]["score"], 6))
-print([round(float(v), 4) for v in results[0]["vector"]])
+print([round(v, 4) for v in results[0]["vector"]])
 ```
 
 *Output*

@@ -1443,9 +1443,8 @@ impl HNSWIndex {
                     };
 
                     if let Some(vec) = vector_data {
-                        // An array rather than a list, matching `search`. See
-                        // `hits_to_python` for why.
-                        dict.set_item("vector", PyArray1::from_vec(py, vec))?;
+                        // A list, matching `search`.
+                        dict.set_item("vector", vec)?;
                     }
                 }
 

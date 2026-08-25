@@ -209,11 +209,10 @@ pub(crate) enum GraphKind {
     CosinePq = 4,
     L2Pq = 5,
     L1Pq = 6,
-    /// Inner product. There is no quantized counterpart, because the ADC table
-    /// a quantized graph scores against is a squared L2 distance whatever the
-    /// space, and ordering by that is not ordering by an inner product once the
-    /// stored vectors differ in length. `create()` refuses the pair, so no dump
-    /// can carry one.
+    /// Inner product. There is no quantized counterpart. `create()` and
+    /// `load()` refuse the pair, so no dump can carry one, and
+    /// `validate_space_supports_quantization` in `hnsw_index/construct.rs`
+    /// records what serving it would take.
     Dot = 7,
 }
 

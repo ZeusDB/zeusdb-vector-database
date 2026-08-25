@@ -469,10 +469,8 @@ impl VectorGraph {
             // Unreachable, see below. Squared L2 is what it was built with.
             "l1" => quantized!(L1PQ, PqMetric::SquaredL2),
             // "dot" is not here and cannot reach here. See
-            // `validate_index_parameters`, which refuses the pair at create()
-            // and at load, because the ADC table every quantized graph scores
-            // against is a squared L2 distance and ordering by it is not
-            // ordering by an inner product.
+            // `validate_space_supports_quantization`, which refuses the pair
+            // at create() and at load and records what serving it would take.
             _ => {
                 error!(
                     operation = "hnsw_creation",
