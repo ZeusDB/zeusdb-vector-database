@@ -33,10 +33,16 @@ version = 2
 # --locked still resolves it.
 yanked = "deny"
 
-# Deliberately empty. An entry here removes the finding from the SARIF report
-# altogether rather than downgrading it, so an entry must state why it is
-# ignored and what would let it be removed.
-ignore = []
+# An entry here removes the finding from the SARIF report altogether rather
+# than downgrading it, so an entry states why it is ignored and what would
+# let it be removed.
+ignore = [
+    # bincode 2.0.1 is the last release that carries code. 3.0.0 holds a README
+    # and a `compile_error!` and nothing else, so there is no version to move
+    # to. The four bincode artefacts stay on 2.0.1 until they move to another
+    # format, which removes this entry. Review by 2027-02-28.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 2.0.1 is the last release carrying code and the artefacts stay on it until they move to another format; review by 2027-02-28" },
+]
 
 [licenses]
 version = 2

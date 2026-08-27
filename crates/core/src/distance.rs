@@ -830,7 +830,7 @@ mod tests {
     use super::*;
     use crate::graph::test_graph::TestGraph;
     use crate::rng::SeededRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     /// Dimensions the grid runs at. 128, 768 and 1536 are the measured ones,
     /// and the rest are the awkward shapes around the eight wide block, being

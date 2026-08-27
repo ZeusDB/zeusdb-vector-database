@@ -6,7 +6,7 @@
 #![allow(clippy::disallowed_types)]
 
 use crate::rng::SeededRng;
-use rand::{seq::SliceRandom, Rng, SeedableRng};
+use rand::{seq::SliceRandom, RngExt, SeedableRng};
 use rayon::prelude::*;
 use std::sync::RwLock;
 
@@ -826,7 +826,7 @@ impl PQ {
         data: &[Vec<f32>],
         k: usize,
         max_iter: usize,
-        rng: &mut impl Rng,
+        rng: &mut impl RngExt,
     ) -> Result<Vec<Vec<f32>>, String> {
         if data.is_empty() {
             return Err("Cannot perform k-means on empty data".to_string());
@@ -906,7 +906,7 @@ impl PQ {
         &self,
         data: &[Vec<f32>],
         k: usize,
-        rng: &mut impl Rng,
+        rng: &mut impl RngExt,
     ) -> Result<Vec<Vec<f32>>, String> {
         let mut centroids = Vec::with_capacity(k);
 
