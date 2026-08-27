@@ -8,7 +8,7 @@ import pytest
 
 import zeusdb_vector_database
 from zeusdb_vector_database import HNSWIndex, VectorDatabase
-from zeusdb_vector_database.zeusdb_vector_database import _create_hnsw_index
+from zeusdb_vector_database._engine import _create_hnsw_index
 
 
 def _build_rust(dim=16, space="cosine", m=16, ef_construction=200,
@@ -331,7 +331,7 @@ def test_public_exports():
 
     __all__ was ["VectorDatabase"] and nothing else was bound here, so
     zeusdb_vector_database.init_logging did not resolve. The names come from
-    the #[pyfunction(name = ...)] attributes in vdb-core/src/logging.rs.
+    the #[pyfunction(name = ...)] attributes in bindings/python/src/logging.rs.
     """
     assert zeusdb_vector_database.__all__ == [
         "AddResult",

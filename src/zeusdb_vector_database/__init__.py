@@ -25,12 +25,12 @@ from .vector_database import VectorDatabase # noqa: E402
 # The three logging functions are exported because the documented programmatic
 # logging recipe calls them at package level and there was nothing here to
 # resolve. Their names come from the #[pyfunction(name = ...)] attributes in
-# vdb-core/src/logging.rs, not from the Rust function names.
+# bindings/python/src/logging.rs, not from the Rust function names.
 #
 # shutdown_logging drains the file appender. Importing the extension registers
 # it with atexit, so a normally exiting process needs no call; it is exported
 # for a caller that wants the file complete at a point of its own choosing.
-from .zeusdb_vector_database import (  # noqa: E402
+from ._engine import (  # noqa: E402
     AddResult,
     HNSWIndex,
     init_file_logging,

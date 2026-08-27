@@ -1,0 +1,92 @@
+# cargo-deny configuration for the Rust dependency tree the wheel ships.
+#
+# The wheel is one compiled object. A user who installs it cannot enumerate the
+# crates inside it, run an advisory check against them or read their licences,
+# so the check runs here.
+#
+# This is the only deny.toml in the tree, at the workspace root. cargo-deny
+# reads the file in the directory it runs from before it looks for the
+# workspace root's, so a copy in a member directory would replace this one for
+# a run from that directory, and the CI gate checks that exactly one exists.
+#
+# dependency-scan.yml runs this config in two passes, one over advisories and
+# one over licences, bans and sources.
+
+[graph]
+# The targets the wheels are built for, from the publish-pypi.yml matrix plus
+# the two the sdist reaches. Without this, cargo-deny walks every target's
+# dependencies, which pulls in crates no wheel links.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+]
+all-features = false
+
+[advisories]
+# The RustSec database, checked against Cargo.lock.
+version = 2
+# A yanked release is a finding. A yanked version stays downloadable and
+# --locked still resolves it.
+yanked = "deny"
+
+# Deliberately empty. An entry here removes the finding from the SARIF report
+# altogether rather than downgrading it, so an entry must state why it is
+# ignored and what would let it be removed.
+ignore = []
+
+[licenses]
+version = 2
+# Every licence the tree carries, and nothing else. A dependency arriving under
+# a licence not listed here fails the run. The package is published under
+# Apache-2.0 and ships NOTICE and ATTRIBUTION.md, so a copyleft crate entering
+# the tree has to be a decision rather than a lockfile update nobody read.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# A crate offering several licences is satisfied by any allowed one, and this
+# is the threshold at which cargo-deny stops asking.
+confidence-threshold = 0.8
+
+[bans]
+# A second copy of a crate is a lockfile that resolved two incompatible semver
+# ranges. It is a warning rather than an error because the resolution is
+# usually not this project's to make.
+multiple-versions = "warn"
+wildcards = "deny"
+# A workspace member depends on another by path alone, with the version coming
+# from [workspace.package], and without this every such edge is a wildcard.
+# It applies only to crates that declare `publish = false`, which every member
+# does.
+allow-wildcard-paths = true
+# The build must not silently gain a crate from a git URL or a local path.
+#
+# Only the binding crate touches Python. `wrappers` names the crates allowed
+# to depend on a banned crate directly and guards that edge alone, so pyo3's
+# own tree is banned too, or a crate taking pyo3-ffi directly would pass. The
+# wrapper names follow pyo3's layout, and an entry no edge uses is reported
+# as `unused-wrapper` when a pyo3 bump moves them. The CI gate also asserts
+# that no crate but the binding reaches any of these through another member.
+deny = [
+    { crate = "pyo3", wrappers = ["zeusdb-vector-python", "numpy"], reason = "only the binding crate touches Python" },
+    { crate = "pyo3-ffi", wrappers = ["pyo3"], reason = "pyo3's own tree, banned so that taking it directly does not pass the pyo3 ban" },
+    { crate = "pyo3-macros", wrappers = ["pyo3"], reason = "pyo3's own tree" },
+    { crate = "pyo3-macros-backend", wrappers = ["pyo3-macros"], reason = "pyo3's own tree" },
+    { crate = "pyo3-build-config", wrappers = ["pyo3", "pyo3-ffi", "numpy"], reason = "pyo3's own tree" },
+    { crate = "tokio", wrappers = [], reason = "no async runtime in the engine" },
+    { crate = "async-std", wrappers = [], reason = "no async runtime in the engine" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -25,12 +25,12 @@
 # ignored file and one other file runs everything, because paths-ignore skips a
 # run only when every changed path matches.
 #
-# The Cargo manifest lives in vdb-core, so every cargo step sets
-# working-directory rather than running from the repository root.
+# The workspace manifest is at the repository root, so every cargo step runs
+# from there, and rust-cache's workspaces input names that root.
 #
-# Cargo steps pass --locked, which fails the run when vdb-core/Cargo.lock is
-# out of date instead of silently updating it. Keep the flag on every cargo
-# step that accepts it.
+# Cargo steps pass --locked, which fails the run when Cargo.lock is out of
+# date instead of silently updating it. Keep the flag on every cargo step
+# that accepts it.
 #
 # The three jobs declare no needs, so they start together. Nothing one of them
 # produces is read by another. The Python suite runs on the extension that job
@@ -74,20 +74,84 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: vdb-core
+          # One workspace root per line, as `root -> target`. The action
+          # hashes every member manifest it finds through cargo metadata
+          # under the named root, so a crate added under crates/ or bindings/
+          # keys the cache without an edit here.
+          workspaces: ". -> target"
           # Shared with test-rust, which compiles the same debug profile from
           # the same lockfile. test-python does not share it, because a release
           # build has nothing in common with a debug one and the two would take
           # turns evicting each other under one key.
-          shared-key: vdb-core
+          shared-key: workspace
           # Save the cache on a failed run too, so a red gate still warms it.
           cache-on-failure: true
       - name: Check Rust formatting
-        working-directory: vdb-core
         run: cargo fmt --all -- --check
       - name: Run clippy
-        working-directory: vdb-core
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The three steps below hold the workspace's shape, and each guards
+      # against something a member manifest could undo without a warning.
+      # Clippy reads the clippy.toml nearest each crate's manifest and
+      # cargo-deny the deny.toml in the directory it runs from, so a second
+      # copy of either replaces the root file for that crate. A wrappers entry
+      # in deny.toml guards only the direct edge to a banned crate, so a member
+      # reaching pyo3 through another member passes cargo-deny. And a member
+      # that spells its own version is invisible to the release gate in
+      # publish-pypi.yml, which reads [workspace.package].
+      - name: Check that clippy.toml and deny.toml exist once each, at the root
+        run: |
+          set -euo pipefail
+          for name in clippy.toml deny.toml; do
+            found=$(git ls-files "$name" "*/$name")
+            if [ "$found" != "$name" ]; then
+              echo "::error::expected exactly one $name, at the repository root, and found: $(echo "${found:-none}" | tr '\n' ' ')"
+              exit 1
+            fi
+            echo "$name is present once, at the root"
+          done
+      - name: Check that no crate but the binding depends on Python or an async runtime
+        # Every workspace member other than the binding is listed, and the
+        # normal and build dependency tree of each must hold none of the
+        # crates deny.toml bans. With no such member there is nothing to list
+        # and the step passes.
+        run: |
+          set -euo pipefail
+          members=$(cargo metadata --no-deps --locked --format-version 1 \
+            | python3 -c 'import json, sys; print("\n".join(p["name"] for p in json.load(sys.stdin)["packages"] if p["name"] != "zeusdb-vector-python"))')
+          if [ -z "$members" ]; then
+            echo "the binding is the only crate in the workspace, so there is nothing to check"
+            exit 0
+          fi
+          status=0
+          for member in $members; do
+            reached=$(cargo tree -p "$member" -e normal,build --prefix none --locked \
+              | grep -E '^(pyo3|pyo3-ffi|pyo3-macros|pyo3-macros-backend|pyo3-build-config|tokio|async-std) ' || true)
+            if [ -n "$reached" ]; then
+              echo "::error::$member reaches a banned crate: $(echo "$reached" | sort -u | tr '\n' ' ')"
+              status=1
+            else
+              echo "$member reaches none of the banned crates"
+            fi
+          done
+          exit "$status"
+      - name: Check that every member takes its version from the workspace
+        run: |
+          set -euo pipefail
+          cargo metadata --no-deps --locked --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          python3 - "$RUNNER_TEMP/metadata.json" <<'PY'
+          import json, pathlib, sys, tomllib
+          own = []
+          for package in json.load(open(sys.argv[1], encoding="utf-8"))["packages"]:
+              manifest = tomllib.loads(pathlib.Path(package["manifest_path"]).read_text(encoding="utf-8-sig"))
+              if manifest["package"].get("version") == {"workspace": True}:
+                  print(f'{package["name"]} takes its version from the workspace')
+              else:
+                  own.append(f'{package["name"]} at {package["manifest_path"]}')
+          if own:
+              print("::error::a member declares a version of its own rather than version.workspace = true: " + ", ".join(own))
+              sys.exit(1)
+          PY
 
   test-python:
     runs-on: ubuntu-latest
@@ -101,13 +165,13 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: vdb-core
+          workspaces: ". -> target"
           # Its own key. This is the only job that builds the release profile,
           # which is what the wheel is and what maturin produces through the
           # build backend. Under the shared key it restored the lint job's debug
           # artefacts, which a release build cannot use, and then declined to
           # save its own because the key was already taken.
-          shared-key: vdb-core-release
+          shared-key: workspace-release
           cache-on-failure: true
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
@@ -132,8 +196,8 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: vdb-core
-          shared-key: vdb-core
+          workspaces: ". -> target"
+          shared-key: workspace
           cache-on-failure: true
       # The Rust tests link an executable, and an executable has to resolve
       # every libpython symbol it references. `cargo test` below turns
@@ -149,8 +213,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-dev
       - name: Run the Rust test suite
-        working-directory: vdb-core
-        # --no-default-features turns off this crate's `extension-module`
+        # --no-default-features turns off the binding crate's `extension-module`
         # feature, which is on for every other cargo command and for the wheel.
-        # See the comment on it in vdb-core/Cargo.toml.
+        # See the comment on it in bindings/python/Cargo.toml.
         run: cargo test --workspace --locked --no-default-features

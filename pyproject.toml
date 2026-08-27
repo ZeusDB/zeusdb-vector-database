@@ -6,8 +6,8 @@ readme = "README.md"
 authors = [
     { name = "ZeusDB", email = "contact@zeusdb.com" }
 ]
-# The floor and the abi3 target move together. vdb-core/Cargo.toml enables
-# pyo3/abi3-py310, so the wheel is tagged cp310-abi3 and pip on 3.10 selects
+# The floor and the abi3 target move together. The workspace's Cargo.toml
+# enables pyo3/abi3-py310, so the wheel is tagged cp310-abi3 and pip on 3.10 selects
 # it. Raising one without the other leaves a version with no wheel that pip
 # can match, which falls back to building the sdist from source.
 requires-python = ">=3.10"
@@ -28,13 +28,18 @@ build-backend = "maturin"
 
 [tool.maturin]
 # abi3-py310 is deliberately not listed here. maturin has no abi3 key and
-# reads the target from the pyo3 cargo feature, which is declared in
-# vdb-core/Cargo.toml instead, so that cargo build, cargo clippy and cargo
-# test compile the configuration the wheel ships rather than a different one.
+# reads the target from the pyo3 cargo feature, which is declared on the
+# pyo3 dependency in the workspace's Cargo.toml instead, so that cargo build,
+# cargo clippy and cargo test compile the configuration the wheel ships
+# rather than a different one.
 features = ["pyo3/extension-module"]
 python-source = "src"
-manifest-path = "vdb-core/Cargo.toml"
-module-name = "zeusdb_vector_database" # <-- matches Rust crate name
+# The binding crate, a member of the workspace whose manifest is at the root.
+manifest-path = "bindings/python/Cargo.toml"
+# The extension module inside the package, named by the #[pymodule]
+# attribute in bindings/python/src/lib.rs. The crate name in Cargo.toml is
+# a separate name and does not have to match.
+module-name = "zeusdb_vector_database._engine"
 bindings = "pyo3" # <-- explicitly state to maturin that it's a PyO3 project
 include = [
     "LICENSE",

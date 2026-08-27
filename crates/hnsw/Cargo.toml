@@ -1,0 +1,35 @@
+# The index, being what stands between the engine's floor in
+# zeusdb-vector-core and the binding. The collection and its one space, every
+# operation the binding calls, the rerank rule, the lock rank registry and the
+# persistence of a directory all live here. Nothing in it names Python. The
+# bans in deny.toml and the lint job in ci.yml hold it to that, and
+# `cargo test -p zeusdb-vector-hnsw` compiles no Python crate.
+[package]
+name = "zeusdb-vector-hnsw"
+# The version, the edition and the licence are the workspace's, declared once
+# in the root Cargo.toml.
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Nothing in this workspace is published to crates.io. The wheel is the only
+# artefact.
+publish = false
+
+# Every version is the workspace's, declared once in the root Cargo.toml with
+# the reason for each pin.
+[dependencies]
+zeusdb-vector-core = { workspace = true }
+bincode = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The engine again, with its test data turned on, for the tests in
+# src/rerank.rs and src/collection/training.rs that measure against it.
+# cargo applies a dev-dependency's features to this crate's test targets and
+# to nothing else, so the wheel is built without them.
+zeusdb-vector-core = { workspace = true, features = ["test-support"] }

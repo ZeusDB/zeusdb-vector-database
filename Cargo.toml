@@ -1,0 +1,133 @@
+# The workspace. Every crate in the tree is a member, the binding under
+# bindings/ and the engine crates under crates/, and this is the manifest
+# every cargo command reads from the repository root.
+#
+# Three things live here and nowhere else.
+#
+# [workspace.package] holds the version, the edition and the licence, and a
+# member takes each one with `<key>.workspace = true`. The version is the one
+# pyproject.toml and src/zeusdb_vector_database/__init__.py declare, and the
+# release gate in .github/workflows/publish-pypi.yml reads it from this table.
+#
+# [workspace.dependencies] holds every dependency once, the external crates at
+# one version and the workspace's own crates by path. A member names a
+# dependency as `{ workspace = true }`, so a version or a path moves in one
+# place and two members cannot resolve the same crate twice.
+#
+# [profile.*] is read from the workspace root only. A profile table in a
+# member manifest is ignored, so every profile is declared here.
+
+[workspace]
+# Explicit, because a virtual manifest does not take the resolver from an
+# edition the way a package manifest does.
+resolver = "2"
+# Every directory under crates/ and bindings/ that holds a manifest is a
+# member. cargo treats a glob that matches nothing as a literal path and
+# fails on it, so each of the two directories has to hold at least one crate.
+members = ["crates/*", "bindings/*"]
+
+[workspace.package]
+version = "0.8.0"
+edition = "2021"
+# The same licence pyproject.toml declares, LICENSE holds and NOTICE restates.
+# cargo-deny reads this field. The wheel's metadata is unaffected, because
+# maturin takes it from pyproject.toml.
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# The workspace's own crates, by path. Each takes the workspace's version, so
+# a member names one with `{ workspace = true }` and no version at all, and
+# cargo-deny's allow-wildcard-paths admits the versionless edge.
+zeusdb-vector-core = { path = "crates/core" }
+zeusdb-vector-hnsw = { path = "crates/hnsw" }
+# abi3-py310 builds against CPython's stable ABI, so one wheel per platform
+# loads on every CPython from 3.10 up, including versions that do not exist
+# yet. The feature lives here rather than in pyproject's [tool.maturin]
+# features, so that cargo build, cargo clippy and cargo test all compile the
+# same configuration the wheel ships. The floor matches requires-python.
+#
+# The cost is PyPy and the free-threaded builds. Neither is expressible in the
+# stable ABI, and the abi3t feature that PEP 803 adds for free-threading is
+# 3.15 only, so it buys nothing at a 3.10 floor.
+#
+# `extension-module` is not here. It is the binding crate's own feature, on by
+# default, so `cargo build`, `cargo clippy` and the wheel are unchanged and
+# only `cargo test --no-default-features` differs. See bindings/python/Cargo.toml.
+pyo3 = { version = "0.29.0", features = ["abi3-py310"] }
+numpy = "0.29.0"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+rayon = "1.10"
+rand = "0.9.1"
+# The generator itself, named rather than taken from `rand::rngs::StdRng`,
+# which `rand` documents as non-portable and free to change algorithm in any
+# release. Every seeded draw in the engine runs on it, being the level stream a
+# graph is built from and both of the product quantizer's. See
+# crates/core/src/rng.rs.
+#
+# `rand`'s default features already pull `rand_chacha` in to build `StdRng` at
+# all, so this names a dependency the lock already held rather than adding one.
+rand_chacha = "0.9"
+# The distance kernels' vector type. See the "How they are compiled" section of
+# crates/core/src/distance.rs. It pulls in safe_arch and bytemuck, and it
+# is a build-time abstraction over the target's own vector registers with no
+# run time component, so it adds nothing to the wheel beyond the code it
+# generates.
+wide = "1"
+bincode = "2.0.1"
+chrono = { version = "0.4.41", features = ["serde"] } # <-- For timestamps
+# Modern structured logging
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "time", "ansi", "registry"] }
+# Terminal detection is `std::io::IsTerminal`, stable since Rust 1.70. The
+# `atty` crate this replaced was unmaintained and carried RUSTSEC-2021-0145.
+tempfile = "3"
+
+# The profile the wheel is built with.
+#
+# Fat LTO with one codegen unit. Thin LTO rebuilds an edit in a fraction of
+# the time and produces the same results, and whether it changes search
+# latency is not decided, because on a developer machine two fat builds of one
+# source differ from each other by as much as a fat build differs from a thin
+# one. The wheel keeps fat so that two wheels built from two commits differ by
+# the code between them alone. What would settle it is a paired comparison of
+# a fat wheel and a thin wheel loaded into one interpreter on the runner that
+# builds the wheel, which is where the wheel runs, rather than on a developer
+# machine.
+[profile.release]
+lto = true          # Fat link-time optimization
+codegen-units = 1   # Single compilation unit
+opt-level = 3       # Full optimization
+
+# An optimised build that keeps `debug_assertions` on.
+#
+# The lock rank registry in crates/hnsw/src/locks.rs is gated
+# on `cfg(debug_assertions)` and on nothing else, so it is live in any profile
+# that leaves them on. This profile is the release profile with the assertions
+# turned back on, so the registry runs at release speed. Build it with
+#
+#   maturin develop --profile checked
+#
+# and run the suite as usual.
+#
+# Thin LTO rather than the release profile's fat, because this profile is
+# built many times a day and thin LTO builds each edit in a fraction of the
+# time, with the same results. The published wheel keeps fat; see the release
+# profile.
+[profile.checked]
+inherits = "release"
+debug-assertions = true
+lto = "thin"
+codegen-units = 16
+
+# The release profile for a developer's own builds, being release with thin
+# LTO so that an edit rebuilds in a fraction of the fat-LTO time. Its output is
+# not what the wheel ships, so a wheel is built with `--release` and a working
+# copy with
+#
+#   maturin develop --profile dev-release
+[profile.dev-release]
+inherits = "release"
+lto = "thin"
+codegen-units = 16

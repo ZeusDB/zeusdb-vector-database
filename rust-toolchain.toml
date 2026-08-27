@@ -14,7 +14,7 @@
 #   cargo fmt --all -- --check
 #   cargo clippy --workspace --all-targets --locked -- -D warnings
 #   cargo test --workspace --locked
-# from vdb-core, fix whatever the new lints find, and commit the bump with
+# from the repository root, fix whatever the new lints find, and commit the bump with
 # those fixes in the same change.
 #
 # What it does not do

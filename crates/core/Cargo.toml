@@ -1,0 +1,34 @@
+# The engine's floor, being what every index crate stands on and what the
+# binding reaches through the re-exports in src/lib.rs. Nothing in it names
+# Python. The bans in deny.toml and the lint job in ci.yml hold it to that,
+# and `cargo test -p zeusdb-vector-core` links no Python library.
+[package]
+name = "zeusdb-vector-core"
+# The version, the edition and the licence are the workspace's, declared once
+# in the root Cargo.toml.
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Nothing in this workspace is published to crates.io. The wheel is the only
+# artefact.
+publish = false
+
+[features]
+# The test data and the small test graph, for a test in another crate that
+# measures against them. Off in every build that is not a test, so the wheel
+# carries neither. The binding turns it on through its dev-dependency on this
+# crate, which cargo applies to that crate's test targets and to nothing else.
+test-support = []
+
+# Every version is the workspace's, declared once in the root Cargo.toml with
+# the reason for each pin.
+[dependencies]
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+rayon = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+wide = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
