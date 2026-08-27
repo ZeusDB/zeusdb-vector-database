@@ -39,16 +39,10 @@
 //! 0.6.0 or earlier still holds those two, and opening it rebuilds the graph
 //! once and writes the new file on the next save. Nothing reads the old format.
 
-use crate::checksum::checksum_of;
-use crate::columns::validate_indexed_fields;
-use crate::error::Error;
-use crate::graph::dump::DUMP_FILENAME as GRAPH_DUMP_FILENAME;
-use crate::graph::dump::LEGACY_DUMP_FILENAMES;
 use crate::hnsw_index::{
     validate_index_parameters, validate_space_supports_quantization, HNSWIndex, QuantizationConfig,
     StorageMode,
 };
-use crate::pq::PQ;
 use crate::rerank::RerankCalibration;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -58,6 +52,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info};
+use zeusdb_vector_core::{
+    checksum_of, validate_indexed_fields, Error, DUMP_FILENAME as GRAPH_DUMP_FILENAME,
+    LEGACY_DUMP_FILENAMES, PQ,
+};
 
 // ============================================================================
 // FORMAT VERSION
@@ -389,7 +387,7 @@ fn sync_directory(_path: &Path) {}
 /// What the manifest records about one artefact it names
 ///
 /// `bytes` is the file's length and `checksum` is
-/// [`crate::checksum::checksum_of`] over its contents, written as sixteen hex
+/// [`zeusdb_vector_core::checksum_of`] over its contents, written as sixteen hex
 /// digits. Both are taken from the buffer as it is written, so neither costs a
 /// read.
 ///

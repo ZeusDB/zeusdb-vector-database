@@ -101,6 +101,10 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use tracing::{info, warn};
 
+/// The target the two records this module emits carry. See `LOG_TARGET` in
+/// the parent module for why it is not `module_path!()`.
+const LOG_TARGET: &str = "zeusdb_vector_database::graph::dump";
+
 /// Layers a graph can hold, which is part of the on-disk contract.
 ///
 /// It sits at header byte 18 and a dump declaring any other value is refused on
@@ -144,7 +148,7 @@ pub(super) struct LoadedPoint<T> {
 }
 
 /// The one file a dump writes, and the one the loader reads.
-pub(crate) const DUMP_FILENAME: &str = "hnsw_index.zdbgraph";
+pub const DUMP_FILENAME: &str = "hnsw_index.zdbgraph";
 
 /// What 0.6.0 and earlier wrote, and what a save removes once it has replaced
 /// them.
@@ -157,8 +161,7 @@ pub(crate) const DUMP_FILENAME: &str = "hnsw_index.zdbgraph";
 /// The completeness check in `persistence` reads the same two names, because a
 /// directory saved by 0.6.0 or earlier lists them under `files_included` and
 /// neither is required to reopen it.
-pub(crate) const LEGACY_DUMP_FILENAMES: [&str; 2] =
-    ["hnsw_index.hnsw.graph", "hnsw_index.hnsw.data"];
+pub const LEGACY_DUMP_FILENAMES: [&str; 2] = ["hnsw_index.hnsw.graph", "hnsw_index.hnsw.data"];
 
 /// `b"ZDBGRAPH"` read little-endian.
 const MAGIC: u64 = u64::from_le_bytes(*b"ZDBGRAPH");
@@ -701,11 +704,13 @@ where
         if path.exists() {
             match std::fs::remove_file(&path) {
                 Ok(()) => info!(
+                    target: LOG_TARGET,
                     operation = "save_hnsw_graph",
                     removed = legacy,
                     "Removed a graph dump written by an earlier release"
                 ),
                 Err(e) => warn!(
+                    target: LOG_TARGET,
                     operation = "save_hnsw_graph",
                     file = legacy,
                     error = %e,

@@ -64,7 +64,12 @@ enum NumericValue {
 /// filter compiles to `All` over its fields and nothing else about it changes.
 /// `Any` and `Not` have no form in the flat language and are reachable only
 /// through `$or` and `$not`.
-pub(crate) enum Filter {
+// `Field` carries a `FieldTest` and `Presence` a `Presence`, both `pub(crate)`.
+// A caller outside the crate hands a compiled filter to `matches_filter` and
+// to the column store and never reads a variant, so the two types stay
+// crate-private rather than widening for an interface nothing outside uses.
+#[allow(private_interfaces)]
+pub enum Filter {
     All(Vec<Filter>),
     Any(Vec<Filter>),
     Not(Box<Filter>),
@@ -161,7 +166,7 @@ pub(crate) enum Op {
 /// [`MAX_FILTER_DEPTH`]. What comes back evaluates against every record without
 /// failing, which is why `matches_filter` has no error channel and the
 /// traversal predicate needs none either.
-pub(crate) fn compile_filter(filter: &HashMap<String, Value>) -> Result<Filter, Error> {
+pub fn compile_filter(filter: &HashMap<String, Value>) -> Result<Filter, Error> {
     // The caller's mapping is a `HashMap`, whose iteration order varies per
     // process. Sorting fixes the order the compiled conjunction is evaluated
     // in, so two runs of one search short circuit at the same field. Nothing
@@ -381,7 +386,7 @@ fn describe(value: &Value) -> &'static str {
 /// It short circuits in both directions. A conjunction stops at the first
 /// branch that fails and a disjunction at the first that holds, which is what
 /// `Iterator::all` and `Iterator::any` do.
-pub(crate) fn matches_filter(metadata: &HashMap<String, Value>, filter: &Filter) -> bool {
+pub fn matches_filter(metadata: &HashMap<String, Value>, filter: &Filter) -> bool {
     match filter {
         Filter::All(branches) => branches
             .iter()
@@ -425,7 +430,7 @@ impl Filter {
     ///
     /// A field test never admits a record that lacks the field, so no leaf is
     /// unconditional and the recursion bottoms out at `false`.
-    pub(crate) fn matches_every_record(&self) -> bool {
+    pub fn matches_every_record(&self) -> bool {
         match self {
             Filter::All(branches) => branches.iter().all(Filter::matches_every_record),
             Filter::Any(branches) => branches.iter().any(Filter::matches_every_record),

@@ -12,13 +12,14 @@
 
 use super::{HNSWIndex, ParsedRecords};
 use crate::conversion::{python_dict_to_value_map, python_object_to_value};
-use crate::error::Error;
+use crate::PyEngineError;
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{error, trace};
+use zeusdb_vector_core::Error;
 impl HNSWIndex {
     /// Pure function for vector normalization
     fn normalize_vector(&self, vector: Vec<f32>) -> Vec<f32> {
@@ -328,7 +329,12 @@ impl HNSWIndex {
                 return self.process_vector_list(list, dict, parsed_vectors);
             } else if let Ok(np_array) = vectors_item.cast::<PyArray2<f32>>() {
                 // FIX: Handle NumPy with IDs and metadata
-                return self.parse_numpy_with_context(np_array, dict, parsed_vectors, errors);
+                return Ok(self.parse_numpy_with_context(
+                    np_array,
+                    dict,
+                    parsed_vectors,
+                    errors,
+                )?);
             }
         }
 
@@ -338,7 +344,12 @@ impl HNSWIndex {
                 return self.process_vector_list(list, dict, parsed_vectors);
             } else if let Ok(np_array) = embeddings_item.cast::<PyArray2<f32>>() {
                 // FIX: Handle NumPy with IDs and metadata
-                return self.parse_numpy_with_context(np_array, dict, parsed_vectors, errors);
+                return Ok(self.parse_numpy_with_context(
+                    np_array,
+                    dict,
+                    parsed_vectors,
+                    errors,
+                )?);
             }
         }
 
@@ -426,7 +437,7 @@ impl HNSWIndex {
         dict: &Bound<PyDict>,
         parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
         errors: &mut Vec<String>,
-    ) -> PyResult<()> {
+    ) -> Result<(), PyEngineError> {
         let readonly = np_array.readonly();
         let shape = readonly.shape();
 
@@ -690,7 +701,7 @@ impl HNSWIndex {
     }
 
     /// Extract a single vector from various Python types (enhanced)
-    fn extract_single_vector(&self, data: &Bound<PyAny>) -> PyResult<Vec<f32>> {
+    fn extract_single_vector(&self, data: &Bound<PyAny>) -> Result<Vec<f32>, PyEngineError> {
         let vector = if let Ok(array1d) = data.cast::<PyArray1<f32>>() {
             // NumPy 1D array
             array1d.readonly().as_slice()?.to_vec()

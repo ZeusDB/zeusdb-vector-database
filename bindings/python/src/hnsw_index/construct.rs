@@ -7,10 +7,7 @@
 
 use super::locks::{MutexAt, RwLockAt};
 use super::{HNSWIndex, QuantizationConfig, StorageMode, MAX_LAYER};
-use crate::columns::{validate_indexed_fields, ColumnStore};
-use crate::error::Error;
-use crate::graph::VectorGraph;
-use crate::pq::PQ;
+use crate::PyEngineError;
 use chrono::Utc;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -19,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace};
+use zeusdb_vector_core::{validate_indexed_fields, ColumnStore, Error, VectorGraph, PQ};
 /// Widest `dim` a caller may declare, and the widest a saved index may name.
 ///
 /// `dim` is the width of one vector buffer, so sizing that buffer from the
@@ -451,7 +449,7 @@ impl HNSWIndex {
         expected_size: usize,
         quantization_config: Option<&Bound<PyDict>>,
         indexed_fields: Vec<String>,
-    ) -> PyResult<Self> {
+    ) -> Result<Self, PyEngineError> {
         let start_time = Instant::now();
 
         // Validation of parameters. The rules live in

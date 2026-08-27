@@ -42,14 +42,14 @@
 //! reaches for any metadata at all. A filter naming no declared field, and one
 //! whose shape leaves no usable bound, take the walk described below, which is
 //! what every filtered search did before the columns existed. See
-//! [`crate::columns::ColumnStore::bound`] for which shapes bound and which do
-//! not.
+//! `ColumnStore::bound` in `zeusdb_vector_core` for which shapes bound and
+//! which do not.
 //!
 //! **The walk is what made a filtered search expensive.** It costs about 250
 //! nanoseconds a record, so a selective filter over 100,000 records cost about
 //! 25 milliseconds where an unfiltered search costs 0.3 to 1.2. See
 //! [`FULL_SCAN_THRESHOLD`] for the measurements and
-//! [`crate::columns`] for what replaces it.
+//! the column store in `zeusdb_vector_core` for what replaces it.
 //!
 //! **Lock order.** Every path takes `rev_map` before the graph and the storage
 //! maps after it, which is the order declared on `HNSWIndex` in the parent
@@ -68,15 +68,12 @@
 //! long read hold delays the next reader as well as the writer.
 
 use super::{HNSWIndex, StorageMode, VectorGraph};
-use crate::columns::{Bitmap, ColumnStore, Selection};
 use crate::conversion::value_map_to_python;
-use crate::error::Error;
-use crate::filter::{matches_filter, Filter};
-use crate::graph::GraphHit;
 use crate::rerank::{
     prepare_reconstruction, raw_distance_fn, reconstruction_needs_unit, rescore_candidate,
     take_best, RawVectors, RerankPlan, SearchParams,
 };
+use crate::PyEngineError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rayon::prelude::*;
@@ -85,6 +82,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, instrument, trace, warn};
+use zeusdb_vector_core::{matches_filter, Bitmap, ColumnStore, Error, Filter, GraphHit, Selection};
 /// Records a filtered search may match before it stops scanning and traverses
 /// the graph instead.
 ///
@@ -815,7 +813,7 @@ impl HNSWIndex {
         filter_conditions: Option<&Filter>,
         params: SearchParams,
         py: Python<'_>,
-    ) -> PyResult<Vec<Py<PyDict>>> {
+    ) -> Result<Vec<Py<PyDict>>, PyEngineError> {
         let search_results = py.detach(|| -> Result<QueryHits, Error> {
             // Six read guards, held for the whole search, in the order every
             // path in the crate takes them: `id_map < rev_map < hnsw <
@@ -864,7 +862,7 @@ impl HNSWIndex {
             )
         })?;
 
-        self.hits_to_python(search_results, py)
+        Ok(self.hits_to_python(search_results, py)?)
     }
 
     /// Internal batch search method for multiple query vectors
@@ -882,7 +880,7 @@ impl HNSWIndex {
         filter_conditions: Option<&Filter>,
         params: SearchParams,
         py: Python<'_>,
-    ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
+    ) -> Result<Vec<Vec<Py<PyDict>>>, PyEngineError> {
         let start_time = Instant::now();
 
         // Validate all vectors have correct dimension
@@ -964,7 +962,7 @@ impl HNSWIndex {
         filter_conditions: Option<&Filter>,
         params: SearchParams,
         py: Python<'_>,
-    ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
+    ) -> Result<Vec<Vec<Py<PyDict>>>, PyEngineError> {
         let rust_results = py.detach(|| -> Result<Vec<QueryHits>, Error> {
             // Six read guards, in the one documented order, held across every
             // query in the batch. See `single_search_internal` for why `id_map`
@@ -1020,7 +1018,7 @@ impl HNSWIndex {
             Ok(all_results)
         })?;
 
-        self.batch_hits_to_python(rust_results, py)
+        Ok(self.batch_hits_to_python(rust_results, py)?)
     }
 
     /// Parallel batch processing (for larger batches)
@@ -1030,7 +1028,7 @@ impl HNSWIndex {
         filter_conditions: Option<&Filter>,
         params: SearchParams,
         py: Python<'_>,
-    ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
+    ) -> Result<Vec<Vec<Py<PyDict>>>, PyEngineError> {
         let span = tracing::Span::current();
         let rust_results = py.detach(|| -> Result<Vec<QueryHits>, Error> {
             let results: Result<Vec<QueryHits>, Error> = vectors
@@ -1090,7 +1088,7 @@ impl HNSWIndex {
             results
         })?;
 
-        self.batch_hits_to_python(rust_results, py)
+        Ok(self.batch_hits_to_python(rust_results, py)?)
     }
 
     /// Raw search without Python objects (for benchmarking)

@@ -9,14 +9,12 @@
 //! calibration; see `hnsw_index::search::rerank_plan` and
 //! `hnsw_index::training::calibrate_rerank`.
 
-use crate::distance::{CosineDist, DotDist, L1Dist, L2Dist};
-use crate::graph::{Distance, VectorGraph};
-use crate::pq::PQ;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+use zeusdb_vector_core::{CosineDist, Distance, DotDist, L1Dist, L2Dist, VectorGraph, PQ};
 /// The three terms of the default rerank fetch.
 ///
 /// A rerank fetch has to be deep enough to contain the true neighbours in the
@@ -717,7 +715,7 @@ pub(crate) fn prepare_reconstruction(needs_unit: bool, mut reconstructed: Vec<f3
 
 /// The raw vector distance for a space
 ///
-/// These are the same `crate::distance` implementations `VectorGraph::new_raw`
+/// These are the same `zeusdb_vector_core` distances `VectorGraph::new_raw`
 /// hands to a raw graph, so a rescored score is the number a raw index would
 /// have reported for the same pair rather than a second implementation of the
 /// same formula.
@@ -1187,11 +1185,9 @@ pub(crate) fn take_best<T>(scored: &mut Vec<(T, f32)>, top_k: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distance::CosineDist;
-    use crate::pq::PQ;
-    use crate::test_vectors::clustered;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use zeusdb_vector_core::{test_support::clustered, CosineDist, PQ};
 
     /// The rescored score has to be the number a raw index would report, not a
     /// second implementation of the same formula that happens to agree today.

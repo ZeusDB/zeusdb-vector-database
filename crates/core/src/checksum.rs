@@ -103,7 +103,7 @@ impl Checksum {
 }
 
 /// Checksum a slice that is already in memory, being the header.
-pub(crate) fn checksum_of(bytes: &[u8]) -> u64 {
+pub fn checksum_of(bytes: &[u8]) -> u64 {
     let mut sum = Checksum::new();
     sum.write(bytes);
     sum.finish()

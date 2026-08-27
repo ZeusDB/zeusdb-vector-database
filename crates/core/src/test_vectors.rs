@@ -19,7 +19,7 @@ use rand::{Rng, SeedableRng};
 /// same codes, their distance is genuinely zero, and the graph partially
 /// collapses for a reason that has nothing to do with what these tests
 /// assert.
-pub(crate) fn clustered(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
+pub fn clustered(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
     let mut rng = SeededRng::seed_from_u64(seed);
     let gauss = |rng: &mut SeededRng| {
         let u: f32 = rng.random::<f32>().max(1e-12);

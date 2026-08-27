@@ -17,6 +17,8 @@ publish = false
 # This one is the crate name. It is the root of every module path in the
 # crate, and so the `target` every log record the engine emits carries and the
 # prefix a `RUST_LOG` directive names, so it stays `zeusdb_vector_database`.
+# A module compiled in another crate of the workspace names this target
+# explicitly; see the crate root of zeusdb-vector-core.
 #
 # The extension module the wheel ships is `_engine`, named by the
 # `#[pymodule]` attribute in src/lib.rs and by module-name in pyproject.toml,
@@ -49,16 +51,16 @@ default = ["extension-module"]
 extension-module = ["pyo3/extension-module"]
 
 # Every version is the workspace's, declared once in the root Cargo.toml with
-# the reason for each pin.
+# the reason for each pin. The engine itself is zeusdb-vector-core, taken by
+# path, and this crate holds what touches Python.
 [dependencies]
+zeusdb-vector-core = { workspace = true }
 pyo3 = { workspace = true }
 numpy = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 rayon = { workspace = true }
 rand = { workspace = true }
-rand_chacha = { workspace = true }
-wide = { workspace = true }
 bincode = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
@@ -66,4 +68,8 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+# The engine again, with its test data and test graph turned on, for the
+# tests under src/hnsw_index/ and in rerank.rs that measure against them.
+# cargo applies a dev-dependency's features to this crate's test targets and
+# to nothing else, so the wheel is built without them.
+zeusdb-vector-core = { workspace = true, features = ["test-support"] }

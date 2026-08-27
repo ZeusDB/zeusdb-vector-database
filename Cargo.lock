@@ -1047,6 +1047,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeusdb-vector-core"
+version = "0.8.0"
+dependencies = [
+ "rand",
+ "rand_chacha",
+ "rayon",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "wide",
+]
+
+[[package]]
 name = "zeusdb-vector-python"
 version = "0.8.0"
 dependencies = [
@@ -1055,15 +1068,13 @@ dependencies = [
  "numpy",
  "pyo3",
  "rand",
- "rand_chacha",
  "rayon",
  "serde",
  "serde_json",
- "tempfile",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "wide",
+ "zeusdb-vector-core",
 ]
 
 [[package]]

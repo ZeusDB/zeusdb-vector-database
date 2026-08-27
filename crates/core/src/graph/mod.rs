@@ -55,6 +55,15 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, trace, warn};
 
+/// The target every record this module emits carries.
+///
+/// It is this module's path under `zeusdb_vector_database`, the package a
+/// user configures logging by, rather than `module_path!()`, which would name
+/// this crate. The filter directive the binding installs and a `RUST_LOG`
+/// directive both match a target by prefix, so a record carrying this crate's
+/// name would fall outside both and be dropped. See the crate root.
+const LOG_TARGET: &str = "zeusdb_vector_database::graph";
+
 pub(crate) mod dump;
 pub(crate) mod store;
 
@@ -72,6 +81,10 @@ pub(crate) mod test_graph;
 // rather than with the enumerated damage cases written by hand.
 #[cfg(test)]
 mod fuzz;
+// The graph and ADC guards, which build a graph directly rather than through
+// an index.
+#[cfg(test)]
+mod guard_tests;
 // The traversal, written once against an accessor.
 #[cfg_attr(not(test), allow(dead_code))]
 mod traverse;
@@ -95,7 +108,7 @@ use traverse::LAYERS;
 /// The shape is the one the trait it replaced had, unchanged, because changing
 /// it would have been a second edit landing at the same time as the deletion
 /// and there is nothing wrong with it.
-pub(crate) trait Distance<T> {
+pub trait Distance<T> {
     /// The distance from `va` to `vb`. Both slices are the graph's width.
     fn eval(&self, va: &[T], vb: &[T]) -> f32;
 }
@@ -171,7 +184,7 @@ fn assert_unit_for_cosine(_vector: &[f32], _site: &str) {
 /// distance as the score when no rerank is in play, so those two fields are
 /// what the seam carries and nothing else.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct GraphHit {
+pub struct GraphHit {
     /// The id the record was inserted under, which `rev_map` resolves.
     pub internal_id: usize,
     /// Distance from the query on whatever scale the graph was built with.
@@ -294,12 +307,14 @@ where
             (Some(store), Some(values)) => store.push(values),
             (None, None) => {}
             (Some(_), None) => error!(
+                target: LOG_TARGET,
                 operation = "vector_insert",
                 error = "invalid_operation",
                 reason = "quantized_with_raw_insert_carried_no_raw_vector",
                 "A quantized graph keeping raw vectors was handed a record without one"
             ),
             (None, Some(_)) => error!(
+                target: LOG_TARGET,
                 operation = "vector_insert",
                 error = "invalid_operation",
                 reason = "graph_keeps_no_raw_vectors",
@@ -327,7 +342,13 @@ where
 /// `u8` codes. They differ in the distance they were built with, which the
 /// graph takes as a type parameter, so the enum is what stands in for a single
 /// graph type.
-pub(crate) enum VectorGraph {
+// The variants carry `Backend`, which is `pub(crate)`. A caller outside the
+// crate can bind one by matching a variant and can do nothing with it, since
+// every method on it is crate-private, so the type stays crate-private rather
+// than widening for an interface nothing outside uses. The binding never
+// matches a variant; it goes through the methods below.
+#[allow(private_interfaces)]
+pub enum VectorGraph {
     // Raw vector variants
     Cosine(Backend<f32, CosineDist>),
     L2(Backend<f32, L2Dist>),
@@ -348,7 +369,7 @@ pub(crate) enum VectorGraph {
 /// raw record and a quantized graph is stated once per phase instead of four
 /// times.
 #[derive(Clone, Copy)]
-pub(crate) enum Record<'a> {
+pub enum Record<'a> {
     /// A raw vector, already normalized for the index space.
     Raw(&'a [f32]),
     /// The quantized codes of one record, one byte per subvector, and the raw
@@ -365,7 +386,7 @@ pub(crate) enum Record<'a> {
 }
 
 impl VectorGraph {
-    pub(crate) fn new_raw(
+    pub fn new_raw(
         space: &str,
         dim: usize,
         m: usize,
@@ -374,6 +395,7 @@ impl VectorGraph {
         ef_construction: usize,
     ) -> Self {
         info!(
+            target: LOG_TARGET,
             operation = "hnsw_creation",
             space = space,
             dim = dim,
@@ -404,6 +426,7 @@ impl VectorGraph {
             "dot" => raw!(Dot, DotDist {}),
             _ => {
                 error!(
+                    target: LOG_TARGET,
                     operation = "hnsw_creation",
                     space = space,
                     error = "invalid_space",
@@ -414,6 +437,7 @@ impl VectorGraph {
                 // load path also does, so the two construction paths agree on
                 // what an unrecognised space means.
                 warn!(
+                    target: LOG_TARGET,
                     operation = "hnsw_creation",
                     space = space,
                     fallback = "cosine",
@@ -424,7 +448,7 @@ impl VectorGraph {
         }
     }
 
-    pub(crate) fn new_pq(
+    pub fn new_pq(
         space: &str,
         m: usize,
         expected_size: usize,
@@ -436,6 +460,7 @@ impl VectorGraph {
         // what states its width rather than the index's declared dimension.
         let dim = pq.subvectors();
         info!(
+            target: LOG_TARGET,
             operation = "hnsw_creation",
             space = space,
             m = m,
@@ -476,12 +501,14 @@ impl VectorGraph {
             // behind the refusal.
             _ => {
                 error!(
+                    target: LOG_TARGET,
                     operation = "hnsw_creation",
                     space = space,
                     error = "invalid_space",
                     "Invalid distance space provided for PQ"
                 );
                 warn!(
+                    target: LOG_TARGET,
                     operation = "hnsw_creation",
                     space = space,
                     fallback = "cosine",
@@ -503,7 +530,7 @@ impl VectorGraph {
     ///
     /// It is taken by generic reference rather than as a trait object so the
     /// closure the caller passes is monomorphised into the traversal.
-    pub(crate) fn search<F>(
+    pub fn search<F>(
         &self,
         query: &[f32],
         k: usize,
@@ -542,7 +569,7 @@ impl VectorGraph {
     /// Number of nodes the graph holds, which is the number of insertions it has
     /// taken. It exceeds the live record count by exactly the number of nodes
     /// that removal and overwrite have stranded.
-    pub(crate) fn nb_points(&self) -> usize {
+    pub fn nb_points(&self) -> usize {
         match self {
             VectorGraph::Cosine(b) => b.graph.nb_points(),
             VectorGraph::L2(b) => b.graph.nb_points(),
@@ -569,7 +596,7 @@ impl VectorGraph {
     /// graph commits more than this names.
     /// Bytes the adjacency, the levels, the origin ids and their inverse ask
     /// for, with no vector counted.
-    pub(crate) fn links_memory_bytes(&self) -> usize {
+    pub fn links_memory_bytes(&self) -> usize {
         match self {
             VectorGraph::Cosine(b) => b.graph.memory_bytes(),
             VectorGraph::L2(b) => b.graph.memory_bytes(),
@@ -583,7 +610,7 @@ impl VectorGraph {
 
     /// Bytes the store the graph scores against asks for, being the raw vectors
     /// on a raw graph and the codes on a quantized one.
-    pub(crate) fn store_memory_bytes(&self) -> usize {
+    pub fn store_memory_bytes(&self) -> usize {
         match self {
             VectorGraph::Cosine(b) => b.store.memory_bytes(),
             VectorGraph::L2(b) => b.store.memory_bytes(),
@@ -629,7 +656,7 @@ impl VectorGraph {
     }
 
     /// The internal id one node was inserted under.
-    pub(crate) fn origin_id_at(&self, node: u32) -> usize {
+    pub fn origin_id_at(&self, node: u32) -> usize {
         match self {
             VectorGraph::Cosine(b) => b.graph.origin_id_of(node),
             VectorGraph::L2(b) => b.graph.origin_id_of(node),
@@ -648,7 +675,7 @@ impl VectorGraph {
     /// at all. `None` where the index keeps no raw vector for that record,
     /// which is every record of a trained `quantized_only` index and any id
     /// this graph never took.
-    pub(crate) fn raw_vector(&self, internal_id: usize) -> Option<&[f32]> {
+    pub fn raw_vector(&self, internal_id: usize) -> Option<&[f32]> {
         let node = self.node_of(internal_id)?;
         match self {
             VectorGraph::Cosine(b) => b.store.try_get(node),
@@ -662,7 +689,7 @@ impl VectorGraph {
     }
 
     /// Whether this graph holds a raw vector for every node it carries.
-    pub(crate) fn holds_raw(&self) -> bool {
+    pub fn holds_raw(&self) -> bool {
         match self {
             VectorGraph::Cosine(_)
             | VectorGraph::L2(_)
@@ -678,7 +705,7 @@ impl VectorGraph {
     ///
     /// A raw graph refuses, because its own store already is the raw vectors
     /// and a second one would be the duplication this replaced.
-    pub(crate) fn open_raw_store(&mut self, dim: usize, records: usize) -> Result<(), String> {
+    pub fn open_raw_store(&mut self, dim: usize, records: usize) -> Result<(), String> {
         // The one construction site of a store that does not clamp its width,
         // because the two graph constructors do and this takes the index's
         // declared dimension instead. That dimension is validated where an
@@ -712,11 +739,7 @@ impl VectorGraph {
     /// whose node numbering is its own. The raws are re-addressed rather than
     /// re-derived, so nothing is quantized, reconstructed or lost, and a record
     /// the source cannot supply is an error rather than a gap.
-    pub(crate) fn adopt_raw_from(
-        &mut self,
-        source: &VectorGraph,
-        dim: usize,
-    ) -> Result<usize, String> {
+    pub fn adopt_raw_from(&mut self, source: &VectorGraph, dim: usize) -> Result<usize, String> {
         let nodes = self.nb_points();
         self.open_raw_store(dim, nodes)?;
         for node in 0..nodes as u32 {
@@ -745,7 +768,7 @@ impl VectorGraph {
     /// For the loader, which fills the store in node order after the graph has
     /// come back from its dump. A raw graph refuses, for the reason
     /// `open_raw_store` refuses.
-    pub(crate) fn push_raw_vector(&mut self, values: &[f32]) -> Result<(), String> {
+    pub fn push_raw_vector(&mut self, values: &[f32]) -> Result<(), String> {
         match self {
             VectorGraph::Cosine(_)
             | VectorGraph::L2(_)
@@ -765,7 +788,7 @@ impl VectorGraph {
 
     /// Raw vectors this graph holds, which is its node count where it holds
     /// them at all.
-    pub(crate) fn raw_count(&self) -> usize {
+    pub fn raw_count(&self) -> usize {
         match self {
             VectorGraph::Cosine(b) => b.store.len(),
             VectorGraph::L2(b) => b.store.len(),
@@ -778,7 +801,7 @@ impl VectorGraph {
     }
 
     /// Values a stored raw vector holds, where this graph holds any.
-    pub(crate) fn raw_dim(&self) -> Option<usize> {
+    pub fn raw_dim(&self) -> Option<usize> {
         match self {
             VectorGraph::Cosine(b) => Some(b.store.dim()),
             VectorGraph::L2(b) => Some(b.store.dim()),
@@ -795,7 +818,7 @@ impl VectorGraph {
     ///
     /// What the slack is and why a built graph carries it where a loaded one
     /// does not is on `MutableGraph::shrink_to_fit`.
-    pub(crate) fn shrink_to_fit(&mut self) -> usize {
+    pub fn shrink_to_fit(&mut self) -> usize {
         let before = self.store_memory_bytes() + self.raw_memory_bytes();
         let links = match self {
             VectorGraph::Cosine(b) => {
@@ -825,7 +848,7 @@ impl VectorGraph {
         links + before.saturating_sub(self.store_memory_bytes() + self.raw_memory_bytes())
     }
 
-    pub(crate) fn is_quantized(&self) -> bool {
+    pub fn is_quantized(&self) -> bool {
         matches!(
             self,
             VectorGraph::CosinePQ(_) | VectorGraph::L2PQ(_) | VectorGraph::L1PQ(_)
@@ -868,7 +891,7 @@ impl VectorGraph {
     /// mutator at a time and every mutating entry point takes it, so nothing can
     /// change the graph between the two phases. `install` asserts the node count
     /// it planned against rather than trusting that.
-    pub(crate) fn plan(&self, record: Record<'_>) -> Option<Planned> {
+    pub fn plan(&self, record: Record<'_>) -> Option<Planned> {
         match (self, record) {
             (VectorGraph::Cosine(b), Record::Raw(v)) => {
                 assert_unit_for_cosine(v, "insert");
@@ -882,6 +905,7 @@ impl VectorGraph {
             | (VectorGraph::L1PQ(b), Record::Codes { codes, .. }) => Some(b.plan(codes)),
             (_, Record::Raw(_)) => {
                 error!(
+                    target: LOG_TARGET,
                     operation = "vector_insert",
                     error = "invalid_operation",
                     reason = "cannot_insert_raw_vectors_into_pq_index",
@@ -891,6 +915,7 @@ impl VectorGraph {
             }
             (_, Record::Codes { .. }) => {
                 error!(
+                    target: LOG_TARGET,
                     operation = "pq_codes_insert",
                     error = "invalid_operation",
                     reason = "cannot_insert_pq_codes_into_raw_index",
@@ -905,7 +930,7 @@ impl VectorGraph {
     ///
     /// Runs under the write guard, and takes the plan the read guarded phase
     /// produced. The record must be the one that was planned.
-    pub(crate) fn install(&mut self, record: Record<'_>, id: usize, planned: Planned) {
+    pub fn install(&mut self, record: Record<'_>, id: usize, planned: Planned) {
         match (self, record) {
             (VectorGraph::Cosine(b), Record::Raw(v)) => b.install(v, id, planned),
             (VectorGraph::L2(b), Record::Raw(v)) => b.install(v, id, planned),
@@ -920,6 +945,7 @@ impl VectorGraph {
             // Unreachable, because a plan the element type refused is `None`
             // and the caller then installs nothing.
             _ => error!(
+                target: LOG_TARGET,
                 operation = "vector_insert",
                 error = "invalid_operation",
                 reason = "element_type_mismatch_at_install",
@@ -935,7 +961,7 @@ impl VectorGraph {
     /// the persistence rebuild, each build a fresh graph off to the side and
     /// swap it in under one write guard, so the graph they insert into is a
     /// local nobody else can reach. They need no phase split and no lock.
-    pub(crate) fn insert(&mut self, vector: &[f32], id: usize) {
+    pub fn insert(&mut self, vector: &[f32], id: usize) {
         if let Some(planned) = self.plan(Record::Raw(vector)) {
             self.install(Record::Raw(vector), id, planned);
         }
@@ -945,8 +971,9 @@ impl VectorGraph {
     /// one-time structural rebuild, at training completion, in `compact` or in
     /// the persistence loader, and each of them sorts its batch by internal id
     /// so that two rebuilds of the same records wire the same graph.
-    pub(crate) fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize)]) -> Result<(), String> {
+    pub fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize)]) -> Result<(), String> {
         debug!(
+            target: LOG_TARGET,
             operation = "batch_insert_pq",
             batch_size = data.len(),
             "Starting PQ batch insertion"
@@ -984,9 +1011,10 @@ impl VectorGraph {
     /// because it appended a random suffix rather than overwriting when a
     /// memory mapped data file was active. Nothing maps anything here and the
     /// file is replaced outright, so the name is a constant.
-    pub(crate) fn dump(&self, dir: &Path) -> Result<String, String> {
+    pub fn dump(&self, dir: &Path) -> Result<String, String> {
         let kind = self.kind();
         trace!(
+            target: LOG_TARGET,
             operation = "save_hnsw_graph",
             distance_type = kind.label(),
             "Writing the graph dump"
@@ -1016,7 +1044,7 @@ impl VectorGraph {
 /// splitting them into two parameters put `restore_graph` over clippy's
 /// argument count.
 #[derive(Clone, Copy)]
-pub(crate) struct DumpBounds {
+pub struct DumpBounds {
     /// The live record count. The graph holds at least this many nodes and
     /// holds more whenever a removal or an overwrite has stranded one.
     pub min_nodes: usize,
@@ -1068,7 +1096,7 @@ pub(crate) struct DumpBounds {
 /// degree. That is what the vendored reload did through
 /// `new_with_absolute_scale`, so it is a match rather than a change. See
 /// [`Backend::restored`].
-pub(crate) fn restore_graph(
+pub fn restore_graph(
     dir: &Path,
     space: &str,
     m: usize,

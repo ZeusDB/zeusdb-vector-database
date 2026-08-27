@@ -83,7 +83,7 @@ const NO_FILTER: Option<&NoFilter> = None;
 /// Nothing here borrows the graph. That is the property that lets the read
 /// guard drop between the phases, and it is why the lists are node indices and
 /// distances rather than slices into the arenas.
-pub(crate) struct Insertion {
+pub struct Insertion {
     /// The level drawn for this point, before either phase ran.
     level: usize,
     /// Nodes the graph held when the plan was made.
@@ -110,7 +110,7 @@ pub(crate) struct Insertion {
 /// vendored insert reads its entry point, finds `None` and returns before it
 /// descends. Which of the two an insertion is is therefore decided under the
 /// read guard along with everything else, and phase two carries it out.
-pub(crate) enum Planned {
+pub enum Planned {
     /// The graph held no point, so the insertion files a node and takes no
     /// edges.
     First { level: usize },

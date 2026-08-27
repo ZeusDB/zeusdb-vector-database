@@ -68,7 +68,6 @@
 //! export ZEUSDB_LOG_ROTATION=daily        # Writes logs/zeusdb.log.2026-08-03
 //! ```
 
-use crate::error::Error;
 use pyo3::prelude::*;
 use std::io;
 use std::io::IsTerminal;
@@ -82,7 +81,9 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
     EnvFilter, Layer, Registry,
 };
+use zeusdb_vector_core::Error;
 
+use crate::PyEngineError;
 use tracing_subscriber::fmt::format::FmtSpan;
 
 static INIT: Once = Once::new();
@@ -354,7 +355,7 @@ pub fn py_init_file_logging(
     log_dir: String,
     level: Option<String>,
     file_prefix: Option<String>,
-) -> PyResult<bool> {
+) -> Result<bool, PyEngineError> {
     // Input validation
     if log_dir.trim().is_empty() {
         return Err(Error::LogDirEmpty.into());

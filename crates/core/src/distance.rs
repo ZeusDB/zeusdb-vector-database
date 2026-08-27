@@ -639,7 +639,7 @@ mod feature {
 
 /// Inner product of two vectors.
 #[inline]
-pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(target_arch = "x86_64")]
     if feature::avx() {
@@ -651,7 +651,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 /// Sum of absolute differences.
 #[inline]
-pub fn l1(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn l1(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(target_arch = "x86_64")]
     if feature::avx() {
@@ -675,7 +675,7 @@ fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
 
 /// Euclidean distance, square root taken.
 #[inline]
-pub fn l2(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn l2(a: &[f32], b: &[f32]) -> f32 {
     l2_squared(a, b).sqrt()
 }
 
@@ -705,7 +705,7 @@ pub fn l2(a: &[f32], b: &[f32]) -> f32 {
 /// asserted on the same input and aborted the process instead. Neither case is
 /// reachable from `add` or `search`, both of which reject non-finite input.
 #[inline]
-pub fn cosine_normalized(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn cosine_normalized(a: &[f32], b: &[f32]) -> f32 {
     let d = 1.0 - dot(a, b);
     // Not `d.max(0.0)`, which would swallow a NaN. A pair of identical unit
     // vectors can accumulate a dot product just above one, and reporting that as
@@ -962,19 +962,19 @@ mod tests {
 
         #[inline]
         #[allow(clippy::needless_range_loop)]
-        pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+        pub(super) fn dot(a: &[f32], b: &[f32]) -> f32 {
             blocked_loop!(a, b, x, y, x * y)
         }
 
         #[inline]
         #[allow(clippy::needless_range_loop)]
-        pub fn l1(a: &[f32], b: &[f32]) -> f32 {
+        pub(super) fn l1(a: &[f32], b: &[f32]) -> f32 {
             blocked_loop!(a, b, x, y, (x - y).abs())
         }
 
         #[inline]
         #[allow(clippy::needless_range_loop)]
-        pub fn l2(a: &[f32], b: &[f32]) -> f32 {
+        pub(super) fn l2(a: &[f32], b: &[f32]) -> f32 {
             blocked_loop!(a, b, x, y, {
                 let d = x - y;
                 d * d
@@ -983,7 +983,7 @@ mod tests {
         }
 
         #[inline]
-        pub fn cosine_normalized(a: &[f32], b: &[f32]) -> f32 {
+        pub(super) fn cosine_normalized(a: &[f32], b: &[f32]) -> f32 {
             let d = 1.0 - dot(a, b);
             if d < 0.0 {
                 0.0
@@ -994,7 +994,7 @@ mod tests {
 
         /// The previous shape wearing the trait, so it can build a graph.
         #[derive(Default, Copy, Clone, Debug)]
-        pub struct PrevCosine;
+        pub(super) struct PrevCosine;
 
         impl crate::graph::Distance<f32> for PrevCosine {
             #[inline]
@@ -1004,7 +1004,7 @@ mod tests {
         }
 
         #[derive(Default, Copy, Clone, Debug)]
-        pub struct PrevL2;
+        pub(super) struct PrevL2;
 
         impl crate::graph::Distance<f32> for PrevL2 {
             #[inline]
@@ -1014,7 +1014,7 @@ mod tests {
         }
 
         #[derive(Default, Copy, Clone, Debug)]
-        pub struct PrevL1;
+        pub(super) struct PrevL1;
 
         impl crate::graph::Distance<f32> for PrevL1 {
             #[inline]
@@ -1615,31 +1615,31 @@ mod tests {
             dot_avx, dot_baseline, l1_avx, l1_baseline, l2_squared_avx, l2_squared_baseline,
         };
 
-        pub fn base_dot(a: &[f32], b: &[f32]) -> f32 {
+        pub(super) fn base_dot(a: &[f32], b: &[f32]) -> f32 {
             dot_baseline(a, b)
         }
 
-        pub fn avx_dot(a: &[f32], b: &[f32]) -> f32 {
+        pub(super) fn avx_dot(a: &[f32], b: &[f32]) -> f32 {
             unsafe { dot_avx(a, b) }
         }
 
-        pub fn base_l1(a: &[f32], b: &[f32]) -> f32 {
+        pub(super) fn base_l1(a: &[f32], b: &[f32]) -> f32 {
             l1_baseline(a, b)
         }
 
-        pub fn avx_l1(a: &[f32], b: &[f32]) -> f32 {
+        pub(super) fn avx_l1(a: &[f32], b: &[f32]) -> f32 {
             unsafe { l1_avx(a, b) }
         }
 
-        pub fn base_l2(a: &[f32], b: &[f32]) -> f32 {
+        pub(super) fn base_l2(a: &[f32], b: &[f32]) -> f32 {
             l2_squared_baseline(a, b).sqrt()
         }
 
-        pub fn avx_l2(a: &[f32], b: &[f32]) -> f32 {
+        pub(super) fn avx_l2(a: &[f32], b: &[f32]) -> f32 {
             unsafe { l2_squared_avx(a, b) }.sqrt()
         }
 
-        pub fn base_cosine(a: &[f32], b: &[f32]) -> f32 {
+        pub(super) fn base_cosine(a: &[f32], b: &[f32]) -> f32 {
             let d = 1.0 - base_dot(a, b);
             if d < 0.0 {
                 0.0
@@ -1648,7 +1648,7 @@ mod tests {
             }
         }
 
-        pub fn avx_cosine(a: &[f32], b: &[f32]) -> f32 {
+        pub(super) fn avx_cosine(a: &[f32], b: &[f32]) -> f32 {
             let d = 1.0 - avx_dot(a, b);
             if d < 0.0 {
                 0.0
@@ -1660,7 +1660,7 @@ mod tests {
         macro_rules! wear_the_trait {
             ($name:ident, $f:path) => {
                 #[derive(Default, Copy, Clone, Debug)]
-                pub struct $name;
+                pub(super) struct $name;
 
                 impl crate::graph::Distance<f32> for $name {
                     #[inline]

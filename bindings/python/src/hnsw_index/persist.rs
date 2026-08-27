@@ -8,8 +8,6 @@
 
 use super::locks::{order, ReadGuard};
 use super::{HNSWIndex, QuantizationConfig, StorageMode, MAX_LAYER};
-use crate::error::Error;
-use crate::graph::{restore_graph, DumpBounds, VectorGraph};
 use crate::rerank::RawVectors;
 use pyo3::prelude::*;
 use serde_json::Value;
@@ -19,6 +17,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
+use zeusdb_vector_core::{restore_graph, DumpBounds, Error, VectorGraph};
 /// Set to any non-empty value other than `0` to skip the saved graph and
 /// rebuild it by re-inserting every record.
 ///
@@ -321,7 +320,7 @@ impl HNSWIndex {
         // pass. A directory written before the manifest carried lengths records
         // none, and nothing is checked.
         if let Some(expected) = recorded_bytes {
-            let found = std::fs::metadata(dir.join(crate::graph::dump::DUMP_FILENAME))
+            let found = std::fs::metadata(dir.join(zeusdb_vector_core::DUMP_FILENAME))
                 .map(|meta| meta.len())
                 .unwrap_or(0);
             if found != expected {
@@ -549,7 +548,7 @@ impl HNSWIndex {
     }
 
     /// Set PQ instance (for persistence loading only)
-    pub(crate) fn set_pq(&mut self, pq: Option<Arc<crate::pq::PQ>>) {
+    pub(crate) fn set_pq(&mut self, pq: Option<Arc<zeusdb_vector_core::PQ>>) {
         self.pq = pq;
     }
 
@@ -801,7 +800,7 @@ impl HNSWIndex {
     }
 
     /// Get reference to the PQ instance
-    pub fn get_pq(&self) -> Option<&Arc<crate::pq::PQ>> {
+    pub fn get_pq(&self) -> Option<&Arc<zeusdb_vector_core::PQ>> {
         self.pq.as_ref()
     }
 

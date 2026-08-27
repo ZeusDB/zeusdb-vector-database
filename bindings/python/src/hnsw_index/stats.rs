@@ -7,7 +7,6 @@
 //! here.
 
 use super::{HNSWIndex, StorageMode};
-use crate::error::Error;
 use crate::rerank::{default_rerank_fetch, RERANK_CALIBRATION_PAGES, RERANK_CALIBRATION_TOP_K};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -16,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, info};
+use zeusdb_vector_core::Error;
 
 /// Control bytes a hashbrown table allocates past its last bucket.
 ///

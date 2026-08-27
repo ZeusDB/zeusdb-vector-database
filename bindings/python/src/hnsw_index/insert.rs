@@ -8,16 +8,15 @@
 
 use super::locks::{order, WriteGuard};
 use super::{HNSWIndex, ParsedRecords, StorageMode, MAX_LAYER};
-use crate::columns::{Bitmap, ColumnStore, Selection};
-use crate::error::Error;
-use crate::filter::{matches_filter, Filter};
-use crate::graph::{Record, VectorGraph};
 use crate::rerank::RawVectors;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
+use zeusdb_vector_core::{
+    matches_filter, Bitmap, ColumnStore, Error, Filter, Record, Selection, VectorGraph,
+};
 /// Multiple of `expected_size` at which an index warns that it has outgrown its
 /// declaration. Fires once per index.
 const EXPECTED_SIZE_OVERGROWTH_FACTOR: usize = 2;

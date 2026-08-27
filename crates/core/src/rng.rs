@@ -55,7 +55,7 @@
 
 /// The generator every seeded draw in the crate runs on. See the module doc for
 /// why it is named rather than taken from `StdRng`.
-pub(crate) type SeededRng = rand_chacha::ChaCha12Rng;
+pub type SeededRng = rand_chacha::ChaCha12Rng;
 
 #[cfg(test)]
 mod tests {

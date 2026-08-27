@@ -89,7 +89,7 @@ const GROUP_KEYS: [&str; 3] = ["$and", "$or", "$not"];
 /// that is 12.5 kilobytes, so a filter of a dozen leaves allocates less than
 /// the page it returns.
 #[derive(Clone)]
-pub(crate) struct Bitmap {
+pub struct Bitmap {
     words: Vec<u64>,
 }
 
@@ -110,13 +110,13 @@ impl Bitmap {
     /// Total over every `usize`, so the traversal predicate can ask it about a
     /// node the store has never heard of and get `false` rather than a panic.
     #[inline]
-    pub(crate) fn contains(&self, slot: usize) -> bool {
+    pub fn contains(&self, slot: usize) -> bool {
         self.words
             .get(slot >> 6)
             .is_some_and(|word| word >> (slot & 63) & 1 == 1)
     }
 
-    pub(crate) fn count(&self) -> usize {
+    pub fn count(&self) -> usize {
         self.words.iter().map(|w| w.count_ones() as usize).sum()
     }
 
@@ -154,7 +154,7 @@ impl Bitmap {
     }
 
     /// Every internal id in the set, in increasing order.
-    pub(crate) fn for_each<F: FnMut(usize)>(&self, mut visit: F) {
+    pub fn for_each<F: FnMut(usize)>(&self, mut visit: F) {
         self.for_each_while(|slot| {
             visit(slot);
             true
@@ -166,7 +166,7 @@ impl Bitmap {
     /// The bounded scan needs it. That scan gives up once too many records have
     /// matched, and a bound holding every slot in the store would otherwise be
     /// walked to the end after the give-up had already been decided.
-    pub(crate) fn for_each_while<F: FnMut(usize) -> bool>(&self, mut visit: F) {
+    pub fn for_each_while<F: FnMut(usize) -> bool>(&self, mut visit: F) {
         for (index, mut word) in self.words.iter().copied().enumerate() {
             while word != 0 {
                 if !visit(index * 64 + word.trailing_zeros() as usize) {
@@ -491,7 +491,7 @@ fn bound_pays(candidates: usize, live: usize) -> bool {
 /// reach, which for a conjunction is a candidate set the caller narrows and for
 /// a disjunction is usually nothing at all. See [`ColumnStore::bound`] for
 /// which shapes yield which.
-pub(crate) enum Selection<'f> {
+pub enum Selection<'f> {
     /// Exactly the records the filter matches. Nothing else has to be read.
     Exact(Bitmap),
     /// A superset of the records the filter matches, and the first field it
@@ -609,7 +609,7 @@ impl Bounds {
 /// loads as. It answers [`ColumnStore::select`] with the first field the filter
 /// names, so every caller falls back to the metadata walk and the index behaves
 /// exactly as it did.
-pub(crate) struct ColumnStore {
+pub struct ColumnStore {
     names: Vec<String>,
     columns: Vec<Column>,
     index_of: HashMap<String, usize>,
@@ -627,7 +627,7 @@ pub(crate) struct ColumnStore {
 impl ColumnStore {
     /// A store for the declared fields, with each column reserved for the
     /// declared size.
-    pub(crate) fn new(names: Vec<String>, expected_size: usize) -> Self {
+    pub fn new(names: Vec<String>, expected_size: usize) -> Self {
         let columns = names.iter().map(|_| Column::new(expected_size)).collect();
         let index_of = names
             .iter()
@@ -644,11 +644,11 @@ impl ColumnStore {
         }
     }
 
-    pub(crate) fn declared(&self) -> &[String] {
+    pub fn declared(&self) -> &[String] {
         &self.names
     }
 
-    pub(crate) fn is_declared(&self) -> bool {
+    pub fn is_declared(&self) -> bool {
         !self.names.is_empty()
     }
 
@@ -666,7 +666,7 @@ impl ColumnStore {
     /// insertion paths, `update_metadata` and the loader. A field the record
     /// does not carry is written as absent rather than left alone, so an
     /// `update_metadata` that drops a key drops it from the column too.
-    pub(crate) fn write(&mut self, slot: usize, metadata: &HashMap<String, Value>) {
+    pub fn write(&mut self, slot: usize, metadata: &HashMap<String, Value>) {
         if self.names.is_empty() {
             return;
         }
@@ -681,7 +681,7 @@ impl ColumnStore {
     }
 
     /// Forget the record at one internal id.
-    pub(crate) fn erase(&mut self, slot: usize) {
+    pub fn erase(&mut self, slot: usize) {
         if self.names.is_empty() || !self.live.contains(slot) {
             return;
         }
@@ -693,7 +693,7 @@ impl ColumnStore {
     }
 
     /// Drop every record, keeping the declaration.
-    pub(crate) fn clear(&mut self, expected_size: usize) {
+    pub fn clear(&mut self, expected_size: usize) {
         let names = std::mem::take(&mut self.names);
         *self = ColumnStore::new(names, expected_size);
     }
@@ -723,7 +723,7 @@ impl ColumnStore {
     /// refuse. The name is what the tree carries, or the empty string where it
     /// names no field, which the warning already declines to print on an index
     /// with no declaration.
-    pub(crate) fn select<'f>(&self, filter: &'f Filter) -> Selection<'f> {
+    pub fn select<'f>(&self, filter: &'f Filter) -> Selection<'f> {
         if self.names.is_empty() {
             return Selection::Whole(self.first_undeclared(filter).unwrap_or(""));
         }
@@ -914,7 +914,7 @@ impl ColumnStore {
     /// call is, so a debug build still reports it if the assertion is ever
     /// deleted.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
-    pub(crate) fn agrees_with(&self, slot: usize, metadata: &HashMap<String, Value>) -> bool {
+    pub fn agrees_with(&self, slot: usize, metadata: &HashMap<String, Value>) -> bool {
         if self.names.is_empty() {
             return true;
         }
@@ -932,11 +932,11 @@ impl ColumnStore {
     /// load rather than per field. True for a store with no declaration, for
     /// the reason above.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
-    pub(crate) fn tracks(&self, records: usize) -> bool {
+    pub fn tracks(&self, records: usize) -> bool {
         self.names.is_empty() || self.records == records
     }
 
-    pub(crate) fn heap_bytes(&self) -> usize {
+    pub fn heap_bytes(&self) -> usize {
         self.columns.iter().map(Column::heap_bytes).sum::<usize>()
             + self.live.heap_bytes()
             + self
@@ -960,7 +960,7 @@ impl ColumnStore {
 ///
 /// `source` prefixes the message and is empty for `build`, matching what
 /// `validate_index_parameters` does with the same argument.
-pub(crate) fn validate_indexed_fields(names: &[String], source: &str) -> Result<(), Error> {
+pub fn validate_indexed_fields(names: &[String], source: &str) -> Result<(), Error> {
     if names.len() > MAX_INDEXED_FIELDS {
         return Err(Error::IndexedFieldsTooMany {
             source: source.to_string(),

@@ -13,13 +13,12 @@
 //! They have their own file because they belong to `DistPQ`, which is used
 //! beside them, rather than to any one part of the index.
 //!
-//! The graph is built through `crate::graph::test_graph`, which is the small
-//! `cfg(test)` surface the graph module offers a caller outside it. The seam
-//! takes a space by name and so cannot be handed a distance directly.
+//! The graph is built through [`super::test_graph`], which is the small
+//! `cfg(test)` surface the graph module offers beside its seam. The seam takes
+//! a space by name and so cannot be handed a distance directly.
 
-use crate::distance::CosineDist;
-use crate::distance::{DistPQ, PqMetric};
-use crate::graph::test_graph::TestGraph;
+use super::test_graph::TestGraph;
+use crate::distance::{CosineDist, DistPQ, PqMetric};
 use crate::pq::PQ;
 use crate::rng::SeededRng;
 use crate::test_vectors::clustered;

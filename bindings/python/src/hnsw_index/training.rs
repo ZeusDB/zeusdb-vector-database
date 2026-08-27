@@ -8,16 +8,14 @@
 //! does so.
 
 use super::{HNSWIndex, StorageMode, MAX_LAYER};
-use crate::graph::VectorGraph;
-use crate::pq::PQ;
 use crate::rerank::{calibrate_rerank_from_sample, raw_distance_fn, RawVectors, RerankCalibration};
-use crate::rng::SeededRng;
 use chrono::Utc;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
+use zeusdb_vector_core::{SeededRng, VectorGraph, PQ};
 /// Seed the training sample is shuffled with before it is used
 ///
 /// The records the sample holds are fixed and cannot be sampled. Training fires
@@ -523,12 +521,10 @@ impl HNSWIndex {
 #[cfg(test)]
 mod tests {
     use super::TRAINING_SAMPLE_SEED;
-    use crate::pq::PQ;
     use crate::rerank::{calibrate_rerank_from_sample, raw_distance_fn};
-    use crate::rng::SeededRng;
-    use crate::test_vectors::clustered;
     use rand::seq::SliceRandom;
     use rand::SeedableRng;
+    use zeusdb_vector_core::{test_support::clustered, SeededRng, PQ};
 
     /// The shuffle the training sample is drawn in is fixed by its seed, so two
     /// builds over the same records produce the same sample order and two

@@ -29,12 +29,12 @@ on:
     # Python package and the tests, runs the release suite in ci.yml alone.
     paths:
       - 'bindings/python/src/hnsw_index/**'
-      - 'bindings/python/src/graph/**'
-      - 'bindings/python/src/columns.rs'
-      - 'bindings/python/src/filter.rs'
       - 'bindings/python/src/persistence.rs'
-      - 'bindings/python/src/pq.rs'
       - 'bindings/python/src/rerank.rs'
+      - 'crates/core/src/graph/**'
+      - 'crates/core/src/columns.rs'
+      - 'crates/core/src/filter.rs'
+      - 'crates/core/src/pq.rs'
       - '.github/workflows/lock-order.yml'
   schedule:
     # 04:17 UTC on Mondays, off the hour because the scheduler queues runs

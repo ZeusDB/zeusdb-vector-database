@@ -1,45 +1,70 @@
 // lib.rs
-// A column per declared filterable field, which is what a filtered search
-// reads instead of walking every record's metadata.
-mod checksum;
-mod columns;
+//
+// The binding, which is what touches Python: the classes, the argument
+// parsing, the result construction, the logging control, and the conversion
+// below of an engine failure into an exception. The engine itself is
+// zeusdb-vector-core.
 mod conversion;
-mod distance;
-// The engine's own error type, and below, the one place it becomes a `PyErr`.
-mod error;
-mod filter;
-mod graph;
 mod hnsw_index;
 mod logging;
 mod persistence;
-mod pq;
 mod rerank;
-// The generator every seeded draw runs on, named in one place so the pin is
-// auditable in one place.
-mod rng;
-// Test data two test modules measure against, so it is defined once.
-#[cfg(test)]
-mod test_vectors;
 
 use pyo3::prelude::*;
+use zeusdb_vector_core::{Error, Exception};
 
-/// The one place an engine failure becomes a Python exception.
+/// An engine failure on its way to Python.
 ///
-/// Every engine module raises `error::Error`, whose `exception` names the class
-/// as a value. This impl is what turns that value into the class, so every
-/// `?` in a `#[pymethods]` body and every `.into()` on an `Error` arrives
-/// here. Nothing else in the crate builds a `PyErr` from an engine failure.
-impl From<error::Error> for PyErr {
-    fn from(error: error::Error) -> PyErr {
+/// Every engine module raises [`Error`], whose `exception` names the class as
+/// a value. `Error` and `PyErr` are both foreign to this crate, so the orphan
+/// rule refuses `impl From<Error> for PyErr` here, and this newtype is the
+/// local type the conversion hangs on. It holds the `PyErr` already built,
+/// so a `?` on a PyO3 result lands in it as well, through the second `From`
+/// below, and a function this crate exposes to PyO3 returns
+/// `Result<T, PyEngineError>` wherever its body raises an engine failure.
+/// PyO3 accepts any error type that converts into a `PyErr` from a
+/// `#[pymethods]` or `#[pyfunction]` body, which the `From` into `PyErr` is.
+/// Nothing else in the crate builds a `PyErr` from an engine failure.
+pub struct PyEngineError(PyErr);
+
+impl From<Error> for PyEngineError {
+    fn from(error: Error) -> Self {
         let message = error.to_string();
-        match error.exception() {
-            error::Exception::Value => pyo3::exceptions::PyValueError::new_err(message),
-            error::Exception::Runtime => pyo3::exceptions::PyRuntimeError::new_err(message),
-            error::Exception::Key => pyo3::exceptions::PyKeyError::new_err(message),
-            error::Exception::FileNotFound => {
-                pyo3::exceptions::PyFileNotFoundError::new_err(message)
-            }
-        }
+        PyEngineError(match error.exception() {
+            Exception::Value => pyo3::exceptions::PyValueError::new_err(message),
+            Exception::Runtime => pyo3::exceptions::PyRuntimeError::new_err(message),
+            Exception::Key => pyo3::exceptions::PyKeyError::new_err(message),
+            Exception::FileNotFound => pyo3::exceptions::PyFileNotFoundError::new_err(message),
+        })
+    }
+}
+
+impl From<PyErr> for PyEngineError {
+    fn from(err: PyErr) -> Self {
+        PyEngineError(err)
+    }
+}
+
+/// The one numpy failure the parsers raise through `?`, being a slice taken
+/// of an array that is not contiguous.
+impl From<numpy::AsSliceError> for PyEngineError {
+    fn from(err: numpy::AsSliceError) -> Self {
+        PyEngineError(err.into())
+    }
+}
+
+/// What `#[instrument(err)]` records when a method returns an error. It is
+/// the `PyErr`'s own rendering, `<class>: <message>`, so the record is the
+/// one the method wrote before this type existed.
+impl std::fmt::Display for PyEngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<PyEngineError> for PyErr {
+    fn from(err: PyEngineError) -> PyErr {
+        err.0
     }
 }
 
@@ -49,7 +74,7 @@ impl From<error::Error> for PyErr {
 /// route and is a one line pass through to this.
 #[pyfunction]
 #[pyo3(name = "_load_index")]
-fn load_index(path: &str) -> PyResult<hnsw_index::HNSWIndex> {
+fn load_index(path: &str) -> Result<hnsw_index::HNSWIndex, PyEngineError> {
     Ok(persistence::load_index(path)?)
 }
 

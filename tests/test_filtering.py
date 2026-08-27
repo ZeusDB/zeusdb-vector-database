@@ -852,7 +852,7 @@ def test_a_filtered_search_survives_a_concurrent_insert():
 # every filter written before this existed means what it always did.
 # ------------------------------------------------------------
 
-# Mirrors MAX_FILTER_DEPTH in bindings/python/src/filter.rs.
+# Mirrors MAX_FILTER_DEPTH in crates/core/src/filter.rs.
 MAX_FILTER_DEPTH = 10
 
 

@@ -9,9 +9,10 @@
 # pyproject.toml and src/zeusdb_vector_database/__init__.py declare, and the
 # release gate in .github/workflows/publish-pypi.yml reads it from this table.
 #
-# [workspace.dependencies] holds every external crate at one version. A member
-# names a dependency as `{ workspace = true }`, so a version moves in one place
-# and two members cannot resolve the same crate twice.
+# [workspace.dependencies] holds every dependency once, the external crates at
+# one version and the workspace's own crates by path. A member names a
+# dependency as `{ workspace = true }`, so a version or a path moves in one
+# place and two members cannot resolve the same crate twice.
 #
 # [profile.*] is read from the workspace root only. A profile table in a
 # member manifest is ignored, so every profile is declared here.
@@ -20,11 +21,9 @@
 # Explicit, because a virtual manifest does not take the resolver from an
 # edition the way a package manifest does.
 resolver = "2"
-# crates/ holds no crate yet, and crates/.gitkeep is what keeps the pattern
-# valid until the first one lands. cargo treats a glob that matches nothing
-# as a literal path and fails on it, and drops any match that is not a
-# directory, so the one file makes the glob match something and contribute
-# no member.
+# Every directory under crates/ and bindings/ that holds a manifest is a
+# member. cargo treats a glob that matches nothing as a literal path and
+# fails on it, so each of the two directories has to hold at least one crate.
 members = ["crates/*", "bindings/*"]
 
 [workspace.package]
@@ -36,6 +35,10 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+# The workspace's own crates, by path. Each takes the workspace's version, so
+# a member names one with `{ workspace = true }` and no version at all, and
+# cargo-deny's allow-wildcard-paths admits the versionless edge.
+zeusdb-vector-core = { path = "crates/core" }
 # abi3-py310 builds against CPython's stable ABI, so one wheel per platform
 # loads on every CPython from 3.10 up, including versions that do not exist
 # yet. The feature lives here rather than in pyproject's [tool.maturin]
@@ -59,13 +62,13 @@ rand = "0.9.1"
 # which `rand` documents as non-portable and free to change algorithm in any
 # release. Every seeded draw in the engine runs on it, being the level stream a
 # graph is built from and both of the product quantizer's. See
-# bindings/python/src/rng.rs.
+# crates/core/src/rng.rs.
 #
 # `rand`'s default features already pull `rand_chacha` in to build `StdRng` at
 # all, so this names a dependency the lock already held rather than adding one.
 rand_chacha = "0.9"
 # The distance kernels' vector type. See the "How they are compiled" section of
-# bindings/python/src/distance.rs. It pulls in safe_arch and bytemuck, and it
+# crates/core/src/distance.rs. It pulls in safe_arch and bytemuck, and it
 # is a build-time abstraction over the target's own vector registers with no
 # run time component, so it adds nothing to the wheel beyond the code it
 # generates.

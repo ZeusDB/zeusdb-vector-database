@@ -37,8 +37,6 @@ mod construct;
 pub(crate) use construct::{
     validate_index_parameters, validate_space_supports_quantization, warn_if_selection_disabled,
 };
-#[cfg(test)]
-mod graph_guard_tests;
 mod input;
 mod insert;
 /// Every lock on this type, with its place in the declared acquisition order
@@ -49,14 +47,7 @@ mod search;
 mod stats;
 mod training;
 
-use crate::columns::{ColumnStore, Selection};
 use crate::conversion::{python_dict_to_value_map, value_map_to_python};
-use crate::filter::{compile_filter, matches_filter};
-// The graph and everything the graph crate supplies arrive through the seam.
-// See the note at the top of `graph.rs`.
-use crate::error::Error;
-use crate::graph::VectorGraph;
-use crate::pq::PQ;
 use crate::rerank::{RawVectors, RerankCalibration, SearchParams};
 use insert::InsertError;
 use locks::{order, MutexAt, RwLockAt};
@@ -69,8 +60,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+// The graph and everything the engine supplies arrive through the seam in
+// zeusdb_vector_core. See the note at the top of graph/mod.rs there.
+use zeusdb_vector_core::{
+    compile_filter, matches_filter, ColumnStore, Error, Selection, VectorGraph, PQ,
+};
 
 // ✅ ENTERPRISE: Structured logging imports
+use crate::PyEngineError;
 use tracing::{debug, error, info, instrument, trace, warn};
 
 /// Records accepted by `add`, after parsing and before insertion, as
@@ -478,7 +475,7 @@ pub fn create_hnsw_index(
     expected_size: usize,
     quantization_config: Option<&Bound<PyDict>>,
     indexed_fields: Option<Vec<String>>,
-) -> PyResult<HNSWIndex> {
+) -> Result<HNSWIndex, PyEngineError> {
     HNSWIndex::build(
         dim,
         space,
@@ -603,7 +600,7 @@ impl HNSWIndex {
         vector_count = self.get_vector_count(),
         has_quantization = self.has_quantization()
     ), err)]
-    pub fn rebuild_with_quantization(&self, py: Python<'_>) -> PyResult<bool> {
+    pub fn rebuild_with_quantization(&self, py: Python<'_>) -> Result<bool, PyEngineError> {
         // The whole rebuild runs with the interpreter lock released, the mutation
         // guard included. Waiting for another writer while holding the lock would
         // stall every Python thread in the process for the length of that writer,
@@ -865,7 +862,7 @@ impl HNSWIndex {
         ef_search: Option<usize>,
         return_vector: bool,
         rerank: Option<usize>,
-    ) -> PyResult<Py<PyAny>> {
+    ) -> Result<Py<PyAny>, PyEngineError> {
         let start_time = Instant::now();
 
         // Both arguments size the candidate heaps the traversal allocates
@@ -1099,7 +1096,7 @@ impl HNSWIndex {
         has_quantization = self.has_quantization(),
         is_quantized = self.is_quantized()
     ), err)]
-    pub fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+    pub fn save(&self, py: Python<'_>, path: &str) -> Result<(), PyEngineError> {
         Ok(py.detach(|| self.save_locked(path))?)
     }
 
@@ -1223,7 +1220,11 @@ impl HNSWIndex {
     /// which is what a search does with the same filter. An empty index counts
     /// zero, and a filter matching nothing counts zero.
     #[pyo3(signature = (filter=None))]
-    pub fn count(&self, py: Python<'_>, filter: Option<&Bound<PyDict>>) -> PyResult<usize> {
+    pub fn count(
+        &self,
+        py: Python<'_>,
+        filter: Option<&Bound<PyDict>>,
+    ) -> Result<usize, PyEngineError> {
         let Some(filter) = filter else {
             return Ok(self.id_map.read().unwrap().len());
         };
@@ -1370,7 +1371,7 @@ impl HNSWIndex {
         input: &Bound<PyAny>,
         return_vector: bool,
         strict: bool,
-    ) -> PyResult<Vec<Py<PyDict>>> {
+    ) -> Result<Vec<Py<PyDict>>, PyEngineError> {
         let ids: Vec<String> = if let Ok(id_str) = input.extract::<String>() {
             vec![id_str]
         } else if let Ok(id_list) = input.extract::<Vec<String>>() {
@@ -1378,7 +1379,8 @@ impl HNSWIndex {
         } else {
             return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
                 "Expected a string or a list of strings for ID(s)",
-            ));
+            )
+            .into());
         };
 
         trace!(
@@ -1527,7 +1529,7 @@ impl HNSWIndex {
         number: usize,
         offset: usize,
         after: Option<String>,
-    ) -> PyResult<Vec<(String, Py<PyAny>)>> {
+    ) -> Result<Vec<(String, Py<PyAny>)>, PyEngineError> {
         let id_map = self.id_map.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
 
@@ -1618,7 +1620,7 @@ impl HNSWIndex {
     /// Remove vector by ID
     /// Public remove_point method (unchanged for API compatibility)
     /// This code delegates to remove_point_internal() which handles all the complex logic
-    pub fn remove_point(&self, py: Python<'_>, id: String) -> PyResult<bool> {
+    pub fn remove_point(&self, py: Python<'_>, id: String) -> Result<bool, PyEngineError> {
         // `id` arrives already converted, and `remove_point_internal` is in the
         // set `insert_parsed_records` verifies, so the whole body is Rust. The
         // removal itself is short, but the wait for the mutation guard is not,
@@ -1699,7 +1701,7 @@ impl HNSWIndex {
         py: Python<'_>,
         ids: Option<&Bound<PyAny>>,
         r#where: Option<&Bound<PyDict>>,
-    ) -> PyResult<usize> {
+    ) -> Result<usize, PyEngineError> {
         match (ids, r#where) {
             (Some(_), Some(_)) => Err(Error::DeleteBothSelectors.into()),
             (None, None) => Err(Error::DeleteNoSelector.into()),
@@ -1711,7 +1713,8 @@ impl HNSWIndex {
                 } else {
                     return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
                         "delete(ids=) expects a string or a list of strings",
-                    ));
+                    )
+                    .into());
                 };
 
                 // A repeated id names one record, so it counts once whether or
@@ -1754,7 +1757,11 @@ impl HNSWIndex {
     /// Stranded graph nodes are left behind, one per record removed, exactly as
     /// `remove_point` leaves them. This does not call `compact()` either; see
     /// `remove_points`.
-    pub fn remove_where(&self, py: Python<'_>, filter: &Bound<PyDict>) -> PyResult<usize> {
+    pub fn remove_where(
+        &self,
+        py: Python<'_>,
+        filter: &Bound<PyDict>,
+    ) -> Result<usize, PyEngineError> {
         let conditions = compile_filter(&python_dict_to_value_map(filter)?)?;
         // Asked of the compiled tree rather than of the caller's mapping.
         // Emptiness was the whole test while `{}` was the only way to write
@@ -1800,7 +1807,7 @@ impl HNSWIndex {
     ///
     /// llama-index probes `hasattr(index, "clear")` and raised
     /// `NotImplementedError` when it found nothing.
-    pub fn clear(&self, py: Python<'_>) -> PyResult<usize> {
+    pub fn clear(&self, py: Python<'_>) -> Result<usize, PyEngineError> {
         let quantized = self.is_quantized();
         let pq = self.pq.as_ref().cloned();
 
@@ -1986,7 +1993,7 @@ impl HNSWIndex {
         m: Option<usize>,
         expected_size: Option<usize>,
         ef_construction: Option<usize>,
-    ) -> PyResult<usize> {
+    ) -> Result<usize, PyEngineError> {
         if m.is_none() && expected_size.is_none() && ef_construction.is_none() {
             return Err(Error::RebuildWithoutChanges.into());
         }
@@ -2047,7 +2054,7 @@ impl HNSWIndex {
     /// reaches is in the set `insert_parsed_records` verifies, plus
     /// `VectorGraph::new_raw` and `VectorGraph::insert`, which are the same
     /// shape as the quantized pair already listed there.
-    pub fn compact(&self, py: Python<'_>) -> PyResult<usize> {
+    pub fn compact(&self, py: Python<'_>) -> Result<usize, PyEngineError> {
         Ok(py.detach(|| self.compact_locked())?)
     }
 
@@ -2062,7 +2069,7 @@ impl HNSWIndex {
         &self,
         query_count: usize,
         max_threads: Option<usize>,
-    ) -> PyResult<HashMap<String, f64>> {
+    ) -> Result<HashMap<String, f64>, PyEngineError> {
         Ok(self.benchmark_reads(query_count, max_threads)?)
     }
 }
