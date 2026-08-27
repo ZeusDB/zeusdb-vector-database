@@ -41,6 +41,7 @@
 
 use crate::checksum::checksum_of;
 use crate::columns::validate_indexed_fields;
+use crate::error::Error;
 use crate::graph::dump::DUMP_FILENAME as GRAPH_DUMP_FILENAME;
 use crate::graph::dump::LEGACY_DUMP_FILENAMES;
 use crate::hnsw_index::{
@@ -50,7 +51,6 @@ use crate::hnsw_index::{
 use crate::pq::PQ;
 use crate::rerank::RerankCalibration;
 use chrono::Utc;
-use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -129,7 +129,7 @@ const CLAIM_PER_WIRE_BYTE: usize = 64;
 /// A file long enough to need more than the top rung is one `fs::read` could
 /// not have returned, so the top rung is the last arm rather than a special
 /// case.
-fn decode_bounded<T>(data: &[u8], file: &str) -> PyResult<T>
+fn decode_bounded<T>(data: &[u8], file: &str) -> Result<T, Error>
 where
     T: bincode::Decode<()>,
 {
@@ -148,21 +148,14 @@ where
 
     match decoded {
         Ok((value, _)) => Ok(value),
-        Err(bincode::error::DecodeError::LimitExceeded) => {
-            Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "{} declares a length its own {} bytes could not hold. A container in \
-                 this file names more entries than the file has bytes to carry, so \
-                 reading it would ask the allocator for memory the file never earned, \
-                 and that allocation is not fallible: the process aborts rather than \
-                 raising. Refusing to read it. Restore the directory from a copy.",
-                file,
-                data.len()
-            )))
-        }
-        Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to deserialize {}: {}",
-            file, e
-        ))),
+        Err(bincode::error::DecodeError::LimitExceeded) => Err(Error::DecodeLengthExceeded {
+            file: file.to_string(),
+            bytes: data.len(),
+        }),
+        Err(e) => Err(Error::DecodeFailed {
+            file: file.to_string(),
+            error: e.to_string(),
+        }),
     }
 }
 
@@ -181,14 +174,9 @@ const REPLACED_SUFFIX: &str = ".zdbold";
 /// A rename is only cheap, and only atomic, within one volume. Staging under
 /// the system temporary directory would put the new index on whichever volume
 /// that is, and the move into place would then be a copy of every byte.
-fn sibling(target: &Path, suffix: &str) -> PyResult<PathBuf> {
-    let name = target.file_name().ok_or_else(|| {
-        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "'{}' does not name a directory this build can save into. A save writes a \
-             sibling directory beside the target and moves it into place, so the target \
-             has to have a name of its own.",
-            target.display()
-        ))
+fn sibling(target: &Path, suffix: &str) -> Result<PathBuf, Error> {
+    let name = target.file_name().ok_or_else(|| Error::TargetHasNoName {
+        target: target.to_path_buf(),
     })?;
     let mut name = name.to_os_string();
     name.push(suffix);
@@ -258,18 +246,15 @@ pub(crate) struct StagingDir {
 impl StagingDir {
     /// Clear what an earlier save left behind and open an empty staging
     /// directory
-    pub(crate) fn open(target: &Path) -> PyResult<Self> {
+    pub(crate) fn open(target: &Path) -> Result<Self, Error> {
         let staging = sibling(target, STAGING_SUFFIX)?;
         let replaced = sibling(target, REPLACED_SUFFIX)?;
 
         Self::recover(target, &staging, &replaced)?;
 
-        fs::create_dir_all(&staging).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to create the staging directory {}: {}",
-                staging.display(),
-                e
-            ))
+        fs::create_dir_all(&staging).map_err(|e| Error::StagingCreateFailed {
+            staging: staging.clone(),
+            error: e.to_string(),
         })?;
 
         Ok(StagingDir {
@@ -288,21 +273,15 @@ impl StagingDir {
     ///
     /// `<name>.zdbold` present beside a target is the previous index after a
     /// save that finished, so it is removed.
-    fn recover(target: &Path, staging: &Path, replaced: &Path) -> PyResult<()> {
+    fn recover(target: &Path, staging: &Path, replaced: &Path) -> Result<(), Error> {
         if replaced.exists() {
             if target.exists() {
                 remove_tree(replaced, "the previous index a finished save left aside")?;
             } else {
-                fs::rename(replaced, target).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                        "An earlier save was interrupted while replacing {}, and the index \
-                         it was replacing is at {}. Moving it back failed: {}. Rename that \
-                         directory to {} by hand before saving again.",
-                        target.display(),
-                        replaced.display(),
-                        e,
-                        target.display()
-                    ))
+                fs::rename(replaced, target).map_err(|e| Error::RecoverRenameFailed {
+                    target: target.to_path_buf(),
+                    replaced: replaced.to_path_buf(),
+                    error: e.to_string(),
                 })?;
                 info!(
                     operation = "save_recover",
@@ -326,17 +305,13 @@ impl StagingDir {
     }
 
     /// Move the staged directory into place
-    pub(crate) fn commit(mut self) -> PyResult<()> {
+    pub(crate) fn commit(mut self) -> Result<(), Error> {
         sync_directory(&self.staging);
 
         if self.target.exists() {
-            fs::rename(&self.target, &self.replaced).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to move the existing index at {} aside: {}. Nothing was changed \
-                     and the directory is as it was.",
-                    self.target.display(),
-                    e
-                ))
+            fs::rename(&self.target, &self.replaced).map_err(|e| Error::MoveAsideFailed {
+                target: self.target.clone(),
+                error: e.to_string(),
             })?;
 
             if let Err(e) = fs::rename(&self.staging, &self.target) {
@@ -344,27 +319,18 @@ impl StagingDir {
                 // index back is the same rename in reverse.
                 let restored = fs::rename(&self.replaced, &self.target).is_ok();
                 self.committed = true;
-                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to move the newly saved index into {}: {}. {}",
-                    self.target.display(),
-                    e,
-                    if restored {
-                        "The index that was there is back in place and nothing was lost."
-                    } else {
-                        "The index that was there could not be put back and is in the \
-                         directory named .zdbold beside it. Rename it back by hand."
-                    }
-                )));
+                return Err(Error::MoveIntoPlaceFailedAfterAside {
+                    target: self.target.clone(),
+                    error: e.to_string(),
+                    restored,
+                });
             }
 
             remove_tree(&self.replaced, "the index this save replaced").ok();
         } else {
-            fs::rename(&self.staging, &self.target).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to move the newly saved index into {}: {}",
-                    self.target.display(),
-                    e
-                ))
+            fs::rename(&self.staging, &self.target).map_err(|e| Error::MoveIntoPlaceFailed {
+                target: self.target.clone(),
+                error: e.to_string(),
             })?;
         }
 
@@ -383,14 +349,11 @@ impl Drop for StagingDir {
 }
 
 /// Remove a directory tree, naming what it was in the failure
-fn remove_tree(path: &Path, what: &str) -> PyResult<()> {
-    fs::remove_dir_all(path).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to remove {}, which is {}: {}",
-            path.display(),
-            what,
-            e
-        ))
+fn remove_tree(path: &Path, what: &'static str) -> Result<(), Error> {
+    fs::remove_dir_all(path).map_err(|e| Error::RemoveTreeFailed {
+        path: path.to_path_buf(),
+        what,
+        error: e.to_string(),
     })
 }
 
@@ -479,23 +442,24 @@ impl SaveLedger {
 /// manifest is complete and whose artefacts are empty. Every byte is already in
 /// memory, so the fsync is the whole cost of that durability and it is measured
 /// rather than assumed.
-fn write_artefact(dir: &Path, name: &str, bytes: &[u8], ledger: &mut SaveLedger) -> PyResult<()> {
+fn write_artefact(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    ledger: &mut SaveLedger,
+) -> Result<(), Error> {
     use std::io::Write;
 
     let path = dir.join(name);
-    let mut file = fs::File::create(&path).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to create {}: {}",
-            name, e
-        ))
+    let mut file = fs::File::create(&path).map_err(|e| Error::ArtefactCreateFailed {
+        name: name.to_string(),
+        error: e.to_string(),
     })?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to write {}: {}",
-                name, e
-            ))
+        .map_err(|e| Error::ArtefactWriteFailed {
+            name: name.to_string(),
+            error: e.to_string(),
         })?;
 
     ledger.record(name, bytes.len() as u64, Some(checksum_of(bytes)));
@@ -512,22 +476,18 @@ fn write_artefact(dir: &Path, name: &str, bytes: &[u8], ledger: &mut SaveLedger)
 ///
 /// A directory written before this field existed carries no digests, so nothing
 /// is checked and it loads exactly as it did.
-fn verify_artefact(name: &str, bytes: &[u8], manifest: &IndexManifest) -> PyResult<()> {
+fn verify_artefact(name: &str, bytes: &[u8], manifest: &IndexManifest) -> Result<(), Error> {
     let Some(recorded) = manifest.file_digests.get(name) else {
         return Ok(());
     };
 
     if bytes.len() as u64 != recorded.bytes {
-        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "{} is {} bytes and manifest.json records it as {}. {} holds {}. The file is \
-             not the one this save wrote, so the index it describes is not the index that \
-             was saved. Refusing to load it. Restore the directory from a copy.",
-            name,
-            bytes.len(),
-            recorded.bytes,
-            name,
-            artefact_contents(name)
-        )));
+        return Err(Error::ArtefactLengthMismatch {
+            name: name.to_string(),
+            actual: bytes.len(),
+            recorded: recorded.bytes,
+            contents: artefact_contents(name),
+        });
     }
 
     let Some(expected) = recorded.checksum.as_deref() else {
@@ -535,42 +495,37 @@ fn verify_artefact(name: &str, bytes: &[u8], manifest: &IndexManifest) -> PyResu
     };
     let actual = format!("{:016x}", checksum_of(bytes));
     if actual != expected {
-        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "{} is the length manifest.json records and its contents do not match the \
-             digest recorded beside it, which is {} against {}. {} holds {}. The file has \
-             changed since it was written, so the index it describes is not the index that \
-             was saved. Refusing to load it. Restore the directory from a copy.",
-            name,
+        return Err(Error::ArtefactDigestMismatch {
+            name: name.to_string(),
             actual,
-            expected,
-            name,
-            artefact_contents(name)
-        )));
+            expected: expected.to_string(),
+            contents: artefact_contents(name),
+        });
     }
 
     Ok(())
 }
 
 /// Read an artefact and verify it before anything parses it
-fn read_artefact(path: &Path, name: &str, manifest: &IndexManifest) -> PyResult<Vec<u8>> {
-    let bytes = fs::read(path.join(name)).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
-            "Failed to read {}: {}",
-            name, e
-        ))
+fn read_artefact(path: &Path, name: &str, manifest: &IndexManifest) -> Result<Vec<u8>, Error> {
+    let bytes = fs::read(path.join(name)).map_err(|e| Error::ArtefactReadFailed {
+        name: name.to_string(),
+        error: e.to_string(),
     })?;
     verify_artefact(name, &bytes, manifest)?;
     Ok(bytes)
 }
 
 /// The same, for the artefacts that are JSON
-fn read_artefact_string(path: &Path, name: &str, manifest: &IndexManifest) -> PyResult<String> {
+fn read_artefact_string(
+    path: &Path,
+    name: &str,
+    manifest: &IndexManifest,
+) -> Result<String, Error> {
     let bytes = read_artefact(path, name, manifest)?;
-    String::from_utf8(bytes).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "{} is not valid UTF-8: {}",
-            name, e
-        ))
+    String::from_utf8(bytes).map_err(|e| Error::ArtefactNotUtf8 {
+        name: name.to_string(),
+        error: e.to_string(),
     })
 }
 
@@ -584,38 +539,22 @@ pub(crate) fn recorded_dump_length(manifest: &IndexManifest, name: &str) -> Opti
 }
 
 /// Refuse a directory this build cannot interpret
-fn check_format_version(format_version: &str) -> PyResult<()> {
+fn check_format_version(format_version: &str) -> Result<(), Error> {
     let major = format_version
         .split('.')
         .next()
         .and_then(|major| major.parse::<u32>().ok())
-        .ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "manifest.json declares format_version '{}', which is not a version this \
-                 build can interpret. A ZeusDB index directory declares a dotted version \
-                 such as {}.",
-                format_version, FORMAT_VERSION
-            ))
+        .ok_or_else(|| Error::FormatVersionUnparsable {
+            format_version: format_version.to_string(),
+            current: FORMAT_VERSION,
         })?;
 
     if major != SUPPORTED_FORMAT_MAJOR {
-        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Index format version {} cannot be opened by this build, which reads format \
-             version {}.x only. The directory was written by a {} release of \
-             zeusdb-vector-database, so {}.",
-            format_version,
-            SUPPORTED_FORMAT_MAJOR,
-            if major > SUPPORTED_FORMAT_MAJOR {
-                "newer"
-            } else {
-                "much older"
-            },
-            if major > SUPPORTED_FORMAT_MAJOR {
-                "upgrade the package to open it"
-            } else {
-                "open it with the release that wrote it"
-            }
-        )));
+        return Err(Error::FormatVersionUnsupported {
+            format_version: format_version.to_string(),
+            supported: SUPPORTED_FORMAT_MAJOR,
+            newer: major > SUPPORTED_FORMAT_MAJOR,
+        });
     }
 
     Ok(())
@@ -686,7 +625,7 @@ fn artefact_contents(name: &str) -> &'static str {
 /// opened as a complete index built entirely from PQ reconstructions, and one
 /// that lost `quantization.json` opened as an unquantized index. Both were
 /// silent.
-fn check_files_present(path: &Path, manifest: &IndexManifest) -> PyResult<()> {
+fn check_files_present(path: &Path, manifest: &IndexManifest) -> Result<(), Error> {
     let missing: Vec<&str> = manifest
         .files_included
         .iter()
@@ -703,33 +642,10 @@ fn check_files_present(path: &Path, manifest: &IndexManifest) -> PyResult<()> {
         return Ok(());
     };
 
-    let others = if missing.len() > 1 {
-        format!(
-            " {} further file{} manifest.json names {} also absent: {}.",
-            missing.len() - 1,
-            if missing.len() == 2 { "" } else { "s" },
-            if missing.len() == 2 { "is" } else { "are" },
-            missing[1..].join(", ")
-        )
-    } else {
-        String::new()
-    };
-
-    Err(PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
-        format!(
-            "manifest.json names {} under files_included and the index directory does \
-             not hold it. {} holds {}. manifest.json is written after every file it \
-             names except the graph dump, so a directory in this state lost the file \
-             after the save that wrote it finished, or was copied without it. \
-             Refusing to load an index assembled from the files that survived, \
-             because it would not hold what was saved. Restore the directory from a \
-             copy.{}",
-            first,
-            first,
-            artefact_contents(first),
-            others
-        ),
-    ))
+    Err(Error::ArtefactsMissing {
+        missing: missing.iter().map(|name| name.to_string()).collect(),
+        contents: artefact_contents(first),
+    })
 }
 
 /// Whether the manifest's inventory names an artefact
@@ -958,18 +874,17 @@ impl TrainingState {
 // ============================================================================
 
 /// Load index configuration from config.json
-fn load_config(path: &Path, manifest: &IndexManifest) -> PyResult<IndexConfig> {
+fn load_config(path: &Path, manifest: &IndexManifest) -> Result<IndexConfig, Error> {
     debug!("Loading config.json...");
 
     let config_path = path.join("config.json");
     let config_data = read_artefact_string(path, "config.json", manifest)?;
 
-    let config: IndexConfig = serde_json::from_str(&config_data).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to parse config.json: {}",
-            e
-        ))
-    })?;
+    let config: IndexConfig =
+        serde_json::from_str(&config_data).map_err(|e| Error::ArtefactParseFailed {
+            name: "config.json",
+            error: e.to_string(),
+        })?;
 
     // The five values `build` validates, validated here too.
     //
@@ -1014,13 +929,10 @@ fn load_config(path: &Path, manifest: &IndexManifest) -> PyResult<IndexConfig> {
     // issued more ids than a node index can name has a graph it could not have
     // built. The check refuses nothing that can exist.
     if config.id_counter > u32::MAX as usize {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}: id_counter is {}, and an internal id is a graph node index, \
-             which is a u32. No index could have issued that many, so this file \
-             does not describe an index this build can rebuild.",
-            config_path.display(),
-            config.id_counter
-        )));
+        return Err(Error::IdCounterTooLarge {
+            file: config_path.display().to_string(),
+            id_counter: config.id_counter,
+        });
     }
     // The declaration too, for the same reason. A config naming a field twice,
     // or naming a reserved filter key, would build a store the index could not
@@ -1035,7 +947,7 @@ fn load_config(path: &Path, manifest: &IndexManifest) -> PyResult<IndexConfig> {
 }
 
 /// Load ID mappings from mappings.bin
-fn load_mappings(path: &Path, manifest: &IndexManifest) -> PyResult<IdMappings> {
+fn load_mappings(path: &Path, manifest: &IndexManifest) -> Result<IdMappings, Error> {
     debug!("Loading mappings.bin...");
 
     let mappings_data = read_artefact(path, "mappings.bin", manifest)?;
@@ -1050,17 +962,15 @@ fn load_mappings(path: &Path, manifest: &IndexManifest) -> PyResult<IdMappings> 
 fn load_metadata(
     path: &Path,
     manifest: &IndexManifest,
-) -> PyResult<HashMap<String, HashMap<String, Value>>> {
+) -> Result<HashMap<String, HashMap<String, Value>>, Error> {
     debug!("Loading metadata.json...");
 
     let metadata_data = read_artefact_string(path, "metadata.json", manifest)?;
 
     let metadata: HashMap<String, HashMap<String, Value>> = serde_json::from_str(&metadata_data)
-        .map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to parse metadata.json: {}",
-                e
-            ))
+        .map_err(|e| Error::ArtefactParseFailed {
+            name: "metadata.json",
+            error: e.to_string(),
         })?;
 
     debug!("metadata.json loaded");
@@ -1072,7 +982,7 @@ fn load_metadata(
 /// Read only when the manifest names it. A trained `quantized_only` index
 /// writes none, and a directory saved over one that did keeps the file the
 /// earlier save left. See `manifest_names`.
-fn load_vectors(path: &Path, manifest: &IndexManifest) -> PyResult<HashMap<String, Vec<f32>>> {
+fn load_vectors(path: &Path, manifest: &IndexManifest) -> Result<HashMap<String, Vec<f32>>, Error> {
     debug!("Loading vectors.bin...");
 
     if !manifest_names(manifest, "vectors.bin") {
@@ -1099,7 +1009,7 @@ fn load_vectors(path: &Path, manifest: &IndexManifest) -> PyResult<HashMap<Strin
 /// from its dump and the rebuild that used to catch this does not run. A record
 /// holding a NaN scores as NaN against every query and orders arbitrarily, so
 /// the index would answer wrongly rather than visibly fail.
-fn check_vectors_are_finite(vectors: &HashMap<String, Vec<f32>>) -> PyResult<()> {
+fn check_vectors_are_finite(vectors: &HashMap<String, Vec<f32>>) -> Result<(), Error> {
     let mut offenders: Vec<&String> = vectors
         .iter()
         .filter(|(_, vector)| vector.iter().any(|value| !value.is_finite()))
@@ -1111,40 +1021,28 @@ fn check_vectors_are_finite(vectors: &HashMap<String, Vec<f32>>) -> PyResult<()>
     }
 
     offenders.sort();
-    let named: Vec<&str> = offenders.iter().take(5).map(|id| id.as_str()).collect();
-    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-        "vectors.bin holds a NaN or an infinity in {} of {} records, so those records \
-         would score as NaN against every query and take an arbitrary place in every \
-         result page. Refusing to load. Affected records include: {}{}",
-        offenders.len(),
-        vectors.len(),
-        named.join(", "),
-        if offenders.len() > named.len() {
-            ", ..."
-        } else {
-            ""
-        }
-    )))
+    Err(Error::VectorsNotFinite {
+        offenders: offenders.into_iter().cloned().collect(),
+        total: vectors.len(),
+    })
 }
 
 /// Load manifest for validation and metadata
-fn load_manifest(path: &Path) -> PyResult<IndexManifest> {
+fn load_manifest(path: &Path) -> Result<IndexManifest, Error> {
     debug!("Loading manifest.json...");
 
     let manifest_path = path.join("manifest.json");
-    let manifest_data = fs::read_to_string(&manifest_path).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
-            "Failed to read manifest.json: {}",
-            e
-        ))
-    })?;
+    let manifest_data =
+        fs::read_to_string(&manifest_path).map_err(|e| Error::ArtefactReadFailed {
+            name: "manifest.json".to_string(),
+            error: e.to_string(),
+        })?;
 
-    let manifest: IndexManifest = serde_json::from_str(&manifest_data).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to parse manifest.json: {}",
-            e
-        ))
-    })?;
+    let manifest: IndexManifest =
+        serde_json::from_str(&manifest_data).map_err(|e| Error::ArtefactParseFailed {
+            name: "manifest.json",
+            error: e.to_string(),
+        })?;
 
     debug!("manifest.json loaded");
     Ok(manifest)
@@ -1155,7 +1053,7 @@ fn load_manifest(path: &Path) -> PyResult<IndexManifest> {
 /// Absent means the index was saved before training completed, which is a
 /// legitimate state. A present but unreadable file is a hard failure, because
 /// the alternative is a codebook that decodes every code to the zero vector.
-fn load_pq_centroids(path: &Path, manifest: &IndexManifest) -> PyResult<Option<Centroids>> {
+fn load_pq_centroids(path: &Path, manifest: &IndexManifest) -> Result<Option<Centroids>, Error> {
     if !manifest_names(manifest, "pq_centroids.bin") {
         return Ok(None);
     }
@@ -1174,7 +1072,7 @@ fn load_pq_centroids(path: &Path, manifest: &IndexManifest) -> PyResult<Option<C
 ///
 /// Absent means no record has been quantized yet. In `quantized_only` these
 /// codes are the only copy of every record added after training completed.
-fn load_pq_codes(path: &Path, manifest: &IndexManifest) -> PyResult<HashMap<String, Vec<u8>>> {
+fn load_pq_codes(path: &Path, manifest: &IndexManifest) -> Result<HashMap<String, Vec<u8>>, Error> {
     if !manifest_names(manifest, "pq_codes.bin") {
         return Ok(HashMap::new());
     }
@@ -1205,32 +1103,24 @@ fn validate_quantization_fields(
     file: &str,
     config: &QuantizationPersistence,
     dim: usize,
-) -> PyResult<()> {
+) -> Result<(), Error> {
     if config.bits < 1 || config.bits > 8 {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}: bits is {}, and bits must be an integer between 1 and 8. The centroid count \
-             is 2 to the bits, so the codebook this names would be {} times the size of the \
-             largest one this build can build, and sizing it is not a fallible allocation: \
-             the process aborts rather than raising.",
-            file,
-            config.bits,
-            1u128 << config.bits.min(96)
-        )));
+        return Err(Error::BitsOutOfRangeInFile {
+            file: file.to_string(),
+            bits: config.bits,
+        });
     }
     if config.subvectors == 0 {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}: subvectors is 0. Every subvector holds dim / subvectors values, so a count \
-             of zero divides by zero.",
-            file
-        )));
+        return Err(Error::SubvectorsZeroInFile {
+            file: file.to_string(),
+        });
     }
     if config.subvectors > dim || !dim.is_multiple_of(config.subvectors) {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}: subvectors is {} and config.json declares dim {}. subvectors must divide \
-             the dimension evenly and cannot exceed it, which is the rule create() applies, \
-             so this file does not describe an index this build can rebuild.",
-            file, config.subvectors, dim
-        )));
+        return Err(Error::SubvectorsInvalidInFile {
+            file: file.to_string(),
+            subvectors: config.subvectors,
+            dim,
+        });
     }
     Ok(())
 }
@@ -1241,7 +1131,7 @@ fn load_quantization(
     manifest: &IndexManifest,
     dim: usize,
     space: &str,
-) -> PyResult<Option<QuantizationArtefacts>> {
+) -> Result<Option<QuantizationArtefacts>, Error> {
     debug!("Loading quantization components...");
 
     let quant_path = path.join("quantization.json");
@@ -1258,12 +1148,11 @@ fn load_quantization(
 
     let quant_data = read_artefact_string(path, "quantization.json", manifest)?;
 
-    let quant_config: QuantizationPersistence = serde_json::from_str(&quant_data).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to parse quantization.json: {}",
-            e
-        ))
-    })?;
+    let quant_config: QuantizationPersistence =
+        serde_json::from_str(&quant_data).map_err(|e| Error::ArtefactParseFailed {
+            name: "quantization.json",
+            error: e.to_string(),
+        })?;
 
     // The two fields that size the codebook, held to the rules `create()`
     // applies to them.
@@ -1305,7 +1194,7 @@ fn load_quantization(
 /// no manifest at all. Staging makes it safe, because a save that fails at any
 /// point leaves the previous directory untouched and the staging directory
 /// removed.
-pub fn save_index(index: &HNSWIndex, dir: &Path) -> PyResult<SaveLedger> {
+pub fn save_index(index: &HNSWIndex, dir: &Path) -> Result<SaveLedger, Error> {
     let mut ledger = SaveLedger::default();
 
     // Save components in order of complexity (simple -> complex)
@@ -1342,7 +1231,7 @@ fn reconstruct_index_simple(
     vectors: HashMap<String, Vec<f32>>,
     quantization: Option<QuantizationArtefacts>,
     dump_bytes: Option<u64>,
-) -> PyResult<HNSWIndex> {
+) -> Result<HNSWIndex, Error> {
     debug!("Creating empty index with loaded configuration...");
 
     // Step 1: Create empty index with loaded config
@@ -1458,12 +1347,9 @@ fn reconstruct_index_simple(
     // from the graph's node count and pushes one vector per node, so at zero
     // nodes it opens an empty store and places nothing.
     if index.raw_store_is_expected() {
-        let placed = index.restore_raw_store(&vectors).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to restore the raw vectors of a quantized_with_raw index: {}",
-                e
-            ))
-        })?;
+        let placed = index
+            .restore_raw_store(&vectors)
+            .map_err(Error::RestoreRawFailed)?;
         debug!("{} raw vectors restored beside the codes", placed);
     }
 
@@ -1492,18 +1378,16 @@ fn check_restored_count(
     config: &IndexConfig,
     raw_count: usize,
     code_count: usize,
-) -> PyResult<()> {
+) -> Result<(), Error> {
     let restored = index.count_stored_records();
 
     if restored != config.vector_count {
-        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Restored record count does not match config.json: the directory yields {} \
-             records while config.json reports {}. vectors.bin holds {} records and \
-             pq_codes.bin holds {}, so a data file is missing or truncated. Refusing to \
-             load an index that would report a count it cannot produce; restore the \
-             directory from a copy.",
-            restored, config.vector_count, raw_count, code_count
-        )));
+        return Err(Error::RestoredCountMismatch {
+            restored,
+            expected: config.vector_count,
+            raw_count,
+            code_count,
+        });
     }
 
     index.set_vector_count(restored);
@@ -1522,7 +1406,7 @@ fn restore_data_fields(
     _vectors: HashMap<String, Vec<f32>>,
     config: &IndexConfig,
     quantization: Option<QuantizationArtefacts>,
-) -> PyResult<()> {
+) -> Result<(), Error> {
     // Before the mappings move, because this reads their keys. The floor is
     // what stops an old directory reissuing a generated id it already holds.
     let generated_floor = HNSWIndex::highest_generated_id(mappings.id_map.keys());
@@ -1564,7 +1448,7 @@ fn restore_data_fields(
 /// read pq_centroids.bin on load and so re-saved the zero codebook that
 /// `PQ::new` starts with. Both fail the load rather than let the index come
 /// back reporting itself trained while decoding every code to zeros.
-fn install_centroids(pq: &PQ, centroids: Centroids) -> PyResult<()> {
+fn install_centroids(pq: &PQ, centroids: Centroids) -> Result<(), Error> {
     let expected = (pq.subvectors(), pq.num_centroids(), pq.sub_dim());
     let actual = (
         centroids.len(),
@@ -1580,42 +1464,26 @@ fn install_centroids(pq: &PQ, centroids: Centroids) -> PyResult<()> {
         .all(|sub| sub.len() == actual.1 && sub.iter().all(|c| c.len() == actual.2));
 
     if actual != expected || !uniform {
-        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "pq_centroids.bin does not match quantization.json: codebook is {}x{}x{}, \
-             expected {}x{}x{} for {} subvectors at {} bits. The codebook belongs to a \
-             different index, so this directory cannot be loaded.",
-            actual.0,
-            actual.1,
-            actual.2,
-            expected.0,
-            expected.1,
-            expected.2,
-            pq.subvectors(),
-            pq.bits()
-        )));
+        return Err(Error::CodebookShapeMismatch {
+            actual,
+            expected,
+            subvectors: pq.subvectors(),
+            bits: pq.bits(),
+        });
     }
 
     if centroids
         .iter()
         .all(|sub| sub.iter().all(|c| c.iter().all(|&v| v == 0.0)))
     {
-        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-            "pq_centroids.bin holds an all-zero codebook, so every PQ code in this \
-             directory decodes to the zero vector. This is what a save performed by \
-             zeusdb-vector-database 0.3.0 through 0.4.1 writes over a directory it has \
-             just loaded, because those versions never read the codebook back. Restore \
-             the directory from a copy taken before that save; the records cannot be \
-             recovered from this one."
-                .to_string(),
-        ));
+        return Err(Error::CodebookAllZero);
     }
 
     // Going through set_centroids rather than writing the field rebuilds the
     // symmetric distance table from the codebook that has just been read, so a
     // loaded index can build a graph on real distances exactly as a freshly
     // trained one does.
-    pq.set_centroids(centroids)
-        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    pq.set_centroids(centroids).map_err(Error::Engine)
 }
 
 /// Restore quantization state (simplified for reconstruction)
@@ -1623,12 +1491,11 @@ fn restore_quantization_state_simple(
     index: &mut HNSWIndex,
     quant_data: QuantizationPersistence,
     centroids: Option<Centroids>,
-) -> PyResult<()> {
+) -> Result<(), Error> {
     debug!("Restoring quantization state...");
 
     // Convert QuantizationPersistence back to QuantizationConfig
-    let storage_mode = StorageMode::from_string(&quant_data.storage_mode)
-        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+    let storage_mode = StorageMode::from_string(&quant_data.storage_mode).map_err(Error::Engine)?;
 
     let quant_config = QuantizationConfig {
         subvectors: quant_data.subvectors,
@@ -1677,14 +1544,7 @@ fn restore_quantization_state_simple(
         // The codebook is what makes a trained PQ trained. Without it the
         // instance would report itself trained while holding the zeros that
         // PQ::new starts with, and every reconstruction would return them.
-        let centroids = centroids.ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
-                "quantization.json reports a trained codebook but pq_centroids.bin is \
-                 missing from the index directory. The codebook cannot be rebuilt from \
-                 the other files, so restore it from a copy of the saved directory."
-                    .to_string(),
-            )
-        })?;
+        let centroids = centroids.ok_or(Error::CentroidsMissing)?;
         install_centroids(&pq, centroids)?;
 
         pq.set_trained(true);
@@ -1712,10 +1572,10 @@ fn rebuild_graph_from_codes(
     index: &mut HNSWIndex,
     pq_codes: &HashMap<String, Vec<u8>>,
     vectors: &HashMap<String, Vec<f32>>,
-) -> PyResult<()> {
+) -> Result<(), Error> {
     let (inserted, quantized_from_raw, remapped) = index
         .rebuild_graph_from_codes(pq_codes, vectors)
-        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        .map_err(Error::Engine)?;
 
     if quantized_from_raw > 0 {
         debug!(
@@ -1753,7 +1613,7 @@ fn rebuild_graph_from_data(
     vectors: &HashMap<String, Vec<f32>>,
     pq_codes: &HashMap<String, Vec<u8>>,
     metadata: &HashMap<String, HashMap<String, Value>>,
-) -> PyResult<()> {
+) -> Result<(), Error> {
     if vectors.is_empty() && pq_codes.is_empty() {
         debug!("No records to rebuild (empty index)");
         return Ok(());
@@ -1783,27 +1643,19 @@ fn rebuild_graph_from_data(
         .collect();
 
     if !code_only.is_empty() {
-        let pq = index.get_pq().cloned().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "{} records are stored as PQ codes with no raw vector, but the index has \
-                 no codebook to reconstruct them with. pq_codes.bin and quantization.json \
-                 disagree about whether this index was trained, so the directory cannot \
-                 be loaded without dropping those records.",
-                code_only.len()
-            ))
+        let pq = index.get_pq().cloned().ok_or(Error::CodesWithoutCodebook {
+            count: code_only.len(),
         })?;
 
         for ext_id in code_only {
             let codes = &pq_codes[ext_id];
-            let vector = pq.reconstruct(codes).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to reconstruct record '{}' from its {} PQ codes: {}. The \
-                     codebook in pq_centroids.bin does not fit the codes in pq_codes.bin.",
-                    ext_id,
-                    codes.len(),
-                    e
-                ))
-            })?;
+            let vector = pq
+                .reconstruct(codes)
+                .map_err(|e| Error::ReconstructFailed {
+                    id: ext_id.clone(),
+                    codes: codes.len(),
+                    error: e,
+                })?;
 
             if !metadata.contains_key(ext_id) {
                 missing_metadata += 1;
@@ -1874,20 +1726,19 @@ fn rebuild_graph_from_data(
 
 /// Load an HNSWIndex from a directory structure (Approach B: Simple Reconstruction)
 ///
-/// Registered as `_load_index`. `VectorDatabase.load(path)` is the documented
-/// route and is a one line pass through to this.
-#[pyfunction]
-#[pyo3(name = "_load_index")]
-pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
+/// Registered as `_load_index` by the wrapper in `lib.rs`.
+/// `VectorDatabase.load(path)` is the documented route and is a one line pass
+/// through to this.
+pub fn load_index(path: &str) -> Result<HNSWIndex, Error> {
     debug!("Starting index load with reconstruction from: {}", path);
 
     let path_buf = Path::new(path);
 
     // Validate directory exists
     if !path_buf.exists() {
-        return Err(PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
-            format!("Index directory not found: {}", path),
-        ));
+        return Err(Error::IndexDirectoryNotFound {
+            path: path.to_string(),
+        });
     }
 
     // Phase 1: Load all ZeusDB components
@@ -1960,7 +1811,7 @@ pub fn load_index(path: &str) -> PyResult<HNSWIndex> {
 // ============================================================================
 
 /// Save index configuration as JSON
-fn save_config(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyResult<()> {
+fn save_config(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
     debug!("Saving config.json...");
 
     let config = IndexConfig {
@@ -1977,12 +1828,11 @@ fn save_config(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyRes
         indexed_fields: index.indexed_fields(),
     };
 
-    let config_json = serde_json::to_string_pretty(&config).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to serialize config: {}",
-            e
-        ))
-    })?;
+    let config_json =
+        serde_json::to_string_pretty(&config).map_err(|e| Error::SerializeFailed {
+            what: "config",
+            error: e.to_string(),
+        })?;
 
     write_artefact(path, "config.json", config_json.as_bytes(), ledger)?;
 
@@ -1991,7 +1841,7 @@ fn save_config(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyRes
 }
 
 /// Save ID mappings using efficient binary format
-fn save_mappings(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyResult<()> {
+fn save_mappings(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
     debug!("Saving mappings.bin...");
 
     // Both guards end with this block. They are taken in the documented order,
@@ -2009,10 +1859,10 @@ fn save_mappings(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyR
 
     let mappings_data =
         bincode::encode_to_vec(&mappings, bincode::config::standard()).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to serialize mappings: {}",
-                e
-            ))
+            Error::SerializeFailed {
+                what: "mappings",
+                error: e.to_string(),
+            }
         })?;
 
     write_artefact(path, "mappings.bin", &mappings_data, ledger)?;
@@ -2022,7 +1872,7 @@ fn save_mappings(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyR
 }
 
 /// Save vector metadata as JSON for external tool compatibility
-fn save_metadata(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyResult<()> {
+fn save_metadata(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
     debug!("Saving metadata.json...");
 
     // The guard ends with the serialize. `to_string_pretty` returns an owned
@@ -2033,11 +1883,9 @@ fn save_metadata(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyR
         let json = serde_json::to_string_pretty(&*vector_metadata);
         (json, vector_metadata.len())
     };
-    let metadata_json = metadata_json.map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to serialize metadata: {}",
-            e
-        ))
+    let metadata_json = metadata_json.map_err(|e| Error::SerializeFailed {
+        what: "metadata",
+        error: e.to_string(),
     })?;
 
     write_artefact(path, "metadata.json", metadata_json.as_bytes(), ledger)?;
@@ -2051,7 +1899,7 @@ fn save_quantization_config(
     index: &HNSWIndex,
     path: &Path,
     ledger: &mut SaveLedger,
-) -> PyResult<()> {
+) -> Result<(), Error> {
     if let Some(config) = index.get_quantization_config() {
         debug!("Saving quantization.json...");
 
@@ -2110,10 +1958,10 @@ fn save_quantization_config(
         };
 
         let quant_json = serde_json::to_string_pretty(&quant_persistence).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to serialize quantization config: {}",
-                e
-            ))
+            Error::SerializeFailed {
+                what: "quantization config",
+                error: e.to_string(),
+            }
         })?;
 
         write_artefact(path, "quantization.json", quant_json.as_bytes(), ledger)?;
@@ -2128,7 +1976,7 @@ fn save_quantization_config(
 }
 
 /// Save PQ centroids for vector reconstruction
-fn save_pq_centroids(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyResult<()> {
+fn save_pq_centroids(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
     if let Some(pq) = index.get_pq() {
         if pq.is_trained() {
             debug!("Saving pq_centroids.bin...");
@@ -2140,11 +1988,9 @@ fn save_pq_centroids(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) ->
                 .with_centroids(|centroids| {
                     bincode::encode_to_vec(centroids, bincode::config::standard())
                 })
-                .map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                        "Failed to serialize PQ centroids: {}",
-                        e
-                    ))
+                .map_err(|e| Error::SerializeFailed {
+                    what: "PQ centroids",
+                    error: e.to_string(),
                 })?;
 
             write_artefact(path, "pq_centroids.bin", &centroids_data, ledger)?;
@@ -2156,7 +2002,7 @@ fn save_pq_centroids(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) ->
 }
 
 /// Save quantized vector codes
-fn save_pq_codes(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyResult<()> {
+fn save_pq_codes(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
     // The guard ends with the serialize, so the file is written with nothing
     // held. `encode_to_vec` was already producing an owned buffer, so this
     // narrows the guard rather than adding a copy.
@@ -2172,11 +2018,9 @@ fn save_pq_codes(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyR
         )
     };
 
-    let codes_data = codes_data.map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to serialize PQ codes: {}",
-            e
-        ))
+    let codes_data = codes_data.map_err(|e| Error::SerializeFailed {
+        what: "PQ codes",
+        error: e.to_string(),
     })?;
 
     write_artefact(path, "pq_codes.bin", &codes_data, ledger)?;
@@ -2194,7 +2038,7 @@ fn save_pq_codes(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyR
 ///
 /// A trained `quantized_only` index writes none, as before, because it holds
 /// none.
-fn save_vectors(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyResult<()> {
+fn save_vectors(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
     if !index.holds_raw_vectors() {
         return Ok(());
     }
@@ -2210,11 +2054,9 @@ fn save_vectors(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyRe
         )
     };
 
-    let vectors_data = vectors_data.map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to serialize vectors: {}",
-            e
-        ))
+    let vectors_data = vectors_data.map_err(|e| Error::SerializeFailed {
+        what: "vectors",
+        error: e.to_string(),
     })?;
 
     write_artefact(path, "vectors.bin", &vectors_data, ledger)?;
@@ -2229,7 +2071,11 @@ fn save_vectors(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> PyRe
 /// records the directory size. All three are facts about files that are already
 /// on disk, which is why it is written last and why there is no second pass to
 /// correct any of them.
-pub(crate) fn save_manifest(index: &HNSWIndex, path: &Path, ledger: SaveLedger) -> PyResult<()> {
+pub(crate) fn save_manifest(
+    index: &HNSWIndex,
+    path: &Path,
+    ledger: SaveLedger,
+) -> Result<(), Error> {
     debug!("Saving manifest.json...");
 
     // The manifest needs two facts about the stores rather than the stores
@@ -2343,12 +2189,11 @@ pub(crate) fn save_manifest(index: &HNSWIndex, path: &Path, ledger: SaveLedger) 
         compression_info,
     };
 
-    let manifest_json = serde_json::to_string_pretty(&manifest).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to serialize manifest: {}",
-            e
-        ))
-    })?;
+    let manifest_json =
+        serde_json::to_string_pretty(&manifest).map_err(|e| Error::SerializeFailed {
+            what: "manifest",
+            error: e.to_string(),
+        })?;
 
     // Through the same writer every other artefact took, so it is fsynced
     // before the staging directory is moved into place. Its own digest is

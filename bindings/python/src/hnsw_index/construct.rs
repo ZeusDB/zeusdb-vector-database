@@ -8,6 +8,7 @@
 use super::locks::{MutexAt, RwLockAt};
 use super::{HNSWIndex, QuantizationConfig, StorageMode, MAX_LAYER};
 use crate::columns::{validate_indexed_fields, ColumnStore};
+use crate::error::Error;
 use crate::graph::VectorGraph;
 use crate::pq::PQ;
 use chrono::Utc;
@@ -121,7 +122,7 @@ pub(crate) fn validate_index_parameters(
     ef_construction: usize,
     expected_size: usize,
     source: &str,
-) -> PyResult<String> {
+) -> Result<String, Error> {
     if dim == 0 {
         error!(
             operation = "validation",
@@ -129,10 +130,10 @@ pub(crate) fn validate_index_parameters(
             value = dim,
             "Invalid dimension"
         );
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}dim must be positive, got {}",
-            source, dim
-        )));
+        return Err(Error::DimZero {
+            source: source.to_string(),
+            dim,
+        });
     }
     if dim > MAX_DIM {
         error!(
@@ -142,19 +143,11 @@ pub(crate) fn validate_index_parameters(
             max_allowed = MAX_DIM,
             "dim exceeds maximum"
         );
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}dim must be at most {}, got {}. dim is the width of one vector \
-             buffer, so sizing that buffer from the declared width is the \
-             first allocation this index makes. That allocation is not \
-             fallible: above this bound the process aborts rather than \
-             raising. One vector at the ceiling is {} bytes, an order of \
-             magnitude above the widest embedding any published model \
-             produces.",
-            source,
-            MAX_DIM,
+        return Err(Error::DimTooLarge {
+            source: source.to_string(),
             dim,
-            MAX_DIM * 4
-        )));
+            max: MAX_DIM,
+        });
     }
     if ef_construction == 0 {
         error!(
@@ -163,10 +156,10 @@ pub(crate) fn validate_index_parameters(
             value = ef_construction,
             "Invalid ef_construction"
         );
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}ef_construction must be positive, got {}",
-            source, ef_construction
-        )));
+        return Err(Error::EfConstructionZero {
+            source: source.to_string(),
+            value: ef_construction,
+        });
     }
     if ef_construction > MAX_EF_CONSTRUCTION {
         error!(
@@ -176,18 +169,11 @@ pub(crate) fn validate_index_parameters(
             max_allowed = MAX_EF_CONSTRUCTION,
             "ef_construction exceeds maximum"
         );
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}ef_construction must be at most {}, got {}. It is the width of the \
-             candidate search every insertion runs, and the graph sizes two \
-             candidate heaps from it, 8 bytes a slot, before each insertion visits \
-             a node. That allocation is not fallible: a value of 2^40 asks for 8 TB \
-             on the first add() and the process aborts rather than raising. The \
-             ceiling is eight times the neighbour budget at the largest m, being \
-             2 * 256, so the default's margin over that budget is available at \
-             every m the index allows, and a build at the ceiling runs about \
-             thirteen times longer than one at the default.",
-            source, MAX_EF_CONSTRUCTION, ef_construction
-        )));
+        return Err(Error::EfConstructionTooLarge {
+            source: source.to_string(),
+            value: ef_construction,
+            max: MAX_EF_CONSTRUCTION,
+        });
     }
     if expected_size == 0 {
         error!(
@@ -196,10 +182,10 @@ pub(crate) fn validate_index_parameters(
             value = expected_size,
             "Invalid expected_size"
         );
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}expected_size must be positive, got {}",
-            source, expected_size
-        )));
+        return Err(Error::ExpectedSizeZero {
+            source: source.to_string(),
+            value: expected_size,
+        });
     }
     if expected_size > MAX_EXPECTED_SIZE {
         error!(
@@ -209,24 +195,11 @@ pub(crate) fn validate_index_parameters(
             max_allowed = MAX_EXPECTED_SIZE,
             "expected_size exceeds maximum"
         );
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}expected_size must be at most {}, got {}. The graph reserves one \
- slot per \
-             declared record at creation, 8 bytes each, so this \
- declaration would ask for \
-             {:.1} GB before a single record is \
- added. That allocation is not fallible: \
-             above this bound the \
- process aborts rather than raising. expected_size is a \
-             capacity \
- hint and not a limit, and under-declaring only costs some \
- \
-             reallocation, so declare what you expect to hold.",
-            source,
-            MAX_EXPECTED_SIZE,
-            expected_size,
-            (expected_size as f64 * 8.0) / 1_000_000_000.0
-        )));
+        return Err(Error::ExpectedSizeTooLarge {
+            source: source.to_string(),
+            value: expected_size,
+            max: MAX_EXPECTED_SIZE,
+        });
     }
     if m < 2 {
         error!(
@@ -236,21 +209,10 @@ pub(crate) fn validate_index_parameters(
             min_allowed = 2,
             "m below minimum"
         );
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}m must be at least 2, got {}. Layer assignment samples from a \
- scale of 1 / \
-             ln(m), which is infinity at m 1, so every point \
- overflows the layer cap and \
-             is redispatched uniformly across all \
- 16 layers instead of following the \
-             exponential distribution the \
- graph depends on. Measured on 3,000 records of \
-             32 dimensions, \
- recall at 10 was 0.0220 at m 1 against 0.6880 at m 2 and \
-             1.0000 \
- at m 16.",
-            source, m
-        )));
+        return Err(Error::MBelowMinimum {
+            source: source.to_string(),
+            m,
+        });
     }
     if m > 256 {
         error!(
@@ -260,10 +222,10 @@ pub(crate) fn validate_index_parameters(
             max_allowed = 256,
             "m exceeds maximum"
         );
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}m must be less than or equal to 256, got {}",
-            source, m
-        )));
+        return Err(Error::MTooLarge {
+            source: source.to_string(),
+            m,
+        });
     }
 
     // Early space validation with user-friendly error
@@ -274,10 +236,10 @@ pub(crate) fn validate_index_parameters(
         }
         _ => {
             error!(operation = "validation", field = "space", value = %space, "Unsupported distance space");
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "{}Unsupported space: '{}'. Supported spaces: 'cosine', 'l2', 'l1', 'dot'",
-                source, space
-            )));
+            return Err(Error::UnsupportedSpace {
+                source: source.to_string(),
+                space: space.to_string(),
+            });
         }
     }
     Ok(space_normalized)
@@ -383,7 +345,7 @@ pub(crate) fn validate_index_parameters(
 ///
 /// Called at `create()` and again at load, because a hand edited `config.json`
 /// reaches the same constructors.
-pub(crate) fn validate_space_supports_quantization(space: &str, source: &str) -> PyResult<()> {
+pub(crate) fn validate_space_supports_quantization(space: &str, source: &str) -> Result<(), Error> {
     // The remedy differs by space, so each pair carries its own middle clause.
     // The opening sentence and the closing offer are shared, because the reason
     // is one reason and the way out of it is the same way out.
@@ -408,10 +370,12 @@ pub(crate) fn validate_space_supports_quantization(space: &str, source: &str) ->
     } else {
         " A directory saved with this pair by an earlier release cannot be opened by this build and has to be rebuilt from the vectors it was given."
     };
-    Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-        "{}space='{}' cannot be quantized. A quantized graph scores every candidate from tables of squared L2 distances to the codebook, and {}, or drop quantization_config.{}",
-        source, space, reason, recovery
-    )))
+    Err(Error::SpaceCannotBeQuantized {
+        source: source.to_string(),
+        space: space.to_string(),
+        reason,
+        recovery,
+    })
 }
 
 /// Warn where `ef_construction` switches the neighbour selection heuristic off.
@@ -515,10 +479,7 @@ impl HNSWIndex {
 
             if qtype != "pq" {
                 error!(operation = "validation", field = "quantization_type", value = %qtype, "Unsupported quantization type");
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Unsupported quantization type: '{}'. Only 'pq' is currently supported.",
-                    qtype
-                )));
+                return Err(Error::UnsupportedQuantizationType { qtype }.into());
             }
 
             // Extract PQ parameters
@@ -561,8 +522,8 @@ impl HNSWIndex {
                 .transpose()?
                 .unwrap_or_else(|| "quantized_only".to_string());
 
-            let storage_mode = StorageMode::from_string(&storage_mode_str)
-                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+            let storage_mode =
+                StorageMode::from_string(&storage_mode_str).map_err(Error::InvalidStorageMode)?;
 
             // Validate PQ parameters
             if subvectors == 0 {
@@ -572,9 +533,7 @@ impl HNSWIndex {
                     value = subvectors,
                     "Subvectors must be positive"
                 );
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "subvectors must be a positive integer, got 0",
-                ));
+                return Err(Error::SubvectorsZero.into());
             }
 
             if subvectors > dim {
@@ -585,10 +544,7 @@ impl HNSWIndex {
                     subvectors = subvectors,
                     "Subvectors exceed dimension"
                 );
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "subvectors ({}) cannot exceed dimension ({})",
-                    subvectors, dim
-                )));
+                return Err(Error::SubvectorsExceedDim { subvectors, dim }.into());
             }
 
             if !dim.is_multiple_of(subvectors) {
@@ -599,10 +555,7 @@ impl HNSWIndex {
                     subvectors = subvectors,
                     "Subvectors must divide dimension evenly"
                 );
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "subvectors ({}) must divide dimension ({}) evenly",
-                    subvectors, dim
-                )));
+                return Err(Error::SubvectorsDoNotDivideDim { subvectors, dim }.into());
             }
 
             if !(1..=8).contains(&bits) {
@@ -614,10 +567,7 @@ impl HNSWIndex {
                     max = 8,
                     "Bits out of range"
                 );
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "bits must be between 1 and 8, got {}",
-                    bits
-                )));
+                return Err(Error::BitsOutOfRange { bits }.into());
             }
 
             if training_size < 1000 {
@@ -628,10 +578,7 @@ impl HNSWIndex {
                     min = 1000,
                     "Training size too small"
                 );
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "training_size must be at least 1000, got {}",
-                    training_size
-                )));
+                return Err(Error::TrainingSizeTooSmall { training_size }.into());
             }
 
             // A max below the threshold produces an index that reaches its
@@ -648,10 +595,11 @@ impl HNSWIndex {
                         training_size = training_size,
                         "max_training_vectors below training_size"
                     );
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                        "max_training_vectors ({}) must be >= training_size ({})",
-                        max_training, training_size
-                    )));
+                    return Err(Error::MaxTrainingBelowTrainingSize {
+                        max_training,
+                        training_size,
+                    }
+                    .into());
                 }
             }
 

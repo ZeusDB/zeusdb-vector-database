@@ -8,6 +8,7 @@
 
 use super::locks::{order, ReadGuard};
 use super::{HNSWIndex, QuantizationConfig, StorageMode, MAX_LAYER};
+use crate::error::Error;
 use crate::graph::{restore_graph, DumpBounds, VectorGraph};
 use crate::rerank::RawVectors;
 use pyo3::prelude::*;
@@ -178,7 +179,7 @@ impl HNSWIndex {
     }
 
     /// The body of `save`, with the interpreter lock already released
-    pub(super) fn save_locked(&self, path: &str) -> PyResult<()> {
+    pub(super) fn save_locked(&self, path: &str) -> Result<(), Error> {
         // A save reads the mappings, the metadata, the codes, the vectors and
         // the graph in five separate passes, so it needs the index to hold
         // still. PyO3's exclusive borrow used to guarantee that by keeping every
@@ -238,7 +239,7 @@ impl HNSWIndex {
         &self,
         path: &Path,
         ledger: &mut crate::persistence::SaveLedger,
-    ) -> PyResult<()> {
+    ) -> Result<(), Error> {
         debug!(
             operation = "save_hnsw_graph_start",
             "Starting HNSW graph save"
@@ -268,12 +269,7 @@ impl HNSWIndex {
                 // the disk for a guarantee its own two checksums already give.
                 let bytes = std::fs::metadata(path.join(&filename))
                     .map(|meta| meta.len())
-                    .map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                            "The graph dump was written and its length could not be read: {}",
-                            e
-                        ))
-                    })?;
+                    .map_err(|e| Error::DumpLengthUnreadable(e.to_string()))?;
                 ledger.record_length(&filename, bytes);
                 debug!(
                     operation = "save_hnsw_graph_complete",
@@ -285,10 +281,7 @@ impl HNSWIndex {
             }
             Err(e) => {
                 error!(operation = "save_hnsw_graph", error = %e, "HNSW graph dump failed");
-                Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "HNSW graph dump failed: {}",
-                    e
-                )))
+                Err(Error::GraphDumpFailed(e))
             }
         }
     }
@@ -296,7 +289,7 @@ impl HNSWIndex {
     // 6. PERSISTENCE INTEGRATION METHODS (2 methods)
 
     /// Load an index from a .zdb directory structure (Phase 2)
-    pub fn load(path: &str) -> PyResult<Self> {
+    pub fn load(path: &str) -> Result<Self, Error> {
         crate::persistence::load_index(path)
     }
 
@@ -610,7 +603,7 @@ impl HNSWIndex {
     pub(crate) fn rebuild_from_records(
         &self,
         records: Vec<(String, Vec<f32>, HashMap<String, Value>)>,
-    ) -> PyResult<usize> {
+    ) -> Result<usize, Error> {
         let total = records.len();
 
         // The validation `extract_single_vector` ran on the way through Python.
@@ -622,24 +615,22 @@ impl HNSWIndex {
         let mut validated = Vec::with_capacity(total);
         for (id, vector, metadata) in records {
             if vector.len() != self.dim {
-                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Graph rebuild refused record '{}': vector dimension mismatch, \
-                     expected {}, got {}. Refusing to load a partial graph.",
+                return Err(Error::RebuildRefusedDimension {
                     id,
-                    self.dim,
-                    vector.len()
-                )));
+                    expected: self.dim,
+                    got: vector.len(),
+                });
             }
             if let Some((position, value)) = vector
                 .iter()
                 .enumerate()
                 .find(|(_, value)| !value.is_finite())
             {
-                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Graph rebuild refused record '{}': vector contains {} at index {}, \
-                     which is not finite. Refusing to load a partial graph.",
-                    id, value, position
-                )));
+                return Err(Error::RebuildRefusedNotFinite {
+                    id,
+                    value: *value,
+                    position,
+                });
             }
             validated.push((id, self.process_vector_for_space(vector), metadata));
         }
@@ -664,21 +655,12 @@ impl HNSWIndex {
         // not left set on the way out of a failed rebuild.
         self.set_rebuilding_from_persistence(false);
 
-        // A `PyErr`'s `Display` acquires the interpreter lock, so the messages
-        // are formatted here and not above.
         let refused: Vec<String> = errors
             .into_iter()
             .filter_map(|error| error.into_counted_message())
             .collect();
         if !refused.is_empty() {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Graph rebuild refused {} of {} records, so the loaded index would \
-                 hold records that no query can reach. Refusing to load a partial \
-                 graph. Rejected records: {}",
-                refused.len(),
-                total,
-                refused.join("; ")
-            )));
+            return Err(Error::RebuildRefusedRecords { refused, total });
         }
 
         Ok(inserted.len())

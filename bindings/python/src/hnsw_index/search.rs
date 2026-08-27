@@ -70,6 +70,7 @@
 use super::{HNSWIndex, StorageMode, VectorGraph};
 use crate::columns::{Bitmap, ColumnStore, Selection};
 use crate::conversion::value_map_to_python;
+use crate::error::Error;
 use crate::filter::{matches_filter, Filter};
 use crate::graph::GraphHit;
 use crate::rerank::{
@@ -735,7 +736,7 @@ impl HNSWIndex {
         pq_codes: &HashMap<String, Vec<u8>>,
         vector_metadata: &HashMap<String, HashMap<String, Value>>,
         params: SearchParams,
-    ) -> PyResult<QueryHits> {
+    ) -> Result<QueryHits, Error> {
         let mut scored = candidates;
 
         if let Some(plan) = params.rerank.as_ref() {
@@ -815,7 +816,7 @@ impl HNSWIndex {
         params: SearchParams,
         py: Python<'_>,
     ) -> PyResult<Vec<Py<PyDict>>> {
-        let search_results = py.detach(|| -> PyResult<QueryHits> {
+        let search_results = py.detach(|| -> Result<QueryHits, Error> {
             // Six read guards, held for the whole search, in the order every
             // path in the crate takes them: `id_map < rev_map < hnsw <
             // pq_codes < vector_metadata < columns`. `id_map` is here because the raw
@@ -894,12 +895,12 @@ impl HNSWIndex {
                     actual_dim = vector.len(),
                     "Vector dimension mismatch in batch"
                 );
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Vector {}: dimension mismatch: expected {}, got {}",
-                    i,
-                    self.dim,
-                    vector.len()
-                )));
+                return Err(Error::BatchVectorDimension {
+                    position: i,
+                    expected: self.dim,
+                    got: vector.len(),
+                }
+                .into());
             }
 
             // The same value check the single query path applies. A non-finite
@@ -917,10 +918,12 @@ impl HNSWIndex {
                         value = value,
                         "Vector in batch contains invalid value"
                     );
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                        "Vector {} in batch contains invalid value at index {}: {} (must be finite)",
-                        i, component, value
-                    )));
+                    return Err(Error::BatchVectorNotFinite {
+                        position: i,
+                        index: component,
+                        value,
+                    }
+                    .into());
                 }
             }
         }
@@ -962,7 +965,7 @@ impl HNSWIndex {
         params: SearchParams,
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
-        let rust_results = py.detach(|| -> PyResult<Vec<QueryHits>> {
+        let rust_results = py.detach(|| -> Result<Vec<QueryHits>, Error> {
             // Six read guards, in the one documented order, held across every
             // query in the batch. See `single_search_internal` for why `id_map`
             // is first and where the raw vector map went.
@@ -1029,10 +1032,10 @@ impl HNSWIndex {
         py: Python<'_>,
     ) -> PyResult<Vec<Vec<Py<PyDict>>>> {
         let span = tracing::Span::current();
-        let rust_results = py.detach(|| -> PyResult<Vec<QueryHits>> {
-            let results: PyResult<Vec<QueryHits>> = vectors
+        let rust_results = py.detach(|| -> Result<Vec<QueryHits>, Error> {
+            let results: Result<Vec<QueryHits>, Error> = vectors
                 .par_iter()
-                .map(|vector| -> PyResult<QueryHits> {
+                .map(|vector| -> Result<QueryHits, Error> {
                     let _entered = span.clone().entered();
                     // FIX: Process each query vector for space
                     let processed_query = self.process_vector_for_space(vector.clone());

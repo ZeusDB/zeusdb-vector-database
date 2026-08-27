@@ -12,6 +12,7 @@
 
 use super::{HNSWIndex, ParsedRecords};
 use crate::conversion::{python_dict_to_value_map, python_object_to_value};
+use crate::error::Error;
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -41,7 +42,10 @@ impl HNSWIndex {
     }
 
     /// Helper for query processing (mirrors extract_single_vector validation)
-    pub(super) fn validate_and_process_query_vector(&self, vector: Vec<f32>) -> PyResult<Vec<f32>> {
+    pub(super) fn validate_and_process_query_vector(
+        &self,
+        vector: Vec<f32>,
+    ) -> Result<Vec<f32>, Error> {
         // Same validation as extract_single_vector
         if vector.is_empty() {
             error!(
@@ -49,9 +53,7 @@ impl HNSWIndex {
                 error = "empty_vector",
                 "Search vector cannot be empty"
             );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Search vector cannot be empty",
-            ));
+            return Err(Error::SearchVectorEmpty);
         }
         if vector.len() != self.dim {
             error!(
@@ -61,11 +63,10 @@ impl HNSWIndex {
                 actual = vector.len(),
                 "Search vector dimension mismatch"
             );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Search vector dimension mismatch: expected {}, got {}",
-                self.dim,
-                vector.len()
-            )));
+            return Err(Error::SearchVectorDimension {
+                expected: self.dim,
+                got: vector.len(),
+            });
         }
         for (i, &val) in vector.iter().enumerate() {
             if !val.is_finite() {
@@ -76,10 +77,10 @@ impl HNSWIndex {
                     value = val,
                     "Search vector contains invalid value"
                 );
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Search vector contains invalid value at index {}: {}",
-                    i, val
-                )));
+                return Err(Error::SearchVectorNotFinite {
+                    index: i,
+                    value: val,
+                });
             }
         }
 
@@ -439,10 +440,11 @@ impl HNSWIndex {
                 actual_shape = format!("{:?}", shape),
                 "NumPy array shape validation failed"
             );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "NumPy array must have shape (N, {}), got {:?}",
-                self.dim, shape
-            )));
+            return Err(Error::BatchArrayShape {
+                dim: self.dim,
+                shape: shape.to_vec(),
+            }
+            .into());
         }
 
         let flat = readonly.as_slice()?;
@@ -704,26 +706,25 @@ impl HNSWIndex {
 
         // Comprehensive validation
         if vector.is_empty() {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Vector cannot be empty",
-            ));
+            return Err(Error::VectorEmpty.into());
         }
 
         if vector.len() != self.dim {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Vector dimension mismatch: expected {}, got {}",
-                self.dim,
-                vector.len()
-            )));
+            return Err(Error::VectorDimension {
+                expected: self.dim,
+                got: vector.len(),
+            }
+            .into());
         }
 
         // Check for invalid values
         for (i, &val) in vector.iter().enumerate() {
             if !val.is_finite() {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Vector contains invalid value at index {}: {} (must be finite)",
-                    i, val
-                )));
+                return Err(Error::VectorNotFinite {
+                    index: i,
+                    value: val,
+                }
+                .into());
             }
         }
 

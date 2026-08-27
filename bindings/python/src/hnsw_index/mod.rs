@@ -54,6 +54,7 @@ use crate::conversion::{python_dict_to_value_map, value_map_to_python};
 use crate::filter::{compile_filter, matches_filter};
 // The graph and everything the graph crate supplies arrive through the seam.
 // See the note at the top of `graph.rs`.
+use crate::error::Error;
 use crate::graph::VectorGraph;
 use crate::pq::PQ;
 use crate::rerank::{RawVectors, RerankCalibration, SearchParams};
@@ -518,7 +519,7 @@ impl HNSWIndex {
     /// worded to match it: an empty batch is refused in the same words, and a
     /// row of the wrong width says "dimension mismatch" rather than describing
     /// a shape, because that is what a caller who passed a list would read.
-    fn validate_batch_array_shape(shape: &[usize], dim: usize) -> PyResult<()> {
+    fn validate_batch_array_shape(shape: &[usize], dim: usize) -> Result<(), Error> {
         if shape.len() != 2 {
             error!(
                 operation = "search",
@@ -527,10 +528,10 @@ impl HNSWIndex {
                 actual_shape = format!("{:?}", shape),
                 "NumPy array shape mismatch"
             );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "NumPy array must have shape (N, {}), got {:?}",
-                dim, shape
-            )));
+            return Err(Error::BatchArrayShape {
+                dim,
+                shape: shape.to_vec(),
+            });
         }
 
         if shape[0] == 0 {
@@ -539,9 +540,7 @@ impl HNSWIndex {
                 error = "empty_batch",
                 "Batch cannot be empty"
             );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Batch cannot be empty",
-            ));
+            return Err(Error::BatchEmpty);
         }
 
         if shape[1] != dim {
@@ -552,10 +551,10 @@ impl HNSWIndex {
                 actual = shape[1],
                 "NumPy batch row width does not match the index"
             );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Search vector dimension mismatch: expected {}, got {}",
-                dim, shape[1]
-            )));
+            return Err(Error::SearchVectorDimension {
+                expected: dim,
+                got: shape[1],
+            });
         }
 
         Ok(())
@@ -609,11 +608,12 @@ impl HNSWIndex {
         // guard included. Waiting for another writer while holding the lock would
         // stall every Python thread in the process for the length of that writer,
         // which is the failure `add` releasing the lock would otherwise create.
-        py.detach(|| {
-            let _writers = self.writers.lock().unwrap();
-            self.rebuild_with_quantization_locked()
-        })
-        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        Ok(py
+            .detach(|| {
+                let _writers = self.writers.lock().unwrap();
+                self.rebuild_with_quantization_locked()
+            })
+            .map_err(Error::Engine)?)
     }
 
     /// Check if the index is using quantized search
@@ -718,9 +718,8 @@ impl HNSWIndex {
         let total_inserted = inserted_ids.len();
 
         // The errors come back in the order they happened. Two of the three
-        // variants carry a message Rust already built. The third carries a
-        // `PyErr`, which is formatted here because `PyErr`'s `Display` acquires
-        // the interpreter lock and so could not run above.
+        // variants carry a message Rust already built. The third carries the
+        // `Error` the record's insertion raised, formatted here against its id.
         for insert_error in insert_errors {
             match insert_error {
                 InsertError::Counted(message) => {
@@ -737,7 +736,12 @@ impl HNSWIndex {
                         error = %err,
                         "Vector addition failed"
                     );
-                    errors.push(format!("Vector {}: {}", id, err));
+                    errors.push(format!(
+                        "Vector {}: {}: {}",
+                        id,
+                        err.exception().name(),
+                        err
+                    ));
                     total_errors += 1;
                 }
             }
@@ -870,27 +874,19 @@ impl HNSWIndex {
         // not a dead interpreter, and before `ef` is derived so the derivation
         // cannot overflow on a value the check would have refused.
         if top_k > MAX_TOP_K {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "top_k must be at most {}, got {}. top_k sizes the candidate search \
-                 through the default ef_search of twice top_k, and the graph sizes two \
-                 candidate heaps from that width, 8 bytes a slot, before it visits a \
-                 node. That allocation is not fallible: a top_k of 2^40 asks for 16 TB \
-                 and the process aborts rather than raising. The ceiling is four times \
-                 the largest page any comparable engine serves.",
-                MAX_TOP_K, top_k
-            )));
+            return Err(Error::TopKTooLarge {
+                max: MAX_TOP_K,
+                top_k,
+            }
+            .into());
         }
         if let Some(requested) = ef_search {
             if requested > MAX_EF_SEARCH {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "ef_search must be at most {}, got {}. ef_search is the width of the \
-                     candidate search, and the graph sizes two candidate heaps from it, 8 \
-                     bytes a slot, before it visits a node. That allocation is not \
-                     fallible: an ef_search of 2^40 asks for 8 TB and the process aborts \
-                     rather than raising. The ceiling is twice the top_k ceiling, which is \
-                     the default ef_search at the largest page.",
-                    MAX_EF_SEARCH, requested
-                )));
+                return Err(Error::EfSearchTooLarge {
+                    max: MAX_EF_SEARCH,
+                    ef_search: requested,
+                }
+                .into());
             }
         }
 
@@ -1003,9 +999,7 @@ impl HNSWIndex {
                     error = "empty_batch",
                     "Batch cannot be empty"
                 );
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "Batch cannot be empty",
-                ));
+                return Err(Error::BatchEmpty.into());
             }
 
             // Check for empty vectors within the batch
@@ -1017,10 +1011,7 @@ impl HNSWIndex {
                         vector_index = i,
                         "Vector in batch cannot be empty"
                     );
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                        "Vector {} in batch cannot be empty",
-                        i
-                    )));
+                    return Err(Error::BatchVectorEmpty { position: i }.into());
                 }
             }
 
@@ -1109,7 +1100,7 @@ impl HNSWIndex {
         is_quantized = self.is_quantized()
     ), err)]
     pub fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        py.detach(|| self.save_locked(path))
+        Ok(py.detach(|| self.save_locked(path))?)
     }
 
     /// Python property: `index.dim`
@@ -1459,20 +1450,7 @@ impl HNSWIndex {
             // a list wants the whole list. Sorted so the message does not depend
             // on the order the ids were asked in.
             absent.sort();
-            let named: Vec<&str> = absent.iter().take(10).map(String::as_str).collect();
-            return Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "get_records(strict=True) was asked for {} id{} the index does not hold: \
-                 {}{}. Call it without strict=True to receive the records that are present, \
-                 or test an id with contains(id) first.",
-                absent.len(),
-                if absent.len() == 1 { "" } else { "s" },
-                named.join(", "),
-                if absent.len() > named.len() {
-                    format!(", and {} more", absent.len() - named.len())
-                } else {
-                    String::new()
-                }
-            )));
+            return Err(Error::RecordsAbsent { absent }.into());
         }
 
         trace!(
@@ -1557,21 +1535,14 @@ impl HNSWIndex {
             None => None,
             Some(ref id) => {
                 if offset != 0 {
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                        "list() takes after or offset, not both, and it was given after='{}' \
-                         with offset={}. after names the last record of the previous page \
-                         and offset counts from the start, so the two name different places.",
-                        id, offset
-                    )));
+                    return Err(Error::ListAfterWithOffset {
+                        after: id.clone(),
+                        offset,
+                    }
+                    .into());
                 }
                 let Some(&internal) = id_map.get(id.as_str()) else {
-                    return Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                        "list(after='{}') names a record the index does not hold, so there \
-                         is no position to resume from. The cursor record was removed while \
-                         the caller was paging. Resume from an id the index still holds, or \
-                         start again from offset 0.",
-                        id
-                    )));
+                    return Err(Error::ListCursorMissing { after: id.clone() }.into());
                 };
                 Some(internal)
             }
@@ -1653,11 +1624,12 @@ impl HNSWIndex {
         // removal itself is short, but the wait for the mutation guard is not,
         // because `add` can now hold it for a long insert with the lock released.
         // Waiting here with the lock held would stall every Python thread.
-        py.detach(|| {
-            let _writers = self.writers.lock().unwrap();
-            self.remove_point_internal(id)
-        })
-        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        Ok(py
+            .detach(|| {
+                let _writers = self.writers.lock().unwrap();
+                self.remove_point_internal(id)
+            })
+            .map_err(Error::Engine)?)
     }
 
     /// Remove a batch of records, taking the mutation lock once.
@@ -1729,16 +1701,8 @@ impl HNSWIndex {
         r#where: Option<&Bound<PyDict>>,
     ) -> PyResult<usize> {
         match (ids, r#where) {
-            (Some(_), Some(_)) => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "delete takes 'ids' or 'where', not both. Two selections do not compose \
-                 into one without a rule, and either rule deletes the wrong records. Call \
-                 it twice, or name the records you mean with delete(ids=...).",
-            )),
-            (None, None) => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "delete requires 'ids' or 'where'. It does not default to deleting every \
-                 record. Use delete(ids=[...]) to name records, delete(where={...}) to \
-                 select them by metadata, or clear() to empty the index.",
-            )),
+            (Some(_), Some(_)) => Err(Error::DeleteBothSelectors.into()),
+            (None, None) => Err(Error::DeleteNoSelector.into()),
             (Some(ids), None) => {
                 let requested: Vec<String> = if let Ok(single) = ids.extract::<String>() {
                     vec![single]
@@ -1798,11 +1762,7 @@ impl HNSWIndex {
         // `{"$not": {"$or": []}}` to it. Both are refused here for the same
         // reason the empty mapping is.
         if conditions.matches_every_record() {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "remove_where requires a filter that selects records. An empty filter \
-                 matches every record, so this would delete the whole index. Name the \
-                 records with remove_points(ids) if that is what you want.",
-            ));
+            return Err(Error::RemoveWhereMatchesEverything.into());
         }
         Ok(py.detach(|| {
             let _writers = self.writers.lock().unwrap();
@@ -1845,9 +1805,7 @@ impl HNSWIndex {
         let pq = self.pq.as_ref().cloned();
 
         if quantized && pq.is_none() {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Index reports a quantized graph but holds no product quantizer",
-            ));
+            return Err(Error::NoQuantizer.into());
         }
 
         py.detach(|| {
@@ -2030,12 +1988,7 @@ impl HNSWIndex {
         ef_construction: Option<usize>,
     ) -> PyResult<usize> {
         if m.is_none() && expected_size.is_none() && ef_construction.is_none() {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "rebuild() changes m, expected_size, ef_construction or any combination \
-                 of them, and was given none. Rebuilding the graph as it stands is \
-                 compact(), which reclaims the nodes that removals and overwrites leave \
-                 behind.",
-            ));
+            return Err(Error::RebuildWithoutChanges.into());
         }
         let new_m = m.unwrap_or_else(|| self.get_m());
         let new_expected_size = expected_size.unwrap_or_else(|| self.get_expected_size());
@@ -2062,7 +2015,7 @@ impl HNSWIndex {
             // the old one has already been claimed if it fired.
             self.overgrowth_warned.store(false, Ordering::Release);
         }
-        py.detach(|| self.rebuild_locked(new_m, new_expected_size, new_ef_construction))
+        Ok(py.detach(|| self.rebuild_locked(new_m, new_expected_size, new_ef_construction))?)
     }
 
     /// Rebuild the graph in memory and reclaim the nodes removal and overwrite strand.
@@ -2095,7 +2048,7 @@ impl HNSWIndex {
     /// `VectorGraph::new_raw` and `VectorGraph::insert`, which are the same
     /// shape as the quantized pair already listed there.
     pub fn compact(&self, py: Python<'_>) -> PyResult<usize> {
-        py.detach(|| self.compact_locked())
+        Ok(py.detach(|| self.compact_locked())?)
     }
 
     /// Get performance characteristics and limitations
@@ -2110,6 +2063,6 @@ impl HNSWIndex {
         query_count: usize,
         max_threads: Option<usize>,
     ) -> PyResult<HashMap<String, f64>> {
-        self.benchmark_reads(query_count, max_threads)
+        Ok(self.benchmark_reads(query_count, max_threads)?)
     }
 }

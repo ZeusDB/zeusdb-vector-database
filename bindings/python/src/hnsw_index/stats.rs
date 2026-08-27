@@ -7,6 +7,7 @@
 //! here.
 
 use super::{HNSWIndex, StorageMode};
+use crate::error::Error;
 use crate::rerank::{default_rerank_fetch, RERANK_CALIBRATION_PAGES, RERANK_CALIBRATION_TOP_K};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -754,7 +755,7 @@ impl HNSWIndex {
         &self,
         query_count: usize,
         max_threads: Option<usize>,
-    ) -> PyResult<HashMap<String, f64>> {
+    ) -> Result<HashMap<String, f64>, Error> {
         use rand::random; // Import for random number generation
 
         let start_time = Instant::now();

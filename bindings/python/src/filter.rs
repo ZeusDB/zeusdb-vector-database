@@ -19,7 +19,7 @@
 //! read a field of it, so they are free functions here, which is what they
 //! already were.
 
-use pyo3::prelude::*;
+use crate::error::Error;
 use serde_json::Value;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
@@ -161,7 +161,7 @@ pub(crate) enum Op {
 /// [`MAX_FILTER_DEPTH`]. What comes back evaluates against every record without
 /// failing, which is why `matches_filter` has no error channel and the
 /// traversal predicate needs none either.
-pub(crate) fn compile_filter(filter: &HashMap<String, Value>) -> PyResult<Filter> {
+pub(crate) fn compile_filter(filter: &HashMap<String, Value>) -> Result<Filter, Error> {
     // The caller's mapping is a `HashMap`, whose iteration order varies per
     // process. Sorting fixes the order the compiled conjunction is evaluated
     // in, so two runs of one search short circuit at the same field. Nothing
@@ -180,7 +180,7 @@ pub(crate) fn compile_filter(filter: &HashMap<String, Value>) -> PyResult<Filter
 fn compile_entries<'a>(
     entries: impl Iterator<Item = (&'a String, &'a Value)>,
     depth: usize,
-) -> PyResult<Filter> {
+) -> Result<Filter, Error> {
     let mut children = Vec::new();
 
     for (key, condition) in entries {
@@ -201,7 +201,7 @@ fn compile_entries<'a>(
 /// `{"$and": []}` matches every record and `{"$or": []}` matches none. That is
 /// what `all` and `any` already do with an empty target array, so the language
 /// answers the empty case the same way in both places.
-fn compile_group(key: &str, condition: &Value, depth: usize) -> PyResult<Vec<Filter>> {
+fn compile_group(key: &str, condition: &Value, depth: usize) -> Result<Vec<Filter>, Error> {
     let Value::Array(branches) = condition else {
         return Err(reserved_key_error(key, condition));
     };
@@ -210,12 +210,10 @@ fn compile_group(key: &str, condition: &Value, depth: usize) -> PyResult<Vec<Fil
     let mut compiled = Vec::with_capacity(branches.len());
     for branch in branches {
         let Value::Object(map) = branch else {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Every entry of \"{}\" must be a filter mapping, for example \
-                 {{\"lang\": \"en\"}}, but one of them is {}.",
-                key,
-                describe(branch)
-            )));
+            return Err(Error::FilterBranchNotMapping {
+                key: key.to_string(),
+                found: describe(branch),
+            });
         };
         compiled.push(compile_entries(map.iter(), depth + 1)?);
     }
@@ -228,7 +226,7 @@ fn compile_group(key: &str, condition: &Value, depth: usize) -> PyResult<Vec<Fil
 /// no convention to invent about whether a list under `$not` is negated
 /// together or separately. `{"$not": {"$or": [...]}}` is the second of those
 /// and is written out.
-fn compile_negation(condition: &Value, depth: usize) -> PyResult<Filter> {
+fn compile_negation(condition: &Value, depth: usize) -> Result<Filter, Error> {
     let Value::Object(map) = condition else {
         return Err(reserved_key_error(GROUP_NOT, condition));
     };
@@ -247,7 +245,7 @@ fn compile_negation(condition: &Value, depth: usize) -> PyResult<Filter> {
 /// every other operator is answered after. A mapping holding both kinds
 /// compiles to a conjunction of a `Presence` node per presence operator and one
 /// `Field` node carrying the rest, which is what the mapping already meant.
-fn compile_field(name: &str, condition: &Value) -> PyResult<Filter> {
+fn compile_field(name: &str, condition: &Value) -> Result<Filter, Error> {
     let Value::Object(operations) = condition else {
         return Ok(Filter::Field {
             name: name.to_string(),
@@ -297,23 +295,21 @@ fn presence_op(op: &str) -> Option<[Presence; 2]> {
 /// A string or a number here is a filter that means nothing, and reading it as
 /// truthy would silently pick one of the two answers. The three operators are
 /// new, so refusing is free.
-fn presence_target(name: &str, op: &str, target: &Value) -> PyResult<bool> {
-    target.as_bool().ok_or_else(|| {
-        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "\"{}\" takes true or false, and {{\"{}\": {{\"{}\": ...}}}} was given {}.",
-            op,
-            name,
-            op,
-            describe(target)
-        ))
-    })
+fn presence_target(name: &str, op: &str, target: &Value) -> Result<bool, Error> {
+    target
+        .as_bool()
+        .ok_or_else(|| Error::PresenceTargetNotBool {
+            name: name.to_string(),
+            op: op.to_string(),
+            found: describe(target),
+        })
 }
 
 /// An operator name as an [`Op`].
 ///
 /// The message names the operator and nothing else, which is what it said
 /// before this became a compile step and is what the README quotes.
-fn parse_op(op: &str) -> PyResult<Op> {
+fn parse_op(op: &str) -> Result<Op, Error> {
     Ok(match op {
         "eq" => Op::Eq,
         "ne" => Op::Ne,
@@ -328,23 +324,17 @@ fn parse_op(op: &str) -> PyResult<Op> {
         "nin" => Op::Nin,
         "any" => Op::Any,
         "all" => Op::All,
-        _ => {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Unknown filter operation: {}",
-                op
-            )))
-        }
+        _ => return Err(Error::UnknownFilterOperation { op: op.to_string() }),
     })
 }
 
-fn check_depth(key: &str, depth: usize) -> PyResult<()> {
+fn check_depth(key: &str, depth: usize) -> Result<(), Error> {
     if depth >= MAX_FILTER_DEPTH {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "Filter groups nest to {} levels and \"{}\" would open level {}.",
-            MAX_FILTER_DEPTH,
-            key,
-            depth + 1
-        )));
+        return Err(Error::FilterTooDeep {
+            max: MAX_FILTER_DEPTH,
+            key: key.to_string(),
+            level: depth + 1,
+        });
     }
     Ok(())
 }
@@ -355,20 +345,17 @@ fn check_depth(key: &str, depth: usize) -> PyResult<()> {
 /// is why the collision is loud. Their filter stops working, which is the cost
 /// of the reservation, but it stops working with a message that names the key
 /// rather than by quietly selecting the wrong records.
-fn reserved_key_error(key: &str, condition: &Value) -> PyErr {
+fn reserved_key_error(key: &str, condition: &Value) -> Error {
     let shape = if key == GROUP_NOT {
         "one filter mapping, for example {\"$not\": {\"lang\": \"en\"}}"
     } else {
         "a list of filter mappings, for example {\"$or\": [{\"lang\": \"en\"}, {\"lang\": \"es\"}]}"
     };
-    PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-        "\"{}\" is a reserved filter key and takes {}, but it was given {}. A \
-         metadata field named \"{}\" cannot be filtered on.",
-        key,
+    Error::ReservedKeyShape {
+        key: key.to_string(),
         shape,
-        describe(condition),
-        key
-    ))
+        found: describe(condition),
+    }
 }
 
 /// What a value is, for an error message. The value itself is not printed,

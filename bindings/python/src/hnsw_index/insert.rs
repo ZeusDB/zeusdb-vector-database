@@ -9,10 +9,10 @@
 use super::locks::{order, WriteGuard};
 use super::{HNSWIndex, ParsedRecords, StorageMode, MAX_LAYER};
 use crate::columns::{Bitmap, ColumnStore, Selection};
+use crate::error::Error;
 use crate::filter::{matches_filter, Filter};
 use crate::graph::{Record, VectorGraph};
 use crate::rerank::RawVectors;
-use pyo3::prelude::*;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -23,12 +23,11 @@ use tracing::{debug, error, info, instrument, trace, warn};
 const EXPECTED_SIZE_OVERGROWTH_FACTOR: usize = 2;
 /// An error raised inside `add`'s insertion phase, carried out to be recorded
 ///
-/// The insertion phase runs with the interpreter lock released, so it cannot
-/// build the message for an error that arrives as a `PyErr`. `PyErr`'s
-/// `Display` implementation calls `Python::attach`, which would reacquire the
-/// lock in the middle of the region that exists to have released it, and would
-/// do so while the mutation guard and possibly a storage guard are held.
-/// `add` formats those once the lock is back.
+/// The insertion phase runs with the interpreter lock released. The error a
+/// record's insertion raises is carried out as an `Error`, whose `Display`
+/// touches nothing of the interpreter, so it can be formatted anywhere. `add`
+/// formats it once the lock is back, which is where the per record messages
+/// are assembled.
 pub(super) enum InsertError {
     /// A message Rust already holds, counted against `total_errors`
     Counted(String),
@@ -37,24 +36,29 @@ pub(super) enum InsertError {
     /// path has always done, because a training failure is not a rejected record
     Training(String),
 
-    /// A `PyErr` from one of the three insert paths, with the id it belongs to.
-    /// Counted against `total_errors` once formatted
-    Vector { id: String, err: PyErr },
+    /// An error from one of the three insert paths, with the id it belongs to.
+    /// Counted against `total_errors` once formatted, as
+    /// `Vector <id>: <class>: <message>`, which is what the `PyErr` it used to
+    /// carry displayed as
+    Vector { id: String, err: Error },
 }
 
 impl InsertError {
     /// The message this counts as a rejected record, or `None` where it does
     /// not count as one.
     ///
-    /// Formatting a `PyErr` acquires the interpreter lock, so this runs after
-    /// the insertion phase has reacquired it and never inside the released
-    /// region. `add` and the load path's rebuild both need the same split, and
+    /// `add` and the load path's rebuild both need the same split, and
     /// disagreeing about which variants count is what this stops.
     pub(super) fn into_counted_message(self) -> Option<String> {
         match self {
             InsertError::Counted(message) => Some(message),
             InsertError::Training(_) => None,
-            InsertError::Vector { id, err } => Some(format!("Vector {}: {}", id, err)),
+            InsertError::Vector { id, err } => Some(format!(
+                "Vector {}: {}: {}",
+                id,
+                err.exception().name(),
+                err
+            )),
         }
     }
 }
@@ -481,7 +485,7 @@ impl HNSWIndex {
     }
 
     /// The body of `compact`, with the interpreter lock already released
-    pub(super) fn compact_locked(&self) -> PyResult<usize> {
+    pub(super) fn compact_locked(&self) -> Result<usize, Error> {
         let _writers = self.writers.lock().unwrap();
         let start_time = Instant::now();
 
@@ -551,7 +555,7 @@ impl HNSWIndex {
         m: usize,
         expected_size: usize,
         ef_construction: usize,
-    ) -> PyResult<usize> {
+    ) -> Result<usize, Error> {
         let _writers = self.writers.lock().unwrap();
         let start_time = Instant::now();
 
@@ -606,16 +610,12 @@ impl HNSWIndex {
         m: usize,
         expected_size: usize,
         ef_construction: usize,
-    ) -> PyResult<usize> {
+    ) -> Result<usize, Error> {
         let live_count = self.id_map.read().unwrap().len();
         let quantized = self.is_quantized();
 
         let mut new_hnsw = if quantized {
-            let pq = self.pq.as_ref().cloned().ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    "Index reports a quantized graph but holds no product quantizer",
-                )
-            })?;
+            let pq = self.pq.as_ref().cloned().ok_or(Error::NoQuantizer)?;
             VectorGraph::new_pq(
                 &self.space,
                 m,
@@ -671,10 +671,7 @@ impl HNSWIndex {
                 if missing.is_empty() && !batch.is_empty() {
                     new_hnsw.insert_batch_pq(&batch).map_err(|e| {
                         error!(operation = "rebuild_graph", error = %e, "Failed to re-insert quantized codes");
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                            "Failed to re-insert quantized codes during compact: {}",
-                            e
-                        ))
+                        Error::ReinsertCodesFailed(e)
                     })?;
                 }
 
@@ -686,10 +683,7 @@ impl HNSWIndex {
                     if let Some(dim) = old_hnsw.raw_dim() {
                         new_hnsw.adopt_raw_from(&old_hnsw, dim).map_err(|e| {
                             error!(operation = "rebuild_graph", error = %e, "Failed to carry the raw vectors over");
-                            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                                "Failed to carry the raw vectors over during compact: {}",
-                                e
-                            ))
+                            Error::AdoptRawFailed(e)
                         })?;
                     }
                 }
@@ -717,17 +711,15 @@ impl HNSWIndex {
                 quantized = quantized,
                 "Refusing to rebuild, some live records have no source data to rebuild from"
             );
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Refusing to compact: {} of {} live records have no stored {} to rebuild \
-                 the graph from, so compacting would drop them. The index is unchanged.",
-                missing.len(),
-                live_count,
-                if quantized {
+            return Err(Error::CompactRefused {
+                missing: missing.len(),
+                live: live_count,
+                what: if quantized {
                     "quantized codes"
                 } else {
                     "vector"
-                }
-            )));
+                },
+            });
         }
 
         let nodes_after = new_hnsw.nb_points();
@@ -939,7 +931,7 @@ impl HNSWIndex {
         vector: Vec<f32>,
         metadata: HashMap<String, Value>,
         overwrite: bool,
-    ) -> PyResult<bool> {
+    ) -> Result<bool, Error> {
         // Check if this is a new vector or an overwrite
         let is_new = {
             let id_map = self.id_map.read().unwrap();
@@ -953,10 +945,7 @@ impl HNSWIndex {
                 reason = "already_exists",
                 "Vector already exists and overwrite=false"
             );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Vector with ID '{}' already exists",
-                id
-            )));
+            return Err(Error::DuplicateId { id });
         }
 
         trace!(
@@ -993,7 +982,7 @@ impl HNSWIndex {
         id: String,
         vector: Vec<f32>, // Already processed by extract_single_vector
         metadata: HashMap<String, Value>,
-    ) -> PyResult<()> {
+    ) -> Result<(), Error> {
         let internal_id = self.get_next_id();
 
         // Store metadata, and the declared fields of it in their columns.
@@ -1047,7 +1036,7 @@ impl HNSWIndex {
         id: String,
         vector: Vec<f32>, // Already processed
         metadata: HashMap<String, Value>,
-    ) -> PyResult<()> {
+    ) -> Result<(), Error> {
         // 1. Store vector normally (single storage)
         self.add_raw_vector(id.clone(), vector, metadata)?;
 
@@ -1142,7 +1131,7 @@ impl HNSWIndex {
         id: String,
         vector: Vec<f32>, // Already processed
         metadata: HashMap<String, Value>,
-    ) -> PyResult<()> {
+    ) -> Result<(), Error> {
         let internal_id = self.get_next_id();
 
         // Store metadata, and the declared fields of it in their columns.
@@ -1179,10 +1168,7 @@ impl HNSWIndex {
                 error = %e,
                 "Failed to quantize vector"
             );
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to quantize vector: {}",
-                e
-            ))
+            Error::QuantizeFailed(e)
         })?;
 
         // Store quantized codes (always)

@@ -5,6 +5,8 @@ mod checksum;
 mod columns;
 mod conversion;
 mod distance;
+// The engine's own error type, and below, the one place it becomes a `PyErr`.
+mod error;
 mod filter;
 mod graph;
 mod hnsw_index;
@@ -20,6 +22,36 @@ mod rng;
 mod test_vectors;
 
 use pyo3::prelude::*;
+
+/// The one place an engine failure becomes a Python exception.
+///
+/// Every engine module raises `error::Error`, whose `exception` names the class
+/// as a value. This impl is what turns that value into the class, so every
+/// `?` in a `#[pymethods]` body and every `.into()` on an `Error` arrives
+/// here. Nothing else in the crate builds a `PyErr` from an engine failure.
+impl From<error::Error> for PyErr {
+    fn from(error: error::Error) -> PyErr {
+        let message = error.to_string();
+        match error.exception() {
+            error::Exception::Value => pyo3::exceptions::PyValueError::new_err(message),
+            error::Exception::Runtime => pyo3::exceptions::PyRuntimeError::new_err(message),
+            error::Exception::Key => pyo3::exceptions::PyKeyError::new_err(message),
+            error::Exception::FileNotFound => {
+                pyo3::exceptions::PyFileNotFoundError::new_err(message)
+            }
+        }
+    }
+}
+
+/// Load an index from a directory. See `persistence::load_index`.
+///
+/// Registered as `_load_index`. `VectorDatabase.load(path)` is the documented
+/// route and is a one line pass through to this.
+#[pyfunction]
+#[pyo3(name = "_load_index")]
+fn load_index(path: &str) -> PyResult<hnsw_index::HNSWIndex> {
+    Ok(persistence::load_index(path)?)
+}
 
 /// ZeusDB Vector Database Python Module
 ///
@@ -49,7 +81,7 @@ fn engine(py: Python, m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
 
     // Persistence functions, private because VectorDatabase.load is the
     // documented route.
-    m.add_function(wrap_pyfunction!(persistence::load_index, m)?)?;
+    m.add_function(wrap_pyfunction!(load_index, m)?)?;
 
     // Optional logging control for power users
     m.add_function(wrap_pyfunction!(logging::py_init_logging, m)?)?;

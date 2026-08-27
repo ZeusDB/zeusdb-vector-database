@@ -49,8 +49,8 @@
 //! A disjunction with an undeclared branch is the last of those, since that
 //! branch could match anything and a union with the live set is the live set.
 
+use crate::error::Error;
 use crate::filter::{field_test_matches, FieldTest, Filter, Presence};
-use pyo3::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -960,40 +960,33 @@ impl ColumnStore {
 ///
 /// `source` prefixes the message and is empty for `build`, matching what
 /// `validate_index_parameters` does with the same argument.
-pub(crate) fn validate_indexed_fields(names: &[String], source: &str) -> PyResult<()> {
+pub(crate) fn validate_indexed_fields(names: &[String], source: &str) -> Result<(), Error> {
     if names.len() > MAX_INDEXED_FIELDS {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "{}indexed_fields names {} fields and the limit is {}. Declare the fields \
-             you filter on; every other field is still stored and still filterable, \
-             it just costs a walk of the metadata store.",
-            source,
-            names.len(),
-            MAX_INDEXED_FIELDS
-        )));
+        return Err(Error::IndexedFieldsTooMany {
+            source: source.to_string(),
+            count: names.len(),
+            max: MAX_INDEXED_FIELDS,
+        });
     }
 
     let mut seen: Vec<&str> = Vec::with_capacity(names.len());
     for name in names {
         if name.is_empty() {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "{}indexed_fields contains an empty name. Every entry has to be the \
-                 name of a metadata field.",
-                source
-            )));
+            return Err(Error::IndexedFieldEmpty {
+                source: source.to_string(),
+            });
         }
         if GROUP_KEYS.contains(&name.as_str()) {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "{}indexed_fields names \"{}\", which is a reserved filter key rather \
-                 than a metadata field. A field with that name cannot be filtered on, \
-                 so a column for it could never be read.",
-                source, name
-            )));
+            return Err(Error::IndexedFieldReserved {
+                source: source.to_string(),
+                name: name.clone(),
+            });
         }
         if seen.contains(&name.as_str()) {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "{}indexed_fields names \"{}\" twice. Each field is declared once.",
-                source, name
-            )));
+            return Err(Error::IndexedFieldRepeated {
+                source: source.to_string(),
+                name: name.clone(),
+            });
         }
         seen.push(name);
     }

@@ -68,6 +68,7 @@
 //! export ZEUSDB_LOG_ROTATION=daily        # Writes logs/zeusdb.log.2026-08-03
 //! ```
 
+use crate::error::Error;
 use pyo3::prelude::*;
 use std::io;
 use std::io::IsTerminal;
@@ -356,9 +357,7 @@ pub fn py_init_file_logging(
 ) -> PyResult<bool> {
     // Input validation
     if log_dir.trim().is_empty() {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "log_dir cannot be empty",
-        ));
+        return Err(Error::LogDirEmpty.into());
     }
 
     let mut took_init = false;
