@@ -20,15 +20,18 @@
 //!
 //! # What it costs
 //!
-//! Nothing measurable and nothing to the stream. `StdRng` in `rand` 0.9 is a
-//! newtype over `rand_chacha::ChaCha12Rng` that forwards `next_u32`,
+//! Nothing measurable and nothing to the stream. `StdRng` in `rand` 0.9 was a
+//! newtype over `rand_chacha::ChaCha12Rng` that forwarded `next_u32`,
 //! `next_u64`, `fill_bytes` and `from_seed` to it unchanged, so naming
-//! `ChaCha12Rng` reproduces the stream `StdRng` produced word for word.
+//! `ChaCha12Rng` reproduces the stream `StdRng` produced word for word. In
+//! `rand` 0.10 `StdRng` is a newtype over the `chacha20` crate's ChaCha12
+//! instead, a second implementation of the same generator, and the stream
+//! is unchanged.
 //! [`the_pin_reproduces_the_std_rng_stream`] holds that directly, and
 //! `graph::structure::the_level_stream_matches_the_recorded_one` holds it end
-//! to end against a stream recorded before the pin existed. `rand` already
-//! depends on `rand_chacha` to build `StdRng` at all, so the direct dependency
-//! adds no crate to the lockfile.
+//! to end against a stream recorded before the pin existed. `rand` 0.10 no
+//! longer depends on `rand_chacha`, so the direct dependency is what keeps it
+//! in the lockfile, beside the `chacha20` crate `rand` builds `StdRng` on.
 //!
 //! # What is still not pinned
 //!
@@ -39,8 +42,8 @@
 //! two byte seed comes from `rand_core`. It carries no portability warning, and
 //! it carries the opposite one, being "*Changing* the implementation of this
 //! function should be considered a value-breaking change". A value-breaking
-//! change to a `0.9` crate needs a `0.10`, which the caret constraint on `rand`
-//! will not resolve to. [`the_seed_expansion_is_the_recorded_one`] records the
+//! change to a `0.x` crate needs a new minor, which the caret constraint on
+//! `rand` will not resolve to. [`the_seed_expansion_is_the_recorded_one`] records the
 //! bytes regardless, so a move would be a named failure rather than a silent
 //! one. The expansion is PCG32 rather than the SplitMix64 an earlier comment in
 //! `pq` claimed, which changes nothing about the streams and is written down
@@ -61,7 +64,7 @@ pub type SeededRng = rand_chacha::ChaCha12Rng;
 mod tests {
     use super::SeededRng;
     use rand::rngs::StdRng;
-    use rand::{RngCore, SeedableRng};
+    use rand::{Rng, SeedableRng};
 
     /// The seeds the crate installs, so the two tests below cover the streams
     /// that actually build something rather than an arbitrary value.

@@ -33,6 +33,10 @@ updates:
       cargo:
         patterns:
           - "*"
+    ignore:
+      # bincode 3.0.0 carries no code, only a compile error. See deny.toml.
+      - dependency-name: bincode
+        update-types: ["version-update:semver-major"]
     open-pull-requests-limit: 5
 
   - package-ecosystem: uv

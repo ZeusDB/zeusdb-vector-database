@@ -58,16 +58,18 @@ numpy = "0.29.0"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 rayon = "1.10"
-rand = "0.9.1"
+rand = "0.10"
 # The generator itself, named rather than taken from `rand::rngs::StdRng`,
 # which `rand` documents as non-portable and free to change algorithm in any
 # release. Every seeded draw in the engine runs on it, being the level stream a
 # graph is built from and both of the product quantizer's. See
 # crates/core/src/rng.rs.
 #
-# `rand`'s default features already pull `rand_chacha` in to build `StdRng` at
-# all, so this names a dependency the lock already held rather than adding one.
-rand_chacha = "0.9"
+# `rand` 0.10 builds `StdRng` on the `chacha20` crate rather than on
+# `rand_chacha`, so this is a dependency of its own. The two crates
+# implement the same generator and produce the same stream word for word,
+# which crates/core/src/rng.rs holds by test.
+rand_chacha = "0.10"
 # The distance kernels' vector type. See the "How they are compiled" section of
 # crates/core/src/distance.rs. It pulls in safe_arch and bytemuck, and it
 # is a build-time abstraction over the target's own vector registers with no

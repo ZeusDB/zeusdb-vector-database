@@ -6,7 +6,7 @@
 //! that reason.
 
 use crate::rng::SeededRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 /// Clustered unit vectors. Fifty Gaussian centres, points drawn as a centre
 /// plus 0.15 times a Gaussian perturbation, then L2 normalised, with the
 /// centres deliberately left unnormalised. This is the shape real

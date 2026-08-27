@@ -22,7 +22,7 @@ use crate::distance::{CosineDist, DistPQ, PqMetric};
 use crate::pq::PQ;
 use crate::rng::SeededRng;
 use crate::test_vectors::clustered;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 // Scale for the quantized graph tests. Small enough for CI and large
