@@ -672,15 +672,23 @@ where
         file_bytes,
     };
 
-    // The body is on disk before the header names it, and the magic arrives
+    // The body is written before the header names it, and the magic arrives
     // with the header. A save interrupted before this point leaves zeros at
     // offset zero, which reads as no dump at all rather than as a short one.
+    //
+    // The file is fsynced once the header is in place, as every other
+    // artefact is by `write_artefact` in persistence.rs and for the same
+    // reason. The rename that moves the staging directory into place can
+    // otherwise be recorded while these bytes are still in the page cache,
+    // and a power loss then leaves a directory whose manifest is complete and
+    // whose graph dump is short.
     let mut file = inner
         .into_inner()
         .map_err(|e| format!("the graph dump could not be flushed: {}", e))?;
     file.seek(SeekFrom::Start(0))
         .and_then(|_| file.write_all(&header.encode()))
         .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
         .map_err(|e| format!("the graph dump's header could not be written: {}", e))?;
 
     // Only once the new dump is whole. A save over a directory written by an

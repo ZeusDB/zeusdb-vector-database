@@ -28,5 +28,5 @@ graph is ZeusDB's own and that crate is no longer a dependency in any
 form. ZeusDB's graph reproduces the behaviour of that implementation and
 the acknowledgement is kept for that reason.
 
-Every dependency is declared in `vdb-core/Cargo.toml` and resolved from
-crates.io.
+Every dependency is declared in the `Cargo.toml` at the repository root and
+resolved from crates.io.

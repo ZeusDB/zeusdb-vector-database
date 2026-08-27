@@ -4,9 +4,10 @@
 # crates inside it, run an advisory check against them or read their licences,
 # so the check runs here.
 #
-# It lives beside Cargo.toml rather than at the repository root, because
-# cargo-deny reads the manifest directory and every cargo step in this project
-# already sets working-directory to vdb-core.
+# This is the only deny.toml in the tree, at the workspace root. cargo-deny
+# reads the file in the directory it runs from before it looks for the
+# workspace root's, so a copy in a member directory would replace this one for
+# a run from that directory, and the CI gate checks that exactly one exists.
 #
 # dependency-scan.yml runs this config in two passes, one over advisories and
 # one over licences, bans and sources.
@@ -62,8 +63,28 @@ confidence-threshold = 0.8
 # usually not this project's to make.
 multiple-versions = "warn"
 wildcards = "deny"
+# A workspace member depends on another by path alone, with the version coming
+# from [workspace.package], and without this every such edge is a wildcard.
+# It applies only to crates that declare `publish = false`, which every member
+# does.
+allow-wildcard-paths = true
 # The build must not silently gain a crate from a git URL or a local path.
-deny = []
+#
+# Only the binding crate touches Python. `wrappers` names the crates allowed
+# to depend on a banned crate directly and guards that edge alone, so pyo3's
+# own tree is banned too, or a crate taking pyo3-ffi directly would pass. The
+# wrapper names follow pyo3's layout, and an entry no edge uses is reported
+# as `unused-wrapper` when a pyo3 bump moves them. The CI gate also asserts
+# that no crate but the binding reaches any of these through another member.
+deny = [
+    { crate = "pyo3", wrappers = ["zeusdb-vector-python", "numpy"], reason = "only the binding crate touches Python" },
+    { crate = "pyo3-ffi", wrappers = ["pyo3"], reason = "pyo3's own tree, banned so that taking it directly does not pass the pyo3 ban" },
+    { crate = "pyo3-macros", wrappers = ["pyo3"], reason = "pyo3's own tree" },
+    { crate = "pyo3-macros-backend", wrappers = ["pyo3-macros"], reason = "pyo3's own tree" },
+    { crate = "pyo3-build-config", wrappers = ["pyo3", "pyo3-ffi", "numpy"], reason = "pyo3's own tree" },
+    { crate = "tokio", wrappers = [], reason = "no async runtime in the engine" },
+    { crate = "async-std", wrappers = [], reason = "no async runtime in the engine" },
+]
 
 [sources]
 unknown-registry = "deny"

@@ -1,0 +1,69 @@
+# The Python binding, which is the crate the wheel is built from. maturin
+# reaches it through manifest-path in pyproject.toml.
+[package]
+name = "zeusdb-vector-python"
+# The version, the edition and the licence are the workspace's, declared once
+# in the root Cargo.toml.
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Nothing in this workspace is published to crates.io. The wheel is the only
+# artefact.
+publish = false
+
+[lib]
+# Two names, and they are independent.
+#
+# This one is the crate name. It is the root of every module path in the
+# crate, and so the `target` every log record the engine emits carries and the
+# prefix a `RUST_LOG` directive names, so it stays `zeusdb_vector_database`.
+#
+# The extension module the wheel ships is `_engine`, named by the
+# `#[pymodule]` attribute in src/lib.rs and by module-name in pyproject.toml,
+# and lives inside the zeusdb_vector_database package as
+# zeusdb_vector_database._engine.
+name = "zeusdb_vector_database"
+crate-type = ["cdylib"]
+
+# On by default, so every ordinary cargo command and the wheel build compile
+# the same thing, and off for `cargo test` alone.
+#
+# `pyo3/extension-module` tells PyO3 that the output is a module a Python
+# interpreter will load, so on Unix its build script deliberately emits no
+# `-lpython`: the interpreter already holds those symbols and a shared object
+# is allowed to leave them undefined. **An executable is not.** `cargo test`
+# builds the lib target as a test executable, so with the feature on that
+# executable links with every libpython symbol it references unresolved, and
+# on Linux the link fails.
+#
+# Windows is unaffected, because there every symbol must resolve at link time
+# and PyO3 emits the import library whatever this feature says.
+#
+# **On Linux, run the tests as `cargo test --workspace --no-default-features`**,
+# which is what the CI gate does. Turning the feature off makes PyO3 emit
+# `-lpython3.x`, so the link needs a libpython the linker can resolve, which on
+# Debian and Ubuntu means the python3-dev package rather than the interpreter
+# alone.
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
+# Every version is the workspace's, declared once in the root Cargo.toml with
+# the reason for each pin.
+[dependencies]
+pyo3 = { workspace = true }
+numpy = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+rayon = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+wide = { workspace = true }
+bincode = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

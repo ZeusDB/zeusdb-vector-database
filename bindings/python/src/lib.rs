@@ -25,8 +25,14 @@ use pyo3::prelude::*;
 ///
 /// Automatically initializes structured logging on import.
 /// Logs are controlled by environment variables or optional Python functions.
-#[pymodule]
-fn zeusdb_vector_database(py: Python, m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
+///
+/// The module is `_engine`, and is imported as `zeusdb_vector_database._engine`
+/// by the Python package. The name is given here and by module-name in
+/// pyproject.toml, and is independent of the crate name in Cargo.toml, which
+/// stays `zeusdb_vector_database` because it is the root of every log
+/// record's target.
+#[pymodule(name = "_engine")]
+fn engine(py: Python, m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
     // Auto-initialize logging on module import
     // Respects ZEUSDB_DISABLE_AUTOLOG for power users
     logging::init_logging();

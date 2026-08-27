@@ -24,7 +24,7 @@ An acknowledgement within seven days, and an assessment of whether the report is
 
 ## Scope
 
-In scope are the `zeusdb-vector-database` package on PyPI, this repository's source under `vdb-core/` and `src/`, and the workflows under `.github/workflows/`.
+In scope are the `zeusdb-vector-database` package on PyPI, this repository's source under `bindings/`, `crates/` and `src/`, and the workflows under `.github/workflows/`.
 
 Out of scope, and reported in their own repositories, are the `zeusdb` umbrella package, `langchain-zeusdb` and `llama-index-vector-stores-zeusdb`.
 

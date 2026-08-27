@@ -11,8 +11,9 @@
 #     segment, publishes to TestPyPI
 #   - any other v* tag publishes to production PyPI
 #   Tags must be the letter v followed by a PEP 440 version in its canonical
-#   spelling, and the version must be the one pyproject.toml,
-#   vdb-core/Cargo.toml and src/zeusdb_vector_database/__version__ declare.
+#   spelling, and the version must be the one pyproject.toml, the root
+#   Cargo.toml's [workspace.package] and src/zeusdb_vector_database/__version__
+#   declare.
 #   check-version parses all four with the packaging library and fails the
 #   run, before a single wheel is built, naming whichever disagreed or did not
 #   parse. The publish jobs read its prerelease output and nothing else, so a
@@ -47,10 +48,11 @@
 # records. Renaming this file breaks publishing until both records are updated.
 #
 # Every wheel build passes --locked to maturin, which forwards it to cargo, so
-# a release fails when vdb-core/Cargo.lock is out of date instead of resolving
+# a release fails when Cargo.lock is out of date instead of resolving
 # fresh. The sdist command takes no such flag.
 #
-# One wheel per platform, six in total. vdb-core enables pyo3/abi3-py310, so a
+# One wheel per platform, six in total. The workspace's Cargo.toml enables
+# pyo3/abi3-py310 on the pyo3 dependency, so a
 # single build produces a cp310-abi3 wheel that loads on every CPython from
 # 3.10 up, including releases that do not exist yet. That is why no job passes
 # --find-interpreter and why none names an interpreter: with abi3 the wheel is
@@ -124,12 +126,30 @@ jobs:
 
           def toml_version(path, table):
               text = pathlib.Path(path).read_text(encoding="utf-8-sig")
-              return tomllib.loads(text)[table]["version"]
+              data = tomllib.loads(text)
+              # A workspace root declares the version once, in
+              # [workspace.package], and a member takes it with
+              # version.workspace = true. A single-crate manifest declares it
+              # in [package].
+              if table == "package" and "workspace" in data and "package" in data["workspace"]:
+                  return data["workspace"]["package"]["version"]
+              return data[table]["version"]
 
           declared = {
               "pyproject.toml": toml_version("pyproject.toml", "project"),
-              "vdb-core/Cargo.toml": toml_version("vdb-core/Cargo.toml", "package"),
+              "Cargo.toml": toml_version("Cargo.toml", "package"),
           }
+
+          # Every member manifest must take the workspace's version rather
+          # than spell one of its own, or the version read above is not the
+          # one that member is built with.
+          members = sorted(pathlib.Path("bindings").glob("*/Cargo.toml")) + sorted(pathlib.Path("crates").glob("*/Cargo.toml"))
+          for manifest in members:
+              member = tomllib.loads(manifest.read_text(encoding="utf-8-sig"))
+              if member.get("package", {}).get("version") != {"workspace": True}:
+                  fail(f"{manifest.as_posix()} declares a version of its own rather than "
+                       "version.workspace = true")
+              print(f"{manifest.as_posix()} takes its version from the workspace")
           init_path = "src/zeusdb_vector_database/__init__.py"
           init = pathlib.Path(init_path).read_text(encoding="utf-8")
           found = re.search(r'^__version__ = "([^"]+)"$', init, re.MULTILINE)
@@ -765,7 +785,7 @@ jobs:
       - name: Build the dependency SBOM
         if: steps.existing.outputs.found == 'false'
         # A CycloneDX listing of every crate the wheel links, read from
-        # vdb-core/Cargo.lock and attached to the release beside the notes.
+        # Cargo.lock and attached to the release beside the notes.
         # The wheel is one compiled object, so a user who installs it cannot
         # enumerate what is inside it, and this is the file that answers that.
         #
@@ -777,7 +797,7 @@ jobs:
         # are excluded by construction, so tempfile and the seven crates it
         # brings in are absent, because cargo test compiles them and no wheel
         # ships them. That gives 109 components against the 118 entries in
-        # Cargo.lock, the last of which is the crate the SBOM describes.
+        # Cargo.lock, one of which is the crate the SBOM describes.
         #
         # cargo is already on the runner image, so only cargo-cyclonedx is
         # installed, and compiling it is the whole cost of this step.
@@ -787,12 +807,12 @@ jobs:
           set -euo pipefail
           cargo install --locked cargo-cyclonedx
           cargo cyclonedx \
-            --manifest-path vdb-core/Cargo.toml \
+            --manifest-path bindings/python/Cargo.toml \
             --format json \
             --describe crate \
             --target all \
             --spec-version 1.5
-          mv vdb-core/zeusdb-vector-database.cdx.json \
+          mv bindings/python/zeusdb-vector-python.cdx.json \
              "$RUNNER_TEMP/zeusdb-vector-database-${TAG#v}.cdx.json"
           ls -lh "$RUNNER_TEMP"/*.cdx.json
 

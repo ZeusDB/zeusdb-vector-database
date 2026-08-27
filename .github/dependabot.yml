@@ -3,7 +3,8 @@
 # github-actions raises the pinned commit SHA and the version comment beside it
 # for every action under .github/workflows, grouped into one pull request.
 #
-# cargo watches vdb-core/Cargo.toml and vdb-core/Cargo.lock.
+# cargo watches the workspace at the root, being Cargo.toml, Cargo.lock and
+# every member manifest under bindings/ and crates/.
 #
 # uv watches pyproject.toml and uv.lock.
 version: 2
@@ -22,7 +23,7 @@ updates:
     open-pull-requests-limit: 5
 
   - package-ecosystem: cargo
-    directory: /vdb-core
+    directory: /
     schedule:
       interval: weekly
       day: monday

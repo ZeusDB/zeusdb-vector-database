@@ -1384,7 +1384,7 @@ def test_pq_reconstructed_record_fidelity(saved_pq_index):
 #
 # The tests below are the public API half of that guard. The graph structure
 # itself is not reachable from Python, so the shuffle test that proves the
-# adjacency depends on the codes lives in vdb-core's own test module.
+# adjacency depends on the codes lives in the extension crate's own test module.
 #
 # 16 * 4 / 8 is 8x compression, below the 50x threshold in
 # _check_memory_usage, so neither mode warns about the ratio. Clustered unit

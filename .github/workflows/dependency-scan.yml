@@ -2,7 +2,9 @@
 #
 # The wheel is one compiled object. A user who installs it cannot enumerate the
 # crates inside it, run an advisory check against them or read their licences,
-# so the check runs here. What each pass allows is in vdb-core/deny.toml.
+# so the check runs here. What each pass allows is in deny.toml at the
+# repository root, beside the workspace's Cargo.toml and Cargo.lock, which
+# is where both passes run from.
 #
 # Two passes. The advisory pass writes SARIF and uploads it to code scanning,
 # where a finding is triaged and dismissed with a recorded reason. The licence,
@@ -19,16 +21,20 @@ on:
   push:
     branches: [main, development]
     paths:
-      - 'vdb-core/Cargo.toml'
-      - 'vdb-core/Cargo.lock'
-      - 'vdb-core/deny.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - 'bindings/*/Cargo.toml'
+      - 'crates/*/Cargo.toml'
       - '.github/workflows/dependency-scan.yml'
   pull_request:
     branches: [main, development]
     paths:
-      - 'vdb-core/Cargo.toml'
-      - 'vdb-core/Cargo.lock'
-      - 'vdb-core/deny.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - 'bindings/*/Cargo.toml'
+      - 'crates/*/Cargo.toml'
       - '.github/workflows/dependency-scan.yml'
   schedule:
     # 02:15 UTC daily, off the hour because the shared scheduler queues runs
@@ -79,7 +85,6 @@ jobs:
           cargo deny \
             --all-features \
             --locked \
-            --manifest-path vdb-core/Cargo.toml \
             --format sarif \
             check advisories > "$RUNNER_TEMP/cargo-deny.sarif"
 
@@ -125,5 +130,4 @@ jobs:
           cargo deny \
             --all-features \
             --locked \
-            --manifest-path vdb-core/Cargo.toml \
             check licenses bans sources

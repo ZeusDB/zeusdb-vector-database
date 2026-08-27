@@ -5,7 +5,7 @@ Factory for creating vector indexes with support for multiple types and quantiza
 Currently supports HNSW (Hierarchical Navigable Small World) with extensible design.
 """
 from typing import Dict, Any, Optional
-from .zeusdb_vector_database import _create_hnsw_index
+from ._engine import _create_hnsw_index
 # Index types are registered in _index_types and dispatched in _build_index.
 
 # A _MemoryInfo TypedDict used to sit here, describing a __memory_info__ entry
@@ -421,7 +421,7 @@ class VectorDatabase:
             >>> loaded_index = vdb.load("my_index.zdb")
             >>> results = loaded_index.search(query_vector, top_k=5)
         """
-        from .zeusdb_vector_database import _load_index  # Direct function import
+        from ._engine import _load_index  # Direct function import
         return _load_index(path)
 
 

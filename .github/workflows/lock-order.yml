@@ -1,9 +1,9 @@
 # The whole Python suite with the lock rank registry live.
 #
-# The registry in vdb-core/src/hnsw_index/locks.rs is gated on
+# The registry in bindings/python/src/hnsw_index/locks.rs is gated on
 # `cfg(debug_assertions)` and on nothing else. Every gate in ci.yml builds the
 # extension the way the wheel is built, which is a release build with the
-# assertions off. The `checked` profile in vdb-core/Cargo.toml is the release
+# assertions off. The `checked` profile in the root Cargo.toml is the release
 # profile with the assertions turned back on, and this workflow is where it
 # runs.
 #
@@ -28,13 +28,13 @@ on:
     # The modules named in the header. A change elsewhere, including to the
     # Python package and the tests, runs the release suite in ci.yml alone.
     paths:
-      - 'vdb-core/src/hnsw_index/**'
-      - 'vdb-core/src/graph/**'
-      - 'vdb-core/src/columns.rs'
-      - 'vdb-core/src/filter.rs'
-      - 'vdb-core/src/persistence.rs'
-      - 'vdb-core/src/pq.rs'
-      - 'vdb-core/src/rerank.rs'
+      - 'bindings/python/src/hnsw_index/**'
+      - 'bindings/python/src/graph/**'
+      - 'bindings/python/src/columns.rs'
+      - 'bindings/python/src/filter.rs'
+      - 'bindings/python/src/persistence.rs'
+      - 'bindings/python/src/pq.rs'
+      - 'bindings/python/src/rerank.rs'
       - '.github/workflows/lock-order.yml'
   schedule:
     # 04:17 UTC on Mondays, off the hour because the scheduler queues runs
@@ -62,12 +62,12 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: vdb-core
+          workspaces: ". -> target"
           # Its own key. The `checked` profile is a third profile, beside the
           # debug one ci.yml's lint and test-rust jobs share and the release one
           # its test-python job keeps, so sharing either key would evict that
           # cache on every run of this one.
-          shared-key: vdb-core-checked
+          shared-key: workspace-checked
           cache-on-failure: true
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:

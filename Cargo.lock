@@ -1047,7 +1047,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zeusdb-vector-database"
+name = "zeusdb-vector-python"
 version = "0.8.0"
 dependencies = [
  "bincode",

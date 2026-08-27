@@ -544,7 +544,7 @@ def test_filter_numeric_comparison_is_consistent_across_operators():
 # one.
 # ------------------------------------------------------------
 
-# Mirrors FULL_SCAN_THRESHOLD in vdb-core/src/hnsw_index/search.rs. The Rust
+# Mirrors FULL_SCAN_THRESHOLD in bindings/python/src/hnsw_index/search.rs. The Rust
 # constant is the one that decides; this is what the boundary tests aim at.
 FULL_SCAN_THRESHOLD = 5000
 
@@ -852,7 +852,7 @@ def test_a_filtered_search_survives_a_concurrent_insert():
 # every filter written before this existed means what it always did.
 # ------------------------------------------------------------
 
-# Mirrors MAX_FILTER_DEPTH in vdb-core/src/filter.rs.
+# Mirrors MAX_FILTER_DEPTH in bindings/python/src/filter.rs.
 MAX_FILTER_DEPTH = 10
 
 

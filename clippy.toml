@@ -1,4 +1,9 @@
-# Lint configuration for this crate.
+# Lint configuration for every crate in the workspace.
+#
+# This is the only clippy.toml in the tree, at the workspace root. Clippy reads
+# the file nearest each crate's own manifest, so a copy in a member directory
+# would replace this one for that crate without a warning, and the CI gate
+# checks that exactly one exists.
 #
 # `disallowed-types` is why a lock added to `HNSWIndex` later cannot bypass the
 # guard registry. The registry only works if every lock on that type goes
