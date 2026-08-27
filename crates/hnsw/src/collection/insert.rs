@@ -1,12 +1,20 @@
-//! Insertion, replacement, removal and compaction.
+//! Insertion, replacement, removal, compaction, rebuild and clear.
 //!
-//! `insert_parsed_records` is the whole of what `add` does once parsing is over,
-//! and it runs with the interpreter lock released. The three `add_*` paths below
-//! it are chosen by whether the index is quantized and whether it is still
-//! collecting for training. Removal is logical, and `compact_locked` reclaims
-//! the graph nodes that removal and replacement leave behind.
+//! `add` is the whole of what the Python entry point does once parsing is
+//! over, and the binding calls it with the interpreter lock released. The
+//! three `add_*` paths below `insert_parsed_records` are chosen by whether the
+//! index is quantized and whether it is still collecting for training. Removal
+//! is logical, and `compact` reclaims the graph nodes that removal and
+//! replacement leave behind.
+//!
+//! Every mutating operation the binding calls takes `writers` here, first and
+//! before any guard, and the helpers under it never do.
 
-use super::{HNSWIndex, ParsedRecords, StorageMode, MAX_LAYER};
+use super::{
+    validate_index_parameters, Collection, LiveRecords, ParsedRecords, StorageMode, MAX_LAYER,
+};
+use crate::locks::{order, WriteGuard};
+use crate::RawVectors;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -15,8 +23,14 @@ use tracing::{debug, error, info, instrument, trace, warn};
 use zeusdb_vector_core::{
     matches_filter, Bitmap, ColumnStore, Error, Filter, Record, Selection, VectorGraph,
 };
-use zeusdb_vector_hnsw::locks::{order, WriteGuard};
-use zeusdb_vector_hnsw::RawVectors;
+
+/// The target every record this file emits carries. See the parent module.
+const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::insert";
+
+/// The target the records of `add` and `clear` carry. Both were entry point
+/// bodies in the parent module before they moved here, so their records keep
+/// the parent's target and a filter directive that matched them still does.
+const ENTRY_TARGET: &str = super::LOG_TARGET;
 /// Multiple of `expected_size` at which an index warns that it has outgrown its
 /// declaration. Fires once per index.
 const EXPECTED_SIZE_OVERGROWTH_FACTOR: usize = 2;
@@ -61,21 +75,21 @@ impl InsertError {
         }
     }
 }
-/// The write guards a removal holds, taken in the order `HNSWIndex` declares.
+/// The write guards a removal holds, taken in the order `Collection` declares.
 ///
 /// A struct rather than five locals so that a batch can take them once and lend
 /// them to the per record helper. They drop in field order, which is the
 /// acquisition order, and releasing may happen in any order.
 struct RemovalGuards<'a> {
     id_map: WriteGuard<'a, { order::ID_MAP }, HashMap<String, usize>>,
-    rev_map: WriteGuard<'a, { order::REV_MAP }, HashMap<usize, String>>,
+    rev_map: WriteGuard<'a, { order::REV_MAP }, LiveRecords>,
     pq_codes: WriteGuard<'a, { order::PQ_CODES }, HashMap<String, Vec<u8>>>,
     vector_metadata:
         WriteGuard<'a, { order::VECTOR_METADATA }, HashMap<String, HashMap<String, Value>>>,
     columns: WriteGuard<'a, { order::COLUMNS }, ColumnStore>,
 }
 
-impl HNSWIndex {
+impl Collection {
     /// Warn once when the index holds materially more records than it declared
     ///
     /// `expected_size` is a capacity hint rather than a limit, so exceeding it is
@@ -98,7 +112,7 @@ impl HNSWIndex {
         }
 
         let threshold = self
-            .get_expected_size()
+            .expected_size()
             .saturating_mul(EXPECTED_SIZE_OVERGROWTH_FACTOR);
         let live_records = self.id_map.read().unwrap().len();
         if live_records <= threshold {
@@ -113,11 +127,10 @@ impl HNSWIndex {
             return;
         }
 
-        warn!(
-            operation = "expected_size_exceeded",
+        warn!(target: LOG_TARGET, operation = "expected_size_exceeded",
             live_records = live_records,
-            expected_size = self.get_expected_size(),
-            m = self.get_m(),
+            expected_size = self.expected_size(),
+            m = self.space.m(),
             "Index holds more than {}x the records its expected_size declared. \
              expected_size is a hint and not a limit, so nothing is broken, but m \
              was sized for the declaration. Call rebuild(m=..., expected_size=...) \
@@ -167,14 +180,14 @@ impl HNSWIndex {
     /// Both guards are taken with no other guard held. The three storage maps
     /// this record has already been written to were each taken and released in
     /// their own block above, so `hnsw` is acquired alone, which satisfies the
-    /// order declared on `HNSWIndex` whichever way it is read.
+    /// order declared on `Collection` whichever way it is read.
     fn insert_one(&self, record: Record<'_>, internal_id: usize) {
         let planned = {
-            let hnsw_guard = self.hnsw.read().unwrap();
+            let hnsw_guard = self.space.hnsw.read().unwrap();
             hnsw_guard.plan(record)
         };
         if let Some(planned) = planned {
-            let mut hnsw_guard = self.hnsw.write().unwrap();
+            let mut hnsw_guard = self.space.hnsw.write().unwrap();
             hnsw_guard.install(record, internal_id, planned);
         }
     }
@@ -190,7 +203,7 @@ impl HNSWIndex {
         *counter
     }
 
-    /// Every write guard a removal takes, in the order `HNSWIndex` declares
+    /// Every write guard a removal takes, in the order `Collection` declares
     /// them.
     ///
     /// A batch removal holds one set of these for the whole batch rather than
@@ -202,7 +215,7 @@ impl HNSWIndex {
         RemovalGuards {
             id_map: self.id_map.write().unwrap(),
             rev_map: self.rev_map.write().unwrap(),
-            pq_codes: self.pq_codes.write().unwrap(),
+            pq_codes: self.space.pq_codes.write().unwrap(),
             vector_metadata: self.vector_metadata.write().unwrap(),
             columns: self.columns.write().unwrap(),
         }
@@ -220,8 +233,7 @@ impl HNSWIndex {
         storage_mode: &str,
     ) -> bool {
         let Some(internal_id) = guards.id_map.remove(id) else {
-            trace!(
-                operation = "remove_point_internal",
+            trace!(target: LOG_TARGET, operation = "remove_point_internal",
                 vector_id = %id,
                 "Vector not found for removal"
             );
@@ -239,6 +251,7 @@ impl HNSWIndex {
         // one keeps none.
         let had_raw_vector = !(storage_mode == "quantized_active"
             && self
+                .space
                 .quantization_config
                 .as_ref()
                 .is_some_and(|config| config.storage_mode == StorageMode::QuantizedOnly));
@@ -256,7 +269,7 @@ impl HNSWIndex {
                                            // leaves a hole in every column exactly as it leaves a stranded node.
         guards.columns.erase(internal_id);
         guards.pq_codes.remove(id); // Remove PQ codes (if present)
-        guards.rev_map.remove(&internal_id); // Remove ID mapping
+        guards.rev_map.remove(internal_id); // Remove ID mapping, and the live bit with it
         debug_assert!(
             guards.columns.tracks(guards.id_map.len()),
             "a column store holds one entry per live record, and a removal writes both"
@@ -271,20 +284,18 @@ impl HNSWIndex {
                 training_ids.retain(|training_id| training_id != id);
 
                 if training_ids.len() != original_len {
-                    trace!(
-                        operation = "training_cleanup",
+                    trace!(target: LOG_TARGET, operation = "training_cleanup",
                         vector_id = %id,
                         remaining_training_vectors = training_ids.len(),
                         "Removed vector from training set"
                     );
 
                     // Update threshold status if we dropped below training size
-                    if let Some(config) = &self.quantization_config {
+                    if let Some(config) = &self.space.quantization_config {
                         if training_ids.len() < config.training_size {
                             self.training_threshold_reached
                                 .store(false, std::sync::atomic::Ordering::Release);
-                            debug!(
-                                operation = "training_threshold_reset",
+                            debug!(target: LOG_TARGET, operation = "training_threshold_reset",
                                 remaining_vectors = training_ids.len(),
                                 required = config.training_size,
                                 "Training threshold reset due to removal"
@@ -303,8 +314,7 @@ impl HNSWIndex {
             }
         }
 
-        debug!(
-            operation = "remove_point_internal",
+        debug!(target: LOG_TARGET, operation = "remove_point_internal",
             vector_id = %id,
             internal_id = internal_id,
             had_raw_vector = had_raw_vector,
@@ -322,7 +332,7 @@ impl HNSWIndex {
     pub(super) fn remove_point_internal(&self, id: String) -> Result<bool, String> {
         // Read before the guards are taken, because it reaches the graph lock and
         // the declared order puts the graph above every map held below.
-        let storage_mode = self.get_storage_mode();
+        let storage_mode = self.storage_mode();
         let mut guards = self.removal_guards();
         Ok(self.remove_under_guards(&mut guards, &id, &storage_mode))
     }
@@ -341,7 +351,7 @@ impl HNSWIndex {
     /// What that changes for a reader is that the batch is atomic against every
     /// search: none of them sees the index part way through it.
     pub(super) fn remove_points_internal(&self, ids: &[String]) -> Vec<String> {
-        let storage_mode = self.get_storage_mode();
+        let storage_mode = self.storage_mode();
         let mut guards = self.removal_guards();
         let mut handled: HashSet<&str> = HashSet::with_capacity(ids.len());
         let mut missing = Vec::new();
@@ -457,8 +467,7 @@ impl HNSWIndex {
     ) -> bool {
         let id_map = self.id_map.read().unwrap();
         let Some(&internal_id) = id_map.get(id) else {
-            trace!(
-                operation = "update_metadata",
+            trace!(target: LOG_TARGET, operation = "update_metadata",
                 vector_id = %id,
                 "Record not found, metadata not written"
             );
@@ -475,8 +484,7 @@ impl HNSWIndex {
             "every declared field's column holds what the record's metadata holds"
         );
         vector_metadata.insert(id.to_string(), metadata);
-        trace!(
-            operation = "update_metadata",
+        trace!(target: LOG_TARGET, operation = "update_metadata",
             vector_id = %id,
             "Metadata replaced"
         );
@@ -489,11 +497,10 @@ impl HNSWIndex {
         let start_time = Instant::now();
 
         let live_count = self.id_map.read().unwrap().len();
-        let nodes_before = self.hnsw.read().unwrap().nb_points();
+        let nodes_before = self.space.hnsw.read().unwrap().nb_points();
 
         if nodes_before <= live_count {
-            debug!(
-                operation = "compact",
+            debug!(target: LOG_TARGET, operation = "compact",
                 graph_nodes = nodes_before,
                 live_records = live_count,
                 "No stranded nodes, compact is a no-op"
@@ -503,13 +510,12 @@ impl HNSWIndex {
 
         let quantized = self.is_quantized();
         let nodes_after = self.rebuild_graph(
-            self.get_m(),
-            self.get_expected_size(),
-            self.get_ef_construction(),
+            self.space.m(),
+            self.expected_size(),
+            self.space.ef_construction(),
         )?;
         let reclaimed = nodes_before - nodes_after;
-        info!(
-            operation = "compact_complete",
+        info!(target: LOG_TARGET, operation = "compact_complete",
             nodes_before = nodes_before,
             nodes_after = nodes_after,
             nodes_reclaimed = reclaimed,
@@ -558,21 +564,21 @@ impl HNSWIndex {
         let _writers = self.writers.lock().unwrap();
         let start_time = Instant::now();
 
-        let previous_m = self.get_m();
-        let previous_expected_size = self.get_expected_size();
-        let previous_ef_construction = self.get_ef_construction();
+        let previous_m = self.space.m();
+        let previous_expected_size = self.expected_size();
+        let previous_ef_construction = self.space.ef_construction();
         let live_count = self.id_map.read().unwrap().len();
-        let nodes_before = self.hnsw.read().unwrap().nb_points();
+        let nodes_before = self.space.hnsw.read().unwrap().nb_points();
 
         let nodes_after = self.rebuild_graph(m, expected_size, ef_construction)?;
 
-        self.m.store(m, Ordering::Release);
+        self.space.m.store(m, Ordering::Release);
         self.expected_size.store(expected_size, Ordering::Release);
-        self.ef_construction
+        self.space
+            .ef_construction
             .store(ef_construction, Ordering::Release);
 
-        info!(
-            operation = "rebuild_complete",
+        info!(target: LOG_TARGET, operation = "rebuild_complete",
             m_before = previous_m,
             m_after = m,
             expected_size_before = previous_expected_size,
@@ -614,9 +620,9 @@ impl HNSWIndex {
         let quantized = self.is_quantized();
 
         let mut new_hnsw = if quantized {
-            let pq = self.pq.as_ref().cloned().ok_or(Error::NoQuantizer)?;
+            let pq = self.space.pq.as_ref().cloned().ok_or(Error::NoQuantizer)?;
             VectorGraph::new_pq(
-                &self.space,
+                &self.space.metric,
                 m,
                 expected_size,
                 MAX_LAYER,
@@ -625,8 +631,8 @@ impl HNSWIndex {
             )
         } else {
             VectorGraph::new_raw(
-                &self.space,
-                self.dim,
+                &self.space.metric,
+                self.space.dim,
                 m,
                 expected_size,
                 MAX_LAYER,
@@ -643,7 +649,7 @@ impl HNSWIndex {
             // The graph being replaced, which is where the vectors live. Taken
             // after `id_map` and released with it, before `replace_graph`
             // takes the write guard below.
-            let old_hnsw = self.hnsw.read().unwrap();
+            let old_hnsw = self.space.hnsw.read().unwrap();
 
             // Internal id order, which is arrival order, rather than the order a
             // hash map hands its entries out. Two compactions of the same index
@@ -656,7 +662,7 @@ impl HNSWIndex {
             live.sort_by_key(|&(_, internal_id)| internal_id);
 
             if quantized {
-                let pq_codes = self.pq_codes.read().unwrap();
+                let pq_codes = self.space.pq_codes.read().unwrap();
                 let mut batch: Vec<(&Vec<u8>, usize)> = Vec::with_capacity(id_map.len());
                 let mut missing = Vec::new();
 
@@ -669,7 +675,7 @@ impl HNSWIndex {
 
                 if missing.is_empty() && !batch.is_empty() {
                     new_hnsw.insert_batch_pq(&batch).map_err(|e| {
-                        error!(operation = "rebuild_graph", error = %e, "Failed to re-insert quantized codes");
+                        error!(target: LOG_TARGET, operation = "rebuild_graph", error = %e, "Failed to re-insert quantized codes");
                         Error::ReinsertCodesFailed(e)
                     })?;
                 }
@@ -681,7 +687,7 @@ impl HNSWIndex {
                 if missing.is_empty() && old_hnsw.holds_raw() {
                     if let Some(dim) = old_hnsw.raw_dim() {
                         new_hnsw.adopt_raw_from(&old_hnsw, dim).map_err(|e| {
-                            error!(operation = "rebuild_graph", error = %e, "Failed to carry the raw vectors over");
+                            error!(target: LOG_TARGET, operation = "rebuild_graph", error = %e, "Failed to carry the raw vectors over");
                             Error::AdoptRawFailed(e)
                         })?;
                     }
@@ -703,8 +709,7 @@ impl HNSWIndex {
         };
 
         if !missing.is_empty() {
-            error!(
-                operation = "rebuild_graph",
+            error!(target: LOG_TARGET, operation = "rebuild_graph",
                 missing_records = missing.len(),
                 live_records = live_count,
                 quantized = quantized,
@@ -729,7 +734,7 @@ impl HNSWIndex {
         // the write guard costs one copy of the live bytes against a rebuild that
         // has just re-inserted every record.
         new_hnsw.shrink_to_fit();
-        self.replace_graph(new_hnsw);
+        self.space.replace_graph(new_hnsw);
 
         Ok(nodes_after)
     }
@@ -789,8 +794,8 @@ impl HNSWIndex {
             // Phase 1: Batch identify and remove existing documents
             let (ids_to_remove, storage_analysis) = {
                 let id_map = self.id_map.read().unwrap();
-                let hnsw = self.hnsw.read().unwrap();
-                let pq_codes = self.pq_codes.read().unwrap();
+                let hnsw = self.space.hnsw.read().unwrap();
+                let pq_codes = self.space.pq_codes.read().unwrap();
                 let raws = RawVectors {
                     id_map: &id_map,
                     graph: &hnsw,
@@ -822,8 +827,7 @@ impl HNSWIndex {
             }; // Release all read locks here
 
             if !ids_to_remove.is_empty() {
-                info!(
-                    operation = "overwrite_preparation",
+                info!(target: LOG_TARGET, operation = "overwrite_preparation",
                     documents_to_remove = ids_to_remove.len(),
                     storage_analysis = format!(
                         "raw_only: {}, pq_only: {}, both: {}",
@@ -841,8 +845,7 @@ impl HNSWIndex {
                         Ok(was_removed) => {
                             if was_removed {
                                 removed_count += 1;
-                                trace!(
-                                    operation = "overwrite_removal",
+                                trace!(target: LOG_TARGET, operation = "overwrite_removal",
                                     vector_id = %id,
                                     "Removed existing vector/codes for overwrite"
                                 );
@@ -850,8 +853,7 @@ impl HNSWIndex {
                         }
                         Err(e) => {
                             removal_errors += 1;
-                            warn!(
-                                operation = "overwrite_removal",
+                            warn!(target: LOG_TARGET, operation = "overwrite_removal",
                                 vector_id = %id,
                                 error = %e,
                                 "Failed to remove existing vector for overwrite"
@@ -864,8 +866,7 @@ impl HNSWIndex {
                     }
                 }
 
-                info!(
-                    operation = "overwrite_removal_complete",
+                info!(target: LOG_TARGET, operation = "overwrite_removal_complete",
                     removed_count = removed_count,
                     removal_errors = removal_errors,
                     "Completed removal phase for overwrite"
@@ -874,9 +875,8 @@ impl HNSWIndex {
         }
 
         // Phase 2: Add new vectors using the correct path based on current PQ state
-        debug!(
-            operation = "add_vectors_insertion_phase",
-            current_state = self.get_storage_mode(),
+        debug!(target: LOG_TARGET, operation = "add_vectors_insertion_phase",
+            current_state = self.storage_mode(),
             "Starting insertion phase"
         );
 
@@ -898,8 +898,7 @@ impl HNSWIndex {
 
                     // Check training trigger (graceful failure handling)
                     if let Err(training_error) = self.maybe_trigger_training() {
-                        warn!(
-                            operation = "training_trigger",
+                        warn!(target: LOG_TARGET, operation = "training_trigger",
                             error = %training_error,
                             vector_id = %id_for_error,
                             "Training trigger failed"
@@ -938,8 +937,7 @@ impl HNSWIndex {
         };
 
         if !overwrite && !is_new {
-            warn!(
-                operation = "add_single_vector",
+            warn!(target: LOG_TARGET, operation = "add_single_vector",
                 vector_id = %id,
                 reason = "already_exists",
                 "Vector already exists and overwrite=false"
@@ -947,8 +945,7 @@ impl HNSWIndex {
             return Err(Error::DuplicateId { id });
         }
 
-        trace!(
-            operation = "add_single_vector",
+        trace!(target: LOG_TARGET, operation = "add_single_vector",
             vector_id = %id,
             is_new = is_new,
             has_quantization = self.has_quantization(),
@@ -972,7 +969,7 @@ impl HNSWIndex {
     }
 
     /// Path A: Raw storage (no quantization)
-    #[instrument(level = "trace", skip(self, vector, metadata), fields(
+    #[instrument(target = LOG_TARGET, level = "trace", skip(self, vector, metadata), fields(
         vector_id = %id,
         path = "raw_storage"
     ))]
@@ -1015,8 +1012,7 @@ impl HNSWIndex {
         // against holds it, and there is no second map to write.
         self.insert_one(Record::Raw(&vector), internal_id); // Already normalized
 
-        trace!(
-            operation = "add_raw_vector_complete",
+        trace!(target: LOG_TARGET, operation = "add_raw_vector_complete",
             vector_id = %id,
             internal_id = internal_id,
             "Raw vector added successfully"
@@ -1026,7 +1022,7 @@ impl HNSWIndex {
     }
 
     /// Path B: ID collection for consistent training
-    #[instrument(level = "trace", skip(self, vector, metadata), fields(
+    #[instrument(target = LOG_TARGET, level = "trace", skip(self, vector, metadata), fields(
         vector_id = %id,
         path = "id_collection"
     ))]
@@ -1044,8 +1040,7 @@ impl HNSWIndex {
             .rebuilding_from_persistence
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            trace!(
-                operation = "add_with_id_collection",
+            trace!(target: LOG_TARGET, operation = "add_with_id_collection",
                 vector_id = %id,
                 reason = "rebuilding_from_persistence",
                 "Skipping training ID collection during rebuild"
@@ -1083,7 +1078,7 @@ impl HNSWIndex {
         // What is drawn randomly is the order the sample is held in, which is
         // what every subset of it is taken by. `train_quantization_from_ids`
         // shuffles it under a fixed seed; see `TRAINING_SAMPLE_SEED`.
-        if let Some(config) = &self.quantization_config {
+        if let Some(config) = &self.space.quantization_config {
             if !self.training_threshold_reached.load(Ordering::Acquire) {
                 let mut training_ids = self.training_ids.write().unwrap();
 
@@ -1093,8 +1088,7 @@ impl HNSWIndex {
                         * 100.0)
                         .min(100.0);
 
-                    trace!(
-                        operation = "training_id_collection",
+                    trace!(target: LOG_TARGET, operation = "training_id_collection",
                         vector_id = %id,
                         collected_count = training_ids.len(),
                         target_size = config.training_size,
@@ -1106,8 +1100,7 @@ impl HNSWIndex {
                     if training_ids.len() >= config.training_size {
                         self.training_threshold_reached
                             .store(true, Ordering::Release);
-                        info!(
-                            operation = "training_threshold_reached",
+                        info!(target: LOG_TARGET, operation = "training_threshold_reached",
                             collected_count = training_ids.len(),
                             target_size = config.training_size,
                             "Training threshold reached - ready for PQ training"
@@ -1121,7 +1114,7 @@ impl HNSWIndex {
     }
 
     /// Path C: Quantized storage with configurable raw vector retention
-    #[instrument(level = "trace", skip(self, vector, metadata), fields(
+    #[instrument(target = LOG_TARGET, level = "trace", skip(self, vector, metadata), fields(
         vector_id = %id,
         path = "quantized_storage"
     ))]
@@ -1159,10 +1152,9 @@ impl HNSWIndex {
         }
 
         // Quantize the vector
-        let pq = self.pq.as_ref().unwrap();
+        let pq = self.space.pq.as_ref().unwrap();
         let codes = pq.quantize(&vector).map_err(|e| {
-            error!(
-                operation = "add_quantized_vector",
+            error!(target: LOG_TARGET, operation = "add_quantized_vector",
                 vector_id = %id,
                 error = %e,
                 "Failed to quantize vector"
@@ -1172,7 +1164,7 @@ impl HNSWIndex {
 
         // Store quantized codes (always)
         {
-            let mut pq_codes = self.pq_codes.write().unwrap();
+            let mut pq_codes = self.space.pq_codes.write().unwrap();
             pq_codes.insert(id.clone(), codes.clone());
         }
 
@@ -1180,6 +1172,7 @@ impl HNSWIndex {
         // are installed at is the node the raw has to sit at. Under
         // QuantizedOnly nothing travels and no raw vector is kept.
         let keeps_raw = self
+            .space
             .quantization_config
             .as_ref()
             .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw);
@@ -1194,8 +1187,7 @@ impl HNSWIndex {
             internal_id,
         );
 
-        trace!(
-            operation = "add_quantized_vector_complete",
+        trace!(target: LOG_TARGET, operation = "add_quantized_vector_complete",
             vector_id = %id,
             internal_id = internal_id,
             codes_length = codes.len(),
@@ -1204,4 +1196,379 @@ impl HNSWIndex {
 
         Ok(())
     }
+
+    /// The whole of `add` once parsing is over.
+    ///
+    /// The records arrive parsed and processed for the space, with the
+    /// per-record parse failures already worded, and the binding calls this
+    /// with the interpreter lock released. The mutation guard is taken here,
+    /// around the insertion alone, so a caller waiting for another writer
+    /// waits without the lock. Holding it while waiting would stall every
+    /// Python thread in the process for the length of the writer ahead.
+    ///
+    /// `insert_parsed_records` carries the proof that nothing inside touches
+    /// Python. The errors come back in the order they happened. Two of the
+    /// three variants carry a message Rust already built. The third carries
+    /// the `Error` the record's insertion raised, formatted here against its
+    /// id.
+    pub fn add(
+        &self,
+        parsed_data: ParsedRecords,
+        parse_errors: Vec<String>,
+        overwrite: bool,
+    ) -> Added {
+        let start_time = Instant::now();
+
+        let mut total_errors = 0;
+        let mut errors = Vec::new();
+
+        // Add parse errors to the collection
+        for parse_error in parse_errors {
+            errors.push(parse_error);
+            total_errors += 1;
+        }
+
+        if parsed_data.is_empty() && errors.is_empty() {
+            trace!(
+                target: ENTRY_TARGET,
+                operation = "add_vectors",
+                result = "empty_input",
+                "No vectors to process"
+            );
+            return Added {
+                inserted: vec![],
+                errors: vec![],
+                total_errors: 0,
+                vector_shape: Some((0, self.space.dim)),
+            };
+        }
+
+        let total_input_count = parsed_data.len() + total_errors;
+        let vector_shape = Some((total_input_count, self.space.dim));
+
+        debug!(
+            target: ENTRY_TARGET,
+            operation = "add_vectors_start",
+            total_vectors = parsed_data.len(),
+            parse_errors = total_errors,
+            overwrite = overwrite,
+            has_quantization = self.has_quantization(),
+            is_quantized = self.is_quantized(),
+            storage_mode = self.storage_mode(),
+            "Starting vector addition"
+        );
+
+        let (inserted_ids, insert_errors) = {
+            let _writers = self.writers.lock().unwrap();
+            self.insert_parsed_records(parsed_data, overwrite)
+        };
+        let total_inserted = inserted_ids.len();
+
+        for insert_error in insert_errors {
+            match insert_error {
+                InsertError::Counted(message) => {
+                    errors.push(message);
+                    total_errors += 1;
+                }
+                InsertError::Training(message) => {
+                    errors.push(message);
+                }
+                InsertError::Vector { id, err } => {
+                    trace!(
+                        target: ENTRY_TARGET,
+                        operation = "add_vector_error",
+                        vector_id = %id,
+                        error = %err,
+                        "Vector addition failed"
+                    );
+                    errors.push(format!(
+                        "Vector {}: {}: {}",
+                        id,
+                        err.exception().name(),
+                        err
+                    ));
+                    total_errors += 1;
+                }
+            }
+        }
+
+        let duration_ms = start_time.elapsed().as_millis();
+        info!(
+            target: ENTRY_TARGET,
+            operation = "add_vectors_complete",
+            total_inserted = total_inserted,
+            total_errors = total_errors,
+            success_rate = if total_input_count > 0 {
+                total_inserted as f64 / total_input_count as f64 * 100.0
+            } else {
+                100.0
+            },
+            duration_ms = duration_ms,
+            overwrite_mode = overwrite,
+            final_storage_mode = self.storage_mode(),
+            "Vector addition completed"
+        );
+
+        self.warn_if_outgrown_expected_size();
+
+        Added {
+            inserted: inserted_ids,
+            errors,
+            total_errors,
+            vector_shape,
+        }
+    }
+
+    /// Remove one record by id. `false` for an id the index does not hold.
+    pub fn remove_point(&self, id: String) -> Result<bool, Error> {
+        let _writers = self.writers.lock().unwrap();
+        self.remove_point_internal(id).map_err(Error::Engine)
+    }
+
+    /// Remove a batch of records under one acquisition of the mutation guard,
+    /// returning the ids that were not in the index. See
+    /// `remove_points_internal`.
+    pub fn remove_points(&self, ids: &[String]) -> Vec<String> {
+        let _writers = self.writers.lock().unwrap();
+        self.remove_points_internal(ids)
+    }
+
+    /// Remove the records these ids name and report how many went.
+    ///
+    /// A repeated id names one record, so it counts once whether or not it
+    /// was there. `remove_points_internal` already skips a repeat rather than
+    /// reporting it missing.
+    pub fn delete_ids(&self, requested: &[String]) -> usize {
+        let distinct: HashSet<&String> = requested.iter().collect();
+        let distinct_count = distinct.len();
+
+        let missing = {
+            let _writers = self.writers.lock().unwrap();
+            self.remove_points_internal(requested)
+        };
+
+        distinct_count - missing.len()
+    }
+
+    /// Remove every record whose metadata matches the filter, and report how
+    /// many were removed.
+    ///
+    /// **A filter matching every record is refused.** Everywhere else in this
+    /// language an empty filter matches every record, and `search(filter={})`
+    /// returns the whole index for exactly that reason. This is the one
+    /// operation where following that rule destroys every record, so it is
+    /// asked of the compiled tree, which also refuses `{"$and": []}` and
+    /// `{"$not": {"$or": []}}`. A caller who does mean it names the records.
+    pub fn remove_where(&self, conditions: &Filter) -> Result<usize, Error> {
+        if conditions.matches_every_record() {
+            return Err(Error::RemoveWhereMatchesEverything);
+        }
+        let _writers = self.writers.lock().unwrap();
+        Ok(self.remove_where_locked(conditions))
+    }
+
+    /// Replace one record's metadata without touching its vector. See
+    /// `update_metadata_locked`.
+    pub fn update_metadata(&self, id: &str, metadata: HashMap<String, Value>) -> bool {
+        let _writers = self.writers.lock().unwrap();
+        self.update_metadata_locked(id, metadata)
+    }
+
+    /// Rebuild the graph in memory and reclaim the nodes removal and overwrite
+    /// strand. See `compact_locked`.
+    pub fn compact(&self) -> Result<usize, Error> {
+        self.compact_locked()
+    }
+
+    /// Return the graph's spare buffer capacity to the allocator, reporting
+    /// the bytes released. See `VectorGraph::shrink_to_fit`.
+    pub fn shrink_to_fit(&self) -> usize {
+        let _writers = self.writers.lock().unwrap();
+        let mut hnsw = self.space.hnsw.write().unwrap();
+        hnsw.shrink_to_fit()
+    }
+
+    /// Resolve a rebuild request against the configuration the index holds.
+    ///
+    /// At least one of the three has to be given, since rebuilding the graph
+    /// as it stands is `compact`. The three are held to the rules `create()`
+    /// applies, on the same five values, and an invalid one raises the message
+    /// `create()` raises for it. The plan is returned rather than acted on so
+    /// the binding can raise the neighbour selection warning, which needs the
+    /// interpreter, between the check and the rebuild.
+    pub fn plan_rebuild(
+        &self,
+        m: Option<usize>,
+        expected_size: Option<usize>,
+        ef_construction: Option<usize>,
+    ) -> Result<RebuildPlan, Error> {
+        if m.is_none() && expected_size.is_none() && ef_construction.is_none() {
+            return Err(Error::RebuildWithoutChanges);
+        }
+        let new_m = m.unwrap_or_else(|| self.space.m());
+        let new_expected_size = expected_size.unwrap_or_else(|| self.expected_size());
+        let new_ef_construction = ef_construction.unwrap_or_else(|| self.space.ef_construction());
+        validate_index_parameters(
+            self.space.dim,
+            &self.space.metric,
+            new_m,
+            new_ef_construction,
+            new_expected_size,
+            "",
+        )?;
+        Ok(RebuildPlan {
+            m: new_m,
+            expected_size: new_expected_size,
+            ef_construction: new_ef_construction,
+            // A raised declaration is a new bar for the overgrowth warning, and
+            // the old one has already been claimed if it fired.
+            rearm_overgrowth: expected_size.is_some(),
+        })
+    }
+
+    /// Rebuild the graph at the degree a plan names. See `rebuild_locked`.
+    pub fn rebuild(&self, plan: RebuildPlan) -> Result<usize, Error> {
+        if plan.rearm_overgrowth {
+            self.overgrowth_warned.store(false, Ordering::Release);
+        }
+        self.rebuild_locked(plan.m, plan.expected_size, plan.ef_construction)
+    }
+
+    /// Empty the index, keeping its configuration, and report how many
+    /// records went.
+    ///
+    /// **A fresh graph and empty maps, not `remove_points` over every id.**
+    /// Removing every record one at a time is linear in the record count and
+    /// leaves one stranded graph node per record. Replacing the graph reclaims
+    /// all of it at once and leaves `stranded_graph_nodes` at zero, which is
+    /// what an empty index should report.
+    ///
+    /// What it keeps is the index: the declaration, the index-level metadata,
+    /// and the quantization configuration including a fitted codebook.
+    /// **Training is not undone.** A codebook is fitted from data that is now
+    /// gone and cannot be refitted from an empty index, so a trained quantized
+    /// index stays trained and its replacement graph is a quantized graph. An
+    /// untrained one returns to collecting. The internal id counter restarts,
+    /// because nothing is left for a reissued id to collide with and
+    /// restarting keeps the internal ids in step with the fresh graph's node
+    /// indices. The generated id counter does not; see the field.
+    pub fn clear(&self) -> Result<usize, Error> {
+        let quantized = self.is_quantized();
+        let pq = self.space.pq.as_ref().cloned();
+
+        if quantized && pq.is_none() {
+            return Err(Error::NoQuantizer);
+        }
+
+        let _writers = self.writers.lock().unwrap();
+
+        // Built before any guard is taken, so the allocation happens
+        // outside the write guard exactly as `compact` arranges it.
+        let fresh = if let (true, Some(pq)) = (quantized, pq) {
+            let mut graph = VectorGraph::new_pq(
+                &self.space.metric,
+                self.space.m(),
+                self.expected_size(),
+                MAX_LAYER,
+                self.space.ef_construction(),
+                pq,
+            );
+            // A cleared `quantized_with_raw` index goes on keeping raw
+            // vectors, so its replacement graph opens the store the next
+            // insertion writes into. Without this the store is absent and
+            // every record added after a clear would lose its raw vector.
+            if self.space.keeps_raw() {
+                graph
+                    .open_raw_store(self.space.dim, self.expected_size())
+                    .expect("a quantized graph accepts a raw side store");
+            }
+            graph
+        } else {
+            VectorGraph::new_raw(
+                &self.space.metric,
+                self.space.dim,
+                self.space.m(),
+                self.expected_size(),
+                MAX_LAYER,
+                self.space.ef_construction(),
+            )
+        };
+
+        // The storage guards in the order declared on the struct, which is
+        // the order every other multi-guard path here takes them in.
+        let removed = {
+            let mut id_map = self.id_map.write().unwrap();
+            let mut rev_map = self.rev_map.write().unwrap();
+            let mut pq_codes = self.space.pq_codes.write().unwrap();
+            let mut vector_metadata = self.vector_metadata.write().unwrap();
+            let mut columns = self.columns.write().unwrap();
+            let mut training_ids = self.training_ids.write().unwrap();
+            let mut id_counter = self.id_counter.lock().unwrap();
+            let mut vector_count = self.vector_count.lock().unwrap();
+
+            let removed = id_map.len();
+            id_map.clear();
+            rev_map.clear();
+            pq_codes.clear();
+            vector_metadata.clear();
+            // Keeps the declaration and drops every record, which is what
+            // `clear` does to the index itself. The reservation comes back
+            // too, since a cleared index is about to be filled again.
+            columns.clear(self.expected_size());
+            training_ids.clear();
+            *id_counter = 0;
+            *vector_count = 0;
+            removed
+        };
+
+        self.space.replace_graph(fresh);
+
+        // An index still collecting for training starts collecting again,
+        // since what it had collected is gone. A trained one is left alone,
+        // because the flag records that training happened and it did.
+        if !quantized {
+            self.training_threshold_reached
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.overgrowth_warned
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        info!(
+            target: ENTRY_TARGET,
+            operation = "clear",
+            records_removed = removed,
+            quantized = quantized,
+            "Index cleared"
+        );
+
+        Ok(removed)
+    }
+}
+
+/// What `add` did.
+///
+/// `inserted` is the id of every record the call put in the index, in
+/// insertion order, and `total_errors` counts the rejected records, which the
+/// `errors` list names. `vector_shape` is the input's record count against the
+/// index's width. The binding turns this into the `AddResult` Python sees, and
+/// the contract of each field is documented there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Added {
+    pub inserted: Vec<String>,
+    pub errors: Vec<String>,
+    pub total_errors: usize,
+    pub vector_shape: Option<(usize, usize)>,
+}
+
+/// A rebuild request resolved against the index, ready to run.
+///
+/// Returned by `Collection::plan_rebuild` and consumed by `Collection::rebuild`.
+/// The two fields the neighbour selection warning reads are public so the
+/// binding can raise it between the two calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebuildPlan {
+    pub m: usize,
+    pub expected_size: usize,
+    pub ef_construction: usize,
+    rearm_overgrowth: bool,
 }

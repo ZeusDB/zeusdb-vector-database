@@ -88,7 +88,7 @@ const GROUP_KEYS: [&str; 3] = ["$and", "$or", "$not"];
 /// slot is an internal id and internal ids are never reused. At 100,000 records
 /// that is 12.5 kilobytes, so a filter of a dozen leaves allocates less than
 /// the page it returns.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Bitmap {
     words: Vec<u64>,
 }
@@ -103,6 +103,33 @@ impl Bitmap {
     #[inline]
     fn set(&mut self, slot: usize) {
         self.words[slot >> 6] |= 1u64 << (slot & 63);
+    }
+
+    /// Put an internal id in the set, growing the words to reach it.
+    ///
+    /// The three methods below are what a set maintained beside a map needs,
+    /// being the live record set the collection keeps under its reverse map.
+    /// The columns never call them: every bitmap a column builds is sized to
+    /// the store at once by [`Bitmap::zeros`] and filled by [`Bitmap::set`].
+    pub fn insert(&mut self, slot: usize) {
+        let index = slot >> 6;
+        if index >= self.words.len() {
+            self.words.resize(index + 1, 0);
+        }
+        self.words[index] |= 1u64 << (slot & 63);
+    }
+
+    /// Take an internal id out of the set. An id beyond the words was never in
+    /// it, so there is nothing to clear.
+    pub fn remove(&mut self, slot: usize) {
+        if let Some(word) = self.words.get_mut(slot >> 6) {
+            *word &= !(1u64 << (slot & 63));
+        }
+    }
+
+    /// Empty the set, keeping its allocation for the ids about to refill it.
+    pub fn clear(&mut self) {
+        self.words.iter_mut().for_each(|word| *word = 0);
     }
 
     /// Whether an internal id is in the set.
@@ -899,7 +926,7 @@ impl ColumnStore {
     /// A record at internal id `slot` occupies the slot, and every declared
     /// field reads back the value `vector_metadata` holds for that record, with
     /// a field the record does not carry reading absent. Checking it needs both
-    /// stores, so the call sites are in `hnsw_index` and this is the half only
+    /// stores, so the call sites are in the index and this is the half only
     /// the column can answer.
     ///
     /// **True for a store with no declaration, whatever the slot.** Such a

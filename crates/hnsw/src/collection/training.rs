@@ -7,17 +7,18 @@
 //! vectors at the end of that rebuild, which is the single point where the mode
 //! does so.
 
-use super::{HNSWIndex, StorageMode, MAX_LAYER};
+use super::{Collection, StorageMode, MAX_LAYER};
+use crate::{calibrate_rerank_from_sample, raw_distance_fn, RawVectors, RerankCalibration};
 use chrono::Utc;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
-use zeusdb_vector_core::{SeededRng, VectorGraph, PQ};
-use zeusdb_vector_hnsw::{
-    calibrate_rerank_from_sample, raw_distance_fn, RawVectors, RerankCalibration,
-};
+use zeusdb_vector_core::{Error, SeededRng, VectorGraph, PQ};
+
+/// The target every record this file emits carries. See the parent module.
+const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::training";
 /// Seed the training sample is shuffled with before it is used
 ///
 /// The records the sample holds are fixed and cannot be sampled. Training fires
@@ -39,9 +40,9 @@ use zeusdb_vector_hnsw::{
 /// `PQ_TRAINING_SEED` in `pq.rs`, so the codebook is a function of the sample
 /// as well and two builds over the same records produce one codebook.
 const TRAINING_SAMPLE_SEED: u64 = 0x5A_EE_5D_B0_5E_ED_57_01;
-impl HNSWIndex {
+impl Collection {
     /// TRAINING TRIGGER: Uses threshold flag for race condition safety
-    #[instrument(level = "info", skip(self), fields(
+    #[instrument(target = LOG_TARGET, level = "info", skip(self), fields(
         threshold_reached = self.training_threshold_reached.load(Ordering::Acquire),
         has_quantization = self.has_quantization()
     ))]
@@ -52,11 +53,10 @@ impl HNSWIndex {
         }
 
         // Only proceed if we have quantization config and aren't already trained
-        if let Some(_config) = &self.quantization_config {
-            if let Some(pq) = &self.pq {
+        if let Some(_config) = &self.space.quantization_config {
+            if let Some(pq) = &self.space.pq {
                 if !pq.is_trained() {
-                    info!(
-                        operation = "training_trigger",
+                    info!(target: LOG_TARGET, operation = "training_trigger",
                         "Training threshold reached - starting PQ training"
                     );
                     return self.train_quantization_from_ids();
@@ -68,15 +68,16 @@ impl HNSWIndex {
     }
 
     /// TRAINING EXECUTION: Uses collected IDs for deterministic training set
-    #[instrument(level = "info", skip(self), fields(
-        has_pq = self.pq.is_some(),
-        has_config = self.quantization_config.is_some()
+    #[instrument(target = LOG_TARGET, level = "info", skip(self), fields(
+        has_pq = self.space.pq.is_some(),
+        has_config = self.space.quantization_config.is_some()
     ))]
     fn train_quantization_from_ids(&self) -> Result<(), String> {
         let start_time = Instant::now();
 
-        let pq = self.pq.as_ref().ok_or("PQ not available")?.clone();
+        let pq = self.space.pq.as_ref().ok_or("PQ not available")?.clone();
         let config = self
+            .space
             .quantization_config
             .as_ref()
             .ok_or("Config not available")?
@@ -88,7 +89,7 @@ impl HNSWIndex {
         // them takes them in.
         let training_vectors = {
             let id_map = self.id_map.read().unwrap();
-            let hnsw = self.hnsw.read().unwrap();
+            let hnsw = self.space.hnsw.read().unwrap();
             let vectors = RawVectors {
                 id_map: &id_map,
                 graph: &hnsw,
@@ -97,8 +98,7 @@ impl HNSWIndex {
 
             // ADD EARLY CHECK:
             if training_ids.is_empty() {
-                warn!(
-                    operation = "pq_training",
+                warn!(target: LOG_TARGET, operation = "pq_training",
                     reason = "no_training_ids",
                     "No training IDs available"
                 );
@@ -120,16 +120,14 @@ impl HNSWIndex {
             }
 
             if missing_vectors > 0 {
-                warn!(
-                    operation = "pq_training",
+                warn!(target: LOG_TARGET, operation = "pq_training",
                     missing_vectors = missing_vectors,
                     available_vectors = training_data.len(),
                     "Some training vectors were removed before training"
                 );
             }
 
-            debug!(
-                operation = "pq_training_dataset",
+            debug!(target: LOG_TARGET, operation = "pq_training_dataset",
                 collected_ids = training_ids.len(),
                 available_vectors = training_data.len(),
                 target_size = config.training_size,
@@ -140,8 +138,7 @@ impl HNSWIndex {
         };
 
         if training_vectors.len() < config.training_size {
-            error!(
-                operation = "pq_training",
+            error!(target: LOG_TARGET, operation = "pq_training",
                 available = training_vectors.len(),
                 required = config.training_size,
                 "Insufficient vectors for training"
@@ -164,8 +161,7 @@ impl HNSWIndex {
         // Respect max_training_vectors limit
         let final_training_set = if let Some(max_training) = config.max_training_vectors {
             if training_vectors.len() > max_training {
-                debug!(
-                    operation = "pq_training_limit",
+                debug!(target: LOG_TARGET, operation = "pq_training_limit",
                     available = training_vectors.len(),
                     using = max_training,
                     "Limiting training set size"
@@ -178,8 +174,7 @@ impl HNSWIndex {
             training_vectors
         };
 
-        info!(
-            operation = "pq_training_start",
+        info!(target: LOG_TARGET, operation = "pq_training_start",
             training_vectors = final_training_set.len(),
             subvectors = config.subvectors,
             bits = config.bits,
@@ -194,10 +189,9 @@ impl HNSWIndex {
         // The one point where the codebook goes from absent to fitted, so it is
         // the one point that can stamp when that happened. `quantization.json`
         // used to write the save time under this name. See the field.
-        *self.training_completed_at.write().unwrap() = Some(Utc::now().to_rfc3339());
+        *self.space.training_completed_at.write().unwrap() = Some(Utc::now().to_rfc3339());
 
-        info!(
-            operation = "pq_training_complete",
+        info!(target: LOG_TARGET, operation = "pq_training_complete",
             training_vectors = final_training_set.len(),
             duration_ms = training_duration.as_millis(),
             "PQ training completed successfully"
@@ -209,15 +203,14 @@ impl HNSWIndex {
         // frame, so this is the only point where the measurement is free of a
         // second pass over the records.
         if let Some(calibration) = self.calibrate_rerank(&pq, &final_training_set) {
-            info!(
-                operation = "rerank_calibration",
+            info!(target: LOG_TARGET, operation = "rerank_calibration",
                 fetch = calibration.fetch,
                 sample_records = calibration.sample_records,
                 queries = calibration.queries,
                 duration_ms = calibration.millis,
                 "Rerank fetch calibrated from the training sample"
             );
-            *self.rerank_calibration.write().unwrap() = Some(calibration);
+            *self.space.rerank_calibration.write().unwrap() = Some(calibration);
         }
 
         // Clear training IDs (no longer needed)
@@ -227,8 +220,7 @@ impl HNSWIndex {
         }
 
         // Rebuild index with quantization
-        debug!(
-            operation = "pq_rebuild_start",
+        debug!(target: LOG_TARGET, operation = "pq_rebuild_start",
             "Rebuilding index with quantization"
         );
         let rebuild_start = Instant::now();
@@ -242,18 +234,17 @@ impl HNSWIndex {
             // field used to sit beside it, carrying 1 - 1/compression_ratio,
             // which is the same number in another form and was labelled as a
             // saving the index does not make.
-            let compression_ratio = (self.dim as f64 * 4.0) / pq.subvectors() as f64;
+            let compression_ratio = (self.space.dim as f64 * 4.0) / pq.subvectors() as f64;
 
             let total_duration_ms = start_time.elapsed().as_millis();
-            info!(
-                operation = "pq_complete",
+            info!(target: LOG_TARGET, operation = "pq_complete",
                 rebuild_duration_ms = rebuild_duration.as_millis(),
                 compression_ratio = compression_ratio,
                 total_duration_ms = total_duration_ms,
                 "Index successfully rebuilt with quantization"
             );
         } else {
-            error!(operation = "pq_rebuild", "Index rebuild returned false");
+            error!(target: LOG_TARGET, operation = "pq_rebuild", "Index rebuild returned false");
             return Err("Index rebuild returned false".to_string());
         }
 
@@ -271,6 +262,7 @@ impl HNSWIndex {
     /// `quantized_only` never reranks, so it is not calibrated.
     fn calibrate_rerank(&self, pq: &PQ, sample: &[Vec<f32>]) -> Option<RerankCalibration> {
         let keeps_raw = self
+            .space
             .quantization_config
             .as_ref()
             .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw);
@@ -278,17 +270,7 @@ impl HNSWIndex {
             return None;
         }
 
-        calibrate_rerank_from_sample(pq, sample, raw_distance_fn(&self.space))
-    }
-
-    /// What training measured, where it ran
-    pub fn get_rerank_calibration(&self) -> Option<RerankCalibration> {
-        *self.rerank_calibration.read().unwrap()
-    }
-
-    /// Install a calibration read back from a saved index
-    pub fn set_rerank_calibration(&self, calibration: Option<RerankCalibration>) {
-        *self.rerank_calibration.write().unwrap() = calibration;
+        calibrate_rerank_from_sample(pq, sample, raw_distance_fn(&self.space.metric))
     }
 
     /// The body of `rebuild_with_quantization`, with the writers guard already held
@@ -297,18 +279,16 @@ impl HNSWIndex {
     /// call, so the two entry points are separate rather than one taking the guard
     /// twice and deadlocking on itself.
     ///
-    /// Errors are `String` rather than `PyErr` because both callers reach this with
-    /// the interpreter lock released, and `PyErr`'s `Display` acquires it. The
-    /// entry point above turns the message back into the `PyRuntimeError` it always
-    /// raised.
+    /// Errors are `String`, which `rebuild_with_quantization` turns into the
+    /// `Error::Engine` the binding raises as the `RuntimeError` it always
+    /// raised, and the training path formats into its own message.
     pub(super) fn rebuild_with_quantization_locked(&self) -> Result<bool, String> {
         let start_time = Instant::now();
 
-        let pq = match &self.pq {
+        let pq = match &self.space.pq {
             Some(pq) if pq.is_trained() => pq.clone(),
             _ => {
-                warn!(
-                    operation = "rebuild_quantization",
+                warn!(target: LOG_TARGET, operation = "rebuild_quantization",
                     reason = "pq_not_trained",
                     "Cannot rebuild: PQ not trained"
                 );
@@ -317,8 +297,7 @@ impl HNSWIndex {
         };
 
         // Create new PQ-based HNSW index
-        trace!(
-            operation = "rebuild_quantization",
+        trace!(target: LOG_TARGET, operation = "rebuild_quantization",
             max_layer = MAX_LAYER,
             "Creating new PQ HNSW index"
         );
@@ -335,7 +314,7 @@ impl HNSWIndex {
         // neither raw vectors nor codes has nothing to rebuild from.
         let (vector_count, retained) = {
             let id_map = self.id_map.read().unwrap();
-            let hnsw = self.hnsw.read().unwrap();
+            let hnsw = self.space.hnsw.read().unwrap();
             let vectors = RawVectors {
                 id_map: &id_map,
                 graph: &hnsw,
@@ -358,32 +337,29 @@ impl HNSWIndex {
                 .collect();
 
             if with_raw.is_empty() {
-                let code_count = self.pq_codes.read().unwrap().len();
+                let code_count = self.space.pq_codes.read().unwrap().len();
                 if code_count == 0 {
-                    warn!(
-                        operation = "rebuild_quantization",
+                    warn!(target: LOG_TARGET, operation = "rebuild_quantization",
                         reason = "no_vectors_or_codes",
                         "Cannot rebuild: no vectors or codes available"
                     );
                     return Ok(false);
                 }
-                info!(
-                    operation = "quantization_rebuild_start",
+                info!(target: LOG_TARGET, operation = "quantization_rebuild_start",
                     vector_count = 0,
                     codes_retained = code_count,
                     "Starting quantization rebuild from stored codes"
                 );
                 (0, code_count)
             } else {
-                info!(
-                    operation = "quantization_rebuild_start",
+                info!(target: LOG_TARGET, operation = "quantization_rebuild_start",
                     vector_count = with_raw.len(),
                     "Starting quantization rebuild"
                 );
 
                 let vector_refs: Vec<&[f32]> = with_raw.iter().map(|&(_, vector)| vector).collect();
                 let quantized_codes = pq.quantize_batch(&vector_refs).map_err(|e| {
-                    error!(operation = "quantization_rebuild", error = %e, "Failed to quantize vectors");
+                    error!(target: LOG_TARGET, operation = "quantization_rebuild", error = %e, "Failed to quantize vectors");
                     format!("Failed to quantize vectors: {}", e)
                 })?;
 
@@ -393,7 +369,7 @@ impl HNSWIndex {
                 // and there is nothing left to re-quantize them from. Clearing
                 // dropped those records from the index outright. Removal already
                 // deletes an id's codes, so nothing stale can survive here.
-                let mut pq_codes = self.pq_codes.write().unwrap();
+                let mut pq_codes = self.space.pq_codes.write().unwrap();
                 let retained = pq_codes
                     .keys()
                     .filter(|id| !vectors.contains(id.as_str()))
@@ -404,8 +380,7 @@ impl HNSWIndex {
                         pq_codes.insert((*id).clone(), quantized_codes[i].clone());
                     }
                 }
-                debug!(
-                    operation = "quantization_rebuild",
+                debug!(target: LOG_TARGET, operation = "quantization_rebuild",
                     codes_stored = pq_codes.len(),
                     codes_retained = retained,
                     "Quantized codes stored"
@@ -419,7 +394,7 @@ impl HNSWIndex {
         // Copying costs one byte per subvector per record.
         let batch_data: Vec<(Vec<u8>, usize)> = {
             let id_map = self.id_map.read().unwrap();
-            let pq_codes = self.pq_codes.read().unwrap();
+            let pq_codes = self.space.pq_codes.read().unwrap();
             pq_codes
                 .iter()
                 .filter_map(|(id, codes)| {
@@ -439,11 +414,11 @@ impl HNSWIndex {
         batch_data.sort_unstable_by_key(|&(_, internal_id)| internal_id);
 
         let mut new_hnsw = VectorGraph::new_pq(
-            &self.space,
-            self.get_m(),
-            self.get_expected_size(),
+            &self.space.metric,
+            self.space.m(),
+            self.expected_size(),
             MAX_LAYER,
-            self.get_ef_construction(),
+            self.space.ef_construction(),
             pq.clone(),
         );
 
@@ -454,7 +429,7 @@ impl HNSWIndex {
                 .collect();
             new_hnsw.insert_batch_pq(&batch)
                 .map_err(|e| {
-                    error!(operation = "quantization_rebuild", error = %e, "Failed to insert quantized vectors");
+                    error!(target: LOG_TARGET, operation = "quantization_rebuild", error = %e, "Failed to insert quantized vectors");
                     format!("Failed to insert quantized vectors: {}", e)
                 })?;
         }
@@ -472,15 +447,16 @@ impl HNSWIndex {
         // the mode sheds its training records: the raws go when the graph that
         // held them goes. It used to be an explicit clear of a separate map.
         let keeps_raw = self
+            .space
             .quantization_config
             .as_ref()
             .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw);
         let released = {
-            let old_hnsw = self.hnsw.read().unwrap();
+            let old_hnsw = self.space.hnsw.read().unwrap();
             let held = old_hnsw.raw_count();
             if keeps_raw && old_hnsw.holds_raw() {
                 new_hnsw
-                    .adopt_raw_from(&old_hnsw, self.dim)
+                    .adopt_raw_from(&old_hnsw, self.space.dim)
                     .map_err(|e| format!("Failed to carry the raw vectors over: {}", e))?;
                 0
             } else {
@@ -495,7 +471,7 @@ impl HNSWIndex {
         //
         // The old graph is moved out and dropped after the guard is released.
         // See `replace_graph`.
-        self.replace_graph(new_hnsw);
+        self.space.replace_graph(new_hnsw);
         let released = if vector_count > 0 && !keeps_raw {
             released
         } else {
@@ -505,8 +481,7 @@ impl HNSWIndex {
         // ✅ ENTERPRISE: Add duration timing with fixed compression ratio calculation
         let duration_ms = start_time.elapsed().as_millis();
         let compression_ratio = (pq.dim() as f64 * 4.0) / pq.subvectors() as f64;
-        info!(
-            operation = "quantization_rebuild_complete",
+        info!(target: LOG_TARGET, operation = "quantization_rebuild_complete",
             vector_count = vector_count,
             codes_inserted = batch_data.len(),
             codes_retained = retained,
@@ -518,15 +493,66 @@ impl HNSWIndex {
 
         Ok(true)
     }
+
+    /// Rebuild the graph over the codes after training is complete.
+    ///
+    /// Re-encodes whatever raw vectors the index still holds through the
+    /// trained codebook and rebuilds the graph from the stored codes. It never
+    /// retrains the codebook; training runs exactly once, on the `add` that
+    /// reaches `training_size`. Returns false when there is no trained
+    /// quantizer or nothing stored to rebuild from. Takes the mutation guard,
+    /// which the training path already holds when it reaches the body.
+    pub fn rebuild_with_quantization(&self) -> Result<bool, Error> {
+        let _writers = self.writers.lock().unwrap();
+        self.rebuild_with_quantization_locked()
+            .map_err(Error::Engine)
+    }
+
+    /// How far the training collection has come, as a percentage, and 100 on
+    /// an index whose codebook is fitted. Zero on an index declared without
+    /// quantization.
+    pub fn training_progress(&self) -> f32 {
+        if let Some(config) = &self.space.quantization_config {
+            // If PQ is trained, always return 100%
+            if let Some(pq) = &self.space.pq {
+                if pq.is_trained() {
+                    return 100.0;
+                }
+            }
+            let training_ids = self.training_ids.read().unwrap();
+            (training_ids.len() as f32 / config.training_size as f32 * 100.0).min(100.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Get number of training vectors still needed
+    pub fn training_vectors_needed(&self) -> usize {
+        if let Some(config) = &self.space.quantization_config {
+            if self.training_threshold_reached.load(Ordering::Acquire) {
+                0
+            } else {
+                let training_ids = self.training_ids.read().unwrap();
+                config.training_size.saturating_sub(training_ids.len())
+            }
+        } else {
+            0
+        }
+    }
+
+    /// Check if training is ready to be triggered
+    pub fn is_training_ready(&self) -> bool {
+        self.training_threshold_reached.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::TRAINING_SAMPLE_SEED;
+    use crate::{calibrate_rerank_from_sample, raw_distance_fn};
     use rand::seq::SliceRandom;
     use rand::SeedableRng;
     use zeusdb_vector_core::{test_support::clustered, SeededRng, PQ};
-    use zeusdb_vector_hnsw::{calibrate_rerank_from_sample, raw_distance_fn};
 
     /// The shuffle the training sample is drawn in is fixed by its seed, so two
     /// builds over the same records produce the same sample order and two

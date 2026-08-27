@@ -79,7 +79,7 @@ mod tests {
         0x5A_EE_5D_B0_5E_ED_57_02,
         0x5A_EE_5D_B0_5E_ED_57_03,
         0x5A_EE_5D_B0_5E_ED_57_00,
-        // `hnsw_index::training::TRAINING_SAMPLE_SEED`, and `s == 2`.
+        // `collection::training::TRAINING_SAMPLE_SEED`, and `s == 2`.
         0x5A_EE_5D_B0_5E_ED_57_01,
         // Low Hamming weight values, which the expansion exists to spread.
         0,

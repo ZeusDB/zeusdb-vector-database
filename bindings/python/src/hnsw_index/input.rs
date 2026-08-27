@@ -1,16 +1,20 @@
-//! Reading records and query vectors out of Python.
+//! Reading records out of Python.
 //!
-//! `add` accepts five input shapes and `search` accepts three, and everything
-//! that turns any of them into owned Rust lives here. What leaves this file is
-//! `ParsedRecords` and validated query vectors, neither of which holds a Python
-//! object, which is what lets insertion and search release the interpreter lock.
+//! `add` accepts five input shapes and everything that turns any of them into
+//! owned Rust lives here. What leaves this file is `ParsedRecords`, which
+//! holds no Python object, which is what lets insertion release the
+//! interpreter lock. Every vector is processed for the space on the way
+//! through, by the collection's own rule, so a record is stored as the engine
+//! expects it. What a query vector is checked against once it is out of
+//! Python is the engine's half of this module, `Collection::validate_query`,
+//! and its records carry this module's target.
 //!
 //! Two validators that look alike are deliberately not one.
 //! `extract_single_vector` raises a `PyErr` and `extract_single_vector_safe`
 //! returns a `String` that `add` reports against the record it belongs to, and
 //! their messages differ.
 
-use super::{HNSWIndex, ParsedRecords};
+use super::HNSWIndex;
 use crate::conversion::{python_dict_to_value_map, python_object_to_value};
 use crate::PyEngineError;
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
@@ -20,75 +24,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{error, trace};
 use zeusdb_vector_core::Error;
+use zeusdb_vector_hnsw::ParsedRecords;
 impl HNSWIndex {
-    /// Pure function for vector normalization
-    fn normalize_vector(&self, vector: Vec<f32>) -> Vec<f32> {
-        let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            vector.iter().map(|x| x / norm).collect()
-        } else {
-            vector // Return unchanged for zero vectors
-        }
-    }
-
-    /// Process vector according to distance space
-    pub(super) fn process_vector_for_space(&self, vector: Vec<f32>) -> Vec<f32> {
-        match self.space.to_lowercase().as_str() {
-            "cosine" => self.normalize_vector(vector),
-            // Future extensions:
-            // "l2" => self.preprocess_l2(vector),
-            // "l1" => self.preprocess_l1(vector),
-            _ => vector,
-        }
-    }
-
-    /// Helper for query processing (mirrors extract_single_vector validation)
-    pub(super) fn validate_and_process_query_vector(
-        &self,
-        vector: Vec<f32>,
-    ) -> Result<Vec<f32>, Error> {
-        // Same validation as extract_single_vector
-        if vector.is_empty() {
-            error!(
-                operation = "query_validation",
-                error = "empty_vector",
-                "Search vector cannot be empty"
-            );
-            return Err(Error::SearchVectorEmpty);
-        }
-        if vector.len() != self.dim {
-            error!(
-                operation = "query_validation",
-                error = "dimension_mismatch",
-                expected = self.dim,
-                actual = vector.len(),
-                "Search vector dimension mismatch"
-            );
-            return Err(Error::SearchVectorDimension {
-                expected: self.dim,
-                got: vector.len(),
-            });
-        }
-        for (i, &val) in vector.iter().enumerate() {
-            if !val.is_finite() {
-                error!(
-                    operation = "query_validation",
-                    error = "invalid_value",
-                    index = i,
-                    value = val,
-                    "Search vector contains invalid value"
-                );
-                return Err(Error::SearchVectorNotFinite {
-                    index: i,
-                    value: val,
-                });
-            }
-        }
-
-        // Apply same processing as storage vectors
-        Ok(self.process_vector_for_space(vector))
-    }
-
     /// Parse input data into (id, vector, metadata) tuples with error collection
     ///
     /// Two error channels, and which one a mistake takes is the distinction
@@ -117,7 +54,7 @@ impl HNSWIndex {
             // Single vector
             match self.extract_single_vector_safe(data) {
                 Ok(vector) => {
-                    let id = self.generate_id();
+                    let id = self.inner.generate_id();
                     parsed_vectors.push((id, vector, HashMap::new()));
                 }
                 Err(e) => {
@@ -158,8 +95,8 @@ impl HNSWIndex {
                     let id = match dict.get_item("id") {
                         Ok(Some(id_item)) => id_item
                             .extract::<String>()
-                            .unwrap_or_else(|_| self.generate_id()),
-                        _ => self.generate_id(),
+                            .unwrap_or_else(|_| self.inner.generate_id()),
+                        _ => self.inner.generate_id(),
                     };
 
                     let metadata = match dict.get_item("metadata") {
@@ -388,10 +325,10 @@ impl HNSWIndex {
                     if i < ids_list.len() {
                         ids_list.get_item(i)?.extract::<String>()?
                     } else {
-                        self.generate_id()
+                        self.inner.generate_id()
                     }
                 }
-                None => self.generate_id(),
+                None => self.inner.generate_id(),
             };
 
             // Extract metadata from "metadatas" or "metadata" arrays
@@ -443,16 +380,16 @@ impl HNSWIndex {
 
         trace!(operation = "parse_numpy_context", shape = ?shape, "Processing NumPy array with context");
 
-        if shape.len() != 2 || shape[1] != self.dim {
+        if shape.len() != 2 || shape[1] != self.inner.dim() {
             error!(
                 operation = "parse_numpy_context",
                 error = "shape_mismatch",
-                expected_shape = format!("(N, {})", self.dim),
+                expected_shape = format!("(N, {})", self.inner.dim()),
                 actual_shape = format!("{:?}", shape),
                 "NumPy array shape validation failed"
             );
             return Err(Error::BatchArrayShape {
-                dim: self.dim,
+                dim: self.inner.dim(),
                 shape: shape.to_vec(),
             }
             .into());
@@ -483,8 +420,8 @@ impl HNSWIndex {
         let mut rejected = 0usize;
 
         for i in 0..num_vectors {
-            let start_idx = i * self.dim;
-            let end_idx = start_idx + self.dim;
+            let start_idx = i * self.inner.dim();
+            let end_idx = start_idx + self.inner.dim();
             let raw_vector = &flat[start_idx..end_idx];
 
             // Resolve the caller's id before validating, so a rejected row can
@@ -513,12 +450,12 @@ impl HNSWIndex {
                 continue;
             }
 
-            let processed_vector = self.process_vector_for_space(raw_vector.to_vec());
+            let processed_vector = self.inner.process_vector_for_space(raw_vector.to_vec());
 
             // Get ID from provided IDs or generate
             let id = match provided_id {
                 Some(id) => id,
-                None => self.generate_id(),
+                None => self.inner.generate_id(),
             };
 
             // Get metadata from provided metadata or use empty
@@ -581,8 +518,8 @@ impl HNSWIndex {
                         let id = match item_dict.get_item("id") {
                             Ok(Some(id_item)) => id_item
                                 .extract::<String>()
-                                .unwrap_or_else(|_| self.generate_id()),
-                            _ => self.generate_id(),
+                                .unwrap_or_else(|_| self.inner.generate_id()),
+                            _ => self.inner.generate_id(),
                         };
 
                         // Extract metadata
@@ -621,7 +558,7 @@ impl HNSWIndex {
                 // Direct vector item
                 match self.extract_single_vector_safe(&item) {
                     Ok(vector) => {
-                        let id = self.generate_id();
+                        let id = self.inner.generate_id();
                         parsed_vectors.push((id, vector, HashMap::new()));
                     }
                     Err(e) => {
@@ -643,10 +580,11 @@ impl HNSWIndex {
         let readonly = np_array.readonly();
         let shape = readonly.shape();
 
-        if shape.len() != 2 || shape[1] != self.dim {
+        if shape.len() != 2 || shape[1] != self.inner.dim() {
             return Err(format!(
                 "NumPy array must have shape (N, {}), got {:?}",
-                self.dim, shape
+                self.inner.dim(),
+                shape
             ));
         }
 
@@ -656,8 +594,8 @@ impl HNSWIndex {
         let num_vectors = shape[0];
 
         for i in 0..num_vectors {
-            let start_idx = i * self.dim;
-            let end_idx = start_idx + self.dim;
+            let start_idx = i * self.inner.dim();
+            let end_idx = start_idx + self.inner.dim();
             let raw_vector = &flat[start_idx..end_idx];
 
             // A bare array carries no ids, so a rejected row is named by its
@@ -678,8 +616,8 @@ impl HNSWIndex {
                 continue;
             }
 
-            let processed_vector = self.process_vector_for_space(raw_vector.to_vec());
-            let id = self.generate_id();
+            let processed_vector = self.inner.process_vector_for_space(raw_vector.to_vec());
+            let id = self.inner.generate_id();
             parsed_vectors.push((id, processed_vector, HashMap::new()));
         }
 
@@ -720,9 +658,9 @@ impl HNSWIndex {
             return Err(Error::VectorEmpty.into());
         }
 
-        if vector.len() != self.dim {
+        if vector.len() != self.inner.dim() {
             return Err(Error::VectorDimension {
-                expected: self.dim,
+                expected: self.inner.dim(),
                 got: vector.len(),
             }
             .into());
@@ -740,18 +678,7 @@ impl HNSWIndex {
         }
 
         // ✅ Apply space-specific processing
-        Ok(self.process_vector_for_space(vector))
-    }
-
-    /// Generate a unique ID for a vector
-    ///
-    /// From a counter of its own rather than from the internal id counter. See
-    /// `HNSWIndex::generated_ids` for what each of the two has to guarantee and
-    /// why one counter could not do both.
-    fn generate_id(&self) -> String {
-        let mut counter = self.generated_ids.lock().unwrap();
-        *counter += 1;
-        format!("vec_{}", *counter)
+        Ok(self.inner.process_vector_for_space(vector))
     }
 
     /// Safe version of extract_single_vector that returns String errors instead of PyErr
@@ -778,10 +705,10 @@ impl HNSWIndex {
         if vector.is_empty() {
             return Err("Vector cannot be empty".to_string());
         }
-        if vector.len() != self.dim {
+        if vector.len() != self.inner.dim() {
             return Err(format!(
                 "Vector dimension mismatch: expected {}, got {}",
-                self.dim,
+                self.inner.dim(),
                 vector.len()
             ));
         }
@@ -794,6 +721,6 @@ impl HNSWIndex {
             }
         }
 
-        Ok(self.process_vector_for_space(vector))
+        Ok(self.inner.process_vector_for_space(vector))
     }
 }

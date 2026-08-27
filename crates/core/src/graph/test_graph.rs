@@ -3,7 +3,7 @@
 //! The seam is [`super::VectorGraph`], which takes a space by name and so
 //! cannot be handed an arbitrary distance. Two test modules need exactly that:
 //! `distance` builds one graph per kernel and compares the two, and
-//! `hnsw_index::graph_guard_tests` builds one per fixture and holds it to a
+//! `graph::guard_tests` builds one per fixture and holds it to a
 //! property of its adjacency. Both did it through the vendored `Hnsw`, which
 //! was `pub` and so reachable from anywhere in the crate.
 //!

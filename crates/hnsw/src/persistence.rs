@@ -4,7 +4,7 @@
 //! It implements a directory-based persistence format with hybrid JSON/Binary storage.
 //!
 //! ## File Format:
-//! ```
+//! ```text
 //! my_index.zdb/
 //! ├── manifest.json           # Index metadata and file list
 //! ├── config.json             # Index configuration
@@ -32,17 +32,25 @@
 //!
 //! The graph file is ZeusDB's own format, written and read by `graph::dump`,
 //! and the loader restores the graph from it rather than rebuilding it by
-//! re-inserting every record. See `HNSWIndex::restore_graph_from_dump`.
+//! re-inserting every record. See `Collection::restore_graph_from_dump`.
+//!
+//! This module and `collection::persist` call each other: `save` and `load`
+//! on the collection reach `save_index`, `save_manifest`, `StagingDir` and
+//! `load_index` here, and `load_index` builds a collection and restores it
+//! through the setters `persist.rs` declares. That is a module cycle inside
+//! one crate, which cargo tolerates, and it is the shape the two had in the
+//! binding.
 //!
 //! It replaces the two files the vendored graph crate wrote,
 //! `hnsw_index.hnsw.graph` and `hnsw_index.hnsw.data`. A directory saved by
 //! 0.6.0 or earlier still holds those two, and opening it rebuilds the graph
 //! once and writes the new file on the next save. Nothing reads the old format.
 
-use crate::hnsw_index::{
-    validate_index_parameters, validate_space_supports_quantization, HNSWIndex, QuantizationConfig,
-    StorageMode,
+use crate::collection::{
+    validate_index_parameters, validate_space_supports_quantization, Collection,
+    QuantizationConfig, StorageMode,
 };
+use crate::RerankCalibration;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -55,7 +63,11 @@ use zeusdb_vector_core::{
     checksum_of, validate_indexed_fields, Error, DUMP_FILENAME as GRAPH_DUMP_FILENAME,
     LEGACY_DUMP_FILENAMES, PQ,
 };
-use zeusdb_vector_hnsw::RerankCalibration;
+
+/// The target every record this file emits carries. It is the module path
+/// this file had in the binding, so a filter directive naming it still
+/// matches. See the crate root.
+const LOG_TARGET: &str = "zeusdb_vector_database::persistence";
 
 // ============================================================================
 // FORMAT VERSION
@@ -281,8 +293,7 @@ impl StagingDir {
                     replaced: replaced.to_path_buf(),
                     error: e.to_string(),
                 })?;
-                info!(
-                    operation = "save_recover",
+                info!(target: LOG_TARGET, operation = "save_recover",
                     restored = %target.display(),
                     "An interrupted save had moved the index aside; it is back in place"
                 );
@@ -399,10 +410,10 @@ fn sync_directory(_path: &Path) {}
 /// verified by `parse_dump` on every load, so a manifest digest would duplicate
 /// a check the loader already makes. Its length is recorded and checked.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtefactDigest {
-    pub bytes: u64,
+pub(crate) struct ArtefactDigest {
+    pub(crate) bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checksum: Option<String>,
+    pub(crate) checksum: Option<String>,
 }
 
 /// The length and digest of every artefact a save has written so far
@@ -633,8 +644,7 @@ fn check_files_present(path: &Path, manifest: &IndexManifest) -> Result<(), Erro
         .collect();
 
     let Some(&first) = missing.first() else {
-        debug!(
-            "Every file manifest.json names is present ({} checked)",
+        debug!(target: LOG_TARGET, "Every file manifest.json names is present ({} checked)",
             manifest.files_included.len()
         );
         return Ok(());
@@ -670,18 +680,18 @@ fn manifest_names(manifest: &IndexManifest, name: &str) -> bool {
 
 /// Manifest file structure - tracks index metadata and included files
 #[derive(Debug, Serialize, Deserialize)]
-pub struct IndexManifest {
-    pub format_version: String,
-    pub zeusdb_version: String,
-    pub created_at: String,
-    pub saved_at: String,
-    pub total_vectors: usize,
-    pub index_type: String,
-    pub has_quantization: bool,
-    pub quantization_trained: bool,
-    pub storage_mode: String,
-    pub files_included: Vec<String>,
-    pub files_excluded: Vec<String>,
+pub(crate) struct IndexManifest {
+    pub(crate) format_version: String,
+    pub(crate) zeusdb_version: String,
+    pub(crate) created_at: String,
+    pub(crate) saved_at: String,
+    pub(crate) total_vectors: usize,
+    pub(crate) index_type: String,
+    pub(crate) has_quantization: bool,
+    pub(crate) quantization_trained: bool,
+    pub(crate) storage_mode: String,
+    pub(crate) files_included: Vec<String>,
+    pub(crate) files_excluded: Vec<String>,
 
     /// The length and digest of every artefact `files_included` names
     ///
@@ -696,7 +706,7 @@ pub struct IndexManifest {
     /// See `ArtefactDigest` for what is recorded and why the graph dump carries
     /// a length alone.
     #[serde(default)]
-    pub file_digests: HashMap<String, ArtefactDigest>,
+    pub(crate) file_digests: HashMap<String, ArtefactDigest>,
 
     /// Every byte the directory holds except `manifest.json` itself
     ///
@@ -705,44 +715,44 @@ pub struct IndexManifest {
     /// before the graph dump and then rewritten through a temporary file to
     /// record a total it had missed the largest artefact of, which is a second
     /// write this ordering removes.
-    pub total_size_mb: f64,
-    pub compression_info: Option<CompressionInfo>,
+    pub(crate) total_size_mb: f64,
+    pub(crate) compression_info: Option<CompressionInfo>,
 }
 
 /// Compression statistics for quantized indexes
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CompressionInfo {
-    pub original_size_mb: f64,
-    pub compressed_size_mb: f64,
-    pub compression_ratio: f64,
+pub(crate) struct CompressionInfo {
+    pub(crate) original_size_mb: f64,
+    pub(crate) compressed_size_mb: f64,
+    pub(crate) compression_ratio: f64,
 }
 
 /// Index configuration for reconstruction
 #[derive(Debug, Serialize, Deserialize)]
-pub struct IndexConfig {
-    pub dim: usize,
-    pub space: String,
-    pub m: usize,
-    pub ef_construction: usize,
-    pub expected_size: usize,
-    pub id_counter: usize,
-    pub vector_count: usize,
+pub(crate) struct IndexConfig {
+    pub(crate) dim: usize,
+    pub(crate) space: String,
+    pub(crate) m: usize,
+    pub(crate) ef_construction: usize,
+    pub(crate) expected_size: usize,
+    pub(crate) id_counter: usize,
+    pub(crate) vector_count: usize,
 
     /// How many generated ids the index had issued, being the `N` of `vec_N`
     ///
     /// Separate from `id_counter`, which `clear` resets and this does not. See
-    /// `HNSWIndex::generated_ids`. Defaulted, so a directory written before the
+    /// `Collection::generated_ids`. Defaulted, so a directory written before the
     /// field existed loads with a zero and takes its floor from the records it
     /// holds instead.
     #[serde(default)]
-    pub generated_ids: usize,
+    pub(crate) generated_ids: usize,
 
     /// Index level metadata set through `add_metadata`
     ///
     /// Defaulted rather than required, so a directory written before this field
     /// existed loads with an empty map instead of failing to parse.
     #[serde(default)]
-    pub metadata: HashMap<String, String>,
+    pub(crate) metadata: HashMap<String, String>,
 
     /// The filterable fields declared at `create()`, in declaration order.
     ///
@@ -757,57 +767,57 @@ pub struct IndexConfig {
     /// does not know, so a directory written with one also opens in a build
     /// that predates it, at the cost of the columns rather than of the load.
     #[serde(default)]
-    pub indexed_fields: Vec<String>,
+    pub(crate) indexed_fields: Vec<String>,
 }
 
 /// Complete quantization configuration and state
 #[derive(Debug, Serialize, Deserialize)]
-pub struct QuantizationPersistence {
-    pub r#type: String,
-    pub subvectors: usize,
-    pub bits: usize,
-    pub training_size: usize,
-    pub max_training_vectors: Option<usize>,
-    pub storage_mode: String,
-    pub is_trained: bool,
-    pub training_completed_at: Option<String>,
-    pub memory_stats: Option<MemoryStats>,
-    pub pq_config: PQConfig,
+pub(crate) struct QuantizationPersistence {
+    pub(crate) r#type: String,
+    pub(crate) subvectors: usize,
+    pub(crate) bits: usize,
+    pub(crate) training_size: usize,
+    pub(crate) max_training_vectors: Option<usize>,
+    pub(crate) storage_mode: String,
+    pub(crate) is_trained: bool,
+    pub(crate) training_completed_at: Option<String>,
+    pub(crate) memory_stats: Option<MemoryStats>,
+    pub(crate) pq_config: PQConfig,
     #[serde(default)]
-    pub training_ids: Vec<String>,
+    pub(crate) training_ids: Vec<String>,
     #[serde(default)]
-    pub training_threshold_reached: bool,
+    pub(crate) training_threshold_reached: bool,
     /// What training measured about the rerank fetch on this index's own data.
     ///
     /// Absent from every directory written before the calibration existed, so
     /// it defaults to `None` and those indexes fall back to the corpus terms
     /// they were built against. See `RerankCalibration`.
     #[serde(default)]
-    pub rerank_calibration: Option<RerankCalibration>,
+    pub(crate) rerank_calibration: Option<RerankCalibration>,
 }
 
 /// Memory usage statistics for quantization
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MemoryStats {
-    pub centroid_storage_mb: f64,
-    pub compression_ratio: f64,
-    pub centroids_per_subvector: usize,
-    pub total_centroids: usize,
+pub(crate) struct MemoryStats {
+    pub(crate) centroid_storage_mb: f64,
+    pub(crate) compression_ratio: f64,
+    pub(crate) centroids_per_subvector: usize,
+    pub(crate) total_centroids: usize,
 }
 
 /// Product Quantization configuration details
 #[derive(Debug, Serialize, Deserialize)]
-pub struct PQConfig {
-    pub dim: usize,
-    pub sub_dim: usize,
-    pub num_centroids: usize,
+pub(crate) struct PQConfig {
+    pub(crate) dim: usize,
+    pub(crate) sub_dim: usize,
+    pub(crate) num_centroids: usize,
 }
 
 /// ID mappings between external and internal IDs
 #[derive(Debug, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
-pub struct IdMappings {
-    pub id_map: HashMap<String, usize>,
-    pub rev_map: HashMap<usize, String>,
+pub(crate) struct IdMappings {
+    pub(crate) id_map: HashMap<String, usize>,
+    pub(crate) rev_map: HashMap<usize, String>,
 }
 
 /// PQ codebook laid out as [subvector][centroid][dimension within subvector]
@@ -844,7 +854,7 @@ impl TrainingState {
         }
     }
 
-    fn apply(self, index: &mut HNSWIndex) {
+    fn apply(self, index: &mut Collection) {
         // A trained index cleared its collection when training ran, so this is
         // only ever populated for an index saved while still collecting.
         let collected = self.ids.len();
@@ -860,8 +870,7 @@ impl TrainingState {
         };
         index.set_training_threshold_reached(reached);
 
-        debug!(
-            "Training state restored ({} collected ids, threshold reached: {})",
+        debug!(target: LOG_TARGET, "Training state restored ({} collected ids, threshold reached: {})",
             collected, reached
         );
     }
@@ -873,7 +882,7 @@ impl TrainingState {
 
 /// Load index configuration from config.json
 fn load_config(path: &Path, manifest: &IndexManifest) -> Result<IndexConfig, Error> {
-    debug!("Loading config.json...");
+    debug!(target: LOG_TARGET, "Loading config.json...");
 
     let config_path = path.join("config.json");
     let config_data = read_artefact_string(path, "config.json", manifest)?;
@@ -940,19 +949,19 @@ fn load_config(path: &Path, manifest: &IndexManifest) -> Result<IndexConfig, Err
         &format!("{}: ", config_path.display()),
     )?;
 
-    debug!("config.json loaded");
+    debug!(target: LOG_TARGET, "config.json loaded");
     Ok(config)
 }
 
 /// Load ID mappings from mappings.bin
 fn load_mappings(path: &Path, manifest: &IndexManifest) -> Result<IdMappings, Error> {
-    debug!("Loading mappings.bin...");
+    debug!(target: LOG_TARGET, "Loading mappings.bin...");
 
     let mappings_data = read_artefact(path, "mappings.bin", manifest)?;
 
     let mappings: IdMappings = decode_bounded(&mappings_data, "mappings.bin")?;
 
-    debug!("mappings.bin loaded");
+    debug!(target: LOG_TARGET, "mappings.bin loaded");
     Ok(mappings)
 }
 
@@ -961,7 +970,7 @@ fn load_metadata(
     path: &Path,
     manifest: &IndexManifest,
 ) -> Result<HashMap<String, HashMap<String, Value>>, Error> {
-    debug!("Loading metadata.json...");
+    debug!(target: LOG_TARGET, "Loading metadata.json...");
 
     let metadata_data = read_artefact_string(path, "metadata.json", manifest)?;
 
@@ -971,7 +980,7 @@ fn load_metadata(
             error: e.to_string(),
         })?;
 
-    debug!("metadata.json loaded");
+    debug!(target: LOG_TARGET, "metadata.json loaded");
     Ok(metadata)
 }
 
@@ -981,10 +990,10 @@ fn load_metadata(
 /// writes none, and a directory saved over one that did keeps the file the
 /// earlier save left. See `manifest_names`.
 fn load_vectors(path: &Path, manifest: &IndexManifest) -> Result<HashMap<String, Vec<f32>>, Error> {
-    debug!("Loading vectors.bin...");
+    debug!(target: LOG_TARGET, "Loading vectors.bin...");
 
     if !manifest_names(manifest, "vectors.bin") {
-        debug!("manifest.json does not list vectors.bin, so no raw vectors are read");
+        debug!(target: LOG_TARGET, "manifest.json does not list vectors.bin, so no raw vectors are read");
         return Ok(HashMap::new());
     }
 
@@ -994,7 +1003,7 @@ fn load_vectors(path: &Path, manifest: &IndexManifest) -> Result<HashMap<String,
 
     check_vectors_are_finite(&vectors)?;
 
-    debug!("vectors.bin loaded");
+    debug!(target: LOG_TARGET, "vectors.bin loaded");
     Ok(vectors)
 }
 
@@ -1027,7 +1036,7 @@ fn check_vectors_are_finite(vectors: &HashMap<String, Vec<f32>>) -> Result<(), E
 
 /// Load manifest for validation and metadata
 fn load_manifest(path: &Path) -> Result<IndexManifest, Error> {
-    debug!("Loading manifest.json...");
+    debug!(target: LOG_TARGET, "Loading manifest.json...");
 
     let manifest_path = path.join("manifest.json");
     let manifest_data =
@@ -1042,7 +1051,7 @@ fn load_manifest(path: &Path) -> Result<IndexManifest, Error> {
             error: e.to_string(),
         })?;
 
-    debug!("manifest.json loaded");
+    debug!(target: LOG_TARGET, "manifest.json loaded");
     Ok(manifest)
 }
 
@@ -1056,13 +1065,13 @@ fn load_pq_centroids(path: &Path, manifest: &IndexManifest) -> Result<Option<Cen
         return Ok(None);
     }
 
-    debug!("Loading pq_centroids.bin...");
+    debug!(target: LOG_TARGET, "Loading pq_centroids.bin...");
 
     let centroids_data = read_artefact(path, "pq_centroids.bin", manifest)?;
 
     let centroids: Centroids = decode_bounded(&centroids_data, "pq_centroids.bin")?;
 
-    debug!("pq_centroids.bin loaded ({} subvectors)", centroids.len());
+    debug!(target: LOG_TARGET, "pq_centroids.bin loaded ({} subvectors)", centroids.len());
     Ok(Some(centroids))
 }
 
@@ -1075,13 +1084,13 @@ fn load_pq_codes(path: &Path, manifest: &IndexManifest) -> Result<HashMap<String
         return Ok(HashMap::new());
     }
 
-    debug!("Loading pq_codes.bin...");
+    debug!(target: LOG_TARGET, "Loading pq_codes.bin...");
 
     let codes_data = read_artefact(path, "pq_codes.bin", manifest)?;
 
     let codes: HashMap<String, Vec<u8>> = decode_bounded(&codes_data, "pq_codes.bin")?;
 
-    debug!("pq_codes.bin loaded ({} records)", codes.len());
+    debug!(target: LOG_TARGET, "pq_codes.bin loaded ({} records)", codes.len());
     Ok(codes)
 }
 
@@ -1130,11 +1139,11 @@ fn load_quantization(
     dim: usize,
     space: &str,
 ) -> Result<Option<QuantizationArtefacts>, Error> {
-    debug!("Loading quantization components...");
+    debug!(target: LOG_TARGET, "Loading quantization components...");
 
     let quant_path = path.join("quantization.json");
     if !manifest_names(manifest, "quantization.json") {
-        debug!("manifest.json does not list quantization.json (non-quantized index)");
+        debug!(target: LOG_TARGET, "manifest.json does not list quantization.json (non-quantized index)");
         return Ok(None);
     }
 
@@ -1164,7 +1173,7 @@ fn load_quantization(
     // not describe an index this build can rebuild.
     validate_quantization_fields(&quant_path.display().to_string(), &quant_config, dim)?;
 
-    debug!("quantization.json loaded");
+    debug!(target: LOG_TARGET, "quantization.json loaded");
 
     let centroids = load_pq_centroids(path, manifest)?;
     let codes = load_pq_codes(path, manifest)?;
@@ -1192,7 +1201,7 @@ fn load_quantization(
 /// no manifest at all. Staging makes it safe, because a save that fails at any
 /// point leaves the previous directory untouched and the staging directory
 /// removed.
-pub fn save_index(index: &HNSWIndex, dir: &Path) -> Result<SaveLedger, Error> {
+pub(crate) fn save_index(index: &Collection, dir: &Path) -> Result<SaveLedger, Error> {
     let mut ledger = SaveLedger::default();
 
     // Save components in order of complexity (simple -> complex)
@@ -1220,7 +1229,7 @@ pub fn save_index(index: &HNSWIndex, dir: &Path) -> Result<SaveLedger, Error> {
 // RECONSTRUCTION FUNCTIONS
 // ============================================================================
 
-/// Reconstruct HNSWIndex using Simple Reconstruction
+/// Reconstruct Collection using Simple Reconstruction
 fn reconstruct_index_simple(
     path: &Path,
     config: IndexConfig,
@@ -1229,11 +1238,11 @@ fn reconstruct_index_simple(
     vectors: HashMap<String, Vec<f32>>,
     quantization: Option<QuantizationArtefacts>,
     dump_bytes: Option<u64>,
-) -> Result<HNSWIndex, Error> {
-    debug!("Creating empty index with loaded configuration...");
+) -> Result<Collection, Error> {
+    debug!(target: LOG_TARGET, "Creating empty index with loaded configuration...");
 
     // Step 1: Create empty index with loaded config
-    let mut index = HNSWIndex::new_empty(
+    let mut index = Collection::new_empty(
         config.dim,
         config.space.clone(),
         config.m,
@@ -1242,7 +1251,7 @@ fn reconstruct_index_simple(
         config.indexed_fields.clone(),
     );
 
-    debug!("Restoring data fields...");
+    debug!(target: LOG_TARGET, "Restoring data fields...");
 
     // The codes are needed twice, once to rebuild the graph for records that
     // have no raw vector and once to restore the stored codes afterwards.
@@ -1271,15 +1280,15 @@ fn reconstruct_index_simple(
     // patches have since fixed. See `restore_graph_from_dump`.
     match index.restore_graph_from_dump(path, config.id_counter, dump_bytes) {
         Ok(nodes) => {
-            debug!("HNSW graph restored from the saved dump ({} nodes)", nodes);
+            debug!(target: LOG_TARGET, "HNSW graph restored from the saved dump ({} nodes)", nodes);
         }
         Err(reason) => {
-            debug!("Rebuilding the HNSW graph, because {}", reason);
+            debug!(target: LOG_TARGET, "Rebuilding the HNSW graph, because {}", reason);
             if index.can_use_quantization() {
-                debug!("Rebuilding quantized HNSW graph from stored PQ codes...");
+                debug!(target: LOG_TARGET, "Rebuilding quantized HNSW graph from stored PQ codes...");
                 rebuild_graph_from_codes(&mut index, &pq_codes, &vectors)?;
             } else {
-                debug!("Rebuilding HNSW graph from vectors...");
+                debug!(target: LOG_TARGET, "Rebuilding HNSW graph from vectors...");
                 rebuild_graph_from_data(&mut index, &vectors, &pq_codes, &metadata)?;
             }
         }
@@ -1305,15 +1314,14 @@ fn reconstruct_index_simple(
     // codes.
     let quantized_only_trained = index.can_use_quantization()
         && index
-            .get_quantization_config()
+            .quantization_config()
             .is_some_and(|config| config.storage_mode == StorageMode::QuantizedOnly);
     let vectors = if quantized_only_trained {
         let (kept, dropped): (HashMap<_, _>, HashMap<_, _>) = vectors
             .into_iter()
             .partition(|(id, _)| !pq_codes.contains_key(id));
         if !dropped.is_empty() {
-            debug!(
-                "Released {} raw training vectors quantized_only no longer keeps",
+            debug!(target: LOG_TARGET, "Released {} raw training vectors quantized_only no longer keeps",
                 dropped.len()
             );
         }
@@ -1348,7 +1356,7 @@ fn reconstruct_index_simple(
         let placed = index
             .restore_raw_store(&vectors)
             .map_err(Error::RestoreRawFailed)?;
-        debug!("{} raw vectors restored beside the codes", placed);
+        debug!(target: LOG_TARGET, "{} raw vectors restored beside the codes", placed);
     }
 
     // Step 5: Put back the training collection the rebuild stripped
@@ -1359,7 +1367,7 @@ fn reconstruct_index_simple(
     // Step 6: Check the saved count against the index that was actually built
     check_restored_count(&mut index, &config, raw_count, code_count)?;
 
-    debug!("Reconstruction completed!");
+    debug!(target: LOG_TARGET, "Reconstruction completed!");
     Ok(index)
 }
 
@@ -1372,7 +1380,7 @@ fn reconstruct_index_simple(
 /// disagreement means a file is missing or truncated and the load fails rather
 /// than producing an index that misreports what it holds.
 fn check_restored_count(
-    index: &mut HNSWIndex,
+    index: &mut Collection,
     config: &IndexConfig,
     raw_count: usize,
     code_count: usize,
@@ -1389,8 +1397,7 @@ fn check_restored_count(
     }
 
     index.set_vector_count(restored);
-    debug!(
-        "Vector count verified against restored records: {}",
+    debug!(target: LOG_TARGET, "Vector count verified against restored records: {}",
         restored
     );
     Ok(())
@@ -1398,7 +1405,7 @@ fn check_restored_count(
 
 /// Restore all data fields to the index (everything except the HNSW graph)
 fn restore_data_fields(
-    index: &mut HNSWIndex,
+    index: &mut Collection,
     mappings: IdMappings,
     _metadata: HashMap<String, HashMap<String, Value>>,
     _vectors: HashMap<String, Vec<f32>>,
@@ -1407,7 +1414,7 @@ fn restore_data_fields(
 ) -> Result<(), Error> {
     // Before the mappings move, because this reads their keys. The floor is
     // what stops an old directory reissuing a generated id it already holds.
-    let generated_floor = HNSWIndex::highest_generated_id(mappings.id_map.keys());
+    let generated_floor = Collection::highest_generated_id(mappings.id_map.keys());
     index.set_id_mappings(mappings.id_map, mappings.rev_map);
 
     // The add() method will properly:
@@ -1424,8 +1431,7 @@ fn restore_data_fields(
     // config.json carried the field, which is what those directories held.
     if !config.metadata.is_empty() {
         index.add_metadata(config.metadata.clone());
-        debug!(
-            "Index level metadata restored ({} entries)",
+        debug!(target: LOG_TARGET, "Index level metadata restored ({} entries)",
             config.metadata.len()
         );
     }
@@ -1435,7 +1441,7 @@ fn restore_data_fields(
         restore_quantization_state_simple(index, artefacts.config, artefacts.centroids)?;
     }
 
-    debug!("All data fields restored successfully");
+    debug!(target: LOG_TARGET, "All data fields restored successfully");
     Ok(())
 }
 
@@ -1486,11 +1492,11 @@ fn install_centroids(pq: &PQ, centroids: Centroids) -> Result<(), Error> {
 
 /// Restore quantization state (simplified for reconstruction)
 fn restore_quantization_state_simple(
-    index: &mut HNSWIndex,
+    index: &mut Collection,
     quant_data: QuantizationPersistence,
     centroids: Option<Centroids>,
 ) -> Result<(), Error> {
-    debug!("Restoring quantization state...");
+    debug!(target: LOG_TARGET, "Restoring quantization state...");
 
     // Convert QuantizationPersistence back to QuantizationConfig
     let storage_mode = StorageMode::from_string(&quant_data.storage_mode).map_err(Error::Engine)?;
@@ -1524,7 +1530,7 @@ fn restore_quantization_state_simple(
     // maybe_trigger_training can never fire, so an index saved while still
     // collecting could reach the threshold again and still never train.
     let pq = Arc::new(PQ::new(
-        index.get_dim(),
+        index.dim(),
         quant_data.subvectors,
         quant_data.bits,
         quant_data.training_size,
@@ -1534,8 +1540,7 @@ fn restore_quantization_state_simple(
     if !quant_data.is_trained {
         index.set_pq(Some(pq));
 
-        debug!(
-            "Quantization state restored (untrained, {} collected training IDs)",
+        debug!(target: LOG_TARGET, "Quantization state restored (untrained, {} collected training IDs)",
             quant_data.training_ids.len()
         );
     } else {
@@ -1548,8 +1553,7 @@ fn restore_quantization_state_simple(
         pq.set_trained(true);
         index.set_pq(Some(pq));
 
-        debug!(
-            "Quantization state restored (trained, codebook loaded, {} training IDs)",
+        debug!(target: LOG_TARGET, "Quantization state restored (trained, codebook loaded, {} training IDs)",
             quant_data.training_ids.len()
         );
     }
@@ -1567,7 +1571,7 @@ fn restore_quantization_state_simple(
 /// full width. The internal ids come from mappings.bin, so no id is reassigned
 /// and the counters stay as saved.
 fn rebuild_graph_from_codes(
-    index: &mut HNSWIndex,
+    index: &mut Collection,
     pq_codes: &HashMap<String, Vec<u8>>,
     vectors: &HashMap<String, Vec<f32>>,
 ) -> Result<(), Error> {
@@ -1576,21 +1580,18 @@ fn rebuild_graph_from_codes(
         .map_err(Error::Engine)?;
 
     if quantized_from_raw > 0 {
-        debug!(
-            "{} records had a raw vector and no stored PQ codes and were quantized \
+        debug!(target: LOG_TARGET, "{} records had a raw vector and no stored PQ codes and were quantized \
              through the loaded codebook",
             quantized_from_raw
         );
     }
     if remapped > 0 {
-        debug!(
-            "{} records were missing from mappings.bin and were assigned fresh \
+        debug!(target: LOG_TARGET, "{} records were missing from mappings.bin and were assigned fresh \
              internal ids",
             remapped
         );
     }
-    debug!(
-        "Quantized graph rebuilt ({} records inserted from stored PQ codes)",
+    debug!(target: LOG_TARGET, "Quantized graph rebuilt ({} records inserted from stored PQ codes)",
         inserted
     );
     Ok(())
@@ -1607,13 +1608,13 @@ fn rebuild_graph_from_codes(
 /// the record. The codes themselves are restored as stored and are never
 /// recomputed from a reconstruction.
 fn rebuild_graph_from_data(
-    index: &mut HNSWIndex,
+    index: &mut Collection,
     vectors: &HashMap<String, Vec<f32>>,
     pq_codes: &HashMap<String, Vec<u8>>,
     metadata: &HashMap<String, HashMap<String, Value>>,
 ) -> Result<(), Error> {
     if vectors.is_empty() && pq_codes.is_empty() {
-        debug!("No records to rebuild (empty index)");
+        debug!(target: LOG_TARGET, "No records to rebuild (empty index)");
         return Ok(());
     }
 
@@ -1641,7 +1642,7 @@ fn rebuild_graph_from_data(
         .collect();
 
     if !code_only.is_empty() {
-        let pq = index.get_pq().cloned().ok_or(Error::CodesWithoutCodebook {
+        let pq = index.pq().cloned().ok_or(Error::CodesWithoutCodebook {
             count: code_only.len(),
         })?;
 
@@ -1666,8 +1667,7 @@ fn rebuild_graph_from_data(
     }
 
     if missing_metadata > 0 {
-        debug!(
-            "{} records have no entry in metadata.json and are restored with empty metadata",
+        debug!(target: LOG_TARGET, "{} records have no entry in metadata.json and are restored with empty metadata",
             missing_metadata
         );
     }
@@ -1690,7 +1690,7 @@ fn rebuild_graph_from_data(
         .map(|((id, vector), metadata)| (id, vector, metadata))
         .collect();
     {
-        let id_map = index.get_id_map();
+        let id_map = index.id_map();
         records.sort_by(|a, b| {
             let left = id_map.get(&a.0).copied().unwrap_or(usize::MAX);
             let right = id_map.get(&b.0).copied().unwrap_or(usize::MAX);
@@ -1698,13 +1698,12 @@ fn rebuild_graph_from_data(
         });
     }
 
-    debug!(
-        "Prepared {} records for batch insertion ({} replayed from raw vectors, {} reconstructed from PQ codes)",
+    debug!(target: LOG_TARGET, "Prepared {} records for batch insertion ({} replayed from raw vectors, {} reconstructed from PQ codes)",
         records.len(),
         records.len() - reconstructed,
         reconstructed
     );
-    debug!("Rebuilding the graph from the restored records...");
+    debug!(target: LOG_TARGET, "Rebuilding the graph from the restored records...");
 
     // The records are owned Rust and go straight into the insertion phase. This
     // used to build a PyDict holding three PyLists and call add(), which parsed
@@ -1712,8 +1711,8 @@ fn rebuild_graph_from_data(
     // pairing, releases the interpreter lock and refuses a partial graph.
     let inserted = index.rebuild_from_records(records)?;
 
-    debug!("Graph rebuild completed: {} records inserted", inserted);
-    debug!("Final vector count: {}", index.get_vector_count());
+    debug!(target: LOG_TARGET, "Graph rebuild completed: {} records inserted", inserted);
+    debug!(target: LOG_TARGET, "Final vector count: {}", index.vector_count());
 
     Ok(())
 }
@@ -1722,13 +1721,13 @@ fn rebuild_graph_from_data(
 // LOAD INTERFACE
 // ============================================================================
 
-/// Load an HNSWIndex from a directory structure (Approach B: Simple Reconstruction)
+/// Load a Collection from a directory structure (Approach B: Simple Reconstruction)
 ///
-/// Registered as `_load_index` by the wrapper in `lib.rs`.
-/// `VectorDatabase.load(path)` is the documented route and is a one line pass
-/// through to this.
-pub fn load_index(path: &str) -> Result<HNSWIndex, Error> {
-    debug!("Starting index load with reconstruction from: {}", path);
+/// Reached through `Collection::load`, which the binding registers as
+/// `_load_index`. `VectorDatabase.load(path)` is the documented route and is
+/// a one line pass through to that.
+pub(crate) fn load_index(path: &str) -> Result<Collection, Error> {
+    debug!(target: LOG_TARGET, "Starting index load with reconstruction from: {}", path);
 
     let path_buf = Path::new(path);
 
@@ -1740,7 +1739,7 @@ pub fn load_index(path: &str) -> Result<HNSWIndex, Error> {
     }
 
     // Phase 1: Load all ZeusDB components
-    debug!("Phase 1: Loading ZeusDB components...");
+    debug!(target: LOG_TARGET, "Phase 1: Loading ZeusDB components...");
 
     let manifest = load_manifest(path_buf)?;
     check_format_version(&manifest.format_version)?;
@@ -1748,27 +1747,25 @@ pub fn load_index(path: &str) -> Result<HNSWIndex, Error> {
     // Before any artefact is read, so a directory missing two files names the
     // first rather than failing on whichever one a partial load reaches.
     check_files_present(path_buf, &manifest)?;
-    debug!(
-        "Manifest loaded: {} vectors, format v{}",
+    debug!(target: LOG_TARGET, "Manifest loaded: {} vectors, format v{}",
         manifest.total_vectors, manifest.format_version
     );
 
     let config = load_config(path_buf, &manifest)?;
-    debug!("Config loaded: dim={}, space={}", config.dim, config.space);
+    debug!(target: LOG_TARGET, "Config loaded: dim={}, space={}", config.dim, config.space);
 
     let mappings = load_mappings(path_buf, &manifest)?;
-    debug!("Mappings loaded: {} ID mappings", mappings.id_map.len());
+    debug!(target: LOG_TARGET, "Mappings loaded: {} ID mappings", mappings.id_map.len());
 
     let metadata = load_metadata(path_buf, &manifest)?;
-    debug!("Metadata loaded: {} records", metadata.len());
+    debug!(target: LOG_TARGET, "Metadata loaded: {} records", metadata.len());
 
     let vectors = load_vectors(path_buf, &manifest)?;
-    debug!("Vectors loaded: {} vectors", vectors.len());
+    debug!(target: LOG_TARGET, "Vectors loaded: {} vectors", vectors.len());
 
     let quantization = load_quantization(path_buf, &manifest, config.dim, &config.space)?;
     if let Some(ref quant) = quantization {
-        debug!(
-            "Quantization loaded: {} subvectors, trained={}, codebook={}",
+        debug!(target: LOG_TARGET, "Quantization loaded: {} subvectors, trained={}, codebook={}",
             quant.config.subvectors,
             quant.config.is_trained,
             if quant.centroids.is_some() {
@@ -1783,7 +1780,7 @@ pub fn load_index(path: &str) -> Result<HNSWIndex, Error> {
     // mappings and the codebook first to judge it against.
 
     // Phase 2: Create empty index and restore state
-    debug!("Phase 2: Creating empty index and restoring state...");
+    debug!(target: LOG_TARGET, "Phase 2: Creating empty index and restoring state...");
     let mut restored_index = reconstruct_index_simple(
         path_buf,
         config,
@@ -1800,7 +1797,7 @@ pub fn load_index(path: &str) -> Result<HNSWIndex, Error> {
     // load and save claimed to have been created then.
     restored_index.set_created_at(manifest.created_at);
 
-    debug!("Index reconstruction completed successfully!");
+    debug!(target: LOG_TARGET, "Index reconstruction completed successfully!");
     Ok(restored_index)
 }
 
@@ -1809,20 +1806,20 @@ pub fn load_index(path: &str) -> Result<HNSWIndex, Error> {
 // ============================================================================
 
 /// Save index configuration as JSON
-fn save_config(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
-    debug!("Saving config.json...");
+fn save_config(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+    debug!(target: LOG_TARGET, "Saving config.json...");
 
     let config = IndexConfig {
-        dim: index.get_dim(),
+        dim: index.dim(),
         //space: index.get_space().to_string(),
-        space: index.space_str().to_string(),
-        m: index.get_m(),
-        ef_construction: index.get_ef_construction(),
-        expected_size: index.get_expected_size(),
-        id_counter: index.get_id_counter(),
-        vector_count: index.get_vector_count(),
-        generated_ids: index.get_generated_ids(),
-        metadata: index.get_all_metadata(),
+        space: index.metric().to_string(),
+        m: index.m(),
+        ef_construction: index.ef_construction(),
+        expected_size: index.expected_size(),
+        id_counter: index.id_counter(),
+        vector_count: index.vector_count(),
+        generated_ids: index.generated_ids(),
+        metadata: index.all_metadata(),
         indexed_fields: index.indexed_fields(),
     };
 
@@ -1834,23 +1831,23 @@ fn save_config(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Resul
 
     write_artefact(path, "config.json", config_json.as_bytes(), ledger)?;
 
-    debug!("config.json saved");
+    debug!(target: LOG_TARGET, "config.json saved");
     Ok(())
 }
 
 /// Save ID mappings using efficient binary format
-fn save_mappings(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
-    debug!("Saving mappings.bin...");
+fn save_mappings(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+    debug!(target: LOG_TARGET, "Saving mappings.bin...");
 
     // Both guards end with this block. They are taken in the documented order,
     // id_map before rev_map, and the copy they were already making is what the
     // rest of the function works from.
     let mappings = {
-        let id_map = index.get_id_map();
-        let rev_map = index.get_rev_map();
+        let id_map = index.id_map();
+        let rev_map = index.rev_map();
         IdMappings {
             id_map: id_map.clone(),
-            rev_map: rev_map.clone(),
+            rev_map: rev_map.map().clone(),
         }
     };
     let mapping_count = mappings.id_map.len();
@@ -1865,19 +1862,19 @@ fn save_mappings(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Res
 
     write_artefact(path, "mappings.bin", &mappings_data, ledger)?;
 
-    debug!("mappings.bin saved ({} mappings)", mapping_count);
+    debug!(target: LOG_TARGET, "mappings.bin saved ({} mappings)", mapping_count);
     Ok(())
 }
 
 /// Save vector metadata as JSON for external tool compatibility
-fn save_metadata(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
-    debug!("Saving metadata.json...");
+fn save_metadata(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+    debug!(target: LOG_TARGET, "Saving metadata.json...");
 
     // The guard ends with the serialize. `to_string_pretty` returns an owned
     // String, so the file is written with nothing held and nothing is copied
     // that was not being copied already.
     let (metadata_json, record_count) = {
-        let vector_metadata = index.get_vector_metadata();
+        let vector_metadata = index.vector_metadata();
         let json = serde_json::to_string_pretty(&*vector_metadata);
         (json, vector_metadata.len())
     };
@@ -1888,32 +1885,32 @@ fn save_metadata(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Res
 
     write_artefact(path, "metadata.json", metadata_json.as_bytes(), ledger)?;
 
-    debug!("metadata.json saved ({} records)", record_count);
+    debug!(target: LOG_TARGET, "metadata.json saved ({} records)", record_count);
     Ok(())
 }
 
 /// Save quantization configuration and training state
 fn save_quantization_config(
-    index: &HNSWIndex,
+    index: &Collection,
     path: &Path,
     ledger: &mut SaveLedger,
 ) -> Result<(), Error> {
-    if let Some(config) = index.get_quantization_config() {
-        debug!("Saving quantization.json...");
+    if let Some(config) = index.quantization_config() {
+        debug!(target: LOG_TARGET, "Saving quantization.json...");
 
         // When the codebook was fitted, taken from the index rather than from
         // the clock. This used to be `Utc::now()`, so the field recorded the
         // save and moved every time a trained index was saved again. `None` on
         // an index that never trained, and also on one loaded from a directory
         // written before the index carried the value; see the field on
-        // `HNSWIndex`.
-        let training_completed_at = index.get_training_completed_at();
+        // `Collection`.
+        let training_completed_at = index.training_completed_at();
 
         // CAPTURE TRAINING STATE:
-        let training_ids = index.get_training_ids().clone();
-        let training_threshold_reached = index.get_training_threshold_reached();
+        let training_ids = index.training_ids().clone();
+        let training_threshold_reached = index.training_threshold_reached();
 
-        let (memory_stats, pq_config) = if let Some(pq) = index.get_pq() {
+        let (memory_stats, pq_config) = if let Some(pq) = index.pq() {
             let (memory_mb, total_centroids) = pq.get_memory_stats();
 
             let memory_stats = MemoryStats {
@@ -1932,8 +1929,8 @@ fn save_quantization_config(
             (Some(memory_stats), pq_config)
         } else {
             let pq_config = PQConfig {
-                dim: index.get_dim(),
-                sub_dim: index.get_dim() / config.subvectors,
+                dim: index.dim(),
+                sub_dim: index.dim() / config.subvectors,
                 num_centroids: 1 << config.bits,
             };
             (None, pq_config)
@@ -1952,7 +1949,7 @@ fn save_quantization_config(
             pq_config,
             training_ids,
             training_threshold_reached,
-            rerank_calibration: index.get_rerank_calibration(),
+            rerank_calibration: index.rerank_calibration(),
         };
 
         let quant_json = serde_json::to_string_pretty(&quant_persistence).map_err(|e| {
@@ -1964,9 +1961,8 @@ fn save_quantization_config(
 
         write_artefact(path, "quantization.json", quant_json.as_bytes(), ledger)?;
 
-        //debug!("quantization.json saved");
-        debug!(
-            "quantization.json saved with {} training IDs",
+        //debug!(target: LOG_TARGET, "quantization.json saved");
+        debug!(target: LOG_TARGET, "quantization.json saved with {} training IDs",
             quant_persistence.training_ids.len()
         );
     }
@@ -1974,10 +1970,14 @@ fn save_quantization_config(
 }
 
 /// Save PQ centroids for vector reconstruction
-fn save_pq_centroids(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
-    if let Some(pq) = index.get_pq() {
+fn save_pq_centroids(
+    index: &Collection,
+    path: &Path,
+    ledger: &mut SaveLedger,
+) -> Result<(), Error> {
+    if let Some(pq) = index.pq() {
         if pq.is_trained() {
-            debug!("Saving pq_centroids.bin...");
+            debug!(target: LOG_TARGET, "Saving pq_centroids.bin...");
 
             // The codebook is serialized inside the closure and written outside
             // it, so the lock is held for the encode alone. `bincode` returns an
@@ -1993,23 +1993,23 @@ fn save_pq_centroids(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) ->
 
             write_artefact(path, "pq_centroids.bin", &centroids_data, ledger)?;
 
-            debug!("pq_centroids.bin saved");
+            debug!(target: LOG_TARGET, "pq_centroids.bin saved");
         }
     }
     Ok(())
 }
 
 /// Save quantized vector codes
-fn save_pq_codes(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+fn save_pq_codes(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
     // The guard ends with the serialize, so the file is written with nothing
     // held. `encode_to_vec` was already producing an owned buffer, so this
     // narrows the guard rather than adding a copy.
     let (codes_data, code_count) = {
-        let pq_codes = index.get_pq_codes();
+        let pq_codes = index.pq_codes();
         if pq_codes.is_empty() {
             return Ok(());
         }
-        debug!("Saving pq_codes.bin...");
+        debug!(target: LOG_TARGET, "Saving pq_codes.bin...");
         (
             bincode::encode_to_vec(&*pq_codes, bincode::config::standard()),
             pq_codes.len(),
@@ -2023,7 +2023,7 @@ fn save_pq_codes(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Res
 
     write_artefact(path, "pq_codes.bin", &codes_data, ledger)?;
 
-    debug!("pq_codes.bin saved ({} vectors)", code_count);
+    debug!(target: LOG_TARGET, "pq_codes.bin saved ({} vectors)", code_count);
     Ok(())
 }
 
@@ -2036,7 +2036,7 @@ fn save_pq_codes(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Res
 ///
 /// A trained `quantized_only` index writes none, as before, because it holds
 /// none.
-fn save_vectors(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+fn save_vectors(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
     if !index.holds_raw_vectors() {
         return Ok(());
     }
@@ -2045,7 +2045,7 @@ fn save_vectors(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Resu
         if vectors.is_empty() {
             return Ok(());
         }
-        debug!("Saving vectors.bin...");
+        debug!(target: LOG_TARGET, "Saving vectors.bin...");
         (
             bincode::encode_to_vec(&vectors, bincode::config::standard()),
             vectors.len(),
@@ -2059,7 +2059,7 @@ fn save_vectors(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Resu
 
     write_artefact(path, "vectors.bin", &vectors_data, ledger)?;
 
-    debug!("vectors.bin saved ({} vectors)", vector_count);
+    debug!(target: LOG_TARGET, "vectors.bin saved ({} vectors)", vector_count);
     Ok(())
 }
 
@@ -2070,11 +2070,11 @@ fn save_vectors(index: &HNSWIndex, path: &Path, ledger: &mut SaveLedger) -> Resu
 /// on disk, which is why it is written last and why there is no second pass to
 /// correct any of them.
 pub(crate) fn save_manifest(
-    index: &HNSWIndex,
+    index: &Collection,
     path: &Path,
     ledger: SaveLedger,
 ) -> Result<(), Error> {
-    debug!("Saving manifest.json...");
+    debug!(target: LOG_TARGET, "Saving manifest.json...");
 
     // The manifest needs two facts about the stores rather than the stores
     // themselves, so it takes those two facts and releases both guards here.
@@ -2086,8 +2086,8 @@ pub(crate) fn save_manifest(
     // holds the mutation lock and every path that takes the graph's write guard
     // holds it too, so no counterparty could be in flight. That is the same
     // reasoning that failed the three inversions found before this one.
-    let has_raw_vectors = index.holds_raw_vectors() && index.get_vector_count() > 0;
-    let code_count = index.get_pq_codes().len();
+    let has_raw_vectors = index.holds_raw_vectors() && index.vector_count() > 0;
+    let code_count = index.pq_codes().len();
 
     // Determine what files are included based on what we actually saved
     let mut files_included = vec![
@@ -2124,14 +2124,14 @@ pub(crate) fn save_manifest(
     // build never asked for, and the split meant the two halves could disagree
     // with each other. ZeusDB's format carries both, so the pair is now one
     // length check rather than a cross file comparison.
-    let vector_count = index.get_vector_count();
+    let vector_count = index.vector_count();
     if vector_count > 0 {
         files_included.push(GRAPH_DUMP_FILENAME.to_string());
-        debug!("Graph file in manifest:");
-        debug!("Included: {}", GRAPH_DUMP_FILENAME);
+        debug!(target: LOG_TARGET, "Graph file in manifest:");
+        debug!(target: LOG_TARGET, "Included: {}", GRAPH_DUMP_FILENAME);
     } else {
         files_excluded.push(GRAPH_DUMP_FILENAME.to_string());
-        debug!("No graph file (empty index)");
+        debug!(target: LOG_TARGET, "No graph file (empty index)");
     }
 
     // Calculate compression info for quantized indexes
@@ -2147,9 +2147,9 @@ pub(crate) fn save_manifest(
     // two counts were already equal, so this changes nothing there.
     let compression_info =
         if index.has_quantization() && index.can_use_quantization() && code_count > 0 {
-            let raw_size_mb = (code_count * index.get_dim() * 4) as f64 / (1024.0 * 1024.0);
+            let raw_size_mb = (code_count * index.dim() * 4) as f64 / (1024.0 * 1024.0);
             let compressed_size_mb =
-                (code_count * index.get_quantization_subvectors()) as f64 / (1024.0 * 1024.0);
+                (code_count * index.quantization_subvectors()) as f64 / (1024.0 * 1024.0);
             let compression_ratio = if compressed_size_mb > 0.0 {
                 raw_size_mb / compressed_size_mb
             } else {
@@ -2173,13 +2173,13 @@ pub(crate) fn save_manifest(
     let manifest = IndexManifest {
         format_version: FORMAT_VERSION.to_string(),
         zeusdb_version: env!("CARGO_PKG_VERSION").to_string(),
-        created_at: index.get_created_at(),
+        created_at: index.created_at(),
         saved_at: Utc::now().to_rfc3339(),
         total_vectors: vector_count,
         index_type: "HNSW".to_string(),
         has_quantization: index.has_quantization(),
         quantization_trained: index.can_use_quantization(),
-        storage_mode: index.get_storage_mode(),
+        storage_mode: index.storage_mode(),
         files_included,
         files_excluded,
         file_digests: ledger.digests,
@@ -2204,7 +2204,7 @@ pub(crate) fn save_manifest(
         &mut discard,
     )?;
 
-    debug!("manifest.json saved");
+    debug!(target: LOG_TARGET, "manifest.json saved");
     Ok(())
 }
 
@@ -2241,7 +2241,7 @@ fn calculate_directory_size(path: &Path) -> Result<f64, std::io::Error> {
 /// registration in lib.rs. The allow keeps the reservation visible instead of
 /// silencing dead code across the module.
 #[allow(dead_code)]
-pub fn is_valid_index(_path: &str) -> bool {
+pub(crate) fn is_valid_index(_path: &str) -> bool {
     false
 }
 
@@ -2250,6 +2250,6 @@ pub fn is_valid_index(_path: &str) -> bool {
 /// Reserved surface. The body is a placeholder that reports no manifest for
 /// every path and must be implemented before any caller is wired up.
 #[allow(dead_code)]
-pub fn get_index_info(_path: &str) -> Option<IndexManifest> {
+pub(crate) fn get_index_info(_path: &str) -> Option<IndexManifest> {
     None
 }

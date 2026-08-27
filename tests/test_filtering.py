@@ -544,7 +544,7 @@ def test_filter_numeric_comparison_is_consistent_across_operators():
 # one.
 # ------------------------------------------------------------
 
-# Mirrors FULL_SCAN_THRESHOLD in bindings/python/src/hnsw_index/search.rs. The Rust
+# Mirrors FULL_SCAN_THRESHOLD in crates/hnsw/src/collection/search.rs. The Rust
 # constant is the one that decides; this is what the boundary tests aim at.
 FULL_SCAN_THRESHOLD = 5000
 

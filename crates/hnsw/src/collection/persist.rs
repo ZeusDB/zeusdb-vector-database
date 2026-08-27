@@ -1,23 +1,27 @@
-//! The face the persistence layer speaks to.
+//! The face the persistence layer speaks to, and the two operations that
+//! reach it.
 //!
 //! `persistence.rs` reads and writes the directory; this file is the only way it
 //! reaches the index. Every private field it needs is behind an accessor here
 //! and every field it restores is behind a setter, so the storage layer names no
-//! field of `HNSWIndex` and cannot leave one in a state the index did not
-//! choose.
+//! field of `Collection` and cannot leave one in a state the index did not
+//! choose. `save` and `load` are the two doors, and the binding calls both
+//! with the interpreter lock released.
 
-use super::{HNSWIndex, QuantizationConfig, StorageMode, MAX_LAYER};
-use pyo3::prelude::*;
+use super::{Collection, LiveRecords, QuantizationConfig, StorageMode, MAX_LAYER};
+use crate::locks::{order, ReadGuard};
+use crate::RawVectors;
+use crate::RerankCalibration;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{restore_graph, DumpBounds, Error, VectorGraph};
-use zeusdb_vector_hnsw::locks::{order, ReadGuard};
-use zeusdb_vector_hnsw::RawVectors;
+
+/// The target every record this file emits carries. See the parent module.
+const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::persist";
 /// Set to any non-empty value other than `0` to skip the saved graph and
 /// rebuild it by re-inserting every record.
 ///
@@ -34,18 +38,18 @@ fn rebuild_requested() -> bool {
         Err(_) => false,
     }
 }
-impl HNSWIndex {
+impl Collection {
     /// Count the records the index actually holds
     ///
     /// The union of the raw vectors and the PQ codes, because `quantized_only`
     /// keeps a record added after training in the codes alone. This is derived
     /// from the stored data rather than from the counter, so it is what the
-    /// counter is checked against after a load. Not exposed to Python, since
-    /// the only caller is the load path in `persistence`.
-    pub fn count_stored_records(&self) -> usize {
+    /// counter is checked against after a load. Crate private, since the
+    /// only caller is the load path in `persistence`.
+    pub(crate) fn count_stored_records(&self) -> usize {
         let id_map = self.id_map.read().unwrap();
-        let hnsw = self.hnsw.read().unwrap();
-        let pq_codes = self.pq_codes.read().unwrap();
+        let hnsw = self.space.hnsw.read().unwrap();
+        let pq_codes = self.space.pq_codes.read().unwrap();
         let raws = RawVectors {
             id_map: &id_map,
             graph: &hnsw,
@@ -69,7 +73,7 @@ impl HNSWIndex {
     /// carries its store.
     pub(crate) fn collect_raw_vectors(&self) -> HashMap<String, Vec<f32>> {
         let id_map = self.id_map.read().unwrap();
-        let hnsw = self.hnsw.read().unwrap();
+        let hnsw = self.space.hnsw.read().unwrap();
         let mut out = HashMap::with_capacity(id_map.len());
         for (ext_id, &internal_id) in id_map.iter() {
             if let Some(vector) = hnsw.raw_vector(internal_id) {
@@ -85,9 +89,10 @@ impl HNSWIndex {
     /// placed, which is the one moment the graph is quantized and the store is
     /// still empty, so `raws_need_their_own_file` would answer no.
     pub(crate) fn raw_store_is_expected(&self) -> bool {
-        let quantized = self.hnsw.read().unwrap().is_quantized();
+        let quantized = self.space.hnsw.read().unwrap().is_quantized();
         quantized
             && self
+                .space
                 .quantization_config
                 .as_ref()
                 .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw)
@@ -108,7 +113,7 @@ impl HNSWIndex {
     /// a damaged dump unloadable, which is a recovery path the loader
     /// documents and thirty-three tests hold.
     pub(crate) fn holds_raw_vectors(&self) -> bool {
-        self.hnsw.read().unwrap().holds_raw()
+        self.space.hnsw.read().unwrap().holds_raw()
     }
 
     /// Rebuild the raw side store of a loaded quantized graph.
@@ -132,12 +137,12 @@ impl HNSWIndex {
         vectors: &HashMap<String, Vec<f32>>,
     ) -> Result<usize, String> {
         let id_map = self.id_map.read().unwrap();
-        let mut hnsw = self.hnsw.write().unwrap();
+        let mut hnsw = self.space.hnsw.write().unwrap();
         if !hnsw.is_quantized() {
             return Ok(0);
         }
         let nodes = hnsw.nb_points();
-        hnsw.open_raw_store(self.dim, nodes)?;
+        hnsw.open_raw_store(self.space.dim, nodes)?;
         let mut by_internal: HashMap<usize, &Vec<f32>> = HashMap::with_capacity(vectors.len());
         for (ext_id, vector) in vectors {
             if let Some(&internal_id) = id_map.get(ext_id) {
@@ -145,7 +150,7 @@ impl HNSWIndex {
             }
         }
         let live: std::collections::HashSet<usize> = id_map.values().copied().collect();
-        let stranded_fill = vec![0f32; self.dim];
+        let stranded_fill = vec![0f32; self.space.dim];
         let mut placed = 0usize;
         let mut stranded = 0usize;
         for node in 0..nodes as u32 {
@@ -168,8 +173,7 @@ impl HNSWIndex {
             }
         }
         if stranded > 0 {
-            debug!(
-                operation = "restore_raw_store",
+            debug!(target: LOG_TARGET, operation = "restore_raw_store",
                 stranded_nodes = stranded,
                 "Stranded graph nodes took a zero vector no reader can reach"
             );
@@ -177,8 +181,13 @@ impl HNSWIndex {
         Ok(placed)
     }
 
-    /// The body of `save`, with the interpreter lock already released
-    pub(super) fn save_locked(&self, path: &str) -> Result<(), Error> {
+    /// Save the index to a directory.
+    ///
+    /// Four phases under one hold of the mutation lock: the artefacts, the
+    /// graph dump, the manifest, and the move into place. The binding calls
+    /// this with the interpreter lock released, and every phase speaks only
+    /// to `serde_json`, `bincode`, `std::fs` and `graph::dump`.
+    pub fn save(&self, path: &str) -> Result<(), Error> {
         // A save reads the mappings, the metadata, the codes, the vectors and
         // the graph in five separate passes, so it needs the index to hold
         // still. PyO3's exclusive borrow used to guarantee that by keeping every
@@ -188,7 +197,7 @@ impl HNSWIndex {
         // instead, which blocks a concurrent write and no reader at all.
         let _writers = self.writers.lock().unwrap();
         let start_time = Instant::now();
-        info!(operation = "save_start", path = path, "Starting index save");
+        info!(target: LOG_TARGET, operation = "save_start", path = path, "Starting index save");
 
         let target = Path::new(path);
 
@@ -199,29 +208,27 @@ impl HNSWIndex {
         let staging = crate::persistence::StagingDir::open(target)?;
 
         // Phase 1: Save all ZeusDB components (already tested to work)
-        debug!(operation = "save_phase1", "Saving ZeusDB components");
+        debug!(target: LOG_TARGET, operation = "save_phase1", "Saving ZeusDB components");
         let mut ledger = crate::persistence::save_index(self, staging.path())?;
 
         // Phase 2: Save the HNSW graph in ZeusDB's own format
-        debug!(operation = "save_phase2", "Saving HNSW graph");
+        debug!(target: LOG_TARGET, operation = "save_phase2", "Saving HNSW graph");
         self.save_hnsw_graph(staging.path(), &mut ledger)?;
 
         // Phase 3: The manifest, last, because it records a length and a digest
         // for every artefact above and the directory size all of them add up
         // to.
-        debug!(operation = "save_phase3", "Writing the manifest");
+        debug!(target: LOG_TARGET, operation = "save_phase3", "Writing the manifest");
         crate::persistence::save_manifest(self, staging.path(), ledger)?;
 
         // Phase 4: Two renames, or one where nothing is there yet.
-        debug!(
-            operation = "save_phase4",
+        debug!(target: LOG_TARGET, operation = "save_phase4",
             "Moving the saved index into place"
         );
         staging.commit()?;
 
         let duration_ms = start_time.elapsed().as_millis();
-        info!(
-            operation = "save_complete",
+        info!(target: LOG_TARGET, operation = "save_complete",
             path = path,
             duration_ms = duration_ms,
             "Index save completed successfully"
@@ -230,8 +237,8 @@ impl HNSWIndex {
     }
 
     /// Write the HNSW graph in ZeusDB's own format. See `graph::dump`.
-    #[instrument(level = "info", skip(self, ledger), fields(
-        vector_count = self.get_vector_count(),
+    #[instrument(target = LOG_TARGET, level = "info", skip(self, ledger), fields(
+        vector_count = self.vector_count(),
         path = %path.display()
     ))]
     fn save_hnsw_graph(
@@ -239,23 +246,21 @@ impl HNSWIndex {
         path: &Path,
         ledger: &mut crate::persistence::SaveLedger,
     ) -> Result<(), Error> {
-        debug!(
-            operation = "save_hnsw_graph_start",
+        debug!(target: LOG_TARGET, operation = "save_hnsw_graph_start",
             "Starting HNSW graph save"
         );
 
         // EMPTY INDEX CHECK:
-        let vector_count = self.get_vector_count();
+        let vector_count = self.vector_count();
         if vector_count == 0 {
-            debug!(
-                operation = "save_hnsw_graph",
+            debug!(target: LOG_TARGET, operation = "save_hnsw_graph",
                 reason = "empty_index",
                 "Skipping HNSW graph dump - index is empty"
             );
             return Ok(());
         }
 
-        let hnsw_guard = self.hnsw.read().unwrap();
+        let hnsw_guard = self.space.hnsw.read().unwrap();
 
         let dump_result = hnsw_guard.dump(path);
 
@@ -270,8 +275,7 @@ impl HNSWIndex {
                     .map(|meta| meta.len())
                     .map_err(|e| Error::DumpLengthUnreadable(e.to_string()))?;
                 ledger.record_length(&filename, bytes);
-                debug!(
-                    operation = "save_hnsw_graph_complete",
+                debug!(target: LOG_TARGET, operation = "save_hnsw_graph_complete",
                     file_created = %filename,
                     file_bytes = bytes,
                     "HNSW graph saved successfully"
@@ -279,7 +283,7 @@ impl HNSWIndex {
                 Ok(())
             }
             Err(e) => {
-                error!(operation = "save_hnsw_graph", error = %e, "HNSW graph dump failed");
+                error!(target: LOG_TARGET, operation = "save_hnsw_graph", error = %e, "HNSW graph dump failed");
                 Err(Error::GraphDumpFailed(e))
             }
         }
@@ -287,7 +291,11 @@ impl HNSWIndex {
 
     // 6. PERSISTENCE INTEGRATION METHODS (2 methods)
 
-    /// Load an index from a .zdb directory structure (Phase 2)
+    /// Load an index from a .zdb directory. See `persistence::load_index`.
+    ///
+    /// The binding calls this with the interpreter lock released, so the
+    /// whole load, the graph rebuild it may fall back to included, runs
+    /// without it.
     pub fn load(path: &str) -> Result<Self, Error> {
         crate::persistence::load_index(path)
     }
@@ -341,17 +349,17 @@ impl HNSWIndex {
 
         // A trained product quantizer is what makes the saved graph a quantized
         // one, so it is what decides which element type the dump must carry.
-        let pq = match &self.pq {
+        let pq = match &self.space.pq {
             Some(pq) if pq.is_trained() => Some(pq.clone()),
             _ => None,
         };
 
         let (graph, nodes) = restore_graph(
             dir,
-            &self.space,
-            self.get_m(),
-            self.get_ef_construction(),
-            self.dim,
+            &self.space.metric,
+            self.space.m(),
+            self.space.ef_construction(),
+            self.space.dim,
             pq,
             DumpBounds {
                 min_nodes: live,
@@ -359,7 +367,7 @@ impl HNSWIndex {
             },
         )?;
 
-        self.replace_graph(graph);
+        self.space.replace_graph(graph);
         Ok(nodes)
     }
 
@@ -384,7 +392,7 @@ impl HNSWIndex {
         pq_codes: &HashMap<String, Vec<u8>>,
         vectors: &HashMap<String, Vec<f32>>,
     ) -> Result<(usize, usize, usize), String> {
-        let pq = match &self.pq {
+        let pq = match &self.space.pq {
             Some(pq) if pq.is_trained() => pq.clone(),
             _ => {
                 return Err(
@@ -411,11 +419,11 @@ impl HNSWIndex {
         extra.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut new_hnsw = VectorGraph::new_pq(
-            &self.space,
-            self.get_m(),
-            self.get_expected_size(),
+            &self.space.metric,
+            self.space.m(),
+            self.expected_size(),
             MAX_LAYER,
-            self.get_ef_construction(),
+            self.space.ef_construction(),
             pq,
         );
 
@@ -455,7 +463,7 @@ impl HNSWIndex {
         if !batch.is_empty() {
             new_hnsw.insert_batch_pq(&batch)?;
         }
-        self.replace_graph(new_hnsw);
+        self.space.replace_graph(new_hnsw);
 
         Ok((batch.len(), extra.len(), remapped))
     }
@@ -467,7 +475,7 @@ impl HNSWIndex {
         rev_map: HashMap<usize, String>,
     ) {
         *self.id_map.write().unwrap() = id_map;
-        *self.rev_map.write().unwrap() = rev_map;
+        self.rev_map.write().unwrap().replace(rev_map);
     }
 
     /// Set counters (for persistence loading only)
@@ -497,7 +505,7 @@ impl HNSWIndex {
         pq_codes: HashMap<String, Vec<u8>>,
         vector_metadata: HashMap<String, HashMap<String, Value>>,
     ) {
-        *self.pq_codes.write().unwrap() = pq_codes;
+        *self.space.pq_codes.write().unwrap() = pq_codes;
         *self.vector_metadata.write().unwrap() = vector_metadata;
         self.rebuild_columns();
     }
@@ -531,7 +539,7 @@ impl HNSWIndex {
         if !columns.is_declared() {
             return;
         }
-        columns.clear(self.get_expected_size());
+        columns.clear(self.expected_size());
         let empty = HashMap::new();
         for (ext_id, &internal_id) in id_map.iter() {
             columns.write(internal_id, vector_metadata.get(ext_id).unwrap_or(&empty));
@@ -544,12 +552,12 @@ impl HNSWIndex {
 
     /// Set quantization config (for persistence loading only)
     pub(crate) fn set_quantization_config(&mut self, config: Option<QuantizationConfig>) {
-        self.quantization_config = config;
+        self.space.quantization_config = config;
     }
 
     /// Set PQ instance (for persistence loading only)
     pub(crate) fn set_pq(&mut self, pq: Option<Arc<zeusdb_vector_core::PQ>>) {
-        self.pq = pq;
+        self.space.pq = pq;
     }
 
     /// Set training threshold reached flag (for persistence loading only)
@@ -613,10 +621,10 @@ impl HNSWIndex {
         // non-finite value is the case that reaches here.
         let mut validated = Vec::with_capacity(total);
         for (id, vector, metadata) in records {
-            if vector.len() != self.dim {
+            if vector.len() != self.space.dim {
                 return Err(Error::RebuildRefusedDimension {
                     id,
-                    expected: self.dim,
+                    expected: self.space.dim,
                     got: vector.len(),
                 });
             }
@@ -636,19 +644,15 @@ impl HNSWIndex {
 
         self.set_rebuilding_from_persistence(true);
 
-        // The interpreter lock is released across the whole rebuild, which is
-        // the k-means, the graph inserts and nothing else. There is no Python
-        // work left inside it to hold the lock for.
-        //
-        // The mutation guard is taken inside the released region rather than
-        // around it, which is the shape `add` uses, so a loader waiting on
-        // another writer waits without the lock.
-        let (inserted, errors) = Python::attach(|py| {
-            py.detach(|| {
-                let _writers = self.writers.lock().unwrap();
-                self.insert_parsed_records(validated, true)
-            })
-        });
+        // The binding releases the interpreter lock around the whole load, so
+        // the rebuild, which is the k-means, the graph inserts and nothing
+        // else, runs without it and there is no Python work inside it to hold
+        // the lock for. The mutation guard is taken around the insertion
+        // alone, which is the shape `add` uses.
+        let (inserted, errors) = {
+            let _writers = self.writers.lock().unwrap();
+            self.insert_parsed_records(validated, true)
+        };
 
         // Cleared before the result is judged rather than after, so the flag is
         // not left set on the way out of a failed rebuild.
@@ -683,53 +687,15 @@ impl HNSWIndex {
     /// For persistence loading only. See the field for why the value is carried
     /// rather than restamped.
     pub(crate) fn set_training_completed_at(&mut self, completed_at: Option<String>) {
-        *self.training_completed_at.write().unwrap() = completed_at;
+        *self.space.training_completed_at.write().unwrap() = completed_at;
     }
 
     // ============================================================================
     // PERSISTENCE GETTERS - For accessing private fields from persistence module
     // ============================================================================
 
-    /// Get the vector dimension
-    pub fn get_dim(&self) -> usize {
-        self.dim
-    }
-
-    /// Get the distance space (cosine, l2, l1) without cloning it
-    ///
-    /// Named `space_str` rather than `space` because the Python property that
-    /// serves `index.space` is a `#[getter]` in the `#[pymethods]` block, and
-    /// PyO3 takes the property name from the Rust method name. Two methods of
-    /// one name on one type do not coexist across impl blocks, so the internal
-    /// accessor is the one that moves.
-    pub fn space_str(&self) -> &str {
-        &self.space
-    }
-
-    /// Get the maximum number of bidirectional links per node
-    ///
-    /// **The one read of `m` in the crate**, so that `rebuild` writing it has a
-    /// single place to be seen from. Acquire against the release the write
-    /// makes, though every writer also holds `writers` and every reader that
-    /// matters runs after it.
-    pub fn get_m(&self) -> usize {
-        self.m.load(Ordering::Acquire)
-    }
-
-    /// Get the construction parameter ef_construction. The one read of it, for
-    /// the reason `get_m` gives.
-    pub fn get_ef_construction(&self) -> usize {
-        self.ef_construction.load(Ordering::Acquire)
-    }
-
-    /// Get the expected size parameter. The one read of it, for the reason
-    /// `get_m` gives.
-    pub fn get_expected_size(&self) -> usize {
-        self.expected_size.load(Ordering::Acquire)
-    }
-
     /// How many generated ids this index has issued, for `config.json`
-    pub(crate) fn get_generated_ids(&self) -> usize {
+    pub(crate) fn generated_ids(&self) -> usize {
         *self.generated_ids.lock().unwrap()
     }
 
@@ -760,76 +726,85 @@ impl HNSWIndex {
     }
 
     /// Get the current ID counter value (thread-safe)
-    pub fn get_id_counter(&self) -> usize {
+    pub(crate) fn id_counter(&self) -> usize {
         *self.id_counter.lock().unwrap()
     }
 
     /// Get read access to the PQ codes HashMap (thread-safe)
     ///
-    /// `pub(crate)` rather than `pub`, as are the four accessors below that
-    /// also hand out a guard. They return a [`ReadGuard`], which
-    /// is a crate type, and a `pub` item returning one is a private type in a
-    /// public interface. Nothing outside the crate could call them in any case,
-    /// since `hnsw_index` is a private module.
-    pub(crate) fn get_pq_codes(
-        &self,
-    ) -> ReadGuard<'_, { order::PQ_CODES }, HashMap<String, Vec<u8>>> {
-        self.pq_codes.read().unwrap()
+    /// Crate private, as are the four accessors below that also hand out a
+    /// guard. They return a [`ReadGuard`], and the binding reaches nothing
+    /// through a guard: it takes owned values from the operations and
+    /// nothing else.
+    pub(crate) fn pq_codes(&self) -> ReadGuard<'_, { order::PQ_CODES }, HashMap<String, Vec<u8>>> {
+        self.space.pq_codes.read().unwrap()
     }
 
     /// Get read access to the vector metadata HashMap (thread-safe)
-    pub(crate) fn get_vector_metadata(
+    pub(crate) fn vector_metadata(
         &self,
     ) -> ReadGuard<'_, { order::VECTOR_METADATA }, HashMap<String, HashMap<String, Value>>> {
         self.vector_metadata.read().unwrap()
     }
 
     /// Get read access to the ID map (external ID -> internal ID)
-    pub(crate) fn get_id_map(&self) -> ReadGuard<'_, { order::ID_MAP }, HashMap<String, usize>> {
+    pub(crate) fn id_map(&self) -> ReadGuard<'_, { order::ID_MAP }, HashMap<String, usize>> {
         self.id_map.read().unwrap()
     }
 
-    /// Get read access to the reverse ID map (internal ID -> external ID)
-    pub(crate) fn get_rev_map(&self) -> ReadGuard<'_, { order::REV_MAP }, HashMap<usize, String>> {
+    /// Get read access to the reverse ID map (internal ID -> external ID),
+    /// with the live set beside it
+    pub(crate) fn rev_map(&self) -> ReadGuard<'_, { order::REV_MAP }, LiveRecords> {
         self.rev_map.read().unwrap()
     }
 
     /// Get reference to the quantization configuration
-    pub fn get_quantization_config(&self) -> Option<&QuantizationConfig> {
-        self.quantization_config.as_ref()
+    pub(crate) fn quantization_config(&self) -> Option<&QuantizationConfig> {
+        self.space.quantization_config.as_ref()
     }
 
     /// Get reference to the PQ instance
-    pub fn get_pq(&self) -> Option<&Arc<zeusdb_vector_core::PQ>> {
-        self.pq.as_ref()
+    pub(crate) fn pq(&self) -> Option<&Arc<zeusdb_vector_core::PQ>> {
+        self.space.pq.as_ref()
     }
 
     /// Helper to get quantization subvectors count
-    pub fn get_quantization_subvectors(&self) -> usize {
-        self.quantization_config
+    pub(crate) fn quantization_subvectors(&self) -> usize {
+        self.space
+            .quantization_config
             .as_ref()
             .map(|config| config.subvectors)
             .unwrap_or(1)
     }
 
     /// Get the index creation timestamp
-    pub fn get_created_at(&self) -> String {
+    pub(crate) fn created_at(&self) -> String {
         self.created_at.read().unwrap().clone()
     }
 
     /// When the codebook was fitted, or `None` on an index that never trained
-    pub fn get_training_completed_at(&self) -> Option<String> {
-        self.training_completed_at.read().unwrap().clone()
+    pub(crate) fn training_completed_at(&self) -> Option<String> {
+        self.space.training_completed_at.read().unwrap().clone()
     }
 
     /// Get read access to training IDs (for persistence)
-    pub(crate) fn get_training_ids(&self) -> ReadGuard<'_, { order::TRAINING_IDS }, Vec<String>> {
+    pub(crate) fn training_ids(&self) -> ReadGuard<'_, { order::TRAINING_IDS }, Vec<String>> {
         self.training_ids.read().unwrap()
     }
 
     /// Get training threshold reached flag (for persistence)
-    pub fn get_training_threshold_reached(&self) -> bool {
+    pub(crate) fn training_threshold_reached(&self) -> bool {
         self.training_threshold_reached
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// What training measured, where it ran. See `Space::rerank_calibration`.
+    pub(crate) fn rerank_calibration(&self) -> Option<RerankCalibration> {
+        self.space.rerank_calibration()
+    }
+
+    /// Install a calibration read back from a saved index.
+    pub(crate) fn set_rerank_calibration(&self, calibration: Option<RerankCalibration>) {
+        self.space.set_rerank_calibration(calibration);
     }
 }

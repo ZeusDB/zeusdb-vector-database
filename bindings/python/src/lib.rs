@@ -2,15 +2,17 @@
 //
 // The binding, which is what touches Python: the classes, the argument
 // parsing, the result construction, the logging control, and the conversion
-// below of an engine failure into an exception. The engine itself is
-// zeusdb-vector-core.
+// below of an engine failure into an exception. The index itself is
+// zeusdb-vector-hnsw, over the engine's floor in zeusdb-vector-core, and
+// every method here parses, releases the interpreter lock, calls one
+// operation on the collection and converts what comes back.
 mod conversion;
 mod hnsw_index;
 mod logging;
-mod persistence;
 
 use pyo3::prelude::*;
 use zeusdb_vector_core::{Error, Exception};
+use zeusdb_vector_hnsw::Collection;
 
 /// An engine failure on its way to Python.
 ///
@@ -67,14 +69,20 @@ impl From<PyEngineError> for PyErr {
     }
 }
 
-/// Load an index from a directory. See `persistence::load_index`.
+/// Load an index from a directory. See `Collection::load`.
 ///
 /// Registered as `_load_index`. `VectorDatabase.load(path)` is the documented
 /// route and is a one line pass through to this.
+///
+/// The whole load runs with the interpreter lock released, the graph rebuild
+/// it may fall back to included. Nothing in the load path touches Python:
+/// the directory is read, the collection is built and restored, and the
+/// result is wrapped here with the lock back.
 #[pyfunction]
 #[pyo3(name = "_load_index")]
-fn load_index(path: &str) -> Result<hnsw_index::HNSWIndex, PyEngineError> {
-    Ok(persistence::load_index(path)?)
+fn load_index(py: Python<'_>, path: &str) -> Result<hnsw_index::HNSWIndex, PyEngineError> {
+    let inner = py.detach(|| Collection::load(path))?;
+    Ok(hnsw_index::HNSWIndex::wrap(inner))
 }
 
 /// ZeusDB Vector Database Python Module

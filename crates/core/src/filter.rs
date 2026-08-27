@@ -15,7 +15,7 @@
 //! a group's shape is checked once, and `matches_filter` returns `bool` because
 //! there is no longer anything for it to fail on.
 //!
-//! These were fifteen methods on `HNSWIndex`. Every one took `&self` and not one
+//! These were fifteen methods on the index type. Every one took `&self` and not one
 //! read a field of it, so they are free functions here, which is what they
 //! already were.
 

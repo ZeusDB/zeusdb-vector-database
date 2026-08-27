@@ -46,7 +46,7 @@ pub use columns::{validate_indexed_fields, Bitmap, ColumnStore, Selection};
 pub use distance::{CosineDist, DistPQ, DotDist, L1Dist, L2Dist, PqMetric};
 pub use error::{Error, Exception};
 pub use filter::{compile_filter, matches_filter, Filter};
-pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES};
+pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES, NB_LAYER_MAX};
 pub use graph::{restore_graph, Distance, DumpBounds, GraphHit, Record, VectorGraph};
 pub use pq::PQ;
 pub use rng::SeededRng;

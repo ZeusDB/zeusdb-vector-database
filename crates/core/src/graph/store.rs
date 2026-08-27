@@ -23,7 +23,7 @@
 //! A raw vector is held once. On a raw graph the store is the raw vectors and
 //! nothing else holds them. On a quantized graph the store is the codes, and
 //! the raw vectors, where the storage mode keeps them, are in a second store
-//! beside it. `HNSWIndex` holds no vector map of its own.
+//! beside it. The index holds no vector map of its own.
 
 /// A contiguous block of stored values, addressed by node index.
 ///

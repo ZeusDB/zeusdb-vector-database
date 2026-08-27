@@ -1,5 +1,5 @@
-// The locks in this file are not fields of `HNSWIndex`, so they are outside the
-// registry in `hnsw_index::locks` and outside the order it enforces. The
+// The locks in this file are not fields of the index, so they are outside the
+// registry in `zeusdb_vector_hnsw::locks` and outside the order it enforces. The
 // declared order already places them: they are leaves, since nothing here can
 // name an index guard, so any of them may be taken under any index guard and no
 // index guard is ever taken under one. See `clippy.toml`.
@@ -17,7 +17,7 @@ use std::sync::RwLock;
 /// of codes, two graphs and two rerank calibrations. A fixed seed makes the
 /// codebook a function of the training data alone, the same way
 /// `DEFAULT_LEVEL_SEED` in the vendored graph crate fixes level assignment
-/// and `TRAINING_SAMPLE_SEED` in `hnsw_index` fixes the sample order.
+/// and `TRAINING_SAMPLE_SEED` in `collection::training` fixes the sample order.
 ///
 /// The k-means of each subvector runs on its own rayon worker, so one shared
 /// generator would hand out draws in thread arrival order and reintroduce the
@@ -103,7 +103,7 @@ pub struct PQ {
     /// One lock over both rather than one lock each. A cosine distance needs
     /// the pair together, and a single guard says so without adding a second
     /// bare lock to this module that would then have to be ordered against the
-    /// first. `hnsw_index::locks` ranks the index's own guards and does not
+    /// first. `zeusdb_vector_hnsw::locks` ranks the index's own guards and does not
     /// reach in here.
     derived: RwLock<Derived>,
 

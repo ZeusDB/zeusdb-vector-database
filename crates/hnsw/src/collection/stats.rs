@@ -1,23 +1,22 @@
 //! What the index reports about itself.
 //!
-//! `collect_stats` is the memory accounting as well as the counters, and it is
-//! the one call that prices every structure the index holds. The four reports
+//! `stats` is the memory accounting as well as the counters, and it is the
+//! one call that prices every structure the index holds. The four reports
 //! beside it are the bodies of Python methods that do nothing but ask this file
-//! a question, so the documented surface stays on the method and the work stays
-//! here.
+//! a question, so the documented surface stays on the entry point and the work
+//! stays here.
 
-use super::{HNSWIndex, StorageMode};
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use super::{Collection, StorageMode};
+use crate::{default_rerank_fetch, RERANK_CALIBRATION_PAGES, RERANK_CALIBRATION_TOP_K};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, info};
 use zeusdb_vector_core::Error;
-use zeusdb_vector_hnsw::{
-    default_rerank_fetch, RERANK_CALIBRATION_PAGES, RERANK_CALIBRATION_TOP_K,
-};
+
+/// The target every record this file emits carries. See the parent module.
+const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::stats";
 
 /// Control bytes a hashbrown table allocates past its last bucket.
 ///
@@ -64,7 +63,7 @@ fn key_text_bytes<V, S>(map: &HashMap<String, V, S>) -> usize {
     map.keys().map(|id| id.len()).sum()
 }
 
-impl HNSWIndex {
+impl Collection {
     /// Every counter and every memory figure, as `get_stats` reports them.
     ///
     /// Every guard is taken alone, in the declared order, released within its
@@ -90,7 +89,7 @@ impl HNSWIndex {
     /// consistency check. Nothing here re-enters a helper that locks; the
     /// storage mode, the training progress and the vectors still needed are
     /// derived from the captured values by the same rules the helpers apply.
-    pub(super) fn collect_stats(&self) -> HashMap<String, String> {
+    pub fn stats(&self) -> HashMap<String, String> {
         // The record count and, from the same guard, what the map itself
         // occupies. Every `bookkeeping` term below is one structure's own
         // storage, and none of them is the payload the five memory keys price.
@@ -123,7 +122,7 @@ impl HNSWIndex {
         // is the graph's own store on a raw index and the store beside the
         // codes on a `quantized_with_raw` one.
         let (graph_nodes, graph_memory_mb, graph_quantized, keeps_raw) = {
-            let hnsw = self.hnsw.read().unwrap();
+            let hnsw = self.space.hnsw.read().unwrap();
             let quantized = hnsw.is_quantized();
             let graph_bytes = hnsw.links_memory_bytes()
                 + if quantized {
@@ -139,7 +138,7 @@ impl HNSWIndex {
             )
         };
         let pq_code_count = {
-            let pq_codes = self.pq_codes.read().unwrap();
+            let pq_codes = self.space.pq_codes.read().unwrap();
             bookkeeping += table_bytes(&pq_codes) + key_text_bytes(&pq_codes);
             pq_codes.len()
         };
@@ -190,12 +189,12 @@ impl HNSWIndex {
         let threshold_reached = self.training_threshold_reached.load(Ordering::Acquire);
 
         // `rerank_calibration` sits outside the declared order and is never
-        // held together with another guard; see the order note on `HNSWIndex`.
-        let calibration = self.get_rerank_calibration();
+        // held together with another guard; see the order note on `Collection`.
+        let calibration = self.space.rerank_calibration();
 
         // The quantizer's own locks are leaves: nothing in `pq.rs` can reach an
         // index guard, so its accessors are safe wherever they are called.
-        let pq_trained = self.pq.as_ref().is_some_and(|pq| pq.is_trained());
+        let pq_trained = self.space.pq.as_ref().is_some_and(|pq| pq.is_trained());
 
         // What `is_quantized` answers, from the captured flag.
         let quantization_active = pq_trained && graph_quantized;
@@ -204,18 +203,18 @@ impl HNSWIndex {
 
         // Basic stats
         stats.insert("total_vectors".to_string(), vector_count.to_string());
-        stats.insert("dimension".to_string(), self.dim.to_string());
+        stats.insert("dimension".to_string(), self.space.dim.to_string());
         stats.insert(
             "expected_size".to_string(),
-            self.get_expected_size().to_string(),
+            self.expected_size().to_string(),
         );
-        stats.insert("space".to_string(), self.space.clone());
+        stats.insert("space".to_string(), self.space.metric.clone());
         stats.insert("index_type".to_string(), "HNSW".to_string());
 
-        stats.insert("m".to_string(), self.get_m().to_string());
+        stats.insert("m".to_string(), self.space.m().to_string());
         stats.insert(
             "ef_construction".to_string(),
-            self.get_ef_construction().to_string(),
+            self.space.ef_construction().to_string(),
         );
         stats.insert("thread_safety".to_string(), "RwLock+Mutex".to_string());
 
@@ -245,7 +244,7 @@ impl HNSWIndex {
         // stranded keeps its slot until `compact` runs, and neither is charged
         // here for the same reason the codes are charged at their payload.
         let raw_vector_count = if keeps_raw { live } else { 0 };
-        let raw_memory_mb = (raw_vector_count * self.dim * 4) as f64 / (1024.0 * 1024.0);
+        let raw_memory_mb = (raw_vector_count * self.space.dim * 4) as f64 / (1024.0 * 1024.0);
         let mut total_memory_mb = graph_memory_mb + raw_memory_mb;
         stats.insert(
             "graph_memory_mb".to_string(),
@@ -267,7 +266,7 @@ impl HNSWIndex {
         );
 
         // Training info
-        if let Some(config) = &self.quantization_config {
+        if let Some(config) = &self.space.quantization_config {
             stats.insert("quantization_type".to_string(), "pq".to_string());
             stats.insert(
                 "quantization_training_size".to_string(),
@@ -374,7 +373,7 @@ impl HNSWIndex {
                 threshold_reached.to_string(),
             );
 
-            if let Some(pq) = &self.pq {
+            if let Some(pq) = &self.space.pq {
                 stats.insert("quantization_trained".to_string(), pq_trained.to_string());
                 stats.insert(
                     "quantization_active".to_string(),
@@ -511,7 +510,7 @@ impl HNSWIndex {
         // What `get_storage_mode` answers, from the captured flags rather than
         // through it, because it reaches the graph lock via `is_quantized` and
         // this used to call it while holding three storage guards.
-        let storage_mode_description = if self.quantization_config.is_none() {
+        let storage_mode_description = if self.space.quantization_config.is_none() {
             "raw_only"
         } else if !pq_trained {
             if threshold_reached {
@@ -592,20 +591,26 @@ impl HNSWIndex {
     }
 
     /// The one line description `info` returns.
-    pub(super) fn info_string(&self) -> String {
+    ///
+    /// `vectors=` is the live record count in every storage mode.
+    pub fn info(&self) -> String {
         let record_count = self.id_map.read().unwrap().len();
+        // The name Python sees. The class is `HNSWIndex` there whatever the
+        // engine type is called, and the README and the examples print this
+        // line.
         let base_info = format!(
             "HNSWIndex(dim={}, space={}, m={}, ef_construction={}, expected_size={}, vectors={}",
-            self.dim,
-            self.space,
-            self.get_m(),
-            self.get_ef_construction(),
-            self.get_expected_size(),
+            self.space.dim,
+            self.space.metric,
+            self.space.m(),
+            self.space.ef_construction(),
+            self.expected_size(),
             record_count
         );
 
-        if let Some(config) = &self.quantization_config {
+        if let Some(config) = &self.space.quantization_config {
             let trained_status = self
+                .space
                 .pq
                 .as_ref()
                 .map(|pq| {
@@ -625,6 +630,7 @@ impl HNSWIndex {
 
             // Use cached compression ratio calculation with proper float division
             let compression_info = self
+                .space
                 .pq
                 .as_ref()
                 .map(|pq| format!("{:.1}x", (pq.dim() as f64 * 4.0) / pq.subvectors() as f64))
@@ -644,63 +650,47 @@ impl HNSWIndex {
         }
     }
 
-    /// The quantization dictionary `get_quantization_info` returns.
-    pub(super) fn quantization_info(&self) -> Option<Py<PyAny>> {
-        Python::attach(|py| {
-            if let Some(config) = &self.quantization_config {
-                let dict = PyDict::new(py);
-                dict.set_item("type", "pq").ok()?;
-                dict.set_item("subvectors", config.subvectors).ok()?;
-                dict.set_item("bits", config.bits).ok()?;
-                dict.set_item("training_size", config.training_size).ok()?;
+    /// The figures `get_quantization_info` reports, or `None` on an index
+    /// declared without quantization.
+    ///
+    /// Owned values rather than a mapping, so the binding builds the dict
+    /// Python receives with the keys in the order it always had them.
+    pub fn quantization_report(&self) -> Option<QuantizationReport> {
+        let config = self.space.quantization_config.as_ref()?;
+        let quantizer = self.space.pq.as_ref().map(|pq| {
+            // Use enhanced PQ methods
+            let (memory_mb, total_centroids) = pq.get_memory_stats();
 
-                if let Some(max_training) = config.max_training_vectors {
-                    dict.set_item("max_training_vectors", max_training).ok()?;
-                }
-
-                if let Some(pq) = &self.pq {
-                    dict.set_item("is_trained", pq.is_trained()).ok()?;
-
-                    // Use enhanced PQ methods
-                    let (memory_mb, total_centroids) = pq.get_memory_stats();
-                    dict.set_item("memory_mb", memory_mb).ok()?;
-                    dict.set_item("total_centroids", total_centroids).ok()?;
-
-                    // The symmetric distance table graph construction reads.
-                    // Reported separately because it is derived from the
-                    // codebook rather than part of it, and because it scales
-                    // with subvectors and bits alone while memory_mb scales
-                    // with the dimension too.
-                    dict.set_item(
-                        "sdc_memory_mb",
-                        pq.sdc_memory_bytes() as f64 / (1024.0 * 1024.0),
-                    )
-                    .ok()?;
-
-                    // The centroid norm table the cosine scorer reads, on the
-                    // same footing and for the same reason.
-                    dict.set_item(
-                        "centroid_norm_memory_mb",
-                        pq.centroid_norm_memory_bytes() as f64 / (1024.0 * 1024.0),
-                    )
-                    .ok()?;
-
-                    // Calculate compression ratio using cached values
-                    let original_bytes = pq.dim() * 4; // f32
-                    let compressed_bytes = pq.subvectors(); // u8 per subvector
-                    let compression_ratio = original_bytes as f64 / compressed_bytes as f64;
-                    dict.set_item("compression_ratio", compression_ratio).ok()?;
-                }
-
-                Some(dict.into())
-            } else {
-                None
+            // Calculate compression ratio using cached values
+            let original_bytes = pq.dim() * 4; // f32
+            let compressed_bytes = pq.subvectors(); // u8 per subvector
+            QuantizerReport {
+                is_trained: pq.is_trained(),
+                memory_mb,
+                total_centroids,
+                // The symmetric distance table graph construction reads.
+                // Reported separately because it is derived from the
+                // codebook rather than part of it, and because it scales
+                // with subvectors and bits alone while memory_mb scales
+                // with the dimension too.
+                sdc_memory_mb: pq.sdc_memory_bytes() as f64 / (1024.0 * 1024.0),
+                // The centroid norm table the cosine scorer reads, on the
+                // same footing and for the same reason.
+                centroid_norm_memory_mb: pq.centroid_norm_memory_bytes() as f64 / (1024.0 * 1024.0),
+                compression_ratio: original_bytes as f64 / compressed_bytes as f64,
             }
+        });
+        Some(QuantizationReport {
+            subvectors: config.subvectors,
+            bits: config.bits,
+            training_size: config.training_size,
+            max_training_vectors: config.max_training_vectors,
+            quantizer,
         })
     }
 
     /// The characteristics `get_performance_info` returns.
-    pub(super) fn performance_info(&self) -> HashMap<String, String> {
+    pub fn performance_info(&self) -> HashMap<String, String> {
         let mut info = HashMap::new();
         info.insert("search_speedup_expected".to_string(), "1.2x-2x".to_string());
         info.insert(
@@ -723,8 +713,8 @@ impl HNSWIndex {
         // `quantization_compression` does not, so it is gone rather than
         // qualified. Memory belongs to `get_stats`, which measures rather than
         // projects.
-        if let Some(config) = &self.quantization_config {
-            let original_bytes = self.dim * 4; // f32
+        if let Some(config) = &self.space.quantization_config {
+            let original_bytes = self.space.dim * 4; // f32
             let compressed_bytes = config.subvectors; // u8 per subvector
             let compression_ratio = original_bytes as f64 / compressed_bytes as f64;
 
@@ -753,7 +743,7 @@ impl HNSWIndex {
     }
 
     /// The measurement `benchmark_concurrent_reads` returns.
-    pub(super) fn benchmark_reads(
+    pub fn benchmark_reads(
         &self,
         query_count: usize,
         max_threads: Option<usize>,
@@ -762,8 +752,7 @@ impl HNSWIndex {
 
         let start_time = Instant::now();
 
-        debug!(
-            operation = "benchmark_start",
+        debug!(target: LOG_TARGET, operation = "benchmark_start",
             query_count = query_count,
             max_threads = max_threads,
             "Starting concurrent read benchmark"
@@ -778,7 +767,9 @@ impl HNSWIndex {
         // `process_vector_for_space`.
         let queries: Vec<Vec<f32>> = (0..query_count)
             .map(|_| {
-                self.process_vector_for_space((0..self.dim).map(|_| random::<f32>()).collect())
+                self.process_vector_for_space(
+                    (0..self.space.dim).map(|_| random::<f32>()).collect(),
+                )
             })
             .collect();
 
@@ -818,8 +809,7 @@ impl HNSWIndex {
         results.insert("threads_used".to_string(), num_threads as f64);
 
         let total_duration_ms = start_time.elapsed().as_millis();
-        info!(
-            operation = "benchmark_complete",
+        info!(target: LOG_TARGET, operation = "benchmark_complete",
             sequential_qps = queries.len() as f64 / sequential_time,
             parallel_qps = queries.len() as f64 / parallel_time,
             speedup = sequential_time / parallel_time,
@@ -829,4 +819,29 @@ impl HNSWIndex {
 
         Ok(results)
     }
+}
+
+/// What `get_quantization_info` reports about a quantized index.
+///
+/// The declaration, and the quantizer's own figures where an instance exists,
+/// which on every index built by this crate it does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuantizationReport {
+    pub subvectors: usize,
+    pub bits: usize,
+    pub training_size: usize,
+    pub max_training_vectors: Option<usize>,
+    pub quantizer: Option<QuantizerReport>,
+}
+
+/// The quantizer's own figures: whether it is fitted, what the codebook and
+/// its two derived tables occupy, and the code size against the vector size.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuantizerReport {
+    pub is_trained: bool,
+    pub memory_mb: f64,
+    pub total_centroids: usize,
+    pub sdc_memory_mb: f64,
+    pub centroid_norm_memory_mb: f64,
+    pub compression_ratio: f64,
 }

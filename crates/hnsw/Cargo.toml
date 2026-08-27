@@ -1,6 +1,8 @@
-# The graph index's own rules, being what stands between the engine's floor
-# in zeusdb-vector-core and the binding. Nothing in it names Python. The bans
-# in deny.toml and the lint job in ci.yml hold it to that, and
+# The index, being what stands between the engine's floor in
+# zeusdb-vector-core and the binding. The collection and its one space, every
+# operation the binding calls, the rerank rule, the lock rank registry and the
+# persistence of a directory all live here. Nothing in it names Python. The
+# bans in deny.toml and the lint job in ci.yml hold it to that, and
 # `cargo test -p zeusdb-vector-hnsw` compiles no Python crate.
 [package]
 name = "zeusdb-vector-hnsw"
@@ -17,14 +19,17 @@ publish = false
 # the reason for each pin.
 [dependencies]
 zeusdb-vector-core = { workspace = true }
+bincode = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 # The engine again, with its test data turned on, for the tests in
-# src/rerank.rs that measure against it. cargo applies a dev-dependency's
-# features to this crate's test targets and to nothing else, so the wheel is
-# built without them.
+# src/rerank.rs and src/collection/training.rs that measure against it.
+# cargo applies a dev-dependency's features to this crate's test targets and
+# to nothing else, so the wheel is built without them.
 zeusdb-vector-core = { workspace = true, features = ["test-support"] }
-# For the one test that reads a calibration back from an older JSON record.
-serde_json = { workspace = true }

@@ -42,8 +42,8 @@
 //! the other four, which is what removed this module's dependency on
 //! `hnsw_index`.
 
-// `levels: Mutex<LevelGenerator>` is not a field of `HNSWIndex`, so it is
-// outside the registry in `hnsw_index::locks` and outside the order it
+// `levels: Mutex<LevelGenerator>` is not a field of the index, so it is
+// outside the registry in `zeusdb_vector_hnsw::locks` and outside the order it
 // enforces. Every path that draws a level already holds the graph's own write
 // guard, so the generator is reached under one lock and never held across
 // another. See `clippy.toml`.
@@ -119,7 +119,7 @@ pub trait Distance<T> {
 /// the check computes and a square root would only add error to it.
 ///
 /// The residual a correct normalisation leaves is the whole of what this has to
-/// absorb. `HNSWIndex::normalize_vector` divides by an `f32` norm accumulated in
+/// absorb. `Space::normalize_vector` divides by an `f32` norm accumulated in
 /// `f32`, and the worst `|sum(x * x) - 1|` that leaves, measured over the real
 /// 128, 768 and 1,536 dimensional sets and over adversarial input of four
 /// thousand values spanning eight orders of magnitude, is 3.576e-7, which is
@@ -230,7 +230,7 @@ where
     /// `expected_size` asks for.
     ///
     /// The arguments are clamped rather than validated, because every caller has
-    /// validated them already: `HNSWIndex::build` rejects a zero dimension, a
+    /// validated them already: `Declaration::validate` rejects a zero dimension, a
     /// zero `expected_size` and an `m` outside 2 to 256, and the loader's
     /// constructor is fed a directory this crate wrote. The clamp is what makes
     /// the `expect` below unreachable rather than merely unlikely, and it is

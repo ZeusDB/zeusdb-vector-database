@@ -1063,9 +1063,13 @@ dependencies = [
 name = "zeusdb-vector-hnsw"
 version = "0.8.0"
 dependencies = [
+ "bincode",
+ "chrono",
+ "rand",
  "rayon",
  "serde",
  "serde_json",
+ "tracing",
  "zeusdb-vector-core",
 ]
 
@@ -1073,13 +1077,9 @@ dependencies = [
 name = "zeusdb-vector-python"
 version = "0.8.0"
 dependencies = [
- "bincode",
  "chrono",
  "numpy",
  "pyo3",
- "rand",
- "rayon",
- "serde",
  "serde_json",
  "tracing",
  "tracing-appender",

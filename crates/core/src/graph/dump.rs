@@ -111,7 +111,7 @@ const LOG_TARGET: &str = "zeusdb_vector_database::graph::dump";
 /// load, so it is a number the format fixes rather than a tuning knob. Every
 /// per node array in the structure is sized by it and `super::traverse` walks
 /// down from it.
-pub(super) const NB_LAYER_MAX: u8 = 16;
+pub const NB_LAYER_MAX: u8 = 16;
 
 /// Where a point sits, being its layer and its rank within that layer.
 ///
@@ -214,12 +214,12 @@ pub(crate) enum GraphKind {
     /// Quantized l1. Written by 0.7.0 and earlier and refused at load since,
     /// so no directory this build writes carries one. The number stays
     /// reserved. `validate_space_supports_quantization` in
-    /// `hnsw_index/construct.rs` records the measurement that keeps the pair
+    /// `collection/construct.rs` records the measurement that keeps the pair
     /// refused.
     L1Pq = 6,
     /// Inner product. There is no quantized counterpart. `create()` and
     /// `load()` refuse the pair, so no dump can carry one, and
-    /// `validate_space_supports_quantization` in `hnsw_index/construct.rs`
+    /// `validate_space_supports_quantization` in `collection/construct.rs`
     /// records the measurement that keeps it refused.
     Dot = 7,
 }

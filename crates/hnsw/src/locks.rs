@@ -1,4 +1,5 @@
-//! Every lock on `HNSWIndex`, with its place in the declared order.
+//! Every lock on `Collection` and its `Space`, with its place in the declared
+//! order.
 //!
 //! # What this is for
 //!
@@ -58,7 +59,7 @@ use std::sync::{LockResult, Mutex, PoisonError, RwLock};
 ///
 /// **Ascending is earlier.** A thread may take a lock only when every lock it
 /// already holds ranks strictly below it, so the numbers here are the order
-/// `HNSWIndex` documents in prose, written down once in a form the
+/// `Collection` documents in prose, written down once in a form the
 /// build can check.
 ///
 /// The prose order is

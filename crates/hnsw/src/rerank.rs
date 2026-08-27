@@ -6,8 +6,8 @@
 //! which is what lets the whole rule be exercised without building one, and it
 //! is why this sits in its own crate rather than inside the index. The index decides
 //! whether a search reranks at all and hands the training sample to the
-//! calibration; see `hnsw_index::search::rerank_plan` and
-//! `hnsw_index::training::calibrate_rerank`.
+//! calibration; see `collection::search::rerank_plan` and
+//! `collection::training::calibrate_rerank`.
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -882,7 +882,7 @@ pub(crate) fn measure_rerank_fetches(
 
 /// The rerank calibration, with no index around it
 ///
-/// Split from `HNSWIndex::calibrate_rerank` so the measurement is reachable
+/// Split from `Collection::calibrate_rerank` so the measurement is reachable
 /// without an index, which is what lets it be tested directly. The method
 /// decides whether to run this, and this decides what it produces.
 ///
@@ -1025,7 +1025,7 @@ pub(crate) fn least_squares_slope(points: &[(f64, f64)]) -> Option<f64> {
 /// How a quantized search over-fetches and rescores
 ///
 /// Present only when the index is quantized, its storage mode keeps raw
-/// vectors, and the caller has not turned rerank off. `HNSWIndex::rerank_plan`
+/// vectors, and the caller has not turned rerank off. `Collection::rerank_plan`
 /// is the single place that decides, and all three search paths take it from
 /// there.
 #[derive(Clone, Copy)]

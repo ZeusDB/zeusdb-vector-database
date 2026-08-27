@@ -156,7 +156,7 @@ thread_local! {
 pub enum PqMetric {
     /// Squared L2 from the query to the reconstruction.
     ///
-    /// What the ADC table sums directly. `HNSWIndex::sqrt_adc_page` roots the
+    /// What the ADC table sums directly. `Collection::sqrt_adc_page` roots the
     /// page on the way out, because the ordering is the same before and after
     /// and the root is worth one call per returned candidate rather than one
     /// per distance evaluation.
@@ -221,8 +221,8 @@ impl Drop for QueryLut {
 ///
 /// ZeusDB's own format carries a `graph::dump::GraphKind` discriminant instead,
 /// so the pin is gone. It was costing a dependency cycle: `graph` reached into
-/// `hnsw_index` for this one name, through a re-export in this file that hid
-/// the fact, while `hnsw_index` is built on `graph`.
+/// the index module for this one name, through a re-export in this file that hid
+/// the fact, while the index is built on `graph`.
 #[derive(Clone)]
 pub struct DistPQ {
     /// Reference to the PQ instance for accessing centroids
@@ -732,8 +732,8 @@ pub(crate) fn cosine_normalized(a: &[f32], b: &[f32]) -> f32 {
 /// Every path into a cosine graph normalises first, and
 /// `graph::assert_unit_for_cosine` asserts it at the seam in debug builds. The
 /// set of paths is closed. In outline,
-/// insertion normalises in `HNSWIndex::process_vector_for_space`, querying
-/// normalises in `HNSWIndex::validate_and_process_query_vector` or in
+/// insertion normalises in `Space::process_vector_for_space`, querying
+/// normalises in `Space::validate_query` or in
 /// `process_vector_for_space` on the two batch paths, and the three rebuild
 /// paths re-insert vectors that were normalised when they were first stored.
 ///

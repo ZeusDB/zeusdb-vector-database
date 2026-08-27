@@ -12,7 +12,7 @@
 //! written without a reference. What holds the graph now is the
 //! round trip, the loader's rejections, the memory arithmetic, the sort tie
 //! order, the level stream against a recorded golden vector, the reservation
-//! cap, the seam wiring, the eight graph guards in `hnsw_index`, and the
+//! cap, the seam wiring, the eight graph guards in `guard_tests`, and the
 //! Python-level suite over real data. A change to the insert is provable
 //! against ZeusDB's own recorded behaviour and not against an independent
 //! builder.
@@ -822,7 +822,7 @@ fn the_level_seed_resets_the_generator() {
 /// The creation-time reservation is capped in bytes.
 ///
 /// `Vec::with_capacity` aborts the process on allocation failure rather than
-/// unwinding, so the largest declaration `HNSWIndex::build` admits has to be
+/// unwinding, so the largest declaration `Declaration::validate` admits has to be
 /// bounded before it is reached rather than caught afterwards. Checked over the
 /// arithmetic rather than by taking the allocation, since taking it is the thing
 /// being prevented.

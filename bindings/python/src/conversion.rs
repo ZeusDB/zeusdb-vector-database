@@ -1,5 +1,6 @@
 //! Conversion between Python objects and the `serde_json::Value` tree the
-//! index stores metadata in.
+//! index stores metadata in, and of a search page into the list of dicts
+//! Python receives.
 //!
 //! Both directions live here because both are needed in two places. The index
 //! reads Python metadata on the way in and writes it back on the way out, and
@@ -14,6 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use serde_json::Value;
 use std::collections::HashMap;
+use zeusdb_vector_hnsw::QueryHits;
 
 /// How deeply a Python object may nest on the way in.
 ///
@@ -159,4 +161,34 @@ pub(crate) fn value_to_python_object(value: &Value, py: Python<'_>) -> PyResult<
     };
 
     Ok(py_obj)
+}
+
+/// One query's hits as the list of dicts Python receives.
+pub(crate) fn hits_to_python(hits: QueryHits, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+    let mut output = Vec::with_capacity(hits.len());
+    for (id, score, metadata, vector_data) in hits {
+        let dict = PyDict::new(py);
+        dict.set_item("id", id)?;
+        dict.set_item("score", score)?;
+        dict.set_item("metadata", value_map_to_python(&metadata, py)?)?;
+        if let Some(vec) = vector_data {
+            // A list of Python floats, as every release has returned. Both
+            // adapters read it as a list, and one of them tests for it.
+            dict.set_item("vector", vec)?;
+        }
+        output.push(dict.into());
+    }
+    Ok(output)
+}
+
+/// A batch's hits as one list of dicts per query, in query order.
+pub(crate) fn batch_hits_to_python(
+    batches: Vec<QueryHits>,
+    py: Python<'_>,
+) -> PyResult<Vec<Vec<Py<PyDict>>>> {
+    let mut output = Vec::with_capacity(batches.len());
+    for hits in batches {
+        output.push(hits_to_python(hits, py)?);
+    }
+    Ok(output)
 }

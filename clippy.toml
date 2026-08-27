@@ -5,7 +5,7 @@
 # would replace this one for that crate without a warning, and the CI gate
 # checks that exactly one exists.
 #
-# `disallowed-types` is why a lock added to `HNSWIndex` later cannot bypass the
+# `disallowed-types` is why a lock added to `Collection` or `Space` later cannot bypass the
 # guard registry. The registry only works if every lock on that type goes
 # through `zeusdb_vector_hnsw::locks`, and nothing in Rust stops a later field from
 # writing `std::sync::RwLock` directly. Naming the two standard types here makes
@@ -17,7 +17,7 @@
 #
 # Three modules carry a module level allow saying why they are exempt.
 # `zeusdb_vector_hnsw::locks` is where the wrapping happens. `pq` and `graph` hold locks
-# that are not fields of `HNSWIndex`: the ones inside `PQ` are leaves the
+# that are not fields of the index: the ones inside `PQ` are leaves the
 # declared order already places below every index guard, and the graph's level
 # generator is reached only under the graph's own write guard.
 disallowed-types = [
