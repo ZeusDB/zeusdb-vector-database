@@ -1,6 +1,6 @@
 # The whole Python suite with the lock rank registry live.
 #
-# The registry in bindings/python/src/hnsw_index/locks.rs is gated on
+# The registry in crates/hnsw/src/locks.rs is gated on
 # `cfg(debug_assertions)` and on nothing else. Every gate in ci.yml builds the
 # extension the way the wheel is built, which is a release build with the
 # assertions off. The `checked` profile in the root Cargo.toml is the release
@@ -30,7 +30,7 @@ on:
     paths:
       - 'bindings/python/src/hnsw_index/**'
       - 'bindings/python/src/persistence.rs'
-      - 'bindings/python/src/rerank.rs'
+      - 'crates/hnsw/src/rerank.rs'
       - 'crates/core/src/graph/**'
       - 'crates/core/src/columns.rs'
       - 'crates/core/src/filter.rs'

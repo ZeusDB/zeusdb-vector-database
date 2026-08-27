@@ -69,10 +69,6 @@
 
 use super::{HNSWIndex, StorageMode, VectorGraph};
 use crate::conversion::value_map_to_python;
-use crate::rerank::{
-    prepare_reconstruction, raw_distance_fn, reconstruction_needs_unit, rescore_candidate,
-    take_best, RawVectors, RerankPlan, SearchParams,
-};
 use crate::PyEngineError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -83,6 +79,10 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, instrument, trace, warn};
 use zeusdb_vector_core::{matches_filter, Bitmap, ColumnStore, Error, Filter, GraphHit, Selection};
+use zeusdb_vector_hnsw::{
+    prepare_reconstruction, raw_distance_fn, reconstruction_needs_unit, rescore_candidate,
+    take_best, RawVectors, RerankPlan, SearchParams,
+};
 /// Records a filtered search may match before it stops scanning and traverses
 /// the graph instead.
 ///

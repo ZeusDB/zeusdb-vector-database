@@ -5,7 +5,6 @@
 //! Rust constructor agree. `new_empty` is the loader's constructor and validates
 //! nothing, because its configuration comes from a directory this crate wrote.
 
-use super::locks::{MutexAt, RwLockAt};
 use super::{HNSWIndex, QuantizationConfig, StorageMode, MAX_LAYER};
 use crate::PyEngineError;
 use chrono::Utc;
@@ -17,6 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace};
 use zeusdb_vector_core::{validate_indexed_fields, ColumnStore, Error, VectorGraph, PQ};
+use zeusdb_vector_hnsw::locks::{MutexAt, RwLockAt};
 /// Widest `dim` a caller may declare, and the widest a saved index may name.
 ///
 /// `dim` is the width of one vector buffer, so sizing that buffer from the

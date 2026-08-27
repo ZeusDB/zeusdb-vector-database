@@ -52,9 +52,11 @@ extension-module = ["pyo3/extension-module"]
 
 # Every version is the workspace's, declared once in the root Cargo.toml with
 # the reason for each pin. The engine itself is zeusdb-vector-core, taken by
-# path, and this crate holds what touches Python.
+# path, the index rules are zeusdb-vector-hnsw, taken the same way, and this
+# crate holds what touches Python.
 [dependencies]
 zeusdb-vector-core = { workspace = true }
+zeusdb-vector-hnsw = { workspace = true }
 pyo3 = { workspace = true }
 numpy = { workspace = true }
 serde_json = { workspace = true }
@@ -69,7 +71,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 # The engine again, with its test data and test graph turned on, for the
-# tests under src/hnsw_index/ and in rerank.rs that measure against them.
+# tests under src/hnsw_index/ that measure against them.
 # cargo applies a dev-dependency's features to this crate's test targets and
 # to nothing else, so the wheel is built without them.
 zeusdb-vector-core = { workspace = true, features = ["test-support"] }

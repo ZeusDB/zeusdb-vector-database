@@ -6,9 +6,7 @@
 //! collecting for training. Removal is logical, and `compact_locked` reclaims
 //! the graph nodes that removal and replacement leave behind.
 
-use super::locks::{order, WriteGuard};
 use super::{HNSWIndex, ParsedRecords, StorageMode, MAX_LAYER};
-use crate::rerank::RawVectors;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -17,6 +15,8 @@ use tracing::{debug, error, info, instrument, trace, warn};
 use zeusdb_vector_core::{
     matches_filter, Bitmap, ColumnStore, Error, Filter, Record, Selection, VectorGraph,
 };
+use zeusdb_vector_hnsw::locks::{order, WriteGuard};
+use zeusdb_vector_hnsw::RawVectors;
 /// Multiple of `expected_size` at which an index warns that it has outgrown its
 /// declaration. Fires once per index.
 const EXPECTED_SIZE_OVERGROWTH_FACTOR: usize = 2;

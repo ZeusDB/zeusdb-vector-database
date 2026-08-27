@@ -105,7 +105,7 @@ static INIT: Once = Once::new();
 /// with `atexit` so a normally exiting process needs no call.
 ///
 /// `clippy.toml` disallows the standard `Mutex` so that a lock added to
-/// `HNSWIndex` cannot bypass the rank registry in `hnsw_index::locks`. This is
+/// `HNSWIndex` cannot bypass the rank registry in `zeusdb_vector_hnsw::locks`. This is
 /// not a lock on `HNSWIndex` and is not reachable from one. It is taken twice
 /// in the life of a process, once at import and once at exit, and no index
 /// guard is held at either point, so it has no place in the declared order.

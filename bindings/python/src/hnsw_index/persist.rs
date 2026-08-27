@@ -6,9 +6,7 @@
 //! field of `HNSWIndex` and cannot leave one in a state the index did not
 //! choose.
 
-use super::locks::{order, ReadGuard};
 use super::{HNSWIndex, QuantizationConfig, StorageMode, MAX_LAYER};
-use crate::rerank::RawVectors;
 use pyo3::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -18,6 +16,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{restore_graph, DumpBounds, Error, VectorGraph};
+use zeusdb_vector_hnsw::locks::{order, ReadGuard};
+use zeusdb_vector_hnsw::RawVectors;
 /// Set to any non-empty value other than `0` to skip the saved graph and
 /// rebuild it by re-inserting every record.
 ///
@@ -767,7 +767,7 @@ impl HNSWIndex {
     /// Get read access to the PQ codes HashMap (thread-safe)
     ///
     /// `pub(crate)` rather than `pub`, as are the four accessors below that
-    /// also hand out a guard. They return a [`super::locks::ReadGuard`], which
+    /// also hand out a guard. They return a [`ReadGuard`], which
     /// is a crate type, and a `pub` item returning one is a private type in a
     /// public interface. Nothing outside the crate could call them in any case,
     /// since `hnsw_index` is a private module.

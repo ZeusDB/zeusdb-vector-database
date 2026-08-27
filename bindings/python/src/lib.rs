@@ -8,7 +8,6 @@ mod conversion;
 mod hnsw_index;
 mod logging;
 mod persistence;
-mod rerank;
 
 use pyo3::prelude::*;
 use zeusdb_vector_core::{Error, Exception};

@@ -39,18 +39,13 @@ pub(crate) use construct::{
 };
 mod input;
 mod insert;
-/// Every lock on this type, with its place in the declared acquisition order
-/// asserted on a debug build.
-pub(crate) mod locks;
 mod persist;
 mod search;
 mod stats;
 mod training;
 
 use crate::conversion::{python_dict_to_value_map, value_map_to_python};
-use crate::rerank::{RawVectors, RerankCalibration, SearchParams};
 use insert::InsertError;
-use locks::{order, MutexAt, RwLockAt};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -60,6 +55,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use zeusdb_vector_hnsw::locks::{order, MutexAt, RwLockAt};
+use zeusdb_vector_hnsw::{RawVectors, RerankCalibration, SearchParams};
 // The graph and everything the engine supplies arrive through the seam in
 // zeusdb_vector_core. See the note at the top of graph/mod.rs there.
 use zeusdb_vector_core::{
@@ -234,9 +231,9 @@ impl AddResult {
 /// ```
 ///
 /// **This order is checked rather than believed.** Every field below is a
-/// [`locks::RwLockAt`] or a [`locks::MutexAt`] carrying its rank as a const
+/// [`RwLockAt`] or a [`MutexAt`] carrying its rank as a const
 /// generic, and on a debug build each acquisition asserts that the thread holds
-/// none of the same lock and nothing ranked above it. See [`locks`] for what
+/// none of the same lock and nothing ranked above it. See [`zeusdb_vector_hnsw::locks`] for what
 /// that catches, what it costs and what it misses. In release the wrappers are
 /// the standard types by another name.
 ///

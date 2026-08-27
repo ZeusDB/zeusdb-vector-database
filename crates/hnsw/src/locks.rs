@@ -1,4 +1,4 @@
-//! Every lock on [`super::HNSWIndex`], with its place in the declared order.
+//! Every lock on `HNSWIndex`, with its place in the declared order.
 //!
 //! # What this is for
 //!
@@ -58,7 +58,7 @@ use std::sync::{LockResult, Mutex, PoisonError, RwLock};
 ///
 /// **Ascending is earlier.** A thread may take a lock only when every lock it
 /// already holds ranks strictly below it, so the numbers here are the order
-/// [`super::HNSWIndex`] documents in prose, written down once in a form the
+/// `HNSWIndex` documents in prose, written down once in a form the
 /// build can check.
 ///
 /// The prose order is
@@ -78,27 +78,27 @@ use std::sync::{LockResult, Mutex, PoisonError, RwLock};
 /// held while anything else is. That is the weaker half of the claim, and it is
 /// the half a rank can state without inventing a rule the code has not agreed
 /// to.
-pub(crate) mod order {
+pub mod order {
     /// The mutation lock, taken by a Python entry point before any guard.
-    pub(crate) const WRITERS: u8 = 0;
-    pub(crate) const ID_MAP: u8 = 1;
-    pub(crate) const REV_MAP: u8 = 2;
-    pub(crate) const HNSW: u8 = 3;
-    pub(crate) const PQ_CODES: u8 = 4;
-    pub(crate) const VECTOR_METADATA: u8 = 5;
-    pub(crate) const COLUMNS: u8 = 6;
-    pub(crate) const TRAINING_IDS: u8 = 7;
-    pub(crate) const METADATA: u8 = 8;
-    pub(crate) const ID_COUNTER: u8 = 9;
-    pub(crate) const VECTOR_COUNT: u8 = 10;
+    pub const WRITERS: u8 = 0;
+    pub const ID_MAP: u8 = 1;
+    pub const REV_MAP: u8 = 2;
+    pub const HNSW: u8 = 3;
+    pub const PQ_CODES: u8 = 4;
+    pub const VECTOR_METADATA: u8 = 5;
+    pub const COLUMNS: u8 = 6;
+    pub const TRAINING_IDS: u8 = 7;
+    pub const METADATA: u8 = 8;
+    pub const ID_COUNTER: u8 = 9;
+    pub const VECTOR_COUNT: u8 = 10;
     /// A leaf. See the module documentation.
-    pub(crate) const RERANK_CALIBRATION: u8 = 11;
+    pub const RERANK_CALIBRATION: u8 = 11;
     /// A leaf.
-    pub(crate) const TRAINING_COMPLETED_AT: u8 = 12;
+    pub const TRAINING_COMPLETED_AT: u8 = 12;
     /// A leaf.
-    pub(crate) const CREATED_AT: u8 = 13;
+    pub const CREATED_AT: u8 = 13;
     /// A leaf, taken by `generate_id` alone and held across nothing.
-    pub(crate) const GENERATED_IDS: u8 = 14;
+    pub const GENERATED_IDS: u8 = 14;
 
     /// The largest rank declared above.
     ///
@@ -111,7 +111,7 @@ pub(crate) mod order {
     /// Compiled under `cfg(test)` alone, because the test is its only reader and
     /// a release build otherwise warns that it is never used.
     #[cfg(test)]
-    pub(crate) const HIGHEST: u8 = GENERATED_IDS;
+    pub const HIGHEST: u8 = GENERATED_IDS;
 }
 
 /// How a rank names itself in an assertion a developer reads.
@@ -222,18 +222,18 @@ fn held_now() -> Vec<&'static str> {
 /// beside the documentation that explains what the field holds, and the two
 /// constructors cannot disagree about it.
 #[repr(transparent)]
-pub(crate) struct RwLockAt<const RANK: u8, T> {
+pub struct RwLockAt<const RANK: u8, T> {
     inner: RwLock<T>,
 }
 
 impl<const RANK: u8, T> RwLockAt<RANK, T> {
-    pub(crate) const fn new(value: T) -> Self {
+    pub const fn new(value: T) -> Self {
         RwLockAt {
             inner: RwLock::new(value),
         }
     }
 
-    pub(crate) fn read(&self) -> LockResult<ReadGuard<'_, RANK, T>> {
+    pub fn read(&self) -> LockResult<ReadGuard<'_, RANK, T>> {
         #[cfg(debug_assertions)]
         enter(RANK);
         match self.inner.read() {
@@ -244,7 +244,7 @@ impl<const RANK: u8, T> RwLockAt<RANK, T> {
         }
     }
 
-    pub(crate) fn write(&self) -> LockResult<WriteGuard<'_, RANK, T>> {
+    pub fn write(&self) -> LockResult<WriteGuard<'_, RANK, T>> {
         #[cfg(debug_assertions)]
         enter(RANK);
         match self.inner.write() {
@@ -258,18 +258,18 @@ impl<const RANK: u8, T> RwLockAt<RANK, T> {
 
 /// A `Mutex` that knows its place in the declared order.
 #[repr(transparent)]
-pub(crate) struct MutexAt<const RANK: u8, T> {
+pub struct MutexAt<const RANK: u8, T> {
     inner: Mutex<T>,
 }
 
 impl<const RANK: u8, T> MutexAt<RANK, T> {
-    pub(crate) const fn new(value: T) -> Self {
+    pub const fn new(value: T) -> Self {
         MutexAt {
             inner: Mutex::new(value),
         }
     }
 
-    pub(crate) fn lock(&self) -> LockResult<Locked<'_, RANK, T>> {
+    pub fn lock(&self) -> LockResult<Locked<'_, RANK, T>> {
         #[cfg(debug_assertions)]
         enter(RANK);
         match self.inner.lock() {
@@ -300,7 +300,7 @@ macro_rules! guard {
         /// its own, so it is the standard guard by another name and the
         /// standard guard's own release is all that runs.
         #[repr(transparent)]
-        pub(crate) struct $name<'a, const RANK: u8, T> {
+        pub struct $name<'a, const RANK: u8, T> {
             inner: std::sync::$inner<'a, T>,
         }
 

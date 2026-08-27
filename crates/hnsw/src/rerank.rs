@@ -4,7 +4,7 @@
 //!
 //! Everything here is a free function or a plain value. Nothing reads an index,
 //! which is what lets the whole rule be exercised without building one, and it
-//! is why this sits beside `hnsw_index` rather than inside it. The index decides
+//! is why this sits in its own crate rather than inside the index. The index decides
 //! whether a search reranks at all and hands the training sample to the
 //! calibration; see `hnsw_index::search::rerank_plan` and
 //! `hnsw_index::training::calibrate_rerank`.
@@ -163,8 +163,8 @@ use zeusdb_vector_core::{CosineDist, Distance, DotDist, L1Dist, L2Dist, VectorGr
 /// of `subvectors` and no rerank expression that holds recall moves that
 /// crossing. See the README table.
 pub const DEFAULT_RERANK_CORPUS_DIVISOR: usize = 50;
-pub const DEFAULT_RERANK_MIN_CANDIDATES: usize = 250;
-pub const DEFAULT_RERANK_PAGE_FACTOR: usize = 5;
+pub(crate) const DEFAULT_RERANK_MIN_CANDIDATES: usize = 250;
+pub(crate) const DEFAULT_RERANK_PAGE_FACTOR: usize = 5;
 
 /// The calibrated rerank fetch, measured on the index's own data
 ///
@@ -387,12 +387,12 @@ pub const DEFAULT_RERANK_PAGE_FACTOR: usize = 5;
 /// An index trained before this existed carries no calibration, and its
 /// `quantization.json` has no field for one. It falls back to the three corpus
 /// terms above, which is what it was built against.
-pub const RERANK_CALIBRATION_TARGET: f64 = 0.99;
-pub const RERANK_CALIBRATION_SAFETY: f64 = 1.75;
-pub const RERANK_CALIBRATION_EXPONENT_BIAS: f64 = 0.15;
-pub const RERANK_CALIBRATION_EXPONENT_MIN: f64 = 0.40;
-pub const RERANK_CALIBRATION_EXPONENT_MAX: f64 = 1.00;
-pub const RERANK_CALIBRATION_CAP_DIVISOR: usize = 4;
+pub(crate) const RERANK_CALIBRATION_TARGET: f64 = 0.99;
+pub(crate) const RERANK_CALIBRATION_SAFETY: f64 = 1.75;
+pub(crate) const RERANK_CALIBRATION_EXPONENT_BIAS: f64 = 0.15;
+pub(crate) const RERANK_CALIBRATION_EXPONENT_MIN: f64 = 0.40;
+pub(crate) const RERANK_CALIBRATION_EXPONENT_MAX: f64 = 1.00;
+pub(crate) const RERANK_CALIBRATION_CAP_DIVISOR: usize = 4;
 
 /// Fractions of the training sample the exponent is fitted over
 ///
@@ -401,9 +401,9 @@ pub const RERANK_CALIBRATION_CAP_DIVISOR: usize = 4;
 /// has to be one of them, since its fetch is what the search scales from. The
 /// measurement costs the sum of these in units of one pass over the sample, so
 /// this set costs 2.5 against the 1.5 the two point fit cost.
-pub const RERANK_CALIBRATION_FIT_FRACTIONS: [f64; 4] = [0.25, 0.50, 0.75, 1.00];
+pub(crate) const RERANK_CALIBRATION_FIT_FRACTIONS: [f64; 4] = [0.25, 0.50, 0.75, 1.00];
 
-pub const RERANK_CALIBRATION_QUERIES: usize = 512;
+pub(crate) const RERANK_CALIBRATION_QUERIES: usize = 512;
 
 /// Page size the calibration measures the depth for
 ///
@@ -449,8 +449,8 @@ pub const RERANK_CALIBRATION_PAGES: [usize; 3] = [1, 10, 100];
 /// Zero is a fetch that ignores the page, which is what shipped before this was
 /// measured. One is a fetch proportional to the page, which is what every
 /// constant multiple of `top_k` assumes and which no measured corpus needs.
-pub const RERANK_CALIBRATION_PAGE_EXPONENT_MIN: f64 = 0.0;
-pub const RERANK_CALIBRATION_PAGE_EXPONENT_MAX: f64 = 1.0;
+pub(crate) const RERANK_CALIBRATION_PAGE_EXPONENT_MIN: f64 = 0.0;
+pub(crate) const RERANK_CALIBRATION_PAGE_EXPONENT_MAX: f64 = 1.0;
 
 /// The page exponent an index that never measured one falls back to
 ///
@@ -468,7 +468,7 @@ pub const RERANK_CALIBRATION_PAGE_EXPONENT_MAX: f64 = 1.0;
 /// recall at the reference page, because the scaling is exactly one there
 /// whatever the exponent is. Above the reference page it can only deepen the
 /// fetch.
-pub const RERANK_CALIBRATION_DEFAULT_PAGE_EXPONENT: f64 = 0.49;
+pub(crate) const RERANK_CALIBRATION_DEFAULT_PAGE_EXPONENT: f64 = 0.49;
 
 /// What the calibration measured, and on what
 ///
@@ -671,7 +671,7 @@ impl RerankCalibration {
 /// One place decides it, so the exact scan, which has the space in hand, and
 /// the rerank plan, which carries the answer past it, cannot disagree about
 /// which spaces are in the set.
-pub(crate) fn reconstruction_needs_unit(space: &str) -> bool {
+pub fn reconstruction_needs_unit(space: &str) -> bool {
     space == "cosine"
 }
 
@@ -698,7 +698,7 @@ pub(crate) fn reconstruction_needs_unit(space: &str) -> bool {
 /// Every other space takes the vector as it is. `l2` and `l1` are defined on
 /// unnormalised input and a `dot` index is never quantized, so nothing else
 /// reaches here with a reconstruction at all.
-pub(crate) fn prepare_reconstruction(needs_unit: bool, mut reconstructed: Vec<f32>) -> Vec<f32> {
+pub fn prepare_reconstruction(needs_unit: bool, mut reconstructed: Vec<f32>) -> Vec<f32> {
     if !needs_unit {
         return reconstructed;
     }
@@ -719,7 +719,7 @@ pub(crate) fn prepare_reconstruction(needs_unit: bool, mut reconstructed: Vec<f3
 /// hands to a raw graph, so a rescored score is the number a raw index would
 /// have reported for the same pair rather than a second implementation of the
 /// same formula.
-pub(crate) fn raw_distance_fn(space: &str) -> fn(&[f32], &[f32]) -> f32 {
+pub fn raw_distance_fn(space: &str) -> fn(&[f32], &[f32]) -> f32 {
     match space {
         "l2" => |a: &[f32], b: &[f32]| L2Dist {}.eval(a, b),
         "l1" => |a: &[f32], b: &[f32]| L1Dist {}.eval(a, b),
@@ -891,7 +891,7 @@ pub(crate) fn measure_rerank_fetches(
 /// them is what fixes the record exponent. That last measurement also answers
 /// every page in `RERANK_CALIBRATION_PAGES` from the same pass, which is what
 /// fixes the page exponent; see `RerankCalibration`.
-pub(crate) fn calibrate_rerank_from_sample(
+pub fn calibrate_rerank_from_sample(
     pq: &PQ,
     sample: &[Vec<f32>],
     distance: fn(&[f32], &[f32]) -> f32,
@@ -1029,20 +1029,20 @@ pub(crate) fn least_squares_slope(points: &[(f64, f64)]) -> Option<f64> {
 /// is the single place that decides, and all three search paths take it from
 /// there.
 #[derive(Clone, Copy)]
-pub(crate) struct RerankPlan {
+pub struct RerankPlan {
     /// Candidates to pull from the graph per requested result, when the caller
     /// named a factor. `None` means the caller named none and the fetch comes
     /// from the calibration, or from the live record count where there is no
     /// calibration; see `SearchParams::fetch_k`.
-    pub(crate) factor: Option<usize>,
+    pub factor: Option<usize>,
     /// What training measured on this index's own data, where it ran. `None`
     /// for an index trained before the calibration existed.
-    pub(crate) calibration: Option<RerankCalibration>,
+    pub calibration: Option<RerankCalibration>,
     /// The space's raw vector distance.
-    pub(crate) distance: fn(&[f32], &[f32]) -> f32,
+    pub distance: fn(&[f32], &[f32]) -> f32,
     /// Whether `distance` requires a unit vector, which decides what happens to
     /// a reconstruction before it is scored. See `prepare_reconstruction`.
-    pub(crate) unit_reconstruction: bool,
+    pub unit_reconstruction: bool,
 }
 
 /// The settings a search carries once its input has been parsed
@@ -1052,11 +1052,11 @@ pub(crate) struct RerankPlan {
 /// traversal breadth and the rerank plan are read together wherever they are
 /// read at all.
 #[derive(Clone, Copy)]
-pub(crate) struct SearchParams {
-    pub(crate) top_k: usize,
-    pub(crate) ef: usize,
-    pub(crate) return_vector: bool,
-    pub(crate) rerank: Option<RerankPlan>,
+pub struct SearchParams {
+    pub top_k: usize,
+    pub ef: usize,
+    pub return_vector: bool,
+    pub rerank: Option<RerankPlan>,
 }
 
 impl SearchParams {
@@ -1073,7 +1073,7 @@ impl SearchParams {
     /// the live record count; see `RerankCalibration`. Where there is no
     /// calibration it takes the largest of the corpus term, the floor and the
     /// page term, for the reasons recorded on those three constants.
-    pub(crate) fn fetch_k(&self, live_records: usize) -> usize {
+    pub fn fetch_k(&self, live_records: usize) -> usize {
         match self.rerank {
             Some(plan) => match plan.factor {
                 Some(factor) => self
@@ -1101,7 +1101,7 @@ impl SearchParams {
 /// and the page term, for the reasons recorded on those three constants. Either
 /// way the live record count is the final bound, since the graph cannot return
 /// more nodes than it holds.
-pub(crate) fn default_rerank_fetch(
+pub fn default_rerank_fetch(
     calibration: Option<RerankCalibration>,
     live_records: usize,
     top_k: usize,
@@ -1126,23 +1126,23 @@ pub(crate) fn default_rerank_fetch(
 /// The two are always taken `id_map` first and the graph second, which is the
 /// order every path in the crate takes them in.
 #[derive(Clone, Copy)]
-pub(crate) struct RawVectors<'a> {
+pub struct RawVectors<'a> {
     /// The external id to internal id map, which is the record set.
-    pub(crate) id_map: &'a HashMap<String, usize>,
+    pub id_map: &'a HashMap<String, usize>,
     /// The graph, which owns the store the vectors live in.
-    pub(crate) graph: &'a VectorGraph,
+    pub graph: &'a VectorGraph,
 }
 
 impl RawVectors<'_> {
     /// One record's raw vector, or `None` where the index keeps none for it.
     #[inline]
-    pub(crate) fn get(&self, ext_id: &str) -> Option<&[f32]> {
+    pub fn get(&self, ext_id: &str) -> Option<&[f32]> {
         self.graph.raw_vector(*self.id_map.get(ext_id)?)
     }
 
     /// Whether the index keeps a raw vector for this record.
     #[inline]
-    pub(crate) fn contains(&self, ext_id: &str) -> bool {
+    pub fn contains(&self, ext_id: &str) -> bool {
         self.get(ext_id).is_some()
     }
 }
@@ -1157,7 +1157,7 @@ impl RawVectors<'_> {
 /// `None` means the candidate holds neither a raw vector nor codes, which no
 /// record resolving through `rev_map` can be. The callers sort such a candidate
 /// last rather than letting an unscored one displace a scored one.
-pub(crate) fn rescore_candidate(
+pub fn rescore_candidate(
     plan: &RerankPlan,
     query: &[f32],
     ext_id: &str,
@@ -1177,7 +1177,7 @@ pub(crate) fn rescore_candidate(
 ///
 /// `total_cmp` rather than `partial_cmp`, so a non-finite score orders rather
 /// than panicking the sort.
-pub(crate) fn take_best<T>(scored: &mut Vec<(T, f32)>, top_k: usize) {
+pub fn take_best<T>(scored: &mut Vec<(T, f32)>, top_k: usize) {
     scored.sort_by(|a, b| a.1.total_cmp(&b.1));
     scored.truncate(top_k);
 }

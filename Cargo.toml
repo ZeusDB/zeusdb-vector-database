@@ -39,6 +39,7 @@ license = "Apache-2.0"
 # a member names one with `{ workspace = true }` and no version at all, and
 # cargo-deny's allow-wildcard-paths admits the versionless edge.
 zeusdb-vector-core = { path = "crates/core" }
+zeusdb-vector-hnsw = { path = "crates/hnsw" }
 # abi3-py310 builds against CPython's stable ABI, so one wheel per platform
 # loads on every CPython from 3.10 up, including versions that do not exist
 # yet. The feature lives here rather than in pyproject's [tool.maturin]
@@ -101,7 +102,7 @@ opt-level = 3       # Full optimization
 
 # An optimised build that keeps `debug_assertions` on.
 #
-# The lock rank registry in bindings/python/src/hnsw_index/locks.rs is gated
+# The lock rank registry in crates/hnsw/src/locks.rs is gated
 # on `cfg(debug_assertions)` and on nothing else, so it is live in any profile
 # that leaves them on. This profile is the release profile with the assertions
 # turned back on, so the registry runs at release speed. Build it with

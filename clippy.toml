@@ -7,7 +7,7 @@
 #
 # `disallowed-types` is why a lock added to `HNSWIndex` later cannot bypass the
 # guard registry. The registry only works if every lock on that type goes
-# through `hnsw_index::locks`, and nothing in Rust stops a later field from
+# through `zeusdb_vector_hnsw::locks`, and nothing in Rust stops a later field from
 # writing `std::sync::RwLock` directly. Naming the two standard types here makes
 # that a lint, and the gate runs
 #
@@ -16,11 +16,11 @@
 # so it is a build failure rather than a convention.
 #
 # Three modules carry a module level allow saying why they are exempt.
-# `hnsw_index::locks` is where the wrapping happens. `pq` and `graph` hold locks
+# `zeusdb_vector_hnsw::locks` is where the wrapping happens. `pq` and `graph` hold locks
 # that are not fields of `HNSWIndex`: the ones inside `PQ` are leaves the
 # declared order already places below every index guard, and the graph's level
 # generator is reached only under the graph's own write guard.
 disallowed-types = [
-    { path = "std::sync::RwLock", reason = "use hnsw_index::locks::RwLockAt, which carries the lock's place in the declared acquisition order and asserts it on a debug build" },
-    { path = "std::sync::Mutex", reason = "use hnsw_index::locks::MutexAt, which carries the lock's place in the declared acquisition order and asserts it on a debug build" },
+    { path = "std::sync::RwLock", reason = "use zeusdb_vector_hnsw::locks::RwLockAt, which carries the lock's place in the declared acquisition order and asserts it on a debug build" },
+    { path = "std::sync::Mutex", reason = "use zeusdb_vector_hnsw::locks::MutexAt, which carries the lock's place in the declared acquisition order and asserts it on a debug build" },
 ]

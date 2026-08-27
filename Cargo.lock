@@ -1060,6 +1060,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeusdb-vector-hnsw"
+version = "0.8.0"
+dependencies = [
+ "rayon",
+ "serde",
+ "serde_json",
+ "zeusdb-vector-core",
+]
+
+[[package]]
 name = "zeusdb-vector-python"
 version = "0.8.0"
 dependencies = [
@@ -1075,6 +1085,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "zeusdb-vector-core",
+ "zeusdb-vector-hnsw",
 ]
 
 [[package]]

@@ -43,7 +43,6 @@ use crate::hnsw_index::{
     validate_index_parameters, validate_space_supports_quantization, HNSWIndex, QuantizationConfig,
     StorageMode,
 };
-use crate::rerank::RerankCalibration;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -56,6 +55,7 @@ use zeusdb_vector_core::{
     checksum_of, validate_indexed_fields, Error, DUMP_FILENAME as GRAPH_DUMP_FILENAME,
     LEGACY_DUMP_FILENAMES, PQ,
 };
+use zeusdb_vector_hnsw::RerankCalibration;
 
 // ============================================================================
 // FORMAT VERSION
