@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.9.0] - 2026-08-28
+
+### Changed
+
+- Unfiltered search is faster. The live record set the traversal checks each candidate against is a bitmap rather than a hash lookup, which removes a `HashMap` probe from every candidate the graph visits. Measured paired in one interpreter at 50,000 records, this is 22 percent on SIFT-128 under `l2`, 18 percent on GloVe-100 under `cosine` and 6.5 percent on DBpedia-OpenAI-1536 under `cosine`. Every result page is identical to 0.8.0's, id for id and score bit for score bit.
+
+- `rand` moves to 0.10 and `rand_chacha` to 0.10. The generated stream is unchanged, verified against every seed the engine records over a million draws each, so every graph, codebook and saved directory is exactly what 0.8.0 produced.
+
+### Internal
+
+- The engine is a Cargo workspace of three crates, `zeusdb-vector-core`, `zeusdb-vector-hnsw` and the Python binding, none published to crates.io. The source distribution carries all three under `crates/` and `bindings/`. Neither engine crate depends on PyO3, so the engine builds and tests without a Python interpreter.
+
+- Every failure the engine raises is one `Error` type, mapped to a Python exception at the binding boundary. Every exception class and every message is unchanged.
+
+- `HNSWIndex` is a Python wrapper over the engine's collection type. Its methods, properties, return values and docstrings are unchanged.
+
+- The `duration_ms` field on the `add` completion log record now measures the insertion alone, where it previously included parsing the arguments. Log record targets are unchanged.
+
+- `save()` now flushes the graph file to disk before the directory is renamed into place, closing a window where a power loss could leave a complete manifest naming an incomplete graph.
+
+- RUSTSEC-2025-0141, `bincode` being unmaintained, is accepted with a review date. No version of `bincode` clears the advisory, and the artefacts stay on 2.0.1 until they move to another format.
+
+### Unchanged, and verified
+
+Across the restructure, 148 error probes are identical in class and message, 64,800 result pages across 24 index configurations are identical, every saved artefact is identical by content, all 24 recorded directories reload identically, and the saved directory format is unchanged at 1.1.0. Every directory saved by 0.8.0 opens as it did.
+
 ## [0.8.0] - 2026-08-25
 
 The filter language gains boolean composition, presence tests and columns for the fields you declare, and a filtered search returns the nearest of the records the filter matches rather than whatever survived an unfiltered page. The index gains the verbs a store expects, `len()`, `in`, `count()`, `delete()`, `clear()`, `update_metadata()` and `rebuild()` among them, and `dot` as a fourth metric. A save is atomic and verified, a quantized index is scored on the metric it declared, and an unquantized index holds about half the memory it did. `dim` is now required, `add()` raises on a malformed batch and `l1` can no longer be quantized, so read the breaking list before upgrading. A directory saved by 0.7.0 opens unchanged unless it pairs `l1` with quantization or was created outside the new bounds.

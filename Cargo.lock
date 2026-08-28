@@ -1034,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "zeusdb-vector-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "rand",
  "rand_chacha",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "zeusdb-vector-hnsw"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bincode",
  "chrono",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "zeusdb-vector-python"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "numpy",

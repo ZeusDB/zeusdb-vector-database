@@ -22,3 +22,16 @@ uv.lock         text eol=lf
 
 # Markdown
 *.md            text eol=lf
+
+# Repository metadata, licence text and tool configuration. None of these
+# carries an extension the rules above match, so each is named. LICENSE and
+# NOTICE are read from the working tree by maturin and copied into the wheel
+# and the source distribution byte for byte.
+.gitattributes      text eol=lf
+.gitignore          text eol=lf
+LICENSE             text eol=lf
+NOTICE              text eol=lf
+clippy.toml         text eol=lf
+deny.toml           text eol=lf
+rust-toolchain.toml text eol=lf
+py.typed            text eol=lf
