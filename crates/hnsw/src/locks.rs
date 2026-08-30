@@ -1,4 +1,4 @@
-//! Every lock on `Collection` and its `Space`, with its place in the declared
+//! Every lock on `Collection` and its spaces, with its place in the declared
 //! order.
 //!
 //! # What this is for
@@ -19,18 +19,30 @@
 //!
 //! # What it costs
 //!
-//! In release, nothing. The rank lives in a const generic, the tracked types
-//! are `#[repr(transparent)]` over the standard ones, the guards have no `Drop`
-//! of their own, and every registry call is behind `#[cfg(debug_assertions)]`.
-//! [`tests::a_tracked_lock_is_the_size_of_the_lock_it_wraps`] asserts the sizes,
-//! and it is the one test here that is not itself gated on
+//! In release, nothing. The rank is a field that exists only under
+//! `debug_assertions`, the tracked types are `#[repr(transparent)]` over the
+//! standard ones there, the guards have no `Drop` of their own, and every
+//! registry call is behind `#[cfg(debug_assertions)]`.
+//! [`tests::a_tracked_lock_is_the_size_of_the_lock_it_wraps`] asserts the
+//! sizes, and it is the one test here that is not itself gated on
 //! `debug_assertions`, so it runs on a release build too. The three assertion
 //! messages below are absent from a release artefact, so the whole body is gone
 //! rather than merely unreachable.
 //!
-//! In debug, one thread local access, a scan of at most fourteen entries and a
-//! push per acquisition, against a lock acquisition that already costs an
-//! atomic.
+//! In debug, one byte and its padding per lock, one thread local access, a
+//! scan of at most a few dozen entries and a push per acquisition, against a
+//! lock acquisition that already costs an atomic.
+//!
+//! # Why the rank is a field and not a const generic
+//!
+//! It was a const generic, which put the rank in the type beside the field's
+//! declaration and cost no memory at all. A collection holding several spaces
+//! cannot do that, because every space's index guard sits at the same place
+//! in the order relative to the collection's own locks and at a different
+//! place relative to the other spaces', so the rank has to carry the space's
+//! position, which is decided when the collection is built. The field is
+//! compiled out of a release build, so the memory cost is a debug build's
+//! alone.
 //!
 //! # Why a field added later cannot bypass it
 //!
@@ -65,54 +77,122 @@ use std::sync::{LockResult, Mutex, PoisonError, RwLock};
 /// The prose order is
 ///
 /// ```text
-/// id_map < rev_map < hnsw < pq_codes < vector_metadata < columns
-///        < training_ids < metadata < id_counter < vector_count
+/// id_map < rev_map < [each space's index guard, then its codes guard,
+///                     in the order the spaces were declared]
+///        < vector_metadata < columns < training_ids < metadata
+///        < id_counter < vector_count
 /// ```
 ///
 /// `writers` sits above all of them because the mutating Python entry points
 /// take it before any guard and no internal helper takes it at all.
 ///
-/// `rerank_calibration`, `training_completed_at` and `created_at` are the
-/// leaves. The prose says they are never held together with any other guard,
-/// which is stronger than a rank can express, so they take the bottom ranks:
-/// anything may be held while one of them is taken, and none of them may be
-/// held while anything else is. That is the weaker half of the claim, and it is
-/// the half a rank can state without inventing a rule the code has not agreed
-/// to.
+/// The spaces sit in one block between the record set and the storage maps,
+/// each at a stride of two ranks, so a search over several spaces takes every
+/// space's guards after the reverse map and before the metadata, which is the
+/// shape a search over one space already has. A space's position in the block
+/// is its position in the collection's declaration, and two spaces' guards are
+/// therefore ordered against each other, which is what lets the registry see
+/// an inversion between them.
+///
+/// Each space's `rerank_calibration` and `training_completed_at`, and the
+/// collection's `created_at`, are the leaves. The prose says they are never
+/// held together with any other guard, which is stronger than a rank can
+/// express, so they take the bottom ranks: anything may be held while one of
+/// them is taken, and none of them may be held while anything else is. That is
+/// the weaker half of the claim, and it is the half a rank can state without
+/// inventing a rule the code has not agreed to.
 pub mod order {
     /// The mutation lock, taken by a Python entry point before any guard.
     pub const WRITERS: u8 = 0;
     pub const ID_MAP: u8 = 1;
     pub const REV_MAP: u8 = 2;
-    pub const HNSW: u8 = 3;
-    pub const PQ_CODES: u8 = 4;
-    pub const VECTOR_METADATA: u8 = 5;
-    pub const COLUMNS: u8 = 6;
-    pub const TRAINING_IDS: u8 = 7;
-    pub const METADATA: u8 = 8;
-    pub const ID_COUNTER: u8 = 9;
-    pub const VECTOR_COUNT: u8 = 10;
-    /// A leaf. See the module documentation.
-    pub const RERANK_CALIBRATION: u8 = 11;
+
+    /// Spaces a collection may hold. Each takes two ranks in the block below
+    /// and two among the leaves.
+    pub const MAX_SPACES: usize = 4;
+    const SPACE_BASE: u8 = 3;
+    const SPACE_STRIDE: u8 = 2;
+
+    /// The guard over a space's index, being the graph of a dense space and
+    /// the postings of a sparse one, for the space at `space` in the
+    /// declaration.
+    pub const fn space_index(space: usize) -> u8 {
+        SPACE_BASE + (space as u8) * SPACE_STRIDE
+    }
+
+    /// The guard over a dense space's code store, taken after its index.
+    pub const fn space_codes(space: usize) -> u8 {
+        space_index(space) + 1
+    }
+
+    const AFTER_SPACES: u8 = SPACE_BASE + (MAX_SPACES as u8) * SPACE_STRIDE;
+    pub const VECTOR_METADATA: u8 = AFTER_SPACES;
+    pub const COLUMNS: u8 = AFTER_SPACES + 1;
+    pub const TRAINING_IDS: u8 = AFTER_SPACES + 2;
+    pub const METADATA: u8 = AFTER_SPACES + 3;
+    pub const ID_COUNTER: u8 = AFTER_SPACES + 4;
+    pub const VECTOR_COUNT: u8 = AFTER_SPACES + 5;
+
+    const LEAF_BASE: u8 = AFTER_SPACES + 6;
+
+    /// A leaf. The rerank calibration of the dense space at `space`.
+    pub const fn space_calibration(space: usize) -> u8 {
+        LEAF_BASE + (space as u8) * 2
+    }
+
+    /// A leaf. When the dense space at `space` fitted its codebook.
+    pub const fn space_trained_at(space: usize) -> u8 {
+        space_calibration(space) + 1
+    }
+
+    const AFTER_LEAVES: u8 = LEAF_BASE + (MAX_SPACES as u8) * 2;
     /// A leaf.
-    pub const TRAINING_COMPLETED_AT: u8 = 12;
-    /// A leaf.
-    pub const CREATED_AT: u8 = 13;
+    pub const CREATED_AT: u8 = AFTER_LEAVES;
     /// A leaf, taken by `generate_id` alone and held across nothing.
-    pub const GENERATED_IDS: u8 = 14;
+    pub const GENERATED_IDS: u8 = AFTER_LEAVES + 1;
+
+    /// The first space's four ranks, by the names the collection's
+    /// documentation uses for them.
+    pub const HNSW: u8 = space_index(0);
+    pub const PQ_CODES: u8 = space_codes(0);
+    pub const RERANK_CALIBRATION: u8 = space_calibration(0);
+    pub const TRAINING_COMPLETED_AT: u8 = space_trained_at(0);
 
     /// The largest rank declared above.
     ///
     /// `every_declared_rank_is_named` walks up to this and checks that one past
     /// it is unnamed, so adding a rank without naming it fails there rather than
-    /// silently reporting the fallback. It named `CREATED_AT` directly until a
-    /// rank was added after it, which made the test fail for the one reason it
-    /// was not looking for.
+    /// silently reporting the fallback.
     ///
     /// Compiled under `cfg(test)` alone, because the test is its only reader and
     /// a release build otherwise warns that it is never used.
     #[cfg(test)]
     pub const HIGHEST: u8 = GENERATED_IDS;
+
+    /// Which space a rank in the space block or the leaf block belongs to,
+    /// and which of its guards it is. `None` for a collection rank.
+    #[cfg(debug_assertions)]
+    pub(super) fn space_of(rank: u8) -> Option<(usize, &'static str)> {
+        if (SPACE_BASE..AFTER_SPACES).contains(&rank) {
+            let offset = rank - SPACE_BASE;
+            let which = if offset.is_multiple_of(SPACE_STRIDE) {
+                "index"
+            } else {
+                "codes"
+            };
+            return Some(((offset / SPACE_STRIDE) as usize, which));
+        }
+        if (LEAF_BASE..AFTER_LEAVES).contains(&rank) {
+            let offset = rank - LEAF_BASE;
+            let which = if offset.is_multiple_of(2) {
+                "rerank_calibration"
+            } else {
+                "training_completed_at"
+            };
+            return Some(((offset / 2) as usize, which));
+        }
+        None
+    }
 }
 
 /// How a rank names itself in an assertion a developer reads.
@@ -121,24 +201,27 @@ pub mod order {
 /// field names are paired. A rank with no name here is a rank nobody declared,
 /// which is why the fallback says so rather than printing the number alone.
 #[cfg(debug_assertions)]
-const fn name_of(rank: u8) -> &'static str {
-    match rank {
-        order::WRITERS => "writers",
-        order::ID_MAP => "id_map",
-        order::REV_MAP => "rev_map",
-        order::HNSW => "hnsw",
-        order::PQ_CODES => "pq_codes",
-        order::VECTOR_METADATA => "vector_metadata",
-        order::COLUMNS => "columns",
-        order::TRAINING_IDS => "training_ids",
-        order::METADATA => "metadata",
-        order::ID_COUNTER => "id_counter",
-        order::GENERATED_IDS => "generated_ids",
-        order::VECTOR_COUNT => "vector_count",
-        order::RERANK_CALIBRATION => "rerank_calibration",
-        order::TRAINING_COMPLETED_AT => "training_completed_at",
-        order::CREATED_AT => "created_at",
-        _ => "a lock with no declared place in the order",
+fn name_of(rank: u8) -> String {
+    let fixed = match rank {
+        order::WRITERS => Some("writers"),
+        order::ID_MAP => Some("id_map"),
+        order::REV_MAP => Some("rev_map"),
+        order::VECTOR_METADATA => Some("vector_metadata"),
+        order::COLUMNS => Some("columns"),
+        order::TRAINING_IDS => Some("training_ids"),
+        order::METADATA => Some("metadata"),
+        order::ID_COUNTER => Some("id_counter"),
+        order::VECTOR_COUNT => Some("vector_count"),
+        order::CREATED_AT => Some("created_at"),
+        order::GENERATED_IDS => Some("generated_ids"),
+        _ => None,
+    };
+    if let Some(name) = fixed {
+        return name.to_string();
+    }
+    match order::space_of(rank) {
+        Some((space, which)) => format!("space {}'s {} guard", space, which),
+        None => "a lock with no declared place in the order".to_string(),
     }
 }
 
@@ -147,8 +230,8 @@ const fn name_of(rank: u8) -> &'static str {
 // ============================================================================
 
 // What this thread holds, innermost last. A `Vec` rather than a bitset because
-// the assertion has to name what is already held, and because fourteen entries
-// scanned linearly is cheaper than anything cleverer at this size.
+// the assertion has to name what is already held, and because a few dozen
+// entries scanned linearly is cheaper than anything cleverer at this size.
 #[cfg(debug_assertions)]
 thread_local! {
     static HELD: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -208,7 +291,7 @@ fn leave(rank: u8) {
 
 /// What this thread holds, by name, for a test that wants to assert on it.
 #[cfg(all(test, debug_assertions))]
-fn held_now() -> Vec<&'static str> {
+fn held_now() -> Vec<String> {
     HELD.try_with(|held| held.borrow().iter().map(|&r| name_of(r)).collect())
         .unwrap_or_default()
 }
@@ -219,64 +302,93 @@ fn held_now() -> Vec<&'static str> {
 
 /// An `RwLock` that knows its place in the declared order.
 ///
-/// The rank is a const generic, so it sits in the field's own declaration
-/// beside the documentation that explains what the field holds, and the two
-/// constructors cannot disagree about it.
-#[repr(transparent)]
-pub struct RwLockAt<const RANK: u8, T> {
+/// The rank is given at construction, beside the field's initialiser, and it
+/// exists only in a build that checks it.
+#[cfg_attr(not(debug_assertions), repr(transparent))]
+pub struct RwLockAt<T> {
     inner: RwLock<T>,
+    #[cfg(debug_assertions)]
+    rank: u8,
 }
 
-impl<const RANK: u8, T> RwLockAt<RANK, T> {
-    pub const fn new(value: T) -> Self {
+impl<T> RwLockAt<T> {
+    pub const fn new(rank: u8, value: T) -> Self {
+        #[cfg(not(debug_assertions))]
+        let _ = rank;
         RwLockAt {
             inner: RwLock::new(value),
+            #[cfg(debug_assertions)]
+            rank,
         }
     }
 
-    pub fn read(&self) -> LockResult<ReadGuard<'_, RANK, T>> {
+    pub fn read(&self) -> LockResult<ReadGuard<'_, T>> {
         #[cfg(debug_assertions)]
-        enter(RANK);
+        enter(self.rank);
         match self.inner.read() {
-            Ok(guard) => Ok(ReadGuard { inner: guard }),
+            Ok(guard) => Ok(ReadGuard {
+                inner: guard,
+                #[cfg(debug_assertions)]
+                rank: self.rank,
+            }),
             Err(poison) => Err(PoisonError::new(ReadGuard {
                 inner: poison.into_inner(),
+                #[cfg(debug_assertions)]
+                rank: self.rank,
             })),
         }
     }
 
-    pub fn write(&self) -> LockResult<WriteGuard<'_, RANK, T>> {
+    pub fn write(&self) -> LockResult<WriteGuard<'_, T>> {
         #[cfg(debug_assertions)]
-        enter(RANK);
+        enter(self.rank);
         match self.inner.write() {
-            Ok(guard) => Ok(WriteGuard { inner: guard }),
+            Ok(guard) => Ok(WriteGuard {
+                inner: guard,
+                #[cfg(debug_assertions)]
+                rank: self.rank,
+            }),
             Err(poison) => Err(PoisonError::new(WriteGuard {
                 inner: poison.into_inner(),
+                #[cfg(debug_assertions)]
+                rank: self.rank,
             })),
         }
     }
 }
 
 /// A `Mutex` that knows its place in the declared order.
-#[repr(transparent)]
-pub struct MutexAt<const RANK: u8, T> {
+#[cfg_attr(not(debug_assertions), repr(transparent))]
+pub struct MutexAt<T> {
     inner: Mutex<T>,
+    #[cfg(debug_assertions)]
+    rank: u8,
 }
 
-impl<const RANK: u8, T> MutexAt<RANK, T> {
-    pub const fn new(value: T) -> Self {
+impl<T> MutexAt<T> {
+    pub const fn new(rank: u8, value: T) -> Self {
+        #[cfg(not(debug_assertions))]
+        let _ = rank;
         MutexAt {
             inner: Mutex::new(value),
+            #[cfg(debug_assertions)]
+            rank,
         }
     }
 
-    pub fn lock(&self) -> LockResult<Locked<'_, RANK, T>> {
+    pub fn lock(&self) -> LockResult<Locked<'_, T>> {
         #[cfg(debug_assertions)]
-        enter(RANK);
+        enter(self.rank);
         match self.inner.lock() {
-            Ok(guard) => Ok(Locked { inner: guard }),
+            Ok(guard) => Ok(Locked {
+                inner: guard,
+                #[cfg(debug_assertions)]
+                rank: self.rank,
+            }),
             Err(poison) => Err(PoisonError::new(Locked {
                 inner: poison.into_inner(),
+                #[cfg(debug_assertions)]
+                rank: self.rank,
             })),
         }
     }
@@ -300,12 +412,14 @@ macro_rules! guard {
         /// In release it is a `#[repr(transparent)]` wrapper with no `Drop` of
         /// its own, so it is the standard guard by another name and the
         /// standard guard's own release is all that runs.
-        #[repr(transparent)]
-        pub struct $name<'a, const RANK: u8, T> {
+        #[cfg_attr(not(debug_assertions), repr(transparent))]
+        pub struct $name<'a, T> {
             inner: std::sync::$inner<'a, T>,
+            #[cfg(debug_assertions)]
+            rank: u8,
         }
 
-        impl<const RANK: u8, T> std::ops::Deref for $name<'_, RANK, T> {
+        impl<T> std::ops::Deref for $name<'_, T> {
             type Target = T;
             #[inline]
             fn deref(&self) -> &T {
@@ -314,9 +428,9 @@ macro_rules! guard {
         }
 
         #[cfg(debug_assertions)]
-        impl<const RANK: u8, T> Drop for $name<'_, RANK, T> {
+        impl<T> Drop for $name<'_, T> {
             fn drop(&mut self) {
-                leave(RANK);
+                leave(self.rank);
             }
         }
     };
@@ -329,7 +443,7 @@ macro_rules! guard {
 /// read worse than two invocations do.
 macro_rules! guard_mut {
     ($name:ident) => {
-        impl<const RANK: u8, T> std::ops::DerefMut for $name<'_, RANK, T> {
+        impl<T> std::ops::DerefMut for $name<'_, T> {
             #[inline]
             fn deref_mut(&mut self) -> &mut T {
                 &mut self.inner
@@ -356,29 +470,28 @@ mod tests {
     use super::*;
     use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 
-    /// The wrapper is the standard lock's size, so the rank costs no memory.
-    ///
-    /// This holds in debug as well as in release, because the rank is a const
-    /// generic and lives in the type rather than in a field. The guards carry a
-    /// `Drop` in debug and none in release, and neither changes their size.
+    /// In release the wrapper is the standard lock's size, so the rank costs
+    /// no memory. In debug the rank is one byte, and what it costs is that
+    /// byte and its padding.
     #[test]
     fn a_tracked_lock_is_the_size_of_the_lock_it_wraps() {
-        assert_eq!(
-            std::mem::size_of::<RwLockAt<{ order::HNSW }, Vec<u8>>>(),
-            std::mem::size_of::<RwLock<Vec<u8>>>()
-        );
-        assert_eq!(
-            std::mem::size_of::<MutexAt<{ order::WRITERS }, ()>>(),
-            std::mem::size_of::<Mutex<()>>()
-        );
-        assert_eq!(
-            std::mem::size_of::<ReadGuard<'_, { order::HNSW }, Vec<u8>>>(),
-            std::mem::size_of::<RwLockReadGuard<'_, Vec<u8>>>()
-        );
-        assert_eq!(
-            std::mem::size_of::<WriteGuard<'_, { order::HNSW }, Vec<u8>>>(),
-            std::mem::size_of::<RwLockWriteGuard<'_, Vec<u8>>>()
-        );
+        let lock_extra =
+            std::mem::size_of::<RwLockAt<Vec<u8>>>() - std::mem::size_of::<RwLock<Vec<u8>>>();
+        let mutex_extra = std::mem::size_of::<MutexAt<()>>() - std::mem::size_of::<Mutex<()>>();
+        let read_extra = std::mem::size_of::<ReadGuard<'_, Vec<u8>>>()
+            - std::mem::size_of::<RwLockReadGuard<'_, Vec<u8>>>();
+        let write_extra = std::mem::size_of::<WriteGuard<'_, Vec<u8>>>()
+            - std::mem::size_of::<RwLockWriteGuard<'_, Vec<u8>>>();
+        let extras = [lock_extra, mutex_extra, read_extra, write_extra];
+        if cfg!(debug_assertions) {
+            assert!(
+                extras.iter().all(|&extra| (1..=8).contains(&extra)),
+                "debug adds one byte and its padding, and added {:?}",
+                extras
+            );
+        } else {
+            assert_eq!(extras, [0, 0, 0, 0]);
+        }
     }
 
     /// A second read on one thread is refused, which is the whole point.
@@ -386,7 +499,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "taking the same guard twice on one thread")]
     fn a_second_read_on_one_thread_is_refused() {
-        let lock: RwLockAt<{ order::COLUMNS }, u32> = RwLockAt::new(7);
+        let lock: RwLockAt<u32> = RwLockAt::new(order::COLUMNS, 7);
         let _first = lock.read().unwrap();
         let _second = lock.read().unwrap();
     }
@@ -396,7 +509,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "taking the same guard twice on one thread")]
     fn a_write_under_a_read_of_the_same_lock_is_refused() {
-        let lock: RwLockAt<{ order::COLUMNS }, u32> = RwLockAt::new(7);
+        let lock: RwLockAt<u32> = RwLockAt::new(order::COLUMNS, 7);
         let _first = lock.read().unwrap();
         let _second = lock.write().unwrap();
     }
@@ -406,18 +519,90 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "inverts the declared lock order")]
     fn taking_a_lower_lock_under_a_higher_one_is_refused() {
-        let columns: RwLockAt<{ order::COLUMNS }, u32> = RwLockAt::new(1);
-        let id_map: RwLockAt<{ order::ID_MAP }, u32> = RwLockAt::new(2);
+        let columns: RwLockAt<u32> = RwLockAt::new(order::COLUMNS, 1);
+        let id_map: RwLockAt<u32> = RwLockAt::new(order::ID_MAP, 2);
         let _held = columns.read().unwrap();
         let _inverted = id_map.read().unwrap();
+    }
+
+    /// Two spaces' index guards are ordered by the spaces' declaration, so
+    /// taking the second space's before the first's is an inversion the
+    /// registry sees.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "inverts the declared lock order")]
+    fn taking_the_second_space_before_the_first_is_refused() {
+        let first: RwLockAt<u32> = RwLockAt::new(order::space_index(0), 1);
+        let second: RwLockAt<u32> = RwLockAt::new(order::space_index(1), 2);
+        let _held = second.read().unwrap();
+        let _inverted = first.read().unwrap();
+    }
+
+    /// Two spaces' guards at the same place in their own blocks are distinct
+    /// ranks, so a search over both takes both without tripping the
+    /// recursion check, and both sit between the record set and the storage
+    /// maps.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn two_spaces_in_declaration_order_are_allowed_between_the_maps() {
+        let rev_map: RwLockAt<u32> = RwLockAt::new(order::REV_MAP, 0);
+        let first: RwLockAt<u32> = RwLockAt::new(order::space_index(0), 1);
+        let first_codes: RwLockAt<u32> = RwLockAt::new(order::space_codes(0), 1);
+        let second: RwLockAt<u32> = RwLockAt::new(order::space_index(1), 2);
+        let vector_metadata: RwLockAt<u32> = RwLockAt::new(order::VECTOR_METADATA, 3);
+        {
+            let _a = rev_map.read().unwrap();
+            let _b = first.read().unwrap();
+            let _c = first_codes.read().unwrap();
+            let _d = second.read().unwrap();
+            let _e = vector_metadata.read().unwrap();
+            assert_eq!(
+                held_now(),
+                vec![
+                    "rev_map",
+                    "space 0's index guard",
+                    "space 0's codes guard",
+                    "space 1's index guard",
+                    "vector_metadata"
+                ]
+            );
+        }
+        assert!(held_now().is_empty());
+    }
+
+    /// Every space's ranks are distinct, in declaration order, and inside
+    /// the block the collection's own ranks leave for them.
+    #[test]
+    fn the_space_ranks_are_distinct_and_sit_in_their_block() {
+        let mut seen = Vec::new();
+        for space in 0..order::MAX_SPACES {
+            for rank in [
+                order::space_index(space),
+                order::space_codes(space),
+                order::space_calibration(space),
+                order::space_trained_at(space),
+            ] {
+                assert!(!seen.contains(&rank), "rank {} declared twice", rank);
+                seen.push(rank);
+            }
+            assert!(order::space_index(space) > order::REV_MAP);
+            assert!(order::space_codes(space) < order::VECTOR_METADATA);
+            assert!(order::space_calibration(space) > order::VECTOR_COUNT);
+            assert!(order::space_trained_at(space) < order::CREATED_AT);
+            if space > 0 {
+                assert!(order::space_index(space) > order::space_codes(space - 1));
+            }
+        }
+        assert_eq!(order::HNSW, order::space_index(0));
+        assert_eq!(order::PQ_CODES, order::space_codes(0));
     }
 
     /// Two locks in the declared order are allowed, and both are released.
     #[test]
     #[cfg(debug_assertions)]
     fn the_declared_order_is_allowed_and_the_set_empties() {
-        let id_map: RwLockAt<{ order::ID_MAP }, u32> = RwLockAt::new(1);
-        let columns: RwLockAt<{ order::COLUMNS }, u32> = RwLockAt::new(2);
+        let id_map: RwLockAt<u32> = RwLockAt::new(order::ID_MAP, 1);
+        let columns: RwLockAt<u32> = RwLockAt::new(order::COLUMNS, 2);
         {
             let first = id_map.read().unwrap();
             let second = columns.write().unwrap();
@@ -441,9 +626,9 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn guards_released_in_acquisition_order_pair_correctly() {
-        let id_map: RwLockAt<{ order::ID_MAP }, u32> = RwLockAt::new(1);
-        let rev_map: RwLockAt<{ order::REV_MAP }, u32> = RwLockAt::new(2);
-        let columns: RwLockAt<{ order::COLUMNS }, u32> = RwLockAt::new(3);
+        let id_map: RwLockAt<u32> = RwLockAt::new(order::ID_MAP, 1);
+        let rev_map: RwLockAt<u32> = RwLockAt::new(order::REV_MAP, 2);
+        let columns: RwLockAt<u32> = RwLockAt::new(order::COLUMNS, 3);
 
         let first = id_map.write().unwrap();
         let second = rev_map.write().unwrap();
@@ -460,7 +645,7 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn the_held_set_is_per_thread() {
-        let lock: RwLockAt<{ order::COLUMNS }, u32> = RwLockAt::new(9);
+        let lock: RwLockAt<u32> = RwLockAt::new(order::COLUMNS, 9);
         let _held = lock.read().unwrap();
         std::thread::scope(|scope| {
             scope.spawn(|| {

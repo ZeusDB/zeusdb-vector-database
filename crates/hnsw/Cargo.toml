@@ -1,9 +1,11 @@
 # The index, being what stands between the engine's floor in
-# zeusdb-vector-core and the binding. The collection and its one space, every
+# zeusdb-vector-core and the binding. The collection and its spaces, every
 # operation the binding calls, the rerank rule, the lock rank registry and the
-# persistence of a directory all live here. Nothing in it names Python. The
-# bans in deny.toml and the lint job in ci.yml hold it to that, and
-# `cargo test -p zeusdb-vector-hnsw` compiles no Python crate.
+# persistence of a directory all live here. The dense space is this crate's
+# own graph over the floor and the sparse space is zeusdb-vector-sparse,
+# taken by path. Nothing in it names Python. The bans in deny.toml and the
+# lint job in ci.yml hold it to that, and `cargo test -p zeusdb-vector-hnsw`
+# compiles no Python crate.
 [package]
 name = "zeusdb-vector-hnsw"
 # The version, the edition and the licence are the workspace's, declared once
@@ -19,6 +21,7 @@ publish = false
 # the reason for each pin.
 [dependencies]
 zeusdb-vector-core = { workspace = true }
+zeusdb-vector-sparse = { workspace = true }
 bincode = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }

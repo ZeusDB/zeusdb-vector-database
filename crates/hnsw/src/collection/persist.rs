@@ -8,8 +8,11 @@
 //! choose. `save` and `load` are the two doors, and the binding calls both
 //! with the interpreter lock released.
 
-use super::{Collection, LiveRecords, QuantizationConfig, StorageMode, MAX_LAYER};
-use crate::locks::{order, ReadGuard};
+use super::{
+    Collection, DenseIndex, DenseOpen, LiveRecords, ParsedRecord, QuantizationConfig, StorageMode,
+    MAX_LAYER,
+};
+use crate::locks::ReadGuard;
 use crate::RawVectors;
 use crate::RerankCalibration;
 use serde_json::Value;
@@ -18,7 +21,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
-use zeusdb_vector_core::{restore_graph, DumpBounds, Error, VectorGraph};
+use zeusdb_vector_core::{
+    ArtefactRecord, Bounds, Error, Inventory, Persist, Restore, VectorGraph, DUMP_FILENAME,
+};
 
 /// The target every record this file emits carries. See the parent module.
 const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::persist";
@@ -38,6 +43,23 @@ fn rebuild_requested() -> bool {
         Err(_) => false,
     }
 }
+
+/// What the manifest recorded about the graph dump, as the inventory the
+/// dense index checks before it reads the dump. A directory written before
+/// the manifest carried lengths records none, and nothing is checked.
+struct DumpLength(Option<u64>);
+
+impl Inventory for DumpLength {
+    fn recorded(&self, name: &str) -> Option<ArtefactRecord> {
+        if name != DUMP_FILENAME {
+            return None;
+        }
+        self.0.map(|bytes| ArtefactRecord {
+            bytes,
+            checksum: None,
+        })
+    }
+}
 impl Collection {
     /// Count the records the index actually holds
     ///
@@ -48,11 +70,11 @@ impl Collection {
     /// only caller is the load path in `persistence`.
     pub(crate) fn count_stored_records(&self) -> usize {
         let id_map = self.id_map.read().unwrap();
-        let hnsw = self.space.hnsw.read().unwrap();
-        let pq_codes = self.space.pq_codes.read().unwrap();
+        let index = self.dense().index.read().unwrap();
+        let pq_codes = self.dense().pq_codes.read().unwrap();
         let raws = RawVectors {
             id_map: &id_map,
-            graph: &hnsw,
+            graph: index.graph(),
         };
         let with_raw = id_map
             .keys()
@@ -73,10 +95,10 @@ impl Collection {
     /// carries its store.
     pub(crate) fn collect_raw_vectors(&self) -> HashMap<String, Vec<f32>> {
         let id_map = self.id_map.read().unwrap();
-        let hnsw = self.space.hnsw.read().unwrap();
+        let index = self.dense().index.read().unwrap();
         let mut out = HashMap::with_capacity(id_map.len());
         for (ext_id, &internal_id) in id_map.iter() {
-            if let Some(vector) = hnsw.raw_vector(internal_id) {
+            if let Some(vector) = index.graph().raw_vector(internal_id) {
                 out.insert(ext_id.clone(), vector.to_vec());
             }
         }
@@ -89,10 +111,10 @@ impl Collection {
     /// placed, which is the one moment the graph is quantized and the store is
     /// still empty, so `raws_need_their_own_file` would answer no.
     pub(crate) fn raw_store_is_expected(&self) -> bool {
-        let quantized = self.space.hnsw.read().unwrap().is_quantized();
+        let quantized = self.dense().index.read().unwrap().graph().is_quantized();
         quantized
             && self
-                .space
+                .dense()
                 .quantization_config
                 .as_ref()
                 .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw)
@@ -113,7 +135,7 @@ impl Collection {
     /// a damaged dump unloadable, which is a recovery path the loader
     /// documents and thirty-three tests hold.
     pub(crate) fn holds_raw_vectors(&self) -> bool {
-        self.space.hnsw.read().unwrap().holds_raw()
+        self.dense().index.read().unwrap().graph().holds_raw()
     }
 
     /// Rebuild the raw side store of a loaded quantized graph.
@@ -137,12 +159,13 @@ impl Collection {
         vectors: &HashMap<String, Vec<f32>>,
     ) -> Result<usize, String> {
         let id_map = self.id_map.read().unwrap();
-        let mut hnsw = self.space.hnsw.write().unwrap();
+        let mut index = self.dense().index.write().unwrap();
+        let hnsw = index.graph_mut();
         if !hnsw.is_quantized() {
             return Ok(0);
         }
         let nodes = hnsw.nb_points();
-        hnsw.open_raw_store(self.space.dim, nodes)?;
+        hnsw.open_raw_store(self.dense().dim, nodes)?;
         let mut by_internal: HashMap<usize, &Vec<f32>> = HashMap::with_capacity(vectors.len());
         for (ext_id, vector) in vectors {
             if let Some(&internal_id) = id_map.get(ext_id) {
@@ -150,7 +173,7 @@ impl Collection {
             }
         }
         let live: std::collections::HashSet<usize> = id_map.values().copied().collect();
-        let stranded_fill = vec![0f32; self.space.dim];
+        let stranded_fill = vec![0f32; self.dense().dim];
         let mut placed = 0usize;
         let mut stranded = 0usize;
         for node in 0..nodes as u32 {
@@ -260,32 +283,28 @@ impl Collection {
             return Ok(());
         }
 
-        let hnsw_guard = self.space.hnsw.read().unwrap();
-
-        let dump_result = hnsw_guard.dump(path);
-
-        match dump_result {
-            Ok(filename) => {
-                // Its length rather than a digest, for the reason
-                // `persistence::ArtefactDigest` gives: the dump streams itself
-                // and seeks back to write its header, so hashing it whole would
-                // mean reading the largest artefact in the directory back off
-                // the disk for a guarantee its own two checksums already give.
-                let bytes = std::fs::metadata(path.join(&filename))
-                    .map(|meta| meta.len())
-                    .map_err(|e| Error::DumpLengthUnreadable(e.to_string()))?;
-                ledger.record_length(&filename, bytes);
+        // The dense index writes its one artefact, the dump, under an empty
+        // prefix, which is the directory's root, and records its length
+        // rather than a digest, for the reason `persistence::ArtefactDigest`
+        // gives: the dump streams itself and seeks back to write its header,
+        // so hashing it whole would mean reading the largest artefact in the
+        // directory back off the disk for a guarantee its own two checksums
+        // already give.
+        let index = self.dense().index.read().unwrap();
+        match index.write("", path, ledger) {
+            Ok(()) => {
                 debug!(target: LOG_TARGET, operation = "save_hnsw_graph_complete",
-                    file_created = %filename,
-                    file_bytes = bytes,
+                    file_created = DUMP_FILENAME,
+                    file_bytes = ledger.recorded_bytes(DUMP_FILENAME).unwrap_or(0),
                     "HNSW graph saved successfully"
                 );
                 Ok(())
             }
-            Err(e) => {
+            Err(Error::GraphDumpFailed(e)) => {
                 error!(target: LOG_TARGET, operation = "save_hnsw_graph", error = %e, "HNSW graph dump failed");
                 Err(Error::GraphDumpFailed(e))
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -321,24 +340,6 @@ impl Collection {
             return Err(format!("{} asked for the rebuild", REBUILD_ENV));
         }
 
-        // The dump's own header and payload checksums say the file is
-        // internally consistent. The length manifest.json recorded says it is
-        // the file this directory's save wrote, which a self-consistent dump
-        // from a different save of an index of the same shape would otherwise
-        // pass. A directory written before the manifest carried lengths records
-        // none, and nothing is checked.
-        if let Some(expected) = recorded_bytes {
-            let found = std::fs::metadata(dir.join(zeusdb_vector_core::DUMP_FILENAME))
-                .map(|meta| meta.len())
-                .unwrap_or(0);
-            if found != expected {
-                return Err(format!(
-                    "the graph dump is {} bytes and manifest.json records it as {}",
-                    found, expected
-                ));
-            }
-        }
-
         // A save skips the graph dump entirely when the index holds nothing, so
         // any dump left in an empty index's directory belongs to an earlier
         // save and describes records this one no longer holds.
@@ -347,27 +348,33 @@ impl Collection {
             return Err("the index holds no records".to_string());
         }
 
-        // A trained product quantizer is what makes the saved graph a quantized
-        // one, so it is what decides which element type the dump must carry.
-        let pq = match &self.space.pq {
-            Some(pq) if pq.is_trained() => Some(pq.clone()),
-            _ => None,
+        // The dense index restores itself from the dump. The length
+        // manifest.json recorded is checked there before the dump is read,
+        // since the dump's own checksums say the file is internally
+        // consistent and the length says it is the file this directory's
+        // save wrote. A trained product quantizer is what makes the saved
+        // graph a quantized one, so it is what decides which element type
+        // the dump must carry.
+        let dense = self.dense();
+        let open = DenseOpen {
+            metric: dense.metric.clone(),
+            dim: dense.dim,
+            m: dense.m(),
+            ef_construction: dense.ef_construction(),
+            pq: dense.pq.clone(),
+            keeps_raw: dense.keeps_raw(),
         };
+        let bounds = Bounds {
+            min_records: live,
+            max_records: max_origin_id,
+            max_bytes: u64::MAX,
+        };
+        let index = DenseIndex::restore(&open, "", dir, &DumpLength(recorded_bytes), &bounds)
+            .map_err(|e| e.to_string())?;
+        let nodes = index.graph().nb_points();
 
-        let (graph, nodes) = restore_graph(
-            dir,
-            &self.space.metric,
-            self.space.m(),
-            self.space.ef_construction(),
-            self.space.dim,
-            pq,
-            DumpBounds {
-                min_nodes: live,
-                max_origin_id,
-            },
-        )?;
-
-        self.space.replace_graph(graph);
+        dense.replace_index(index);
+        self.sync_dense_live();
         Ok(nodes)
     }
 
@@ -392,7 +399,7 @@ impl Collection {
         pq_codes: &HashMap<String, Vec<u8>>,
         vectors: &HashMap<String, Vec<f32>>,
     ) -> Result<(usize, usize, usize), String> {
-        let pq = match &self.space.pq {
+        let pq = match &self.dense().pq {
             Some(pq) if pq.is_trained() => pq.clone(),
             _ => {
                 return Err(
@@ -419,11 +426,11 @@ impl Collection {
         extra.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut new_hnsw = VectorGraph::new_pq(
-            &self.space.metric,
-            self.space.m(),
+            &self.dense().metric,
+            self.dense().m(),
             self.expected_size(),
             MAX_LAYER,
-            self.space.ef_construction(),
+            self.dense().ef_construction(),
             pq,
         );
 
@@ -463,7 +470,8 @@ impl Collection {
         if !batch.is_empty() {
             new_hnsw.insert_batch_pq(&batch)?;
         }
-        self.space.replace_graph(new_hnsw);
+        self.dense().replace_graph(new_hnsw);
+        self.sync_dense_live();
 
         Ok((batch.len(), extra.len(), remapped))
     }
@@ -476,6 +484,9 @@ impl Collection {
     ) {
         *self.id_map.write().unwrap() = id_map;
         self.rev_map.write().unwrap().replace(rev_map);
+        // The dense index's live set is the mappings' key set, so a rebuild
+        // that replays every record removes ids the index holds.
+        self.sync_dense_live();
     }
 
     /// Set counters (for persistence loading only)
@@ -505,7 +516,7 @@ impl Collection {
         pq_codes: HashMap<String, Vec<u8>>,
         vector_metadata: HashMap<String, HashMap<String, Value>>,
     ) {
-        *self.space.pq_codes.write().unwrap() = pq_codes;
+        *self.dense().pq_codes.write().unwrap() = pq_codes;
         *self.vector_metadata.write().unwrap() = vector_metadata;
         self.rebuild_columns();
     }
@@ -552,12 +563,19 @@ impl Collection {
 
     /// Set quantization config (for persistence loading only)
     pub(crate) fn set_quantization_config(&mut self, config: Option<QuantizationConfig>) {
-        self.space.quantization_config = config;
+        let keeps_raw = config
+            .as_ref()
+            .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw);
+        let dense = self.dense_mut();
+        dense.quantization_config = config;
+        dense.index.write().unwrap().set_keeps_raw(keeps_raw);
     }
 
     /// Set PQ instance (for persistence loading only)
     pub(crate) fn set_pq(&mut self, pq: Option<Arc<zeusdb_vector_core::PQ>>) {
-        self.space.pq = pq;
+        let dense = self.dense_mut();
+        dense.pq = pq.clone();
+        dense.index.write().unwrap().set_pq(pq);
     }
 
     /// Set training threshold reached flag (for persistence loading only)
@@ -621,10 +639,10 @@ impl Collection {
         // non-finite value is the case that reaches here.
         let mut validated = Vec::with_capacity(total);
         for (id, vector, metadata) in records {
-            if vector.len() != self.space.dim {
+            if vector.len() != self.dense().dim {
                 return Err(Error::RebuildRefusedDimension {
                     id,
-                    expected: self.space.dim,
+                    expected: self.dense().dim,
                     got: vector.len(),
                 });
             }
@@ -651,7 +669,8 @@ impl Collection {
         // alone, which is the shape `add` uses.
         let (inserted, errors) = {
             let _writers = self.writers.lock().unwrap();
-            self.insert_parsed_records(validated, true)
+            let records = validated.into_iter().map(ParsedRecord::from).collect();
+            self.insert_parsed_records(records, true)
         };
 
         // Cleared before the result is judged rather than after, so the flag is
@@ -687,7 +706,7 @@ impl Collection {
     /// For persistence loading only. See the field for why the value is carried
     /// rather than restamped.
     pub(crate) fn set_training_completed_at(&mut self, completed_at: Option<String>) {
-        *self.space.training_completed_at.write().unwrap() = completed_at;
+        *self.dense().training_completed_at.write().unwrap() = completed_at;
     }
 
     // ============================================================================
@@ -736,41 +755,39 @@ impl Collection {
     /// guard. They return a [`ReadGuard`], and the binding reaches nothing
     /// through a guard: it takes owned values from the operations and
     /// nothing else.
-    pub(crate) fn pq_codes(&self) -> ReadGuard<'_, { order::PQ_CODES }, HashMap<String, Vec<u8>>> {
-        self.space.pq_codes.read().unwrap()
+    pub(crate) fn pq_codes(&self) -> ReadGuard<'_, HashMap<String, Vec<u8>>> {
+        self.dense().pq_codes.read().unwrap()
     }
 
     /// Get read access to the vector metadata HashMap (thread-safe)
-    pub(crate) fn vector_metadata(
-        &self,
-    ) -> ReadGuard<'_, { order::VECTOR_METADATA }, HashMap<String, HashMap<String, Value>>> {
+    pub(crate) fn vector_metadata(&self) -> ReadGuard<'_, HashMap<String, HashMap<String, Value>>> {
         self.vector_metadata.read().unwrap()
     }
 
     /// Get read access to the ID map (external ID -> internal ID)
-    pub(crate) fn id_map(&self) -> ReadGuard<'_, { order::ID_MAP }, HashMap<String, usize>> {
+    pub(crate) fn id_map(&self) -> ReadGuard<'_, HashMap<String, usize>> {
         self.id_map.read().unwrap()
     }
 
     /// Get read access to the reverse ID map (internal ID -> external ID),
     /// with the live set beside it
-    pub(crate) fn rev_map(&self) -> ReadGuard<'_, { order::REV_MAP }, LiveRecords> {
+    pub(crate) fn rev_map(&self) -> ReadGuard<'_, LiveRecords> {
         self.rev_map.read().unwrap()
     }
 
     /// Get reference to the quantization configuration
     pub(crate) fn quantization_config(&self) -> Option<&QuantizationConfig> {
-        self.space.quantization_config.as_ref()
+        self.dense().quantization_config.as_ref()
     }
 
     /// Get reference to the PQ instance
     pub(crate) fn pq(&self) -> Option<&Arc<zeusdb_vector_core::PQ>> {
-        self.space.pq.as_ref()
+        self.dense().pq.as_ref()
     }
 
     /// Helper to get quantization subvectors count
     pub(crate) fn quantization_subvectors(&self) -> usize {
-        self.space
+        self.dense()
             .quantization_config
             .as_ref()
             .map(|config| config.subvectors)
@@ -784,11 +801,11 @@ impl Collection {
 
     /// When the codebook was fitted, or `None` on an index that never trained
     pub(crate) fn training_completed_at(&self) -> Option<String> {
-        self.space.training_completed_at.read().unwrap().clone()
+        self.dense().training_completed_at.read().unwrap().clone()
     }
 
     /// Get read access to training IDs (for persistence)
-    pub(crate) fn training_ids(&self) -> ReadGuard<'_, { order::TRAINING_IDS }, Vec<String>> {
+    pub(crate) fn training_ids(&self) -> ReadGuard<'_, Vec<String>> {
         self.training_ids.read().unwrap()
     }
 
@@ -800,11 +817,11 @@ impl Collection {
 
     /// What training measured, where it ran. See `Space::rerank_calibration`.
     pub(crate) fn rerank_calibration(&self) -> Option<RerankCalibration> {
-        self.space.rerank_calibration()
+        self.dense().rerank_calibration()
     }
 
     /// Install a calibration read back from a saved index.
     pub(crate) fn set_rerank_calibration(&self, calibration: Option<RerankCalibration>) {
-        self.space.set_rerank_calibration(calibration);
+        self.dense().set_rerank_calibration(calibration);
     }
 }

@@ -245,6 +245,18 @@ impl DistPQ {
         self.pq.subvectors()
     }
 
+    /// Values one raw query holds, which is the width of the query the ADC
+    /// table is computed from.
+    pub(crate) fn dim(&self) -> usize {
+        self.pq.dim()
+    }
+
+    /// The vector one code stands for, which the seam uses as a query when
+    /// it times a search on a graph that holds codes alone.
+    pub(crate) fn reconstruct(&self, codes: &[u8]) -> Result<Vec<f32>, String> {
+        self.pq.reconstruct(codes)
+    }
+
     /// Compute this query's ADC table and install it for the calling thread.
     ///
     /// The returned guard must be held for the whole traversal. Dropping it

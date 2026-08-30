@@ -10,14 +10,14 @@
 //! The parsing itself stays in the binding, in `hnsw_index/input.rs`. This is
 //! the engine's half of that module and its records keep that module's target.
 
-use super::{Collection, Space};
+use super::{Collection, DenseSpace};
 use tracing::error;
 use zeusdb_vector_core::Error;
 
 /// The target every record this file emits carries. See the parent module.
 const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::input";
 
-impl Space {
+impl DenseSpace {
     /// Pure function for vector normalization
     fn normalize_vector(&self, vector: Vec<f32>) -> Vec<f32> {
         let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -91,12 +91,12 @@ impl Collection {
     /// A vector as the space stores it, which on a cosine index is the unit
     /// vector. The binding applies this to every parsed record.
     pub fn process_vector_for_space(&self, vector: Vec<f32>) -> Vec<f32> {
-        self.space.process_vector_for_space(vector)
+        self.dense().process_vector_for_space(vector)
     }
 
     /// A query vector checked for its width and for non-finite values, then
     /// processed as a stored vector is.
     pub fn validate_query(&self, vector: Vec<f32>) -> Result<Vec<f32>, Error> {
-        self.space.validate_query(vector)
+        self.dense().validate_query(vector)
     }
 }

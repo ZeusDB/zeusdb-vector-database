@@ -237,6 +237,36 @@ pub enum Error {
     Engine(String),
 
     // ------------------------------------------------------------------
+    // Spaces, and the index seam every space sits behind
+    // ------------------------------------------------------------------
+    /// A space declared with an empty name
+    SpaceNameEmpty,
+    /// A name no space in the collection carries
+    SpaceUnknown { name: String },
+    /// A name two spaces were declared under
+    SpaceDeclaredTwice { name: String },
+    /// More spaces declared than a collection holds
+    SpacesTooMany { max: usize },
+    /// A sparse vector offered to a collection that declares no sparse space
+    NoSparseSpace,
+    /// A vector of one family offered to a space of another
+    SpaceKindMismatch {
+        space: String,
+        expected: &'static str,
+        got: &'static str,
+    },
+    /// An insert under an internal id the index already holds
+    RecordAlreadyHeld { id: u32 },
+    /// A removal of an internal id the index does not hold
+    RecordNotHeld { id: u32 },
+    /// A sparse vector whose two slices differ in length
+    SparseVectorShape { dims: usize, values: usize },
+    /// A sparse vector whose dimensions are not strictly increasing
+    SparseDimsNotIncreasing { position: usize },
+    /// A sparse vector holding a NaN or an infinity
+    SparseValueNotFinite { index: usize, value: f32 },
+
+    // ------------------------------------------------------------------
     // Logging
     // ------------------------------------------------------------------
     /// `log_dir` is empty
@@ -446,9 +476,20 @@ impl Error {
             | IdCounterTooLarge { .. }
             | BitsOutOfRangeInFile { .. }
             | SubvectorsZeroInFile { .. }
-            | SubvectorsInvalidInFile { .. } => Exception::Value,
+            | SubvectorsInvalidInFile { .. }
+            | SpaceNameEmpty
+            | SpaceDeclaredTwice { .. }
+            | SpacesTooMany { .. }
+            | NoSparseSpace
+            | SpaceKindMismatch { .. }
+            | SparseVectorShape { .. }
+            | SparseDimsNotIncreasing { .. }
+            | SparseValueNotFinite { .. } => Exception::Value,
 
-            RecordsAbsent { .. } | ListCursorMissing { .. } => Exception::Key,
+            RecordsAbsent { .. }
+            | ListCursorMissing { .. }
+            | SpaceUnknown { .. }
+            | RecordNotHeld { .. } => Exception::Key,
 
             ArtefactReadFailed { .. }
             | ArtefactsMissing { .. }
@@ -462,6 +503,7 @@ impl Error {
             | AdoptRawFailed(_)
             | QuantizeFailed(_)
             | Engine(_)
+            | RecordAlreadyHeld { .. }
             | RebuildRefusedDimension { .. }
             | RebuildRefusedNotFinite { .. }
             | RebuildRefusedRecords { .. }
@@ -823,6 +865,44 @@ impl fmt::Display for Error {
             ),
             QuantizeFailed(error) => write!(f, "Failed to quantize vector: {}", error),
             Engine(message) => f.write_str(message),
+
+            SpaceNameEmpty => f.write_str("A space name must not be empty"),
+            SpaceUnknown { name } => write!(f, "No space is named '{}'", name),
+            SpaceDeclaredTwice { name } => {
+                write!(f, "Space '{}' is declared twice", name)
+            }
+            SpacesTooMany { max } => write!(f, "A collection holds at most {} spaces", max),
+            NoSparseSpace => f.write_str("This collection declares no sparse space"),
+            SpaceKindMismatch {
+                space,
+                expected,
+                got,
+            } => write!(
+                f,
+                "Space '{}' holds {} vectors and was given a {} vector",
+                space, expected, got
+            ),
+            RecordAlreadyHeld { id } => write!(
+                f,
+                "Record {} is already held by this space. A record is removed before                  it is added again, and an internal id is never reused.",
+                id
+            ),
+            RecordNotHeld { id } => write!(f, "Record {} is not held by this space", id),
+            SparseVectorShape { dims, values } => write!(
+                f,
+                "Sparse vector has {} dims and {} values, and the two must be the same                  length",
+                dims, values
+            ),
+            SparseDimsNotIncreasing { position } => write!(
+                f,
+                "Sparse vector dims must be strictly increasing, and the dim at position                  {} is not above the one before it",
+                position
+            ),
+            SparseValueNotFinite { index, value } => write!(
+                f,
+                "Sparse vector contains invalid value at index {}: {} (must be finite)",
+                index, value
+            ),
 
             LogDirEmpty => f.write_str("log_dir cannot be empty"),
 

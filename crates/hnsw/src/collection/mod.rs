@@ -6,19 +6,29 @@
 //! [`Collection`] is the record set and everything addressed by a record: the
 //! two id maps and the live set, the metadata and its columns, the counters,
 //! the training buffer, the timestamps, the mutation lock and the warning
-//! flags. [`Space`] is one vector space over those records: the graph, the
-//! quantizer with its codes and calibration, the metric, the width and the two
-//! graph tunables. A collection holds one space today, as a plain field. The
-//! fields are divided so that a map of named spaces is an addition later
-//! rather than a second division, and nothing here assumes there will only
-//! ever be one.
+//! flags. A [`Space`] is one vector space over those records. The dense one,
+//! [`DenseSpace`], holds the graph behind its guard as a [`DenseIndex`], the
+//! quantizer with its codes and calibration, the metric, the width and the
+//! two graph tunables. The sparse one, [`SparseSpace`], holds a postings index
+//! behind one guard. A collection holds its spaces in a list in declaration
+//! order, which is the lock order, and the first is always the dense space
+//! the binding declares, reached as `self.dense()`.
+//!
+//! Each index implements the seam in `zeusdb_vector_core`, so an insertion is
+//! `prepare` under the space's read guard and `insert` under its write guard,
+//! a removal is `remove`, and a search is `search` under an admit set the
+//! collection builds from its live set, its columns and its metadata. The
+//! collection never reaches past the seam into a structure, except to read
+//! the graph for the rerank rule, the persistence and the statistics, which
+//! is what `DenseIndex::graph` exists for.
 //!
 //! The one path that crosses the two is training. It reads the training ids
 //! from the collection, fetches their vectors through the space's graph, fits
 //! the space's quantizer, writes the codes and the calibration on the space
-//! and clears the buffer on the collection. It is a method on the collection
-//! that borrows its space, which is what every operation here is: the
-//! collection owns the space and reaches into it as `self.space`.
+//! and clears the buffer on the collection. The training buffer is the
+//! collection's and `training_size` is the space's, which holds while one
+//! space can be quantized; a second such space would need a buffer of its
+//! own.
 //!
 //! # What lives here and what does not
 //!
@@ -55,10 +65,13 @@
 //! attribute in it passes that constant.
 
 mod construct;
+mod dense;
 mod input;
 mod insert;
 mod persist;
 mod search;
+#[cfg(test)]
+mod spaces_tests;
 mod stats;
 mod training;
 
@@ -67,11 +80,12 @@ mod training;
 // arguments.
 pub use construct::Declaration;
 pub(crate) use construct::{validate_index_parameters, validate_space_supports_quantization};
+pub(crate) use dense::{DenseIndex, DenseOpen};
 pub use insert::{Added, RebuildPlan};
-pub use search::QueryHits;
+pub use search::{QueryHits, SparseHits};
 pub use stats::{QuantizationReport, QuantizerReport};
 
-use crate::locks::{order, MutexAt, RwLockAt};
+use crate::locks::{MutexAt, RwLockAt};
 use crate::RerankCalibration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -80,8 +94,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, Bitmap, ColumnStore, Error, Filter, Selection, VectorGraph, PQ,
+    matches_filter, Bitmap, ColumnStore, Error, Filter, Selection, SpaceName, SparseVector,
+    VectorGraph, VectorIndex, PQ,
 };
+use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 
 /// The target every record this file emits carries. See the module
 /// documentation.
@@ -95,6 +111,31 @@ const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index";
 /// interpreter lock is released across. The binding produces it and `insert`
 /// consumes it.
 pub type ParsedRecords = Vec<(String, Vec<f32>, HashMap<String, Value>)>;
+
+/// One record on its way in, with a vector for every space it fills.
+///
+/// The dense vector is always present, since the binding's surface declares
+/// one dense space and every record fills it. The sparse vector fills the
+/// collection's sparse space where one is declared, and a record may leave
+/// it empty. A `ParsedRecords` tuple is a record with no sparse vector.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedRecord {
+    pub id: String,
+    pub vector: Vec<f32>,
+    pub sparse: Option<SparseVector>,
+    pub metadata: HashMap<String, Value>,
+}
+
+impl From<(String, Vec<f32>, HashMap<String, Value>)> for ParsedRecord {
+    fn from((id, vector, metadata): (String, Vec<f32>, HashMap<String, Value>)) -> Self {
+        ParsedRecord {
+            id,
+            vector,
+            sparse: None,
+            metadata,
+        }
+    }
+}
 
 /// Layers every graph this crate builds is created with.
 ///
@@ -138,7 +179,7 @@ impl StorageMode {
 /// the rules `create()` applies, or read back from `quantization.json` by the
 /// loader, which holds them to the same rules through
 /// `validate_quantization_fields`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuantizationConfig {
     pub subvectors: usize,
     pub bits: usize,
@@ -149,6 +190,12 @@ pub struct QuantizationConfig {
 
 /// One page of `list`, as (id, metadata) in ascending internal id.
 pub type Listing = Vec<(String, HashMap<String, Value>)>;
+
+/// The name of the dense space the binding declares.
+///
+/// An ordinary name to everything below the binding. A collection built
+/// through `Declaration` always holds a dense space under it, first.
+pub const DEFAULT_SPACE: &str = "default";
 
 /// One record as `get_records` returns it: its id, its metadata, and its
 /// vector where one was asked for and the index could supply one.
@@ -223,10 +270,28 @@ impl LiveRecords {
         self.live = live;
     }
 
-    /// The set as bits, for the traversal predicate.
-    #[inline]
+    /// The set as bits.
+    ///
+    /// The traversal used to run under this bitmap. It runs under the dense
+    /// index's own live set now, which is maintained on the same writes, and
+    /// this one is what that set is checked against on a debug build; see
+    /// [`Collection::live_sets_agree`].
+    #[cfg(test)]
     pub(crate) fn live(&self) -> &Bitmap {
         &self.live
+    }
+
+    /// Whether `other` holds exactly the ids this set holds.
+    pub(crate) fn agrees_with(&self, other: &Bitmap) -> bool {
+        if self.live.count() != other.count() {
+            return false;
+        }
+        let mut agrees = true;
+        self.live.for_each_while(|slot| {
+            agrees = other.contains(slot);
+            agrees
+        });
+        agrees
     }
 
     /// The map itself, for the saver, which writes it whole.
@@ -244,23 +309,66 @@ impl std::ops::Deref for LiveRecords {
 }
 
 // ============================================================================
-// THE SPACE
+// THE SPACES
 // ============================================================================
 
-/// One vector space over the collection's records.
+/// How one space is declared, as the collection reports it back.
 ///
-/// The graph, the quantizer with its codes and its calibration, the metric,
-/// the width and the two graph tunables. Everything that would be repeated
-/// per named space if there were more than one, and nothing that would not.
-/// The record set, the metadata and the training buffer are the collection's,
-/// because a record is one record however many spaces hold a vector for it.
+/// Each variant carries the index's own configuration type, and the crate
+/// root re-exports every one of them, so a caller declaring a space depends
+/// on this crate alone. Adding a kind of space adds a variant here.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum SpaceConfig {
+    Dense(DenseConfig),
+    Sparse(SparseConfig),
+}
+
+/// The declaration of a dense space, being what `create()` takes for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DenseConfig {
+    pub dim: usize,
+    /// The distance space, normalised to lower case: cosine, l2, l1 or dot.
+    pub metric: String,
+    pub m: usize,
+    pub ef_construction: usize,
+    pub quantization: Option<QuantizationConfig>,
+}
+
+/// One vector space over the collection's records, of whichever kind.
 ///
-/// Its locks keep the ranks they had on the undivided struct, `hnsw` at 3,
-/// `pq_codes` at 4, `rerank_calibration` at 11 and `training_completed_at` at
-/// 12, so a search that takes `id_map` at 1 and then `hnsw` at 3 through two
-/// structs is the same acquisition it was through one. See the order on
+/// The dense variant is several times the sparse one, since it carries the
+/// declaration and four guards where the sparse carries one. The enum is
+/// held once per space in a list of at most a few entries, and boxing the
+/// dense variant would put an indirection on every read of the dense space,
+/// which is every operation, so the size difference is accepted.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Space {
+    Dense(DenseSpace),
+    Sparse(SparseSpace),
+}
+
+/// A space with the name it was declared under.
+pub(crate) struct NamedSpace {
+    pub(crate) name: SpaceName,
+    pub(crate) space: Space,
+}
+
+/// The dense vector space over the collection's records.
+///
+/// The graph, behind its guard as a [`DenseIndex`], the quantizer with its
+/// codes and its calibration, the metric, the width and the two graph
+/// tunables. Everything that would be repeated per dense space if there were
+/// more than one, and nothing that would not. The record set, the metadata
+/// and the training buffer are the collection's, because a record is one
+/// record however many spaces hold a vector for it.
+///
+/// Its four locks take their ranks from the space's position in the
+/// collection's declaration, so the first dense space's index guard sits at
+/// the rank the graph guard has always had and its codes guard one above,
+/// and a second space's sit two above those. See the order on
 /// [`Collection`].
-pub(crate) struct Space {
+pub(crate) struct DenseSpace {
     dim: usize,
     /// The distance space, normalised to lower case: cosine, l2, l1 or dot.
     metric: String,
@@ -277,7 +385,7 @@ pub(crate) struct Space {
     // Quantization configuration and PQ instance
     quantization_config: Option<QuantizationConfig>,
     pq: Option<Arc<PQ>>,
-    pq_codes: RwLockAt<{ order::PQ_CODES }, HashMap<String, Vec<u8>>>, // PQ codes storage
+    pq_codes: RwLockAt<HashMap<String, Vec<u8>>>, // PQ codes storage
 
     /// What training measured about how deep this space's codes bury a true
     /// neighbour, which is what the default rerank fetch is derived from.
@@ -286,14 +394,16 @@ pub(crate) struct Space {
     /// loader from `quantization.json`. `None` on an unquantized space, on a
     /// `quantized_only` one, before training, and on a space trained before
     /// the calibration existed. See `RerankCalibration`.
-    rerank_calibration: RwLockAt<{ order::RERANK_CALIBRATION }, Option<RerankCalibration>>,
+    rerank_calibration: RwLockAt<Option<RerankCalibration>>,
 
-    /// The graph, and the raw vector store addressed by its node indices.
+    /// The index, being the graph, the live set it is searched under, and the
+    /// raw vector store addressed by its node indices.
     ///
-    /// A read guard covers a traversal and the compute phase of a single record
-    /// insertion. A write guard covers the install phase of that insertion, and
-    /// covers replacing the whole backend, which `compact`,
-    /// `rebuild_with_quantization` and the persistence rebuild each do once.
+    /// A read guard covers a traversal and `prepare`, the compute phase of a
+    /// single record insertion. A write guard covers `insert`, the install
+    /// phase of that insertion, a removal, and replacing the whole graph,
+    /// which `compact`, `rebuild_with_quantization` and the persistence
+    /// rebuild each do once.
     ///
     /// The insertion is what takes this lock twice for one operation, a read
     /// guard for the phase that decides and a write guard for the phase that
@@ -316,7 +426,7 @@ pub(crate) struct Space {
     /// graph they are a second store beside the codes, carried over node by
     /// node when training replaced the graph. On a trained `quantized_only`
     /// graph there are none.
-    hnsw: RwLockAt<{ order::HNSW }, VectorGraph>,
+    index: RwLockAt<DenseIndex>,
 
     /// When the codebook was fitted, in RFC 3339, or `None` on a space that
     /// has never trained.
@@ -331,10 +441,10 @@ pub(crate) struct Space {
     /// real one. The loader restores what is there rather than restamping it,
     /// so the wrong value stops moving instead of being replaced by a newer
     /// wrong value.
-    training_completed_at: RwLockAt<{ order::TRAINING_COMPLETED_AT }, Option<String>>,
+    training_completed_at: RwLockAt<Option<String>>,
 }
 
-impl Space {
+impl DenseSpace {
     /// The graph degree.
     ///
     /// **The one read of `m` in the crate**, so that `rebuild` writing it has a
@@ -362,13 +472,13 @@ impl Space {
 
     /// Whether the graph scores against codes.
     ///
-    /// Takes the graph's read guard, so it cannot be asked by a path already
-    /// holding one. `search_candidates` asks the guard it was handed instead.
+    /// Takes the index's read guard, so it cannot be asked by a path already
+    /// holding one. The search paths ask the guard they were handed instead.
     pub(crate) fn is_quantized(&self) -> bool {
         if let Some(pq) = &self.pq {
             if pq.is_trained() {
-                let hnsw_guard = self.hnsw.read().unwrap();
-                return hnsw_guard.is_quantized();
+                let index = self.index.read().unwrap();
+                return index.graph().is_quantized();
             }
         }
         false
@@ -379,6 +489,17 @@ impl Space {
         self.quantization_config
             .as_ref()
             .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw)
+    }
+
+    /// The declaration, as the collection reports it.
+    pub(crate) fn config(&self) -> DenseConfig {
+        DenseConfig {
+            dim: self.dim,
+            metric: self.metric.clone(),
+            m: self.m(),
+            ef_construction: self.ef_construction(),
+            quantization: self.quantization_config.clone(),
+        }
     }
 
     /// Install a replacement graph, and drop the old one outside the guard
@@ -400,13 +521,37 @@ impl Space {
     /// an assignment rather than written as a call.
     ///
     /// Moving the old value out and dropping it after the guard is released
-    /// keeps the swap to a pointer move under the guard.
+    /// keeps the swap to a pointer move under the guard. The replacement's
+    /// unit cost is timed before the guard is taken, for the same reason.
     pub(crate) fn replace_graph(&self, new_hnsw: VectorGraph) {
+        let timed = DenseIndex::time_graph(&new_hnsw);
         let old = {
-            let mut hnsw_guard = self.hnsw.write().unwrap();
-            std::mem::replace(&mut *hnsw_guard, new_hnsw)
+            let mut index = self.index.write().unwrap();
+            index.replace_graph(new_hnsw, timed)
         };
         drop(old);
+    }
+
+    /// Replace the whole index, which `clear` does with a fresh graph and an
+    /// empty live set. The old graph is dropped outside the guard, for the
+    /// reason `replace_graph` gives.
+    pub(crate) fn replace_index(&self, fresh: DenseIndex) {
+        let old = {
+            let mut index = self.index.write().unwrap();
+            std::mem::replace(&mut *index, fresh)
+        };
+        drop(old);
+    }
+
+    /// A fresh index over `graph` for this space, with the live set empty.
+    pub(crate) fn fresh_index(&self, graph: VectorGraph) -> DenseIndex {
+        DenseIndex::new(
+            graph,
+            &self.metric,
+            self.dim,
+            self.pq.clone(),
+            self.keeps_raw(),
+        )
     }
 
     /// What training measured, where it ran
@@ -420,11 +565,28 @@ impl Space {
     }
 }
 
+/// The sparse vector space over the collection's records.
+///
+/// A postings index behind one guard, at the index rank of the space's
+/// position. A search runs under the read guard and an insertion, a removal
+/// and a compaction under the write guard. The index keeps its own live set,
+/// as the dense one does, and a record may leave this space empty.
+pub(crate) struct SparseSpace {
+    config: SparseConfig,
+    pub(crate) index: RwLockAt<PostingsIndex>,
+}
+
+impl SparseSpace {
+    pub(crate) fn config(&self) -> &SparseConfig {
+        &self.config
+    }
+}
+
 // ============================================================================
 // THE COLLECTION
 // ============================================================================
 
-/// The record set, with one vector space over it.
+/// The record set, with its vector spaces over it.
 ///
 /// # Lock acquisition order
 ///
@@ -432,18 +594,24 @@ impl Space {
 /// order, top to bottom. Releasing may happen in any order.
 ///
 /// ```text
-/// id_map < rev_map < hnsw < pq_codes < vector_metadata < columns
-///        < training_ids < metadata < id_counter < vector_count
+/// id_map < rev_map < [space 0 index < space 0 codes < space 1 index < ...]
+///        < vector_metadata < columns < training_ids < metadata
+///        < id_counter < vector_count
 /// ```
 ///
+/// `hnsw` and `pq_codes` in the prose elsewhere are the first space's index
+/// and codes guards, which sit where they always did. A second space's guards
+/// sit after them, so a search over two spaces takes both between the
+/// reverse map and the metadata, in declaration order.
+///
 /// **This order is checked rather than believed.** Every lock below, and every
-/// lock on [`Space`], is a [`RwLockAt`] or a [`MutexAt`] carrying its rank as
-/// a const generic, and on a debug build each acquisition asserts that the
+/// lock on a space, is a [`RwLockAt`] or a [`MutexAt`] given its rank at
+/// construction, and on a debug build each acquisition asserts that the
 /// thread holds none of the same lock and nothing ranked above it. See
 /// [`crate::locks`] for what that catches, what it costs and what it misses.
 /// In release the wrappers are the standard types by another name. A rank is
 /// a number and the registry does not care which struct holds the lock, so
-/// dividing the fields between two structs changed nothing it checks.
+/// dividing the fields between structs changed nothing it checks.
 ///
 /// `columns` sits directly below `vector_metadata` because every path that
 /// writes one writes the other, and a filtered search holds both: the columns
@@ -486,8 +654,10 @@ impl Space {
 /// so it fires in an ordinary single threaded test rather than waiting for a
 /// writer to land in the window.
 pub struct Collection {
-    /// The one vector space. See [`Space`] for what it holds and why.
-    space: Space,
+    /// The vector spaces, in declaration order, which is their lock order.
+    /// The first is always the dense space the binding declares; see
+    /// [`Collection::dense`].
+    spaces: Vec<NamedSpace>,
 
     /// The record count declared at creation.
     ///
@@ -500,9 +670,9 @@ pub struct Collection {
     expected_size: AtomicUsize,
 
     // Index-level metadata (simple, infrequently accessed)
-    metadata: MutexAt<{ order::METADATA }, HashMap<String, String>>,
+    metadata: MutexAt<HashMap<String, String>>,
 
-    vector_metadata: RwLockAt<{ order::VECTOR_METADATA }, HashMap<String, HashMap<String, Value>>>,
+    vector_metadata: RwLockAt<HashMap<String, HashMap<String, Value>>>,
 
     /// One column per field declared at `create()`, addressed by internal id.
     ///
@@ -523,7 +693,7 @@ pub struct Collection {
     /// declared field with few distinct values costs four bytes a record. A
     /// declared field whose value differs on every record is held in full a
     /// second time; see `columns::Column`.
-    columns: RwLockAt<{ order::COLUMNS }, ColumnStore>,
+    columns: RwLockAt<ColumnStore>,
 
     /// Set once a filtered search has warned that it named a field this index
     /// did not declare, so the warning fires once rather than per search.
@@ -533,13 +703,13 @@ pub struct Collection {
     /// declaration asked for.
     undeclared_filter_warned: AtomicBool,
 
-    id_map: RwLockAt<{ order::ID_MAP }, HashMap<String, usize>>,
+    id_map: RwLockAt<HashMap<String, usize>>,
     /// Internal id to external id, and the live set as bits. See
     /// [`LiveRecords`].
-    rev_map: RwLockAt<{ order::REV_MAP }, LiveRecords>,
+    rev_map: RwLockAt<LiveRecords>,
 
     // Mutex for write-only fields
-    id_counter: MutexAt<{ order::ID_COUNTER }, usize>,
+    id_counter: MutexAt<usize>,
 
     /// The counter behind a generated external id, being `vec_N`.
     ///
@@ -561,8 +731,8 @@ pub struct Collection {
     /// own consumed six internal ids and the fourth record added afterwards was
     /// `vec_7`. `list`'s ordering is unaffected either way, since it reads the
     /// internal ids the records actually hold.
-    generated_ids: MutexAt<{ order::GENERATED_IDS }, usize>,
-    vector_count: MutexAt<{ order::VECTOR_COUNT }, usize>, // Track total vectors for training trigger
+    generated_ids: MutexAt<usize>,
+    vector_count: MutexAt<usize>, // Track total vectors for training trigger
 
     /// Serialises the mutating operations against each other, not against reads.
     ///
@@ -578,11 +748,11 @@ pub struct Collection {
     /// across all four of its phases. An internal caller reaching a mutating
     /// helper is already inside the guard, so the helpers never take it and
     /// cannot deadlock against the caller that owns it.
-    writers: MutexAt<{ order::WRITERS }, ()>,
+    writers: MutexAt<()>,
 
     // ID-based training collection
-    training_ids: RwLockAt<{ order::TRAINING_IDS }, Vec<String>>, // Just IDs, not vectors
-    training_threshold_reached: AtomicBool,                       // Atomic flag for safety
+    training_ids: RwLockAt<Vec<String>>, // Just IDs, not vectors
+    training_threshold_reached: AtomicBool, // Atomic flag for safety
 
     /// Timestamp when the index was created, in RFC 3339.
     ///
@@ -590,7 +760,7 @@ pub struct Collection {
     /// `Utc::now()` because it has nothing better to start from, and until the
     /// loader wrote the saved value back over it a load reset the field, so a
     /// save of a loaded index recorded the load as the creation.
-    created_at: RwLockAt<{ order::CREATED_AT }, String>,
+    created_at: RwLockAt<String>,
 
     /// Set while a load rebuilds the graph, so the rebuild does not refill the
     /// training collection with the ids it is replaying.
@@ -608,24 +778,88 @@ pub struct Collection {
 }
 
 impl Collection {
+    /// The dense space, which is always the first declared.
+    ///
+    /// The binding's surface declares one dense space and reaches it through
+    /// this, so every operation that reads the graph, the quantizer or the
+    /// width reads this space's.
+    pub(crate) fn dense(&self) -> &DenseSpace {
+        match &self.spaces[0].space {
+            Space::Dense(dense) => dense,
+            Space::Sparse(_) => unreachable!("the first space is the dense one by construction"),
+        }
+    }
+
+    /// The dense space, for the loader's setters.
+    pub(crate) fn dense_mut(&mut self) -> &mut DenseSpace {
+        match &mut self.spaces[0].space {
+            Space::Dense(dense) => dense,
+            Space::Sparse(_) => unreachable!("the first space is the dense one by construction"),
+        }
+    }
+
+    /// Whether the dense index's live set is the collection's, which every
+    /// write keeps true and a debug build checks at the points where the
+    /// two are read together.
+    ///
+    /// Taken in the declared order, `rev_map` then the index.
+    pub(crate) fn live_sets_agree(&self) -> bool {
+        let rev_map = self.rev_map.read().unwrap();
+        let index = self.dense().index.read().unwrap();
+        rev_map.agrees_with(index.live_set()) && rev_map.len() == index.len()
+    }
+
+    /// Bring the dense index's live set into step with `id_map`, which the
+    /// loader does after it restores the mappings or replaces the graph.
+    ///
+    /// Taken in the declared order, `id_map` then the index, even though the
+    /// loader holds `&mut self` and nothing else can be running.
+    pub(crate) fn sync_dense_live(&self) {
+        let id_map = self.id_map.read().unwrap();
+        let mut index = self.dense().index.write().unwrap();
+        index.set_live(id_map.values().copied());
+    }
+
+    /// The sparse space, where one was declared.
+    pub(crate) fn sparse(&self) -> Option<&SparseSpace> {
+        self.spaces.iter().find_map(|named| match &named.space {
+            Space::Sparse(sparse) => Some(sparse),
+            Space::Dense(_) => None,
+        })
+    }
+
+    /// Every space's name and declaration, in declaration order.
+    pub fn space_configs(&self) -> Vec<(SpaceName, SpaceConfig)> {
+        self.spaces
+            .iter()
+            .map(|named| {
+                let config = match &named.space {
+                    Space::Dense(dense) => SpaceConfig::Dense(dense.config()),
+                    Space::Sparse(sparse) => SpaceConfig::Sparse(sparse.config().clone()),
+                };
+                (named.name.clone(), config)
+            })
+            .collect()
+    }
+
     /// The vector width.
     pub fn dim(&self) -> usize {
-        self.space.dim
+        self.dense().dim
     }
 
     /// The distance space, normalised: cosine, l2, l1 or dot.
     pub fn metric(&self) -> &str {
-        &self.space.metric
+        &self.dense().metric
     }
 
     /// The graph degree. See `Space::m`.
     pub fn m(&self) -> usize {
-        self.space.m()
+        self.dense().m()
     }
 
     /// The construction width. See `Space::ef_construction`.
     pub fn ef_construction(&self) -> usize {
-        self.space.ef_construction()
+        self.dense().ef_construction()
     }
 
     /// The record count declared at creation. The one read of it, for the
@@ -642,17 +876,17 @@ impl Collection {
 
     /// Whether the space was declared with quantization.
     pub fn has_quantization(&self) -> bool {
-        self.space.has_quantization()
+        self.dense().has_quantization()
     }
 
     /// Whether the codebook is fitted.
     pub fn can_use_quantization(&self) -> bool {
-        self.space.can_use_quantization()
+        self.dense().can_use_quantization()
     }
 
     /// Whether the graph scores against codes. Takes the graph's read guard.
     pub fn is_quantized(&self) -> bool {
-        self.space.is_quantized()
+        self.dense().is_quantized()
     }
 
     /// The storage mode as `get_storage_mode` reports it.
@@ -800,12 +1034,12 @@ impl Collection {
         // and the graph is where the raw vectors live, so both are taken here
         // and in that order.
         let id_map = self.id_map.read().unwrap();
-        let hnsw = self.space.hnsw.read().unwrap();
-        let pq_codes = self.space.pq_codes.read().unwrap();
+        let index = self.dense().index.read().unwrap();
+        let pq_codes = self.dense().pq_codes.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
         let raws = crate::RawVectors {
             id_map: &id_map,
-            graph: &hnsw,
+            graph: index.graph(),
         };
 
         for id in ids {
@@ -820,7 +1054,7 @@ impl Collection {
                     if let Some(raw_vector) = raws.get(&id) {
                         // Case 1: Raw vector available (QuantizedWithRaw mode or non-quantized)
                         Some(raw_vector.to_vec())
-                    } else if let (Some(pq), Some(codes)) = (&self.space.pq, pq_codes.get(&id)) {
+                    } else if let (Some(pq), Some(codes)) = (&self.dense().pq, pq_codes.get(&id)) {
                         // Case 2: Only quantized codes available (QuantizedOnly mode)
                         match pq.reconstruct(codes) {
                             Ok(reconstructed) => Some(reconstructed),

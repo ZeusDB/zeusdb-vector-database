@@ -1,25 +1,47 @@
 //! Running a search, on one query or on a batch.
 //!
-//! Four paths reach the graph: one query, a batch of five or fewer run in turn,
-//! a larger batch fanned across rayon, and the benchmark. They differ only in
-//! how long they hold the storage guards, so what each does with a candidate is
-//! in `collect_hits`. What each hands back is a [`QueryHits`] page of owned
-//! Rust, which the binding turns into the list of dicts Python receives.
+//! Four paths reach the dense index: one query, a batch of five or fewer run
+//! in turn, a larger batch fanned across rayon, and the benchmark. They
+//! differ only in how long they hold the storage guards, so what each does
+//! with a candidate is in `collect_hits`. What each hands back is a
+//! [`QueryHits`] page of owned Rust, which the binding turns into the list
+//! of dicts Python receives. A fifth path, `search_sparse`, reaches the
+//! sparse index the same way and is reachable from Rust alone.
+//!
+//! # What the collection decides and what the index decides
+//!
+//! The collection owns the metadata and the columns, so it decides which
+//! records a search may return, and it hands the index that decision as an
+//! admit set. A filter over declared fields is a bitmap. A filter mixing a
+//! declared field with an undeclared one is the bound the declared fields
+//! leave, walked here with the whole filter judged on each candidate. A
+//! filter over undeclared fields alone is a walk of every record's metadata.
+//! Where a walk finishes under [`FULL_SCAN_THRESHOLD`] its matches are the
+//! admit set, and where it gives up the admit set is the bound conjoined
+//! with the metadata predicate, or the predicate alone.
+//!
+//! The index decides the path. An admit set it can enumerate whose count is
+//! at or under the threshold is scored exactly, and everything else
+//! traverses the graph under the set as a predicate. The threshold is stated
+//! once, in the index, and the walks here stop at the same figure so that a
+//! walk that gives up hands the index a set it will traverse.
 //!
 //! # The page says which path produced it
 //!
-//! [`Hits`] carries `exact`, set by the scan paths and not by the traversal.
-//! The two order a tie differently. The scan takes its candidates in the
-//! metadata store's hash order or in bitmap order, so two records at exactly
-//! equal distance have to be ordered by something that is not where a hasher
-//! put a key, and that is the external id string. The traversal's order among
-//! equal distances is the heap's, which is a function of the graph, and it is
-//! returned as it comes: a traversal of a fixed graph is deterministic, and
-//! 1,208 of 64,800 recorded pages hold a tie the string order would reverse.
-//! So the tie break applies to exact pages and to nothing else, in one place,
-//! `Hits::cut`.
+//! [`Scored`] carries `exact`, set by the index for a scored page and not for
+//! a traversal. The two order a tie differently. The scan takes its
+//! candidates in the metadata store's hash order or in bitmap order, so two
+//! records at exactly equal distance have to be ordered by something that is
+//! not where a hasher put a key, and that is the external id string. The
+//! traversal's order among equal distances is the heap's, which is a
+//! function of the graph, and it is returned as it comes: a traversal of a
+//! fixed graph is deterministic, and 1,208 of 64,800 recorded pages hold a
+//! tie the string order would reverse. So the tie break applies to exact
+//! pages and to nothing else, in one place, `Scored::cut`. The index keeps
+//! the whole tie group at an exact page's boundary so that rule can decide
+//! the cut.
 //!
-//! # A filter now decides the page rather than trimming it
+//! # A filter decides the page rather than trimming it
 //!
 //! The filter used to run in `collect_hits`, which is after the graph
 //! has already cut to `top_k`. A filter matching one record in a hundred
@@ -28,63 +50,37 @@
 //! measured as post-filter recall of 0.0090 at one match in a hundred and 0.0000
 //! below it, on all three real sets.
 //!
-//! Two paths replace it, and [`Collection::search_candidates`] picks between
-//! them per search.
-//!
-//! [`Collection::scan_candidates`] walks the metadata once and scores every
-//! record that matches, which is exact and has no recall question. It gives up
-//! and returns `None` the moment the match count passes
-//! [`FULL_SCAN_THRESHOLD`], so a broad filter pays a bounded walk rather than a
-//! full one.
-//!
-//! Where the scan gives up, the traversal runs with the filter conjoined into
-//! the predicate it already carried for liveness. That is the correct answer
-//! for a broad filter and a latency pathology for a selective one, which is why
-//! the scan is not optional. A filter matching one record in 100,000 costs 128
-//! to 359 milliseconds through the traversal and 26 through the scan, both
-//! measured on this code.
+//! The exact scan under a selective filter is what replaced it, and it gives
+//! up once the match count passes [`FULL_SCAN_THRESHOLD`], so a broad filter
+//! pays a bounded walk rather than a full one. Where the scan gives up, the
+//! traversal runs with the filter conjoined into the predicate it already
+//! carried for liveness. That is the correct answer for a broad filter and a
+//! latency pathology for a selective one, which is why the scan is not
+//! optional. A filter matching one record in 100,000 costs 128 to 359
+//! milliseconds through the traversal and 26 through the scan, both measured
+//! on this code.
 //!
 //! **A filter over declared fields does not walk anything.** The fields named
 //! at `create(indexed_fields=[...])` each carry a column addressed by internal
 //! id, so a filter over them compiles to a bitmap and both paths read it: the
 //! exact scan takes the set bits and the traversal tests one bit per node.
 //!
-//! **A filter mixing a declared field with one that was not declared walks the
-//! candidates the declared fields leave.** The columns bound the matching set
-//! from above, the scan reads the metadata of the records inside that bound
-//! rather than of every record, and the traversal tests the bound before it
-//! reaches for any metadata at all. A filter naming no declared field, and one
-//! whose shape leaves no usable bound, take the walk described below, which is
-//! what every filtered search did before the columns existed. See
-//! `ColumnStore::bound` in `zeusdb_vector_core` for which shapes bound and
-//! which do not.
-//!
 //! **The walk is what made a filtered search expensive.** It costs about 250
 //! nanoseconds a record, so a selective filter over 100,000 records cost about
 //! 25 milliseconds where an unfiltered search costs 0.3 to 1.2. See
-//! [`FULL_SCAN_THRESHOLD`] for the measurements and
-//! the column store in `zeusdb_vector_core` for what replaces it.
+//! [`FULL_SCAN_THRESHOLD`] for the measurements and the column store in
+//! `zeusdb_vector_core` for what replaces it.
 //!
-//! **Lock order.** Every path takes `rev_map` before the graph and the storage
-//! maps after it, which is the order declared on `Collection` in the parent
-//! module. A search holds `rev_map` for its whole traversal, so a mutation
-//! taking `vectors` before `rev_map` deadlocks against it, and that is the
-//! inversion `remove_point_internal` used to carry.
-//!
-//! The filter predicate reads `vector_metadata`, so that guard is now held
-//! across the traversal too, and so are `vectors` and `pq_codes` because the
-//! scan runs before the traversal and scores against them. The declared order
-//! is `hnsw < vectors < pq_codes < vector_metadata`, so taking all four before
-//! traversing is in order rather than against it, and it is the shape
-//! `batch_search_sequential` already ran in. What it costs is duration. The
-//! window a writer waits on grows from the post-traversal phase to the whole
-//! search, and `std::sync::RwLock` queues readers behind a waiting writer, so a
-//! long read hold delays the next reader as well as the writer.
+//! **Lock order.** Every path takes `rev_map` before the index and the
+//! storage maps after it, which is the order declared on `Collection` in the
+//! parent module. A search holds `rev_map` for its whole traversal, so a
+//! mutation taking a storage map before `rev_map` deadlocks against it, and
+//! that is the inversion `remove_point_internal` used to carry.
 
 use super::{Collection, LiveRecords, StorageMode};
 use crate::{
-    prepare_reconstruction, raw_distance_fn, reconstruction_needs_unit, rescore_candidate,
-    take_best, RawVectors, RerankPlan, SearchParams,
+    raw_distance_fn, reconstruction_needs_unit, rescore_candidate, take_best, RawVectors,
+    RerankPlan, SearchParams,
 };
 use rayon::prelude::*;
 use serde_json::Value;
@@ -93,7 +89,8 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, instrument, trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, Bitmap, ColumnStore, Error, Filter, GraphHit, Selection, VectorGraph,
+    matches_filter, Admit, And, Bitmap, Budget, Candidates, ColumnStore, Error, Filter, Hits,
+    RecordId, Selection, SparseRef, VectorIndex,
 };
 
 /// The target every record this file emits carries. See the parent module.
@@ -179,36 +176,61 @@ const MAX_EF_SEARCH: usize = 2 * MAX_TOP_K;
 ///
 /// It is not settable per search. Nothing measured here wants a different
 /// number, and a knob nobody has a reason to turn is a knob that goes wrong.
+///
+/// The dense index reads it to decide between the exact scan and the
+/// traversal, and the two metadata walks here stop at it, so a walk that
+/// gives up hands the index a set it will traverse.
 pub(super) const FULL_SCAN_THRESHOLD: usize = 5_000;
 
-/// One search's candidates, as borrowed external ids paired with the distance
+/// One search's candidates, as borrowed external ids paired with the score
 /// whichever path found them scored them at, and whether that path was exact.
 ///
-/// Both paths produce this. The traversal resolves each graph hit through
-/// `rev_map` and borrows the id it finds there, and the scan borrows the id
-/// from the metadata store's own key. Nothing is cloned until the page is cut,
-/// so an over-fetched page pays to clone the metadata and the vector of the
-/// results it returns rather than of every candidate it considered.
+/// The index returns a page of internal ids and this is that page resolved
+/// through `rev_map`, borrowing the id it finds there. Nothing is cloned until
+/// the page is cut, so an over-fetched page pays to clone the metadata and
+/// the vector of the results it returns rather than of every candidate it
+/// considered.
 ///
 /// `exact` is true when every admitted record was scored, which is the scan
-/// and never the traversal. It decides the tie break; see [`Hits::cut`] and
+/// and never the traversal. It decides the tie break; see [`Scored::cut`] and
 /// the module documentation.
-pub(super) struct Hits<'a> {
+pub(super) struct Scored<'a> {
     pub(super) items: Vec<(&'a String, f32)>,
     pub(super) exact: bool,
 }
 
-impl<'a> Hits<'a> {
+impl<'a> Scored<'a> {
     /// A page every admitted record was scored for.
+    #[cfg(test)]
     fn exact(items: Vec<(&'a String, f32)>) -> Self {
-        Hits { items, exact: true }
+        Scored { items, exact: true }
     }
 
     /// A page in the traversal's own order.
+    #[cfg(test)]
     fn traversed(items: Vec<(&'a String, f32)>) -> Self {
-        Hits {
+        Scored {
             items,
             exact: false,
+        }
+    }
+
+    /// The index's page with every id resolved to the external id it names.
+    ///
+    /// An id that no longer resolves is dropped, which is the liveness rule
+    /// every path applies. The index searched under the live set, so this
+    /// drops nothing in practice, and `rev_map` is what turns a node into a
+    /// record so the resolution has to happen somewhere.
+    fn resolve(hits: Hits, rev_map: &'a LiveRecords) -> Self {
+        let mut items = Vec::with_capacity(hits.items.len());
+        for hit in hits.items {
+            if let Some(ext_id) = rev_map.get(&hit.id.slot()) {
+                items.push((ext_id, hit.score));
+            }
+        }
+        Scored {
+            items,
+            exact: hits.exact,
         }
     }
 
@@ -243,48 +265,79 @@ impl<'a> Hits<'a> {
     }
 }
 
-/// Everything a filtered search reads that an unfiltered one does not.
+/// The metadata predicate, as an admit set.
 ///
-/// The conditions, the columns that answer them, the metadata store they are
-/// judged against where a column cannot, and the two stores the exact scan
-/// scores a matching record from. They travel together because a search carries
-/// either all of them or none, and because that is what decides which guards a
-/// path has to take: `raw_search_no_gil` passes `None` and takes neither the
-/// metadata guard, the columns guard nor the two storage guards.
-#[derive(Clone, Copy)]
-struct Filtered<'a> {
+/// What a filter that cannot be answered from the columns alone reads. It
+/// resolves a node to its record through `rev_map`, which is the liveness
+/// check, reads the record's metadata and judges the filter on it. A record
+/// with no metadata entry does not match, which is the rule `collect_hits`
+/// applied when the filter ran there. It cannot count itself and cannot
+/// enumerate itself, so the index asks it one node at a time.
+struct MetadataAdmit<'a> {
     conditions: &'a Filter,
-    columns: &'a ColumnStore,
+    rev_map: &'a LiveRecords,
     metadata: &'a HashMap<String, HashMap<String, Value>>,
-    vectors: RawVectors<'a>,
-    pq_codes: &'a HashMap<String, Vec<u8>>,
 }
 
-impl<'a> Filtered<'a> {
-    /// Whether the record this external id names exists and matches.
-    ///
-    /// A record with no metadata entry does not match, which is the rule
-    /// `collect_hits` applied when the filter ran there.
-    #[inline]
-    fn admits(&self, ext_id: &String) -> bool {
-        match self.metadata.get(ext_id) {
-            Some(meta) => self.judge(meta),
-            None => false,
-        }
-    }
-
+impl MetadataAdmit<'_> {
     /// Whether one record's metadata matches, with no lookup.
     ///
     /// **There is no error channel and none is needed.** What reaches here is a
     /// compiled [`Filter`], which `compile_filter` built from the caller's
     /// mapping once per search and before any record was examined, rejecting
     /// every operator name and every group shape the engine cannot evaluate.
-    /// Nothing below `matches_filter` can fail, so it returns `bool`. This was
-    /// a `match` on a `PyResult` whose `Err` arm carried a debug assertion
-    /// explaining why it could not fire.
+    /// Nothing below `matches_filter` can fail, so it returns `bool`.
     #[inline]
     fn judge(&self, meta: &HashMap<String, Value>) -> bool {
         matches_filter(meta, self.conditions)
+    }
+}
+
+impl Admit for MetadataAdmit<'_> {
+    #[inline]
+    fn admits(&self, id: RecordId) -> bool {
+        match self.rev_map.get(&id.slot()) {
+            Some(ext_id) => match self.metadata.get(ext_id) {
+                Some(meta) => self.judge(meta),
+                None => false,
+            },
+            None => false,
+        }
+    }
+
+    fn len_hint(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// What the collection decided a search may return, before the index is
+/// asked.
+///
+/// Four shapes. Everything, for a search with no filter, which the index
+/// runs under its own live set. A bitmap, for a filter every field of which
+/// is declared. The matches of a walk that finished, in increasing internal
+/// id order. Or the walk's give-up, being the bound the declared fields left
+/// conjoined with the metadata predicate, or the predicate alone where they
+/// left none, which the index traverses under.
+enum AdmitPlan<'a> {
+    All,
+    Bitmap(Bitmap),
+    Matched(Vec<RecordId>),
+    Bounded(Bitmap, MetadataAdmit<'a>),
+    Predicate(MetadataAdmit<'a>),
+}
+
+impl AdmitPlan<'_> {
+    /// Run `search` under the set, building the conjunction where there is
+    /// one.
+    fn run<R>(&self, search: impl FnOnce(&dyn Admit) -> R) -> R {
+        match self {
+            AdmitPlan::All => search(&Candidates::All),
+            AdmitPlan::Bitmap(bitmap) => search(bitmap),
+            AdmitPlan::Matched(ids) => search(&Candidates::Sorted(ids.clone())),
+            AdmitPlan::Bounded(bound, predicate) => search(&And(bound, predicate)),
+            AdmitPlan::Predicate(predicate) => search(predicate),
+        }
     }
 }
 
@@ -293,6 +346,10 @@ impl<'a> Filtered<'a> {
 /// for it and the index still holds one, or could reconstruct one from its
 /// codes. Owned Rust, which the binding converts to a list of dicts.
 pub type QueryHits = Vec<(String, f32, HashMap<String, Value>, Option<Vec<f32>>)>;
+
+/// Search hits for one sparse query, as (external id, score), best first.
+pub type SparseHits = Vec<(String, f32)>;
+
 impl Collection {
     // 2. SEARCH OPERATIONS (2 methods)
 
@@ -320,7 +377,7 @@ impl Collection {
         }
 
         let keeps_raw = self
-            .space
+            .dense()
             .quantization_config
             .as_ref()
             .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw);
@@ -330,423 +387,160 @@ impl Collection {
 
         Some(RerankPlan {
             factor: rerank.map(|factor| factor.max(1)),
-            calibration: self.space.rerank_calibration(),
-            distance: raw_distance_fn(&self.space.metric),
-            unit_reconstruction: reconstruction_needs_unit(&self.space.metric),
+            calibration: self.dense().rerank_calibration(),
+            distance: raw_distance_fn(&self.dense().metric),
+            unit_reconstruction: reconstruction_needs_unit(&self.dense().metric),
         })
     }
 
-    // 5. BATCH SEARCH METHODS (3 methods)
-
-    /// The candidates a filtered search's exact scan found, or `None` where
-    /// there were too many of them
+    /// What one search may return, decided from its filter.
     ///
-    /// One walk of the metadata store, evaluating the filter on each record and
-    /// keeping the ones that match. It gives up and returns `None` the moment
-    /// the match count passes [`FULL_SCAN_THRESHOLD`], so the walk **stops**
-    /// rather than completing: a filter matching half the corpus reaches the
-    /// give-up point after roughly twice the threshold in records examined,
-    /// whatever the corpus size, and the caller then traverses.
+    /// An unfiltered search admits everything and the index runs it under
+    /// its own live set. A filtered one is decided by the shape the columns
+    /// leave.
+    ///
+    /// **A filter every field of which is declared is a bitmap**, and the
+    /// index scans it where it is small and traverses under it where it is
+    /// not, which is the threshold rule stated once in the index.
+    ///
+    /// **A filter mixing a declared field with one that has no column** walks
+    /// the bound the declared fields leave, judging the whole filter on each
+    /// candidate's metadata. The bound is a superset of the matching set, so
+    /// what the columns bought is how few candidates there are. The walk
+    /// gives up at [`FULL_SCAN_THRESHOLD`] matches and the index then
+    /// traverses under the bound conjoined with the predicate, which admits
+    /// exactly what the predicate alone admits since a record the filter
+    /// matches is inside the bound by construction. The bit test comes first
+    /// in that conjunction, so a node outside the bound costs one word read.
+    ///
+    /// **A filter naming no declared field** walks every record's metadata,
+    /// which is what every filtered search did before the columns existed,
+    /// and gives up at the same figure, after which the index traverses under
+    /// the predicate.
     ///
     /// **The distances are computed after the walk and not during it.** Every
     /// distance a fused walk evaluated before giving up would be thrown away,
     /// and at 1,536 dimensions that is thousands of six kilobyte reads charged
-    /// to every broad filtered search. Deferring them costs one extra pass over
-    /// a list of at most `FULL_SCAN_THRESHOLD` borrowed ids and makes the
-    /// give-up path free of distance work entirely. A single fused pass gives
-    /// identical results, and this is the cheaper of the two.
+    /// to every broad filtered search. The walk collects internal ids alone,
+    /// the index scores them, and the give-up path is free of distance work
+    /// entirely.
     ///
-    /// **What it scores against.** The stored raw vector where the index holds
-    /// one and the reconstruction from the record's codes where it does not,
-    /// which is `rescore_candidate`'s rule and therefore the same scale a
-    /// reranked search orders on. Three cases follow. A raw index is scored on
-    /// its raw vectors, so the scan's scores are the numbers the traversal
-    /// would have reported. A `quantized_with_raw` index is scored on its raw
-    /// vectors, which is exact, and matches what rerank produces on the default
-    /// path; a caller who passed `rerank=0` asked for ADC scores and gets raw
-    /// ones, which is the more accurate of the two and is the one deliberate
-    /// difference here. A `quantized_only` index holds no raw vectors, so every
-    /// record is scored against its reconstruction, which carries exactly the
-    /// information the ADC distance uses. The scan is exact over what that
-    /// index retains rather than over the vectors it was given, and no path in
-    /// this crate can be exact over those once the raws are gone.
-    ///
-    /// **A reconstruction is normalised first where the space requires it.**
-    /// `prepare_reconstruction` says which spaces those are and why. Without it
-    /// a `quantized_only` cosine index answered a narrow filter with `1 - dot`
-    /// on a vector of length 0.90, which is neither the cosine distance the
-    /// traversal now returns nor the squared L2 it used to, and the gap between
-    /// the two paths ran with the distance rather than being a constant a
-    /// caller could allow for.
-    ///
-    /// **Fewer than `top_k` matches is a result and not a failure.** The scan
-    /// returns every record that matched, ranked, so a filter matching three
-    /// records returns three results to a caller who asked for ten, and a
-    /// filter matching none returns an empty page. That is what the search
-    /// already did and it is what an exact answer to the question is.
-    fn scan_candidates<'a>(
+    /// **Fewer than `top_k` matches is a result and not a failure.** A filter
+    /// matching three records returns three results to a caller who asked for
+    /// ten, and a filter matching none returns an empty page.
+    fn admit_plan<'a>(
         &self,
-        query: &[f32],
-        filter: Filtered<'a>,
-        fetch_k: usize,
-    ) -> Option<Hits<'a>> {
-        let mut matched: Vec<&'a String> = Vec::new();
-        for (ext_id, meta) in filter.metadata.iter() {
-            if filter.judge(meta) {
-                if matched.len() == FULL_SCAN_THRESHOLD {
-                    // One past the threshold, so the walk stops here and the
-                    // caller traverses. Nothing has been scored yet.
-                    return None;
-                }
-                matched.push(ext_id);
-            }
-        }
-
-        self.score_matched(query, matched, filter, fetch_k)
-    }
-
-    /// The candidates a selected bitmap names, scored and ranked.
-    ///
-    /// The counterpart of [`Self::scan_candidates`] for a filter every field of
-    /// which is declared. The bitmap already holds the whole matching set, so
-    /// this resolves each set bit through `rev_map` and hands the ids to the
-    /// same scorer. **A slot the bitmap holds always resolves**, because
-    /// `ColumnStore::erase` clears a slot in the same write that removes it from
-    /// `rev_map`; a slot that somehow did not resolve is dropped, which is the
-    /// liveness rule every other path applies.
-    fn scan_selected<'a>(
-        &self,
-        query: &[f32],
-        selected: &Bitmap,
+        conditions: Option<&'a Filter>,
+        columns: &ColumnStore,
         rev_map: &'a LiveRecords,
-        filter: Filtered<'a>,
-        fetch_k: usize,
-    ) -> Hits<'a> {
-        let mut matched: Vec<&'a String> = Vec::with_capacity(selected.count());
-        selected.for_each(|slot| {
-            if let Some(ext_id) = rev_map.get(&slot) {
-                matched.push(ext_id);
-            }
-        });
-        // Infallible here. `score_matched` returns an `Option` only so that the
-        // walk above can express its give-up point, and the caller has already
-        // decided this set is small enough to score.
-        self.score_matched(query, matched, filter, fetch_k)
-            .unwrap_or_else(|| Hits::exact(Vec::new()))
-    }
-
-    /// Score a matched set and cut it to the page.
-    ///
-    /// Every path that produces an exact answer ends here, so the ranking and
-    /// the tie break are stated once and no path can drift from another. The
-    /// tie break itself is `Hits::cut`, keyed on the page being exact.
-    fn score_matched<'a>(
-        &self,
-        query: &[f32],
-        matched: Vec<&'a String>,
-        filter: Filtered<'a>,
-        fetch_k: usize,
-    ) -> Option<Hits<'a>> {
-        let distance = raw_distance_fn(&self.space.metric);
-        let needs_unit = reconstruction_needs_unit(&self.space.metric);
-        let mut scored: Vec<(&'a String, f32)> = Vec::with_capacity(matched.len());
-        for ext_id in matched {
-            let score = match filter.vectors.get(ext_id.as_str()) {
-                Some(stored) => distance(query, stored),
-                None => match filter
-                    .pq_codes
-                    .get(ext_id)
-                    .and_then(|codes| self.space.pq.as_ref()?.reconstruct(codes).ok())
-                {
-                    Some(reconstructed) => {
-                        distance(query, &prepare_reconstruction(needs_unit, reconstructed))
-                    }
-                    // A record holding neither a raw vector nor codes cannot
-                    // exist, since every insertion writes one or the other.
-                    // Sorting it last is what `rescore_candidate`'s callers do
-                    // with the same impossibility.
-                    None => f32::INFINITY,
-                },
-            };
-            scored.push((ext_id, score));
-        }
-        // Ordered and cut by `Hits::cut`, which is where the tie break for an
-        // exact page is stated.
-        Some(Hits::exact(scored).cut(fetch_k))
-    }
-
-    /// The candidates inside a bound, judged and scored, or `None` where too
-    /// many of them matched.
-    ///
-    /// The counterpart of [`Self::scan_candidates`] for a filter mixing a
-    /// declared field with one that has no column. The bound is a superset of
-    /// the matching set, so every candidate it names still has its metadata
-    /// read and the whole filter judged on it. What changes is how many
-    /// candidates there are: a conjunction whose declared branch matches a
-    /// hundred records reads a hundred metadata entries where the walk read
-    /// every one in the index.
-    ///
-    /// **The page is the one the walk returns.** This produces its candidates
-    /// in increasing internal id order and the walk produces them in hash
-    /// order, and [`Self::score_matched`] sorts both by distance then external
-    /// id, which is total over a set of unique ids.
-    ///
-    /// The give-up point is [`FULL_SCAN_THRESHOLD`] matches, as it is for the
-    /// walk, and the caller traverses where it fires. A slot the bound holds
-    /// that no longer resolves is skipped, which is the liveness rule every
-    /// other path applies.
-    fn scan_bounded<'a>(
-        &self,
-        query: &[f32],
-        bound: &Bitmap,
-        rev_map: &'a LiveRecords,
-        filter: Filtered<'a>,
-        fetch_k: usize,
-    ) -> Option<Hits<'a>> {
-        let mut matched: Vec<&'a String> = Vec::new();
-        let mut gave_up = false;
-        bound.for_each_while(|slot| {
-            let Some(ext_id) = rev_map.get(&slot) else {
-                return true;
-            };
-            let Some(meta) = filter.metadata.get(ext_id) else {
-                return true;
-            };
-            if filter.judge(meta) {
-                if matched.len() == FULL_SCAN_THRESHOLD {
-                    // One past the threshold, so the walk stops here and the
-                    // caller traverses. Nothing has been scored yet.
-                    gave_up = true;
-                    return false;
-                }
-                matched.push(ext_id);
-            }
-            true
-        });
-        if gave_up {
-            return None;
-        }
-
-        self.score_matched(query, matched, filter, fetch_k)
-    }
-
-    /// One query's candidates, by whichever of the two paths suits its filter
-    ///
-    /// An unfiltered search traverses under the live set, which is the record
-    /// store's bitmap, and nothing else about it changes. A filtered search
-    /// tries the exact scan first and traverses with the filter conjoined into
-    /// the predicate where the scan gives up.
-    ///
-    /// **The combined predicate is the liveness check and `matches_filter`,
-    /// conjoined.** `rev_map.get` answering `Some` is the liveness check, since
-    /// a node stranded by a removal or an overwrite no longer resolves, and
-    /// `Filtered::admits` is the filter. A node either check rejects still
-    /// routes the search and never consumes a result slot, which is what the
-    /// traversal's predicate has always done.
-    ///
-    /// Every closure is monomorphised into the traversal by
-    /// `VectorGraph::search`'s generic parameter, so each arm compiles to its
-    /// own specialisation and none pays for an indirect call. That is why the
-    /// branch is written out rather than folded into one closure with an
-    /// `Option` inside it.
-    ///
-    /// **The unfiltered predicate is a bit test.** It used to be
-    /// `rev_map.contains_key`, a lookup in a `HashMap<usize, String>` with the
-    /// default hasher, made once for every six to eight distance evaluations,
-    /// and at 50,000 records it cost 46 of a 179 microsecond search on SIFT and
-    /// 41 of 189 on GloVe. The bitmap admits exactly the ids the map holds,
-    /// since `LiveRecords` writes both in one call, so the page is the same
-    /// and the lookup is gone.
-    fn search_candidates<'a>(
-        &self,
-        hnsw: &VectorGraph,
-        query: &[f32],
-        rev_map: &'a LiveRecords,
-        filter: Option<Filtered<'a>>,
-        fetch_k: usize,
-        ef: usize,
-    ) -> Hits<'a> {
-        let hits = match filter {
-            Some(filter) => match filter.columns.select(filter.conditions) {
-                Selection::Exact(selected) => {
-                    let matched = selected.count();
-                    if matched <= FULL_SCAN_THRESHOLD {
-                        trace!(
-                            target: LOG_TARGET,
-                            operation = "filtered_columns",
-                            matched = matched,
-                            "Filtered search answered from the columns"
-                        );
-                        self.scan_selected(query, &selected, rev_map, filter, fetch_k)
-                    } else {
-                        // Above the threshold the traversal runs, and the bitmap
-                        // is the whole predicate. One bit test replaces the
-                        // node, `rev_map`, metadata, field lookup chain the walk
-                        // had to make per node, and it subsumes the liveness
-                        // check because a slot holding no record holds no bit.
-                        trace!(
-                            target: LOG_TARGET,
-                            operation = "filtered_columns",
-                            matched = matched,
-                            "Filtered search traverses with a bitmap predicate"
-                        );
-                        let admits = |internal_id: &usize| selected.contains(*internal_id);
-                        self.traverse(hnsw, query, rev_map, fetch_k, ef, &admits)
-                    }
-                }
-                // A filter mixing a declared field with one that has no column.
-                // The declared fields bound the candidates and the metadata
-                // decides among them, so both paths below read the records the
-                // bound names rather than all of them.
-                Selection::Narrowed(bound, undeclared) => {
-                    let candidates = bound.count();
-                    self.warn_undeclared_filter_field(filter.columns, undeclared, Some(candidates));
-                    if let Some(scanned) =
-                        self.scan_bounded(query, &bound, rev_map, filter, fetch_k)
-                    {
-                        trace!(
-                            target: LOG_TARGET,
-                            operation = "filtered_bounded_scan",
-                            candidates = candidates,
-                            matched = scanned.items.len(),
-                            "Filtered search answered by a bounded scan"
-                        );
-                        scanned
-                    } else {
-                        // The bit test comes first, so a node outside the bound
-                        // costs one word read rather than a `rev_map` lookup, a
-                        // metadata lookup and a field walk. It admits exactly
-                        // what the metadata predicate alone admits, because a
-                        // record the filter matches is inside the bound by
-                        // construction.
-                        trace!(
-                            target: LOG_TARGET,
-                            operation = "filtered_bounded_traversal",
-                            candidates = candidates,
-                            "Filtered search traverses inside a bitmap bound"
-                        );
-                        let admits = |internal_id: &usize| {
-                            bound.contains(*internal_id)
-                                && match rev_map.get(internal_id) {
-                                    Some(ext_id) => filter.admits(ext_id),
-                                    None => false,
-                                }
-                        };
-                        self.traverse(hnsw, query, rev_map, fetch_k, ef, &admits)
-                    }
-                }
-                Selection::Whole(undeclared) => {
-                    self.warn_undeclared_filter_field(filter.columns, undeclared, None);
-                    if let Some(scanned) = self.scan_candidates(query, filter, fetch_k) {
-                        trace!(
-                            target: LOG_TARGET,
-                            operation = "filtered_scan",
-                            matched = scanned.items.len(),
-                            "Filtered search answered by the exact scan"
-                        );
-                        scanned
-                    } else {
-                        let admits = |internal_id: &usize| match rev_map.get(internal_id) {
-                            Some(ext_id) => filter.admits(ext_id),
-                            None => false,
-                        };
-                        self.traverse(hnsw, query, rev_map, fetch_k, ef, &admits)
-                    }
-                }
-            },
-            None => {
-                let live = rev_map.live();
-                let admits = |internal_id: &usize| live.contains(*internal_id);
-                self.traverse(hnsw, query, rev_map, fetch_k, ef, &admits)
-            }
+        metadata: &'a HashMap<String, HashMap<String, Value>>,
+        id_map: &HashMap<String, usize>,
+    ) -> AdmitPlan<'a> {
+        let Some(conditions) = conditions else {
+            return AdmitPlan::All;
         };
-        hits.cut(fetch_k)
-    }
-
-    /// Run the traversal under one predicate and resolve what it found.
-    ///
-    /// The three filtered arms and the unfiltered one all end here, each with
-    /// its own closure type, so this is generic and each call is its own
-    /// specialisation. The page comes back in the traversal's order and is
-    /// marked as such; see `Hits`.
-    fn traverse<'a, F>(
-        &self,
-        hnsw: &VectorGraph,
-        query: &[f32],
-        rev_map: &'a LiveRecords,
-        fetch_k: usize,
-        ef: usize,
-        admits: &F,
-    ) -> Hits<'a>
-    where
-        F: Fn(&usize) -> bool,
-    {
-        // Asked of the guard this function was handed, not of
-        // `Collection::is_quantized`, which takes the graph read lock itself.
-        // Calling that from here took `hnsw` a second time on a thread already
-        // holding it, which the lock order forbids for exactly the reason it
-        // then demonstrated: the standard library queues readers behind a
-        // waiting writer, so the second read blocked forever the moment a
-        // concurrent insert landed between the two. It deadlocked the
-        // concurrency suite on the first run.
-        let quantized = hnsw.is_quantized();
-        let operation = if quantized {
-            "adc_search"
-        } else {
-            "raw_search"
+        let predicate = MetadataAdmit {
+            conditions,
+            rev_map,
+            metadata,
         };
-
-        let graph_hits = hnsw
-            .search(query, fetch_k, ef, Some(admits))
-            .unwrap_or_else(|e| {
-                error!(target: LOG_TARGET, operation = operation, error = %e, "Graph search failed");
-                Vec::new()
-            });
-
-        let mut candidates = Self::resolve(graph_hits, rev_map);
-        Self::sqrt_adc_page(&mut candidates, quantized, &self.space.metric);
-        Hits::traversed(candidates)
-    }
-
-    /// Put an l2 index's approximate scores back on the scale it reports
-    ///
-    /// `DistPQ::eval` sums a table of squared L2 distances and takes no root,
-    /// because the graph orders by the value and a root is a monotone map that
-    /// would cost one square root per distance evaluation to change nothing.
-    /// `L2Dist` does take the root, so the same index reported two scales.
-    ///
-    /// One `quantized_only` l2 index over 3,000 records returned one record at
-    /// 159.416 from the traversal and at 12.626 from the exact scan a narrow
-    /// filter takes, on one query, and 12.626 is the square root of 159.416.
-    /// Which number a caller saw depended on how selective their filter was,
-    /// which is not a thing a caller should have to know about.
-    ///
-    /// **On the page rather than in the hot loop.** The traversal evaluates a
-    /// distance per node visited and this touches `fetch_k` of them, so the
-    /// ordering work stays on squared distance and the root is paid once per
-    /// returned candidate. The order cannot move, because the square root is
-    /// monotone on the non-negative values a sum of squares produces.
-    ///
-    /// **Only the traversal's own scores reach here.** Every path that answers
-    /// from the exact scan returns before `resolve`, and those already score
-    /// with `raw_distance_fn`, so nothing is rooted twice. Rerank overwrites
-    /// every entry afterwards with a raw distance, so a reranked page is
-    /// unaffected either way.
-    ///
-    /// **Only l2, and only l2 needs a page pass at all.** A cosine index does
-    /// not arrive here needing one, because `DistPQ` under `PqMetric::Cosine`
-    /// returns the cosine distance from the traversal itself. It has to. The
-    /// conversion divides by the reconstruction's own length, which varies from
-    /// record to record, so it is not monotone in the ADC sum and a page pass
-    /// would leave the scores out of order. l2's conversion is a square root,
-    /// which is monotone, which is the whole reason it can be done here and the
-    /// cosine one cannot. l1 is refused outright.
-    fn sqrt_adc_page(candidates: &mut [(&String, f32)], quantized: bool, space: &str) {
-        if !quantized || space != "l2" {
-            return;
-        }
-        for entry in candidates.iter_mut() {
-            entry.1 = entry.1.max(0.0).sqrt();
+        match columns.select(conditions) {
+            Selection::Exact(selected) => {
+                let matched = selected.count();
+                if matched <= FULL_SCAN_THRESHOLD {
+                    trace!(
+                        target: LOG_TARGET,
+                        operation = "filtered_columns",
+                        matched = matched,
+                        "Filtered search answered from the columns"
+                    );
+                } else {
+                    // Above the threshold the traversal runs, and the bitmap
+                    // is the whole predicate. One bit test replaces the
+                    // node, `rev_map`, metadata, field lookup chain the walk
+                    // had to make per node, and it subsumes the liveness
+                    // check because a slot holding no record holds no bit.
+                    trace!(
+                        target: LOG_TARGET,
+                        operation = "filtered_columns",
+                        matched = matched,
+                        "Filtered search traverses with a bitmap predicate"
+                    );
+                }
+                AdmitPlan::Bitmap(selected)
+            }
+            Selection::Narrowed(bound, undeclared) => {
+                let candidates = bound.count();
+                self.warn_undeclared_filter_field(columns, undeclared, Some(candidates));
+                let mut matched: Vec<RecordId> = Vec::new();
+                let mut gave_up = false;
+                bound.for_each_while(|slot| {
+                    let Some(ext_id) = rev_map.get(&slot) else {
+                        return true;
+                    };
+                    let Some(meta) = metadata.get(ext_id) else {
+                        return true;
+                    };
+                    if predicate.judge(meta) {
+                        if matched.len() == FULL_SCAN_THRESHOLD {
+                            // One past the threshold, so the walk stops here
+                            // and the index traverses. Nothing has been
+                            // scored yet.
+                            gave_up = true;
+                            return false;
+                        }
+                        matched.push(RecordId::from_slot(slot));
+                    }
+                    true
+                });
+                if gave_up {
+                    trace!(
+                        target: LOG_TARGET,
+                        operation = "filtered_bounded_traversal",
+                        candidates = candidates,
+                        "Filtered search traverses inside a bitmap bound"
+                    );
+                    AdmitPlan::Bounded(bound, predicate)
+                } else {
+                    trace!(
+                        target: LOG_TARGET,
+                        operation = "filtered_bounded_scan",
+                        candidates = candidates,
+                        matched = matched.len(),
+                        "Filtered search answered by a bounded scan"
+                    );
+                    AdmitPlan::Matched(matched)
+                }
+            }
+            Selection::Whole(undeclared) => {
+                self.warn_undeclared_filter_field(columns, undeclared, None);
+                let mut matched: Vec<RecordId> = Vec::new();
+                for (ext_id, meta) in metadata.iter() {
+                    if predicate.judge(meta) {
+                        if matched.len() == FULL_SCAN_THRESHOLD {
+                            // One past the threshold, so the walk stops here
+                            // and the index traverses. Nothing has been
+                            // scored yet.
+                            return AdmitPlan::Predicate(predicate);
+                        }
+                        if let Some(&internal_id) = id_map.get(ext_id) {
+                            matched.push(RecordId::from_slot(internal_id));
+                        }
+                    }
+                }
+                // The walk arrives in hash order and the index expects a
+                // sorted set, so the matches are sorted once here. The page
+                // is the same either way, since the index sorts an exact page
+                // by distance and the collection breaks ties by external id.
+                matched.sort_unstable();
+                trace!(
+                    target: LOG_TARGET,
+                    operation = "filtered_scan",
+                    matched = matched.len(),
+                    "Filtered search answered by the exact scan"
+                );
+                AdmitPlan::Matched(matched)
+            }
         }
     }
 
@@ -814,21 +608,6 @@ impl Collection {
         }
     }
 
-    /// Graph hits as candidates, dropping any whose node no longer resolves
-    ///
-    /// The traversal's predicate has already rejected those, so this drops
-    /// nothing in practice. It is kept because `rev_map` is what turns a node
-    /// into a record and the resolution has to happen somewhere.
-    fn resolve(hits: Vec<GraphHit>, rev_map: &LiveRecords) -> Vec<(&String, f32)> {
-        let mut out = Vec::with_capacity(hits.len());
-        for hit in hits {
-            if let Some(ext_id) = rev_map.get(&hit.internal_id) {
-                out.push((ext_id, hit.distance));
-            }
-        }
-        out
-    }
-
     /// Score and cut one query's candidates
     ///
     /// The single query path and the two batch paths each held their own copy
@@ -841,12 +620,12 @@ impl Collection {
     /// takes its own per worker, and none of that is this function's business.
     ///
     /// **The filter is not applied here.** It used to be, which is what made a
-    /// selective filter return an empty page, and it now runs inside
-    /// `search_candidates` before the page is cut. Every candidate arriving
-    /// here has already been admitted by whichever path produced it.
+    /// selective filter return an empty page, and it now decides the admit set
+    /// the index searched under. Every candidate arriving here has already
+    /// been admitted by whichever path produced it.
     fn collect_hits(
         &self,
-        candidates: Hits<'_>,
+        candidates: Scored<'_>,
         query: &[f32],
         vectors: RawVectors<'_>,
         pq_codes: &HashMap<String, Vec<u8>>,
@@ -862,7 +641,7 @@ impl Collection {
                     query,
                     entry.0,
                     vectors,
-                    self.space.pq.as_ref(),
+                    self.dense().pq.as_ref(),
                     pq_codes,
                 )
                 .unwrap_or(f32::INFINITY);
@@ -883,7 +662,7 @@ impl Collection {
                     .map(<[f32]>::to_vec)
                     .or_else(|| {
                         let codes = pq_codes.get(ext_id)?;
-                        self.space.pq.as_ref()?.reconstruct(codes).ok()
+                        self.dense().pq.as_ref()?.reconstruct(codes).ok()
                     })
             } else {
                 None
@@ -928,7 +707,7 @@ impl Collection {
             }
         }
 
-        let ef = ef_search.unwrap_or_else(|| match self.space.metric.to_lowercase().as_str() {
+        let ef = ef_search.unwrap_or_else(|| match self.dense().metric.to_lowercase().as_str() {
             "l1" | "l2" => std::cmp::max(2 * top_k, 150),
             _ => std::cmp::max(2 * top_k, 100),
         });
@@ -945,12 +724,25 @@ impl Collection {
             target: super::LOG_TARGET,
             operation = "search_config",
             ef = ef,
-            space = %self.space.metric,
+            space = %self.dense().metric,
             rerank_factor = params.rerank.and_then(|plan| plan.factor),
             "Search parameters configured"
         );
 
         Ok(params)
+    }
+
+    /// The budget every dense search hands the index.
+    ///
+    /// The traversal width the parameters resolved, and the boundary tie
+    /// group, because the collection orders an exact page's ties by external
+    /// id and needs the whole group at the cut to do so.
+    fn dense_budget(params: &SearchParams) -> Budget {
+        Budget {
+            ef: Some(params.ef),
+            boundary_ties: true,
+            ..Budget::default()
+        }
     }
 
     /// The single query search path
@@ -966,41 +758,35 @@ impl Collection {
         params: SearchParams,
     ) -> Result<QueryHits, Error> {
         // Six read guards, held for the whole search, in the order every
-        // path in the crate takes them: `id_map < rev_map < hnsw <
+        // path in the crate takes them: `id_map < rev_map < index <
         // pq_codes < vector_metadata < columns`. `id_map` is here because the raw
         // vectors are addressed by node index now and it is what turns an
         // external id into one; it is taken before `rev_map` because a
         // removal holds `id_map` and then takes `rev_map`, and the reverse
         // order here would deadlock against it. The raw vector map that
-        // used to sit between `hnsw` and `pq_codes` is gone.
+        // used to sit between the index and `pq_codes` is gone.
         let id_map = self.id_map.read().unwrap();
         let rev_map = self.rev_map.read().unwrap();
-        let hnsw_guard = self.space.hnsw.read().unwrap();
-        let pq_codes = self.space.pq_codes.read().unwrap();
+        let index = self.dense().index.read().unwrap();
+        let pq_codes = self.dense().pq_codes.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
         let columns = self.columns.read().unwrap();
         let vectors = RawVectors {
             id_map: &id_map,
-            graph: &hnsw_guard,
+            graph: index.graph(),
         };
 
-        let filter = filter_conditions.map(|conditions| Filtered {
-            conditions,
-            columns: &columns,
-            metadata: &vector_metadata,
-            vectors,
-            pq_codes: &pq_codes,
-        });
-        let fetch_k = params.fetch_k(rev_map.len());
-
-        let candidates = self.search_candidates(
-            &hnsw_guard,
-            processed_query,
+        let plan = self.admit_plan(
+            filter_conditions,
+            &columns,
             &rev_map,
-            filter,
-            fetch_k,
-            params.ef,
+            &vector_metadata,
+            &id_map,
         );
+        let fetch_k = params.fetch_k(rev_map.len());
+        let budget = Self::dense_budget(&params);
+        let hits = plan.run(|admit| index.search(processed_query, fetch_k, admit, &budget))?;
+        let candidates = Scored::resolve(hits, &rev_map).cut(fetch_k);
 
         self.collect_hits(
             candidates,
@@ -1037,18 +823,18 @@ impl Collection {
 
         // Validate all vectors have correct dimension
         for (i, vector) in vectors.iter().enumerate() {
-            if vector.len() != self.space.dim {
+            if vector.len() != self.dense().dim {
                 error!(
                     target: LOG_TARGET,
                     operation = "batch_search_validation",
                     vector_index = i,
-                    expected_dim = self.space.dim,
+                    expected_dim = self.dense().dim,
                     actual_dim = vector.len(),
                     "Vector dimension mismatch in batch"
                 );
                 return Err(Error::BatchVectorDimension {
                     position: i,
-                    expected: self.space.dim,
+                    expected: self.dense().dim,
                     got: vector.len(),
                 });
             }
@@ -1122,41 +908,37 @@ impl Collection {
         // where the raw vector map went.
         let id_map = self.id_map.read().unwrap();
         let rev_map = self.rev_map.read().unwrap();
-        let hnsw_guard = self.space.hnsw.read().unwrap();
-        let code_store = self.space.pq_codes.read().unwrap();
+        let index = self.dense().index.read().unwrap();
+        let code_store = self.dense().pq_codes.read().unwrap();
         let metadata_store = self.vector_metadata.read().unwrap();
         let column_store = self.columns.read().unwrap();
         let vector_store = RawVectors {
             id_map: &id_map,
-            graph: &hnsw_guard,
+            graph: index.graph(),
         };
 
-        let filter = filter_conditions.map(|conditions| Filtered {
-            conditions,
-            columns: &column_store,
-            metadata: &metadata_store,
-            vectors: vector_store,
-            pq_codes: &code_store,
-        });
+        // The admit set is the filter's, so it is decided once for the batch.
+        let plan = self.admit_plan(
+            filter_conditions,
+            &column_store,
+            &rev_map,
+            &metadata_store,
+            &id_map,
+        );
 
         // The same over-fetch the single query path applies, so a batch of
         // one query returns what that query returns on its own.
         let fetch_k = params.fetch_k(rev_map.len());
+        let budget = Self::dense_budget(&params);
 
         let mut all_results = Vec::with_capacity(vectors.len());
 
         for vector in vectors {
             // FIX: Process each query vector for space
-            let processed_query = self.space.process_vector_for_space(vector.clone());
+            let processed_query = self.dense().process_vector_for_space(vector.clone());
 
-            let candidates = self.search_candidates(
-                &hnsw_guard,
-                &processed_query,
-                &rev_map,
-                filter,
-                fetch_k,
-                params.ef,
-            );
+            let hits = plan.run(|admit| index.search(&processed_query, fetch_k, admit, &budget))?;
+            let candidates = Scored::resolve(hits, &rev_map).cut(fetch_k);
 
             all_results.push(self.collect_hits(
                 candidates,
@@ -1184,7 +966,7 @@ impl Collection {
             .map(|vector| -> Result<QueryHits, Error> {
                 let _entered = span.clone().entered();
                 // FIX: Process each query vector for space
-                let processed_query = self.space.process_vector_for_space(vector.clone());
+                let processed_query = self.dense().process_vector_for_space(vector.clone());
 
                 // Six read guards per worker, in the one documented order
                 // and held across the traversal. Every guard is a read, so
@@ -1193,34 +975,30 @@ impl Collection {
                 // first and where the raw vector map went.
                 let id_map = self.id_map.read().unwrap();
                 let rev_map = self.rev_map.read().unwrap();
-                let hnsw_guard = self.space.hnsw.read().unwrap();
-                let code_store = self.space.pq_codes.read().unwrap();
+                let index = self.dense().index.read().unwrap();
+                let code_store = self.dense().pq_codes.read().unwrap();
                 let metadata_store = self.vector_metadata.read().unwrap();
                 let column_store = self.columns.read().unwrap();
                 let vector_store = RawVectors {
                     id_map: &id_map,
-                    graph: &hnsw_guard,
+                    graph: index.graph(),
                 };
 
-                let filter = filter_conditions.map(|conditions| Filtered {
-                    conditions,
-                    columns: &column_store,
-                    metadata: &metadata_store,
-                    vectors: vector_store,
-                    pq_codes: &code_store,
-                });
+                let plan = self.admit_plan(
+                    filter_conditions,
+                    &column_store,
+                    &rev_map,
+                    &metadata_store,
+                    &id_map,
+                );
 
                 // The same over-fetch the other two search paths apply.
                 let fetch_k = params.fetch_k(rev_map.len());
+                let budget = Self::dense_budget(&params);
 
-                let candidates = self.search_candidates(
-                    &hnsw_guard,
-                    &processed_query,
-                    &rev_map,
-                    filter,
-                    fetch_k,
-                    params.ef,
-                );
+                let hits =
+                    plan.run(|admit| index.search(&processed_query, fetch_k, admit, &budget))?;
+                let candidates = Scored::resolve(hits, &rev_map).cut(fetch_k);
 
                 self.collect_hits(
                     candidates,
@@ -1236,25 +1014,101 @@ impl Collection {
 
     /// Raw search with no page building (for benchmarking)
     ///
-    /// Two read guards in declared order, `rev_map` then `hnsw`, and the graph
-    /// guard is now held across the resolution as well as the traversal because
-    /// it is `search_candidates` that owns both. This path takes no filter, so
-    /// it takes no storage guards and its predicate is the live set alone.
+    /// Two read guards in declared order, `rev_map` then the index, and the
+    /// index guard is held across the resolution as well as the traversal.
+    /// This path takes no filter, so it takes no storage guards and the
+    /// index runs under its live set alone.
     pub(super) fn raw_search_no_gil(&self, query: &[f32]) -> Vec<(String, f32)> {
         let rev_map = self.rev_map.read().unwrap();
-        let hnsw_guard = self.space.hnsw.read().unwrap();
+        let index = self.dense().index.read().unwrap();
 
-        self.search_candidates(&hnsw_guard, query, &rev_map, None, 10, 100)
+        let budget = Budget {
+            ef: Some(100),
+            ..Budget::default()
+        };
+        let hits = index
+            .search(query, 10, &Candidates::All, &budget)
+            .unwrap_or_else(|e| {
+                error!(target: LOG_TARGET, operation = "raw_search", error = %e, "Search failed");
+                Hits {
+                    items: Vec::new(),
+                    kind: zeusdb_vector_core::ScoreKind::Distance,
+                    exact: false,
+                }
+            });
+        Scored::resolve(hits, &rev_map)
             .items
             .into_iter()
             .map(|(ext_id, distance)| (ext_id.clone(), distance))
             .collect()
     }
+
+    /// Search the sparse space, where the collection declares one.
+    ///
+    /// The one arm of a sparse search, reachable from Rust alone. It takes
+    /// the same admit set a dense search takes under the same filter, so a
+    /// filter selects the same records whichever space is asked, and it
+    /// holds the guards in the declared order, skipping the dense space's
+    /// two since it reads neither.
+    ///
+    /// The page is best first, by score and then by external id among equal
+    /// scores, which is the rule an exact dense page follows. Scores are
+    /// the sparse dot product of the query and the record, so higher is
+    /// better, and a record sharing no dimension with the query never
+    /// appears, so the page may be shorter than `top_k`.
+    pub fn search_sparse(
+        &self,
+        query: SparseRef<'_>,
+        filter_conditions: Option<&Filter>,
+        top_k: usize,
+    ) -> Result<SparseHits, Error> {
+        if top_k > MAX_TOP_K {
+            return Err(Error::TopKTooLarge {
+                max: MAX_TOP_K,
+                top_k,
+            });
+        }
+        query.validate()?;
+        let space = self.sparse().ok_or(Error::NoSparseSpace)?;
+
+        let id_map = self.id_map.read().unwrap();
+        let rev_map = self.rev_map.read().unwrap();
+        let index = space.index.read().unwrap();
+        let vector_metadata = self.vector_metadata.read().unwrap();
+        let columns = self.columns.read().unwrap();
+
+        let plan = self.admit_plan(
+            filter_conditions,
+            &columns,
+            &rev_map,
+            &vector_metadata,
+            &id_map,
+        );
+        let budget = Budget {
+            boundary_ties: true,
+            ..Budget::default()
+        };
+        let hits = plan.run(|admit| index.search(query, top_k, admit, &budget))?;
+        let mut page: Vec<(&String, f32)> = Vec::with_capacity(hits.items.len());
+        for hit in hits.items {
+            if let Some(ext_id) = rev_map.get(&hit.id.slot()) {
+                page.push((ext_id, hit.score));
+            }
+        }
+        // Higher is better here, and the tie goes to the external id, as an
+        // exact dense page's does.
+        page.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        page.truncate(top_k);
+        Ok(page
+            .into_iter()
+            .map(|(ext_id, score)| (ext_id.clone(), score))
+            .collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Hits;
+    use super::Scored;
 
     /// An exact page is ordered by distance and then by external id, and cut.
     /// A traversal's page is returned as the traversal produced it, so a tie
@@ -1268,11 +1122,11 @@ mod tests {
         // on the 12,002 record l2 corpus the tie-break probe records.
         let items = vec![(&b, 1.0f32), (&a, 1.0), (&c, 0.5)];
 
-        let exact = Hits::exact(items.clone()).cut(2);
+        let exact = Scored::exact(items.clone()).cut(2);
         assert!(exact.exact);
         assert_eq!(exact.items, vec![(&c, 0.5), (&a, 1.0)]);
 
-        let traversed = Hits::traversed(items.clone()).cut(2);
+        let traversed = Scored::traversed(items.clone()).cut(2);
         assert!(!traversed.exact);
         assert_eq!(traversed.items, items);
     }
