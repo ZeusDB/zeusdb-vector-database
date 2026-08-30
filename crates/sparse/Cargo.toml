@@ -1,0 +1,24 @@
+# The sparse index, being a mutable postings index over the engine's floor.
+# It implements the index seam zeusdb-vector-core declares for sparse vectors
+# and depends on that crate and on nothing else in the workspace. Nothing in it
+# names Python. The bans in deny.toml and the lint job in ci.yml hold it to
+# that, and `cargo test -p zeusdb-vector-sparse` links no Python library.
+[package]
+name = "zeusdb-vector-sparse"
+# The version, the edition and the licence are the workspace's, declared once
+# in the root Cargo.toml.
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Nothing in this workspace is published to crates.io. The wheel is the only
+# artefact.
+publish = false
+
+# Every version is the workspace's, declared once in the root Cargo.toml with
+# the reason for each pin.
+[dependencies]
+zeusdb-vector-core = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

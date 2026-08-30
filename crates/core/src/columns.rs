@@ -100,6 +100,14 @@ impl Bitmap {
         }
     }
 
+    /// An empty set whose words already reach `slots`, so a test of any id
+    /// below that reads a word rather than falling off the end. What a
+    /// measurement of the bit test's cost wants, since the set that admits
+    /// nothing and holds no words answers without a read.
+    pub fn with_slots(slots: usize) -> Self {
+        Self::zeros(slots)
+    }
+
     #[inline]
     fn set(&mut self, slot: usize) {
         self.words[slot >> 6] |= 1u64 << (slot & 63);
@@ -204,7 +212,8 @@ impl Bitmap {
         }
     }
 
-    fn heap_bytes(&self) -> usize {
+    /// Bytes the words ask the allocator for.
+    pub fn heap_bytes(&self) -> usize {
         self.words.capacity() * 8
     }
 }

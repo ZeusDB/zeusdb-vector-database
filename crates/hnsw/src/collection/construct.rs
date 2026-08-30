@@ -7,15 +7,19 @@
 //! validates nothing, because its configuration comes from a directory this
 //! crate wrote and the loader holds it to the same rules on the way in.
 
-use super::{Collection, LiveRecords, QuantizationConfig, Space, StorageMode, MAX_LAYER};
-use crate::locks::{MutexAt, RwLockAt};
+use super::{
+    Collection, DenseIndex, DenseSpace, LiveRecords, NamedSpace, QuantizationConfig, Space,
+    SparseSpace, StorageMode, DEFAULT_SPACE, MAX_LAYER,
+};
+use crate::locks::{order, MutexAt, RwLockAt};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, trace};
-use zeusdb_vector_core::{validate_indexed_fields, ColumnStore, Error, VectorGraph, PQ};
+use zeusdb_vector_core::{validate_indexed_fields, ColumnStore, Error, SpaceName, VectorGraph, PQ};
+use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 
 /// The target every record this file emits carries. See the parent module.
 const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::construct";
@@ -389,6 +393,9 @@ pub struct Declaration {
     ef_construction: usize,
     expected_size: usize,
     indexed_fields: Vec<String>,
+    /// A sparse space beside the dense one, by name. Declared through
+    /// [`Declaration::with_sparse`], which nothing in the binding calls.
+    sparse: Option<(SpaceName, SparseConfig)>,
 }
 
 impl Declaration {
@@ -413,7 +420,27 @@ impl Declaration {
             ef_construction,
             expected_size,
             indexed_fields,
+            sparse: None,
         })
+    }
+
+    /// Declare a sparse space beside the dense one.
+    ///
+    /// The name is refused where it is empty or is the dense space's, and a
+    /// second sparse space is refused, since a collection holds one dense
+    /// space and at most one sparse space.
+    pub fn with_sparse(mut self, name: &str, config: SparseConfig) -> Result<Self, Error> {
+        let name = SpaceName::new(name)?;
+        if name.as_str() == DEFAULT_SPACE {
+            return Err(Error::SpaceDeclaredTwice {
+                name: name.as_str().to_string(),
+            });
+        }
+        if self.sparse.is_some() {
+            return Err(Error::SpacesTooMany { max: 2 });
+        }
+        self.sparse = Some((name, config));
+        Ok(self)
     }
 
     /// Refuse the space if this build cannot quantize it. Checked before any
@@ -545,6 +572,7 @@ impl Collection {
             ef_construction,
             expected_size,
             indexed_fields,
+            sparse,
         } = declaration;
 
         let pq_instance = quantization.as_ref().map(|config| {
@@ -613,6 +641,7 @@ impl Collection {
             quantization,
             pq_instance,
             hnsw,
+            sparse,
         )
     }
 
@@ -653,11 +682,17 @@ impl Collection {
             None,
             None,
             hnsw,
+            None,
         )
     }
 
-    /// The one place the two structs are put together, so the two
-    /// constructors cannot disagree about a field's starting value.
+    /// The one place the structs are put together, so the two constructors
+    /// cannot disagree about a field's starting value.
+    ///
+    /// The dense space is first, under [`DEFAULT_SPACE`], and takes the
+    /// first space's four ranks. A sparse space, where one was declared,
+    /// is second and takes the second space's index rank. Every lock is
+    /// given its rank here, beside the field it guards.
     #[allow(clippy::too_many_arguments)]
     fn assemble(
         dim: usize,
@@ -669,35 +704,60 @@ impl Collection {
         quantization_config: Option<QuantizationConfig>,
         pq: Option<Arc<PQ>>,
         hnsw: VectorGraph,
+        sparse: Option<(SpaceName, SparseConfig)>,
     ) -> Self {
-        // Initialize all fields with proper thread-safe wrappers
-        Collection {
-            space: Space {
+        let keeps_raw = quantization_config
+            .as_ref()
+            .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw);
+        let index = DenseIndex::new(hnsw, &metric, dim, pq.clone(), keeps_raw);
+        let mut spaces = vec![NamedSpace {
+            name: SpaceName::new(DEFAULT_SPACE).expect("the default space name is not empty"),
+            space: Space::Dense(DenseSpace {
                 dim,
                 metric,
                 m: AtomicUsize::new(m),
                 ef_construction: AtomicUsize::new(ef_construction),
                 quantization_config,
                 pq,
-                pq_codes: RwLockAt::new(HashMap::new()),
-                rerank_calibration: RwLockAt::new(None),
-                hnsw: RwLockAt::new(hnsw),
-                training_completed_at: RwLockAt::new(None),
-            },
+                pq_codes: RwLockAt::new(order::space_codes(0), HashMap::new()),
+                rerank_calibration: RwLockAt::new(order::space_calibration(0), None),
+                index: RwLockAt::new(order::space_index(0), index),
+                training_completed_at: RwLockAt::new(order::space_trained_at(0), None),
+            }),
+        }];
+        if let Some((name, config)) = sparse {
+            let position = spaces.len();
+            spaces.push(NamedSpace {
+                name,
+                space: Space::Sparse(SparseSpace {
+                    index: RwLockAt::new(
+                        order::space_index(position),
+                        PostingsIndex::new(config.clone()),
+                    ),
+                    config,
+                }),
+            });
+        }
+        // Initialize all fields with proper thread-safe wrappers
+        Collection {
+            spaces,
             expected_size: AtomicUsize::new(expected_size),
-            metadata: MutexAt::new(HashMap::new()),
-            vector_metadata: RwLockAt::new(HashMap::new()),
-            columns: RwLockAt::new(ColumnStore::new(indexed_fields, expected_size)),
+            metadata: MutexAt::new(order::METADATA, HashMap::new()),
+            vector_metadata: RwLockAt::new(order::VECTOR_METADATA, HashMap::new()),
+            columns: RwLockAt::new(
+                order::COLUMNS,
+                ColumnStore::new(indexed_fields, expected_size),
+            ),
             undeclared_filter_warned: AtomicBool::new(false),
-            id_map: RwLockAt::new(HashMap::new()),
-            rev_map: RwLockAt::new(LiveRecords::new()),
-            id_counter: MutexAt::new(0),
-            generated_ids: MutexAt::new(0),
-            vector_count: MutexAt::new(0),
-            writers: MutexAt::new(()),
-            training_ids: RwLockAt::new(Vec::new()),
+            id_map: RwLockAt::new(order::ID_MAP, HashMap::new()),
+            rev_map: RwLockAt::new(order::REV_MAP, LiveRecords::new()),
+            id_counter: MutexAt::new(order::ID_COUNTER, 0),
+            generated_ids: MutexAt::new(order::GENERATED_IDS, 0),
+            vector_count: MutexAt::new(order::VECTOR_COUNT, 0),
+            writers: MutexAt::new(order::WRITERS, ()),
+            training_ids: RwLockAt::new(order::TRAINING_IDS, Vec::new()),
             training_threshold_reached: AtomicBool::new(false),
-            created_at: RwLockAt::new(Utc::now().to_rfc3339()),
+            created_at: RwLockAt::new(order::CREATED_AT, Utc::now().to_rfc3339()),
             rebuilding_from_persistence: AtomicBool::new(false),
             overgrowth_warned: AtomicBool::new(false),
         }

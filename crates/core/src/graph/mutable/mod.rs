@@ -107,7 +107,7 @@ mod insert;
 
 /// What phase one hands phase two, re-exported so the seam can name it without
 /// the arena's own module being visible outside `mutable`.
-pub(crate) use insert::Planned;
+pub use insert::Planned;
 
 /// Naming no upper list, which is every node whose span is zero.
 const NO_UPPER: u32 = u32::MAX;

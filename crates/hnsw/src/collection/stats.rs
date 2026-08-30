@@ -90,6 +90,11 @@ impl Collection {
     /// storage mode, the training progress and the vectors still needed are
     /// derived from the captured values by the same rules the helpers apply.
     pub fn stats(&self) -> HashMap<String, String> {
+        debug_assert!(
+            self.live_sets_agree(),
+            "the dense index's live set is the collection's"
+        );
+
         // The record count and, from the same guard, what the map itself
         // occupies. Every `bookkeeping` term below is one structure's own
         // storage, and none of them is the payload the five memory keys price.
@@ -122,7 +127,8 @@ impl Collection {
         // is the graph's own store on a raw index and the store beside the
         // codes on a `quantized_with_raw` one.
         let (graph_nodes, graph_memory_mb, graph_quantized, keeps_raw) = {
-            let hnsw = self.space.hnsw.read().unwrap();
+            let index = self.dense().index.read().unwrap();
+            let hnsw = index.graph();
             let quantized = hnsw.is_quantized();
             let graph_bytes = hnsw.links_memory_bytes()
                 + if quantized {
@@ -138,7 +144,7 @@ impl Collection {
             )
         };
         let pq_code_count = {
-            let pq_codes = self.space.pq_codes.read().unwrap();
+            let pq_codes = self.dense().pq_codes.read().unwrap();
             bookkeeping += table_bytes(&pq_codes) + key_text_bytes(&pq_codes);
             pq_codes.len()
         };
@@ -190,11 +196,11 @@ impl Collection {
 
         // `rerank_calibration` sits outside the declared order and is never
         // held together with another guard; see the order note on `Collection`.
-        let calibration = self.space.rerank_calibration();
+        let calibration = self.dense().rerank_calibration();
 
         // The quantizer's own locks are leaves: nothing in `pq.rs` can reach an
         // index guard, so its accessors are safe wherever they are called.
-        let pq_trained = self.space.pq.as_ref().is_some_and(|pq| pq.is_trained());
+        let pq_trained = self.dense().pq.as_ref().is_some_and(|pq| pq.is_trained());
 
         // What `is_quantized` answers, from the captured flag.
         let quantization_active = pq_trained && graph_quantized;
@@ -203,18 +209,18 @@ impl Collection {
 
         // Basic stats
         stats.insert("total_vectors".to_string(), vector_count.to_string());
-        stats.insert("dimension".to_string(), self.space.dim.to_string());
+        stats.insert("dimension".to_string(), self.dense().dim.to_string());
         stats.insert(
             "expected_size".to_string(),
             self.expected_size().to_string(),
         );
-        stats.insert("space".to_string(), self.space.metric.clone());
+        stats.insert("space".to_string(), self.dense().metric.clone());
         stats.insert("index_type".to_string(), "HNSW".to_string());
 
-        stats.insert("m".to_string(), self.space.m().to_string());
+        stats.insert("m".to_string(), self.dense().m().to_string());
         stats.insert(
             "ef_construction".to_string(),
-            self.space.ef_construction().to_string(),
+            self.dense().ef_construction().to_string(),
         );
         stats.insert("thread_safety".to_string(), "RwLock+Mutex".to_string());
 
@@ -244,7 +250,7 @@ impl Collection {
         // stranded keeps its slot until `compact` runs, and neither is charged
         // here for the same reason the codes are charged at their payload.
         let raw_vector_count = if keeps_raw { live } else { 0 };
-        let raw_memory_mb = (raw_vector_count * self.space.dim * 4) as f64 / (1024.0 * 1024.0);
+        let raw_memory_mb = (raw_vector_count * self.dense().dim * 4) as f64 / (1024.0 * 1024.0);
         let mut total_memory_mb = graph_memory_mb + raw_memory_mb;
         stats.insert(
             "graph_memory_mb".to_string(),
@@ -266,7 +272,7 @@ impl Collection {
         );
 
         // Training info
-        if let Some(config) = &self.space.quantization_config {
+        if let Some(config) = &self.dense().quantization_config {
             stats.insert("quantization_type".to_string(), "pq".to_string());
             stats.insert(
                 "quantization_training_size".to_string(),
@@ -373,7 +379,7 @@ impl Collection {
                 threshold_reached.to_string(),
             );
 
-            if let Some(pq) = &self.space.pq {
+            if let Some(pq) = &self.dense().pq {
                 stats.insert("quantization_trained".to_string(), pq_trained.to_string());
                 stats.insert(
                     "quantization_active".to_string(),
@@ -510,7 +516,7 @@ impl Collection {
         // What `get_storage_mode` answers, from the captured flags rather than
         // through it, because it reaches the graph lock via `is_quantized` and
         // this used to call it while holding three storage guards.
-        let storage_mode_description = if self.space.quantization_config.is_none() {
+        let storage_mode_description = if self.dense().quantization_config.is_none() {
             "raw_only"
         } else if !pq_trained {
             if threshold_reached {
@@ -600,17 +606,17 @@ impl Collection {
         // line.
         let base_info = format!(
             "HNSWIndex(dim={}, space={}, m={}, ef_construction={}, expected_size={}, vectors={}",
-            self.space.dim,
-            self.space.metric,
-            self.space.m(),
-            self.space.ef_construction(),
+            self.dense().dim,
+            self.dense().metric,
+            self.dense().m(),
+            self.dense().ef_construction(),
             self.expected_size(),
             record_count
         );
 
-        if let Some(config) = &self.space.quantization_config {
+        if let Some(config) = &self.dense().quantization_config {
             let trained_status = self
-                .space
+                .dense()
                 .pq
                 .as_ref()
                 .map(|pq| {
@@ -630,7 +636,7 @@ impl Collection {
 
             // Use cached compression ratio calculation with proper float division
             let compression_info = self
-                .space
+                .dense()
                 .pq
                 .as_ref()
                 .map(|pq| format!("{:.1}x", (pq.dim() as f64 * 4.0) / pq.subvectors() as f64))
@@ -656,8 +662,8 @@ impl Collection {
     /// Owned values rather than a mapping, so the binding builds the dict
     /// Python receives with the keys in the order it always had them.
     pub fn quantization_report(&self) -> Option<QuantizationReport> {
-        let config = self.space.quantization_config.as_ref()?;
-        let quantizer = self.space.pq.as_ref().map(|pq| {
+        let config = self.dense().quantization_config.as_ref()?;
+        let quantizer = self.dense().pq.as_ref().map(|pq| {
             // Use enhanced PQ methods
             let (memory_mb, total_centroids) = pq.get_memory_stats();
 
@@ -713,8 +719,8 @@ impl Collection {
         // `quantization_compression` does not, so it is gone rather than
         // qualified. Memory belongs to `get_stats`, which measures rather than
         // projects.
-        if let Some(config) = &self.space.quantization_config {
-            let original_bytes = self.space.dim * 4; // f32
+        if let Some(config) = &self.dense().quantization_config {
+            let original_bytes = self.dense().dim * 4; // f32
             let compressed_bytes = config.subvectors; // u8 per subvector
             let compression_ratio = original_bytes as f64 / compressed_bytes as f64;
 
@@ -768,7 +774,7 @@ impl Collection {
         let queries: Vec<Vec<f32>> = (0..query_count)
             .map(|_| {
                 self.process_vector_for_space(
-                    (0..self.space.dim).map(|_| random::<f32>()).collect(),
+                    (0..self.dense().dim).map(|_| random::<f32>()).collect(),
                 )
             })
             .collect();

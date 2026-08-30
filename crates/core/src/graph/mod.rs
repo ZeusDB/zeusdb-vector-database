@@ -91,7 +91,10 @@ mod traverse;
 
 use dump::{Expected, GraphKind};
 use levels::LevelGenerator;
-use mutable::{MutableGraph, Planned};
+use mutable::MutableGraph;
+/// What phase one of an insertion hands to phase two. Opaque outside the
+/// graph, and nameable so a caller can carry it between the two guards.
+pub use mutable::Planned;
 use store::VectorStore;
 use traverse::LAYERS;
 
@@ -686,6 +689,129 @@ impl VectorGraph {
                 b.raw.as_ref()?.try_get(node)
             }
         }
+    }
+
+    /// One record's quantized codes, by the internal id `id_map` hands out.
+    ///
+    /// The store a quantized graph scores against holds one code per node, so
+    /// this is the same two array reads `raw_vector` makes on a raw graph.
+    /// `None` on a raw graph, which holds no codes, and for any id this graph
+    /// never took.
+    pub fn codes_of(&self, internal_id: usize) -> Option<&[u8]> {
+        let node = self.node_of(internal_id)?;
+        match self {
+            VectorGraph::Cosine(_)
+            | VectorGraph::L2(_)
+            | VectorGraph::L1(_)
+            | VectorGraph::Dot(_) => None,
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                b.store.try_get(node)
+            }
+        }
+    }
+
+    /// Whether this graph took a node under this internal id. True for a
+    /// node removal has stranded, since the node stays.
+    pub fn holds(&self, internal_id: usize) -> bool {
+        self.node_of(internal_id).is_some()
+    }
+
+    /// Time one distance evaluation on this graph's own store, in
+    /// nanoseconds, as the median of `rounds` rounds of `evaluations`
+    /// evaluations between stored points.
+    ///
+    /// What a search costs is a number of these, so an index prices a
+    /// search by multiplying a count by this figure. It is measured rather
+    /// than tabulated because it moves with the machine and the build, and
+    /// it is never persisted for the same reason. `None` where the store
+    /// holds fewer than two points, in which case the caller falls back to
+    /// its compiled-in floor.
+    ///
+    /// A quantized graph evaluates against a table computed for one query of
+    /// zeros, which costs the same table reads a real query does.
+    pub fn time_distance_ns(&self, evaluations: usize, rounds: usize) -> Option<f64> {
+        fn time<T, D: Distance<T>>(
+            dist: &D,
+            store: &VectorStore<T>,
+            evaluations: usize,
+            rounds: usize,
+        ) -> Option<f64> {
+            let n = store.len();
+            if n < 2 || evaluations == 0 || rounds == 0 {
+                return None;
+            }
+            let mut samples = Vec::with_capacity(rounds);
+            for round in 0..rounds {
+                let mut acc = 0f32;
+                let started = std::time::Instant::now();
+                for k in 0..evaluations {
+                    let i = (k + round) % n;
+                    let j = (k.wrapping_mul(7919).wrapping_add(1)) % n;
+                    acc += dist.eval(store.get(i as u32), store.get(j as u32));
+                }
+                let elapsed = started.elapsed().as_secs_f64();
+                std::hint::black_box(acc);
+                samples.push(elapsed * 1e9 / evaluations as f64);
+            }
+            samples.sort_by(|a, b| a.total_cmp(b));
+            Some(samples[samples.len() / 2])
+        }
+        match self {
+            VectorGraph::Cosine(b) => time(b.graph.distance(), &b.store, evaluations, rounds),
+            VectorGraph::L2(b) => time(b.graph.distance(), &b.store, evaluations, rounds),
+            VectorGraph::L1(b) => time(b.graph.distance(), &b.store, evaluations, rounds),
+            VectorGraph::Dot(b) => time(b.graph.distance(), &b.store, evaluations, rounds),
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                let query = vec![0f32; b.graph.distance().dim()];
+                let _query_lut = b.graph.distance().install_query_lut(&query).ok()?;
+                time(b.graph.distance(), &b.store, evaluations, rounds)
+            }
+        }
+    }
+
+    /// Time one whole search on this graph, in nanoseconds, as the median of
+    /// `rounds` searches at `k` and `ef`, each asked with one of the graph's
+    /// own points as its query.
+    ///
+    /// What a traversal costs is not what a distance evaluation costs
+    /// multiplied by a count. A traversal's time is the memory it touches,
+    /// being the neighbour lists and the vectors of nodes scattered across
+    /// the store, where a kernel timed in a loop runs from cache. Measured
+    /// at width 100 over 50,000 points, a search at `ef` 200 took as long as
+    /// eleven thousand kernel evaluations and visited about a thousand
+    /// nodes. So an index prices a traversal from this figure and a scan
+    /// from [`VectorGraph::time_distance_ns`]. `None` where the graph holds
+    /// fewer than two points.
+    ///
+    /// The query on a quantized graph is the reconstruction of a stored
+    /// code, so the table it installs is one a real query would.
+    pub fn time_search_ns(&self, k: usize, ef: usize, rounds: usize) -> Option<f64> {
+        let n = self.nb_points();
+        if n < 2 || rounds == 0 {
+            return None;
+        }
+        let mut samples = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let node = ((round.wrapping_mul(7919).wrapping_add(1)) % n) as u32;
+            let query: Vec<f32> = match self {
+                VectorGraph::Cosine(b) => b.store.get(node).to_vec(),
+                VectorGraph::L2(b) => b.store.get(node).to_vec(),
+                VectorGraph::L1(b) => b.store.get(node).to_vec(),
+                VectorGraph::Dot(b) => b.store.get(node).to_vec(),
+                VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                    b.graph.distance().reconstruct(b.store.get(node)).ok()?
+                }
+            };
+            let started = std::time::Instant::now();
+            let hits = self
+                .search(&query, k, ef, None::<&fn(&usize) -> bool>)
+                .ok()?;
+            let elapsed = started.elapsed();
+            std::hint::black_box(hits);
+            samples.push(elapsed.as_secs_f64() * 1e9);
+        }
+        samples.sort_by(|a, b| a.total_cmp(b));
+        Some(samples[samples.len() / 2])
     }
 
     /// Whether this graph holds a raw vector for every node it carries.

@@ -1,15 +1,21 @@
 //! The index, above the engine's floor and below the binding.
 //!
-//! [`Collection`] is the record set with one vector space over it, and every
+//! [`Collection`] is the record set with its vector spaces over it, and every
 //! operation the binding exposes is a method on it: building, adding,
-//! searching, removing, rebuilding, saving and loading. Beside it are the
-//! rerank rule, being how far a quantized search over-fetches before it
-//! rescores against raw vectors and how that depth is measured on the index's
-//! own data, the lock rank registry, being every lock the index holds with its
-//! place in the declared acquisition order, and the persistence of a saved
-//! directory. Nothing here names Python. The binding holds the `#[pyclass]`
-//! that wraps a `Collection` by value, parses every argument, releases the
-//! interpreter lock around the call and converts what comes back.
+//! searching, removing, rebuilding, saving and loading. The dense space is
+//! this crate's graph behind the seam `zeusdb_vector_core` declares, and the
+//! sparse space is `zeusdb_vector_sparse` behind the same seam. Beside them
+//! are the rerank rule, being how far a quantized search over-fetches before
+//! it rescores against raw vectors and how that depth is measured on the
+//! index's own data, the lock rank registry, being every lock the index
+//! holds with its place in the declared acquisition order, and the
+//! persistence of a saved directory. Nothing here names Python. The binding
+//! holds the `#[pyclass]` that wraps a `Collection` by value, parses every
+//! argument, releases the interpreter lock around the call and converts what
+//! comes back.
+//!
+//! Every configuration type a space is declared with is re-exported here,
+//! so a caller declaring a space depends on this crate alone.
 //!
 //! The binding takes this crate as a path dependency and reaches it through
 //! the `pub use` list below and the one public module, `locks`, whose ranks
@@ -39,8 +45,9 @@ mod persistence;
 mod rerank;
 
 pub use collection::{
-    Added, Collection, Declaration, Listing, ParsedRecords, QuantizationConfig, QuantizationReport,
-    QuantizerReport, QueryHits, RebuildPlan, RecordView, StorageMode,
+    Added, Collection, Declaration, DenseConfig, Listing, ParsedRecord, ParsedRecords,
+    QuantizationConfig, QuantizationReport, QuantizerReport, QueryHits, RebuildPlan, RecordView,
+    SpaceConfig, SparseHits, StorageMode, DEFAULT_SPACE,
 };
 pub use rerank::{
     calibrate_rerank_from_sample, default_rerank_fetch, prepare_reconstruction, raw_distance_fn,
@@ -48,3 +55,5 @@ pub use rerank::{
     RerankPlan, SearchParams, DEFAULT_RERANK_CORPUS_DIVISOR, RERANK_CALIBRATION_PAGES,
     RERANK_CALIBRATION_TOP_K,
 };
+pub use zeusdb_vector_core::SpaceName;
+pub use zeusdb_vector_sparse::{SparseConfig, Unlink};

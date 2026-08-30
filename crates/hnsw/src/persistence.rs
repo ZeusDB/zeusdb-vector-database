@@ -427,7 +427,7 @@ pub(crate) struct SaveLedger {
 }
 
 impl SaveLedger {
-    fn record(&mut self, name: &str, bytes: u64, checksum: Option<u64>) {
+    fn record_digest(&mut self, name: &str, bytes: u64, checksum: Option<u64>) {
         self.digests.insert(
             name.to_string(),
             ArtefactDigest {
@@ -437,9 +437,18 @@ impl SaveLedger {
         );
     }
 
-    /// Record an artefact this module did not write, being the graph dump
-    pub(crate) fn record_length(&mut self, name: &str, bytes: u64) {
-        self.record(name, bytes, None);
+    /// The length recorded for an artefact, where one has been.
+    pub(crate) fn recorded_bytes(&self, name: &str) -> Option<u64> {
+        self.digests.get(name).map(|digest| digest.bytes)
+    }
+}
+
+/// An index writes its artefacts through the seam's ledger, which is this
+/// one, so the manifest records what the index wrote the same way it
+/// records what this module wrote.
+impl zeusdb_vector_core::Ledger for SaveLedger {
+    fn record(&mut self, name: &str, record: zeusdb_vector_core::ArtefactRecord) {
+        self.record_digest(name, record.bytes, record.checksum);
     }
 }
 
@@ -471,7 +480,7 @@ fn write_artefact(
             error: e.to_string(),
         })?;
 
-    ledger.record(name, bytes.len() as u64, Some(checksum_of(bytes)));
+    ledger.record_digest(name, bytes.len() as u64, Some(checksum_of(bytes)));
     Ok(())
 }
 

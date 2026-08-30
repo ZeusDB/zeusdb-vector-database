@@ -53,8 +53,8 @@ impl Collection {
         }
 
         // Only proceed if we have quantization config and aren't already trained
-        if let Some(_config) = &self.space.quantization_config {
-            if let Some(pq) = &self.space.pq {
+        if let Some(_config) = &self.dense().quantization_config {
+            if let Some(pq) = &self.dense().pq {
                 if !pq.is_trained() {
                     info!(target: LOG_TARGET, operation = "training_trigger",
                         "Training threshold reached - starting PQ training"
@@ -69,15 +69,15 @@ impl Collection {
 
     /// TRAINING EXECUTION: Uses collected IDs for deterministic training set
     #[instrument(target = LOG_TARGET, level = "info", skip(self), fields(
-        has_pq = self.space.pq.is_some(),
-        has_config = self.space.quantization_config.is_some()
+        has_pq = self.dense().pq.is_some(),
+        has_config = self.dense().quantization_config.is_some()
     ))]
     fn train_quantization_from_ids(&self) -> Result<(), String> {
         let start_time = Instant::now();
 
-        let pq = self.space.pq.as_ref().ok_or("PQ not available")?.clone();
+        let pq = self.dense().pq.as_ref().ok_or("PQ not available")?.clone();
         let config = self
-            .space
+            .dense()
             .quantization_config
             .as_ref()
             .ok_or("Config not available")?
@@ -89,10 +89,10 @@ impl Collection {
         // them takes them in.
         let training_vectors = {
             let id_map = self.id_map.read().unwrap();
-            let hnsw = self.space.hnsw.read().unwrap();
+            let index = self.dense().index.read().unwrap();
             let vectors = RawVectors {
                 id_map: &id_map,
-                graph: &hnsw,
+                graph: index.graph(),
             };
             let training_ids = self.training_ids.read().unwrap();
 
@@ -189,7 +189,7 @@ impl Collection {
         // The one point where the codebook goes from absent to fitted, so it is
         // the one point that can stamp when that happened. `quantization.json`
         // used to write the save time under this name. See the field.
-        *self.space.training_completed_at.write().unwrap() = Some(Utc::now().to_rfc3339());
+        *self.dense().training_completed_at.write().unwrap() = Some(Utc::now().to_rfc3339());
 
         info!(target: LOG_TARGET, operation = "pq_training_complete",
             training_vectors = final_training_set.len(),
@@ -210,7 +210,7 @@ impl Collection {
                 duration_ms = calibration.millis,
                 "Rerank fetch calibrated from the training sample"
             );
-            *self.space.rerank_calibration.write().unwrap() = Some(calibration);
+            *self.dense().rerank_calibration.write().unwrap() = Some(calibration);
         }
 
         // Clear training IDs (no longer needed)
@@ -234,7 +234,7 @@ impl Collection {
             // field used to sit beside it, carrying 1 - 1/compression_ratio,
             // which is the same number in another form and was labelled as a
             // saving the index does not make.
-            let compression_ratio = (self.space.dim as f64 * 4.0) / pq.subvectors() as f64;
+            let compression_ratio = (self.dense().dim as f64 * 4.0) / pq.subvectors() as f64;
 
             let total_duration_ms = start_time.elapsed().as_millis();
             info!(target: LOG_TARGET, operation = "pq_complete",
@@ -262,7 +262,7 @@ impl Collection {
     /// `quantized_only` never reranks, so it is not calibrated.
     fn calibrate_rerank(&self, pq: &PQ, sample: &[Vec<f32>]) -> Option<RerankCalibration> {
         let keeps_raw = self
-            .space
+            .dense()
             .quantization_config
             .as_ref()
             .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw);
@@ -270,7 +270,7 @@ impl Collection {
             return None;
         }
 
-        calibrate_rerank_from_sample(pq, sample, raw_distance_fn(&self.space.metric))
+        calibrate_rerank_from_sample(pq, sample, raw_distance_fn(&self.dense().metric))
     }
 
     /// The body of `rebuild_with_quantization`, with the writers guard already held
@@ -285,7 +285,7 @@ impl Collection {
     pub(super) fn rebuild_with_quantization_locked(&self) -> Result<bool, String> {
         let start_time = Instant::now();
 
-        let pq = match &self.space.pq {
+        let pq = match &self.dense().pq {
             Some(pq) if pq.is_trained() => pq.clone(),
             _ => {
                 warn!(target: LOG_TARGET, operation = "rebuild_quantization",
@@ -314,10 +314,11 @@ impl Collection {
         // neither raw vectors nor codes has nothing to rebuild from.
         let (vector_count, retained) = {
             let id_map = self.id_map.read().unwrap();
-            let hnsw = self.space.hnsw.read().unwrap();
+            let index = self.dense().index.read().unwrap();
+            let hnsw = index.graph();
             let vectors = RawVectors {
                 id_map: &id_map,
-                graph: &hnsw,
+                graph: hnsw,
             };
 
             // Every live record that still has a raw vector, in internal id
@@ -337,7 +338,7 @@ impl Collection {
                 .collect();
 
             if with_raw.is_empty() {
-                let code_count = self.space.pq_codes.read().unwrap().len();
+                let code_count = self.dense().pq_codes.read().unwrap().len();
                 if code_count == 0 {
                     warn!(target: LOG_TARGET, operation = "rebuild_quantization",
                         reason = "no_vectors_or_codes",
@@ -369,7 +370,7 @@ impl Collection {
                 // and there is nothing left to re-quantize them from. Clearing
                 // dropped those records from the index outright. Removal already
                 // deletes an id's codes, so nothing stale can survive here.
-                let mut pq_codes = self.space.pq_codes.write().unwrap();
+                let mut pq_codes = self.dense().pq_codes.write().unwrap();
                 let retained = pq_codes
                     .keys()
                     .filter(|id| !vectors.contains(id.as_str()))
@@ -394,7 +395,7 @@ impl Collection {
         // Copying costs one byte per subvector per record.
         let batch_data: Vec<(Vec<u8>, usize)> = {
             let id_map = self.id_map.read().unwrap();
-            let pq_codes = self.space.pq_codes.read().unwrap();
+            let pq_codes = self.dense().pq_codes.read().unwrap();
             pq_codes
                 .iter()
                 .filter_map(|(id, codes)| {
@@ -414,11 +415,11 @@ impl Collection {
         batch_data.sort_unstable_by_key(|&(_, internal_id)| internal_id);
 
         let mut new_hnsw = VectorGraph::new_pq(
-            &self.space.metric,
-            self.space.m(),
+            &self.dense().metric,
+            self.dense().m(),
             self.expected_size(),
             MAX_LAYER,
-            self.space.ef_construction(),
+            self.dense().ef_construction(),
             pq.clone(),
         );
 
@@ -447,16 +448,17 @@ impl Collection {
         // the mode sheds its training records: the raws go when the graph that
         // held them goes. It used to be an explicit clear of a separate map.
         let keeps_raw = self
-            .space
+            .dense()
             .quantization_config
             .as_ref()
             .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw);
         let released = {
-            let old_hnsw = self.space.hnsw.read().unwrap();
+            let old_index = self.dense().index.read().unwrap();
+            let old_hnsw = old_index.graph();
             let held = old_hnsw.raw_count();
             if keeps_raw && old_hnsw.holds_raw() {
                 new_hnsw
-                    .adopt_raw_from(&old_hnsw, self.space.dim)
+                    .adopt_raw_from(old_hnsw, self.dense().dim)
                     .map_err(|e| format!("Failed to carry the raw vectors over: {}", e))?;
                 0
             } else {
@@ -471,7 +473,7 @@ impl Collection {
         //
         // The old graph is moved out and dropped after the guard is released.
         // See `replace_graph`.
-        self.space.replace_graph(new_hnsw);
+        self.dense().replace_graph(new_hnsw);
         let released = if vector_count > 0 && !keeps_raw {
             released
         } else {
@@ -512,9 +514,9 @@ impl Collection {
     /// an index whose codebook is fitted. Zero on an index declared without
     /// quantization.
     pub fn training_progress(&self) -> f32 {
-        if let Some(config) = &self.space.quantization_config {
+        if let Some(config) = &self.dense().quantization_config {
             // If PQ is trained, always return 100%
-            if let Some(pq) = &self.space.pq {
+            if let Some(pq) = &self.dense().pq {
                 if pq.is_trained() {
                     return 100.0;
                 }
@@ -528,7 +530,7 @@ impl Collection {
 
     /// Get number of training vectors still needed
     pub fn training_vectors_needed(&self) -> usize {
-        if let Some(config) = &self.space.quantization_config {
+        if let Some(config) = &self.dense().quantization_config {
             if self.training_threshold_reached.load(Ordering::Acquire) {
                 0
             } else {
