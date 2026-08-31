@@ -42,6 +42,7 @@
 //! | `construct` | building a collection and validating the declaration |
 //! | `input` | what a vector becomes once it is out of Python |
 //! | `insert` | insertion, replacement, removal, compaction, rebuild, clear |
+//! | `query` | a query over one or more arms, its plan and its fused page |
 //! | `search` | the four paths that reach the graph, and the page they build |
 //! | `training` | fitting the codebook and rebuilding over the codes |
 //! | `stats` | what the index reports about itself |
@@ -69,6 +70,9 @@ mod dense;
 mod input;
 mod insert;
 mod persist;
+mod query;
+#[cfg(test)]
+mod query_tests;
 mod search;
 #[cfg(test)]
 mod spaces_tests;
@@ -82,6 +86,9 @@ pub use construct::Declaration;
 pub(crate) use construct::{validate_index_parameters, validate_space_supports_quantization};
 pub(crate) use dense::{DenseIndex, DenseOpen};
 pub use insert::{Added, RebuildPlan};
+pub use query::{
+    AdmitShape, Arm, ArmPlan, Page, Plan, Query, QueryHit, DEFAULT_FETCH_PER_K, MAX_ARMS,
+};
 pub use search::{QueryHits, SparseHits};
 pub use stats::{QuantizationReport, QuantizerReport};
 
@@ -280,6 +287,13 @@ impl LiveRecords {
     #[cfg(test)]
     pub(crate) fn live(&self) -> &Bitmap {
         &self.live
+    }
+
+    /// Whether `other` admits every live record, by a word walk of the
+    /// intersection against the live count. What decides that a filter's
+    /// bitmap is no filter at all; see `Collection::admit_plan`.
+    pub(crate) fn admits_every_live(&self, other: &Bitmap) -> bool {
+        other.count_and(&self.live) == self.by_internal.len()
     }
 
     /// Whether `other` holds exactly the ids this set holds.

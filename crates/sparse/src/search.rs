@@ -449,7 +449,12 @@ impl PostingsIndex {
     /// scoring its members from the arena is estimated cheaper than the
     /// scan under it, and the scan runs otherwise, monomorphised over the
     /// bitmap where the set is one. A set admitting everything, which
-    /// answers no hint, is the scan with no predicate but the dead test.
+    /// answers no hint, is the scan with no predicate but the dead test,
+    /// and the dead test only where a record has been removed since the
+    /// last compaction. Asked through the table instead, as a set that
+    /// answers no hint and is not a bitmap is, the scan paid one indirect
+    /// call per posting for a predicate that is always true, and ran
+    /// slower under no filter than under a bitmap admitting everything.
     fn auto<S: Scorer>(
         &self,
         scorer: &S,
@@ -459,6 +464,16 @@ impl PostingsIndex {
         admit: &dyn Admit,
         has_dead: bool,
     ) -> Vec<Hit> {
+        if admit.admits_all() {
+            let dead = &self.dead;
+            return if has_dead {
+                self.scan_per_posting(scorer, query, k, boundary_ties, |id| {
+                    !dead.contains(id as usize)
+                })
+            } else {
+                self.scan_per_posting(scorer, query, k, boundary_ties, |_| true)
+            };
+        }
         let Some(admitted) = admit.len_hint() else {
             let dead = &self.dead;
             return match (admit.as_bitmap(), has_dead) {

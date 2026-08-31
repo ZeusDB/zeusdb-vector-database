@@ -5,8 +5,10 @@
 //! differ only in how long they hold the storage guards, so what each does
 //! with a candidate is in `collect_hits`. What each hands back is a
 //! [`QueryHits`] page of owned Rust, which the binding turns into the list
-//! of dicts Python receives. A fifth path, `search_sparse`, reaches the
-//! sparse index the same way and is reachable from Rust alone.
+//! of dicts Python receives. The two sparse searches at the end of this file
+//! are one arm queries, and a query over several arms is `query.rs`, which
+//! builds its admit set and its dense page with the same pieces these four
+//! paths use.
 //!
 //! # What the collection decides and what the index decides
 //!
@@ -77,7 +79,7 @@
 //! mutation taking a storage map before `rev_map` deadlocks against it, and
 //! that is the inversion `remove_point_internal` used to carry.
 
-use super::{Collection, LiveRecords, StorageMode};
+use super::{Arm, Collection, LiveRecords, Query, StorageMode};
 use crate::{
     raw_distance_fn, reconstruction_needs_unit, rescore_candidate, take_best, RawVectors,
     RerankPlan, SearchParams,
@@ -89,10 +91,9 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, instrument, trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, Admit, And, Bitmap, Budget, Candidates, ColumnStore, Error, Filter, Hits,
-    IdfScope, RecordId, Selection, SparseRef, SparseVector, VectorIndex,
+    matches_filter, Admit, And, Bitmap, Budget, Candidates, ColumnStore, Error, Filter, Fusion,
+    Hits, IdfScope, RecordId, Selection, SparseRef, VectorIndex,
 };
-use zeusdb_vector_text::vectorize_query;
 
 /// The target every record this file emits carries. See the parent module.
 const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::search";
@@ -109,7 +110,7 @@ const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::search";
 /// The ceiling is far above any page a caller has reason to ask for, so no
 /// real caller is refused. At the ceiling the heaps are 2 MiB and the result
 /// list is 65,536 Python dicts, which is slow and is what was asked for.
-const MAX_TOP_K: usize = 65_536;
+pub(super) const MAX_TOP_K: usize = 65_536;
 
 /// Largest `ef_search` a search may pass, being the default `ef_search` at
 /// the largest `top_k`.
@@ -119,7 +120,7 @@ const MAX_TOP_K: usize = 65_536;
 /// 2 MiB, and a search at that width on a corpus smaller than it is an
 /// exhaustive scan, which is the slowest thing a search can be and is bounded
 /// by the corpus.
-const MAX_EF_SEARCH: usize = 2 * MAX_TOP_K;
+pub(super) const MAX_EF_SEARCH: usize = 2 * MAX_TOP_K;
 /// Records a filtered search may match before it stops scanning and traverses
 /// the graph instead.
 ///
@@ -221,7 +222,7 @@ impl<'a> Scored<'a> {
     /// every path applies. The index searched under the live set, so this
     /// drops nothing in practice, and `rev_map` is what turns a node into a
     /// record so the resolution has to happen somewhere.
-    fn resolve(hits: Hits, rev_map: &'a LiveRecords) -> Self {
+    pub(super) fn resolve(hits: Hits, rev_map: &'a LiveRecords) -> Self {
         let mut items = Vec::with_capacity(hits.items.len());
         for hit in hits.items {
             if let Some(ext_id) = rev_map.get(&hit.id.slot()) {
@@ -255,7 +256,7 @@ impl<'a> Scored<'a> {
     /// at most `fetch_k` long. Its order among equal distances is the heap's,
     /// which is a function of the graph and is deterministic, and re-sorting
     /// it by string would move a page that has never moved.
-    fn cut(mut self, fetch_k: usize) -> Self {
+    pub(super) fn cut(mut self, fetch_k: usize) -> Self {
         if self.exact {
             self.items
                 .sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(b.0)));
@@ -273,7 +274,7 @@ impl<'a> Scored<'a> {
 /// with no metadata entry does not match, which is the rule `collect_hits`
 /// applied when the filter ran there. It cannot count itself and cannot
 /// enumerate itself, so the index asks it one node at a time.
-struct MetadataAdmit<'a> {
+pub(super) struct MetadataAdmit<'a> {
     conditions: &'a Filter,
     rev_map: &'a LiveRecords,
     metadata: &'a HashMap<String, HashMap<String, Value>>,
@@ -319,7 +320,7 @@ impl Admit for MetadataAdmit<'_> {
 /// id order. Or the walk's give-up, being the bound the declared fields left
 /// conjoined with the metadata predicate, or the predicate alone where they
 /// left none, which the index traverses under.
-enum AdmitPlan<'a> {
+pub(super) enum AdmitPlan<'a> {
     All,
     Bitmap(Bitmap),
     Matched(Vec<RecordId>),
@@ -330,7 +331,7 @@ enum AdmitPlan<'a> {
 impl AdmitPlan<'_> {
     /// Run `search` under the set, building the conjunction where there is
     /// one.
-    fn run<R>(&self, search: impl FnOnce(&dyn Admit) -> R) -> R {
+    pub(super) fn run<R>(&self, search: impl FnOnce(&dyn Admit) -> R) -> R {
         match self {
             AdmitPlan::All => search(&Candidates::All),
             AdmitPlan::Bitmap(bitmap) => search(bitmap),
@@ -428,7 +429,7 @@ impl Collection {
     /// **Fewer than `top_k` matches is a result and not a failure.** A filter
     /// matching three records returns three results to a caller who asked for
     /// ten, and a filter matching none returns an empty page.
-    fn admit_plan<'a>(
+    pub(super) fn admit_plan<'a>(
         &self,
         conditions: Option<&'a Filter>,
         columns: &ColumnStore,
@@ -454,6 +455,28 @@ impl Collection {
                         matched = matched,
                         "Filtered search answered from the columns"
                     );
+                    AdmitPlan::Bitmap(selected)
+                } else if rev_map.admits_every_live(&selected) {
+                    // Every live record, so the filter is no filter and the
+                    // index runs under its own live set, which is the
+                    // unfiltered search. Handed on as a bitmap instead, a
+                    // term weighted sparse scan would walk the query's
+                    // lists to count a corpus it can read from its own
+                    // totals, a fifth of such a query, a dot product scan
+                    // would test a bit per posting, an eighth, and a dense
+                    // traversal would test a bit per node, which measures
+                    // as nothing. Only above the threshold, because below
+                    // it the exact scan over the bitmap is the cheaper and
+                    // the better page, and it would become a traversal.
+                    // One word walk of the intersection against the live
+                    // count decides it.
+                    trace!(
+                        target: LOG_TARGET,
+                        operation = "filtered_columns",
+                        matched = matched,
+                        "Filtered search admits every live record and runs unfiltered"
+                    );
+                    AdmitPlan::All
                 } else {
                     // Above the threshold the traversal runs, and the bitmap
                     // is the whole predicate. One bit test replaces the
@@ -466,8 +489,8 @@ impl Collection {
                         matched = matched,
                         "Filtered search traverses with a bitmap predicate"
                     );
+                    AdmitPlan::Bitmap(selected)
                 }
-                AdmitPlan::Bitmap(selected)
             }
             Selection::Narrowed(bound, undeclared) => {
                 let candidates = bound.count();
@@ -633,21 +656,7 @@ impl Collection {
         params: SearchParams,
     ) -> Result<QueryHits, Error> {
         let mut scored = candidates.items;
-
-        if let Some(plan) = params.rerank.as_ref() {
-            for entry in scored.iter_mut() {
-                entry.1 = rescore_candidate(
-                    plan,
-                    query,
-                    entry.0,
-                    vectors,
-                    self.dense().pq.as_ref(),
-                    pq_codes,
-                )
-                .unwrap_or(f32::INFINITY);
-            }
-            take_best(&mut scored, params.top_k);
-        }
+        self.rescore_page(&mut scored, query, vectors, pq_codes, &params);
 
         let mut results = Vec::with_capacity(scored.len());
         for (ext_id, score) in scored {
@@ -672,6 +681,39 @@ impl Collection {
         }
 
         Ok(results)
+    }
+
+    /// Rescore a page against the raw vectors where the plan reranks, and
+    /// cut it to the page size.
+    ///
+    /// Nothing happens without a rerank plan. With one, every candidate the
+    /// graph over-fetched is rescored against its raw vector, or against the
+    /// reconstruction of its codes where the index keeps no raw vector, a
+    /// candidate that has neither sorts last, and the best `top_k` are kept.
+    /// The single space search and the query path both apply it, so a dense
+    /// arm inside a query returns the page the single space search returns.
+    pub(super) fn rescore_page(
+        &self,
+        scored: &mut Vec<(&String, f32)>,
+        query: &[f32],
+        vectors: RawVectors<'_>,
+        pq_codes: &HashMap<String, Vec<u8>>,
+        params: &SearchParams,
+    ) {
+        if let Some(plan) = params.rerank.as_ref() {
+            for entry in scored.iter_mut() {
+                entry.1 = rescore_candidate(
+                    plan,
+                    query,
+                    entry.0,
+                    vectors,
+                    self.dense().pq.as_ref(),
+                    pq_codes,
+                )
+                .unwrap_or(f32::INFINITY);
+            }
+            take_best(scored, params.top_k);
+        }
     }
 
     /// Resolve the search arguments into the parameters every path reads.
@@ -737,7 +779,7 @@ impl Collection {
     /// The traversal width the parameters resolved, and the boundary tie
     /// group, because the collection orders an exact page's ties by external
     /// id and needs the whole group at the cut to do so.
-    fn dense_budget(params: &SearchParams) -> Budget {
+    pub(super) fn dense_budget(params: &SearchParams) -> Budget {
         Budget {
             ef: Some(params.ef),
             boundary_ties: true,
@@ -1045,17 +1087,14 @@ impl Collection {
 
     /// Search the sparse space, where the collection declares one.
     ///
-    /// The one arm of a sparse search, reachable from Rust alone. It takes
-    /// the same admit set a dense search takes under the same filter, so a
-    /// filter selects the same records whichever space is asked, and it
-    /// holds the guards in the declared order, skipping the dense space's
-    /// two since it reads neither.
-    ///
-    /// The page is best first, by score and then by external id among equal
-    /// scores, which is the rule an exact dense page follows. Scores are
-    /// the sparse dot product of the query and the record, so higher is
-    /// better, and a record sharing no dimension with the query never
-    /// appears, so the page may be shorter than `top_k`.
+    /// A one arm query, reachable from Rust alone. It takes the same admit
+    /// set a dense search takes under the same filter, so a filter selects
+    /// the same records whichever space is asked. The page is best first,
+    /// by score and then by external id among equal scores, which is the
+    /// rule an exact dense page follows. Scores are the sparse space's own,
+    /// higher better, and a record sharing no dimension with the query
+    /// never appears, so the page may be shorter than `top_k`. See
+    /// [`Collection::query`] for the query it is.
     pub fn search_sparse(
         &self,
         query: SparseRef<'_>,
@@ -1063,57 +1102,17 @@ impl Collection {
         top_k: usize,
         idf: IdfScope,
     ) -> Result<SparseHits, Error> {
-        if top_k > MAX_TOP_K {
-            return Err(Error::TopKTooLarge {
-                max: MAX_TOP_K,
-                top_k,
-            });
-        }
-        query.validate()?;
-        let space = self.sparse().ok_or(Error::NoSparseSpace)?;
-
-        let id_map = self.id_map.read().unwrap();
-        let rev_map = self.rev_map.read().unwrap();
-        let index = space.index.read().unwrap();
-        let vector_metadata = self.vector_metadata.read().unwrap();
-        let columns = self.columns.read().unwrap();
-
-        let plan = self.admit_plan(
-            filter_conditions,
-            &columns,
-            &rev_map,
-            &vector_metadata,
-            &id_map,
-        );
-        let budget = Budget {
-            boundary_ties: true,
-            idf,
-            ..Budget::default()
-        };
-        let hits = plan.run(|admit| index.search(query, top_k, admit, &budget))?;
-        let mut page: Vec<(&String, f32)> = Vec::with_capacity(hits.items.len());
-        for hit in hits.items {
-            if let Some(ext_id) = rev_map.get(&hit.id.slot()) {
-                page.push((ext_id, hit.score));
-            }
-        }
-        // Higher is better here, and the tie goes to the external id, as an
-        // exact dense page's does.
-        page.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-        page.truncate(top_k);
-        Ok(page
-            .into_iter()
-            .map(|(ext_id, score)| (ext_id.clone(), score))
-            .collect())
+        let arms = [Arm::Sparse { vector: query, idf }];
+        self.one_arm(&arms, filter_conditions, top_k)
     }
 
     /// Search the sparse space with a text, where the space has a text
     /// layer.
     ///
-    /// The text is tokenized as the records were and looked up in the
-    /// dictionary under its read guard, taken alone and released before the
-    /// search, and a term no record has carried is dropped. The rest is
-    /// `search_sparse`.
+    /// A one arm query. The text is counted into term ids as the records
+    /// were, under the dictionary's read guard taken alone and released
+    /// before the search, and a term no record has carried is dropped. The
+    /// rest is `search_sparse`.
     pub fn search_text(
         &self,
         text: &str,
@@ -1121,13 +1120,29 @@ impl Collection {
         top_k: usize,
         idf: IdfScope,
     ) -> Result<SparseHits, Error> {
-        let space = self.sparse().ok_or(Error::NoSparseSpace)?;
-        let layer = space.text.as_ref().ok_or(Error::NoTextLayer)?;
-        let query: SparseVector = {
-            let dictionary = layer.dictionary.read().unwrap();
-            vectorize_query(&*layer.tokenizer, &dictionary, text)
-        };
-        self.search_sparse(query.as_ref(), filter_conditions, top_k, idf)
+        let arms = [Arm::Text { text, idf }];
+        self.one_arm(&arms, filter_conditions, top_k)
+    }
+
+    /// One arm's page as (external id, score), best first.
+    fn one_arm(
+        &self,
+        arms: &[Arm<'_>],
+        filter_conditions: Option<&Filter>,
+        top_k: usize,
+    ) -> Result<SparseHits, Error> {
+        let page = self.query(&Query {
+            arms,
+            filter: filter_conditions,
+            k: top_k,
+            fetch: None,
+            fusion: Fusion::default(),
+        })?;
+        Ok(page
+            .hits
+            .into_iter()
+            .map(|hit| (hit.id, hit.score))
+            .collect())
     }
 }
 
