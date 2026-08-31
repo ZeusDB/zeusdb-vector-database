@@ -928,8 +928,8 @@ def test_not_negates_a_whole_filter(operator_index):
     # `$not` is negation, so the same question asked of the group admits r04.
     assert filtered_ids(index, {"$not": {"flag": True}}) == ["r02", "r04"]
 
-    # Negating a disjunction is what Qdrant calls must_not, and it is written
-    # out rather than given a key of its own.
+    # Negating a disjunction is written out rather than given a key of
+    # its own.
     assert filtered_ids(
         index, {"$not": {"$or": [{"count": 10}, {"count": 20}]}}
     ) == ["r03"]

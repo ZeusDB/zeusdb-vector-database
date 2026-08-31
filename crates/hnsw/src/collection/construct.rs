@@ -92,8 +92,8 @@ const MAX_EXPECTED_SIZE: usize = 100_000_000;
 /// `m` of 16. Carrying that margin to the largest `m` is 3,200, and 4,096 is
 /// the first power of two above it, so every `m` the index allows has the
 /// default's headroom available and nothing a real build asks for is
-/// refused. The highest comparable ceiling in the field is Lucene's beam
-/// width of 3,200, and pgvector stops at 1,000.
+/// refused. The ceiling sits far above any beam width a graph search
+/// benefits from, so it bounds a mistake rather than a workload.
 ///
 /// What it costs at the ceiling, measured on 20,000 records of 64
 /// dimensions. 2.28 s to build at 200 and 30.0 s at 4,096, thirteen times the

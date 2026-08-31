@@ -900,6 +900,114 @@ def test_get_stats_never_deadlocks_against_mutation(tmp_path, probe_mode):
 
 
 # ============================================================================
+# The two live sets, read from outside the mutation lock
+# ============================================================================
+#
+# The dense index keeps a bitmap of the records it holds, which is what an
+# unfiltered traversal runs its predicate against, and the collection keeps the
+# same set beside its reverse map. They are one set held twice, and `get_stats`
+# checks them against each other on a build with debug assertions.
+#
+# Two paths wrote one of them and then the other under a separate acquisition,
+# so the invariant was false for the whole gap between the two writes, and
+# `get_stats` takes no mutation lock and lands in that gap.
+#
+# **The insertion.** `add` wrote `id_map` and `rev_map`, released both, ran
+# phase one of the insertion, which is the descent at `ef_construction` and the
+# whole cost of an insertion, and only then took the index write guard and set
+# the live bit. A `get_stats` entering after the map write and before the index
+# write saw the collection holding a record the index did not. The gap was not a
+# hairline: on a release build one stats call in seven landed inside it.
+#
+# **The clear.** `clear` emptied `id_map` and `rev_map` under the storage
+# guards, released them, built the replacement index and only then swapped it
+# in. A `get_stats` between the two saw an empty collection and an index still
+# holding every record, which is the same disagreement the other way round.
+#
+# Both arms are work bounded rather than time bounded, so a slow machine does
+# the same number of interleavings as a fast one and neither passes by idling.
+# The budget is the ceiling for a machine that cannot reach the work at all,
+# and reaching it fails the arm rather than passing it.
+
+LIVE_SET_BUDGET_S = 20.0
+LIVE_SET_WRITES = 40
+
+
+@pytest.mark.parametrize("path", ["insert", "clear"])
+def test_the_two_live_sets_agree_under_a_concurrent_reader(path):
+    """get_stats beside a write never sees the two live sets disagree.
+
+    The reader runs in its own thread and takes no mutation lock, so it
+    lands wherever the writer happens to be. On a build with debug
+    assertions a disagreement raises out of `get_stats` into this thread,
+    and the arm reports it rather than letting the traceback pass by.
+    """
+    dim = 8
+    fill = 100
+    rng = np.random.default_rng(136)
+    vectors = rng.standard_normal((fill, dim)).astype(np.float32)
+    ids = [f"live_{i}" for i in range(fill)]
+    index = VectorDatabase().create("hnsw", dim=dim, expected_size=fill * 4)
+    if path == "insert":
+        # A seed so the descent in phase one has a graph to descend, which is
+        # what makes the gap wide enough to land in.
+        index.add({"ids": ids, "embeddings": vectors})
+
+    stop = threading.Event()
+    counts = {"reads": 0, "writes": 0}
+    raised = []
+
+    def reader():
+        while not stop.is_set():
+            try:
+                index.get_stats()
+            except BaseException as exc:  # noqa: BLE001
+                raised.append(f"{type(exc).__name__}: {exc}")
+                stop.set()
+                return
+            counts["reads"] += 1
+
+    def writer():
+        n = 0
+        while not stop.is_set():
+            if path == "insert":
+                batch = [f"churn_{n}_{i}" for i in range(fill)]
+                index.add({"ids": batch, "embeddings": vectors})
+            else:
+                index.add({"ids": ids, "embeddings": vectors})
+                index.clear()
+            counts["writes"] += 1
+            n += 1
+
+    threads = [
+        threading.Thread(target=reader, daemon=True),
+        threading.Thread(target=reader, daemon=True),
+        threading.Thread(target=writer, daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + LIVE_SET_BUDGET_S
+    while (
+        not stop.is_set()
+        and counts["writes"] < LIVE_SET_WRITES
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+    stop.set()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not raised, (
+        f"get_stats saw the two live sets disagree during a {path}: {raised[0]}"
+    )
+    # Both loops have to have run, or the arm proves nothing.
+    assert counts["reads"] > 500, f"the reader barely ran: {counts['reads']}"
+    assert counts["writes"] >= LIVE_SET_WRITES // 2, (
+        f"the writer barely ran: {counts['writes']}"
+    )
+
+
+# ============================================================================
 # save() against concurrent mutation
 # ============================================================================
 #

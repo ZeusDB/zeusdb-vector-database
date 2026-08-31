@@ -675,13 +675,12 @@ def tiers(n):
 
 
 # ------------------------------------------------------------
-# delete, the name four of five comparators use
+# delete, the ordinary name for the operation
 # ------------------------------------------------------------
 def test_delete_dispatches_to_the_two_existing_methods():
     """An alias, and the existing names stay.
 
-    A caller arriving from hnswlib, ChromaDB, Qdrant or LanceDB reaches for
-    index.delete(...) and got an AttributeError.
+    A caller reaches for index.delete(...) and got an AttributeError.
     """
     index = build(6, metadatas=tiers(6))
 
@@ -892,8 +891,8 @@ def test_clear_survives_a_save_and_load():
 def test_construction_parameters_are_typed_properties():
     """int(index.get_stats()['m']) is what a caller wrote before this.
 
-    hnswlib exposes M, ef_construction and max_elements as read-only
-    properties, and every comparator exposes the equivalent typed.
+    The three construction parameters are read back as typed read-only
+    properties, so a caller reads an int rather than parsing a string.
     """
     index = VectorDatabase().create(
         "hnsw", dim=8, space="l2", m=24, ef_construction=120, expected_size=777
