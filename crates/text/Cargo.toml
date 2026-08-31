@@ -1,0 +1,20 @@
+# The text layer, being what turns a string into the term ids and term
+# frequencies a sparse space stores. It depends on zeusdb-vector-core for the
+# vector and error types and on nothing else in the workspace. Nothing in it
+# names Python. The bans in deny.toml and the lint job in ci.yml hold it to
+# that, and `cargo test -p zeusdb-vector-text` links no Python library.
+[package]
+name = "zeusdb-vector-text"
+# The version, the edition and the licence are the workspace's, declared once
+# in the root Cargo.toml.
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Nothing in this workspace is published to crates.io. The wheel is the only
+# artefact.
+publish = false
+
+# Every version is the workspace's, declared once in the root Cargo.toml with
+# the reason for each pin.
+[dependencies]
+zeusdb-vector-core = { workspace = true }

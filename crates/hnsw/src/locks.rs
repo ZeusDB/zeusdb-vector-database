@@ -175,10 +175,12 @@ pub mod order {
     pub(super) fn space_of(rank: u8) -> Option<(usize, &'static str)> {
         if (SPACE_BASE..AFTER_SPACES).contains(&rank) {
             let offset = rank - SPACE_BASE;
+            // The second guard holds the codes of a dense space and the
+            // term dictionary of a sparse one.
             let which = if offset.is_multiple_of(SPACE_STRIDE) {
                 "index"
             } else {
-                "codes"
+                "codes or terms"
             };
             return Some(((offset / SPACE_STRIDE) as usize, which));
         }
@@ -561,7 +563,7 @@ mod tests {
                 vec![
                     "rev_map",
                     "space 0's index guard",
-                    "space 0's codes guard",
+                    "space 0's codes or terms guard",
                     "space 1's index guard",
                     "vector_metadata"
                 ]

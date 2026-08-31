@@ -47,7 +47,7 @@ mod rerank;
 pub use collection::{
     Added, Collection, Declaration, DenseConfig, Listing, ParsedRecord, ParsedRecords,
     QuantizationConfig, QuantizationReport, QuantizerReport, QueryHits, RebuildPlan, RecordView,
-    SpaceConfig, SparseHits, StorageMode, DEFAULT_SPACE,
+    SpaceConfig, SparseHits, StorageMode, TextConfig, DEFAULT_SPACE,
 };
 pub use rerank::{
     calibrate_rerank_from_sample, default_rerank_fetch, prepare_reconstruction, raw_distance_fn,
@@ -55,5 +55,6 @@ pub use rerank::{
     RerankPlan, SearchParams, DEFAULT_RERANK_CORPUS_DIVISOR, RERANK_CALIBRATION_PAGES,
     RERANK_CALIBRATION_TOP_K,
 };
-pub use zeusdb_vector_core::SpaceName;
-pub use zeusdb_vector_sparse::{SparseConfig, Unlink};
+pub use zeusdb_vector_core::{IdfScope, SpaceName};
+pub use zeusdb_vector_sparse::{SparseConfig, Unlink, Weighting};
+pub use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerConfig};

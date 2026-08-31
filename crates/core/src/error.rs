@@ -265,6 +265,19 @@ pub enum Error {
     SparseDimsNotIncreasing { position: usize },
     /// A sparse vector holding a NaN or an infinity
     SparseValueNotFinite { index: usize, value: f32 },
+    /// A stored value at or below zero offered to a space whose scoring rule
+    /// reads every value as a term frequency
+    SparseValueNotPositive { index: usize, value: f32 },
+    /// A term weighting parameter outside its range
+    SparseWeightingInvalid {
+        parameter: &'static str,
+        value: f32,
+        rule: &'static str,
+    },
+    /// Text offered to a collection whose sparse space takes term ids alone
+    NoTextLayer,
+    /// A term dictionary that has issued every id it can
+    TermIdsExhausted,
 
     // ------------------------------------------------------------------
     // Logging
@@ -484,12 +497,17 @@ impl Error {
             | SpaceKindMismatch { .. }
             | SparseVectorShape { .. }
             | SparseDimsNotIncreasing { .. }
-            | SparseValueNotFinite { .. } => Exception::Value,
+            | SparseValueNotFinite { .. }
+            | SparseValueNotPositive { .. }
+            | SparseWeightingInvalid { .. }
+            | NoTextLayer => Exception::Value,
 
             RecordsAbsent { .. }
             | ListCursorMissing { .. }
             | SpaceUnknown { .. }
             | RecordNotHeld { .. } => Exception::Key,
+
+            TermIdsExhausted => Exception::Runtime,
 
             ArtefactReadFailed { .. }
             | ArtefactsMissing { .. }
@@ -903,6 +921,23 @@ impl fmt::Display for Error {
                 "Sparse vector contains invalid value at index {}: {} (must be finite)",
                 index, value
             ),
+            SparseValueNotPositive { index, value } => write!(
+                f,
+                "Sparse vector value at index {} is {}, and a space weighted by term \
+                 frequency takes values above zero alone",
+                index, value
+            ),
+            SparseWeightingInvalid {
+                parameter,
+                value,
+                rule,
+            } => write!(
+                f,
+                "Term weighting parameter {} is {}, and it must be {}",
+                parameter, value, rule
+            ),
+            NoTextLayer => f.write_str("This collection's sparse space takes no text"),
+            TermIdsExhausted => f.write_str("The term dictionary has issued every id it can"),
 
             LogDirEmpty => f.write_str("log_dir cannot be empty"),
 

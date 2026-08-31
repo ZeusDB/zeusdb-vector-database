@@ -11,6 +11,11 @@
 //! removed under each of the three policies, with the admit sets rebuilt to
 //! exclude them and once left as they were, then `vector` against the corpus
 //! for every id, then a save and a restore, then a compaction.
+//!
+//! The term frequency weighting has a verifier of its own, `verify_bm25`,
+//! whose brute force counts the document frequencies over the admitted
+//! records itself and applies the formula from its definition, under both
+//! corpus scopes, through the same states.
 
 use std::collections::HashMap;
 
@@ -20,8 +25,9 @@ use zeusdb_vector_core::{
 };
 
 use crate::corpus::{self, Corpus, Rng};
-use crate::index::{PostingsIndex, SparseConfig, Unlink};
+use crate::index::{PostingsIndex, SparseConfig, Unlink, Weighting};
 use crate::search::Mode;
+use zeusdb_vector_core::IdfScope;
 
 const MODES: [Mode; 6] = [
     Mode::Auto,
@@ -33,8 +39,13 @@ const MODES: [Mode; 6] = [
 ];
 
 fn build(corpus: &Corpus, unlink: Unlink) -> PostingsIndex {
+    build_weighted(corpus, unlink, Weighting::Dot)
+}
+
+fn build_weighted(corpus: &Corpus, unlink: Unlink, weighting: Weighting) -> PostingsIndex {
     let mut index = PostingsIndex::new(SparseConfig {
         unlink,
+        weighting,
         ..SparseConfig::default()
     });
     for (i, d) in corpus.docs.iter().enumerate() {
@@ -336,6 +347,337 @@ pub(crate) fn verify(regime: &str, n: usize, nq: usize) -> (usize, usize) {
     );
 
     (tally.pages, tally.differ)
+}
+
+/// The term frequency weighting by brute force, written from the formula
+/// rather than from the index's scorer. The document frequencies are counted
+/// over the admitted live records by a walk of the corpus, or over every
+/// live record under the global scope, and each admitted live record is
+/// scored by a merge in ascending dimension order with the same single
+/// precision arithmetic the scan applies, so the comparison is on exact
+/// equality. The mean length is the index's own, checked separately against
+/// a fresh sum.
+#[allow(clippy::too_many_arguments)]
+fn brute_bm25(
+    corpus: &Corpus,
+    dead: &Bitmap,
+    admit: &dyn Admit,
+    scope: IdfScope,
+    q: SparseRef<'_>,
+    k: usize,
+    k1: f32,
+    b: f32,
+    mean: f64,
+) -> Vec<Hit> {
+    let admitted = |i: usize| {
+        let id = RecordId(i as u32 + 1);
+        !dead.contains(id.slot()) && admit.admits(id)
+    };
+    let live = |i: usize| !dead.contains(i + 1);
+    let counted: &dyn Fn(usize) -> bool = match scope {
+        IdfScope::Corpus => &admitted,
+        IdfScope::Global => &live,
+    };
+    let mut documents = 0usize;
+    let mut df = vec![0usize; q.dims.len()];
+    for (i, d) in corpus.docs.iter().enumerate() {
+        if !counted(i) {
+            continue;
+        }
+        documents += 1;
+        for (j, dim) in q.dims.iter().enumerate() {
+            if d.dims.binary_search(dim).is_ok() {
+                df[j] += 1;
+            }
+        }
+    }
+    let n = documents as f64;
+    let weights: Vec<f32> = q
+        .values
+        .iter()
+        .zip(&df)
+        .map(|(&qw, &df)| {
+            if df == 0 {
+                0.0
+            } else {
+                let df = df as f64;
+                (qw as f64 * (1.0 + (n - df + 0.5) / (df + 0.5)).ln() * (k1 as f64 + 1.0)) as f32
+            }
+        })
+        .collect();
+    let c0 = k1 * (1.0 - b);
+    let c1 = (k1 as f64 * b as f64 / if mean > 0.0 { mean } else { 1.0 }) as f32;
+    let mut cands: Vec<(f32, u32)> = Vec::new();
+    for (i, d) in corpus.docs.iter().enumerate() {
+        if !admitted(i) {
+            continue;
+        }
+        let len = d.values.iter().map(|&v| v as f64).sum::<f64>() as f32;
+        let mut s = 0f32;
+        for (j, dim) in q.dims.iter().enumerate() {
+            if let Ok(at) = d.dims.binary_search(dim) {
+                let tf = d.values[at];
+                s += weights[j] * tf / (tf + c0 + c1 * len);
+            }
+        }
+        if s != 0.0 {
+            cands.push((s, i as u32 + 1));
+        }
+    }
+    cands.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    cands.truncate(k);
+    cands
+        .into_iter()
+        .map(|(s, id)| Hit {
+            id: RecordId(id),
+            score: s,
+        })
+        .collect()
+}
+
+/// A fresh mean length from the corpus, for the check of the running sum.
+fn fresh_mean(corpus: &Corpus, dead: &Bitmap) -> f64 {
+    let (mut total, mut live) = (0f64, 0usize);
+    for (i, d) in corpus.docs.iter().enumerate() {
+        if dead.contains(i + 1) {
+            continue;
+        }
+        total += d.values.iter().map(|&v| v as f64).sum::<f64>() as f32 as f64;
+        live += 1;
+    }
+    if live == 0 {
+        0.0
+    } else {
+        total / live as f64
+    }
+}
+
+/// Every loop under every admit shape and both scopes against the brute
+/// force weighting, for one index state.
+#[allow(clippy::too_many_arguments)]
+fn check_bm25(
+    tally: &mut Tally,
+    label: &str,
+    corpus: &Corpus,
+    index: &PostingsIndex,
+    dead: &Bitmap,
+    admits: &[(&str, &dyn Admit)],
+    k: usize,
+    k1: f32,
+    b: f32,
+) {
+    let mean = index.mean_length();
+    let fresh = fresh_mean(corpus, dead);
+    assert!(
+        (mean - fresh).abs() <= 1e-9 * fresh.max(1.0),
+        "{label}: the running length total drifted, {mean} against {fresh}"
+    );
+    for (aname, admit) in admits {
+        for scope in [IdfScope::Corpus, IdfScope::Global] {
+            for mode in MODES {
+                if mode == Mode::Floor && (*aname != "live" || dead.count() > 0) {
+                    continue;
+                }
+                for q in &corpus.queries {
+                    let expect =
+                        brute_bm25(corpus, dead, *admit, scope, q.as_ref(), k, k1, b, mean);
+                    let got = index
+                        .search_scoped(mode, q.as_ref(), k, *admit, false, scope)
+                        .unwrap();
+                    assert!(got.exact);
+                    tally.pages += 1;
+                    if !same(&expect, &got.items) {
+                        tally.differ += 1;
+                        if tally.differ == 1 {
+                            eprintln!(
+                                "first mismatch {label} {aname} {scope:?} {mode:?}: expect {:?} got {:?}",
+                                &expect[..expect.len().min(3)],
+                                &got.items[..got.items.len().min(3)]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The whole verification of the term frequency weighting over one regime
+/// at one size: fresh, a fifth removed under the lazy policy with the admit
+/// sets rebuilt and left stale, restored, and compacted.
+pub(crate) fn verify_bm25(regime: &str, n: usize, nq: usize) -> (usize, usize) {
+    let corpus = corpus::corpus(regime, n, nq);
+    let (k, k1, b) = (10, 1.2f32, 0.75f32);
+    let mut tally = Tally {
+        pages: 0,
+        differ: 0,
+    };
+    let none = Bitmap::default();
+    let live = live_bitmap(n, &none);
+    let narrow = filter_bitmap(n, 100, 7, &none);
+    let mut sorted_ids: Vec<RecordId> =
+        (0..50).map(|i| RecordId((i * 97 % n + 1) as u32)).collect();
+    sorted_ids.sort();
+    sorted_ids.dedup();
+    let chained = Candidates::Sorted(sorted_ids.clone());
+    let admits: Vec<(&str, &dyn Admit)> = vec![
+        ("live", &live),
+        ("filter_10pct", &narrow),
+        ("chained_50", &chained),
+    ];
+    let mut lazy = build_weighted(&corpus, Unlink::Lazy, Weighting::Bm25 { k1, b });
+    check_bm25(
+        &mut tally, "fresh", &corpus, &lazy, &none, &admits, k, k1, b,
+    );
+
+    // The trait's own search under a set admitting everything is the
+    // global weighting over the live set, and the trait's statistics under
+    // the filter count what the filter admits.
+    {
+        let object: &dyn VectorIndex<zeusdb_vector_core::Sparse> = &lazy;
+        let mean = lazy.mean_length();
+        for q in &corpus.queries {
+            let hits = object
+                .search(q.as_ref(), k, &Candidates::All, &Budget::default())
+                .unwrap();
+            tally.pages += 1;
+            let expect = brute_bm25(
+                &corpus,
+                &none,
+                &live,
+                IdfScope::Global,
+                q.as_ref(),
+                k,
+                k1,
+                b,
+                mean,
+            );
+            if !same(&hits.items, &expect) {
+                tally.differ += 1;
+            }
+            let stats = object.corpus_stats(&q.dims, &narrow).unwrap();
+            assert_eq!(stats.documents, narrow.count());
+        }
+    }
+
+    let mut rng = Rng::new(99);
+    let mut dead = Bitmap::default();
+    let mut doomed = Vec::new();
+    for id in 1..=n {
+        if rng.below(100) < 20 {
+            dead.insert(id);
+            doomed.push(RecordId(id as u32));
+        }
+    }
+    for id in &doomed {
+        lazy.remove(*id).unwrap();
+    }
+    let live_after = live_bitmap(n, &dead);
+    let narrow_after = filter_bitmap(n, 100, 7, &dead);
+    let chained_after = Candidates::Sorted(
+        sorted_ids
+            .iter()
+            .copied()
+            .filter(|id| !dead.contains(id.slot()))
+            .collect(),
+    );
+    let admits_after: Vec<(&str, &dyn Admit)> = vec![
+        ("live", &live_after),
+        ("filter_10pct", &narrow_after),
+        ("chained_50", &chained_after),
+    ];
+    let admits_stale: Vec<(&str, &dyn Admit)> = vec![
+        ("live_stale", &live),
+        ("filter_10pct_stale", &narrow),
+        ("chained_50_stale", &chained),
+    ];
+    check_bm25(
+        &mut tally,
+        "removed",
+        &corpus,
+        &lazy,
+        &dead,
+        &admits_after,
+        k,
+        k1,
+        b,
+    );
+    check_bm25(
+        &mut tally,
+        "removed_stale",
+        &corpus,
+        &lazy,
+        &dead,
+        &admits_stale,
+        k,
+        k1,
+        b,
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut manifest = Manifest::default();
+    lazy.write("bm25.", dir.path(), &mut manifest).unwrap();
+    let bounds = Bounds {
+        min_records: 0,
+        max_records: n,
+        max_bytes: 1 << 34,
+    };
+    let restored =
+        PostingsIndex::restore(lazy.config(), "bm25.", dir.path(), &manifest, &bounds).unwrap();
+    check_bm25(
+        &mut tally,
+        "restored",
+        &corpus,
+        &restored,
+        &dead,
+        &admits_after,
+        k,
+        k1,
+        b,
+    );
+
+    lazy.compact();
+    check_bm25(
+        &mut tally,
+        "compacted",
+        &corpus,
+        &lazy,
+        &dead,
+        &admits_stale,
+        k,
+        k1,
+        b,
+    );
+
+    (tally.pages, tally.differ)
+}
+
+#[test]
+fn the_text_regime_weighted_by_term_frequency_matches_brute_force() {
+    let (pages, differ) = verify_bm25("text", 3_000, 40);
+    assert_eq!(
+        differ, 0,
+        "{differ} of {pages} pages differ from brute force"
+    );
+    assert!(pages > 6_000);
+}
+
+#[test]
+fn the_splade_regime_weighted_by_term_frequency_matches_brute_force() {
+    let (pages, differ) = verify_bm25("splade", 1_000, 30);
+    assert_eq!(
+        differ, 0,
+        "{differ} of {pages} pages differ from brute force"
+    );
+    assert!(pages > 4_000);
+}
+
+#[test]
+#[ignore]
+fn the_text_regime_weighted_by_term_frequency_matches_brute_force_at_scale() {
+    let (pages, differ) = verify_bm25("text", 50_000, 100);
+    eprintln!("text bm25 at scale: {pages} pages, {differ} differ");
+    assert_eq!(differ, 0);
 }
 
 #[test]

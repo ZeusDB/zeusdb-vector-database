@@ -1058,6 +1058,7 @@ dependencies = [
  "tracing",
  "zeusdb-vector-core",
  "zeusdb-vector-sparse",
+ "zeusdb-vector-text",
 ]
 
 [[package]]
@@ -1081,6 +1082,13 @@ version = "0.9.0"
 dependencies = [
  "tempfile",
  "tracing",
+ "zeusdb-vector-core",
+]
+
+[[package]]
+name = "zeusdb-vector-text"
+version = "0.9.0"
+dependencies = [
  "zeusdb-vector-core",
 ]
 

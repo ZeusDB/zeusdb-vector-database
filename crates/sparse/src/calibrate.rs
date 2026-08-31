@@ -9,7 +9,7 @@
 use std::time::Instant;
 
 use tracing::debug;
-use zeusdb_vector_core::{Bitmap, SparseRef, SparseVector};
+use zeusdb_vector_core::{Bitmap, IdfScope, SparseRef, SparseVector};
 
 use crate::index::PostingsIndex;
 use crate::search::Mode;
@@ -166,12 +166,13 @@ impl PostingsIndex {
         // The scan with no predicate, per posting.
         let posting_ns = median(ROUNDS, || {
             for q in &queries {
-                let _ = std::hint::black_box(self.search_mode(
+                let _ = std::hint::black_box(self.search_scoped(
                     Mode::Floor,
                     q.as_ref(),
                     10,
                     &all,
                     false,
+                    IdfScope::Global,
                 ));
             }
             postings
@@ -180,12 +181,13 @@ impl PostingsIndex {
         // and rejected, per posting.
         let reject_ns = median(ROUNDS, || {
             for q in &queries {
-                let _ = std::hint::black_box(self.search_mode(
+                let _ = std::hint::black_box(self.search_scoped(
                     Mode::BitmapPerPosting,
                     q.as_ref(),
                     10,
                     &nothing,
                     false,
+                    IdfScope::Global,
                 ));
             }
             postings
@@ -219,12 +221,13 @@ impl PostingsIndex {
         // half the misprediction cost.
         let half_ns = median(ROUNDS, || {
             for q in &queries {
-                let _ = std::hint::black_box(self.search_mode(
+                let _ = std::hint::black_box(self.search_scoped(
                     Mode::BitmapPerPosting,
                     q.as_ref(),
                     10,
                     &half,
                     false,
+                    IdfScope::Global,
                 ));
             }
             postings
@@ -237,12 +240,13 @@ impl PostingsIndex {
             queries.iter().map(|q| q.dims.len()).sum::<usize>() as f64 / queries.len() as f64;
         let enumerate_ns = median(ROUNDS, || {
             for q in &queries {
-                let _ = std::hint::black_box(self.search_mode(
+                let _ = std::hint::black_box(self.search_scoped(
                     Mode::Enumerate,
                     q.as_ref(),
                     10,
                     &few,
                     false,
+                    IdfScope::Global,
                 ));
             }
             few_count * queries.len()

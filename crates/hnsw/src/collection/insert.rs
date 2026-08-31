@@ -1688,6 +1688,9 @@ impl Collection {
         // its own guard taken alone.
         if let Some(space) = self.sparse() {
             *space.index.write().unwrap() = PostingsIndex::new(space.config().clone());
+            if let Some(text) = &space.text {
+                *text.dictionary.write().unwrap() = zeusdb_vector_text::TermDictionary::new();
+            }
         }
 
         // An index still collecting for training starts collecting again,

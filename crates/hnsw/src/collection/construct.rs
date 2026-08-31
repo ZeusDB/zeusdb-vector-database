@@ -9,7 +9,7 @@
 
 use super::{
     Collection, DenseIndex, DenseSpace, LiveRecords, NamedSpace, QuantizationConfig, Space,
-    SparseSpace, StorageMode, DEFAULT_SPACE, MAX_LAYER,
+    SparseSpace, StorageMode, TextLayer, DEFAULT_SPACE, MAX_LAYER,
 };
 use crate::locks::{order, MutexAt, RwLockAt};
 use chrono::Utc;
@@ -20,6 +20,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, trace};
 use zeusdb_vector_core::{validate_indexed_fields, ColumnStore, Error, SpaceName, VectorGraph, PQ};
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
+use zeusdb_vector_text::{TermDictionary, Tokenizer};
 
 /// The target every record this file emits carries. See the parent module.
 const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::construct";
@@ -393,9 +394,18 @@ pub struct Declaration {
     ef_construction: usize,
     expected_size: usize,
     indexed_fields: Vec<String>,
-    /// A sparse space beside the dense one, by name. Declared through
-    /// [`Declaration::with_sparse`], which nothing in the binding calls.
-    sparse: Option<(SpaceName, SparseConfig)>,
+    /// A sparse space beside the dense one, by name, with a tokenizer
+    /// where it takes text. Declared through [`Declaration::with_sparse`]
+    /// or [`Declaration::with_text`], which nothing in the binding calls.
+    sparse: Option<SparseDeclaration>,
+}
+
+/// A sparse space as declared.
+#[derive(Debug, Clone)]
+pub(crate) struct SparseDeclaration {
+    pub(crate) name: SpaceName,
+    pub(crate) config: SparseConfig,
+    pub(crate) tokenizer: Option<Arc<dyn Tokenizer>>,
 }
 
 impl Declaration {
@@ -429,7 +439,32 @@ impl Declaration {
     /// The name is refused where it is empty or is the dense space's, and a
     /// second sparse space is refused, since a collection holds one dense
     /// space and at most one sparse space.
-    pub fn with_sparse(mut self, name: &str, config: SparseConfig) -> Result<Self, Error> {
+    pub fn with_sparse(self, name: &str, config: SparseConfig) -> Result<Self, Error> {
+        self.declare_sparse(name, config, None)
+    }
+
+    /// Declare a sparse space with a text layer beside the dense one.
+    ///
+    /// The same rules as [`Declaration::with_sparse`], and the space takes
+    /// text through `Collection::vectorize_texts` and `search_text` as well
+    /// as term ids. The tokenizer is the caller's to keep: an index that
+    /// used one the engine cannot write down must be handed the same
+    /// implementation when it is opened.
+    pub fn with_text(
+        self,
+        name: &str,
+        config: SparseConfig,
+        tokenizer: Arc<dyn Tokenizer>,
+    ) -> Result<Self, Error> {
+        self.declare_sparse(name, config, Some(tokenizer))
+    }
+
+    fn declare_sparse(
+        mut self,
+        name: &str,
+        config: SparseConfig,
+        tokenizer: Option<Arc<dyn Tokenizer>>,
+    ) -> Result<Self, Error> {
         let name = SpaceName::new(name)?;
         if name.as_str() == DEFAULT_SPACE {
             return Err(Error::SpaceDeclaredTwice {
@@ -439,7 +474,12 @@ impl Declaration {
         if self.sparse.is_some() {
             return Err(Error::SpacesTooMany { max: 2 });
         }
-        self.sparse = Some((name, config));
+        config.validate()?;
+        self.sparse = Some(SparseDeclaration {
+            name,
+            config,
+            tokenizer,
+        });
         Ok(self)
     }
 
@@ -704,7 +744,7 @@ impl Collection {
         quantization_config: Option<QuantizationConfig>,
         pq: Option<Arc<PQ>>,
         hnsw: VectorGraph,
-        sparse: Option<(SpaceName, SparseConfig)>,
+        sparse: Option<SparseDeclaration>,
     ) -> Self {
         let keeps_raw = quantization_config
             .as_ref()
@@ -725,7 +765,12 @@ impl Collection {
                 training_completed_at: RwLockAt::new(order::space_trained_at(0), None),
             }),
         }];
-        if let Some((name, config)) = sparse {
+        if let Some(SparseDeclaration {
+            name,
+            config,
+            tokenizer,
+        }) = sparse
+        {
             let position = spaces.len();
             spaces.push(NamedSpace {
                 name,
@@ -735,6 +780,13 @@ impl Collection {
                         PostingsIndex::new(config.clone()),
                     ),
                     config,
+                    text: tokenizer.map(|tokenizer| TextLayer {
+                        tokenizer,
+                        dictionary: RwLockAt::new(
+                            order::space_codes(position),
+                            TermDictionary::new(),
+                        ),
+                    }),
                 }),
             });
         }
