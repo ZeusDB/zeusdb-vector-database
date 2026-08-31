@@ -105,10 +105,9 @@ const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::search";
 /// **aborted the process** with exit status 3221226505, and `top_k=2**33`
 /// died the same way asking for 137 GB. Nothing checked either argument.
 ///
-/// The ceiling is four times the largest page any comparable engine serves,
-/// Milvus at 16,384, and six times Elasticsearch's 10,000, so no real caller
-/// is refused. At the ceiling the heaps are 2 MiB and the result list is
-/// 65,536 Python dicts, which is slow and is what was asked for.
+/// The ceiling is far above any page a caller has reason to ask for, so no
+/// real caller is refused. At the ceiling the heaps are 2 MiB and the result
+/// list is 65,536 Python dicts, which is slow and is what was asked for.
 const MAX_TOP_K: usize = 65_536;
 
 /// Largest `ef_search` a search may pass, being the default `ef_search` at

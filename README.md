@@ -1769,7 +1769,7 @@ print(matched({"$not": {"tier": "free"}}))
 # Records with no lang field at all, which no operator can select.
 print(matched({"$not": {"lang": {"all": []}}}))
 
-# None of these, which is Qdrant's must_not over a group.
+# None of these, which is a negated disjunction over a group.
 print(matched({"$not": {"$or": [{"lang": "es"}, {"tier": "gold"}]}}))
 ```
 

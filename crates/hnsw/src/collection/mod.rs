@@ -532,9 +532,13 @@ impl DenseSpace {
         drop(old);
     }
 
-    /// Replace the whole index, which `clear` does with a fresh graph and an
-    /// empty live set. The old graph is dropped outside the guard, for the
-    /// reason `replace_graph` gives.
+    /// Replace the whole index, which the loader does with the index it
+    /// restored from a dump. The old graph is dropped outside the guard, for
+    /// the reason `replace_graph` gives.
+    ///
+    /// `clear` swaps the index itself rather than calling this, because it has
+    /// to empty the collection's live set and the index's under one
+    /// acquisition and this takes the index guard alone.
     pub(crate) fn replace_index(&self, fresh: DenseIndex) {
         let old = {
             let mut index = self.index.write().unwrap();

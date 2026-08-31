@@ -660,9 +660,8 @@ impl HNSWIndex {
     /// The graph degree, and the one creation parameter `rebuild` can change.
     ///
     /// Reachable before this only as `int(index.get_stats()["m"])`, which is a
-    /// number formatted into a string and parsed back. hnswlib exposes `M`,
-    /// `ef_construction` and `max_elements` as read-only properties by those
-    /// names, and every other comparator exposes the equivalent typed.
+    /// number formatted into a string and parsed back. A caller reads the
+    /// construction parameters as typed properties instead.
     ///
     /// Read-only, because `m` is what the graph was built with. Assigning it
     /// would describe a graph that does not exist. Changing it for real is
@@ -688,8 +687,8 @@ impl HNSWIndex {
     /// Python property: `index.expected_size`
     ///
     /// The record count declared at creation. A capacity hint rather than a
-    /// cap, unlike hnswlib's `max_elements`, so an index that grows past it
-    /// grows the graph rather than raising. It selected the default `m` and it
+    /// cap, so an index that grows past it grows the graph rather than
+    /// raising. It selected the default `m` and it
     /// sized the initial reservation, which is why it is worth reading back.
     ///
     /// `len(index)` is the actual count and this is the declaration. The two
@@ -1028,10 +1027,10 @@ impl HNSWIndex {
     ///
     /// An alias. `delete(ids=...)` is `remove_points`, `delete(where=...)` is
     /// `remove_where`, and both of those stay. It exists because `delete` is
-    /// what four of the five comparators call the operation, so a caller
-    /// arriving from any of them reaches for `index.delete(...)`, gets an
-    /// `AttributeError`, and has to go looking. The existing family compounds
-    /// that: `remove_point` and `remove_points` differ by one character.
+    /// the ordinary name for the operation, so a caller reaches for
+    /// `index.delete(...)`, gets an `AttributeError`, and has to go looking.
+    /// The existing family compounds that: `remove_point` and `remove_points`
+    /// differ by one character.
     ///
     /// **Both arguments is an error.** Two selections do not compose into one
     /// without a rule, and either rule is a guess. The union deletes records

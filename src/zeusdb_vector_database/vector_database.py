@@ -335,9 +335,9 @@ class VectorDatabase:
         # It defaulted to 1536 up to 0.7.0, so vdb.create("hnsw") built a
         # 1,536 wide index and then rejected every vector of any other width
         # with a dimension mismatch, reporting the mistake at the add rather
-        # than at the call that made it. No comparator defaults the dimension:
-        # hnswlib and Qdrant require it and ChromaDB infers it from the first
-        # batch.
+        # than at the call that made it. There is no safe default: a width
+        # is either declared or inferred from the first batch, and this
+        # engine declares it.
         #
         # There is no value that could be right. Every other default here is
         # either measured on this index's own data or right for the large
@@ -595,8 +595,8 @@ class VectorDatabase:
         # default of 8 bits the floor governs and the effective rate is 39
         # points per centroid.
         #
-        # faiss targets 256 points per centroid and warns below 39, so this
-        # sits exactly at its warning floor. Raising it to faiss's target was
+        # 39 points per centroid is the floor below which a codebook is
+        # fitted on too little data to be stable. Raising it to 256 was
         # measured rather than assumed, at dim 768 over 100,000 records on an
         # anisotropic embedding-like corpus, 100 queries:
         #
@@ -675,10 +675,6 @@ class VectorDatabase:
     # documented in the README rather than taken by default, because it costs
     # more memory than not quantizing at 10,000 records and five times the build
     # at 100,000.
-    #
-    # The field runs lower still, LanceDB at 32x and Weaviate at 24x, and
-    # neither holds the raw vectors alongside the codes as this mode does, so
-    # neither has reranking to lean on.
     DEFAULT_SUBVECTOR_WIDTH = 32
 
     # Floor on the derived count. A code is one byte per subvector, so a small

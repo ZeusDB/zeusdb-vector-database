@@ -148,21 +148,44 @@ impl Collection {
         );
     }
 
-    /// Put one record into the dense index, in the two phases the graph
-    /// splits an insertion into.
+    /// Put one record into the dense index and name it in the record set, in
+    /// the two phases the graph splits an insertion into.
     ///
     /// ```text
     /// index.read()   prepare: quantize where the graph holds codes, draw the
     ///                level, descend, choose the neighbour lists
     ///   drop
+    /// id_map.write()
+    /// rev_map.write()
     /// index.write()  insert: append the node, install its lists, update the
-    ///                reverse links, mark the record live
+    ///                reverse links, mark the record live, and name it in
+    ///                both id maps
     /// ```
     ///
     /// This is the only caller that takes the index lock twice for one
     /// operation, and it is the only one that needs to. The three rebuild paths
     /// each fill a local graph nobody else can reach and swap it in under one
     /// write guard, so they insert with no lock held at all.
+    ///
+    /// # Why the two id maps are written here
+    ///
+    /// The dense index keeps its own live set and the collection keeps one
+    /// beside `rev_map`, and the two are the same set. Writing the maps in
+    /// their own block above and the live bit here left the invariant false
+    /// for the whole of phase one, which is where an insertion spends its
+    /// time, so a reader taking no mutation guard saw the collection holding a
+    /// record the index did not. `get_stats` is such a reader, and on a build
+    /// with debug assertions its check of the two sets fired. The two writes
+    /// are one write, so they happen under one acquisition, which is what
+    /// `remove_under_guards` already does with the same pair.
+    ///
+    /// It costs nothing on the search path. A search takes `id_map`, `rev_map`
+    /// and the index read guards in that order and holds all three for its
+    /// whole traversal, so a writer waiting for the index write guard was
+    /// already waiting for exactly those searches. What is new is that the
+    /// maps are held across phase two, being the fixed `m * 2 * m` memory
+    /// operations the index guard was already held across, and not across
+    /// phase one.
     ///
     /// # Why the split
     ///
@@ -185,26 +208,41 @@ impl Collection {
     /// survives it, and `VectorGraph::install` asserts the node count the plan
     /// was made against rather than taking that argument on trust.
     ///
+    /// The record is named in the maps after the index has accepted it, so an
+    /// insertion the index refuses leaves the record set untouched rather than
+    /// naming a record the graph does not hold.
+    ///
     /// # The lock order
     ///
-    /// Both guards are taken with no other guard held. The three storage maps
-    /// this record has already been written to were each taken and released in
-    /// their own block above, so `hnsw` is acquired alone, which satisfies the
-    /// order declared on `Collection` whichever way it is read.
+    /// Phase one takes the index read guard with no other guard held. Phase two
+    /// takes `id_map`, `rev_map` and the index in that order, which is the
+    /// order declared on `Collection` and the order `removal_guards` takes the
+    /// same three in. The metadata and the columns this record has already been
+    /// written to were taken and released in their own block above, and they
+    /// rank below the index, so nothing here is held out of order.
     ///
     /// Returns the codes the graph installed where it holds codes, so the
     /// caller can key them by external id for the paths that reach a record
     /// by name. They are read under the write guard the install took, so a
     /// search sees the node and its codes together or neither.
-    fn insert_one(&self, vector: &[f32], internal_id: usize) -> Result<Option<Vec<u8>>, Error> {
+    fn insert_one(
+        &self,
+        external_id: &str,
+        vector: &[f32],
+        internal_id: usize,
+    ) -> Result<Option<Vec<u8>>, Error> {
         let id = RecordId::from_slot(internal_id);
         let prepared = {
             let index = self.dense().index.read().unwrap();
             index.prepare(id, vector)?
         };
         let (codes, due) = {
+            let mut id_map = self.id_map.write().unwrap();
+            let mut rev_map = self.rev_map.write().unwrap();
             let mut index = self.dense().index.write().unwrap();
             index.insert(id, vector, prepared)?;
+            id_map.insert(external_id.to_string(), internal_id);
+            rev_map.insert(internal_id, external_id.to_string());
             (
                 index.graph().codes_of(internal_id).map(<[u8]>::to_vec),
                 index.due_for_timing(),
@@ -1117,20 +1155,14 @@ impl Collection {
             vector_metadata.insert(id.clone(), metadata);
         }
 
-        // Update ID mappings
-        {
-            let mut id_map = self.id_map.write().unwrap();
-            let mut rev_map = self.rev_map.write().unwrap();
-
-            id_map.insert(id.clone(), internal_id);
-            rev_map.insert(internal_id, id.clone());
-        }
-
-        // Insert the processed vector into the graph, in the two phases the
-        // graph splits an insertion into. See `insert_one`. This is the only
-        // copy of the vector the index keeps: the store the graph is addressed
-        // against holds it, and there is no second map to write.
-        self.insert_one(&vector, internal_id)?; // Already normalized
+        // Insert the processed vector into the graph and name the record in
+        // both id maps, in the two phases the graph splits an insertion into.
+        // See `insert_one`. The maps are written there rather than here so
+        // that the record enters the collection's live set and the index's
+        // under one acquisition. This is the only copy of the vector the index
+        // keeps: the store the graph is addressed against holds it, and there
+        // is no second map to write.
+        self.insert_one(&id, &vector, internal_id)?; // Already normalized
 
         trace!(target: LOG_TARGET, operation = "add_raw_vector_complete",
             vector_id = %id,
@@ -1262,22 +1294,17 @@ impl Collection {
             vector_metadata.insert(id.clone(), metadata);
         }
 
-        // Update ID mappings
-        {
-            let mut id_map = self.id_map.write().unwrap();
-            let mut rev_map = self.rev_map.write().unwrap();
-
-            id_map.insert(id.clone(), internal_id);
-            rev_map.insert(internal_id, id.clone());
-        }
-
-        // Quantize and insert, in the two phases the graph splits an
-        // insertion into. The index quantizes in the first phase, under the
-        // read guard, and installs the codes in the second, carrying the raw
-        // vector beside them where the storage mode keeps one, because the
-        // node the codes are installed at is the node the raw has to sit at.
-        // See `insert_one`.
-        let codes = self.insert_one(&vector, internal_id)?.unwrap_or_default();
+        // Quantize and insert, and name the record in both id maps, in the two
+        // phases the graph splits an insertion into. The index quantizes in
+        // the first phase, under the read guard, and installs the codes in the
+        // second, carrying the raw vector beside them where the storage mode
+        // keeps one, because the node the codes are installed at is the node
+        // the raw has to sit at. The maps are written in the second phase, so
+        // that the record enters the collection's live set and the index's
+        // under one acquisition. See `insert_one`.
+        let codes = self
+            .insert_one(&id, &vector, internal_id)?
+            .unwrap_or_default();
 
         // Store quantized codes (always), keyed by external id for the paths
         // that reach a record by name.
@@ -1608,11 +1635,26 @@ impl Collection {
             )
         };
 
+        // The replacement index, wrapping the fresh graph, with an empty live
+        // set since the maps below are about to be empty too. Built and timed
+        // before any guard is taken, so the guarded block below is a move and
+        // not a construction.
+        let replacement = self.dense().fresh_index(fresh);
+
         // The storage guards in the order declared on the struct, which is
         // the order every other multi-guard path here takes them in.
-        let removed = {
+        //
+        // The dense index is one of them, between `rev_map` and the codes it
+        // ranks above and below. Emptying `rev_map` here and replacing the
+        // index afterwards left the collection's live set empty while the
+        // index's still held every record, which is the same disagreement the
+        // insertion path carried and which a `get_stats` running beside a
+        // `clear` observed. The two sets are one set, so they empty under one
+        // acquisition.
+        let (removed, old_index) = {
             let mut id_map = self.id_map.write().unwrap();
             let mut rev_map = self.rev_map.write().unwrap();
+            let mut index = self.dense().index.write().unwrap();
             let mut pq_codes = self.dense().pq_codes.write().unwrap();
             let mut vector_metadata = self.vector_metadata.write().unwrap();
             let mut columns = self.columns.write().unwrap();
@@ -1623,6 +1665,7 @@ impl Collection {
             let removed = id_map.len();
             id_map.clear();
             rev_map.clear();
+            let old_index = std::mem::replace(&mut *index, replacement);
             pq_codes.clear();
             vector_metadata.clear();
             // Keeps the declaration and drops every record, which is what
@@ -1632,13 +1675,17 @@ impl Collection {
             training_ids.clear();
             *id_counter = 0;
             *vector_count = 0;
-            removed
+            (removed, old_index)
         };
 
-        // A fresh index over the fresh graph, with an empty live set, since
-        // `id_map` is empty too. The sparse space, where there is one, starts
-        // again as well, under its own guard taken alone.
-        self.dense().replace_index(self.dense().fresh_index(fresh));
+        // The graph that was replaced, dropped with every guard released. A
+        // graph's drop forks to rayon, and a rayon fork under a write guard
+        // deadlocks against a batch search holding the pool; see
+        // `DenseSpace::replace_graph`.
+        drop(old_index);
+
+        // The sparse space, where there is one, starts again as well, under
+        // its own guard taken alone.
         if let Some(space) = self.sparse() {
             *space.index.write().unwrap() = PostingsIndex::new(space.config().clone());
         }
