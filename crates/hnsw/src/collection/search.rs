@@ -90,8 +90,9 @@ use std::time::Instant;
 use tracing::{debug, error, instrument, trace, warn};
 use zeusdb_vector_core::{
     matches_filter, Admit, And, Bitmap, Budget, Candidates, ColumnStore, Error, Filter, Hits,
-    RecordId, Selection, SparseRef, VectorIndex,
+    IdfScope, RecordId, Selection, SparseRef, SparseVector, VectorIndex,
 };
+use zeusdb_vector_text::vectorize_query;
 
 /// The target every record this file emits carries. See the parent module.
 const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::search";
@@ -1060,6 +1061,7 @@ impl Collection {
         query: SparseRef<'_>,
         filter_conditions: Option<&Filter>,
         top_k: usize,
+        idf: IdfScope,
     ) -> Result<SparseHits, Error> {
         if top_k > MAX_TOP_K {
             return Err(Error::TopKTooLarge {
@@ -1085,6 +1087,7 @@ impl Collection {
         );
         let budget = Budget {
             boundary_ties: true,
+            idf,
             ..Budget::default()
         };
         let hits = plan.run(|admit| index.search(query, top_k, admit, &budget))?;
@@ -1102,6 +1105,29 @@ impl Collection {
             .into_iter()
             .map(|(ext_id, score)| (ext_id.clone(), score))
             .collect())
+    }
+
+    /// Search the sparse space with a text, where the space has a text
+    /// layer.
+    ///
+    /// The text is tokenized as the records were and looked up in the
+    /// dictionary under its read guard, taken alone and released before the
+    /// search, and a term no record has carried is dropped. The rest is
+    /// `search_sparse`.
+    pub fn search_text(
+        &self,
+        text: &str,
+        filter_conditions: Option<&Filter>,
+        top_k: usize,
+        idf: IdfScope,
+    ) -> Result<SparseHits, Error> {
+        let space = self.sparse().ok_or(Error::NoSparseSpace)?;
+        let layer = space.text.as_ref().ok_or(Error::NoTextLayer)?;
+        let query: SparseVector = {
+            let dictionary = layer.dictionary.read().unwrap();
+            vectorize_query(&*layer.tokenizer, &dictionary, text)
+        };
+        self.search_sparse(query.as_ref(), filter_conditions, top_k, idf)
     }
 }
 

@@ -5,13 +5,82 @@ use std::path::Path;
 
 use tracing::{debug, trace};
 use zeusdb_vector_core::{
-    Admit, Bitmap, Budget, Cost, Error, Hits, Inventory, Ledger, Persist, Prepared, RecordId,
-    Restore, Selectivity, Sparse, SparseRef, SparseVector, VectorIndex,
+    Admit, Bitmap, Budget, CorpusStats, Cost, Error, Hits, Inventory, Ledger, Persist, Prepared,
+    RecordId, Restore, Selectivity, Sparse, SparseRef, SparseVector, VectorIndex,
 };
 
 use crate::calibrate::UnitCosts;
 use crate::search::Mode;
 use crate::LOG_TARGET;
+
+/// The saturation parameter a term frequency weighted space applies unless
+/// told otherwise. The value the weighting is most often published with.
+pub const DEFAULT_BM25_K1: f32 = 1.2;
+
+/// The length normalisation parameter a term frequency weighted space
+/// applies unless told otherwise. Zero applies none and one applies it in
+/// full.
+pub const DEFAULT_BM25_B: f32 = 0.75;
+
+/// How a stored value and a query value combine into a score.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Weighting {
+    /// The product of the stored value and the query value, summed over the
+    /// dimensions the two share. The values mean whatever the caller's
+    /// encoder decided.
+    Dot,
+    /// Every stored value is a term frequency, and a query term contributes
+    /// its query value times the rarity of the term over the corpus times
+    /// the saturated, length-normalised frequency
+    ///
+    /// ```text
+    /// tf * (k1 + 1) / (tf + k1 * (1 - b + b * length / mean_length))
+    /// ```
+    ///
+    /// where `length` is the record's total term frequency, `mean_length`
+    /// is the mean over the live records, and rarity is
+    /// `ln(1 + (n - df + 0.5) / (df + 0.5))` over a corpus of `n` records
+    /// of which `df` carry the term. The corpus is the admitted records by
+    /// default; see `IdfScope`. Nothing derived from a corpus statistic is
+    /// stored, so every query is scored under the statistics of the moment
+    /// and a record leaving or arriving moves no stored weight.
+    Bm25 { k1: f32, b: f32 },
+}
+
+impl Weighting {
+    /// Term frequency weighting at the published defaults.
+    pub const BM25: Weighting = Weighting::Bm25 {
+        k1: DEFAULT_BM25_K1,
+        b: DEFAULT_BM25_B,
+    };
+
+    /// `k1` is finite and at least zero, and `b` is between zero and one.
+    pub fn validate(&self) -> Result<(), Error> {
+        if let Weighting::Bm25 { k1, b } = *self {
+            if !(k1.is_finite() && k1 >= 0.0) {
+                return Err(Error::SparseWeightingInvalid {
+                    parameter: "k1",
+                    value: k1,
+                    rule: "finite and at least zero",
+                });
+            }
+            if !(b.is_finite() && (0.0..=1.0).contains(&b)) {
+                return Err(Error::SparseWeightingInvalid {
+                    parameter: "b",
+                    value: b,
+                    rule: "between zero and one",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether every stored value is read as a term frequency, which is
+    /// what makes a value at or below zero a refusal at insert.
+    pub fn reads_term_frequency(&self) -> bool {
+        matches!(self, Weighting::Bm25 { .. })
+    }
+}
 
 /// Dead share of a list, in percent of its length, above which a lazy unlink
 /// rewrites the list.
@@ -40,12 +109,14 @@ pub enum Unlink {
 }
 
 /// How a sparse space is declared.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SparseConfig {
     pub unlink: Unlink,
     /// Dead share, in percent of a list's length, above which a lazy unlink
     /// rewrites the list. Read under `Unlink::Lazy` alone.
     pub lazy_threshold_percent: u32,
+    /// The scoring rule.
+    pub weighting: Weighting,
 }
 
 impl Default for SparseConfig {
@@ -53,7 +124,15 @@ impl Default for SparseConfig {
         SparseConfig {
             unlink: Unlink::Lazy,
             lazy_threshold_percent: DEFAULT_LAZY_THRESHOLD_PERCENT,
+            weighting: Weighting::Dot,
         }
+    }
+}
+
+impl SparseConfig {
+    /// The rules a declaration has to satisfy before a space is built on it.
+    pub fn validate(&self) -> Result<(), Error> {
+        self.weighting.validate()
     }
 }
 
@@ -102,6 +181,9 @@ pub struct HeapBytes {
     pub map: usize,
     pub forward: usize,
     pub records: usize,
+    /// The length per record slot, four bytes each.
+    pub lengths: usize,
+    /// The dead set and the live set together.
     pub dead: usize,
 }
 
@@ -112,6 +194,7 @@ impl HeapBytes {
             + self.map
             + self.forward
             + self.records
+            + self.lengths
             + self.dead
     }
 }
@@ -127,11 +210,23 @@ pub struct PostingsIndex {
     pub(crate) fwd_values: Vec<f32>,
     /// By record id. Grows with the id counter, not the live count.
     pub(crate) records: Vec<Slot>,
+    /// Each record's length, being the sum of its values, by record id and
+    /// parallel to `records`. What a term frequency weighting normalises
+    /// by, read once per posting the scan admits. Kept under every
+    /// weighting, since it costs four bytes a slot and one sum an insert.
+    pub(crate) lengths: Vec<f32>,
     /// Records removed and not yet compacted out.
     pub(crate) dead: Bitmap,
+    /// Records held and not removed, being what `holds` answers, as a set a
+    /// filter's bitmap can be intersected with in a walk over words.
+    pub(crate) live_set: Bitmap,
     pub(crate) dead_records: usize,
     pub(crate) live: usize,
     pub(crate) live_nnz: usize,
+    /// The sum of every live record's length, so the mean is a division.
+    /// Recomputed from the records at compaction, which bounds the drift a
+    /// running sum of single-precision lengths accumulates.
+    pub(crate) live_length: f64,
     /// Postings in every list, live and dead.
     pub(crate) postings_total: usize,
     pub(crate) dead_postings: usize,
@@ -151,10 +246,13 @@ impl PostingsIndex {
             fwd_dims: Vec::new(),
             fwd_values: Vec::new(),
             records: Vec::new(),
+            lengths: Vec::new(),
             dead: Bitmap::default(),
+            live_set: Bitmap::default(),
             dead_records: 0,
             live: 0,
             live_nnz: 0,
+            live_length: 0.0,
             postings_total: 0,
             dead_postings: 0,
             units: UnitCosts::FLOOR,
@@ -169,11 +267,32 @@ impl PostingsIndex {
         index.fwd_dims.reserve(nnz);
         index.fwd_values.reserve(nnz);
         index.records.reserve(records.saturating_add(1));
+        index.lengths.reserve(records.saturating_add(1));
         index
     }
 
     pub fn config(&self) -> &SparseConfig {
         &self.config
+    }
+
+    /// Mean length of the live records, being the mean sum of values. Zero
+    /// for an empty index.
+    pub fn mean_length(&self) -> f64 {
+        if self.live == 0 {
+            0.0
+        } else {
+            self.live_length / self.live as f64
+        }
+    }
+
+    /// The length of one live record, being the sum of its values.
+    pub fn length_of(&self, id: RecordId) -> Option<f32> {
+        self.slot_of(id).map(|_| self.lengths[id.slot()])
+    }
+
+    /// The live set, being every record `holds` answers true for.
+    pub fn live_set(&self) -> &Bitmap {
+        &self.live_set
     }
 
     /// Document frequency of a dimension, being the live postings on its
@@ -235,13 +354,15 @@ impl PostingsIndex {
         let map = self.slots_by_dim.capacity() * (std::mem::size_of::<(u32, u32)>() + 1);
         let forward = self.fwd_dims.capacity() * 4 + self.fwd_values.capacity() * 4;
         let records = self.records.capacity() * std::mem::size_of::<Slot>();
-        let dead = self.dead.heap_bytes();
+        let lengths = self.lengths.capacity() * 4;
+        let dead = self.dead.heap_bytes() + self.live_set.heap_bytes();
         HeapBytes {
             lists_postings,
             lists_headers,
             map,
             forward,
             records,
+            lengths,
             dead,
         }
     }
@@ -310,15 +431,18 @@ impl PostingsIndex {
             }
             self.lists[slot as usize].postings.shrink_to_fit();
         }
-        // The forward arena, rebuilt in id order.
+        // The forward arena, rebuilt in id order, and the length total
+        // summed again from the records that survive.
         let mut dims = Vec::with_capacity(self.live_nnz);
         let mut values = Vec::with_capacity(self.live_nnz);
+        let mut live_length = 0f64;
         for (id, slot) in self.records.iter_mut().enumerate() {
             if !slot.held() {
                 continue;
             }
             if self.dead.contains(id) {
                 *slot = NEVER_HELD;
+                self.lengths[id] = 0.0;
                 continue;
             }
             let (s, e) = (slot.start as usize, (slot.start + slot.len) as usize);
@@ -326,13 +450,16 @@ impl PostingsIndex {
             dims.extend_from_slice(&self.fwd_dims[s..e]);
             values.extend_from_slice(&self.fwd_values[s..e]);
             slot.start = start;
+            live_length += self.lengths[id] as f64;
         }
         self.fwd_dims = dims;
         self.fwd_values = values;
+        self.live_length = live_length;
         self.dead = Bitmap::default();
         self.dead_records = 0;
         self.lists.shrink_to_fit();
         self.records.shrink_to_fit();
+        self.lengths.shrink_to_fit();
         self.slots_by_dim.shrink_to_fit();
         debug_assert_eq!(self.dead_postings, 0);
         debug!(
@@ -354,9 +481,20 @@ impl PostingsIndex {
         vector: SparseRef<'_>,
     ) -> Result<(), Error> {
         vector.validate()?;
+        if self.config.weighting.reads_term_frequency() {
+            if let Some((index, &value)) = vector
+                .values
+                .iter()
+                .enumerate()
+                .find(|(_, value)| **value <= 0.0)
+            {
+                return Err(Error::SparseValueNotPositive { index, value });
+            }
+        }
         let slot_index = id.slot();
         if slot_index >= self.records.len() {
             self.records.resize(slot_index + 1, NEVER_HELD);
+            self.lengths.resize(slot_index + 1, 0.0);
         }
         if self.records[slot_index].held() && !self.dead.contains(slot_index) {
             return Err(Error::RecordAlreadyHeld { id: id.0 });
@@ -377,6 +515,10 @@ impl PostingsIndex {
             start,
             len: nnz as u32,
         };
+        let length = vector.values.iter().map(|&v| v as f64).sum::<f64>() as f32;
+        self.lengths[slot_index] = length;
+        self.live_length += length as f64;
+        self.live_set.insert(slot_index);
 
         for (&d, &w) in vector.dims.iter().zip(vector.values) {
             let slot = match self.slots_by_dim.get(&d) {
@@ -428,9 +570,11 @@ impl PostingsIndex {
             return Err(Error::RecordNotHeld { id: id.0 });
         };
         self.dead.insert(id.slot());
+        self.live_set.remove(id.slot());
         self.dead_records += 1;
         self.live -= 1;
         self.live_nnz -= slot.len as usize;
+        self.live_length -= self.lengths[id.slot()] as f64;
         let (s, e) = (slot.start as usize, (slot.start + slot.len) as usize);
         match self.config.unlink {
             Unlink::Strand => {
@@ -537,8 +681,16 @@ impl VectorIndex<Sparse> for PostingsIndex {
         budget: &Budget,
     ) -> Result<Hits, Error> {
         // `ef`, `fetch` and `rerank` name nothing a postings scan has. The
-        // one knob read is the boundary tie rule.
-        self.search_mode(Mode::Auto, query, k, admit, budget.boundary_ties)
+        // two knobs read are the boundary tie rule and the corpus the term
+        // weighting counts over.
+        self.search_scoped(
+            Mode::Auto,
+            query,
+            k,
+            admit,
+            budget.boundary_ties,
+            budget.idf,
+        )
     }
 
     fn cost(&self, query: SparseRef<'_>, k: usize, admitted: Option<&Selectivity>) -> Cost {
@@ -552,7 +704,19 @@ impl VectorIndex<Sparse> for PostingsIndex {
                 // the bitmap scan and the enumerate-driven path.
                 let (scan_ns, enumerate_ns) =
                     self.arm_costs(scan, sel.expected as usize, true, query.nnz());
-                scan_ns.min(enumerate_ns)
+                if self.config.weighting.reads_term_frequency() {
+                    // A term weighting under an admit set first counts the
+                    // query's postings under it, which is the scan's
+                    // predicate loop without its accumulate on the bitmap
+                    // arm and a second merge pass on the enumerate arm.
+                    let (walk_ns, _) = self.arm_costs(scan, 0, true, query.nnz());
+                    let frac = (sel.expected as f64 / self.live.max(1) as f64).min(1.0);
+                    let walk_ns = walk_ns
+                        + scan as f64 * 2.0 * frac * (1.0 - frac) * self.units.mispredict_ns;
+                    (scan_ns + walk_ns).min(2.0 * enumerate_ns)
+                } else {
+                    scan_ns.min(enumerate_ns)
+                }
             }
             None => scan as f64 * self.units.posting_ns,
         };
@@ -560,6 +724,10 @@ impl VectorIndex<Sparse> for PostingsIndex {
             work_ns,
             exact: true,
         }
+    }
+
+    fn corpus_stats(&self, dims: &[u32], admit: &dyn Admit) -> Option<CorpusStats> {
+        self.stats_under(dims, admit)
     }
 }
 

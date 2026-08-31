@@ -302,6 +302,40 @@ pub struct Budget {
     /// rerank against and ignored otherwise.
     pub rerank: Option<usize>,
     pub boundary_ties: bool,
+    /// Which corpus a term-weighted search takes its document frequencies
+    /// from. Read by an index whose scoring rule weights terms by their
+    /// rarity and ignored by every other.
+    pub idf: IdfScope,
+}
+
+/// The corpus a term's rarity is measured over.
+///
+/// A search under a filter ranks the admitted records, and a term common
+/// among them is a weak signal there however rare it is across the whole
+/// index. Weighting by the admitted corpus was measured to rank better than
+/// weighting by the whole index at every filter width tried, and the two are
+/// the same weighting when nothing is filtered, so the admitted corpus is the
+/// default. The cost is one pass over the query's postings under the admit
+/// set, and, where a filter admits a few hundred records, an estimate of
+/// rarity noisy enough to move a page slightly, which the measurement put an
+/// order of magnitude below the gain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IdfScope {
+    /// The records the admit set admits.
+    #[default]
+    Corpus,
+    /// Every live record in the index, whatever the admit set.
+    Global,
+}
+
+/// Document frequencies over one corpus, for corpus-scoped term weighting.
+///
+/// `df` is parallel to the dimensions it was asked for, and `documents` is
+/// the number of records in the corpus that the index holds a vector for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorpusStats {
+    pub documents: usize,
+    pub df: Vec<usize>,
 }
 
 /// What a score means, so a fusion can normalise and a caller can be told.
@@ -460,6 +494,20 @@ pub trait VectorIndex<K: Kind>: Persist + Send + Sync {
     /// one corpus. A graph ignores it and prices from `ef` and the record
     /// count.
     fn cost(&self, query: K::Query<'_>, k: usize, admitted: Option<&Selectivity>) -> Cost;
+
+    /// Document frequencies of the dimensions named, over the records the
+    /// admit set admits, and the count of admitted records this index holds
+    /// a vector for. What a corpus-scoped term weighting reads.
+    ///
+    /// `None` from an index that keeps no postings, which is the default,
+    /// and from a postings index handed an admit set it can neither test as
+    /// a bitmap nor enumerate, since counting the corpus under such a set
+    /// would evaluate its predicate over every record. A caller that gets
+    /// `None` weights by the whole index instead.
+    fn corpus_stats(&self, dims: &[u32], admit: &dyn Admit) -> Option<CorpusStats> {
+        let _ = (dims, admit);
+        None
+    }
 }
 
 // ============================================================================

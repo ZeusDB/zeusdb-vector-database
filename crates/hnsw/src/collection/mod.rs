@@ -98,6 +98,7 @@ use zeusdb_vector_core::{
     VectorGraph, VectorIndex, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
+use zeusdb_vector_text::{vectorize_record, TermDictionary, Tokenizer, TokenizerConfig};
 
 /// The target every record this file emits carries. See the module
 /// documentation.
@@ -321,7 +322,18 @@ impl std::ops::Deref for LiveRecords {
 #[non_exhaustive]
 pub enum SpaceConfig {
     Dense(DenseConfig),
+    /// A sparse space that takes term ids and weights alone.
     Sparse(SparseConfig),
+    /// A sparse space with a text layer, which takes text as well.
+    Text(TextConfig),
+}
+
+/// The declaration of a sparse space with a text layer, being the index's
+/// own configuration and the tokenizer as a value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextConfig {
+    pub index: SparseConfig,
+    pub tokenizer: TokenizerConfig,
 }
 
 /// The declaration of a dense space, being what `create()` takes for it.
@@ -578,12 +590,38 @@ impl DenseSpace {
 pub(crate) struct SparseSpace {
     config: SparseConfig,
     pub(crate) index: RwLockAt<PostingsIndex>,
+    /// The text layer, where the space was declared with a tokenizer.
+    pub(crate) text: Option<TextLayer>,
 }
 
 impl SparseSpace {
     pub(crate) fn config(&self) -> &SparseConfig {
         &self.config
     }
+
+    /// The declaration as the collection reports it.
+    pub(crate) fn space_config(&self) -> SpaceConfig {
+        match &self.text {
+            Some(text) => SpaceConfig::Text(TextConfig {
+                index: self.config.clone(),
+                tokenizer: text.tokenizer.config(),
+            }),
+            None => SpaceConfig::Sparse(self.config.clone()),
+        }
+    }
+}
+
+/// What turns a record's text or a query's text into the term ids the
+/// postings index stores.
+///
+/// The dictionary sits behind the space's second guard, and the guard is
+/// never held together with the index's. A record's text is counted under
+/// the dictionary's write guard, released, and the vector is then inserted
+/// under the index's write guard, so the interning of a batch and a search
+/// under the index never wait on one another.
+pub(crate) struct TextLayer {
+    pub(crate) tokenizer: Arc<dyn Tokenizer>,
+    pub(crate) dictionary: RwLockAt<TermDictionary>,
 }
 
 // ============================================================================
@@ -832,6 +870,30 @@ impl Collection {
         })
     }
 
+    /// Count each text into the sparse space's term ids and term
+    /// frequencies, issuing an id to every term not seen before, under the
+    /// dictionary's guard taken alone. What a record's text becomes before
+    /// `add_records` takes it as the record's sparse half.
+    ///
+    /// Refused where the collection declares no sparse space, or one that
+    /// takes term ids alone.
+    pub fn vectorize_texts(&self, texts: &[&str]) -> Result<Vec<SparseVector>, Error> {
+        let space = self.sparse().ok_or(Error::NoSparseSpace)?;
+        let layer = space.text.as_ref().ok_or(Error::NoTextLayer)?;
+        let mut dictionary = layer.dictionary.write().unwrap();
+        texts
+            .iter()
+            .map(|text| vectorize_record(&*layer.tokenizer, &mut dictionary, text))
+            .collect()
+    }
+
+    /// Distinct terms the sparse space's dictionary holds, where it has
+    /// one.
+    pub fn term_count(&self) -> Option<usize> {
+        let layer = self.sparse()?.text.as_ref()?;
+        Some(layer.dictionary.read().unwrap().len())
+    }
+
     /// Every space's name and declaration, in declaration order.
     pub fn space_configs(&self) -> Vec<(SpaceName, SpaceConfig)> {
         self.spaces
@@ -839,7 +901,7 @@ impl Collection {
             .map(|named| {
                 let config = match &named.space {
                     Space::Dense(dense) => SpaceConfig::Dense(dense.config()),
-                    Space::Sparse(sparse) => SpaceConfig::Sparse(sparse.config().clone()),
+                    Space::Sparse(sparse) => sparse.space_config(),
                 };
                 (named.name.clone(), config)
             })

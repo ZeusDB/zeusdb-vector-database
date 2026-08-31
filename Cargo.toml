@@ -41,6 +41,7 @@ license = "Apache-2.0"
 zeusdb-vector-core = { path = "crates/core" }
 zeusdb-vector-hnsw = { path = "crates/hnsw" }
 zeusdb-vector-sparse = { path = "crates/sparse" }
+zeusdb-vector-text = { path = "crates/text" }
 # abi3-py310 builds against CPython's stable ABI, so one wheel per platform
 # loads on every CPython from 3.10 up, including versions that do not exist
 # yet. The feature lives here rather than in pyproject's [tool.maturin]

@@ -155,6 +155,18 @@ impl Bitmap {
         self.words.iter().map(|w| w.count_ones() as usize).sum()
     }
 
+    /// How many internal ids are in both sets, by a walk over the shorter
+    /// word range. A postings index counts the records a filter admits
+    /// among those it holds with this, rather than by testing each admitted
+    /// id.
+    pub fn count_and(&self, other: &Bitmap) -> usize {
+        self.words
+            .iter()
+            .zip(&other.words)
+            .map(|(mine, theirs)| (mine & theirs).count_ones() as usize)
+            .sum()
+    }
+
     fn is_empty(&self) -> bool {
         self.words.iter().all(|word| *word == 0)
     }

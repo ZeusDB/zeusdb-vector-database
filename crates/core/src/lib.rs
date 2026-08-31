@@ -56,9 +56,9 @@ pub use graph::{restore_graph, Distance, DumpBounds, GraphHit, Planned, Record, 
 pub use pq::PQ;
 pub use rng::SeededRng;
 pub use space::{
-    read_artefact, write_artefact, ArtefactRecord, Bounds, Budget, Cost, Dense, Hit, Hits,
-    Inventory, Kind, Ledger, Persist, Prepared, RecordId, Restore, ScoreKind, Selectivity,
-    SpaceKind, SpaceName, Sparse, SparseRef, SparseVector, VectorIndex,
+    read_artefact, write_artefact, ArtefactRecord, Bounds, Budget, CorpusStats, Cost, Dense, Hit,
+    Hits, IdfScope, Inventory, Kind, Ledger, Persist, Prepared, RecordId, Restore, ScoreKind,
+    Selectivity, SpaceKind, SpaceName, Sparse, SparseRef, SparseVector, VectorIndex,
 };
 
 /// What a test in another crate measures against.
