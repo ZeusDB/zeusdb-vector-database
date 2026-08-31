@@ -3,9 +3,10 @@
 //! What every index crate stands on, and it names nothing of Python: the
 //! error type, the checksum, the seeded generator, the filter language and
 //! the column store that answers it, the distance kernels, the product
-//! quantizer, the graph with its dump format, and the seam every index sits
+//! quantizer, the graph with its dump format, the seam every index sits
 //! behind, being the index trait, the admit family and the persistence traits
-//! in `space` and `admit`. The binding takes this crate as a path dependency
+//! in `space` and `admit`, and the fusion that combines several indexes'
+//! pages into one. The binding takes this crate as a path dependency
 //! and reaches it through the re-exports below, so the crate's surface is
 //! this file's `pub use` list and nothing else.
 //! Every module is private. An item a module marks `pub` that this file does
@@ -37,6 +38,7 @@ mod columns;
 mod distance;
 mod error;
 mod filter;
+mod fusion;
 mod graph;
 mod pq;
 mod rng;
@@ -51,6 +53,7 @@ pub use columns::{validate_indexed_fields, Bitmap, ColumnStore, Selection};
 pub use distance::{CosineDist, DistPQ, DotDist, L1Dist, L2Dist, PqMetric};
 pub use error::{Error, Exception};
 pub use filter::{compile_filter, matches_filter, Filter};
+pub use fusion::{fuse, Contribution, FusedHit, Fusion, DEFAULT_RRF_K};
 pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES, NB_LAYER_MAX};
 pub use graph::{restore_graph, Distance, DumpBounds, GraphHit, Planned, Record, VectorGraph};
 pub use pq::PQ;

@@ -280,6 +280,18 @@ pub enum Error {
     TermIdsExhausted,
 
     // ------------------------------------------------------------------
+    // A query over several arms
+    // ------------------------------------------------------------------
+    /// A query naming no arm
+    QueryArmsEmpty,
+    /// A query naming more arms than the limit
+    QueryArmsTooMany { max: usize, arms: usize },
+    /// `fetch` above the ceiling
+    FetchTooLarge { max: usize, fetch: usize },
+    /// A fusion constant outside its range
+    FusionConstantInvalid { value: f32 },
+
+    // ------------------------------------------------------------------
     // Logging
     // ------------------------------------------------------------------
     /// `log_dir` is empty
@@ -500,7 +512,11 @@ impl Error {
             | SparseValueNotFinite { .. }
             | SparseValueNotPositive { .. }
             | SparseWeightingInvalid { .. }
-            | NoTextLayer => Exception::Value,
+            | NoTextLayer
+            | QueryArmsEmpty
+            | QueryArmsTooMany { .. }
+            | FetchTooLarge { .. }
+            | FusionConstantInvalid { .. } => Exception::Value,
 
             RecordsAbsent { .. }
             | ListCursorMissing { .. }
@@ -938,6 +954,21 @@ impl fmt::Display for Error {
             ),
             NoTextLayer => f.write_str("This collection's sparse space takes no text"),
             TermIdsExhausted => f.write_str("The term dictionary has issued every id it can"),
+            QueryArmsEmpty => f.write_str("A query needs at least one arm"),
+            QueryArmsTooMany { max, arms } => {
+                write!(f, "A query names at most {} arms, got {}", max, arms)
+            }
+            FetchTooLarge { max, fetch } => write!(
+                f,
+                "fetch must be at most {}, got {}. fetch is the page each arm contributes \
+                 to the fusion, and it sizes the same candidate heaps top_k does.",
+                max, fetch
+            ),
+            FusionConstantInvalid { value } => write!(
+                f,
+                "Reciprocal rank constant is {}, and it must be finite and at least zero",
+                value
+            ),
 
             LogDirEmpty => f.write_str("log_dir cannot be empty"),
 
