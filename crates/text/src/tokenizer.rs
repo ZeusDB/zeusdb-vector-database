@@ -4,6 +4,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use zeusdb_vector_core::Error;
 
 /// How a space's tokenizer is declared, as a value.
 ///
@@ -46,9 +47,21 @@ impl TokenizerConfig {
 ///
 /// A record's terms and a query's terms come through the same method, so a
 /// query is tokenized as the records were.
+///
+/// An implementation may fail, and what it returns reaches the caller of the
+/// operation that ran it. The built-in tokenizer never fails. A caller's own
+/// carries whatever it raised in [`Error::TokenizerFailed`], so a binding can
+/// hand the caller their own failure back.
+///
+/// The engine never calls this with one of its guards held. A caller's
+/// implementation may need something of the caller's to run, such as an
+/// interpreter lock, and a thread holding that while waiting for a guard the
+/// tokenizing thread holds would wait forever. So the collection tokenizes
+/// first, under nothing, and counts the terms it collected under the
+/// dictionary's guard afterwards.
 pub trait Tokenizer: Send + Sync {
     /// Every term of `text`, in order, repeats included.
-    fn tokenize(&self, text: &str, term: &mut dyn FnMut(&str));
+    fn tokenize(&self, text: &str, term: &mut dyn FnMut(&str)) -> Result<(), Error>;
 
     /// What this tokenizer is declared as. A caller's implementation is
     /// `External` unless it says otherwise.
@@ -77,7 +90,7 @@ impl fmt::Debug for dyn Tokenizer {
 pub struct SimpleTokenizer;
 
 impl Tokenizer for SimpleTokenizer {
-    fn tokenize(&self, text: &str, term: &mut dyn FnMut(&str)) {
+    fn tokenize(&self, text: &str, term: &mut dyn FnMut(&str)) -> Result<(), Error> {
         let mut lowered = String::new();
         for run in text.split(|c: char| !c.is_alphanumeric()) {
             if run.is_empty() {
@@ -91,6 +104,7 @@ impl Tokenizer for SimpleTokenizer {
                 term(&lowered);
             }
         }
+        Ok(())
     }
 
     fn config(&self) -> TokenizerConfig {
@@ -104,7 +118,9 @@ mod tests {
 
     fn terms(text: &str) -> Vec<String> {
         let mut out = Vec::new();
-        SimpleTokenizer.tokenize(text, &mut |t| out.push(t.to_string()));
+        SimpleTokenizer
+            .tokenize(text, &mut |t| out.push(t.to_string()))
+            .unwrap();
         out
     }
 
@@ -157,8 +173,9 @@ mod tests {
     fn a_callers_tokenizer_is_external_by_default() {
         struct Whitespace;
         impl Tokenizer for Whitespace {
-            fn tokenize(&self, text: &str, term: &mut dyn FnMut(&str)) {
+            fn tokenize(&self, text: &str, term: &mut dyn FnMut(&str)) -> Result<(), Error> {
                 text.split_whitespace().for_each(term);
+                Ok(())
             }
         }
         assert_eq!(Whitespace.config(), TokenizerConfig::External);

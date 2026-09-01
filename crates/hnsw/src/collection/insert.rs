@@ -1087,14 +1087,13 @@ impl Collection {
             return Err(Error::DuplicateId { id });
         }
 
-        // A sparse vector is held to its rules, and to the collection having
-        // a sparse space, before anything is written, so a record refused for
-        // its sparse half leaves nothing behind in the dense one.
+        // A sparse vector is held to its rules, the weighting's included,
+        // and to the collection having a sparse space, before anything is
+        // written, so a record refused for its sparse half leaves nothing
+        // behind in the dense one.
         if let Some(sparse) = &sparse {
-            if self.sparse().is_none() {
-                return Err(Error::NoSparseSpace);
-            }
-            sparse.as_ref().validate()?;
+            let space = self.sparse().ok_or(Error::NoSparseSpace)?;
+            space.config().weighting.validate_record(sparse.as_ref())?;
         }
 
         trace!(target: LOG_TARGET, operation = "add_single_vector",

@@ -9,6 +9,7 @@
 mod conversion;
 mod hnsw_index;
 mod logging;
+mod tokenizer;
 
 use pyo3::prelude::*;
 use zeusdb_vector_core::{Error, Exception};
@@ -30,6 +31,17 @@ pub struct PyEngineError(PyErr);
 
 impl From<Error> for PyEngineError {
     fn from(error: Error) -> Self {
+        // A failure inside a tokenizer the caller wrote is the caller's own
+        // exception, carried out through the engine, and it is raised as
+        // itself so the caller reads their own class and traceback.
+        if let Error::TokenizerFailed(inner) = error {
+            return match inner.downcast::<PyErr>() {
+                Ok(raised) => PyEngineError(*raised),
+                Err(other) => PyEngineError(pyo3::exceptions::PyRuntimeError::new_err(
+                    Error::TokenizerFailed(other).to_string(),
+                )),
+            };
+        }
         let message = error.to_string();
         PyEngineError(match error.exception() {
             Exception::Value => pyo3::exceptions::PyValueError::new_err(message),
@@ -69,19 +81,37 @@ impl From<PyEngineError> for PyErr {
     }
 }
 
-/// Load an index from a directory. See `Collection::load`.
+/// Load an index from a directory. See `Collection::load_with`.
 ///
-/// Registered as `_load_index`. `VectorDatabase.load(path)` is the documented
-/// route and is a one line pass through to this.
+/// Registered as `_load_index`. `VectorDatabase.load(path, tokenizer=None)`
+/// is the documented route and is a one line pass through to this.
+///
+/// `tokenizer` is the tokenizer the directory's text layer was declared
+/// with, where it has one: `"simple"` for the built-in tokenizer, which a
+/// directory recording `simple` rebuilds on its own and needs none handed,
+/// or the callable the space was created with, which a directory records as
+/// `external` and cannot reproduce. A directory recording `external` refuses
+/// to open without one, one handed whose declaration is not the recorded
+/// one is refused, and one handed to a directory that takes no text is
+/// refused, since ignoring it would open the index under a tokenizer the
+/// caller did not ask for.
 ///
 /// The whole load runs with the interpreter lock released, the graph rebuild
 /// it may fall back to included. Nothing in the load path touches Python:
 /// the directory is read, the collection is built and restored, and the
-/// result is wrapped here with the lock back.
+/// result is wrapped here with the lock back. A tokenizer handed in is
+/// stored and never run by the load.
 #[pyfunction]
-#[pyo3(name = "_load_index")]
-fn load_index(py: Python<'_>, path: &str) -> Result<hnsw_index::HNSWIndex, PyEngineError> {
-    let inner = py.detach(|| Collection::load(path))?;
+#[pyo3(name = "_load_index", signature = (path, tokenizer = None))]
+fn load_index(
+    py: Python<'_>,
+    path: &str,
+    tokenizer: Option<&Bound<PyAny>>,
+) -> Result<hnsw_index::HNSWIndex, PyEngineError> {
+    let tokenizer = tokenizer
+        .map(|argument| tokenizer::tokenizer_from_python(argument, "tokenizer"))
+        .transpose()?;
+    let inner = py.detach(|| Collection::load_with(path, tokenizer))?;
     Ok(hnsw_index::HNSWIndex::wrap(inner))
 }
 

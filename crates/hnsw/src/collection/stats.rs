@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, info};
-use zeusdb_vector_core::Error;
+use zeusdb_vector_core::{Error, VectorIndex};
 
 /// The target every record this file emits carries. See the parent module.
 const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::stats";
@@ -564,8 +564,56 @@ impl Collection {
             format!("{:.2}", bookkeeping_mb),
         );
 
-        // The sum of the six memory keys above. It is what the index holds in
-        // the structures this call can price, being the graph, the raw vector
+        // The sparse space, where one is declared, under keys a dense-only
+        // index never carries, so nothing such an index reports moves. The
+        // space's guard and the dictionary's are each taken alone, as every
+        // guard in this call is.
+        if let Some((name, space)) = self.sparse_named() {
+            let (records, postings, dead_postings, sparse_bytes) = {
+                let index = space.index.read().unwrap();
+                (
+                    index.len(),
+                    index.postings_total(),
+                    index.dead_postings(),
+                    index.heap_bytes().total(),
+                )
+            };
+            stats.insert("sparse_space".to_string(), name.as_str().to_string());
+            stats.insert(
+                "sparse_weighting".to_string(),
+                space.config().weighting.name().to_string(),
+            );
+            stats.insert("sparse_records".to_string(), records.to_string());
+            stats.insert("sparse_postings".to_string(), postings.to_string());
+            stats.insert(
+                "sparse_dead_postings".to_string(),
+                dead_postings.to_string(),
+            );
+            let sparse_mb = sparse_bytes as f64 / (1024.0 * 1024.0);
+            total_memory_mb += sparse_mb;
+            stats.insert("sparse_memory_mb".to_string(), format!("{:.2}", sparse_mb));
+            if let Some(text) = &space.text {
+                stats.insert(
+                    "sparse_tokenizer".to_string(),
+                    text.tokenizer.config().name().to_string(),
+                );
+                let (terms, dictionary_bytes) = {
+                    let dictionary = text.dictionary.read().unwrap();
+                    (dictionary.len(), dictionary.heap_bytes())
+                };
+                stats.insert("term_count".to_string(), terms.to_string());
+                let dictionary_mb = dictionary_bytes as f64 / (1024.0 * 1024.0);
+                total_memory_mb += dictionary_mb;
+                stats.insert(
+                    "dictionary_memory_mb".to_string(),
+                    format!("{:.2}", dictionary_mb),
+                );
+            }
+        }
+
+        // The sum of the six memory keys above, and of the sparse space's
+        // two where one is declared. It is what the index holds in the
+        // structures this call can price, being the graph, the raw vector
         // store, the codes, the codebook, the centroid distance table and the
         // bookkeeping.
         //

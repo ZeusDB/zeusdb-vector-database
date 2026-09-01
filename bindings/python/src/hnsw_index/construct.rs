@@ -1,19 +1,132 @@
-//! Parsing a declaration and its quantization mapping, and the one warning
-//! that needs the interpreter.
+//! Parsing a declaration, its quantization mapping and its sparse space,
+//! and the one warning that needs the interpreter.
 //!
 //! The rules a valid index has to satisfy live in `zeusdb_vector_hnsw`, on
 //! `Declaration`. What is here is the reading of the quantization mapping's
 //! keys, which is Python, interleaved with those rules in the order they have
 //! always applied, so the message a caller reads is the one for the first
-//! rule their declaration broke.
+//! rule their declaration broke, and after them the reading of the sparse
+//! space's mapping.
 
 use super::HNSWIndex;
+use crate::conversion::python_object_to_value;
+use crate::tokenizer::tokenizer_from_python;
 use crate::PyEngineError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use serde_json::{json, Value};
 use tracing::{error, instrument};
 use zeusdb_vector_core::Error;
-use zeusdb_vector_hnsw::{Collection, Declaration, StorageMode};
+use zeusdb_vector_hnsw::{Collection, Declaration, SparseConfig, StorageMode};
+
+/// The keys a sparse space declaration may carry. `name` and `tokenizer`
+/// are the binding's, and the other three are the fields of `SparseConfig`
+/// as `config.json` writes them.
+const SPARSE_KEYS: [&str; 5] = [
+    "name",
+    "unlink",
+    "lazy_threshold_percent",
+    "weighting",
+    "tokenizer",
+];
+
+/// The three keys the sparse index's own declaration is read from.
+const SPARSE_CONFIG_KEYS: [&str; 3] = ["unlink", "lazy_threshold_percent", "weighting"];
+
+/// The name a sparse space takes where the declaration gives none.
+const DEFAULT_SPARSE_NAME: &str = "sparse";
+
+/// Declare the sparse space a `create()` mapping describes.
+///
+/// **One mapping, which is the sparse crate's own.** `unlink`, `weighting`
+/// and the tokenizer's name are read by the serde derive that reads
+/// `config.json`, so the spellings a caller writes are the spellings a
+/// saved directory carries and there is no second table of them here. A
+/// field left out takes its default, which is what the derive gives it,
+/// with one exception made here: `weighting` left out beside a `tokenizer`
+/// takes `bm25`, since a text layer stores term counts and the term
+/// frequency rule is the one that reads a count as a count, where the
+/// derive alone would give `dot`. Every other combination is read as
+/// written, so a declaration without a tokenizer defaults to `dot` and
+/// `dot` beside a tokenizer is what it says. A key that is not a field is
+/// refused by name. A weighting given as a bare string is read as
+/// `{"type": <string>}`, so `"bm25"` is the published defaults and
+/// `{"type": "bm25", "k1": 1.5, "b": 0.6}` sets them.
+///
+/// `name` is the space's name, which is the directory its artefacts are
+/// saved under; it defaults to `sparse`. `tokenizer` is `"simple"` for the
+/// built-in tokenizer or a callable of the caller's own, and its presence
+/// is what declares the text layer. A value of `None` under any key is the
+/// key left out.
+fn declare_sparse(
+    declaration: Declaration,
+    sparse: &Bound<PyDict>,
+) -> Result<Declaration, PyEngineError> {
+    for key in sparse.keys() {
+        let key = key.extract::<String>().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                "sparse declaration keys must be strings",
+            )
+        })?;
+        if !SPARSE_KEYS.contains(&key.as_str()) {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "sparse declares '{}', which is not a field of a sparse space. The fields                  are name, weighting, unlink, lazy_threshold_percent and tokenizer.",
+                key
+            ))
+            .into());
+        }
+    }
+    let present = |key: &str| -> PyResult<Option<Bound<PyAny>>> {
+        Ok(sparse.get_item(key)?.filter(|value| !value.is_none()))
+    };
+    let name = match present("name")? {
+        Some(value) => value.extract::<String>().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                "sparse['name'] must be a str, got {}",
+                value
+                    .get_type()
+                    .name()
+                    .map(|name| name.to_string())
+                    .unwrap_or_default()
+            ))
+        })?,
+        None => DEFAULT_SPARSE_NAME.to_string(),
+    };
+    let tokenizer = present("tokenizer")?;
+    let mut fields = serde_json::Map::new();
+    for key in SPARSE_CONFIG_KEYS {
+        if let Some(value) = present(key)? {
+            let mut value = python_object_to_value(&value)?;
+            if key == "weighting" {
+                if let Value::String(rule) = &value {
+                    value = json!({ "type": rule });
+                }
+            }
+            fields.insert(key.to_string(), value);
+        }
+    }
+    // The one default the derive does not give. A text layer stores term
+    // counts, and the term frequency rule reads a count as a count, so a
+    // tokenizer with no weighting named takes it at its published
+    // parameters. `config.json` names the weighting in full, so a saved
+    // space reads what was written and never takes this default.
+    if tokenizer.is_some() && !fields.contains_key("weighting") {
+        fields.insert("weighting".to_string(), json!({ "type": "bm25" }));
+    }
+    let config: SparseConfig = serde_json::from_value(Value::Object(fields)).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "The sparse space declaration could not be read: {}",
+            e
+        ))
+    })?;
+    match tokenizer {
+        None => Ok(declaration.with_sparse(&name, config)?),
+        Some(argument) => {
+            let tokenizer = tokenizer_from_python(&argument, "sparse['tokenizer']")?;
+            Ok(declaration.with_text(&name, config, tokenizer)?)
+        }
+    }
+}
 
 /// Warn where `ef_construction` switches the neighbour selection heuristic off.
 ///
@@ -77,15 +190,20 @@ pub(super) fn warn_if_selection_disabled(
 /// space is checked for quantization before any of the mapping is read, then
 /// the mapping's keys are read one at a time and the product quantizer's own
 /// rules run on what they held. Each rule runs once and in the order it
-/// always did.
-#[instrument(level = "info", skip(quantization_config), fields(
+/// always did. The sparse space is declared after all of them, so a caller
+/// reads the same message for the same mistake whether or not one is
+/// declared.
+#[instrument(level = "info", skip(quantization_config, sparse), fields(
     dim = dim,
     space = %space,
     m = m,
     ef_construction = ef_construction,
     expected_size = expected_size,
-    has_quantization = quantization_config.is_some()
+    has_quantization = quantization_config.is_some(),
+    has_sparse = sparse.is_some()
 ))]
+// The argument list is the Python signature's, one value per keyword.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build(
     dim: usize,
     space: String,
@@ -94,6 +212,7 @@ pub(super) fn build(
     expected_size: usize,
     quantization_config: Option<&Bound<PyDict>>,
     indexed_fields: Vec<String>,
+    sparse: Option<&Bound<PyDict>>,
 ) -> Result<HNSWIndex, PyEngineError> {
     let declaration = Declaration::validate(
         dim,
@@ -176,6 +295,11 @@ pub(super) fn build(
             )?)
         }
         None => None,
+    };
+
+    let declaration = match sparse {
+        Some(sparse) => declare_sparse(declaration, sparse)?,
+        None => declaration,
     };
 
     Ok(HNSWIndex::wrap(Collection::build(

@@ -321,8 +321,9 @@ fn a_text_layer_round_trips_with_its_dictionary() {
 fn an_external_tokenizer_must_be_handed_back() {
     struct Whitespace;
     impl Tokenizer for Whitespace {
-        fn tokenize(&self, text: &str, term: &mut dyn FnMut(&str)) {
+        fn tokenize(&self, text: &str, term: &mut dyn FnMut(&str)) -> Result<(), Error> {
             text.split_whitespace().for_each(term);
+            Ok(())
         }
     }
     let declaration = base()

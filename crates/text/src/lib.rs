@@ -3,8 +3,10 @@
 //! A sparse space stores term ids and weights and never sees a string. What
 //! turns a string into those is here: a [`Tokenizer`] that splits a text
 //! into terms, a [`TermDictionary`] that gives each distinct term a stable
-//! id, and the two functions in `vectorize` that count a text's terms into a
-//! sparse vector, one for a record and one for a query.
+//! id, and the functions in `vectorize` that count a text's terms into a
+//! sparse vector, one for a record and one for a query, each in a one step
+//! form that runs the tokenizer and a two step form that takes terms already
+//! tokenized, so the tokenizer can run under no guard.
 //!
 //! # The pre-tokenized path is the primary route
 //!
@@ -41,4 +43,4 @@ mod vectorize;
 
 pub use dictionary::TermDictionary;
 pub use tokenizer::{SimpleTokenizer, Tokenizer, TokenizerConfig};
-pub use vectorize::{vectorize_query, vectorize_record};
+pub use vectorize::{count_query, count_record, tokenize, vectorize_query, vectorize_record};

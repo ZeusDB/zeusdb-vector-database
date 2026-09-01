@@ -37,9 +37,11 @@
 //! The guards a single space search takes, in the declared order,
 //! `id_map < rev_map < dense index < dense codes < sparse index <
 //! vector_metadata < columns`, each space's taken only where an arm reads
-//! it. A text arm is counted into term ids under the dictionary's guard
-//! before any of them, and that guard is released before the first is
-//! taken, which is the rule the text layer declares.
+//! it. A text arm is tokenized under no guard at all, since the tokenizer
+//! may be the caller's own, and its terms are counted into term ids under
+//! the dictionary's guard before any of the above is taken, and that guard
+//! is released before the first of them is, which is the rule the text
+//! layer declares.
 
 use super::search::{AdmitPlan, Scored, MAX_TOP_K};
 use super::Collection;
@@ -50,7 +52,7 @@ use zeusdb_vector_core::{
     fuse, Budget, Contribution, Cost, Error, Filter, Fusion, IdfScope, Selectivity, SpaceKind,
     SpaceName, SparseRef, SparseVector, VectorIndex,
 };
-use zeusdb_vector_text::vectorize_query;
+use zeusdb_vector_text::count_query;
 
 /// Arms a query may name.
 ///
@@ -96,9 +98,16 @@ pub enum Arm<'a> {
         vector: SparseRef<'a>,
         idf: IdfScope,
     },
-    /// The sparse space's text layer, asked with a string the layer counts
-    /// into term ids as it counted the records.
+    /// The sparse space's text layer, asked with a string the layer's
+    /// tokenizer splits, under no guard, and the layer counts into term
+    /// ids as it counted the records.
     Text { text: &'a str, idf: IdfScope },
+    /// The sparse space's text layer, asked with terms a caller has already
+    /// split as the layer's tokenizer would, in order and repeats included,
+    /// which the layer counts into term ids as it counted the records. What
+    /// a caller hands over after running the tokenizer itself through
+    /// `Collection::tokenize`, under whatever the tokenizer needs.
+    Terms { terms: &'a [String], idf: IdfScope },
 }
 
 impl Arm<'_> {
@@ -106,7 +115,7 @@ impl Arm<'_> {
     pub fn kind(&self) -> SpaceKind {
         match self {
             Arm::Dense { .. } => SpaceKind::Dense,
-            Arm::Sparse { .. } | Arm::Text { .. } => SpaceKind::Sparse,
+            Arm::Sparse { .. } | Arm::Text { .. } | Arm::Terms { .. } => SpaceKind::Sparse,
         }
     }
 }
@@ -359,17 +368,30 @@ impl Collection {
                     }
                 }
                 Arm::Text { text, idf } => {
-                    let space = self.sparse().ok_or(Error::NoSparseSpace)?;
-                    let layer = space.text.as_ref().ok_or(Error::NoTextLayer)?;
-                    let vector = {
-                        let dictionary = layer.dictionary.read().unwrap();
-                        vectorize_query(&*layer.tokenizer, &dictionary, text)
-                    };
-                    Resolved::Sparse { vector, idf }
+                    // The tokenizer under no guard, then the terms under
+                    // the dictionary's alone; see `Collection::tokenize`.
+                    let terms = self.tokenize(text)?;
+                    Resolved::Sparse {
+                        vector: self.count_terms(&terms)?,
+                        idf,
+                    }
                 }
+                Arm::Terms { terms, idf } => Resolved::Sparse {
+                    vector: self.count_terms(terms)?,
+                    idf,
+                },
             });
         }
         Ok((resolved, fetch))
+    }
+
+    /// Terms looked up in the text layer's dictionary and counted, under
+    /// its read guard taken alone and released before any search guard is
+    /// taken. A term no record has carried is dropped.
+    fn count_terms(&self, terms: &[String]) -> Result<SparseVector, Error> {
+        let layer = self.text_layer()?;
+        let dictionary = layer.dictionary.read().unwrap();
+        Ok(count_query(&dictionary, terms))
     }
 
     /// Plan, and run where asked.

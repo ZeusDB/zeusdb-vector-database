@@ -268,6 +268,9 @@ pub enum Error {
     /// A stored value at or below zero offered to a space whose scoring rule
     /// reads every value as a term frequency
     SparseValueNotPositive { index: usize, value: f32 },
+    /// A stored value that is not a whole number offered to a space whose
+    /// scoring rule reads every value as a term frequency
+    SparseValueNotWhole { index: usize, value: f32 },
     /// A term weighting parameter outside its range
     SparseWeightingInvalid {
         parameter: &'static str,
@@ -276,8 +279,14 @@ pub enum Error {
     },
     /// Text offered to a collection whose sparse space takes term ids alone
     NoTextLayer,
+    /// A sparse vector of term ids offered to a collection whose sparse
+    /// space has a text layer and takes text alone
+    SparseVectorOnTextSpace,
     /// A term dictionary that has issued every id it can
     TermIdsExhausted,
+    /// The caller's own tokenizer failed, carrying what it raised, so a
+    /// binding can hand the caller their own failure back
+    TokenizerFailed(Box<dyn std::error::Error + Send + Sync>),
     /// A directory whose text layer recorded a tokenizer of the caller's own,
     /// opened without one
     TokenizerRequired { space: String },
@@ -536,8 +545,10 @@ impl Error {
             | SparseDimsNotIncreasing { .. }
             | SparseValueNotFinite { .. }
             | SparseValueNotPositive { .. }
+            | SparseValueNotWhole { .. }
             | SparseWeightingInvalid { .. }
             | NoTextLayer
+            | SparseVectorOnTextSpace
             | QueryArmsEmpty
             | QueryArmsTooMany { .. }
             | FetchTooLarge { .. }
@@ -549,6 +560,7 @@ impl Error {
             | RecordNotHeld { .. } => Exception::Key,
 
             TermIdsExhausted
+            | TokenizerFailed(_)
             | TokenizerRequired { .. }
             | TokenizerMismatch { .. }
             | TokenizerUnexpected
@@ -975,6 +987,12 @@ impl fmt::Display for Error {
                  frequency takes values above zero alone",
                 index, value
             ),
+            SparseValueNotWhole { index, value } => write!(
+                f,
+                "Sparse vector value at index {} is {}, and a space weighted by term \
+                 frequency takes whole numbers alone",
+                index, value
+            ),
             SparseWeightingInvalid {
                 parameter,
                 value,
@@ -985,7 +1003,11 @@ impl fmt::Display for Error {
                 parameter, value, rule
             ),
             NoTextLayer => f.write_str("This collection's sparse space takes no text"),
+            SparseVectorOnTextSpace => {
+                f.write_str("This collection's sparse space takes text alone")
+            }
             TermIdsExhausted => f.write_str("The term dictionary has issued every id it can"),
+            TokenizerFailed(inner) => write!(f, "The tokenizer raised {}", inner),
             QueryArmsEmpty => f.write_str("A query needs at least one arm"),
             QueryArmsTooMany { max, arms } => {
                 write!(f, "A query names at most {} arms, got {}", max, arms)
