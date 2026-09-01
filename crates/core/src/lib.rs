@@ -38,6 +38,7 @@ mod columns;
 mod distance;
 mod error;
 mod filter;
+mod frame;
 mod fusion;
 mod graph;
 mod pq;
@@ -53,6 +54,11 @@ pub use columns::{validate_indexed_fields, Bitmap, ColumnStore, Selection};
 pub use distance::{CosineDist, DistPQ, DotDist, L1Dist, L2Dist, PqMetric};
 pub use error::{Error, Exception};
 pub use filter::{compile_filter, matches_filter, Filter};
+pub use frame::{
+    begin as frame_begin, finish as frame_finish, frame, fuzz as frame_fuzz, unframe,
+    FrameEncoding, FrameKind, Framed, FRAME_HEADER_BYTES, FRAME_MAGIC, FRAME_OVERHEAD_BYTES,
+    FRAME_TRAILER_BYTES,
+};
 pub use fusion::{fuse, Contribution, FusedHit, Fusion, DEFAULT_RRF_K};
 pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES, NB_LAYER_MAX};
 pub use graph::{restore_graph, Distance, DumpBounds, GraphHit, Planned, Record, VectorGraph};

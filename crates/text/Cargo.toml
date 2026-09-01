@@ -18,3 +18,4 @@ publish = false
 # the reason for each pin.
 [dependencies]
 zeusdb-vector-core = { workspace = true }
+serde = { workspace = true }

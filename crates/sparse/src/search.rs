@@ -194,7 +194,8 @@ impl PostingsIndex {
     /// of the tests. A set that is not a bitmap is tested through the table,
     /// which is priced as one more posting visit per posting on top of the
     /// accumulate. The enumerate-driven path pays a fixed cost per admitted
-    /// record and a merge of the record against the query.
+    /// record, one unit per nonzero of the record and one per nonzero of
+    /// the query.
     pub fn arm_costs(
         &self,
         scan_postings: usize,
@@ -214,7 +215,9 @@ impl PostingsIndex {
         };
         let scan_ns = scan_postings as f64 * per_posting;
         let enumerate_ns = admitted as f64
-            * (units.record_ns + (self.mean_nnz() + query_nnz as f64) * units.merge_ns);
+            * (units.record_ns
+                + self.mean_nnz() * units.merge_ns
+                + query_nnz as f64 * units.query_ns);
         (scan_ns, enumerate_ns)
     }
 

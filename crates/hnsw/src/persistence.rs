@@ -14,8 +14,32 @@
 //! ├── quantization.json       # PQ configuration (if enabled)
 //! ├── pq_codes.bin            # Quantized codes (if PQ enabled)
 //! ├── pq_centroids.bin        # PQ centroids (if trained)
-//! └── hnsw_index.zdbgraph     # HNSW graph topology and the point each node holds
+//! ├── hnsw_index.zdbgraph     # HNSW graph topology and the point each node holds
+//! └── spaces/                 # one directory per sparse space, where one is declared
+//!     └── <name>/
+//!         ├── postings.zdbsparse  # every live record's term ids and weights
+//!         └── terms.zdbdict       # the term dictionary, where the space takes text
 //! ```
+//!
+//! ## The format version
+//!
+//! A directory holding a dense space alone is written at `1.1.0`, with the
+//! flat names above and nothing under `spaces/`, and it is byte for byte
+//! what 0.9.0 wrote. A directory holding a sparse space is written at
+//! `2.0.0`. The bump is a major because a sparse space is not additive: a
+//! release reading `1.x` alone would find every file it knows, read the
+//! seven names it knows, and open the collection without its sparse space
+//! and without a word, which is the failure this format has already
+//! suffered once. At `2.0.0` such a release refuses at the version check
+//! with a message naming the newer release. This build reads both majors.
+//!
+//! `config.json` declares the sparse space under `spaces`, by value: the
+//! space's name, its unlink policy, its lazy threshold, its weighting with
+//! the weighting's parameters, and its tokenizer where it takes text. The
+//! declaration is validated on load under the rules `Declaration` applies.
+//! A tokenizer the engine cannot write down is recorded as `external`, and
+//! a directory recording one opens only through `Collection::load_with`
+//! with the same implementation handed to it.
 //!
 //! ## How a save lands
 //!
@@ -48,7 +72,7 @@
 
 use crate::collection::{
     validate_index_parameters, validate_space_supports_quantization, Collection,
-    QuantizationConfig, StorageMode,
+    QuantizationConfig, SparseDeclaration, StorageMode, DEFAULT_SPACE,
 };
 use crate::RerankCalibration;
 use chrono::Utc;
@@ -60,9 +84,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info};
 use zeusdb_vector_core::{
-    checksum_of, validate_indexed_fields, Error, DUMP_FILENAME as GRAPH_DUMP_FILENAME,
-    LEGACY_DUMP_FILENAMES, PQ,
+    checksum_of, validate_indexed_fields, ArtefactRecord, Bounds, Error, Inventory, Persist,
+    Restore, SpaceName, VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME, LEGACY_DUMP_FILENAMES,
+    PQ,
 };
+use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
+use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerConfig};
 
 /// The target every record this file emits carries. It is the module path
 /// this file had in the binding, so a filter directive naming it still
@@ -73,22 +100,29 @@ const LOG_TARGET: &str = "zeusdb_vector_database::persistence";
 // FORMAT VERSION
 // ============================================================================
 
-/// Version written into manifest.json by this build
+/// Version written into manifest.json by a save of a collection holding a
+/// dense space alone.
 ///
-/// Bumped from 1.0.0 because config.json now carries an index level `metadata`
-/// map. The change is additive on both sides. A directory written by this build
-/// still opens in 0.4.1, which ignores unknown config fields and never read the
-/// version, and a directory written by 0.4.1 still opens here because the field
-/// is defaulted.
-const FORMAT_VERSION: &str = "1.1.0";
+/// 1.1.0 rather than 1.0.0 because config.json carries an index level
+/// `metadata` map, which is additive on both sides. A directory written at
+/// this version opens on every release that reads 1.x, and one written by
+/// such a release opens here.
+const DENSE_FORMAT_VERSION: &str = "1.1.0";
 
-/// Major version this build can interpret
+/// Version written into manifest.json by a save of a collection holding a
+/// sparse space. See the module documentation for why it is a major.
+const SPACES_FORMAT_VERSION: &str = "2.0.0";
+
+/// The majors this build reads.
 ///
-/// A minor bump is additive by construction, so any 1.x is read. A different
-/// major means the layout changed in a way this build cannot reason about, and
-/// guessing at it would be the silent truncation this format has already
-/// suffered once.
-const SUPPORTED_FORMAT_MAJOR: u32 = 1;
+/// A minor bump is additive by construction, so any 1.x and any 2.x is read.
+/// A different major means the layout changed in a way this build cannot
+/// reason about, and guessing at it would be the silent truncation this
+/// format has already suffered once.
+const SUPPORTED_FORMAT_MAJORS: [u32; 2] = [1, 2];
+
+/// The majors this build reads, as a refusal spells them.
+const SUPPORTED_FORMAT_LABEL: &str = "1.x and 2.x";
 
 // ============================================================================
 // THE BINCODE CLAIM BUDGET
@@ -556,26 +590,27 @@ pub(crate) fn recorded_dump_length(manifest: &IndexManifest, name: &str) -> Opti
     manifest.file_digests.get(name).map(|entry| entry.bytes)
 }
 
-/// Refuse a directory this build cannot interpret
-fn check_format_version(format_version: &str) -> Result<(), Error> {
+/// Refuse a directory this build cannot interpret, and return the major it
+/// declares.
+fn check_format_version(format_version: &str) -> Result<u32, Error> {
     let major = format_version
         .split('.')
         .next()
         .and_then(|major| major.parse::<u32>().ok())
         .ok_or_else(|| Error::FormatVersionUnparsable {
             format_version: format_version.to_string(),
-            current: FORMAT_VERSION,
+            current: DENSE_FORMAT_VERSION,
         })?;
 
-    if major != SUPPORTED_FORMAT_MAJOR {
+    if !SUPPORTED_FORMAT_MAJORS.contains(&major) {
         return Err(Error::FormatVersionUnsupported {
             format_version: format_version.to_string(),
-            supported: SUPPORTED_FORMAT_MAJOR,
-            newer: major > SUPPORTED_FORMAT_MAJOR,
+            supported: SUPPORTED_FORMAT_LABEL,
+            newer: major > SUPPORTED_FORMAT_MAJORS[SUPPORTED_FORMAT_MAJORS.len() - 1],
         });
     }
 
-    Ok(())
+    Ok(major)
 }
 
 // ============================================================================
@@ -616,9 +651,19 @@ fn artefact_contents(name: &str) -> &'static str {
         "quantization.json" => "the product quantization configuration and the training state",
         "pq_centroids.bin" => "the trained PQ codebook, which every stored code decodes through",
         "pq_codes.bin" => "the quantized code of every record",
+        _ if name.ends_with("/postings.zdbsparse") => {
+            "the postings of a sparse space, being every record's term ids and weights"
+        }
+        _ if name.ends_with("/terms.zdbdict") => {
+            "the term dictionary of a text layer, being every term and its id"
+        }
         _ => "a component of the saved index that this build does not recognise",
     }
 }
+
+/// What the dictionary artefact holds, for the message its absence produces.
+const DICTIONARY_CONTENTS: &str =
+    "the term dictionary of a text layer, being every term and its id";
 
 /// Refuse a directory that does not hold what its manifest says it holds
 ///
@@ -728,6 +773,26 @@ pub(crate) struct IndexManifest {
     pub(crate) compression_info: Option<CompressionInfo>,
 }
 
+/// The manifest is what an index reads its artefacts' recorded lengths from.
+///
+/// A framed artefact is recorded by its length alone, so `checksum` is
+/// `None` for one, and the frame's own payload checksum is what the reader
+/// verifies. A directory written before the manifest carried digests
+/// records nothing, and an index restoring from one is refused before it
+/// reads, since no such directory holds a space.
+impl Inventory for IndexManifest {
+    fn recorded(&self, name: &str) -> Option<ArtefactRecord> {
+        let digest = self.file_digests.get(name)?;
+        Some(ArtefactRecord {
+            bytes: digest.bytes,
+            checksum: digest
+                .checksum
+                .as_deref()
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok()),
+        })
+    }
+}
+
 /// Compression statistics for quantized indexes
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct CompressionInfo {
@@ -777,6 +842,108 @@ pub(crate) struct IndexConfig {
     /// that predates it, at the cost of the columns rather than of the load.
     #[serde(default)]
     pub(crate) indexed_fields: Vec<String>,
+
+    /// The sparse space declared beside the dense one, by value, where one
+    /// was.
+    ///
+    /// Absent from the file where none was declared, so a dense-only
+    /// directory's `config.json` is byte for byte what it was before the
+    /// field existed and opens on a release that predates it. Present, it
+    /// is what makes the directory a 2.x one; see the module documentation.
+    /// A list rather than one record, so a further space is a further entry
+    /// rather than a further field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) spaces: Vec<SpaceRecord>,
+}
+
+/// One sparse space as `config.json` declares it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SpaceRecord {
+    /// The name the space was declared under, which is the directory under
+    /// `spaces/` its artefacts are written to.
+    pub(crate) name: String,
+    /// The family of vector the space holds. `sparse` is the one this build
+    /// writes, and a reader that is not the engine reads it before the
+    /// fields below.
+    pub(crate) kind: String,
+    /// The index's own declaration, every field named.
+    pub(crate) index: SparseConfig,
+    /// The tokenizer, where the space takes text. `simple` is the built-in
+    /// one and `external` is an implementation the caller keeps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tokenizer: Option<TokenizerConfig>,
+}
+
+/// The one kind of space `config.json` declares under `spaces`.
+const SPARSE_KIND: &str = "sparse";
+
+/// Hold the spaces `config.json` declares to the rules `Declaration`
+/// applies to a caller's own, so a hand edited file cannot build a space
+/// the collection would refuse to declare.
+fn validate_spaces(spaces: &[SpaceRecord], file: &str) -> Result<(), Error> {
+    let invalid = |detail: String| Error::SpaceRecordInvalid {
+        file: file.to_string(),
+        detail,
+    };
+    if spaces.len() > 1 {
+        return Err(invalid(format!(
+            "a collection holds one sparse space and {} are declared",
+            spaces.len()
+        )));
+    }
+    for space in spaces {
+        if space.kind != SPARSE_KIND {
+            return Err(invalid(format!(
+                "space '{}' declares kind '{}', which this build does not hold",
+                space.name, space.kind
+            )));
+        }
+        SpaceName::new(&space.name).map_err(|e| invalid(e.to_string()))?;
+        if space.name == DEFAULT_SPACE {
+            return Err(invalid(format!(
+                "space '{}' takes the dense space's name",
+                space.name
+            )));
+        }
+        space.index.validate().map_err(|e| invalid(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// The tokenizer a restored text layer runs, from what `config.json`
+/// recorded and what the caller handed to `load`.
+///
+/// The built-in tokenizer is recorded as `simple` and is built here where
+/// none was handed. A caller's own is recorded as `external` and is
+/// accepted only when handed. A handed tokenizer whose own declaration is
+/// not the recorded one is refused, and so is one handed to a directory
+/// with no text layer, since ignoring it would open the collection under a
+/// tokenizer the caller did not ask for.
+fn resolve_tokenizer(
+    space: Option<&SpaceRecord>,
+    handed: Option<Arc<dyn Tokenizer>>,
+) -> Result<Option<Arc<dyn Tokenizer>>, Error> {
+    let recorded = space.and_then(|space| space.tokenizer.as_ref());
+    match (recorded, handed) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(Error::TokenizerUnexpected),
+        (Some(TokenizerConfig::Simple), None) => Ok(Some(Arc::new(SimpleTokenizer))),
+        (Some(TokenizerConfig::External), None) => Err(Error::TokenizerRequired {
+            space: space.map(|s| s.name.clone()).unwrap_or_default(),
+        }),
+        (Some(recorded), Some(handed)) => {
+            let declared = handed.config();
+            if declared == *recorded {
+                Ok(Some(handed))
+            } else {
+                Err(Error::TokenizerMismatch {
+                    space: space.map(|s| s.name.clone()).unwrap_or_default(),
+                    recorded: recorded.name(),
+                    handed: declared.name(),
+                })
+            }
+        }
+    }
 }
 
 /// Complete quantization configuration and state
@@ -957,9 +1124,87 @@ fn load_config(path: &Path, manifest: &IndexManifest) -> Result<IndexConfig, Err
         &config.indexed_fields,
         &format!("{}: ", config_path.display()),
     )?;
+    // The spaces too, under the rules a declaration is held to.
+    validate_spaces(&config.spaces, &config_path.display().to_string())?;
 
     debug!(target: LOG_TARGET, "config.json loaded");
     Ok(config)
+}
+
+/// Read the sparse space's artefacts back and install them, where the
+/// collection declares one.
+///
+/// Runs after the id mappings are restored and before the graph is, for two
+/// reasons. The largest internal id the mappings hold is what bounds the
+/// space's slot table, and the graph's rebuild fallback replays every record
+/// through `add`, which reads each record's sparse half out of the space and
+/// carries it through; see `Collection::rebuild_from_records`.
+///
+/// Every record the space holds must be one the mappings name. A record may
+/// leave the space empty, so the space may hold fewer, and a space holding
+/// an id the mappings do not is a directory whose two artefacts came from
+/// different saves. A text layer's dictionary must hold every term id the
+/// postings carry, for the same reason.
+fn restore_spaces(index: &Collection, path: &Path, manifest: &IndexManifest) -> Result<(), Error> {
+    let Some((name, space)) = index.sparse_named() else {
+        return Ok(());
+    };
+    let prefix = Collection::space_prefix(name);
+    let largest_id = index.rev_map().keys().max().copied().unwrap_or(0);
+    let bounds = Bounds {
+        min_records: 0,
+        max_records: largest_id,
+        max_bytes: u64::MAX,
+    };
+    let restored = PostingsIndex::restore(space.config(), &prefix, path, manifest, &bounds)?;
+    let unmapped = {
+        let rev_map = index.rev_map();
+        let mut unmapped = None;
+        restored.live_set().for_each_while(|slot| {
+            if rev_map.contains_key(&slot) {
+                true
+            } else {
+                unmapped = Some(slot);
+                false
+            }
+        });
+        unmapped
+    };
+    if let Some(slot) = unmapped {
+        return Err(Error::SparseRecordUnmapped {
+            space: name.as_str().to_string(),
+            id: u32::try_from(slot).unwrap_or(u32::MAX),
+        });
+    }
+    if space.text.is_some() {
+        let dictionary_name = Collection::dictionary_name(&prefix);
+        let bytes = zeusdb_vector_core::read_artefact(
+            path,
+            &dictionary_name,
+            manifest,
+            DICTIONARY_CONTENTS,
+            u64::MAX,
+        )?;
+        let dictionary = TermDictionary::decode(&bytes, &dictionary_name)?;
+        if let Some(term) = restored.max_dim() {
+            if term as usize >= dictionary.len() {
+                return Err(Error::TermIdBeyondDictionary {
+                    space: name.as_str().to_string(),
+                    term,
+                    terms: dictionary.len(),
+                });
+            }
+        }
+        debug!(target: LOG_TARGET, "{} restored ({} terms)", dictionary_name, dictionary.len());
+        index.set_dictionary(dictionary);
+    }
+    debug!(target: LOG_TARGET, "{}postings.zdbsparse restored ({} records, {} postings)",
+        prefix,
+        restored.len(),
+        restored.postings_total()
+    );
+    index.set_sparse_index(restored);
+    Ok(())
 }
 
 /// Load ID mappings from mappings.bin
@@ -1231,7 +1476,38 @@ pub(crate) fn save_index(index: &Collection, dir: &Path) -> Result<SaveLedger, E
     // Save vectors based on storage mode
     save_vectors(index, dir, &mut ledger)?;
 
+    // The sparse space, where one is declared, under `spaces/<name>/`.
+    save_spaces(index, dir, &mut ledger)?;
+
     Ok(ledger)
+}
+
+/// Write the sparse space's artefacts under `spaces/<name>/`, where the
+/// collection declares one.
+///
+/// The postings are written by the index itself through the seam, and the
+/// dictionary by the collection, since the text layer is the collection's.
+/// Each is recorded in the manifest by its length alone, because both are
+/// framed and the frame's payload checksum is what the reader verifies; see
+/// `zeusdb_vector_core::frame`. The two guards are taken one at a time and
+/// never together.
+fn save_spaces(index: &Collection, dir: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+    let Some((name, space)) = index.sparse_named() else {
+        return Ok(());
+    };
+    let prefix = Collection::space_prefix(name);
+    debug!(target: LOG_TARGET, "Saving {}postings.zdbsparse...", prefix);
+    space.index.read().unwrap().write(&prefix, dir, ledger)?;
+    debug!(target: LOG_TARGET, "{}postings.zdbsparse saved", prefix);
+    if let Some(text) = &space.text {
+        let dictionary_name = Collection::dictionary_name(&prefix);
+        debug!(target: LOG_TARGET, "Saving {}...", dictionary_name);
+        let bytes = text.dictionary.read().unwrap().encode();
+        zeusdb_vector_core::write_artefact(dir, &dictionary_name, &bytes)?;
+        ledger.record_digest(&dictionary_name, bytes.len() as u64, None);
+        debug!(target: LOG_TARGET, "{} saved ({} bytes)", dictionary_name, bytes.len());
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -1239,13 +1515,16 @@ pub(crate) fn save_index(index: &Collection, dir: &Path) -> Result<SaveLedger, E
 // ============================================================================
 
 /// Reconstruct Collection using Simple Reconstruction
+#[allow(clippy::too_many_arguments)]
 fn reconstruct_index_simple(
     path: &Path,
+    manifest: &IndexManifest,
     config: IndexConfig,
     mappings: IdMappings,
     metadata: HashMap<String, HashMap<String, Value>>,
     vectors: HashMap<String, Vec<f32>>,
     quantization: Option<QuantizationArtefacts>,
+    sparse: Option<SparseDeclaration>,
     dump_bytes: Option<u64>,
 ) -> Result<Collection, Error> {
     debug!(target: LOG_TARGET, "Creating empty index with loaded configuration...");
@@ -1258,6 +1537,7 @@ fn reconstruct_index_simple(
         config.ef_construction,
         config.expected_size,
         config.indexed_fields.clone(),
+        sparse,
     );
 
     debug!(target: LOG_TARGET, "Restoring data fields...");
@@ -1281,6 +1561,18 @@ fn reconstruct_index_simple(
         &config,
         quantization,
     )?;
+
+    // Step 2a: The metadata and its columns, before the graph, so the
+    // collection holds one column entry per mapped record while the graph's
+    // rebuild fallback removes and re-adds every record. The fallback routes
+    // through `add`, which writes metadata and columns under the ids it
+    // allocates, and step 4 writes both back from the file afterwards, so
+    // this is what makes the invariant a removal checks hold in between.
+    index.restore_storage_maps(pq_codes.clone(), metadata.clone());
+
+    // Step 2b: The sparse space, once the mappings are in and before the
+    // graph, for the reasons `restore_spaces` gives.
+    restore_spaces(&index, path, manifest)?;
 
     // Step 3: Restore the graph the save wrote. Every save dumps the graph, so
     // the ordinary path is a read. A dump that is absent, damaged, or written
@@ -1735,7 +2027,10 @@ fn rebuild_graph_from_data(
 /// Reached through `Collection::load`, which the binding registers as
 /// `_load_index`. `VectorDatabase.load(path)` is the documented route and is
 /// a one line pass through to that.
-pub(crate) fn load_index(path: &str) -> Result<Collection, Error> {
+pub(crate) fn load_index(
+    path: &str,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+) -> Result<Collection, Error> {
     debug!(target: LOG_TARGET, "Starting index load with reconstruction from: {}", path);
 
     let path_buf = Path::new(path);
@@ -1751,7 +2046,7 @@ pub(crate) fn load_index(path: &str) -> Result<Collection, Error> {
     debug!(target: LOG_TARGET, "Phase 1: Loading ZeusDB components...");
 
     let manifest = load_manifest(path_buf)?;
-    check_format_version(&manifest.format_version)?;
+    let major = check_format_version(&manifest.format_version)?;
 
     // Before any artefact is read, so a directory missing two files names the
     // first rather than failing on whichever one a partial load reaches.
@@ -1762,6 +2057,22 @@ pub(crate) fn load_index(path: &str) -> Result<Collection, Error> {
 
     let config = load_config(path_buf, &manifest)?;
     debug!(target: LOG_TARGET, "Config loaded: dim={}, space={}", config.dim, config.space);
+
+    // A 1.x directory declares no space, since no release writing 1.x held
+    // one, and a 1.x manifest over a config that declares one is a
+    // directory assembled by hand.
+    if major < 2 && !config.spaces.is_empty() {
+        return Err(Error::FormatVersionSpaces {
+            format_version: manifest.format_version.clone(),
+        });
+    }
+    let space_record = config.spaces.first();
+    let sparse_tokenizer = resolve_tokenizer(space_record, tokenizer)?;
+    let sparse = space_record.map(|record| SparseDeclaration {
+        name: SpaceName::new(&record.name).expect("validated by load_config"),
+        config: record.index.clone(),
+        tokenizer: sparse_tokenizer,
+    });
 
     let mappings = load_mappings(path_buf, &manifest)?;
     debug!(target: LOG_TARGET, "Mappings loaded: {} ID mappings", mappings.id_map.len());
@@ -1792,11 +2103,13 @@ pub(crate) fn load_index(path: &str) -> Result<Collection, Error> {
     debug!(target: LOG_TARGET, "Phase 2: Creating empty index and restoring state...");
     let mut restored_index = reconstruct_index_simple(
         path_buf,
+        &manifest,
         config,
         mappings,
         metadata,
         vectors,
         quantization,
+        sparse,
         recorded_dump_length(&manifest, GRAPH_DUMP_FILENAME),
     )?;
 
@@ -1830,6 +2143,16 @@ fn save_config(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Resu
         generated_ids: index.generated_ids(),
         metadata: index.all_metadata(),
         indexed_fields: index.indexed_fields(),
+        spaces: index
+            .sparse_named()
+            .map(|(name, space)| SpaceRecord {
+                name: name.as_str().to_string(),
+                kind: SPARSE_KIND.to_string(),
+                index: space.config().clone(),
+                tokenizer: space.text.as_ref().map(|text| text.tokenizer.config()),
+            })
+            .into_iter()
+            .collect(),
     };
 
     let config_json =
@@ -2126,6 +2449,13 @@ pub(crate) fn save_manifest(
         files_excluded.push("vectors.bin".to_string());
     }
 
+    // The sparse space's artefacts, where one is declared. Always written,
+    // an empty space included, so the directory's shape says the space
+    // exists.
+    let space_names = index.space_artefact_names();
+    let holds_spaces = !space_names.is_empty();
+    files_included.extend(space_names);
+
     // Phase 2: Add the HNSW graph file
     //
     // One file where there used to be two. The vendored format split the
@@ -2180,7 +2510,12 @@ pub(crate) fn save_manifest(
     let total_size_mb = calculate_directory_size(path).unwrap_or(0.0);
 
     let manifest = IndexManifest {
-        format_version: FORMAT_VERSION.to_string(),
+        format_version: if holds_spaces {
+            SPACES_FORMAT_VERSION.to_string()
+        } else {
+            DENSE_FORMAT_VERSION.to_string()
+        }
+        .to_string(),
         zeusdb_version: env!("CARGO_PKG_VERSION").to_string(),
         created_at: index.created_at(),
         saved_at: Utc::now().to_rfc3339(),
@@ -2221,21 +2556,24 @@ pub(crate) fn save_manifest(
 // HELPER FUNCTIONS
 // ============================================================================
 
-/// Calculate the total size of a directory in MB
+/// Calculate the total size of a directory in MB, the artefacts under
+/// `spaces/` included.
 fn calculate_directory_size(path: &Path) -> Result<f64, std::io::Error> {
-    let mut total_size = 0u64;
-
-    if path.is_dir() {
+    fn bytes_under(path: &Path) -> Result<u64, std::io::Error> {
+        let mut total = 0u64;
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             let metadata = entry.metadata()?;
-
             if metadata.is_file() {
-                total_size += metadata.len();
+                total += metadata.len();
+            } else if metadata.is_dir() {
+                total += bytes_under(&entry.path())?;
             }
         }
+        Ok(total)
     }
 
+    let total_size = if path.is_dir() { bytes_under(path)? } else { 0 };
     Ok(total_size as f64 / (1024.0 * 1024.0))
 }
 

@@ -580,13 +580,16 @@ pub trait Restore: Sized {
     ) -> Result<Self, Error>;
 }
 
-/// Write one artefact whole and return its checksum, for an index that holds
-/// its artefact in memory before it writes it.
+/// Write one artefact whole, for an index that holds its artefact in memory
+/// before it writes it.
 ///
 /// The file is fsynced before this returns, so a rename that moves the
 /// directory into place cannot be recorded while the bytes it names are still
-/// in the page cache.
-pub fn write_artefact(dir: &Path, name: &str, bytes: &[u8]) -> Result<u64, Error> {
+/// in the page cache. No digest is taken here: a framed artefact carries its
+/// own payload checksum, computed as the frame is closed, and a second pass
+/// over the buffer cost a save of a 70 MB artefact a seventh of its time. A
+/// writer that records a digest in the manifest computes one itself.
+pub fn write_artefact(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Error> {
     use std::io::Write;
 
     // A prefix may carry directories, which are created on the way.
@@ -607,7 +610,7 @@ pub fn write_artefact(dir: &Path, name: &str, bytes: &[u8]) -> Result<u64, Error
             name: name.to_string(),
             error: e.to_string(),
         })?;
-    Ok(checksum_of(bytes))
+    Ok(())
 }
 
 /// Read one artefact whole and hold it to what the inventory recorded.
@@ -767,7 +770,8 @@ mod tests {
     fn an_artefact_round_trips_and_every_damage_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let bytes: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
-        let checksum = write_artefact(dir.path(), "a.bin", &bytes).unwrap();
+        write_artefact(dir.path(), "a.bin", &bytes).unwrap();
+        let checksum = checksum_of(&bytes);
         let mut manifest = Manifest(HashMap::new());
         manifest.record(
             "a.bin",

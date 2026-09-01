@@ -433,7 +433,9 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
         assert ("checksum" in entry) is (name != "hnsw_index.zdbgraph"), name
 
     # 1.1.0 rather than 1.0.0 because config.json gained the index level
-    # metadata field. The loader reads any 1.x and refuses another major.
+    # metadata field. A directory holding a dense space alone stays at 1.x,
+    # so it opens on every release that reads 1.x; only a directory holding
+    # a sparse space declares 2.0.0. The loader reads both majors.
     assert manifest["format_version"] == "1.1.0"
     assert manifest["index_type"] == "HNSW"
     assert manifest["total_vectors"] == 3
@@ -978,11 +980,11 @@ def test_persistence_drops_raw_vectors_from_an_old_quantized_only_directory(tmp_
 # Test 81: Persistence: the format version gate
 # ------------------------------------------------------------
 def test_persistence_format_version_gate(tmp_path):
-    """A later minor is read, another major is refused.
+    """A later minor is read, a major this build does not know is refused.
 
-    Minor bumps are additive by construction, so any 1.x is accepted. A
-    different major means the layout changed in a way this build cannot reason
-    about, and guessing at it is how a format loses data quietly.
+    Minor bumps are additive by construction, so any 1.x and any 2.x is
+    accepted. A different major means the layout changed in a way this build
+    cannot reason about, and guessing at it is how a format loses data quietly.
     """
     vdb = VectorDatabase()
     source = tmp_path / "versioned.zdb"
@@ -1001,8 +1003,14 @@ def test_persistence_format_version_gate(tmp_path):
     assert vdb.load(str(with_version("1.0.0", "v100.zdb"))).get_vector_count() == 1
     assert vdb.load(str(with_version("1.9.3", "v193.zdb"))).get_vector_count() == 1
 
-    with pytest.raises(RuntimeError, match=r"format version 2.0.0 cannot be opened"):
-        vdb.load(str(with_version("2.0.0", "v200.zdb")))
+    # A 2.x label on a dense-only directory is read as well: 2.0.0 is what a
+    # directory holding a sparse space declares, and the loader reads both
+    # majors. A third major is what it refuses.
+    assert vdb.load(str(with_version("2.0.0", "v200.zdb"))).get_vector_count() == 1
+    assert vdb.load(str(with_version("2.4.1", "v241.zdb"))).get_vector_count() == 1
+
+    with pytest.raises(RuntimeError, match=r"format version 3.0.0 cannot be opened"):
+        vdb.load(str(with_version("3.0.0", "v300.zdb")))
 
     with pytest.raises(RuntimeError, match=r"not a version this build can interpret"):
         vdb.load(str(with_version("banana", "vbanana.zdb")))

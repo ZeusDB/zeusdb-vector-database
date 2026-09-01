@@ -1622,7 +1622,7 @@ all checks passed
 
 - **Same volume.** The staging directory is a sibling of the target, so both are on the target's volume and the move is a rename rather than a copy.
 
-- **Version compatibility.** The manifest records a format version. This build writes 1.1.0 and reads any 1.x. A different major version is refused.
+- **Version compatibility.** The manifest records a format version. This build writes 1.1.0 for a directory holding a dense space alone, which opens on every release that reads 1.x, and reads any 1.x or 2.x. A different major version is refused.
 
 - **Integrity checks on load.** Four run, in this order: the format version, then `files_included` against the directory, then each artefact against its recorded length and digest, then the restored record count against the count in `config.json`.
 

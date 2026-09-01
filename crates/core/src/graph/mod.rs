@@ -388,6 +388,13 @@ pub enum Record<'a> {
     },
 }
 
+/// The stride the timing kernels take across the store, a prime large
+/// enough that successive records share no cache line and no page, and the
+/// offset each round starts from, another prime, so a round touches records
+/// the last one did not.
+const SCATTER_STRIDE: usize = 7919;
+const SCATTER_OFFSET: usize = 104_729;
+
 impl VectorGraph {
     pub fn new_raw(
         space: &str,
@@ -729,25 +736,48 @@ impl VectorGraph {
     ///
     /// A quantized graph evaluates against a table computed for one query of
     /// zeros, which costs the same table reads a real query does.
-    pub fn time_distance_ns(&self, evaluations: usize, rounds: usize) -> Option<f64> {
+    pub fn time_distance_ns(
+        &self,
+        evaluations: usize,
+        rounds: usize,
+        admits: &dyn Fn(usize) -> bool,
+    ) -> Option<f64> {
+        // One query against records scattered across the store, each first
+        // tested by the predicate, which is what an exact scan does per
+        // admitted record. The records are taken at a stride of a large
+        // prime from an offset that moves with the round, so a round touches
+        // records the last one did not and the figure is what the kernel
+        // costs over memory rather than over a line the last evaluation
+        // left in cache. Measured at width 1,536 over 50,000 points, a
+        // sequential walk priced the exact scan at 1.8 to 2.4 times its
+        // measured cost between 250 and 1,000 admitted and this walk at 1.2
+        // to 1.8; at width 100 the two agree within 30 percent. Timed against
+        // one of the graph's own points as the query, where a query vector
+        // is a stored point's twin in every way the kernel can see.
         fn time<T, D: Distance<T>>(
             dist: &D,
             store: &VectorStore<T>,
             evaluations: usize,
             rounds: usize,
+            admits: &dyn Fn(usize) -> bool,
         ) -> Option<f64> {
             let n = store.len();
             if n < 2 || evaluations == 0 || rounds == 0 {
                 return None;
             }
+            let query = store.get(1);
             let mut samples = Vec::with_capacity(rounds);
             for round in 0..rounds {
                 let mut acc = 0f32;
                 let started = std::time::Instant::now();
                 for k in 0..evaluations {
-                    let i = (k + round) % n;
-                    let j = (k.wrapping_mul(7919).wrapping_add(1)) % n;
-                    acc += dist.eval(store.get(i as u32), store.get(j as u32));
+                    let i = k
+                        .wrapping_mul(SCATTER_STRIDE)
+                        .wrapping_add(round.wrapping_mul(SCATTER_OFFSET))
+                        % n;
+                    if admits(i) {
+                        acc += dist.eval(query, store.get(i as u32));
+                    }
                 }
                 let elapsed = started.elapsed().as_secs_f64();
                 std::hint::black_box(acc);
@@ -757,21 +787,23 @@ impl VectorGraph {
             Some(samples[samples.len() / 2])
         }
         match self {
-            VectorGraph::Cosine(b) => time(b.graph.distance(), &b.store, evaluations, rounds),
-            VectorGraph::L2(b) => time(b.graph.distance(), &b.store, evaluations, rounds),
-            VectorGraph::L1(b) => time(b.graph.distance(), &b.store, evaluations, rounds),
-            VectorGraph::Dot(b) => time(b.graph.distance(), &b.store, evaluations, rounds),
+            VectorGraph::Cosine(b) => {
+                time(b.graph.distance(), &b.store, evaluations, rounds, admits)
+            }
+            VectorGraph::L2(b) => time(b.graph.distance(), &b.store, evaluations, rounds, admits),
+            VectorGraph::L1(b) => time(b.graph.distance(), &b.store, evaluations, rounds, admits),
+            VectorGraph::Dot(b) => time(b.graph.distance(), &b.store, evaluations, rounds, admits),
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 let query = vec![0f32; b.graph.distance().dim()];
                 let _query_lut = b.graph.distance().install_query_lut(&query).ok()?;
-                time(b.graph.distance(), &b.store, evaluations, rounds)
+                time(b.graph.distance(), &b.store, evaluations, rounds, admits)
             }
         }
     }
 
     /// Time one whole search on this graph, in nanoseconds, as the median of
-    /// `rounds` searches at `k` and `ef`, each asked with one of the graph's
-    /// own points as its query.
+    /// `rounds` searches at `k` and `ef` under `admits`, each asked with a
+    /// query built from two of the graph's own points.
     ///
     /// What a traversal costs is not what a distance evaluation costs
     /// multiplied by a count. A traversal's time is the memory it touches,
@@ -783,17 +815,31 @@ impl VectorGraph {
     /// from [`VectorGraph::time_distance_ns`]. `None` where the graph holds
     /// fewer than two points.
     ///
-    /// The query on a quantized graph is the reconstruction of a stored
-    /// code, so the table it installs is one a real query would.
-    pub fn time_search_ns(&self, k: usize, ef: usize, rounds: usize) -> Option<f64> {
+    /// The query is the midpoint of two points scattered across the store,
+    /// normalised on a cosine graph, rather than a stored point itself, so
+    /// the search is for a vector the graph does not hold, which is what a
+    /// query is. The predicate is in place because every search the
+    /// collection runs carries one, being its live set at least, and the
+    /// test is paid once per candidate. Measured at width 100 over 50,000
+    /// points, this figure sits within 3 percent of a search the collection
+    /// runs on the same graph; a stored point as the query, with no
+    /// predicate, sat within 10 percent of it, so the two changes are for
+    /// the search's shape rather than for a gap they close. On a quantized
+    /// graph the two points are reconstructed from their codes, so the
+    /// table the query installs is one a real query would.
+    pub fn time_search_ns(
+        &self,
+        k: usize,
+        ef: usize,
+        rounds: usize,
+        admits: &dyn Fn(usize) -> bool,
+    ) -> Option<f64> {
         let n = self.nb_points();
         if n < 2 || rounds == 0 {
             return None;
         }
-        let mut samples = Vec::with_capacity(rounds);
-        for round in 0..rounds {
-            let node = ((round.wrapping_mul(7919).wrapping_add(1)) % n) as u32;
-            let query: Vec<f32> = match self {
+        let point = |node: u32| -> Option<Vec<f32>> {
+            Some(match self {
                 VectorGraph::Cosine(b) => b.store.get(node).to_vec(),
                 VectorGraph::L2(b) => b.store.get(node).to_vec(),
                 VectorGraph::L1(b) => b.store.get(node).to_vec(),
@@ -801,11 +847,28 @@ impl VectorGraph {
                 VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                     b.graph.distance().reconstruct(b.store.get(node)).ok()?
                 }
-            };
+            })
+        };
+        let cosine = matches!(self, VectorGraph::Cosine(_) | VectorGraph::CosinePQ(_));
+        let mut samples = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let first = (round.wrapping_mul(SCATTER_STRIDE).wrapping_add(1) % n) as u32;
+            let second = (round
+                .wrapping_mul(SCATTER_STRIDE)
+                .wrapping_add(SCATTER_OFFSET)
+                % n) as u32;
+            let a = point(first)?;
+            let b = point(second)?;
+            let mut query: Vec<f32> = a.iter().zip(&b).map(|(x, y)| 0.5 * (x + y)).collect();
+            if cosine {
+                let norm = query.iter().map(|v| v * v).sum::<f32>().sqrt();
+                if norm > 0.0 {
+                    query.iter_mut().for_each(|v| *v /= norm);
+                }
+            }
+            let predicate = |id: &usize| admits(*id);
             let started = std::time::Instant::now();
-            let hits = self
-                .search(&query, k, ef, None::<&fn(&usize) -> bool>)
-                .ok()?;
+            let hits = self.search(&query, k, ef, Some(&predicate)).ok()?;
             let elapsed = started.elapsed();
             std::hint::black_box(hits);
             samples.push(elapsed.as_secs_f64() * 1e9);
