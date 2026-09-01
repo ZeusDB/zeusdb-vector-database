@@ -688,8 +688,11 @@ impl Collection {
     // ============================================================================
     // PERSISTENCE Minimal Empty Constructor and SETTERS
     // ============================================================================
-    /// Minimal constructor for persistence loading - creates empty index with config
-    /// No validation needed since config comes from trusted saved state
+    /// The constructor the loader uses, being an empty collection under the
+    /// configuration `config.json` recorded. The loader validates every
+    /// value before it reaches here, through the same rules `validate`
+    /// applies, and builds the sparse declaration from the space
+    /// `config.json` recorded and the tokenizer handed to `load`.
     pub(crate) fn new_empty(
         dim: usize,
         space: String,
@@ -697,6 +700,7 @@ impl Collection {
         ef_construction: usize,
         expected_size: usize,
         indexed_fields: Vec<String>,
+        sparse: Option<SparseDeclaration>,
     ) -> Self {
         let space_normalized = space.to_lowercase();
         let hnsw = VectorGraph::new_raw(
@@ -722,7 +726,7 @@ impl Collection {
             None,
             None,
             hnsw,
-            None,
+            sparse,
         )
     }
 

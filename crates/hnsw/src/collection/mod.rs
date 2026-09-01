@@ -70,6 +70,8 @@ mod dense;
 mod input;
 mod insert;
 mod persist;
+#[cfg(test)]
+mod persist_tests;
 mod query;
 #[cfg(test)]
 mod query_tests;
@@ -83,7 +85,9 @@ mod training;
 // ones to `config.json` that `Declaration::validate` applies to a caller's
 // arguments.
 pub use construct::Declaration;
-pub(crate) use construct::{validate_index_parameters, validate_space_supports_quantization};
+pub(crate) use construct::{
+    validate_index_parameters, validate_space_supports_quantization, SparseDeclaration,
+};
 pub(crate) use dense::{DenseIndex, DenseOpen};
 pub use insert::{Added, RebuildPlan};
 pub use query::{
@@ -101,8 +105,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, Bitmap, ColumnStore, Error, Filter, Selection, SpaceName, SparseVector,
-    VectorGraph, VectorIndex, PQ,
+    matches_filter, Bitmap, ColumnStore, Error, Filter, Persist, Selection, SpaceName,
+    SparseVector, VectorGraph, VectorIndex, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{vectorize_record, TermDictionary, Tokenizer, TokenizerConfig};
@@ -878,10 +882,42 @@ impl Collection {
 
     /// The sparse space, where one was declared.
     pub(crate) fn sparse(&self) -> Option<&SparseSpace> {
+        self.sparse_named().map(|(_, space)| space)
+    }
+
+    /// The sparse space with the name it was declared under, where one was
+    /// declared. The name is the directory the space's artefacts are saved
+    /// under.
+    pub(crate) fn sparse_named(&self) -> Option<(&SpaceName, &SparseSpace)> {
         self.spaces.iter().find_map(|named| match &named.space {
-            Space::Sparse(sparse) => Some(sparse),
+            Space::Sparse(sparse) => Some((&named.name, sparse)),
             Space::Dense(_) => None,
         })
+    }
+
+    /// The prefix a sparse space's artefacts are written under, being
+    /// `spaces/<name>/`.
+    pub(crate) fn space_prefix(name: &SpaceName) -> String {
+        format!("spaces/{}/", name)
+    }
+
+    /// The name of a text layer's dictionary artefact under `prefix`.
+    pub(crate) fn dictionary_name(prefix: &str) -> String {
+        format!("{prefix}terms.zdbdict")
+    }
+
+    /// Every artefact the sparse space writes, in the order it writes them,
+    /// for the manifest's inventory. Empty where no sparse space is declared.
+    pub(crate) fn space_artefact_names(&self) -> Vec<String> {
+        let Some((name, space)) = self.sparse_named() else {
+            return Vec::new();
+        };
+        let prefix = Self::space_prefix(name);
+        let mut names = space.index.read().unwrap().artefact_names(&prefix);
+        if space.text.is_some() {
+            names.push(Self::dictionary_name(&prefix));
+        }
+        names
     }
 
     /// Count each text into the sparse space's term ids and term

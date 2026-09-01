@@ -278,6 +278,28 @@ pub enum Error {
     NoTextLayer,
     /// A term dictionary that has issued every id it can
     TermIdsExhausted,
+    /// A directory whose text layer recorded a tokenizer of the caller's own,
+    /// opened without one
+    TokenizerRequired { space: String },
+    /// A tokenizer handed to `load` whose declaration is not the one the
+    /// directory recorded
+    TokenizerMismatch {
+        space: String,
+        recorded: &'static str,
+        handed: &'static str,
+    },
+    /// A tokenizer handed to `load` for a directory with no text layer
+    TokenizerUnexpected,
+    /// A record the sparse artefact holds and the mappings do not name
+    SparseRecordUnmapped { space: String, id: u32 },
+    /// A term id the postings carry beyond the dictionary's count
+    TermIdBeyondDictionary {
+        space: String,
+        term: u32,
+        terms: usize,
+    },
+    /// A space named in `config.json` that the collection cannot hold
+    SpaceRecordInvalid { file: String, detail: String },
 
     // ------------------------------------------------------------------
     // A query over several arms
@@ -385,9 +407,12 @@ pub enum Error {
     /// `format_version` names a major this build does not read
     FormatVersionUnsupported {
         format_version: String,
-        supported: u32,
+        supported: &'static str,
         newer: bool,
     },
+    /// A 1.x manifest over a `config.json` that declares a sparse space,
+    /// which no release writing 1.x could have produced
+    FormatVersionSpaces { format_version: String },
     /// Files the manifest names and the directory does not hold, in manifest
     /// order, with what the first of them holds
     ArtefactsMissing {
@@ -523,7 +548,14 @@ impl Error {
             | SpaceUnknown { .. }
             | RecordNotHeld { .. } => Exception::Key,
 
-            TermIdsExhausted => Exception::Runtime,
+            TermIdsExhausted
+            | TokenizerRequired { .. }
+            | TokenizerMismatch { .. }
+            | TokenizerUnexpected
+            | SparseRecordUnmapped { .. }
+            | TermIdBeyondDictionary { .. }
+            | SpaceRecordInvalid { .. }
+            | FormatVersionSpaces { .. } => Exception::Runtime,
 
             ArtefactReadFailed { .. }
             | ArtefactsMissing { .. }
@@ -1136,7 +1168,7 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "Index format version {} cannot be opened by this build, which reads format \
-                 version {}.x only. The directory was written by a {} release of \
+                 versions {} only. The directory was written by a {} release of \
                  zeusdb-vector-database, so {}.",
                 format_version,
                 supported,
@@ -1147,6 +1179,48 @@ impl fmt::Display for Error {
                     "open it with the release that wrote it"
                 }
             ),
+            FormatVersionSpaces { format_version } => write!(
+                f,
+                "manifest.json declares format_version {} and config.json declares a sparse \
+                 space, which no release writing that format holds. A directory holding a \
+                 sparse space declares format_version 2.0.0 or later.",
+                format_version
+            ),
+            TokenizerRequired { space } => write!(
+                f,
+                "The sparse space '{}' was declared with a tokenizer of the caller's own, which \
+                 the directory records as external and cannot reproduce. Open it with the same \
+                 implementation handed to load.",
+                space
+            ),
+            TokenizerMismatch {
+                space,
+                recorded,
+                handed,
+            } => write!(
+                f,
+                "The sparse space '{}' recorded its tokenizer as {} and the one handed to load \
+                 declares itself {}. A saved space is opened with the tokenizer it was declared \
+                 with.",
+                space, recorded, handed
+            ),
+            TokenizerUnexpected => f.write_str(
+                "A tokenizer was handed to load and no space in the directory takes text",
+            ),
+            SparseRecordUnmapped { space, id } => write!(
+                f,
+                "The sparse space '{}' holds a record under internal id {} that mappings.bin \
+                 does not name",
+                space, id
+            ),
+            TermIdBeyondDictionary { space, term, terms } => write!(
+                f,
+                "The sparse space '{}' carries term id {} and its dictionary holds {} terms",
+                space, term, terms
+            ),
+            SpaceRecordInvalid { file, detail } => {
+                write!(f, "{}: the spaces declared are invalid: {}", file, detail)
+            }
             ArtefactsMissing { missing, contents } => {
                 let first = missing.first().map(String::as_str).unwrap_or("");
                 let others = if missing.len() > 1 {

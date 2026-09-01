@@ -24,6 +24,9 @@ use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
     ArtefactRecord, Bounds, Error, Inventory, Persist, Restore, VectorGraph, DUMP_FILENAME,
 };
+use zeusdb_vector_core::{RecordId, SparseVector, VectorIndex};
+use zeusdb_vector_sparse::PostingsIndex;
+use zeusdb_vector_text::{TermDictionary, Tokenizer};
 
 /// The target every record this file emits carries. See the parent module.
 const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::persist";
@@ -315,8 +318,53 @@ impl Collection {
     /// The binding calls this with the interpreter lock released, so the
     /// whole load, the graph rebuild it may fall back to included, runs
     /// without it.
+    ///
+    /// A directory whose text layer recorded a tokenizer of the caller's own
+    /// refuses to open this way, since the engine cannot reproduce one; see
+    /// [`Collection::load_with`].
     pub fn load(path: &str) -> Result<Self, Error> {
-        crate::persistence::load_index(path)
+        Self::load_with(path, None)
+    }
+
+    /// Load an index, handing it the tokenizer its text layer was declared
+    /// with.
+    ///
+    /// `config.json` records the tokenizer by value. The built-in one is
+    /// recorded as `simple` and needs nothing handed. A caller's own
+    /// implementation is recorded as `external`, and a directory recording
+    /// that opens only when the same implementation is handed here, because
+    /// a query tokenized any other way would not find the terms the records
+    /// were counted into. A tokenizer whose declaration is not the one
+    /// recorded is refused, and so is one handed to a directory that takes
+    /// no text.
+    pub fn load_with(path: &str, tokenizer: Option<Arc<dyn Tokenizer>>) -> Result<Self, Error> {
+        crate::persistence::load_index(path, tokenizer)
+    }
+
+    /// Install the sparse space's index read back from its artefact, under
+    /// the space's guard taken alone. For persistence loading only.
+    pub(crate) fn set_sparse_index(&self, index: PostingsIndex) {
+        if let Some(space) = self.sparse() {
+            *space.index.write().unwrap() = index;
+        }
+    }
+
+    /// Install the text layer's dictionary read back from its artefact,
+    /// under its guard taken alone. For persistence loading only.
+    pub(crate) fn set_dictionary(&self, dictionary: TermDictionary) {
+        if let Some(text) = self.sparse().and_then(|space| space.text.as_ref()) {
+            *text.dictionary.write().unwrap() = dictionary;
+        }
+    }
+
+    /// The sparse vector the space holds for the record named `id`, where
+    /// the space holds one. Taken in the declared order, `id_map` then the
+    /// space's index.
+    fn sparse_vector_of(&self, id: &str) -> Option<SparseVector> {
+        let internal = *self.id_map.read().unwrap().get(id)?;
+        let space = self.sparse()?;
+        let index = space.index.read().unwrap();
+        index.recover(RecordId::from_slot(internal))
     }
 
     /// Restore the graph the save wrote, instead of rebuilding it
@@ -625,6 +673,14 @@ impl Collection {
     /// `overwrite` is true because the loader restores the id mappings before
     /// the rebuild runs, so every record being replayed is already named in
     /// `id_map` and has to be removed before it is inserted.
+    ///
+    /// **Each record carries its sparse half through the replay.** The
+    /// sparse space is restored before the graph, under the internal ids the
+    /// mappings recorded, and the replay removes each record and inserts it
+    /// under a fresh id. The record's sparse vector is read out of the space
+    /// before that and inserted with it, so the space comes out of the
+    /// rebuild holding every vector it held, under the ids the rebuilt
+    /// collection holds.
     pub(crate) fn rebuild_from_records(
         &self,
         records: Vec<(String, Vec<f32>, HashMap<String, Value>)>,
@@ -657,7 +713,13 @@ impl Collection {
                     position,
                 });
             }
-            validated.push((id, self.process_vector_for_space(vector), metadata));
+            let sparse = self.sparse_vector_of(&id);
+            validated.push(ParsedRecord {
+                sparse,
+                vector: self.process_vector_for_space(vector),
+                id,
+                metadata,
+            });
         }
 
         self.set_rebuilding_from_persistence(true);
@@ -669,8 +731,7 @@ impl Collection {
         // alone, which is the shape `add` uses.
         let (inserted, errors) = {
             let _writers = self.writers.lock().unwrap();
-            let records = validated.into_iter().map(ParsedRecord::from).collect();
-            self.insert_parsed_records(records, true)
+            self.insert_parsed_records(validated, true)
         };
 
         // Cleared before the result is judged rather than after, so the flag is

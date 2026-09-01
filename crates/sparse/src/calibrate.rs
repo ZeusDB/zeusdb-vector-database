@@ -9,7 +9,7 @@
 use std::time::Instant;
 
 use tracing::debug;
-use zeusdb_vector_core::{Bitmap, IdfScope, SparseRef, SparseVector};
+use zeusdb_vector_core::{Bitmap, IdfScope, SparseVector};
 
 use crate::index::PostingsIndex;
 use crate::search::Mode;
@@ -29,10 +29,22 @@ pub struct UnitCosts {
     /// costs several times a test admitting all or none, and a scan priced
     /// without this term came out four times too cheap at half admitted.
     pub mispredict_ns: f64,
-    /// One element merged when a record is scored from the arena.
+    /// One of the record's own nonzeros advanced past when a record is
+    /// scored from the arena.
     pub merge_ns: f64,
-    /// What scoring one admitted record costs beyond its merge, being the
-    /// walk of the admit set, the slot lookup and the arena read.
+    /// One nonzero of the query when a record is scored from the arena,
+    /// being what a query element adds to the merge on top of the record's
+    /// own. It is above the record-side unit because the merge's branch on
+    /// which side advances is predictable while the query is short against
+    /// the record and less so as the query widens, and the merge timed at
+    /// one width priced a query of another wrong by that difference.
+    pub query_ns: f64,
+    /// What scoring one admitted record costs before any element is
+    /// merged, being the walk of the admit set, the slot lookup and the
+    /// call. Timed directly under an empty query rather than derived by
+    /// subtraction, since a subtraction of two figures near each other
+    /// left this at zero or at a noise figure from one calibration to the
+    /// next.
     pub record_ns: f64,
     /// Whether the figures were timed on this index or are the floor.
     pub measured: bool,
@@ -50,7 +62,8 @@ impl UnitCosts {
         reject_ns: 1.0,
         mispredict_ns: 8.0,
         merge_ns: 3.0,
-        record_ns: 80.0,
+        query_ns: 10.0,
+        record_ns: 10.0,
         measured: false,
     };
 }
@@ -81,6 +94,11 @@ const SAMPLE_RECORDS: usize = 8;
 /// regimes this was measured on centre around.
 const QUERY_DIMS: usize = 8;
 
+/// Dimensions the wider timing query carries, which with the narrow one
+/// gives the merge's cost at two widths and so its cost per query element.
+/// Forty is the width a learned sparse encoder's queries centre around.
+const WIDE_QUERY_DIMS: usize = 40;
+
 /// Rounds each measurement runs, of which the median is kept.
 const ROUNDS: usize = 5;
 
@@ -88,7 +106,7 @@ const ROUNDS: usize = 5;
 const ENUMERATE_SAMPLE: usize = 256;
 
 impl PostingsIndex {
-    /// Time the three unit costs on this index and keep them.
+    /// Time the unit costs on this index and keep them.
     ///
     /// Called at open, by `compact`, each time the live count doubles past
     /// [`CALIBRATION_MIN_RECORDS`], and by a caller that has just filled an
@@ -106,23 +124,23 @@ impl PostingsIndex {
         // record, so a query carries the record's spread of common and rare
         // terms rather than its first few.
         let mut queries: Vec<SparseVector> = Vec::with_capacity(SAMPLE_RECORDS);
+        let mut wide: Vec<SparseVector> = Vec::with_capacity(SAMPLE_RECORDS);
         let step = (self.records.len() / SAMPLE_RECORDS).max(1);
         let mut at = 0usize;
         while queries.len() < SAMPLE_RECORDS && at < self.records.len() {
             if let Some(v) = self.slot_of(zeusdb_vector_core::RecordId::from_slot(at)) {
                 let v = self.forward(v);
-                let stride = (v.dims.len() / QUERY_DIMS).max(1);
-                let dims: Vec<u32> = v
-                    .dims
-                    .iter()
-                    .copied()
-                    .step_by(stride)
-                    .take(QUERY_DIMS)
-                    .collect();
-                queries.push(SparseVector {
-                    values: vec![1.0; dims.len()],
-                    dims,
-                });
+                let cut = |width: usize| -> SparseVector {
+                    let stride = (v.dims.len() / width).max(1);
+                    let dims: Vec<u32> =
+                        v.dims.iter().copied().step_by(stride).take(width).collect();
+                    SparseVector {
+                        values: vec![1.0; dims.len()],
+                        dims,
+                    }
+                };
+                queries.push(cut(QUERY_DIMS));
+                wide.push(cut(WIDE_QUERY_DIMS));
             }
             at += step;
         }
@@ -192,29 +210,6 @@ impl PostingsIndex {
             }
             postings
         });
-        // The merge of every sampled record against every sampled query, per
-        // element merged, which is what the enumerate-driven path pays per
-        // admitted record.
-        let records: Vec<SparseRef<'_>> = (0..self.records.len())
-            .step_by(step)
-            .filter_map(|at| self.slot_of(zeusdb_vector_core::RecordId::from_slot(at)))
-            .take(SAMPLE_RECORDS)
-            .map(|slot| self.forward(slot))
-            .collect();
-        let merge_elements: usize = records
-            .iter()
-            .flat_map(|a| queries.iter().map(move |b| a.dims.len() + b.dims.len()))
-            .sum();
-        let merge_ns = median(ROUNDS, || {
-            let mut acc = 0f32;
-            for a in &records {
-                for b in &queries {
-                    acc += a.dot(b.as_ref());
-                }
-            }
-            std::hint::black_box(acc);
-            merge_elements
-        });
         // The bitmap scan under the random half, per posting, less what the
         // admitted and rejected halves would cost were every test
         // predicted. Half the tests mispredict there, so the remainder is
@@ -233,30 +228,55 @@ impl PostingsIndex {
             postings
         });
         let mispredict_ns = ((half_ns - 0.5 * posting_ns - 0.5 * reject_ns) * 2.0).max(0.0);
-        // The enumerate-driven path over the few, per record, less the
-        // merge each record costs at the sampled query length.
+        // The enumerate-driven path over the few, per record, at three
+        // query widths. Under an empty query nothing is merged, so that
+        // figure is the fixed cost of scoring a record outright. The two
+        // wider figures are the fixed cost plus the merge of the mean record
+        // against a query of each width, and the difference between them is
+        // what a query element adds, from which the record's own element
+        // follows.
         let mean_nnz = self.mean_nnz();
-        let mean_query =
+        let enumerate_at = |queries: &[SparseVector]| {
+            median(ROUNDS, || {
+                for q in queries {
+                    let _ = std::hint::black_box(self.search_scoped(
+                        Mode::Enumerate,
+                        q.as_ref(),
+                        10,
+                        &few,
+                        false,
+                        IdfScope::Global,
+                    ));
+                }
+                few_count * queries.len()
+            })
+        };
+        let empty: Vec<SparseVector> = vec![SparseVector::default(); queries.len()];
+        let record_ns = enumerate_at(&empty);
+        let narrow_ns = enumerate_at(&queries);
+        let wide_ns = enumerate_at(&wide);
+        let narrow_width =
             queries.iter().map(|q| q.dims.len()).sum::<usize>() as f64 / queries.len() as f64;
-        let enumerate_ns = median(ROUNDS, || {
-            for q in &queries {
-                let _ = std::hint::black_box(self.search_scoped(
-                    Mode::Enumerate,
-                    q.as_ref(),
-                    10,
-                    &few,
-                    false,
-                    IdfScope::Global,
-                ));
-            }
-            few_count * queries.len()
-        });
-        let record_ns = (enumerate_ns - merge_ns * (mean_nnz + mean_query)).max(0.0);
+        let wide_width =
+            wide.iter().map(|q| q.dims.len()).sum::<usize>() as f64 / wide.len() as f64;
+        let (merge_ns, query_ns) = if wide_width > narrow_width {
+            let query_ns = ((wide_ns - narrow_ns) / (wide_width - narrow_width)).max(0.0);
+            let merge_ns =
+                ((narrow_ns - record_ns - query_ns * narrow_width) / mean_nnz.max(1.0)).max(0.0);
+            (merge_ns, query_ns)
+        } else {
+            // Every record is narrower than the wide width, so the two
+            // widths coincide and the merge is one unit for both sides.
+            let per_element =
+                ((narrow_ns - record_ns) / (mean_nnz + narrow_width).max(1.0)).max(0.0);
+            (per_element, per_element)
+        };
         self.units = UnitCosts {
             posting_ns,
             reject_ns,
             mispredict_ns,
             merge_ns,
+            query_ns,
             record_ns,
             measured: true,
         };
@@ -267,6 +287,7 @@ impl PostingsIndex {
             reject_ns = reject_ns,
             mispredict_ns = mispredict_ns,
             merge_ns = merge_ns,
+            query_ns = query_ns,
             record_ns = record_ns,
             postings_timed = postings,
             "Timed the unit costs on the index"
@@ -294,11 +315,13 @@ fn median<F: FnMut() -> usize>(rounds: usize, mut work: F) -> f64 {
 #[allow(dead_code)]
 pub(crate) fn describe(units: &UnitCosts) -> String {
     format!(
-        "posting {:.2} ns, reject {:.2} ns, mispredict {:.2} ns, merge {:.2} ns, record {:.2} ns{}",
+        "posting {:.2} ns, reject {:.2} ns, mispredict {:.2} ns, merge {:.2} ns, query {:.2} ns, \
+         record {:.2} ns{}",
         units.posting_ns,
         units.reject_ns,
         units.mispredict_ns,
         units.merge_ns,
+        units.query_ns,
         units.record_ns,
         if units.measured { "" } else { " (floor)" }
     )
@@ -346,8 +369,9 @@ mod tests {
         assert!(units.posting_ns > 0.0 && units.posting_ns.is_finite());
         assert!(units.reject_ns > 0.0 && units.reject_ns.is_finite());
         assert!(units.mispredict_ns >= 0.0 && units.mispredict_ns.is_finite());
-        assert!(units.merge_ns > 0.0 && units.merge_ns.is_finite());
-        assert!(units.record_ns >= 0.0 && units.record_ns.is_finite());
+        assert!(units.merge_ns >= 0.0 && units.merge_ns.is_finite());
+        assert!(units.query_ns >= 0.0 && units.query_ns.is_finite());
+        assert!(units.record_ns > 0.0 && units.record_ns.is_finite());
         assert!(!describe(&units).contains("floor"));
     }
 }

@@ -1080,6 +1080,7 @@ dependencies = [
 name = "zeusdb-vector-sparse"
 version = "0.9.0"
 dependencies = [
+ "serde",
  "tempfile",
  "tracing",
  "zeusdb-vector-core",
@@ -1089,6 +1090,7 @@ dependencies = [
 name = "zeusdb-vector-text"
 version = "0.9.0"
 dependencies = [
+ "serde",
  "zeusdb-vector-core",
 ]
 

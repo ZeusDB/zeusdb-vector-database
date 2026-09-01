@@ -49,14 +49,23 @@
 //! insertion prices its searches on what it holds rather than on the floor
 //! it started from. Neither is persisted, since both move with the machine
 //! and the build. A traversal is priced per unit of
-//! `ef` from a whole search timed on the graph's own points, because a
-//! traversal's time is the memory it touches and a kernel timed in a loop
-//! runs from cache: at width 100 a search at `ef` 200 cost as much as eleven
-//! thousand kernel evaluations and visited about a thousand nodes. An exact
-//! scan is priced per record from the kernel, timed over a strided walk of
-//! the store. A filtered traversal grows as the admitted share falls, from
-//! two measured points. An index too small to time takes a compiled-in
-//! floor for each.
+//! `ef` from a whole search timed on the graph, because a traversal's time
+//! is the memory it touches and a kernel timed in a loop runs from cache:
+//! at width 100 a search at `ef` 200 cost as much as eleven thousand kernel
+//! evaluations and visited about a thousand nodes. Both units are timed
+//! over records scattered across the store, under a bitmap test per
+//! candidate as every search the collection runs pays, and the search is
+//! asked for a vector the graph does not hold. An exact scan is priced per
+//! record from the kernel. A filtered traversal grows as the admitted share
+//! falls, from two measured points. An index too small to time takes a
+//! compiled-in floor for each.
+//!
+//! What the figure prices is the arm's own work. At 50,000 records of width
+//! 100 the traversal measured 106 microseconds and a filter admitting every
+//! record added 70 more, being the filter's evaluation over the column
+//! codes and the page's assembly, which no arm's cost includes and which
+//! `ArmPlan::cost` says. A caller reading the plan against a filtered
+//! query's wall time sees that difference, not a unit that is wrong.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -219,20 +228,29 @@ impl DenseIndex {
     }
 
     /// Time the two units on a graph that is not yet installed, so a
-    /// replacement is measured with no guard held. The kernel over a strided
-    /// walk of the store, and a whole search per unit of `ef`.
+    /// replacement is measured with no guard held. The kernel over records
+    /// scattered across the store, and a whole search per unit of `ef`,
+    /// both under a bitmap test admitting every node, which is the
+    /// predicate's cost without its outcome.
     pub(crate) fn time_graph(graph: &VectorGraph) -> Option<(f64, f64)> {
-        if graph.nb_points() < CALIBRATION_MIN_NODES {
+        let nodes = graph.nb_points();
+        if nodes < CALIBRATION_MIN_NODES {
             return None;
         }
+        let mut every = Bitmap::with_slots(nodes);
+        for node in 0..nodes {
+            every.insert(node);
+        }
+        let admits = |id: usize| every.contains(id);
         let distance_ns = graph
-            .time_distance_ns(CALIBRATION_EVALUATIONS, CALIBRATION_ROUNDS)
+            .time_distance_ns(CALIBRATION_EVALUATIONS, CALIBRATION_ROUNDS, &admits)
             .filter(|ns| ns.is_finite() && *ns > 0.0)?;
         let search_ns = graph
             .time_search_ns(
                 CALIBRATION_SEARCH_K,
                 CALIBRATION_SEARCH_EF,
                 CALIBRATION_SEARCHES,
+                &admits,
             )
             .filter(|ns| ns.is_finite() && *ns > 0.0)?;
         Some((distance_ns, search_ns / CALIBRATION_SEARCH_EF as f64))

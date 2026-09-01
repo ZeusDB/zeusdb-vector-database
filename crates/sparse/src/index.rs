@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 use zeusdb_vector_core::{
     Admit, Bitmap, Budget, CorpusStats, Cost, Error, Hits, Inventory, Ledger, Persist, Prepared,
@@ -23,7 +24,12 @@ pub const DEFAULT_BM25_K1: f32 = 1.2;
 pub const DEFAULT_BM25_B: f32 = 0.75;
 
 /// How a stored value and a query value combine into a score.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// Written into `config.json` by value as `{"type": "dot"}` or
+/// `{"type": "bm25", "k1": 1.2, "b": 0.75}`, so a saved space is scored as it
+/// was declared.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
 pub enum Weighting {
     /// The product of the stored value and the query value, summed over the
     /// dimensions the two share. The values mean whatever the caller's
@@ -93,7 +99,10 @@ impl Weighting {
 pub const DEFAULT_LAZY_THRESHOLD_PERCENT: u32 = 10;
 
 /// What `remove` does to the record's postings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Written into `config.json` as `"strand"`, `"lazy"` or `"eager"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Unlink {
     /// Leave every posting where it is, counting it dead on its list. The
     /// dead bitmap hides the record and `compact` reclaims the postings. This
@@ -109,7 +118,10 @@ pub enum Unlink {
 }
 
 /// How a sparse space is declared.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Written into `config.json` by value, every field named, so a directory
+/// records the declaration itself rather than a name for it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SparseConfig {
     pub unlink: Unlink,
     /// Dead share, in percent of a list's length, above which a lazy unlink
@@ -307,6 +319,14 @@ impl PostingsIndex {
 
     pub fn distinct_dims(&self) -> usize {
         self.lists.len()
+    }
+
+    /// The largest dimension any list is kept for, or `None` on an index
+    /// that has seen no posting. What a text layer's dictionary is checked
+    /// against, since every dimension of a text space is a term id the
+    /// dictionary issued.
+    pub fn max_dim(&self) -> Option<u32> {
+        self.slots_by_dim.keys().copied().max()
     }
 
     pub fn postings_total(&self) -> usize {

@@ -3,12 +3,19 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// How a space's tokenizer is declared, as a value.
 ///
 /// The variants are what an index can write down and read back so that a
 /// query is tokenized the way the records were. A caller's own
 /// implementation has no such value, and is recorded as `External`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Written into `config.json` as `"simple"` or `"external"`. An index that
+/// recorded `external` is opened with the implementation handed to it or
+/// not at all.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TokenizerConfig {
     /// [`SimpleTokenizer`]. It has no parameters, so the variant is the
     /// whole of its value.
