@@ -8,13 +8,16 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 use zeusdb_vector_core::{compile_filter, Error, IdfScope, SpaceName, SparseRef, SparseVector};
-use zeusdb_vector_sparse::{SparseConfig, Weighting};
-use zeusdb_vector_text::{SimpleTokenizer, TokenizerConfig};
+use zeusdb_vector_sparse::{SparseConfig, Unlink, Weighting};
+use zeusdb_vector_text::{SimpleTokenizer, Tokenizer, TokenizerConfig};
 
-use super::{Collection, Declaration, ParsedRecord, SpaceConfig, TextConfig, DEFAULT_SPACE};
+use super::{
+    Arm, Collection, Declaration, ParsedRecord, Query, SpaceConfig, TextConfig, DEFAULT_SPACE,
+};
 
 fn record(id: &str, dense: &[f32], sparse: Option<(&[u32], &[f32])>, cat: &str) -> ParsedRecord {
     let mut metadata: HashMap<String, Value> = HashMap::new();
@@ -176,6 +179,34 @@ fn a_record_refused_for_its_sparse_half_leaves_nothing_behind() {
     );
     assert!(!collection.contains("r1"));
     assert_eq!(collection.len(), 0);
+
+    // The weighting's own rule is applied at the same door, so a value at
+    // or below zero under term frequency weighting leaves nothing behind
+    // either, and the graph holds no node for it.
+    let weighted = Collection::build(
+        Declaration::validate(2, "l2", 4, 50, 100, vec!["cat".to_string()])
+            .unwrap()
+            .with_sparse(
+                "terms",
+                SparseConfig {
+                    weighting: Weighting::BM25,
+                    ..SparseConfig::default()
+                },
+            )
+            .unwrap(),
+        None,
+    );
+    let zero = record("r1", &[0.0, 0.0], Some((&[1, 5], &[1.0, 0.0])), "a");
+    let added = weighted.add_records(vec![zero], vec![], false);
+    assert_eq!(added.total_errors, 1);
+    assert_eq!(
+        added.errors[0],
+        "Vector r1: ValueError: Sparse vector value at index 1 is 0, and a space weighted by term frequency takes values above zero alone"
+    );
+    assert!(!weighted.contains("r1"));
+    assert_eq!(weighted.len(), 0);
+    assert_eq!(weighted.stats()["graph_nodes"], "0");
+    assert_eq!(weighted.stats()["sparse_records"], "0");
 }
 
 #[test]
@@ -393,4 +424,249 @@ fn text_is_refused_where_the_sparse_space_takes_term_ids_alone() {
         ),
         Err(Error::SparseWeightingInvalid { parameter: "b", .. })
     ));
+}
+
+/// A text arm and a terms arm over the same text answer the same page, the
+/// collection's `tokenize` hands over what the layer's tokenizer does, and
+/// `vectorize_terms` over those terms is `vectorize_texts` over the text.
+#[test]
+fn a_text_arm_and_a_terms_arm_answer_the_same_page() {
+    let declaration = Declaration::validate(2, "l2", 4, 50, 100, vec![])
+        .unwrap()
+        .with_text(
+            "text",
+            SparseConfig {
+                weighting: Weighting::BM25,
+                ..SparseConfig::default()
+            },
+            Arc::new(SimpleTokenizer),
+        )
+        .unwrap();
+    let collection = Collection::build(declaration, None);
+    let texts = [
+        "The quick brown fox",
+        "a lazy DOG",
+        "the fox and the dog",
+        "quick quick",
+    ];
+    let by_text = collection.vectorize_texts(&texts).unwrap();
+    let terms: Vec<Vec<String>> = texts
+        .iter()
+        .map(|text| collection.tokenize(text).unwrap())
+        .collect();
+    assert_eq!(terms[1], ["a", "lazy", "dog"]);
+    // The same terms counted again issue no id and give the same vectors.
+    let by_terms = collection.vectorize_terms(&terms).unwrap();
+    assert_eq!(by_terms, by_text);
+    assert_eq!(collection.term_count(), Some(8));
+
+    let records: Vec<ParsedRecord> = by_text
+        .into_iter()
+        .enumerate()
+        .map(|(i, sparse)| ParsedRecord {
+            id: format!("t{i}"),
+            vector: vec![i as f32, 0.0],
+            sparse: Some(sparse),
+            metadata: HashMap::new(),
+        })
+        .collect();
+    assert_eq!(
+        collection.add_records(records, vec![], false).total_errors,
+        0
+    );
+
+    let query_terms = collection.tokenize("Quick fox!").unwrap();
+    assert_eq!(query_terms, ["quick", "fox"]);
+    let text_arm = [Arm::Text {
+        text: "Quick fox!",
+        idf: IdfScope::Corpus,
+    }];
+    let terms_arm = [Arm::Terms {
+        terms: &query_terms,
+        idf: IdfScope::Corpus,
+    }];
+    assert_eq!(terms_arm[0].kind(), zeusdb_vector_core::SpaceKind::Sparse);
+    let by_text = collection.query(&Query::new(&text_arm, 5)).unwrap();
+    let by_terms = collection.query(&Query::new(&terms_arm, 5)).unwrap();
+    assert_eq!(by_text, by_terms);
+    assert_eq!(by_text.hits[0].id, "t0");
+    assert_eq!(by_text.hits.len(), 3);
+    // A query issues no id, and an unknown term is dropped.
+    assert_eq!(collection.term_count(), Some(8));
+    let unknown = [Arm::Terms {
+        terms: &["zebra".to_string()],
+        idf: IdfScope::Corpus,
+    }];
+    assert!(collection
+        .query(&Query::new(&unknown, 5))
+        .unwrap()
+        .hits
+        .is_empty());
+    let dense_only = Collection::build(
+        Declaration::validate(2, "l2", 4, 50, 100, vec![]).unwrap(),
+        None,
+    );
+    assert!(matches!(
+        dense_only.query(&Query::new(&terms_arm, 5)),
+        Err(Error::NoSparseSpace)
+    ));
+    assert!(matches!(
+        dense_only.tokenize("x"),
+        Err(Error::NoSparseSpace)
+    ));
+    assert!(matches!(
+        dense_only.vectorize_terms(&[vec!["x".to_string()]]),
+        Err(Error::NoSparseSpace)
+    ));
+}
+
+/// The tokenizer runs under no guard. A tokenizer that reads the collection
+/// while it runs takes the dictionary's guard itself, which would deadlock
+/// or trip the registry if the collection held that guard around it.
+#[test]
+fn the_tokenizer_runs_under_no_guard() {
+    struct Probing {
+        collection: OnceLock<Weak<Collection>>,
+        calls: AtomicUsize,
+    }
+    impl Tokenizer for Probing {
+        fn tokenize(&self, text: &str, term: &mut dyn FnMut(&str)) -> Result<(), Error> {
+            if let Some(collection) = self.collection.get().and_then(Weak::upgrade) {
+                // The dictionary's read guard, taken inside the tokenizer.
+                let _ = collection.term_count();
+                // And the whole of `stats`, which takes every guard in turn.
+                let _ = collection.stats();
+            }
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            text.split_whitespace().for_each(term);
+            Ok(())
+        }
+    }
+    let probe = Arc::new(Probing {
+        collection: OnceLock::new(),
+        calls: AtomicUsize::new(0),
+    });
+    let declaration = Declaration::validate(2, "l2", 4, 50, 100, vec![])
+        .unwrap()
+        .with_text("text", SparseConfig::default(), probe.clone())
+        .unwrap();
+    let collection = Arc::new(Collection::build(declaration, None));
+    probe
+        .collection
+        .set(Arc::downgrade(&collection))
+        .ok()
+        .unwrap();
+
+    let vectors = collection
+        .vectorize_texts(&["alpha beta", "beta gamma"])
+        .unwrap();
+    let records: Vec<ParsedRecord> = vectors
+        .into_iter()
+        .enumerate()
+        .map(|(i, sparse)| ParsedRecord {
+            id: format!("t{i}"),
+            vector: vec![i as f32, 0.0],
+            sparse: Some(sparse),
+            metadata: HashMap::new(),
+        })
+        .collect();
+    assert_eq!(
+        collection.add_records(records, vec![], false).total_errors,
+        0
+    );
+    let page = collection
+        .search_text("gamma", None, 5, IdfScope::Corpus)
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(probe.calls.load(Ordering::Relaxed), 3);
+}
+
+/// A tokenizer's own failure comes back from every door it can be reached
+/// through, as the tokenizer returned it.
+#[test]
+fn a_failing_tokenizer_reaches_the_caller() {
+    struct Broken;
+    impl Tokenizer for Broken {
+        fn tokenize(&self, text: &str, _term: &mut dyn FnMut(&str)) -> Result<(), Error> {
+            Err(Error::TokenizerFailed(
+                format!("cannot split {text:?}").into(),
+            ))
+        }
+    }
+    let declaration = Declaration::validate(2, "l2", 4, 50, 100, vec![])
+        .unwrap()
+        .with_text("text", SparseConfig::default(), Arc::new(Broken))
+        .unwrap();
+    let collection = Collection::build(declaration, None);
+    for result in [
+        collection.tokenize("a b").map(|_| ()),
+        collection.vectorize_texts(&["a b"]).map(|_| ()),
+        collection
+            .search_text("a b", None, 5, IdfScope::Corpus)
+            .map(|_| ()),
+    ] {
+        match result {
+            Err(Error::TokenizerFailed(inner)) => {
+                assert_eq!(inner.to_string(), "cannot split \"a b\"")
+            }
+            other => panic!("expected the tokenizer's failure, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        collection.tokenize("a b").unwrap_err().to_string(),
+        "The tokenizer raised cannot split \"a b\""
+    );
+    assert_eq!(
+        collection.tokenize("x").unwrap_err().exception(),
+        zeusdb_vector_core::Exception::Runtime
+    );
+    // Terms already split need no tokenizer, so they still count.
+    assert!(collection.vectorize_terms(&[vec!["a".to_string()]]).is_ok());
+}
+
+/// A declaration read back by name takes the defaults for what it leaves
+/// out, the names it takes are the ones `config.json` writes, and the
+/// weighting's name agrees with its tag.
+#[test]
+fn a_declaration_by_name_takes_its_defaults() {
+    let named: SparseConfig =
+        serde_json::from_value(json!({"weighting": {"type": "bm25"}})).unwrap();
+    assert_eq!(
+        named,
+        SparseConfig {
+            weighting: Weighting::BM25,
+            ..SparseConfig::default()
+        }
+    );
+    let empty: SparseConfig = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(empty, SparseConfig::default());
+    let full: SparseConfig = serde_json::from_value(json!({
+        "unlink": "eager",
+        "lazy_threshold_percent": 25,
+        "weighting": {"type": "bm25", "k1": 1.5, "b": 0.6}
+    }))
+    .unwrap();
+    assert_eq!(full.unlink, Unlink::Eager);
+    assert_eq!(full.lazy_threshold_percent, 25);
+    assert_eq!(full.weighting, Weighting::Bm25 { k1: 1.5, b: 0.6 });
+    // What the file writes is what the name reads.
+    let written = serde_json::to_value(&full).unwrap();
+    assert_eq!(
+        serde_json::from_value::<SparseConfig>(written).unwrap(),
+        full
+    );
+    for weighting in [Weighting::Dot, Weighting::BM25] {
+        assert_eq!(
+            serde_json::to_value(weighting).unwrap()["type"],
+            json!(weighting.name())
+        );
+    }
+    assert!(
+        serde_json::from_value::<SparseConfig>(json!({"weighting": {"type": "bm26"}})).is_err()
+    );
+    assert!(serde_json::from_value::<SparseConfig>(json!({"unlink": "sometimes"})).is_err());
+    assert_eq!(
+        serde_json::from_value::<TokenizerConfig>(json!("simple")).unwrap(),
+        TokenizerConfig::Simple
+    );
 }

@@ -662,9 +662,11 @@ fn the_text_regime_weighted_by_term_frequency_matches_brute_force() {
     assert!(pages > 6_000);
 }
 
+/// The `splade` structure under the term frequency weighting, which takes
+/// whole numbers alone, so over the regime that rounds its weights up.
 #[test]
-fn the_splade_regime_weighted_by_term_frequency_matches_brute_force() {
-    let (pages, differ) = verify_bm25("splade", 1_000, 30);
+fn the_splade_counts_regime_weighted_by_term_frequency_matches_brute_force() {
+    let (pages, differ) = verify_bm25("splade-counts", 1_000, 30);
     assert_eq!(
         differ, 0,
         "{differ} of {pages} pages differ from brute force"

@@ -1,13 +1,28 @@
 //! Reading records out of Python.
 //!
 //! `add` accepts five input shapes and everything that turns any of them into
-//! owned Rust lives here. What leaves this file is `ParsedRecords`, which
-//! holds no Python object, which is what lets insertion release the
-//! interpreter lock. Every vector is processed for the space on the way
-//! through, by the collection's own rule, so a record is stored as the engine
-//! expects it. What a query vector is checked against once it is out of
-//! Python is the engine's half of this module, `Collection::validate_query`,
-//! and its records carry this module's target.
+//! owned Rust lives here. What leaves this file is a list of [`Parsed`]
+//! records, which hold no Python object, which is what lets insertion
+//! release the interpreter lock. Every vector is processed for the space on
+//! the way through, by the collection's own rule, so a record is stored as
+//! the engine expects it. What a query vector is checked against once it is
+//! out of Python is the engine's half of this module,
+//! `Collection::validate_query`, and its records carry this module's target.
+//!
+//! # The sparse half of a record
+//!
+//! A record may fill the collection's sparse space as well as the dense
+//! one, under one of two keys. `sparse` is a mapping `{"dims": [...],
+//! "values": [...]}` of term ids and weights, parallel and sorted by id,
+//! and `text` is a string the space's text layer counts into term ids. In
+//! the single object and list shapes each record carries its own; in the
+//! batch shapes `sparse` and `texts` are parallel arrays beside `ids`,
+//! with `None` for a record that fills the dense space alone, and they are
+//! held to the length rule the other parallel arrays are held to. A record
+//! carries one or the other. Which of the two the space takes is the
+//! space's rule and is applied in `add` after parsing, where a text is
+//! tokenized with the interpreter lock held; see the crate's `tokenizer`
+//! module. Every shape without either key parses as it always did.
 //!
 //! Two validators that look alike are deliberately not one.
 //! `extract_single_vector` raises a `PyErr` and `extract_single_vector_safe`
@@ -23,10 +38,157 @@ use pyo3::types::{PyDict, PyList};
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{error, trace};
-use zeusdb_vector_core::Error;
-use zeusdb_vector_hnsw::ParsedRecords;
+use zeusdb_vector_core::{Error, SparseVector};
+
+/// A record's sparse half as it arrived: nothing, a vector of term ids and
+/// weights, or a text the space's text layer counts.
+pub(super) enum SparseInput {
+    None,
+    Vector(SparseVector),
+    Text(String),
+}
+
+/// One record out of Python, with the vector processed for the space and
+/// the sparse half not yet counted.
+pub(super) struct Parsed {
+    pub(super) id: String,
+    pub(super) vector: Vec<f32>,
+    pub(super) metadata: HashMap<String, Value>,
+    pub(super) sparse: SparseInput,
+}
+
+impl Parsed {
+    fn dense(id: String, vector: Vec<f32>, metadata: HashMap<String, Value>) -> Self {
+        Parsed {
+            id,
+            vector,
+            metadata,
+            sparse: SparseInput::None,
+        }
+    }
+}
+
+/// The two keys a sparse vector mapping carries.
+const SPARSE_VECTOR_KEYS: [&str; 2] = ["dims", "values"];
+
+/// A sparse vector out of a mapping `{"dims": [...], "values": [...]}`.
+///
+/// The dims are read as integers and held to the width of a term id, the
+/// values as numbers, from a list or a one dimensional array of either. The
+/// rules the vector itself has to satisfy, being parallel slices, strictly
+/// increasing dims and finite values, are the engine's and are applied
+/// where the vector is used, so a malformed vector is refused with the
+/// engine's message wherever it arrives.
+pub(super) fn extract_sparse_vector(value: &Bound<PyAny>) -> Result<SparseVector, String> {
+    let dict = value.cast::<PyDict>().map_err(|_| {
+        format!(
+            "'sparse' must be a mapping {{'dims': [...], 'values': [...]}}, got {}",
+            value
+                .get_type()
+                .name()
+                .map(|name| name.to_string())
+                .unwrap_or_default()
+        )
+    })?;
+    for key in dict.keys() {
+        let key = key
+            .extract::<String>()
+            .map_err(|_| "'sparse' keys must be strings".to_string())?;
+        if !SPARSE_VECTOR_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "'sparse' carries '{}', and a sparse vector is {{'dims': [...], 'values': [...]}}",
+                key
+            ));
+        }
+    }
+    let dims = dict.get_item("dims").ok().flatten().ok_or_else(|| {
+        "'sparse' is missing 'dims', the term ids in increasing order".to_string()
+    })?;
+    let values = dict
+        .get_item("values")
+        .ok()
+        .flatten()
+        .ok_or_else(|| "'sparse' is missing 'values', one weight per dim".to_string())?;
+    let dims: Vec<i64> = dims
+        .extract()
+        .map_err(|_| "'sparse' dims must be a list of non-negative integers".to_string())?;
+    let dims: Vec<u32> = dims
+        .into_iter()
+        .map(|dim| {
+            u32::try_from(dim).map_err(|_| {
+                format!(
+                    "'sparse' dim {} is outside 0 to {}, which is the width of a term id",
+                    dim,
+                    u32::MAX
+                )
+            })
+        })
+        .collect::<Result<Vec<u32>, String>>()?;
+    let values: Vec<f32> = values
+        .extract()
+        .map_err(|_| "'sparse' values must be a list of numbers".to_string())?;
+    Ok(SparseVector { dims, values })
+}
+
+/// The sparse half a record carries under `sparse` and `text`, given the
+/// two values where present. `None` under either is the key left out.
+fn sparse_input(
+    sparse: Option<&Bound<PyAny>>,
+    text: Option<&Bound<PyAny>>,
+) -> Result<SparseInput, String> {
+    let sparse = sparse.filter(|value| !value.is_none());
+    let text = text.filter(|value| !value.is_none());
+    match (sparse, text) {
+        (None, None) => Ok(SparseInput::None),
+        (Some(_), Some(_)) => Err(
+            "a record fills the sparse space with 'sparse' or with 'text', not both".to_string(),
+        ),
+        (Some(vector), None) => extract_sparse_vector(vector).map(SparseInput::Vector),
+        (None, Some(text)) => text
+            .extract::<String>()
+            .map(SparseInput::Text)
+            .map_err(|_| {
+                format!(
+                    "'text' must be a str, got {}",
+                    text.get_type()
+                        .name()
+                        .map(|name| name.to_string())
+                        .unwrap_or_default()
+                )
+            }),
+    }
+}
+
+/// The sparse half a record mapping carries.
+fn sparse_input_of_record(dict: &Bound<PyDict>) -> Result<SparseInput, String> {
+    let sparse = dict.get_item("sparse").ok().flatten();
+    let text = dict.get_item("text").ok().flatten();
+    sparse_input(sparse.as_ref(), text.as_ref())
+}
+
+/// The sparse half at position `i` of a batch, from the `sparse` and
+/// `texts` arrays where the batch carries them. Both are lists by the time
+/// this runs, since `check_batch_lengths` refused anything else.
+fn sparse_input_at(
+    sparse_list: Option<&Bound<PyList>>,
+    texts_list: Option<&Bound<PyList>>,
+    i: usize,
+) -> Result<SparseInput, String> {
+    let sparse = sparse_list.and_then(|list| list.get_item(i).ok());
+    let text = texts_list.and_then(|list| list.get_item(i).ok());
+    sparse_input(sparse.as_ref(), text.as_ref())
+}
+
+/// A batch's parallel array under `key`, where it is a list.
+fn parallel_list<'py>(dict: &Bound<'py, PyDict>, key: &str) -> Option<Bound<'py, PyList>> {
+    dict.get_item(key)
+        .ok()
+        .flatten()
+        .and_then(|item| item.cast::<PyList>().ok().cloned())
+}
+
 impl HNSWIndex {
-    /// Parse input data into (id, vector, metadata) tuples with error collection
+    /// Parse input data into records with error collection
     ///
     /// Two error channels, and which one a mistake takes is the distinction
     /// this function exists to draw. A bad record is collected into `errors`
@@ -37,7 +199,7 @@ impl HNSWIndex {
     pub(super) fn parse_input_data(
         &self,
         data: &Bound<PyAny>,
-    ) -> PyResult<(ParsedRecords, Vec<String>)> {
+    ) -> PyResult<(Vec<Parsed>, Vec<String>)> {
         let mut parsed_vectors = Vec::new();
         let mut errors = Vec::new();
 
@@ -55,7 +217,7 @@ impl HNSWIndex {
             match self.extract_single_vector_safe(data) {
                 Ok(vector) => {
                     let id = self.inner.generate_id();
-                    parsed_vectors.push((id, vector, HashMap::new()));
+                    parsed_vectors.push(Parsed::dense(id, vector, HashMap::new()));
                 }
                 Err(e) => {
                     errors.push(format!("Single vector error: {}", e));
@@ -73,7 +235,7 @@ impl HNSWIndex {
     fn parse_dict_input_safe(
         &self,
         dict: &Bound<PyDict>,
-        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+        parsed_vectors: &mut Vec<Parsed>,
         errors: &mut Vec<String>,
     ) -> PyResult<()> {
         // Check for single object format
@@ -110,7 +272,15 @@ impl HNSWIndex {
                         _ => HashMap::new(),
                     };
 
-                    parsed_vectors.push((id, vector, metadata));
+                    match sparse_input_of_record(dict) {
+                        Ok(sparse) => parsed_vectors.push(Parsed {
+                            id,
+                            vector,
+                            metadata,
+                            sparse,
+                        }),
+                        Err(e) => errors.push(format!("Vector {}: {}", id, e)),
+                    }
                 }
                 Err(e) => {
                     let id = dict
@@ -207,20 +377,39 @@ impl HNSWIndex {
             "metadata"
         };
 
-        for (field, singular) in [("ids", "id"), (metadata_field, "metadata mapping")] {
+        // `sparse` and `texts` are the sparse half's parallel arrays, held to
+        // the same rule, and a non-list under either raises as one under
+        // `ids` does, since neither has a spelling an earlier release read.
+        for (field, singular) in [
+            ("ids", "id"),
+            (metadata_field, "metadata mapping"),
+            ("sparse", "sparse vector"),
+            ("texts", "text"),
+        ] {
             let Some(item) = dict.get_item(field)? else {
                 continue;
             };
             let Ok(list) = item.cast::<PyList>() else {
-                if field != "ids" {
+                if field == metadata_field {
                     // A non-list under a metadata key is ignored by both
                     // parsers today and carries no id, so it is left alone.
                     continue;
                 }
+                if field == "ids" {
+                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                        "add expected '{}' to be a list, got {}. A batch pairs '{}' with \
+                         '{}' by position and reads only a list that way, so any other type \
+                         is discarded whole and every record takes a generated id.",
+                        field,
+                        item.get_type().name()?,
+                        field,
+                        vector_field
+                    )));
+                }
                 return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
-                    "add expected '{}' to be a list, got {}. A batch pairs '{}' with \
-                     '{}' by position and reads only a list that way, so any other type \
-                     is discarded whole and every record takes a generated id.",
+                    "add expected '{}' to be a list, got {}. A batch pairs '{}' with '{}' \
+                     by position and reads only a list that way, with None for a record \
+                     that fills the dense space alone.",
                     field,
                     item.get_type().name()?,
                     field,
@@ -255,7 +444,7 @@ impl HNSWIndex {
     fn parse_batch_format(
         &self,
         dict: &Bound<PyDict>,
-        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+        parsed_vectors: &mut Vec<Parsed>,
         errors: &mut Vec<String>,
     ) -> PyResult<()> {
         // Process each key path immediately without storing references
@@ -263,7 +452,7 @@ impl HNSWIndex {
         // Try "vectors" key
         if let Some(vectors_item) = dict.get_item("vectors")? {
             if let Ok(list) = vectors_item.cast::<PyList>() {
-                return self.process_vector_list(list, dict, parsed_vectors);
+                return self.process_vector_list(list, dict, parsed_vectors, errors);
             } else if let Ok(np_array) = vectors_item.cast::<PyArray2<f32>>() {
                 // FIX: Handle NumPy with IDs and metadata
                 return Ok(self.parse_numpy_with_context(
@@ -278,7 +467,7 @@ impl HNSWIndex {
         // Try "embeddings" key
         if let Some(embeddings_item) = dict.get_item("embeddings")? {
             if let Ok(list) = embeddings_item.cast::<PyList>() {
-                return self.process_vector_list(list, dict, parsed_vectors);
+                return self.process_vector_list(list, dict, parsed_vectors, errors);
             } else if let Ok(np_array) = embeddings_item.cast::<PyArray2<f32>>() {
                 // FIX: Handle NumPy with IDs and metadata
                 return Ok(self.parse_numpy_with_context(
@@ -293,7 +482,7 @@ impl HNSWIndex {
         // Try "values" key
         if let Some(values_item) = dict.get_item("values")? {
             if let Ok(list) = values_item.cast::<PyList>() {
-                return self.process_vector_list(list, dict, parsed_vectors);
+                return self.process_vector_list(list, dict, parsed_vectors, errors);
             } else {
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                     "values field must be a list in batch format",
@@ -312,8 +501,12 @@ impl HNSWIndex {
         &self,
         vectors: &Bound<PyList>,
         dict: &Bound<PyDict>,
-        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+        parsed_vectors: &mut Vec<Parsed>,
+        errors: &mut Vec<String>,
     ) -> PyResult<()> {
+        let sparse_list = parallel_list(dict, "sparse");
+        let texts_list = parallel_list(dict, "texts");
+
         // Process each vector in the batch
         for (i, vector_item) in vectors.iter().enumerate() {
             let vector = self.extract_single_vector(&vector_item)?;
@@ -361,7 +554,15 @@ impl HNSWIndex {
                 None => HashMap::new(),
             };
 
-            parsed_vectors.push((id, vector, meta));
+            match sparse_input_at(sparse_list.as_ref(), texts_list.as_ref(), i) {
+                Ok(sparse) => parsed_vectors.push(Parsed {
+                    id,
+                    vector,
+                    metadata: meta,
+                    sparse,
+                }),
+                Err(e) => errors.push(format!("Vector {}: {}", id, e)),
+            }
         }
 
         Ok(())
@@ -372,7 +573,7 @@ impl HNSWIndex {
         &self,
         np_array: &Bound<PyArray2<f32>>,
         dict: &Bound<PyDict>,
-        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+        parsed_vectors: &mut Vec<Parsed>,
         errors: &mut Vec<String>,
     ) -> Result<(), PyEngineError> {
         let readonly = np_array.readonly();
@@ -408,6 +609,10 @@ impl HNSWIndex {
             .get_item("metadatas")?
             .or_else(|| dict.get_item("metadata").ok().flatten())
             .and_then(|item| item.cast::<PyList>().ok().cloned());
+
+        // The sparse half's parallel arrays, where the batch carries them.
+        let sparse_list = parallel_list(dict, "sparse");
+        let texts_list = parallel_list(dict, "texts");
 
         trace!(
             operation = "parse_numpy_context",
@@ -482,7 +687,18 @@ impl HNSWIndex {
                 "Parsed NumPy vector with context"
             );
 
-            parsed_vectors.push((id, processed_vector, metadata));
+            match sparse_input_at(sparse_list.as_ref(), texts_list.as_ref(), i) {
+                Ok(sparse) => parsed_vectors.push(Parsed {
+                    id,
+                    vector: processed_vector,
+                    metadata,
+                    sparse,
+                }),
+                Err(e) => {
+                    errors.push(format!("Vector {}: {}", id, e));
+                    rejected += 1;
+                }
+            }
         }
 
         trace!(
@@ -498,7 +714,7 @@ impl HNSWIndex {
     fn parse_list_input_safe(
         &self,
         list: &Bound<PyList>,
-        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+        parsed_vectors: &mut Vec<Parsed>,
         errors: &mut Vec<String>,
     ) {
         for (item_index, item) in list.iter().enumerate() {
@@ -540,7 +756,15 @@ impl HNSWIndex {
                             _ => HashMap::new(),
                         };
 
-                        parsed_vectors.push((id, vector, metadata));
+                        match sparse_input_of_record(item_dict) {
+                            Ok(sparse) => parsed_vectors.push(Parsed {
+                                id,
+                                vector,
+                                metadata,
+                                sparse,
+                            }),
+                            Err(e) => errors.push(format!("Vector {}: {}", id, e)),
+                        }
                     }
                     Err(e) => {
                         // Collect error with item index and ID for context
@@ -559,7 +783,7 @@ impl HNSWIndex {
                 match self.extract_single_vector_safe(&item) {
                     Ok(vector) => {
                         let id = self.inner.generate_id();
-                        parsed_vectors.push((id, vector, HashMap::new()));
+                        parsed_vectors.push(Parsed::dense(id, vector, HashMap::new()));
                     }
                     Err(e) => {
                         errors.push(format!("Item {}: {}", item_index, e));
@@ -573,7 +797,7 @@ impl HNSWIndex {
     fn parse_numpy_input_safe(
         &self,
         np_array: &Bound<PyArray2<f32>>,
-        parsed_vectors: &mut Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+        parsed_vectors: &mut Vec<Parsed>,
         errors: &mut Vec<String>,
     ) -> Result<(), String> {
         // This is the same as your current parse_numpy_input but returns Result<(), String>
@@ -618,7 +842,7 @@ impl HNSWIndex {
 
             let processed_vector = self.inner.process_vector_for_space(raw_vector.to_vec());
             let id = self.inner.generate_id();
-            parsed_vectors.push((id, processed_vector, HashMap::new()));
+            parsed_vectors.push(Parsed::dense(id, processed_vector, HashMap::new()));
         }
 
         Ok(())

@@ -1,7 +1,7 @@
 //! Synthetic sparse corpora at realistic term counts, for the tests.
 //!
-//! Two regimes, both assumptions about what a real corpus looks like and
-//! labelled as such wherever a figure from them is quoted.
+//! Three regimes, each an assumption about what a real corpus looks like
+//! and labelled as such wherever a figure from them is quoted.
 //!
 //! - `text`: a tokenised passage corpus. Vocabulary 100,000, term popularity
 //!   Zipf with exponent 1.0, about 45 distinct terms per record, lognormal and
@@ -11,6 +11,9 @@
 //!   popularity Zipf with exponent 0.7, about 180 nonzeros per record, normal
 //!   and clipped to 20 to 500, positive lognormal weights, queries of about
 //!   40 nonzeros.
+//! - `splade-counts`: the `splade` structure with every weight rounded up to
+//!   a whole number, so a corpus of that shape indexes under the term
+//!   frequency weighting, which takes counts alone.
 
 use zeusdb_vector_core::SparseVector;
 
@@ -127,9 +130,27 @@ pub(crate) fn text_like(n: usize, nq: usize, seed: u64) -> Corpus {
 }
 
 pub(crate) fn splade_like(n: usize, nq: usize, seed: u64) -> Corpus {
+    splade_shaped(n, nq, seed, "splade", false)
+}
+
+/// The `splade` structure over whole number weights: the same draws in the
+/// same order, each weight rounded up, so the dims are the `splade`
+/// corpus's and every value is a count.
+pub(crate) fn splade_counts_like(n: usize, nq: usize, seed: u64) -> Corpus {
+    splade_shaped(n, nq, seed, "splade-counts", true)
+}
+
+fn splade_shaped(n: usize, nq: usize, seed: u64, name: &'static str, whole: bool) -> Corpus {
     let mut rng = Rng::new(seed);
     let zipf = Zipf::new(30_522, 0.7);
-    let mut w = |rng: &mut Rng| -> f32 { (0.6 * rng.gauss()).exp() as f32 };
+    let mut w = |rng: &mut Rng| -> f32 {
+        let weight = (0.6 * rng.gauss()).exp() as f32;
+        if whole {
+            weight.ceil()
+        } else {
+            weight
+        }
+    };
     let docs = (0..n)
         .map(|_| {
             let len = (180.0 + 40.0 * rng.gauss()).round().clamp(20.0, 500.0) as usize;
@@ -143,7 +164,7 @@ pub(crate) fn splade_like(n: usize, nq: usize, seed: u64) -> Corpus {
         })
         .collect();
     Corpus {
-        name: "splade",
+        name,
         docs,
         queries,
     }
@@ -153,6 +174,7 @@ pub(crate) fn corpus(regime: &str, n: usize, nq: usize) -> Corpus {
     match regime {
         "text" => text_like(n, nq, 133),
         "splade" => splade_like(n, nq, 133),
+        "splade-counts" => splade_counts_like(n, nq, 133),
         other => panic!("unknown regime {other}"),
     }
 }

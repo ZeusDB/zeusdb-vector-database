@@ -233,6 +233,46 @@ class VectorDatabase:
                   did before this existed. Up to 32 names, each a metadata field
                   name, no duplicates, and none of "$and", "$or" or "$not", which
                   are filter keys rather than fields.
+                - sparse (dict): A sparse vector space beside the dense one,
+                  which a record fills under `sparse` in add() with term ids
+                  and weights, or, where the space has a text layer, under
+                  `text` with a string and under nothing else, and which
+                  query() asks with a sparse or a text arm the same way. None
+                  by default, which is an index holding the dense
+                  space alone, as every index did before this existed. The
+                  mapping's keys are the fields a saved directory records for
+                  the space, so a declaration and its config.json spell them
+                  the same way:
+                    - name (str): The space's name, which is the directory its
+                      artefacts are saved under. Default "sparse".
+                    - weighting: The scoring rule. "dot" scores the product of
+                      the stored weight and the query weight summed over the
+                      shared term ids, and is the default where the space takes
+                      term ids alone. "bm25" reads every stored weight as a
+                      term frequency and weights a query term by its rarity
+                      over the corpus at the moment of the query, so it takes
+                      whole numbers above zero alone, and is the default where
+                      a tokenizer is declared, since a text layer stores term
+                      counts; as a mapping, {"type": "bm25", "k1": 1.2,
+                      "b": 0.75} sets its two parameters, k1 finite and at least
+                      zero and b between zero and one.
+                    - unlink: What a removal does to the record's postings,
+                      "lazy" (default), "strand" or "eager".
+                    - lazy_threshold_percent (int): The dead share of a
+                      postings list above which a lazy unlink rewrites it.
+                      Default 10.
+                    - tokenizer: Declares the text layer. "simple" is the
+                      built-in tokenizer, which splits where a character is
+                      neither a letter nor a digit and lowercases, and knows no
+                      language. A callable is a tokenizer of your own, taking
+                      the text as a str and returning an iterable of str, one
+                      per term in order with every repeat. A directory saved
+                      from such an index records the tokenizer as external and
+                      opens only through load(path, tokenizer=<the callable>).
+                  A directory saved from an index holding a sparse space
+                  declares format version 2.0.0 and needs this release or later
+                  to open; a directory holding the dense space alone is what
+                  earlier releases wrote and opens where it did.
 
                   A filter naming only declared fields is answered from the
                   columns. A filter naming anything else returns exactly the same
@@ -406,23 +446,37 @@ class VectorDatabase:
             raise RuntimeError(f"Failed to create {index_type.upper()} index: {e}") from e
 
 
-    def load(self, path: str) -> Any:
+    def load(self, path: str, tokenizer: Any = None) -> Any:
         """
         Load a previously saved ZeusDB index from disk.
-    
+
         Args:
             path: Path to the .zdb directory containing the saved index
-        
+            tokenizer: The tokenizer the index's text layer was declared
+                with, where the directory cannot rebuild it. A directory
+                whose sparse space was declared with tokenizer="simple"
+                records that and needs nothing here. One declared with a
+                callable of your own records the tokenizer as external and
+                cannot reproduce it, so it opens only when the same callable
+                is handed here, and raises RuntimeError naming the space
+                otherwise. A callable handed for a directory that recorded
+                "simple", "simple" handed for one that recorded external,
+                and anything handed for a directory with no text layer are
+                each refused, since opening the index under a tokenizer it
+                was not declared with would count a query's terms
+                differently from its records'. The tokenizer is stored and
+                never run by the load.
+
         Returns:
             HNSWIndex: The loaded index ready for use
-        
+
         Example:
             >>> vdb = VectorDatabase()
             >>> loaded_index = vdb.load("my_index.zdb")
             >>> results = loaded_index.search(query_vector, top_k=5)
         """
         from ._engine import _load_index  # Direct function import
-        return _load_index(path)
+        return _load_index(path, tokenizer)
 
 
     def _validate_quantization_config(self, config: Dict[str, Any], dim: int,

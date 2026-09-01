@@ -27,7 +27,9 @@ pub const DEFAULT_BM25_B: f32 = 0.75;
 ///
 /// Written into `config.json` by value as `{"type": "dot"}` or
 /// `{"type": "bm25", "k1": 1.2, "b": 0.75}`, so a saved space is scored as it
-/// was declared.
+/// was declared. Read back, a term weighting parameter left out takes its
+/// published default, so a declaration handed in by name needs only the
+/// type; `config.json` names both, so a saved space never takes one.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Weighting {
@@ -50,7 +52,20 @@ pub enum Weighting {
     /// default; see `IdfScope`. Nothing derived from a corpus statistic is
     /// stored, so every query is scored under the statistics of the moment
     /// and a record leaving or arriving moves no stored weight.
-    Bm25 { k1: f32, b: f32 },
+    Bm25 {
+        #[serde(default = "default_k1")]
+        k1: f32,
+        #[serde(default = "default_b")]
+        b: f32,
+    },
+}
+
+fn default_k1() -> f32 {
+    DEFAULT_BM25_K1
+}
+
+fn default_b() -> f32 {
+    DEFAULT_BM25_B
 }
 
 impl Weighting {
@@ -82,9 +97,42 @@ impl Weighting {
     }
 
     /// Whether every stored value is read as a term frequency, which is
-    /// what makes a value at or below zero a refusal at insert.
+    /// what makes a value at or below zero, or one that is not a whole
+    /// number, a refusal at insert.
     pub fn reads_term_frequency(&self) -> bool {
         matches!(self, Weighting::Bm25 { .. })
+    }
+
+    /// The rules a record's vector has to satisfy before this rule stores
+    /// it: the vector's own three, and on every value where the rule reads
+    /// a term frequency, above zero and a whole number, since a term
+    /// frequency is a count and the rule's saturation and length read it
+    /// as one. The first value breaking a rule is named, the positivity
+    /// rule first. What `insert` applies, and what a collection applies
+    /// before it writes any other space for the record, so a record
+    /// refused here leaves nothing behind.
+    pub fn validate_record(&self, vector: SparseRef<'_>) -> Result<(), Error> {
+        vector.validate()?;
+        if self.reads_term_frequency() {
+            for (index, &value) in vector.values.iter().enumerate() {
+                if value <= 0.0 {
+                    return Err(Error::SparseValueNotPositive { index, value });
+                }
+                if value.fract() != 0.0 {
+                    return Err(Error::SparseValueNotWhole { index, value });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The rule's name, as `config.json` spells its `type` and as a
+    /// declaration names it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Weighting::Dot => "dot",
+            Weighting::Bm25 { .. } => "bm25",
+        }
     }
 }
 
@@ -120,8 +168,12 @@ pub enum Unlink {
 /// How a sparse space is declared.
 ///
 /// Written into `config.json` by value, every field named, so a directory
-/// records the declaration itself rather than a name for it.
+/// records the declaration itself rather than a name for it. Read back, a
+/// field left out takes the value `Default` gives it, so a declaration
+/// handed in by name carries only what it sets and the one serde derive
+/// serves both the file and the declaration.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SparseConfig {
     pub unlink: Unlink,
     /// Dead share, in percent of a list's length, above which a lazy unlink
@@ -500,17 +552,7 @@ impl PostingsIndex {
         id: RecordId,
         vector: SparseRef<'_>,
     ) -> Result<(), Error> {
-        vector.validate()?;
-        if self.config.weighting.reads_term_frequency() {
-            if let Some((index, &value)) = vector
-                .values
-                .iter()
-                .enumerate()
-                .find(|(_, value)| **value <= 0.0)
-            {
-                return Err(Error::SparseValueNotPositive { index, value });
-            }
-        }
+        self.config.weighting.validate_record(vector)?;
         let slot_index = id.slot();
         if slot_index >= self.records.len() {
             self.records.resize(slot_index + 1, NEVER_HELD);
@@ -789,6 +831,40 @@ mod tests {
             dims: dims.to_vec(),
             values: values.to_vec(),
         }
+    }
+
+    /// Under the term frequency weighting a value that is not a whole
+    /// number is refused and named, after the positivity rule on the same
+    /// value, a whole number of any size is a count, and the dot product
+    /// takes the same values.
+    #[test]
+    fn a_term_frequency_space_refuses_a_fraction_and_names_it() {
+        let none = zeusdb_vector_core::Prepared::none;
+        let mut index = PostingsIndex::new(SparseConfig {
+            weighting: Weighting::BM25,
+            ..SparseConfig::default()
+        });
+        assert!(matches!(
+            index.insert(RecordId(1), sparse(&[1, 2], &[1.0, 0.5]).as_ref(), none()),
+            Err(Error::SparseValueNotWhole { index: 1, value }) if value == 0.5
+        ));
+        assert!(matches!(
+            index.insert(RecordId(1), sparse(&[1, 2], &[1.0, -0.5]).as_ref(), none()),
+            Err(Error::SparseValueNotPositive { index: 1, .. })
+        ));
+        assert_eq!(index.len(), 0);
+        index
+            .insert(
+                RecordId(1),
+                sparse(&[1, 2], &[3.0, 1_000_000.0]).as_ref(),
+                none(),
+            )
+            .unwrap();
+        assert_eq!(index.len(), 1);
+        let mut dot = PostingsIndex::new(SparseConfig::default());
+        dot.insert(RecordId(1), sparse(&[1, 2], &[1.0, 0.5]).as_ref(), none())
+            .unwrap();
+        assert_eq!(dot.len(), 1);
     }
 
     /// An id already held is refused, an id never held cannot be removed,

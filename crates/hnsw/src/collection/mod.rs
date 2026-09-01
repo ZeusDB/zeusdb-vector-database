@@ -109,7 +109,7 @@ use zeusdb_vector_core::{
     SparseVector, VectorGraph, VectorIndex, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
-use zeusdb_vector_text::{vectorize_record, TermDictionary, Tokenizer, TokenizerConfig};
+use zeusdb_vector_text::{count_record, TermDictionary, Tokenizer, TokenizerConfig};
 
 /// The target every record this file emits carries. See the module
 /// documentation.
@@ -632,11 +632,15 @@ impl SparseSpace {
 /// What turns a record's text or a query's text into the term ids the
 /// postings index stores.
 ///
-/// The dictionary sits behind the space's second guard, and the guard is
-/// never held together with the index's. A record's text is counted under
-/// the dictionary's write guard, released, and the vector is then inserted
-/// under the index's write guard, so the interning of a batch and a search
-/// under the index never wait on one another.
+/// The tokenizer runs under no guard at all. It may be the caller's own and
+/// need something of the caller's to run, such as an interpreter lock, and a
+/// thread holding that while it waited for a guard the tokenizing thread
+/// held would wait forever; see [`Collection::tokenize`]. The dictionary
+/// sits behind the space's second guard, and the guard is never held
+/// together with the index's. A record's terms are counted under the
+/// dictionary's write guard, released, and the vector is then inserted under
+/// the index's write guard, so the interning of a batch and a search under
+/// the index never wait on one another.
 pub(crate) struct TextLayer {
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
     pub(crate) dictionary: RwLockAt<TermDictionary>,
@@ -920,21 +924,60 @@ impl Collection {
         names
     }
 
-    /// Count each text into the sparse space's term ids and term
-    /// frequencies, issuing an id to every term not seen before, under the
-    /// dictionary's guard taken alone. What a record's text becomes before
-    /// `add_records` takes it as the record's sparse half.
+    /// The text layer, where the sparse space has one. Refused where the
+    /// collection declares no sparse space, or one that takes term ids
+    /// alone, in that order.
+    pub(crate) fn text_layer(&self) -> Result<&TextLayer, Error> {
+        let space = self.sparse().ok_or(Error::NoSparseSpace)?;
+        space.text.as_ref().ok_or(Error::NoTextLayer)
+    }
+
+    /// Every term of `text` as the sparse space's tokenizer hands them over,
+    /// in order and repeats included, an empty term dropped.
+    ///
+    /// **Under no guard.** The tokenizer may be the caller's own and need
+    /// something of the caller's to run, such as an interpreter lock. A
+    /// thread holding that lock while it waited for the dictionary's guard,
+    /// and a thread holding the dictionary's guard while its tokenizer
+    /// waited for the lock, would wait for each other forever, so the
+    /// engine never runs a tokenizer with a guard held: this takes none,
+    /// and [`Collection::vectorize_terms`] and a text arm count the terms
+    /// collected here under the dictionary's guard afterwards.
+    ///
+    /// A failure of the tokenizer itself comes back as the tokenizer
+    /// returned it. Refused where the collection declares no sparse space,
+    /// or one that takes term ids alone.
+    pub fn tokenize(&self, text: &str) -> Result<Vec<String>, Error> {
+        let layer = self.text_layer()?;
+        zeusdb_vector_text::tokenize(&*layer.tokenizer, text)
+    }
+
+    /// Count each record's terms, as [`Collection::tokenize`] handed them
+    /// over, into the sparse space's term ids and term frequencies, issuing
+    /// an id to every term not seen before, under the dictionary's guard
+    /// taken once for the batch and alone. What a record's text becomes
+    /// before `add_records` takes it as the record's sparse half.
     ///
     /// Refused where the collection declares no sparse space, or one that
     /// takes term ids alone.
-    pub fn vectorize_texts(&self, texts: &[&str]) -> Result<Vec<SparseVector>, Error> {
-        let space = self.sparse().ok_or(Error::NoSparseSpace)?;
-        let layer = space.text.as_ref().ok_or(Error::NoTextLayer)?;
+    pub fn vectorize_terms(&self, terms: &[Vec<String>]) -> Result<Vec<SparseVector>, Error> {
+        let layer = self.text_layer()?;
         let mut dictionary = layer.dictionary.write().unwrap();
-        texts
+        terms
             .iter()
-            .map(|text| vectorize_record(&*layer.tokenizer, &mut dictionary, text))
+            .map(|record| count_record(&mut dictionary, record))
             .collect()
+    }
+
+    /// Count each text into the sparse space's term ids and term
+    /// frequencies: [`Collection::tokenize`] on every text under no guard,
+    /// then [`Collection::vectorize_terms`] under the dictionary's.
+    pub fn vectorize_texts(&self, texts: &[&str]) -> Result<Vec<SparseVector>, Error> {
+        let terms = texts
+            .iter()
+            .map(|text| self.tokenize(text))
+            .collect::<Result<Vec<Vec<String>>, Error>>()?;
+        self.vectorize_terms(&terms)
     }
 
     /// Distinct terms the sparse space's dictionary holds, where it has

@@ -15,8 +15,9 @@
 //!
 //! | module | what it covers |
 //! |---|---|
-//! | `construct` | reading a declaration and its quantization mapping, and the neighbour selection warning |
+//! | `construct` | reading a declaration, its quantization mapping and its sparse space, and the neighbour selection warning |
 //! | `input` | turning Python input into records and query vectors |
+//! | `query` | reading a query over one or more arms, and writing its page and its plan |
 //!
 //! # Why the module keeps its name
 //!
@@ -36,19 +37,22 @@
 
 mod construct;
 mod input;
+mod query;
 
 use crate::conversion::{
     batch_hits_to_python, hits_to_python, python_dict_to_value_map, value_map_to_python,
 };
 use crate::PyEngineError;
+use input::{Parsed, SparseInput};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use query::{page_to_python, plan_to_python};
 use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{debug, error, instrument, trace};
 use zeusdb_vector_core::{compile_filter, Error};
-use zeusdb_vector_hnsw::{Added, Collection};
+use zeusdb_vector_hnsw::{Added, Collection, ParsedRecord};
 
 /// `skip_from_py_object` because nothing extracts an `AddResult`. It is the
 /// return type of `add` and appears in no argument position, in this crate or
@@ -163,9 +167,11 @@ pub struct HNSWIndex {
 /// `isinstance` checks and type annotations while direct construction raises
 /// `TypeError`. Every rule that governs a valid index is enforced here, which
 /// is what makes the Python factory and this function agree.
+// The argument list is the Python signature, one value per keyword.
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(name = "_create_hnsw_index")]
-#[pyo3(signature = (dim, space, m, ef_construction, expected_size, quantization_config = None, indexed_fields = None))]
+#[pyo3(signature = (dim, space, m, ef_construction, expected_size, quantization_config = None, indexed_fields = None, sparse = None))]
 pub fn create_hnsw_index(
     dim: usize,
     space: String,
@@ -174,6 +180,7 @@ pub fn create_hnsw_index(
     expected_size: usize,
     quantization_config: Option<&Bound<PyDict>>,
     indexed_fields: Option<Vec<String>>,
+    sparse: Option<&Bound<PyDict>>,
 ) -> Result<HNSWIndex, PyEngineError> {
     construct::build(
         dim,
@@ -183,6 +190,7 @@ pub fn create_hnsw_index(
         expected_size,
         quantization_config,
         indexed_fields.unwrap_or_default(),
+        sparse,
     )
 }
 impl HNSWIndex {
@@ -318,14 +326,50 @@ impl HNSWIndex {
         self.inner.can_use_quantization()
     }
 
-    /// Enhanced add method that properly handles PQ overwrite scenarios
+    /// Add records, in any of the five shapes, each filling the sparse
+    /// space as well where the index declares one.
+    ///
+    /// A record fills the sparse space under the key the space takes.
+    /// `sparse` is a mapping `{"dims": [...], "values": [...]}` of term ids
+    /// and weights, parallel, the dims strictly increasing and the values
+    /// finite, and whole numbers above zero on a space weighted by term
+    /// frequency; a space that takes term ids alone takes it, and a space
+    /// with a text layer refuses it, since that space's term ids are its
+    /// dictionary's to issue. `text` is a string the space's text layer
+    /// splits with the tokenizer it was declared with and counts into term
+    /// ids and term frequencies, issuing an id to every term it has not
+    /// seen; a space without a text layer refuses it. A record carries one
+    /// or the other, or neither and fills the dense space alone. In the
+    /// single object and list shapes each record carries its own key; in
+    /// the batch shapes `sparse` and `texts` are parallel arrays beside
+    /// `ids`, one entry per vector with `None` where a record fills the
+    /// dense space alone, and held to the same length rule as `ids` and
+    /// `metadatas`. The text itself is not stored; put it in the metadata
+    /// to read it back.
+    ///
+    /// A record refused for its sparse half is counted and named in
+    /// `errors`, and the records around it are inserted, as a record with a
+    /// malformed vector is treated. That covers a malformed mapping, a
+    /// sparse vector or a text on an index whose space does not take it,
+    /// the engine's rules on the vector, and an exception the tokenizer
+    /// raised, which is named with its class in the record's error.
+    ///
+    /// # Where the interpreter lock is held
+    ///
+    /// Parsing holds it, as it always has. Every text is then tokenized
+    /// with it still held and no engine guard taken, since the tokenizer
+    /// may be a Python callable; see the crate's `tokenizer` module. The
+    /// lock is released after that, and the terms are counted into ids
+    /// under the dictionary's guard and the records inserted under the
+    /// spaces' guards without it, so the interning and the postings insert
+    /// never hold the lock and a search never waits on a Python callable.
     #[pyo3(signature = (data, overwrite = true))]
     #[instrument(level = "info", skip(self, data), fields(
         overwrite = overwrite,
         has_quantization = self.inner.has_quantization(),
         is_quantized = self.inner.is_quantized()
     ), err)]
-    pub fn add(&self, data: Bound<PyAny>, overwrite: bool) -> PyResult<AddResult> {
+    pub fn add(&self, data: Bound<PyAny>, overwrite: bool) -> Result<AddResult, PyEngineError> {
         // Input validation
         if data.is_none() {
             error!(
@@ -333,27 +377,95 @@ impl HNSWIndex {
                 error = "data_is_none",
                 "Data cannot be None"
             );
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Data cannot be None",
-            ));
+            return Err(
+                PyErr::new::<pyo3::exceptions::PyValueError, _>("Data cannot be None").into(),
+            );
         }
 
         // Use error-collecting parsing
-        let (parsed_data, parse_errors) = self.parse_input_data(&data)?;
+        let (parsed, mut errors) = self.parse_input_data(&data)?;
 
-        // Parsing is the whole of what reads Python objects, and it is done.
-        // Everything below works on `parsed_data`, which is owned Rust, so the
-        // insertion phase runs with the interpreter lock released. The mutation
-        // guard is taken inside that region rather than above it, so a caller
-        // waiting for another writer waits without the lock. Holding it while
-        // waiting would stall every Python thread in the process for the length
-        // of the writer ahead, which is the failure this change would otherwise
-        // introduce in place of the one it removes.
+        // The texts, tokenized with the lock held and no guard taken. A
+        // tokenizer that fails on a record is that record's error, and so
+        // is a supplied vector on a space with a text layer, whose term
+        // ids are the dictionary's to issue. Whether the space has one is
+        // read once per call, through an accessor that takes no guard
+        // where there is none and the dictionary's read guard alone, for
+        // a length, where there is.
+        let takes_text_alone = self.inner.term_count().is_some();
+        let mut records: Vec<ParsedRecord> = Vec::with_capacity(parsed.len());
+        let mut text_positions: Vec<usize> = Vec::new();
+        let mut text_terms: Vec<Vec<String>> = Vec::new();
+        for Parsed {
+            id,
+            vector,
+            metadata,
+            sparse,
+        } in parsed
+        {
+            let sparse = match sparse {
+                SparseInput::None => None,
+                SparseInput::Vector(vector) => {
+                    if takes_text_alone {
+                        // The vector's own rules first, as the engine
+                        // applies them, so a malformed vector reads the
+                        // same message on either kind of space, and then
+                        // the space's.
+                        let refused = match vector.as_ref().validate() {
+                            Err(rule) => rule,
+                            Ok(()) => Error::SparseVectorOnTextSpace,
+                        };
+                        errors.push(format!(
+                            "Vector {}: {}: {}",
+                            id,
+                            refused.exception().name(),
+                            refused
+                        ));
+                        continue;
+                    }
+                    Some(vector)
+                }
+                SparseInput::Text(text) => match self.inner.tokenize(&text) {
+                    Ok(terms) => {
+                        text_positions.push(records.len());
+                        text_terms.push(terms);
+                        None
+                    }
+                    Err(e) => {
+                        errors.push(format!("Vector {}: {}: {}", id, e.exception().name(), e));
+                        continue;
+                    }
+                },
+            };
+            records.push(ParsedRecord {
+                id,
+                vector,
+                sparse,
+                metadata,
+            });
+        }
+
+        // Parsing and tokenizing are the whole of what reads Python objects,
+        // and both are done. Everything below works on owned Rust, so the
+        // interning and the insertion run with the interpreter lock
+        // released. The mutation guard is taken inside that region rather
+        // than above it, so a caller waiting for another writer waits
+        // without the lock. Holding it while waiting would stall every
+        // Python thread in the process for the length of the writer ahead.
         //
-        // `Collection::add` carries the proof that nothing inside touches
-        // Python.
+        // `Collection::add_records` carries the proof that nothing inside
+        // touches Python, and `Collection::vectorize_terms` takes the
+        // dictionary's guard alone.
         let py = data.py();
-        let added = py.detach(|| self.inner.add(parsed_data, parse_errors, overwrite));
+        let added = py.detach(|| -> Result<Added, Error> {
+            if !text_terms.is_empty() {
+                let vectors = self.inner.vectorize_terms(&text_terms)?;
+                for (position, vector) in text_positions.into_iter().zip(vectors) {
+                    records[position].sparse = Some(vector);
+                }
+            }
+            Ok(self.inner.add_records(records, errors, overwrite))
+        })?;
 
         Ok(AddResult::from(added))
     }
@@ -600,6 +712,147 @@ impl HNSWIndex {
         );
 
         Ok(result)
+    }
+
+    /// Search one or more spaces with one query and return one page.
+    ///
+    /// `arms` is a list of mappings, one per arm, each asking one space with
+    /// one query. `{"vector": [...]}` asks the dense space, with the
+    /// vector on the caller's scale as `search` takes it, and takes
+    /// `ef_search` and `rerank` as `search` does. `{"sparse": {"dims":
+    /// [...], "values": [...]}}` asks a sparse space that takes term ids
+    /// alone, with term ids and weights; a space with a text layer refuses
+    /// it, since that space's term ids are its dictionary's. `{"text":
+    /// "..."}` asks a space with a text layer, with a string the layer
+    /// splits and counts as it counted the records; a space without one
+    /// refuses it. Either takes `idf`: `"corpus"`, the default, weights a
+    /// term by its rarity over the records the filter admits, and
+    /// `"global"` over every live record. A query names one to eight arms.
+    ///
+    /// Every arm runs under the one admit set the `filter` decides, which
+    /// is the filter `search` takes and selects the same records. `top_k`
+    /// is the page. `fetch` is the candidates each arm contributes to the
+    /// fusion, which is the page for one arm and five times it for several
+    /// unless set; a record just outside one arm's page cannot be lifted by
+    /// its rank on another, so a deeper fetch gives the fusion more to work
+    /// with, and the dense arm's traversal widens once the fetch passes
+    /// half its default width. `fusion` is how the arms' pages become one,
+    /// `"rrf"` or `{"type": "rrf", "k": 60.0}`, being reciprocal rank
+    /// fusion: a record's fused score is the sum over the pages it appears
+    /// on of `1 / (k + rank)`, rank counted from one, reading no score,
+    /// because a dense distance and a sparse similarity are not comparable.
+    /// It is read where there is more than one arm.
+    ///
+    /// The page is a list of dicts, best first and cut to `top_k`, and may
+    /// be shorter, since a sparse arm returns no record sharing no term
+    /// with the query and a filter may admit fewer records than asked for.
+    /// Each carries `id`, `score`, `metadata` and `contributions`. For one
+    /// arm the score is the arm's own, being the dense distance or the
+    /// sparse similarity, and a one arm dense query is `search` id for id
+    /// and score for score. For several it is the fused score, higher
+    /// better and comparable only with the other fused scores of the same
+    /// query, and `contributions` is what it was made from: one entry per
+    /// arm's page the record appeared on, in arm order, each carrying the
+    /// arm's position in `arms`, the record's `rank` on that page from one,
+    /// and the `score` that arm gave it. Among equal fused scores the id
+    /// orders the page, so a query returns the same page from one run to
+    /// the next.
+    ///
+    /// Every rule is checked before any guard is taken, so a refused query
+    /// changes nothing. `explain` returns the plan the same query runs
+    /// under without running it.
+    ///
+    /// # Where the interpreter lock is held
+    ///
+    /// Reading the arms holds it, and a text arm's tokenizer runs then,
+    /// with no engine guard taken. The lock is released for the search,
+    /// which takes the spaces' guards without it, and taken back to build
+    /// the page.
+    #[pyo3(signature = (arms, filter=None, top_k=10, fetch=None, fusion=None))]
+    #[instrument(level = "debug", skip(self, py, arms, filter, fusion), fields(
+        top_k = top_k,
+        fetch = fetch
+    ), err)]
+    pub fn query(
+        &self,
+        py: Python<'_>,
+        arms: &Bound<PyAny>,
+        filter: Option<&Bound<PyDict>>,
+        top_k: usize,
+        fetch: Option<usize>,
+        fusion: Option<&Bound<PyAny>>,
+    ) -> Result<Py<PyAny>, PyEngineError> {
+        let start_time = Instant::now();
+        let parsed = self.parse_query(arms, filter, top_k, fetch, fusion)?;
+        let page = py.detach(|| {
+            let arms = parsed.arms();
+            self.inner.query(&parsed.query(&arms))
+        })?;
+        let results_count = page.hits.len();
+        let result = page_to_python(page.hits, py)?;
+        debug!(
+            operation = "query_complete",
+            arms = page.plan.arms.len(),
+            results_count = results_count,
+            duration_ms = start_time.elapsed().as_millis(),
+            "Query completed"
+        );
+        Ok(result)
+    }
+
+    /// The plan a query would run under, without running it.
+    ///
+    /// Takes what `query` takes, holds the query to every rule `query`
+    /// applies, decides the admit set every arm would run under, prices
+    /// every arm under it, and returns that as a dict, which is the plan
+    /// `query` would produce beside the same page. It costs the admit set,
+    /// which for a filter over undeclared fields is a walk of the
+    /// metadata, and not the search.
+    ///
+    /// `admit` is the shape of the admit set: `{"shape": "all"}` for no
+    /// filter or a filter admitting every live record above the dense scan
+    /// threshold, `{"shape": "bitmap", "admitted": n}` for a filter every
+    /// field of which is declared, `{"shape": "sorted", "admitted": n}` for
+    /// a metadata walk that finished, `{"shape": "bounded", "bound": n}`
+    /// for a walk that gave up inside the bound the declared fields left,
+    /// and `{"shape": "predicate"}` for one that gave up over every record.
+    ///
+    /// `arms` is one dict per arm, in arm order: `space` and `kind` name
+    /// the space the arm asks, `fetch` is the candidates it was asked for,
+    /// `exact` says whether its page is exact by construction, being a
+    /// scan rather than a graph traversal, and `cost_ns` is the arm's own
+    /// estimate of its work, in nanoseconds.
+    ///
+    /// **`cost_ns` is an estimate of the arm's own work and nothing more.**
+    /// It is priced from unit costs the space timed on itself when it was
+    /// built or loaded, and it leaves out what the collection pays around
+    /// the arm, being the filter's evaluation over the columns and the
+    /// page's assembly, which measured near seventy microseconds a query at
+    /// fifty thousand records under a filter admitting every record. A
+    /// wall time measured under a filter exceeds it by that much, a dense
+    /// arm on a freshly loaded index of low width may be priced up to one
+    /// and a half times what it runs at from a warm cache, and a sparse
+    /// arm's price is within about fifteen percent where it was measured.
+    /// It is a figure to compare arms of one query by, not a promise.
+    ///
+    /// `fusion` is the fusion `query` would apply, `{"type": "rrf", "k":
+    /// 60.0}`, or `None` for a one arm query, whose page is the arm's own.
+    #[pyo3(signature = (arms, filter=None, top_k=10, fetch=None, fusion=None))]
+    pub fn explain(
+        &self,
+        py: Python<'_>,
+        arms: &Bound<PyAny>,
+        filter: Option<&Bound<PyDict>>,
+        top_k: usize,
+        fetch: Option<usize>,
+        fusion: Option<&Bound<PyAny>>,
+    ) -> Result<Py<PyDict>, PyEngineError> {
+        let parsed = self.parse_query(arms, filter, top_k, fetch, fusion)?;
+        let plan = py.detach(|| {
+            let arms = parsed.arms();
+            self.inner.explain(&parsed.query(&arms))
+        })?;
+        plan_to_python(&plan, py)
     }
 
     /// Enhanced Save method to include HNSW Graph
