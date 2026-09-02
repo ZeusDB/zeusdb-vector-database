@@ -587,6 +587,8 @@ were actually validating that cosine normalization was properly implemented.
 ### Removed
 - All usages of `.query()` must be replaced with `.search()`.
 
+> **Since 0.9.0** `query()` names a different method, taking `arms` rather than a vector. The rename above still stands; `search()` is the single-space k-nearest-neighbour method. See the README's Hybrid Search section.
+
 ---
 
 ## [0.0.8] - 2025-07-10

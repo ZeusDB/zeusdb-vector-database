@@ -165,6 +165,7 @@ def test_readme_names_only_entry_points_that_exist():
             "print", "len", "sorted", "matched", "range",
             "enumerate", "round", "compile", "getLogger", "setLevel", "basicConfig",
             "default_rng", "random", "tolist", "keys", "items", "listdir",
+            "lower", "split",
         }
     )
     missing = sorted(name for name in named if name not in known)
