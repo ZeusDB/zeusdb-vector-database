@@ -59,7 +59,11 @@ impl Collection {
                     info!(target: LOG_TARGET, operation = "training_trigger",
                         "Training threshold reached - starting PQ training"
                     );
-                    return self.train_quantization_from_ids();
+                    // The clock is read here, on the path where the codebook
+                    // is fitted for the first time, and handed down as the
+                    // stamp. A caller replaying a recorded training hands the
+                    // stamp that training took instead.
+                    return self.train_quantization_from_ids(Utc::now().to_rfc3339());
                 }
             }
         }
@@ -68,11 +72,19 @@ impl Collection {
     }
 
     /// TRAINING EXECUTION: Uses collected IDs for deterministic training set
-    #[instrument(target = LOG_TARGET, level = "info", skip(self), fields(
+    ///
+    /// `completed_at` is the RFC 3339 stamp the codebook is recorded as fitted
+    /// at. It is a parameter rather than a clock reading taken here so that
+    /// the one value training cannot reproduce is supplied by the caller:
+    /// `maybe_trigger_training` reads the clock, and a caller replaying a
+    /// recorded training hands the stamp that training took. Everything else
+    /// training produces is a function of the records that reached the
+    /// threshold, since every draw is seeded and every order is fixed.
+    #[instrument(target = LOG_TARGET, level = "info", skip(self, completed_at), fields(
         has_pq = self.dense().pq.is_some(),
         has_config = self.dense().quantization_config.is_some()
     ))]
-    fn train_quantization_from_ids(&self) -> Result<(), String> {
+    pub(super) fn train_quantization_from_ids(&self, completed_at: String) -> Result<(), String> {
         let start_time = Instant::now();
 
         let pq = self.dense().pq.as_ref().ok_or("PQ not available")?.clone();
@@ -187,9 +199,10 @@ impl Collection {
         let training_duration = training_start.elapsed();
 
         // The one point where the codebook goes from absent to fitted, so it is
-        // the one point that can stamp when that happened. `quantization.json`
-        // used to write the save time under this name. See the field.
-        *self.dense().training_completed_at.write().unwrap() = Some(Utc::now().to_rfc3339());
+        // the one point that stamps when that happened, with the stamp the
+        // caller handed in. `quantization.json` used to write the save time
+        // under this name. See the field.
+        *self.dense().training_completed_at.write().unwrap() = Some(completed_at);
 
         info!(target: LOG_TARGET, operation = "pq_training_complete",
             training_vectors = final_training_set.len(),

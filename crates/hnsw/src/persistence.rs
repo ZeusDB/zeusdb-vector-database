@@ -1006,13 +1006,13 @@ struct QuantizationArtefacts {
     codes: HashMap<String, Vec<u8>>,
 }
 
-/// Training collection state, held back until after the graph rebuild
+/// Training collection state, applied once the graph is back
 ///
-/// The rebuild re-adds every record through `add(overwrite=true)`, and every id
-/// is already in the restored mapping, so each one goes through
-/// `remove_point_internal` first. That strips the id from `training_ids`, and
-/// re-insertion cannot refill the list because collection is suppressed during
-/// a rebuild. Applying the collected ids afterwards is what makes them survive.
+/// The collected ids and the threshold flag are what `quantization.json`
+/// recorded, and they are applied after the graph is restored or rebuilt so
+/// that the flag is judged against the records the loaded collection holds.
+/// Neither fallback touches the training collection: both build the graph off
+/// to the side under the mapped ids and swap it in.
 struct TrainingState {
     ids: Vec<String>,
     threshold_reached: bool,
@@ -1562,15 +1562,7 @@ fn reconstruct_index_simple(
         quantization,
     )?;
 
-    // Step 2a: The metadata and its columns, before the graph, so the
-    // collection holds one column entry per mapped record while the graph's
-    // rebuild fallback removes and re-adds every record. The fallback routes
-    // through `add`, which writes metadata and columns under the ids it
-    // allocates, and step 4 writes both back from the file afterwards, so
-    // this is what makes the invariant a removal checks hold in between.
-    index.restore_storage_maps(pq_codes.clone(), metadata.clone());
-
-    // Step 2b: The sparse space, once the mappings are in and before the
+    // Step 2a: The sparse space, once the mappings are in and before the
     // graph, for the reasons `restore_spaces` gives.
     restore_spaces(&index, path, manifest)?;
 
@@ -1590,16 +1582,15 @@ fn reconstruct_index_simple(
                 rebuild_graph_from_codes(&mut index, &pq_codes, &vectors)?;
             } else {
                 debug!(target: LOG_TARGET, "Rebuilding HNSW graph from vectors...");
-                rebuild_graph_from_data(&mut index, &vectors, &pq_codes, &metadata)?;
+                rebuild_graph_from_data(&mut index, &vectors, &pq_codes)?;
             }
         }
     }
 
-    // Step 4: Put the stored record data back exactly as it was written. The
-    // quantized rebuild never touches the storage maps, and the raw rebuild
-    // routes through add(), which stores whatever vector it was given, so
-    // without this a reconstructed record would be kept at full width and
-    // quantized_only would lose the memory saving that is its whole purpose.
+    // Step 4: The stored record data, exactly as it was written, once the
+    // graph is back. Neither rebuild touches the storage maps, and the
+    // columns are built over `id_map`, which either rebuild may have added
+    // an id to for a record the mappings did not name.
     let raw_count = vectors.len();
     let code_count = pq_codes.len();
 
@@ -1898,7 +1889,8 @@ fn rebuild_graph_from_codes(
     Ok(())
 }
 
-/// Rebuild the HNSW graph by re-inserting every record using existing add logic
+/// Rebuild the graph from the records the directory holds, under the ids the
+/// mappings name
 ///
 /// This is the path for an index that is not trained, meaning one saved with no
 /// quantization at all or one saved while still collecting training vectors.
@@ -1907,33 +1899,24 @@ fn rebuild_graph_from_codes(
 /// already does for the same record while the index is live, so the graph is
 /// built at the fidelity the storage mode already delivers rather than losing
 /// the record. The codes themselves are restored as stored and are never
-/// recomputed from a reconstruction.
+/// recomputed from a reconstruction. The metadata is not carried here; step 4
+/// of the reconstruction writes it back from the file under the same ids.
 fn rebuild_graph_from_data(
     index: &mut Collection,
     vectors: &HashMap<String, Vec<f32>>,
     pq_codes: &HashMap<String, Vec<u8>>,
-    metadata: &HashMap<String, HashMap<String, Value>>,
 ) -> Result<(), Error> {
     if vectors.is_empty() && pq_codes.is_empty() {
         debug!(target: LOG_TARGET, "No records to rebuild (empty index)");
         return Ok(());
     }
 
-    // Prepare batch data for efficient insertion
-    let mut batch_vectors: Vec<Vec<f32>> = Vec::new();
-    let mut batch_ids: Vec<String> = Vec::new();
-    let mut batch_metadatas: Vec<HashMap<String, Value>> = Vec::new();
+    let mut records: Vec<(String, Vec<f32>)> = Vec::with_capacity(vectors.len() + pq_codes.len());
     let mut reconstructed = 0usize;
-    let mut missing_metadata = 0usize;
 
     // Every record with a raw vector, replayed from it
     for (ext_id, vector) in vectors.iter() {
-        if !metadata.contains_key(ext_id) {
-            missing_metadata += 1;
-        }
-        batch_vectors.push(vector.clone());
-        batch_ids.push(ext_id.clone());
-        batch_metadatas.push(metadata.get(ext_id).cloned().unwrap_or_default());
+        records.push((ext_id.clone(), vector.clone()));
     }
 
     // Every record that has codes and no raw vector, reconstructed
@@ -1956,60 +1939,22 @@ fn rebuild_graph_from_data(
                     codes: codes.len(),
                     error: e,
                 })?;
-
-            if !metadata.contains_key(ext_id) {
-                missing_metadata += 1;
-            }
-            batch_vectors.push(vector);
-            batch_ids.push(ext_id.clone());
-            batch_metadatas.push(metadata.get(ext_id).cloned().unwrap_or_default());
+            records.push((ext_id.clone(), vector));
             reconstructed += 1;
         }
     }
 
-    if missing_metadata > 0 {
-        debug!(target: LOG_TARGET, "{} records have no entry in metadata.json and are restored with empty metadata",
-            missing_metadata
-        );
-    }
-
-    // Insert in the order the records were first added rather than in the order
-    // a hash map hands them out. A HashMap's iteration order varies per process,
-    // so two rebuilds of one directory used to produce two differently wired
-    // graphs that answered the same query differently. Internal ids are handed
-    // out in arrival order, so sorting on them also puts the rebuild as close to
-    // the original build as a rebuild can get.
-    //
-    // The sort is over the whole batch, so the records reconstructed from codes
-    // are still ordered against the ones replayed from raw vectors rather than
-    // appended after them. Zipping the three lists together first is what makes
-    // that one sort rather than three index permutations of three clones.
-    let mut records: Vec<(String, Vec<f32>, HashMap<String, Value>)> = batch_ids
-        .into_iter()
-        .zip(batch_vectors)
-        .zip(batch_metadatas)
-        .map(|((id, vector), metadata)| (id, vector, metadata))
-        .collect();
-    {
-        let id_map = index.id_map();
-        records.sort_by(|a, b| {
-            let left = id_map.get(&a.0).copied().unwrap_or(usize::MAX);
-            let right = id_map.get(&b.0).copied().unwrap_or(usize::MAX);
-            left.cmp(&right).then_with(|| a.0.cmp(&b.0))
-        });
-    }
-
-    debug!(target: LOG_TARGET, "Prepared {} records for batch insertion ({} replayed from raw vectors, {} reconstructed from PQ codes)",
+    debug!(target: LOG_TARGET, "Prepared {} records for the graph rebuild ({} replayed from raw vectors, {} reconstructed from PQ codes)",
         records.len(),
         records.len() - reconstructed,
         reconstructed
     );
     debug!(target: LOG_TARGET, "Rebuilding the graph from the restored records...");
 
-    // The records are owned Rust and go straight into the insertion phase. This
-    // used to build a PyDict holding three PyLists and call add(), which parsed
-    // them back into exactly this. `rebuild_from_records` holds the flag
-    // pairing, releases the interpreter lock and refuses a partial graph.
+    // The records are owned Rust and go straight into a fresh graph, in
+    // ascending internal id, which `rebuild_from_records` orders them into
+    // from the restored mappings. This used to build a PyDict holding three
+    // PyLists and call add(), which parsed them back into exactly this.
     let inserted = index.rebuild_from_records(records)?;
 
     debug!(target: LOG_TARGET, "Graph rebuild completed: {} records inserted", inserted);

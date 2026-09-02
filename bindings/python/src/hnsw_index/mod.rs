@@ -52,7 +52,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{debug, error, instrument, trace};
 use zeusdb_vector_core::{compile_filter, Error};
-use zeusdb_vector_hnsw::{Added, Collection, ParsedRecord};
+use zeusdb_vector_hnsw::{Added, Collection, ParsedRecord, SparseHalf};
 
 /// `skip_from_py_object` because nothing extracts an `AddResult`. It is the
 /// return type of `add` and appears in no argument position, in this crate or
@@ -359,8 +359,8 @@ impl HNSWIndex {
     /// Parsing holds it, as it always has. Every text is then tokenized
     /// with it still held and no engine guard taken, since the tokenizer
     /// may be a Python callable; see the crate's `tokenizer` module. The
-    /// lock is released after that, and the terms are counted into ids
-    /// under the dictionary's guard and the records inserted under the
+    /// lock is released after that, and the terms are counted into ids and
+    /// the records inserted under the engine's mutation guard and the
     /// spaces' guards without it, so the interning and the postings insert
     /// never hold the lock and a search never waits on a Python callable.
     #[pyo3(signature = (data, overwrite = true))]
@@ -394,8 +394,6 @@ impl HNSWIndex {
         // a length, where there is.
         let takes_text_alone = self.inner.term_count().is_some();
         let mut records: Vec<ParsedRecord> = Vec::with_capacity(parsed.len());
-        let mut text_positions: Vec<usize> = Vec::new();
-        let mut text_terms: Vec<Vec<String>> = Vec::new();
         for Parsed {
             id,
             vector,
@@ -423,14 +421,10 @@ impl HNSWIndex {
                         ));
                         continue;
                     }
-                    Some(vector)
+                    Some(SparseHalf::Vector(vector))
                 }
                 SparseInput::Text(text) => match self.inner.tokenize(&text) {
-                    Ok(terms) => {
-                        text_positions.push(records.len());
-                        text_terms.push(terms);
-                        None
-                    }
+                    Ok(terms) => Some(SparseHalf::Terms(terms)),
                     Err(e) => {
                         errors.push(format!("Vector {}: {}: {}", id, e.exception().name(), e));
                         continue;
@@ -454,18 +448,11 @@ impl HNSWIndex {
         // Python thread in the process for the length of the writer ahead.
         //
         // `Collection::add_records` carries the proof that nothing inside
-        // touches Python, and `Collection::vectorize_terms` takes the
-        // dictionary's guard alone.
+        // touches Python. A record's terms travel as strings and are counted
+        // into ids there, under the mutation guard, so nothing this thread
+        // holds across the boundary is an id the dictionary issued.
         let py = data.py();
-        let added = py.detach(|| -> Result<Added, Error> {
-            if !text_terms.is_empty() {
-                let vectors = self.inner.vectorize_terms(&text_terms)?;
-                for (position, vector) in text_positions.into_iter().zip(vectors) {
-                    records[position].sparse = Some(vector);
-                }
-            }
-            Ok(self.inner.add_records(records, errors, overwrite))
-        })?;
+        let added: Added = py.detach(|| self.inner.add_records(records, errors, overwrite));
 
         Ok(AddResult::from(added))
     }
@@ -1212,9 +1199,14 @@ impl HNSWIndex {
         self.inner.contains(&id)
     }
 
-    /// Add index-level metadata
-    pub fn add_metadata(&self, metadata: HashMap<String, String>) {
-        self.inner.add_metadata(metadata)
+    /// Add index-level metadata, merging the pairs into what is held.
+    ///
+    /// The engine takes its mutation guard for this, as it does for every
+    /// other change a save records, so the interpreter lock is released
+    /// around the call: a caller waiting for another writer waits without
+    /// it, as `add` and `clear` arrange.
+    pub fn add_metadata(&self, py: Python<'_>, metadata: HashMap<String, String>) {
+        py.detach(|| self.inner.add_metadata(metadata))
     }
 
     /// Get index-level metadata value

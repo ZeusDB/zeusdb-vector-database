@@ -446,8 +446,9 @@ impl Declaration {
     /// Declare a sparse space with a text layer beside the dense one.
     ///
     /// The same rules as [`Declaration::with_sparse`], and the space takes
-    /// text through `Collection::vectorize_texts` and `search_text` as well
-    /// as term ids. The tokenizer is the caller's to keep: an index that
+    /// text as well as term ids, split by `Collection::tokenize` into the
+    /// terms a record carries and searched through `search_text`. The
+    /// tokenizer is the caller's to keep: an index that
     /// used one the engine cannot write down must be handed the same
     /// implementation when it is opened.
     pub fn with_text(
@@ -814,7 +815,6 @@ impl Collection {
             training_ids: RwLockAt::new(order::TRAINING_IDS, Vec::new()),
             training_threshold_reached: AtomicBool::new(false),
             created_at: RwLockAt::new(order::CREATED_AT, Utc::now().to_rfc3339()),
-            rebuilding_from_persistence: AtomicBool::new(false),
             overgrowth_warned: AtomicBool::new(false),
         }
     }

@@ -448,8 +448,20 @@ impl DenseIndex {
         }
     }
 
-    /// Phase one for a vector, whatever the graph holds.
-    fn plan(&self, id: RecordId, vector: &[f32]) -> Result<DensePlan, Error> {
+    /// Draw the level the next record's node takes, advancing the graph's
+    /// level stream by one draw. See `VectorGraph::draw_level`.
+    pub(crate) fn draw_level(&self) -> usize {
+        self.graph.draw_level()
+    }
+
+    /// Phase one for a vector at `level`, whatever the graph holds. Quantizes
+    /// first where the graph holds codes, and draws nothing.
+    fn plan_at_level(
+        &self,
+        id: RecordId,
+        vector: &[f32],
+        level: usize,
+    ) -> Result<DensePlan, Error> {
         if self.graph.is_quantized() {
             let pq = self.pq.as_ref().ok_or(Error::NoQuantizer)?;
             let codes = pq.quantize(vector).map_err(|e| {
@@ -460,10 +472,13 @@ impl DenseIndex {
                 );
                 Error::QuantizeFailed(e)
             })?;
-            let planned = self.graph.plan(Record::Codes {
-                codes: &codes,
-                raw: self.keeps_raw.then_some(vector),
-            });
+            let planned = self.graph.plan_at_level(
+                Record::Codes {
+                    codes: &codes,
+                    raw: self.keeps_raw.then_some(vector),
+                },
+                level,
+            );
             Ok(DensePlan {
                 codes: Some(codes),
                 planned,
@@ -471,9 +486,25 @@ impl DenseIndex {
         } else {
             Ok(DensePlan {
                 codes: None,
-                planned: self.graph.plan(Record::Raw(vector)),
+                planned: self.graph.plan_at_level(Record::Raw(vector), level),
             })
         }
+    }
+
+    /// Phase one at a level the caller drew.
+    ///
+    /// The collection draws the level through [`DenseIndex::draw_level`]
+    /// before it writes anything for the record, so the level is in hand
+    /// before the insertion begins, and hands it here under the read guard it
+    /// takes for the plan. The seam's own `prepare` is for a caller holding no
+    /// level of its own.
+    pub(crate) fn prepare_at_level(
+        &self,
+        id: RecordId,
+        vector: &[f32],
+        level: usize,
+    ) -> Result<Prepared, Error> {
+        Ok(Prepared::new(self.plan_at_level(id, vector, level)?))
     }
 }
 
@@ -486,15 +517,18 @@ impl VectorIndex<Dense> for DenseIndex {
         self.live.contains(id.slot())
     }
 
-    /// Phase one. Draws the level, descends and chooses the neighbour lists
-    /// under the read guard, and quantizes first where the graph holds
-    /// codes.
+    /// Phase one for a caller holding no level of its own: draws one and
+    /// plans at it under the read guard, quantizing first where the graph
+    /// holds codes. The collection draws ahead of this and calls
+    /// [`DenseIndex::prepare_at_level`] instead.
     fn prepare(&self, id: RecordId, vector: &[f32]) -> Result<Prepared, Error> {
-        Ok(Prepared::new(self.plan(id, vector)?))
+        let level = self.graph.draw_level();
+        self.prepare_at_level(id, vector, level)
     }
 
     /// Phase two. Appends the node and installs its lists under the write
-    /// guard. A caller that skipped `prepare` has both phases run here.
+    /// guard. A caller that skipped `prepare` has the draw and both phases
+    /// run here.
     ///
     /// A plan the graph refused, because the record's element type is not
     /// the graph's, installs nothing and is logged by the graph, which is
@@ -506,7 +540,10 @@ impl VectorIndex<Dense> for DenseIndex {
         }
         let plan = match prepared.take::<DensePlan>() {
             Some(plan) => plan,
-            None => self.plan(id, vector)?,
+            None => {
+                let level = self.graph.draw_level();
+                self.plan_at_level(id, vector, level)?
+            }
         };
         if let Some(planned) = plan.planned {
             let record = match &plan.codes {

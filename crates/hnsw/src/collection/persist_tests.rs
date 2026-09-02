@@ -11,11 +11,14 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use zeusdb_vector_core::{compile_filter, Error, IdfScope, SparseVector, VectorIndex};
+use zeusdb_vector_core::{
+    compile_filter, Error, IdfScope, SparseVector, VectorGraph, VectorIndex, DUMP_FILENAME,
+    NB_LAYER_MAX,
+};
 use zeusdb_vector_sparse::{SparseConfig, Weighting};
 use zeusdb_vector_text::{SimpleTokenizer, Tokenizer, TokenizerConfig};
 
-use super::{Collection, Declaration, ParsedRecord, SpaceConfig};
+use super::{Collection, Declaration, ParsedRecord, SpaceConfig, SparseHalf};
 
 /// A directory under the system's temporary directory, removed on drop.
 struct TempDir(std::path::PathBuf);
@@ -47,12 +50,43 @@ fn record(id: &str, dense: &[f32], sparse: Option<(&[u32], &[f32])>, cat: &str) 
     ParsedRecord {
         id: id.to_string(),
         vector: dense.to_vec(),
-        sparse: sparse.map(|(dims, values)| SparseVector {
-            dims: dims.to_vec(),
-            values: values.to_vec(),
+        sparse: sparse.map(|(dims, values)| {
+            SparseHalf::Vector(SparseVector {
+                dims: dims.to_vec(),
+                values: values.to_vec(),
+            })
         }),
         metadata,
     }
+}
+
+/// A record carrying `text` as the terms the collection's tokenizer splits
+/// it into, which the collection counts into ids as it inserts the record.
+fn text_record(collection: &Collection, id: &str, dense: &[f32], text: &str) -> ParsedRecord {
+    ParsedRecord {
+        id: id.to_string(),
+        vector: dense.to_vec(),
+        sparse: Some(SparseHalf::Terms(collection.tokenize(text).unwrap())),
+        metadata: HashMap::new(),
+    }
+}
+
+/// The id the text layer's dictionary holds for `term`, where it holds one.
+fn term_id(collection: &Collection, term: &str) -> Option<u32> {
+    let text = collection.sparse().unwrap().text.as_ref().unwrap();
+    let dictionary = text.dictionary.read().unwrap();
+    dictionary.id_of(term)
+}
+
+/// Every live record's external id with its internal id, sorted.
+fn ids_of(collection: &Collection) -> Vec<(String, usize)> {
+    let map = collection.id_map();
+    let mut ids: Vec<(String, usize)> = map
+        .iter()
+        .map(|(id, &internal)| (id.clone(), internal))
+        .collect();
+    ids.sort();
+    ids
 }
 
 fn base() -> Declaration {
@@ -266,16 +300,10 @@ fn a_text_layer_round_trips_with_its_dictionary() {
         "quick quick slow",
         "nothing in common here",
     ];
-    let vectors = collection.vectorize_texts(&texts).unwrap();
-    let records: Vec<ParsedRecord> = vectors
-        .into_iter()
+    let records: Vec<ParsedRecord> = texts
+        .iter()
         .enumerate()
-        .map(|(i, sparse)| ParsedRecord {
-            id: format!("t{i}"),
-            vector: vec![i as f32, 1.0],
-            sparse: Some(sparse),
-            metadata: HashMap::new(),
-        })
+        .map(|(i, text)| text_record(&collection, &format!("t{i}"), &[i as f32, 1.0], text))
         .collect();
     assert_eq!(
         collection.add_records(records, vec![], false).total_errors,
@@ -307,8 +335,13 @@ fn a_text_layer_round_trips_with_its_dictionary() {
     );
     // A new term after the load takes the next id, so the dictionary came
     // back whole.
-    let more = loaded.vectorize_texts(&["zebra"]).unwrap();
-    assert_eq!(more[0].dims, vec![terms as u32]);
+    let added = loaded.add_records(
+        vec![text_record(&loaded, "t9", &[9.0, 1.0], "zebra")],
+        vec![],
+        false,
+    );
+    assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    assert_eq!(term_id(&loaded, "zebra"), Some(terms as u32));
     // The built-in tokenizer may be handed as well, and its declaration
     // matches.
     assert!(Collection::load_with(path.to_str().unwrap(), Some(Arc::new(SimpleTokenizer))).is_ok());
@@ -330,18 +363,10 @@ fn an_external_tokenizer_must_be_handed_back() {
         .with_text("text", SparseConfig::default(), Arc::new(Whitespace))
         .unwrap();
     let collection = Collection::build(declaration, None);
-    let vectors = collection
-        .vectorize_texts(&["Alpha beta", "beta GAMMA"])
-        .unwrap();
-    let records: Vec<ParsedRecord> = vectors
-        .into_iter()
+    let records: Vec<ParsedRecord> = ["Alpha beta", "beta GAMMA"]
+        .iter()
         .enumerate()
-        .map(|(i, sparse)| ParsedRecord {
-            id: format!("t{i}"),
-            vector: vec![i as f32, 0.0],
-            sparse: Some(sparse),
-            metadata: HashMap::new(),
-        })
+        .map(|(i, text)| text_record(&collection, &format!("t{i}"), &[i as f32, 0.0], text))
         .collect();
     assert_eq!(
         collection.add_records(records, vec![], false).total_errors,
@@ -483,18 +508,10 @@ fn a_space_out_of_step_with_the_mappings_is_refused() {
         .with_text("text", SparseConfig::default(), Arc::new(SimpleTokenizer))
         .unwrap();
     let collection = Collection::build(declaration, None);
-    let vectors = collection
-        .vectorize_texts(&["one two", "two three", "three four"])
-        .unwrap();
-    let records: Vec<ParsedRecord> = vectors
-        .into_iter()
+    let records: Vec<ParsedRecord> = ["one two", "two three", "three four"]
+        .iter()
         .enumerate()
-        .map(|(i, sparse)| ParsedRecord {
-            id: format!("t{i}"),
-            vector: vec![i as f32, 0.0],
-            sparse: Some(sparse),
-            metadata: HashMap::new(),
-        })
+        .map(|(i, text)| text_record(&collection, &format!("t{i}"), &[i as f32, 0.0], text))
         .collect();
     assert_eq!(
         collection.add_records(records, vec![], false).total_errors,
@@ -540,7 +557,12 @@ fn a_space_out_of_step_with_the_mappings_is_refused() {
             .unwrap(),
         None,
     );
-    fewer.vectorize_texts(&["one two"]).unwrap();
+    let added = fewer.add_records(
+        vec![text_record(&fewer, "f0", &[0.0, 0.0], "one two")],
+        vec![],
+        false,
+    );
+    assert_eq!(added.total_errors, 0, "{:?}", added.errors);
     let fewer_path = dir.path().join("fewer.zdb");
     fewer.save(fewer_path.to_str().unwrap()).unwrap();
     std::fs::copy(
@@ -574,9 +596,10 @@ fn a_space_out_of_step_with_the_mappings_is_refused() {
     }
 }
 
-/// The graph's rebuild fallback replays every record through `add`, which
-/// reissues internal ids. The sparse space rides through it: the loaded
-/// collection answers the same sparse page under the new ids.
+/// The graph's rebuild fallback keeps every internal id the mappings name,
+/// so the sparse space, restored under those ids before the graph, needs
+/// nothing carried through it: the loaded collection answers the same sparse
+/// page and holds the ids and the counter a load from the dump holds.
 #[test]
 fn the_graph_rebuild_fallback_carries_the_sparse_space() {
     let declaration = base()
@@ -596,7 +619,128 @@ fn the_graph_rebuild_fallback_carries_the_sparse_space() {
     assert_eq!(after.1, before.1);
     assert_eq!(after.2, before.2);
     assert_eq!(loaded.sparse().unwrap().index.read().unwrap().len(), 40);
-    debug_assert!(loaded.live_sets_agree());
+    assert!(loaded.live_sets_agree());
+    assert_eq!(ids_of(&loaded), ids_of(&collection));
+    assert_eq!(loaded.id_counter(), collection.id_counter());
+}
+
+/// The raw rebuild fallback keeps every internal id the mappings name and
+/// the counter `config.json` records, so a directory loaded through it is
+/// the directory its own artefacts describe. It used to route every record
+/// through `add` with overwrite, which reissued every id above the saved
+/// counter and left the counter doubled.
+#[test]
+fn the_raw_rebuild_fallback_keeps_every_internal_id_and_the_counter() {
+    let collection = Collection::build(base(), None);
+    let records: Vec<ParsedRecord> = (0..300u32)
+        .map(|i| {
+            record(
+                &format!("r{i}"),
+                &[(i % 17) as f32 * 0.3, (i % 11) as f32 * 0.7],
+                None,
+                if i % 2 == 0 { "a" } else { "b" },
+            )
+        })
+        .collect();
+    assert_eq!(
+        collection.add_records(records, vec![], false).total_errors,
+        0
+    );
+    // A removal and an overwrite, so the ids are not simply one to the count.
+    assert!(collection.remove_point("r10".to_string()).unwrap());
+    assert!(collection.remove_point("r11".to_string()).unwrap());
+    let overwritten = record("r5", &[9.0, 9.0], None, "b");
+    assert_eq!(
+        collection
+            .add_records(vec![overwritten], vec![], true)
+            .total_errors,
+        0
+    );
+    let ids = ids_of(&collection);
+    assert_eq!(ids.len(), 298);
+    assert_eq!(collection.id_counter(), 301);
+    assert_eq!(ids.iter().find(|(id, _)| id == "r5").unwrap().1, 301);
+
+    let dir = TempDir::new();
+    let path = dir.path().join("raw.zdb");
+    collection.save(path.to_str().unwrap()).unwrap();
+    assert_eq!(config(&path)["id_counter"], 301);
+    let fallback = dir.path().join("fallback.zdb");
+    copy_dir(&path, &fallback);
+    std::fs::remove_file(fallback.join("hnsw_index.zdbgraph")).unwrap();
+
+    let from_dump = Collection::load(path.to_str().unwrap()).unwrap();
+    let rebuilt = Collection::load(fallback.to_str().unwrap()).unwrap();
+    assert_eq!(ids_of(&from_dump), ids);
+    assert_eq!(ids_of(&rebuilt), ids);
+    assert_eq!(rebuilt.id_counter(), 301);
+    assert_eq!(rebuilt.len(), 298);
+    assert!(rebuilt.live_sets_agree());
+
+    // The rebuilt graph holds one node per live record, under those ids, and
+    // none for the id the overwrite retired.
+    {
+        let index = rebuilt.dense().index.read().unwrap();
+        assert_eq!(index.graph().nb_points(), 298);
+        for &(_, internal_id) in &ids {
+            assert!(index.graph().holds(internal_id));
+        }
+        assert!(!index.graph().holds(6));
+    }
+
+    // The next record takes the id after the saved counter, and the rebuilt
+    // collection filters and searches over the ids it kept.
+    assert_eq!(
+        rebuilt
+            .add_records(vec![record("r900", &[1.0, 1.0], None, "a")], vec![], false)
+            .total_errors,
+        0
+    );
+    assert_eq!(rebuilt.id_map().get("r900").copied(), Some(302));
+    let filter = compile_filter(&HashMap::from([("cat".to_string(), json!("b"))])).unwrap();
+    assert_eq!(rebuilt.count(Some(&filter)), from_dump.count(Some(&filter)));
+    let params = rebuilt.search_params(5, None, false, None).unwrap();
+    let page = rebuilt.search_one(&[1.5, 3.0], None, params).unwrap();
+    assert_eq!(page.len(), 5);
+    for hit in &page {
+        assert!(ids.iter().any(|(id, _)| *id == hit.0) || hit.0 == "r900");
+    }
+}
+
+/// The collection's insert path, which draws the level before it writes
+/// anything for the record and plans at it under the index's read guard,
+/// dumps the graph an outright `VectorGraph::insert` over the same vectors
+/// in the same order dumps, byte for byte.
+#[test]
+fn the_collections_insert_path_builds_the_graph_the_outright_insert_builds() {
+    let collection = Collection::build(base(), None);
+    let vectors: Vec<Vec<f32>> = (0..200)
+        .map(|i| vec![(i as f32 * 0.37).sin(), (i as f32 * 0.11).cos()])
+        .collect();
+    for (batch, chunk) in vectors.chunks(50).enumerate() {
+        let records: Vec<ParsedRecord> = chunk
+            .iter()
+            .enumerate()
+            .map(|(j, vector)| record(&format!("r{}", batch * 50 + j), vector, None, "a"))
+            .collect();
+        assert_eq!(
+            collection.add_records(records, vec![], false).total_errors,
+            0
+        );
+    }
+    let dir = TempDir::new();
+    let path = dir.path().join("built.zdb");
+    collection.save(path.to_str().unwrap()).unwrap();
+    let saved = std::fs::read(path.join(DUMP_FILENAME)).unwrap();
+
+    let mut graph = VectorGraph::new_raw("l2", 2, 4, 100, NB_LAYER_MAX as usize, 50);
+    for (i, vector) in vectors.iter().enumerate() {
+        graph.insert(vector, i + 1);
+    }
+    let outright = dir.path().join("outright");
+    std::fs::create_dir_all(&outright).unwrap();
+    graph.dump(&outright).unwrap();
+    assert_eq!(saved, std::fs::read(outright.join(DUMP_FILENAME)).unwrap());
 }
 
 /// `clear`, `compact` and a removal each leave the saved shape correct.
@@ -609,17 +753,10 @@ fn every_mutating_path_keeps_the_saved_shape_correct() {
     let texts: Vec<String> = (0..40)
         .map(|i| format!("word{} word{} common", i, i % 5))
         .collect();
-    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-    let vectors = collection.vectorize_texts(&refs).unwrap();
-    let records: Vec<ParsedRecord> = vectors
-        .into_iter()
+    let records: Vec<ParsedRecord> = texts
+        .iter()
         .enumerate()
-        .map(|(i, sparse)| ParsedRecord {
-            id: format!("t{i}"),
-            vector: vec![i as f32, 0.0],
-            sparse: Some(sparse),
-            metadata: HashMap::new(),
-        })
+        .map(|(i, text)| text_record(&collection, &format!("t{i}"), &[i as f32, 0.0], text))
         .collect();
     assert_eq!(
         collection.add_records(records, vec![], false).total_errors,
@@ -660,8 +797,14 @@ fn every_mutating_path_keeps_the_saved_shape_correct() {
     let loaded = Collection::load(cleared.to_str().unwrap()).unwrap();
     assert_eq!(loaded.len(), 0);
     assert_eq!(loaded.term_count(), Some(0));
-    let vectors = loaded.vectorize_texts(&["fresh start"]).unwrap();
-    assert_eq!(vectors[0].dims, vec![0, 1]);
+    let added = loaded.add_records(
+        vec![text_record(&loaded, "t0", &[0.0, 0.0], "fresh start")],
+        vec![],
+        false,
+    );
+    assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    assert_eq!(term_id(&loaded, "fresh"), Some(0));
+    assert_eq!(term_id(&loaded, "start"), Some(1));
 }
 
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {

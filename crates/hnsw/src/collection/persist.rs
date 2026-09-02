@@ -9,8 +9,7 @@
 //! with the interpreter lock released.
 
 use super::{
-    Collection, DenseIndex, DenseOpen, LiveRecords, ParsedRecord, QuantizationConfig, StorageMode,
-    MAX_LAYER,
+    Collection, DenseIndex, DenseOpen, LiveRecords, QuantizationConfig, StorageMode, MAX_LAYER,
 };
 use crate::locks::ReadGuard;
 use crate::RawVectors;
@@ -24,7 +23,6 @@ use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
     ArtefactRecord, Bounds, Error, Inventory, Persist, Restore, VectorGraph, DUMP_FILENAME,
 };
-use zeusdb_vector_core::{RecordId, SparseVector, VectorIndex};
 use zeusdb_vector_sparse::PostingsIndex;
 use zeusdb_vector_text::{TermDictionary, Tokenizer};
 
@@ -357,16 +355,6 @@ impl Collection {
         }
     }
 
-    /// The sparse vector the space holds for the record named `id`, where
-    /// the space holds one. Taken in the declared order, `id_map` then the
-    /// space's index.
-    fn sparse_vector_of(&self, id: &str) -> Option<SparseVector> {
-        let internal = *self.id_map.read().unwrap().get(id)?;
-        let space = self.sparse()?;
-        let index = space.index.read().unwrap();
-        index.recover(RecordId::from_slot(internal))
-    }
-
     /// Restore the graph the save wrote, instead of rebuilding it
     ///
     /// For persistence loading only, and only after `restore_data_fields` has
@@ -546,19 +534,19 @@ impl Collection {
     /// Set the vector count alone (for persistence loading only)
     ///
     /// Separate from `set_counters` because the id counter must keep whatever
-    /// the graph rebuild advanced it to. Rewinding it would hand out internal
-    /// ids the rebuild has already used.
+    /// a graph rebuild advanced it to for a record the mappings did not name.
+    /// Rewinding it would hand out an internal id such a record already holds.
     pub(crate) fn set_vector_count(&mut self, vector_count: usize) {
         *self.vector_count.lock().unwrap() = vector_count;
     }
 
     /// Replace the stored record data with what was read from disk
     ///
-    /// For persistence loading only, and only after the graph rebuild. The
-    /// rebuild routes every record through add(), which stores whatever vector
-    /// it was handed, so a record that was reconstructed from PQ codes would
-    /// otherwise be kept at full width. Writing the three maps back leaves the
-    /// loaded index holding exactly what was saved.
+    /// For persistence loading only, and only after the graph is back, because
+    /// the columns are built over `id_map` and either rebuild fallback may add
+    /// an id for a record the mappings did not name. Writing the two maps back
+    /// and building the columns from them leaves the loaded index holding
+    /// exactly what was saved.
     pub(crate) fn restore_storage_maps(
         &mut self,
         pq_codes: HashMap<String, Vec<u8>>,
@@ -582,11 +570,9 @@ impl Collection {
     /// written the metadata back, so `id_map` holds the internal id every
     /// column entry is addressed by. It is a no-op on an index that declared
     /// nothing, which is every directory saved before this existed.
-    /// It clears before it writes. The graph rebuild path routes every record
-    /// through `add`, which writes a column entry under whatever internal id it
-    /// allocated, and those are not the ids the restored mappings carry. Wiping
-    /// first is what makes this the one authority on what the columns hold
-    /// rather than a second writer over the first one's leftovers.
+    /// It clears before it writes, so this is the one authority on what the
+    /// columns hold rather than a second writer over an earlier one's
+    /// leftovers.
     ///
     /// The guards are taken in the declared order, `id_map` then
     /// `vector_metadata` then `columns`, even though the loader holds `&mut
@@ -632,121 +618,110 @@ impl Collection {
             .store(value, std::sync::atomic::Ordering::Release);
     }
 
-    /// Suppress or resume training id collection (for persistence loading only)
-    ///
-    /// Wraps the flag the graph rebuild sets while it replays every record.
-    /// Every id being replayed is already in the restored collection, so
-    /// collecting them again would double the list. Private to this file now
-    /// that `rebuild_from_records` is the only thing that sets it, and it is
-    /// set and cleared in one place rather than around a call in the storage
-    /// layer.
-    fn set_rebuilding_from_persistence(&self, value: bool) {
-        self.rebuilding_from_persistence
-            .store(value, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Replay records read off disk into the graph.
+    /// Rebuild the graph from records read off disk, under the internal ids
+    /// the mappings name.
     ///
     /// This is the load path's fallback, taken where the saved graph dump is
     /// absent, damaged, or written by a release this build cannot read. The
-    /// records arrive as owned Rust, one per record the directory holds, in the
-    /// order the caller sorted them into.
+    /// records arrive as owned Rust, one per record the directory holds.
     ///
-    /// **It used to go through `add`.** The loader built a `PyDict` holding a
-    /// `PyList` of vectors, a `PyList` of ids and a `PyList` of per-record
-    /// metadata dicts, called `add`, and `add` parsed the whole thing straight
-    /// back into the `Vec<(String, Vec<f32>, HashMap<String, Value>)>` the
-    /// loader already had. Every record made a round trip through the
-    /// interpreter for nothing, and the interpreter lock was held for the whole
-    /// rebuild, which is the graph build itself and not a short window. Every
-    /// other Python thread in the process was stopped for the duration.
+    /// **Every record keeps the internal id the mappings give it.** A fresh
+    /// graph is built off to the side, each record inserted under its mapped
+    /// id in ascending id order, and the graph swapped in under one write
+    /// guard, which is the shape `rebuild_graph_from_codes` and `compact`
+    /// take. The id maps, the metadata, the columns, the counters and the
+    /// sparse space are left as the directory restored them, so the loaded
+    /// collection holds the ids `mappings.bin` names and the counter
+    /// `config.json` records. It used to route every record through `add`
+    /// with overwrite, which removed each record and reissued its id above
+    /// the saved counter, so a directory loaded this way disagreed with its
+    /// own mappings, with the quantized fallback, and with anything outside
+    /// the directory keyed on internal ids.
     ///
-    /// What that round trip did do, and what is reproduced here exactly, is
+    /// A record the mappings do not name is given a fresh id, as the
+    /// quantized fallback gives one, taken in external id order so the ids
+    /// are handed out the same way in every process. Ascending internal id
+    /// is arrival order, so the rebuild is as close to the original build as
+    /// a rebuild can get, and two rebuilds of one directory are one graph.
+    ///
+    /// What is reproduced exactly from the path this replaced is
     /// `extract_single_vector`'s validation and its call to
-    /// `process_vector_for_space`. A stored vector is already normalized for a
-    /// cosine index, and normalizing it a second time is what `add` did, so it
-    /// is what this does. **The graph a rebuild produces is unchanged, bit for
-    /// bit, and that is the point.** Skipping the second normalization would be
-    /// defensible and would build a different graph, which on this path means
-    /// giving a user's index different answers.
-    ///
-    /// `overwrite` is true because the loader restores the id mappings before
-    /// the rebuild runs, so every record being replayed is already named in
-    /// `id_map` and has to be removed before it is inserted.
-    ///
-    /// **Each record carries its sparse half through the replay.** The
-    /// sparse space is restored before the graph, under the internal ids the
-    /// mappings recorded, and the replay removes each record and inserts it
-    /// under a fresh id. The record's sparse vector is read out of the space
-    /// before that and inserted with it, so the space comes out of the
-    /// rebuild holding every vector it held, under the ids the rebuilt
-    /// collection holds.
+    /// `process_vector_for_space`. A stored vector is already normalized for
+    /// a cosine index, and normalizing it a second time is what `add` did, so
+    /// it is what this does. Skipping it would build a different graph, which
+    /// on this path means giving a user's index different answers. A refused
+    /// record fails the whole rebuild rather than being dropped, since a
+    /// graph short of a record the storage maps still report is an index
+    /// every query silently misses on.
     pub(crate) fn rebuild_from_records(
         &self,
-        records: Vec<(String, Vec<f32>, HashMap<String, Value>)>,
+        records: Vec<(String, Vec<f32>)>,
     ) -> Result<usize, Error> {
-        let total = records.len();
-
-        // The validation `extract_single_vector` ran on the way through Python.
-        // It fails the whole rebuild rather than dropping the record, which is
-        // what the round trip did: a refused record left the graph short while
-        // the storage maps, written back afterwards, still reported the full
-        // count, so every query missed it. A saved directory holding a
-        // non-finite value is the case that reaches here.
-        let mut validated = Vec::with_capacity(total);
-        for (id, vector, metadata) in records {
-            if vector.len() != self.dense().dim {
-                return Err(Error::RebuildRefusedDimension {
-                    id,
-                    expected: self.dense().dim,
-                    got: vector.len(),
-                });
+        let mut mapped: Vec<(usize, Vec<f32>)> = Vec::with_capacity(records.len());
+        let mut unmapped: Vec<(String, Vec<f32>)> = Vec::new();
+        {
+            let id_map = self.id_map.read().unwrap();
+            for (id, vector) in records {
+                if vector.len() != self.dense().dim {
+                    return Err(Error::RebuildRefusedDimension {
+                        id,
+                        expected: self.dense().dim,
+                        got: vector.len(),
+                    });
+                }
+                if let Some((position, value)) = vector
+                    .iter()
+                    .enumerate()
+                    .find(|(_, value)| !value.is_finite())
+                {
+                    return Err(Error::RebuildRefusedNotFinite {
+                        id,
+                        value: *value,
+                        position,
+                    });
+                }
+                let vector = self.process_vector_for_space(vector);
+                match id_map.get(&id) {
+                    Some(&internal_id) => mapped.push((internal_id, vector)),
+                    None => unmapped.push((id, vector)),
+                }
             }
-            if let Some((position, value)) = vector
-                .iter()
-                .enumerate()
-                .find(|(_, value)| !value.is_finite())
-            {
-                return Err(Error::RebuildRefusedNotFinite {
-                    id,
-                    value: *value,
-                    position,
-                });
-            }
-            let sparse = self.sparse_vector_of(&id);
-            validated.push(ParsedRecord {
-                sparse,
-                vector: self.process_vector_for_space(vector),
-                id,
-                metadata,
-            });
         }
 
-        self.set_rebuilding_from_persistence(true);
+        // The binding releases the interpreter lock around the whole load,
+        // so the rebuild runs without it. The mutation guard is held for the
+        // ids handed to unmapped records and for the swap, which is the
+        // discipline every other mutation keeps, though nothing else can
+        // reach a collection the loader still holds.
+        let _writers = self.writers.lock().unwrap();
+        unmapped.sort_by(|a, b| a.0.cmp(&b.0));
+        for (id, vector) in unmapped {
+            let internal_id = self.get_next_id();
+            self.id_map.write().unwrap().insert(id.clone(), internal_id);
+            self.rev_map.write().unwrap().insert(internal_id, id);
+            mapped.push((internal_id, vector));
+        }
+        mapped.sort_by_key(|&(internal_id, _)| internal_id);
 
-        // The binding releases the interpreter lock around the whole load, so
-        // the rebuild, which is the k-means, the graph inserts and nothing
-        // else, runs without it and there is no Python work inside it to hold
-        // the lock for. The mutation guard is taken around the insertion
-        // alone, which is the shape `add` uses.
-        let (inserted, errors) = {
-            let _writers = self.writers.lock().unwrap();
-            self.insert_parsed_records(validated, true)
-        };
-
-        // Cleared before the result is judged rather than after, so the flag is
-        // not left set on the way out of a failed rebuild.
-        self.set_rebuilding_from_persistence(false);
-
-        let refused: Vec<String> = errors
-            .into_iter()
-            .filter_map(|error| error.into_counted_message())
-            .collect();
-        if !refused.is_empty() {
-            return Err(Error::RebuildRefusedRecords { refused, total });
+        let dense = self.dense();
+        let mut new_hnsw = VectorGraph::new_raw(
+            &dense.metric,
+            dense.dim,
+            dense.m(),
+            self.expected_size(),
+            MAX_LAYER,
+            dense.ef_construction(),
+        );
+        for (internal_id, vector) in &mapped {
+            new_hnsw.insert(vector, *internal_id);
         }
 
-        Ok(inserted.len())
+        // Filled before it is installed, and installed under one write guard,
+        // so the graph the index holds is never a partly rebuilt one.
+        dense.replace_graph(new_hnsw);
+        self.sync_dense_live();
+
+        Ok(mapped.len())
     }
 
     /// Set training IDs (for persistence loading only)
