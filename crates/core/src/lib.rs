@@ -5,8 +5,9 @@
 //! the column store that answers it, the distance kernels, the product
 //! quantizer, the graph with its dump format, the seam every index sits
 //! behind, being the index trait, the admit family and the persistence traits
-//! in `space` and `admit`, and the fusion that combines several indexes'
-//! pages into one. The binding takes this crate as a path dependency
+//! in `space` and `admit`, the fusion that combines several indexes'
+//! pages into one, and the write-ahead journal's format with its reader and
+//! the operations it records. The binding takes this crate as a path dependency
 //! and reaches it through the re-exports below, so the crate's surface is
 //! this file's `pub use` list and nothing else.
 //! Every module is private. An item a module marks `pub` that this file does
@@ -41,6 +42,8 @@ mod filter;
 mod frame;
 mod fusion;
 mod graph;
+mod journal;
+mod operation;
 mod pq;
 mod rng;
 mod space;
@@ -62,6 +65,13 @@ pub use frame::{
 pub use fusion::{fuse, Contribution, FusedHit, Fusion, DEFAULT_RRF_K};
 pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES, NB_LAYER_MAX};
 pub use graph::{restore_graph, Distance, DumpBounds, GraphHit, Planned, Record, VectorGraph};
+pub use journal::{
+    encode_journal_header, encode_journal_record, read_journal, CommitMode, JournalContents,
+    JournalDamage, JournalHeader, JournalKind, JournalRecord, JournalSyncHandle, JournalWriter,
+    OperationKind, JOURNAL_HEADER_BYTES, JOURNAL_MAGIC, JOURNAL_MAX_PAYLOAD,
+    JOURNAL_RECORD_CHECKSUM_BYTES, JOURNAL_RECORD_HEADER_BYTES, JOURNAL_RECORD_OVERHEAD_BYTES,
+};
+pub use operation::Operation;
 pub use pq::PQ;
 pub use rng::SeededRng;
 pub use space::{
