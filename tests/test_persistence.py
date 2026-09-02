@@ -1845,11 +1845,10 @@ def test_the_rebuild_is_byte_deterministic(tmp_path):
     the dump the rebuild writes is compared byte for byte rather than by
     recall.
 
-    **The rebuilt graph is not the graph the dump holds and never was.** The
-    original was built from the vectors as supplied and the rebuild builds from
-    the stored ones, processed once more, under internal ids that continue from
-    the saved counter. What has to hold is that the rebuild produces one answer
-    every time.
+    **The rebuilt graph need not be the graph the dump holds.** The original
+    was built from the vectors as supplied and the rebuild builds from the
+    stored ones, processed once more, under the internal ids the mappings
+    name. What has to hold is that the rebuild produces one answer every time.
     """
     vectors = _clustered_unit_vectors(600, 16, 987654)
     ids = [f"v_{i}" for i in range(len(vectors))]

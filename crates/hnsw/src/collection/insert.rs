@@ -12,7 +12,7 @@
 
 use super::{
     validate_index_parameters, Collection, DenseIndex, LiveRecords, ParsedRecord, ParsedRecords,
-    StorageMode, MAX_LAYER,
+    SparseHalf, StorageMode, MAX_LAYER,
 };
 use crate::locks::WriteGuard;
 use crate::RawVectors;
@@ -57,26 +57,6 @@ pub(super) enum InsertError {
     /// `Vector <id>: <class>: <message>`, which is what the `PyErr` it used to
     /// carry displayed as
     Vector { id: String, err: Error },
-}
-
-impl InsertError {
-    /// The message this counts as a rejected record, or `None` where it does
-    /// not count as one.
-    ///
-    /// `add` and the load path's rebuild both need the same split, and
-    /// disagreeing about which variants count is what this stops.
-    pub(super) fn into_counted_message(self) -> Option<String> {
-        match self {
-            InsertError::Counted(message) => Some(message),
-            InsertError::Training(_) => None,
-            InsertError::Vector { id, err } => Some(format!(
-                "Vector {}: {}: {}",
-                id,
-                err.exception().name(),
-                err
-            )),
-        }
-    }
 }
 /// The write guards a removal holds, taken in the order `Collection` declares.
 ///
@@ -152,8 +132,9 @@ impl Collection {
     /// the two phases the graph splits an insertion into.
     ///
     /// ```text
-    /// index.read()   prepare: quantize where the graph holds codes, draw the
-    ///                level, descend, choose the neighbour lists
+    /// index.read()   prepare: quantize where the graph holds codes, descend
+    ///                from the level the caller drew, choose the neighbour
+    ///                lists
     ///   drop
     /// id_map.write()
     /// rev_map.write()
@@ -221,6 +202,16 @@ impl Collection {
     /// written to were taken and released in their own block above, and they
     /// rank below the index, so nothing here is held out of order.
     ///
+    /// # The level
+    ///
+    /// `level` is what the caller drew through [`Collection::draw_level`]
+    /// after the internal id was issued and before anything was written for
+    /// the record. Phase one plans at it and draws nothing, so the level is
+    /// in the caller's hand before the insertion begins, which is what lets a
+    /// record of the insertion carry it and a replay of that record install
+    /// at it. Nothing between the draw and the plan reaches the stream, so
+    /// the graph is the one a draw inside phase one built.
+    ///
     /// Returns the codes the graph installed where it holds codes, so the
     /// caller can key them by external id for the paths that reach a record
     /// by name. They are read under the write guard the install took, so a
@@ -230,11 +221,12 @@ impl Collection {
         external_id: &str,
         vector: &[f32],
         internal_id: usize,
+        level: usize,
     ) -> Result<Option<Vec<u8>>, Error> {
         let id = RecordId::from_slot(internal_id);
         let prepared = {
             let index = self.dense().index.read().unwrap();
-            index.prepare(id, vector)?
+            index.prepare_at_level(id, vector, level)?
         };
         let (codes, due) = {
             let mut id_map = self.id_map.write().unwrap();
@@ -283,6 +275,20 @@ impl Collection {
         let mut counter = self.id_counter.lock().unwrap();
         *counter += 1;
         *counter
+    }
+
+    /// Draw the level the next record's graph node takes, advancing the
+    /// dense graph's level stream by one draw.
+    ///
+    /// Drawn after the internal id is issued and before anything is written
+    /// for the record, rather than inside the graph's first phase, so that
+    /// the level is in hand before the insertion begins. Under `writers`, so
+    /// the stream advances once per record in insertion order, which is what
+    /// makes two builds of the same records the same graph. Takes the index
+    /// read guard alone and releases it, since the generator is a leaf of
+    /// the graph and not part of a plan.
+    pub(super) fn draw_level(&self) -> usize {
+        self.dense().index.read().unwrap().draw_level()
     }
 
     /// Every write guard a removal takes, in the order `Collection` declares
@@ -892,8 +898,10 @@ impl Collection {
     ///   `rebuild_with_quantization_locked`
     /// - `PQ::is_trained`, `quantize`, `quantize_batch` and `train`, plus the
     ///   k-means below `train`
-    /// - `VectorGraph::plan`, `install`, `insert`, `insert_batch_pq`, `new_pq`
-    ///   and `nb_points`, and the graph structure in `graph::mutable` below them
+    /// - `VectorGraph::draw_level`, `plan_at_level`, `install`, `insert`,
+    ///   `insert_batch_pq`, `new_pq` and `nb_points`, and the graph structure
+    ///   in `graph::mutable` below them
+    /// - `count_record_terms`, and through it the text layer's dictionary
     ///
     /// None of them takes a `Python` token, and none of them calls into the
     /// interpreter. `pq.rs`, `distance.rs` and the vendored crate name PyO3
@@ -1068,7 +1076,7 @@ impl Collection {
         &self,
         id: String,
         vector: Vec<f32>,
-        sparse: Option<SparseVector>,
+        sparse: Option<SparseHalf>,
         metadata: HashMap<String, Value>,
         overwrite: bool,
     ) -> Result<bool, Error> {
@@ -1087,10 +1095,19 @@ impl Collection {
             return Err(Error::DuplicateId { id });
         }
 
-        // A sparse vector is held to its rules, the weighting's included,
-        // and to the collection having a sparse space, before anything is
-        // written, so a record refused for its sparse half leaves nothing
-        // behind in the dense one.
+        // The sparse half. Terms are counted into term ids here, under the
+        // mutation guard the caller holds, so the ids a record's postings
+        // carry are the dictionary's at the moment the record is inserted
+        // and nothing can empty the dictionary between the two. A sparse
+        // vector is then held to its rules, the weighting's included, and to
+        // the collection having a sparse space, before anything is written,
+        // so a record refused for its sparse half leaves nothing behind in
+        // the dense one.
+        let sparse = match sparse {
+            None => None,
+            Some(SparseHalf::Vector(vector)) => Some(vector),
+            Some(SparseHalf::Terms(terms)) => Some(self.count_record_terms(&terms)?),
+        };
         if let Some(sparse) = &sparse {
             let space = self.sparse().ok_or(Error::NoSparseSpace)?;
             space.config().weighting.validate_record(sparse.as_ref())?;
@@ -1137,6 +1154,7 @@ impl Collection {
         metadata: HashMap<String, Value>,
     ) -> Result<usize, Error> {
         let internal_id = self.get_next_id();
+        let level = self.draw_level();
 
         // Store metadata, and the declared fields of it in their columns.
         //
@@ -1155,13 +1173,13 @@ impl Collection {
         }
 
         // Insert the processed vector into the graph and name the record in
-        // both id maps, in the two phases the graph splits an insertion into.
-        // See `insert_one`. The maps are written there rather than here so
-        // that the record enters the collection's live set and the index's
-        // under one acquisition. This is the only copy of the vector the index
-        // keeps: the store the graph is addressed against holds it, and there
-        // is no second map to write.
-        self.insert_one(&id, &vector, internal_id)?; // Already normalized
+        // both id maps, in the two phases the graph splits an insertion into,
+        // at the level drawn above. See `insert_one`. The maps are written
+        // there rather than here so that the record enters the collection's
+        // live set and the index's under one acquisition. This is the only
+        // copy of the vector the index keeps: the store the graph is addressed
+        // against holds it, and there is no second map to write.
+        self.insert_one(&id, &vector, internal_id, level)?; // Already normalized
 
         trace!(target: LOG_TARGET, operation = "add_raw_vector_complete",
             vector_id = %id,
@@ -1185,19 +1203,6 @@ impl Collection {
     ) -> Result<usize, Error> {
         // 1. Store vector normally (single storage)
         let internal_id = self.add_raw_vector(id.clone(), vector, metadata)?;
-
-        // SKIP TRAINING ID COLLECTION DURING PERSISTENCE REBUILD
-        if self
-            .rebuilding_from_persistence
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            trace!(target: LOG_TARGET, operation = "add_with_id_collection",
-                vector_id = %id,
-                reason = "rebuilding_from_persistence",
-                "Skipping training ID collection during rebuild"
-            );
-            return Ok(internal_id);
-        }
 
         // 2. Collect ID for training (minimal memory overhead)
         //
@@ -1276,6 +1281,7 @@ impl Collection {
         metadata: HashMap<String, Value>,
     ) -> Result<usize, Error> {
         let internal_id = self.get_next_id();
+        let level = self.draw_level();
 
         // Store metadata, and the declared fields of it in their columns.
         //
@@ -1294,15 +1300,16 @@ impl Collection {
         }
 
         // Quantize and insert, and name the record in both id maps, in the two
-        // phases the graph splits an insertion into. The index quantizes in
-        // the first phase, under the read guard, and installs the codes in the
-        // second, carrying the raw vector beside them where the storage mode
-        // keeps one, because the node the codes are installed at is the node
-        // the raw has to sit at. The maps are written in the second phase, so
-        // that the record enters the collection's live set and the index's
-        // under one acquisition. See `insert_one`.
+        // phases the graph splits an insertion into, at the level drawn above.
+        // The index quantizes in the first phase, under the read guard, and
+        // installs the codes in the second, carrying the raw vector beside
+        // them where the storage mode keeps one, because the node the codes
+        // are installed at is the node the raw has to sit at. The maps are
+        // written in the second phase, so that the record enters the
+        // collection's live set and the index's under one acquisition. See
+        // `insert_one`.
         let codes = self
-            .insert_one(&id, &vector, internal_id)?
+            .insert_one(&id, &vector, internal_id, level)?
             .unwrap_or_default();
 
         // Store quantized codes (always), keyed by external id for the paths
@@ -1349,8 +1356,11 @@ impl Collection {
     /// `add` for records that may fill the sparse space as well.
     ///
     /// What the binding's `add` becomes once parsing is over, taking the
-    /// record shape a Rust caller builds. Nothing in the binding builds a
-    /// sparse vector yet, so from Python every record arrives through `add`.
+    /// record shape a Rust caller builds. A record whose sparse half is terms
+    /// has them counted into term ids inside the mutation guard this takes,
+    /// as the record is inserted, so nothing can empty the dictionary between
+    /// a record's ids being issued and its postings being written. The terms
+    /// themselves come from `tokenize`, which runs under no guard.
     pub fn add_records(
         &self,
         parsed_data: Vec<ParsedRecord>,
@@ -1684,7 +1694,9 @@ impl Collection {
         drop(old_index);
 
         // The sparse space, where there is one, starts again as well, under
-        // its own guard taken alone.
+        // its own guard taken alone. A record's terms are counted into ids
+        // under `writers` as well, in `add_single_vector`, so no caller holds
+        // an id the dictionary this empties issued.
         if let Some(space) = self.sparse() {
             *space.index.write().unwrap() = PostingsIndex::new(space.config().clone());
             if let Some(text) = &space.text {

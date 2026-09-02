@@ -47,8 +47,8 @@ mod rerank;
 pub use collection::{
     Added, AdmitShape, Arm, ArmPlan, Collection, Declaration, DenseConfig, Listing, Page,
     ParsedRecord, ParsedRecords, Plan, QuantizationConfig, QuantizationReport, QuantizerReport,
-    Query, QueryHit, QueryHits, RebuildPlan, RecordView, SpaceConfig, SparseHits, StorageMode,
-    TextConfig, DEFAULT_FETCH_PER_K, DEFAULT_SPACE, MAX_ARMS,
+    Query, QueryHit, QueryHits, RebuildPlan, RecordView, SpaceConfig, SparseHalf, SparseHits,
+    StorageMode, TextConfig, DEFAULT_FETCH_PER_K, DEFAULT_SPACE, MAX_ARMS,
 };
 pub use rerank::{
     calibrate_rerank_from_sample, default_rerank_fetch, prepare_reconstruction, raw_distance_fn,

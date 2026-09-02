@@ -19,7 +19,9 @@ use zeusdb_vector_core::{
 };
 use zeusdb_vector_sparse::SparseConfig;
 
-use super::{AdmitShape, Arm, Collection, Declaration, ParsedRecord, Query, DEFAULT_SPACE};
+use super::{
+    AdmitShape, Arm, Collection, Declaration, ParsedRecord, Query, SparseHalf, DEFAULT_SPACE,
+};
 
 /// splitmix64, so every test sees the same records.
 struct Rng(u64);
@@ -67,7 +69,7 @@ fn corpus(n: usize, cats: usize) -> (Collection, Vec<ParsedRecord>) {
             ParsedRecord {
                 id: format!("r{i:05}"),
                 vector,
-                sparse: Some(SparseVector { dims, values }),
+                sparse: Some(SparseHalf::Vector(SparseVector { dims, values })),
                 metadata,
             }
         })

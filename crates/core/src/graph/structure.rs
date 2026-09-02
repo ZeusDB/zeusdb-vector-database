@@ -25,7 +25,7 @@ use super::levels::{LevelGenerator, DEFAULT_LEVEL_SEED};
 use super::mutable::{reserved_records, MutableGraph, RESERVE_BYTES};
 use super::store::VectorStore;
 use super::traverse::LAYERS;
-use super::{Distance, VectorGraph};
+use super::{Distance, Record, VectorGraph};
 use crate::distance::{CosineDist, L1Dist, L2Dist};
 use crate::distance::{DistPQ, PqMetric};
 use crate::pq::PQ;
@@ -897,5 +897,53 @@ fn the_seam_reseeds_the_level_stream() {
         "seam reseed: default {} bytes, other seed {} bytes",
         untouched.len(),
         reseeded_elsewhere.len()
+    );
+}
+
+/// The seam's split insertion is the seam's outright insertion.
+///
+/// A caller that draws the level, plans at it and installs, which is what the
+/// index does across its two guards, builds the graph a caller handing the
+/// graph one `insert` at a time builds, byte for byte. The draw sits ahead of
+/// the plan rather than inside it, and this holds that moving it moved the
+/// stream's consumption nowhere. A third graph installed at the levels the
+/// first drew, drawing nothing, is the same graph again, which is what a
+/// replay of recorded draws relies on.
+#[test]
+fn the_split_insertion_is_the_outright_insertion() {
+    let data = unit_sample_vectors(600, 12, 4243);
+    let dump_of = |graph: &VectorGraph| {
+        let dir = tempfile::tempdir().unwrap();
+        graph.dump(dir.path()).unwrap();
+        std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap()
+    };
+    let fresh = || VectorGraph::new_raw("cosine", 12, 16, data.len(), LAYERS, 64);
+
+    let mut outright = fresh();
+    let mut split = fresh();
+    let mut levels = Vec::with_capacity(data.len());
+    for (id, vector) in data.iter().enumerate() {
+        outright.insert(vector, id);
+        let level = split.draw_level();
+        levels.push(level);
+        let planned = split
+            .plan_at_level(Record::Raw(vector), level)
+            .expect("a raw vector belongs in a raw graph");
+        split.install(Record::Raw(vector), id, planned);
+    }
+    let outright = dump_of(&outright);
+    assert_eq!(outright, dump_of(&split));
+
+    let mut replayed = fresh();
+    for ((id, vector), &level) in data.iter().enumerate().zip(&levels) {
+        let planned = replayed
+            .plan_at_level(Record::Raw(vector), level)
+            .expect("a raw vector belongs in a raw graph");
+        replayed.install(Record::Raw(vector), id, planned);
+    }
+    assert_eq!(outright, dump_of(&replayed));
+    assert!(
+        levels.iter().any(|&level| level > 0),
+        "the sample drew above the base layer, so the levels did some work"
     );
 }

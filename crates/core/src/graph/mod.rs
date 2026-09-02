@@ -44,9 +44,9 @@
 
 // `levels: Mutex<LevelGenerator>` is not a field of the index, so it is
 // outside the registry in `zeusdb_vector_hnsw::locks` and outside the order it
-// enforces. Every path that draws a level already holds the graph's own write
-// guard, so the generator is reached under one lock and never held across
-// another. See `clippy.toml`.
+// enforces. Every path that draws a level holds the graph's own guard or the
+// graph outright, so the generator is reached under one lock and never held
+// across another. See `clippy.toml`.
 #![allow(clippy::disallowed_types)]
 
 use crate::distance::{CosineDist, DistPQ, DotDist, L1Dist, L2Dist, PqMetric};
@@ -201,10 +201,11 @@ pub struct GraphHit {
 /// would make the second graph a function of the first one's history. Every
 /// path that replaces the graph replaces the pair.
 ///
-/// The generator is behind a mutex because the draw happens in phase one, which
-/// runs under the index's graph **read** guard. It is a leaf: nothing inside it
-/// takes another lock, and no other lock is taken while it is held. It is also
-/// uncontended, since the index's `writers` mutex admits one mutator at a time.
+/// The generator is behind a mutex because the draw happens under the index's
+/// graph **read** guard, taken for the draw alone ahead of phase one. It is a
+/// leaf: nothing inside it takes another lock, and no other lock is taken while
+/// it is held. It is also uncontended, since the index's `writers` mutex admits
+/// one mutator at a time.
 pub(crate) struct Backend<T, D> {
     graph: MutableGraph<T, D>,
     /// The vectors this graph scores against, addressed by node index.
@@ -281,13 +282,23 @@ where
         }
     }
 
-    /// Phase one. Draws the level and decides the insertion, reading only.
-    fn plan(&self, data: &[T]) -> Planned {
-        let level = self
-            .levels
+    /// Draw the level the next node takes, advancing the stream by one draw.
+    ///
+    /// Separate from phase one so that a caller holds the level before the
+    /// insertion begins and can record it, and so that a caller replaying a
+    /// recorded level can plan at it without drawing. The stream advances
+    /// once per insertion either way, in insertion order, which is what makes
+    /// two builds of the same records the same graph.
+    fn draw_level(&self) -> usize {
+        self.levels
             .lock()
             .expect("the level generator is a leaf and no path panics holding it")
-            .generate();
+            .generate()
+    }
+
+    /// Phase one at `level`. Decides the insertion, reading only and drawing
+    /// nothing.
+    fn plan_at_level(&self, data: &[T], level: usize) -> Planned {
         self.graph.plan_insertion(&self.store, data, level)
     }
 
@@ -332,9 +343,10 @@ where
         );
     }
 
-    /// Both phases, for a caller holding the graph outright.
+    /// The draw and both phases, for a caller holding the graph outright.
     fn insert(&mut self, data: &[T], origin_id: usize) {
-        let planned = self.plan(data);
+        let level = self.draw_level();
+        let planned = self.plan_at_level(data, level);
         self.install(data, origin_id, planned);
     }
 }
@@ -1068,30 +1080,58 @@ impl VectorGraph {
         }
     }
 
-    /// Phase one of one insertion: draw the level, descend, choose the lists.
+    /// Draw the level the next insertion's node takes, advancing the level
+    /// stream by one draw.
+    ///
+    /// Reads the graph and writes nothing but the stream's own position, so it
+    /// runs under a read guard, taken for the draw alone. The draw sits ahead
+    /// of [`Self::plan_at_level`] rather than inside it so that a caller holds
+    /// the level before the insertion begins: one that records the level can
+    /// record it then, and one replaying a recorded level plans at it without
+    /// drawing. Exactly one draw per insertion, in insertion order, is what
+    /// makes two builds of the same records the same graph, so a caller that
+    /// draws and then installs nothing has moved the stream.
+    pub fn draw_level(&self) -> usize {
+        match self {
+            VectorGraph::Cosine(b) => b.draw_level(),
+            VectorGraph::L2(b) => b.draw_level(),
+            VectorGraph::L1(b) => b.draw_level(),
+            VectorGraph::Dot(b) => b.draw_level(),
+            VectorGraph::CosinePQ(b) => b.draw_level(),
+            VectorGraph::L2PQ(b) => b.draw_level(),
+            VectorGraph::L1PQ(b) => b.draw_level(),
+        }
+    }
+
+    /// Phase one of one insertion at `level`: descend and choose the lists,
+    /// drawing nothing.
     ///
     /// Reads the graph and writes nothing, so it runs under a read guard. What
     /// comes back owns everything it holds, so the guard is dropped before
     /// [`Self::install`] takes the write guard. `None` means the record does not
     /// belong in this graph, which is a programming error rather than a state,
-    /// and the caller then installs nothing.
+    /// and the caller then installs nothing. `level` is what
+    /// [`Self::draw_level`] handed out, or what a record of that draw carries;
+    /// the install asserts it below the layer count.
     ///
     /// The soundness of the split is the index's `writers` mutex: it admits one
     /// mutator at a time and every mutating entry point takes it, so nothing can
     /// change the graph between the two phases. `install` asserts the node count
     /// it planned against rather than trusting that.
-    pub fn plan(&self, record: Record<'_>) -> Option<Planned> {
+    pub fn plan_at_level(&self, record: Record<'_>, level: usize) -> Option<Planned> {
         match (self, record) {
             (VectorGraph::Cosine(b), Record::Raw(v)) => {
                 assert_unit_for_cosine(v, "insert");
-                Some(b.plan(v))
+                Some(b.plan_at_level(v, level))
             }
-            (VectorGraph::L2(b), Record::Raw(v)) => Some(b.plan(v)),
-            (VectorGraph::L1(b), Record::Raw(v)) => Some(b.plan(v)),
-            (VectorGraph::Dot(b), Record::Raw(v)) => Some(b.plan(v)),
+            (VectorGraph::L2(b), Record::Raw(v)) => Some(b.plan_at_level(v, level)),
+            (VectorGraph::L1(b), Record::Raw(v)) => Some(b.plan_at_level(v, level)),
+            (VectorGraph::Dot(b), Record::Raw(v)) => Some(b.plan_at_level(v, level)),
             (VectorGraph::CosinePQ(b), Record::Codes { codes, .. })
             | (VectorGraph::L2PQ(b), Record::Codes { codes, .. })
-            | (VectorGraph::L1PQ(b), Record::Codes { codes, .. }) => Some(b.plan(codes)),
+            | (VectorGraph::L1PQ(b), Record::Codes { codes, .. }) => {
+                Some(b.plan_at_level(codes, level))
+            }
             (_, Record::Raw(_)) => {
                 error!(
                     target: LOG_TARGET,
@@ -1143,15 +1183,16 @@ impl VectorGraph {
         }
     }
 
-    /// Insert one raw vector, both phases, for a caller holding the graph
-    /// outright.
+    /// Insert one raw vector, the draw and both phases, for a caller holding
+    /// the graph outright.
     ///
     /// The three rebuild paths, being `compact`, the quantization rebuild and
     /// the persistence rebuild, each build a fresh graph off to the side and
     /// swap it in under one write guard, so the graph they insert into is a
     /// local nobody else can reach. They need no phase split and no lock.
     pub fn insert(&mut self, vector: &[f32], id: usize) {
-        if let Some(planned) = self.plan(Record::Raw(vector)) {
+        let level = self.draw_level();
+        if let Some(planned) = self.plan_at_level(Record::Raw(vector), level) {
             self.install(Record::Raw(vector), id, planned);
         }
     }

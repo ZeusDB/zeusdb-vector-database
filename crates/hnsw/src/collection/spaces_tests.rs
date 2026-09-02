@@ -16,7 +16,8 @@ use zeusdb_vector_sparse::{SparseConfig, Unlink, Weighting};
 use zeusdb_vector_text::{SimpleTokenizer, Tokenizer, TokenizerConfig};
 
 use super::{
-    Arm, Collection, Declaration, ParsedRecord, Query, SpaceConfig, TextConfig, DEFAULT_SPACE,
+    Arm, Collection, Declaration, ParsedRecord, Query, SpaceConfig, SparseHalf, TextConfig,
+    DEFAULT_SPACE,
 };
 
 fn record(id: &str, dense: &[f32], sparse: Option<(&[u32], &[f32])>, cat: &str) -> ParsedRecord {
@@ -25,12 +26,22 @@ fn record(id: &str, dense: &[f32], sparse: Option<(&[u32], &[f32])>, cat: &str) 
     ParsedRecord {
         id: id.to_string(),
         vector: dense.to_vec(),
-        sparse: sparse.map(|(dims, values)| SparseVector {
-            dims: dims.to_vec(),
-            values: values.to_vec(),
+        sparse: sparse.map(|(dims, values)| {
+            SparseHalf::Vector(SparseVector {
+                dims: dims.to_vec(),
+                values: values.to_vec(),
+            })
         }),
         metadata,
     }
+}
+
+/// A record carrying `text` as the terms the collection's tokenizer splits
+/// it into, which the collection counts into ids as it inserts the record.
+fn text_record(collection: &Collection, id: &str, dense: &[f32], text: &str) -> ParsedRecord {
+    let mut record = record(id, dense, None, "a");
+    record.sparse = Some(SparseHalf::Terms(collection.tokenize(text).unwrap()));
+    record
 }
 
 fn collection() -> Collection {
@@ -52,7 +63,10 @@ fn brute(
         .iter()
         .filter(|r| admit(r))
         .filter_map(|r| {
-            let score = r.sparse.as_ref()?.as_ref().dot(query);
+            let SparseHalf::Vector(sparse) = r.sparse.as_ref()? else {
+                return None;
+            };
+            let score = sparse.as_ref().dot(query);
             (score != 0.0).then(|| (r.id.clone(), score))
         })
         .collect();
@@ -329,19 +343,15 @@ fn a_text_space_indexes_and_searches_text() {
         "The dog sleeps",
         "Nothing here about animals",
     ];
-    let vectors = collection.vectorize_texts(&texts).unwrap();
-    assert_eq!(collection.term_count(), Some(17));
-    let records: Vec<ParsedRecord> = vectors
-        .into_iter()
+    let records: Vec<ParsedRecord> = texts
+        .iter()
         .enumerate()
-        .map(|(i, sparse)| {
-            let mut r = record(&format!("r{}", i + 1), &[i as f32, 0.0], None, "a");
-            r.sparse = Some(sparse);
-            r
-        })
+        .map(|(i, text)| text_record(&collection, &format!("r{}", i + 1), &[i as f32, 0.0], text))
         .collect();
+    assert_eq!(collection.term_count(), Some(0), "tokenizing issues no id");
     let added = collection.add_records(records, vec![], false);
     assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    assert_eq!(collection.term_count(), Some(17));
 
     // "fox" is in r1 and r2, "dog" in r1, r2 and r3. r2 is the shortest of
     // those carrying both, so it leads, then r1, then r3 on "dog" alone.
@@ -404,10 +414,24 @@ fn a_text_space_indexes_and_searches_text() {
 #[test]
 fn text_is_refused_where_the_sparse_space_takes_term_ids_alone() {
     let collection = collection();
-    assert!(matches!(
-        collection.vectorize_texts(&["a"]),
-        Err(Error::NoTextLayer)
-    ));
+    assert!(matches!(collection.tokenize("a"), Err(Error::NoTextLayer)));
+    let mut terms = record("t", &[0.0, 0.0], None, "a");
+    terms.sparse = Some(SparseHalf::Terms(vec!["a".to_string()]));
+    let added = collection.add_records(vec![terms], vec![], false);
+    assert_eq!(added.total_errors, 1);
+    assert_eq!(
+        added.errors[0],
+        format!(
+            "Vector t: {}: {}",
+            Error::NoTextLayer.exception().name(),
+            Error::NoTextLayer
+        )
+    );
+    assert_eq!(
+        collection.len(),
+        0,
+        "a record refused for its terms leaves nothing behind"
+    );
     assert!(matches!(
         collection.search_text("a", None, 10, IdfScope::Corpus),
         Err(Error::NoTextLayer)
@@ -428,7 +452,8 @@ fn text_is_refused_where_the_sparse_space_takes_term_ids_alone() {
 
 /// A text arm and a terms arm over the same text answer the same page, the
 /// collection's `tokenize` hands over what the layer's tokenizer does, and
-/// `vectorize_terms` over those terms is `vectorize_texts` over the text.
+/// the terms are counted into ids as the records are inserted and not
+/// before.
 #[test]
 fn a_text_arm_and_a_terms_arm_answer_the_same_page() {
     let declaration = Declaration::validate(2, "l2", 4, 50, 100, vec![])
@@ -449,24 +474,20 @@ fn a_text_arm_and_a_terms_arm_answer_the_same_page() {
         "the fox and the dog",
         "quick quick",
     ];
-    let by_text = collection.vectorize_texts(&texts).unwrap();
     let terms: Vec<Vec<String>> = texts
         .iter()
         .map(|text| collection.tokenize(text).unwrap())
         .collect();
     assert_eq!(terms[1], ["a", "lazy", "dog"]);
-    // The same terms counted again issue no id and give the same vectors.
-    let by_terms = collection.vectorize_terms(&terms).unwrap();
-    assert_eq!(by_terms, by_text);
-    assert_eq!(collection.term_count(), Some(8));
+    assert_eq!(collection.term_count(), Some(0), "tokenizing issues no id");
 
-    let records: Vec<ParsedRecord> = by_text
-        .into_iter()
+    let records: Vec<ParsedRecord> = terms
+        .iter()
         .enumerate()
-        .map(|(i, sparse)| ParsedRecord {
+        .map(|(i, terms)| ParsedRecord {
             id: format!("t{i}"),
             vector: vec![i as f32, 0.0],
-            sparse: Some(sparse),
+            sparse: Some(SparseHalf::Terms(terms.clone())),
             metadata: HashMap::new(),
         })
         .collect();
@@ -474,6 +495,7 @@ fn a_text_arm_and_a_terms_arm_answer_the_same_page() {
         collection.add_records(records, vec![], false).total_errors,
         0
     );
+    assert_eq!(collection.term_count(), Some(8));
 
     let query_terms = collection.tokenize("Quick fox!").unwrap();
     assert_eq!(query_terms, ["quick", "fox"]);
@@ -514,10 +536,33 @@ fn a_text_arm_and_a_terms_arm_answer_the_same_page() {
         dense_only.tokenize("x"),
         Err(Error::NoSparseSpace)
     ));
-    assert!(matches!(
-        dense_only.vectorize_terms(&[vec!["x".to_string()]]),
-        Err(Error::NoSparseSpace)
-    ));
+    let mut terms = record("x", &[0.0, 0.0], None, "a");
+    terms.sparse = Some(SparseHalf::Terms(vec!["x".to_string()]));
+    let added = dense_only.add_records(vec![terms], vec![], false);
+    assert_eq!(added.total_errors, 1);
+    assert!(added.errors[0].ends_with(&Error::NoSparseSpace.to_string()));
+
+    // The same terms counted again issue no id.
+    let again: Vec<ParsedRecord> = terms_of(&texts, &collection)
+        .into_iter()
+        .enumerate()
+        .map(|(i, terms)| ParsedRecord {
+            id: format!("u{i}"),
+            vector: vec![i as f32, 1.0],
+            sparse: Some(SparseHalf::Terms(terms)),
+            metadata: HashMap::new(),
+        })
+        .collect();
+    assert_eq!(collection.add_records(again, vec![], false).total_errors, 0);
+    assert_eq!(collection.term_count(), Some(8));
+}
+
+/// Every text split by the collection's tokenizer, in order.
+fn terms_of(texts: &[&str], collection: &Collection) -> Vec<Vec<String>> {
+    texts
+        .iter()
+        .map(|text| collection.tokenize(text).unwrap())
+        .collect()
 }
 
 /// The tokenizer runs under no guard. A tokenizer that reads the collection
@@ -557,16 +602,13 @@ fn the_tokenizer_runs_under_no_guard() {
         .ok()
         .unwrap();
 
-    let vectors = collection
-        .vectorize_texts(&["alpha beta", "beta gamma"])
-        .unwrap();
-    let records: Vec<ParsedRecord> = vectors
-        .into_iter()
+    let records: Vec<ParsedRecord> = ["alpha beta", "beta gamma"]
+        .iter()
         .enumerate()
-        .map(|(i, sparse)| ParsedRecord {
+        .map(|(i, text)| ParsedRecord {
             id: format!("t{i}"),
             vector: vec![i as f32, 0.0],
-            sparse: Some(sparse),
+            sparse: Some(SparseHalf::Terms(collection.tokenize(text).unwrap())),
             metadata: HashMap::new(),
         })
         .collect();
@@ -600,7 +642,6 @@ fn a_failing_tokenizer_reaches_the_caller() {
     let collection = Collection::build(declaration, None);
     for result in [
         collection.tokenize("a b").map(|_| ()),
-        collection.vectorize_texts(&["a b"]).map(|_| ()),
         collection
             .search_text("a b", None, 5, IdfScope::Corpus)
             .map(|_| ()),
@@ -621,7 +662,11 @@ fn a_failing_tokenizer_reaches_the_caller() {
         zeusdb_vector_core::Exception::Runtime
     );
     // Terms already split need no tokenizer, so they still count.
-    assert!(collection.vectorize_terms(&[vec!["a".to_string()]]).is_ok());
+    let mut split = record("t", &[0.0, 0.0], None, "a");
+    split.sparse = Some(SparseHalf::Terms(vec!["a".to_string()]));
+    let added = collection.add_records(vec![split], vec![], false);
+    assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    assert_eq!(collection.term_count(), Some(1));
 }
 
 /// A declaration read back by name takes the defaults for what it leaves

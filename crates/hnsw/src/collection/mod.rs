@@ -69,6 +69,8 @@ mod construct;
 mod dense;
 mod input;
 mod insert;
+#[cfg(test)]
+mod mutation_tests;
 mod persist;
 #[cfg(test)]
 mod persist_tests;
@@ -124,17 +126,37 @@ const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index";
 /// consumes it.
 pub type ParsedRecords = Vec<(String, Vec<f32>, HashMap<String, Value>)>;
 
+/// What a record hands the sparse space, where it hands anything.
+///
+/// A space that takes term ids takes a vector of them. A space with a text
+/// layer takes the terms its tokenizer split, which the collection counts
+/// into term ids and term frequencies as it inserts the record, under the
+/// mutation guard, issuing an id to every term not seen before. The terms
+/// travel as strings rather than as ids so that nothing between the
+/// tokenizer and the insertion holds an id the dictionary issued. Ids issued
+/// outside the mutation guard were ids a `clear` could reissue: the
+/// dictionary was emptied under a caller's ids, and the caller's postings
+/// then named terms other records had been given.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SparseHalf {
+    /// Term ids and weights, on a space that takes term ids.
+    Vector(SparseVector),
+    /// Terms already split, on a space with a text layer. Counted under the
+    /// mutation guard, so the ids are issued as the record is inserted.
+    Terms(Vec<String>),
+}
+
 /// One record on its way in, with a vector for every space it fills.
 ///
 /// The dense vector is always present, since the binding's surface declares
-/// one dense space and every record fills it. The sparse vector fills the
+/// one dense space and every record fills it. The sparse half fills the
 /// collection's sparse space where one is declared, and a record may leave
-/// it empty. A `ParsedRecords` tuple is a record with no sparse vector.
+/// it empty. A `ParsedRecords` tuple is a record with no sparse half.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedRecord {
     pub id: String,
     pub vector: Vec<f32>,
-    pub sparse: Option<SparseVector>,
+    pub sparse: Option<SparseHalf>,
     pub metadata: HashMap<String, Value>,
 }
 
@@ -639,8 +661,12 @@ impl SparseSpace {
 /// sits behind the space's second guard, and the guard is never held
 /// together with the index's. A record's terms are counted under the
 /// dictionary's write guard, released, and the vector is then inserted under
-/// the index's write guard, so the interning of a batch and a search under
-/// the index never wait on one another.
+/// the index's write guard, so the interning of a record and a search under
+/// the index never wait on one another. Both run under `writers`, taken by
+/// `add_records` before any record's terms are counted, so nothing can empty
+/// the dictionary between a record's ids being issued and its postings being
+/// written. The tokenizer runs before `writers` is taken, so a tokenizer that
+/// needs the caller's lock costs the mutation guard nothing.
 pub(crate) struct TextLayer {
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
     pub(crate) dictionary: RwLockAt<TermDictionary>,
@@ -808,10 +834,12 @@ pub struct Collection {
     /// race. This restores exactly the mutual exclusion the borrow flag gave
     /// them and nothing more, which leaves searches free to run throughout.
     ///
-    /// Held by the operations the binding calls, and by `save`, which holds it
-    /// across all four of its phases. An internal caller reaching a mutating
-    /// helper is already inside the guard, so the helpers never take it and
-    /// cannot deadlock against the caller that owns it.
+    /// Held by the operations the binding calls, `add_metadata` among them,
+    /// and by `save`, which holds it across all four of its phases, so every
+    /// mutation of what a save writes is ordered against every other. An
+    /// internal caller reaching a mutating helper is already inside the
+    /// guard, so the helpers never take it and cannot deadlock against the
+    /// caller that owns it.
     writers: MutexAt<()>,
 
     // ID-based training collection
@@ -825,15 +853,6 @@ pub struct Collection {
     /// loader wrote the saved value back over it a load reset the field, so a
     /// save of a loaded index recorded the load as the creation.
     created_at: RwLockAt<String>,
-
-    /// Set while a load rebuilds the graph, so the rebuild does not refill the
-    /// training collection with the ids it is replaying.
-    ///
-    /// Private, and written only through `set_rebuilding_from_persistence`.
-    /// It was the one field of this struct that `persistence.rs` named, and a
-    /// field the storage layer can reach is a field the storage layer can leave
-    /// set, which would suppress training collection for the life of the index.
-    rebuilding_from_persistence: AtomicBool,
 
     /// Set once the index has warned that it holds materially more records than
     /// `expected_size` declared, so the warning fires once rather than on every
@@ -941,8 +960,9 @@ impl Collection {
     /// and a thread holding the dictionary's guard while its tokenizer
     /// waited for the lock, would wait for each other forever, so the
     /// engine never runs a tokenizer with a guard held: this takes none,
-    /// and [`Collection::vectorize_terms`] and a text arm count the terms
-    /// collected here under the dictionary's guard afterwards.
+    /// and the terms collected here are counted under the dictionary's
+    /// guard afterwards, by `add_records` for a record's
+    /// [`SparseHalf::Terms`] and by a query for a text arm.
     ///
     /// A failure of the tokenizer itself comes back as the tokenizer
     /// returned it. Refused where the collection declares no sparse space,
@@ -952,32 +972,22 @@ impl Collection {
         zeusdb_vector_text::tokenize(&*layer.tokenizer, text)
     }
 
-    /// Count each record's terms, as [`Collection::tokenize`] handed them
+    /// Count one record's terms, as [`Collection::tokenize`] handed them
     /// over, into the sparse space's term ids and term frequencies, issuing
     /// an id to every term not seen before, under the dictionary's guard
-    /// taken once for the batch and alone. What a record's text becomes
-    /// before `add_records` takes it as the record's sparse half.
+    /// taken alone.
     ///
+    /// Reached from `add_single_vector` alone, under `writers`, so a term id
+    /// is issued only while the mutation guard is held and the record's
+    /// postings are written under the same hold. There is deliberately no
+    /// public way to count terms outside it: a caller holding ids across a
+    /// gap in the guard would hold ids a `clear` in that gap could reissue.
     /// Refused where the collection declares no sparse space, or one that
     /// takes term ids alone.
-    pub fn vectorize_terms(&self, terms: &[Vec<String>]) -> Result<Vec<SparseVector>, Error> {
+    fn count_record_terms(&self, terms: &[String]) -> Result<SparseVector, Error> {
         let layer = self.text_layer()?;
         let mut dictionary = layer.dictionary.write().unwrap();
-        terms
-            .iter()
-            .map(|record| count_record(&mut dictionary, record))
-            .collect()
-    }
-
-    /// Count each text into the sparse space's term ids and term
-    /// frequencies: [`Collection::tokenize`] on every text under no guard,
-    /// then [`Collection::vectorize_terms`] under the dictionary's.
-    pub fn vectorize_texts(&self, texts: &[&str]) -> Result<Vec<SparseVector>, Error> {
-        let terms = texts
-            .iter()
-            .map(|text| self.tokenize(text))
-            .collect::<Result<Vec<Vec<String>>, Error>>()?;
-        self.vectorize_terms(&terms)
+        count_record(&mut dictionary, terms)
     }
 
     /// Distinct terms the sparse space's dictionary holds, where it has
@@ -1317,8 +1327,18 @@ impl Collection {
         Ok(results)
     }
 
-    /// Add index-level metadata
+    /// Add index-level metadata, merging the pairs into what is held.
+    ///
+    /// Under the mutation guard, taken first as every other durable mutation
+    /// takes it, so a save, which holds the guard for its four phases, and
+    /// every other mutation are ordered against this one. The metadata mutex
+    /// alone kept the map whole; it did not order this call against the
+    /// mutations a save records. The pairs are what `config.json` writes
+    /// under `metadata`. The binding calls this with the interpreter lock
+    /// released, since waiting for another writer with it held would stall
+    /// every Python thread for the length of that writer.
     pub fn add_metadata(&self, metadata: HashMap<String, String>) {
+        let _writers = self.writers.lock().unwrap();
         let mut meta_lock = self.metadata.lock().unwrap();
         for (key, value) in metadata {
             meta_lock.insert(key, value);
