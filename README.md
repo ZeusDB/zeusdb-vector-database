@@ -49,6 +49,10 @@ ZeusDB leverages the HNSW (Hierarchical Navigable Small World) algorithm for spe
 
 🗂️ Metadata-aware filtering for precise and contextual querying
 
+🔤 Text search over a sparse space, with a built-in tokenizer or one you supply
+
+🔀 Hybrid search that runs dense, sparse and text arms over one candidate set and fuses them by rank
+
 💾 Save and load complete indexes to disk
 
 <br/>
@@ -74,6 +78,8 @@ All distance metrics in ZeusDB Vector Database return distance values, not simil
  - A vector identical to the query scores 0.0, or a value within floating point error of it
 
 This applies to all distance types, including cosine. `dot` is the one exception to the zero, because its score is `1 - dot` and an inner product above one takes it below zero.
+
+**This is what `search()` returns.** A `query()` page is scored differently. A sparse or text arm's score is a similarity, so higher is more similar, and a fused score is a reciprocal rank sum, which is higher for a record that placed well on more arms. See [Hybrid Search](#-hybrid-search).
 
 Under `cosine`, vectors are normalized to unit length when they are stored. A vector you read back with `return_vector=True` or `get_records()` is therefore the normalized form, not the values you supplied. Under `l1`, `l2` and `dot` the values are stored unchanged.
 
@@ -213,6 +219,7 @@ HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=5, vecto
 | `expected_size`  | `int`  | `10000`   | Estimated number of records to be inserted, from 1 to 100,000,000. Used for preallocating internal data structures and for choosing the default `m`. Not a hard limit, see below. |
 | `quantization_config` | `dict` | `None` | Product Quantization configuration for memory-efficient vector compression. See [Product Quantization](#️-product-quantization). |
 | `indexed_fields` | `list[str]` | `None` | Metadata fields to build a column for, so that a filter naming only those fields does not read every record. Up to 32 names, no duplicates, none of `$and`, `$or` or `$not`. See [Declaring the fields you filter on](#-declaring-the-fields-you-filter-on). |
+| `sparse`         | `dict` | `None` | Declares a sparse space beside the dense one. `tokenizer` makes it a text layer and defaults the weighting to `"bm25"`; without one the weighting defaults to `"dot"`. `name` is the directory the space saves under and defaults to `sparse`. Also takes `unlink` and `lazy_threshold_percent`. See [Text Search](#-text-search) and [Sparse Vectors](#-sparse-vectors). |
 
 **`dim` is required.** There is no default, because `dim` has to equal the width your embedding model produces and an index built at any other width rejects every vector you add to it. Omitting it raises `TypeError`.
 
@@ -228,18 +235,18 @@ except TypeError as error:
 create() requires 'dim', the width of the vectors this index will hold. There is no default because dim has to equal the width your embedding model produces, and an index built at any other width rejects every vector you add to it. Read it off one embedding with len(vector), or pass the width your model documents, for example dim=1536 for OpenAI text-embedding-3-small or dim=768 for most sentence-transformers models.
 ```
 
-**The default `m` depends on `expected_size`.** It is 16 for an `expected_size` of 25,000 or less, and 32 above that. A graph too sparse for the number of records loses recall that no search width recovers, so declare `expected_size` honestly or set `m` yourself. Passing `m` explicitly always wins, and [`rebuild()`](#-change-m-after-the-fact-with-rebuild) changes it afterwards.
+**The default `m` depends on `expected_size`.** It is 16 for an `expected_size` of 25,000 or less, and 32 above that. A graph too sparse for the number of records loses recall that no search width recovers, so declare `expected_size` honestly or set `m` yourself. Passing `m` explicitly always wins, and [`rebuild()`](#️-change-m-after-the-fact-with-rebuild) changes it afterwards.
 
 ```python
 vdb.create("hnsw", dim=8, expected_size=25_000).get_stats()["m"]   # '16'
 vdb.create("hnsw", dim=8, expected_size=25_001).get_stats()["m"]   # '32'
 ```
 
-**`expected_size` is a hint and not a limit.** An index accepts more records than it declared and the graph grows to fit them. What it does not change is `m`, which [`rebuild()`](#-change-m-after-the-fact-with-rebuild) does. Passing twice the declared size logs a warning once, on the `add()` that crosses it.
+**`expected_size` is a hint and not a limit.** An index accepts more records than it declared and the graph grows to fit them. What it does not change is `m`, which [`rebuild()`](#️-change-m-after-the-fact-with-rebuild) does. Passing twice the declared size logs a warning once, on the `add()` that crosses it.
 
 **`ef_construction` costs build time and buys graph quality.** It changes neither search latency nor the size of the finished index. Build time is linear in it above 100, so 50,000 records of `dim=1536` build in 76.9 s at the default and 262.1 s at 800. Recall stops improving at or near the default on most data, and where it keeps climbing a larger `ef_search` buys more for less, so raise `ef_search` before raising this. The default does not move with `m`, so 200 is 6.25 times the layer zero neighbour budget of 32 at `m=16` and 3.125 times the budget of 64 at `m=32`. Measured at 50,000 records with `m=32`, raising it to 400 bought 0.0010 recall at 10 on OpenAI embeddings of `dim=1536`, 0.0002 on SIFT and 0.0078 on GloVe, for 1.9 to 2.2 times the build time, which is why the constant stays.
 
-**Keep `ef_construction` above `2 × m`.** At or below the neighbour budget the graph keeps every candidate the insertion search returned and prunes none of them. `create()` and [`rebuild()`](#-change-m-after-the-fact-with-rebuild) both warn when the pair reaches that point, and both take the pair, so either remedy the warning names can be taken. The defaults are clear of it.
+**Keep `ef_construction` above `2 × m`.** At or below the neighbour budget the graph keeps every candidate the insertion search returned and prunes none of them. `create()` and [`rebuild()`](#️-change-m-after-the-fact-with-rebuild) both warn when the pair reaches that point, and both take the pair, so either remedy the warning names can be taken. The defaults are clear of it.
 
 <br/>
 
@@ -354,6 +361,46 @@ print(add_result)
 AddResult(inserted=2, errors=0, shape=Some((2, 2)))
 ```
 
+#### ✅ Format 6 – Sparse and text beside the vector
+
+An index declaring a sparse space takes one more key per record. A record dict spells it `text` or `sparse`, a batch dict spells the same thing `texts` or `sparse`, one entry per record.
+
+```python
+from zeusdb_vector_database import VectorDatabase
+
+vdb = VectorDatabase()
+index = vdb.create("hnsw", dim=2, sparse={"tokenizer": "simple"})
+
+# A record dict carries text, one key per record.
+print(index.add({"id": "doc1", "values": [0.1, 0.2], "text": "the quick brown fox"}))
+
+# A batch dict carries texts, one per record, aligned with ids.
+print(index.add({
+    "ids": ["doc2", "doc3"],
+    "embeddings": [[0.3, 0.4], [0.5, 0.6]],
+    "texts": ["a lazy brown dog", "the rain in spain"],
+}))
+
+# A record the space takes nothing from leaves the key out.
+print(index.add({"id": "doc4", "values": [0.7, 0.8]}))
+print(index.get_stats()["sparse_records"], len(index))
+```
+
+*Output*
+```
+AddResult(inserted=1, errors=0, shape=Some((1, 2)))
+AddResult(inserted=2, errors=0, shape=Some((2, 2)))
+AddResult(inserted=1, errors=0, shape=Some((1, 2)))
+3 4
+```
+
+| Shape | Text layer | Term ids |
+|-------|-----------|----------|
+| A record dict, formats 1 and 2 | `text` | `sparse` |
+| A batch dict, formats 3 and 5 | `texts` | `sparse` |
+
+**A space takes one spelling and refuses the other.** `sparse` on a text layer is that record's error, and `text` on a space declared without a tokenizer is the same. On an index declaring no sparse space at all, either key gives `This collection declares no sparse space`, one error per record. The parallel array rule extends to these, so a `texts` list short against `ids` raises before anything is inserted.
+
 Each format is parsed and validated automatically. Invalid records are skipped rather than aborting the call, and the reason for each is returned in `errors`. A record whose vector contains `NaN` or an infinity is rejected this way.
 
 <br/>
@@ -395,7 +442,7 @@ The `add()` method inserts or replaces one or more vectors in the index.
 
 | Parameter | Type                                | Default | Description |
 |-----------|-------------------------------------|---------|-------------|
-| `data`    | `dict`, `list[dict]`, `dict` of arrays, or `np.ndarray` | *required* | Input records to upsert into the index. Supports the five formats above. |
+| `data`    | `dict`, `list[dict]`, `dict` of arrays, or `np.ndarray` | *required* | Input records to upsert into the index. Supports the six formats above. |
 | `overwrite` | `bool`                            | `True`  | Whether an ID already in the index is replaced. With `False`, a colliding record is skipped and counted as an error. |
 
 **The parallel arrays must be the same length.** Formats 3 and 5 pair `ids[i]` with `vectors[i]` and `metadatas[i]` by position, so a disagreement in length is a caller error and raises `ValueError` naming both lengths and which field is short. Nothing is inserted before the raise, so the call is safe to retry.
@@ -590,6 +637,8 @@ The `search()` method retrieves the top-k most similar vectors from the index gi
 
 A query vector containing `NaN` or an infinity raises `ValueError` rather than returning meaningless distances.
 
+`search()` asks one space. To ask several in one call, and to see what a query would cost before it runs, see [Hybrid Search](#-hybrid-search) and [Query Plans](#️-query-plans).
+
 <br/>
 
 ### 🧰 Additional functionality
@@ -745,7 +794,7 @@ storage_mode_description: raw_only
 | `quantized_codes_memory_mb` | The codes, which grow with the record count |
 | `codebook_memory_mb`, `sdc_table_memory_mb`, `centroid_norm_memory_mb` | The trained tables, fixed by `dim`, `subvectors` and `bits` |
 | `index_bookkeeping_memory_mb` | The hash tables that find a record |
-| `total_memory_mb` | The sum of the seven figures above |
+| `total_memory_mb` | The sum of the seven figures above, and of `sparse_memory_mb` and `dictionary_memory_mb` where the index declares a sparse space |
 | `quantization_type` | `pq`, or `none` on an unquantized index |
 | `raw_vectors_retained` | The storage mode's policy, `none_once_trained` or `all_records`. Quantized indexes only |
 
@@ -1404,6 +1453,7 @@ The persistence system supports:
 ✅ **Hybrid storage format**, binary encoding for vectors with human-readable JSON for metadata
 ✅ **Quantization support**, both raw and quantized storage modes, including the trained codebook
 ✅ **Training state recovery**, so an index saved mid-collection resumes collecting
+✅ **Sparse spaces**, the postings and the term dictionary, under `spaces/<name>/`
 ✅ **Format versioning**, so a directory this build cannot interpret is refused rather than misread
 ✅ **Atomic saves**, so a reader sees the whole previous index or the whole new one
 ✅ **A digest per artefact**, checked on load, so a file that has changed since it was written is refused
@@ -1467,6 +1517,8 @@ top hit: doc_0
 
 The graph is rebuilt by re-inserting every record only when the saved graph cannot be used, which covers a directory whose graph files were lost or damaged and one written by a release too old for this build to interpret. Set `ZEUSDB_LOAD_REBUILD_GRAPH=1` to ask for that rebuild on a directory whose graph is perfectly readable, which is how an index built by an earlier release picks up graph improvements made since.
 
+**A directory whose sparse space was declared with your own tokenizer needs it handed back**, as `vdb.load(path, tokenizer=tokenize)`. See [Text Search](#-text-search).
+
 <br />
 
 ### 🗜️ Persistence with Product Quantization
@@ -1524,8 +1576,14 @@ my_index.zdb/
 ├── quantization.json       # PQ configuration (if enabled)
 ├── pq_centroids.bin        # Trained centroids (if PQ trained)
 ├── pq_codes.bin            # Quantized codes (if PQ active)
-└── hnsw_index.zdbgraph     # HNSW graph structure and payload
+├── hnsw_index.zdbgraph     # HNSW graph structure and payload
+└── spaces/                 # One directory per sparse space (if declared)
+    └── <name>/
+        ├── postings.zdbsparse  # Every live record's term ids and weights
+        └── terms.zdbdict       # The term dictionary (text layers only)
 ```
+
+`<name>` is the space's `name`, which defaults to `sparse`. `terms.zdbdict` is written only where the space was declared with a tokenizer.
 
 `manifest.json` lists every file the save wrote under `files_included` and is the last file written, so it is the inventory of what the directory does hold. Beside the list, `file_digests` records each artefact's length and a digest of its contents.
 
@@ -1622,9 +1680,9 @@ all checks passed
 
 - **Same volume.** The staging directory is a sibling of the target, so both are on the target's volume and the move is a rename rather than a copy.
 
-- **Version compatibility.** The manifest records a format version. This build writes 1.1.0 for a directory holding a dense space alone, which opens on every release that reads 1.x, and reads any 1.x or 2.x. A different major version is refused.
+- **Version compatibility.** The manifest records a format version. This build writes 1.1.0 for a directory holding a dense space alone, which opens on every release that reads 1.x, and 2.0.0 for a directory holding a sparse space, which needs this release or later. It reads any 1.x or 2.x. A different major version is refused.
 
-- **Integrity checks on load.** Four run, in this order: the format version, then `files_included` against the directory, then each artefact against its recorded length and digest, then the restored record count against the count in `config.json`.
+- **Integrity checks on load.** Four run, in this order: the format version, then `files_included` against the directory, then each artefact against its recorded length and digest, then the restored record count against the count in `config.json`. A directory holding a sparse space adds two, being every record the space holds against the id mappings, and every term id the postings carry against the length of the dictionary.
 
 - **`save()` and `load()` are silent.** Every step they used to print to stdout is a `debug` log line instead, so a library caller sees nothing on stdout. Set `ZEUSDB_LOG_LEVEL=debug` to see the steps.
 
@@ -1952,6 +2010,294 @@ print(matched({"$not": {"author": "Bob"}}))
 ['doc_1', 'doc_3']
 ['doc_1', 'doc_3']
 ```
+
+---
+
+<br/>
+
+## 🔎 Sparse and Hybrid Search
+
+### 🔤 Text Search
+
+A sparse space indexes term counts beside the dense vectors. Declare it with a tokenizer and records carry a `text` field, which the tokenizer splits and the space counts.
+
+```python
+from zeusdb_vector_database import VectorDatabase
+
+vdb = VectorDatabase()
+index = vdb.create("hnsw", dim=4, sparse={"tokenizer": "simple"})
+
+index.add([
+    {"id": "d1", "values": [0.1, 0.1, 0.1, 0.1],
+     "text": "the quick brown fox jumps over the lazy dog"},
+    {"id": "d2", "values": [0.2, 0.2, 0.2, 0.2],
+     "text": "a quick brown dog outpaces a lazy fox"},
+    {"id": "d3", "values": [0.3, 0.3, 0.3, 0.3],
+     "text": "the rain in spain falls mainly on the plain"},
+])
+
+for hit in index.query(arms=[{"text": "quick fox"}], top_k=2):
+    print(hit["id"], round(hit["score"], 4))
+```
+
+*Output*
+```
+d2 0.9705
+d1 0.9254
+```
+
+| Key | Takes | Means |
+|-----|-------|-------|
+| `tokenizer` | `"simple"` or a callable | How a text becomes terms. Declaring it makes the space a text layer |
+| `weighting` | `"dot"`, `"bm25"`, or a mapping | How a term count scores. Defaults to `bm25` where a tokenizer is declared. `{"type": "bm25", "k1": 1.5, "b": 0.6}` sets the parameters, which otherwise take 1.2 and 0.75 |
+| `name` | a string | The directory the space saves under. Defaults to `sparse` |
+
+**Scores are similarities.** Higher is better, unlike the dense `search()`, whose scores are distances. A space with a text layer takes `text` and refuses `sparse`.
+
+<br/>
+
+**The built-in tokenizer** splits on anything that is not a letter or a digit and lowercases. It does no stemming, no stopword removal and no segmentation of a script written without spaces, so `state-of-the-art` is four terms and `don't` is two. A caller who needs more supplies their own.
+
+```python
+def tokenize(text):
+    return [w.strip(".,!?").lower() for w in text.split() if len(w) > 2]
+
+index = vdb.create("hnsw", dim=4, sparse={"tokenizer": tokenize})
+index.add({"id": "d1", "values": [0.1, 0.1, 0.1, 0.1],
+           "text": "The quick brown fox."})
+
+print(index.get_stats()["term_count"])
+```
+
+*Output*
+```
+4
+```
+
+A tokenizer takes a `str` and returns an iterable of `str`, one per term, in order and with every repeat, since the count is what the space stores. An exception it raises comes back as itself from `query()`, and from `add()` as that record's error naming the class.
+
+<br/>
+
+**Reopening an index built with your own tokenizer** needs the same tokenizer handed back, because the directory records that one was used and cannot reproduce it.
+
+```python
+index.save("my_index.zdb")
+
+reopened = vdb.load("my_index.zdb", tokenizer=tokenize)
+```
+
+`vdb.load("my_index.zdb")` on such a directory raises, since the directory records that a tokenizer of your own was used and cannot reproduce it. It records nothing that identifies which one, so a different callable opens it without complaint and tokenizes queries its own way. An index built with `"simple"` reopens with nothing handed.
+
+---
+
+<br/>
+
+### 🧮 Sparse Vectors
+
+A caller running their own sparse encoder declares the space without a tokenizer and supplies the pairs directly. The dimensions are the caller's own term ids and the values are the caller's own weights.
+
+```python
+from zeusdb_vector_database import VectorDatabase
+
+vdb = VectorDatabase()
+index = vdb.create("hnsw", dim=4, sparse={"name": "encoder"})
+
+index.add([
+    {"id": "d1", "values": [0.1, 0.1, 0.1, 0.1],
+     "sparse": {"dims": [12, 977, 4021], "values": [0.41, 1.20, 0.08]}},
+    {"id": "d2", "values": [0.2, 0.2, 0.2, 0.2],
+     "sparse": {"dims": [12, 350], "values": [0.90, 0.15]}},
+])
+
+hits = index.query(
+    arms=[{"sparse": {"dims": [12, 977], "values": [0.9, 0.3]}}],
+    top_k=2,
+)
+for hit in hits:
+    print(hit["id"], round(hit["score"], 4))
+```
+
+*Output*
+```
+d2 0.81
+d1 0.729
+```
+
+| Key | Takes | Means |
+|-----|-------|-------|
+| `dims` | a list of integers | Term ids, strictly increasing |
+| `values` | a list of numbers | The weight of each term |
+
+**The default weighting is `dot`**, which is the sum of products, and it leaves a trained encoder's weights alone. A space declared this way takes `sparse` and refuses `text`.
+
+<br/>
+
+**A caller counting terms themselves** declares `"weighting": "bm25"` and supplies raw counts. The engine then applies the saturation, the length normalisation and the rarity over the records the query admits.
+
+```python
+index = vdb.create("hnsw", dim=4, sparse={"name": "counts", "weighting": "bm25"})
+
+index.add({"id": "d1", "values": [0.1, 0.1, 0.1, 0.1],
+           "sparse": {"dims": [3, 9, 41], "values": [2.0, 1.0, 1.0]}})
+```
+
+Under `bm25` a value must be a whole number above zero, since a term frequency is a count. A trained encoder's weight is refused with the value named, which is what tells you the space wants `dot` instead.
+
+---
+
+<br/>
+
+### 🔀 Hybrid Search
+
+`query()` runs several arms over one set of candidates and fuses their pages by rank. An arm is a dense vector, a sparse vector or a text, and every arm shares the filter.
+
+```python
+from zeusdb_vector_database import VectorDatabase
+
+vdb = VectorDatabase()
+index = vdb.create("hnsw", dim=4, space="l2", sparse={"tokenizer": "simple"})
+
+index.add([
+    {"id": "d1", "values": [0.1, 0.1, 0.1, 0.1],
+     "text": "the quick brown fox", "metadata": {"lang": "en"}},
+    {"id": "d2", "values": [0.9, 0.9, 0.9, 0.9],
+     "text": "a lazy brown dog", "metadata": {"lang": "en"}},
+    {"id": "d3", "values": [0.2, 0.2, 0.2, 0.2],
+     "text": "un renard brun rapide", "metadata": {"lang": "fr"}},
+])
+
+hits = index.query(
+    arms=[{"vector": [0.1, 0.1, 0.1, 0.1]}, {"text": "quick fox"}],
+    filter={"lang": "en"},
+    top_k=2,
+)
+for hit in hits:
+    print(hit["id"], round(hit["score"], 4),
+          [(c["arm"], c["rank"]) for c in hit["contributions"]])
+```
+
+*Output*
+```
+d1 0.0328 [(0, 1), (1, 1)]
+d2 0.0161 [(0, 2)]
+```
+
+| Argument | Takes | Means |
+|----------|-------|-------|
+| `arms` | a list of mappings | One to eight arms. Each names `vector`, `sparse` or `text` |
+| `filter` | a filter | Applied once, to every arm |
+| `top_k` | an integer | The page size |
+| `fetch` | an integer | What each arm contributes. Defaults to `top_k` for one arm and five times it for several |
+| `fusion` | `"rrf"` or a mapping | How the pages combine. `{"type": "rrf", "k": 60.0}` sets the constant |
+
+**A hit carries its rank and score on every arm's page it appeared on**, under `contributions`, indexed by the arm's position in `arms`. A fused score is a rank sum and means nothing on its own, which is what the contributions are for.
+
+<br/>
+
+**An arm takes the options its own kind takes.** A dense arm takes `ef_search` and `rerank` as `search()` does, and a sparse or text arm takes `idf`.
+
+```python
+hits = index.query(
+    arms=[
+        {"vector": [0.1, 0.1, 0.1, 0.1], "ef_search": 200},
+        {"text": "quick fox", "idf": "global"},
+    ],
+    top_k=2,
+    fusion={"type": "rrf", "k": 30.0},
+)
+```
+
+| Key | On | Means |
+|-----|----|-------|
+| `ef_search` | a dense arm | The search width, as `search()` takes it |
+| `rerank` | a dense arm | How many candidates to rescore against true vectors |
+| `idf` | a sparse or text arm | `"corpus"` counts term rarity over the records the filter admits, `"global"` over every record. Defaults to `"corpus"` |
+
+**A one arm query is that arm's search.** A single dense arm returns the page `search()` returns, id for id and score for score, with each hit carrying its `contributions` as well. `query()` is the shape to reach for whenever more than one arm is in play.
+
+---
+
+<br/>
+
+### 🗺️ Query Plans
+
+`explain()` takes the same arguments as `query()` and returns what the query would do, without running it.
+
+```python
+plan = index.explain(
+    arms=[{"vector": [0.1, 0.1, 0.1, 0.1]}, {"text": "quick fox"}],
+    filter={"lang": "en"},
+    top_k=10,
+)
+print(plan["admit"])
+for arm in plan["arms"]:
+    print(arm["kind"], arm["fetch"], round(arm["cost_ns"]))
+```
+
+*Output*
+```
+{'shape': 'sorted', 'admitted': 2}
+dense 50 235
+sparse 50 22
+```
+
+| Key | Means |
+|-----|-------|
+| `admit` | The shape the filter compiled to, and how many records it admits |
+| `arms` | One entry per arm, carrying its space, kind, fetch, estimated cost and whether its page is exact |
+| `fusion` | The rule the pages combine under, or `None` for one arm |
+
+**`cost_ns` is an arm's own estimate of its own work**, in nanoseconds, and it is a figure to compare arms of one query by. It leaves out the filter's evaluation and the page's assembly, so a wall time you measure will exceed it.
+
+<br/>
+
+**The admit shape says how the filter was answered.**
+
+| Shape | Means |
+|-------|-------|
+| `all` | Every live record, either no filter or one that admits all of them |
+| `bitmap` | A filter every field of which is declared, answered from the columns |
+| `sorted` | A short list of matching records, walked exactly |
+| `bounded` | A walk that stopped at a bound, so the count is an upper limit |
+| `predicate` | A walk that gave up, so each candidate is tested as it is visited |
+
+---
+
+<br/>
+
+### 📊 Statistics
+
+An index holding a sparse space reports it in `get_stats()` beside the dense figures.
+
+```python
+stats = index.get_stats()
+for key in ("sparse_space", "sparse_weighting", "sparse_records",
+            "sparse_postings", "sparse_memory_mb"):
+    print(key, stats[key])
+```
+
+*Output*
+```
+sparse_space sparse
+sparse_weighting bm25
+sparse_records 3
+sparse_postings 12
+sparse_memory_mb 0.00
+```
+
+| Key | Means |
+|-----|-------|
+| `sparse_space` | The space's name |
+| `sparse_weighting` | `dot` or `bm25` |
+| `sparse_records` | Records the space holds, which may be fewer than the index holds |
+| `sparse_postings` | Live entries across every record, one per distinct term per record |
+| `sparse_dead_postings` | Occurrences left by removed records, reclaimed at `compact()` |
+| `sparse_memory_mb` | What the postings and their index hold |
+| `sparse_tokenizer` | `simple` or `external`, on a text layer alone |
+| `term_count` | Distinct terms the dictionary holds, on a text layer alone |
+| `dictionary_memory_mb` | What the dictionary holds, on a text layer alone |
+
+**These keys are present on a sparse index and absent otherwise**, and `total_memory_mb` sums them in.
 
 <br />
 
