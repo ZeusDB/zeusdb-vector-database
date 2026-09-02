@@ -1351,8 +1351,23 @@ impl Collection {
 
 #[cfg(test)]
 mod tests {
+    use super::construct::MAX_DIM;
     use super::LiveRecords;
     use std::collections::HashMap;
+    use zeusdb_vector_core::JOURNAL_MAX_PAYLOAD;
+
+    /// The journal's payload ceiling is derived from this crate's ceilings,
+    /// being a codebook at the widest `dim` and the most centroids `bits`
+    /// admits, plus a mebibyte, so a change to either ceiling here is a
+    /// change to the journal's bound as well.
+    #[test]
+    fn the_journal_payload_ceiling_follows_the_declaration_ceilings() {
+        let most_centroids = 1usize << 8;
+        assert_eq!(
+            JOURNAL_MAX_PAYLOAD,
+            MAX_DIM * most_centroids * 4 + (1 << 20)
+        );
+    }
 
     /// The bitmap admits exactly the ids the map holds, after every kind of
     /// write, which is what makes the unfiltered traversal's page the same

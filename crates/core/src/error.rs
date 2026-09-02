@@ -351,6 +351,33 @@ pub enum Error {
     GraphDumpFailed(String),
 
     // ------------------------------------------------------------------
+    // The journal
+    // ------------------------------------------------------------------
+    /// A journal's file header cannot be read
+    JournalHeaderInvalid { file: String, detail: String },
+    /// A record fails and records follow it, so its bytes changed after it
+    /// was written
+    JournalCorrupt {
+        file: String,
+        sequence: u64,
+        at: u64,
+        detail: String,
+    },
+    /// A record's payload does not decode
+    JournalRecordInvalid {
+        file: String,
+        sequence: u64,
+        at: u64,
+        detail: String,
+    },
+    /// The journal's file could not be created, written, synced or cut
+    JournalIoFailed {
+        path: PathBuf,
+        what: &'static str,
+        error: String,
+    },
+
+    // ------------------------------------------------------------------
     // The saved directory
     // ------------------------------------------------------------------
     /// A container in a bincode artefact declares more than the file holds
@@ -609,7 +636,11 @@ impl Error {
             | CodebookAllZero
             | CodesWithoutCodebook { .. }
             | ReconstructFailed { .. }
-            | SerializeFailed { .. } => Exception::Runtime,
+            | SerializeFailed { .. }
+            | JournalHeaderInvalid { .. }
+            | JournalCorrupt { .. }
+            | JournalRecordInvalid { .. }
+            | JournalIoFailed { .. } => Exception::Runtime,
         }
     }
 }
@@ -1058,6 +1089,42 @@ impl fmt::Display for Error {
             ),
             GraphDumpFailed(error) => write!(f, "HNSW graph dump failed: {}", error),
 
+            JournalHeaderInvalid { file, detail } => write!(
+                f,
+                "The journal {} cannot be read: {}. Nothing in it was replayed.",
+                file, detail
+            ),
+            JournalCorrupt {
+                file,
+                sequence,
+                at,
+                detail,
+            } => write!(
+                f,
+                "Record {} at byte {} of the journal {} is corrupt ({}) and records \
+                 follow it, so it was written whole and its bytes changed afterwards. \
+                 Refusing to open, because skipping it would recover a state nothing \
+                 acknowledged. Restore the journal from a copy, or repair it by name \
+                 to cut it at byte {} and lose record {} and everything after it.",
+                sequence, at, file, detail, at, sequence
+            ),
+            JournalRecordInvalid {
+                file,
+                sequence,
+                at,
+                detail,
+            } => write!(
+                f,
+                "Record {} at byte {} of the journal {} does not decode: {}",
+                sequence, at, file, detail
+            ),
+            JournalIoFailed { path, what, error } => write!(
+                f,
+                "Failed to {} the journal {}: {}",
+                what,
+                path.display(),
+                error
+            ),
             DecodeLengthExceeded { file, bytes } => write!(
                 f,
                 "{} declares a length its own {} bytes could not hold. A container in \
