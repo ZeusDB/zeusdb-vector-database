@@ -70,7 +70,7 @@ fn declare_sparse(
         })?;
         if !SPARSE_KEYS.contains(&key.as_str()) {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "sparse declares '{}', which is not a field of a sparse space. The fields                  are name, weighting, unlink, lazy_threshold_percent and tokenizer.",
+                "sparse declares '{}', which is not a field of a sparse space. The fields are name, weighting, unlink, lazy_threshold_percent and tokenizer.",
                 key
             ))
             .into());

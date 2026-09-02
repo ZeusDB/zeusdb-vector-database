@@ -27,7 +27,7 @@ resolver = "2"
 members = ["crates/*", "bindings/*"]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 # The same licence pyproject.toml declares, LICENSE holds and NOTICE restates.
 # cargo-deny reads this field. The wheel's metadata is unaffected, because
