@@ -962,18 +962,18 @@ impl fmt::Display for Error {
             ),
             RecordAlreadyHeld { id } => write!(
                 f,
-                "Record {} is already held by this space. A record is removed before                  it is added again, and an internal id is never reused.",
+                "Record {} is already held by this space. A record is removed before it is added again, and an internal id is never reused.",
                 id
             ),
             RecordNotHeld { id } => write!(f, "Record {} is not held by this space", id),
             SparseVectorShape { dims, values } => write!(
                 f,
-                "Sparse vector has {} dims and {} values, and the two must be the same                  length",
+                "Sparse vector has {} dims and {} values, and the two must be the same length",
                 dims, values
             ),
             SparseDimsNotIncreasing { position } => write!(
                 f,
-                "Sparse vector dims must be strictly increasing, and the dim at position                  {} is not above the one before it",
+                "Sparse vector dims must be strictly increasing, and the dim at position {} is not above the one before it",
                 position
             ),
             SparseValueNotFinite { index, value } => write!(

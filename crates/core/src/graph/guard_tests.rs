@@ -394,13 +394,13 @@ fn layer_zero_in_degree() {
     );
     assert!(
         overflows > N as u64,
-        "the overflow pop fired {} times over {} nodes, which is not often enough          to exercise the guard",
+        "the overflow pop fired {} times over {} nodes, which is not often enough to exercise the guard",
         overflows,
         N
     );
     assert!(
         saves > 0,
-        "the guard never skipped the farthest entry, so it changed no outcome          here and this fixture does not test it"
+        "the guard never skipped the farthest entry, so it changed no outcome here and this fixture does not test it"
     );
 
     let in_degree = graph.layer_zero_in_degree();

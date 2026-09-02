@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.10.0] - 2026-09-02
+
+### Added
+
+- **Sparse vector spaces.** A collection can declare a sparse space beside its
+  dense one, holding term ids and weights in an inverted index. Declared
+  through `create(..., sparse={...})`, filled through the `sparse` key on a
+  record or the `sparse` array on a batch, and queried as an arm of `query()`.
+
+- **Text search.** A sparse space declared with a tokenizer takes a `text`
+  field instead, which the tokenizer splits and the space counts. The built-in
+  tokenizer splits on anything that is not a letter or a digit and lowercases.
+  A caller supplies their own as a callable taking a `str` and returning an
+  iterable of `str`.
+
+- **Term frequency weighting.** A sparse space scores by the dot product or by
+  term frequency weighting with `k1` and `b`. A term is weighted by its rarity
+  over the records the query admits, or over every live record on request. A
+  space declared with a tokenizer takes term frequency weighting by default.
+
+- **`query()` and `explain()`.** `query()` runs one to eight arms over one set
+  of candidates and fuses their pages by reciprocal rank. An arm is a dense
+  vector, a sparse vector or a text, and every arm shares the filter. Each hit
+  carries its rank and score on every arm's page it appeared on. `explain()`
+  takes the same arguments and returns the plan alone, being the admit set's
+  shape, each arm's fetch and estimated cost, and the fusion.
+
+- **Sparse spaces persist.** A collection holding one saves it under
+  `spaces/<name>/`, with the postings and, for a text layer, the term
+  dictionary. `load(path, tokenizer=...)` takes the tokenizer a text layer was
+  declared with.
+
+- **`get_stats()` reports a sparse space**, under nine keys, and
+  `total_memory_mb` sums them in.
+
+### Changed
+
+- **An unfiltered search is faster** by 22 percent on SIFT-128 under `l2`, 18
+  percent on GloVe-100 under `cosine` and 6.5 percent on DBpedia-1536 under
+  `cosine`, measured at 50,000 records. Every result page is identical.
+
+- **A directory holding a sparse space declares format version 2.0.0** and
+  needs this release or later. A directory holding a dense space alone stays
+  at 1.1.0 and opens on every release that reads 1.x. Every directory 0.8.0
+  and 0.9.0 wrote opens unchanged.
+
+### Internal
+
+- The engine is a Cargo workspace of five crates, none published to
+  crates.io. Every failure is one `Error` type mapped to the same exception
+  classes and messages.
+
+- `save()` flushes the graph file to disk before the directory is renamed into
+  place.
+
+- `wide` moves to 1.7 and `chacha20` to 0.10.2.
+
 ## [0.9.0] - 2026-08-28
 
 ### Changed
