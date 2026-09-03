@@ -35,14 +35,13 @@
 //!
 //! # The three arms
 //!
-//! `sync` commits with [`CommitMode::Sync`], so every record a call returns
-//! from is on the device. `none` commits with [`CommitMode::Deferred`] and
-//! never syncs, so the records are in the kernel; a process abort loses
-//! nothing, which is what these tests kill with. `interval` commits
-//! deferred and a thread of the test's own syncs the file every ten
-//! milliseconds, which is the shape a policy that syncs on an interval
-//! takes. The policies themselves are not the engine's yet; these are the
-//! commit modes it has.
+//! The three durability policies, each by name. `sync` is
+//! [`Durability::PerCall`], so every record a call returns from is on the
+//! device. `none` is [`Durability::NoSync`], so the records are in the
+//! kernel and nothing syncs them; a process abort loses nothing, which is
+//! what these tests kill with. `interval` is [`Durability::PerInterval`] at
+//! ten milliseconds, so the engine's own thread syncs the file, and an abort
+//! lands wherever that thread happens to be.
 //!
 //! # How the child is run
 //!
@@ -56,11 +55,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
-use zeusdb_vector_core::{CommitMode, JournalDamage, KillPoint};
+use zeusdb_vector_core::{JournalDamage, KillPoint};
+
+use crate::journal::Durability;
 
 use super::{Collection, Declaration, ParsedRecord};
 
@@ -190,48 +190,12 @@ const ENV_MATRIX: &str = "ZEUSDB_KILL_MATRIX";
 /// The name of the child test, as `--exact` spells it.
 const CHILD_TEST: &str = "collection::crash_tests::the_kill_matrixs_child";
 
-/// What each arm commits with, and whether a thread syncs beside it.
-fn commit_mode(arm: &str) -> CommitMode {
+/// The policy each arm runs under.
+fn durability(arm: &str) -> Durability {
     match arm {
-        "sync" => CommitMode::Sync,
-        _ => CommitMode::Deferred,
-    }
-}
-
-/// A thread that syncs the journal every ten milliseconds, which is the
-/// shape an interval policy takes. It opens the file itself rather than
-/// taking a handle off the sink, so nothing about the policy has to reach
-/// into the collection.
-struct Flusher {
-    stop: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Flusher {
-    fn start(path: PathBuf) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = stop.clone();
-        let handle = std::thread::spawn(move || {
-            while !flag.load(Ordering::Relaxed) {
-                if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
-                    let _ = file.sync_data();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        });
-        Flusher {
-            stop,
-            handle: Some(handle),
-        }
-    }
-}
-
-impl Drop for Flusher {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        "sync" => Durability::PerCall,
+        "interval" => Durability::PerInterval(Duration::from_millis(10)),
+        _ => Durability::NoSync,
     }
 }
 
@@ -371,12 +335,10 @@ fn the_kill_matrixs_child() {
         None => (None, String::new()),
     };
     let vectors = corpus();
-    let mode = commit_mode(&arm);
-    let flusher =
-        (arm == "interval").then(|| Flusher::start(crate::journal::journal_path(&dir).unwrap()));
+    let durability = durability(&arm);
 
     let (collection, start_at) = if resume {
-        let (collection, report) = Collection::recover(&dir.to_string_lossy(), None, mode)
+        let (collection, report) = Collection::recover(&dir.to_string_lossy(), None, durability)
             .expect("the directory the parent left opens");
         eprintln!("resumed: {report:?}");
         let done = std::fs::read_to_string(&acknowledgements)
@@ -391,7 +353,7 @@ fn the_kill_matrixs_child() {
         let collection = Collection::build(declaration(), None);
         let _ = std::fs::remove_file(&acknowledgements);
         collection
-            .journal_to(&dir.to_string_lossy(), mode)
+            .journal_to(&dir.to_string_lossy(), durability)
             .expect("the journal opens beside the directory");
         (collection, 0)
     };
@@ -452,7 +414,6 @@ fn the_kill_matrixs_child() {
     }
     zeusdb_vector_core::kill_disarm();
     acknowledge(&acknowledgements, "done");
-    drop(flusher);
 }
 
 // ============================================================================
@@ -591,7 +552,7 @@ fn the_kill_matrix_holds_at_every_point() {
             // directory again gives back.
             let expected = acknowledged(&dir.with_extension("ack"));
             let (recovered, report) =
-                Collection::recover(&dir.to_string_lossy(), None, CommitMode::Deferred)
+                Collection::recover(&dir.to_string_lossy(), None, Durability::NoSync)
                     .unwrap_or_else(|e| panic!("recovering {name} refused: {e}"));
             let unacknowledged = holds(&recovered, &expected, &vectors)
                 .unwrap_or_else(|e| panic!("after {name}: {e}"));
@@ -647,7 +608,7 @@ fn the_kill_matrix_holds_at_every_point() {
                 "the finished script holds every record but the one it removes"
             );
             let (recovered, _) =
-                Collection::recover(&dir.to_string_lossy(), None, CommitMode::Deferred)
+                Collection::recover(&dir.to_string_lossy(), None, Durability::NoSync)
                     .unwrap_or_else(|e| panic!("reopening {name} after the resume refused: {e}"));
             holds(&recovered, &expected, &vectors)
                 .unwrap_or_else(|e| panic!("after resuming {name}: {e}"));

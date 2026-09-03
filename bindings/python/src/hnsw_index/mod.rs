@@ -42,6 +42,7 @@ mod query;
 use crate::conversion::{
     batch_hits_to_python, hits_to_python, python_dict_to_value_map, value_map_to_python,
 };
+use crate::durability::parse_durability;
 use crate::PyEngineError;
 use input::{Parsed, SparseInput};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
@@ -844,6 +845,9 @@ impl HNSWIndex {
 
     /// Enhanced Save method to include HNSW Graph
     ///
+    /// On a journaled index the directory is the journal's own and no other,
+    /// and the save is a checkpoint; see `journal_to` and `checkpoint`.
+    ///
     /// The whole save runs with the interpreter lock released. `save` reaches
     /// `save_config`, `save_mappings`, `save_metadata`,
     /// `save_quantization_config`, `save_pq_centroids`, `save_pq_codes` and
@@ -859,6 +863,109 @@ impl HNSWIndex {
     ), err)]
     pub fn save(&self, py: Python<'_>, path: &str) -> Result<(), PyEngineError> {
         Ok(py.detach(|| self.inner.save(path))?)
+    }
+
+    /// Open a journal beside `path` and record every mutation to it from now on.
+    ///
+    /// The journal is a file, `<path>.zdbwal`, beside the directory at `path`.
+    /// It holds every add, removal, metadata change, clear, compaction, rebuild
+    /// and training since the directory was last saved, and `load(path)`
+    /// replays it over the directory, so a process that stops without saving,
+    /// however it stops, loses nothing that a call had returned from.
+    ///
+    /// Opening it saves the index into `path` first, as `save(path)` would, so
+    /// the file has a checkpoint to replay onto. From then on `save` on this
+    /// index takes `path` and no other directory, `checkpoint()` is `save`
+    /// with the path taken from the journal, and `journal_path` is the file.
+    /// An index is journaled once.
+    ///
+    /// `durability` is what a call promises about its records once it has
+    /// returned. A process that stops loses nothing under any of the three;
+    /// they differ in what an operating system crash or a power loss costs.
+    ///
+    /// - `"call"`, the default: every record of a call is on the device before
+    ///   the call returns, or the call raised. One flush per call, about a
+    ///   millisecond, which a caller adding in batches does not notice and a
+    ///   caller adding one record at a time pays on every record.
+    /// - `"interval"`: every record is in the kernel when the call returns, and
+    ///   a thread of the index's own flushes the file within `interval_ms`
+    ///   milliseconds, 10 by default, of the first call that dirtied it. The
+    ///   thread stops with the index. What is traded is the calls that
+    ///   returned inside the last interval, which a crash of the operating
+    ///   system loses; a stopped process loses none of them.
+    /// - `"none"`: every record is in the kernel when the call returns and
+    ///   nothing flushes the file until the next checkpoint. For a bulk load
+    ///   that calls `checkpoint()` at the end.
+    ///
+    /// A call whose flush fails raises, or under `add` reports every record of
+    /// the batch in `AddResult.errors`, installs none of them, and the index
+    /// then refuses every mutation until `checkpoint()` succeeds, because the
+    /// refused records may have reached the file and a replay would install
+    /// them. See `checkpoint`.
+    ///
+    /// A directory saved with a journal declares format version 3.0.0 and opens
+    /// on this release or later. `load` holds the journal open until the index
+    /// is dropped, and a file deleted or moved under a live index is one the
+    /// directory can no longer replay, so drop the index before touching the
+    /// file. A record whose journal entry would exceed 65 MiB is refused on a
+    /// journaled index and accepted on one without a journal.
+    ///
+    /// Raises ValueError for a durability that is not one of the three, for
+    /// `interval_ms` under any other durability, or for `interval_ms` of 0, and
+    /// RuntimeError for an index that already has a journal.
+    #[pyo3(signature = (path, durability = "call", interval_ms = None))]
+    #[instrument(level = "info", skip(self, py), fields(
+        path = path,
+        durability = durability,
+        vector_count = self.inner.vector_count()
+    ), err)]
+    pub fn journal_to(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        durability: &str,
+        interval_ms: Option<u64>,
+    ) -> Result<(), PyEngineError> {
+        let durability = parse_durability(durability, interval_ms)?;
+        Ok(py.detach(|| self.inner.journal_to(path, durability))?)
+    }
+
+    /// Save the index into the directory its journal sits beside and empty the
+    /// journal.
+    ///
+    /// What `save(path)` does on a journaled index, with the path taken from
+    /// the journal. Nothing runs it for you. An index that is never
+    /// checkpointed opens by replaying every record in its journal, each at the
+    /// cost of the `add` that wrote it, so a directory with a million records
+    /// in the journal takes minutes to open where its checkpoint takes seconds.
+    /// `get_stats()["journal_records"]` is how many a replay would apply, and a
+    /// checkpoint costs one save. A bulk load checkpoints once at the end; a
+    /// long-running process checkpoints on a schedule of its own, since a
+    /// checkpoint holds writes for the length of the save.
+    ///
+    /// After a call whose flush failed, this is what lets the index take
+    /// mutations again: the flush is tried once more, the records the failed
+    /// call refused are put behind the sequence the directory names so a
+    /// replay skips them, and the journal is emptied.
+    ///
+    /// Raises RuntimeError on an index with no journal.
+    #[instrument(level = "info", skip(self, py), fields(
+        vector_count = self.inner.vector_count()
+    ), err)]
+    pub fn checkpoint(&self, py: Python<'_>) -> Result<(), PyEngineError> {
+        Ok(py.detach(|| self.inner.checkpoint())?)
+    }
+
+    /// Python property: `index.journal_path`
+    ///
+    /// The file this index records its mutations to, or `None` where it has
+    /// no journal. `journal_to` sets it and `load` of a journaled directory
+    /// finds it.
+    #[getter]
+    pub fn journal_path(&self) -> Option<String> {
+        self.inner
+            .journal_status()
+            .map(|status| status.path.display().to_string())
     }
 
     /// Python property: `index.dim`

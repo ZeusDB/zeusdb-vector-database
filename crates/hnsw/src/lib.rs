@@ -33,7 +33,8 @@
 //! `zeusdb_vector_database::...`, the module path it carried in the binding,
 //! rather than taking this crate's name from `module_path!()`, for the reason
 //! the crate root of zeusdb-vector-core gives. See `LOG_TARGET` at the top of
-//! each file under `collection/`, in `persistence.rs` and in `journal.rs`.
+//! each file under `collection/`, in `persistence.rs`, in `journal.rs` and in
+//! `flusher.rs`.
 //!
 //! # Tests
 //!
@@ -42,19 +43,22 @@
 #![warn(unreachable_pub)]
 
 mod collection;
+mod flusher;
 mod journal;
 pub mod locks;
 mod persistence;
 mod rerank;
 
 pub use collection::{
-    Added, AdmitShape, Arm, ArmPlan, Collection, Declaration, DenseConfig, Listing, OperationSink,
-    Page, ParsedRecord, ParsedRecords, Plan, QuantizationConfig, QuantizationReport,
+    Added, AdmitShape, Arm, ArmPlan, Collection, Declaration, DenseConfig, JournalStatus, Listing,
+    OperationSink, Page, ParsedRecord, ParsedRecords, Plan, QuantizationConfig, QuantizationReport,
     QuantizerReport, Query, QueryHit, QueryHits, RebuildPlan, RecordView, SpaceConfig, SparseHalf,
     SparseHits, StorageMode, TextConfig, DEFAULT_FETCH_PER_K, DEFAULT_SPACE, MAX_ARMS,
 };
+#[cfg(test)]
+pub use flusher::Watch;
 pub use journal::{
-    journal_path, JournalPolicy, JournalSink, Recovery, DEFAULT_COMMIT_MODE, JOURNAL_SUFFIX,
+    directory_of, journal_path, Durability, JournalPolicy, JournalSink, Recovery, JOURNAL_SUFFIX,
 };
 pub use rerank::{
     calibrate_rerank_from_sample, default_rerank_fetch, prepare_reconstruction, raw_distance_fn,

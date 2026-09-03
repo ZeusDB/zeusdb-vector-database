@@ -7,6 +7,7 @@
 // every method here parses, releases the interpreter lock, calls one
 // operation on the collection and converts what comes back.
 mod conversion;
+mod durability;
 mod hnsw_index;
 mod logging;
 mod tokenizer;
@@ -96,22 +97,59 @@ impl From<PyEngineError> for PyErr {
 /// refused, since ignoring it would open the index under a tokenizer the
 /// caller did not ask for.
 ///
+/// A directory whose manifest names a journal is recovered: every record
+/// the journal holds above the checkpoint is replayed, the journal is
+/// reopened for append, and the index hands its mutations to it from then
+/// on under `durability`, which takes the three names `journal_to` takes
+/// and defaults to `"call"`. `interval_ms` belongs to `"interval"`. Naming
+/// either for a directory that has no journal is refused rather than
+/// ignored, since a caller who named a policy expects one to be in force.
+/// `checkpoint_only=True` opens the checkpoint alone, reads no journal,
+/// attaches none and takes no policy; it is the way in for a directory
+/// copied without its sibling, and for a caller who wants the state as of
+/// the last checkpoint.
+///
 /// The whole load runs with the interpreter lock released, the graph rebuild
 /// it may fall back to included. Nothing in the load path touches Python:
 /// the directory is read, the collection is built and restored, and the
 /// result is wrapped here with the lock back. A tokenizer handed in is
 /// stored and never run by the load.
 #[pyfunction]
-#[pyo3(name = "_load_index", signature = (path, tokenizer = None))]
+#[pyo3(name = "_load_index", signature = (path, tokenizer = None, durability = None, interval_ms = None, checkpoint_only = false))]
 fn load_index(
     py: Python<'_>,
     path: &str,
     tokenizer: Option<&Bound<PyAny>>,
+    durability: Option<&str>,
+    interval_ms: Option<u64>,
+    checkpoint_only: bool,
 ) -> Result<hnsw_index::HNSWIndex, PyEngineError> {
     let tokenizer = tokenizer
         .map(|argument| tokenizer::tokenizer_from_python(argument, "tokenizer"))
         .transpose()?;
-    let inner = py.detach(|| Collection::load_with(path, tokenizer))?;
+    let named = durability.is_some() || interval_ms.is_some();
+    if checkpoint_only {
+        if named {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "checkpoint_only=True opens the checkpoint alone and attaches no journal, so \
+                 durability and interval_ms do not apply to it",
+            )
+            .into());
+        }
+        let inner = py.detach(|| Collection::load_checkpoint_only(path, tokenizer))?;
+        return Ok(hnsw_index::HNSWIndex::wrap(inner));
+    }
+    let durability = durability::parse_durability(durability.unwrap_or("call"), interval_ms)?;
+    let (inner, recovery) = py.detach(|| Collection::recover(path, tokenizer, durability))?;
+    if named && !recovery.journaled {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "load names a durability and the directory at '{}' has no journal. A durability \
+             applies to a journaled directory; index.journal_to(path) opens a journal beside \
+             one that has none.",
+            path
+        ))
+        .into());
+    }
     Ok(hnsw_index::HNSWIndex::wrap(inner))
 }
 

@@ -11,7 +11,7 @@
 use super::{
     Collection, DenseIndex, DenseOpen, LiveRecords, QuantizationConfig, StorageMode, MAX_LAYER,
 };
-use crate::journal::{JournalPolicy, Recovery};
+use crate::journal::{Durability, JournalPolicy, Recovery};
 use crate::locks::ReadGuard;
 use crate::RawVectors;
 use crate::RerankCalibration;
@@ -22,8 +22,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
-    ArtefactRecord, Bounds, CommitMode, Error, Inventory, Persist, Restore, VectorGraph,
-    DUMP_FILENAME,
+    ArtefactRecord, Bounds, Error, Inventory, Persist, Restore, VectorGraph, DUMP_FILENAME,
 };
 use zeusdb_vector_sparse::PostingsIndex;
 use zeusdb_vector_text::{TermDictionary, Tokenizer};
@@ -426,7 +425,7 @@ impl Collection {
         crate::persistence::load_index(
             path,
             tokenizer,
-            JournalPolicy::Replay(crate::journal::DEFAULT_COMMIT_MODE),
+            JournalPolicy::Replay(Durability::default()),
         )
         .map(|(index, _)| index)
     }
@@ -434,8 +433,11 @@ impl Collection {
     /// Open a directory and say what recovering it took.
     ///
     /// What [`Collection::load_with`] does, with the report it discards.
-    /// The commit mode is the sink's from here on, so a caller that means to
-    /// keep writing to the journal names the one it wants.
+    /// The durability is the sink's from here on, so a caller that means to
+    /// keep writing to the journal names the policy it wants; it is not
+    /// recorded in the directory, because it is a property of the process
+    /// writing and not of the data, and a bulk loader and a server open the
+    /// same directory wanting different ones.
     ///
     /// The order matters and is the whole of recovery. The index a save was
     /// killed between its two renames left aside is put back first, because
@@ -456,9 +458,9 @@ impl Collection {
     pub fn recover(
         path: &str,
         tokenizer: Option<Arc<dyn Tokenizer>>,
-        mode: CommitMode,
+        durability: Durability,
     ) -> Result<(Self, Recovery), Error> {
-        crate::persistence::load_index(path, tokenizer, JournalPolicy::Replay(mode))
+        crate::persistence::load_index(path, tokenizer, JournalPolicy::Replay(durability))
     }
 
     /// Open a directory's checkpoint and leave the journal beside it alone.
@@ -511,11 +513,13 @@ impl Collection {
     ///
     /// A process killed between the file and the save leaves a journal with
     /// no directory, which nothing opens and the next call replaces.
-    pub fn journal_to(&self, dir: &str, mode: CommitMode) -> Result<(), Error> {
+    pub fn journal_to(&self, dir: &str, durability: Durability) -> Result<(), Error> {
         let _writers = self.writers.lock().unwrap();
         if self.sink_attached() {
             return Err(Error::Engine(
-                "This collection already hands its records to a sink, so opening a journal for                  it would leave the records of one call in two places. A collection is                  journaled once."
+                "This collection already hands its records to a sink, so opening a journal for \
+                 it would leave the records of one call in two places. A collection is \
+                 journaled once."
                     .to_string(),
             ));
         }
@@ -526,9 +530,35 @@ impl Collection {
             journal = %wal.display(),
             "Opening a journal beside the directory and writing the checkpoint it replays onto"
         );
-        let sink = crate::journal::JournalSink::create(&wal, self.collection_id(), mode)?;
+        let sink = crate::journal::JournalSink::create(&wal, self.collection_id(), durability)?;
         self.attach_sink_locked(Box::new(sink));
         self.save_locked(dir)
+    }
+
+    /// Save into the directory the journal sits beside and empty the
+    /// journal, which is [`Collection::save`] with the path taken from the
+    /// journal rather than named again.
+    ///
+    /// Nothing runs this on its own. A checkpoint holds the mutation guard
+    /// for the whole of a save, which is seconds at scale, and an engine
+    /// that ran one inside an `add` would make one call in some thousands
+    /// stall for that long at a moment the caller did not choose. The
+    /// caller who opened the journal chooses when to pay it, and what they
+    /// pay for not choosing is an open that replays every record above the
+    /// checkpoint at the speed of an insert. [`Collection::journal_status`]
+    /// reports how many that is.
+    ///
+    /// After a commit that failed, this is also what lets the collection
+    /// take mutations again; see `SinkSlot`.
+    pub fn checkpoint(&self) -> Result<(), Error> {
+        let _writers = self.writers.lock().unwrap();
+        let Some(journal) = self.sink_journal_path() else {
+            return Err(Error::NotJournaled);
+        };
+        let dir = crate::journal::directory_of(&journal).ok_or_else(|| Error::TargetHasNoName {
+            target: journal.clone(),
+        })?;
+        self.save_locked(&dir.to_string_lossy())
     }
 
     /// Install the sparse space's index read back from its artefact, under

@@ -42,6 +42,7 @@
 //! | `apply` | a journaled operation applied at the values its record names |
 //! | `construct` | building a collection and validating the declaration |
 //! | `crash_tests` | what a killed process leaves, and what opening it recovers |
+//! | `durability_tests` | the three policies, the interval thread, and what a failed commit leaves |
 //! | `input` | what a vector becomes once it is out of Python |
 //! | `insert` | insertion, replacement, removal, compaction, rebuild, clear |
 //! | `journal_tests` | a directory and the journal beside it |
@@ -73,6 +74,8 @@ mod construct;
 #[cfg(test)]
 mod crash_tests;
 mod dense;
+#[cfg(test)]
+mod durability_tests;
 mod input;
 mod insert;
 #[cfg(test)]
@@ -108,6 +111,7 @@ pub use query::{
 pub use search::{QueryHits, SparseHits};
 pub use stats::{QuantizationReport, QuantizerReport};
 
+use crate::journal::Durability;
 use crate::locks::{MutexAt, RwLockAt};
 use crate::RerankCalibration;
 use serde::{Deserialize, Serialize};
@@ -260,6 +264,87 @@ pub trait OperationSink: Send + std::fmt::Debug {
     /// be held to the directory the file belongs beside.
     fn journal_path(&self) -> Option<&std::path::Path> {
         None
+    }
+
+    /// The durability policy this sink keeps, where it keeps one. What a
+    /// caller reads back, and nothing the collection acts on.
+    fn durability(&self) -> Option<Durability> {
+        None
+    }
+
+    /// The size of this sink's file, where it is a file, so a caller can
+    /// see what a replay would read.
+    fn journal_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    /// The interval policy's thread, for the tests that hold it to its
+    /// lifetime and its cost. Compiled away outside them.
+    #[cfg(test)]
+    fn flusher_watch(&self) -> Option<crate::flusher::Watch> {
+        None
+    }
+}
+
+/// The sink a collection hands its records to, and the fault a failed
+/// commit left on it.
+///
+/// A commit that fails leaves the records it was to make durable in the
+/// sink and out of the collection, since the call refuses them, and they
+/// may or may not be on the device. A replay would install them. So a
+/// mutation recorded after them would replay onto a collection holding
+/// records this one refused, and an insert under the same id, which is what
+/// a retry is, would refuse the whole open as a record the collection
+/// already holds. The fault stops that: every record is refused with it
+/// until a checkpoint syncs the journal, records a sequence at or above the
+/// refused records so a replay skips them, and truncates them.
+#[derive(Debug, Default)]
+pub(crate) struct SinkSlot {
+    attached: Option<Box<dyn OperationSink>>,
+    fault: Option<SinkFault>,
+}
+
+/// What the commit that failed said, and the sequence it had reached.
+#[derive(Clone, Debug)]
+struct SinkFault {
+    sequence: u64,
+    error: String,
+}
+
+impl SinkSlot {
+    /// The refusal every record meets while the fault stands.
+    fn refuse_if_faulted(&self) -> Result<(), Error> {
+        match &self.fault {
+            Some(fault) => Err(Error::JournalCommitFailed {
+                sequence: fault.sequence,
+                error: fault.error.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The journal a collection hands its records to, as a caller sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalStatus {
+    /// The file.
+    pub path: std::path::PathBuf,
+    /// The policy every commit keeps.
+    pub durability: Durability,
+    /// The sequence the checkpoint in the directory holds.
+    pub checkpoint_sequence: u64,
+    /// The last sequence handed to the journal.
+    pub sequence_reached: u64,
+    /// The file's length, where the filesystem answered.
+    pub bytes: Option<u64>,
+}
+
+impl JournalStatus {
+    /// Records a replay of the journal would apply, being every record
+    /// above the checkpoint's sequence.
+    pub fn records_since_checkpoint(&self) -> u64 {
+        self.sequence_reached
+            .saturating_sub(self.checkpoint_sequence)
     }
 }
 
@@ -939,12 +1024,13 @@ pub struct Collection {
     /// caller that owns it.
     writers: MutexAt<()>,
 
-    /// Where every mutation's record goes, once something is attached; see
-    /// [`OperationSink`]. `None` on every collection this crate builds, so
-    /// the insert path encodes nothing and no mutation waits on anything.
+    /// Where every mutation's record goes, once something is attached, and
+    /// the fault a failed commit left; see [`OperationSink`] and
+    /// [`SinkSlot`]. Empty on every collection this crate builds, so the
+    /// insert path encodes nothing and no mutation waits on anything.
     /// Attached and detached under `writers`, so whether a batch is
     /// recorded is settled before its first record is admitted.
-    sink: MutexAt<Option<Box<dyn OperationSink>>>,
+    sink: MutexAt<SinkSlot>,
 
     /// The collection this is, drawn once when it is built and carried for
     /// its life.
@@ -1145,12 +1231,14 @@ impl Collection {
 
     /// [`Collection::attach_sink`] with `writers` already held, for a caller
     /// that attaches and checkpoints under one hold so nothing mutates
-    /// between the two.
+    /// between the two. A fault the replaced sink left goes with it.
     pub(crate) fn attach_sink_locked(
         &self,
         sink: Box<dyn OperationSink>,
     ) -> Option<Box<dyn OperationSink>> {
-        self.sink.lock().unwrap().replace(sink)
+        let mut slot = self.sink.lock().unwrap();
+        slot.fault = None;
+        slot.attached.replace(sink)
     }
 
     /// The id that pairs this collection with the journal beside its
@@ -1176,15 +1264,52 @@ impl Collection {
         *self.journal_sequence.lock().unwrap() = sequence;
     }
 
-    /// Make every record handed over durable whatever the commit mode, and
+    /// The journal this collection hands its records to, as a caller sees
+    /// it. `None` on a collection with no sink and on one whose sink is
+    /// not a journal.
+    ///
+    /// The sink's guard is taken alone and released before the checkpoint
+    /// sequence is read, so nothing is held across anything.
+    pub fn journal_status(&self) -> Option<JournalStatus> {
+        let (path, durability, sequence_reached, bytes) = {
+            let slot = self.sink.lock().unwrap();
+            let sink = slot.attached.as_ref()?;
+            let path = sink.journal_path()?.to_path_buf();
+            let durability = sink.durability()?;
+            (
+                path,
+                durability,
+                sink.sequence_reached(),
+                sink.journal_bytes(),
+            )
+        };
+        Some(JournalStatus {
+            path,
+            durability,
+            checkpoint_sequence: self.journal_sequence(),
+            sequence_reached,
+            bytes,
+        })
+    }
+
+    /// The interval policy's thread, where the sink runs one. Tests only.
+    #[cfg(test)]
+    pub(crate) fn flusher_watch(&self) -> Option<crate::flusher::Watch> {
+        self.sink.lock().unwrap().attached.as_ref()?.flusher_watch()
+    }
+
+    /// Make every record handed over durable whatever the policy, and
     /// report the sequence the sink has reached, which is what a checkpoint
     /// records. `None` where no sink is attached.
     ///
     /// The mutation guard is the caller's, because a checkpoint syncs and
     /// then saves under one hold, so nothing is handed over between the two.
+    /// A fault a failed commit left stands through this: the sync makes the
+    /// refused records durable, and it is the truncation after the save
+    /// that puts them behind the sequence the directory names.
     pub(crate) fn sync_sink_locked(&self) -> Result<Option<u64>, Error> {
-        let mut sink = self.sink.lock().unwrap();
-        let Some(sink) = sink.as_mut() else {
+        let mut slot = self.sink.lock().unwrap();
+        let Some(sink) = slot.attached.as_mut() else {
             return Ok(None);
         };
         sink.sync()?;
@@ -1192,11 +1317,19 @@ impl Collection {
     }
 
     /// Drop every record the sink holds, which the checkpoint that has just
-    /// committed its directory now holds itself. Does nothing where no sink
-    /// is attached. The mutation guard is the caller's.
+    /// committed its directory now holds itself, and with them the fault a
+    /// failed commit left, since the records it refused are now at or below
+    /// the sequence the directory names and a replay skips them. Does
+    /// nothing where no sink is attached. The mutation guard is the
+    /// caller's.
     pub(crate) fn truncate_sink_locked(&self) -> Result<(), Error> {
-        match self.sink.lock().unwrap().as_mut() {
-            Some(sink) => sink.truncate(),
+        let mut slot = self.sink.lock().unwrap();
+        match slot.attached.as_mut() {
+            Some(sink) => {
+                sink.truncate()?;
+                slot.fault = None;
+                Ok(())
+            }
             None => Ok(()),
         }
     }
@@ -1205,8 +1338,8 @@ impl Collection {
     /// a checkpoint writes. `None` where no sink is attached or where the
     /// sink is not a file.
     pub(crate) fn sink_journal_names(&self) -> Option<(String, u128)> {
-        let sink = self.sink.lock().unwrap();
-        let sink = sink.as_ref()?;
+        let slot = self.sink.lock().unwrap();
+        let sink = slot.attached.as_ref()?;
         let file = sink.journal_file()?.to_string();
         let id = sink.journal_collection_id()?;
         Some((file, id))
@@ -1214,30 +1347,38 @@ impl Collection {
 
     /// The path the sink's file sits at, where it has one.
     pub(crate) fn sink_journal_path(&self) -> Option<std::path::PathBuf> {
-        let sink = self.sink.lock().unwrap();
-        sink.as_ref()?.journal_path().map(|p| p.to_path_buf())
+        let slot = self.sink.lock().unwrap();
+        slot.attached
+            .as_ref()?
+            .journal_path()
+            .map(|p| p.to_path_buf())
     }
 
     /// Detach the sink, returning it, so that nothing is recorded from now
-    /// on. Under `writers`, as [`Collection::attach_sink`] is.
+    /// on. The fault it left goes with it, since the fault is about its
+    /// records. Under `writers`, as [`Collection::attach_sink`] is.
     pub fn detach_sink(&self) -> Option<Box<dyn OperationSink>> {
         let _writers = self.writers.lock().unwrap();
-        self.sink.lock().unwrap().take()
+        let mut slot = self.sink.lock().unwrap();
+        slot.fault = None;
+        slot.attached.take()
     }
 
     /// Whether a sink is attached. The insert path asks once per batch,
     /// under `writers`, and skips the encode when none is.
     fn sink_attached(&self) -> bool {
-        self.sink.lock().unwrap().is_some()
+        self.sink.lock().unwrap().attached.is_some()
     }
 
     /// Hand one operation's record to the sink, where one is attached,
     /// building the operation only then. For the kinds whose record is a
     /// few bytes; the insert path encodes its own record ahead of the id
-    /// and hands the bytes to [`Collection::append_record`].
+    /// and hands the bytes to [`Collection::append_record`]. Refused with
+    /// the fault while one stands.
     fn record(&self, operation: impl FnOnce() -> Operation) -> Result<(), Error> {
-        let mut sink = self.sink.lock().unwrap();
-        let Some(sink) = sink.as_mut() else {
+        let mut slot = self.sink.lock().unwrap();
+        slot.refuse_if_faulted()?;
+        let Some(sink) = slot.attached.as_mut() else {
             return Ok(());
         };
         let operation = operation();
@@ -1247,9 +1388,11 @@ impl Collection {
     }
 
     /// Hand one record's bytes, already encoded, to the sink, where one is
-    /// attached.
+    /// attached. Refused with the fault while one stands.
     fn append_record(&self, kind: OperationKind, payload: &[u8]) -> Result<(), Error> {
-        match self.sink.lock().unwrap().as_mut() {
+        let mut slot = self.sink.lock().unwrap();
+        slot.refuse_if_faulted()?;
+        match slot.attached.as_mut() {
             Some(sink) => sink.append(kind, payload),
             None => Ok(()),
         }
@@ -1257,10 +1400,36 @@ impl Collection {
 
     /// Commit what the sink holds, where one is attached, after the last
     /// record of a call and before the call mutates.
+    ///
+    /// A commit that fails is the one failure the seam holds on to. The
+    /// caller refuses every record the commit was to make durable, so they
+    /// are in the sink and not in the collection, and they may or may not
+    /// be on the device. The failure is written onto the slot with the
+    /// sequence the sink had reached, and every record after it is refused
+    /// with it until a checkpoint reconciles the two; see [`SinkSlot`].
     fn commit_records(&self) -> Result<(), Error> {
-        match self.sink.lock().unwrap().as_mut() {
-            Some(sink) => sink.commit(),
-            None => Ok(()),
+        let mut slot = self.sink.lock().unwrap();
+        let Some(sink) = slot.attached.as_mut() else {
+            return Ok(());
+        };
+        match sink.commit() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let sequence = sink.sequence_reached();
+                let message = error.to_string();
+                tracing::error!(target: "zeusdb_vector_database::journal",
+                    operation = "journal_commit_failed",
+                    sequence = sequence,
+                    error = %message,
+                    "The journal's commit failed; its records are refused and nothing is \
+                     recorded until a checkpoint reconciles the journal with the directory"
+                );
+                slot.fault = Some(SinkFault {
+                    sequence,
+                    error: message,
+                });
+                Err(error)
+            }
         }
     }
 
