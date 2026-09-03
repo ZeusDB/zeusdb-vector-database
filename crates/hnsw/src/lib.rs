@@ -45,10 +45,10 @@ mod persistence;
 mod rerank;
 
 pub use collection::{
-    Added, AdmitShape, Arm, ArmPlan, Collection, Declaration, DenseConfig, Listing, Page,
-    ParsedRecord, ParsedRecords, Plan, QuantizationConfig, QuantizationReport, QuantizerReport,
-    Query, QueryHit, QueryHits, RebuildPlan, RecordView, SpaceConfig, SparseHalf, SparseHits,
-    StorageMode, TextConfig, DEFAULT_FETCH_PER_K, DEFAULT_SPACE, MAX_ARMS,
+    Added, AdmitShape, Arm, ArmPlan, Collection, Declaration, DenseConfig, Listing, OperationSink,
+    Page, ParsedRecord, ParsedRecords, Plan, QuantizationConfig, QuantizationReport,
+    QuantizerReport, Query, QueryHit, QueryHits, RebuildPlan, RecordView, SpaceConfig, SparseHalf,
+    SparseHits, StorageMode, TextConfig, DEFAULT_FETCH_PER_K, DEFAULT_SPACE, MAX_ARMS,
 };
 pub use rerank::{
     calibrate_rerank_from_sample, default_rerank_fetch, prepare_reconstruction, raw_distance_fn,
@@ -57,7 +57,8 @@ pub use rerank::{
     RERANK_CALIBRATION_TOP_K,
 };
 pub use zeusdb_vector_core::{
-    Contribution, Cost, Fusion, IdfScope, SpaceKind, SpaceName, DEFAULT_RRF_K,
+    Contribution, Cost, Fusion, IdfScope, Operation, OperationKind, SpaceKind, SpaceName,
+    DEFAULT_RRF_K,
 };
 pub use zeusdb_vector_sparse::{SparseConfig, Unlink, Weighting};
 pub use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerConfig};

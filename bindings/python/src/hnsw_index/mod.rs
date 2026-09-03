@@ -1205,8 +1205,12 @@ impl HNSWIndex {
     /// other change a save records, so the interpreter lock is released
     /// around the call: a caller waiting for another writer waits without
     /// it, as `add` and `clear` arrange.
-    pub fn add_metadata(&self, py: Python<'_>, metadata: HashMap<String, String>) {
-        py.detach(|| self.inner.add_metadata(metadata))
+    pub fn add_metadata(
+        &self,
+        py: Python<'_>,
+        metadata: HashMap<String, String>,
+    ) -> Result<(), PyEngineError> {
+        Ok(py.detach(|| self.inner.add_metadata(metadata))?)
     }
 
     /// Get index-level metadata value
@@ -1264,8 +1268,12 @@ impl HNSWIndex {
     /// per record removed. Search already excludes them. `compact()` reclaims
     /// them and this does not call it, because compaction costs a full rebuild
     /// and the caller is the one who knows whether the debris is worth it.
-    pub fn remove_points(&self, py: Python<'_>, ids: Vec<String>) -> Vec<String> {
-        py.detach(|| self.inner.remove_points(&ids))
+    pub fn remove_points(
+        &self,
+        py: Python<'_>,
+        ids: Vec<String>,
+    ) -> Result<Vec<String>, PyEngineError> {
+        Ok(py.detach(|| self.inner.remove_points(&ids))?)
     }
 
     /// Remove records by id or by filter, and report how many went.
@@ -1318,7 +1326,7 @@ impl HNSWIndex {
                     .into());
                 };
 
-                Ok(py.detach(|| self.inner.delete_ids(&requested)))
+                Ok(py.detach(|| self.inner.delete_ids(&requested))?)
             }
             (None, Some(filter)) => self.remove_where(py, filter),
         }
@@ -1417,9 +1425,9 @@ impl HNSWIndex {
         py: Python<'_>,
         id: String,
         metadata: &Bound<PyDict>,
-    ) -> PyResult<bool> {
+    ) -> Result<bool, PyEngineError> {
         let fields = python_dict_to_value_map(metadata)?;
-        Ok(py.detach(|| self.inner.update_metadata(&id, fields)))
+        Ok(py.detach(|| self.inner.update_metadata(&id, fields))?)
     }
 
     /// Rebuild the graph at a new degree, in place.

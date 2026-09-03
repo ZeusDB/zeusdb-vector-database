@@ -52,12 +52,23 @@
 //! The encoder writes every length as a `u32`; a field wider than that
 //! would make a payload wider than [`crate::journal::JOURNAL_MAX_PAYLOAD`],
 //! which the writer refuses to append, so no such record reaches a file.
+//!
+//! An insert is encoded twice over. [`Operation::encode`] takes a whole
+//! operation, which is what a caller holding one has. The insert path holds
+//! the record's parts borrowed and has not yet issued the record's internal
+//! id or drawn its level, so [`Operation::encode_insert`] encodes from the
+//! parts with both left at zero, the caller sizes the payload against the
+//! ceiling before it issues anything, and [`Operation::stamp_insert`] writes
+//! the two values in once they are known. The metadata is written with its
+//! keys in order either way, so the bytes do not depend on the order a hash
+//! map hands its entries out.
 
 use crate::error::Error;
 use crate::graph::dump::NB_LAYER_MAX;
 use crate::journal::{JournalRecord, OperationKind};
-use crate::space::SparseVector;
+use crate::space::{SparseRef, SparseVector};
 use serde_json::{Map, Value};
+use std::collections::{BTreeMap, HashMap};
 
 /// The value `nnz` carries for a record with no sparse vector.
 const NO_SPARSE: u32 = u32::MAX;
@@ -137,26 +148,16 @@ impl Operation {
                 metadata,
                 sparse,
             } => {
-                put_bytes(out, id.as_bytes());
-                out.extend_from_slice(&internal_id.to_le_bytes());
-                out.push(*level);
-                out.extend_from_slice(&(vector.len() as u32).to_le_bytes());
-                for value in vector {
-                    out.extend_from_slice(&value.to_le_bytes());
-                }
-                put_json(out, metadata);
-                match sparse {
-                    None => out.extend_from_slice(&NO_SPARSE.to_le_bytes()),
-                    Some(sparse) => {
-                        out.extend_from_slice(&(sparse.dims.len() as u32).to_le_bytes());
-                        for dim in &sparse.dims {
-                            out.extend_from_slice(&dim.to_le_bytes());
-                        }
-                        for value in &sparse.values {
-                            out.extend_from_slice(&value.to_le_bytes());
-                        }
-                    }
-                }
+                let json = serde_json::to_vec(metadata).unwrap_or_default();
+                write_insert(
+                    out,
+                    id,
+                    *internal_id,
+                    *level,
+                    vector,
+                    &json,
+                    sparse.as_ref().map(SparseVector::as_ref),
+                );
             }
             Operation::Remove { ids } => {
                 out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
@@ -193,6 +194,32 @@ impl Operation {
                 }
             }
         }
+    }
+
+    /// Encode an insert from its borrowed parts, with the internal id and
+    /// the level left at zero for [`Operation::stamp_insert`] to write once
+    /// they are issued. `out` is cleared first.
+    ///
+    /// The bytes are what [`Operation::encode`] writes for the same insert,
+    /// so a caller can size the record against the ceiling and refuse it
+    /// before the counter moves, then stamp and append the same buffer.
+    pub fn encode_insert(parts: &InsertParts<'_>, out: &mut Vec<u8>) {
+        out.clear();
+        // The keys in order, which is the order a `Map` holds them in, so
+        // the bytes are the ones `encode` writes for the same insert.
+        let sorted: BTreeMap<&String, &Value> = parts.metadata.iter().collect();
+        let json = serde_json::to_vec(&sorted).unwrap_or_default();
+        write_insert(out, parts.id, 0, 0, parts.vector, &json, parts.sparse);
+    }
+
+    /// Write the internal id and the level into a payload
+    /// [`Operation::encode_insert`] built, at the place the layout puts
+    /// them, being after the id's length and its bytes.
+    pub fn stamp_insert(payload: &mut [u8], internal_id: u64, level: u8) {
+        let id_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+        let at = 4 + id_len;
+        payload[at..at + 8].copy_from_slice(&internal_id.to_le_bytes());
+        payload[at + 8] = level;
     }
 
     /// Decode a record's payload, holding every length to what remains of
@@ -232,6 +259,52 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 fn put_json(out: &mut Vec<u8>, metadata: &Map<String, Value>) {
     let json = serde_json::to_vec(metadata).unwrap_or_default();
     put_bytes(out, &json);
+}
+
+/// An insert's parts, borrowed from the caller, so the insert path encodes
+/// its record without building an [`Operation`] from clones of the record.
+///
+/// The internal id and the level are not here. They are issued after the
+/// record is encoded and sized, so [`Operation::encode_insert`] leaves both
+/// at zero and [`Operation::stamp_insert`] writes them once they are known.
+pub struct InsertParts<'a> {
+    pub id: &'a str,
+    pub vector: &'a [f32],
+    pub metadata: &'a HashMap<String, Value>,
+    pub sparse: Option<SparseRef<'a>>,
+}
+
+/// The insert layout, written once for both encoders. `json` is the
+/// metadata already serialised, with its keys in order.
+fn write_insert(
+    out: &mut Vec<u8>,
+    id: &str,
+    internal_id: u64,
+    level: u8,
+    vector: &[f32],
+    json: &[u8],
+    sparse: Option<SparseRef<'_>>,
+) {
+    put_bytes(out, id.as_bytes());
+    out.extend_from_slice(&internal_id.to_le_bytes());
+    out.push(level);
+    out.extend_from_slice(&(vector.len() as u32).to_le_bytes());
+    for value in vector {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    put_bytes(out, json);
+    match sparse {
+        None => out.extend_from_slice(&NO_SPARSE.to_le_bytes()),
+        Some(sparse) => {
+            out.extend_from_slice(&(sparse.dims.len() as u32).to_le_bytes());
+            for dim in sparse.dims {
+                out.extend_from_slice(&dim.to_le_bytes());
+            }
+            for value in sparse.values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
 }
 
 /// A position in a payload. Every read checks what remains first.
@@ -468,6 +541,7 @@ mod tests {
     use super::*;
     use crate::frame::fuzz::{Rng, HOSTILE};
     use crate::journal::JOURNAL_MAX_PAYLOAD;
+    use serde_json::json;
 
     const DIM: usize = 4;
 
@@ -577,6 +651,74 @@ mod tests {
         // Encoding clears the buffer first.
         Operation::Clear.encode(&mut out);
         assert!(out.is_empty());
+    }
+
+    /// The insert path's borrowed encoder writes what `encode` writes for
+    /// the same insert once the id and the level are stamped in, whatever
+    /// order the hash map hands its keys out, and before the stamp both
+    /// read zero.
+    #[test]
+    fn the_borrowed_insert_encoder_matches_encode_once_stamped() {
+        let mut map: HashMap<String, Value> = HashMap::new();
+        for (i, key) in ["zeta", "alpha", "mid", "beta", "omega", "kappa"]
+            .iter()
+            .enumerate()
+        {
+            map.insert(key.to_string(), json!({ "n": i, "tags": ["x", i] }));
+        }
+        let sparse = SparseVector {
+            dims: vec![3, 9, 1000],
+            values: vec![1.0, 2.0, 0.5],
+        };
+        let vector = vec![1.0, -2.5, 0.0, 1e-7];
+        let parts = InsertParts {
+            id: "doc-1",
+            vector: &vector,
+            metadata: &map,
+            sparse: Some(sparse.as_ref()),
+        };
+        let mut borrowed = Vec::new();
+        Operation::encode_insert(&parts, &mut borrowed);
+        match decode(OperationKind::Insert, &borrowed).unwrap() {
+            Operation::Insert {
+                internal_id, level, ..
+            } => {
+                assert_eq!(internal_id, 0);
+                assert_eq!(level, 0);
+            }
+            other => panic!("{other:?}"),
+        }
+        Operation::stamp_insert(&mut borrowed, 0x0102_0304_0506_0708, 7);
+        let mut whole = Vec::new();
+        Operation::Insert {
+            id: "doc-1".into(),
+            internal_id: 0x0102_0304_0506_0708,
+            level: 7,
+            vector: vector.clone(),
+            metadata: map.clone().into_iter().collect(),
+            sparse: Some(sparse),
+        }
+        .encode(&mut whole);
+        assert_eq!(borrowed, whole);
+        // The buffer is cleared first, and no sparse half is the marker.
+        let parts = InsertParts {
+            id: "ü",
+            vector: &vector,
+            metadata: &HashMap::new(),
+            sparse: None,
+        };
+        Operation::encode_insert(&parts, &mut borrowed);
+        Operation::stamp_insert(&mut borrowed, 1, 0);
+        Operation::Insert {
+            id: "ü".into(),
+            internal_id: 1,
+            level: 0,
+            vector: vector.clone(),
+            metadata: Map::new(),
+            sparse: None,
+        }
+        .encode(&mut whole);
+        assert_eq!(borrowed, whole);
     }
 
     /// The insert layout is what the module says, byte for byte.

@@ -15,7 +15,7 @@ use rand::SeedableRng;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
-use zeusdb_vector_core::{Error, SeededRng, VectorGraph, PQ};
+use zeusdb_vector_core::{Error, Operation, SeededRng, VectorGraph, PQ};
 
 /// The target every record this file emits carries. See the parent module.
 const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::training";
@@ -61,9 +61,18 @@ impl Collection {
                     );
                     // The clock is read here, on the path where the codebook
                     // is fitted for the first time, and handed down as the
-                    // stamp. A caller replaying a recorded training hands the
-                    // stamp that training took instead.
-                    return self.train_quantization_from_ids(Utc::now().to_rfc3339());
+                    // stamp. The training's record carries that stamp and is
+                    // handed to the sink before the codebook is fitted, so a
+                    // replay of the records reaches this same trigger as a
+                    // function of the records before it and takes the stamp
+                    // from the record rather than from its own clock.
+                    let completed_at = Utc::now().to_rfc3339();
+                    self.record(|| Operation::Train {
+                        completed_at: completed_at.clone(),
+                    })
+                    .map_err(|e| e.to_string())?;
+                    self.commit_records().map_err(|e| e.to_string())?;
+                    return self.train_quantization_from_ids(completed_at);
                 }
             }
         }
@@ -516,9 +525,14 @@ impl Collection {
     /// retrains the codebook; training runs exactly once, on the `add` that
     /// reaches `training_size`. Returns false when there is no trained
     /// quantizer or nothing stored to rebuild from. Takes the mutation guard,
-    /// which the training path already holds when it reaches the body.
+    /// which the training path already holds when it reaches the body, and
+    /// hands the record over before the body runs, whether or not the body
+    /// turns out to rebuild, since a replay of the record decides that the
+    /// same way.
     pub fn rebuild_with_quantization(&self) -> Result<bool, Error> {
         let _writers = self.writers.lock().unwrap();
+        self.record(|| Operation::RebuildQuantized)?;
+        self.commit_records()?;
         self.rebuild_with_quantization_locked()
             .map_err(Error::Engine)
     }

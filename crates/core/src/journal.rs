@@ -176,7 +176,7 @@ impl JournalKind {
 /// **The numbers are on disk for ever. Never reuse one and never change
 /// one.** A build that reads a kind it does not know refuses the record,
 /// so a new kind is a new format version.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OperationKind {
     /// One record inserted, with its whole content.
     Insert = 1,

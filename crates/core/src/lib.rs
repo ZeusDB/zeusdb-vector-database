@@ -71,7 +71,7 @@ pub use journal::{
     OperationKind, JOURNAL_HEADER_BYTES, JOURNAL_MAGIC, JOURNAL_MAX_PAYLOAD,
     JOURNAL_RECORD_CHECKSUM_BYTES, JOURNAL_RECORD_HEADER_BYTES, JOURNAL_RECORD_OVERHEAD_BYTES,
 };
-pub use operation::Operation;
+pub use operation::{InsertParts, Operation};
 pub use pq::PQ;
 pub use rng::SeededRng;
 pub use space::{

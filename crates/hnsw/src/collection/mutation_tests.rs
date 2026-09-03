@@ -188,10 +188,12 @@ fn add_metadata_waits_for_the_mutation_guard() {
     );
     assert_eq!(collection.metadata("owner"), None);
     drop(held);
-    writer.join().unwrap();
+    writer.join().unwrap().unwrap();
     assert_eq!(collection.metadata("owner").as_deref(), Some("held"));
 
-    collection.add_metadata(HashMap::from([("dataset".to_string(), "docs".to_string())]));
+    collection
+        .add_metadata(HashMap::from([("dataset".to_string(), "docs".to_string())]))
+        .unwrap();
     let all = collection.all_metadata();
     assert_eq!(all.len(), 2);
     assert_eq!(all.get("owner").map(String::as_str), Some("held"));

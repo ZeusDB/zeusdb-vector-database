@@ -9,6 +9,15 @@
 //!
 //! Every mutating operation the binding calls takes `writers` here, first and
 //! before any guard, and the helpers under it never do.
+//!
+//! # The seam
+//!
+//! Every mutation hands its record to the collection's sink, where one is
+//! attached, after it has taken `writers` and before it takes any storage
+//! guard, then commits the sink, then runs. See [`Collection::attach_sink`]
+//! and `insert_parsed_records` for the order inside a batch. The `_locked`
+//! bodies below the entry points hand nothing over, so `Collection::apply`
+//! can run them for a recorded operation without recording it again.
 
 use super::{
     validate_index_parameters, Collection, DenseIndex, LiveRecords, ParsedRecord, ParsedRecords,
@@ -22,8 +31,8 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, Bitmap, ColumnStore, Error, Filter, Prepared, RecordId, Selection,
-    SparseVector, VectorGraph, VectorIndex,
+    matches_filter, Bitmap, ColumnStore, Error, Filter, InsertParts, Operation, OperationKind,
+    Prepared, RecordId, Selection, SparseVector, VectorGraph, VectorIndex, JOURNAL_MAX_PAYLOAD,
 };
 use zeusdb_vector_sparse::PostingsIndex;
 
@@ -75,6 +84,22 @@ struct RemovalGuards<'a> {
     sparse: Option<WriteGuard<'a, PostingsIndex>>,
     vector_metadata: WriteGuard<'a, HashMap<String, HashMap<String, Value>>>,
     columns: WriteGuard<'a, ColumnStore>,
+}
+
+/// One record past the door and not yet installed.
+///
+/// What `admit` produces and `install` consumes: the record's content, the
+/// internal id issued for it and the level drawn for it, both already in
+/// the record the sink was handed. A replay builds one from a recorded
+/// insert, at the id and the level the record names, and installs it the
+/// same way.
+pub(super) struct Admitted {
+    pub(super) id: String,
+    pub(super) vector: Vec<f32>,
+    pub(super) sparse: Option<SparseVector>,
+    pub(super) metadata: HashMap<String, Value>,
+    pub(super) internal_id: usize,
+    pub(super) level: usize,
 }
 
 impl Collection {
@@ -275,6 +300,62 @@ impl Collection {
         let mut counter = self.id_counter.lock().unwrap();
         *counter += 1;
         *counter
+    }
+
+    /// Take back the id `get_next_id` just issued, because the record it
+    /// was issued for was refused by the sink. Sound under `writers`, since
+    /// nothing else issues an id while it is held, which the assertion
+    /// states.
+    fn retract_id(&self, issued: usize) {
+        let mut counter = self.id_counter.lock().unwrap();
+        debug_assert_eq!(
+            *counter, issued,
+            "no id was issued after the one taken back"
+        );
+        *counter = issued - 1;
+    }
+
+    /// Issue the next internal id only if it is `expected`, which is what a
+    /// replay does with the id a record names. The counter does not move
+    /// when it is not.
+    pub(super) fn issue_expected_id(&self, expected: usize) -> Result<usize, Error> {
+        let mut counter = self.id_counter.lock().unwrap();
+        if *counter + 1 != expected {
+            return Err(Error::JournalReplayMismatch {
+                detail: format!(
+                    "the record names internal id {} and the collection would issue {}",
+                    expected,
+                    *counter + 1
+                ),
+            });
+        }
+        *counter += 1;
+        Ok(*counter)
+    }
+
+    /// The ids of `requested` the index holds, each once, in the order first
+    /// named. What a removal's record carries, since a record names what
+    /// was removed and never a filter or a request.
+    pub(super) fn held_ids(&self, requested: &[String]) -> Vec<String> {
+        let id_map = self.id_map.read().unwrap();
+        let mut seen: HashSet<&str> = HashSet::with_capacity(requested.len());
+        requested
+            .iter()
+            .filter(|id| id_map.contains_key(id.as_str()) && seen.insert(id.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Hand a removal's record to the sink and commit it, where a sink is
+    /// attached and the removal names anything. Nothing is handed over for
+    /// a removal of nothing, so a call naming only absent ids costs the
+    /// sink nothing.
+    fn record_removal(&self, held: &[String]) -> Result<(), Error> {
+        if held.is_empty() {
+            return Ok(());
+        }
+        self.record(|| Operation::Remove { ids: held.to_vec() })?;
+        self.commit_records()
     }
 
     /// Draw the level the next record's graph node takes, advancing the
@@ -493,8 +574,9 @@ impl Collection {
     /// The filter arrives compiled, so nothing here can fail on it. The caller
     /// built it from the mapping it was handed and every operator name and
     /// group shape the engine cannot evaluate was rejected there, before any
-    /// record was read.
-    pub(super) fn remove_where_locked(&self, filter: &Filter) -> usize {
+    /// record was read. What can fail is the sink, which is handed the
+    /// resolved ids between the two phases.
+    pub(super) fn remove_where_locked(&self, filter: &Filter) -> Result<usize, Error> {
         // `rev_map` before `vector_metadata` before `columns`, which is the
         // declared order, because the bitmap holds internal ids and a removal
         // names external ones. The columns guard is dropped before the metadata
@@ -545,13 +627,17 @@ impl Collection {
         };
         drop(rev_map);
 
+        // The resolved ids, and never the filter, since the filter's answer
+        // depends on the state it was asked against.
+        self.record_removal(&doomed)?;
+
         let total = doomed.len();
         let missing = self.remove_points_internal(&doomed);
         debug_assert!(
             missing.is_empty(),
             "every id came from the metadata store under the mutation guard, so none of them can have been absent by the time it was removed"
         );
-        total - missing.len()
+        Ok(total - missing.len())
     }
 
     /// Replace one record's metadata, leaving its vector and the graph alone.
@@ -600,9 +686,9 @@ impl Collection {
         true
     }
 
-    /// The body of `compact`, with the interpreter lock already released
+    /// The body of `compact`, with the mutation guard held by the caller and
+    /// the record already handed over.
     pub(super) fn compact_locked(&self) -> Result<usize, Error> {
-        let _writers = self.writers.lock().unwrap();
         let start_time = Instant::now();
 
         // The sparse space first, where there is one, since what it has to
@@ -688,14 +774,14 @@ impl Collection {
     /// whose records could not be rebuilt from still reports the configuration
     /// its graph actually has.
     ///
-    /// Returns the live record count the replacement holds.
+    /// Returns the live record count the replacement holds. The mutation
+    /// guard is held by the caller and the record already handed over.
     pub(super) fn rebuild_locked(
         &self,
         m: usize,
         expected_size: usize,
         ef_construction: usize,
     ) -> Result<usize, Error> {
-        let _writers = self.writers.lock().unwrap();
         let start_time = Instant::now();
 
         let previous_m = self.dense().m();
@@ -881,19 +967,47 @@ impl Collection {
 
     /// The insertion phase of `add`, run with the interpreter lock released
     ///
-    /// Everything here operates on `ParsedRecords`, which is
-    /// `Vec<(String, Vec<f32>, HashMap<String, Value>)>` and holds no Python
-    /// object, no `Py<T>` and no borrow of anything Python owns.
-    /// The caller holds the mutation guard.
+    /// Everything here operates on `ParsedRecord`s, which hold no Python
+    /// object, no `Py<T>` and no borrow of anything Python owns. The caller
+    /// holds the mutation guard.
+    ///
+    /// # The two passes
+    ///
+    /// A batch goes through the door first and is installed second. The
+    /// first pass, `admit`, runs every check that can refuse a record,
+    /// encodes the record and holds it to the sink's ceiling, issues its
+    /// internal id, draws its level and hands the record over, and the sink
+    /// is then committed once for the pass. The second pass, `install`,
+    /// writes the metadata and the columns and puts the vector into the
+    /// graph at the level the first pass drew. So every record a search can
+    /// see was handed over and committed first, a record refused at the door
+    /// has moved nothing, and a torn batch is a prefix of the batch, which
+    /// is what the crashed process had installed.
+    ///
+    /// # Segments
+    ///
+    /// The batch is cut where an install may replace the graph under the
+    /// records after it, which is training. Training rebuilds the graph
+    /// with a fresh level stream and the records after it draw from that
+    /// stream, so their levels cannot be drawn ahead of it. A segment ends
+    /// at the record that fills the training set, training fires as that
+    /// record is installed, and the next segment draws from the rebuilt
+    /// graph; see `segment_limit`. On an index that is not collecting the
+    /// whole batch is one segment. The levels are therefore the ones a
+    /// build without a sink draws, record for record, and the graph is the
+    /// same graph.
     ///
     /// The complete set of functions reachable from here, verified by reading
     /// each one rather than by inference:
     ///
     /// - `remove_point_internal`, and through it `get_storage_mode`,
     ///   `has_quantization` and `can_use_quantization`
-    /// - `add_single_vector`, and the three paths below it, `add_raw_vector`,
+    /// - `admit`, and through it `count_record_terms`, the text layer's
+    ///   dictionary, `Operation::encode_insert`, `get_next_id`,
+    ///   `draw_level` and the sink's `append`
+    /// - `install`, and the three paths below it, `add_raw_vector`,
     ///   `add_with_id_collection` and `add_quantized_vector`
-    /// - `get_next_id`, `is_quantized`
+    /// - `is_quantized`, `segment_limit`
     /// - `maybe_trigger_training`, `train_quantization_from_ids` and
     ///   `rebuild_with_quantization_locked`
     /// - `PQ::is_trained`, `quantize`, `quantize_batch` and `train`, plus the
@@ -901,7 +1015,6 @@ impl Collection {
     /// - `VectorGraph::draw_level`, `plan_at_level`, `install`, `insert`,
     ///   `insert_batch_pq`, `new_pq` and `nb_points`, and the graph structure
     ///   in `graph::mutable` below them
-    /// - `count_record_terms`, and through it the text layer's dictionary
     ///
     /// None of them takes a `Python` token, and none of them calls into the
     /// interpreter. `pq.rs`, `distance.rs` and the vendored crate name PyO3
@@ -944,6 +1057,7 @@ impl Collection {
                 };
 
                 let mut ids_to_remove = Vec::new();
+                let mut doomed: HashSet<&str> = HashSet::new();
                 let mut has_raw = 0;
                 let mut has_pq = 0;
                 let mut has_both = 0;
@@ -951,7 +1065,11 @@ impl Collection {
                 for record in &parsed_data {
                     let id = &record.id;
                     if id_map.contains_key(id) {
-                        ids_to_remove.push(id.clone());
+                        // Once per id, so the removal's record names each
+                        // id once.
+                        if doomed.insert(id.as_str()) {
+                            ids_to_remove.push(id.clone());
+                        }
 
                         // Analyze what's being replaced for logging
                         let has_raw_vector = raws.contains(id);
@@ -978,6 +1096,17 @@ impl Collection {
                     ),
                     "Removing existing documents for overwrite"
                 );
+
+                // The removal's record first. A sink that refuses it refuses
+                // the call, since the records would replace what was never
+                // removed.
+                if let Err(err) = self.record_removal(&ids_to_remove) {
+                    errors.push(InsertError::Counted(format!(
+                        "Failed to record the removal for overwrite: {}",
+                        err
+                    )));
+                    return (inserted_ids, errors);
+                }
 
                 // Batch remove existing documents (handles both raw and PQ data)
                 let mut removed_count = 0;
@@ -1023,46 +1152,96 @@ impl Collection {
             "Starting insertion phase"
         );
 
-        for ParsedRecord {
-            id,
-            vector,
-            sparse,
-            metadata,
-        } in parsed_data
-        {
-            let id_for_error = id.clone();
-
-            // Use overwrite=false since we already handled removals above
-            // The add_single_vector method will route to the correct path based on current PQ state
-            match self.add_single_vector(id, vector, sparse, metadata, false) {
-                Ok(inserted_new) => {
-                    // The id is recorded here rather than counted, because the
-                    // caller now needs to know which records landed and not only
-                    // how many. `total_inserted` is this list's length.
-                    inserted_ids.push(id_for_error.clone());
-                    if inserted_new {
-                        let mut count = self.vector_count.lock().unwrap();
-                        *count += 1;
-                    }
-
-                    // Check training trigger (graceful failure handling)
-                    if let Err(training_error) = self.maybe_trigger_training() {
-                        warn!(target: LOG_TARGET, operation = "training_trigger",
-                            error = %training_error,
-                            vector_id = %id_for_error,
-                            "Training trigger failed"
-                        );
-                        errors.push(InsertError::Training(format!(
-                            "Training failed: {}",
-                            training_error
-                        )));
-                    }
+        // Whether a sink is attached is read once for the batch. Attaching
+        // one takes the mutation guard, so it cannot change under this call.
+        let attached = self.sink_attached();
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::with_capacity(parsed_data.len());
+        let mut pending = parsed_data.into_iter().peekable();
+        while pending.peek().is_some() {
+            let limit = self.segment_limit();
+            let mut segment: Vec<Result<Admitted, InsertError>> = Vec::new();
+            let mut admitted = 0usize;
+            while let Some(record) = pending.next_if(|_| limit.is_none_or(|limit| admitted < limit))
+            {
+                let outcome = self.admit(record, &mut seen, attached, &mut buffer);
+                if outcome.is_ok() {
+                    admitted += 1;
                 }
-                Err(e) => {
-                    errors.push(InsertError::Vector {
-                        id: id_for_error,
-                        err: e,
-                    });
+                segment.push(outcome);
+            }
+
+            // One commit for the segment, before any of it is installed. A
+            // commit that fails refuses every record it was to make durable
+            // and the rest of the batch with them, installing none, since
+            // the call's contract is that what it returns is on the device.
+            // The ids issued stay issued, because the records may have
+            // reached the sink.
+            if admitted > 0 {
+                if let Err(err) = self.commit_records() {
+                    let class = err.exception().name();
+                    let message = err.to_string();
+                    for outcome in segment.into_iter().chain(pending.map(|record| {
+                        Ok(Admitted {
+                            id: record.id,
+                            vector: record.vector,
+                            sparse: None,
+                            metadata: record.metadata,
+                            internal_id: 0,
+                            level: 0,
+                        })
+                    })) {
+                        errors.push(match outcome {
+                            Ok(admitted) => InsertError::Counted(format!(
+                                "Vector {}: {}: {}",
+                                admitted.id, class, message
+                            )),
+                            Err(e) => e,
+                        });
+                    }
+                    return (inserted_ids, errors);
+                }
+            }
+
+            for outcome in segment {
+                let admitted = match outcome {
+                    Ok(admitted) => admitted,
+                    Err(e) => {
+                        errors.push(e);
+                        continue;
+                    }
+                };
+                let id_for_error = admitted.id.clone();
+                match self.install(admitted) {
+                    Ok(()) => {
+                        // The id is recorded here rather than counted, because the
+                        // caller now needs to know which records landed and not only
+                        // how many. `total_inserted` is this list's length.
+                        inserted_ids.push(id_for_error.clone());
+                        {
+                            let mut count = self.vector_count.lock().unwrap();
+                            *count += 1;
+                        }
+
+                        // Check training trigger (graceful failure handling)
+                        if let Err(training_error) = self.maybe_trigger_training() {
+                            warn!(target: LOG_TARGET, operation = "training_trigger",
+                                error = %training_error,
+                                vector_id = %id_for_error,
+                                "Training trigger failed"
+                            );
+                            errors.push(InsertError::Training(format!(
+                                "Training failed: {}",
+                                training_error
+                            )));
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(InsertError::Vector {
+                            id: id_for_error,
+                            err: e,
+                        });
+                    }
                 }
             }
         }
@@ -1070,29 +1249,72 @@ impl Collection {
         (inserted_ids, errors)
     }
 
-    // 1. CORE VECTOR OPERATIONS (6 methods)
-    /// 3-PATH ARCHITECTURE - Main router
-    fn add_single_vector(
-        &self,
-        id: String,
-        vector: Vec<f32>,
-        sparse: Option<SparseHalf>,
-        metadata: HashMap<String, Value>,
-        overwrite: bool,
-    ) -> Result<bool, Error> {
-        // Check if this is a new vector or an overwrite
-        let is_new = {
-            let id_map = self.id_map.read().unwrap();
-            !id_map.contains_key(&id)
-        };
+    /// How many records the next segment of a batch may admit, or `None`
+    /// for every record left.
+    ///
+    /// A segment ends at a record whose install may replace the graph under
+    /// the records after it, which is the record that fills the training
+    /// set: training fires as it is installed, rebuilds the graph with a
+    /// fresh level stream, and every record after it draws from that
+    /// stream, so their levels cannot be drawn ahead of it. Nothing inside
+    /// `add` replaces the graph on an index declared without quantization or
+    /// on one whose codebook is fitted. On one whose threshold is reached
+    /// and whose codebook is not fitted, which is an index whose training
+    /// failed, every install tries again, so the segment is one record.
+    fn segment_limit(&self) -> Option<usize> {
+        let config = self.dense().quantization_config.as_ref()?;
+        if self.can_use_quantization() {
+            return None;
+        }
+        if self.training_threshold_reached.load(Ordering::Acquire) {
+            return Some(1);
+        }
+        let collected = self.training_ids.read().unwrap().len();
+        Some(config.training_size.saturating_sub(collected).max(1))
+    }
 
-        if !overwrite && !is_new {
+    /// One record through the door.
+    ///
+    /// Every check that can refuse the record runs first, being the
+    /// duplicate check against the index and against the batch so far, the
+    /// terms counted into ids where the sparse half is terms, which hands
+    /// each new term to the sink as it is issued, and the sparse rules under
+    /// the space's weighting. Where a sink is attached the record is then
+    /// encoded and held to the sink's ceiling while nothing has been issued
+    /// for it, so a record too large to journal is refused with the counter
+    /// and the level stream where they were. Only then is the level drawn
+    /// and the internal id issued, both written into the encoded record, and
+    /// the record handed over. A sink that refuses it takes the id back,
+    /// since nothing else issues one under the mutation guard, so the
+    /// refusal leaves the counter where it was; the draw it consumed moves
+    /// the stream, which the next record's own draw records.
+    ///
+    /// With no sink attached nothing is encoded and no ceiling applies.
+    fn admit(
+        &self,
+        record: ParsedRecord,
+        seen: &mut HashSet<String>,
+        attached: bool,
+        buffer: &mut Vec<u8>,
+    ) -> Result<Admitted, InsertError> {
+        let ParsedRecord {
+            id,
+            vector,
+            sparse,
+            metadata,
+        } = record;
+
+        let is_new = !seen.contains(&id) && !self.id_map.read().unwrap().contains_key(&id);
+        if !is_new {
             warn!(target: LOG_TARGET, operation = "add_single_vector",
                 vector_id = %id,
                 reason = "already_exists",
                 "Vector already exists and overwrite=false"
             );
-            return Err(Error::DuplicateId { id });
+            return Err(InsertError::Vector {
+                err: Error::DuplicateId { id: id.clone() },
+                id,
+            });
         }
 
         // The sparse half. Terms are counted into term ids here, under the
@@ -1106,32 +1328,96 @@ impl Collection {
         let sparse = match sparse {
             None => None,
             Some(SparseHalf::Vector(vector)) => Some(vector),
-            Some(SparseHalf::Terms(terms)) => Some(self.count_record_terms(&terms)?),
+            Some(SparseHalf::Terms(terms)) => match self.count_record_terms(&terms) {
+                Ok(vector) => Some(vector),
+                Err(err) => return Err(InsertError::Vector { id, err }),
+            },
         };
         if let Some(sparse) = &sparse {
-            let space = self.sparse().ok_or(Error::NoSparseSpace)?;
-            space.config().weighting.validate_record(sparse.as_ref())?;
+            let checked = self
+                .sparse()
+                .ok_or(Error::NoSparseSpace)
+                .and_then(|space| space.config().weighting.validate_record(sparse.as_ref()));
+            if let Err(err) = checked {
+                return Err(InsertError::Vector { id, err });
+            }
         }
+
+        if attached {
+            let parts = InsertParts {
+                id: &id,
+                vector: &vector,
+                metadata: &metadata,
+                sparse: sparse.as_ref().map(SparseVector::as_ref),
+            };
+            Operation::encode_insert(&parts, buffer);
+            if buffer.len() > JOURNAL_MAX_PAYLOAD {
+                return Err(InsertError::Vector {
+                    id,
+                    err: Error::JournalRecordTooLarge {
+                        bytes: buffer.len(),
+                        ceiling: JOURNAL_MAX_PAYLOAD,
+                    },
+                });
+            }
+        }
+
+        let level = self.draw_level();
+        let internal_id = self.get_next_id();
+        if attached {
+            Operation::stamp_insert(buffer, internal_id as u64, level as u8);
+            if let Err(err) = self.append_record(OperationKind::Insert, buffer) {
+                self.retract_id(internal_id);
+                return Err(InsertError::Vector { id, err });
+            }
+        }
+
+        seen.insert(id.clone());
+        Ok(Admitted {
+            id,
+            vector,
+            sparse,
+            metadata,
+            internal_id,
+            level,
+        })
+    }
+
+    /// The second pass over one admitted record: the metadata and the
+    /// columns written, the vector put into the graph at the level admission
+    /// drew, and the sparse half into its space, all under the internal id
+    /// admission issued. Routed by the storage state as `add` has always
+    /// routed, being raw storage, raw storage while collecting for training,
+    /// or quantized storage.
+    pub(super) fn install(&self, admitted: Admitted) -> Result<(), Error> {
+        let Admitted {
+            id,
+            vector,
+            sparse,
+            metadata,
+            internal_id,
+            level,
+        } = admitted;
 
         trace!(target: LOG_TARGET, operation = "add_single_vector",
             vector_id = %id,
-            is_new = is_new,
+            is_new = true,
             has_quantization = self.has_quantization(),
             is_quantized = self.is_quantized(),
             "Routing vector addition"
         );
 
         // Clean 3-Path Architecture
-        let internal_id = if !self.has_quantization() {
+        if !self.has_quantization() {
             // Path A: Raw storage (no quantization config)
-            self.add_raw_vector(id, vector, metadata)?
+            self.add_raw_vector(&id, vector, metadata, internal_id, level)?;
         } else if !self.is_quantized() {
             // Path B: Raw storage + ID collection for training
-            self.add_with_id_collection(id, vector, metadata)?
+            self.add_with_id_collection(&id, vector, metadata, internal_id, level)?;
         } else {
             // Path C: Quantized storage (PQ trained and active)
-            self.add_quantized_vector(id, vector, metadata)?
-        };
+            self.add_quantized_vector(&id, vector, metadata, internal_id, level)?;
+        }
 
         // The sparse half, under the same internal id, once the dense half
         // and the maps are in.
@@ -1139,7 +1425,7 @@ impl Collection {
             self.insert_sparse(internal_id, &sparse)?;
         }
 
-        Ok(is_new)
+        Ok(())
     }
 
     /// Path A: Raw storage (no quantization)
@@ -1149,13 +1435,12 @@ impl Collection {
     ))]
     fn add_raw_vector(
         &self,
-        id: String,
+        id: &str,
         vector: Vec<f32>, // Already processed by extract_single_vector
         metadata: HashMap<String, Value>,
-    ) -> Result<usize, Error> {
-        let internal_id = self.get_next_id();
-        let level = self.draw_level();
-
+        internal_id: usize,
+        level: usize,
+    ) -> Result<(), Error> {
         // Store metadata, and the declared fields of it in their columns.
         //
         // One block and one order, because the two are the same write seen from
@@ -1169,17 +1454,17 @@ impl Collection {
                 columns.agrees_with(internal_id, &metadata),
                 "every declared field's column holds what the record's metadata holds"
             );
-            vector_metadata.insert(id.clone(), metadata);
+            vector_metadata.insert(id.to_string(), metadata);
         }
 
         // Insert the processed vector into the graph and name the record in
         // both id maps, in the two phases the graph splits an insertion into,
-        // at the level drawn above. See `insert_one`. The maps are written
+        // at the level admission drew. See `insert_one`. The maps are written
         // there rather than here so that the record enters the collection's
         // live set and the index's under one acquisition. This is the only
         // copy of the vector the index keeps: the store the graph is addressed
         // against holds it, and there is no second map to write.
-        self.insert_one(&id, &vector, internal_id, level)?; // Already normalized
+        self.insert_one(id, &vector, internal_id, level)?; // Already normalized
 
         trace!(target: LOG_TARGET, operation = "add_raw_vector_complete",
             vector_id = %id,
@@ -1187,7 +1472,7 @@ impl Collection {
             "Raw vector added successfully"
         );
 
-        Ok(internal_id)
+        Ok(())
     }
 
     /// Path B: ID collection for consistent training
@@ -1197,12 +1482,14 @@ impl Collection {
     ))]
     fn add_with_id_collection(
         &self,
-        id: String,
+        id: &str,
         vector: Vec<f32>, // Already processed
         metadata: HashMap<String, Value>,
-    ) -> Result<usize, Error> {
+        internal_id: usize,
+        level: usize,
+    ) -> Result<(), Error> {
         // 1. Store vector normally (single storage)
-        let internal_id = self.add_raw_vector(id.clone(), vector, metadata)?;
+        self.add_raw_vector(id, vector, metadata, internal_id, level)?;
 
         // 2. Collect ID for training (minimal memory overhead)
         //
@@ -1239,7 +1526,7 @@ impl Collection {
                 let mut training_ids = self.training_ids.write().unwrap();
 
                 if training_ids.len() < config.training_size {
-                    training_ids.push(id.clone());
+                    training_ids.push(id.to_string());
                     let progress = (training_ids.len() as f32 / config.training_size as f32
                         * 100.0)
                         .min(100.0);
@@ -1266,7 +1553,7 @@ impl Collection {
             }
         }
 
-        Ok(internal_id)
+        Ok(())
     }
 
     /// Path C: Quantized storage with configurable raw vector retention
@@ -1276,13 +1563,12 @@ impl Collection {
     ))]
     fn add_quantized_vector(
         &self,
-        id: String,
+        id: &str,
         vector: Vec<f32>, // Already processed
         metadata: HashMap<String, Value>,
-    ) -> Result<usize, Error> {
-        let internal_id = self.get_next_id();
-        let level = self.draw_level();
-
+        internal_id: usize,
+        level: usize,
+    ) -> Result<(), Error> {
         // Store metadata, and the declared fields of it in their columns.
         //
         // One block and one order, because the two are the same write seen from
@@ -1296,27 +1582,27 @@ impl Collection {
                 columns.agrees_with(internal_id, &metadata),
                 "every declared field's column holds what the record's metadata holds"
             );
-            vector_metadata.insert(id.clone(), metadata);
+            vector_metadata.insert(id.to_string(), metadata);
         }
 
         // Quantize and insert, and name the record in both id maps, in the two
-        // phases the graph splits an insertion into, at the level drawn above.
-        // The index quantizes in the first phase, under the read guard, and
-        // installs the codes in the second, carrying the raw vector beside
-        // them where the storage mode keeps one, because the node the codes
-        // are installed at is the node the raw has to sit at. The maps are
-        // written in the second phase, so that the record enters the
+        // phases the graph splits an insertion into, at the level admission
+        // drew. The index quantizes in the first phase, under the read guard,
+        // and installs the codes in the second, carrying the raw vector
+        // beside them where the storage mode keeps one, because the node the
+        // codes are installed at is the node the raw has to sit at. The maps
+        // are written in the second phase, so that the record enters the
         // collection's live set and the index's under one acquisition. See
         // `insert_one`.
         let codes = self
-            .insert_one(&id, &vector, internal_id, level)?
+            .insert_one(id, &vector, internal_id, level)?
             .unwrap_or_default();
 
         // Store quantized codes (always), keyed by external id for the paths
         // that reach a record by name.
         {
             let mut pq_codes = self.dense().pq_codes.write().unwrap();
-            pq_codes.insert(id.clone(), codes.clone());
+            pq_codes.insert(id.to_string(), codes.clone());
         }
 
         trace!(target: LOG_TARGET, operation = "add_quantized_vector_complete",
@@ -1326,7 +1612,7 @@ impl Collection {
             "Quantized vector added successfully"
         );
 
-        Ok(internal_id)
+        Ok(())
     }
 
     /// The whole of `add` once parsing is over.
@@ -1470,17 +1756,26 @@ impl Collection {
     }
 
     /// Remove one record by id. `false` for an id the index does not hold.
+    ///
+    /// The removal's record, naming the id where the index holds it, is
+    /// handed to the sink before the record goes, and a sink that refuses it
+    /// refuses the call.
     pub fn remove_point(&self, id: String) -> Result<bool, Error> {
         let _writers = self.writers.lock().unwrap();
+        let held = self.held_ids(std::slice::from_ref(&id));
+        self.record_removal(&held)?;
         self.remove_point_internal(id).map_err(Error::Engine)
     }
 
     /// Remove a batch of records under one acquisition of the mutation guard,
     /// returning the ids that were not in the index. See
-    /// `remove_points_internal`.
-    pub fn remove_points(&self, ids: &[String]) -> Vec<String> {
+    /// `remove_points_internal`. The record names the ids the index held,
+    /// each once, and is handed over before any goes.
+    pub fn remove_points(&self, ids: &[String]) -> Result<Vec<String>, Error> {
         let _writers = self.writers.lock().unwrap();
-        self.remove_points_internal(ids)
+        let held = self.held_ids(ids);
+        self.record_removal(&held)?;
+        Ok(self.remove_points_internal(ids))
     }
 
     /// Remove the records these ids name and report how many went.
@@ -1488,16 +1783,18 @@ impl Collection {
     /// A repeated id names one record, so it counts once whether or not it
     /// was there. `remove_points_internal` already skips a repeat rather than
     /// reporting it missing.
-    pub fn delete_ids(&self, requested: &[String]) -> usize {
+    pub fn delete_ids(&self, requested: &[String]) -> Result<usize, Error> {
         let distinct: HashSet<&String> = requested.iter().collect();
         let distinct_count = distinct.len();
 
         let missing = {
             let _writers = self.writers.lock().unwrap();
+            let held = self.held_ids(requested);
+            self.record_removal(&held)?;
             self.remove_points_internal(requested)
         };
 
-        distinct_count - missing.len()
+        Ok(distinct_count - missing.len())
     }
 
     /// Remove every record whose metadata matches the filter, and report how
@@ -1514,19 +1811,40 @@ impl Collection {
             return Err(Error::RemoveWhereMatchesEverything);
         }
         let _writers = self.writers.lock().unwrap();
-        Ok(self.remove_where_locked(conditions))
+        self.remove_where_locked(conditions)
     }
 
     /// Replace one record's metadata without touching its vector. See
-    /// `update_metadata_locked`.
-    pub fn update_metadata(&self, id: &str, metadata: HashMap<String, Value>) -> bool {
+    /// `update_metadata_locked`. The record, being the id and the whole new
+    /// map, is handed to the sink before anything is written, and only
+    /// where the index holds the id, since nothing is written otherwise.
+    pub fn update_metadata(
+        &self,
+        id: &str,
+        metadata: HashMap<String, Value>,
+    ) -> Result<bool, Error> {
         let _writers = self.writers.lock().unwrap();
-        self.update_metadata_locked(id, metadata)
+        if self.contains(id) {
+            self.record(|| Operation::UpdateMetadata {
+                id: id.to_string(),
+                metadata: metadata
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            })?;
+            self.commit_records()?;
+        }
+        Ok(self.update_metadata_locked(id, metadata))
     }
 
     /// Rebuild the graph in memory and reclaim the nodes removal and overwrite
-    /// strand. See `compact_locked`.
+    /// strand. See `compact_locked`. The record is handed over whether or
+    /// not the graph turns out to hold a stranded node, since the decision is
+    /// the body's and a replay of the record makes it the same way.
     pub fn compact(&self) -> Result<usize, Error> {
+        let _writers = self.writers.lock().unwrap();
+        self.record(|| Operation::Compact)?;
+        self.commit_records()?;
         self.compact_locked()
     }
 
@@ -1577,10 +1895,20 @@ impl Collection {
     }
 
     /// Rebuild the graph at the degree a plan names. See `rebuild_locked`.
+    /// The record carries the three values the plan resolved, never the
+    /// options the caller gave, since an option's meaning depends on the
+    /// configuration it was resolved against.
     pub fn rebuild(&self, plan: RebuildPlan) -> Result<usize, Error> {
         if plan.rearm_overgrowth {
             self.overgrowth_warned.store(false, Ordering::Release);
         }
+        let _writers = self.writers.lock().unwrap();
+        self.record(|| Operation::Rebuild {
+            m: plan.m as u64,
+            expected_size: plan.expected_size as u64,
+            ef_construction: plan.ef_construction as u64,
+        })?;
+        self.commit_records()?;
         self.rebuild_locked(plan.m, plan.expected_size, plan.ef_construction)
     }
 
@@ -1603,6 +1931,25 @@ impl Collection {
     /// restarting keeps the internal ids in step with the fresh graph's node
     /// indices. The generated id counter does not; see the field.
     pub fn clear(&self) -> Result<usize, Error> {
+        let _writers = self.writers.lock().unwrap();
+        let replacement = self.replacement_for_clear()?;
+        self.record(|| Operation::Clear)?;
+        self.commit_records()?;
+        Ok(self.clear_with(replacement))
+    }
+
+    /// The body of `clear`, with the mutation guard held by the caller and
+    /// the record already handed over.
+    pub(super) fn clear_locked(&self) -> Result<usize, Error> {
+        let replacement = self.replacement_for_clear()?;
+        Ok(self.clear_with(replacement))
+    }
+
+    /// The fresh index a clear installs, and whether the graph it replaces
+    /// scores against codes. Built before any guard is taken, so the
+    /// allocation happens outside the write guard exactly as `compact`
+    /// arranges it.
+    fn replacement_for_clear(&self) -> Result<(bool, DenseIndex), Error> {
         let quantized = self.is_quantized();
         let pq = self.dense().pq.as_ref().cloned();
 
@@ -1610,10 +1957,6 @@ impl Collection {
             return Err(Error::NoQuantizer);
         }
 
-        let _writers = self.writers.lock().unwrap();
-
-        // Built before any guard is taken, so the allocation happens
-        // outside the write guard exactly as `compact` arranges it.
         let fresh = if let (true, Some(pq)) = (quantized, pq) {
             let mut graph = VectorGraph::new_pq(
                 &self.dense().metric,
@@ -1645,11 +1988,15 @@ impl Collection {
         };
 
         // The replacement index, wrapping the fresh graph, with an empty live
-        // set since the maps below are about to be empty too. Built and timed
-        // before any guard is taken, so the guarded block below is a move and
-        // not a construction.
-        let replacement = self.dense().fresh_index(fresh);
+        // set since the maps are about to be empty too. Built and timed
+        // before any guard is taken, so the guarded block is a move and not
+        // a construction.
+        Ok((quantized, self.dense().fresh_index(fresh)))
+    }
 
+    /// Install the replacement `replacement_for_clear` built and empty every
+    /// map, reporting how many records went.
+    fn clear_with(&self, (quantized, replacement): (bool, DenseIndex)) -> usize {
         // The storage guards in the order declared on the struct, which is
         // the order every other multi-guard path here takes them in.
         //
@@ -1722,7 +2069,7 @@ impl Collection {
             "Index cleared"
         );
 
-        Ok(removed)
+        removed
     }
 }
 
