@@ -1,12 +1,13 @@
-//! The journal beside a directory, and the sink that reaches it.
+//! The journal beside a directory, the sink that reaches it, and the three
+//! durability policies.
 //!
 //! [`zeusdb_vector_core`] holds what a journal is, being the file header, the
 //! record framing, the reader that classifies a torn tail and a corrupt
 //! middle, and the writer. The collection holds where a record comes from,
 //! being an [`OperationSink`](crate::OperationSink) it hands every mutation
 //! to before the mutation runs. This module is the join: a sink that is a
-//! journal writer, the rule for where the file lives, and what a checkpoint
-//! asks of it.
+//! journal writer, the rule for where the file lives, what a checkpoint asks
+//! of it, and what a caller is promised under each policy.
 //!
 //! # Where the file lives
 //!
@@ -38,27 +39,48 @@
 //!
 //! A save of a journaled collection is a checkpoint. Under the one hold of
 //! the mutation guard that the save already takes: the journal is synced
-//! whatever the commit mode, the sequence it reached is written onto the
+//! whatever the policy, the sequence it reached is written onto the
 //! collection so the manifest records it, the four save phases run, and then
 //! the journal is truncated in two steps that are each durable on their own.
 //! A crash anywhere in that leaves either the previous directory with a
 //! journal that replays onto it or the new directory with a journal that
 //! replays onto that, and never a directory whose records are in neither.
 //!
-//! # The commit mode
+//! # The three policies
 //!
-//! A sink takes a [`CommitMode`] as a value and does not choose one.
-//! [`DEFAULT_COMMIT_MODE`] is what a caller who names nothing gets, and it is
-//! [`CommitMode::Sync`], being one flush per entry point call. The durability
-//! policies a caller picks between, and the thread an interval policy syncs
-//! from, are not here.
+//! [`Durability`] is what a journaled collection promises about a record
+//! once the call that added it has returned. Each sits on one of the two
+//! commit modes the writer has, and the interval policy adds a thread.
+//!
+//! | Policy | When the call returns | A process abort | An OS crash or power loss |
+//! |---|---|---|---|
+//! | [`Durability::PerCall`] | every record of the call is on the device, or the call did not return | nothing acknowledged is lost | nothing acknowledged is lost, on a device that honours the flush |
+//! | [`Durability::PerInterval`] | every record is in the kernel, and a thread syncs the file within the interval | nothing acknowledged is lost | up to one interval of acknowledged calls is lost |
+//! | [`Durability::NoSync`] | every record is in the kernel | nothing acknowledged is lost | everything since the kernel last wrote the file is lost |
+//!
+//! The middle column is the same for all three because a process abort
+//! loses nothing the kernel holds, and every policy hands the bytes to the
+//! kernel before the call returns. The right column is what each policy
+//! syncs, and what "acknowledged" means is that the call returned without
+//! an error. A record refused by the call, or a call that raised, was never
+//! promised under any policy. A checkpoint syncs the journal whatever the
+//! policy, so the loss window of the two weaker policies closes at every
+//! save.
+//!
+//! The default is [`Durability::PerCall`], because it is the one a caller
+//! who has not thought about durability should have, and what it costs is a
+//! function of the caller's batch size rather than of the engine: one flush
+//! per call, which is a millisecond or so, against the insert work the call
+//! does.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tracing::{debug, info};
 use zeusdb_vector_core::{CommitMode, Error, JournalDamage, JournalWriter, OperationKind};
 
 use crate::collection::OperationSink;
+use crate::flusher::Flusher;
 
 /// The target the log records in this module carry. See the crate root.
 const LOG_TARGET: &str = "zeusdb_vector_database::journal";
@@ -66,12 +88,57 @@ const LOG_TARGET: &str = "zeusdb_vector_database::journal";
 /// The suffix a collection's journal takes beside its directory.
 pub const JOURNAL_SUFFIX: &str = ".zdbwal";
 
-/// What a commit does when the caller has named nothing.
-///
-/// One flush per entry point call, so every record a call returns from is on
-/// the device. It is the safe end of the three policies and the one a caller
-/// who has not thought about durability should have.
-pub const DEFAULT_COMMIT_MODE: CommitMode = CommitMode::Sync;
+/// What a journaled collection promises about a record once the call that
+/// added it has returned. See the module's table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Durability {
+    /// Every record of a call is on the device before the call returns, or
+    /// the call did not return. One flush per call. The default.
+    #[default]
+    PerCall,
+    /// Every record is in the kernel when the call returns, and a thread of
+    /// the collection's own syncs the file within this long of the first
+    /// call that dirtied it. What a caller trades is that an operating
+    /// system crash or a power loss inside the window loses the calls that
+    /// fell in it, and what they get is a single-record `add` that does not
+    /// wait on a flush.
+    PerInterval(Duration),
+    /// Every record is in the kernel when the call returns and nothing syncs
+    /// the file until the next checkpoint. A process abort still loses
+    /// nothing. For a bulk load that will checkpoint at the end.
+    NoSync,
+}
+
+impl Durability {
+    /// The interval a caller who names the interval policy and no interval
+    /// gets.
+    pub const DEFAULT_INTERVAL: Duration = Duration::from_millis(10);
+
+    /// The commit mode the sink takes under this policy.
+    pub fn commit_mode(self) -> CommitMode {
+        match self {
+            Durability::PerCall => CommitMode::Sync,
+            Durability::PerInterval(_) | Durability::NoSync => CommitMode::Deferred,
+        }
+    }
+
+    /// The name the binding and the stats spell the policy by.
+    pub fn name(self) -> &'static str {
+        match self {
+            Durability::PerCall => "call",
+            Durability::PerInterval(_) => "interval",
+            Durability::NoSync => "none",
+        }
+    }
+
+    /// The interval, where the policy has one.
+    pub fn interval(self) -> Option<Duration> {
+        match self {
+            Durability::PerInterval(interval) => Some(interval),
+            Durability::PerCall | Durability::NoSync => None,
+        }
+    }
+}
 
 /// The journal beside `target`, being its sibling under [`JOURNAL_SUFFIX`].
 ///
@@ -87,6 +154,18 @@ pub fn journal_path(target: &Path) -> Result<PathBuf, Error> {
     Ok(target.parent().unwrap_or_else(|| Path::new("")).join(name))
 }
 
+/// The directory a journal at `journal` sits beside, being
+/// [`journal_path`] undone. `None` where the file does not carry the
+/// suffix.
+pub fn directory_of(journal: &Path) -> Option<PathBuf> {
+    let name = journal.file_name()?.to_str()?;
+    let stem = name.strip_suffix(JOURNAL_SUFFIX)?;
+    if stem.is_empty() {
+        return None;
+    }
+    Some(journal.parent().unwrap_or_else(|| Path::new("")).join(stem))
+}
+
 /// A collection id as the manifest spells it, being 32 lower case
 /// hexadecimal digits.
 pub(crate) fn collection_id_hex(id: u128) -> String {
@@ -100,14 +179,18 @@ pub(crate) fn collection_id_from_hex(hex: &str) -> Option<u128> {
 
 /// The sink a journaled collection hands every record to.
 ///
-/// One journal writer and the mode its commits take. `append` drops the
-/// sequence the writer returns, because the collection has no use for it:
-/// what a checkpoint records is the sequence the journal has reached, which
+/// One journal writer, the policy its commits keep, and the thread the
+/// interval policy syncs from. `append` drops the sequence the writer
+/// returns, because the collection has no use for it: what a checkpoint
+/// records is the sequence the journal has reached, which
 /// [`OperationSink::sequence_reached`] reports after the fact.
 #[derive(Debug)]
 pub struct JournalSink {
     writer: JournalWriter,
-    mode: CommitMode,
+    durability: Durability,
+    /// The thread, under the interval policy alone. Dropped with the sink,
+    /// which joins it.
+    flusher: Option<Flusher>,
     /// The name the manifest records, held here so the checkpoint writing
     /// the manifest does not derive it a second time.
     file: String,
@@ -116,22 +199,31 @@ pub struct JournalSink {
 impl JournalSink {
     /// Create a journal at `path` for `collection_id`, replacing any file
     /// there, with its first record at sequence one.
-    pub fn create(path: &Path, collection_id: u128, mode: CommitMode) -> Result<Self, Error> {
+    pub fn create(path: &Path, collection_id: u128, durability: Durability) -> Result<Self, Error> {
         let writer = JournalWriter::create(path, collection_id, 1)?;
-        Ok(JournalSink {
-            file: file_name_of(path),
-            writer,
-            mode,
-        })
+        Self::over(writer, durability)
     }
 
     /// Take a writer a recovery reopened for append.
-    pub fn from_writer(writer: JournalWriter, mode: CommitMode) -> Self {
-        JournalSink {
+    pub fn from_writer(writer: JournalWriter, durability: Durability) -> Result<Self, Error> {
+        Self::over(writer, durability)
+    }
+
+    fn over(writer: JournalWriter, durability: Durability) -> Result<Self, Error> {
+        let flusher = match durability {
+            Durability::PerInterval(interval) => Some(Flusher::start(
+                writer.sync_handle(),
+                writer.path().to_path_buf(),
+                interval,
+            )?),
+            Durability::PerCall | Durability::NoSync => None,
+        };
+        Ok(JournalSink {
             file: file_name_of(writer.path()),
             writer,
-            mode,
-        }
+            durability,
+            flusher,
+        })
     }
 
     /// The collection the journal's header names.
@@ -144,13 +236,12 @@ impl JournalSink {
         self.writer.path()
     }
 
-    /// The mode every commit takes.
-    pub fn mode(&self) -> CommitMode {
-        self.mode
+    /// The policy every commit keeps.
+    pub fn durability(&self) -> Durability {
+        self.durability
     }
 
-    /// A handle that syncs the file and does nothing else, for a policy that
-    /// syncs on an interval from a thread of its own.
+    /// A handle that syncs the file and does nothing else.
     pub fn sync_handle(&self) -> zeusdb_vector_core::JournalSyncHandle {
         self.writer.sync_handle()
     }
@@ -183,12 +274,32 @@ impl OperationSink for JournalSink {
         self.writer.append(kind, payload).map(|_| ())
     }
 
+    /// Under the per-call policy, the flush. Under the other two, nothing on
+    /// the device: the interval policy's thread is told the file is dirty,
+    /// and a sync that thread could not complete since the last commit is
+    /// this commit's failure, so a device that will not flush is reported at
+    /// the next call rather than never.
     fn commit(&mut self) -> Result<(), Error> {
-        self.writer.commit(self.mode)
+        match self.durability.commit_mode() {
+            CommitMode::Sync => self.writer.sync(),
+            CommitMode::Deferred => {
+                if let Some(flusher) = &self.flusher {
+                    if let Some(failure) = flusher.take_failure() {
+                        return Err(failure);
+                    }
+                    flusher.mark_dirty();
+                }
+                Ok(())
+            }
+        }
     }
 
     fn sync(&mut self) -> Result<(), Error> {
-        self.writer.sync()
+        self.writer.sync()?;
+        if let Some(flusher) = &self.flusher {
+            flusher.mark_clean();
+        }
+        Ok(())
     }
 
     fn sequence_reached(&self) -> u64 {
@@ -196,7 +307,11 @@ impl OperationSink for JournalSink {
     }
 
     fn truncate(&mut self) -> Result<(), Error> {
-        self.writer.truncate()
+        self.writer.truncate()?;
+        if let Some(flusher) = &self.flusher {
+            flusher.mark_clean();
+        }
+        Ok(())
     }
 
     fn journal_file(&self) -> Option<&str> {
@@ -209,6 +324,19 @@ impl OperationSink for JournalSink {
 
     fn journal_path(&self) -> Option<&Path> {
         Some(self.writer.path())
+    }
+
+    fn durability(&self) -> Option<Durability> {
+        Some(self.durability)
+    }
+
+    fn journal_bytes(&self) -> Option<u64> {
+        self.writer.file_len().ok()
+    }
+
+    #[cfg(test)]
+    fn flusher_watch(&self) -> Option<crate::flusher::Watch> {
+        self.flusher.as_ref().map(Flusher::watch)
     }
 }
 
@@ -311,9 +439,9 @@ impl Recovery {
 pub enum JournalPolicy {
     /// Replay every record above the sequence the checkpoint holds, cut the
     /// journal back to its last whole record, reopen it for append under
-    /// this mode and attach a sink over it. This is recovery, and it is what
-    /// [`crate::Collection::load`] does.
-    Replay(CommitMode),
+    /// this policy and attach a sink over it. This is recovery, and it is
+    /// what [`crate::Collection::load`] does under the default policy.
+    Replay(Durability),
     /// Open the checkpoint alone. The journal is neither read nor reopened,
     /// no sink is attached, and the mutations it holds are not applied.
     ///
@@ -377,6 +505,13 @@ mod tests {
     fn the_journal_is_a_sibling_of_the_directory() {
         let path = journal_path(Path::new("a/b/index.zdb")).unwrap();
         assert_eq!(path, Path::new("a/b/index.zdb.zdbwal"));
+        assert_eq!(directory_of(&path).unwrap(), Path::new("a/b/index.zdb"));
+        assert_eq!(directory_of(Path::new("a/b/index.zdb")), None);
+        assert_eq!(directory_of(Path::new(".zdbwal")), None);
+        assert_eq!(
+            directory_of(Path::new("index.zdb.zdbwal")).unwrap(),
+            Path::new("index.zdb")
+        );
     }
 
     #[test]
@@ -395,7 +530,25 @@ mod tests {
     }
 
     #[test]
-    fn the_default_commit_mode_syncs() {
-        assert_eq!(DEFAULT_COMMIT_MODE, CommitMode::Sync);
+    fn the_three_policies_sit_on_the_two_commit_modes() {
+        assert_eq!(Durability::default(), Durability::PerCall);
+        assert_eq!(Durability::PerCall.commit_mode(), CommitMode::Sync);
+        assert_eq!(
+            Durability::PerInterval(Durability::DEFAULT_INTERVAL).commit_mode(),
+            CommitMode::Deferred
+        );
+        assert_eq!(Durability::NoSync.commit_mode(), CommitMode::Deferred);
+        assert_eq!(Durability::PerCall.name(), "call");
+        assert_eq!(
+            Durability::PerInterval(Duration::from_millis(3)).name(),
+            "interval"
+        );
+        assert_eq!(Durability::NoSync.name(), "none");
+        assert_eq!(Durability::PerCall.interval(), None);
+        assert_eq!(
+            Durability::PerInterval(Duration::from_millis(3)).interval(),
+            Some(Duration::from_millis(3))
+        );
+        assert_eq!(Durability::DEFAULT_INTERVAL, Duration::from_millis(10));
     }
 }

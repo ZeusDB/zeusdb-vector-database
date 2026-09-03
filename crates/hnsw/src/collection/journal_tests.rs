@@ -10,11 +10,11 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use zeusdb_vector_core::{CommitMode, Error, SparseVector, DUMP_FILENAME};
+use zeusdb_vector_core::{Error, SparseVector, DUMP_FILENAME};
 use zeusdb_vector_sparse::SparseConfig;
 
 use super::{Collection, Declaration, ParsedRecord};
-use crate::journal::{journal_path, DEFAULT_COMMIT_MODE};
+use crate::journal::{journal_path, Durability};
 
 // ============================================================================
 // FIXTURES
@@ -99,7 +99,7 @@ fn ids(collection: &Collection) -> Vec<(String, usize)> {
 fn journaled(dir: &std::path::Path) -> Collection {
     let collection = Collection::build(declaration(), None);
     collection
-        .journal_to(dir.to_str().unwrap(), DEFAULT_COMMIT_MODE)
+        .journal_to(dir.to_str().unwrap(), Durability::default())
         .unwrap();
     collection
 }
@@ -229,7 +229,7 @@ fn a_recovered_collection_is_the_collection_the_script_built() {
     drop(collection);
 
     let (recovered, report) =
-        Collection::recover(path.to_str().unwrap(), None, DEFAULT_COMMIT_MODE).unwrap();
+        Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
     assert_eq!(report.checkpoint_sequence, 30);
     assert_eq!(
         report.replayed, 24,
@@ -256,7 +256,7 @@ fn a_collection_that_never_saves_again_replays_in_full() {
     drop(collection);
 
     let (recovered, report) =
-        Collection::recover(path.to_str().unwrap(), None, DEFAULT_COMMIT_MODE).unwrap();
+        Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
     assert_eq!(report.checkpoint_sequence, 0);
     assert_eq!(report.replayed, 25);
     assert_eq!(report.skipped, 0);
@@ -283,7 +283,7 @@ fn records_at_or_below_the_checkpoints_sequence_are_skipped() {
 
     std::fs::write(&wal, &before_the_save).unwrap();
     let (recovered, report) =
-        Collection::recover(path.to_str().unwrap(), None, DEFAULT_COMMIT_MODE).unwrap();
+        Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
     assert_eq!(report.checkpoint_sequence, 8);
     assert_eq!(report.records_in_journal, 8);
     assert_eq!(report.skipped, 8, "the checkpoint already holds every one");
@@ -344,7 +344,7 @@ fn a_crash_between_the_truncations_two_steps_is_recoverable_end_to_end() {
     // The reopen completes the second step, and the records appended after it
     // carry the sequences the checkpoint left off at.
     let (recovered, report) =
-        Collection::recover(path.to_str().unwrap(), None, DEFAULT_COMMIT_MODE).unwrap();
+        Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
     assert_eq!(report.checkpoint_sequence, 8);
     assert_eq!(report.records_in_journal, 0);
     assert_eq!(report.replayed, 0);
@@ -369,7 +369,7 @@ fn a_crash_between_the_truncations_two_steps_is_recoverable_end_to_end() {
     // And the six records are still there at the next open, which is what a
     // header left at 1 would have lost.
     let (reopened, report) =
-        Collection::recover(path.to_str().unwrap(), None, DEFAULT_COMMIT_MODE).unwrap();
+        Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
     assert_eq!(report.checkpoint_sequence, 8);
     assert_eq!(report.replayed, 6);
     assert_eq!(ids(&reopened), before);
@@ -397,7 +397,7 @@ fn a_journal_from_another_index_is_refused() {
 
     // The other index's journal, under this one's name.
     std::fs::copy(journal_path(&two).unwrap(), journal_path(&one).unwrap()).unwrap();
-    match Collection::recover(one.to_str().unwrap(), None, DEFAULT_COMMIT_MODE) {
+    match Collection::recover(one.to_str().unwrap(), None, Durability::default()) {
         Err(Error::JournalNotThisCollection {
             journal_id,
             directory_id,
@@ -459,7 +459,7 @@ fn a_journal_that_starts_above_the_checkpoint_is_refused() {
     // The checkpoint names sequence 6. Put it back to 2, so the journal's
     // first record at 7 is four above what it may be.
     rewrite_manifest(&path, |m| m["journal"]["sequence"] = json!(2));
-    match Collection::recover(path.to_str().unwrap(), None, DEFAULT_COMMIT_MODE) {
+    match Collection::recover(path.to_str().unwrap(), None, Durability::default()) {
         Err(Error::JournalStartsAfterCheckpoint {
             first, checkpoint, ..
         }) => {
@@ -493,7 +493,7 @@ fn a_corrupt_middle_refuses_the_open() {
     bytes[at] ^= 0x5a;
     std::fs::write(&wal, &bytes).unwrap();
 
-    match Collection::recover(path.to_str().unwrap(), None, DEFAULT_COMMIT_MODE) {
+    match Collection::recover(path.to_str().unwrap(), None, Durability::default()) {
         Err(Error::JournalCorrupt {
             sequence: named, ..
         }) => assert_eq!(named, sequence),
@@ -514,7 +514,7 @@ fn a_record_that_does_not_belong_refuses_the_open_naming_its_sequence() {
     // A checkpoint claiming to hold the first two records, which it does
     // not, so the third record's internal id is two ahead of the counter.
     rewrite_manifest(&path, |m| m["journal"]["sequence"] = json!(2));
-    match Collection::recover(path.to_str().unwrap(), None, DEFAULT_COMMIT_MODE) {
+    match Collection::recover(path.to_str().unwrap(), None, Durability::default()) {
         Err(Error::JournalReplayFailed {
             sequence, detail, ..
         }) => {
@@ -594,7 +594,7 @@ fn a_journaled_directory_with_a_space_takes_the_third_major() {
         .unwrap();
     let collection = Collection::build(declaration, None);
     collection
-        .journal_to(path.to_str().unwrap(), DEFAULT_COMMIT_MODE)
+        .journal_to(path.to_str().unwrap(), Durability::default())
         .unwrap();
     let records: Vec<ParsedRecord> = (0..12usize)
         .map(|i| {
@@ -614,7 +614,7 @@ fn a_journaled_directory_with_a_space_takes_the_third_major() {
 
     assert_eq!(manifest(&path)["format_version"], json!("3.0.0"));
     let (recovered, _) =
-        Collection::recover(path.to_str().unwrap(), None, DEFAULT_COMMIT_MODE).unwrap();
+        Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
     assert_eq!(ids(&recovered), before);
 }
 
@@ -652,7 +652,7 @@ fn a_checkpoint_whose_dump_was_refused_reports_the_rebuild() {
     });
 
     let (recovered, report) =
-        Collection::recover(path.to_str().unwrap(), None, DEFAULT_COMMIT_MODE).unwrap();
+        Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
     assert!(report.graph_rebuilt, "the dump was not read");
     assert_eq!(report.replayed, 5);
     // The rebuild keeps the ids the mappings hold, so the records and the
@@ -660,7 +660,7 @@ fn a_checkpoint_whose_dump_was_refused_reports_the_rebuild() {
     assert_eq!(ids(&recovered), before);
 }
 
-/// The commit mode is the caller's and the default is the one a caller who
+/// The policy is the caller's and the default is the one a caller who
 /// names nothing gets.
 #[test]
 fn the_sink_takes_the_mode_it_is_given() {
@@ -668,7 +668,7 @@ fn the_sink_takes_the_mode_it_is_given() {
     let path = temp.at("mode.zdb");
     let collection = Collection::build(declaration(), None);
     collection
-        .journal_to(path.to_str().unwrap(), CommitMode::Deferred)
+        .journal_to(path.to_str().unwrap(), Durability::NoSync)
         .unwrap();
     add(&collection, 0..4);
     collection.save(path.to_str().unwrap()).unwrap();
@@ -677,10 +677,13 @@ fn the_sink_takes_the_mode_it_is_given() {
     drop(collection);
 
     let (recovered, report) =
-        Collection::recover(path.to_str().unwrap(), None, CommitMode::Deferred).unwrap();
+        Collection::recover(path.to_str().unwrap(), None, Durability::NoSync).unwrap();
     assert_eq!(report.replayed, 4);
     assert_eq!(ids(&recovered), before);
-    assert_eq!(DEFAULT_COMMIT_MODE, CommitMode::Sync);
+    assert_eq!(
+        Durability::default().commit_mode(),
+        zeusdb_vector_core::CommitMode::Sync
+    );
 }
 
 /// A collection is journaled once.
@@ -692,7 +695,7 @@ fn a_collection_that_already_has_a_sink_is_not_journaled_again() {
     let collection = journaled(&path);
     add(&collection, 0..4);
     let message = collection
-        .journal_to(second.to_str().unwrap(), DEFAULT_COMMIT_MODE)
+        .journal_to(second.to_str().unwrap(), Durability::default())
         .err()
         .unwrap()
         .to_string();

@@ -2205,7 +2205,7 @@ pub(crate) fn load_index(
     restored_index.set_collection_id(directory_id);
     restored_index.set_journal_sequence(record.sequence);
 
-    let mode = match policy {
+    let durability = match policy {
         JournalPolicy::CheckpointOnly => {
             warn!(target: LOG_TARGET, operation = "load_checkpoint_only",
                 directory = path,
@@ -2219,7 +2219,7 @@ pub(crate) fn load_index(
             recovery.report(path);
             return Ok((restored_index, recovery));
         }
-        JournalPolicy::Replay(mode) => mode,
+        JournalPolicy::Replay(durability) => durability,
     };
 
     let wal = crate::journal::journal_path(path_buf)?;
@@ -2265,8 +2265,8 @@ pub(crate) fn load_index(
     let writer =
         zeusdb_vector_core::JournalWriter::open_for_append(&wal, &contents, record.sequence + 1)?;
     restored_index.attach_sink(Box::new(crate::journal::JournalSink::from_writer(
-        writer, mode,
-    )));
+        writer, durability,
+    )?));
 
     let recovery = Recovery {
         checkpoint_sequence: record.sequence,

@@ -611,6 +611,33 @@ impl Collection {
             }
         }
 
+        // The journal, where one is attached, under keys a collection with
+        // no journal never carries, so nothing such a collection reports
+        // moves. The sink's guard is taken alone, as every guard here is.
+        if let Some(journal) = self.journal_status() {
+            stats.insert(
+                "journal_durability".to_string(),
+                journal.durability.name().to_string(),
+            );
+            if let Some(interval) = journal.durability.interval() {
+                stats.insert(
+                    "journal_interval_ms".to_string(),
+                    interval.as_millis().to_string(),
+                );
+            }
+            stats.insert(
+                "journal_sequence".to_string(),
+                journal.checkpoint_sequence.to_string(),
+            );
+            stats.insert(
+                "journal_records".to_string(),
+                journal.records_since_checkpoint().to_string(),
+            );
+            if let Some(bytes) = journal.bytes {
+                stats.insert("journal_bytes".to_string(), bytes.to_string());
+            }
+        }
+
         // The sum of the six memory keys above, and of the sparse space's
         // two where one is declared. It is what the index holds in the
         // structures this call can price, being the graph, the raw vector
@@ -661,6 +688,12 @@ impl Collection {
             self.expected_size(),
             record_count
         );
+        // The journal's policy, on a journaled collection alone, so the line
+        // an unjournaled index prints is the line it always printed.
+        let base_info = match self.journal_status() {
+            Some(journal) => format!("{}, journal={}", base_info, journal.durability.name()),
+            None => base_info,
+        };
 
         if let Some(config) = &self.dense().quantization_config {
             let trained_status = self

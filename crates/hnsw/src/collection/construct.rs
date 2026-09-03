@@ -826,7 +826,7 @@ impl Collection {
             generated_ids: MutexAt::new(order::GENERATED_IDS, 0),
             vector_count: MutexAt::new(order::VECTOR_COUNT, 0),
             writers: MutexAt::new(order::WRITERS, ()),
-            sink: MutexAt::new(order::JOURNAL, None),
+            sink: MutexAt::new(order::JOURNAL, super::SinkSlot::default()),
             collection_id: draw_collection_id(),
             journal_sequence: MutexAt::new(order::JOURNAL_SEQUENCE, 0),
             training_ids: RwLockAt::new(order::TRAINING_IDS, Vec::new()),

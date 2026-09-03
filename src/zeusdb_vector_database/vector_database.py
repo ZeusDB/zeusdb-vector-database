@@ -446,9 +446,15 @@ class VectorDatabase:
             raise RuntimeError(f"Failed to create {index_type.upper()} index: {e}") from e
 
 
-    def load(self, path: str, tokenizer: Any = None) -> Any:
+    def load(self, path: str, tokenizer: Any = None, durability: Optional[str] = None,
+             interval_ms: Optional[int] = None, checkpoint_only: bool = False) -> Any:
         """
         Load a previously saved ZeusDB index from disk.
+
+        A directory saved with a journal beside it is recovered: every
+        mutation the journal holds since the directory was last saved is
+        replayed, the journal is reopened, and the index keeps recording to
+        it. See HNSWIndex.journal_to for what a journal is.
 
         Args:
             path: Path to the .zdb directory containing the saved index
@@ -465,10 +471,36 @@ class VectorDatabase:
                 each refused, since opening the index under a tokenizer it
                 was not declared with would count a query's terms
                 differently from its records'. The tokenizer is stored and
-                never run by the load.
+                never run by the load. A journaled directory needs it the
+                same way, since the records replayed from the journal are
+                queried through it.
+            durability: What a call promises about its records from now on,
+                for a directory that has a journal: "call" (the default),
+                "interval" or "none", exactly as journal_to takes them. It
+                is not recorded in the directory, because a bulk loader and
+                a long-running process open the same directory wanting
+                different ones, so name it on every load that wants other
+                than the default. Naming it for a directory with no journal
+                raises ValueError rather than being ignored.
+            interval_ms: The flush interval under durability="interval",
+                10 by default. Refused under any other durability.
+            checkpoint_only: Open the directory as it was at its last save
+                and leave the journal beside it alone: nothing is replayed,
+                the file is neither read nor opened, and the index records
+                nothing until journal_to is called on it. This is the way in
+                for a directory copied without its journal, which load
+                otherwise refuses with FileNotFoundError naming the file,
+                and for a caller who wants the state as of the checkpoint.
+                durability and interval_ms do not apply and are refused
+                beside it.
 
         Returns:
             HNSWIndex: The loaded index ready for use
+
+        A loaded journaled index holds its journal file open until the index
+        is dropped, and a file deleted or moved under a live index is one the
+        directory can no longer replay, so drop the index before touching the
+        file.
 
         Example:
             >>> vdb = VectorDatabase()
@@ -476,7 +508,8 @@ class VectorDatabase:
             >>> results = loaded_index.search(query_vector, top_k=5)
         """
         from ._engine import _load_index  # Direct function import
-        return _load_index(path, tokenizer)
+        return _load_index(path, tokenizer, durability=durability, interval_ms=interval_ms,
+                           checkpoint_only=checkpoint_only)
 
 
     def _validate_quantization_config(self, config: Dict[str, Any], dim: int,

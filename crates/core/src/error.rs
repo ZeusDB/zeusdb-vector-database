@@ -413,6 +413,11 @@ pub enum Error {
         sequence: u64,
         detail: String,
     },
+    /// A commit of the journal failed, so its records were refused and
+    /// nothing more is recorded until a checkpoint reconciles the journal
+    JournalCommitFailed { sequence: u64, error: String },
+    /// A checkpoint was asked of a collection that has no journal
+    NotJournaled,
 
     // ------------------------------------------------------------------
     // The saved directory
@@ -689,7 +694,9 @@ impl Error {
             | JournalDirectoryMismatch { .. }
             | JournalNotThisCollection { .. }
             | JournalStartsAfterCheckpoint { .. }
-            | JournalReplayFailed { .. } => Exception::Runtime,
+            | JournalReplayFailed { .. }
+            | JournalCommitFailed { .. }
+            | NotJournaled => Exception::Runtime,
         }
     }
 }
@@ -1398,6 +1405,19 @@ impl fmt::Display for Error {
                  space, which no release writing that format holds. A directory holding a \
                  sparse space declares format_version 2.0.0 or later.",
                 format_version
+            ),
+            JournalCommitFailed { sequence, error } => write!(
+                f,
+                "The journal's commit failed at sequence {}: {} The records that commit was \
+                 to make durable were refused and may or may not be on the device, so \
+                 nothing is recorded until a checkpoint reconciles the journal with the \
+                 directory. Call checkpoint().",
+                sequence, error
+            ),
+            NotJournaled => f.write_str(
+                "This index has no journal, so there is no directory for a checkpoint to \
+                 write. journal_to(path) opens one and writes the checkpoint it replays \
+                 onto; save(path) writes a directory without one.",
             ),
             FormatVersionJournal { format_version } => write!(
                 f,
