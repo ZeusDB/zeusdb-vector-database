@@ -1110,9 +1110,9 @@ impl Collection {
     /// layer.
     ///
     /// A one arm query. The text is counted into term ids as the records
-    /// were, under the dictionary's read guard taken alone and released
-    /// before the search, and a term no record has carried is dropped. The
-    /// rest is `search_sparse`.
+    /// were, under the dictionary's read guard taken after the sparse
+    /// index's and held with it through the search, and a term no record
+    /// has carried is dropped. The rest is `search_sparse`.
     pub fn search_text(
         &self,
         text: &str,

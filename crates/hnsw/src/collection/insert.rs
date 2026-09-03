@@ -2057,8 +2057,10 @@ impl Collection {
 
         // The sparse space, where there is one, starts again as well, under
         // its own guard taken alone. A record's terms are counted into ids
-        // under `writers` as well, in `add_single_vector`, so no caller holds
-        // an id the dictionary this empties issued.
+        // under `writers` as well, in `add_single_vector`, and a query's
+        // under the dictionary's read guard held through its search, so
+        // nothing holds an id this dictionary issued by the time the next
+        // record's terms are counted.
         if let Some(space) = self.sparse() {
             *space.index.write().unwrap() = PostingsIndex::new(space.config().clone());
             if let Some(text) = &space.text {

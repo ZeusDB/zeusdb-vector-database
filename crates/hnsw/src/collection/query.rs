@@ -36,23 +36,30 @@
 //!
 //! The guards a single space search takes, in the declared order,
 //! `id_map < rev_map < dense index < dense codes < sparse index <
-//! vector_metadata < columns`, each space's taken only where an arm reads
-//! it. A text arm is tokenized under no guard at all, since the tokenizer
-//! may be the caller's own, and its terms are counted into term ids under
-//! the dictionary's guard before any of the above is taken, and that guard
-//! is released before the first of them is, which is the rule the text
-//! layer declares.
+//! dictionary < vector_metadata < columns`, each space's taken only where
+//! an arm reads it and the dictionary's only where an arm carries terms. A
+//! text arm is tokenized under no guard at all, since the tokenizer may be
+//! the caller's own, and its terms travel as strings into the search,
+//! where they are counted into term ids under the dictionary's read guard,
+//! taken after the sparse index's and held with it until the page is made.
+//! So the dictionary a text arm's terms are counted against is the one the
+//! postings it searches were counted against, which is the rule the text
+//! layer declares. An id counted before the guards were taken was an id a
+//! `clear` and an insert landing between the count and the search could
+//! reissue to another term, and the arm then searched postings that never
+//! carried its terms.
 
 use super::search::{AdmitPlan, Scored, MAX_TOP_K};
 use super::Collection;
 use crate::{RawVectors, SearchParams};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use zeusdb_vector_core::{
     fuse, Budget, Contribution, Cost, Error, Filter, Fusion, IdfScope, Selectivity, SpaceKind,
     SpaceName, SparseRef, SparseVector, VectorIndex,
 };
-use zeusdb_vector_text::count_query;
+use zeusdb_vector_text::{count_query, TermDictionary};
 
 /// Arms a query may name.
 ///
@@ -272,9 +279,50 @@ pub struct ArmPlan {
     pub cost: Cost,
 }
 
-/// An arm with its query settled before any guard is taken: the dense
-/// vector checked and processed for its space with its parameters resolved,
-/// or the sparse vector owned, a text arm's counted from the dictionary.
+/// An arm held to its rules before any guard is taken: the dense vector
+/// checked and processed for its space with its parameters resolved, the
+/// sparse vector owned, or a text arm's terms as the tokenizer split them,
+/// which carry no id until the search holds the dictionary's guard. The
+/// terms of an arm that arrived split are borrowed, so a query from the
+/// binding, whose text is tokenized under the interpreter lock, copies
+/// nothing here.
+enum Settled<'a> {
+    Dense {
+        vector: Vec<f32>,
+        params: SearchParams,
+    },
+    Sparse {
+        vector: SparseVector,
+        idf: IdfScope,
+    },
+    Terms {
+        terms: Cow<'a, [String]>,
+        idf: IdfScope,
+    },
+}
+
+impl Settled<'_> {
+    /// The arm with its query resolved under the guards the search holds,
+    /// a text arm's terms counted into ids from `dictionary`, which stays
+    /// held for the whole search, so what the arm was counted against is
+    /// what it searches. A term no record has carried is dropped, and no
+    /// id is issued.
+    fn resolve(self, dictionary: Option<&TermDictionary>) -> Resolved {
+        match self {
+            Settled::Dense { vector, params } => Resolved::Dense { vector, params },
+            Settled::Sparse { vector, idf } => Resolved::Sparse { vector, idf },
+            Settled::Terms { terms, idf } => Resolved::Sparse {
+                vector: count_query(
+                    dictionary.expect("a text arm took the dictionary's guard"),
+                    terms.iter(),
+                ),
+                idf,
+            },
+        }
+    }
+}
+
+/// An arm with its query resolved under the guards the search holds.
 enum Resolved {
     Dense {
         vector: Vec<f32>,
@@ -286,13 +334,36 @@ enum Resolved {
     },
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What a test runs on the calling thread once every arm's query is
+    /// resolved, term ids included, and before any page is made, with
+    /// every guard the query holds still held. Taken and run once. The
+    /// test that holds a `clear` out of the window between a text arm's
+    /// count and its search sets it, and nothing else does.
+    pub(super) static AFTER_RESOLVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run the hook a test set, once, where one did.
+#[cfg(test)]
+fn after_resolve() {
+    let hook = AFTER_RESOLVE.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 impl Collection {
     /// The plan a query would run under, without running it.
     ///
-    /// Takes the guards the query would take, decides the admit set from
-    /// the filter, which for a filter over undeclared fields is the walk
-    /// itself, prices every arm and releases. What it reports is what
-    /// [`Collection::query`] reports beside its page.
+    /// Takes the guards the query would take, the dictionary's included
+    /// where an arm carries terms, counts those terms as the query would,
+    /// decides the admit set from the filter, which for a filter over
+    /// undeclared fields is the walk itself, prices every arm and releases.
+    /// What it reports is what [`Collection::query`] reports beside its
+    /// page, and a term no record has carried is dropped here as there,
+    /// without being given an id.
     pub fn explain(&self, query: &Query<'_>) -> Result<Plan, Error> {
         self.execute(query, false).map(|(plan, _)| plan)
     }
@@ -315,8 +386,9 @@ impl Collection {
     }
 
     /// Hold a query to its rules and settle every arm's query, taking no
-    /// guard but a text arm's dictionary, alone.
-    fn resolve_arms(&self, query: &Query<'_>) -> Result<(Vec<Resolved>, usize), Error> {
+    /// guard at all. A text arm is settled to its terms, which are counted
+    /// into ids once the search holds the dictionary's guard.
+    fn settle_arms<'a>(&self, query: &Query<'a>) -> Result<(Vec<Settled<'a>>, usize), Error> {
         if query.arms.is_empty() {
             return Err(Error::QueryArmsEmpty);
         }
@@ -344,9 +416,9 @@ impl Collection {
             });
         }
         query.fusion.validate()?;
-        let mut resolved = Vec::with_capacity(query.arms.len());
+        let mut settled = Vec::with_capacity(query.arms.len());
         for arm in query.arms {
-            resolved.push(match *arm {
+            settled.push(match *arm {
                 Arm::Dense { vector, ef, rerank } => {
                     // The bounds, the width default and the rerank plan,
                     // resolved once here as the single space search does,
@@ -354,12 +426,12 @@ impl Collection {
                     // the graph's own.
                     let params = self.search_params(fetch, ef, false, rerank)?;
                     let vector = self.validate_query(vector.to_vec())?;
-                    Resolved::Dense { vector, params }
+                    Settled::Dense { vector, params }
                 }
                 Arm::Sparse { vector, idf } => {
                     vector.validate()?;
                     self.sparse().ok_or(Error::NoSparseSpace)?;
-                    Resolved::Sparse {
+                    Settled::Sparse {
                         vector: SparseVector {
                             dims: vector.dims.to_vec(),
                             values: vector.values.to_vec(),
@@ -368,30 +440,24 @@ impl Collection {
                     }
                 }
                 Arm::Text { text, idf } => {
-                    // The tokenizer under no guard, then the terms under
-                    // the dictionary's alone; see `Collection::tokenize`.
-                    let terms = self.tokenize(text)?;
-                    Resolved::Sparse {
-                        vector: self.count_terms(&terms)?,
+                    // The tokenizer under no guard; see `Collection::tokenize`.
+                    Settled::Terms {
+                        terms: Cow::Owned(self.tokenize(text)?),
                         idf,
                     }
                 }
-                Arm::Terms { terms, idf } => Resolved::Sparse {
-                    vector: self.count_terms(terms)?,
-                    idf,
-                },
+                Arm::Terms { terms, idf } => {
+                    // Refused at the door where there is no text layer, as
+                    // a text is by its tokenizer.
+                    self.text_layer()?;
+                    Settled::Terms {
+                        terms: Cow::Borrowed(terms),
+                        idf,
+                    }
+                }
             });
         }
-        Ok((resolved, fetch))
-    }
-
-    /// Terms looked up in the text layer's dictionary and counted, under
-    /// its read guard taken alone and released before any search guard is
-    /// taken. A term no record has carried is dropped.
-    fn count_terms(&self, terms: &[String]) -> Result<SparseVector, Error> {
-        let layer = self.text_layer()?;
-        let dictionary = layer.dictionary.read().unwrap();
-        Ok(count_query(&dictionary, terms))
+        Ok((settled, fetch))
     }
 
     /// Plan, and run where asked.
@@ -400,25 +466,49 @@ impl Collection {
         query: &Query<'_>,
         run: bool,
     ) -> Result<(Plan, Option<Vec<QueryHit>>), Error> {
-        let (arms, fetch) = self.resolve_arms(query)?;
-        let wants_dense = arms.iter().any(|arm| matches!(arm, Resolved::Dense { .. }));
-        let wants_sparse = arms
+        let (settled, fetch) = self.settle_arms(query)?;
+        let wants_dense = settled
             .iter()
-            .any(|arm| matches!(arm, Resolved::Sparse { .. }));
+            .any(|arm| matches!(arm, Settled::Dense { .. }));
+        let wants_sparse = settled
+            .iter()
+            .any(|arm| matches!(arm, Settled::Sparse { .. } | Settled::Terms { .. }));
+        let wants_terms = settled
+            .iter()
+            .any(|arm| matches!(arm, Settled::Terms { .. }));
 
         // The guards, in the declared order, a space's only where an arm
-        // reads it.
+        // reads it and the dictionary's only where an arm carries terms.
         let id_map = self.id_map.read().unwrap();
         let rev_map = self.rev_map.read().unwrap();
         let dense = wants_dense.then(|| self.dense().index.read().unwrap());
         let pq_codes = wants_dense.then(|| self.dense().pq_codes.read().unwrap());
         let sparse_space = wants_sparse.then(|| {
             self.sparse()
-                .expect("every sparse arm found the sparse space when it was resolved")
+                .expect("every sparse arm found the sparse space when it was settled")
         });
         let sparse = sparse_space.map(|space| space.index.read().unwrap());
+        let dictionary = wants_terms.then(|| {
+            sparse_space
+                .and_then(|space| space.text.as_ref())
+                .expect("every text arm found the text layer when it was settled")
+                .dictionary
+                .read()
+                .unwrap()
+        });
         let vector_metadata = self.vector_metadata.read().unwrap();
         let columns = self.columns.read().unwrap();
+
+        // Every text arm's terms counted into ids under the guards above,
+        // so the dictionary they are counted against is the one whose ids
+        // the postings under `sparse` carry, and stays so until the page is
+        // made.
+        let arms: Vec<Resolved> = settled
+            .into_iter()
+            .map(|arm| arm.resolve(dictionary.as_deref()))
+            .collect();
+        #[cfg(test)]
+        after_resolve();
 
         // The admit set, once, for every arm.
         let admit = self.admit_plan(query.filter, &columns, &rev_map, &vector_metadata, &id_map);

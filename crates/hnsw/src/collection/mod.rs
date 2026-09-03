@@ -835,15 +835,21 @@ impl SparseSpace {
 /// need something of the caller's to run, such as an interpreter lock, and a
 /// thread holding that while it waited for a guard the tokenizing thread
 /// held would wait forever; see [`Collection::tokenize`]. The dictionary
-/// sits behind the space's second guard, and the guard is never held
-/// together with the index's. A record's terms are counted under the
-/// dictionary's write guard, released, and the vector is then inserted under
-/// the index's write guard, so the interning of a record and a search under
-/// the index never wait on one another. Both run under `writers`, taken by
-/// `add_records` before any record's terms are counted, so nothing can empty
-/// the dictionary between a record's ids being issued and its postings being
-/// written. The tokenizer runs before `writers` is taken, so a tokenizer that
-/// needs the caller's lock costs the mutation guard nothing.
+/// sits behind the space's second guard, ranked after the index's, and the
+/// terms a tokenizer split travel as strings up to the guard that counts
+/// them, so nothing holds an id across a gap in which a `clear` could
+/// reissue it. A record's terms are counted under the dictionary's write
+/// guard, released, and the vector is then inserted under the index's write
+/// guard, both under `writers`, taken by `add_records` before any record's
+/// terms are counted, so nothing can empty the dictionary between a
+/// record's ids being issued and its postings being written. A query's
+/// terms are counted under the dictionary's read guard, taken after the
+/// index's read guard and held with it until the page is made, so nothing
+/// can empty the dictionary between a query's ids being counted and its
+/// postings being searched; a record interning a new term waits for such a
+/// query there, as it would at the record set's guard directly after. The
+/// tokenizer runs before `writers` is taken, so a tokenizer that needs the
+/// caller's lock costs the mutation guard nothing.
 pub(crate) struct TextLayer {
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
     pub(crate) dictionary: RwLockAt<TermDictionary>,

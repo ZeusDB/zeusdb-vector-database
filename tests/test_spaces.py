@@ -1455,3 +1455,46 @@ def test_a_python_tokenizer_never_deadlocks_against_readers_and_writers():
     assert failures == []
     assert len(index) == 50 + 2 * 5
     assert ids(index.query(arms=[{"text": "seed"}], top_k=1))[0].startswith("seed")
+
+
+def test_a_text_query_never_returns_a_record_that_never_held_the_term_under_concurrent_reissues():
+    """A text query counts its terms into ids under the guards its search
+    holds, so a clear and an insert on another thread cannot reissue those
+    ids between the count and the search. Each round the other thread clears
+    and inserts one record carrying a term of its own, so every clear
+    reissues id 0 to a new term, and a query for a term returns the one
+    record that carried it or nothing."""
+    index = with_text(expected_size=1000)
+    index.add({"id": "r0", "vector": vec(0), "text": "only0"})
+    generation = [0]
+    stop = threading.Event()
+    failures = []
+
+    def mutator():
+        try:
+            rounds = 0
+            while not stop.is_set():
+                index.clear()
+                rounds += 1
+                index.add({"id": f"r{rounds}", "vector": vec(rounds), "text": f"only{rounds}"})
+                generation[0] = rounds
+        except BaseException as e:  # noqa: BLE001
+            failures.append(e)
+
+    thread = threading.Thread(target=mutator)
+    thread.start()
+    wrong = []
+    hits = 0
+    for _ in range(1500):
+        current = generation[0]
+        for hit in index.query(arms=[{"text": f"only{current}"}], top_k=5):
+            hits += 1
+            if hit["id"] != f"r{current}":
+                wrong.append((current, hit["id"]))
+    stop.set()
+    thread.join(timeout=60)
+    assert not thread.is_alive(), "the mutating thread hung"
+    assert failures == []
+    assert wrong == [], f"records returned for a term they never held: {wrong}"
+    assert generation[0] > 0, "the mutating thread ran"
+    assert hits > 0, "some query found the record its term named"
