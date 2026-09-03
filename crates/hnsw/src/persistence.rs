@@ -19,6 +19,8 @@
 //!     └── <name>/
 //!         ├── postings.zdbsparse  # every live record's term ids and weights
 //!         └── terms.zdbdict       # the term dictionary, where the space takes text
+//!
+//! my_index.zdb.zdbwal         # the journal, where the collection held one
 //! ```
 //!
 //! ## The format version
@@ -31,7 +33,26 @@
 //! seven names it knows, and open the collection without its sparse space
 //! and without a word, which is the failure this format has already
 //! suffered once. At `2.0.0` such a release refuses at the version check
-//! with a message naming the newer release. This build reads both majors.
+//! with a message naming the newer release.
+//!
+//! A directory a journaled collection saved is written at `3.0.0`, for the
+//! same reason. Its manifest names the journal beside it, and a release
+//! reading `1.x` and `2.x` alone would find every file the manifest names,
+//! ignore the `journal` field it does not know, and open an index missing
+//! every acknowledged mutation since the checkpoint, again without a word.
+//! This build reads all three majors, and a directory saved by a collection
+//! holding no journal keeps `1.1.0` or `2.0.0` and opens everywhere it does
+//! today.
+//!
+//! ## The journal
+//!
+//! A journaled collection records every mutation to `<name>.zdbwal`, a
+//! sibling of the directory rather than a file inside it, and a save is the
+//! checkpoint that journal replays onto. `manifest.json` names the file, the
+//! collection id both carry and the sequence the checkpoint holds, so the two
+//! are paired by content. A load replays every record above that sequence
+//! before it hands the collection back. See `crate::journal` for where the
+//! file lives and why, and for what is refused.
 //!
 //! `config.json` declares the sparse space under `spaces`, by value: the
 //! space's name, its unlink policy, its lazy threshold, its weighting with
@@ -74,6 +95,7 @@ use crate::collection::{
     validate_index_parameters, validate_space_supports_quantization, Collection,
     QuantizationConfig, SparseDeclaration, StorageMode, DEFAULT_SPACE,
 };
+use crate::journal::{JournalPolicy, Recovery};
 use crate::RerankCalibration;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -82,7 +104,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use zeusdb_vector_core::{
     checksum_of, validate_indexed_fields, ArtefactRecord, Bounds, Error, Inventory, Persist,
     Restore, SpaceName, VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME, LEGACY_DUMP_FILENAMES,
@@ -113,16 +135,34 @@ const DENSE_FORMAT_VERSION: &str = "1.1.0";
 /// sparse space. See the module documentation for why it is a major.
 const SPACES_FORMAT_VERSION: &str = "2.0.0";
 
+/// Version written into manifest.json by a checkpoint of a collection
+/// holding a journal.
+///
+/// A major, by the same rule the sparse space's was. A build that reads 1.x
+/// and 2.x alone opens a journaled directory without a word: it finds every
+/// file the manifest names, ignores the `journal` field it does not know,
+/// and hands back an index missing every acknowledged mutation since the
+/// checkpoint. Nothing in the directory would tell the caller. A major stops
+/// that build at the version and says why.
+///
+/// A directory saved by a collection holding no journal keeps 1.1.0 or
+/// 2.0.0 and opens everywhere it does today, because nothing about it
+/// changed.
+const JOURNAL_FORMAT_VERSION: &str = "3.0.0";
+
 /// The majors this build reads.
 ///
-/// A minor bump is additive by construction, so any 1.x and any 2.x is read.
-/// A different major means the layout changed in a way this build cannot
-/// reason about, and guessing at it would be the silent truncation this
-/// format has already suffered once.
-const SUPPORTED_FORMAT_MAJORS: [u32; 2] = [1, 2];
+/// A minor bump is additive by construction, so any 1.x, any 2.x and any
+/// 3.x is read. A different major means the layout changed in a way this
+/// build cannot reason about, and guessing at it would be the silent
+/// truncation this format has already suffered once.
+const SUPPORTED_FORMAT_MAJORS: [u32; 3] = [1, 2, 3];
 
 /// The majors this build reads, as a refusal spells them.
-const SUPPORTED_FORMAT_LABEL: &str = "1.x and 2.x";
+const SUPPORTED_FORMAT_LABEL: &str = "1.x, 2.x and 3.x";
+
+/// The first major whose manifest may name a journal.
+const JOURNAL_FORMAT_MAJOR: u32 = 3;
 
 // ============================================================================
 // THE BINCODE CLAIM BUDGET
@@ -313,25 +353,15 @@ impl StagingDir {
     ///
     /// `<name>.zdbold` present with no target is the one case that holds data:
     /// the previous save died between the two renames and that directory is the
-    /// only copy of the index. It is renamed back rather than removed.
+    /// only copy of the index. `restore_replaced` renames it back, and a load
+    /// now does the same before it opens a directory.
     ///
-    /// `<name>.zdbold` present beside a target is the previous index after a
-    /// save that finished, so it is removed.
+    /// `<name>.zdbold` still present after that is the previous index after a
+    /// save that finished, so it is removed. Only a save removes it, because
+    /// only a save knows the target beside it is the one it wrote.
     fn recover(target: &Path, staging: &Path, replaced: &Path) -> Result<(), Error> {
-        if replaced.exists() {
-            if target.exists() {
-                remove_tree(replaced, "the previous index a finished save left aside")?;
-            } else {
-                fs::rename(replaced, target).map_err(|e| Error::RecoverRenameFailed {
-                    target: target.to_path_buf(),
-                    replaced: replaced.to_path_buf(),
-                    error: e.to_string(),
-                })?;
-                info!(target: LOG_TARGET, operation = "save_recover",
-                    restored = %target.display(),
-                    "An interrupted save had moved the index aside; it is back in place"
-                );
-            }
+        if !restore_replaced(target)? && replaced.exists() {
+            remove_tree(replaced, "the previous index a finished save left aside")?;
         }
         if staging.exists() {
             remove_tree(
@@ -356,6 +386,8 @@ impl StagingDir {
                 target: self.target.clone(),
                 error: e.to_string(),
             })?;
+
+            zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveBetweenRenames);
 
             if let Err(e) = fs::rename(&self.staging, &self.target) {
                 // The target is empty at this point, so putting the previous
@@ -389,6 +421,42 @@ impl Drop for StagingDir {
             let _ = fs::remove_dir_all(&self.staging);
         }
     }
+}
+
+/// Put back an index a save was killed between its two renames
+///
+/// `<name>.zdbold` present with no target is the one case that holds data:
+/// the save died between the two renames and that directory is the only copy
+/// of the index. It is renamed back rather than removed, and the caller then
+/// opens it.
+///
+/// `<name>.zdbold` present beside a target is the previous index after a
+/// save that finished, and this leaves it where it is. Only a save removes
+/// it, because only a save knows the target beside it is the one it wrote.
+///
+/// Reached from two places. `StagingDir::open`, so the next save puts the
+/// index back before it stages a new one, which is where it has always been
+/// reached from. And `load_index`, because recovery from a killed process is
+/// a load: until this ran there, a process killed in that window left the
+/// whole index beside the target and `load` reported the directory as not
+/// found, and only another save could put it back.
+///
+/// Returns whether it moved anything.
+pub(crate) fn restore_replaced(target: &Path) -> Result<bool, Error> {
+    let replaced = sibling(target, REPLACED_SUFFIX)?;
+    if !replaced.exists() || target.exists() {
+        return Ok(false);
+    }
+    fs::rename(&replaced, target).map_err(|e| Error::RecoverRenameFailed {
+        target: target.to_path_buf(),
+        replaced: replaced.clone(),
+        error: e.to_string(),
+    })?;
+    info!(target: LOG_TARGET, operation = "save_recover",
+        restored = %target.display(),
+        "An interrupted save had moved the index aside; it is back in place"
+    );
+    Ok(true)
 }
 
 /// Remove a directory tree, naming what it was in the failure
@@ -771,6 +839,35 @@ pub(crate) struct IndexManifest {
     /// write this ordering removes.
     pub(crate) total_size_mb: f64,
     pub(crate) compression_info: Option<CompressionInfo>,
+
+    /// The journal beside the directory, where the collection that saved it
+    /// held one.
+    ///
+    /// Absent from the file where none was held, so a directory saved
+    /// without a journal is byte for byte the directory the same records
+    /// wrote before this field existed, and its `format_version` does not
+    /// move either. Present, it is what makes the directory a 3.x one; see
+    /// `JOURNAL_FORMAT_VERSION`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) journal: Option<JournalManifest>,
+}
+
+/// How `manifest.json` names the journal beside the directory.
+///
+/// The three values are what pair a directory with a file that is not in it.
+/// `collection_id` is drawn when a collection is built and is in the
+/// journal's own header too, so a journal from another index is refused by
+/// content. `sequence` is what the journal had reached when this checkpoint
+/// was taken, so a recovery replays every record above it and skips every
+/// record at or below it. `file` is the sibling's name as the checkpoint
+/// wrote it, which a refusal quotes; the file a load actually opens is
+/// derived from the directory it was handed, so a directory renamed together
+/// with its journal opens under the new name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct JournalManifest {
+    pub(crate) file: String,
+    pub(crate) sequence: u64,
+    pub(crate) collection_id: String,
 }
 
 /// The manifest is what an index reads its artefacts' recorded lengths from.
@@ -1526,7 +1623,7 @@ fn reconstruct_index_simple(
     quantization: Option<QuantizationArtefacts>,
     sparse: Option<SparseDeclaration>,
     dump_bytes: Option<u64>,
-) -> Result<Collection, Error> {
+) -> Result<(Collection, bool), Error> {
     debug!(target: LOG_TARGET, "Creating empty index with loaded configuration...");
 
     // Step 1: Create empty index with loaded config
@@ -1571,9 +1668,10 @@ fn reconstruct_index_simple(
     // by a release this build cannot interpret falls back to the rebuild, which
     // is the path that also upgrades a graph carrying a defect the vendored
     // patches have since fixed. See `restore_graph_from_dump`.
-    match index.restore_graph_from_dump(path, config.id_counter, dump_bytes) {
+    let graph_rebuilt = match index.restore_graph_from_dump(path, config.id_counter, dump_bytes) {
         Ok(nodes) => {
             debug!(target: LOG_TARGET, "HNSW graph restored from the saved dump ({} nodes)", nodes);
+            false
         }
         Err(reason) => {
             debug!(target: LOG_TARGET, "Rebuilding the HNSW graph, because {}", reason);
@@ -1584,8 +1682,13 @@ fn reconstruct_index_simple(
                 debug!(target: LOG_TARGET, "Rebuilding HNSW graph from vectors...");
                 rebuild_graph_from_data(&mut index, &vectors, &pq_codes)?;
             }
+            true
         }
-    }
+    };
+    // An empty directory holds no dump to read, since a save of an empty
+    // index writes none, so the rebuild that runs over no records is the
+    // ordinary path rather than a graph that could not be read.
+    let graph_rebuilt = graph_rebuilt && index.vector_count() > 0;
 
     // Step 4: The stored record data, exactly as it was written, once the
     // graph is back. Neither rebuild touches the storage maps, and the
@@ -1660,7 +1763,7 @@ fn reconstruct_index_simple(
     check_restored_count(&mut index, &config, raw_count, code_count)?;
 
     debug!(target: LOG_TARGET, "Reconstruction completed!");
-    Ok(index)
+    Ok((index, graph_rebuilt))
 }
 
 /// Reconcile the stored vector count with the records that were restored
@@ -1975,10 +2078,17 @@ fn rebuild_graph_from_data(
 pub(crate) fn load_index(
     path: &str,
     tokenizer: Option<Arc<dyn Tokenizer>>,
-) -> Result<Collection, Error> {
+    policy: JournalPolicy,
+) -> Result<(Collection, Recovery), Error> {
     debug!(target: LOG_TARGET, "Starting index load with reconstruction from: {}", path);
 
     let path_buf = Path::new(path);
+
+    // A save killed between its two renames left the whole index beside the
+    // target and nothing at it. Recovery from a killed process is a load, so
+    // it is put back here, before the directory is looked for. See
+    // `restore_replaced`.
+    let restored_from_aside = restore_replaced(path_buf)?;
 
     // Validate directory exists
     if !path_buf.exists() {
@@ -1992,6 +2102,15 @@ pub(crate) fn load_index(
 
     let manifest = load_manifest(path_buf)?;
     let major = check_format_version(&manifest.format_version)?;
+
+    // A manifest below the major that names a journal is a directory
+    // assembled by hand, since no release writing that format wrote the
+    // field. The same rule the sparse space's declaration takes below.
+    if major < JOURNAL_FORMAT_MAJOR && manifest.journal.is_some() {
+        return Err(Error::FormatVersionJournal {
+            format_version: manifest.format_version.clone(),
+        });
+    }
 
     // Before any artefact is read, so a directory missing two files names the
     // first rather than failing on whichever one a partial load reaches.
@@ -2046,7 +2165,7 @@ pub(crate) fn load_index(
 
     // Phase 2: Create empty index and restore state
     debug!(target: LOG_TARGET, "Phase 2: Creating empty index and restoring state...");
-    let mut restored_index = reconstruct_index_simple(
+    let (mut restored_index, graph_rebuilt) = reconstruct_index_simple(
         path_buf,
         &manifest,
         config,
@@ -2065,7 +2184,104 @@ pub(crate) fn load_index(
     restored_index.set_created_at(manifest.created_at);
 
     debug!(target: LOG_TARGET, "Index reconstruction completed successfully!");
-    Ok(restored_index)
+
+    // Phase 3: The journal beside the directory, where the manifest names
+    // one. Nothing below runs for a directory saved without one, so such a
+    // directory loads exactly as it did.
+    let Some(record) = manifest.journal else {
+        let recovery = Recovery::unjournaled(restored_from_aside, graph_rebuilt);
+        recovery.report(path);
+        return Ok((restored_index, recovery));
+    };
+
+    let Some(directory_id) = crate::journal::collection_id_from_hex(&record.collection_id) else {
+        return Err(Error::JournalManifestInvalid {
+            detail: format!(
+                "its collection_id is '{}', which is not 32 hexadecimal digits",
+                record.collection_id
+            ),
+        });
+    };
+    restored_index.set_collection_id(directory_id);
+    restored_index.set_journal_sequence(record.sequence);
+
+    let mode = match policy {
+        JournalPolicy::CheckpointOnly => {
+            warn!(target: LOG_TARGET, operation = "load_checkpoint_only",
+                directory = path,
+                journal = %record.file,
+                sequence = record.sequence,
+                "Opened the checkpoint alone; every mutation after the sequence it holds is in \
+                 the journal beside it and was not applied"
+            );
+            let mut recovery = Recovery::unjournaled(restored_from_aside, graph_rebuilt);
+            recovery.checkpoint_sequence = record.sequence;
+            recovery.report(path);
+            return Ok((restored_index, recovery));
+        }
+        JournalPolicy::Replay(mode) => mode,
+    };
+
+    let wal = crate::journal::journal_path(path_buf)?;
+    if !wal.exists() {
+        return Err(Error::JournalMissing {
+            directory: path.to_string(),
+            file: wal.display().to_string(),
+            recorded: record.file.clone(),
+            sequence: record.sequence,
+        });
+    }
+    let file = wal.display().to_string();
+    let bytes = crate::journal::read_journal_bytes(&wal)?;
+    let contents = zeusdb_vector_core::read_journal(&bytes, &file)?;
+    crate::journal::check_contents(&contents, &file, directory_id, record.sequence)?;
+
+    // Every record above the sequence the checkpoint holds, applied at the
+    // values it names. `apply` refuses to run with a sink attached, which is
+    // why the sink goes on after this loop and not before it.
+    let dim = restored_index.dim();
+    let mut replayed = 0usize;
+    let mut skipped = 0usize;
+    for journal_record in &contents.records {
+        if journal_record.sequence <= record.sequence {
+            skipped += 1;
+            continue;
+        }
+        let operation = zeusdb_vector_core::Operation::decode(journal_record, dim, &file)?;
+        restored_index
+            .apply(operation)
+            .map_err(|error| Error::JournalReplayFailed {
+                file: file.clone(),
+                sequence: journal_record.sequence,
+                detail: error.to_string(),
+            })?;
+        replayed += 1;
+    }
+
+    // The journal is cut back to its last whole record and reopened for
+    // append after it. Where the body is empty the header is restated at the
+    // checkpoint's sequence plus one, which completes a truncation a crash
+    // left half done.
+    let writer =
+        zeusdb_vector_core::JournalWriter::open_for_append(&wal, &contents, record.sequence + 1)?;
+    restored_index.attach_sink(Box::new(crate::journal::JournalSink::from_writer(
+        writer, mode,
+    )));
+
+    let recovery = Recovery {
+        checkpoint_sequence: record.sequence,
+        first_sequence: contents.header.first_sequence,
+        records_in_journal: contents.records.len(),
+        replayed,
+        skipped,
+        damage: contents.damage.clone(),
+        good_bytes: contents.good_bytes,
+        restored_from_aside,
+        graph_rebuilt,
+        journaled: true,
+    };
+    recovery.report(path);
+    Ok((restored_index, recovery))
 }
 
 // ============================================================================
@@ -2454,8 +2670,22 @@ pub(crate) fn save_manifest(
     // directory without it, which the field's own comment states.
     let total_size_mb = calculate_directory_size(path).unwrap_or(0.0);
 
+    // The journal, where the collection holds one. Its two names come from
+    // the sink itself and the sequence from the collection, which the
+    // checkpoint wrote there after it synced, so all three describe the
+    // records the directory being written already holds.
+    let journal = index
+        .sink_journal_names()
+        .map(|(file, collection_id)| JournalManifest {
+            file,
+            sequence: index.journal_sequence(),
+            collection_id: crate::journal::collection_id_hex(collection_id),
+        });
+
     let manifest = IndexManifest {
-        format_version: if holds_spaces {
+        format_version: if journal.is_some() {
+            JOURNAL_FORMAT_VERSION.to_string()
+        } else if holds_spaces {
             SPACES_FORMAT_VERSION.to_string()
         } else {
             DENSE_FORMAT_VERSION.to_string()
@@ -2474,6 +2704,7 @@ pub(crate) fn save_manifest(
         file_digests: ledger.digests,
         total_size_mb,
         compression_info,
+        journal,
     };
 
     let manifest_json =

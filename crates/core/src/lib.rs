@@ -6,8 +6,9 @@
 //! quantizer, the graph with its dump format, the seam every index sits
 //! behind, being the index trait, the admit family and the persistence traits
 //! in `space` and `admit`, the fusion that combines several indexes'
-//! pages into one, and the write-ahead journal's format with its reader and
-//! the operations it records. The binding takes this crate as a path dependency
+//! pages into one, the write-ahead journal's format with its reader and
+//! the operations it records, and the abort hook a crash test kills a
+//! process at. The binding takes this crate as a path dependency
 //! and reaches it through the re-exports below, so the crate's surface is
 //! this file's `pub use` list and nothing else.
 //! Every module is private. An item a module marks `pub` that this file does
@@ -43,6 +44,7 @@ mod frame;
 mod fusion;
 mod graph;
 mod journal;
+mod kill;
 mod operation;
 mod pq;
 mod rng;
@@ -70,6 +72,12 @@ pub use journal::{
     JournalDamage, JournalHeader, JournalKind, JournalRecord, JournalSyncHandle, JournalWriter,
     OperationKind, JOURNAL_HEADER_BYTES, JOURNAL_MAGIC, JOURNAL_MAX_PAYLOAD,
     JOURNAL_RECORD_CHECKSUM_BYTES, JOURNAL_RECORD_HEADER_BYTES, JOURNAL_RECORD_OVERHEAD_BYTES,
+};
+// The abort hook the crash tests kill a process at. Compiled away when
+// `debug_assertions` are off, which is every profile the wheel is built
+// with; see `kill`.
+pub use kill::{
+    arm as kill_arm, armed_at as kill_armed_at, at as kill_at, disarm as kill_disarm, KillPoint,
 };
 pub use operation::{InsertParts, Operation};
 pub use pq::PQ;

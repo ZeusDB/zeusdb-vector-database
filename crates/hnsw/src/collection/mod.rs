@@ -41,8 +41,10 @@
 //! |---|---|
 //! | `apply` | a journaled operation applied at the values its record names |
 //! | `construct` | building a collection and validating the declaration |
+//! | `crash_tests` | what a killed process leaves, and what opening it recovers |
 //! | `input` | what a vector becomes once it is out of Python |
 //! | `insert` | insertion, replacement, removal, compaction, rebuild, clear |
+//! | `journal_tests` | a directory and the journal beside it |
 //! | `query` | a query over one or more arms, its plan and its fused page |
 //! | `search` | the four paths that reach the graph, and the page they build |
 //! | `training` | fitting the codebook and rebuilding over the codes |
@@ -68,9 +70,13 @@
 
 mod apply;
 mod construct;
+#[cfg(test)]
+mod crash_tests;
 mod dense;
 mod input;
 mod insert;
+#[cfg(test)]
+mod journal_tests;
 #[cfg(test)]
 mod mutation_tests;
 mod persist;
@@ -182,14 +188,22 @@ impl From<(String, Vec<f32>, HashMap<String, Value>)> for ParsedRecord {
 /// `append` per record and one `commit` per entry point call, so that
 /// nothing a search can see was left unrecorded. A term interned for a
 /// record is handed over under the text layer's dictionary guard at the
-/// moment its id is issued, so the records arrive in id order. Nothing in
-/// the engine implements this yet: a collection is built with no sink, the
-/// insert path then skips the encode, and every mutation runs as it did.
-/// What attaches one, what it does with the bytes and what a refusal
-/// costs the caller are the journal's business. A collection applying
-/// recorded operations back, through [`Collection::apply`], hands nothing
-/// here.
-pub trait OperationSink: Send {
+/// moment its id is issued, so the records arrive in id order. The engine
+/// holds one implementation, being [`crate::JournalSink`], a
+/// write-ahead journal beside the collection's directory. A collection is
+/// built with no sink, and then the insert path skips the encode and every
+/// mutation runs as it did. A collection applying recorded operations back,
+/// through [`Collection::apply`], hands nothing here.
+///
+/// Beyond the two a mutation uses, the trait carries what a checkpoint asks
+/// of the sink, being the sync, the sequence it has reached, the truncation
+/// once the directory holds those records, and the two values a manifest
+/// records so that a directory and its records are paired by content. They
+/// are on the trait rather than reached by detaching the sink around the
+/// save, because detaching and attaching each take the mutation guard and
+/// release it, and a mutation running in the window between the save and the
+/// reattachment would land in neither the directory nor the records.
+pub trait OperationSink: Send + std::fmt::Debug {
     /// Take one record's bytes. Called with `writers` held on every
     /// mutation path and with the dictionary's write guard held for an
     /// interning, and with nothing else. A refusal refuses the mutation
@@ -199,6 +213,54 @@ pub trait OperationSink: Send {
     /// Make everything appended so far durable, after the last record of a
     /// call and before the call mutates anything a search can see.
     fn commit(&mut self) -> Result<(), Error>;
+
+    /// Make everything appended so far durable whatever the policy, which a
+    /// checkpoint does before it records the sequence it is about to hold.
+    ///
+    /// The default does what [`OperationSink::commit`] does, which is right
+    /// for a sink that is already durable at every commit and wrong for one
+    /// that defers.
+    fn sync(&mut self) -> Result<(), Error> {
+        self.commit()
+    }
+
+    /// The last sequence handed over, or the first less one where nothing
+    /// has been. A checkpoint records this after it syncs, and a recovery
+    /// replays every record above it.
+    ///
+    /// A sink that carries no sequence reports zero, which is the value that
+    /// means no record was ever appended.
+    fn sequence_reached(&self) -> u64 {
+        0
+    }
+
+    /// Drop every record handed over so far, which the checkpoint that just
+    /// ran now holds. Called after the save has committed its directory and
+    /// never before.
+    fn truncate(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// The name a manifest records for this sink's file, where it has one.
+    ///
+    /// A sink that is not a file records nothing, and a directory saved by a
+    /// collection holding one is a directory with no journal.
+    fn journal_file(&self) -> Option<&str> {
+        None
+    }
+
+    /// The collection this sink's records belong to, where it names one, so
+    /// the manifest and the file's own header can be held against each
+    /// other.
+    fn journal_collection_id(&self) -> Option<u128> {
+        None
+    }
+
+    /// Where this sink's file sits, where it is a file, so a checkpoint can
+    /// be held to the directory the file belongs beside.
+    fn journal_path(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 /// Layers every graph this crate builds is created with.
@@ -884,6 +946,31 @@ pub struct Collection {
     /// recorded is settled before its first record is admitted.
     sink: MutexAt<Option<Box<dyn OperationSink>>>,
 
+    /// The collection this is, drawn once when it is built and carried for
+    /// its life.
+    ///
+    /// It exists to pair a directory with the journal beside it. A save of a
+    /// journaled collection records this in `manifest.json` and the journal's
+    /// own header carries it too, so a journal from another index is refused
+    /// by content rather than by name. A load takes it from the manifest
+    /// where one is recorded and draws a fresh one where none is, so it is
+    /// stable across a save and a load of a journaled directory and is not
+    /// carried by a directory that has never held a journal.
+    ///
+    /// Not a lock. It is drawn once when the collection is built and
+    /// replaced once, through an exclusive borrow, by a load that reads one
+    /// from a manifest, both before the collection is shared with anything.
+    collection_id: u128,
+
+    /// The sequence the checkpoint in the collection's directory holds.
+    ///
+    /// Zero on a collection that has never been journaled and on one whose
+    /// journal has had no record appended. A checkpoint syncs the sink,
+    /// writes the sequence the sink had reached here, and the manifest
+    /// records it, so a recovery replays every record above it and skips
+    /// every record at or below it.
+    journal_sequence: MutexAt<u64>,
+
     // ID-based training collection
     training_ids: RwLockAt<Vec<String>>, // Just IDs, not vectors
     training_threshold_reached: AtomicBool, // Atomic flag for safety
@@ -1053,7 +1140,82 @@ impl Collection {
     /// recorded.
     pub fn attach_sink(&self, sink: Box<dyn OperationSink>) -> Option<Box<dyn OperationSink>> {
         let _writers = self.writers.lock().unwrap();
+        self.attach_sink_locked(sink)
+    }
+
+    /// [`Collection::attach_sink`] with `writers` already held, for a caller
+    /// that attaches and checkpoints under one hold so nothing mutates
+    /// between the two.
+    pub(crate) fn attach_sink_locked(
+        &self,
+        sink: Box<dyn OperationSink>,
+    ) -> Option<Box<dyn OperationSink>> {
         self.sink.lock().unwrap().replace(sink)
+    }
+
+    /// The id that pairs this collection with the journal beside its
+    /// directory. See the field.
+    pub fn collection_id(&self) -> u128 {
+        self.collection_id
+    }
+
+    /// Take the id a directory's manifest recorded, so a collection loaded
+    /// from a journaled directory is the collection its journal names.
+    pub(crate) fn set_collection_id(&mut self, id: u128) {
+        self.collection_id = id;
+    }
+
+    /// The sequence the checkpoint in the collection's directory holds.
+    pub fn journal_sequence(&self) -> u64 {
+        *self.journal_sequence.lock().unwrap()
+    }
+
+    /// Record the sequence a checkpoint holds, or the one a load read back
+    /// from the manifest.
+    pub(crate) fn set_journal_sequence(&self, sequence: u64) {
+        *self.journal_sequence.lock().unwrap() = sequence;
+    }
+
+    /// Make every record handed over durable whatever the commit mode, and
+    /// report the sequence the sink has reached, which is what a checkpoint
+    /// records. `None` where no sink is attached.
+    ///
+    /// The mutation guard is the caller's, because a checkpoint syncs and
+    /// then saves under one hold, so nothing is handed over between the two.
+    pub(crate) fn sync_sink_locked(&self) -> Result<Option<u64>, Error> {
+        let mut sink = self.sink.lock().unwrap();
+        let Some(sink) = sink.as_mut() else {
+            return Ok(None);
+        };
+        sink.sync()?;
+        Ok(Some(sink.sequence_reached()))
+    }
+
+    /// Drop every record the sink holds, which the checkpoint that has just
+    /// committed its directory now holds itself. Does nothing where no sink
+    /// is attached. The mutation guard is the caller's.
+    pub(crate) fn truncate_sink_locked(&self) -> Result<(), Error> {
+        match self.sink.lock().unwrap().as_mut() {
+            Some(sink) => sink.truncate(),
+            None => Ok(()),
+        }
+    }
+
+    /// The file name and the collection id the sink names, for the manifest
+    /// a checkpoint writes. `None` where no sink is attached or where the
+    /// sink is not a file.
+    pub(crate) fn sink_journal_names(&self) -> Option<(String, u128)> {
+        let sink = self.sink.lock().unwrap();
+        let sink = sink.as_ref()?;
+        let file = sink.journal_file()?.to_string();
+        let id = sink.journal_collection_id()?;
+        Some((file, id))
+    }
+
+    /// The path the sink's file sits at, where it has one.
+    pub(crate) fn sink_journal_path(&self) -> Option<std::path::PathBuf> {
+        let sink = self.sink.lock().unwrap();
+        sink.as_ref()?.journal_path().map(|p| p.to_path_buf())
     }
 
     /// Detach the sink, returning it, so that nothing is recorded from now

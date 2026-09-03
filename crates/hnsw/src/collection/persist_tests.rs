@@ -449,19 +449,21 @@ fn the_version_rule_holds_in_both_directions() {
         other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
     }
 
-    // A later major, refused with the majors this build reads.
+    // A later major, refused with the majors this build reads. Three is a
+    // major this build writes and reads, so the refusal starts at four; see
+    // the journal in persistence.rs.
     let future = dir.path().join("future.zdb");
     copy_dir(&path, &future);
-    rewrite_manifest(&future, |m| m["format_version"] = json!("3.0.0"));
+    rewrite_manifest(&future, |m| m["format_version"] = json!("4.0.0"));
     let message = Collection::load(future.to_str().unwrap())
         .err()
         .unwrap()
         .to_string();
     assert!(
-        message.contains("format version 3.0.0 cannot be opened"),
+        message.contains("format version 4.0.0 cannot be opened"),
         "{message}"
     );
-    assert!(message.contains("1.x and 2.x"), "{message}");
+    assert!(message.contains("1.x, 2.x and 3.x"), "{message}");
     assert!(message.contains("newer"), "{message}");
 
     // A 2.x label on a dense-only directory opens, since the minor and the

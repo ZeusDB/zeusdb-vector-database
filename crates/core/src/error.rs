@@ -381,6 +381,38 @@ pub enum Error {
     /// A replayed record names a value the collection would not have
     /// issued, so the records and the collection do not belong together
     JournalReplayMismatch { detail: String },
+    /// The `journal` record in `manifest.json` names a value this build
+    /// cannot read
+    JournalManifestInvalid { detail: String },
+    /// A checkpoint of a journaled collection was asked for a directory
+    /// other than the one its journal sits beside
+    JournalDirectoryMismatch { journal: String, target: String },
+    /// A directory's manifest names a journal that is not beside it
+    JournalMissing {
+        directory: String,
+        file: String,
+        recorded: String,
+        sequence: u64,
+    },
+    /// The journal beside a directory belongs to another collection
+    JournalNotThisCollection {
+        file: String,
+        journal_id: String,
+        directory_id: String,
+    },
+    /// The journal's first record is above the one after the checkpoint's,
+    /// so records the checkpoint does not hold were cut from it
+    JournalStartsAfterCheckpoint {
+        file: String,
+        first: u64,
+        checkpoint: u64,
+    },
+    /// A record above the checkpoint's sequence would not apply
+    JournalReplayFailed {
+        file: String,
+        sequence: u64,
+        detail: String,
+    },
 
     // ------------------------------------------------------------------
     // The saved directory
@@ -454,6 +486,9 @@ pub enum Error {
     /// A 1.x manifest over a `config.json` that declares a sparse space,
     /// which no release writing 1.x could have produced
     FormatVersionSpaces { format_version: String },
+    /// A manifest below 3.x that names a journal, which no release writing
+    /// that format could have produced
+    FormatVersionJournal { format_version: String },
     /// Files the manifest names and the directory does not hold, in manifest
     /// order, with what the first of them holds
     ArtefactsMissing {
@@ -600,12 +635,14 @@ impl Error {
             | SparseRecordUnmapped { .. }
             | TermIdBeyondDictionary { .. }
             | SpaceRecordInvalid { .. }
-            | FormatVersionSpaces { .. } => Exception::Runtime,
+            | FormatVersionSpaces { .. }
+            | FormatVersionJournal { .. } => Exception::Runtime,
 
             ArtefactReadFailed { .. }
             | ArtefactsMissing { .. }
             | CentroidsMissing
-            | IndexDirectoryNotFound { .. } => Exception::FileNotFound,
+            | IndexDirectoryNotFound { .. }
+            | JournalMissing { .. } => Exception::FileNotFound,
 
             UnsupportedSpace { .. }
             | NoQuantizer
@@ -647,7 +684,12 @@ impl Error {
             | JournalCorrupt { .. }
             | JournalRecordInvalid { .. }
             | JournalIoFailed { .. }
-            | JournalReplayMismatch { .. } => Exception::Runtime,
+            | JournalReplayMismatch { .. }
+            | JournalManifestInvalid { .. }
+            | JournalDirectoryMismatch { .. }
+            | JournalNotThisCollection { .. }
+            | JournalStartsAfterCheckpoint { .. }
+            | JournalReplayFailed { .. } => Exception::Runtime,
         }
     }
 }
@@ -1145,6 +1187,68 @@ impl fmt::Display for Error {
                  record on was applied.",
                 detail
             ),
+            JournalDirectoryMismatch { journal, target } => write!(
+                f,
+                "This collection records its mutations to the journal {}, and a save of \
+                 it is the checkpoint that journal replays onto, so it saves to the \
+                 directory the journal sits beside and to no other. Saving to {} would \
+                 write a manifest naming a journal that is not beside it, which nothing \
+                 could open.",
+                journal, target
+            ),
+            JournalManifestInvalid { detail } => write!(
+                f,
+                "manifest.json names a journal this build cannot read: {}. A directory \
+                 saved with a journal records its file name, the collection id both it \
+                 and the directory carry, and the sequence the checkpoint holds.",
+                detail
+            ),
+            JournalMissing {
+                directory,
+                file,
+                recorded,
+                sequence,
+            } => write!(
+                f,
+                "The directory {} was saved with a journal, which its manifest names as {}, \
+                 and no journal is beside it at {}. Every mutation after sequence {} is in \
+                 that file and in no other, so opening the directory without it would lose \
+                 them without a word. Put the journal back beside the directory, or open \
+                 the checkpoint alone and accept that loss by name.",
+                directory, recorded, file, sequence
+            ),
+            JournalNotThisCollection {
+                file,
+                journal_id,
+                directory_id,
+            } => write!(
+                f,
+                "The journal {} belongs to collection {} and the directory beside it to \
+                 collection {}. A journal records one collection's mutations and cannot \
+                 be applied to another's.",
+                file, journal_id, directory_id
+            ),
+            JournalStartsAfterCheckpoint {
+                file,
+                first,
+                checkpoint,
+            } => write!(
+                f,
+                "The journal {} starts at sequence {} and the checkpoint beside it holds \
+                 sequence {}. The records between the two are in neither, so the directory \
+                 and the journal are from different histories.",
+                file, first, checkpoint
+            ),
+            JournalReplayFailed {
+                file,
+                sequence,
+                detail,
+            } => write!(
+                f,
+                "Record {} of the journal {} could not be applied: {} Nothing from that \
+                 record on was applied and the directory was not opened.",
+                sequence, file, detail
+            ),
             DecodeLengthExceeded { file, bytes } => write!(
                 f,
                 "{} declares a length its own {} bytes could not hold. A container in \
@@ -1293,6 +1397,13 @@ impl fmt::Display for Error {
                 "manifest.json declares format_version {} and config.json declares a sparse \
                  space, which no release writing that format holds. A directory holding a \
                  sparse space declares format_version 2.0.0 or later.",
+                format_version
+            ),
+            FormatVersionJournal { format_version } => write!(
+                f,
+                "manifest.json declares format_version {} and names a journal, which no \
+                 release writing that format holds. A directory saved with a journal \
+                 declares format_version 3.0.0 or later.",
                 format_version
             ),
             TokenizerRequired { space } => write!(

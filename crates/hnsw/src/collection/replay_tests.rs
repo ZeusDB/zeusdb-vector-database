@@ -59,7 +59,7 @@ impl Drop for TempDir {
 }
 
 /// What a recording sink has been handed.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Log {
     records: Vec<(OperationKind, Vec<u8>)>,
     commits: usize,
@@ -67,7 +67,7 @@ struct Log {
 
 /// A sink that keeps every record's bytes, shared with the test that
 /// attached it.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 struct Recording(Arc<Mutex<Log>>);
 
 impl Recording {
@@ -111,6 +111,7 @@ impl OperationSink for Recording {
 }
 
 /// A sink that refuses every record.
+#[derive(Debug)]
 struct Refusing;
 
 impl OperationSink for Refusing {

@@ -11,6 +11,7 @@
 use super::{
     Collection, DenseIndex, DenseOpen, LiveRecords, QuantizationConfig, StorageMode, MAX_LAYER,
 };
+use crate::journal::{JournalPolicy, Recovery};
 use crate::locks::ReadGuard;
 use crate::RawVectors;
 use crate::RerankCalibration;
@@ -21,7 +22,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
-    ArtefactRecord, Bounds, Error, Inventory, Persist, Restore, VectorGraph, DUMP_FILENAME,
+    ArtefactRecord, Bounds, CommitMode, Error, Inventory, Persist, Restore, VectorGraph,
+    DUMP_FILENAME,
 };
 use zeusdb_vector_sparse::PostingsIndex;
 use zeusdb_vector_text::{TermDictionary, Tokenizer};
@@ -204,7 +206,22 @@ impl Collection {
         }
         Ok(placed)
     }
+}
 
+/// Whether two paths name the same file, as far as this needs to know.
+///
+/// A checkpoint compares the journal it holds open with the journal the
+/// directory it is being asked to save to would sit beside. Both are ordinary
+/// paths a caller wrote, so they are made absolute first, since `index.zdb`
+/// and `./index.zdb` are the same directory and compare unequal as written.
+/// Neither is canonicalised, because the target of a first save does not
+/// exist yet and canonicalising a path that does not exist fails.
+fn same_file_path(one: &Path, two: &Path) -> bool {
+    let absolute = |path: &Path| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    absolute(one) == absolute(two)
+}
+
+impl Collection {
     /// Save the index to a directory.
     ///
     /// Four phases under one hold of the mutation lock: the artefacts, the
@@ -220,6 +237,72 @@ impl Collection {
         // vectors came from different instants. This takes the mutation lock
         // instead, which blocks a concurrent write and no reader at all.
         let _writers = self.writers.lock().unwrap();
+        self.save_locked(path)
+    }
+
+    /// The save, and the checkpoint it is on a journaled collection, with
+    /// the mutation guard already held.
+    ///
+    /// On a collection with no sink attached this is the four phases and
+    /// nothing else, and the directory it writes is byte for byte the
+    /// directory the four phases have always written.
+    ///
+    /// On a journaled collection three things wrap them.
+    ///
+    /// The journal is synced first, whatever the commit mode the sink was
+    /// given, and the sequence it has reached is written onto the collection
+    /// so that phase three records it in the manifest. Syncing before the
+    /// phases rather than after is what makes the pair consistent: every
+    /// record the manifest claims is on the device before a byte of the
+    /// directory is written.
+    ///
+    /// Then the four phases, under the one hold this already has, so the
+    /// directory that is committed holds exactly the mutations at or below
+    /// the sequence it names.
+    ///
+    /// Then the journal is truncated, in the two steps the writer makes each
+    /// durable on its own. A crash before the truncation leaves records the
+    /// new directory already holds, which a recovery skips by sequence. A
+    /// crash between the two steps leaves an empty body under a header naming
+    /// the old first sequence, which the reader accepts and the next open
+    /// completes. A crash after both is the ordinary state.
+    pub(crate) fn save_locked(&self, path: &str) -> Result<(), Error> {
+        // A checkpoint saves to the directory its journal sits beside and to
+        // no other, because the manifest it writes names that journal as a
+        // sibling and a directory whose sibling is elsewhere is one nothing
+        // can open.
+        if let Some(journal) = self.sink_journal_path() {
+            let wanted = crate::journal::journal_path(Path::new(path))?;
+            if !same_file_path(&journal, &wanted) {
+                return Err(Error::JournalDirectoryMismatch {
+                    journal: journal.display().to_string(),
+                    target: path.to_string(),
+                });
+            }
+        }
+        // Every record handed over is on the device before the directory
+        // that will claim them is written.
+        if let Some(reached) = self.sync_sink_locked()? {
+            self.set_journal_sequence(reached);
+            debug!(target: LOG_TARGET, operation = "checkpoint_sync",
+                sequence = reached,
+                "The journal is synced and the checkpoint will name its sequence"
+            );
+        }
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::CheckpointBeforeSave);
+        self.save_phases(path)?;
+        zeusdb_vector_core::kill_at(
+            zeusdb_vector_core::KillPoint::CheckpointAfterSaveBeforeTruncate,
+        );
+        // The directory now holds every record at or below the sequence it
+        // names, so the journal need hold none of them.
+        self.truncate_sink_locked()?;
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::CheckpointAfterTruncate);
+        Ok(())
+    }
+
+    /// The four phases, with the mutation guard already held.
+    fn save_phases(&self, path: &str) -> Result<(), Error> {
         let start_time = Instant::now();
         info!(target: LOG_TARGET, operation = "save_start", path = path, "Starting index save");
 
@@ -234,22 +317,26 @@ impl Collection {
         // Phase 1: Save all ZeusDB components (already tested to work)
         debug!(target: LOG_TARGET, operation = "save_phase1", "Saving ZeusDB components");
         let mut ledger = crate::persistence::save_index(self, staging.path())?;
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterArtefacts);
 
         // Phase 2: Save the HNSW graph in ZeusDB's own format
         debug!(target: LOG_TARGET, operation = "save_phase2", "Saving HNSW graph");
         self.save_hnsw_graph(staging.path(), &mut ledger)?;
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterDump);
 
         // Phase 3: The manifest, last, because it records a length and a digest
         // for every artefact above and the directory size all of them add up
         // to.
         debug!(target: LOG_TARGET, operation = "save_phase3", "Writing the manifest");
         crate::persistence::save_manifest(self, staging.path(), ledger)?;
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterManifest);
 
         // Phase 4: Two renames, or one where nothing is there yet.
         debug!(target: LOG_TARGET, operation = "save_phase4",
             "Moving the saved index into place"
         );
         staging.commit()?;
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterCommit);
 
         let duration_ms = start_time.elapsed().as_millis();
         info!(target: LOG_TARGET, operation = "save_complete",
@@ -336,7 +423,112 @@ impl Collection {
     /// recorded is refused, and so is one handed to a directory that takes
     /// no text.
     pub fn load_with(path: &str, tokenizer: Option<Arc<dyn Tokenizer>>) -> Result<Self, Error> {
-        crate::persistence::load_index(path, tokenizer)
+        crate::persistence::load_index(
+            path,
+            tokenizer,
+            JournalPolicy::Replay(crate::journal::DEFAULT_COMMIT_MODE),
+        )
+        .map(|(index, _)| index)
+    }
+
+    /// Open a directory and say what recovering it took.
+    ///
+    /// What [`Collection::load_with`] does, with the report it discards.
+    /// The commit mode is the sink's from here on, so a caller that means to
+    /// keep writing to the journal names the one it wants.
+    ///
+    /// The order matters and is the whole of recovery. The index a save was
+    /// killed between its two renames left aside is put back first, because
+    /// otherwise there is no directory to open. The checkpoint is read as it
+    /// always was. The journal beside it is held to the checkpoint by
+    /// collection id and by sequence. Every record above the sequence the
+    /// checkpoint holds is applied, in order, at the internal id and the
+    /// level it names. Only then is a sink attached, because
+    /// [`Collection::apply`] refuses to run with one attached and a replay is
+    /// not a new mutation.
+    ///
+    /// A record that will not apply refuses the open, naming the sequence,
+    /// and the collection is as it was before that record. So is a corrupt
+    /// middle, a journal whose header names another collection, and a
+    /// journal whose first record sits above the one after the checkpoint's.
+    /// A torn tail is not a refusal: the records before it are whole, they
+    /// are replayed, and the journal is cut back to them.
+    pub fn recover(
+        path: &str,
+        tokenizer: Option<Arc<dyn Tokenizer>>,
+        mode: CommitMode,
+    ) -> Result<(Self, Recovery), Error> {
+        crate::persistence::load_index(path, tokenizer, JournalPolicy::Replay(mode))
+    }
+
+    /// Open a directory's checkpoint and leave the journal beside it alone.
+    ///
+    /// The escape hatch for a directory copied without its sibling, which is
+    /// what [`Error::JournalMissing`] tells the caller about. Every mutation
+    /// after the sequence the checkpoint holds is in the journal and is not
+    /// applied here, the file is neither read nor reopened, and no sink is
+    /// attached, so the collection this returns records nothing until one is.
+    /// A record is written to the log at `warn` saying so.
+    pub fn load_checkpoint_only(
+        path: &str,
+        tokenizer: Option<Arc<dyn Tokenizer>>,
+    ) -> Result<Self, Error> {
+        crate::persistence::load_index(path, tokenizer, JournalPolicy::CheckpointOnly)
+            .map(|(index, _)| index)
+    }
+
+    /// Journal this collection to `dir`, writing the checkpoint the journal
+    /// replays onto and attaching a sink over it.
+    ///
+    /// # Why the checkpoint is written here
+    ///
+    /// A journal is a list of mutations since a checkpoint, so it is worth
+    /// nothing without one. A collection that has never been saved has no
+    /// `config.json` to replay onto, and a journal opened beside a directory
+    /// that does not exist would record a million inserts that no recovery
+    /// could apply. So turning the journal on writes the empty checkpoint
+    /// itself, and from that moment the directory and the file beside it are
+    /// a pair. A caller who never calls [`Collection::save`] again keeps a
+    /// directory holding the empty checkpoint and a journal holding every
+    /// mutation, which opens and replays in full; what they pay for never
+    /// checkpointing is an open that runs at insert speed, which any later
+    /// save collapses.
+    ///
+    /// The path is named here rather than at `create()` because this is the
+    /// first moment the engine has one. The declaration a collection is built
+    /// from carries no directory.
+    ///
+    /// # The order
+    ///
+    /// The mutation guard is held for the whole of it, so nothing is
+    /// recorded that the checkpoint does not hold and nothing is held that
+    /// is not recorded. The file is created first, because the manifest
+    /// names it and a manifest naming a file that was never created is a
+    /// directory this build refuses to open. Then the sink is attached. Then
+    /// the save runs as a checkpoint, which syncs a journal with no records,
+    /// records sequence zero, writes a manifest naming the file at format
+    /// 3.0.0, and truncates a journal that is already empty.
+    ///
+    /// A process killed between the file and the save leaves a journal with
+    /// no directory, which nothing opens and the next call replaces.
+    pub fn journal_to(&self, dir: &str, mode: CommitMode) -> Result<(), Error> {
+        let _writers = self.writers.lock().unwrap();
+        if self.sink_attached() {
+            return Err(Error::Engine(
+                "This collection already hands its records to a sink, so opening a journal for                  it would leave the records of one call in two places. A collection is                  journaled once."
+                    .to_string(),
+            ));
+        }
+        let target = Path::new(dir);
+        let wal = crate::journal::journal_path(target)?;
+        info!(target: LOG_TARGET, operation = "journal_open",
+            directory = dir,
+            journal = %wal.display(),
+            "Opening a journal beside the directory and writing the checkpoint it replays onto"
+        );
+        let sink = crate::journal::JournalSink::create(&wal, self.collection_id(), mode)?;
+        self.attach_sink_locked(Box::new(sink));
+        self.save_locked(dir)
     }
 
     /// Install the sparse space's index read back from its artefact, under
