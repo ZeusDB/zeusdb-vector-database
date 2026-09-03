@@ -158,6 +158,10 @@ pub mod order {
     /// any guard may be held while it is taken and none may be taken under
     /// it.
     pub const JOURNAL: u8 = AFTER_LEAVES + 2;
+    /// A leaf. The sequence the checkpoint in the collection's directory
+    /// holds, written by a checkpoint under `writers` and read by the save
+    /// that writes the manifest naming it.
+    pub const JOURNAL_SEQUENCE: u8 = AFTER_LEAVES + 3;
 
     /// The first space's four ranks, by the names the collection's
     /// documentation uses for them.
@@ -175,7 +179,7 @@ pub mod order {
     /// Compiled under `cfg(test)` alone, because the test is its only reader and
     /// a release build otherwise warns that it is never used.
     #[cfg(test)]
-    pub const HIGHEST: u8 = JOURNAL;
+    pub const HIGHEST: u8 = JOURNAL_SEQUENCE;
 
     /// Which space a rank in the space block or the leaf block belongs to,
     /// and which of its guards it is. `None` for a collection rank.
@@ -225,6 +229,7 @@ fn name_of(rank: u8) -> String {
         order::CREATED_AT => Some("created_at"),
         order::GENERATED_IDS => Some("generated_ids"),
         order::JOURNAL => Some("journal"),
+        order::JOURNAL_SEQUENCE => Some("journal_sequence"),
         _ => None,
     };
     if let Some(name) = fixed {

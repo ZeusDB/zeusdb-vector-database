@@ -793,6 +793,29 @@ impl JournalWriter {
         Ok(sequence)
     }
 
+    /// Write the first `bytes` of the record and no more, leaving the
+    /// sequence where it was.
+    ///
+    /// What a process killed inside one `write_all` leaves, reproduced on
+    /// purpose so a crash test can leave it deliberately. The caller aborts
+    /// straight afterwards, so the writer is not usable after this and the
+    /// sequence is deliberately not advanced. Debug builds only, since it is
+    /// the crash tests' and nothing else's.
+    #[cfg(debug_assertions)]
+    pub fn append_torn(
+        &mut self,
+        kind: OperationKind,
+        payload: &[u8],
+        bytes: usize,
+    ) -> Result<(), Error> {
+        encode_journal_record(self.next_sequence, kind, payload, &mut self.buffer);
+        let cut = bytes.min(self.buffer.len());
+        (&*self.file)
+            .write_all(&self.buffer[..cut])
+            .map_err(Self::io(&self.path, "append to"))?;
+        self.file.sync_data().map_err(Self::io(&self.path, "sync"))
+    }
+
     /// Make everything appended so far durable under `mode`.
     pub fn commit(&mut self, mode: CommitMode) -> Result<(), Error> {
         match mode {
@@ -816,8 +839,11 @@ impl JournalWriter {
     /// reader accepts as a journal with no records, and the next
     /// [`open_for_append`](Self::open_for_append) completes the second step.
     pub fn truncate(&mut self) -> Result<(), Error> {
+        crate::kill_at(crate::KillPoint::TruncateBefore);
         self.cut_body()?;
+        crate::kill_at(crate::KillPoint::TruncateAfterSetLen);
         self.restate_header(self.next_sequence)?;
+        crate::kill_at(crate::KillPoint::TruncateAfterHeader);
         (&*self.file)
             .seek(SeekFrom::End(0))
             .map_err(Self::io(&self.path, "seek"))

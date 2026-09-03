@@ -597,6 +597,20 @@ impl Declaration {
     }
 }
 
+/// Draw the id that pairs a collection with the journal beside its
+/// directory.
+///
+/// Two collections must not draw the same value, since the pairing check
+/// would then admit one collection's journal onto another's directory. The
+/// draw is the process's entropy source through `rand::rng`, which is seeded
+/// from the operating system and is not the seeded generator every
+/// reproducible draw in the engine uses. Nothing about an index reproduces
+/// this value and nothing should.
+fn draw_collection_id() -> u128 {
+    use rand::RngExt;
+    rand::rng().random()
+}
+
 impl Collection {
     /// Build a collection from a validated declaration.
     ///
@@ -813,6 +827,8 @@ impl Collection {
             vector_count: MutexAt::new(order::VECTOR_COUNT, 0),
             writers: MutexAt::new(order::WRITERS, ()),
             sink: MutexAt::new(order::JOURNAL, None),
+            collection_id: draw_collection_id(),
+            journal_sequence: MutexAt::new(order::JOURNAL_SEQUENCE, 0),
             training_ids: RwLockAt::new(order::TRAINING_IDS, Vec::new()),
             training_threshold_reached: AtomicBool::new(false),
             created_at: RwLockAt::new(order::CREATED_AT, Utc::now().to_rfc3339()),

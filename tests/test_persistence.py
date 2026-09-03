@@ -982,9 +982,10 @@ def test_persistence_drops_raw_vectors_from_an_old_quantized_only_directory(tmp_
 def test_persistence_format_version_gate(tmp_path):
     """A later minor is read, a major this build does not know is refused.
 
-    Minor bumps are additive by construction, so any 1.x and any 2.x is
-    accepted. A different major means the layout changed in a way this build
-    cannot reason about, and guessing at it is how a format loses data quietly.
+    Minor bumps are additive by construction, so any 1.x, any 2.x and any 3.x
+    is accepted. A different major means the layout changed in a way this
+    build cannot reason about, and guessing at it is how a format loses data
+    quietly.
     """
     vdb = VectorDatabase()
     source = tmp_path / "versioned.zdb"
@@ -1004,13 +1005,16 @@ def test_persistence_format_version_gate(tmp_path):
     assert vdb.load(str(with_version("1.9.3", "v193.zdb"))).get_vector_count() == 1
 
     # A 2.x label on a dense-only directory is read as well: 2.0.0 is what a
-    # directory holding a sparse space declares, and the loader reads both
-    # majors. A third major is what it refuses.
+    # directory holding a sparse space declares. A 3.x label is read too:
+    # 3.0.0 is what a directory saved beside a journal declares. A fourth
+    # major is what the loader refuses.
     assert vdb.load(str(with_version("2.0.0", "v200.zdb"))).get_vector_count() == 1
     assert vdb.load(str(with_version("2.4.1", "v241.zdb"))).get_vector_count() == 1
+    assert vdb.load(str(with_version("3.0.0", "v300.zdb"))).get_vector_count() == 1
+    assert vdb.load(str(with_version("3.2.5", "v325.zdb"))).get_vector_count() == 1
 
-    with pytest.raises(RuntimeError, match=r"format version 3.0.0 cannot be opened"):
-        vdb.load(str(with_version("3.0.0", "v300.zdb")))
+    with pytest.raises(RuntimeError, match=r"format version 4.0.0 cannot be opened"):
+        vdb.load(str(with_version("4.0.0", "v400.zdb")))
 
     with pytest.raises(RuntimeError, match=r"not a version this build can interpret"):
         vdb.load(str(with_version("banana", "vbanana.zdb")))
@@ -2657,6 +2661,35 @@ def test_an_index_moved_aside_by_a_killed_save_is_put_back(tmp_path):
 
     assert sorted(p.name for p in tmp_path.iterdir()) == ["window.zdb"]
     assert VectorDatabase().load(str(path)).get_vector_count() == 1
+
+
+def test_an_index_moved_aside_by_a_killed_save_is_put_back_by_a_load(tmp_path):
+    """Recovery from a killed save is a load, not only the next save.
+
+    A process killed between the two renames leaves the whole index at
+    `<name>.zdbold` and nothing at `<name>`. Until this, only the next save
+    put it back and a load reported the directory as not found, so a caller
+    whose next act was to read had lost the index with no way to know where
+    it had gone. The load now puts it back first.
+
+    A `<name>.zdbold` sitting beside a directory that does exist is the
+    previous index after a save that finished, and a load leaves that where
+    it is: only a save knows which of the two it wrote.
+    """
+    path, _, _ = _saved(tmp_path, "reopened.zdb")
+    expected = VectorDatabase().load(str(path)).get_vector_count()
+    aside = tmp_path / "reopened.zdb.zdbold"
+    os.rename(path, aside)
+    assert not path.exists()
+
+    assert VectorDatabase().load(str(path)).get_vector_count() == expected
+    assert path.is_dir()
+    assert not aside.exists()
+
+    # One beside a live directory is left alone.
+    shutil.copytree(path, aside)
+    assert VectorDatabase().load(str(path)).get_vector_count() == expected
+    assert aside.is_dir()
 
 
 @pytest.mark.parametrize("quantized", [False, True])

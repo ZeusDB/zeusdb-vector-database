@@ -1158,6 +1158,12 @@ impl Collection {
         let mut buffer: Vec<u8> = Vec::new();
         let mut seen: HashSet<String> = HashSet::with_capacity(parsed_data.len());
         let mut pending = parsed_data.into_iter().peekable();
+        // Five of the six points a crash test aborts an `add` at, each named
+        // where the step it follows finishes. The sixth is inside the sink,
+        // which is what writes half a record. All of them are compiled away
+        // when `debug_assertions` are off; see `zeusdb_vector_core::kill_at`.
+        let mut handed_over = 0usize;
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::AddBeforeFirstAppend);
         while pending.peek().is_some() {
             let limit = self.segment_limit();
             let mut segment: Vec<Result<Admitted, InsertError>> = Vec::new();
@@ -1167,9 +1173,16 @@ impl Collection {
                 let outcome = self.admit(record, &mut seen, attached, &mut buffer);
                 if outcome.is_ok() {
                     admitted += 1;
+                    handed_over += 1;
+                    if handed_over == 2 {
+                        zeusdb_vector_core::kill_at(
+                            zeusdb_vector_core::KillPoint::AddAfterSecondAppend,
+                        );
+                    }
                 }
                 segment.push(outcome);
             }
+            zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::AddAfterAppendBeforeCommit);
 
             // One commit for the segment, before any of it is installed. A
             // commit that fails refuses every record it was to make durable
@@ -1202,6 +1215,7 @@ impl Collection {
                     return (inserted_ids, errors);
                 }
             }
+            zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::AddAfterCommitBeforeApply);
 
             for outcome in segment {
                 let admitted = match outcome {
@@ -1246,6 +1260,7 @@ impl Collection {
             }
         }
 
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::AddAfterApply);
         (inserted_ids, errors)
     }
 

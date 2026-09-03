@@ -8,8 +8,10 @@
 //! are the rerank rule, being how far a quantized search over-fetches before
 //! it rescores against raw vectors and how that depth is measured on the
 //! index's own data, the lock rank registry, being every lock the index
-//! holds with its place in the declared acquisition order, and the
-//! persistence of a saved directory. Nothing here names Python. The binding
+//! holds with its place in the declared acquisition order, the persistence
+//! of a saved directory, and the write-ahead journal beside one, being the
+//! sink every mutation's record reaches and the recovery that replays it
+//! back. Nothing here names Python. The binding
 //! holds the `#[pyclass]` that wraps a `Collection` by value, parses every
 //! argument, releases the interpreter lock around the call and converts what
 //! comes back.
@@ -31,7 +33,7 @@
 //! `zeusdb_vector_database::...`, the module path it carried in the binding,
 //! rather than taking this crate's name from `module_path!()`, for the reason
 //! the crate root of zeusdb-vector-core gives. See `LOG_TARGET` at the top of
-//! each file under `collection/` and in `persistence.rs`.
+//! each file under `collection/`, in `persistence.rs` and in `journal.rs`.
 //!
 //! # Tests
 //!
@@ -40,6 +42,7 @@
 #![warn(unreachable_pub)]
 
 mod collection;
+mod journal;
 pub mod locks;
 mod persistence;
 mod rerank;
@@ -50,6 +53,9 @@ pub use collection::{
     QuantizerReport, Query, QueryHit, QueryHits, RebuildPlan, RecordView, SpaceConfig, SparseHalf,
     SparseHits, StorageMode, TextConfig, DEFAULT_FETCH_PER_K, DEFAULT_SPACE, MAX_ARMS,
 };
+pub use journal::{
+    journal_path, JournalPolicy, JournalSink, Recovery, DEFAULT_COMMIT_MODE, JOURNAL_SUFFIX,
+};
 pub use rerank::{
     calibrate_rerank_from_sample, default_rerank_fetch, prepare_reconstruction, raw_distance_fn,
     reconstruction_needs_unit, rescore_candidate, take_best, RawVectors, RerankCalibration,
@@ -57,8 +63,8 @@ pub use rerank::{
     RERANK_CALIBRATION_TOP_K,
 };
 pub use zeusdb_vector_core::{
-    Contribution, Cost, Fusion, IdfScope, Operation, OperationKind, SpaceKind, SpaceName,
-    DEFAULT_RRF_K,
+    kill_arm, kill_disarm, CommitMode, Contribution, Cost, Fusion, IdfScope, JournalDamage,
+    Operation, OperationKind, SpaceKind, SpaceName, DEFAULT_RRF_K,
 };
 pub use zeusdb_vector_sparse::{SparseConfig, Unlink, Weighting};
 pub use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerConfig};
