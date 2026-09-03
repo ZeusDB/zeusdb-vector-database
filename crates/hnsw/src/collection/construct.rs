@@ -812,6 +812,7 @@ impl Collection {
             generated_ids: MutexAt::new(order::GENERATED_IDS, 0),
             vector_count: MutexAt::new(order::VECTOR_COUNT, 0),
             writers: MutexAt::new(order::WRITERS, ()),
+            sink: MutexAt::new(order::JOURNAL, None),
             training_ids: RwLockAt::new(order::TRAINING_IDS, Vec::new()),
             training_threshold_reached: AtomicBool::new(false),
             created_at: RwLockAt::new(order::CREATED_AT, Utc::now().to_rfc3339()),

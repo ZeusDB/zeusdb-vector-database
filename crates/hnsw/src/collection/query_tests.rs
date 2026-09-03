@@ -320,7 +320,7 @@ fn a_filter_admitting_every_live_record_is_planned_as_no_filter() {
     // A filter leaving one live record out is a bitmap.
     let mut metadata = HashMap::new();
     metadata.insert("cat".to_string(), json!("other"));
-    assert!(collection.update_metadata("r00001", metadata));
+    assert!(collection.update_metadata("r00001", metadata).unwrap());
     let most = collection
         .query(&Query {
             filter: Some(&all),

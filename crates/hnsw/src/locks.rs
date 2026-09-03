@@ -100,7 +100,9 @@ use std::sync::{LockResult, Mutex, PoisonError, RwLock};
 /// express, so they take the bottom ranks: anything may be held while one of
 /// them is taken, and none of them may be held while anything else is. That is
 /// the weaker half of the claim, and it is the half a rank can state without
-/// inventing a rule the code has not agreed to.
+/// inventing a rule the code has not agreed to. The journal sink is the
+/// last leaf, below them all, because it is taken under `writers` on the
+/// mutation paths and under the dictionary's guard for an interning.
 pub mod order {
     /// The mutation lock, taken by a Python entry point before any guard.
     pub const WRITERS: u8 = 0;
@@ -150,6 +152,12 @@ pub mod order {
     pub const CREATED_AT: u8 = AFTER_LEAVES;
     /// A leaf, taken by `generate_id` alone and held across nothing.
     pub const GENERATED_IDS: u8 = AFTER_LEAVES + 1;
+    /// A leaf below every other rank. The sink a mutation hands its record
+    /// to, taken with `writers` held and nothing else on the mutation paths
+    /// and with the text layer's dictionary guard held for an interning, so
+    /// any guard may be held while it is taken and none may be taken under
+    /// it.
+    pub const JOURNAL: u8 = AFTER_LEAVES + 2;
 
     /// The first space's four ranks, by the names the collection's
     /// documentation uses for them.
@@ -167,7 +175,7 @@ pub mod order {
     /// Compiled under `cfg(test)` alone, because the test is its only reader and
     /// a release build otherwise warns that it is never used.
     #[cfg(test)]
-    pub const HIGHEST: u8 = GENERATED_IDS;
+    pub const HIGHEST: u8 = JOURNAL;
 
     /// Which space a rank in the space block or the leaf block belongs to,
     /// and which of its guards it is. `None` for a collection rank.
@@ -216,6 +224,7 @@ fn name_of(rank: u8) -> String {
         order::VECTOR_COUNT => Some("vector_count"),
         order::CREATED_AT => Some("created_at"),
         order::GENERATED_IDS => Some("generated_ids"),
+        order::JOURNAL => Some("journal"),
         _ => None,
     };
     if let Some(name) = fixed {

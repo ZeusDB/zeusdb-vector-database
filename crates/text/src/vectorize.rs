@@ -54,13 +54,35 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    count_record_with(dictionary, terms, |_, _| Ok(()))
+}
+
+/// [`count_record`], with `issued` called for every term this call gives
+/// an id to, at the moment of issue, with the id and the term. A refusal
+/// from `issued` stops the count, after the term was interned. What a
+/// caller recording each interning as it happens counts through.
+pub fn count_record_with<I, S, F>(
+    dictionary: &mut TermDictionary,
+    terms: I,
+    mut issued: F,
+) -> Result<SparseVector, Error>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+    F: FnMut(u32, &str) -> Result<(), Error>,
+{
     let mut ids: Vec<u32> = Vec::new();
     for term in terms {
         let term = term.as_ref();
         if term.is_empty() {
             continue;
         }
-        ids.push(dictionary.intern(term)?);
+        let before = dictionary.len();
+        let id = dictionary.intern(term)?;
+        if dictionary.len() > before {
+            issued(id, term)?;
+        }
+        ids.push(id);
     }
     Ok(count(ids))
 }
@@ -163,6 +185,35 @@ mod tests {
         assert_eq!(
             count_record(&mut two, ["", "fox", ""]).unwrap().dims,
             vec![1]
+        );
+
+        // The observed form reports each new term once, at the id it took,
+        // and nothing for a term already held or a repeat inside the call.
+        let mut three = TermDictionary::new();
+        three.intern("the").unwrap();
+        let mut issued = Vec::new();
+        let counted = count_record_with(&mut three, &terms, |id, term| {
+            issued.push((id, term.to_string()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(counted, by_terms);
+        assert_eq!(
+            issued,
+            vec![
+                (1, "fox".to_string()),
+                (2, "dog".to_string()),
+                (3, "end".to_string())
+            ]
+        );
+        let refused = count_record_with(&mut three, ["new"], |_, _| {
+            Err(Error::TokenizerFailed("no".into()))
+        });
+        assert!(refused.is_err());
+        assert_eq!(
+            three.id_of("new"),
+            Some(4),
+            "the term was interned before the refusal"
         );
 
         let query = "dog dog cat THE";

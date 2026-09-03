@@ -39,6 +39,7 @@
 //!
 //! | module | what it covers |
 //! |---|---|
+//! | `apply` | a journaled operation applied at the values its record names |
 //! | `construct` | building a collection and validating the declaration |
 //! | `input` | what a vector becomes once it is out of Python |
 //! | `insert` | insertion, replacement, removal, compaction, rebuild, clear |
@@ -65,6 +66,7 @@
 //! once, as `LOG_TARGET`, and every macro call and every `#[instrument]`
 //! attribute in it passes that constant.
 
+mod apply;
 mod construct;
 mod dense;
 mod input;
@@ -77,6 +79,8 @@ mod persist_tests;
 mod query;
 #[cfg(test)]
 mod query_tests;
+#[cfg(test)]
+mod replay_tests;
 mod search;
 #[cfg(test)]
 mod spaces_tests;
@@ -107,11 +111,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, Bitmap, ColumnStore, Error, Filter, Persist, Selection, SpaceName,
-    SparseVector, VectorGraph, VectorIndex, PQ,
+    matches_filter, Bitmap, ColumnStore, Error, Filter, Operation, OperationKind, Persist,
+    Selection, SpaceName, SparseVector, VectorGraph, VectorIndex, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
-use zeusdb_vector_text::{count_record, TermDictionary, Tokenizer, TokenizerConfig};
+use zeusdb_vector_text::{count_record_with, TermDictionary, Tokenizer, TokenizerConfig};
 
 /// The target every record this file emits carries. See the module
 /// documentation.
@@ -169,6 +173,32 @@ impl From<(String, Vec<f32>, HashMap<String, Value>)> for ParsedRecord {
             metadata,
         }
     }
+}
+
+/// Where a mutation's record goes, once something is attached to take it.
+///
+/// Every durable mutation is encoded as an [`Operation`] record and handed
+/// here before it runs, under `writers` and before any storage guard, one
+/// `append` per record and one `commit` per entry point call, so that
+/// nothing a search can see was left unrecorded. A term interned for a
+/// record is handed over under the text layer's dictionary guard at the
+/// moment its id is issued, so the records arrive in id order. Nothing in
+/// the engine implements this yet: a collection is built with no sink, the
+/// insert path then skips the encode, and every mutation runs as it did.
+/// What attaches one, what it does with the bytes and what a refusal
+/// costs the caller are the journal's business. A collection applying
+/// recorded operations back, through [`Collection::apply`], hands nothing
+/// here.
+pub trait OperationSink: Send {
+    /// Take one record's bytes. Called with `writers` held on every
+    /// mutation path and with the dictionary's write guard held for an
+    /// interning, and with nothing else. A refusal refuses the mutation
+    /// before it runs, with the error carried out to the caller.
+    fn append(&mut self, kind: OperationKind, payload: &[u8]) -> Result<(), Error>;
+
+    /// Make everything appended so far durable, after the last record of a
+    /// call and before the call mutates anything a search can see.
+    fn commit(&mut self) -> Result<(), Error>;
 }
 
 /// Layers every graph this crate builds is created with.
@@ -736,6 +766,11 @@ pub(crate) struct TextLayer {
 /// any of the above but no index guard may be taken under them, which no path
 /// does.
 ///
+/// `sink` is the last leaf, below every rank above. A mutation takes it with
+/// `writers` held and nothing else, and an interning takes it with the
+/// dictionary's write guard held, so anything may be held while it is taken
+/// and nothing is taken under it.
+///
 /// Taking the same guard twice on one thread is forbidden even for reads.
 /// The standard library queues readers behind a waiting writer, so a second
 /// read on the thread already holding one deadlocks the moment a writer lands
@@ -841,6 +876,13 @@ pub struct Collection {
     /// guard, so the helpers never take it and cannot deadlock against the
     /// caller that owns it.
     writers: MutexAt<()>,
+
+    /// Where every mutation's record goes, once something is attached; see
+    /// [`OperationSink`]. `None` on every collection this crate builds, so
+    /// the insert path encodes nothing and no mutation waits on anything.
+    /// Attached and detached under `writers`, so whether a batch is
+    /// recorded is settled before its first record is admitted.
+    sink: MutexAt<Option<Box<dyn OperationSink>>>,
 
     // ID-based training collection
     training_ids: RwLockAt<Vec<String>>, // Just IDs, not vectors
@@ -977,17 +1019,87 @@ impl Collection {
     /// an id to every term not seen before, under the dictionary's guard
     /// taken alone.
     ///
-    /// Reached from `add_single_vector` alone, under `writers`, so a term id
-    /// is issued only while the mutation guard is held and the record's
-    /// postings are written under the same hold. There is deliberately no
-    /// public way to count terms outside it: a caller holding ids across a
-    /// gap in the guard would hold ids a `clear` in that gap could reissue.
-    /// Refused where the collection declares no sparse space, or one that
-    /// takes term ids alone.
+    /// Reached from the insert path's admission alone, under `writers`, so a
+    /// term id is issued only while the mutation guard is held and the
+    /// record's postings are written under the same hold. There is
+    /// deliberately no public way to count terms outside it: a caller
+    /// holding ids across a gap in the guard would hold ids a `clear` in
+    /// that gap could reissue. Refused where the collection declares no
+    /// sparse space, or one that takes term ids alone.
+    ///
+    /// Every term given an id here is handed to the sink as an
+    /// [`Operation::Intern`] at the moment of issue, under the dictionary's
+    /// guard, so the records arrive in id order and each precedes the
+    /// insert whose sparse half carries the id. A sink that refuses the
+    /// record refuses the count, with the term interned, which is the state
+    /// a replay of the records before it reaches.
     fn count_record_terms(&self, terms: &[String]) -> Result<SparseVector, Error> {
         let layer = self.text_layer()?;
         let mut dictionary = layer.dictionary.write().unwrap();
-        count_record(&mut dictionary, terms)
+        count_record_with(&mut dictionary, terms, |term_id, term| {
+            self.record(|| Operation::Intern {
+                term_id,
+                term: term.to_string(),
+            })
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // The seam
+    // ------------------------------------------------------------------
+
+    /// Attach the sink every mutation from now on hands its records to,
+    /// returning the one it replaces. Under `writers`, so no batch is half
+    /// recorded.
+    pub fn attach_sink(&self, sink: Box<dyn OperationSink>) -> Option<Box<dyn OperationSink>> {
+        let _writers = self.writers.lock().unwrap();
+        self.sink.lock().unwrap().replace(sink)
+    }
+
+    /// Detach the sink, returning it, so that nothing is recorded from now
+    /// on. Under `writers`, as [`Collection::attach_sink`] is.
+    pub fn detach_sink(&self) -> Option<Box<dyn OperationSink>> {
+        let _writers = self.writers.lock().unwrap();
+        self.sink.lock().unwrap().take()
+    }
+
+    /// Whether a sink is attached. The insert path asks once per batch,
+    /// under `writers`, and skips the encode when none is.
+    fn sink_attached(&self) -> bool {
+        self.sink.lock().unwrap().is_some()
+    }
+
+    /// Hand one operation's record to the sink, where one is attached,
+    /// building the operation only then. For the kinds whose record is a
+    /// few bytes; the insert path encodes its own record ahead of the id
+    /// and hands the bytes to [`Collection::append_record`].
+    fn record(&self, operation: impl FnOnce() -> Operation) -> Result<(), Error> {
+        let mut sink = self.sink.lock().unwrap();
+        let Some(sink) = sink.as_mut() else {
+            return Ok(());
+        };
+        let operation = operation();
+        let mut payload = Vec::new();
+        operation.encode(&mut payload);
+        sink.append(operation.kind(), &payload)
+    }
+
+    /// Hand one record's bytes, already encoded, to the sink, where one is
+    /// attached.
+    fn append_record(&self, kind: OperationKind, payload: &[u8]) -> Result<(), Error> {
+        match self.sink.lock().unwrap().as_mut() {
+            Some(sink) => sink.append(kind, payload),
+            None => Ok(()),
+        }
+    }
+
+    /// Commit what the sink holds, where one is attached, after the last
+    /// record of a call and before the call mutates.
+    fn commit_records(&self) -> Result<(), Error> {
+        match self.sink.lock().unwrap().as_mut() {
+            Some(sink) => sink.commit(),
+            None => Ok(()),
+        }
     }
 
     /// Distinct terms the sparse space's dictionary holds, where it has
@@ -1337,8 +1449,27 @@ impl Collection {
     /// under `metadata`. The binding calls this with the interpreter lock
     /// released, since waiting for another writer with it held would stall
     /// every Python thread for the length of that writer.
-    pub fn add_metadata(&self, metadata: HashMap<String, String>) {
+    ///
+    /// The pairs are handed to the sink, in key order, before they are
+    /// merged, and a sink that refuses them refuses the call.
+    pub fn add_metadata(&self, metadata: HashMap<String, String>) -> Result<(), Error> {
         let _writers = self.writers.lock().unwrap();
+        self.record(|| {
+            let mut pairs: Vec<(String, String)> = metadata
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            pairs.sort();
+            Operation::AddMetadata { pairs }
+        })?;
+        self.commit_records()?;
+        self.add_metadata_locked(metadata);
+        Ok(())
+    }
+
+    /// The body of `add_metadata`, with the mutation guard held by the
+    /// caller and the record already handed over.
+    pub(super) fn add_metadata_locked(&self, metadata: HashMap<String, String>) {
         let mut meta_lock = self.metadata.lock().unwrap();
         for (key, value) in metadata {
             meta_lock.insert(key, value);

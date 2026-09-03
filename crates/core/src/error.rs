@@ -376,6 +376,11 @@ pub enum Error {
         what: &'static str,
         error: String,
     },
+    /// A record's journal payload would be above the ceiling
+    JournalRecordTooLarge { bytes: usize, ceiling: usize },
+    /// A replayed record names a value the collection would not have
+    /// issued, so the records and the collection do not belong together
+    JournalReplayMismatch { detail: String },
 
     // ------------------------------------------------------------------
     // The saved directory
@@ -571,6 +576,7 @@ impl Error {
             | SparseVectorShape { .. }
             | SparseDimsNotIncreasing { .. }
             | SparseValueNotFinite { .. }
+            | JournalRecordTooLarge { .. }
             | SparseValueNotPositive { .. }
             | SparseValueNotWhole { .. }
             | SparseWeightingInvalid { .. }
@@ -640,7 +646,8 @@ impl Error {
             | JournalHeaderInvalid { .. }
             | JournalCorrupt { .. }
             | JournalRecordInvalid { .. }
-            | JournalIoFailed { .. } => Exception::Runtime,
+            | JournalIoFailed { .. }
+            | JournalReplayMismatch { .. } => Exception::Runtime,
         }
     }
 }
@@ -1124,6 +1131,19 @@ impl fmt::Display for Error {
                 what,
                 path.display(),
                 error
+            ),
+            JournalRecordTooLarge { bytes, ceiling } => write!(
+                f,
+                "The record encodes to {} bytes and the journal's record ceiling is {} bytes. \
+                 Nothing was written for it and no internal id was issued. Reduce the \
+                 record's metadata.",
+                bytes, ceiling
+            ),
+            JournalReplayMismatch { detail } => write!(
+                f,
+                "The journal and the checkpoint do not belong together: {}. Nothing from this \
+                 record on was applied.",
+                detail
             ),
             DecodeLengthExceeded { file, bytes } => write!(
                 f,

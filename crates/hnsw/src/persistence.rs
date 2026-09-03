@@ -1722,7 +1722,7 @@ fn restore_data_fields(
     // Restore index level metadata. Empty for a directory written before
     // config.json carried the field, which is what those directories held.
     if !config.metadata.is_empty() {
-        index.add_metadata(config.metadata.clone());
+        index.add_metadata(config.metadata.clone())?;
         debug!(target: LOG_TARGET, "Index level metadata restored ({} entries)",
             config.metadata.len()
         );
