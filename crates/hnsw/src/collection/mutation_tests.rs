@@ -266,6 +266,15 @@ fn clear_between_a_querys_counting_and_its_search_cannot_reissue_its_terms() {
 /// clears and inserts one record carrying a term of its own each time, so
 /// every clear reissues id 0 to a new term, which is the reissue the query
 /// path is held against, under a race rather than by arrangement.
+///
+/// `wrong` is the invariant and holds however the race falls. That the
+/// pairing works at all is checked where it is decided rather than raced
+/// for: the mutator reads `stop` at the top of its loop, so it always
+/// finishes its insert and its generation store before returning, and the
+/// collection it leaves holds exactly the record of the last round.
+/// Counting the searches that landed inside a record's window instead is a
+/// count of how often the searching thread got in between an insert and the
+/// clear after it, which is a property of the machine.
 #[test]
 fn a_search_never_returns_a_record_that_never_held_the_term_under_concurrent_reissues() {
     let collection = Arc::new(text_collection());
@@ -300,7 +309,6 @@ fn a_search_never_returns_a_record_that_never_held_the_term_under_concurrent_rei
     };
 
     let mut wrong = Vec::new();
-    let mut hits = 0usize;
     let mut queries = 0usize;
     while queries < 3000 {
         let current = generation.load(Ordering::Acquire);
@@ -313,7 +321,6 @@ fn a_search_never_returns_a_record_that_never_held_the_term_under_concurrent_rei
             .search_text(&format!("only{current}"), None, 5, IdfScope::Corpus)
             .unwrap();
         for (id, _) in &page {
-            hits += 1;
             if *id != format!("r{current}") {
                 wrong.push((current, id.clone()));
             }
@@ -326,7 +333,14 @@ fn a_search_never_returns_a_record_that_never_held_the_term_under_concurrent_rei
         "records returned for a term they never held: {wrong:?}"
     );
     assert!(clears > 0, "the mutating thread ran");
-    assert!(hits > 0, "some search found the record its term named");
+
+    // Settled. One record, and a search for its term returns it.
+    assert_eq!(collection.len(), 1);
+    let settled = collection
+        .search_text(&format!("only{clears}"), None, 5, IdfScope::Corpus)
+        .unwrap();
+    let last = format!("r{clears}");
+    assert_eq!(ids_of(&settled), [last.as_str()]);
 }
 
 /// `add_metadata` takes the mutation guard, as every durable mutation does,

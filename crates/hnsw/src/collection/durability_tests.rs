@@ -173,25 +173,40 @@ fn the_interval_thread_syncs_nothing_while_the_file_is_clean() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(watch.syncs(), Some(1), "and nothing is synced after it");
 
-    // A burst inside one interval gathers behind one sync.
+    // A burst gathers behind the interval rather than behind the commits.
+    // The count is held against the intervals the burst spanned rather than
+    // against the number two, because whether five commits fit inside one
+    // interval is a statement about the machine while one sync an interval
+    // is the policy. A sink that synced per commit reads five here.
+    let before = watch.syncs().expect("the interval policy counts its syncs");
+    let started = Instant::now();
     for i in 1..6 {
         add(&collection, i..i + 1);
     }
-    assert!(wait_for(Duration::from_secs(5), || watch.syncs() == Some(2)));
+    assert!(
+        wait_for(Duration::from_secs(5), || watch.syncs() > Some(before)),
+        "the burst was synced"
+    );
     std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(
-        watch.syncs(),
-        Some(2),
-        "five commits inside one interval, one sync"
+    let spanned = started.elapsed().as_millis() / interval.as_millis() + 1;
+    let synced = u128::from(watch.syncs().unwrap() - before);
+    assert!(
+        synced <= spanned,
+        "five commits cost {synced} syncs over {spanned} intervals"
     );
 
     // A checkpoint syncs the file itself, so the thread finds it clean.
+    // Read the count as the checkpoint returns rather than before the
+    // commit, since whether the thread fired between the two is the
+    // machine's business and what the checkpoint promises is that nothing
+    // is left to sync after it.
     add(&collection, 6..7);
     collection.checkpoint().unwrap();
+    let after_checkpoint = watch.syncs();
     std::thread::sleep(Duration::from_millis(600));
     assert_eq!(
         watch.syncs(),
-        Some(2),
+        after_checkpoint,
         "the checkpoint left the thread nothing to sync"
     );
     assert_eq!(collection.journal_sequence(), 7);

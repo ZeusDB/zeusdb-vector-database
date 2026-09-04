@@ -51,31 +51,43 @@ PQ_CONFIG = {"type": "pq", "subvectors": 8, "bits": 8, "training_size": 1000}
 THREADS = 8
 ROUNDS = 6
 
-# The interpreter lock tests below. `GIL_INSERT` is sized so the single `add`
-# call lasts long enough to sample a rate against, on any machine that runs the
-# rest of this file in seconds.
+# The interpreter lock test below. The insert is split into rounds so that
+# each one can be timed against a control window of its own length, and the
+# rounds together insert what one call used to.
 GIL_DIM = 32
 GIL_BASE = 1500
-GIL_INSERT = 6000
-SOLO_WINDOW_S = 0.30
+GIL_ROUNDS = 9
+GIL_BATCH = 700
 MIN_ADD_WINDOW_S = 0.10
 
 # The search rate during an insert, as a share of the rate the same thread
-# reaches with no insert running, measured moments earlier in the same process.
-# A share rather than a count, so the bound is a fraction of what this machine
-# actually does rather than a number tuned to one machine.
+# reaches over a window of the same length with a second search thread beside
+# it in place of the insert. A share rather than a count, so the bound is a
+# fraction of what this machine actually does rather than a number tuned to
+# one machine.
+#
+# Both halves of "same length" and "in place of" are load bearing, and neither
+# held before. The control window was a fixed 0.30 seconds against an insert
+# lasting seconds, and a 0.30 second sample on a loaded machine lands anywhere
+# across a factor of four. The control also ran with the reader alone in the
+# process while the insert's window held two threads, so the share measured
+# how many cores the machine has as much as what the lock does. On four cores
+# the old form read 0.164 and 0.194 against this bound with nothing wrong.
+# Matched in length, matched in threads and reduced by a median over the
+# rounds, the same contention reads 0.61 to 1.79.
 #
 # A build where `add` never released the lock was measured at 2.2 to 2.4
-# percent. Releasing it puts the two threads in ordinary competition for the
-# CPU, which is a half share on a single core and close to a full share on
-# anything wider. A fifth sits an order of magnitude above the first and well
-# below the second.
+# percent of the reader's rate. Releasing it puts the two threads in ordinary
+# competition for the CPU. A fifth sits an order of magnitude above the first
+# and well below what a matched pair reads.
 MIN_SEARCH_SHARE = 0.20
 
-# The sustained mixed workload. Short enough for the suite, and its assertions
-# are counts and known answers rather than durations, so a slow machine runs
-# fewer rounds rather than failing.
-SUSTAINED_SECONDS = 2.0
+# The sustained mixed workload. Its assertions are counts and known answers
+# rather than durations, and the writer is bounded by batches rather than by a
+# clock. Bounded by a clock, the eight readers had to be created and scheduled
+# inside the writer's window. On four cores they were not: every reader
+# returned nothing and the run failed with the index exactly right.
+SUSTAINED_ROUNDS = 40
 SUSTAINED_BASE = 800
 SUSTAINED_BATCH = 100
 EXACT_SCORE_TOLERANCE = 1e-5
@@ -218,10 +230,16 @@ class ReadLoad:
         for thread in self._threads:
             thread.start()
         # Do not proceed until the readers are actually running, so the first
-        # write is not raced against an empty pool.
+        # write is not raced against an empty pool. The bound is a stuck pool
+        # detector and not a race bound: a pool that has completed no read in
+        # thirty seconds is not slow, and saying so here is better than
+        # letting the caller spend its own budget discovering that what it
+        # raced was empty.
         deadline = time.monotonic() + 30.0
         while self.reads == 0 and not self.errors and time.monotonic() < deadline:
             time.sleep(0.001)
+        self.check()
+        assert self.reads > 0, "the reader pool completed no read in thirty seconds"
         return self
 
     def __exit__(self, *_):
@@ -408,7 +426,11 @@ def test_concurrent_searches_during_add_stay_correct(build):
         query = queries[worker]
         seen = 0
         readers_up.wait(timeout=30)
-        while writing.is_set():
+        # One search on every reader before the flag is read, then as many as
+        # the write lasts for. The count below is the reader count whatever
+        # the scheduler does, and the barrier above is what puts those
+        # searches on top of the write rather than after it.
+        while True:
             results = index.search(query, top_k=TOP_K)
             assert len(results) <= TOP_K
             found = [hit["id"] for hit in results]
@@ -417,7 +439,8 @@ def test_concurrent_searches_during_add_stay_correct(build):
             scores = [hit["score"] for hit in results]
             assert scores == sorted(scores)
             seen += 1
-        return seen
+            if not writing.is_set():
+                return seen
 
     failure = []
 
@@ -444,7 +467,10 @@ def test_concurrent_searches_during_add_stay_correct(build):
 
     if failure:
         raise failure[0]
-    assert sum(counts) > 0, "no search ran during the add, so nothing was proved"
+    assert sum(counts) >= THREADS, (
+        f"every reader runs a search before it reads the flag, so {sum(counts)} "
+        f"searches across {THREADS} readers means a reader never ran"
+    )
 
 
 # ------------------------------------------------------------
@@ -481,10 +507,14 @@ class SearchCounter:
     def __enter__(self):
         self._thread.start()
         # Do not sample until the thread has actually issued a search, so the
-        # first window is a steady state rather than thread start-up.
+        # first window is a steady state rather than thread start-up. The bound
+        # is a stuck thread detector and not a race bound, as `ReadLoad`'s is.
         deadline = time.monotonic() + 30.0
         while self.count == 0 and self.error is None and time.monotonic() < deadline:
             time.sleep(0.001)
+        if self.error is not None:
+            raise self.error
+        assert self.count > 0, "the search thread completed no search in thirty seconds"
         return self
 
     def __exit__(self, *_):
@@ -492,58 +522,101 @@ class SearchCounter:
         self._thread.join(timeout=120)
         return False
 
-    def rate_over(self, seconds):
-        started = time.monotonic()
-        before = self.count
-        time.sleep(seconds)
-        return (self.count - before) / (time.monotonic() - started)
-
 
 def test_search_keeps_its_rate_while_one_insert_runs():
     """A search thread keeps running at a real rate through a long insert.
 
     `add` used to hold the interpreter lock for its whole duration, so no other
     Python thread could start a search at all while one ran. That collapse was
-    measured at 97.6 to 98.4 percent of the solo rate, and the cause was the
+    measured at 97.6 to 98.4 percent of the reader's rate, and the cause was the
     interpreter lock rather than any lock inside the index.
 
-    The bound is a share of the rate this same thread reaches with no insert
-    running, sampled seconds earlier in the same process, so it does not depend
-    on the machine being fast. A build that holds the lock cannot reach a fifth
-    of its solo rate on any machine, and a build that releases it cannot fall
-    below a half share on any machine, because the two threads then simply
-    compete for the CPU.
+    The bound is a share of the rate this same thread reaches over a window of
+    the same length with a second search thread beside it in place of the
+    insert. Both windows therefore hold two threads working the index, and both
+    are the same length, so neither the machine's speed nor its core count sits
+    in the comparison. The arms alternate round by round and the rounds are
+    reduced by a median, which is the only form a timing claim takes here.
 
-    The insert is one call rather than a loop, so the window being measured is
-    exactly one `add` and there are no gaps between calls to hide in. The test
-    asserts the window was long enough to sample, so a machine that finished the
-    insert too fast to measure fails rather than passing on three samples.
+    Each round's insert is one call, so the window measured is exactly one `add`
+    and there are no gaps between calls to hide in. The rounds together are
+    asserted to be long enough to sample, so a machine that finished them too
+    fast to measure fails rather than passing on a handful of samples.
     """
     index, _ = build_raw(n=GIL_BASE, dim=GIL_DIM, seed=17)
     queries = query_set(GIL_DIM, 64, seed=808)
-    batch = {
-        "ids": [f"bulk_{i}" for i in range(GIL_INSERT)],
-        "embeddings": clustered(GIL_INSERT, GIL_DIM, seed=909),
-    }
+    batches = [
+        {
+            "ids": [f"bulk_{round_}_{i}" for i in range(GIL_BATCH)],
+            "embeddings": clustered(GIL_BATCH, GIL_DIM, seed=909 + round_),
+        }
+        for round_ in range(GIL_ROUNDS)
+    ]
 
-    with SearchCounter(index, queries) as reader:
-        solo_rate = reader.rate_over(SOLO_WINDOW_S)
+    # The control arm's thread. It searches only while the gate is open, so an
+    # insert's window holds the reader and the insert, a control window holds
+    # the reader and this, and neither holds three.
+    gate = threading.Event()
+    stop = threading.Event()
+    control_error = []
 
-        before = reader.count
-        started = time.monotonic()
-        result = index.add(batch)
-        window = time.monotonic() - started
-        during_rate = (reader.count - before) / window
+    def control():
+        cursor = 0
+        try:
+            while not stop.is_set():
+                if not gate.wait(timeout=0.05):
+                    continue
+                index.search(queries[cursor], top_k=TOP_K)
+                cursor = cursor + 1 if cursor + 1 < len(queries) else 0
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
+            control_error.append(exc)
 
+    control_thread = threading.Thread(target=control)
+    control_thread.start()
+    shares = []
+    inserted = 0
+    insert_seconds = 0.0
+    try:
+        with SearchCounter(index, queries) as reader:
+            for batch in batches:
+                before = reader.count
+                started = time.monotonic()
+                result = index.add(batch)
+                window = time.monotonic() - started
+                during_rate = (reader.count - before) / window
+                inserted += result.total_inserted
+                insert_seconds += window
+
+                gate.set()
+                before = reader.count
+                started = time.monotonic()
+                time.sleep(window)
+                control_window = time.monotonic() - started
+                control_rate = (reader.count - before) / control_window
+                gate.clear()
+
+                shares.append(
+                    during_rate / control_rate if control_rate else float("inf")
+                )
+    finally:
+        stop.set()
+        gate.set()
+        control_thread.join(timeout=120)
+
+    assert not control_thread.is_alive(), "the control thread hung"
+    assert not control_error, control_error[0]
     assert reader.error is None, reader.error
-    assert result.total_inserted == GIL_INSERT
-    assert window >= MIN_ADD_WINDOW_S, (
-        f"the insert took {window:.3f}s, too short to sample a rate against"
+    assert inserted == GIL_ROUNDS * GIL_BATCH
+    assert insert_seconds >= MIN_ADD_WINDOW_S, (
+        f"the inserts took {insert_seconds:.3f}s together, too short to sample "
+        f"a rate against"
     )
-    assert solo_rate > 0, "the reader never completed a search on its own"
-    assert during_rate >= MIN_SEARCH_SHARE * solo_rate, (
-        f"searches ran at {during_rate:.0f}/s during the insert against "
-        f"{solo_rate:.0f}/s alone, a share of {during_rate / solo_rate:.3f}"
+    shares.sort()
+    share = shares[len(shares) // 2]
+    assert share >= MIN_SEARCH_SHARE, (
+        f"the reader ran at a paired median {share:.3f} of its own rate during "
+        f"an insert, against a bound of {MIN_SEARCH_SHARE}. Rounds: "
+        f"{[round(s, 3) for s in shares]}"
     )
 
 
@@ -587,9 +660,14 @@ def test_sustained_mixed_workload_leaves_the_index_exact():
     possible. A query set that did not have that property would make the whole
     test vacuous.
 
-    The count assertion is exact and independent of timing. The writer inserts a
-    fixed number of batches with fixed ids, the readers stop when it finishes,
-    and the final record count must equal the base plus every id written.
+    Nothing here is bounded by a clock. The writer inserts a fixed number of
+    batches with fixed ids, the readers stop when it finishes, and the final
+    record count must equal the base plus every id written. The readers and
+    the writer meet at a barrier before the first batch and every reader runs
+    a search before it reads the flag, so the count below is the reader count
+    on a machine of any speed. Bounded by a clock instead, the readers had to
+    be created and scheduled inside the writer's window, and on four cores
+    they were not.
     """
     dim = 32
     base = half_space(SUSTAINED_BASE, dim, seed=21, upper=False)
@@ -610,12 +688,15 @@ def test_sustained_mixed_workload_leaves_the_index_exact():
     writing.set()
     written = []
     failure = []
+    # Every reader and the writer meet here before the first batch, so the
+    # readers are running when the writing starts rather than being created
+    # inside a window the writer is already spending.
+    readers_up = threading.Barrier(THREADS + 1)
 
     def writer():
         try:
-            round_ = 0
-            deadline = time.monotonic() + SUSTAINED_SECONDS
-            while time.monotonic() < deadline:
+            readers_up.wait(timeout=30)
+            for round_ in range(SUSTAINED_ROUNDS):
                 batch_ids = [f"other_{round_}_{i}" for i in range(SUSTAINED_BATCH)]
                 index.add(
                     {
@@ -626,7 +707,6 @@ def test_sustained_mixed_workload_leaves_the_index_exact():
                     }
                 )
                 written.extend(batch_ids)
-                round_ += 1
         except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
             failure.append(exc)
         finally:
@@ -637,7 +717,8 @@ def test_sustained_mixed_workload_leaves_the_index_exact():
         expected = ids[probe]
         query = base[probe]
         seen = 0
-        while writing.is_set():
+        readers_up.wait(timeout=30)
+        while True:
             results = index.search(query, top_k=TOP_K)
             assert results[0]["id"] == expected
             assert results[0]["score"] < EXACT_SCORE_TOLERANCE
@@ -646,7 +727,8 @@ def test_sustained_mixed_workload_leaves_the_index_exact():
             scores = [hit["score"] for hit in results]
             assert scores == sorted(scores)
             seen += 1
-        return seen
+            if not writing.is_set():
+                return seen
 
     write_thread = threading.Thread(target=writer)
     write_thread.start()
@@ -659,8 +741,11 @@ def test_sustained_mixed_workload_leaves_the_index_exact():
 
     if failure:
         raise failure[0]
-    assert sum(counts) > 0, "no search ran during the workload"
-    assert written, "no batch was written"
+    assert sum(counts) >= THREADS, (
+        f"every reader runs a search before it reads the flag, so {sum(counts)} "
+        f"searches across {THREADS} readers means a reader never ran"
+    )
+    assert len(written) == SUSTAINED_ROUNDS * SUSTAINED_BATCH
 
     assert index.get_vector_count() == SUSTAINED_BASE + len(written)
     for written_id in (written[0], written[len(written) // 2], written[-1]):
