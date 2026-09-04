@@ -1463,11 +1463,28 @@ def test_a_text_query_never_returns_a_record_that_never_held_the_term_under_conc
     ids between the count and the search. Each round the other thread clears
     and inserts one record carrying a term of its own, so every clear
     reissues id 0 to a new term, and a query for a term returns the one
-    record that carried it or nothing."""
+    record that carried it or nothing.
+
+    `wrong == []` is the invariant, and it holds however the race falls. It
+    is asserted over the whole run rather than over the queries that
+    happened to land inside a record's window, because a query that matched
+    nothing cannot have matched wrongly.
+
+    The check that the pairing works at all is made where it is decided
+    rather than raced for. The mutator reads `stop` at the top of its loop,
+    so it always finishes its `add` and its generation assignment before
+    returning, and the index it leaves behind holds exactly the record of
+    the last round. A query for that record's term returns it, on a machine
+    of any speed. Counting hits taken during the race instead is a count of
+    how often the querying thread got in between an insert and the clear
+    after it, which is a property of the machine: on four cores that count
+    reached zero in 8 of 200 runs with nothing wrong.
+    """
     index = with_text(expected_size=1000)
     index.add({"id": "r0", "vector": vec(0), "text": "only0"})
     generation = [0]
     stop = threading.Event()
+    first_round = threading.Event()
     failures = []
 
     def mutator():
@@ -1478,17 +1495,21 @@ def test_a_text_query_never_returns_a_record_that_never_held_the_term_under_conc
                 rounds += 1
                 index.add({"id": f"r{rounds}", "vector": vec(rounds), "text": f"only{rounds}"})
                 generation[0] = rounds
+                first_round.set()
         except BaseException as e:  # noqa: BLE001
             failures.append(e)
+        finally:
+            # Set here as well, so a mutator that raised releases the wait
+            # below rather than leaving it on a round nobody will run.
+            first_round.set()
 
     thread = threading.Thread(target=mutator)
     thread.start()
+    assert first_round.wait(timeout=60), "the mutating thread never completed a round"
     wrong = []
-    hits = 0
     for _ in range(1500):
         current = generation[0]
         for hit in index.query(arms=[{"text": f"only{current}"}], top_k=5):
-            hits += 1
             if hit["id"] != f"r{current}":
                 wrong.append((current, hit["id"]))
     stop.set()
@@ -1497,4 +1518,8 @@ def test_a_text_query_never_returns_a_record_that_never_held_the_term_under_conc
     assert failures == []
     assert wrong == [], f"records returned for a term they never held: {wrong}"
     assert generation[0] > 0, "the mutating thread ran"
-    assert hits > 0, "some query found the record its term named"
+
+    # Settled. One record, and a query for its term returns it.
+    settled = generation[0]
+    assert len(index) == 1
+    assert ids(index.query(arms=[{"text": f"only{settled}"}], top_k=5)) == [f"r{settled}"]
