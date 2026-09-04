@@ -3,7 +3,7 @@
 //! What every index crate stands on, and it names nothing of Python: the
 //! error type, the checksum, the seeded generator, the filter language and
 //! the column store that answers it, the distance kernels, the product
-//! quantizer, the graph with its dump format, the seam every index sits
+//! quantizer, the scalar codec, the graph with its dump format, the seam every index sits
 //! behind, being the index trait, the admit family and the persistence traits
 //! in `space` and `admit`, the fusion that combines several indexes'
 //! pages into one, the write-ahead journal's format with its reader and
@@ -43,6 +43,7 @@ mod filter;
 mod frame;
 mod fusion;
 mod graph;
+mod int8;
 mod journal;
 mod kill;
 mod metadata;
@@ -57,7 +58,7 @@ mod test_vectors;
 pub use admit::{Admit, And, Candidates};
 pub use checksum::checksum_of;
 pub use columns::{validate_indexed_fields, Bitmap, ColumnStore, Selection};
-pub use distance::{CosineDist, DistPQ, DotDist, L1Dist, L2Dist, PqMetric};
+pub use distance::{CosineDist, DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric};
 pub use error::{Error, Exception};
 pub use filter::{compile_filter, matches_filter, FieldLookup, Filter};
 pub use frame::{
@@ -67,7 +68,10 @@ pub use frame::{
 };
 pub use fusion::{fuse, Contribution, FusedHit, Fusion, DEFAULT_RRF_K};
 pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES, NB_LAYER_MAX};
-pub use graph::{restore_graph, Distance, DumpBounds, GraphHit, Planned, Record, VectorGraph};
+pub use graph::{
+    restore_graph, restore_int8_graph, Distance, DumpBounds, GraphHit, Planned, Record, VectorGraph,
+};
+pub use int8::Int8Codec;
 pub use journal::{
     encode_journal_header, encode_journal_record, read_journal, CommitMode, JournalContents,
     JournalDamage, JournalHeader, JournalKind, JournalRecord, JournalSyncHandle, JournalWriter,

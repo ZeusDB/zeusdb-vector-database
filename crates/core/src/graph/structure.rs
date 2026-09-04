@@ -25,9 +25,10 @@ use super::levels::{LevelGenerator, DEFAULT_LEVEL_SEED};
 use super::mutable::{reserved_records, MutableGraph, RESERVE_BYTES};
 use super::store::VectorStore;
 use super::traverse::LAYERS;
-use super::{Distance, Record, VectorGraph};
+use super::{restore_graph, restore_int8_graph, Distance, DumpBounds, Record, VectorGraph};
 use crate::distance::{CosineDist, L1Dist, L2Dist};
-use crate::distance::{DistPQ, PqMetric};
+use crate::distance::{DistPQ, Int8Dist, Int8Metric, PqMetric};
+use crate::int8::Int8Codec;
 use crate::pq::PQ;
 use std::sync::Arc;
 
@@ -577,6 +578,138 @@ fn a_dump_round_trips_through_the_mutable_graph() {
         DistPQ::new(pq.clone(), PqMetric::SquaredL2)
     });
     println!("round trip quantized bytes {} residue {}", bytes, residue);
+
+    // The scalar quantized graph, whose elements are `i8` codes decoded
+    // through the codec's scales on every distance.
+    let unit = unit_sample_vectors(900, 24, 0x78_06);
+    let codec = Arc::new(Int8Codec::fit(24, &unit).unwrap());
+    let dist = Int8Dist::new(codec.clone(), Int8Metric::Cosine);
+    let rows: Vec<Vec<i8>> = unit.iter().map(|v| dist.encode(v).unwrap()).collect();
+    let (scalar, scalar_store) = build(&rows, 16, 64, dist);
+    let (bytes, residue) = round_trip(&scalar, &scalar_store, GraphKind::CosineInt8, || {
+        Int8Dist::new(codec.clone(), Int8Metric::Cosine)
+    });
+    println!("round trip int8 bytes {} residue {}", bytes, residue);
+    assert!(residue > 0, "the scalar fixture must carry descent residue");
+}
+
+// ============================================================================
+// THE SCALAR GRAPH THROUGH THE SEAM
+// ============================================================================
+
+/// A scalar quantized graph built through the seam dumps and restores as
+/// itself, answers the same page before and after, and the dump is refused
+/// by the raw reader on its element and by the wrong space on its kind.
+#[test]
+fn an_int8_graph_dumps_and_restores_through_the_seam() {
+    const N: usize = 1200;
+    const DIM: usize = 32;
+    let unit = unit_sample_vectors(N, DIM, 0x78_07);
+    let codec = Arc::new(Int8Codec::fit(DIM, &unit).unwrap());
+    let codes: Vec<Vec<i8>> = unit.iter().map(|v| codec.quantize(v).unwrap()).collect();
+
+    let mut graph = VectorGraph::new_int8("cosine", 16, N, LAYERS, 100, codec.clone());
+    assert!(graph.is_int8() && graph.is_quantized() && !graph.is_pq());
+    assert!(!graph.holds_raw());
+    // The rows the graph stores, being the codes and the norm tail on a
+    // cosine graph, encoded through the graph's own codec.
+    let rows: Vec<Vec<i8>> = unit.iter().map(|v| graph.int8_encode(v).unwrap()).collect();
+    assert!(rows.iter().all(|row| row.len() == DIM + 4));
+    // Internal ids from one, as the collection issues them.
+    let batch: Vec<(&[i8], usize)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.as_slice(), i + 1))
+        .collect();
+    graph.insert_batch_int8(&batch).unwrap();
+    assert_eq!(graph.nb_points(), N);
+    assert_eq!(graph.int8_codes_of(1), Some(codes[0].as_slice()));
+    assert_eq!(graph.int8_row_of(1), Some(rows[0].as_slice()));
+    assert_eq!(graph.int8_codes_of(N + 1), None);
+    assert!(graph.raw_vector(1).is_none());
+    assert!(graph.codes_of(1).is_none());
+    assert_eq!(graph.int8_codec().unwrap().dim(), DIM);
+    assert!(graph.open_raw_store(DIM, 1).is_err());
+    assert!(graph.push_raw_vector(&unit[0]).is_err());
+    assert_eq!(graph.raw_count(), 0);
+    assert_eq!(graph.raw_dim(), None);
+    assert_eq!(graph.raw_vectors_memory_bytes(), 0);
+    assert!(graph.store_memory_bytes() >= N * (DIM + 4));
+
+    let queries = unit_sample_vectors(50, DIM, 0x78_08);
+    let admits = |_: &usize| true;
+    let before: Vec<Vec<(usize, u32)>> = queries
+        .iter()
+        .map(|q| {
+            graph
+                .search(q, 10, 100, Some(&admits))
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.internal_id, h.distance.to_bits()))
+                .collect()
+        })
+        .collect();
+    // Every page holds ten, and the nearest record to a stored vector's own
+    // decoded twin is that record.
+    assert!(before.iter().all(|page| page.len() == 10));
+    let twin = codec.reconstruct(&codes[7]).unwrap();
+    let norm: f32 = twin.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let twin: Vec<f32> = twin.iter().map(|x| x / norm).collect();
+    let nearest = graph.search(&twin, 1, 100, Some(&admits)).unwrap();
+    assert_eq!(nearest[0].internal_id, 8);
+
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(graph.dump(dir.path()).unwrap(), DUMP_FILENAME);
+    let bounds = DumpBounds {
+        min_nodes: N,
+        max_origin_id: N,
+    };
+
+    // The raw reader refuses it on the element, and the wrong space on the
+    // kind, each before anything is built.
+    let as_raw = restore_graph(dir.path(), "cosine", 16, 100, DIM, None, bounds);
+    assert!(as_raw.is_err());
+    let reason = as_raw.err().unwrap();
+    assert!(
+        reason.contains("element type 3") && reason.contains("holds 1"),
+        "{reason}"
+    );
+    let as_l2 = restore_int8_graph(dir.path(), "l2", 16, 100, codec.clone(), bounds);
+    let reason = as_l2.err().unwrap();
+    assert!(
+        reason.contains("written for int8 cosine") && reason.contains("declares int8 l2"),
+        "{reason}"
+    );
+
+    // And it comes back as itself.
+    let (restored, nodes) =
+        restore_int8_graph(dir.path(), "cosine", 16, 100, codec.clone(), bounds).unwrap();
+    assert_eq!(nodes, N);
+    assert!(restored.is_int8());
+    assert_eq!(restored.int8_row_of(1), Some(rows[0].as_slice()));
+    let after: Vec<Vec<(usize, u32)>> = queries
+        .iter()
+        .map(|q| {
+            restored
+                .search(q, 10, 100, Some(&admits))
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.internal_id, h.distance.to_bits()))
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        before, after,
+        "the restored graph answers the pages the built one answered"
+    );
+
+    // Written again, the dump is the same bytes.
+    let again = tempfile::tempdir().unwrap();
+    restored.dump(again.path()).unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+        std::fs::read(again.path().join(DUMP_FILENAME)).unwrap()
+    );
 }
 
 // ============================================================================

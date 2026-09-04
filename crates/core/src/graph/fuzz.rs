@@ -59,8 +59,10 @@ use super::dump::{
 use super::levels::LevelGenerator;
 use super::mutable::MutableGraph;
 use super::Distance;
-use crate::distance::{CosineDist, DotDist, L1Dist, L2Dist};
+use crate::distance::{CosineDist, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist};
+use crate::int8::Int8Codec;
 use std::path::Path;
+use std::sync::Arc;
 
 // ============================================================================
 // THE BUDGET
@@ -397,12 +399,24 @@ impl Distance<u8> for CodeDist {
 /// What a corpus entry is read back as.
 ///
 /// `read_dump` is generic over the element type and the distance, and these are
-/// the two shapes the crate ships, so the entry carries which of them applies
+/// the three shapes the crate ships, so the entry carries which of them applies
 /// rather than the driver guessing.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Element {
     Raw,
     Code,
+    Int8,
+}
+
+/// The distance a scalar dump is read back through. The codec's width is the
+/// dump's, its scales are one over the code range so a code decodes to the
+/// value it was encoded from, and the metric is one whose row is the codes
+/// alone, since the reader is what is being driven and not the kernel.
+fn int8_dist(dim: usize) -> Int8Dist {
+    Int8Dist::new(
+        Arc::new(Int8Codec::from_scales(vec![1.0 / 127.0; dim]).unwrap()),
+        Int8Metric::Dot,
+    )
 }
 
 /// One valid dump, with what the reader must be told to expect of it.
@@ -555,6 +569,29 @@ fn corpus() -> Vec<Entry> {
             CodeDist,
             |v| ((v + 0.5) * 255.0) as u8,
         ),
+        entry(
+            "dot-int8-m16",
+            GraphKind::DotInt8,
+            Element::Int8,
+            200,
+            8,
+            16,
+            int8_dist(8),
+            |v| (v * 254.0) as i8,
+        ),
+        entry(
+            "l2-int8-m8",
+            GraphKind::L2Int8,
+            Element::Int8,
+            140,
+            16,
+            8,
+            Int8Dist::new(
+                Arc::new(Int8Codec::from_scales(vec![1.0 / 127.0; 16]).unwrap()),
+                Int8Metric::L2,
+            ),
+            |v| (v * 254.0) as i8,
+        ),
     ]
 }
 
@@ -624,6 +661,11 @@ fn drive(dir: &Path, blob: &[u8], entry: &Entry) -> Outcome {
         Element::Code => read_dump::<u8, CodeDist>(&owned, &expected, CodeDist)
             .map(|_| ())
             .err(),
+        Element::Int8 => {
+            read_dump::<i8, Int8Dist>(&owned, &expected, int8_dist(expected.dimension))
+                .map(|_| ())
+                .err()
+        }
     });
 
     match result {
@@ -1003,6 +1045,13 @@ fn every_corpus_entry_round_trips() {
             Element::Code => read_dump::<u8, CodeDist>(dir.path(), &entry.expected, CodeDist)
                 .map(|(graph, store)| (graph.nb_points(), store.len()))
                 .unwrap_or_else(|e| panic!("{} did not load: {}", entry.label, e)),
+            Element::Int8 => read_dump::<i8, Int8Dist>(
+                dir.path(),
+                &entry.expected,
+                int8_dist(entry.expected.dimension),
+            )
+            .map(|(graph, store)| (graph.nb_points(), store.len()))
+            .unwrap_or_else(|e| panic!("{} did not load: {}", entry.label, e)),
         };
         assert_eq!(counts.0, counts.1, "{} lost vectors", entry.label);
     }
