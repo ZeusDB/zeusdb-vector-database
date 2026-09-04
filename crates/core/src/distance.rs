@@ -101,6 +101,7 @@
 // from the crate itself. ZeusDB implements it, so the name has to be visible
 // here; see the note at the top of `graph.rs`.
 use crate::graph::Distance;
+use crate::int8::{decode, Int8Codec};
 use crate::pq::PQ;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -211,7 +212,8 @@ impl Drop for QueryLut {
 }
 /// Custom distance function for Product Quantization using ADC
 ///
-/// The fifth implementor of `graph::Distance`, beside the other four.
+/// One of the six implementors of `graph::Distance`, and the one over `u8`
+/// codes.
 ///
 /// It was declared in `hnsw_index` for the first six releases because the dump
 /// format those releases wrote carried `std::any::type_name::<D>()` in its
@@ -835,6 +837,435 @@ impl Distance<f32> for DotDist {
     fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
         1.0 - dot(va, vb)
     }
+}
+
+// ============================================================================
+// THE SCALAR CODE KERNELS
+// ============================================================================
+
+thread_local! {
+    /// The query the calling thread's scalar quantized search is running,
+    /// at full width.
+    ///
+    /// The same shape as [`QUERY_LUT`] and for the same reason.
+    /// `Distance::eval` takes `&self` and two stored points, and has no
+    /// parameter to carry per query state, so a search installs its query
+    /// on its own thread for the length of one traversal and the guard
+    /// removes it. An insertion installs nothing, so the kernel it reaches
+    /// is the symmetric one, code against code, and a search on another
+    /// thread can never observe a query it did not install itself.
+    static INT8_QUERY: RefCell<Option<Vec<f32>>> = const { RefCell::new(None) };
+}
+
+/// Holds a query on the calling thread for one scalar quantized traversal
+/// and removes it on drop, so an early return or a panic inside the
+/// traversal cannot leave it behind for the next query this thread runs.
+pub(crate) struct Int8QueryGuard;
+
+impl Drop for Int8QueryGuard {
+    fn drop(&mut self) {
+        INT8_QUERY.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// The metric a scalar quantized graph orders and scores by.
+///
+/// All four spaces, because every kernel here decodes the code to the
+/// value it stands for and applies the space's own arithmetic to it. There
+/// is no table fitted to one objective standing between the query and the
+/// record, which is what kept two of the four spaces refused under product
+/// quantization.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Int8Metric {
+    Cosine,
+    L2,
+    L1,
+    Dot,
+}
+
+impl Int8Metric {
+    /// The metric a space name declares. An unrecognised name is cosine,
+    /// which is what the two graph constructors fall back to as well, so
+    /// the construction paths agree on what a bad space means.
+    pub fn from_space(space: &str) -> Self {
+        match space {
+            "l2" => Int8Metric::L2,
+            "l1" => Int8Metric::L1,
+            "dot" => Int8Metric::Dot,
+            _ => Int8Metric::Cosine,
+        }
+    }
+
+    /// The space name this metric serves.
+    pub fn space(self) -> &'static str {
+        match self {
+            Int8Metric::Cosine => "cosine",
+            Int8Metric::L2 => "l2",
+            Int8Metric::L1 => "l1",
+            Int8Metric::Dot => "dot",
+        }
+    }
+}
+
+/// The distance over scalar quantized codes.
+///
+/// The sixth implementor of `graph::Distance`, over `i8` where the four raw
+/// kernels are over `f32` and `DistPQ` is over `u8`.
+///
+/// # What it computes
+///
+/// Every value is decoded inside the kernel as `code * scale`, which is the
+/// one multiply [`Int8Codec::reconstruct`] makes, and the space's own term
+/// is then accumulated over the decoded values in the same eight lanes, the
+/// same order and the same reduction the raw kernels use. So a distance
+/// evaluated here is the `f32` the raw kernel returns over the decoded
+/// vectors, bit for bit, and a graph built over codes is the graph the raw
+/// builder builds over the decoded vectors, edge for edge. That is what lets
+/// the recall of an index holding codes be measured on a raw index holding
+/// the decoded values, and it is asserted by
+/// `an_int8_graph_is_the_raw_graph_over_its_decoded_vectors` rather than
+/// argued.
+///
+/// # The cosine row carries its norm
+///
+/// A cosine index encodes unit vectors, and the decoded vector is unit
+/// length only to within the rounding the codes introduce. Scoring `1 - dot`
+/// over it without correcting for that was measured at 100,000 records to
+/// cost 0.004 of recall at 10 on 100 dimensional word vectors and 0.033 on
+/// 1,536 dimensional embeddings against the same codes renormalised, because
+/// a record whose decoded length came out above one outranked its
+/// neighbours by that excess. So a cosine row is the codes followed by four
+/// bytes holding the reciprocal of the decoded vector's length, computed
+/// once when the record is encoded, and the kernel scores
+/// `1 - dot(query, decoded) * inv_norm`, which is the cosine distance to the
+/// renormalised decoded vector. Graph construction scales by both records'
+/// norms. The other three metrics need no norm and their row is the codes
+/// alone, so [`Int8Dist::row_width`] is the codec's width plus four on a
+/// cosine graph and the codec's width otherwise.
+///
+/// # Search and construction
+///
+/// A query on this thread means a search is running. `a` is then the dummy
+/// code vector the seam hands the traversal and the real query lives on the
+/// thread at full width, so the distance is query against decoded code. No
+/// query means graph construction, where both `a` and `b` are stored codes
+/// and both are decoded. Choosing the branch on the thread rather than on
+/// `a` is what `DistPQ` does, for the reason recorded there.
+#[derive(Clone)]
+pub struct Int8Dist {
+    codec: Arc<Int8Codec>,
+    metric: Int8Metric,
+}
+
+impl Int8Dist {
+    pub fn new(codec: Arc<Int8Codec>, metric: Int8Metric) -> Self {
+        Int8Dist { codec, metric }
+    }
+
+    /// Which space this graph declared.
+    pub fn metric(&self) -> Int8Metric {
+        self.metric
+    }
+
+    /// The codec the codes decode through.
+    pub fn codec(&self) -> &Arc<Int8Codec> {
+        &self.codec
+    }
+
+    /// Bytes one stored row holds, being one code a value and, on a cosine
+    /// graph, the four bytes of the record's inverse norm after them. This
+    /// is the width of the store and of the dummy query the seam hands the
+    /// traversal.
+    pub fn row_width(&self) -> usize {
+        self.codec.dim() + self.tail_bytes()
+    }
+
+    /// The same as [`Int8Dist::row_width`], under the name the seam asks
+    /// every distance for.
+    pub(crate) fn dim(&self) -> usize {
+        self.row_width()
+    }
+
+    /// Bytes after the codes in one row.
+    #[inline]
+    fn tail_bytes(&self) -> usize {
+        match self.metric {
+            Int8Metric::Cosine => INV_NORM_BYTES,
+            _ => 0,
+        }
+    }
+
+    /// Encode one vector as the row the graph stores for it: its codes, and
+    /// on a cosine graph the reciprocal of the decoded vector's length.
+    ///
+    /// The norm is taken over the decoded values rather than the given
+    /// ones, so it corrects exactly the length the codes decode to. A vector
+    /// whose codes decode to zero gets a reciprocal of zero, which puts it
+    /// at distance one from everything, where [`cosine_normalized`] puts a
+    /// zero vector too. Refuses a vector of the wrong width.
+    pub fn encode(&self, vector: &[f32]) -> Result<Vec<i8>, String> {
+        let dim = self.codec.dim();
+        if vector.len() != dim {
+            return Err(format!(
+                "Vector dimension mismatch: expected {}, got {}",
+                dim,
+                vector.len()
+            ));
+        }
+        let mut row = vec![0i8; self.row_width()];
+        self.codec.quantize_into(vector, &mut row[..dim]);
+        if self.metric == Int8Metric::Cosine {
+            let norm_sq = int8_dot_codes(&row[..dim], &row[..dim], self.codec.scales());
+            let inv = if norm_sq > 0.0 {
+                norm_sq.sqrt().recip()
+            } else {
+                0.0
+            };
+            for (slot, byte) in row[dim..].iter_mut().zip(inv.to_le_bytes()) {
+                *slot = byte as i8;
+            }
+        }
+        Ok(row)
+    }
+
+    /// The codes of one row, without the tail.
+    #[inline]
+    pub fn codes_of_row<'a>(&self, row: &'a [i8]) -> &'a [i8] {
+        &row[..self.codec.dim().min(row.len())]
+    }
+
+    /// The inverse norm a cosine row carries, and one on every other row.
+    #[inline]
+    fn inv_norm(&self, row: &[i8]) -> f32 {
+        let dim = self.codec.dim();
+        if self.metric != Int8Metric::Cosine || row.len() < dim + INV_NORM_BYTES {
+            return 1.0;
+        }
+        let tail = &row[dim..dim + INV_NORM_BYTES];
+        f32::from_le_bytes([tail[0] as u8, tail[1] as u8, tail[2] as u8, tail[3] as u8])
+    }
+
+    /// The vector one row stands for, which on a cosine graph is the decoded
+    /// vector scaled by the reciprocal the row carries, being the vector the
+    /// graph scores as. Refuses a row of the wrong width.
+    pub fn reconstruct(&self, row: &[i8]) -> Result<Vec<f32>, String> {
+        if row.len() != self.row_width() {
+            return Err(format!(
+                "Row length mismatch: expected {}, got {}",
+                self.row_width(),
+                row.len()
+            ));
+        }
+        let mut decoded = self.codec.reconstruct(self.codes_of_row(row))?;
+        if self.metric == Int8Metric::Cosine {
+            let inv = self.inv_norm(row);
+            for value in decoded.iter_mut() {
+                *value *= inv;
+            }
+        }
+        Ok(decoded)
+    }
+
+    /// Install this query for the calling thread.
+    ///
+    /// The returned guard must be held for the whole traversal. Dropping it
+    /// returns the thread to construction mode, where `eval` decodes both
+    /// arguments.
+    pub(crate) fn install_query(&self, query: &[f32]) -> Result<Int8QueryGuard, String> {
+        if query.len() != self.codec.dim() {
+            return Err(format!(
+                "Query dimension mismatch: expected {}, got {}",
+                self.codec.dim(),
+                query.len()
+            ));
+        }
+        INT8_QUERY.with(|slot| *slot.borrow_mut() = Some(query.to_vec()));
+        Ok(Int8QueryGuard)
+    }
+
+    /// The distance from `query` to one row, on the metric this graph
+    /// declared. What a search evaluates, reachable by name so an exact
+    /// scan over rows scores the same number a traversal does.
+    #[inline]
+    pub fn query_distance(&self, query: &[f32], row: &[i8]) -> f32 {
+        let scales = self.codec.scales();
+        let codes = self.codes_of_row(row);
+        match self.metric {
+            Int8Metric::Cosine => {
+                cosine_from_dot(int8_dot_query(query, codes, scales) * self.inv_norm(row))
+            }
+            Int8Metric::Dot => 1.0 - int8_dot_query(query, codes, scales),
+            Int8Metric::L2 => int8_l2_squared_query(query, codes, scales).sqrt(),
+            Int8Metric::L1 => int8_l1_query(query, codes, scales),
+        }
+    }
+
+    /// The distance between two rows, on the metric this graph declared.
+    /// What graph construction evaluates.
+    #[inline]
+    pub fn code_distance(&self, a: &[i8], b: &[i8]) -> f32 {
+        let scales = self.codec.scales();
+        let (ca, cb) = (self.codes_of_row(a), self.codes_of_row(b));
+        match self.metric {
+            Int8Metric::Cosine => cosine_from_dot(
+                (int8_dot_codes(ca, cb, scales) * self.inv_norm(a)) * self.inv_norm(b),
+            ),
+            Int8Metric::Dot => 1.0 - int8_dot_codes(ca, cb, scales),
+            Int8Metric::L2 => int8_l2_squared_codes(ca, cb, scales).sqrt(),
+            Int8Metric::L1 => int8_l1_codes(ca, cb, scales),
+        }
+    }
+}
+
+/// Bytes a cosine row carries after its codes, being one `f32`.
+const INV_NORM_BYTES: usize = 4;
+
+impl Distance<i8> for Int8Dist {
+    #[inline]
+    fn eval(&self, a: &[i8], b: &[i8]) -> f32 {
+        INT8_QUERY.with(|slot| match slot.borrow().as_ref() {
+            Some(query) => self.query_distance(query, b),
+            None => self.code_distance(a, b),
+        })
+    }
+}
+
+/// `1 - dot`, clamped at zero from below the way [`cosine_normalized`]
+/// clamps and not through `f32::max`, which would swallow a NaN.
+#[inline(always)]
+fn cosine_from_dot(dot: f32) -> f32 {
+    let d = 1.0 - dot;
+    if d < 0.0 {
+        0.0
+    } else {
+        d
+    }
+}
+
+/// Decode one block of eight codes against their eight scales into the
+/// lanes the kernels accumulate over.
+///
+/// Each lane is `code as f32 * scale`, the same scalar multiply
+/// [`Int8Codec::reconstruct`] makes for that value, so the lane holds the
+/// `f32` a raw store would hold for the decoded vector, bit for bit.
+#[inline(always)]
+fn decode_block(codes: &[i8; LANES], scales: &[f32; LANES]) -> f32x8 {
+    let mut out = [0.0f32; LANES];
+    for (slot, (&code, &scale)) in out.iter_mut().zip(codes.iter().zip(scales)) {
+        *slot = decode(code, scale);
+    }
+    f32x8::new(out)
+}
+
+/// Accumulate `$term` over a query and a code vector, eight values at a
+/// time, decoding the codes as they are loaded.
+///
+/// The same loop as [`lane_loop`] with the second operand decoded, so the
+/// block width, the lane assignment, the separate tail accumulator and the
+/// reduction are the raw kernel's, and a result here is the raw kernel's
+/// result over the decoded vector.
+macro_rules! int8_query_loop {
+    ($q:expr, $codes:expr, $scales:expr, $x:ident, $y:ident, $term:expr) => {{
+        let n = core::cmp::min($q.len(), core::cmp::min($codes.len(), $scales.len()));
+        let blocks = n / LANES;
+        let main = blocks * LANES;
+        let head_q = &$q[..main];
+        let head_c = &$codes[..main];
+        let head_s = &$scales[..main];
+
+        let mut acc = f32x8::ZERO;
+        for k in 0..blocks {
+            let block_q: &[f32; LANES] = head_q[k * LANES..(k + 1) * LANES].try_into().unwrap();
+            let block_c: &[i8; LANES] = head_c[k * LANES..(k + 1) * LANES].try_into().unwrap();
+            let block_s: &[f32; LANES] = head_s[k * LANES..(k + 1) * LANES].try_into().unwrap();
+            let ($x, $y) = (f32x8::new(*block_q), decode_block(block_c, block_s));
+            acc += $term;
+        }
+
+        let mut tail = 0.0f32;
+        for j in main..n {
+            let ($x, $y) = ($q[j], decode($codes[j], $scales[j]));
+            tail += $term;
+        }
+
+        reduce(acc.to_array()) + tail
+    }};
+}
+
+/// Accumulate `$term` over two code vectors, decoding both.
+macro_rules! int8_code_loop {
+    ($a:expr, $b:expr, $scales:expr, $x:ident, $y:ident, $term:expr) => {{
+        let n = core::cmp::min($a.len(), core::cmp::min($b.len(), $scales.len()));
+        let blocks = n / LANES;
+        let main = blocks * LANES;
+        let head_a = &$a[..main];
+        let head_b = &$b[..main];
+        let head_s = &$scales[..main];
+
+        let mut acc = f32x8::ZERO;
+        for k in 0..blocks {
+            let block_a: &[i8; LANES] = head_a[k * LANES..(k + 1) * LANES].try_into().unwrap();
+            let block_b: &[i8; LANES] = head_b[k * LANES..(k + 1) * LANES].try_into().unwrap();
+            let block_s: &[f32; LANES] = head_s[k * LANES..(k + 1) * LANES].try_into().unwrap();
+            let ($x, $y) = (
+                decode_block(block_a, block_s),
+                decode_block(block_b, block_s),
+            );
+            acc += $term;
+        }
+
+        let mut tail = 0.0f32;
+        for j in main..n {
+            let ($x, $y) = (decode($a[j], $scales[j]), decode($b[j], $scales[j]));
+            tail += $term;
+        }
+
+        reduce(acc.to_array()) + tail
+    }};
+}
+
+/// Inner product of a query and a decoded code vector.
+#[inline]
+fn int8_dot_query(q: &[f32], codes: &[i8], scales: &[f32]) -> f32 {
+    int8_query_loop!(q, codes, scales, x, y, x * y)
+}
+
+/// Sum of absolute differences between a query and a decoded code vector.
+#[inline]
+fn int8_l1_query(q: &[f32], codes: &[i8], scales: &[f32]) -> f32 {
+    int8_query_loop!(q, codes, scales, x, y, (x - y).abs())
+}
+
+/// Sum of squared differences between a query and a decoded code vector,
+/// before the square root.
+#[inline]
+fn int8_l2_squared_query(q: &[f32], codes: &[i8], scales: &[f32]) -> f32 {
+    int8_query_loop!(q, codes, scales, x, y, {
+        let d = x - y;
+        d * d
+    })
+}
+
+/// Inner product of two decoded code vectors.
+#[inline]
+fn int8_dot_codes(a: &[i8], b: &[i8], scales: &[f32]) -> f32 {
+    int8_code_loop!(a, b, scales, x, y, x * y)
+}
+
+/// Sum of absolute differences between two decoded code vectors.
+#[inline]
+fn int8_l1_codes(a: &[i8], b: &[i8], scales: &[f32]) -> f32 {
+    int8_code_loop!(a, b, scales, x, y, (x - y).abs())
+}
+
+/// Sum of squared differences between two decoded code vectors, before the
+/// square root.
+#[inline]
+fn int8_l2_squared_codes(a: &[i8], b: &[i8], scales: &[f32]) -> f32 {
+    int8_code_loop!(a, b, scales, x, y, {
+        let d = x - y;
+        d * d
+    })
 }
 
 #[cfg(test)]
@@ -2448,5 +2879,406 @@ mod tests {
         // A zero query has no direction either.
         let _lut2 = dist.install_query_lut(&[0.0f32; 4]).expect("query lut");
         assert_eq!(dist.eval(&[0u8; 2], &[1, 1]), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod int8_tests {
+    use super::*;
+    use crate::graph::test_graph::TestGraph;
+    use crate::rng::SeededRng;
+    use rand::{RngExt, SeedableRng};
+
+    const DIMS: [usize; 11] = [1, 2, 3, 7, 8, 9, 15, 17, 128, 768, 1536];
+
+    fn rng(seed: u64) -> SeededRng {
+        SeededRng::seed_from_u64(seed)
+    }
+
+    fn random_vector(rng: &mut SeededRng, dim: usize) -> Vec<f32> {
+        (0..dim).map(|_| rng.random_range(-1.0f32..1.0)).collect()
+    }
+
+    fn normalize(v: &[f32]) -> Vec<f32> {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            v.iter().map(|x| x / norm).collect()
+        } else {
+            v.to_vec()
+        }
+    }
+
+    /// A codec fitted to the sample, and for one metric the sample's rows
+    /// and the vectors those rows' codes decode to.
+    fn encode(sample: &[Vec<f32>], metric: Int8Metric) -> (Int8Dist, Vec<Vec<i8>>, Vec<Vec<f32>>) {
+        let dim = sample[0].len();
+        let codec = Arc::new(Int8Codec::fit(dim, sample).unwrap());
+        let dist = Int8Dist::new(codec.clone(), metric);
+        let rows: Vec<Vec<i8>> = sample.iter().map(|v| dist.encode(v).unwrap()).collect();
+        let decoded: Vec<Vec<f32>> = rows
+            .iter()
+            .map(|r| codec.reconstruct(dist.codes_of_row(r)).unwrap())
+            .collect();
+        (dist, rows, decoded)
+    }
+
+    /// The reciprocal a cosine row carries, read back as a test reads it.
+    fn inv_of(dist: &Int8Dist, row: &[i8]) -> f32 {
+        dist.inv_norm(row)
+    }
+
+    /// The cosine the kernel computes, over the decoded vectors and the
+    /// stored reciprocals, in the same order.
+    fn normed_cosine(a: &[f32], inv_a: f32, b: &[f32], inv_b: f32) -> f32 {
+        cosine_from_dot((dot(a, b) * inv_a) * inv_b)
+    }
+
+    /// Every scalar kernel returns the raw kernel's `f32` over the decoded
+    /// vectors, bit for bit, on both the query branch and the code branch,
+    /// over the dimension grid and at three magnitudes. The cosine kernel
+    /// returns the raw dot kernel's `f32` scaled by the stored reciprocals in
+    /// a fixed order, bit for bit.
+    ///
+    /// Compared as bit patterns. This is the assertion the memory case rests
+    /// on: a graph holding codes scores exactly what a graph holding the
+    /// decoded floats scores, so the recall measured on the second is the
+    /// recall of the first, and the first holds one byte a value.
+    #[test]
+    fn the_scalar_kernels_match_the_raw_kernels_over_the_decoded_store_bit_for_bit() {
+        let mut r = rng(156_156);
+        let (mut compared, mut differing) = (0usize, 0usize);
+        let mut first: Option<String> = None;
+        let mut check = |name: &str, dim: usize, got: f32, want: f32| {
+            compared += 1;
+            if got.to_bits() != want.to_bits() {
+                differing += 1;
+                first.get_or_insert_with(|| {
+                    format!("{name} at dim {dim} returned {got:e} where the raw kernel returned {want:e}")
+                });
+            }
+        };
+        for scale in [1.0e-3f32, 1.0, 1.0e3] {
+            for dim in DIMS {
+                let sample: Vec<Vec<f32>> = (0..40)
+                    .map(|_| {
+                        random_vector(&mut r, dim)
+                            .iter()
+                            .map(|x| x * scale)
+                            .collect()
+                    })
+                    .collect();
+                for metric in [
+                    Int8Metric::Cosine,
+                    Int8Metric::L2,
+                    Int8Metric::L1,
+                    Int8Metric::Dot,
+                ] {
+                    let (dist, rows, decoded) = encode(&sample, metric);
+                    let scales = dist.codec().scales();
+                    for pair in 0..20 {
+                        let q: Vec<f32> = random_vector(&mut r, dim)
+                            .iter()
+                            .map(|x| x * scale)
+                            .collect();
+                        let (a, b) = (&rows[pair], &rows[pair + 20]);
+                        let (ca, cb) = (dist.codes_of_row(a), dist.codes_of_row(b));
+                        let (da, db) = (&decoded[pair], &decoded[pair + 20]);
+                        if metric == Int8Metric::L2 {
+                            check(
+                                "dot query",
+                                dim,
+                                int8_dot_query(&q, cb, scales),
+                                dot(&q, db),
+                            );
+                            check("l1 query", dim, int8_l1_query(&q, cb, scales), l1(&q, db));
+                            check(
+                                "l2 query",
+                                dim,
+                                int8_l2_squared_query(&q, cb, scales).sqrt(),
+                                l2(&q, db),
+                            );
+                            check(
+                                "dot codes",
+                                dim,
+                                int8_dot_codes(ca, cb, scales),
+                                dot(da, db),
+                            );
+                            check("l1 codes", dim, int8_l1_codes(ca, cb, scales), l1(da, db));
+                            check(
+                                "l2 codes",
+                                dim,
+                                int8_l2_squared_codes(ca, cb, scales).sqrt(),
+                                l2(da, db),
+                            );
+                        }
+                        let (inv_a, inv_b) = (inv_of(&dist, a), inv_of(&dist, b));
+                        let want_codes = match metric {
+                            Int8Metric::Cosine => normed_cosine(da, inv_a, db, inv_b),
+                            Int8Metric::L2 => L2Dist {}.eval(da, db),
+                            Int8Metric::L1 => L1Dist {}.eval(da, db),
+                            Int8Metric::Dot => DotDist {}.eval(da, db),
+                        };
+                        check("eval codes", dim, dist.eval(a, b), want_codes);
+                        let want_query = match metric {
+                            Int8Metric::Cosine => normed_cosine(&q, 1.0, db, inv_b),
+                            Int8Metric::L2 => L2Dist {}.eval(&q, db),
+                            Int8Metric::L1 => L1Dist {}.eval(&q, db),
+                            Int8Metric::Dot => DotDist {}.eval(&q, db),
+                        };
+                        let _guard = dist.install_query(&q).unwrap();
+                        check("eval query", dim, dist.eval(a, b), want_query);
+                    }
+                }
+            }
+        }
+        println!("scalar kernel bit identity  compared {compared}  differing {differing}");
+        assert_eq!(
+            differing,
+            0,
+            "{differing} of {compared} results differ, the first being {}",
+            first.unwrap_or_default()
+        );
+    }
+
+    /// A cosine row's reciprocal is the reciprocal of its decoded length,
+    /// the kernel's distance is the cosine distance to the renormalised
+    /// decoded vector, `reconstruct` hands that vector back, and the other
+    /// three metrics carry no tail.
+    #[test]
+    fn a_cosine_row_carries_the_reciprocal_of_its_decoded_length() {
+        let mut r = rng(4_156);
+        for dim in [3usize, 8, 100, 1536] {
+            let sample: Vec<Vec<f32>> = (0..30)
+                .map(|_| normalize(&random_vector(&mut r, dim)))
+                .collect();
+            let (dist, rows, decoded) = encode(&sample, Int8Metric::Cosine);
+            assert_eq!(dist.row_width(), dim + 4);
+            for (row, dec) in rows.iter().zip(&decoded) {
+                assert_eq!(row.len(), dim + 4);
+                let length: f64 = dec.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+                let inv = inv_of(&dist, row) as f64;
+                assert!(
+                    (inv * length - 1.0).abs() < 1e-5,
+                    "dim {dim}: inv {inv} length {length}"
+                );
+                let back = dist.reconstruct(row).unwrap();
+                let back_length: f64 = back.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+                assert!(
+                    (back_length - 1.0).abs() < 1e-5,
+                    "dim {dim}: reconstructed length {back_length}"
+                );
+            }
+            // The kernel's cosine against an f64 cosine to the renormalised
+            // decoded vector.
+            let q = normalize(&random_vector(&mut r, dim));
+            let mut worst = 0f64;
+            for (row, dec) in rows.iter().zip(&decoded) {
+                let length: f64 = dec.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+                let want = 1.0
+                    - q.iter()
+                        .zip(dec)
+                        .map(|(x, y)| *x as f64 * *y as f64)
+                        .sum::<f64>()
+                        / length;
+                let got = dist.query_distance(&q, row) as f64;
+                worst = worst.max((got - want.max(0.0)).abs());
+            }
+            println!("cosine row at dim {dim}: worst deviation from the f64 cosine {worst:.3e}");
+            assert!(worst < 2e-6, "dim {dim}: {worst:e}");
+            for metric in [Int8Metric::L2, Int8Metric::L1, Int8Metric::Dot] {
+                let (dist, rows, _) = encode(&sample, metric);
+                assert_eq!(dist.row_width(), dim);
+                assert!(rows.iter().all(|row| row.len() == dim));
+            }
+        }
+        // A row whose codes decode to zero is at distance one from everything.
+        let dist = Int8Dist::new(
+            Arc::new(Int8Codec::from_scales(vec![1.0; 4]).unwrap()),
+            Int8Metric::Cosine,
+        );
+        let zero = dist.encode(&[0.0; 4]).unwrap();
+        assert_eq!(inv_of(&dist, &zero), 0.0);
+        assert_eq!(dist.query_distance(&[1.0, 0.0, 0.0, 0.0], &zero), 1.0);
+        assert!(dist.encode(&[0.0; 5]).is_err());
+        assert!(dist.reconstruct(&[0i8; 4]).is_err());
+    }
+
+    /// The query is on the calling thread alone, it is refused at the wrong
+    /// width, and dropping the guard returns the thread to the code branch.
+    #[test]
+    fn the_query_is_thread_local_and_leaves_with_its_guard() {
+        let codec = Arc::new(Int8Codec::from_scales(vec![0.5, 0.25]).unwrap());
+        let dist = Int8Dist::new(codec, Int8Metric::L2);
+        let (a, b) = ([2i8, 4], [4i8, 8]);
+        // Codes: (1.0, 1.0) against (2.0, 2.0).
+        assert_eq!(dist.eval(&a, &b), 2f32.sqrt());
+        assert!(dist.install_query(&[1.0, 2.0, 3.0]).is_err());
+        {
+            let _guard = dist.install_query(&[0.0, 0.0]).unwrap();
+            // The query against b, which is (2.0, 2.0).
+            assert_eq!(dist.eval(&a, &b), 8f32.sqrt());
+            let on_other_thread = {
+                let dist = dist.clone();
+                std::thread::spawn(move || dist.eval(&a, &b))
+                    .join()
+                    .unwrap()
+            };
+            assert_eq!(on_other_thread, 2f32.sqrt(), "another thread sees no query");
+        }
+        assert_eq!(dist.eval(&a, &b), 2f32.sqrt());
+    }
+
+    /// The cosine the kernel computes, worn by a raw graph over rows of
+    /// decoded values with the reciprocal as one more value at the end.
+    #[derive(Clone)]
+    struct NormedCosine {
+        dim: usize,
+    }
+
+    impl Distance<f32> for NormedCosine {
+        fn eval(&self, a: &[f32], b: &[f32]) -> f32 {
+            normed_cosine(&a[..self.dim], a[self.dim], &b[..self.dim], b[self.dim])
+        }
+    }
+
+    /// A graph built over rows is the graph built over the decoded vectors,
+    /// edge for edge, and it returns the same page with the same score bits,
+    /// on all four metrics. On cosine the raw side carries each record's
+    /// stored reciprocal as one more value and scales by it in the order the
+    /// kernel does.
+    ///
+    /// The level stream is seeded and the insertion is sequential, so the
+    /// only thing that differs between the two builds is which kernel
+    /// computed every distance. Bit identity of the kernels already implies
+    /// this; it is measured because the graph is what the codes are held
+    /// for.
+    #[test]
+    fn an_int8_graph_is_the_raw_graph_over_its_decoded_vectors() {
+        // A thousand nodes a metric rather than the three thousand the two
+        // dispatch graph tests build, because this builds eight graphs on
+        // four metrics and a debug build of the scalar kernel is slow enough
+        // that three thousand cost the gate two and a half minutes.
+        const N: usize = 1000;
+        const DIM: usize = 64;
+        const QUERIES: usize = 200;
+
+        let mut r = rng(2718);
+        let unit: Vec<Vec<f32>> = (0..N)
+            .map(|_| normalize(&random_vector(&mut r, DIM)))
+            .collect();
+        let spread: Vec<Vec<f32>> = (0..N).map(|_| random_vector(&mut r, DIM)).collect();
+        let mut q = rng(999);
+        let unit_queries: Vec<Vec<f32>> = (0..QUERIES)
+            .map(|_| normalize(&random_vector(&mut q, DIM)))
+            .collect();
+        let spread_queries: Vec<Vec<f32>> =
+            (0..QUERIES).map(|_| random_vector(&mut q, DIM)).collect();
+
+        fn compare<D: Distance<f32> + Send + Sync>(
+            name: &str,
+            data: &[Vec<f32>],
+            queries: &[Vec<f32>],
+            metric: Int8Metric,
+            raw: D,
+            with_norm: bool,
+        ) {
+            let (dist, rows, decoded) = encode(data, metric);
+            let raw_rows: Vec<Vec<f32>> = rows
+                .iter()
+                .zip(&decoded)
+                .map(|(row, dec)| {
+                    let mut out = dec.clone();
+                    if with_norm {
+                        out.push(inv_of(&dist, row));
+                    }
+                    out
+                })
+                .collect();
+            let over_codes = TestGraph::build(16, 200, &rows, dist.clone());
+            let over_floats = TestGraph::build(16, 200, &raw_rows, raw);
+            assert_eq!(over_codes.nb_points(), over_floats.nb_points());
+
+            let (a, b) = (over_codes.adjacency(), over_floats.adjacency());
+            let (mut differing_nodes, mut total_edges) = (0usize, 0usize);
+            for id in 0..data.len() {
+                total_edges += a[id].iter().map(Vec::len).sum::<usize>();
+                if a[id] != b[id] {
+                    differing_nodes += 1;
+                }
+            }
+
+            let dummy = vec![0i8; dist.row_width()];
+            let (mut differing_ids, mut differing_scores) = (0usize, 0usize);
+            for query in queries {
+                let page_codes = {
+                    let _guard = dist.install_query(query).unwrap();
+                    over_codes.page(&dummy, 10, 100)
+                };
+                let mut query_row = query.clone();
+                if with_norm {
+                    query_row.push(1.0);
+                }
+                let page_floats = over_floats.page(&query_row, 10, 100);
+                if page_codes
+                    .iter()
+                    .map(|&(id, _)| id)
+                    .ne(page_floats.iter().map(|&(id, _)| id))
+                {
+                    differing_ids += 1;
+                }
+                if page_codes
+                    .iter()
+                    .map(|&(_, d)| d.to_bits())
+                    .ne(page_floats.iter().map(|&(_, d)| d.to_bits()))
+                {
+                    differing_scores += 1;
+                }
+            }
+            println!(
+                "int8 graph {name}  nodes {}  edges {total_edges}  differing nodes {differing_nodes}  \
+                 differing pages {differing_ids} of {}  differing score bits {differing_scores}",
+                data.len(),
+                queries.len()
+            );
+            assert_eq!(differing_nodes, 0, "{name}: {differing_nodes} nodes differ");
+            assert_eq!(differing_ids, 0, "{name}: {differing_ids} pages differ");
+            assert_eq!(
+                differing_scores, 0,
+                "{name}: {differing_scores} pages differ in score bits"
+            );
+        }
+
+        compare(
+            "cosine",
+            &unit,
+            &unit_queries,
+            Int8Metric::Cosine,
+            NormedCosine { dim: DIM },
+            true,
+        );
+        compare(
+            "l2",
+            &spread,
+            &spread_queries,
+            Int8Metric::L2,
+            L2Dist {},
+            false,
+        );
+        compare(
+            "l1",
+            &spread,
+            &spread_queries,
+            Int8Metric::L1,
+            L1Dist {},
+            false,
+        );
+        compare(
+            "dot",
+            &spread,
+            &spread_queries,
+            Int8Metric::Dot,
+            DotDist {},
+            false,
+        );
     }
 }

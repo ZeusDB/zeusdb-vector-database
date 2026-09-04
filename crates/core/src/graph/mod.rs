@@ -19,8 +19,8 @@
 //! # What the seam does not cover
 //!
 //! One thing cannot be hidden, because ZeusDB implements it rather than calling
-//! it. [`Distance`] is the trait `CosineDist`, `L1Dist`, `L2Dist`, `DotDist`
-//! and `DistPQ` implement, and a trait has to be nameable where the
+//! it. [`Distance`] is the trait `CosineDist`, `L1Dist`, `L2Dist`, `DotDist`,
+//! `DistPQ` and `Int8Dist` implement, and a trait has to be nameable where the
 //! implementation is written. It is declared here so `distance.rs` and
 //! `hnsw_index.rs` import it from the seam and the set of implementors stays
 //! countable from one line.
@@ -49,7 +49,10 @@
 // across another. See `clippy.toml`.
 #![allow(clippy::disallowed_types)]
 
-use crate::distance::{CosineDist, DistPQ, DotDist, L1Dist, L2Dist, PqMetric};
+use crate::distance::{
+    CosineDist, DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric,
+};
+use crate::int8::Int8Codec;
 use crate::pq::PQ;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -104,8 +107,8 @@ use traverse::LAYERS;
 /// declared here rather than in `distance.rs` because the graph is what calls
 /// it and `distance.rs` is one of the modules that implements it.
 ///
-/// The implementors are `CosineDist`, `L2Dist`, `L1Dist`, `DotDist` and
-/// `DistPQ`, all five in `distance.rs`. Every one imports the name from this
+/// The implementors are `CosineDist`, `L2Dist`, `L1Dist`, `DotDist`, `DistPQ`
+/// and `Int8Dist`, all six in `distance.rs`. Every one imports the name from this
 /// module, so the set is countable from the `use` sites of this line.
 ///
 /// The shape is the one the trait it replaced had, unchanged, because changing
@@ -351,10 +354,11 @@ where
     }
 }
 
-/// The graph, in whichever of the six shapes this index built it
+/// The graph, in whichever of the eight shapes this index built it
 ///
-/// Three raw variants holding `f32` points and three quantized variants holding
-/// `u8` codes. They differ in the distance they were built with, which the
+/// Four raw variants holding `f32` points, three product quantized variants
+/// holding `u8` codes and one scalar quantized variant holding `i8` codes.
+/// They differ in the distance they were built with, which the
 /// graph takes as a type parameter, so the enum is what stands in for a single
 /// graph type.
 // The variants carry `Backend`, which is `pub(crate)`. A caller outside the
@@ -374,6 +378,21 @@ pub enum VectorGraph {
     CosinePQ(Backend<u8, DistPQ>),
     L2PQ(Backend<u8, DistPQ>),
     L1PQ(Backend<u8, DistPQ>),
+
+    /// The scalar quantized graph, holding one `i8` a value.
+    ///
+    /// One variant for all four spaces rather than one per space, because
+    /// the metric travels inside [`Int8Dist`] and nothing outside it has to
+    /// match on the space: the dump header takes its kind from the metric
+    /// through [`VectorGraph::kind`] and the loader hands the metric back
+    /// through [`restore_int8_graph`]. The product quantized graphs carry
+    /// one variant per space because their first dump format pinned each to
+    /// a type name, which this one never did.
+    ///
+    /// It keeps no raw side store. A record is one code and nothing else,
+    /// which is what makes the memory case: the store holds a quarter of
+    /// what a raw store holds and there is no second store beside it.
+    Int8(Backend<i8, Int8Dist>),
 }
 
 /// One record on its way into the graph, in whichever form that graph holds.
@@ -398,6 +417,9 @@ pub enum Record<'a> {
         codes: &'a [u8],
         raw: Option<&'a [f32]>,
     },
+    /// The scalar codes of one record, one signed byte a value, already
+    /// encoded through the graph's own codec.
+    Int8(&'a [i8]),
 }
 
 /// The stride the timing kernels take across the store, a prime large
@@ -541,6 +563,48 @@ impl VectorGraph {
         }
     }
 
+    /// A scalar quantized graph over `codec`, for `space`.
+    ///
+    /// The graph holds one row a record, being one `i8` a value and, on a
+    /// cosine graph, four bytes of the record's inverse norm after them, so
+    /// the store's width is [`Int8Dist::row_width`] rather than the index's
+    /// declared dimension. The metric is read off the space name the way the
+    /// two other constructors read it, and an unrecognised name falls back
+    /// to cosine as they do.
+    pub fn new_int8(
+        space: &str,
+        m: usize,
+        expected_size: usize,
+        max_layer: usize,
+        ef_construction: usize,
+        codec: Arc<Int8Codec>,
+    ) -> Self {
+        let metric = Int8Metric::from_space(space);
+        let dist = Int8Dist::new(codec, metric);
+        let dim = dist.row_width();
+        info!(
+            target: LOG_TARGET,
+            operation = "hnsw_creation",
+            space = space,
+            dim = dim,
+            m = m,
+            expected_size = expected_size,
+            max_layer = max_layer,
+            ef_construction = ef_construction,
+            variant = "int8",
+            metric = metric.space(),
+            "Creating scalar quantized HNSW index"
+        );
+        VectorGraph::Int8(Backend::sized(
+            dim,
+            m,
+            max_layer,
+            ef_construction,
+            expected_size,
+            dist,
+        ))
+    }
+
     /// Search the graph, admitting only the internal ids the filter accepts.
     ///
     /// The filter runs inside the traversal, before the fixed `top_k` cut, so a
@@ -585,6 +649,18 @@ impl VectorGraph {
 
                 Ok(b.graph.search(&b.store, &dummy_query, k, ef, filter))
             }
+
+            // Scalar codes. The query is installed on this thread at full
+            // width and the traversal is handed a dummy code, exactly as the
+            // product quantized search is.
+            VectorGraph::Int8(b) => {
+                if b.graph.distance().metric() == Int8Metric::Cosine {
+                    assert_unit_for_cosine(query, "search");
+                }
+                let _query = b.graph.distance().install_query(query)?;
+                let dummy_query = vec![0i8; b.graph.distance().dim()];
+                Ok(b.graph.search(&b.store, &dummy_query, k, ef, filter))
+            }
         }
     }
 
@@ -600,6 +676,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) => b.graph.nb_points(),
             VectorGraph::L2PQ(b) => b.graph.nb_points(),
             VectorGraph::L1PQ(b) => b.graph.nb_points(),
+            VectorGraph::Int8(b) => b.graph.nb_points(),
         }
     }
 
@@ -627,6 +704,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) => b.graph.memory_bytes(),
             VectorGraph::L2PQ(b) => b.graph.memory_bytes(),
             VectorGraph::L1PQ(b) => b.graph.memory_bytes(),
+            VectorGraph::Int8(b) => b.graph.memory_bytes(),
         }
     }
 
@@ -641,6 +719,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) => b.store.memory_bytes(),
             VectorGraph::L2PQ(b) => b.store.memory_bytes(),
             VectorGraph::L1PQ(b) => b.store.memory_bytes(),
+            VectorGraph::Int8(b) => b.store.memory_bytes(),
         }
     }
 
@@ -671,6 +750,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(_) | VectorGraph::L2PQ(_) | VectorGraph::L1PQ(_) => {
                 self.raw_memory_bytes()
             }
+            VectorGraph::Int8(_) => 0,
         }
     }
 
@@ -687,6 +767,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) => b.graph.reserved_bytes(),
             VectorGraph::L2PQ(b) => b.graph.reserved_bytes(),
             VectorGraph::L1PQ(b) => b.graph.reserved_bytes(),
+            VectorGraph::Int8(b) => b.graph.reserved_bytes(),
         }
     }
 
@@ -701,6 +782,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) => b.store.reserved_bytes(),
             VectorGraph::L2PQ(b) => b.store.reserved_bytes(),
             VectorGraph::L1PQ(b) => b.store.reserved_bytes(),
+            VectorGraph::Int8(b) => b.store.reserved_bytes(),
         }
     }
 
@@ -715,6 +797,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(_) | VectorGraph::L2PQ(_) | VectorGraph::L1PQ(_) => {
                 self.raw_store().map_or(0, VectorStore::reserved_bytes)
             }
+            VectorGraph::Int8(_) => 0,
         }
     }
 
@@ -724,7 +807,8 @@ impl VectorGraph {
             VectorGraph::Cosine(_)
             | VectorGraph::L2(_)
             | VectorGraph::L1(_)
-            | VectorGraph::Dot(_) => None,
+            | VectorGraph::Dot(_)
+            | VectorGraph::Int8(_) => None,
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 b.raw.as_ref()
             }
@@ -742,6 +826,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) => b.graph.node_of(internal_id),
             VectorGraph::L2PQ(b) => b.graph.node_of(internal_id),
             VectorGraph::L1PQ(b) => b.graph.node_of(internal_id),
+            VectorGraph::Int8(b) => b.graph.node_of(internal_id),
         }
     }
 
@@ -755,6 +840,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) => b.graph.origin_id_of(node),
             VectorGraph::L2PQ(b) => b.graph.origin_id_of(node),
             VectorGraph::L1PQ(b) => b.graph.origin_id_of(node),
+            VectorGraph::Int8(b) => b.graph.origin_id_of(node),
         }
     }
 
@@ -775,6 +861,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 b.raw.as_ref()?.try_get(node)
             }
+            VectorGraph::Int8(_) => None,
         }
     }
 
@@ -790,10 +877,57 @@ impl VectorGraph {
             VectorGraph::Cosine(_)
             | VectorGraph::L2(_)
             | VectorGraph::L1(_)
-            | VectorGraph::Dot(_) => None,
+            | VectorGraph::Dot(_)
+            | VectorGraph::Int8(_) => None,
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 b.store.try_get(node)
             }
+        }
+    }
+
+    /// One record's stored row, by the internal id `id_map` hands out, being
+    /// its scalar codes and, on a cosine graph, the four bytes of its inverse
+    /// norm after them. What a rebuild re-inserts without re-encoding.
+    ///
+    /// The same two array reads `codes_of` makes on a product quantized
+    /// graph. `None` on every other graph, and for any id this graph never
+    /// took.
+    pub fn int8_row_of(&self, internal_id: usize) -> Option<&[i8]> {
+        let node = self.node_of(internal_id)?;
+        match self {
+            VectorGraph::Int8(b) => b.store.try_get(node),
+            _ => None,
+        }
+    }
+
+    /// One record's scalar codes alone, one a value, by the internal id
+    /// `id_map` hands out. `None` on every other graph, and for any id this
+    /// graph never took.
+    pub fn int8_codes_of(&self, internal_id: usize) -> Option<&[i8]> {
+        match self {
+            VectorGraph::Int8(b) => {
+                let row = self.int8_row_of(internal_id)?;
+                Some(b.graph.distance().codes_of_row(row))
+            }
+            _ => None,
+        }
+    }
+
+    /// Encode one vector as the row this graph stores, through its own
+    /// codec and metric. Refused on every other graph.
+    pub fn int8_encode(&self, vector: &[f32]) -> Result<Vec<i8>, String> {
+        match self {
+            VectorGraph::Int8(b) => b.graph.distance().encode(vector),
+            _ => Err("this graph holds no scalar codes".to_string()),
+        }
+    }
+
+    /// The codec a scalar quantized graph decodes through, and `None` on
+    /// every other graph.
+    pub fn int8_codec(&self) -> Option<&Arc<Int8Codec>> {
+        match self {
+            VectorGraph::Int8(b) => Some(b.graph.distance().codec()),
+            _ => None,
         }
     }
 
@@ -878,6 +1012,14 @@ impl VectorGraph {
                 let _query_lut = b.graph.distance().install_query_lut(&query).ok()?;
                 time(b.graph.distance(), &b.store, evaluations, rounds, admits)
             }
+            // The query is the decoded twin of the point the raw timing takes
+            // as its query, installed on this thread, so the kernel timed is
+            // the one a search runs, being query against decoded code.
+            VectorGraph::Int8(b) => {
+                let query = b.graph.distance().reconstruct(b.store.try_get(1)?).ok()?;
+                let _query = b.graph.distance().install_query(&query).ok()?;
+                time(b.graph.distance(), &b.store, evaluations, rounds, admits)
+            }
         }
     }
 
@@ -927,9 +1069,14 @@ impl VectorGraph {
                 VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                     b.graph.distance().reconstruct(b.store.get(node)).ok()?
                 }
+                VectorGraph::Int8(b) => b.graph.distance().reconstruct(b.store.get(node)).ok()?,
             })
         };
-        let cosine = matches!(self, VectorGraph::Cosine(_) | VectorGraph::CosinePQ(_));
+        let cosine = match self {
+            VectorGraph::Cosine(_) | VectorGraph::CosinePQ(_) => true,
+            VectorGraph::Int8(b) => b.graph.distance().metric() == Int8Metric::Cosine,
+            _ => false,
+        };
         let mut samples = Vec::with_capacity(rounds);
         for round in 0..rounds {
             let first = (round.wrapping_mul(SCATTER_STRIDE).wrapping_add(1) % n) as u32;
@@ -967,6 +1114,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 b.raw.is_some()
             }
+            VectorGraph::Int8(_) => false,
         }
     }
 
@@ -1014,6 +1162,9 @@ impl VectorGraph {
             | VectorGraph::L2(_)
             | VectorGraph::L1(_)
             | VectorGraph::Dot(_) => Err("a raw graph already holds its raw vectors".to_string()),
+            VectorGraph::Int8(_) => {
+                Err("a scalar quantized graph keeps no raw vectors beside its codes".to_string())
+            }
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 b.raw = Some(VectorStore::with_capacity(dim, records));
                 Ok(())
@@ -1049,7 +1200,8 @@ impl VectorGraph {
             VectorGraph::Cosine(_)
             | VectorGraph::L2(_)
             | VectorGraph::L1(_)
-            | VectorGraph::Dot(_) => {}
+            | VectorGraph::Dot(_)
+            | VectorGraph::Int8(_) => {}
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 if let Some(raw) = b.raw.as_mut() {
                     raw.reserve_for(want);
@@ -1101,6 +1253,9 @@ impl VectorGraph {
             | VectorGraph::L2(_)
             | VectorGraph::L1(_)
             | VectorGraph::Dot(_) => Err("a raw graph already holds its raw vectors".to_string()),
+            VectorGraph::Int8(_) => {
+                Err("a scalar quantized graph keeps no raw vectors beside its codes".to_string())
+            }
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 match b.raw.as_mut() {
                     Some(store) => {
@@ -1124,6 +1279,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 b.raw.as_ref().map_or(0, VectorStore::len)
             }
+            VectorGraph::Int8(_) => 0,
         }
     }
 
@@ -1137,6 +1293,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 b.raw.as_ref().map(VectorStore::dim)
             }
+            VectorGraph::Int8(_) => None,
         }
     }
 
@@ -1171,15 +1328,35 @@ impl VectorGraph {
                 }
                 b.graph.shrink_to_fit()
             }
+            VectorGraph::Int8(b) => {
+                b.store.shrink_to_fit();
+                b.graph.shrink_to_fit()
+            }
         };
         links + before.saturating_sub(self.store_memory_bytes() + self.raw_memory_bytes())
     }
 
+    /// Whether this graph scores against codes rather than against the
+    /// vectors themselves, which is true of a product quantized graph and
+    /// of a scalar quantized one. A caller that needs to know which asks
+    /// [`VectorGraph::is_pq`] or [`VectorGraph::is_int8`].
     pub fn is_quantized(&self) -> bool {
+        self.is_pq() || self.is_int8()
+    }
+
+    /// Whether this graph scores against product quantized codes through a
+    /// codebook.
+    pub fn is_pq(&self) -> bool {
         matches!(
             self,
             VectorGraph::CosinePQ(_) | VectorGraph::L2PQ(_) | VectorGraph::L1PQ(_)
         )
+    }
+
+    /// Whether this graph scores against scalar codes, one signed byte a
+    /// value, decoded through a per dimension scale.
+    pub fn is_int8(&self) -> bool {
+        matches!(self, VectorGraph::Int8(_))
     }
 
     /// Reseed the level stream. Resets it rather than extending it, so a caller
@@ -1203,6 +1380,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) => reseed(&b.levels),
             VectorGraph::L2PQ(b) => reseed(&b.levels),
             VectorGraph::L1PQ(b) => reseed(&b.levels),
+            VectorGraph::Int8(b) => reseed(&b.levels),
         }
     }
 
@@ -1226,6 +1404,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) => b.draw_level(),
             VectorGraph::L2PQ(b) => b.draw_level(),
             VectorGraph::L1PQ(b) => b.draw_level(),
+            VectorGraph::Int8(b) => b.draw_level(),
         }
     }
 
@@ -1257,6 +1436,20 @@ impl VectorGraph {
             | (VectorGraph::L2PQ(b), Record::Codes { codes, .. })
             | (VectorGraph::L1PQ(b), Record::Codes { codes, .. }) => {
                 Some(b.plan_at_level(codes, level))
+            }
+            (VectorGraph::Int8(b), Record::Int8(codes)) => Some(b.plan_at_level(codes, level)),
+            // A scalar graph handed anything but scalar codes, or scalar
+            // codes handed to any other graph, is the same programming error
+            // the two arms below name for the other element types.
+            (VectorGraph::Int8(_), _) | (_, Record::Int8(_)) => {
+                error!(
+                    target: LOG_TARGET,
+                    operation = "vector_insert",
+                    error = "invalid_operation",
+                    reason = "scalar_codes_and_graph_disagree",
+                    "A scalar quantized graph takes scalar codes and nothing else takes them"
+                );
+                None
             }
             (_, Record::Raw(_)) => {
                 error!(
@@ -1297,6 +1490,7 @@ impl VectorGraph {
                 b.install(codes, id, planned);
                 b.push_raw(raw);
             }
+            (VectorGraph::Int8(b), Record::Int8(codes)) => b.install(codes, id, planned),
             // Unreachable, because a plan the element type refused is `None`
             // and the caller then installs nothing.
             _ => error!(
@@ -1347,7 +1541,30 @@ impl VectorGraph {
         }
     }
 
-    /// Which of the seven graphs this is, as the dump header records it.
+    /// Insert scalar rows, as [`VectorGraph::int8_encode`] produced them,
+    /// one record at a time in the order given, for the rebuild paths that
+    /// build a fresh graph off to the side. Every caller sorts its batch by
+    /// internal id so that two rebuilds of the same records wire the same
+    /// graph, as [`VectorGraph::insert_batch_pq`] requires of its callers.
+    pub fn insert_batch_int8(&mut self, data: &[(&[i8], usize)]) -> Result<(), String> {
+        debug!(
+            target: LOG_TARGET,
+            operation = "batch_insert_int8",
+            batch_size = data.len(),
+            "Starting scalar code batch insertion"
+        );
+        match self {
+            VectorGraph::Int8(b) => {
+                for (codes, id) in data {
+                    b.insert(codes, *id);
+                }
+                Ok(())
+            }
+            _ => Err("Cannot insert scalar codes into a graph that does not hold them".to_string()),
+        }
+    }
+
+    /// Which of the graphs this is, as the dump header records it.
     fn kind(&self) -> GraphKind {
         match self {
             VectorGraph::Cosine(_) => GraphKind::Cosine,
@@ -1357,6 +1574,12 @@ impl VectorGraph {
             VectorGraph::CosinePQ(_) => GraphKind::CosinePq,
             VectorGraph::L2PQ(_) => GraphKind::L2Pq,
             VectorGraph::L1PQ(_) => GraphKind::L1Pq,
+            VectorGraph::Int8(b) => match b.graph.distance().metric() {
+                Int8Metric::Cosine => GraphKind::CosineInt8,
+                Int8Metric::L2 => GraphKind::L2Int8,
+                Int8Metric::L1 => GraphKind::L1Int8,
+                Int8Metric::Dot => GraphKind::DotInt8,
+            },
         }
     }
 
@@ -1383,6 +1606,7 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
             VectorGraph::L2PQ(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
             VectorGraph::L1PQ(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
+            VectorGraph::Int8(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
         }?;
         Ok(dump::DUMP_FILENAME.to_string())
     }
@@ -1529,6 +1753,51 @@ pub fn restore_graph(
         }
     };
 
+    let nodes = graph.nb_points();
+    Ok((graph, nodes))
+}
+
+/// The scalar quantized kind a space name maps to, which is the kind a dump
+/// of such a graph carries and the kind `restore_int8_graph` expects.
+fn int8_kind(space: &str) -> GraphKind {
+    match Int8Metric::from_space(space) {
+        Int8Metric::Cosine => GraphKind::CosineInt8,
+        Int8Metric::L2 => GraphKind::L2Int8,
+        Int8Metric::L1 => GraphKind::L1Int8,
+        Int8Metric::Dot => GraphKind::DotInt8,
+    }
+}
+
+/// Restore the saved graph of a scalar quantized index.
+///
+/// The counterpart of [`restore_graph`] for a graph holding one `i8` a
+/// value. The codec and the space together decide the row width the dump
+/// must carry, being the codec's width plus the norm tail on a cosine
+/// graph, and the space decides the kind the header must carry. A dump of
+/// any other element type or kind is refused on its header, and every
+/// refusal is a reason to rebuild rather than to fail, exactly as it is for
+/// the other graphs. The bounds are checked the same way, before anything
+/// is allocated from a field.
+pub fn restore_int8_graph(
+    dir: &Path,
+    space: &str,
+    m: usize,
+    ef_construction: usize,
+    codec: Arc<Int8Codec>,
+    bounds: DumpBounds,
+) -> Result<(VectorGraph, usize), String> {
+    let kind = int8_kind(space);
+    let dist = Int8Dist::new(codec, Int8Metric::from_space(space));
+    let expected = Expected {
+        kind,
+        dimension: dist.row_width(),
+        m,
+        ef_construction,
+        min_nodes: bounds.min_nodes,
+        max_origin_id: bounds.max_origin_id,
+    };
+    let restored = Backend::restored(dump::read_dump::<i8, Int8Dist>(dir, &expected, dist)?);
+    let graph = VectorGraph::Int8(restored);
     let nodes = graph.nb_points();
     Ok((graph, nodes))
 }

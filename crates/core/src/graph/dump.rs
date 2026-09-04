@@ -43,7 +43,7 @@
 //!    8   4  format_version    u32
 //!   12   4  flags             u32   reserved, zero
 //!   16   1  distance          u8    GraphKind
-//!   17   1  element           u8    1 f32, 2 u8
+//!   17   1  element           u8    1 f32, 2 u8, 3 i8
 //!   18   1  nb_layer          u8
 //!   19   1  reserved0         u8    zero
 //!   20   4  dimension         u32
@@ -190,7 +190,7 @@ const LAYER_TABLE_ENTRY_BYTES: usize = 4;
 /// Bytes buffered on the way to and from the file.
 const IO_BUFFER_BYTES: usize = 1 << 20;
 
-/// Which of the six graphs a dump holds.
+/// Which graph a dump holds.
 ///
 /// This is what replaces `std::any::type_name::<D>()` in the vendored header.
 /// A discriminant is a value ZeusDB chose, so the distance types are free to
@@ -217,11 +217,20 @@ pub(crate) enum GraphKind {
     /// `collection/construct.rs` records the measurement that keeps the pair
     /// refused.
     L1Pq = 6,
-    /// Inner product. There is no quantized counterpart. `create()` and
-    /// `load()` refuse the pair, so no dump can carry one, and
+    /// Inner product. There is no product quantized counterpart. `create()`
+    /// and `load()` refuse the pair, so no dump can carry one, and
     /// `validate_space_supports_quantization` in `collection/construct.rs`
     /// records the measurement that keeps it refused.
     Dot = 7,
+    /// The four scalar quantized graphs, holding one `i8` a value and
+    /// scoring on the space's own arithmetic over the decoded values. One
+    /// distance type serves all four, `Int8Dist`, which carries the metric,
+    /// so the kind is what tells a dump's metric apart, as it does for the
+    /// three product quantized kinds above.
+    CosineInt8 = 8,
+    L2Int8 = 9,
+    L1Int8 = 10,
+    DotInt8 = 11,
 }
 
 impl GraphKind {
@@ -239,6 +248,10 @@ impl GraphKind {
             GraphKind::L2Pq => "quantized l2",
             GraphKind::L1Pq => "quantized l1",
             GraphKind::Dot => "dot",
+            GraphKind::CosineInt8 => "int8 cosine",
+            GraphKind::L2Int8 => "int8 l2",
+            GraphKind::L1Int8 => "int8 l1",
+            GraphKind::DotInt8 => "int8 dot",
         }
     }
 
@@ -251,6 +264,10 @@ impl GraphKind {
             5 => Some(GraphKind::L2Pq),
             6 => Some(GraphKind::L1Pq),
             7 => Some(GraphKind::Dot),
+            8 => Some(GraphKind::CosineInt8),
+            9 => Some(GraphKind::L2Int8),
+            10 => Some(GraphKind::L1Int8),
+            11 => Some(GraphKind::DotInt8),
             _ => None,
         }
     }
@@ -258,11 +275,13 @@ impl GraphKind {
 
 /// What a point's data is made of, on disk and in memory.
 ///
-/// The graph stores `f32` vectors when it is raw and `u8` codes when it is
-/// quantized, and the dump has to encode either without the reader guessing.
-/// The `KIND` byte is written into the header and checked on the way back, so a
+/// The graph stores `f32` vectors when it is raw, `u8` codes when it is
+/// product quantized and `i8` codes when it is scalar quantized, and the dump
+/// has to encode any of the three without the reader guessing. The `KIND`
+/// byte is written into the header and checked on the way back, so a
 /// quantized dump handed to the raw loader is rejected on the header rather
-/// than misread as a vector a quarter the width.
+/// than misread as a vector a quarter the width, and a scalar dump handed to
+/// the product quantized loader is rejected rather than read as unsigned.
 pub(crate) trait DumpElement:
     Copy + Clone + Send + Sync + std::fmt::Debug + 'static
 {
@@ -304,6 +323,21 @@ impl DumpElement for u8 {
 
     fn decode(bytes: &[u8]) -> Vec<Self> {
         bytes.to_vec()
+    }
+}
+
+/// A scalar code, one signed byte on disk as in memory. The element kind is
+/// what tells it from a product code of the same width.
+impl DumpElement for i8 {
+    const KIND: u8 = 3;
+    const BYTES: usize = 1;
+
+    fn encode(values: &[Self], buf: &mut Vec<u8>) {
+        buf.extend(values.iter().map(|&value| value as u8));
+    }
+
+    fn decode(bytes: &[u8]) -> Vec<Self> {
+        bytes.iter().map(|&byte| byte as i8).collect()
     }
 }
 
