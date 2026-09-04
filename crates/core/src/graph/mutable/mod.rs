@@ -1,17 +1,16 @@
 //! The mutable form of the graph, which is what construction writes into.
 //!
-//! [`super::flat::FlatGraph`] is read-only by construction. Its node order is
-//! layer major, so appending a node of level `l` means inserting into the
-//! middle of the arena and renumbering every higher-layer node, which
-//! invalidates every CSR target. This is the same graph in a form a node can be
-//! appended to.
+//! The dump's own form is read-only by construction. Its node order is layer
+//! major, so appending a node of level `l` means inserting into the middle of
+//! the arena and renumbering every higher-layer node, which invalidates every
+//! target. This is the same graph in a form a node can be appended to.
 //!
 //! # Node identity
 //!
 //! A node is a `u32` handed out in the order nodes arrive, and it never
 //! changes. Loading adopts the dump's own order, which is layer major, so a
-//! loaded graph numbers its nodes exactly as `FlatGraph` does and the two can
-//! be compared node for node. Insertion appends at the end whatever level it
+//! loaded graph numbers its nodes exactly as the dump does and the two can be
+//! compared node for node. Insertion appends at the end whatever level it
 //! drew. The level is carried per node in one byte rather than implied by the
 //! node's position, which is the whole difference.
 //!
@@ -339,16 +338,16 @@ where
 {
     /// Build the structure from the topology the dump reader produces.
     ///
-    /// The same acceptance rules as `Hnsw::from_loaded_points` and
-    /// `FlatGraph::from_loaded`, because all three are fed the same parsed dump
-    /// and have to agree on what a malformed one is, plus one rule the others
-    /// do not need. A neighbour list longer than the cap its layer allows is
+    /// The same acceptance rules as the vendored `Hnsw::from_loaded_points`,
+    /// because both are fed the same parsed dump and have to agree on what a
+    /// malformed one is, plus one rule the other does not need. A neighbour
+    /// list longer than the cap its layer allows is
     /// refused, since the vendored builder cannot produce one and this layout
     /// caps a list at what the guarded pop needs. A refusal reaches the loader's
     /// rebuild path, which is what every other refusal reaches too.
     ///
     /// Nodes are numbered in the order the dump streams them, which is layer
-    /// major, so a loaded graph's node indices match `FlatGraph`'s exactly.
+    /// major, so a loaded graph's node indices match the dump's exactly.
     pub(super) fn from_loaded(
         points_by_layer: Vec<Vec<LoadedPoint<T>>>,
         entry_point: PointId,
@@ -1406,9 +1405,10 @@ where
 
     /// Bytes the structure has asked the allocator for.
     ///
-    /// Exact rather than sampled, for the same reason `FlatGraph`'s figure is:
-    /// every buffer's capacity is known and there is no per-node or per-edge
-    /// allocation to estimate.
+    /// Exact rather than sampled: every buffer's capacity is known and there
+    /// is no per-node or per-edge allocation to estimate. What the figure does
+    /// not see is how much of that capacity has been written, which is
+    /// [`MutableGraph::reserved_bytes`].
     pub(super) fn memory_bytes(&self) -> usize {
         let mut total = std::mem::size_of::<Self>();
         total += self.origin_ids.capacity() * std::mem::size_of::<usize>();
@@ -1426,6 +1426,42 @@ where
         total += self.upper_in_degree.capacity() * std::mem::size_of::<u32>();
         total += self.upper_targets.capacity() * std::mem::size_of::<u32>();
         total += self.upper_dists.capacity() * std::mem::size_of::<f32>();
+        total
+    }
+
+    /// Bytes of that request no node has been written into.
+    ///
+    /// The same fifteen buffers priced at the gap between their capacity and
+    /// their length, plus nothing for the struct itself, which is written in
+    /// full the moment it exists. A graph built by insertion grows its arenas
+    /// geometrically past whatever the creation-time reservation held, so this
+    /// is the slack of the last growth of each of them, and it is exactly what
+    /// [`MutableGraph::shrink_to_fit`] returns to the allocator.
+    ///
+    /// It is committed rather than resident. A page a `Vec` reserved and never
+    /// wrote is charged against the pagefile and is not in the working set,
+    /// which is why the figure is reported beside the request rather than
+    /// subtracted from it.
+    pub(super) fn reserved_bytes(&self) -> usize {
+        fn spare<T>(v: &[T], capacity: usize) -> usize {
+            capacity.saturating_sub(v.len()) * std::mem::size_of::<T>()
+        }
+        let mut total = 0;
+        total += spare(&self.origin_ids, self.origin_ids.capacity());
+        total += spare(&self.levels, self.levels.capacity());
+        total += spare(&self.node_of, self.node_of.capacity());
+        total += spare(&self.base_targets, self.base_targets.capacity());
+        total += spare(&self.base_dists, self.base_dists.capacity());
+        total += spare(&self.base_len, self.base_len.capacity());
+        total += spare(&self.base_in_degree, self.base_in_degree.capacity());
+        total += spare(&self.upper_first, self.upper_first.capacity());
+        total += spare(&self.upper_span, self.upper_span.capacity());
+        total += spare(&self.upper_at, self.upper_at.capacity());
+        total += spare(&self.upper_len, self.upper_len.capacity());
+        total += spare(&self.upper_cap, self.upper_cap.capacity());
+        total += spare(&self.upper_in_degree, self.upper_in_degree.capacity());
+        total += spare(&self.upper_targets, self.upper_targets.capacity());
+        total += spare(&self.upper_dists, self.upper_dists.capacity());
         total
     }
 
@@ -1544,10 +1580,10 @@ where
     /// vendored `Point::neighbours[layer]` returns. That includes the layers
     /// above the node's own level.
     ///
-    /// An earlier layout dropped those edges from `FlatGraph` and held them out
-    /// of this accessor, on the reasoning that no traversal reaches a node at a
-    /// layer above its level. That reasoning has a hole, which porting the
-    /// insert found: `search_layer` seeds its result heap with
+    /// An earlier layout dropped those edges from the read-only form and held
+    /// them out of this accessor, on the reasoning that no traversal reaches a
+    /// node at a layer above its level. That reasoning has a hole, which
+    /// porting the insert found: `search_layer` seeds its result heap with
     /// the point it was entered at whatever that point's level, so a point below
     /// the layer can enter a list there and be reached from it afterwards. The
     /// insertion traversal reads these lists on the vendored path, so it has to

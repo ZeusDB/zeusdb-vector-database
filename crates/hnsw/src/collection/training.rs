@@ -236,9 +236,18 @@ impl Collection {
         }
 
         // Clear training IDs (no longer needed)
+        //
+        // The capacity goes with them. Collection stops for good once
+        // `training_threshold_reached` is set, which happens on the record that
+        // fills the buffer and before this runs, so nothing pushes into it
+        // again for the life of the index and the slots it held are dead
+        // weight. At the default `training_size` of 10,000 the buffer had grown
+        // to 16,384 slots of a 24 byte `String` header, being 393,216 bytes
+        // held inside `index_bookkeeping_memory_mb` on every trained index.
         {
             let mut training_ids = self.training_ids.write().unwrap();
             training_ids.clear();
+            training_ids.shrink_to_fit();
         }
 
         // Rebuild index with quantization
@@ -482,6 +491,17 @@ impl Collection {
                 new_hnsw
                     .adopt_raw_from(old_hnsw, self.dense().dim)
                     .map_err(|e| format!("Failed to carry the raw vectors over: {}", e))?;
+                // The store that carries them is opened at the number of
+                // records present now, which is the training sample, and the
+                // rest of the corpus is still coming. Every record after this
+                // would push into a block sized for a fraction of the index and
+                // the block would double its way up, ending at close to twice
+                // what it holds: measured at 100,000 records of dimension 100,
+                // a store holding 400.0 bytes a record of vectors had been
+                // asked for 640.1. Reserving for the declared size makes it the
+                // size the caller asked for, under the same byte budget the
+                // graph's own arenas are reserved under.
+                new_hnsw.reserve_raw_for(self.expected_size());
                 0
             } else {
                 held

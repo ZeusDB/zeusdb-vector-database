@@ -7,7 +7,10 @@
 //! stays here.
 
 use super::{Collection, StorageMode};
-use crate::{default_rerank_fetch, RERANK_CALIBRATION_PAGES, RERANK_CALIBRATION_TOP_K};
+use crate::{
+    default_rerank_fetch, requested_rerank_fetch, rerank_fetch_ceiling, RERANK_CALIBRATION_PAGES,
+    RERANK_CALIBRATION_TOP_K,
+};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -105,10 +108,15 @@ impl Collection {
         };
 
         // The reverse map holds a second copy of every id, as a value rather
-        // than as a key, so its text is counted again on purpose.
+        // than as a key, so its text is counted again on purpose. Its live
+        // bitmap is priced from the same guard, at one word per sixty-four
+        // internal ids, being the first of the two bitmaps this sum used to
+        // leave out.
         bookkeeping += {
             let rev_map = self.rev_map.read().unwrap();
-            table_bytes(&rev_map) + rev_map.values().map(|id| id.len()).sum::<usize>()
+            table_bytes(&rev_map)
+                + rev_map.values().map(|id| id.len()).sum::<usize>()
+                + rev_map.live_heap_bytes()
         };
 
         // Nodes the graph holds, which exceeds the live record count by exactly the
@@ -126,7 +134,15 @@ impl Collection {
         // raw vectors are reported under their own key wherever they sit, which
         // is the graph's own store on a raw index and the store beside the
         // codes on a `quantized_with_raw` one.
-        let (graph_nodes, graph_memory_mb, graph_quantized, keeps_raw) = {
+        let (
+            graph_nodes,
+            graph_memory_mb,
+            graph_quantized,
+            keeps_raw,
+            raw_bytes,
+            reserved_bytes,
+            dense_live_bytes,
+        ) = {
             let index = self.dense().index.read().unwrap();
             let hnsw = index.graph();
             let quantized = hnsw.is_quantized();
@@ -136,17 +152,41 @@ impl Collection {
                 } else {
                     0
                 };
+            // The same division, taken again at the gap between capacity and
+            // length, so the two figures are the same structures priced twice.
+            let graph_reserved = hnsw.links_reserved_bytes()
+                + if quantized {
+                    hnsw.store_reserved_bytes()
+                } else {
+                    0
+                };
+            let nodes = hnsw.nb_points();
+            let raw = hnsw.raw_vectors_memory_bytes();
+            let reserved = graph_reserved + hnsw.raw_vectors_reserved_bytes();
+            let holds_raw = hnsw.holds_raw();
             (
-                hnsw.nb_points(),
+                nodes,
                 graph_bytes as f64 / (1024.0 * 1024.0),
                 quantized,
-                hnsw.holds_raw(),
+                holds_raw,
+                raw,
+                reserved,
+                // The second of the two bitmaps, priced from the guard that is
+                // already open on the structure holding it.
+                index.live_heap_bytes(),
             )
         };
-        let pq_code_count = {
+        // The codes the map holds, counted and priced under one guard. A code
+        // is a `Vec<u8>` of exactly `subvectors` bytes, so its capacity and its
+        // length are the same number; it is read rather than restated so that
+        // this key prices its structure the way every other memory key does.
+        let (pq_code_count, pq_code_bytes) = {
             let pq_codes = self.dense().pq_codes.read().unwrap();
             bookkeeping += table_bytes(&pq_codes) + key_text_bytes(&pq_codes);
-            pq_codes.len()
+            (
+                pq_codes.len(),
+                pq_codes.values().map(|code| code.capacity()).sum::<usize>(),
+            )
         };
 
         // The metadata map holds an id and a map per record. The inner maps are
@@ -174,6 +214,9 @@ impl Collection {
         // nearly every record holds a different one. Zero on an index created
         // without `indexed_fields`.
         bookkeeping += self.columns.read().unwrap().heap_bytes();
+
+        // The dense index's live set, captured with the graph above.
+        bookkeeping += dense_live_bytes;
 
         let training_id_count = {
             let training_ids = self.training_ids.read().unwrap();
@@ -244,13 +287,28 @@ impl Collection {
         // `total_memory_mb` charged every raw vector twice. There is one copy
         // now, it is priced once, and it is priced under the key that names it.
         //
-        // The raw figure is the payload of the live records, which is the
-        // formula this key always used. The store's own capacity is larger,
-        // because a growing arena carries slack and a node that removal has
-        // stranded keeps its slot until `compact` runs, and neither is charged
-        // here for the same reason the codes are charged at their payload.
+        // # One convention, applied to every key
+        //
+        // **Every memory key prices the capacity its structure asked the
+        // allocator for.** `graph_memory_mb` always did. This one did not: it
+        // was `live * dim * 4`, the payload of the live records, while the
+        // store holding them is a growable block that carries the slack of its
+        // last doubling and keeps a stranded node's slot until `compact` runs.
+        // The sum of a capacity and a payload is neither, and at dimension
+        // 1,536 and 50,000 records that put the report 3,991 bytes a record
+        // below what the index had asked for.
+        //
+        // Nothing is lost by the change. The payload is `raw_vectors_stored`
+        // times `dimension` times four, and both of those keys are reported
+        // beside this one, so a caller who wants the vectors rather than the
+        // block they sit in can still have them exactly.
+        //
+        // The request is the figure to report, rather than the resident set,
+        // because it is the one this call can compute exactly and on every
+        // platform. What separates the two is named under
+        // `reserved_memory_mb`.
         let raw_vector_count = if keeps_raw { live } else { 0 };
-        let raw_memory_mb = (raw_vector_count * self.dense().dim * 4) as f64 / (1024.0 * 1024.0);
+        let raw_memory_mb = raw_bytes as f64 / (1024.0 * 1024.0);
         let mut total_memory_mb = graph_memory_mb + raw_memory_mb;
         stats.insert(
             "graph_memory_mb".to_string(),
@@ -293,8 +351,14 @@ impl Collection {
             // addressed against. This key prices the map, as it always did, and
             // `graph_memory_mb` prices the store. The second copy of the raw
             // vectors is gone and this one is not.
-            let quantized_memory_mb =
-                (pq_code_count * config.subvectors) as f64 / (1024.0 * 1024.0);
+            //
+            // It is the capacity the code vectors hold rather than
+            // `pq_code_count * subvectors`, which is the same number on every
+            // index this crate builds, since `PQ::quantize` returns a vector of
+            // exactly `subvectors` bytes. Reading it keeps this key on the one
+            // convention the rest of them are on rather than on arithmetic that
+            // would stop agreeing the moment a code stopped being exactly sized.
+            let quantized_memory_mb = pq_code_bytes as f64 / (1024.0 * 1024.0);
             total_memory_mb += quantized_memory_mb;
 
             stats.insert(
@@ -411,6 +475,26 @@ impl Collection {
                     format!("{:.2}", norm_mb),
                 );
 
+                // A code against the vector it stands for, and nothing wider.
+                //
+                // `dim * 4` bytes of float32 replaced by one byte per
+                // subvector, which is a property of the configuration and is
+                // the same number before a record is added and after a million
+                // are. **It is not the ratio by which the index shrinks.** An
+                // index is a graph, a set of hash tables and the trained tables
+                // beside the vectors, none of which a code touches, and under
+                // `quantized_with_raw` the vectors are still there as well. On
+                // 100,000 real 100-dimensional records this reads 40.0 while
+                // the whole index under `quantized_only` holds 728.7 bytes a
+                // record against 1,025.3 unquantized, being 1.41 times smaller
+                // rather than forty.
+                //
+                // It is left as it is rather than replaced by a whole index
+                // ratio, because a whole index ratio is a projection and not a
+                // measurement: it needs what the same records would have cost
+                // unquantized, which this index does not hold and cannot
+                // measure. What it can measure is what it holds now, and that
+                // is `total_memory_mb` with its components beside it.
                 if pq_trained {
                     let compression_ratio = (pq.dim() as f64 * 4.0) / pq.subvectors() as f64;
                     stats.insert(
@@ -497,6 +581,21 @@ impl Collection {
                 // plan and `SearchParams::fetch_k` then asks for the page
                 // itself, so those report the page rather than the fallback
                 // they used to report and never fetched.
+                //
+                // Three keys rather than one, because the rule now has two
+                // steps and a caller reading a fetch shorter than the
+                // calibration measured is owed the reason. `..._requested_fetch`
+                // is what the calibration asks for at this record count,
+                // `..._fetch_ceiling` is the bound that fetch is held under, and
+                // `..._default_fetch` is what a search performs. They are equal
+                // on every index whose codes rank well enough for the request to
+                // sit under the bound, which is most of them.
+                let requested_fetch = match config.storage_mode {
+                    StorageMode::QuantizedWithRaw if quantization_active => {
+                        requested_rerank_fetch(calibration, live, RERANK_CALIBRATION_TOP_K)
+                    }
+                    _ => RERANK_CALIBRATION_TOP_K,
+                };
                 let default_fetch = match config.storage_mode {
                     StorageMode::QuantizedWithRaw if quantization_active => {
                         default_rerank_fetch(calibration, live, RERANK_CALIBRATION_TOP_K)
@@ -504,8 +603,20 @@ impl Collection {
                     _ => RERANK_CALIBRATION_TOP_K,
                 };
                 stats.insert(
+                    "rerank_requested_fetch".to_string(),
+                    requested_fetch.to_string(),
+                );
+                stats.insert(
+                    "rerank_fetch_ceiling".to_string(),
+                    rerank_fetch_ceiling(live).to_string(),
+                );
+                stats.insert(
                     "rerank_default_fetch".to_string(),
                     default_fetch.to_string(),
+                );
+                stats.insert(
+                    "rerank_fetch_capped".to_string(),
+                    (default_fetch < requested_fetch).to_string(),
                 );
             }
         } else {
@@ -536,27 +647,45 @@ impl Collection {
 
         // What the index spends on finding a record rather than on holding one.
         //
-        // Five hash tables and two id copies per record. `id_map` and `rev_map`
-        // each hold the record's id, one as a key and one as a value, and
-        // `vectors`, `pq_codes` and `vector_metadata` each hold it again as a
+        // Three hash tables and three copies of the id on an unquantized index,
+        // four of each on a quantized one, plus the declared columns, the
+        // training buffer, the index level metadata and the two live bitmaps.
+        // `id_map` holds the record's id as a key, `rev_map` holds it again as
+        // a value, and `vector_metadata` and `pq_codes` each hold it again as a
         // key. A table is a power of two bucket array with one control byte per
         // bucket, sized from the capacity the map reports, so it is between
         // eight sevenths and sixteen sevenths of the entries it currently
         // holds and it steps rather than growing smoothly. The `Vec` in
-        // `vectors` and in `pq_codes` contributes only its 24 byte header here,
-        // since the bytes it points at are already priced above.
+        // `pq_codes` contributes only its 24 byte header here, since the bytes
+        // it points at are already priced above.
         //
         // It is proportional to the record count and independent of the
-        // dimension. Measured on three loaded indexes of 50,000 dbpedia-openai
-        // records at dimension 1,536 it reads 12.66, 15.95 and 12.66 MiB under
-        // no quantization, `quantized_with_raw` and `quantized_only`, being
-        // 265, 334 and 265 bytes per record. The middle mode is the one holding
-        // both stores, so it carries five tables where the others carry four.
+        // dimension. Measured against a counting allocator on 100,000 records
+        // at `m` 16 with five character ids and no metadata, it reads 197.3
+        // bytes a record unquantized and 266.4 under `quantized_only`, where
+        // the difference is the fourth table and the fourth copy of the id. A record carrying two small metadata fields costs 259 bytes a
+        // record more, because a per record `HashMap<String, Value>` is a four
+        // bucket table of 56 byte buckets holding about sixteen bytes of
+        // payload.
+        //
+        // It steps with the tables' powers of two rather than holding still. At
+        // 100,000 records every table sits at 76 percent of its buckets, which
+        // is near the cheapest point of the cycle; at 115,000 records the same
+        // structures read 332 bytes a record, because the tables have just
+        // doubled and sit at 44 percent. A figure quoted at one record count is
+        // a point on that sawtooth and not a rate.
+        //
+        // An earlier version of this comment read 265, 334 and 265 bytes a
+        // record for the three storage modes. That was five tables rather than
+        // four: it counted a `vectors` map keyed by external id that the
+        // graph's own store replaced, at one table of 32 byte buckets and one
+        // more copy of the id.
         //
         // This is a request count and not a commitment. The allocator's own
         // headers, its rounding and its fragmentation sit outside it, the same
         // way they sit outside `graph_memory_mb`; see
-        // `VectorGraph::memory_bytes`.
+        // `VectorGraph::memory_bytes`. Nothing here is reserved and unwritten,
+        // so none of it appears under `reserved_memory_mb`.
         let bookkeeping_mb = bookkeeping as f64 / (1024.0 * 1024.0);
         total_memory_mb += bookkeeping_mb;
         stats.insert(
@@ -638,6 +767,37 @@ impl Collection {
             }
         }
 
+        // Of the sum below, the bytes no record has been written into.
+        //
+        // The graph's fifteen buffers and the vector stores are growable
+        // blocks. They start at the creation-time reservation, which is
+        // `expected_size` records or as many as `RESERVE_BYTES` holds,
+        // whichever is smaller, and a build past that grows them geometrically,
+        // so the last growth of each leaves capacity nothing has reached. That
+        // capacity is charged against the pagefile and is not in the working
+        // set, which is the whole of why the request and the resident set
+        // differ in this direction.
+        //
+        // **It is a component of `total_memory_mb` rather than a term beside
+        // it.** The sum is unchanged by its presence; this says how much of the
+        // sum is untouched. So `total_memory_mb` is what the index asked for,
+        // `total_memory_mb - reserved_memory_mb` is what it has written, and the
+        // resident set sits above the second by whatever the allocator adds per
+        // block, which no arithmetic here can see.
+        //
+        // It is exactly the figure `shrink_to_fit()` returns, in bytes, since
+        // both are the same fifteen buffers and the same stores priced at the
+        // gap between their capacity and their length. A caller who reads a
+        // large figure here and is finished inserting can call that and get it
+        // back. The hash tables contribute nothing, because hashbrown sizes a
+        // table at a power of two from its length and shrinking recomputes the
+        // same power of two.
+        let reserved_memory_mb = reserved_bytes as f64 / (1024.0 * 1024.0);
+        stats.insert(
+            "reserved_memory_mb".to_string(),
+            format!("{:.2}", reserved_memory_mb),
+        );
+
         // The sum of the six memory keys above, and of the sparse space's
         // two where one is declared. It is what the index holds in the
         // structures this call can price, being the graph, the raw vector
@@ -650,19 +810,20 @@ impl Collection {
         // an integration package forwards comes from `get_quantization_info`
         // and is the codebook alone, which is untouched.
         //
-        // It is still not the resident set. The allocator's headers and its
-        // fragmentation sit outside it. Measured on three loaded indexes of
-        // 50,000 dbpedia-openai records at dimension 1,536, the index held
-        // 805.4, 473.3 and 181.0 MiB of resident where the five key sum
-        // reported 692.4, 400.0 and 107.0, being 0.860, 0.845 and 0.591 of it,
-        // and where this six key sum reports 705.1, 415.9 and 119.7, being
-        // 0.876, 0.879 and 0.661.
+        // **It is what the index asked the allocator for, on one convention
+        // applied to every key.** It is not the resident set, and it is above
+        // it or below it depending on which of two terms is the larger. Above,
+        // by `reserved_memory_mb`, which is committed and never touched. Below,
+        // by what the allocator adds to every block it hands out, which on this
+        // structure is three small blocks a record for the id text and one per
+        // code, and which no figure computed here can see.
         //
-        // What is left is 2,103, 1,202 and 1,285 bytes per record and it is
-        // almost all allocator overhead on the graph, which asks for six small
-        // blocks per point. It runs 1.25 times the graph figure unquantized,
-        // where the per point data block is 6,144 bytes, and 1.63 and 1.67
-        // times under the quantized modes, where that block is 48 bytes.
+        // Audited against a counting global allocator over seven record counts
+        // from 10,000 to 200,000, ten dimensions from 32 to 3,072, six values of
+        // `m` and three real corpora, the sum and the allocator's live request
+        // agree to 0.1 percent at 50,000 records and above and to 0.8 percent at
+        // 10,000, where a few kilobytes of fixed structure are divided by fewer
+        // records.
         stats.insert(
             "total_memory_mb".to_string(),
             format!("{:.2}", total_memory_mb),

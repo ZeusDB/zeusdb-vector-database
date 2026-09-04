@@ -438,8 +438,10 @@ pub struct RecordView {
 ///
 /// A slot is an internal id, and internal ids are never reused, so the bitmap
 /// grows with the id counter rather than with the live count. That is one bit
-/// per id ever issued, which `get_stats` leaves out of
-/// `index_bookkeeping_memory_mb` so that figure is unchanged by the set.
+/// per id ever issued, being a third of a byte a record beside the sixty-odd
+/// the tables hold, and `index_bookkeeping_memory_mb` counts it. It used to
+/// leave it out on the grounds that the figure should be unchanged by the set,
+/// which made the figure a sum with a term missing from it.
 pub(crate) struct LiveRecords {
     by_internal: HashMap<usize, String>,
     live: Bitmap,
@@ -515,6 +517,15 @@ impl LiveRecords {
     /// The map itself, for the saver, which writes it whole.
     pub(crate) fn map(&self) -> &HashMap<usize, String> {
         &self.by_internal
+    }
+
+    /// Bytes the set's bitmap asks the allocator for, for `Collection::stats`.
+    ///
+    /// One word per sixty-four internal ids, which is a third of a byte a
+    /// record. Small, and the report is a sum, so a structure left out of it
+    /// makes the sum wrong by however little it holds.
+    pub(crate) fn live_heap_bytes(&self) -> usize {
+        self.live.heap_bytes()
     }
 }
 

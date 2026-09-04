@@ -763,8 +763,19 @@ def test_storage_mode_configuration():
     # 1.25 MB of fixed cost, which at this record count is larger than
     # everything the records themselves hold.
     assert stats1["quantization_compression_ratio"] == "128.0x"
-    payload_only = raw_memory_only + float(stats1["quantized_codes_memory_mb"])
-    payload_with_raw = raw_memory_with_raw + float(stats2["quantized_codes_memory_mb"])
+
+    # The vectors, not the block that holds them. `raw_vectors_memory_mb` is the
+    # capacity the store asked the allocator for, which on an index declared for
+    # 1,500 records and given 1,200 is the declaration rather than the records.
+    # The payload is `raw_vectors_stored` times `dimension` times four, which is
+    # what the two keys beside it are for.
+    def payload_mb(stats):
+        vectors = (int(stats["raw_vectors_stored"]) * int(stats["dimension"]) * 4
+                   / (1024 * 1024))
+        return vectors + float(stats["quantized_codes_memory_mb"])
+
+    payload_only = payload_mb(stats1)
+    payload_with_raw = payload_mb(stats2)
     assert payload_with_raw > 50 * payload_only
     assert expected_codebook_mb + expected_sdc_mb > payload_with_raw
 

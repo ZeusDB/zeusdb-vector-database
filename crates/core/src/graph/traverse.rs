@@ -1,12 +1,12 @@
 //! The traversal, over whatever structure holds the topology.
 //!
 //! This is the vendored `Hnsw::search_filter` with patch 4 applied, ported once
-//! and written against an accessor rather than against a layout. Two structures
-//! implement that accessor: [`super::flat::FlatGraph`], whose frozen CSR is the
-//! right shape for a loaded read-only index, and
+//! and written against an accessor rather than against a layout.
 //! [`super::mutable::MutableGraph`], whose fixed-capacity slabs are the shape
-//! construction needs. Both return the same page from the same topology,
-//! because both run this code.
+//! construction needs, is what implements that accessor. It was written for two
+//! structures, the other being a frozen CSR for a loaded read-only index, and
+//! both returned the same page from the same topology because both ran this
+//! code. The CSR is gone and the accessor is what remains of it.
 //!
 //! The port was proved against the vendored traversal over 45,465 pages of real
 //! data. Lifting it out of `flat.rs` unchanged is what carries that proof

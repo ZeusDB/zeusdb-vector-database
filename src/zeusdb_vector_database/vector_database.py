@@ -313,17 +313,27 @@ class VectorDatabase:
             full width only until training completes, then released. get_stats()
             reports the codes, the raw vectors, the codebook, the centroid
             distance table, the graph and the hash tables that find a record,
-            and sums them under total_memory_mb. That sum is what the index
-            asked the allocator for rather than what the process holds, and
-            either can be the larger, since an arena reserved and not yet written
-            is asked for and not resident. Recall falls sharply,
+            and sums them under total_memory_mb. Every one of those keys prices
+            the capacity its structure asked the allocator for, so the sum is
+            the request rather than what the process holds, and either can be
+            the larger. reserved_memory_mb is the part of the request no record
+            has been written into, which is committed and not resident, so
+            total_memory_mb minus reserved_memory_mb is what the index has
+            written and the resident set sits above that by whatever the
+            allocator adds per block. reserved_memory_mb is also exactly what
+            shrink_to_fit() would hand back. Recall falls sharply,
             not slightly. Only 'quantized_with_raw' can recover it, by reranking
-            against the raw vectors it keeps. Training triggers automatically on
-            the first .add() call that reaches the training_size threshold, and
-            for 'quantized_with_raw' it also measures how far a search has to
-            over-fetch before reranking, on the training records themselves.
-            get_stats() reports that measurement under the rerank_ keys and the
-            fetch it produces at the current record count.
+            against the raw vectors it keeps, and that rerank costs query time
+            in proportion to the record count. Training triggers automatically
+            on the first .add() call that reaches the training_size threshold,
+            and for 'quantized_with_raw' it also measures how far a search has
+            to over-fetch before reranking, on the training records themselves.
+            get_stats() reports that measurement under the rerank_ keys, the
+            fetch it asks for at the current record count under
+            rerank_requested_fetch, the bound that request is held under as
+            rerank_fetch_ceiling, whether the bound changed it as
+            rerank_fetch_capped, and the fetch a search actually performs under
+            rerank_default_fetch.
 
         Returns:
             An instance of the created vector index.
@@ -630,6 +640,18 @@ class VectorDatabase:
         # version quoted. A ratio needs the graph's neighbour lists in the
         # denominator and those are data dependent; these two terms are not.
         #
+        # The warning names the query cost as well as the memory. It named the
+        # memory alone, and the memory is the smaller of the two: the mode is
+        # the only one that reranks, a rerank fetches candidates in proportion
+        # to the record count and rescores every one of them against a raw
+        # vector, and the traversal has to be as wide as the fetch. So the
+        # search cost grows with the record count where an unquantized search
+        # grows with its logarithm, and on a corpus whose codes rank badly the
+        # default fetch measured at 11.4 percent of the records. That is not a
+        # figure create() can predict, since it is a property of the caller's
+        # data, which is why the sentence points at the three keys that report
+        # it rather than quoting a number.
+        #
         # Suppressed where the configuration never trains, because then no
         # codebook is built, no code is stored and the index holds exactly what
         # an unquantized one holds. _check_memory_usage has already said so, and
@@ -640,17 +662,25 @@ class VectorDatabase:
                         / (1024 * 1024))
             warnings.warn(
                 "storage_mode='quantized_with_raw' is the accuracy mode rather than "
-                "the memory mode. It keeps a raw vector for every record as well as "
-                "its code, so it holds everything an unquantized index holds and adds "
-                f"to it: {2 * subvectors} bytes a record for the two copies of the "
-                f"code, and {fixed_mb:.2f}MB of codebook and centroid distance table "
-                "whatever the record count. No record count reverses that. What it "
-                "buys is accuracy. It is the only mode that rescores candidates "
-                "against true vectors, the only one where get_records() returns what "
-                "you inserted, and the only route to 'quantized_only' without "
-                "re-adding every record. Use 'quantized_only' where memory is the "
-                "constraint. get_stats() reports what your own index holds, under "
-                "total_memory_mb.",
+                "the memory mode, and it costs query time as well as memory. It keeps "
+                "a raw vector for every record as well as its code, so it holds "
+                "everything an unquantized index holds and adds to it: "
+                f"{2 * subvectors} bytes a record for the two copies of the code, and "
+                f"{fixed_mb:.2f}MB of codebook and centroid distance table whatever "
+                "the record count. No record count reverses that. It is also the only "
+                "mode that reranks, and a rerank fetches candidates in proportion to "
+                "the record count and rescores each one against a raw vector, so its "
+                "search time grows with the record count where an unquantized search "
+                "grows with the logarithm of it. How deep it fetches is a property of "
+                "your data and is measured at training, so get_stats() is where it is "
+                "reported, under rerank_default_fetch with rerank_requested_fetch and "
+                "rerank_fetch_capped beside it. What the mode buys is accuracy. It "
+                "rescores candidates against true vectors, it is the only mode where "
+                "get_records() returns what you inserted, and it is the only route to "
+                "'quantized_only' without re-adding every record. Use 'quantized_only' "
+                "where memory is the constraint, and an unquantized index with "
+                "ef_search raised where accuracy is. get_stats() reports what your own "
+                "index holds, under total_memory_mb.",
                 UserWarning,
                 stacklevel=3
             )

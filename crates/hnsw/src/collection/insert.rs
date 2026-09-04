@@ -1985,9 +1985,18 @@ impl Collection {
             // vectors, so its replacement graph opens the store the next
             // insertion writes into. Without this the store is absent and
             // every record added after a clear would lose its raw vector.
+            //
+            // The declaration reaches it through the same byte budget the
+            // graph's own arenas go through. It used to reach it directly, and
+            // `expected_size` is validated at 100 million, so an index declared
+            // at that size and dimension 1,536 asked one `Vec::with_capacity`
+            // for 614 GB. That aborts the process instead of unwinding, so no
+            // exception could be raised for it.
             if self.dense().keeps_raw() {
+                let records =
+                    VectorGraph::reserved_raw_records(self.dense().dim, self.expected_size());
                 graph
-                    .open_raw_store(self.dense().dim, self.expected_size())
+                    .open_raw_store(self.dense().dim, records)
                     .expect("a quantized graph accepts a raw side store");
             }
             graph
