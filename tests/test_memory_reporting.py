@@ -304,8 +304,68 @@ def test_the_bookkeeping_is_reported_on_every_index():
         assert book > 0.0, f"the bookkeeping is {book} at storage_mode {storage_mode}"
 
 
+def test_a_record_pays_for_the_metadata_it_carries_and_no_table_for_it():
+    """A record without metadata costs the bookkeeping sixteen bytes, and a
+    record with two small fields costs one forty byte block per field beside
+    its string text, not a hash table of its own.
+
+    Two indexes over the same records, one with no metadata and one with a
+    string field of twenty distinct values and an integer field, isolate the
+    metadata. Everything else the bookkeeping counts is set by the record
+    count and the configuration. Measured against a counting allocator at
+    100,000 records the difference is 82.5 bytes a record; it was 259 when
+    every record held a `HashMap` of its own, at a four bucket table of 56
+    byte buckets for sixteen bytes of payload.
+    """
+    records, dim = 6000, 32
+    data = _corpus(records, dim, 20260904)
+    ids = [f"m_{i}" for i in range(records)]
+    metas = [{"category": f"c{i % 20}", "year": 1990 + i % 30} for i in range(records)]
+
+    def bookkeeping_bytes(metadatas):
+        index = VectorDatabase().create("hnsw", dim=dim, expected_size=records)
+        batch = {"ids": ids, "embeddings": data}
+        if metadatas is not None:
+            batch["metadatas"] = metadatas
+        assert index.add(batch).is_success()
+        return float(index.get_stats()["index_bookkeeping_memory_mb"]) * 1024 * 1024
+
+    bare = bookkeeping_bytes(None)
+    tagged = bookkeeping_bytes(metas)
+    per_record = (tagged - bare) / records
+    assert 70.0 <= per_record <= 100.0, (
+        f"two small fields cost {per_record:.1f} bytes a record of bookkeeping, "
+        f"which is not one block of two forty byte fields and a short string")
+
+
+def test_metadata_json_names_every_record_and_holds_an_empty_object_for_a_bare_one(tmp_path):
+    """The saved file is one object per live record under its id, and a record
+    added without metadata is written as an empty object, which is what the
+    file held before the store was indexed by internal id."""
+    import json
+
+    records, dim = 200, 8
+    data = _corpus(records, dim, 20260905)
+    ids = [f"m_{i}" for i in range(records)]
+    metas = [{"category": f"c{i % 5}"} if i % 2 else {} for i in range(records)]
+    index = VectorDatabase().create("hnsw", dim=dim, expected_size=records)
+    assert index.add({"ids": ids, "embeddings": data, "metadatas": metas}).is_success()
+    assert index.remove_point("m_3")
+    index.save(str(tmp_path / "meta.zdb"))
+    written = json.loads((tmp_path / "meta.zdb" / "metadata.json").read_text(encoding="utf-8"))
+    expected = {ids[i]: metas[i] for i in range(records) if i != 3}
+    assert written == expected
+
+    loaded = VectorDatabase().load(str(tmp_path / "meta.zdb"))
+    got = {r["id"]: r["metadata"] for r in loaded.get_records(list(expected))}
+    assert got == expected
+    assert loaded.count({"category": "c1"}) == sum(1 for m in expected.values() if m.get("category") == "c1")
+    assert loaded.count({"$not": {"category": "c1"}}) == len(expected) - loaded.count({"category": "c1"})
+
+
 def test_the_bookkeeping_tracks_the_records_and_not_the_dimension():
-    """Five hash tables and two id copies per record, and no vector in any of them.
+    """Two hash tables, two id copies and a metadata entry per record, and no
+    vector in any of them.
 
     An eightfold dimension moves the raw vector store eightfold and must leave
     this figure where it was. Doubling the records doubles it, within the step

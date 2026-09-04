@@ -386,7 +386,7 @@ fn describe(value: &Value) -> &'static str {
 /// It short circuits in both directions. A conjunction stops at the first
 /// branch that fails and a disjunction at the first that holds, which is what
 /// `Iterator::all` and `Iterator::any` do.
-pub fn matches_filter(metadata: &HashMap<String, Value>, filter: &Filter) -> bool {
+pub fn matches_filter<M: FieldLookup + ?Sized>(metadata: &M, filter: &Filter) -> bool {
     match filter {
         Filter::All(branches) => branches
             .iter()
@@ -396,7 +396,26 @@ pub fn matches_filter(metadata: &HashMap<String, Value>, filter: &Filter) -> boo
             .any(|branch| matches_filter(metadata, branch)),
         Filter::Not(inner) => !matches_filter(metadata, inner),
         Filter::Field { name, test } => field_matches(metadata, name, test),
-        Filter::Presence { name, want } => want.holds(metadata.get(name)),
+        Filter::Presence { name, want } => want.holds(metadata.field(name)),
+    }
+}
+
+/// What a filter reads of a record: one field by name.
+///
+/// The mapping a caller hands in is one, and so is a record borrowed from
+/// the metadata store, which holds its fields behind interned names rather
+/// than in a map of its own. `matches_filter` reads nothing else, so it
+/// judges either without a copy.
+pub trait FieldLookup {
+    /// The value the record holds under `name`, or `None` where it carries
+    /// no such field.
+    fn field(&self, name: &str) -> Option<&Value>;
+}
+
+impl FieldLookup for HashMap<String, Value> {
+    #[inline]
+    fn field(&self, name: &str) -> Option<&Value> {
+        self.get(name)
     }
 }
 
@@ -484,8 +503,8 @@ impl Filter {
 /// `{"tag": {"all": []}}` is the empty conjunction and so holds for every value
 /// the field can carry, which makes it "the field is present", and
 /// `{"$not": {"tag": {"all": []}}}` is its complement.
-fn field_matches(metadata: &HashMap<String, Value>, field: &str, test: &FieldTest) -> bool {
-    let Some(field_value) = metadata.get(field) else {
+fn field_matches<M: FieldLookup + ?Sized>(metadata: &M, field: &str, test: &FieldTest) -> bool {
+    let Some(field_value) = metadata.field(field) else {
         return false;
     };
     field_test_matches(field_value, test)

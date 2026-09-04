@@ -91,8 +91,8 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, instrument, trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, Admit, And, Bitmap, Budget, Candidates, ColumnStore, Error, Filter, Fusion,
-    Hits, IdfScope, RecordId, Selection, SparseRef, VectorIndex,
+    matches_filter, Admit, And, Bitmap, Budget, Candidates, ColumnStore, Error, FieldLookup,
+    Filter, Fusion, Hits, IdfScope, MetadataStore, RecordId, Selection, SparseRef, VectorIndex,
 };
 
 /// The target every record this file emits carries. See the parent module.
@@ -269,15 +269,14 @@ impl<'a> Scored<'a> {
 /// The metadata predicate, as an admit set.
 ///
 /// What a filter that cannot be answered from the columns alone reads. It
-/// resolves a node to its record through `rev_map`, which is the liveness
-/// check, reads the record's metadata and judges the filter on it. A record
-/// with no metadata entry does not match, which is the rule `collect_hits`
-/// applied when the filter ran there. It cannot count itself and cannot
-/// enumerate itself, so the index asks it one node at a time.
+/// reads the node's entry in the store by internal id, which is the liveness
+/// check since a removed record holds none, and judges the filter on it. A
+/// record with no metadata entry does not match, which is the rule
+/// `collect_hits` applied when the filter ran there. It cannot count itself
+/// and cannot enumerate itself, so the index asks it one node at a time.
 pub(super) struct MetadataAdmit<'a> {
     conditions: &'a Filter,
-    rev_map: &'a LiveRecords,
-    metadata: &'a HashMap<String, HashMap<String, Value>>,
+    metadata: &'a MetadataStore,
 }
 
 impl MetadataAdmit<'_> {
@@ -289,7 +288,7 @@ impl MetadataAdmit<'_> {
     /// every operator name and every group shape the engine cannot evaluate.
     /// Nothing below `matches_filter` can fail, so it returns `bool`.
     #[inline]
-    fn judge(&self, meta: &HashMap<String, Value>) -> bool {
+    fn judge<M: FieldLookup + ?Sized>(&self, meta: &M) -> bool {
         matches_filter(meta, self.conditions)
     }
 }
@@ -297,11 +296,8 @@ impl MetadataAdmit<'_> {
 impl Admit for MetadataAdmit<'_> {
     #[inline]
     fn admits(&self, id: RecordId) -> bool {
-        match self.rev_map.get(&id.slot()) {
-            Some(ext_id) => match self.metadata.get(ext_id) {
-                Some(meta) => self.judge(meta),
-                None => false,
-            },
+        match self.metadata.get(id.slot()) {
+            Some(fields) => self.judge(&fields),
             None => false,
         }
     }
@@ -434,15 +430,13 @@ impl Collection {
         conditions: Option<&'a Filter>,
         columns: &ColumnStore,
         rev_map: &'a LiveRecords,
-        metadata: &'a HashMap<String, HashMap<String, Value>>,
-        id_map: &HashMap<String, usize>,
+        metadata: &'a MetadataStore,
     ) -> AdmitPlan<'a> {
         let Some(conditions) = conditions else {
             return AdmitPlan::All;
         };
         let predicate = MetadataAdmit {
             conditions,
-            rev_map,
             metadata,
         };
         match columns.select(conditions) {
@@ -480,9 +474,9 @@ impl Collection {
                 } else {
                     // Above the threshold the traversal runs, and the bitmap
                     // is the whole predicate. One bit test replaces the
-                    // node, `rev_map`, metadata, field lookup chain the walk
-                    // had to make per node, and it subsumes the liveness
-                    // check because a slot holding no record holds no bit.
+                    // entry, field lookup chain the walk had to make per
+                    // node, and it subsumes the liveness check because a slot
+                    // holding no record holds no bit.
                     trace!(
                         target: LOG_TARGET,
                         operation = "filtered_columns",
@@ -498,13 +492,10 @@ impl Collection {
                 let mut matched: Vec<RecordId> = Vec::new();
                 let mut gave_up = false;
                 bound.for_each_while(|slot| {
-                    let Some(ext_id) = rev_map.get(&slot) else {
+                    let Some(fields) = metadata.get(slot) else {
                         return true;
                     };
-                    let Some(meta) = metadata.get(ext_id) else {
-                        return true;
-                    };
-                    if predicate.judge(meta) {
+                    if predicate.judge(&fields) {
                         if matched.len() == FULL_SCAN_THRESHOLD {
                             // One past the threshold, so the walk stops here
                             // and the index traverses. Nothing has been
@@ -538,24 +529,26 @@ impl Collection {
             Selection::Whole(undeclared) => {
                 self.warn_undeclared_filter_field(columns, undeclared, None);
                 let mut matched: Vec<RecordId> = Vec::new();
-                for (ext_id, meta) in metadata.iter() {
-                    if predicate.judge(meta) {
+                for (slot, fields) in metadata.iter() {
+                    if predicate.judge(&fields) {
                         if matched.len() == FULL_SCAN_THRESHOLD {
                             // One past the threshold, so the walk stops here
                             // and the index traverses. Nothing has been
                             // scored yet.
                             return AdmitPlan::Predicate(predicate);
                         }
-                        if let Some(&internal_id) = id_map.get(ext_id) {
-                            matched.push(RecordId::from_slot(internal_id));
-                        }
+                        matched.push(RecordId::from_slot(slot));
                     }
                 }
-                // The walk arrives in hash order and the index expects a
-                // sorted set, so the matches are sorted once here. The page
-                // is the same either way, since the index sorts an exact page
-                // by distance and the collection breaks ties by external id.
-                matched.sort_unstable();
+                // The walk arrives in increasing internal id order, which is
+                // the sorted set the index expects. It used to arrive in a
+                // hash map's order and be sorted here, and the page is the
+                // same either way, since the index sorts an exact page by
+                // distance and the collection breaks ties by external id.
+                debug_assert!(
+                    matched.windows(2).all(|pair| pair[0] < pair[1]),
+                    "the store walks in increasing internal id order"
+                );
                 trace!(
                     target: LOG_TARGET,
                     operation = "filtered_scan",
@@ -652,7 +645,7 @@ impl Collection {
         query: &[f32],
         vectors: RawVectors<'_>,
         pq_codes: &HashMap<String, Vec<u8>>,
-        vector_metadata: &HashMap<String, HashMap<String, Value>>,
+        vector_metadata: &MetadataStore,
         params: SearchParams,
     ) -> Result<QueryHits, Error> {
         let mut scored = candidates.items;
@@ -660,7 +653,12 @@ impl Collection {
 
         let mut results = Vec::with_capacity(scored.len());
         for (ext_id, score) in scored {
-            let metadata = vector_metadata.get(ext_id).cloned().unwrap_or_default();
+            let metadata = vectors
+                .id_map
+                .get(ext_id)
+                .and_then(|&slot| vector_metadata.get(slot))
+                .map(|fields| fields.to_map())
+                .unwrap_or_default();
             // The raw vector where one exists and the reconstruction from the
             // codes where none does. Under `quantized_only` every record is
             // code held once training completes, so without the fallback a
@@ -818,13 +816,7 @@ impl Collection {
             graph: index.graph(),
         };
 
-        let plan = self.admit_plan(
-            filter_conditions,
-            &columns,
-            &rev_map,
-            &vector_metadata,
-            &id_map,
-        );
+        let plan = self.admit_plan(filter_conditions, &columns, &rev_map, &vector_metadata);
         let fetch_k = params.fetch_k(rev_map.len());
         let budget = Self::dense_budget(&params);
         let hits = plan.run(|admit| index.search(processed_query, fetch_k, admit, &budget))?;
@@ -960,13 +952,7 @@ impl Collection {
         };
 
         // The admit set is the filter's, so it is decided once for the batch.
-        let plan = self.admit_plan(
-            filter_conditions,
-            &column_store,
-            &rev_map,
-            &metadata_store,
-            &id_map,
-        );
+        let plan = self.admit_plan(filter_conditions, &column_store, &rev_map, &metadata_store);
 
         // The same over-fetch the single query path applies, so a batch of
         // one query returns what that query returns on its own.
@@ -1026,13 +1012,8 @@ impl Collection {
                     graph: index.graph(),
                 };
 
-                let plan = self.admit_plan(
-                    filter_conditions,
-                    &column_store,
-                    &rev_map,
-                    &metadata_store,
-                    &id_map,
-                );
+                let plan =
+                    self.admit_plan(filter_conditions, &column_store, &rev_map, &metadata_store);
 
                 // The same over-fetch the other two search paths apply.
                 let fetch_k = params.fetch_k(rev_map.len());

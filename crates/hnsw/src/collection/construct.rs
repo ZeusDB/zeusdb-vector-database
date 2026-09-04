@@ -814,7 +814,10 @@ impl Collection {
             spaces,
             expected_size: AtomicUsize::new(expected_size),
             metadata: MutexAt::new(order::METADATA, HashMap::new()),
-            vector_metadata: RwLockAt::new(order::VECTOR_METADATA, HashMap::new()),
+            vector_metadata: RwLockAt::new(
+                order::VECTOR_METADATA,
+                zeusdb_vector_core::MetadataStore::new(expected_size),
+            ),
             columns: RwLockAt::new(
                 order::COLUMNS,
                 ColumnStore::new(indexed_fields, expected_size),

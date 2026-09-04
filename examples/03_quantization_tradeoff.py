@@ -247,8 +247,8 @@ compression ratio: 32x
 
 stored per mode
   mode                    raw  codes  raw MB  code MB  fixed MB  graph MB  total
-  no quantization        3000      0    0.73     0.00      0.00      1.06   2.42
-  quantized_only            0   3000    0.00     0.02      1.06      1...   3...
+  no quantization        3000      0    0.73     0.00      0.00      1.06   2.15
+  quantized_only            0   3000    0.00     0.02      1.06      1...   2...
   quantized_with_raw     3000   3000    0.73     0.02      1.06      1...   3...
 
 The raw column is the vectors and the graph column is everything

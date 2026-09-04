@@ -793,7 +793,7 @@ storage_mode_description: raw_only
 | `raw_vectors_memory_mb` | The raw vectors, which are held once |
 | `quantized_codes_memory_mb` | The codes, which grow with the record count |
 | `codebook_memory_mb`, `sdc_table_memory_mb`, `centroid_norm_memory_mb` | The trained tables, fixed by `dim`, `subvectors` and `bits` |
-| `index_bookkeeping_memory_mb` | The hash tables that find a record |
+| `index_bookkeeping_memory_mb` | The hash tables that find a record, the per-record metadata, the declared columns and the live sets |
 | `total_memory_mb` | The sum of the seven figures above, and of `sparse_memory_mb` and `dictionary_memory_mb` where the index declares a sparse space |
 | `quantization_type` | `pq`, or `none` on an unquantized index |
 | `raw_vectors_retained` | The storage mode's policy, `none_once_trained` or `all_records`. Quantized indexes only |
@@ -810,7 +810,7 @@ On a quantized index it also carries `quantization_active`, `quantization_traine
 
 **Size infrastructure from the resident figure rather than from this one.** The gap is widest under `quantized_only`, where the fixed tables and the hash tables that find a record are most of what is left.
 
-`index_bookkeeping_memory_mb` is proportional to the record count and independent of the dimension. It is not independent of the metadata, because the per-record metadata map is one of the tables it counts.
+`index_bookkeeping_memory_mb` is proportional to the record count and independent of the dimension. It is not independent of the metadata, because the per-record metadata is one of the structures it counts. A record without metadata costs it 16 bytes, and a record with metadata costs 40 bytes a field beside the text of its string values.
 
 It also reports what a quantized search will fetch. `rerank_default_fetch` is the number of candidates a search at `top_k=10` fetches and rescores at the record count the index holds now, and a search at a larger `top_k` fetches more than it reports. On an index that does not rerank, being `quantized_only` or one not yet trained, it reads 10, the page itself. `rerank_calibrated` is `true` on a trained `quantized_with_raw` index and `false` on every other one, including an index saved before the calibration existed. When it is `true`, these report what training measured:
 
@@ -1906,7 +1906,7 @@ The same filter answered both ways, on three real 100,000 record sets, milliseco
 | 10,000 | 3.5 to 12.6 | 20.5 to 36.9 |
 | 50,000 | 0.82 to 4.1 | 3.9 to 15.7 |
 
-**Declare the fields you filter on and leave the rest out.** Eight declared fields over 100,000 records cost 6.69 MB, which is 6 percent of what the metadata already costs. A field carrying a distinct value on nearly every record costs 42 bytes a record instead of 4, so declare a document id only if you filter on it.
+**Declare the fields you filter on and leave the rest out.** Eight declared fields over 100,000 records cost 6.67 MB, which is a fifth of what the metadata itself costs. A field carrying a distinct value on nearly every record costs 42 bytes a record instead of 4, so declare a document id only if you filter on it.
 
 **A filter naming an undeclared field returns the same records**, finds them by reading metadata rather than from a column, and logs one warning naming the field. `index.indexed_fields` reads the declaration back and is empty on an index created without it.
 

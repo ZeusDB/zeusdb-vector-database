@@ -511,7 +511,7 @@ impl Collection {
         after_resolve();
 
         // The admit set, once, for every arm.
-        let admit = self.admit_plan(query.filter, &columns, &rev_map, &vector_metadata, &id_map);
+        let admit = self.admit_plan(query.filter, &columns, &rev_map, &vector_metadata);
         let shape = admit.shape();
         let selectivity = shape.selectivity();
         let live = rev_map.len();
@@ -591,7 +591,13 @@ impl Collection {
             }
         }
 
-        let metadata_of = |id: &String| vector_metadata.get(id).cloned().unwrap_or_default();
+        let metadata_of = |id: &String| {
+            id_map
+                .get(id)
+                .and_then(|&slot| vector_metadata.get(slot))
+                .map(|fields| fields.to_map())
+                .unwrap_or_default()
+        };
         let hits: Vec<QueryHit> = if pages.len() == 1 {
             // One arm, so its page is the page and its score is the score.
             pages[0]

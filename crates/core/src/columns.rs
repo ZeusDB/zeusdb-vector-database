@@ -4,8 +4,8 @@
 //! # What this replaces
 //!
 //! A filtered search used to answer "which records match" by walking
-//! `vector_metadata`, which is a `HashMap<String, HashMap<String, Value>>`.
-//! That walk costs about 250 nanoseconds a record, so a filter matching ten
+//! `vector_metadata`, which was then a `HashMap<String, HashMap<String, Value>>`.
+//! That walk cost about 250 nanoseconds a record, so a filter matching ten
 //! records over 100,000 cost 26 to 39 milliseconds where an unfiltered search
 //! cost 0.3 to 1.2. The walk is 73 to 100 percent of a filtered search, and a
 //! column per field was measured walking 224 times faster.
@@ -14,7 +14,7 @@
 //! paths a filtered search can take. The exact scan reads the set bits and
 //! scores those records. The graph traversal tests one bit per node it reaches,
 //! in place of the node, `rev_map`, `vector_metadata`, field lookup chain that
-//! measured at 154 nanoseconds a probe.
+//! measured at 154 nanoseconds a probe on that map.
 //!
 //! # Every operator is served, because the leaf is the same function
 //!
@@ -50,7 +50,7 @@
 //! branch could match anything and a union with the live set is the live set.
 
 use crate::error::Error;
-use crate::filter::{field_test_matches, FieldTest, Filter, Presence};
+use crate::filter::{field_test_matches, FieldLookup, FieldTest, Filter, Presence};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -489,13 +489,13 @@ fn value_payload(value: &Value) -> usize {
 ///
 /// # Why a bound that reads fewer records can still be slower
 ///
-/// The walk iterates `vector_metadata` in the map's own layout and reads each
-/// entry where it lies. A caller reading a bound takes a slot, looks it up in
-/// `rev_map` to get an external id, and looks that id up in `vector_metadata`,
-/// so it pays two hash lookups a candidate and an access pattern the map's
-/// layout has nothing to do with. Measured at 100,000 records on sift-128, the
-/// walk costs 0.345 microseconds a record and the bounded read 0.4 to 1.1 a
-/// candidate.
+/// The walk iterates `vector_metadata` in its own layout and reads each entry
+/// where it lies. A caller reading a bound takes a slot and reads that slot's
+/// entry, so it pays the bitmap walk and an access pattern the layout has
+/// nothing to do with. Measured at 100,000 records on sift-128, when the
+/// store was a hash map keyed by external id and a bound cost two hash
+/// lookups a candidate, the walk cost 0.345 microseconds a record and the
+/// bounded read 0.4 to 1.1 a candidate.
 ///
 /// A bound holding four fifths of the corpus therefore reads a fifth fewer
 /// records at up to three times the cost each. Measured, a mixed filter whose
@@ -714,13 +714,13 @@ impl ColumnStore {
     /// insertion paths, `update_metadata` and the loader. A field the record
     /// does not carry is written as absent rather than left alone, so an
     /// `update_metadata` that drops a key drops it from the column too.
-    pub fn write(&mut self, slot: usize, metadata: &HashMap<String, Value>) {
+    pub fn write<M: FieldLookup + ?Sized>(&mut self, slot: usize, metadata: &M) {
         if self.names.is_empty() {
             return;
         }
         self.reserve(slot);
         for (position, name) in self.names.iter().enumerate() {
-            self.columns[position].write(slot, metadata.get(name));
+            self.columns[position].write(slot, metadata.field(name));
         }
         if !self.live.contains(slot) {
             self.live.set(slot);
@@ -962,7 +962,7 @@ impl ColumnStore {
     /// call is, so a debug build still reports it if the assertion is ever
     /// deleted.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
-    pub fn agrees_with(&self, slot: usize, metadata: &HashMap<String, Value>) -> bool {
+    pub fn agrees_with<M: FieldLookup + ?Sized>(&self, slot: usize, metadata: &M) -> bool {
         if self.names.is_empty() {
             return true;
         }
@@ -971,7 +971,7 @@ impl ColumnStore {
                 .names
                 .iter()
                 .enumerate()
-                .all(|(position, name)| self.columns[position].read(slot) == metadata.get(name))
+                .all(|(position, name)| self.columns[position].read(slot) == metadata.field(name))
     }
 
     /// Whether the store holds one entry per record the index holds.

@@ -45,6 +45,7 @@ mod fusion;
 mod graph;
 mod journal;
 mod kill;
+mod metadata;
 mod operation;
 mod pq;
 mod rng;
@@ -58,7 +59,7 @@ pub use checksum::checksum_of;
 pub use columns::{validate_indexed_fields, Bitmap, ColumnStore, Selection};
 pub use distance::{CosineDist, DistPQ, DotDist, L1Dist, L2Dist, PqMetric};
 pub use error::{Error, Exception};
-pub use filter::{compile_filter, matches_filter, Filter};
+pub use filter::{compile_filter, matches_filter, FieldLookup, Filter};
 pub use frame::{
     begin as frame_begin, finish as frame_finish, frame, fuzz as frame_fuzz, unframe,
     FrameEncoding, FrameKind, Framed, FRAME_HEADER_BYTES, FRAME_MAGIC, FRAME_OVERHEAD_BYTES,
@@ -79,6 +80,7 @@ pub use journal::{
 pub use kill::{
     arm as kill_arm, armed_at as kill_armed_at, at as kill_at, disarm as kill_disarm, KillPoint,
 };
+pub use metadata::{MetadataStore, RecordFields};
 pub use operation::{InsertParts, Operation};
 pub use pq::PQ;
 pub use rng::SeededRng;

@@ -31,8 +31,9 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, Bitmap, ColumnStore, Error, Filter, InsertParts, Operation, OperationKind,
-    Prepared, RecordId, Selection, SparseVector, VectorGraph, VectorIndex, JOURNAL_MAX_PAYLOAD,
+    matches_filter, Bitmap, ColumnStore, Error, Filter, InsertParts, MetadataStore, Operation,
+    OperationKind, Prepared, RecordId, Selection, SparseVector, VectorGraph, VectorIndex,
+    JOURNAL_MAX_PAYLOAD,
 };
 use zeusdb_vector_sparse::PostingsIndex;
 
@@ -82,7 +83,7 @@ struct RemovalGuards<'a> {
     pq_codes: WriteGuard<'a, HashMap<String, Vec<u8>>>,
     /// The sparse index, where the collection declares a sparse space.
     sparse: Option<WriteGuard<'a, PostingsIndex>>,
-    vector_metadata: WriteGuard<'a, HashMap<String, HashMap<String, Value>>>,
+    vector_metadata: WriteGuard<'a, MetadataStore>,
     columns: WriteGuard<'a, ColumnStore>,
 }
 
@@ -432,12 +433,12 @@ impl Collection {
         // removal strands the record's graph node rather than deleting it, and
         // the vector goes with the node when `compact` rebuilds the graph
         // without it. That is what removal already did to the node itself.
-        guards.vector_metadata.remove(id); // Remove metadata
-                                           //
-                                           // The columns are addressed by internal id, so the slot is cleared
-                                           // rather than reclaimed. Internal ids are never reused, which is what
-                                           // the graph's own node arena already assumes, so a removed record
-                                           // leaves a hole in every column exactly as it leaves a stranded node.
+        guards.vector_metadata.remove(internal_id); // Remove metadata
+                                                    //
+                                                    // The columns are addressed by internal id, so the slot is cleared
+                                                    // rather than reclaimed. Internal ids are never reused, which is what
+                                                    // the graph's own node arena already assumes, so a removed record
+                                                    // leaves a hole in every column exactly as it leaves a stranded node.
         guards.columns.erase(internal_id);
         guards.pq_codes.remove(id); // Remove PQ codes (if present)
         guards.rev_map.remove(internal_id); // Remove ID mapping, and the live bit with it
@@ -578,10 +579,10 @@ impl Collection {
     /// resolved ids between the two phases.
     pub(super) fn remove_where_locked(&self, filter: &Filter) -> Result<usize, Error> {
         // `rev_map` before `vector_metadata` before `columns`, which is the
-        // declared order, because the bitmap holds internal ids and a removal
-        // names external ones. The columns guard is dropped before the metadata
-        // one is taken, since the selection owns its bitmap and borrows only the
-        // filter.
+        // declared order, because the store and the bitmap hold internal ids
+        // and a removal names external ones. The columns guard is dropped
+        // before the metadata one is taken, since the selection owns its
+        // bitmap and borrows only the filter.
         let rev_map = self.rev_map.read().unwrap();
         let selection = {
             let columns = self.columns.read().unwrap();
@@ -607,8 +608,8 @@ impl Collection {
                 bound.for_each(|slot| {
                     if let Some(id) = rev_map.get(&slot) {
                         if vector_metadata
-                            .get(id)
-                            .is_some_and(|meta| matches_filter(meta, filter))
+                            .get(slot)
+                            .is_some_and(|fields| matches_filter(&fields, filter))
                         {
                             ids.push(id.clone());
                         }
@@ -616,12 +617,14 @@ impl Collection {
                 });
                 ids
             }
+            // The store walks in increasing internal id order, so the
+            // removal's record names the ids in arrival order.
             Selection::Whole(_) => {
                 let vector_metadata = self.vector_metadata.read().unwrap();
                 vector_metadata
                     .iter()
-                    .filter(|(_, meta)| matches_filter(meta, filter))
-                    .map(|(id, _)| id.clone())
+                    .filter(|(_, fields)| matches_filter(fields, filter))
+                    .filter_map(|(slot, _)| rev_map.get(&slot).cloned())
                     .collect()
             }
         };
@@ -678,7 +681,7 @@ impl Collection {
             columns.agrees_with(internal_id, &metadata),
             "every declared field's column holds what the record's metadata holds"
         );
-        vector_metadata.insert(id.to_string(), metadata);
+        vector_metadata.insert(internal_id, metadata);
         trace!(target: LOG_TARGET, operation = "update_metadata",
             vector_id = %id,
             "Metadata replaced"
@@ -1469,7 +1472,7 @@ impl Collection {
                 columns.agrees_with(internal_id, &metadata),
                 "every declared field's column holds what the record's metadata holds"
             );
-            vector_metadata.insert(id.to_string(), metadata);
+            vector_metadata.insert(internal_id, metadata);
         }
 
         // Insert the processed vector into the graph and name the record in
@@ -1597,7 +1600,7 @@ impl Collection {
                 columns.agrees_with(internal_id, &metadata),
                 "every declared field's column holds what the record's metadata holds"
             );
-            vector_metadata.insert(id.to_string(), metadata);
+            vector_metadata.insert(internal_id, metadata);
         }
 
         // Quantize and insert, and name the record in both id maps, in the two
@@ -2047,7 +2050,7 @@ impl Collection {
             rev_map.clear();
             let old_index = std::mem::replace(&mut *index, replacement);
             pq_codes.clear();
-            vector_metadata.clear();
+            vector_metadata.clear(self.expected_size());
             // Keeps the declaration and drops every record, which is what
             // `clear` does to the index itself. The reservation comes back
             // too, since a cleared index is about to be filled again.

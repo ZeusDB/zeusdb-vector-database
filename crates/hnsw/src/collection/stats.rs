@@ -189,24 +189,16 @@ impl Collection {
             )
         };
 
-        // The metadata map holds an id and a map per record. The inner maps are
-        // empty on a record added without metadata, and an empty `HashMap`
-        // allocates nothing, so the outer table is the whole cost there.
+        // The metadata store holds one sixteen byte entry per internal id
+        // issued, priced at the capacity it reserved, one block of forty bytes
+        // a field behind each record that carries fields, the text of every
+        // string value, and the field names once each, in a list and in the
+        // table that finds a name's symbol. A record added without metadata
+        // costs its entry alone.
         bookkeeping += {
             let vector_metadata = self.vector_metadata.read().unwrap();
-            let mut bytes = table_bytes(&vector_metadata) + key_text_bytes(&vector_metadata);
-            for fields in vector_metadata.values() {
-                bytes += table_bytes(fields) + key_text_bytes(fields);
-                // A `Value` is 32 bytes inside its bucket whatever it holds. A
-                // string is the one variant that also owns text, and it is the
-                // variant a filterable field usually is.
-                bytes += fields
-                    .values()
-                    .filter_map(|value| value.as_str())
-                    .map(|text| text.len())
-                    .sum::<usize>();
-            }
-            bytes
+            let names = vector_metadata.key_table();
+            vector_metadata.heap_bytes() + table_bytes(names) + key_text_bytes(names)
         };
 
         // The declared columns. Four bytes a record per field where the field
@@ -647,39 +639,43 @@ impl Collection {
 
         // What the index spends on finding a record rather than on holding one.
         //
-        // Three hash tables and three copies of the id on an unquantized index,
-        // four of each on a quantized one, plus the declared columns, the
-        // training buffer, the index level metadata and the two live bitmaps.
-        // `id_map` holds the record's id as a key, `rev_map` holds it again as
-        // a value, and `vector_metadata` and `pq_codes` each hold it again as a
-        // key. A table is a power of two bucket array with one control byte per
-        // bucket, sized from the capacity the map reports, so it is between
-        // eight sevenths and sixteen sevenths of the entries it currently
-        // holds and it steps rather than growing smoothly. The `Vec` in
-        // `pq_codes` contributes only its 24 byte header here, since the bytes
-        // it points at are already priced above.
+        // Two hash tables and two copies of the id on an unquantized index,
+        // three of each on a quantized one, plus the metadata store, the
+        // declared columns, the training buffer, the index level metadata and
+        // the two live bitmaps. `id_map` holds the record's id as a key,
+        // `rev_map` holds it again as a value, and `pq_codes` holds it again
+        // as a key. A table is a power of two bucket array with one control
+        // byte per bucket, sized from the capacity the map reports, so it is
+        // between eight sevenths and sixteen sevenths of the entries it
+        // currently holds and it steps rather than growing smoothly. The `Vec`
+        // in `pq_codes` contributes only its 24 byte header here, since the
+        // bytes it points at are already priced above. The metadata store is
+        // indexed by internal id and holds no copy of the id: sixteen bytes an
+        // entry, and a forty byte field block behind a record that carries
+        // fields.
         //
         // It is proportional to the record count and independent of the
         // dimension. Measured against a counting allocator on 100,000 records
-        // at `m` 16 with five character ids and no metadata, it reads 197.3
-        // bytes a record unquantized and 266.4 under `quantized_only`, where
-        // the difference is the fourth table and the fourth copy of the id. A record carrying two small metadata fields costs 259 bytes a
-        // record more, because a per record `HashMap<String, Value>` is a four
-        // bucket table of 56 byte buckets holding about sixteen bytes of
-        // payload.
+        // at `m` 16 with five character ids and no metadata, it reads 112.7
+        // bytes a record unquantized and 181.8 under `quantized_only`, where
+        // the difference is the third table and the third copy of the id. A
+        // record carrying two small metadata fields costs 82.5 bytes a record
+        // more, being one block of two forty byte fields and the text of the
+        // string value.
         //
         // It steps with the tables' powers of two rather than holding still. At
         // 100,000 records every table sits at 76 percent of its buckets, which
         // is near the cheapest point of the cycle; at 115,000 records the same
-        // structures read 332 bytes a record, because the tables have just
+        // structures read 176.9 bytes a record, because the tables have just
         // doubled and sit at 44 percent. A figure quoted at one record count is
         // a point on that sawtooth and not a rate.
         //
-        // An earlier version of this comment read 265, 334 and 265 bytes a
-        // record for the three storage modes. That was five tables rather than
-        // four: it counted a `vectors` map keyed by external id that the
-        // graph's own store replaced, at one table of 32 byte buckets and one
-        // more copy of the id.
+        // Earlier versions of this comment read 197.3 bytes a record, and 265
+        // before that. The first counted a third table keyed by external id
+        // holding a `HashMap<String, Value>` per record, at 72 bytes a bucket
+        // and 244 bytes of inner table for a record with two fields, which the
+        // store indexed by internal id replaced. The second counted a
+        // `vectors` map as well, which the graph's own store replaced.
         //
         // This is a request count and not a commitment. The allocator's own
         // headers, its rounding and its fragmentation sit outside it, the same
