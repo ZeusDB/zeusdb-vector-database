@@ -334,6 +334,79 @@ def test_the_rerank_fetch_is_calibrated_at_training(calibrated_index):
     assert int(stats["rerank_default_fetch"]) >= measured
 
 
+def test_the_default_fetch_is_reported_beside_what_was_asked_for(calibrated_index):
+    """Four keys, so a fetch shorter than the calibration measured says why.
+
+    The calibration measures the depth of the true neighbours in the code
+    ordering and asks for it. On a corpus whose codes rank badly that depth is a
+    large share of the corpus, and the fetch sets the traversal width and the
+    rescoring count together, so the default can turn a graph search into a
+    scan. The ceiling bounds it. A bound that shortened a page without saying so
+    would be worse than no bound, so the request, the ceiling, the performed
+    fetch and whether the ceiling bound it are all reported.
+    """
+    stats = calibrated_index["index"].get_stats()
+
+    requested = int(stats["rerank_requested_fetch"])
+    ceiling = int(stats["rerank_fetch_ceiling"])
+    performed = int(stats["rerank_default_fetch"])
+    capped = stats["rerank_fetch_capped"]
+
+    assert requested > 0 and ceiling > 0 and performed > 0
+    assert performed <= requested, (
+        f"a search performs {performed} candidates where the rule asked for "
+        f"{requested}, so the ceiling lengthened a fetch")
+    assert capped in ("true", "false")
+    assert capped == str(performed < requested).lower()
+
+    # The ceiling is a tenth of the live record count, held under an absolute
+    # 25,000 and above a floor of 1,500 that keeps it from binding on a corpus
+    # small enough to have nothing worth bounding.
+    live = int(stats["total_vectors"])
+    assert ceiling == min(max(live // 10, 1_500), 25_000)
+
+    # On fifty clusters at this size the codes rank well enough that the request
+    # sits under the ceiling, so nothing is bound and the two agree.
+    assert capped == "false"
+    assert performed == requested
+
+
+def test_an_explicit_rerank_factor_is_not_held_under_the_ceiling(calibrated_index):
+    """The ceiling bounds the default and nothing a caller names.
+
+    A caller who asks for a fetch has decided what it is worth, so the bound
+    that stops an unset one from reaching a tenth of the corpus does not apply
+    to it. The arm below asks for a fetch above the ceiling and gets a page the
+    ceiling could not have produced.
+    """
+    case = calibrated_index
+    index, ids, data = case["index"], case["ids"], case["data"]
+    stats = index.get_stats()
+    ceiling = int(stats["rerank_fetch_ceiling"])
+    live = int(stats["total_vectors"])
+
+    # A factor deep enough to pass the ceiling, and still inside the corpus.
+    factor = (2 * ceiling) // 10
+    assert 10 * factor < live, "the deep arm has to stay inside the index"
+
+    rng = np.random.default_rng(9153)
+    picks = rng.choice(len(ids), 60, replace=False)
+    truth = np.argsort(-(data[picks] @ data.T), axis=1)[:, :10]
+
+    def recall(**kw):
+        hits = 0
+        for row, pick in enumerate(picks):
+            found = {h["id"] for h in index.search(data[pick], top_k=10, **kw)}
+            hits += len(found & {ids[j] for j in truth[row]})
+        return hits / (10.0 * len(picks))
+
+    at_ceiling = recall(rerank=ceiling // 10)
+    beyond = recall(rerank=factor)
+    assert beyond >= at_ceiling, (
+        f"a fetch of {10 * factor} returned {beyond:.4f} against {at_ceiling:.4f} "
+        f"at {ceiling}, so the explicit factor was held under the ceiling")
+
+
 def test_the_calibrated_fetch_holds_recall(calibrated_index):
     """The page the calibrated default returns is the page exact search returns.
 

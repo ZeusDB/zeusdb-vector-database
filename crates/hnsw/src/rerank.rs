@@ -364,19 +364,17 @@ pub(crate) const DEFAULT_RERANK_PAGE_FACTOR: usize = 5;
 /// the record term is fitted as an exponent of the record count. See
 /// `RERANK_CALIBRATION_PAGES`.
 ///
-/// # The floor and the cap
+/// # The floor and the ceiling
 ///
 /// The floor is `DEFAULT_RERANK_MIN_CANDIDATES` and the page term, unchanged,
 /// so a calibration that measures a depth of two cannot produce a fetch of
 /// two.
 ///
-/// `RERANK_CALIBRATION_CAP_DIVISOR` is the cap, at one quarter of the live
-/// record count. The deepest calibrated fetch measured is 17.8 percent of its
-/// corpus, on a fifty cluster generator trained on 1,000 records, so the cap
-/// sits above every measured cell and below a full scan. It exists for the case
-/// where the codes resolve nothing and the depth the calibration measures is
-/// most of the sample. It bounds that case rather than
-/// repairing it, and no fetch repairs it.
+/// What this rule produces is the request. What a search performs is that
+/// request held under `rerank_fetch_ceiling`, which bounds the depth term
+/// alone and leaves the page term free to multiply it; see
+/// `RERANK_FETCH_CAP_DIVISOR`. The two figures are reported separately, so a
+/// caller can see the request and see whether the ceiling changed it.
 ///
 /// # What it costs and where it is absent
 ///
@@ -392,7 +390,116 @@ pub(crate) const RERANK_CALIBRATION_SAFETY: f64 = 1.75;
 pub(crate) const RERANK_CALIBRATION_EXPONENT_BIAS: f64 = 0.15;
 pub(crate) const RERANK_CALIBRATION_EXPONENT_MIN: f64 = 0.40;
 pub(crate) const RERANK_CALIBRATION_EXPONENT_MAX: f64 = 1.00;
-pub(crate) const RERANK_CALIBRATION_CAP_DIVISOR: usize = 4;
+
+/// The share of the corpus a default rerank fetch is held under
+///
+/// # Why there is a ceiling at all
+///
+/// The calibration measures the depth of the true neighbours in the code
+/// ordering and asks for it, and on a corpus whose codes rank badly that depth
+/// is a large share of the corpus. On GloVe word vectors at 100,000 records the
+/// rule asks for 11,439 candidates, being 11.44 percent of the corpus, against
+/// 656 and 747 on SIFT descriptors and ada-002 embeddings from the same
+/// constants. The calibration is reading that corpus correctly. It is not a
+/// mis-set constant.
+///
+/// The cost of reading it correctly is that the fetch sets the traversal width
+/// and the rescoring count together, so a reranked quantized search at that
+/// depth is 48 times slower than an unquantized search of the same records at
+/// the default `ef_search`, and 2.7 times slower than an unquantized one raised
+/// to the same recall while holding 10 MiB more. A default that can reach a
+/// tenth of the corpus is a default that can turn a graph search into a scan
+/// without saying so.
+///
+/// # Why this share
+///
+/// The requirement is the smallest fetch reaching mean recall at 10 of 0.99,
+/// read off a built index by sweeping the explicit `rerank` argument, which is
+/// the quantity the calibration is trying to estimate. As a share of the
+/// corpus it is largest on the corpus that needs the deepest fetch and it falls
+/// as the corpus grows, because the count of records the codes cannot separate
+/// from a query grows more slowly than the record count does.
+///
+/// Measured on three real datasets at four record counts, the fetch reaching
+/// mean recall at 10 of 0.99 read off a built index runs 0.5 to 0.8 percent of
+/// the corpus on two of them and 6.0 to 7.5 percent on the third, while the
+/// rule asks for 0.7 to 2.8 percent on the two and 11.4 to 17.8 percent on the
+/// third. A tenth of the corpus is above every one of those requirements and
+/// below the request on the third at every size, so it takes back the surplus
+/// there and touches nothing else.
+///
+/// It is the loosest share that does so, and it is loose on purpose. A ceiling
+/// is a guard against a fetch out of proportion to the corpus, not a tuning
+/// knob, and every point of tightening past the guard is recall a caller did
+/// not ask to give up. Against the uncapped request it costs 0.0004 to 0.0032
+/// of recall at 10 on the corpus it binds, and nothing at all on the other two.
+///
+/// # What it bounds
+///
+/// The depth term alone, at the reference page. The page term is measured on
+/// the index's own data and multiplies whatever survives the ceiling, because
+/// a caller asking for a hundred results is not the pathology this bounds and
+/// a bound that did not scale with the page would take back what the page term
+/// was added to fix.
+///
+/// What a given index asks for and what it performs are both in `get_stats`,
+/// under `rerank_requested_fetch` and `rerank_default_fetch`, with
+/// `rerank_fetch_ceiling` and `rerank_fetch_capped` beside them.
+pub(crate) const RERANK_FETCH_CAP_DIVISOR: usize = 10;
+
+/// The absolute ceiling on the depth term of a default rerank fetch
+///
+/// A share alone does not bound the query. The calibrated fetch grows as a
+/// power of the record count, with a measured exponent of 0.27 to 0.74 on real
+/// data and 0.95 to 0.99 on a generator holding a fixed cluster count, so a
+/// corpus large enough reaches any share's ceiling and goes on growing under
+/// it. Every candidate is one exact distance over a full width vector, so a
+/// fetch of a hundred thousand is a hundred thousand vector reads for one page.
+///
+/// This is what stops that, and it binds only where a share of
+/// `RERANK_FETCH_CAP_DIVISOR` would still ask for more than this many
+/// candidates, which is above 250,000 live records at that divisor. Below it
+/// the share governs and this is never consulted, so it binds on nothing this
+/// was measured on. Above roughly 600,000 records a corpus whose codes rank as
+/// badly as the worst measured one needs a deeper fetch than this, and gets
+/// this instead: `rerank_fetch_capped` is what says so, and an explicit
+/// `rerank` factor is not held under it.
+pub(crate) const RERANK_FETCH_CEILING: usize = 25_000;
+
+/// The shallowest a default rerank fetch is ever held to
+///
+/// The share alone binds at every corpus size, and on a small corpus it binds
+/// close to what the codes need while bounding nothing worth bounding. At
+/// 10,000 records a tenth of the corpus is 1,000 candidates, and on the corpus
+/// whose codes rank worst the fetch reaching recall at 10 of 0.99 there is 745,
+/// so the share sits at 1.34 times the requirement against the 1.75 the
+/// calibration's own safety factor carries. Holding the ceiling here instead
+/// costs 0.0010 of recall at that size against 0.0050 at the share.
+///
+/// And there is nothing to bound. The cost this ceiling exists to bound is a
+/// fetch in proportion to the corpus, and a fetch of this many candidates over
+/// ten thousand records is a bounded query whatever the codes do: measured at
+/// 1.0 ms against 2.4 ms at 25,000 records and 13.4 ms at 100,000 on that same
+/// corpus, where the growth rather than the value is the problem.
+///
+/// So the ceiling is flat at this figure below 15,000 live records and is a
+/// share above it.
+pub(crate) const RERANK_FETCH_CEILING_FLOOR: usize = 1_500;
+
+/// The share of the corpus a whole default fetch is held under
+///
+/// `RERANK_FETCH_CAP_DIVISOR` bounds the depth term and lets the page term
+/// multiply what survives, because a caller asking for a hundred results is not
+/// the pathology that bounds. That leaves the product unbounded, and a page
+/// large enough against a corpus small enough would ask for most of it. This is
+/// the bound on the product.
+///
+/// A quarter of the live records, which is what the calibration's own cap was
+/// before the depth term got one of its own. It governs nothing the depth
+/// ceiling already governs, since a quarter is two and a half tenths, and it
+/// takes over exactly where a deep page has multiplied a bounded depth past it.
+/// The floor is still the floor, so this can never cut below what a page needs.
+pub(crate) const RERANK_FETCH_WHOLE_DIVISOR: usize = 4;
 
 /// Fractions of the training sample the exponent is fitted over
 ///
@@ -625,44 +732,110 @@ impl RerankCalibration {
         scale.clamp(1.0, ratio.max(1.0))
     }
 
-    /// The fetch this calibration asks for at a live record count
+    /// The depth this calibration asks for at a live record count, at the
+    /// reference page
     ///
     /// The measured fetch scaled by the record ratio raised to the fitted
-    /// `exponent` and by what the requested page asks for, multiplied by the
-    /// safety factor, held between the floor terms and the cap. The caller
-    /// applies the live record count as the final bound.
-    ///
-    /// `page_scale` is exactly one at `RERANK_CALIBRATION_TOP_K`, which is the
-    /// page `fetch` was measured at, so a search there asks for exactly what it
-    /// asked for before the page term existed.
-    fn fetch_at(&self, live_records: usize, top_k: usize) -> usize {
-        let floor =
-            DEFAULT_RERANK_MIN_CANDIDATES.max(top_k.saturating_mul(DEFAULT_RERANK_PAGE_FACTOR));
+    /// `exponent`, multiplied by the safety factor. This is the term that grows
+    /// with the corpus and it is the term `rerank_fetch_ceiling` bounds. `None`
+    /// where the calibration carries no sample to scale from, or where the
+    /// product is not a positive finite number, neither of which can come from a
+    /// calibration this crate wrote.
+    fn depth_at(&self, live_records: usize) -> Option<f64> {
         if self.sample_records == 0 {
-            return floor;
+            return None;
         }
-
         let ratio = live_records as f64 / self.sample_records as f64;
         let exponent = self.exponent.clamp(
             RERANK_CALIBRATION_EXPONENT_MIN,
             RERANK_CALIBRATION_EXPONENT_MAX,
         );
-        let scaled = RERANK_CALIBRATION_SAFETY
-            * self.fetch as f64
-            * ratio.powf(exponent)
-            * self.page_scale(top_k);
+        let depth = RERANK_CALIBRATION_SAFETY * self.fetch as f64 * ratio.powf(exponent);
+        if depth.is_finite() && depth > 0.0 {
+            Some(depth)
+        } else {
+            None
+        }
+    }
 
-        // A non-finite or negative product cannot come from a stored
-        // calibration this crate wrote, and the floor answers it rather than a
-        // cast that saturates somewhere surprising.
+    /// The fetch this calibration asks for at a live record count and a page
+    ///
+    /// [`RerankCalibration::depth_at`] carried through the page term and held at
+    /// or above the floor terms. This is the request; the ceiling and the live
+    /// record count are the caller's, on `default_rerank_fetch`.
+    ///
+    /// `page_scale` is exactly one at `RERANK_CALIBRATION_TOP_K`, which is the
+    /// page `fetch` was measured at, so a search there asks for exactly what it
+    /// asked for before the page term existed.
+    fn fetch_at(&self, live_records: usize, top_k: usize) -> usize {
+        self.fetch_from_depth(self.depth_at(live_records), top_k)
+    }
+
+    /// One depth carried through the page term and the floor
+    ///
+    /// Held apart from `fetch_at` so that the same arithmetic serves the
+    /// request and the bounded request, and the two can differ in one term
+    /// alone. `None` is the case `depth_at` refuses, and the floor answers it
+    /// rather than a cast that saturates somewhere surprising.
+    fn fetch_from_depth(&self, depth: Option<f64>, top_k: usize) -> usize {
+        let floor =
+            DEFAULT_RERANK_MIN_CANDIDATES.max(top_k.saturating_mul(DEFAULT_RERANK_PAGE_FACTOR));
+        let Some(depth) = depth else {
+            return floor;
+        };
+        let scaled = depth * self.page_scale(top_k);
         let wanted = if scaled.is_finite() && scaled > 0.0 {
             scaled.round() as usize
         } else {
             floor
         };
+        wanted.max(floor)
+    }
 
-        let cap = (live_records / RERANK_CALIBRATION_CAP_DIVISOR).max(floor);
-        wanted.clamp(floor, cap)
+    /// The fetch this calibration asks for with its depth term held under
+    /// `ceiling`
+    ///
+    /// The ceiling applies to the depth and the page term multiplies what
+    /// survives it, which is why this is not `fetch_at(..).min(ceiling)`. See
+    /// `RERANK_FETCH_CAP_DIVISOR`.
+    fn bounded_fetch_at(&self, live_records: usize, top_k: usize, ceiling: usize) -> usize {
+        let bounded = self
+            .depth_at(live_records)
+            .map(|depth| depth.min(ceiling as f64));
+        self.fetch_from_depth(bounded, top_k)
+    }
+}
+
+/// The deepest a default rerank fetch may reach before the page term
+///
+/// A share of the live record count, held under an absolute ceiling and above a
+/// floor of its own, so it bounds nothing on a corpus small enough to have
+/// nothing worth bounding. It can shorten a depth and can never lengthen one,
+/// and the fetch floor is applied after it, so it cannot take a fetch below
+/// what a page needs. It is the same number whatever page is asked for; see
+/// `RERANK_FETCH_CAP_DIVISOR` for why the page term sits outside it.
+pub fn rerank_fetch_ceiling(live_records: usize) -> usize {
+    // The two constants are literals and the floor is far below the absolute
+    // ceiling, so the clamp cannot be handed an inverted range.
+    (live_records / RERANK_FETCH_CAP_DIVISOR)
+        .clamp(RERANK_FETCH_CEILING_FLOOR, RERANK_FETCH_CEILING)
+}
+
+/// The fetch the rule asks for, before the ceiling
+///
+/// What `get_stats` reports as `rerank_requested_fetch`, and the quantity
+/// `default_rerank_fetch` bounds. Held apart from the fetch a search performs
+/// so that a caller can see both and see which one governed.
+pub fn requested_rerank_fetch(
+    calibration: Option<RerankCalibration>,
+    live_records: usize,
+    top_k: usize,
+) -> usize {
+    match calibration {
+        Some(calibration) => calibration.fetch_at(live_records, top_k),
+        None => (live_records / DEFAULT_RERANK_CORPUS_DIVISOR)
+            .max(DEFAULT_RERANK_MIN_CANDIDATES)
+            .max(top_k.saturating_mul(DEFAULT_RERANK_PAGE_FACTOR)),
     }
 }
 
@@ -1098,21 +1271,34 @@ impl SearchParams {
 /// A calibrated index takes what training measured on its own data, scaled to
 /// the live record count and to the requested page; see `RerankCalibration`.
 /// An index with no calibration takes the largest of the corpus term, the floor
-/// and the page term, for the reasons recorded on those three constants. Either
-/// way the live record count is the final bound, since the graph cannot return
-/// more nodes than it holds.
+/// and the page term, for the reasons recorded on those three constants. That
+/// is `requested_rerank_fetch`.
+///
+/// What a search performs is that request with its depth term held under
+/// `rerank_fetch_ceiling`, and then under the live record count, since the
+/// graph cannot return more nodes than it holds. The ceiling is what stops a
+/// corpus whose codes rank badly from turning the default into a scan, and the
+/// request is reported beside this figure so that a caller can see when the two
+/// differ.
+///
+/// **A caller's own `rerank` factor does not come through here.** The ceiling
+/// bounds the default and nothing else, so an explicit factor still asks for
+/// exactly what it names; see `SearchParams::fetch_k`.
 pub fn default_rerank_fetch(
     calibration: Option<RerankCalibration>,
     live_records: usize,
     top_k: usize,
 ) -> usize {
+    let floor = DEFAULT_RERANK_MIN_CANDIDATES.max(top_k.saturating_mul(DEFAULT_RERANK_PAGE_FACTOR));
+    let ceiling = rerank_fetch_ceiling(live_records);
     let wanted = match calibration {
-        Some(calibration) => calibration.fetch_at(live_records, top_k),
+        Some(calibration) => calibration.bounded_fetch_at(live_records, top_k, ceiling),
         None => (live_records / DEFAULT_RERANK_CORPUS_DIVISOR)
-            .max(DEFAULT_RERANK_MIN_CANDIDATES)
-            .max(top_k.saturating_mul(DEFAULT_RERANK_PAGE_FACTOR)),
+            .min(ceiling)
+            .max(floor),
     };
-    wanted.min(live_records.max(top_k))
+    let whole = (live_records / RERANK_FETCH_WHOLE_DIVISOR).max(floor);
+    wanted.min(whole).min(live_records.max(top_k))
 }
 
 /// Where a raw vector is reached, now that there is no map of them.
@@ -1327,9 +1513,17 @@ mod tests {
         assert_eq!(params(10, Some(auto_plan())).fetch_k(100_000), 2_000);
 
         // GloVe word vectors, which measure 904 at a fitted 0.690 and need
-        // more than the corpus term gives, not less.
+        // more than the corpus term gives, not less. At 10,000 records the rule
+        // asks for 1,582 candidates, being 15.8 percent of the corpus, and the
+        // ceiling holds it at its floor; see `RERANK_FETCH_CEILING_FLOOR`. At
+        // 100,000 the ceiling is a tenth of the corpus and the request sits
+        // under it.
         let glove = calibrated_plan(904, 10_000, 0.690);
-        assert_eq!(params(10, Some(glove)).fetch_k(10_000), 1_582);
+        assert_eq!(requested_rerank_fetch(glove.calibration, 10_000, 10), 1_582);
+        assert_eq!(
+            params(10, Some(glove)).fetch_k(10_000),
+            RERANK_FETCH_CEILING_FLOOR
+        );
         assert_eq!(params(10, Some(glove)).fetch_k(100_000), 7_748);
 
         // SIFT descriptors, which measure 111 at a fitted 0.487.
@@ -1506,11 +1700,11 @@ mod tests {
             10 * ten
         );
 
-        // The cap still binds, so a page term cannot ask for more than a
-        // quarter of the records.
+        // The whole-fetch bound still binds, so a page term multiplying a
+        // bounded depth cannot ask for more than a quarter of the records.
         assert_eq!(
             params(500, Some(linear)).fetch_k(50_000),
-            50_000 / RERANK_CALIBRATION_CAP_DIVISOR,
+            50_000 / RERANK_FETCH_WHOLE_DIVISOR,
         );
     }
 
@@ -1604,10 +1798,10 @@ mod tests {
         );
     }
 
-    /// The floor, the page term and the cap all bind a calibration that would
-    /// otherwise produce a fetch of two or a fetch of the whole corpus.
+    /// The floor, the page term and the ceiling all bind a calibration that
+    /// would otherwise produce a fetch of two or a fetch of the whole corpus.
     #[test]
-    fn the_calibrated_fetch_is_held_between_a_floor_and_a_cap() {
+    fn the_calibrated_fetch_is_held_between_a_floor_and_a_ceiling() {
         // A calibration measuring a single candidate cannot fetch one.
         let shallow = calibrated_plan(1, 10_000, 1.00);
         assert_eq!(
@@ -1618,18 +1812,35 @@ mod tests {
         // The page term still governs a large page on a small corpus.
         assert_eq!(params(100, Some(shallow)).fetch_k(10_000), 500);
 
-        // A calibration measuring the whole sample is capped at a quarter of
-        // the live records rather than scanning them.
+        // A calibration measuring the whole sample is held at the depth ceiling
+        // rather than scanning the corpus.
         let pathological = calibrated_plan(10_000, 10_000, 1.00);
         assert_eq!(
             params(10, Some(pathological)).fetch_k(100_000),
-            100_000 / RERANK_CALIBRATION_CAP_DIVISOR
+            rerank_fetch_ceiling(100_000)
+        );
+        assert_eq!(
+            params(10, Some(pathological)).fetch_k(100_000),
+            100_000 / RERANK_FETCH_CAP_DIVISOR
         );
 
-        // The cap is a quarter of the corpus wherever that sits above the
-        // floor, and it never cuts below the floor where it does not.
+        // The ceiling is a tenth of the corpus wherever that sits above its
+        // own floor, and it is that floor below 15,000 records, so a small
+        // corpus is bounded by the whole-fetch quarter exactly as it was.
+        assert_eq!(rerank_fetch_ceiling(2_000), RERANK_FETCH_CEILING_FLOOR);
         assert_eq!(params(10, Some(pathological)).fetch_k(2_000), 500);
         assert_eq!(params(10, Some(pathological)).fetch_k(400), 250);
+
+        // And it is an absolute ceiling as well as a share, so a corpus large
+        // enough for the share to pass it takes the absolute one.
+        assert_eq!(
+            rerank_fetch_ceiling(RERANK_FETCH_CEILING * RERANK_FETCH_CAP_DIVISOR),
+            RERANK_FETCH_CEILING
+        );
+        assert_eq!(
+            params(10, Some(pathological)).fetch_k(300_000),
+            RERANK_FETCH_CEILING
+        );
 
         // The live record count is still the final bound.
         assert_eq!(params(10, Some(pathological)).fetch_k(120), 120);

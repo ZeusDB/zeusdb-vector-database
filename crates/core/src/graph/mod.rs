@@ -650,6 +650,74 @@ impl VectorGraph {
         self.raw_store().map_or(0, VectorStore::memory_bytes)
     }
 
+    /// Bytes the store holding this graph's raw vectors asks for, wherever it
+    /// sits, and zero on a graph that keeps none.
+    ///
+    /// A raw graph scores against the vectors themselves, so the store the
+    /// graph was handed is the raw store. A quantized graph scores against
+    /// codes, and keeps the vectors in a side store or not at all. One name for
+    /// the same quantity, so a caller pricing the raw vectors does not have to
+    /// know which kind of graph it is holding.
+    ///
+    /// It is the capacity and not the payload. A store filled by insertion
+    /// carries the slack of its last doubling, and that slack is real memory
+    /// the process asked for; see [`VectorGraph::raw_vectors_reserved_bytes`].
+    pub fn raw_vectors_memory_bytes(&self) -> usize {
+        match self {
+            VectorGraph::Cosine(b) => b.store.memory_bytes(),
+            VectorGraph::L2(b) => b.store.memory_bytes(),
+            VectorGraph::L1(b) => b.store.memory_bytes(),
+            VectorGraph::Dot(b) => b.store.memory_bytes(),
+            VectorGraph::CosinePQ(_) | VectorGraph::L2PQ(_) | VectorGraph::L1PQ(_) => {
+                self.raw_memory_bytes()
+            }
+        }
+    }
+
+    /// Bytes of the adjacency's request that no node has been written into.
+    ///
+    /// See `MutableGraph::reserved_bytes`. This is the links alone, on the same
+    /// division `links_memory_bytes` makes.
+    pub fn links_reserved_bytes(&self) -> usize {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.reserved_bytes(),
+            VectorGraph::L2(b) => b.graph.reserved_bytes(),
+            VectorGraph::L1(b) => b.graph.reserved_bytes(),
+            VectorGraph::Dot(b) => b.graph.reserved_bytes(),
+            VectorGraph::CosinePQ(b) => b.graph.reserved_bytes(),
+            VectorGraph::L2PQ(b) => b.graph.reserved_bytes(),
+            VectorGraph::L1PQ(b) => b.graph.reserved_bytes(),
+        }
+    }
+
+    /// Bytes of the scored store's request that no vector has been written
+    /// into, on the same division `store_memory_bytes` makes.
+    pub fn store_reserved_bytes(&self) -> usize {
+        match self {
+            VectorGraph::Cosine(b) => b.store.reserved_bytes(),
+            VectorGraph::L2(b) => b.store.reserved_bytes(),
+            VectorGraph::L1(b) => b.store.reserved_bytes(),
+            VectorGraph::Dot(b) => b.store.reserved_bytes(),
+            VectorGraph::CosinePQ(b) => b.store.reserved_bytes(),
+            VectorGraph::L2PQ(b) => b.store.reserved_bytes(),
+            VectorGraph::L1PQ(b) => b.store.reserved_bytes(),
+        }
+    }
+
+    /// Bytes of the raw vector store's request that no vector has been written
+    /// into, on the same division `raw_vectors_memory_bytes` makes.
+    pub fn raw_vectors_reserved_bytes(&self) -> usize {
+        match self {
+            VectorGraph::Cosine(b) => b.store.reserved_bytes(),
+            VectorGraph::L2(b) => b.store.reserved_bytes(),
+            VectorGraph::L1(b) => b.store.reserved_bytes(),
+            VectorGraph::Dot(b) => b.store.reserved_bytes(),
+            VectorGraph::CosinePQ(_) | VectorGraph::L2PQ(_) | VectorGraph::L1PQ(_) => {
+                self.raw_store().map_or(0, VectorStore::reserved_bytes)
+            }
+        }
+    }
+
     /// The raw side store, where this graph keeps one.
     fn raw_store(&self) -> Option<&VectorStore<f32>> {
         match self {
@@ -902,6 +970,27 @@ impl VectorGraph {
         }
     }
 
+    /// Records a raw side store may be reserved for, given a declaration.
+    ///
+    /// `expected_size` or as many vectors as `RESERVE_BYTES` holds at this
+    /// width, whichever is smaller, which is the rule
+    /// `mutable::reserved_records` applies to the graph's own arenas and the
+    /// same budget. A caller passing a record count it has already counted
+    /// wants that count and does not come through here.
+    ///
+    /// What it is for: `expected_size` is validated at 100 million and a
+    /// `Vec::with_capacity` that cannot be served aborts the process rather
+    /// than unwinding, so a declaration of 100 million records at dimension
+    /// 1,536 asks a raw store for 614 GB and takes the interpreter with it. No
+    /// exception can be raised after that. The graph's own arenas have been
+    /// held to a byte budget since they started reserving a vector per declared
+    /// record; the side store a quantized graph opens was reserved from the
+    /// declaration directly and was not.
+    pub fn reserved_raw_records(dim: usize, expected_size: usize) -> usize {
+        let per_record = dim.saturating_mul(std::mem::size_of::<f32>()).max(1);
+        expected_size.min((mutable::RESERVE_BYTES / per_record).max(1))
+    }
+
     /// Open a raw side store on a quantized graph, sized for `records`.
     ///
     /// A raw graph refuses, because its own store already is the raw vectors
@@ -928,6 +1017,43 @@ impl VectorGraph {
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 b.raw = Some(VectorStore::with_capacity(dim, records));
                 Ok(())
+            }
+        }
+    }
+
+    /// Reserve the raw side store for a declared record count.
+    ///
+    /// A store built by pushing grows geometrically, so a store that starts at
+    /// the record count present when it was opened and then takes the rest of
+    /// the corpus ends holding close to twice what it uses. The training
+    /// transition opens one at the training sample's size, which is a fraction
+    /// of what the index expects, and every record after that is a push into a
+    /// block sized for the sample. Reserving here for what the index was
+    /// declared for makes the block the size the caller asked for, exactly as
+    /// the graph's own arenas are at creation.
+    ///
+    /// The declaration goes through [`VectorGraph::reserved_raw_records`], so
+    /// this cannot ask for more than the byte budget allows. It never shrinks:
+    /// a store already past the declaration keeps what it has, since the
+    /// declaration is a hint and the records are real.
+    ///
+    /// Nothing on a graph that keeps no raw store, which is a raw graph, where
+    /// the store is the graph's own and is reserved at construction, and a
+    /// `quantized_only` graph, which has none.
+    pub fn reserve_raw_for(&mut self, expected_size: usize) {
+        let Some(dim) = self.raw_dim() else {
+            return;
+        };
+        let want = Self::reserved_raw_records(dim, expected_size);
+        match self {
+            VectorGraph::Cosine(_)
+            | VectorGraph::L2(_)
+            | VectorGraph::L1(_)
+            | VectorGraph::Dot(_) => {}
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                if let Some(raw) = b.raw.as_mut() {
+                    raw.reserve_for(want);
+                }
             }
         }
     }

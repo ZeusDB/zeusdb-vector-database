@@ -109,6 +109,31 @@ impl<T> VectorStore<T> {
         std::mem::size_of::<Self>() + self.data.capacity() * std::mem::size_of::<T>()
     }
 
+    /// Bytes of that request no vector has been written into.
+    ///
+    /// The block grows geometrically, so a store filled by insertion carries
+    /// the slack of its last doubling. This is that slack, and it is what
+    /// [`VectorStore::shrink_to_fit`] returns to the allocator.
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.data
+            .capacity()
+            .saturating_sub(self.data.len())
+            .saturating_mul(std::mem::size_of::<T>())
+    }
+
+    /// Grow the block so it holds `records` vectors without reallocating.
+    ///
+    /// Exact rather than amortised, because the caller is a declaration and not
+    /// a push: what it asks for is the size the block is meant to end at, and
+    /// `reserve` would round that up to a doubling and put the slack back.
+    /// A block already at or past that size is left alone.
+    pub(crate) fn reserve_for(&mut self, records: usize) {
+        let want = records.saturating_mul(self.dim);
+        if want > self.data.len() {
+            self.data.reserve_exact(want - self.data.len());
+        }
+    }
+
     /// Return the block's spare capacity to the allocator.
     pub(crate) fn shrink_to_fit(&mut self) {
         self.data.shrink_to_fit();

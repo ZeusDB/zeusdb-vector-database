@@ -62,9 +62,9 @@ pub use journal::{
 };
 pub use rerank::{
     calibrate_rerank_from_sample, default_rerank_fetch, prepare_reconstruction, raw_distance_fn,
-    reconstruction_needs_unit, rescore_candidate, take_best, RawVectors, RerankCalibration,
-    RerankPlan, SearchParams, DEFAULT_RERANK_CORPUS_DIVISOR, RERANK_CALIBRATION_PAGES,
-    RERANK_CALIBRATION_TOP_K,
+    reconstruction_needs_unit, requested_rerank_fetch, rerank_fetch_ceiling, rescore_candidate,
+    take_best, RawVectors, RerankCalibration, RerankPlan, SearchParams,
+    DEFAULT_RERANK_CORPUS_DIVISOR, RERANK_CALIBRATION_PAGES, RERANK_CALIBRATION_TOP_K,
 };
 pub use zeusdb_vector_core::{
     kill_arm, kill_disarm, CommitMode, Contribution, Cost, Fusion, IdfScope, JournalDamage,

@@ -346,3 +346,153 @@ def test_the_graph_figure_survives_a_save_and_a_load(tmp_path):
     assert after == pytest.approx(before, rel=0.10), (
         f"the loaded graph reports {after:.2f} MB where the saved one reported "
         f"{before:.2f} MB")
+
+
+# ------------------------------------------------------------
+# One convention: every key prices the capacity it asked for
+# ------------------------------------------------------------
+def test_the_raw_vector_key_prices_the_block_and_not_the_payload():
+    """`raw_vectors_memory_mb` is the store, slack included.
+
+    It used to be `live records * dim * 4`, the payload, while every key beside
+    it priced a capacity, so the sum was neither the request nor the resident
+    set. The store is a growable block: it starts at the creation-time
+    reservation and a build past that grows it geometrically, so a build that
+    outgrows its declaration holds a store larger than its vectors.
+
+    The payload is not lost by the change. It is `raw_vectors_stored` times
+    `dimension` times four, and both keys are reported beside this one.
+    """
+    records, dim = 6000, 64
+    # An honest declaration, where the reservation covers every record and the
+    # block is exactly its payload.
+    honest, _ = _build(records, dim, None)
+    stats = honest.get_stats()
+    payload_mb = (int(stats["raw_vectors_stored"]) * int(stats["dimension"]) * 4
+                  / (1024 * 1024))
+    assert float(stats["raw_vectors_memory_mb"]) == pytest.approx(payload_mb, abs=0.01)
+    assert int(stats["raw_vectors_stored"]) == records
+
+    # An understated one, where the block has doubled past the declaration and
+    # carries what the last doubling left.
+    data = _corpus(records, dim, 20260810)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        short = VectorDatabase().create("hnsw", dim=dim, expected_size=500)
+    assert short.add({"ids": [f"s_{i}" for i in range(records)],
+                      "embeddings": data}).is_success()
+    stats = short.get_stats()
+    held = float(stats["raw_vectors_memory_mb"])
+    assert held > payload_mb, (
+        f"the store reports {held:.3f} MB for {payload_mb:.3f} MB of vectors, so "
+        "it is still being priced at its payload")
+    assert float(stats["reserved_memory_mb"]) > 0.0
+
+
+def test_the_reserved_figure_is_what_a_shrink_returns():
+    """`reserved_memory_mb` names the bytes `shrink_to_fit()` hands back.
+
+    Both are the graph's fifteen buffers and the vector stores priced at the gap
+    between their capacity and their length, so the report says in advance what
+    the call would release, and the index reports no slack once it has run.
+    """
+    records, dim = 6000, 64
+    data = _corpus(records, dim, 20260810)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        index = VectorDatabase().create("hnsw", dim=dim, expected_size=500)
+    assert index.add({"ids": [f"r_{i}" for i in range(records)],
+                      "embeddings": data}).is_success()
+
+    reserved_mb = float(index.get_stats()["reserved_memory_mb"])
+    assert reserved_mb > 0.0, "a build past its declaration holds no slack"
+
+    released_mb = index.shrink_to_fit() / (1024 * 1024)
+    assert released_mb == pytest.approx(reserved_mb, abs=0.02), (
+        f"the report named {reserved_mb:.3f} MB of slack and the shrink returned "
+        f"{released_mb:.3f} MB")
+
+    after = index.get_stats()
+    assert float(after["reserved_memory_mb"]) == pytest.approx(0.0, abs=0.02)
+    # And the search still answers, because nothing but capacity moved.
+    assert len(index.search(data[0], top_k=5)) == 5
+
+
+def test_the_reserved_figure_is_inside_the_total_rather_than_beside_it():
+    """The sum is unchanged by the key that says how much of it is untouched.
+
+    `total_memory_mb` is the request. `reserved_memory_mb` is the part of that
+    request no record has been written into, so it is bounded by the total and
+    is not one of its terms.
+    """
+    for storage_mode in (None, "quantized_only", "quantized_with_raw"):
+        index, _ = _build(3000, 64, storage_mode)
+        stats = index.get_stats()
+        parts = sum(float(stats[k]) for k in (
+            "graph_memory_mb", "raw_vectors_memory_mb", "quantized_codes_memory_mb",
+            "codebook_memory_mb", "sdc_table_memory_mb", "centroid_norm_memory_mb",
+            "index_bookkeeping_memory_mb") if k in stats)
+        total = float(stats["total_memory_mb"])
+        assert total == pytest.approx(parts, abs=0.05)
+        assert 0.0 <= float(stats["reserved_memory_mb"]) <= total
+
+
+def test_the_training_buffer_is_released_once_the_codebook_is_fitted():
+    """A trained index holds no capacity for the ids it collected to train on.
+
+    The buffer was cleared and kept its slots, at a 24 byte `String` header
+    each, for the life of the index. Collection stops for good once the
+    threshold is reached, so nothing pushes into it again and the slots were
+    dead weight inside `index_bookkeeping_memory_mb`.
+
+    Two indexes over the same records differing only in `training_size` are what
+    isolates it. Everything else the bookkeeping counts is set by the record
+    count and by the configuration, and neither moves here, so a buffer that
+    survived training would be the whole of the difference between them. A `Vec`
+    grown by pushing holds the smallest power of two at or above its length, so
+    at 1,000 and 4,000 the two buffers would be 1,024 and 4,096 slots, being
+    0.070 MB apart. Measured before this was fixed the two read 1.63 and 1.70 MB.
+    """
+    records, dim = 6000, 32
+    reports = []
+    for training_size in (1000, 4000):
+        index, _ = _build(records, dim, "quantized_only", training_size=training_size)
+        assert index.is_quantized(), (
+            f"training_size {training_size} did not train at {records} records")
+        reports.append(float(index.get_stats()["index_bookkeeping_memory_mb"]))
+
+    small, large = reports
+    assert large == pytest.approx(small, abs=0.005), (
+        f"a training_size of 4,000 reports {large:.3f} MB of bookkeeping against "
+        f"{small:.3f} MB at 1,000, so the buffer survived the codebook")
+
+
+def test_the_raw_store_a_training_rebuild_opens_is_sized_for_the_declaration():
+    """A `quantized_with_raw` index holds its vectors in a block it asked for.
+
+    The store that carries the raw vectors across the training transition used
+    to be opened at the record count present at that moment, which is the
+    training sample. Every record added afterwards pushed into a block sized for
+    a fraction of the index, and the block doubled its way up, so an index that
+    declared its size honestly still ended holding close to twice the vectors it
+    had. It is reserved for the declared size now, so the block is the payload
+    where the declaration covers the records.
+
+    The unquantized arm is the control. Its store has always been reserved at
+    creation and has always been exact here.
+    """
+    records, dim, training = 4000, 64, 1000
+    payload_mb = records * dim * 4 / (1024 * 1024)
+
+    raw, _ = _build(records, dim, None)
+    assert float(raw.get_stats()["raw_vectors_memory_mb"]) == pytest.approx(
+        payload_mb, abs=0.01)
+
+    with_raw, _ = _build(records, dim, "quantized_with_raw", training_size=training)
+    assert with_raw.is_quantized(), "training did not complete"
+    stats = with_raw.get_stats()
+    assert int(stats["raw_vectors_stored"]) == records
+    held = float(stats["raw_vectors_memory_mb"])
+    assert held == pytest.approx(payload_mb, abs=0.01), (
+        f"the store holds {held:.3f} MB for {payload_mb:.3f} MB of vectors, so "
+        "it was reserved from the training sample rather than the declaration")

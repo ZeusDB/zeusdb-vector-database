@@ -858,6 +858,96 @@ fn the_reservation_is_capped_in_bytes() {
     assert_eq!(reserved_records::<u8>(96, 33, 5, 50_000), 50_000);
 }
 
+/// The raw side store a quantized graph opens goes through the same budget.
+///
+/// It did not. The declaration reached `VectorStore::with_capacity` directly,
+/// so a `quantized_with_raw` index declared at `MAX_EXPECTED_SIZE` and
+/// dimension 1,536 asked one allocation for 614 GB. `Vec::with_capacity` aborts
+/// the process on failure rather than unwinding, so nothing could turn that
+/// into an exception.
+#[test]
+fn the_raw_side_store_is_capped_in_bytes() {
+    let declared = 100_000_000usize;
+    let dim = 1536usize;
+    let uncapped = declared * dim * 4;
+    let reserved = VectorGraph::reserved_raw_records(dim, declared);
+    println!(
+        "expected_size {} would reserve {} bytes and reserves {} records",
+        declared, uncapped, reserved
+    );
+    assert!(
+        uncapped > 500 * (1usize << 30),
+        "the uncapped reservation is {} bytes, so there is nothing to cap",
+        uncapped
+    );
+    assert!(reserved < declared);
+    assert!(
+        reserved * dim * 4 <= RESERVE_BYTES,
+        "the capped reservation is {} bytes against a budget of {}",
+        reserved * dim * 4,
+        RESERVE_BYTES
+    );
+
+    // A declaration inside the budget is reserved in full, and a store of any
+    // width is reserved for at least one record.
+    assert_eq!(VectorGraph::reserved_raw_records(128, 10_000), 10_000);
+    assert_eq!(VectorGraph::reserved_raw_records(1536, 20_000), 20_000);
+    assert_eq!(VectorGraph::reserved_raw_records(usize::MAX, 5), 1);
+
+    // And the store an opened graph holds really is that size.
+    let mut graph = VectorGraph::new_pq(
+        "cosine",
+        16,
+        1_000,
+        LAYERS,
+        200,
+        Arc::new(PQ::new(8, 4, 4, 100, None)),
+    );
+    let records = VectorGraph::reserved_raw_records(8, declared);
+    graph
+        .open_raw_store(8, records)
+        .expect("a quantized graph accepts a raw side store");
+    assert!(graph.holds_raw());
+    assert!(
+        graph.raw_vectors_memory_bytes() <= RESERVE_BYTES + 1024,
+        "the opened store asks for {} bytes",
+        graph.raw_vectors_memory_bytes()
+    );
+    assert_eq!(
+        graph.raw_vectors_reserved_bytes(),
+        graph.raw_vectors_memory_bytes() - std::mem::size_of::<VectorStore<f32>>(),
+        "an empty store has written none of what it asked for"
+    );
+}
+
+/// What `reserved_memory_mb` reports is what a shrink returns.
+///
+/// Both are the graph's buffers and its stores priced at the gap between their
+/// capacity and their length, so the two are the same arithmetic read at two
+/// moments and the accessor can be checked against the operation.
+#[test]
+fn the_reserved_bytes_are_what_a_shrink_releases() {
+    const DIM: usize = 8;
+    // A declaration far below what arrives, so the arenas double past it.
+    let mut graph = VectorGraph::new_raw("l2", DIM, 8, 64, LAYERS, 100);
+    for i in 0..2_000usize {
+        let v: Vec<f32> = (0..DIM).map(|d| (i * DIM + d) as f32 * 0.001).collect();
+        graph.insert(&v, i);
+    }
+    let reserved = graph.links_reserved_bytes() + graph.raw_vectors_reserved_bytes();
+    assert!(reserved > 0, "a build past its declaration holds no slack");
+
+    let released = graph.shrink_to_fit();
+    assert_eq!(
+        released, reserved,
+        "the accessor named {} bytes of slack and the shrink released {}",
+        reserved, released
+    );
+    assert_eq!(graph.links_reserved_bytes(), 0);
+    assert_eq!(graph.raw_vectors_reserved_bytes(), 0);
+    assert_eq!(graph.nb_points(), 2_000);
+}
+
 /// The seam's `set_level_seed` reaches the generator its graph draws from.
 ///
 /// Built through the shipped seam rather than through the structure, so what is
