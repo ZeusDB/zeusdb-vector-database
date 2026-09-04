@@ -48,6 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   percent on GloVe-100 under `cosine` and 6.5 percent on DBpedia-1536 under
   `cosine`, measured at 50,000 records. Every result page is identical.
 
+- **A record's metadata is held by internal id** rather than in a hash map
+  keyed by the record's id. A record without metadata costs 16 bytes where it
+  cost 101, and a record with two small fields costs 99 where it cost 357,
+  measured at 100,000 records. `index_bookkeeping_memory_mb` and
+  `total_memory_mb` fall by the difference; every result page, `metadata.json`
+  and `mappings.bin` are unchanged.
+
 - **A directory holding a sparse space declares format version 2.0.0** and
   needs this release or later. A directory holding a dense space alone stays
   at 1.1.0 and opens on every release that reads 1.x. Every directory 0.8.0

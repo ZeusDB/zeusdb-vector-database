@@ -22,7 +22,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
-    ArtefactRecord, Bounds, Error, Inventory, Persist, Restore, VectorGraph, DUMP_FILENAME,
+    ArtefactRecord, Bounds, Error, Inventory, MetadataStore, Persist, Restore, VectorGraph,
+    DUMP_FILENAME,
 };
 use zeusdb_vector_sparse::PostingsIndex;
 use zeusdb_vector_text::{TermDictionary, Tokenizer};
@@ -775,8 +776,41 @@ impl Collection {
         vector_metadata: HashMap<String, HashMap<String, Value>>,
     ) {
         *self.dense().pq_codes.write().unwrap() = pq_codes;
-        *self.vector_metadata.write().unwrap() = vector_metadata;
+        self.restore_metadata(vector_metadata);
         self.rebuild_columns();
+    }
+
+    /// Place every record's metadata under the internal id `id_map` holds
+    /// for it.
+    ///
+    /// `metadata.json` is keyed by external id and the store is indexed by
+    /// internal id, so each entry is resolved through `id_map`, which the
+    /// mappings and either graph rebuild have filled by now. An entry naming
+    /// an id the mappings do not hold has no slot to go in and is dropped,
+    /// counted in the log. No reader could reach such an entry by id, since
+    /// every one resolved a record through `id_map` first; a filtered
+    /// `count` on an undeclared field used to count it, and counts it no
+    /// longer.
+    ///
+    /// The guards are taken in the declared order, `id_map` then
+    /// `vector_metadata`.
+    fn restore_metadata(&mut self, metadata: HashMap<String, HashMap<String, Value>>) {
+        let id_map = self.id_map.read().unwrap();
+        let mut store = self.vector_metadata.write().unwrap();
+        store.clear(self.expected_size());
+        let mut unmapped = 0usize;
+        for (ext_id, fields) in metadata {
+            match id_map.get(&ext_id) {
+                Some(&internal_id) => store.insert(internal_id, fields),
+                None => unmapped += 1,
+            }
+        }
+        if unmapped > 0 {
+            debug!(target: LOG_TARGET, operation = "restore_metadata",
+                unmapped = unmapped,
+                "metadata.json names records the mappings do not hold, and their entries were dropped"
+            );
+        }
     }
 
     /// Build every declared column from the restored metadata.
@@ -807,9 +841,12 @@ impl Collection {
             return;
         }
         columns.clear(self.expected_size());
-        let empty = HashMap::new();
-        for (ext_id, &internal_id) in id_map.iter() {
-            columns.write(internal_id, vector_metadata.get(ext_id).unwrap_or(&empty));
+        let empty: HashMap<String, Value> = HashMap::new();
+        for &internal_id in id_map.values() {
+            match vector_metadata.get(internal_id) {
+                Some(fields) => columns.write(internal_id, &fields),
+                None => columns.write(internal_id, &empty),
+            }
         }
         debug_assert!(
             columns.tracks(id_map.len()),
@@ -1017,8 +1054,8 @@ impl Collection {
         self.dense().pq_codes.read().unwrap()
     }
 
-    /// Get read access to the vector metadata HashMap (thread-safe)
-    pub(crate) fn vector_metadata(&self) -> ReadGuard<'_, HashMap<String, HashMap<String, Value>>> {
+    /// Get read access to the metadata store (thread-safe)
+    pub(crate) fn vector_metadata(&self) -> ReadGuard<'_, MetadataStore> {
         self.vector_metadata.read().unwrap()
     }
 

@@ -121,8 +121,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, Bitmap, ColumnStore, Error, Filter, Operation, OperationKind, Persist,
-    Selection, SpaceName, SparseVector, VectorGraph, VectorIndex, PQ,
+    matches_filter, Bitmap, ColumnStore, Error, Filter, MetadataStore, Operation, OperationKind,
+    Persist, Selection, SpaceName, SparseVector, VectorGraph, VectorIndex, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{count_record_with, TermDictionary, Tokenizer, TokenizerConfig};
@@ -961,7 +961,9 @@ pub struct Collection {
     // Index-level metadata (simple, infrequently accessed)
     metadata: MutexAt<HashMap<String, String>>,
 
-    vector_metadata: RwLockAt<HashMap<String, HashMap<String, Value>>>,
+    /// Every record's metadata, indexed by internal id. See
+    /// [`MetadataStore`] for what a record with and without fields costs.
+    vector_metadata: RwLockAt<MetadataStore>,
 
     /// One column per field declared at `create()`, addressed by internal id.
     ///
@@ -975,8 +977,8 @@ pub struct Collection {
     /// index with no declaration, it falls back to the walk, which is what
     /// every index did before this existed.
     ///
-    /// It supplements the metadata map rather than replacing it. `get_records`,
-    /// `list`, the result page and the saver all read the map, and a column
+    /// It supplements the metadata store rather than replacing it. `get_records`,
+    /// `list`, the result page and the saver all read the store, and a column
     /// store is the wrong shape to reassemble a record from. What the columns
     /// hold is a code per record and one copy of each distinct value, so a
     /// declared field with few distinct values costs four bytes a record. A
@@ -1592,27 +1594,26 @@ impl Collection {
         // as a population count over the bitmap rather than a walk. Where
         // one field has no column the declared ones bound the candidates
         // and the metadata decides among them, which is the same count over
-        // fewer reads. The guards below are taken in the declared order,
-        // and the columns guard is released before the other two, since the
-        // selection owns its bitmap.
+        // fewer reads. The columns guard is released before the metadata
+        // guard is taken, since the selection owns its bitmap, and the store
+        // is indexed by the internal ids the bitmap holds, so nothing else
+        // is read. A removed record holds no entry, which is the liveness
+        // check.
         let selection = {
             let columns = self.columns.read().unwrap();
             columns.select(conditions)
         };
-        let rev_map = self.rev_map.read().unwrap();
         match selection {
             Selection::Exact(selected) => selected.count(),
             Selection::Narrowed(bound, _) => {
                 let vector_metadata = self.vector_metadata.read().unwrap();
                 let mut counted = 0;
                 bound.for_each(|slot| {
-                    if let Some(id) = rev_map.get(&slot) {
-                        if vector_metadata
-                            .get(id)
-                            .is_some_and(|meta| matches_filter(meta, conditions))
-                        {
-                            counted += 1;
-                        }
+                    if vector_metadata
+                        .get(slot)
+                        .is_some_and(|fields| matches_filter(&fields, conditions))
+                    {
+                        counted += 1;
                     }
                 });
                 counted
@@ -1620,8 +1621,8 @@ impl Collection {
             Selection::Whole(_) => {
                 let vector_metadata = self.vector_metadata.read().unwrap();
                 vector_metadata
-                    .values()
-                    .filter(|meta| matches_filter(meta, conditions))
+                    .iter()
+                    .filter(|(_, fields)| matches_filter(fields, conditions))
                     .count()
             }
         }
@@ -1676,7 +1677,11 @@ impl Collection {
             let exists = id_map.contains_key(&id) || pq_codes.contains_key(&id);
 
             if exists {
-                let metadata = vector_metadata.get(&id).cloned().unwrap_or_default();
+                let metadata = id_map
+                    .get(&id)
+                    .and_then(|&slot| vector_metadata.get(slot))
+                    .map(|fields| fields.to_map())
+                    .unwrap_or_default();
 
                 let vector = if return_vector {
                     // Priority: raw vector > PQ reconstruction
@@ -1780,8 +1785,11 @@ impl Collection {
 
         let page = window.get(offset.min(end)..).unwrap_or(&[]);
         let mut results = Vec::with_capacity(page.len());
-        for &(_, id) in page.iter() {
-            let metadata = vector_metadata.get(id).cloned().unwrap_or_default();
+        for &(internal, id) in page.iter() {
+            let metadata = vector_metadata
+                .get(internal)
+                .map(|fields| fields.to_map())
+                .unwrap_or_default();
             results.push((id.clone(), metadata));
         }
         Ok(results)

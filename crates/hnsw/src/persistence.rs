@@ -107,8 +107,8 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 use zeusdb_vector_core::{
     checksum_of, validate_indexed_fields, ArtefactRecord, Bounds, Error, Inventory, Persist,
-    Restore, SpaceName, VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME, LEGACY_DUMP_FILENAMES,
-    PQ,
+    RecordFields, Restore, SpaceName, VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME,
+    LEGACY_DUMP_FILENAMES, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerConfig};
@@ -2363,13 +2363,25 @@ fn save_mappings(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Re
 fn save_metadata(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
     debug!(target: LOG_TARGET, "Saving metadata.json...");
 
-    // The guard ends with the serialize. `to_string_pretty` returns an owned
-    // String, so the file is written with nothing held and nothing is copied
-    // that was not being copied already.
+    // Both guards end with the serialize, taken in the documented order,
+    // id_map before vector_metadata. The file is keyed by external id and
+    // the store by internal id, so every record is written under the id the
+    // mappings hold for it, in increasing internal id order. `to_string_pretty`
+    // returns an owned String, so the file is written with nothing held.
     let (metadata_json, record_count) = {
+        let id_map = index.id_map();
         let vector_metadata = index.vector_metadata();
-        let json = serde_json::to_string_pretty(&*vector_metadata);
-        (json, vector_metadata.len())
+        let mut ordered: Vec<(usize, &String)> =
+            id_map.iter().map(|(id, &slot)| (slot, id)).collect();
+        ordered.sort_unstable_by_key(|&(slot, _)| slot);
+        let file = MetadataFile {
+            records: ordered
+                .into_iter()
+                .filter_map(|(slot, id)| vector_metadata.get(slot).map(|fields| (id, fields)))
+                .collect(),
+        };
+        let json = serde_json::to_string_pretty(&file);
+        (json, file.records.len())
     };
     let metadata_json = metadata_json.map_err(|e| Error::SerializeFailed {
         what: "metadata",
@@ -2380,6 +2392,32 @@ fn save_metadata(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Re
 
     debug!(target: LOG_TARGET, "metadata.json saved ({} records)", record_count);
     Ok(())
+}
+
+/// `metadata.json` as it is written: one object per record under its
+/// external id, holding the record's fields. The same shape the file has
+/// always had, which `load_metadata` reads back into a map of maps.
+struct MetadataFile<'a> {
+    records: Vec<(&'a String, RecordFields<'a>)>,
+}
+
+impl Serialize for MetadataFile<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(
+            self.records
+                .iter()
+                .map(|(id, fields)| (id, FieldsObject(*fields))),
+        )
+    }
+}
+
+/// One record's fields as the JSON object its mapping serialises as.
+struct FieldsObject<'a>(RecordFields<'a>);
+
+impl Serialize for FieldsObject<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter())
+    }
 }
 
 /// Save quantization configuration and training state
