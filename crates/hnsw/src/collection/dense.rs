@@ -68,13 +68,14 @@
 //! query's wall time sees that difference, not a unit that is wrong.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tracing::error;
 use zeusdb_vector_core::{
-    restore_graph, Admit, ArtefactRecord, Bitmap, Bounds, Budget, Cost, Dense, DumpBounds, Error,
-    Hit, Hits, Inventory, Ledger, Persist, Planned, Prepared, Record, RecordId, Restore, ScoreKind,
-    Selectivity, VectorGraph, VectorIndex, DUMP_FILENAME, PQ,
+    restore_graph, restore_int8_graph, Admit, ArtefactRecord, Bitmap, Bounds, Budget, Cost, Dense,
+    DumpBounds, Error, Hit, Hits, Int8Codec, Inventory, Ledger, Persist, Planned, Prepared, Record,
+    RecordId, Restore, ScoreKind, Selectivity, VectorGraph, VectorIndex, DUMP_FILENAME, PQ,
 };
 
 use super::search::FULL_SCAN_THRESHOLD;
@@ -137,7 +138,10 @@ pub(crate) struct DenseUnits {
 /// What phase one hands to phase two: the codes a quantized graph installs
 /// and the plan the graph made for them, or the plan for a raw vector.
 struct DensePlan {
+    /// The product quantized codes, where the graph holds them.
     codes: Option<Vec<u8>>,
+    /// The scalar row, where the graph holds those.
+    row: Option<Vec<i8>>,
     planned: Option<Planned>,
 }
 
@@ -153,6 +157,15 @@ pub(crate) struct DenseIndex {
     keeps_raw: bool,
     /// What a scan and a traversal cost per unit on this graph.
     units: DenseUnits,
+    /// Values a scalar quantized graph has clipped at the edge of its code
+    /// range since the scales were fitted, summed over every encode: the
+    /// training rebuild, every insertion after it, and every replay. A
+    /// value beyond the range a dimension's sample reached is saturated
+    /// rather than refused, and this is the one place a caller can see how
+    /// often that happened; `get_stats` reports it and `quantization.json`
+    /// carries it. Zero on every other graph. An atomic because the encode
+    /// runs under the index's read guard.
+    saturated: AtomicU64,
 }
 
 impl DenseIndex {
@@ -179,9 +192,27 @@ impl DenseIndex {
                 ef_ns: 0.0,
                 measured: false,
             },
+            saturated: AtomicU64::new(0),
         };
         index.calibrate();
         index
+    }
+
+    /// Values a scalar quantized graph has clipped since its scales were
+    /// fitted; see the field.
+    pub(crate) fn saturated(&self) -> u64 {
+        self.saturated.load(Ordering::Relaxed)
+    }
+
+    /// Add to the clipped value count, which the training rebuild does for
+    /// the records it encodes off to the side.
+    pub(crate) fn add_saturated(&self, values: u64) {
+        self.saturated.fetch_add(values, Ordering::Relaxed);
+    }
+
+    /// Take the count a saved index recorded.
+    pub(crate) fn set_saturated(&self, values: u64) {
+        self.saturated.store(values, Ordering::Relaxed);
     }
 
     pub(crate) fn graph(&self) -> &VectorGraph {
@@ -314,7 +345,10 @@ impl DenseIndex {
                 };
             }
             None => {
-                let distance_ns = if self.graph.is_quantized() {
+                // A scalar kernel decodes every value inside the distance and
+                // measured no slower than the raw kernel at every width, so it
+                // takes the raw floor.
+                let distance_ns = if self.graph.is_pq() {
                     10.0 + 1.5 * self.pq.as_ref().map_or(8, |pq| pq.subvectors()) as f64
                 } else {
                     115.0 + 0.6 * self.dim as f64
@@ -351,6 +385,12 @@ impl DenseIndex {
     ) -> f32 {
         if let Some(stored) = self.graph.raw_vector(id) {
             return distance(query, stored);
+        }
+        // A scalar row is scored through the graph's own kernel, so the exact
+        // scan and the traversal agree bit for bit and the page is on the
+        // scale the kernel already puts it on.
+        if let Some(scored) = self.graph.int8_distance(query, id) {
+            return scored;
         }
         let reconstructed = self
             .graph
@@ -436,14 +476,17 @@ impl DenseIndex {
                 score: hit.distance,
             })
             .collect();
-        // Put an l2 index's approximate scores back on the scale it reports.
-        // The quantized l2 scorer sums a table of squared distances and takes
-        // no root, because the root is monotone and would cost one per
+        // Put a product quantized l2 index's approximate scores back on the
+        // scale it reports. That scorer sums a table of squared distances and
+        // takes no root, because the root is monotone and would cost one per
         // evaluation to change nothing, so the root is taken once per
         // returned candidate here. Cosine arrives already on its own scale,
         // since its conversion is not monotone in the sum and the scorer has
-        // to make it.
-        if quantized && self.metric == "l2" {
+        // to make it. A scalar l2 scorer takes the root inside the kernel,
+        // reproducing the raw kernel over the decoded values, so its page is
+        // already on that scale and a second root here would move every
+        // score off it; the condition is the product quantized graph alone.
+        if self.graph.is_pq() && self.metric == "l2" {
             for item in &mut items {
                 item.score = item.score.max(0.0).sqrt();
             }
@@ -469,6 +512,28 @@ impl DenseIndex {
         vector: &[f32],
         level: usize,
     ) -> Result<DensePlan, Error> {
+        if self.graph.is_int8() {
+            let row = self.graph.int8_encode(vector).map_err(|e| {
+                error!(target: "zeusdb_vector_database::hnsw_index::insert", operation = "add_quantized_vector",
+                    internal_id = id.0,
+                    error = %e,
+                    "Failed to encode vector"
+                );
+                Error::QuantizeFailed(e)
+            })?;
+            if let Some(codec) = self.graph.int8_codec() {
+                let clipped = codec.saturated(vector);
+                if clipped > 0 {
+                    self.saturated.fetch_add(clipped as u64, Ordering::Relaxed);
+                }
+            }
+            let planned = self.graph.plan_at_level(Record::Int8(&row), level);
+            return Ok(DensePlan {
+                codes: None,
+                row: Some(row),
+                planned,
+            });
+        }
         if self.graph.is_quantized() {
             let pq = self.pq.as_ref().ok_or(Error::NoQuantizer)?;
             let codes = pq.quantize(vector).map_err(|e| {
@@ -488,11 +553,13 @@ impl DenseIndex {
             );
             Ok(DensePlan {
                 codes: Some(codes),
+                row: None,
                 planned,
             })
         } else {
             Ok(DensePlan {
                 codes: None,
+                row: None,
                 planned: self.graph.plan_at_level(Record::Raw(vector), level),
             })
         }
@@ -553,12 +620,13 @@ impl VectorIndex<Dense> for DenseIndex {
             }
         };
         if let Some(planned) = plan.planned {
-            let record = match &plan.codes {
-                Some(codes) => Record::Codes {
+            let record = match (&plan.codes, &plan.row) {
+                (Some(codes), _) => Record::Codes {
                     codes,
                     raw: self.keeps_raw.then_some(vector),
                 },
-                None => Record::Raw(vector),
+                (None, Some(row)) => Record::Int8(row),
+                (None, None) => Record::Raw(vector),
             };
             self.graph.install(record, id.slot(), planned);
         }
@@ -599,6 +667,9 @@ impl VectorIndex<Dense> for DenseIndex {
         }
         if !self.live.contains(id.slot()) {
             return None;
+        }
+        if let Some(decoded) = self.graph.int8_reconstruct(id.slot()) {
+            return Some(decoded);
         }
         let codes = self.graph.codes_of(id.slot())?;
         self.pq.as_ref()?.reconstruct(codes).ok()
@@ -701,6 +772,8 @@ pub(crate) struct DenseOpen {
     pub(crate) ef_construction: usize,
     /// The trained quantizer, where the saved graph was a quantized one.
     pub(crate) pq: Option<Arc<PQ>>,
+    /// The fitted scalar codec, where the saved graph was a scalar one.
+    pub(crate) int8: Option<Arc<Int8Codec>>,
     pub(crate) keeps_raw: bool,
 }
 
@@ -738,19 +811,32 @@ impl Restore for DenseIndex {
                 )));
             }
         }
-        let pq = config.pq.as_ref().filter(|pq| pq.is_trained()).cloned();
-        let (graph, _nodes) = restore_graph(
-            &target,
-            &config.metric,
-            config.m,
-            config.ef_construction,
-            config.dim,
-            pq,
-            DumpBounds {
-                min_nodes: bounds.min_records,
-                max_origin_id: bounds.max_records,
-            },
-        )
+        let dump_bounds = DumpBounds {
+            min_nodes: bounds.min_records,
+            max_origin_id: bounds.max_records,
+        };
+        let (graph, _nodes) = match &config.int8 {
+            Some(codec) => restore_int8_graph(
+                &target,
+                &config.metric,
+                config.m,
+                config.ef_construction,
+                codec.clone(),
+                dump_bounds,
+            ),
+            None => {
+                let pq = config.pq.as_ref().filter(|pq| pq.is_trained()).cloned();
+                restore_graph(
+                    &target,
+                    &config.metric,
+                    config.m,
+                    config.ef_construction,
+                    config.dim,
+                    pq,
+                    dump_bounds,
+                )
+            }
+        }
         .map_err(Error::Engine)?;
         Ok(DenseIndex::new(
             graph,

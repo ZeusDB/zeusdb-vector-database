@@ -187,12 +187,15 @@ pub(super) fn warn_if_selection_disabled(
 /// Build an index from the arguments `_create_hnsw_index` receives.
 ///
 /// The five values and the field declaration are validated first, then the
-/// space is checked for quantization before any of the mapping is read, then
-/// the mapping's keys are read one at a time and the product quantizer's own
-/// rules run on what they held. Each rule runs once and in the order it
-/// always did. The sparse space is declared after all of them, so a caller
-/// reads the same message for the same mistake whether or not one is
-/// declared.
+/// mapping's `type` is read. Under `pq` the space is checked for
+/// quantization before any other key is read, then the keys are read one at
+/// a time and the product quantizer's own rules run on what they held, each
+/// rule once and in the order it always did. Under `int8` the keys the
+/// scheme does not take are refused first, then `scale`, `training_size`,
+/// `max_training_vectors` and `storage_mode` are read and the scalar rules
+/// run on them; a scalar index takes all four spaces. The sparse space is
+/// declared after all of them, so a caller reads the same message for the
+/// same mistake whether or not one is declared.
 #[instrument(level = "info", skip(quantization_config, sparse), fields(
     dim = dim,
     space = %space,
@@ -226,9 +229,6 @@ pub(super) fn build(
     // Extract quantization configuration
     let quantization = match quantization_config {
         Some(config) => {
-            // Before any of the config is read, so the message names the pair
-            // rather than whichever PQ field happens to be checked first.
-            declaration.quantizable()?;
             let qtype = config
                 .get_item("type")?
                 .ok_or_else(|| {
@@ -238,10 +238,19 @@ pub(super) fn build(
                 })?
                 .extract::<String>()?;
 
+            if qtype == "int8" {
+                return build_int8(declaration, config, sparse);
+            }
             if qtype != "pq" {
                 error!(operation = "validation", field = "quantization_type", value = %qtype, "Unsupported quantization type");
                 return Err(Error::UnsupportedQuantizationType { qtype }.into());
             }
+
+            // Before any of the product quantized keys is read, so the
+            // message names the pair rather than whichever PQ field happens
+            // to be checked first.
+            declaration.quantizable()?;
+            refuse_key(config, "scale", "pq", "int8")?;
 
             // Extract PQ parameters
             let subvectors = config
@@ -305,5 +314,95 @@ pub(super) fn build(
     Ok(HNSWIndex::wrap(Collection::build(
         declaration,
         quantization,
+    )))
+}
+
+/// Refuse a key of the other scheme, where the mapping carries it with a
+/// value. A value of `None` is the key left out, as it is for every other
+/// key of the mapping.
+fn refuse_key(
+    config: &Bound<PyDict>,
+    key: &str,
+    scheme: &str,
+    belongs_to: &'static str,
+) -> Result<(), PyEngineError> {
+    if config.get_item(key)?.is_some_and(|value| !value.is_none()) {
+        error!(
+            operation = "validation",
+            field = key,
+            quantization_type = scheme,
+            "Key of the other quantization scheme"
+        );
+        return Err(Error::QuantizationKeyNotForScheme {
+            key: key.to_string(),
+            scheme: scheme.to_string(),
+            belongs_to,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The scalar half of [`build`], for a mapping whose `type` is `int8`.
+///
+/// `subvectors` and `bits` are refused first, since a caller who carried
+/// them over from a product quantized declaration should hear that before
+/// any rule about the keys the scheme does take. `scale` defaults to
+/// `per_dimension`, `training_size` is required as it is under `pq`, and
+/// `storage_mode` defaults to `quantized_only`, the one mode a scalar index
+/// takes; see `Declaration::scalar_quantization` for the rules and the
+/// reason.
+fn build_int8(
+    declaration: Declaration,
+    config: &Bound<PyDict>,
+    sparse: Option<&Bound<PyDict>>,
+) -> Result<HNSWIndex, PyEngineError> {
+    refuse_key(config, "subvectors", "int8", "pq")?;
+    refuse_key(config, "bits", "int8", "pq")?;
+
+    let scale = config
+        .get_item("scale")?
+        .filter(|value| !value.is_none())
+        .map(|value| value.extract::<String>())
+        .transpose()?
+        .unwrap_or_else(|| "per_dimension".to_string());
+
+    let training_size = config
+        .get_item("training_size")?
+        .ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Missing 'training_size' in quantization_config",
+            )
+        })?
+        .extract::<usize>()?;
+
+    let max_training_vectors = config
+        .get_item("max_training_vectors")?
+        .map(|v| v.extract::<usize>())
+        .transpose()?;
+
+    let storage_mode_str = config
+        .get_item("storage_mode")?
+        .map(|v| v.extract::<String>())
+        .transpose()?
+        .unwrap_or_else(|| "quantized_only".to_string());
+    let storage_mode =
+        StorageMode::from_string(&storage_mode_str).map_err(Error::InvalidStorageMode)?;
+
+    let quantization = declaration.scalar_quantization(
+        &scale,
+        training_size,
+        max_training_vectors,
+        storage_mode,
+    )?;
+
+    let declaration = match sparse {
+        Some(sparse) => declare_sparse(declaration, sparse)?,
+        None => declaration,
+    };
+
+    Ok(HNSWIndex::wrap(Collection::build(
+        declaration,
+        Some(quantization),
     )))
 }

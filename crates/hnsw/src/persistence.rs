@@ -11,9 +11,11 @@
 //! ├── mappings.bin            # ID mappings (binary)
 //! ├── metadata.json           # Vector metadata (JSON)
 //! ├── vectors.bin             # Raw vectors (storage mode dependent)
-//! ├── quantization.json       # PQ configuration (if enabled)
+//! ├── quantization.json       # quantization configuration and training state (if enabled)
 //! ├── pq_codes.bin            # Quantized codes (if PQ enabled)
 //! ├── pq_centroids.bin        # PQ centroids (if trained)
+//! ├── int8_scales.zdbint8     # the scales of a scalar quantized index, one a dimension (if trained)
+//! ├── int8_rows.zdbint8       # every record's scalar row (if trained and not empty)
 //! ├── hnsw_index.zdbgraph     # HNSW graph topology and the point each node holds
 //! └── spaces/                 # one directory per sparse space, where one is declared
 //!     └── <name>/
@@ -43,6 +45,17 @@
 //! This build reads all three majors, and a directory saved by a collection
 //! holding no journal keeps `1.1.0` or `2.0.0` and opens everywhere it does
 //! today.
+//!
+//! A directory whose dense space is declared with scalar quantization is
+//! written at the next minor of whichever major its other contents put it
+//! in, being `1.2.0`, `2.1.0` or `3.1.0`. A minor rather than a major
+//! because an older reader never opens such a directory silently: every one
+//! carries a `quantization.json` naming `type: int8` and none of the product
+//! quantized fields, and a reader that knows the product quantized fields
+//! alone refuses it on the first missing one. The minor records that the
+//! directory holds something newer without shutting out a reader that can
+//! cope. A directory declared without scalar quantization keeps the version
+//! it has, byte for byte.
 //!
 //! ## The journal
 //!
@@ -93,7 +106,7 @@
 
 use crate::collection::{
     validate_index_parameters, validate_space_supports_quantization, Collection,
-    QuantizationConfig, SparseDeclaration, StorageMode, DEFAULT_SPACE,
+    QuantizationConfig, QuantizationScheme, SparseDeclaration, StorageMode, DEFAULT_SPACE,
 };
 use crate::journal::{JournalPolicy, Recovery};
 use crate::RerankCalibration;
@@ -106,9 +119,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use zeusdb_vector_core::{
-    checksum_of, validate_indexed_fields, ArtefactRecord, Bounds, Error, Inventory, Persist,
+    checksum_of, frame, frame_begin, frame_finish, unframe, validate_indexed_fields,
+    ArtefactRecord, Bounds, Error, FrameEncoding, FrameKind, Int8Codec, Inventory, Persist,
     RecordFields, Restore, SpaceName, VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME,
-    LEGACY_DUMP_FILENAMES, PQ,
+    FRAME_OVERHEAD_BYTES, LEGACY_DUMP_FILENAMES, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerConfig};
@@ -149,6 +163,19 @@ const SPACES_FORMAT_VERSION: &str = "2.0.0";
 /// 2.0.0 and opens everywhere it does today, because nothing about it
 /// changed.
 const JOURNAL_FORMAT_VERSION: &str = "3.0.0";
+
+/// The minor each major moves to when the dense space is declared with
+/// scalar quantization. See the module documentation for why it is a minor.
+const DENSE_INT8_FORMAT_VERSION: &str = "1.2.0";
+const SPACES_INT8_FORMAT_VERSION: &str = "2.1.0";
+const JOURNAL_INT8_FORMAT_VERSION: &str = "3.1.0";
+
+/// The two artefacts of a trained scalar quantized index.
+const INT8_SCALES_FILENAME: &str = "int8_scales.zdbint8";
+const INT8_ROWS_FILENAME: &str = "int8_rows.zdbint8";
+const INT8_SCALES_CONTENTS: &str =
+    "the scales of a scalar quantized index, one a dimension, which every stored row decodes through";
+const INT8_ROWS_CONTENTS: &str = "the scalar row of every record";
 
 /// The majors this build reads.
 ///
@@ -719,6 +746,8 @@ fn artefact_contents(name: &str) -> &'static str {
         "quantization.json" => "the product quantization configuration and the training state",
         "pq_centroids.bin" => "the trained PQ codebook, which every stored code decodes through",
         "pq_codes.bin" => "the quantized code of every record",
+        INT8_SCALES_FILENAME => INT8_SCALES_CONTENTS,
+        INT8_ROWS_FILENAME => INT8_ROWS_CONTENTS,
         _ if name.ends_with("/postings.zdbsparse") => {
             "the postings of a sparse space, being every record's term ids and weights"
         }
@@ -1093,14 +1122,51 @@ pub(crate) struct IdMappings {
     pub(crate) rev_map: HashMap<usize, String>,
 }
 
+/// quantization.json under `type: int8`: the scalar declaration and the
+/// training state, and none of the product quantized fields.
+///
+/// A reader that knows the product quantized layout alone refuses this file
+/// on its first missing field, which is what lets the format version move by
+/// a minor rather than a major; see the module documentation.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct Int8Persistence {
+    pub(crate) r#type: String,
+    pub(crate) scale: String,
+    pub(crate) training_size: usize,
+    pub(crate) max_training_vectors: Option<usize>,
+    pub(crate) storage_mode: String,
+    pub(crate) is_trained: bool,
+    pub(crate) training_completed_at: Option<String>,
+    #[serde(default)]
+    pub(crate) training_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) training_threshold_reached: bool,
+    /// Values the encode has clipped since the scales were fitted; see
+    /// `DenseIndex::saturated`.
+    #[serde(default)]
+    pub(crate) saturated_values: u64,
+}
+
+/// quantization.json, as one of the two layouts it takes.
+enum QuantizationFile {
+    Pq(QuantizationPersistence),
+    Int8(Int8Persistence),
+}
+
 /// PQ codebook laid out as [subvector][centroid][dimension within subvector]
 type Centroids = Vec<Vec<Vec<f32>>>;
 
 /// Everything the loader reads back for a quantized index
 struct QuantizationArtefacts {
-    config: QuantizationPersistence,
+    config: QuantizationFile,
     centroids: Option<Centroids>,
     codes: HashMap<String, Vec<u8>>,
+    /// The fitted scalar codec, from `int8_scales.zdbint8` on a trained
+    /// scalar directory.
+    int8: Option<Arc<Int8Codec>>,
+    /// Every record's scalar row from `int8_rows.zdbint8`, by internal id,
+    /// ascending.
+    rows: Vec<(usize, Vec<i8>)>,
 }
 
 /// Training collection state, applied once the graph is back
@@ -1115,15 +1181,29 @@ struct TrainingState {
     threshold_reached: bool,
     is_trained: bool,
     training_size: usize,
+    /// The clipped value count a scalar directory recorded, applied once
+    /// the index holds its graph, since the graph's restore builds a fresh
+    /// index whose count starts at zero.
+    saturated: u64,
 }
 
 impl TrainingState {
-    fn from(config: &QuantizationPersistence) -> Self {
-        TrainingState {
-            ids: config.training_ids.clone(),
-            threshold_reached: config.training_threshold_reached,
-            is_trained: config.is_trained,
-            training_size: config.training_size,
+    fn from(config: &QuantizationFile) -> Self {
+        match config {
+            QuantizationFile::Pq(config) => TrainingState {
+                ids: config.training_ids.clone(),
+                threshold_reached: config.training_threshold_reached,
+                is_trained: config.is_trained,
+                training_size: config.training_size,
+                saturated: 0,
+            },
+            QuantizationFile::Int8(config) => TrainingState {
+                ids: config.training_ids.clone(),
+                threshold_reached: config.training_threshold_reached,
+                is_trained: config.is_trained,
+                training_size: config.training_size,
+                saturated: config.saturated_values,
+            },
         }
     }
 
@@ -1142,6 +1222,9 @@ impl TrainingState {
             collected >= self.training_size
         };
         index.set_training_threshold_reached(reached);
+        if self.saturated > 0 {
+            index.set_int8_saturated(self.saturated);
+        }
 
         debug!(target: LOG_TARGET, "Training state restored ({} collected ids, threshold reached: {})",
             collected, reached
@@ -1498,13 +1581,32 @@ fn load_quantization(
         return Ok(None);
     }
 
+    let quant_data = read_artefact_string(path, "quantization.json", manifest)?;
+
+    // Which of the two layouts the file takes, read off its `type` field
+    // before either struct is parsed, so the product quantized struct still
+    // parses a product quantized file and reports its errors word for word.
+    // A file that is not an object, or names no type, is left to that
+    // struct's parse, which refuses it as it always did.
+    let is_int8 = serde_json::from_str::<Value>(&quant_data)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|t| t == "int8")
+        })
+        .unwrap_or(false);
+    if is_int8 {
+        return load_int8_quantization(path, manifest, dim, space, &quant_path, &quant_data)
+            .map(Some);
+    }
+
     // A directory whose config.json names the inner product space and whose
     // manifest names quantization.json describes an index `create()` refuses.
     // No save this build makes can produce one, so it was hand assembled, and
     // building it would give an index ranking by the wrong quantity.
     validate_space_supports_quantization(space, &format!("{}: ", path.display()))?;
-
-    let quant_data = read_artefact_string(path, "quantization.json", manifest)?;
 
     let quant_config: QuantizationPersistence =
         serde_json::from_str(&quant_data).map_err(|e| Error::ArtefactParseFailed {
@@ -1530,10 +1632,214 @@ fn load_quantization(
     let codes = load_pq_codes(path, manifest)?;
 
     Ok(Some(QuantizationArtefacts {
-        config: quant_config,
+        config: QuantizationFile::Pq(quant_config),
         centroids,
         codes,
+        int8: None,
+        rows: Vec::new(),
     }))
+}
+
+/// quantization.json under `type: int8`, with the scales and the rows a
+/// trained directory carries beside it.
+///
+/// The fields are held to the rules `create()` applies to a scalar
+/// declaration, and each artefact to the bounds its frame states: the
+/// scales artefact carries `dim` entries and exactly `dim * 4` payload
+/// bytes, every scale finite and positive, and the rows artefact carries
+/// `entries` records of a `u32` internal id and a row of the codec's width,
+/// ids strictly increasing and none above the saved id counter, in exactly
+/// `entries * (4 + width)` bytes. Every bound is checked before anything is
+/// allocated from a field.
+fn load_int8_quantization(
+    path: &Path,
+    manifest: &IndexManifest,
+    dim: usize,
+    space: &str,
+    quant_path: &Path,
+    quant_data: &str,
+) -> Result<QuantizationArtefacts, Error> {
+    let file = quant_path.display().to_string();
+    let config: Int8Persistence =
+        serde_json::from_str(quant_data).map_err(|e| Error::ArtefactParseFailed {
+            name: "quantization.json",
+            error: e.to_string(),
+        })?;
+    let invalid = |detail: String| Error::Int8ArtefactInvalid {
+        file: file.clone(),
+        detail,
+    };
+    if crate::collection::Int8Scale::from_name(&config.scale).is_none() {
+        return Err(invalid(format!(
+            "scale is '{}', and this build fits '{}' alone",
+            config.scale,
+            crate::collection::Int8Scale::PER_DIMENSION
+        )));
+    }
+    if config.training_size < 1000 {
+        return Err(invalid(format!(
+            "training_size is {}, and create() requires at least 1000",
+            config.training_size
+        )));
+    }
+    if let Some(max_training) = config.max_training_vectors {
+        if max_training < config.training_size {
+            return Err(invalid(format!(
+                "max_training_vectors is {} and training_size is {}, and create() requires \
+                 the first to be at or above the second",
+                max_training, config.training_size
+            )));
+        }
+    }
+    let storage_mode = StorageMode::from_string(&config.storage_mode).map_err(Error::Engine)?;
+    if storage_mode == StorageMode::QuantizedWithRaw {
+        return Err(invalid(
+            "storage_mode is 'quantized_with_raw', which a scalar quantized index never takes"
+                .to_string(),
+        ));
+    }
+    debug!(target: LOG_TARGET, "quantization.json loaded (int8)");
+
+    if !config.is_trained {
+        return Ok(QuantizationArtefacts {
+            config: QuantizationFile::Int8(config),
+            centroids: None,
+            codes: HashMap::new(),
+            int8: None,
+            rows: Vec::new(),
+        });
+    }
+
+    let codec = load_int8_scales(path, manifest, dim)?;
+    let tail = if space == "cosine" { 4 } else { 0 };
+    let rows = load_int8_rows(path, manifest, codec.dim() + tail)?;
+    Ok(QuantizationArtefacts {
+        config: QuantizationFile::Int8(config),
+        centroids: None,
+        codes: HashMap::new(),
+        int8: Some(codec),
+        rows,
+    })
+}
+
+/// The scales artefact, held to its bounds and handed back as the codec.
+fn load_int8_scales(
+    path: &Path,
+    manifest: &IndexManifest,
+    dim: usize,
+) -> Result<Arc<Int8Codec>, Error> {
+    if !manifest_names(manifest, INT8_SCALES_FILENAME) {
+        return Err(Error::Int8ScalesMissing);
+    }
+    debug!(target: LOG_TARGET, "Loading {}...", INT8_SCALES_FILENAME);
+    let invalid = |detail: String| Error::Int8ArtefactInvalid {
+        file: INT8_SCALES_FILENAME.to_string(),
+        detail,
+    };
+    // The bound is the frame plus `dim` floats, since the frame's own header
+    // is held to the same count below.
+    let max_bytes = (dim as u64)
+        .saturating_mul(4)
+        .saturating_add(FRAME_OVERHEAD_BYTES as u64);
+    let bytes = zeusdb_vector_core::read_artefact(
+        path,
+        INT8_SCALES_FILENAME,
+        manifest,
+        INT8_SCALES_CONTENTS,
+        max_bytes,
+    )?;
+    let framed = unframe(&bytes, FrameKind::Int8Scales, INT8_SCALES_FILENAME)?;
+    if framed.entries != dim as u64 {
+        return Err(invalid(format!(
+            "holds {} scales and config.json declares dim {}",
+            framed.entries, dim
+        )));
+    }
+    if framed.payload.len() != dim * 4 {
+        return Err(invalid(format!(
+            "holds {} payload bytes and {} scales take {}",
+            framed.payload.len(),
+            dim,
+            dim * 4
+        )));
+    }
+    let scales: Vec<f32> = framed
+        .payload
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    let codec = Int8Codec::from_scales(scales).map_err(invalid)?;
+    debug!(target: LOG_TARGET, "{} loaded ({} scales)", INT8_SCALES_FILENAME, dim);
+    Ok(Arc::new(codec))
+}
+
+/// The rows artefact, held to its bounds, as (internal id, row) ascending.
+/// Empty where the manifest names none, which is what a trained index
+/// holding no record writes.
+fn load_int8_rows(
+    path: &Path,
+    manifest: &IndexManifest,
+    row_width: usize,
+) -> Result<Vec<(usize, Vec<i8>)>, Error> {
+    if !manifest_names(manifest, INT8_ROWS_FILENAME) {
+        return Ok(Vec::new());
+    }
+    debug!(target: LOG_TARGET, "Loading {}...", INT8_ROWS_FILENAME);
+    let invalid = |detail: String| Error::Int8ArtefactInvalid {
+        file: INT8_ROWS_FILENAME.to_string(),
+        detail,
+    };
+    let stride = 4 + row_width;
+    // The bound is the id ceiling's worth of rows, since an internal id is
+    // a `u32` and every row below is held to that ceiling.
+    let max_bytes = (u32::MAX as u64)
+        .saturating_mul(stride as u64)
+        .saturating_add(FRAME_OVERHEAD_BYTES as u64);
+    let bytes = zeusdb_vector_core::read_artefact(
+        path,
+        INT8_ROWS_FILENAME,
+        manifest,
+        INT8_ROWS_CONTENTS,
+        max_bytes,
+    )?;
+    let framed = unframe(&bytes, FrameKind::Int8Rows, INT8_ROWS_FILENAME)?;
+    let entries = usize::try_from(framed.entries)
+        .ok()
+        .filter(|&entries| entries <= u32::MAX as usize)
+        .ok_or_else(|| {
+            invalid(format!(
+                "names {} rows, above the id ceiling",
+                framed.entries
+            ))
+        })?;
+    let expected = entries
+        .checked_mul(stride)
+        .ok_or_else(|| invalid(format!("names {} rows, which overflows", entries)))?;
+    if framed.payload.len() != expected {
+        return Err(invalid(format!(
+            "holds {} payload bytes and {} rows of {} bytes take {}",
+            framed.payload.len(),
+            entries,
+            stride,
+            expected
+        )));
+    }
+    let mut rows = Vec::with_capacity(entries);
+    let mut previous: Option<u32> = None;
+    for chunk in framed.payload.chunks_exact(stride) {
+        let id = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        if previous.is_some_and(|last| id <= last) {
+            return Err(invalid(format!(
+                "internal id {} follows {}, and the ids are strictly increasing",
+                id,
+                previous.unwrap_or(0)
+            )));
+        }
+        previous = Some(id);
+        rows.push((id as usize, chunk[4..].iter().map(|&b| b as i8).collect()));
+    }
+    debug!(target: LOG_TARGET, "{} loaded ({} rows)", INT8_ROWS_FILENAME, rows.len());
+    Ok(rows)
 }
 
 // ============================================================================
@@ -1565,8 +1871,13 @@ pub(crate) fn save_index(index: &Collection, dir: &Path) -> Result<SaveLedger, E
         save_quantization_config(index, dir, &mut ledger)?;
 
         if index.can_use_quantization() {
-            save_pq_centroids(index, dir, &mut ledger)?;
-            save_pq_codes(index, dir, &mut ledger)?;
+            if index.declares_int8() {
+                save_int8_scales(index, dir, &mut ledger)?;
+                save_int8_rows(index, dir, &mut ledger)?;
+            } else {
+                save_pq_centroids(index, dir, &mut ledger)?;
+                save_pq_codes(index, dir, &mut ledger)?;
+            }
         }
     }
 
@@ -1641,6 +1952,7 @@ fn reconstruct_index_simple(
 
     // The codes are needed twice, once to rebuild the graph for records that
     // have no raw vector and once to restore the stored codes afterwards.
+    let mut quantization = quantization;
     let pq_codes = quantization
         .as_ref()
         .map(|q| q.codes.clone())
@@ -1648,6 +1960,13 @@ fn reconstruct_index_simple(
     let training_state = quantization
         .as_ref()
         .map(|q| TrainingState::from(&q.config));
+    // The scalar rows, taken out rather than cloned, since the artefact is
+    // the largest thing the loader holds after the dump.
+    let int8_trained = quantization.as_ref().is_some_and(|q| q.int8.is_some());
+    let int8_rows: Vec<(usize, Vec<i8>)> = quantization
+        .as_mut()
+        .map(|q| std::mem::take(&mut q.rows))
+        .unwrap_or_default();
 
     // Step 2: Restore all data fields directly (but not the graph)
     restore_data_fields(
@@ -1663,6 +1982,14 @@ fn reconstruct_index_simple(
     // graph, for the reasons `restore_spaces` gives.
     restore_spaces(&index, path, manifest)?;
 
+    // The rows of a trained scalar directory, held to the mappings both
+    // ways before anything is built from either: every row names a record
+    // the mappings hold, and every record the mappings hold has a row. A
+    // directory whose rows and mappings disagree describes two indexes.
+    if int8_trained {
+        check_int8_rows_against_mappings(&index, &int8_rows)?;
+    }
+
     // Step 3: Restore the graph the save wrote. Every save dumps the graph, so
     // the ordinary path is a read. A dump that is absent, damaged, or written
     // by a release this build cannot interpret falls back to the rebuild, which
@@ -1675,7 +2002,13 @@ fn reconstruct_index_simple(
         }
         Err(reason) => {
             debug!(target: LOG_TARGET, "Rebuilding the HNSW graph, because {}", reason);
-            if index.can_use_quantization() {
+            if int8_trained {
+                debug!(target: LOG_TARGET, "Rebuilding scalar quantized HNSW graph from the stored rows...");
+                let inserted = index
+                    .rebuild_graph_from_int8_rows(&int8_rows)
+                    .map_err(Error::Engine)?;
+                debug!(target: LOG_TARGET, "Scalar quantized graph rebuilt ({} rows inserted)", inserted);
+            } else if index.can_use_quantization() {
                 debug!(target: LOG_TARGET, "Rebuilding quantized HNSW graph from stored PQ codes...");
                 rebuild_graph_from_codes(&mut index, &pq_codes, &vectors)?;
             } else {
@@ -1774,6 +2107,41 @@ fn reconstruct_index_simple(
 /// value. They agree for every directory whose files are intact, so a
 /// disagreement means a file is missing or truncated and the load fails rather
 /// than producing an index that misreports what it holds.
+/// Hold the rows artefact to the mappings in both directions.
+fn check_int8_rows_against_mappings(
+    index: &Collection,
+    rows: &[(usize, Vec<i8>)],
+) -> Result<(), Error> {
+    let invalid = |detail: String| Error::Int8ArtefactInvalid {
+        file: INT8_ROWS_FILENAME.to_string(),
+        detail,
+    };
+    let rev_map = index.rev_map();
+    if let Some((id, _)) = rows.iter().find(|(id, _)| !rev_map.contains_key(id)) {
+        return Err(invalid(format!(
+            "names internal id {}, which mappings.bin does not hold",
+            id
+        )));
+    }
+    if rows.len() != rev_map.len() {
+        let held: std::collections::HashSet<usize> = rows.iter().map(|(id, _)| *id).collect();
+        let mut without: Vec<&String> = rev_map
+            .iter()
+            .filter(|(id, _)| !held.contains(id))
+            .map(|(_, ext)| ext)
+            .collect();
+        without.sort();
+        return Err(invalid(format!(
+            "holds {} rows and mappings.bin holds {} records; record '{}' has no row",
+            rows.len(),
+            rev_map.len(),
+            without.first().map(|s| s.as_str()).unwrap_or("")
+        )));
+    }
+    debug!(target: LOG_TARGET, "{} agrees with mappings.bin ({} rows)", INT8_ROWS_FILENAME, rows.len());
+    Ok(())
+}
+
 fn check_restored_count(
     index: &mut Collection,
     config: &IndexConfig,
@@ -1833,7 +2201,12 @@ fn restore_data_fields(
 
     // Restore quantization state if present
     if let Some(artefacts) = quantization {
-        restore_quantization_state_simple(index, artefacts.config, artefacts.centroids)?;
+        restore_quantization_state_simple(
+            index,
+            artefacts.config,
+            artefacts.centroids,
+            artefacts.int8,
+        )?;
     }
 
     debug!(target: LOG_TARGET, "All data fields restored successfully");
@@ -1888,17 +2261,27 @@ fn install_centroids(pq: &PQ, centroids: Centroids) -> Result<(), Error> {
 /// Restore quantization state (simplified for reconstruction)
 fn restore_quantization_state_simple(
     index: &mut Collection,
-    quant_data: QuantizationPersistence,
+    file: QuantizationFile,
     centroids: Option<Centroids>,
+    int8: Option<Arc<Int8Codec>>,
 ) -> Result<(), Error> {
     debug!(target: LOG_TARGET, "Restoring quantization state...");
+
+    let quant_data = match file {
+        QuantizationFile::Pq(quant_data) => quant_data,
+        QuantizationFile::Int8(quant_data) => {
+            return restore_int8_state(index, quant_data, int8);
+        }
+    };
 
     // Convert QuantizationPersistence back to QuantizationConfig
     let storage_mode = StorageMode::from_string(&quant_data.storage_mode).map_err(Error::Engine)?;
 
     let quant_config = QuantizationConfig {
-        subvectors: quant_data.subvectors,
-        bits: quant_data.bits,
+        scheme: QuantizationScheme::Pq {
+            subvectors: quant_data.subvectors,
+            bits: quant_data.bits,
+        },
         training_size: quant_data.training_size,
         max_training_vectors: quant_data.max_training_vectors,
         storage_mode,
@@ -1953,6 +2336,41 @@ fn restore_quantization_state_simple(
         );
     }
 
+    Ok(())
+}
+
+/// The scalar counterpart of `restore_quantization_state_simple`: the
+/// declaration, the stamp, and the codec where the file says it was fitted.
+fn restore_int8_state(
+    index: &mut Collection,
+    quant_data: Int8Persistence,
+    int8: Option<Arc<Int8Codec>>,
+) -> Result<(), Error> {
+    let storage_mode = StorageMode::from_string(&quant_data.storage_mode).map_err(Error::Engine)?;
+    let scale = crate::collection::Int8Scale::from_name(&quant_data.scale).ok_or_else(|| {
+        Error::Int8ArtefactInvalid {
+            file: "quantization.json".to_string(),
+            detail: format!("scale is '{}'", quant_data.scale),
+        }
+    })?;
+    index.set_quantization_config(Some(QuantizationConfig {
+        scheme: QuantizationScheme::Int8 { scale },
+        training_size: quant_data.training_size,
+        max_training_vectors: quant_data.max_training_vectors,
+        storage_mode,
+    }));
+    index.set_training_completed_at(quant_data.training_completed_at);
+    if quant_data.is_trained {
+        let codec = int8.ok_or(Error::Int8ScalesMissing)?;
+        index.set_int8_codec(codec)?;
+        debug!(target: LOG_TARGET, "Quantization state restored (int8, trained, scales loaded, {} training IDs)",
+            quant_data.training_ids.len()
+        );
+    } else {
+        debug!(target: LOG_TARGET, "Quantization state restored (int8, untrained, {} collected training IDs)",
+            quant_data.training_ids.len()
+        );
+    }
     Ok(())
 }
 
@@ -2149,15 +2567,31 @@ pub(crate) fn load_index(
 
     let quantization = load_quantization(path_buf, &manifest, config.dim, &config.space)?;
     if let Some(ref quant) = quantization {
-        debug!(target: LOG_TARGET, "Quantization loaded: {} subvectors, trained={}, codebook={}",
-            quant.config.subvectors,
-            quant.config.is_trained,
-            if quant.centroids.is_some() {
-                "present"
-            } else {
-                "absent"
+        match &quant.config {
+            QuantizationFile::Pq(config) => {
+                debug!(target: LOG_TARGET, "Quantization loaded: {} subvectors, trained={}, codebook={}",
+                    config.subvectors,
+                    config.is_trained,
+                    if quant.centroids.is_some() {
+                        "present"
+                    } else {
+                        "absent"
+                    }
+                );
             }
-        );
+            QuantizationFile::Int8(config) => {
+                debug!(target: LOG_TARGET, "Quantization loaded: int8, scale={}, trained={}, scales={}, rows={}",
+                    config.scale,
+                    config.is_trained,
+                    if quant.int8.is_some() {
+                        "present"
+                    } else {
+                        "absent"
+                    },
+                    quant.rows.len()
+                );
+            }
+        }
     }
 
     // The graph dump itself is read inside the reconstruction, which needs the
@@ -2429,6 +2863,11 @@ fn save_quantization_config(
     if let Some(config) = index.quantization_config() {
         debug!(target: LOG_TARGET, "Saving quantization.json...");
 
+        if let Some(scale) = config.scheme.int8_scale() {
+            return save_int8_quantization_config(index, config, scale, path, ledger);
+        }
+        let (subvectors, bits) = config.scheme.pq_shape().unwrap_or((1, 8));
+
         // When the codebook was fitted, taken from the index rather than from
         // the clock. This used to be `Utc::now()`, so the field recorded the
         // save and moved every time a trained index was saved again. `None` on
@@ -2461,16 +2900,16 @@ fn save_quantization_config(
         } else {
             let pq_config = PQConfig {
                 dim: index.dim(),
-                sub_dim: index.dim() / config.subvectors,
-                num_centroids: 1 << config.bits,
+                sub_dim: index.dim() / subvectors,
+                num_centroids: 1 << bits,
             };
             (None, pq_config)
         };
 
         let quant_persistence = QuantizationPersistence {
             r#type: "pq".to_string(),
-            subvectors: config.subvectors,
-            bits: config.bits,
+            subvectors,
+            bits,
             training_size: config.training_size,
             max_training_vectors: config.max_training_vectors,
             storage_mode: config.storage_mode.to_string().to_string(),
@@ -2497,6 +2936,93 @@ fn save_quantization_config(
             quant_persistence.training_ids.len()
         );
     }
+    Ok(())
+}
+
+/// quantization.json for a scalar quantized space: the declaration, the
+/// training state and the clipped count, and none of the product quantized
+/// fields.
+fn save_int8_quantization_config(
+    index: &Collection,
+    config: &QuantizationConfig,
+    scale: crate::collection::Int8Scale,
+    path: &Path,
+    ledger: &mut SaveLedger,
+) -> Result<(), Error> {
+    // Each guard is taken alone and released before the next, in the
+    // declared order: the index guard for the clipped count, then the
+    // training ids. A temporary guard inside the struct literal would live
+    // to the end of the statement, and the index guard taken after it would
+    // invert the order, which the rank registry refuses.
+    let saturated_values = index.int8_saturated();
+    let training_ids = index.training_ids().clone();
+    let persistence = Int8Persistence {
+        r#type: "int8".to_string(),
+        scale: scale.name().to_string(),
+        training_size: config.training_size,
+        max_training_vectors: config.max_training_vectors,
+        storage_mode: config.storage_mode.to_string().to_string(),
+        is_trained: index.can_use_quantization(),
+        training_completed_at: index.training_completed_at(),
+        training_ids,
+        training_threshold_reached: index.training_threshold_reached(),
+        saturated_values,
+    };
+    let quant_json =
+        serde_json::to_string_pretty(&persistence).map_err(|e| Error::SerializeFailed {
+            what: "quantization config",
+            error: e.to_string(),
+        })?;
+    write_artefact(path, "quantization.json", quant_json.as_bytes(), ledger)?;
+    debug!(target: LOG_TARGET, "quantization.json saved (int8) with {} training IDs",
+        persistence.training_ids.len()
+    );
+    Ok(())
+}
+
+/// The scales artefact: `dim` little endian floats under a frame whose
+/// entry count is `dim`. Recorded by length alone, as every framed artefact
+/// is.
+fn save_int8_scales(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+    let Some(codec) = index.int8_codec() else {
+        return Ok(());
+    };
+    debug!(target: LOG_TARGET, "Saving {}...", INT8_SCALES_FILENAME);
+    let mut payload = Vec::with_capacity(codec.dim() * 4);
+    for scale in codec.scales() {
+        payload.extend_from_slice(&scale.to_le_bytes());
+    }
+    let bytes = frame(
+        FrameKind::Int8Scales,
+        FrameEncoding::Engine,
+        codec.dim() as u64,
+        &payload,
+    );
+    zeusdb_vector_core::write_artefact(path, INT8_SCALES_FILENAME, &bytes)?;
+    ledger.record_digest(INT8_SCALES_FILENAME, bytes.len() as u64, None);
+    debug!(target: LOG_TARGET, "{} saved ({} scales)", INT8_SCALES_FILENAME, codec.dim());
+    Ok(())
+}
+
+/// The rows artefact: every live record's internal id and row, ascending,
+/// written straight into the frame's buffer. Nothing is written for an index
+/// holding no record, and the manifest then names no rows artefact.
+fn save_int8_rows(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+    let stride = 4 + index.quantization_code_bytes();
+    let mut out = frame_begin(
+        FrameKind::Int8Rows,
+        FrameEncoding::Engine,
+        index.len().saturating_mul(stride),
+    );
+    let entries = index.write_int8_rows(&mut out);
+    if entries == 0 {
+        return Ok(());
+    }
+    debug!(target: LOG_TARGET, "Saving {}...", INT8_ROWS_FILENAME);
+    let bytes = frame_finish(out, entries as u64);
+    zeusdb_vector_core::write_artefact(path, INT8_ROWS_FILENAME, &bytes)?;
+    ledger.record_digest(INT8_ROWS_FILENAME, bytes.len() as u64, None);
+    debug!(target: LOG_TARGET, "{} saved ({} rows)", INT8_ROWS_FILENAME, entries);
     Ok(())
 }
 
@@ -2630,13 +3156,21 @@ pub(crate) fn save_manifest(
     let mut files_excluded = Vec::new();
 
     // Add quantization files if they exist
+    let int8 = index.declares_int8();
     if index.has_quantization() {
         files_included.push("quantization.json".to_string());
 
         if index.can_use_quantization() {
-            files_included.push("pq_centroids.bin".to_string());
-            if code_count > 0 {
-                files_included.push("pq_codes.bin".to_string());
+            if int8 {
+                files_included.push(INT8_SCALES_FILENAME.to_string());
+                if index.vector_count() > 0 {
+                    files_included.push(INT8_ROWS_FILENAME.to_string());
+                }
+            } else {
+                files_included.push("pq_centroids.bin".to_string());
+                if code_count > 0 {
+                    files_included.push("pq_codes.bin".to_string());
+                }
             }
         }
     }
@@ -2683,11 +3217,18 @@ pub(crate) fn save_manifest(
     // before training. At 1,000 training records in 3,000 it read 10.7x where
     // the codes are 32x smaller than the vectors. Under quantized_with_raw the
     // two counts were already equal, so this changes nothing there.
+    // A scalar index holds one row a live record, so the coded count is the
+    // live count once it is trained.
+    let code_count = if int8 && index.can_use_quantization() {
+        vector_count
+    } else {
+        code_count
+    };
     let compression_info =
         if index.has_quantization() && index.can_use_quantization() && code_count > 0 {
             let raw_size_mb = (code_count * index.dim() * 4) as f64 / (1024.0 * 1024.0);
             let compressed_size_mb =
-                (code_count * index.quantization_subvectors()) as f64 / (1024.0 * 1024.0);
+                (code_count * index.quantization_code_bytes()) as f64 / (1024.0 * 1024.0);
             let compression_ratio = if compressed_size_mb > 0.0 {
                 raw_size_mb / compressed_size_mb
             } else {
@@ -2720,15 +3261,19 @@ pub(crate) fn save_manifest(
             collection_id: crate::journal::collection_id_hex(collection_id),
         });
 
+    // The major from what the directory holds, and the minor from whether
+    // the dense space is declared with scalar quantization; see the module
+    // documentation.
+    let format_version = match (journal.is_some(), holds_spaces, int8) {
+        (true, _, false) => JOURNAL_FORMAT_VERSION,
+        (true, _, true) => JOURNAL_INT8_FORMAT_VERSION,
+        (false, true, false) => SPACES_FORMAT_VERSION,
+        (false, true, true) => SPACES_INT8_FORMAT_VERSION,
+        (false, false, false) => DENSE_FORMAT_VERSION,
+        (false, false, true) => DENSE_INT8_FORMAT_VERSION,
+    };
     let manifest = IndexManifest {
-        format_version: if journal.is_some() {
-            JOURNAL_FORMAT_VERSION.to_string()
-        } else if holds_spaces {
-            SPACES_FORMAT_VERSION.to_string()
-        } else {
-            DENSE_FORMAT_VERSION.to_string()
-        }
-        .to_string(),
+        format_version: format_version.to_string(),
         zeusdb_version: env!("CARGO_PKG_VERSION").to_string(),
         created_at: index.created_at(),
         saved_at: Utc::now().to_rfc3339(),

@@ -98,8 +98,20 @@ pub enum Error {
     // ------------------------------------------------------------------
     // The quantization declaration at `create()`
     // ------------------------------------------------------------------
-    /// `type` is not `pq`
+    /// `type` is neither `pq` nor `int8`
     UnsupportedQuantizationType { qtype: String },
+    /// A key of one scheme given under the other, such as `subvectors`
+    /// under `int8` or `scale` under `pq`
+    QuantizationKeyNotForScheme {
+        key: String,
+        scheme: String,
+        belongs_to: &'static str,
+    },
+    /// `scale` under `int8` is not `per_dimension`
+    UnsupportedInt8Scale { scale: String },
+    /// `storage_mode` is `quantized_with_raw` under `int8`, which keeps no
+    /// raw vector
+    Int8KeepsNoRaw,
     /// `storage_mode` is not one of the two names, with the message the
     /// parser built
     InvalidStorageMode(String),
@@ -537,6 +549,11 @@ pub enum Error {
     CodebookAllZero,
     /// A trained index with no pq_centroids.bin
     CentroidsMissing,
+    /// A trained scalar quantized index with no int8_scales.zdbint8
+    Int8ScalesMissing,
+    /// A scalar quantization artefact, or a field of quantization.json
+    /// under `int8`, outside the bounds the loader holds it to
+    Int8ArtefactInvalid { file: String, detail: String },
     /// Records held as codes with no codebook to reconstruct them
     CodesWithoutCodebook { count: usize },
     /// A record's codes did not reconstruct
@@ -566,6 +583,9 @@ impl Error {
             | MTooLarge { .. }
             | SpaceCannotBeQuantized { .. }
             | UnsupportedQuantizationType { .. }
+            | QuantizationKeyNotForScheme { .. }
+            | UnsupportedInt8Scale { .. }
+            | Int8KeepsNoRaw
             | InvalidStorageMode(_)
             | SubvectorsZero
             | SubvectorsExceedDim { .. }
@@ -646,6 +666,7 @@ impl Error {
             ArtefactReadFailed { .. }
             | ArtefactsMissing { .. }
             | CentroidsMissing
+            | Int8ScalesMissing
             | IndexDirectoryNotFound { .. }
             | JournalMissing { .. } => Exception::FileNotFound,
 
@@ -681,6 +702,7 @@ impl Error {
             | RestoreRawFailed(_)
             | RestoredCountMismatch { .. }
             | CodebookShapeMismatch { .. }
+            | Int8ArtefactInvalid { .. }
             | CodebookAllZero
             | CodesWithoutCodebook { .. }
             | ReconstructFailed { .. }
@@ -801,8 +823,34 @@ impl fmt::Display for Error {
 
             UnsupportedQuantizationType { qtype } => write!(
                 f,
-                "Unsupported quantization type: '{}'. Only 'pq' is currently supported.",
+                "Unsupported quantization type: '{}'. Supported types: 'pq' and 'int8'.",
                 qtype
+            ),
+            QuantizationKeyNotForScheme {
+                key,
+                scheme,
+                belongs_to,
+            } => write!(
+                f,
+                "quantization_config names '{}' under type '{}', and '{}' is read under type \
+                 '{}' alone. Drop it, or change type.",
+                key, scheme, key, belongs_to
+            ),
+            UnsupportedInt8Scale { scale } => write!(
+                f,
+                "scale must be 'per_dimension', got '{}'. A scalar quantized index holds one \
+                 scale a dimension, fitted as the largest magnitude seen in that dimension over \
+                 the training sample divided by 127.",
+                scale
+            ),
+            Int8KeepsNoRaw => f.write_str(
+                "storage_mode='quantized_with_raw' is not available under type 'int8'. The mode \
+                 exists to rerank a page against the raw vectors it keeps, and a scalar \
+                 quantized graph sits between 0.006 and 0.018 of recall at 10 below a raw \
+                 graph on the three corpora it was measured on at 100,000 records, so a raw \
+                 vector kept beside every row would cost four bytes a value to recover less \
+                 than that. Use 'quantized_only', or a raw index with ef_search raised where \
+                 the last hundredth of recall matters.",
             ),
             InvalidStorageMode(message) => f.write_str(message),
             SubvectorsZero => f.write_str("subvectors must be a positive integer, got 0"),
@@ -1581,6 +1629,12 @@ impl fmt::Display for Error {
                  missing from the index directory. The codebook cannot be rebuilt from \
                  the other files, so restore it from a copy of the saved directory.",
             ),
+            Int8ScalesMissing => f.write_str(
+                "quantization.json reports fitted scales but int8_scales.zdbint8 is missing \
+                 from the index directory. The scales cannot be rebuilt from the other files, \
+                 so restore it from a copy of the saved directory.",
+            ),
+            Int8ArtefactInvalid { file, detail } => write!(f, "{}: {}", file, detail),
             CodesWithoutCodebook { count } => write!(
                 f,
                 "{} records are stored as PQ codes with no raw vector, but the index has \

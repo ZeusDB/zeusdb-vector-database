@@ -53,7 +53,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{debug, error, instrument, trace};
 use zeusdb_vector_core::{compile_filter, Error};
-use zeusdb_vector_hnsw::{Added, Collection, ParsedRecord, SparseHalf};
+use zeusdb_vector_hnsw::{Added, Collection, ParsedRecord, QuantizationScheme, SparseHalf};
 
 /// `skip_from_py_object` because nothing extracts an `AddResult`. It is the
 /// return type of `add` and appears in no argument position, in this crate or
@@ -253,12 +253,27 @@ impl HNSWIndex {
 #[pymethods]
 impl HNSWIndex {
     /// Get quantization configuration and status
+    ///
+    /// `type` is `pq` or `int8`. Under `pq` the mapping carries `subvectors`
+    /// and `bits`, and once trained the codebook's `total_centroids`,
+    /// `sdc_memory_mb` and `centroid_norm_memory_mb`. Under `int8` it carries
+    /// `scale` instead and none of the codebook's keys. `training_size`,
+    /// `max_training_vectors` where set, `is_trained`, `memory_mb`, being
+    /// the codebook or the scales, and `compression_ratio`, being the code
+    /// against the vector, are present under both.
     pub fn get_quantization_info(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         let report = self.inner.quantization_report()?;
         let dict = PyDict::new(py);
-        dict.set_item("type", "pq").ok()?;
-        dict.set_item("subvectors", report.subvectors).ok()?;
-        dict.set_item("bits", report.bits).ok()?;
+        dict.set_item("type", report.scheme.type_name()).ok()?;
+        match &report.scheme {
+            QuantizationScheme::Pq { subvectors, bits } => {
+                dict.set_item("subvectors", *subvectors).ok()?;
+                dict.set_item("bits", *bits).ok()?;
+            }
+            QuantizationScheme::Int8 { scale } => {
+                dict.set_item("scale", scale.name()).ok()?;
+            }
+        }
         dict.set_item("training_size", report.training_size).ok()?;
 
         if let Some(max_training) = report.max_training_vectors {
@@ -268,12 +283,16 @@ impl HNSWIndex {
         if let Some(quantizer) = report.quantizer {
             dict.set_item("is_trained", quantizer.is_trained).ok()?;
             dict.set_item("memory_mb", quantizer.memory_mb).ok()?;
-            dict.set_item("total_centroids", quantizer.total_centroids)
-                .ok()?;
-            dict.set_item("sdc_memory_mb", quantizer.sdc_memory_mb)
-                .ok()?;
-            dict.set_item("centroid_norm_memory_mb", quantizer.centroid_norm_memory_mb)
-                .ok()?;
+            if let Some(total_centroids) = quantizer.total_centroids {
+                dict.set_item("total_centroids", total_centroids).ok()?;
+            }
+            if let Some(sdc_memory_mb) = quantizer.sdc_memory_mb {
+                dict.set_item("sdc_memory_mb", sdc_memory_mb).ok()?;
+            }
+            if let Some(norm_memory_mb) = quantizer.centroid_norm_memory_mb {
+                dict.set_item("centroid_norm_memory_mb", norm_memory_mb)
+                    .ok()?;
+            }
             dict.set_item("compression_ratio", quantizer.compression_ratio)
                 .ok()?;
         }
@@ -296,12 +315,13 @@ impl HNSWIndex {
         self.inner.metric().to_string()
     }
 
-    /// Rebuild the HNSW index to use PQ codes after training is complete
+    /// Rebuild the HNSW index over its codes after training is complete
     ///
     /// Re-encodes whatever raw vectors the index still holds through the
-    /// trained codebook and rebuilds the graph from the stored codes. It never
-    /// retrains the codebook; training runs exactly once, on the `add` that
-    /// reaches `training_size`. A trained `quantized_only` index holds no raw
+    /// trained quantizer and rebuilds the graph from the stored codes, being
+    /// the product quantized codes or the scalar rows. It never retrains the
+    /// quantizer; training runs exactly once, on the `add` that reaches
+    /// `training_size`. A trained `quantized_only` index holds no raw
     /// vectors, so there the rebuild proceeds from the codes alone, and under
     /// either mode nothing is lost by calling it. Returns false when there is
     /// no trained quantizer or nothing stored to rebuild from.
@@ -322,7 +342,7 @@ impl HNSWIndex {
         self.inner.is_quantized()
     }
 
-    /// Check if quantization can be used (PQ is trained)
+    /// Check if quantization can be used (the codebook or the scales are fitted)
     pub fn can_use_quantization(&self) -> bool {
         self.inner.can_use_quantization()
     }
@@ -850,9 +870,10 @@ impl HNSWIndex {
     ///
     /// The whole save runs with the interpreter lock released. `save` reaches
     /// `save_config`, `save_mappings`, `save_metadata`,
-    /// `save_quantization_config`, `save_pq_centroids`, `save_pq_codes` and
-    /// `save_vectors`, and every one of them speaks only to `serde_json`,
-    /// `bincode` and `std::fs`. `save_hnsw_graph` reaches `graph::dump::write_dump`,
+    /// `save_quantization_config`, `save_pq_centroids`, `save_pq_codes`,
+    /// `save_int8_scales`, `save_int8_rows` and `save_vectors`, and every one
+    /// of them speaks only to `serde_json`, `bincode`, the engine's frame and
+    /// `std::fs`. `save_hnsw_graph` reaches `graph::dump::write_dump`,
     /// which names PyO3 nowhere, and `save_manifest` and `StagingDir::commit`
     /// after it speak only to `serde_json` and `std::fs`. Nothing in the index
     /// crate names Python at all.

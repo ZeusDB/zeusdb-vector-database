@@ -87,7 +87,13 @@ impl Collection {
             .keys()
             .filter(|id| !raws.contains(id.as_str()))
             .count();
-        with_raw + code_only
+        // A scalar graph holds its rows and nothing else holds them, so a
+        // record with a row is a record stored.
+        let with_row = id_map
+            .values()
+            .filter(|&&internal| index.graph().int8_row_of(internal).is_some())
+            .count();
+        with_raw + code_only + with_row
     }
 
     /// Every raw vector the index holds, keyed by external id.
@@ -621,6 +627,7 @@ impl Collection {
             m: dense.m(),
             ef_construction: dense.ef_construction(),
             pq: dense.pq.clone(),
+            int8: dense.int8_codec().cloned(),
             keeps_raw: dense.keeps_raw(),
         };
         let bounds = Bounds {
@@ -733,6 +740,100 @@ impl Collection {
         self.sync_dense_live();
 
         Ok((batch.len(), extra.len(), remapped))
+    }
+
+    /// Rebuild the graph of a trained scalar index from the rows artefact,
+    /// the counterpart of `rebuild_graph_from_codes`.
+    ///
+    /// The rows are what the saved graph held, so the rebuild inserts them
+    /// into a fresh scalar graph under the codec the loader installed, in
+    /// internal id order, and no vector is decoded on the way. The caller has
+    /// already held every row to the mappings both ways, so every row names
+    /// a live record and every live record has a row.
+    pub(crate) fn rebuild_graph_from_int8_rows(
+        &mut self,
+        rows: &[(usize, Vec<i8>)],
+    ) -> Result<usize, String> {
+        let codec = self
+            .dense()
+            .int8_codec()
+            .cloned()
+            .ok_or_else(|| "the scalar graph rebuild requires fitted scales".to_string())?;
+        let mut new_hnsw = VectorGraph::new_int8(
+            &self.dense().metric,
+            self.dense().m(),
+            self.expected_size(),
+            MAX_LAYER,
+            self.dense().ef_construction(),
+            codec,
+        );
+        let batch: Vec<(&[i8], usize)> = rows
+            .iter()
+            .map(|(internal_id, row)| (row.as_slice(), *internal_id))
+            .collect();
+        if !batch.is_empty() {
+            new_hnsw.insert_batch_int8(&batch)?;
+        }
+        self.dense().replace_graph(new_hnsw);
+        self.sync_dense_live();
+        Ok(batch.len())
+    }
+
+    /// Whether the dense space was declared with scalar quantization.
+    pub(crate) fn declares_int8(&self) -> bool {
+        self.dense().declares_int8()
+    }
+
+    /// The fitted scalar codec, where the dense space holds one.
+    pub(crate) fn int8_codec(&self) -> Option<Arc<zeusdb_vector_core::Int8Codec>> {
+        self.dense().int8_codec().cloned()
+    }
+
+    /// Install the codec a saved directory recorded (for persistence loading
+    /// only).
+    pub(crate) fn set_int8_codec(
+        &mut self,
+        codec: Arc<zeusdb_vector_core::Int8Codec>,
+    ) -> Result<(), Error> {
+        self.dense()
+            .install_int8_codec(codec)
+            .map_err(|_| Error::Engine("the scalar codec was already fitted".to_string()))
+    }
+
+    /// Append every live record's internal id and scalar row to `out`, in
+    /// internal id order, and return how many were written. The payload of
+    /// the rows artefact, written straight into the frame's buffer so the
+    /// rows are copied once. Zero on any graph that is not a scalar one.
+    pub(crate) fn write_int8_rows(&self, out: &mut Vec<u8>) -> usize {
+        let id_map = self.id_map.read().unwrap();
+        let index = self.dense().index.read().unwrap();
+        let graph = index.graph();
+        let mut live: Vec<usize> = id_map.values().copied().collect();
+        live.sort_unstable();
+        let mut written = 0usize;
+        for internal_id in live {
+            let Some(row) = graph.int8_row_of(internal_id) else {
+                continue;
+            };
+            let id =
+                u32::try_from(internal_id).expect("internal ids are issued below the u32 ceiling");
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend(row.iter().map(|&byte| byte as u8));
+            written += 1;
+        }
+        written
+    }
+
+    /// Values a scalar graph has clipped since its scales were fitted; see
+    /// `DenseIndex::saturated`.
+    pub(crate) fn int8_saturated(&self) -> u64 {
+        self.dense().index.read().unwrap().saturated()
+    }
+
+    /// Take the clipped count a saved directory recorded (for persistence
+    /// loading only).
+    pub(crate) fn set_int8_saturated(&mut self, values: u64) {
+        self.dense().index.read().unwrap().set_saturated(values);
     }
 
     /// Set ID mappings (for persistence loading only)
@@ -1080,13 +1181,20 @@ impl Collection {
         self.dense().pq.as_ref()
     }
 
-    /// Helper to get quantization subvectors count
-    pub(crate) fn quantization_subvectors(&self) -> usize {
-        self.dense()
+    /// Bytes one record's code occupies: one a subvector under product
+    /// quantization, one a value plus the norm tail under scalar
+    /// quantization, and one where no quantization is declared.
+    pub(crate) fn quantization_code_bytes(&self) -> usize {
+        match self
+            .dense()
             .quantization_config
             .as_ref()
-            .map(|config| config.subvectors)
-            .unwrap_or(1)
+            .map(|config| &config.scheme)
+        {
+            Some(super::QuantizationScheme::Pq { subvectors, .. }) => *subvectors,
+            Some(super::QuantizationScheme::Int8 { .. }) => self.int8_row_bytes(),
+            None => 1,
+        }
     }
 
     /// Get the index creation timestamp
