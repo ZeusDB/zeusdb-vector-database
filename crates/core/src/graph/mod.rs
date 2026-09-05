@@ -931,6 +931,45 @@ impl VectorGraph {
         }
     }
 
+    /// Bytes one stored row holds on a scalar quantized graph, being the
+    /// codec's width plus the norm tail on a cosine graph, and `None` on
+    /// every other graph. The stride of the rows artefact.
+    pub fn int8_row_width(&self) -> Option<usize> {
+        match self {
+            VectorGraph::Int8(b) => Some(b.graph.distance().row_width()),
+            _ => None,
+        }
+    }
+
+    /// The distance from `query` to one record's row on the metric this
+    /// graph declared, being the number a traversal scores the record with,
+    /// so an exact scan over scalar rows scores what a traversal scores bit
+    /// for bit. `None` on every other graph, and for any id this graph never
+    /// took.
+    pub fn int8_distance(&self, query: &[f32], internal_id: usize) -> Option<f32> {
+        match self {
+            VectorGraph::Int8(b) => {
+                let row = self.int8_row_of(internal_id)?;
+                Some(b.graph.distance().query_distance(query, row))
+            }
+            _ => None,
+        }
+    }
+
+    /// The vector one record's row stands for, which on a cosine graph is
+    /// the decoded vector at unit length, being the vector the graph scores
+    /// as; see [`Int8Dist::reconstruct`]. `None` on every other graph, and
+    /// for any id this graph never took.
+    pub fn int8_reconstruct(&self, internal_id: usize) -> Option<Vec<f32>> {
+        match self {
+            VectorGraph::Int8(b) => {
+                let row = self.int8_row_of(internal_id)?;
+                b.graph.distance().reconstruct(row).ok()
+            }
+            _ => None,
+        }
+    }
+
     /// Whether this graph took a node under this internal id. True for a
     /// node removal has stranded, since the node stays.
     pub fn holds(&self, internal_id: usize) -> bool {

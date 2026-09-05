@@ -99,6 +99,11 @@ pub enum FrameKind {
     SparsePostings = 5,
     /// A text layer's term dictionary, being every term in id order.
     TermDictionary = 6,
+    /// A scalar quantized space's scales, one `f32` a dimension.
+    Int8Scales = 7,
+    /// A scalar quantized space's rows, being every live record's internal
+    /// id and the row the graph stores for it.
+    Int8Rows = 8,
 }
 
 impl FrameKind {
@@ -110,6 +115,8 @@ impl FrameKind {
         match code {
             5 => Some(FrameKind::SparsePostings),
             6 => Some(FrameKind::TermDictionary),
+            7 => Some(FrameKind::Int8Scales),
+            8 => Some(FrameKind::Int8Rows),
             _ => None,
         }
     }
@@ -119,6 +126,8 @@ impl FrameKind {
         match self {
             FrameKind::SparsePostings => "sparse postings",
             FrameKind::TermDictionary => "term dictionary",
+            FrameKind::Int8Scales => "scalar quantization scales",
+            FrameKind::Int8Rows => "scalar quantization rows",
         }
     }
 }

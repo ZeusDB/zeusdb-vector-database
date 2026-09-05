@@ -6,7 +6,7 @@
 //! a question, so the documented surface stays on the entry point and the work
 //! stays here.
 
-use super::{Collection, StorageMode};
+use super::{Collection, QuantizationScheme, StorageMode};
 use crate::{
     default_rerank_fetch, requested_rerank_fetch, rerank_fetch_ceiling, RERANK_CALIBRATION_PAGES,
     RERANK_CALIBRATION_TOP_K,
@@ -142,6 +142,8 @@ impl Collection {
             raw_bytes,
             reserved_bytes,
             dense_live_bytes,
+            int8_row_width,
+            int8_saturated,
         ) = {
             let index = self.dense().index.read().unwrap();
             let hnsw = index.graph();
@@ -174,6 +176,10 @@ impl Collection {
                 // The second of the two bitmaps, priced from the guard that is
                 // already open on the structure holding it.
                 index.live_heap_bytes(),
+                // The scalar row's width and the values the encode has
+                // clipped, from the same guard, for the keys below.
+                hnsw.int8_row_width(),
+                index.saturated(),
             )
         };
         // The codes the map holds, counted and priced under one guard. A code
@@ -236,9 +242,12 @@ impl Collection {
         // The quantizer's own locks are leaves: nothing in `pq.rs` can reach an
         // index guard, so its accessors are safe wherever they are called.
         let pq_trained = self.dense().pq.as_ref().is_some_and(|pq| pq.is_trained());
+        // The scalar codec's slot is read without a guard; see the field.
+        let int8_codec = self.dense().int8_codec().cloned();
+        let trained = pq_trained || int8_codec.is_some();
 
         // What `is_quantized` answers, from the captured flag.
-        let quantization_active = pq_trained && graph_quantized;
+        let quantization_active = trained && graph_quantized;
 
         let mut stats = HashMap::new();
 
@@ -316,14 +325,24 @@ impl Collection {
             "raw_vectors_stored".to_string(),
             raw_vector_count.to_string(),
         );
-        stats.insert(
-            "quantized_codes_stored".to_string(),
-            pq_code_count.to_string(),
-        );
+        // A scalar graph holds one row a live record in its own store and no
+        // second copy, so the count is the live count once it is active.
+        let code_count = if int8_row_width.is_some() {
+            live
+        } else {
+            pq_code_count
+        };
+        stats.insert("quantized_codes_stored".to_string(), code_count.to_string());
 
         // Training info
         if let Some(config) = &self.dense().quantization_config {
-            stats.insert("quantization_type".to_string(), "pq".to_string());
+            stats.insert(
+                "quantization_type".to_string(),
+                config.scheme.type_name().to_string(),
+            );
+            if let Some(scale) = config.scheme.int8_scale() {
+                stats.insert("quantization_scale".to_string(), scale.name().to_string());
+            }
             stats.insert(
                 "quantization_training_size".to_string(),
                 config.training_size.to_string(),
@@ -410,7 +429,7 @@ impl Collection {
             // keeps. Collection stops at `training_size` and training fires on
             // the record that reaches it, so the threshold is also what was
             // collected.
-            let collected = if pq_trained {
+            let collected = if trained {
                 config.training_size
             } else {
                 training_id_count
@@ -611,6 +630,45 @@ impl Collection {
                     (default_fetch < requested_fetch).to_string(),
                 );
             }
+
+            if config.is_int8() {
+                stats.insert("quantization_trained".to_string(), trained.to_string());
+                stats.insert(
+                    "quantization_active".to_string(),
+                    quantization_active.to_string(),
+                );
+
+                // The one fixed cost of a scalar index, being the scale
+                // array, `dim` floats once per index. Priced at its
+                // capacity, as every memory key is, and inside the total.
+                let scale_bytes = int8_codec.as_ref().map_or(0, |codec| codec.memory_bytes());
+                let scale_mb = scale_bytes as f64 / (1024.0 * 1024.0);
+                total_memory_mb += scale_mb;
+                stats.insert("scale_memory_mb".to_string(), format!("{:.2}", scale_mb));
+
+                // The row against the vector it stands for, being one byte a
+                // value plus the norm tail on a cosine graph. The same
+                // caveat as the product quantized figure: it is the code
+                // against the vector, not the index against an unquantized
+                // one, which `total_memory_mb` measures.
+                if let Some(width) = int8_row_width {
+                    let compression_ratio = (self.dense().dim as f64 * 4.0) / width as f64;
+                    stats.insert(
+                        "quantization_compression_ratio".to_string(),
+                        format!("{:.1}x", compression_ratio),
+                    );
+                }
+
+                // Values the encode clipped at the edge of the code range
+                // since the scales were fitted, summed over every record
+                // encoded. A value beyond the range its dimension's sample
+                // reached saturates rather than being refused, and this is
+                // where a caller sees how often that happened.
+                stats.insert(
+                    "quantization_saturated_values".to_string(),
+                    int8_saturated.to_string(),
+                );
+            }
         } else {
             stats.insert("quantization_type".to_string(), "none".to_string());
             stats.insert("storage_mode".to_string(), "raw_only".to_string());
@@ -621,7 +679,7 @@ impl Collection {
         // this used to call it while holding three storage guards.
         let storage_mode_description = if self.dense().quantization_config.is_none() {
             "raw_only"
-        } else if !pq_trained {
+        } else if !trained {
             if threshold_reached {
                 "raw_ready_for_training"
             } else {
@@ -853,18 +911,11 @@ impl Collection {
         };
 
         if let Some(config) = &self.dense().quantization_config {
-            let trained_status = self
-                .dense()
-                .pq
-                .as_ref()
-                .map(|pq| {
-                    if pq.is_trained() {
-                        "trained"
-                    } else {
-                        "untrained"
-                    }
-                })
-                .unwrap_or("unknown");
+            let trained_status = if self.dense().can_use_quantization() {
+                "trained"
+            } else {
+                "untrained"
+            };
 
             let active_status = if self.is_quantized() {
                 "active"
@@ -872,23 +923,43 @@ impl Collection {
                 "inactive"
             };
 
-            // Use cached compression ratio calculation with proper float division
-            let compression_info = self
-                .dense()
-                .pq
-                .as_ref()
-                .map(|pq| format!("{:.1}x", (pq.dim() as f64 * 4.0) / pq.subvectors() as f64))
-                .unwrap_or_else(|| "unknown".to_string());
+            match &config.scheme {
+                QuantizationScheme::Pq { subvectors, bits } => {
+                    // Use cached compression ratio calculation with proper float division
+                    let compression_info = self
+                        .dense()
+                        .pq
+                        .as_ref()
+                        .map(|pq| {
+                            format!("{:.1}x", (pq.dim() as f64 * 4.0) / pq.subvectors() as f64)
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
 
-            format!(
-                "{}, quantization=pq(subvectors={}, bits={}, {}, {}, compression={}))",
-                base_info,
-                config.subvectors,
-                config.bits,
-                trained_status,
-                active_status,
-                compression_info
-            )
+                    format!(
+                        "{}, quantization=pq(subvectors={}, bits={}, {}, {}, compression={}))",
+                        base_info,
+                        subvectors,
+                        bits,
+                        trained_status,
+                        active_status,
+                        compression_info
+                    )
+                }
+                QuantizationScheme::Int8 { scale } => {
+                    let compression_info = format!(
+                        "{:.1}x",
+                        (self.dense().dim as f64 * 4.0) / self.int8_row_bytes() as f64
+                    );
+                    format!(
+                        "{}, quantization=int8(scale={}, {}, {}, compression={}))",
+                        base_info,
+                        scale.name(),
+                        trained_status,
+                        active_status,
+                        compression_info
+                    )
+                }
+            }
         } else {
             format!("{}, quantization=none)", base_info)
         }
@@ -901,6 +972,26 @@ impl Collection {
     /// Python receives with the keys in the order it always had them.
     pub fn quantization_report(&self) -> Option<QuantizationReport> {
         let config = self.dense().quantization_config.as_ref()?;
+        if config.is_int8() {
+            // The scales are the whole of what a scalar quantizer holds, and
+            // the row is one byte a value plus the norm tail on cosine.
+            let codec = self.dense().int8_codec();
+            let memory_mb =
+                codec.map_or(0.0, |codec| codec.memory_bytes() as f64 / (1024.0 * 1024.0));
+            return Some(QuantizationReport {
+                scheme: config.scheme.clone(),
+                training_size: config.training_size,
+                max_training_vectors: config.max_training_vectors,
+                quantizer: Some(QuantizerReport {
+                    is_trained: codec.is_some(),
+                    memory_mb,
+                    total_centroids: None,
+                    sdc_memory_mb: None,
+                    centroid_norm_memory_mb: None,
+                    compression_ratio: (self.dense().dim * 4) as f64 / self.int8_row_bytes() as f64,
+                }),
+            });
+        }
         let quantizer = self.dense().pq.as_ref().map(|pq| {
             // Use enhanced PQ methods
             let (memory_mb, total_centroids) = pq.get_memory_stats();
@@ -911,22 +1002,23 @@ impl Collection {
             QuantizerReport {
                 is_trained: pq.is_trained(),
                 memory_mb,
-                total_centroids,
+                total_centroids: Some(total_centroids),
                 // The symmetric distance table graph construction reads.
                 // Reported separately because it is derived from the
                 // codebook rather than part of it, and because it scales
                 // with subvectors and bits alone while memory_mb scales
                 // with the dimension too.
-                sdc_memory_mb: pq.sdc_memory_bytes() as f64 / (1024.0 * 1024.0),
+                sdc_memory_mb: Some(pq.sdc_memory_bytes() as f64 / (1024.0 * 1024.0)),
                 // The centroid norm table the cosine scorer reads, on the
                 // same footing and for the same reason.
-                centroid_norm_memory_mb: pq.centroid_norm_memory_bytes() as f64 / (1024.0 * 1024.0),
+                centroid_norm_memory_mb: Some(
+                    pq.centroid_norm_memory_bytes() as f64 / (1024.0 * 1024.0),
+                ),
                 compression_ratio: original_bytes as f64 / compressed_bytes as f64,
             }
         });
         Some(QuantizationReport {
-            subvectors: config.subvectors,
-            bits: config.bits,
+            scheme: config.scheme.clone(),
             training_size: config.training_size,
             max_training_vectors: config.max_training_vectors,
             quantizer,
@@ -959,7 +1051,12 @@ impl Collection {
         // projects.
         if let Some(config) = &self.dense().quantization_config {
             let original_bytes = self.dense().dim * 4; // f32
-            let compressed_bytes = config.subvectors; // u8 per subvector
+            let compressed_bytes = match &config.scheme {
+                // u8 per subvector
+                QuantizationScheme::Pq { subvectors, .. } => *subvectors,
+                // i8 a value, plus the norm tail on cosine
+                QuantizationScheme::Int8 { .. } => self.int8_row_bytes(),
+            };
             let compression_ratio = original_bytes as f64 / compressed_bytes as f64;
 
             info.insert(
@@ -973,17 +1070,34 @@ impl Collection {
             // all of it, and how much depends on the fetch depth, which is why
             // the default fetch is derived from the live record count rather
             // than fixed; see `DEFAULT_RERANK_CORPUS_DIVISOR`.
+            // A scalar graph measured between 0.006 and 0.018 of recall at 10
+            // below a raw graph at 100,000 records on three corpora, with no
+            // rerank to recover it and none needed.
             info.insert(
                 "quantization_accuracy_impact".to_string(),
-                match config.storage_mode {
-                    StorageMode::QuantizedOnly => "large_recall_loss_no_rerank_available",
-                    StorageMode::QuantizedWithRaw => "large_recall_loss_unless_reranked",
+                match (&config.scheme, &config.storage_mode) {
+                    (QuantizationScheme::Int8 { .. }, _) => "small_recall_loss_no_rerank",
+                    (_, StorageMode::QuantizedOnly) => "large_recall_loss_no_rerank_available",
+                    (_, StorageMode::QuantizedWithRaw) => "large_recall_loss_unless_reranked",
                 }
                 .to_string(),
             );
         }
 
         info
+    }
+
+    /// Bytes one scalar row holds, being one a value plus the four bytes of
+    /// the inverse norm on a cosine graph. Arithmetic from the declaration
+    /// rather than a read of the graph, so a report can state it without the
+    /// index guard.
+    pub(crate) fn int8_row_bytes(&self) -> usize {
+        let tail = if self.dense().metric == "cosine" {
+            4
+        } else {
+            0
+        };
+        self.dense().dim + tail
     }
 
     /// The measurement `benchmark_concurrent_reads` returns.
@@ -1071,8 +1185,8 @@ impl Collection {
 /// which on every index built by this crate it does.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuantizationReport {
-    pub subvectors: usize,
-    pub bits: usize,
+    /// The scheme, with the values it alone takes.
+    pub scheme: QuantizationScheme,
     pub training_size: usize,
     pub max_training_vectors: Option<usize>,
     pub quantizer: Option<QuantizerReport>,
@@ -1083,9 +1197,11 @@ pub struct QuantizationReport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuantizerReport {
     pub is_trained: bool,
+    /// The codebook on a product quantized space, the scales on a scalar one.
     pub memory_mb: f64,
-    pub total_centroids: usize,
-    pub sdc_memory_mb: f64,
-    pub centroid_norm_memory_mb: f64,
+    /// The codebook's tables, on a product quantized space alone.
+    pub total_centroids: Option<usize>,
+    pub sdc_memory_mb: Option<f64>,
+    pub centroid_norm_memory_mb: Option<f64>,
     pub compression_ratio: f64,
 }

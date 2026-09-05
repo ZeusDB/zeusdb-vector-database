@@ -50,10 +50,11 @@ mod persistence;
 mod rerank;
 
 pub use collection::{
-    Added, AdmitShape, Arm, ArmPlan, Collection, Declaration, DenseConfig, JournalStatus, Listing,
-    OperationSink, Page, ParsedRecord, ParsedRecords, Plan, QuantizationConfig, QuantizationReport,
-    QuantizerReport, Query, QueryHit, QueryHits, RebuildPlan, RecordView, SpaceConfig, SparseHalf,
-    SparseHits, StorageMode, TextConfig, DEFAULT_FETCH_PER_K, DEFAULT_SPACE, MAX_ARMS,
+    Added, AdmitShape, Arm, ArmPlan, Collection, Declaration, DenseConfig, Int8Scale,
+    JournalStatus, Listing, OperationSink, Page, ParsedRecord, ParsedRecords, Plan,
+    QuantizationConfig, QuantizationReport, QuantizationScheme, QuantizerReport, Query, QueryHit,
+    QueryHits, RebuildPlan, RecordView, SpaceConfig, SparseHalf, SparseHits, StorageMode,
+    TextConfig, DEFAULT_FETCH_PER_K, DEFAULT_SPACE, MAX_ARMS,
 };
 #[cfg(test)]
 pub use flusher::Watch;

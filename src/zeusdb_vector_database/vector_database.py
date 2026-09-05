@@ -194,14 +194,21 @@ class VectorDatabase:
                   'dot' (default: 'cosine'). 'dot' is the inner product, and
                   search() reports it as 1 - dot so that lower stays better;
                   see the README. It does not normalise what you add. Neither
-                  'dot' nor 'l1' can be combined with quantization_config. A
-                  quantized graph works from tables of squared L2 distances
-                  to the codebook, the codebook cannot rank by an inner
-                  product, and the L1 tables and codebook that would serve
-                  'l1' were measured and rank below what quantized 'l2'
-                  reaches; the README records both measurements. 'cosine' and
-                  'l2' are served, and a quantized index of either reports a
-                  score on the same scale a raw index of that space reports.
+                  'dot' nor 'l1' can be combined with a quantization_config of
+                  type 'pq'. A product quantized graph works from tables of
+                  squared L2 distances to the codebook, the codebook cannot
+                  rank by an inner product, and the L1 tables and codebook
+                  that would serve 'l1' were measured and rank below what
+                  quantized 'l2' reaches; the README records both
+                  measurements. 'cosine' and 'l2' are served, and a quantized
+                  index of either reports a score on the same scale a raw
+                  index of that space reports. A quantization_config of type
+                  'int8' takes all four spaces, since its kernel applies the
+                  space's own arithmetic to the decoded values with no table
+                  between them; measured at 100,000 records it sits between
+                  0.017 and 0.039 of recall at 10 below a raw index under
+                  'dot' and 'l1', against 0.006 to 0.018 under 'cosine' and
+                  'l2'.
                 - m (int): Bidirectional links per node (min: 2, max: 256). Defaults
                   to 16 up to an expected_size of 25,000 and 32 above it. A graph
                   too sparse for the record count loses recall that no search
@@ -286,9 +293,9 @@ class VectorDatabase:
                   record is held a second time in full, so declare the fields you
                   filter on rather than every field you store.
 
-            Quantization config format:
+            Quantization config format, product quantization:
                 {
-                    'type': 'pq',              # Currently only 'pq' (Product Quantization) supported
+                    'type': 'pq',              # 'pq' (Product Quantization) or 'int8' (scalar), see below
                     'subvectors': 24,          # Number of subvectors (must divide dim evenly).
                                                # Default: dim / 32 clamped to 8..192 and snapped to
                                                # a divisor of dim, so 128x compression from dim 256 up
@@ -298,7 +305,35 @@ class VectorDatabase:
                     'storage_mode': 'quantized_only' # 'quantized_only' for memory, 'quantized_with_raw' for accuracy
                 }
 
-            Note: Quantization replaces each vector with a code of one byte per
+            Quantization config format, scalar quantization:
+                {
+                    'type': 'int8',
+                    'scale': 'per_dimension',  # The one scale rule this build fits (default)
+                    'training_size': None,     # Records collected before the scales are fitted (default 10000)
+                    'max_training_vectors': None,  # Optional limit on training vectors used
+                    'storage_mode': 'quantized_only' # The one mode a scalar index takes
+                }
+
+            Note on 'int8': every value is held as one signed byte, decoded
+            through one scale per dimension fitted as the largest magnitude
+            seen in that dimension over the training sample divided by 127,
+            so a record costs dim bytes, plus four for its length under
+            'cosine', against dim * 4 raw. The graph scores against the
+            decoded values inside the distance, so no vector is held at full
+            width anywhere in the index and all four spaces are served. A
+            value beyond the range its dimension's sample reached is clipped
+            to the edge of the range rather than refused; get_stats() counts
+            such values under quantization_saturated_values. Measured on
+            this engine's own corpora at 100,000 records, a scalar index sits
+            between 0.006 and 0.018 of recall at 10 below a raw index and
+            searches no slower, and it holds about a third of what a raw
+            index holds at 100 dimensions and a fifth at 1,536. It keeps no
+            raw vector and never reranks, so 'quantized_with_raw' is refused
+            for it, and 'subvectors' and 'bits' are refused under it as
+            'scale' is refused under 'pq'. get_records() returns the decoded
+            vector, at unit length under 'cosine'.
+
+            Note: Product quantization replaces each vector with a code of one byte per
             subvector, so the code is dim * 4 / subvectors smaller than the vector.
             'quantized_only' is the memory mode and 'quantized_with_raw' is the
             accuracy mode. A raw vector is held once, in a store the graph is
@@ -546,14 +581,25 @@ class VectorDatabase:
         
         # Create a copy to avoid modifying the original
         validated_config = config.copy()
-        
+
         # Validate quantization type
-        qtype = validated_config.get('type', '').lower()
+        qtype = str(validated_config.get('type', '')).lower()
+        if qtype == 'int8':
+            return self._validate_int8_config(validated_config, dim, expected_size)
         if qtype != 'pq':
-            raise ValueError(f"Unsupported quantization type: '{qtype}'. Currently only 'pq' is supported.")
-        
+            raise ValueError(f"Unsupported quantization type: '{qtype}'. Supported types: 'pq' and 'int8'.")
+
         validated_config['type'] = 'pq'
-        
+
+        # The scalar scheme's key, refused here as the product quantized keys
+        # are refused under 'int8', so a declaration carried over from the
+        # other scheme is named rather than silently read as the default.
+        if validated_config.get('scale') is not None:
+            raise ValueError(
+                "quantization_config names 'scale' under type 'pq', and 'scale' is read "
+                "under type 'int8' alone. Drop it, or change type."
+            )
+
         # Validate subvectors
         #
         # An unset subvectors is derived from the dimension rather than fixed at
@@ -694,6 +740,116 @@ class VectorDatabase:
         validated_config.setdefault('storage_mode', 'quantized_only')
 
         return validated_config
+
+    # Records a scalar quantized index collects before it fits its scales.
+    #
+    # The scales are the largest magnitude a dimension reaches over the
+    # sample, so what the sample has to see is the range of each dimension
+    # rather than its shape. Fitted on the first 10,000 records of three
+    # corpora of 100,000 and applied to all of them, the scales clipped a
+    # hundredth of a percent of the values and moved recall at 10 by between
+    # 0.0002 and 0.0014 against scales fitted on every record, once upward,
+    # so the sample is fit for the purpose at this size and a larger one
+    # would buy nothing measurable.
+    DEFAULT_INT8_TRAINING_SIZE = 10_000
+
+    def _validate_int8_config(self, config: Dict[str, Any], dim: int,
+                              expected_size: Any = None) -> Dict[str, Any]:
+        """
+        Validate and normalize a scalar quantization configuration.
+
+        The keys of the product quantized scheme are refused first, then the
+        scale rule, the training size, its cap and the storage mode are held
+        to the rules the engine applies, in that order, so the message a
+        caller reads names the first rule the declaration broke.
+
+        Args:
+            config: A copy of the caller's configuration, with `type` `int8`
+            dim: Vector dimension, unused by the rules but kept for symmetry
+            expected_size: The declared record count, used only to warn where
+                the index would never reach its training size
+
+        Returns:
+            Validated and normalized configuration
+
+        Raises:
+            ValueError: If configuration is invalid
+        """
+        import warnings
+
+        for key in ('subvectors', 'bits'):
+            if config.get(key) is not None:
+                raise ValueError(
+                    f"quantization_config names '{key}' under type 'int8', and '{key}' is "
+                    f"read under type 'pq' alone. Drop it, or change type."
+                )
+        config['type'] = 'int8'
+
+        scale = str(config.get('scale') or 'per_dimension').lower()
+        if scale != 'per_dimension':
+            raise ValueError(
+                f"scale must be 'per_dimension', got '{scale}'. A scalar quantized index "
+                f"holds one scale a dimension, fitted as the largest magnitude seen in that "
+                f"dimension over the training sample divided by 127."
+            )
+        config['scale'] = scale
+
+        training_size = config.get('training_size')
+        if training_size is None:
+            training_size = self.DEFAULT_INT8_TRAINING_SIZE
+        elif (not isinstance(training_size, int) or isinstance(training_size, bool)
+              or training_size < 1000):
+            raise ValueError(f"training_size must be at least 1000, got {training_size}")
+        config['training_size'] = training_size
+
+        max_training_vectors = config.get('max_training_vectors')
+        if max_training_vectors is not None:
+            if (not isinstance(max_training_vectors, int) or isinstance(max_training_vectors, bool)
+                    or max_training_vectors < training_size):
+                raise ValueError(
+                    f"max_training_vectors ({max_training_vectors}) must be >= training_size ({training_size})"
+                )
+            config['max_training_vectors'] = max_training_vectors
+
+        storage_mode = str(config.get('storage_mode', 'quantized_only')).lower()
+        if storage_mode == 'quantized_with_raw':
+            raise ValueError(
+                "storage_mode='quantized_with_raw' is not available under type 'int8'. The "
+                "mode exists to rerank a page against the raw vectors it keeps, and a scalar "
+                "quantized graph sits between 0.006 and 0.018 of recall at 10 below a raw "
+                "graph on the three corpora it was measured on at 100,000 records, so a raw "
+                "vector kept beside every row would cost four bytes a value to recover less "
+                "than that. Use 'quantized_only', or a raw index with ef_search raised where "
+                "the last hundredth of recall matters."
+            )
+        if storage_mode != 'quantized_only':
+            raise ValueError(
+                f"Invalid storage_mode: '{storage_mode}'. Under type 'int8' the one mode is quantized_only"
+            )
+        config['storage_mode'] = storage_mode
+
+        # An index whose declared size never reaches training_size never fits
+        # its scales, holds every record raw exactly as an unquantized index
+        # does, and gains nothing; the same warning the product quantized
+        # scheme gives, from the same frame.
+        declared_size = (
+            expected_size
+            if isinstance(expected_size, int) and not isinstance(expected_size, bool)
+            else None
+        )
+        if declared_size is not None and declared_size < training_size:
+            warnings.warn(
+                f"expected_size={expected_size} is below "
+                f"training_size={training_size}, so training will never trigger "
+                f"at the declared size and quantization will never engage. Raise "
+                f"expected_size if the estimate is low, lower training_size, or "
+                f"drop quantization_config.",
+                UserWarning,
+                stacklevel=3
+            )
+
+        config.setdefault('max_training_vectors', None)
+        return config
 
     def _calculate_smart_training_size(self, subvectors: int, bits: int) -> int:
         """

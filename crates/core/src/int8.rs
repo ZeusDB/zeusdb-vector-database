@@ -162,13 +162,20 @@ impl Int8Codec {
         }
     }
 
-    /// Count the values of `vector` that would saturate, for a caller
-    /// measuring how far a corpus reaches past the sample it was fitted on.
+    /// Count the values of `vector` that saturate, being the values `encode`
+    /// clips at the edge of the range, for a caller measuring how far a
+    /// corpus reaches past the sample it was fitted on.
+    ///
+    /// The test is applied after the rounding `encode` applies, so a value
+    /// at the edge of its dimension's range, whose division can land a
+    /// rounding error above 127 and which `encode` rounds to 127 and clips
+    /// nothing from, is not counted. A sample value therefore never counts
+    /// against the sample it was fitted on.
     pub fn saturated(&self, vector: &[f32]) -> usize {
         vector
             .iter()
             .zip(&self.scales)
-            .filter(|(&value, &scale)| (value / scale).abs() > QMAX)
+            .filter(|(&value, &scale)| (value / scale).round_ties_even().abs() > QMAX)
             .count()
     }
 
@@ -254,6 +261,35 @@ mod tests {
         let codes = codec.quantize(&[5.0, -40.0, 0.4, 0.0]).unwrap();
         assert_eq!(codes, vec![127, -127, 0, 0]);
         assert_eq!(codec.saturated(&[5.0, -40.0, 0.4, 0.0]), 2);
+    }
+
+    /// The count agrees with `encode` at the edge: a value at exactly the
+    /// range a dimension was fitted to, and one within half a step of it,
+    /// encode to 127 and are not counted, whatever rounding the division
+    /// lands on, and one a full step past it is.
+    #[test]
+    fn the_saturation_count_agrees_with_the_encoder_at_the_edge() {
+        let magnitudes = [0.3f32, 1.7, 12.7, 0.07, 1e-3, 255.0, 0.9999, 3.3];
+        let sample: Vec<Vec<f32>> = vec![magnitudes.to_vec()];
+        let codec = Int8Codec::fit(magnitudes.len(), &sample).unwrap();
+        for &sign in &[1.0f32, -1.0] {
+            let at_edge: Vec<f32> = magnitudes.iter().map(|m| m * sign).collect();
+            assert_eq!(codec.saturated(&at_edge), 0);
+            assert!(codec
+                .quantize(&at_edge)
+                .unwrap()
+                .iter()
+                .all(|c| c.abs() == 127));
+            let within: Vec<f32> = codec.scales().iter().map(|s| 127.4 * s * sign).collect();
+            assert_eq!(codec.saturated(&within), 0);
+            let past: Vec<f32> = codec.scales().iter().map(|s| 128.0 * s * sign).collect();
+            assert_eq!(codec.saturated(&past), magnitudes.len());
+            assert!(codec
+                .quantize(&past)
+                .unwrap()
+                .iter()
+                .all(|c| c.abs() == 127));
+        }
     }
 
     /// Reconstruction is the one multiply, so a code decodes to exactly

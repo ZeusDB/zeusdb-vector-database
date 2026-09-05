@@ -841,8 +841,30 @@ impl Collection {
     ) -> Result<usize, Error> {
         let live_count = self.id_map.read().unwrap().len();
         let quantized = self.is_quantized();
+        // A scalar graph is rebuilt from its own rows, which nothing else
+        // holds, under the codec the graph being replaced already carries.
+        let int8 = if quantized {
+            self.dense()
+                .index
+                .read()
+                .unwrap()
+                .graph()
+                .int8_codec()
+                .cloned()
+        } else {
+            None
+        };
 
-        let mut new_hnsw = if quantized {
+        let mut new_hnsw = if let Some(codec) = &int8 {
+            VectorGraph::new_int8(
+                &self.dense().metric,
+                m,
+                expected_size,
+                MAX_LAYER,
+                ef_construction,
+                codec.clone(),
+            )
+        } else if quantized {
             let pq = self
                 .dense()
                 .pq
@@ -890,7 +912,26 @@ impl Collection {
                 .collect();
             live.sort_by_key(|&(_, internal_id)| internal_id);
 
-            if quantized {
+            if int8.is_some() {
+                let mut batch: Vec<(&[i8], usize)> = Vec::with_capacity(id_map.len());
+                let mut missing = Vec::new();
+
+                for (ext_id, internal_id) in live {
+                    match old_hnsw.int8_row_of(internal_id) {
+                        Some(row) => batch.push((row, internal_id)),
+                        None => missing.push(ext_id.clone()),
+                    }
+                }
+
+                if missing.is_empty() && !batch.is_empty() {
+                    new_hnsw.insert_batch_int8(&batch).map_err(|e| {
+                        error!(target: LOG_TARGET, operation = "rebuild_graph", error = %e, "Failed to re-insert scalar rows");
+                        Error::ReinsertCodesFailed(e)
+                    })?;
+                }
+
+                missing
+            } else if quantized {
                 let pq_codes = self.dense().pq_codes.read().unwrap();
                 let mut batch: Vec<(&Vec<u8>, usize)> = Vec::with_capacity(id_map.len());
                 let mut missing = Vec::new();
@@ -947,7 +988,9 @@ impl Collection {
             return Err(Error::CompactRefused {
                 missing: missing.len(),
                 live: live_count,
-                what: if quantized {
+                what: if int8.is_some() {
+                    "scalar codes"
+                } else if quantized {
                     "quantized codes"
                 } else {
                     "vector"
@@ -1612,21 +1655,21 @@ impl Collection {
         // are written in the second phase, so that the record enters the
         // collection's live set and the index's under one acquisition. See
         // `insert_one`.
-        let codes = self
-            .insert_one(id, &vector, internal_id, level)?
-            .unwrap_or_default();
+        let codes = self.insert_one(id, &vector, internal_id, level)?;
 
-        // Store quantized codes (always), keyed by external id for the paths
-        // that reach a record by name.
-        {
+        // Store the product quantized codes, keyed by external id for the
+        // paths that reach a record by name. A scalar graph holds its row in
+        // its own store and nowhere else, so there is nothing to keep here.
+        if let Some(codes) = &codes {
             let mut pq_codes = self.dense().pq_codes.write().unwrap();
             pq_codes.insert(id.to_string(), codes.clone());
         }
+        let codes_length = codes.as_ref().map_or(0, Vec::len);
 
         trace!(target: LOG_TARGET, operation = "add_quantized_vector_complete",
             vector_id = %id,
             internal_id = internal_id,
-            codes_length = codes.len(),
+            codes_length = codes_length,
             "Quantized vector added successfully"
         );
 
@@ -1970,12 +2013,25 @@ impl Collection {
     fn replacement_for_clear(&self) -> Result<(bool, DenseIndex), Error> {
         let quantized = self.is_quantized();
         let pq = self.dense().pq.as_ref().cloned();
+        let int8 = self.dense().int8_codec().cloned();
 
-        if quantized && pq.is_none() {
+        if quantized && pq.is_none() && int8.is_none() {
             return Err(Error::NoQuantizer);
         }
 
-        let fresh = if let (true, Some(pq)) = (quantized, pq) {
+        let fresh = if let (true, Some(codec)) = (quantized, int8) {
+            // A cleared scalar index keeps its scales, as a cleared product
+            // quantized one keeps its codebook, so its replacement is a
+            // scalar graph over the same codec, and it holds nothing else.
+            VectorGraph::new_int8(
+                &self.dense().metric,
+                self.dense().m(),
+                self.expected_size(),
+                MAX_LAYER,
+                self.dense().ef_construction(),
+                codec,
+            )
+        } else if let (true, Some(pq)) = (quantized, pq) {
             let mut graph = VectorGraph::new_pq(
                 &self.dense().metric,
                 self.dense().m(),

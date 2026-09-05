@@ -259,6 +259,8 @@ struct Snapshot {
     threshold_reached: bool,
     stamp: Option<String>,
     rerank_fetch: Option<usize>,
+    /// Values a scalar graph has clipped, which every replay must reach.
+    saturated: u64,
     terms: Option<Vec<String>>,
     index_metadata: BTreeMap<String, String>,
     storage_mode: String,
@@ -312,6 +314,8 @@ impl Snapshot {
         let mut names = collection.space_artefact_names();
         names.push(DUMP_FILENAME.to_string());
         names.push("pq_centroids.bin".to_string());
+        names.push("int8_scales.zdbint8".to_string());
+        names.push("int8_rows.zdbint8".to_string());
         let artefacts = names
             .into_iter()
             .filter_map(|name| {
@@ -342,6 +346,7 @@ impl Snapshot {
             threshold_reached: collection.training_threshold_reached(),
             stamp: collection.training_completed_at(),
             rerank_fetch: collection.rerank_calibration().map(|c| c.fetch),
+            saturated: collection.int8_saturated(),
             terms,
             index_metadata: collection.all_metadata().into_iter().collect(),
             storage_mode: collection.storage_mode(),
@@ -385,6 +390,7 @@ impl Snapshot {
         cmp!(threshold_reached);
         cmp!(stamp);
         cmp!(rerank_fetch);
+        cmp!(saturated);
         cmp!(terms);
         cmp!(index_metadata);
         cmp!(storage_mode);
@@ -1128,6 +1134,80 @@ fn replay_reproduces_training_inside_a_batch() {
         }
         assert!(run.original.training_completed_at().is_some());
     }
+}
+
+/// The scalar counterpart of the test above: a checkpoint before the set
+/// fills, training inside a batch, and the mutations after it, replayed
+/// under rule R2 with the scales, the rows and the clipped count among what
+/// is compared. Two builds of the same records reach one codec because the
+/// fit draws nothing, and the rows are a function of the codec and the
+/// records.
+#[test]
+fn replay_reproduces_scalar_training_inside_a_batch() {
+    let vectors = clustered(1400, 16, 0x0015_7b20);
+    let declaration = Declaration::validate(16, "cosine", 8, 60, 2000, vec![]).unwrap();
+    let quantization = declaration
+        .scalar_quantization("per_dimension", 1000, None, StorageMode::QuantizedOnly)
+        .unwrap();
+    let mut run = Run::new(Collection::build(declaration, Some(quantization)));
+    let c = &run.original;
+    let vectors = unit(vectors);
+    for batch in batches(0..600, 200) {
+        add(c, batch.iter().map(|&i| record(i, &vectors)).collect());
+    }
+    run.checkpoint();
+    let c = &run.original;
+    assert!(!c.is_quantized());
+
+    // 600 held, the set fills at 1,000, so the third batch of this loop
+    // trains part way through and the records after it encode through the
+    // scales the batch itself fitted.
+    for batch in batches(600..1200, 150) {
+        add(c, batch.iter().map(|&i| record(i, &vectors)).collect());
+    }
+    assert!(c.is_quantized());
+    assert_eq!(c.stats()["quantization_type"], "int8");
+    assert!(c.remove_point("r1010".to_string()).unwrap());
+    assert!(c.compact().unwrap() > 0);
+    overwrite(
+        c,
+        vec![ParsedRecord {
+            vector: vectors[1399].clone(),
+            ..record(1020, &vectors)
+        }],
+    );
+    assert!(c.rebuild_with_quantization().unwrap());
+    let plan = c.plan_rebuild(Some(6), None, Some(80)).unwrap();
+    c.rebuild(plan).unwrap();
+    for batch in batches(1200..1300, 50) {
+        add(c, batch.iter().map(|&i| record(i, &vectors)).collect());
+    }
+    c.clear().unwrap();
+    assert!(c.is_quantized(), "a clear keeps the scales");
+    for batch in batches(1300..1400, 25) {
+        add(c, batch.iter().map(|&i| record(i, &vectors)).collect());
+    }
+
+    let queries = Queries {
+        dense: vectors[1398].clone(),
+        text: None,
+        sparse: None,
+    };
+    let kinds = run.prove(&queries, None);
+    use OperationKind::*;
+    for kind in [
+        Insert,
+        Train,
+        Remove,
+        Compact,
+        RebuildQuantized,
+        Rebuild,
+        Clear,
+    ] {
+        assert!(kinds.contains(&kind), "{kind:?} was replayed");
+    }
+    assert!(run.original.training_completed_at().is_some());
+    assert!(run.original.int8_codec().is_some());
 }
 
 /// A checkpoint taken after training, on the mode that sheds its raw

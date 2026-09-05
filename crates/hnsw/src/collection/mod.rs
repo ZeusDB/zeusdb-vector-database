@@ -45,6 +45,7 @@
 //! | `durability_tests` | the three policies, the interval thread, and what a failed commit leaves |
 //! | `input` | what a vector becomes once it is out of Python |
 //! | `insert` | insertion, replacement, removal, compaction, rebuild, clear |
+//! | `int8_tests` | a scalar quantized space through the collection, its artefacts and its bounds |
 //! | `journal_tests` | a directory and the journal beside it |
 //! | `query` | a query over one or more arms, its plan and its fused page |
 //! | `search` | the four paths that reach the graph, and the page they build |
@@ -78,6 +79,8 @@ mod dense;
 mod durability_tests;
 mod input;
 mod insert;
+#[cfg(test)]
+mod int8_tests;
 #[cfg(test)]
 mod journal_tests;
 #[cfg(test)]
@@ -118,11 +121,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, Bitmap, ColumnStore, Error, Filter, MetadataStore, Operation, OperationKind,
-    Persist, Selection, SpaceName, SparseVector, VectorGraph, VectorIndex, PQ,
+    matches_filter, Bitmap, ColumnStore, Error, Filter, Int8Codec, MetadataStore, Operation,
+    OperationKind, Persist, Selection, SpaceName, SparseVector, VectorGraph, VectorIndex, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{count_record_with, TermDictionary, Tokenizer, TokenizerConfig};
@@ -384,19 +387,102 @@ impl StorageMode {
         }
     }
 }
-/// The product quantization a space was declared with.
+/// How a scalar quantized space fits its scales.
 ///
-/// Built through [`Declaration::quantization`], which holds the five values to
-/// the rules `create()` applies, or read back from `quantization.json` by the
-/// loader, which holds them to the same rules through
-/// `validate_quantization_fields`.
+/// One value today. It is an enum rather than a flag so that `quantization.json`
+/// names the rule by a word a later release can add to, and so that a caller
+/// reads the word back from `get_stats()` and `get_quantization_info()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Int8Scale {
+    /// One scale a dimension, being the largest magnitude seen in that
+    /// dimension over the training sample divided by 127.
+    #[serde(rename = "per_dimension")]
+    PerDimension,
+}
+
+impl Int8Scale {
+    /// The name `quantization_config` and `quantization.json` spell it by.
+    pub const PER_DIMENSION: &'static str = "per_dimension";
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            Self::PER_DIMENSION => Some(Int8Scale::PerDimension),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Int8Scale::PerDimension => Self::PER_DIMENSION,
+        }
+    }
+}
+
+/// The scheme a quantized space encodes its records under, with the values
+/// that scheme alone takes. What the two schemes share, being the training
+/// size, its cap and the storage mode, sits beside this on
+/// [`QuantizationConfig`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuantizationScheme {
+    /// Product quantization: one byte a subvector, each decoded through a
+    /// codebook of `2^bits` centroids fitted to the training sample.
+    Pq { subvectors: usize, bits: usize },
+    /// Scalar quantization: one signed byte a value, each decoded through
+    /// one scale a dimension fitted to the training sample.
+    Int8 { scale: Int8Scale },
+}
+
+impl QuantizationScheme {
+    /// The word `quantization_config`'s `type` key and `quantization.json`'s
+    /// `type` field carry.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            QuantizationScheme::Pq { .. } => "pq",
+            QuantizationScheme::Int8 { .. } => "int8",
+        }
+    }
+
+    pub fn is_int8(&self) -> bool {
+        matches!(self, QuantizationScheme::Int8 { .. })
+    }
+
+    /// The subvector count and the bits of a product quantized scheme, and
+    /// `None` on a scalar one.
+    pub fn pq_shape(&self) -> Option<(usize, usize)> {
+        match self {
+            QuantizationScheme::Pq { subvectors, bits } => Some((*subvectors, *bits)),
+            QuantizationScheme::Int8 { .. } => None,
+        }
+    }
+
+    /// The scale rule of a scalar scheme, and `None` on a product quantized
+    /// one.
+    pub fn int8_scale(&self) -> Option<Int8Scale> {
+        match self {
+            QuantizationScheme::Int8 { scale } => Some(*scale),
+            QuantizationScheme::Pq { .. } => None,
+        }
+    }
+}
+
+/// The quantization a space was declared with.
+///
+/// Built through [`Declaration::quantization`] for a product quantized
+/// space and [`Declaration::scalar_quantization`] for a scalar one, each of
+/// which holds its values to the rules `create()` applies, or read back from
+/// `quantization.json` by the loader, which holds them to the same rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuantizationConfig {
-    pub subvectors: usize,
-    pub bits: usize,
+    pub scheme: QuantizationScheme,
     pub training_size: usize,
     pub max_training_vectors: Option<usize>,
     pub storage_mode: StorageMode,
+}
+
+impl QuantizationConfig {
+    pub fn is_int8(&self) -> bool {
+        self.scheme.is_int8()
+    }
 }
 
 /// One page of `list`, as (id, metadata) in ascending internal id.
@@ -627,6 +713,22 @@ pub(crate) struct DenseSpace {
     pq: Option<Arc<PQ>>,
     pq_codes: RwLockAt<HashMap<String, Vec<u8>>>, // PQ codes storage
 
+    /// The scalar codec, once a scalar quantized space has fitted it, and
+    /// its trained flag is this slot being filled.
+    ///
+    /// Empty when the space is declared, set once by the training trigger
+    /// under `writers` or by the loader through the exclusive borrow it
+    /// holds, and never cleared, since `clear` keeps a fitted codebook as it
+    /// does for a product quantized space and nothing untrains one. A read
+    /// is an atomic load, so `can_use_quantization` takes no guard on a
+    /// scalar space and sits where `PQ::is_trained` sits in the order:
+    /// readable under every guard, with nothing taken under it. The kernel
+    /// never reads this slot. The graph holds its own `Arc` to the codec
+    /// inside its distance, handed to it by `new_int8` and
+    /// `restore_int8_graph`, so a search and an insertion read the scales
+    /// through the index guard they already hold.
+    int8: OnceLock<Arc<Int8Codec>>,
+
     /// What training measured about how deep this space's codes bury a true
     /// neighbour, which is what the default rerank fetch is derived from.
     ///
@@ -705,9 +807,30 @@ impl DenseSpace {
         self.quantization_config.is_some()
     }
 
-    /// Whether the codebook is fitted.
+    /// Whether the quantizer is fitted, being the codebook on a product
+    /// quantized space and the scales on a scalar one.
     pub(crate) fn can_use_quantization(&self) -> bool {
-        self.pq.as_ref().is_some_and(|pq| pq.is_trained())
+        self.pq.as_ref().is_some_and(|pq| pq.is_trained()) || self.int8.get().is_some()
+    }
+
+    /// Whether the space was declared with scalar quantization, fitted or
+    /// not.
+    pub(crate) fn declares_int8(&self) -> bool {
+        self.quantization_config
+            .as_ref()
+            .is_some_and(QuantizationConfig::is_int8)
+    }
+
+    /// The scalar codec, once fitted.
+    pub(crate) fn int8_codec(&self) -> Option<&Arc<Int8Codec>> {
+        self.int8.get()
+    }
+
+    /// Fill the codec slot. Refused, handing the codec back, where the slot
+    /// is already filled, which no path reaches: the training trigger runs
+    /// once, under `writers`, and the loader fills an empty collection.
+    pub(crate) fn install_int8_codec(&self, codec: Arc<Int8Codec>) -> Result<(), Arc<Int8Codec>> {
+        self.int8.set(codec)
     }
 
     /// Whether the graph scores against codes.
@@ -715,11 +838,9 @@ impl DenseSpace {
     /// Takes the index's read guard, so it cannot be asked by a path already
     /// holding one. The search paths ask the guard they were handed instead.
     pub(crate) fn is_quantized(&self) -> bool {
-        if let Some(pq) = &self.pq {
-            if pq.is_trained() {
-                let index = self.index.read().unwrap();
-                return index.graph().is_quantized();
-            }
+        if self.can_use_quantization() {
+            let index = self.index.read().unwrap();
+            return index.graph().is_quantized();
         }
         false
     }
@@ -1698,8 +1819,11 @@ impl Collection {
                             }
                         }
                     } else {
-                        // Case 3: No vector data available
-                        None
+                        // Case 3: a scalar row, decoded through the scales,
+                        // and nothing where the record holds no vector data
+                        id_map
+                            .get(&id)
+                            .and_then(|&slot| index.graph().int8_reconstruct(slot))
                     }
                 } else {
                     None

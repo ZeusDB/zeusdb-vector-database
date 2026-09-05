@@ -671,6 +671,10 @@ impl Collection {
                         let codes = pq_codes.get(ext_id)?;
                         self.dense().pq.as_ref()?.reconstruct(codes).ok()
                     })
+                    .or_else(|| {
+                        let slot = *vectors.id_map.get(ext_id)?;
+                        vectors.graph.int8_reconstruct(slot)
+                    })
             } else {
                 None
             };
