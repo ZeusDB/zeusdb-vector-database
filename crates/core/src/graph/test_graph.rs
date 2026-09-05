@@ -72,7 +72,7 @@ where
         for node in 0..n as u32 {
             out[self.graph.origin_id_of(node)] = self
                 .graph
-                .neighbourhood_ids(node)
+                .neighbourhood_ids(&self.store, node)
                 .into_iter()
                 .map(|list| list.into_iter().map(|(id, _)| id).collect())
                 .collect();
@@ -85,7 +85,7 @@ where
     pub(crate) fn layer_zero_adjacency(&self) -> Vec<(usize, Vec<usize>)> {
         let mut adj: Vec<(usize, Vec<usize>)> = (0..self.graph.nb_points() as u32)
             .map(|node| {
-                let mut ids: Vec<usize> = self.graph.neighbourhood_ids(node)[0]
+                let mut ids: Vec<usize> = self.graph.neighbourhood_ids(&self.store, node)[0]
                     .iter()
                     .map(|&(id, _)| id)
                     .collect();

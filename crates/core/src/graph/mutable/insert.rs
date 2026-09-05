@@ -94,9 +94,9 @@ pub struct Insertion {
     /// state, because the index's `writers` mutex holds the two phases together;
     /// this is what says so at the moment it matters rather than in a comment.
     nb_points: usize,
-    /// The descent residue, as (layer, target, distance), at layers above
-    /// `level`. See the module documentation of [`super`] for why it is kept.
-    residue: Vec<(u8, u32, f32)>,
+    /// The descent residue, as (layer, target), at layers above `level`. See
+    /// the module documentation of [`super`] for why it is kept.
+    residue: Vec<(u8, u32)>,
     /// The chosen neighbours, one list per layer from `level` down to zero, in
     /// the order the install writes them. A layer whose search came back empty
     /// contributes no entry, exactly as the vendored insert installs nothing
@@ -287,7 +287,7 @@ where
 
         // The descent. From the entry level down to the point's own level plus
         // one, at width one, taking the first strict improvement.
-        let mut residue: Vec<(u8, u32, f32)> = Vec::new();
+        let mut residue: Vec<(u8, u32)> = Vec::new();
         for l in ((level + 1)..=max_level_observed).rev() {
             let mut sorted_points = traverse::search_layer(&view, data, pivot, 1, l, NO_FILTER);
             // The vendored panic, kept because it is behaviour. A width of one
@@ -305,10 +305,10 @@ where
                 // time.
                 let held = residue
                     .iter()
-                    .filter(|&&(layer, _, _)| layer as usize == l)
+                    .filter(|&&(layer, _)| layer as usize == l)
                     .count();
                 if held < self.m() {
-                    residue.push((l as u8, ep.node, ep.dist_to_ref));
+                    residue.push((l as u8, ep.node));
                 }
                 if ep.dist_to_ref < dist_to_entry {
                     pivot = ep.node;
@@ -448,7 +448,7 @@ where
         // moment its owner is at the end of it. The counters are moved here
         // rather than during the descent because the descent runs under a read
         // guard and nothing reads them until the reverse update below.
-        for &(layer, target, _) in &residue {
+        for &(layer, target) in &residue {
             self.bump_in_degree(target, layer as usize, 1);
         }
 
@@ -460,6 +460,7 @@ where
         // not run yet. The vendored decrement loop exists for the parallel path,
         // where another thread's reverse update can push into this list while
         // the selection is still running. The assertion is what holds that.
+        let mut targets: Vec<u32> = Vec::new();
         for (layer, list) in &lists {
             assert_eq!(
                 self.list_len(node, *layer),
@@ -468,10 +469,12 @@ where
                 layer,
                 self.list_len(node, *layer)
             );
+            targets.clear();
             for entry in list {
                 self.bump_in_degree(entry.target, *layer, 1);
+                targets.push(entry.target);
             }
-            self.write_list(node, *layer, list);
+            self.write_list(node, *layer, &targets);
         }
 
         // Install site 3, the reverse link update, with the guarded overflow
@@ -480,14 +483,16 @@ where
         //
         // The vendored loop holds a read guard on the new point's own list for
         // its whole length, which is sound because the one writer that could
-        // touch it is the branch this loop excludes. Copying the list out is the
-        // same thing without the guard, and the reason it is the same is that
-        // nothing this loop does writes back into it.
-        let mut own: Vec<Entry> = Vec::new();
-        let mut scratch: Vec<Entry> = Vec::new();
-        for layer in (0..=level).rev() {
-            self.copy_list(node, layer, &mut own);
-            for entry in &own {
+        // touch it is the branch this loop excludes. Reading the lists phase
+        // one chose is the same thing without the guard, since site 2 wrote
+        // exactly those lists and nothing this loop does writes back into
+        // them. The distance beside each entry is the one the traversal
+        // computed between the new point and that neighbour, which is what
+        // the vendored push stored in the neighbour's list and what places
+        // the reverse link in it.
+        for (layer, list) in &lists {
+            let layer = *layer;
+            for entry in list {
                 let (target, dist) = (entry.target, entry.dist);
                 // A point is never its own neighbour on this path, since the
                 // traversal cannot reach a node nothing links to. The vendored
@@ -501,14 +506,14 @@ where
                 if self.list_names(target, layer, node) {
                     continue;
                 }
-                self.push_edge(target, layer, node, dist);
+                self.push_edge(target, layer, node);
                 self.bump_in_degree(node, layer, 1);
 
                 let nbn_at_l = self.list_len(target, layer);
                 let threshold_shrinking = if layer > 0 { self.m() } else { 2 * self.m() };
                 let shrink = nbn_at_l > threshold_shrinking;
 
-                self.sort_list(target, layer, &mut scratch);
+                self.place_last(target, layer, store, dist);
                 if shrink {
                     self.guarded_pop(target, layer);
                 }

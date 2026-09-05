@@ -1255,7 +1255,7 @@ mod tests {
             let p_id = point_ids[node as usize];
             let values = store.get(node).iter().map(|v| v.to_bits()).collect();
             let adjacency = graph
-                .neighbourhood_ids(node)
+                .neighbourhood_ids(store, node)
                 .iter()
                 .map(|list| {
                     list.iter()

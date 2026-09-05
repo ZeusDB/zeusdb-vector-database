@@ -317,18 +317,35 @@ fn the_mutable_memory_figure_is_exact() {
     expected += nodes * std::mem::size_of::<u32>();
     // No vector. The store is a separate object and its bytes are its own; see
     // `VectorStore::memory_bytes`.
-    // The layer zero slabs, `2 * m + 1` targets and distances each.
-    expected += nodes * (2 * M + 1) * 2 * std::mem::size_of::<u32>();
-    // Per upper list: its offset, its length, its capacity and its inbound
-    // counter, being twelve bytes whatever the list holds.
+    // The layer zero slabs, `2 * m + 1` targets each and no distance.
+    expected += nodes * (2 * M + 1) * std::mem::size_of::<u32>();
+    // One word per upper list, whatever the list holds.
     let lists = mutable.nb_upper_lists();
     expected += lists * std::mem::size_of::<u32>();
-    expected += lists * std::mem::size_of::<u16>();
-    expected += lists * std::mem::size_of::<u16>();
-    expected += lists * std::mem::size_of::<u32>();
-    // The upper slots, a target and a distance each.
-    expected += mutable.upper_slots() * 2 * std::mem::size_of::<u32>();
+    // Per wide list: its offset, its length and its inbound counter, being
+    // ten bytes, and its `m + 1` slots of one target each.
+    let wide = mutable.nb_wide_lists();
+    expected += wide * std::mem::size_of::<u32>();
+    expected += wide * std::mem::size_of::<u16>();
+    expected += wide * std::mem::size_of::<u32>();
+    expected += mutable.upper_slots() * std::mem::size_of::<u32>();
     assert_eq!(mutable.memory_bytes(), expected);
+    assert_eq!(
+        mutable.upper_slots(),
+        wide * (M + 1),
+        "every wide list holds m + 1 slots and nothing else holds a slot"
+    );
+    // Every list at or below its owner's level is wide, every list above it
+    // is one word until the entry point chain promotes it, and a descent
+    // residue list is one word holding its one edge.
+    let (empty, single, wide_words) = mutable.word_census();
+    assert_eq!(empty + single + wide_words, lists);
+    assert!(
+        single <= mutable.above_level_edges(),
+        "{} words hold one edge and {} edges sit above their owner's level",
+        single,
+        mutable.above_level_edges()
+    );
 
     // Every layer holds the points drawn at exactly that level, and the span a
     // node needs runs above it, so the list count exceeds what the levels alone
@@ -338,17 +355,28 @@ fn the_mutable_memory_figure_is_exact() {
         .enumerate()
         .map(|(layer, len)| layer * len)
         .sum();
+    assert!(
+        wide >= by_level,
+        "{} wide lists against {} lists at or below their owner's level",
+        wide,
+        by_level
+    );
     println!(
-        "mutable memory nodes {} edges {} above-level {} upper lists {} (levels alone \
-         predict {}) slots {} bytes {} per_node {:.2}",
+        "mutable memory nodes {} edges {} above-level {} upper words {} (levels alone \
+         predict {}) empty {} single {} wide lists {} of which promoted {} slots {} \
+         bytes {} per_node {:.2}",
         nodes,
         mutable.nb_edges(),
         mutable.above_level_edges(),
         lists,
         by_level,
+        empty,
+        single,
+        wide,
+        wide - by_level,
         mutable.upper_slots(),
         mutable.memory_bytes(),
-        (mutable.memory_bytes() - nodes * DIM * 4) as f64 / nodes as f64
+        mutable.memory_bytes() as f64 / nodes as f64
     );
 }
 
@@ -964,8 +992,8 @@ fn the_reservation_is_capped_in_bytes() {
     // What `MAX_EXPECTED_SIZE` admits, at the dimension the shipped indexes run
     // at and the degree they run at, whose expected span is 5.
     let declared = 100_000_000usize;
-    let per_record = 20 + 1536 * 4 + 33 * 8 + 5 * 20;
-    let reserved = reserved_records::<f32>(1536, 33, 5, declared);
+    let per_record = 20 + 1536 * 4 + 33 * 4 + 5 * 4 + (10 + 17 * 4usize).div_ceil(15);
+    let reserved = reserved_records::<f32>(1536, 16, 5, declared);
     let uncapped = declared * per_record;
     let capped = reserved * per_record;
     println!(
@@ -973,7 +1001,7 @@ fn the_reservation_is_capped_in_bytes() {
         declared, uncapped, capped, reserved
     );
     assert!(
-        uncapped > 600 * (1usize << 30),
+        uncapped > 500 * (1usize << 30),
         "the uncapped reservation is {} bytes, so there is nothing to cap",
         uncapped
     );
@@ -987,8 +1015,8 @@ fn the_reservation_is_capped_in_bytes() {
 
     // A declaration inside the budget is reserved in full, so the cap bounds
     // the hint rather than replacing it.
-    assert_eq!(reserved_records::<f32>(128, 33, 4, 10_000), 10_000);
-    assert_eq!(reserved_records::<u8>(96, 33, 5, 50_000), 50_000);
+    assert_eq!(reserved_records::<f32>(128, 16, 4, 10_000), 10_000);
+    assert_eq!(reserved_records::<u8>(96, 16, 5, 50_000), 50_000);
 }
 
 /// The raw side store a quantized graph opens goes through the same budget.

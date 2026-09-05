@@ -160,10 +160,10 @@ def test_the_quantized_graph_scores_against_codes_rather_than_vectors():
 
     # The graph is more than the codes it holds. What it carries beside them is
     # a fixed capacity neighbour slab per point at layer zero, which is
-    # `(2m + 1)` targets and the same number of distances, so the figure has to
-    # clear that whatever the element type.
+    # `(2m + 1)` targets of four bytes each and no stored distance, so the
+    # figure has to clear that whatever the element type.
     m = int(with_raw.get_stats()["m"])
-    slab_mb = records * (2 * m + 1) * (4 + 4) / (1024 * 1024)
+    slab_mb = records * (2 * m + 1) * 4 / (1024 * 1024)
     assert modes[0] > slab_mb, (
         f"the quantized graph reads as {modes[0]:.2f} MB where its layer zero "
         f"slabs alone are {slab_mb:.2f} MB, so it is not carrying the "
