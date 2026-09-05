@@ -21,18 +21,26 @@
 //!
 //! # Adjacency
 //!
-//! Fixed-capacity slabs, targets and distances in separate arrays.
+//! Fixed-capacity slabs of targets, and no stored distance.
 //!
 //! Layer zero needs no indirection, because every node owns a layer zero slab:
 //! node `n` holds slots `[n * base_cap, n * base_cap + base_cap)`. Only the
 //! upper layers are sparse, holding `1 / (m - 1)` lists per node at the default
-//! scale, so a node carries one `u32` naming its first upper list and the lists
-//! of a node of level `L` are the `L` consecutive ones from there.
+//! scale, so a node carries one `u32` naming its first upper list word and the
+//! words of a node of level `L` are the `L` consecutive ones from there.
 //!
-//! Targets and distances are separate arrays because the traversal reads only
-//! targets. A layer zero list at `m` 16 touches 132 bytes of the target arena
-//! rather than the 264 an interleaved layout would. Construction reads both,
-//! and construction is not latency critical.
+//! **The graph holds targets alone.** The distance between a list's owner and
+//! a target is the kernel's value between two stored vectors, both immutable,
+//! and every kernel is symmetric to the bit, so the value is the same whichever
+//! of the two is the query. The builder therefore recomputes it where it reads
+//! it rather than holding an `f32` beside every target, which is what a layer
+//! zero slab of `2 * m + 1` slots used to spend half its bytes on. What the
+//! builder reads is bounded: a reverse link is placed into a list that is
+//! already ordered, so [`MutableGraph::place_last`] evaluates the distance to
+//! the entries a binary search touches and to nothing else. The dump writer
+//! recomputes every edge's distance at save time, so the file carries what it
+//! carried when the distances were stored. The traversal reads no stored
+//! distance, since it scores every neighbour against the query.
 //!
 //! ## The capacity is one slot above the vendored threshold
 //!
@@ -68,15 +76,23 @@
 //! layer above its own level. From there it is reachable at that layer, so the
 //! link is not a one-off: measured on a 2,000 point cosine graph at `m` 16,
 //! 4,289 above-level lists exist, 4,287 of them holding one entry and two
-//! holding ten and sixteen. **An above-level list grows, is sorted, is evicted
+//! holding ten and sixteen. **An above-level list grows, is ordered, is evicted
 //! from and is counted into, exactly as a list at or below the level is.**
 //!
-//! So the layout carries them as ordinary lists, at two initial capacities. A
-//! list at or below its owner's level starts at `m + 1` because install site 2
-//! fills it wholesale. A list above the level starts at one slot, which is what
-//! 99.95 percent of them ever hold, and is reallocated to `m + 1` the first time
-//! a reverse push overflows it. That is why an upper list carries its own offset
-//! rather than being addressed by multiplication.
+//! So the layout carries them as ordinary lists, in two forms. A list at or
+//! below its owner's level is **wide**: a descriptor holding an offset, a
+//! length and an inbound counter, and `m + 1` slots in the target arena,
+//! because install site 2 fills it wholesale. A list above the level is one
+//! **word**, which is what 99.95 percent of them ever hold. The word is the
+//! target itself where the list holds one entry, [`WORD_EMPTY`] where it holds
+//! none, and otherwise the index of the wide descriptor the list was promoted
+//! to. A word is promoted on the push that gives its list a second entry and
+//! on the first time its owner is named at that layer, because the inbound
+//! counter lives on the wide descriptor. Promotion fires on the order of the
+//! entry level per graph, being the old entry points' lists. A descent residue
+//! list is never pushed into and its owner is never named at that layer, since
+//! no traversal reaches a node above its level except through the entry point
+//! chain, so it stays one word for the life of the graph.
 //!
 //! Keeping these lists is not a choice. The vendored
 //! descent increments the pivot's inbound counter at the layer it files the edge
@@ -86,15 +102,16 @@
 //!
 //! # The inbound counters
 //!
-//! One `u32` per node at layer zero and one per upper list, which is what the
-//! guarded overflow pop reads. Every counter the vendored crate touches is at a
-//! layer the target owns, so the counters need no table of their own: they sit
-//! in step with the lists they count into.
+//! One `u32` per node at layer zero and one per wide upper list, which is what
+//! the guarded overflow pop reads. Every counter the vendored crate touches is
+//! at a layer the target owns a list at, so the counters need no table of their
+//! own: they sit in step with the lists they count into, and a list held as one
+//! word is promoted the first time it is counted into.
 //!
 //! The vendored equivalent is a `[AtomicU32; 16]` on every point whatever its
-//! level, which is 64 bytes per node against 4.27 here at `m` 16, and which
-//! carries a recorded read-then-act race on the parallel insertion path. These
-//! are plain integers because the mutator is serialised.
+//! level, which is 64 bytes per node against about four here at `m` 16, and
+//! which carries a recorded read-then-act race on the parallel insertion path.
+//! These are plain integers because the mutator is serialised.
 
 use super::dump::EachNeighbourhood;
 use super::dump::{LoadedEdge, LoadedPoint, PointId};
@@ -114,12 +131,17 @@ const NO_UPPER: u32 = u32::MAX;
 /// Naming no node, which is every internal id this graph never took.
 const NO_NODE: u32 = u32::MAX;
 
-/// Slots a list above its owner's level opens with.
+/// An upper list word holding no entry.
+const WORD_EMPTY: u32 = u32::MAX;
+
+/// The bit that marks an upper list word as the index of a wide descriptor
+/// rather than a target.
 ///
-/// Measured on a 2,000 point cosine graph at `m` 16, 4,287 of 4,289 such lists
-/// hold exactly one entry for the life of the graph. The two that grow are
-/// widened to `m + 1` on the push that overflows them.
-const ABOVE_LEVEL_CAP: usize = 1;
+/// A target is a node index, so a node index has to stay below this bit and
+/// away from [`WORD_EMPTY`]. [`MutableGraph::append_node`] refuses the node
+/// that would reach it, which is the 2,147,483,648th; at the smallest layer
+/// zero slab a graph of that many nodes holds twenty gigabytes of targets.
+const WORD_WIDE: u32 = 1 << 31;
 
 /// Bytes the creation-time reservation may ask the allocator for.
 ///
@@ -129,8 +151,8 @@ const ABOVE_LEVEL_CAP: usize = 1;
 /// behaviour, so capping what it reserves costs a caller nothing beyond the
 /// reallocations of a build larger than this budget. See [`MutableGraph::new`].
 ///
-/// 128 mebibytes holds 20,557 records at dimension 1,536 and `m` 16, 149,796 at
-/// dimension 128, and 385,675 at the dimension 8 that
+/// 128 mebibytes holds 21,224 records at dimension 1,536 and `m` 16, 199,728 at
+/// dimension 128, and 663,956 at the dimension 8 that
 /// `test_empty_index_at_a_large_declared_size_stays_under_the_bound` declares
 /// five million records at. That test is what fixes the order of magnitude: it
 /// requires an empty index to commit under 256 MB and under 64 bytes per
@@ -148,21 +170,39 @@ pub(super) const RESERVE_BYTES: usize = 1 << 27;
 ///
 /// The per record cost is the whole of what [`MutableGraph::new`] reserves, in
 /// step with what [`MutableGraph::memory_bytes`] prices: the six per node
-/// arrays, the graph's own copy of the vector, the layer zero slab at both its
-/// arrays, and one upper list descriptor and slot per expected span.
+/// arrays, the graph's own copy of the vector, the layer zero slab, one upper
+/// list word per expected span, and the share of a wide list a node is expected
+/// to own, which is one list of `m + 1` slots and a ten byte descriptor for
+/// every `m - 1` nodes.
 pub(super) fn reserved_records<T>(
     dim: usize,
-    base_cap: usize,
+    m: usize,
     span: usize,
     expected_size: usize,
 ) -> usize {
     const PER_NODE_ARRAYS: usize = 8 + 1 + 2 + 4 + 4 + 1;
-    const PER_UPPER_LIST: usize = 4 + 2 + 2 + 4 + 4 + 4;
     let per_record = PER_NODE_ARRAYS
         + dim * std::mem::size_of::<T>()
-        + base_cap * (std::mem::size_of::<u32>() + std::mem::size_of::<f32>())
-        + span * PER_UPPER_LIST;
+        + (2 * m + 1) * std::mem::size_of::<u32>()
+        + span * std::mem::size_of::<u32>()
+        + wide_list_bytes(m).div_ceil(wide_lists_per(m));
     expected_size.min((RESERVE_BYTES / per_record.max(1)).max(1))
+}
+
+/// Bytes one wide upper list costs, being its descriptor and its `m + 1`
+/// slots.
+fn wide_list_bytes(m: usize) -> usize {
+    4 + 2 + 4 + (m + 1) * std::mem::size_of::<u32>()
+}
+
+/// Nodes per wide upper list a graph at `m` is expected to hold.
+///
+/// A node of level `L` owns `L` lists at or below its level, and the expected
+/// level under the exponential law at scale `1 / ln(m)` is `1 / (m - 1)`. So
+/// one node in `m - 1` owns a wide list, before the handful the entry point
+/// chain promotes.
+fn wide_lists_per(m: usize) -> usize {
+    m.saturating_sub(1).max(1)
 }
 
 /// Upper lists a node of a graph this size is expected to own, which is the
@@ -180,7 +220,8 @@ fn expected_span(m: usize, expected_size: usize) -> usize {
     (span.ceil() as usize).min(LAYERS - 1)
 }
 
-/// One stored edge, as a list holds it and as the two sorts order it.
+/// One chosen edge, as phase one hands it to phase two and as the sort orders
+/// it.
 ///
 /// This type used to carry no derives at all, because the sorts were
 /// `sort_unstable` and that dispatches on the element type: a `Copy` pair of
@@ -201,7 +242,7 @@ fn expected_span(m: usize, expected_size: usize) -> usize {
 /// `an_entry_is_eight_bytes` holds the width so that argument stays checkable.
 #[derive(Clone, Copy)]
 pub(super) struct Entry {
-    /// Distance from the list's owner to the target, as it is stored.
+    /// Distance from the new point to the target, as the traversal computed it.
     pub(super) dist: f32,
     /// The node the edge points at.
     pub(super) target: u32,
@@ -234,6 +275,17 @@ pub(super) fn entries_for_test(dists: &[f32]) -> Vec<Entry> {
 #[cfg(test)]
 pub(super) fn sort_entries_for_test(entries: &mut [Entry]) {
     entries.sort_by(by_distance);
+}
+
+/// Which arena one list's slots sit in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Slab {
+    /// The layer zero slab, `2 * m + 1` slots a node.
+    Base,
+    /// One upper list word, holding the target itself or nothing.
+    Inline,
+    /// A wide upper list, `m + 1` slots in the upper target arena.
+    Wide,
 }
 
 /// The mutable graph: an arena of nodes, a vector slab, and slab adjacency.
@@ -274,39 +326,35 @@ pub(super) struct MutableGraph<T, D> {
 
     /// Layer zero targets, node `n` at `[n * base_cap, ..)`.
     base_targets: Vec<u32>,
-    /// Layer zero distances, in step with [`Self::base_targets`].
-    base_dists: Vec<f32>,
     /// Entries in each node's layer zero list.
     base_len: Vec<u16>,
     /// Lists at layer zero naming this node, which the overflow pop guard
     /// reads before it evicts.
     base_in_degree: Vec<u32>,
 
-    /// The first upper list a node owns, or [`NO_UPPER`] where it owns none.
-    /// A node's lists for layers `1..=span` are the consecutive descriptors
+    /// The first upper list word a node owns, or [`NO_UPPER`] where it owns
+    /// none. A node's words for layers `1..=span` are the consecutive ones
     /// from there.
     upper_first: Vec<u32>,
     /// The highest layer each node owns a list at, which is at least its level
     /// and can exceed it. Zero means it owns no upper list.
     upper_span: Vec<u8>,
 
-    /// Where each upper list's slots start in [`Self::upper_targets`]. Held per
-    /// list rather than derived, because the two initial capacities and the
-    /// reallocation that joins them make the offsets irregular.
-    upper_at: Vec<u32>,
-    /// Entries in each upper list.
-    upper_len: Vec<u16>,
-    /// Slots each upper list holds, being `m + 1` at or below its owner's level
-    /// and one above it until a push reallocates it.
-    upper_cap: Vec<u16>,
-    /// Lists naming this list's owner at this list's layer, in step with
-    /// [`Self::upper_len`].
-    upper_in_degree: Vec<u32>,
+    /// One word per upper list: the target where the list holds one entry,
+    /// [`WORD_EMPTY`] where it holds none, and the index of a wide
+    /// descriptor under [`WORD_WIDE`] where it has been promoted.
+    upper_word: Vec<u32>,
 
-    /// Upper layer targets, one list's slots at `[upper_at[i], ..)`.
+    /// Where each wide list's `m + 1` slots start in [`Self::upper_targets`].
+    wide_at: Vec<u32>,
+    /// Entries in each wide list.
+    wide_len: Vec<u16>,
+    /// Lists naming this wide list's owner at this list's layer, in step
+    /// with [`Self::wide_len`].
+    wide_in_degree: Vec<u32>,
+
+    /// Upper layer targets, one wide list's slots at `[wide_at[i], ..)`.
     upper_targets: Vec<u32>,
-    /// Upper layer distances, in step with [`Self::upper_targets`].
-    upper_dists: Vec<f32>,
 
     /// Times the reverse update pushed an entry past its layer's cap and had to
     /// remove one. The vendored counterpart is a process-wide static, which
@@ -345,6 +393,10 @@ where
     /// refused, since the vendored builder cannot produce one and this layout
     /// caps a list at what the guarded pop needs. A refusal reaches the loader's
     /// rebuild path, which is what every other refusal reaches too.
+    ///
+    /// The file's distances order each list and are then dropped, since the
+    /// structure holds targets alone. Every one of them is checked finite
+    /// first, which is the rule the vendored constructor applied to them.
     ///
     /// Nodes are numbered in the order the dump streams them, which is layer
     /// major, so a loaded graph's node indices match the dump's exactly.
@@ -398,6 +450,12 @@ where
                 nb_point
             ));
         }
+        if nb_point >= WORD_WIDE as usize {
+            return Err(format!(
+                "the graph holds {} points and an upper list word names a node below {}",
+                nb_point, WORD_WIDE
+            ));
+        }
         for layer in 0..LAYERS {
             let count = points_by_layer.get(layer).map_or(0, Vec::len) as u32;
             layer_counts[layer] = count;
@@ -424,17 +482,15 @@ where
             levels: Vec::with_capacity(nb_point),
             node_of: Vec::new(),
             base_targets: vec![0u32; nb_point * base_cap],
-            base_dists: vec![0f32; nb_point * base_cap],
             base_len: vec![0u16; nb_point],
             base_in_degree: vec![0u32; nb_point],
             upper_first: Vec::with_capacity(nb_point),
             upper_span: Vec::with_capacity(nb_point),
-            upper_at: Vec::new(),
-            upper_len: Vec::new(),
-            upper_cap: Vec::new(),
-            upper_in_degree: Vec::new(),
+            upper_word: Vec::new(),
+            wide_at: Vec::new(),
+            wide_len: Vec::new(),
+            wide_in_degree: Vec::new(),
             upper_targets: Vec::new(),
-            upper_dists: Vec::new(),
             overflows: 0,
             saves: 0,
             fallbacks: 0,
@@ -444,6 +500,7 @@ where
 
         let mut store = VectorStore::with_capacity(dim, nb_point);
         let mut lists: Vec<Vec<(f32, u32)>> = Vec::new();
+        let mut targets: Vec<u32> = Vec::new();
         for (layer, points) in points_by_layer.into_iter().enumerate() {
             for (rank, point) in points.into_iter().enumerate() {
                 let node = layer_offsets[layer] + rank as u32;
@@ -505,14 +562,15 @@ where
                     if list.is_empty() {
                         continue;
                     }
-                    // A list above its owner's level opens at a single slot,
-                    // which is what almost all of them ever hold, so a loaded
-                    // one carrying more is widened rather than refused. Refusal
-                    // is for a list past the cap its layer allows at all.
-                    if list_layer > 0 && list.len() > graph.list_cap(node, list_layer) {
-                        graph.widen_list(node, list_layer);
-                    }
-                    let cap = graph.list_cap(node, list_layer);
+                    // A list above its owner's level is one word, which holds
+                    // one entry, so a loaded one carrying more is promoted
+                    // rather than refused. Refusal is for a list past the cap
+                    // its layer allows at all.
+                    let cap = if list_layer == 0 {
+                        base_cap
+                    } else {
+                        graph.upper_cap_full()
+                    };
                     if list.len() > cap {
                         return Err(format!(
                             "the point at layer {} rank {} carries {} neighbours at layer {} \
@@ -524,35 +582,12 @@ where
                             cap
                         ));
                     }
-                    let (at, upper) = graph
-                        .slice_of(node, list_layer)
-                        .map(|(at, _, upper)| (at, upper))
-                        .expect("the span covers every layer the point carries a list at");
-                    let (targets, dists) = if upper {
-                        (&mut graph.upper_targets, &mut graph.upper_dists)
-                    } else {
-                        (&mut graph.base_targets, &mut graph.base_dists)
-                    };
-                    for (slot, &(distance, target)) in list.iter().enumerate() {
-                        targets[at + slot] = target;
-                        dists[at + slot] = distance;
-                    }
-                    graph.set_list_len(node, list_layer, list.len());
+                    targets.clear();
+                    targets.extend(list.iter().map(|&(_, target)| target));
+                    graph.install_loaded_list(node, list_layer, &targets);
                 }
             }
         }
-        // Trimming makes every buffer's capacity its length, which is what lets
-        // `memory_bytes` be checked against the counts rather than believed. The
-        // upper regions are the ones whose size is not known before the walk,
-        // because a span is a property of the file.
-        graph.node_of.shrink_to_fit();
-        graph.upper_at.shrink_to_fit();
-        graph.upper_len.shrink_to_fit();
-        graph.upper_cap.shrink_to_fit();
-        graph.upper_in_degree.shrink_to_fit();
-        graph.upper_targets.shrink_to_fit();
-        graph.upper_dists.shrink_to_fit();
-
         // The inbound counters, rebuilt from the edges just installed exactly as
         // `Hnsw::from_loaded_points` rebuilds its own. Every edge counts at the
         // layer its own list sits at, the lists above a node's level included,
@@ -576,6 +611,19 @@ where
             graph.grow_span(target, layer);
             graph.bump_in_degree(target, layer, 1);
         }
+
+        // Trimming makes every buffer's capacity its length, which is what lets
+        // `memory_bytes` be checked against the counts rather than believed. The
+        // upper regions are the ones whose size is not known before the walk,
+        // because a span is a property of the file, and the counters' pass
+        // above promotes the lists the entry point chain named, so the trim
+        // comes after it.
+        graph.node_of.shrink_to_fit();
+        graph.upper_word.shrink_to_fit();
+        graph.wide_at.shrink_to_fit();
+        graph.wide_len.shrink_to_fit();
+        graph.wide_in_degree.shrink_to_fit();
+        graph.upper_targets.shrink_to_fit();
 
         let entry_layer = entry_point.0 as usize;
         let entry_span = if entry_layer < LAYERS {
@@ -601,12 +649,14 @@ where
     /// hint `Hnsw::new` takes and it bounds no behaviour, so a graph that
     /// outgrows it grows geometrically from there. Overshooting it costs the
     /// per node arithmetic in `memory_bytes` per unused record, of which the
-    /// layer zero slab at `(2m + 1) * 8` is nearly all; the unpatched vendored
+    /// layer zero slab at `(2m + 1) * 4` is nearly all; the unpatched vendored
     /// reservation this replaces cost 3,025 bytes per unused record.
     ///
-    /// The upper arena is reserved at one list per expected span per node,
-    /// which is the entry level a graph this size reaches rather than a bound,
-    /// so it is the one region a build routinely grows past.
+    /// The upper words are reserved at one per expected span per node, which
+    /// is the entry level a graph this size reaches rather than a bound, and
+    /// the wide lists at one per `m - 1` nodes, which is the expected level.
+    /// Both are expectations rather than bounds, so they are the regions a
+    /// build can grow past.
     ///
     /// # The reservation is capped in bytes
     ///
@@ -616,7 +666,7 @@ where
     /// `Arc` slot. That was measured at 8.02 bytes per declared record, and
     /// `expected_size` is capped at 100 million on the strength of it, which put
     /// the creation-time reservation at 764 MB. The same declaration here at
-    /// dimension 1,536 asks for 653 GB, and `Vec::with_capacity` aborts the
+    /// dimension 1,536 asks for 632 GB, and `Vec::with_capacity` aborts the
     /// process on allocation failure rather than unwinding, so that is a
     /// declaration a caller could make and never see an exception for.
     ///
@@ -650,15 +700,16 @@ where
             ));
         }
         let base_cap = 2 * m + 1;
-        // The expected span, which is what sizes the upper arena. Almost every
+        // The expected span, which is what sizes the word arena. Almost every
         // node ends up owning a list at every layer from one up to the entry
         // level, because the descent files one there, so the arena is sized by
         // the entry level a graph of `expected_size` points reaches rather than
         // by the far smaller expected level. It is a property of the declared
         // size rather than of the reservation, so it is taken before the cap.
         let span = expected_span(m, expected_size);
-        let reserved = reserved_records::<T>(dim, base_cap, span, expected_size);
-        let upper_lists = reserved * span;
+        let reserved = reserved_records::<T>(dim, m, span, expected_size);
+        let words = reserved * span;
+        let wide = reserved.div_ceil(wide_lists_per(m));
         let store = VectorStore::with_capacity(dim, reserved);
         Ok((
             MutableGraph {
@@ -673,17 +724,15 @@ where
                 levels: Vec::with_capacity(reserved),
                 node_of: Vec::with_capacity(reserved + 1),
                 base_targets: Vec::with_capacity(reserved * base_cap),
-                base_dists: Vec::with_capacity(reserved * base_cap),
                 base_len: Vec::with_capacity(reserved),
                 base_in_degree: Vec::with_capacity(reserved),
                 upper_first: Vec::with_capacity(reserved),
                 upper_span: Vec::with_capacity(reserved),
-                upper_at: Vec::with_capacity(upper_lists),
-                upper_len: Vec::with_capacity(upper_lists),
-                upper_cap: Vec::with_capacity(upper_lists),
-                upper_in_degree: Vec::with_capacity(upper_lists),
-                upper_targets: Vec::with_capacity(upper_lists),
-                upper_dists: Vec::with_capacity(upper_lists),
+                upper_word: Vec::with_capacity(words),
+                wide_at: Vec::with_capacity(wide),
+                wide_len: Vec::with_capacity(wide),
+                wide_in_degree: Vec::with_capacity(wide),
+                upper_targets: Vec::with_capacity(wide * (m + 1)),
                 overflows: 0,
                 saves: 0,
                 fallbacks: 0,
@@ -728,7 +777,7 @@ where
         2 * self.m + 1
     }
 
-    /// Slots one upper list holds once it has been widened, on the same rule.
+    /// Slots one wide upper list holds, on the same rule.
     #[inline]
     fn upper_cap_full(&self) -> usize {
         self.m + 1
@@ -740,7 +789,7 @@ where
         self.upper_span[node as usize] as usize
     }
 
-    /// Which descriptor holds one node's list at one layer, and `None` where the
+    /// Which word holds one node's list at one layer, and `None` where the
     /// node owns none there.
     #[inline]
     fn upper_list(&self, node: u32, layer: usize) -> Option<usize> {
@@ -748,6 +797,18 @@ where
             return None;
         }
         Some(self.upper_first[node as usize] as usize + layer - 1)
+    }
+
+    /// The wide descriptor one word names, or `None` where the word holds the
+    /// list itself.
+    #[inline]
+    fn wide_of(&self, list: usize) -> Option<usize> {
+        let word = self.upper_word[list];
+        if word & WORD_WIDE != 0 && word != WORD_EMPTY {
+            Some((word & !WORD_WIDE) as usize)
+        } else {
+            None
+        }
     }
 
     /// Nodes the graph holds.
@@ -786,8 +847,9 @@ where
     #[inline]
     pub(super) fn neighbours_at(&self, node: u32, layer: usize) -> &[u32] {
         match self.slice_of(node, layer) {
-            Some((at, len, false)) => &self.base_targets[at..at + len],
-            Some((at, len, true)) => &self.upper_targets[at..at + len],
+            Some((at, len, Slab::Base)) => &self.base_targets[at..at + len],
+            Some((at, len, Slab::Wide)) => &self.upper_targets[at..at + len],
+            Some((at, len, Slab::Inline)) => &self.upper_word[at..at + len],
             None => &[],
         }
     }
@@ -797,8 +859,8 @@ where
     pub(super) fn nb_edges(&self) -> usize {
         let base: usize = self.base_len.iter().map(|&len| len as usize).sum();
         // The lists a node's own level reaches, and only those. What sits above
-        // is `above_level_edges`. Walking the nodes rather than summing
-        // `upper_len` is also what keeps an abandoned descriptor run, which
+        // is `above_level_edges`. Walking the nodes rather than summing the
+        // wide lengths is also what keeps an abandoned word run, which
         // `grow_span` leaves behind, out of the count.
         let upper: usize = (0..self.origin_ids.len() as u32)
             .map(|node| {
@@ -823,15 +885,37 @@ where
             .sum()
     }
 
-    /// Upper list descriptors the structure holds, which is what its memory
-    /// figure counts. Includes any run `grow_span` abandoned.
+    /// Upper list words the structure holds, which is what its memory figure
+    /// counts. Includes any run `grow_span` abandoned.
     pub(super) fn nb_upper_lists(&self) -> usize {
-        self.upper_at.len()
+        self.upper_word.len()
     }
 
-    /// Slots the upper arena holds, allocated rather than filled.
+    /// Wide upper lists the structure holds, each with `m + 1` slots.
+    pub(super) fn nb_wide_lists(&self) -> usize {
+        self.wide_at.len()
+    }
+
+    /// Slots the upper target arena holds, allocated rather than filled.
     pub(super) fn upper_slots(&self) -> usize {
         self.upper_targets.len()
+    }
+
+    /// Upper list words by what they hold, as (empty, one entry, wide), for
+    /// the memory test. A word `grow_span` left behind is counted as well.
+    #[cfg(test)]
+    pub(super) fn word_census(&self) -> (usize, usize, usize) {
+        let mut out = (0usize, 0usize, 0usize);
+        for &word in &self.upper_word {
+            if word == WORD_EMPTY {
+                out.0 += 1;
+            } else if word & WORD_WIDE != 0 {
+                out.2 += 1;
+            } else {
+                out.1 += 1;
+            }
+        }
+        out
     }
 
     /// Values per stored vector.
@@ -885,32 +969,43 @@ where
             .collect()
     }
 
-    /// The stored distances of one node's list, in step with its targets.
+    /// The distance from one node to one target, which is what a stored
+    /// distance was.
     ///
-    /// The traversal never reads these; list maintenance does, and so does the
-    /// dump writer.
+    /// The kernel is symmetric to the bit, so this is the value the traversal
+    /// computed when it found `target` for the query that became `node`, and
+    /// the value it computed when it found `node` for the query that became
+    /// `target`, whichever way round the edge was filed.
     #[inline]
-    pub(super) fn distances(&self, node: u32, layer: usize) -> &[f32] {
-        match self.slice_of(node, layer) {
-            Some((at, len, false)) => &self.base_dists[at..at + len],
-            Some((at, len, true)) => &self.upper_dists[at..at + len],
-            None => &[],
-        }
+    fn edge_distance(&self, store: &VectorStore<T>, node: u32, target: u32) -> f32 {
+        self.dist_f.eval(store.get(node), store.get(target))
     }
 
-    /// Where one node's list sits, as (first slot, entries, is upper), or
+    /// Where one node's list sits, as (first slot, entries, which slab), or
     /// `None` where the node owns no list at that layer.
     #[inline]
-    fn slice_of(&self, node: u32, layer: usize) -> Option<(usize, usize, bool)> {
+    fn slice_of(&self, node: u32, layer: usize) -> Option<(usize, usize, Slab)> {
         if layer == 0 {
             let node = node as usize;
-            return Some((node * self.base_cap(), self.base_len[node] as usize, false));
+            return Some((
+                node * self.base_cap(),
+                self.base_len[node] as usize,
+                Slab::Base,
+            ));
         }
         let list = self.upper_list(node, layer)?;
+        let word = self.upper_word[list];
+        if word == WORD_EMPTY {
+            return Some((list, 0, Slab::Inline));
+        }
+        if word & WORD_WIDE == 0 {
+            return Some((list, 1, Slab::Inline));
+        }
+        let wide = (word & !WORD_WIDE) as usize;
         Some((
-            self.upper_at[list] as usize,
-            self.upper_len[list] as usize,
-            true,
+            self.wide_at[wide] as usize,
+            self.wide_len[wide] as usize,
+            Slab::Wide,
         ))
     }
 
@@ -930,60 +1025,66 @@ where
         self.slice_of(node, layer).map_or(0, |(_, len, _)| len)
     }
 
-    /// Slots one node's list at one layer holds right now. An upper list above
-    /// its owner's level starts at one and is widened on the first push that
-    /// overflows it, so this is not a function of the layer alone.
+    /// Slots one node's list at one layer holds right now. A list held as one
+    /// word holds one, and is promoted on the push that needs a second, so
+    /// this is not a function of the layer alone.
     #[inline]
     fn list_cap(&self, node: u32, layer: usize) -> usize {
-        if layer == 0 {
-            return self.base_cap();
-        }
-        match self.upper_list(node, layer) {
-            Some(list) => self.upper_cap[list] as usize,
+        match self.slice_of(node, layer) {
+            Some((_, _, Slab::Base)) => self.base_cap(),
+            Some((_, _, Slab::Wide)) => self.upper_cap_full(),
+            Some((_, _, Slab::Inline)) => 1,
             None => 0,
         }
     }
 
-    /// Open one node's upper arena, giving it a list at every layer from one up
-    /// to `span`. A list at or below `level` starts at the full `m + 1` slots
-    /// because install site 2 fills it wholesale; one above `level` starts at a
-    /// single slot, which is what 99.95 percent of them ever hold.
+    /// Open one node's upper lists, giving it a word at every layer from one up
+    /// to `span`. A list at or below `level` is opened wide, because install
+    /// site 2 fills it wholesale; one above `level` is an empty word, which is
+    /// what 99.95 percent of them ever need.
     fn open_node(&mut self, span: usize, level: usize) {
         if span == 0 {
             self.upper_first.push(NO_UPPER);
             self.upper_span.push(0);
             return;
         }
-        self.upper_first.push(self.upper_at.len() as u32);
+        self.upper_first.push(self.upper_word.len() as u32);
         self.upper_span.push(span as u8);
         for layer in 1..=span {
-            let cap = if layer <= level {
-                self.upper_cap_full()
+            let word = if layer <= level {
+                WORD_WIDE | self.open_wide()
             } else {
-                ABOVE_LEVEL_CAP
+                WORD_EMPTY
             };
-            self.open_list(cap);
+            self.upper_word.push(word);
         }
     }
 
-    /// Append one upper list descriptor with its slots.
-    fn open_list(&mut self, cap: usize) {
-        self.upper_at.push(self.upper_targets.len() as u32);
-        self.upper_len.push(0);
-        self.upper_cap.push(cap as u16);
-        self.upper_in_degree.push(0);
+    /// Append one wide descriptor with its `m + 1` slots, and hand back its
+    /// index.
+    fn open_wide(&mut self) -> u32 {
+        let wide = u32::try_from(self.wide_at.len())
+            .expect("a wide list index is a u32 and the arena is checked on every open");
+        assert!(
+            wide < WORD_WIDE,
+            "the graph holds as many wide upper lists as a word names"
+        );
+        self.wide_at.push(self.upper_targets.len() as u32);
+        self.wide_len.push(0);
+        self.wide_in_degree.push(0);
+        let cap = self.upper_cap_full();
         self.upper_targets.resize(self.upper_targets.len() + cap, 0);
-        self.upper_dists.resize(self.upper_dists.len() + cap, 0.);
+        wide
     }
 
     /// Raise one node's span so that it owns a list at `layer`.
     ///
-    /// A node's descriptors are consecutive, so extending the run means moving
-    /// it to the end of the descriptor arena and leaving the old one behind. The
-    /// slots do not move, because a descriptor names them. This fires only where
-    /// a node is named at a layer above its own level, which happens to the
-    /// point that was the entry point when a higher one arrived, so it is on the
-    /// order of the entry level per graph rather than per node.
+    /// A node's words are consecutive, so extending the run means moving it to
+    /// the end of the word arena and leaving the old one behind. A wide list's
+    /// slots do not move, because its word names them. This fires only where a
+    /// node is named at a layer above its own level, which happens to the point
+    /// that was the entry point when a higher one arrived, so it is on the order
+    /// of the entry level per graph rather than per node.
     fn grow_span(&mut self, node: u32, layer: usize) {
         let old_span = self.span(node);
         if layer <= old_span {
@@ -997,84 +1098,72 @@ where
         );
         let level = self.levels[node as usize] as usize;
         let old_first = self.upper_first[node as usize] as usize;
-        let new_first = self.upper_at.len() as u32;
+        let new_first = self.upper_word.len() as u32;
         for slot in 0..old_span {
-            let (at, len, cap, in_degree) = (
-                self.upper_at[old_first + slot],
-                self.upper_len[old_first + slot],
-                self.upper_cap[old_first + slot],
-                self.upper_in_degree[old_first + slot],
-            );
-            self.upper_at.push(at);
-            self.upper_len.push(len);
-            self.upper_cap.push(cap);
-            self.upper_in_degree.push(in_degree);
+            let word = self.upper_word[old_first + slot];
+            self.upper_word.push(word);
         }
         for new_layer in (old_span + 1)..=layer {
-            let cap = if new_layer <= level {
-                self.upper_cap_full()
+            let word = if new_layer <= level {
+                WORD_WIDE | self.open_wide()
             } else {
-                ABOVE_LEVEL_CAP
+                WORD_EMPTY
             };
-            self.open_list(cap);
+            self.upper_word.push(word);
         }
         self.upper_first[node as usize] = new_first;
         self.upper_span[node as usize] = layer as u8;
     }
 
-    /// Widen one upper list to the full `m + 1` slots, which is what a push into
-    /// a list that started above its owner's level needs the first time a second
-    /// entry arrives. The old slots are left behind.
-    fn widen_list(&mut self, node: u32, layer: usize) {
-        let full = self.upper_cap_full();
-        let list = self
-            .upper_list(node, layer)
-            .expect("a list is widened only where it exists");
-        let (old_at, len, cap) = (
-            self.upper_at[list] as usize,
-            self.upper_len[list] as usize,
-            self.upper_cap[list] as usize,
-        );
+    /// Promote one list held as a word to a wide list, carrying its entry if it
+    /// holds one, and hand back the wide descriptor's index.
+    ///
+    /// This is what a second entry needs and what an inbound counter needs,
+    /// since both live on the wide descriptor. It fires for the old entry
+    /// points' lists above their level and for nothing else on a build.
+    fn promote(&mut self, list: usize) -> usize {
+        let word = self.upper_word[list];
         assert!(
-            cap < full,
-            "a list at layer {} already holds its {} slots, which the vendored reverse \
-             update cannot exceed because it shrinks whenever it passes the threshold",
-            layer,
-            full
+            word & WORD_WIDE == 0 || word == WORD_EMPTY,
+            "a list is promoted once"
         );
-        let new_at = self.upper_targets.len();
-        self.upper_targets.resize(new_at + full, 0);
-        self.upper_dists.resize(new_at + full, 0.);
-        self.upper_targets.copy_within(old_at..old_at + len, new_at);
-        self.upper_dists.copy_within(old_at..old_at + len, new_at);
-        self.upper_at[list] = new_at as u32;
-        self.upper_cap[list] = full as u16;
+        let wide = self.open_wide();
+        if word != WORD_EMPTY {
+            let at = self.wide_at[wide as usize] as usize;
+            self.upper_targets[at] = word;
+            self.wide_len[wide as usize] = 1;
+        }
+        self.upper_word[list] = WORD_WIDE | wide;
+        wide as usize
     }
 
     /// One entry of one list.
     #[inline]
     fn target_at(&self, node: u32, layer: usize, slot: usize) -> u32 {
-        match self.slice_of(node, layer) {
-            Some((at, len, upper)) => {
-                assert!(slot < len, "slot {} of a list holding {}", slot, len);
-                if upper {
-                    self.upper_targets[at + slot]
-                } else {
-                    self.base_targets[at + slot]
-                }
-            }
-            None => panic!("node {} owns no list at layer {}", node, layer),
-        }
+        let list = self.neighbours_at(node, layer);
+        assert!(
+            slot < list.len(),
+            "slot {} of a list holding {}",
+            slot,
+            list.len()
+        );
+        list[slot]
     }
 
     /// Lists at `layer` naming `node`, which is what the guarded pop reads.
+    ///
+    /// A list held as one word has never been counted into, since the first
+    /// count promotes it, so its owner's inbound count at that layer is zero.
     #[inline]
     fn in_degree(&self, node: u32, layer: usize) -> u32 {
         if layer == 0 {
             return self.base_in_degree[node as usize];
         }
-        match self.upper_list(node, layer) {
-            Some(list) => self.upper_in_degree[list],
+        match self
+            .upper_list(node, layer)
+            .and_then(|list| self.wide_of(list))
+        {
+            Some(wide) => self.wide_in_degree[wide],
             None => 0,
         }
     }
@@ -1083,20 +1172,30 @@ where
     /// does exactly once.
     ///
     /// A node can be named at a layer above its own level, so this opens a list
-    /// there rather than assuming one. The vendored counterpart never has to,
-    /// since it carries sixteen counters on every point whatever its level.
+    /// there rather than assuming one, and promotes a list held as one word,
+    /// since the counter lives on the wide descriptor. The vendored counterpart
+    /// never has to, since it carries sixteen counters on every point whatever
+    /// its level.
     #[inline]
     fn bump_in_degree(&mut self, node: u32, layer: usize, delta: i32) {
-        if layer > 0 {
-            self.grow_span(node, layer);
-        }
         let slot = if layer == 0 {
             &mut self.base_in_degree[node as usize]
         } else {
+            self.grow_span(node, layer);
             let list = self
                 .upper_list(node, layer)
                 .expect("the span was just grown to cover this layer");
-            &mut self.upper_in_degree[list]
+            let wide = match self.wide_of(list) {
+                Some(wide) => wide,
+                None => {
+                    assert!(
+                        delta > 0,
+                        "an inbound counter is lowered only on a list that was raised"
+                    );
+                    self.promote(list)
+                }
+            };
+            &mut self.wide_in_degree[wide]
         };
         *slot = slot
             .checked_add_signed(delta)
@@ -1109,113 +1208,203 @@ where
         self.neighbours_at(node, layer).contains(&target)
     }
 
-    /// One list as a vector of entries, which is how both sorts see it.
-    fn copy_list(&self, node: u32, layer: usize, out: &mut Vec<Entry>) {
-        out.clear();
-        let targets = self.neighbours_at(node, layer);
-        let dists = self.distances(node, layer);
-        out.reserve(targets.len());
-        for (&target, &dist) in targets.iter().zip(dists) {
-            out.push(Entry { dist, target });
-        }
-    }
-
     /// Replace one list wholesale, which is what install site 2 does.
-    fn write_list(&mut self, node: u32, layer: usize, list: &[Entry]) {
-        if list.len() > self.list_cap(node, layer) {
-            self.widen_list(node, layer);
-        }
-        let cap = self.list_cap(node, layer);
-        assert!(
-            list.len() <= cap,
-            "a list at layer {} holds {} slots and {} entries were selected",
-            layer,
-            cap,
-            list.len()
-        );
-        let (at, upper) = match self.slice_of(node, layer) {
-            Some((at, _, upper)) => (at, upper),
-            None => panic!("node {} owns no list at layer {}", node, layer),
-        };
-        let (targets, dists) = if upper {
-            (&mut self.upper_targets, &mut self.upper_dists)
-        } else {
-            (&mut self.base_targets, &mut self.base_dists)
-        };
-        for (slot, entry) in list.iter().enumerate() {
-            targets[at + slot] = entry.target;
-            dists[at + slot] = entry.dist;
-        }
-        self.set_list_len(node, layer, list.len());
-    }
-
-    /// Append one edge to one list, which is what the reverse update does.
-    fn push_edge(&mut self, node: u32, layer: usize, target: u32, dist: f32) {
-        self.grow_span(node, layer);
-        if self.list_len(node, layer) == self.list_cap(node, layer) {
-            assert!(
-                layer > 0,
-                "a layer zero list cannot pass its threshold twice"
-            );
-            self.widen_list(node, layer);
-        }
-        let cap = self.list_cap(node, layer);
-        let (at, len, upper) = match self.slice_of(node, layer) {
+    ///
+    /// Site 2 writes at or below the new node's level, where every list was
+    /// opened wide, so a list held as one word is refused here rather than
+    /// promoted; the loader promotes before it writes.
+    fn write_list(&mut self, node: u32, layer: usize, targets: &[u32]) {
+        let (at, _, slab) = match self.slice_of(node, layer) {
             Some(found) => found,
             None => panic!("node {} owns no list at layer {}", node, layer),
         };
+        let cap = self.list_cap(node, layer);
         assert!(
-            len < cap,
-            "a list at layer {} already holds its {} slots, which the vendored reverse \
-             update cannot reach because it shrinks whenever it exceeds the threshold",
+            targets.len() <= cap,
+            "a list at layer {} holds {} slots and {} entries were selected",
             layer,
-            cap
+            cap,
+            targets.len()
         );
-        if upper {
-            self.upper_targets[at + len] = target;
-            self.upper_dists[at + len] = dist;
-        } else {
-            self.base_targets[at + len] = target;
-            self.base_dists[at + len] = dist;
+        match slab {
+            Slab::Base => {
+                self.base_targets[at..at + targets.len()].copy_from_slice(targets);
+                self.base_len[node as usize] = targets.len() as u16;
+            }
+            Slab::Wide => {
+                self.upper_targets[at..at + targets.len()].copy_from_slice(targets);
+                let list = self
+                    .upper_list(node, layer)
+                    .expect("the slice was found through this list");
+                let wide = self.wide_of(list).expect("the slab is wide");
+                self.wide_len[wide] = targets.len() as u16;
+            }
+            Slab::Inline => panic!(
+                "a list at layer {} is held as one word and is not written wholesale",
+                layer
+            ),
         }
-        self.set_list_len(node, layer, len + 1);
     }
 
-    /// Order one list by its stored distances, through the scratch buffer both
-    /// sorts share.
+    /// Install one list the dump carried, in whichever form its layer and its
+    /// owner's level give it.
     ///
-    /// The copy out and back is not avoidable. A list's targets and distances
-    /// live in two separate arenas, so there is no slice holding both to sort
-    /// in place, and sorting the distances alone would not carry the targets
-    /// with them. [`Entry`] is the pair the sort needs.
+    /// The caller has checked the length against the cap of the layer. A list
+    /// above the owner's level holding one entry is the word itself, and one
+    /// holding more is promoted first, which is the state a built graph holds
+    /// an old entry point's list in.
+    fn install_loaded_list(&mut self, node: u32, layer: usize, targets: &[u32]) {
+        if layer > 0 {
+            let list = self
+                .upper_list(node, layer)
+                .expect("the span was opened to cover every layer the point carries a list at");
+            if self.wide_of(list).is_none() {
+                if targets.len() == 1 {
+                    self.upper_word[list] = targets[0];
+                    return;
+                }
+                self.promote(list);
+            }
+        }
+        self.write_list(node, layer, targets);
+    }
+
+    /// Append one edge to one list, which is what the reverse update and the
+    /// descent do.
     ///
-    /// The sort is stable, so two targets at an equal distance keep the order
-    /// they were filed in. This runs once per reverse link per layer, which is
-    /// the hottest sort in the insert.
-    fn sort_list(&mut self, node: u32, layer: usize, scratch: &mut Vec<Entry>) {
-        self.copy_list(node, layer, scratch);
-        scratch.sort_by(by_distance);
-        self.write_list(node, layer, scratch);
+    /// The entry lands at the end of the list, which is where the vendored
+    /// push put it; [`Self::place_last`] then moves it to where the order has
+    /// it. A list held as one word takes its first entry in the word and is
+    /// promoted for its second.
+    fn push_edge(&mut self, node: u32, layer: usize, target: u32) {
+        self.grow_span(node, layer);
+        let (at, len, slab) = match self.slice_of(node, layer) {
+            Some(found) => found,
+            None => panic!("node {} owns no list at layer {}", node, layer),
+        };
+        match slab {
+            Slab::Base => {
+                assert!(
+                    len < self.base_cap(),
+                    "a layer zero list already holds its {} slots, which the vendored \
+                     reverse update cannot reach because it shrinks whenever it exceeds \
+                     the threshold",
+                    self.base_cap()
+                );
+                self.base_targets[at + len] = target;
+                self.base_len[node as usize] = (len + 1) as u16;
+            }
+            Slab::Inline => {
+                if len == 0 {
+                    self.upper_word[at] = target;
+                } else {
+                    let wide = self.promote(at);
+                    let slot = self.wide_at[wide] as usize + 1;
+                    self.upper_targets[slot] = target;
+                    self.wide_len[wide] = 2;
+                }
+            }
+            Slab::Wide => {
+                let cap = self.upper_cap_full();
+                assert!(
+                    len < cap,
+                    "a list at layer {} already holds its {} slots, which the vendored reverse \
+                     update cannot reach because it shrinks whenever it exceeds the threshold",
+                    layer,
+                    cap
+                );
+                self.upper_targets[at + len] = target;
+                let list = self
+                    .upper_list(node, layer)
+                    .expect("the slice was found through this list");
+                let wide = self.wide_of(list).expect("the slab is wide");
+                self.wide_len[wide] = (len + 1) as u16;
+            }
+        }
+    }
+
+    /// Move the entry a push just appended to where the list's order has it,
+    /// which is what the vendored sort after every reverse push did.
+    ///
+    /// Every list is ordered by the distance from its owner to each target
+    /// whenever no push is in flight: install site 2 writes a list phase one
+    /// sorted, the descent writes one entry, the loader sorts by the file's
+    /// distances, and an eviction shifts entries without reordering them. So
+    /// the entries before the last are in order and the last is the one whose
+    /// place is not known. A binary search over the ordered entries finds it,
+    /// evaluating the distance to each entry it probes and to nothing else,
+    /// and the rotation moves the last entry there.
+    ///
+    /// `dist` is the distance the traversal computed between the new point and
+    /// this list's owner, which is the distance from the owner to the new
+    /// point, since the kernel is symmetric. The entry goes after every entry
+    /// at that distance or nearer, which is where a stable sort put it as the
+    /// last element of its input, so two targets at an equal distance keep the
+    /// order they were filed in. A NaN panics as the sort's comparator did.
+    ///
+    /// This runs once per reverse link per layer, which is the hottest list
+    /// operation in the insert.
+    fn place_last(&mut self, node: u32, layer: usize, store: &VectorStore<T>, dist: f32) {
+        assert!(!dist.is_nan(), "got a NaN in a distance");
+        let (at, len, slab) = match self.slice_of(node, layer) {
+            Some(found) => found,
+            None => panic!("node {} owns no list at layer {}", node, layer),
+        };
+        if len < 2 {
+            return;
+        }
+        let owner = store.get(node);
+        let dist_f = &self.dist_f;
+        let ordered = &self.neighbours_at(node, layer)[..len - 1];
+        let place = ordered.partition_point(|&target| {
+            let d = dist_f.eval(owner, store.get(target));
+            assert!(!d.is_nan(), "got a NaN in a distance");
+            d <= dist
+        });
+        let targets = match slab {
+            Slab::Base => &mut self.base_targets[at..at + len],
+            Slab::Wide => &mut self.upper_targets[at..at + len],
+            Slab::Inline => unreachable!("a list held as one word holds at most one entry"),
+        };
+        targets[place..].rotate_right(1);
     }
 
     /// Take one entry out of one list, shifting the rest down, and hand back
     /// the node it named. `Vec::remove` over the slab.
+    ///
+    /// Only a list that overflowed is evicted from, and a list held as one
+    /// word cannot overflow, so the slab here is base or wide.
     fn remove_edge_at(&mut self, node: u32, layer: usize, slot: usize) -> u32 {
-        let (at, len, upper) = match self.slice_of(node, layer) {
+        let (at, len, slab) = match self.slice_of(node, layer) {
             Some(found) => found,
             None => panic!("node {} owns no list at layer {}", node, layer),
         };
         assert!(slot < len, "slot {} of a list holding {}", slot, len);
-        let (targets, dists) = if upper {
-            (&mut self.upper_targets, &mut self.upper_dists)
-        } else {
-            (&mut self.base_targets, &mut self.base_dists)
-        };
-        let removed = targets[at + slot];
-        targets.copy_within(at + slot + 1..at + len, at + slot);
-        dists.copy_within(at + slot + 1..at + len, at + slot);
-        self.set_list_len(node, layer, len - 1);
-        removed
+        match slab {
+            Slab::Base => {
+                let removed = self.base_targets[at + slot];
+                self.base_targets
+                    .copy_within(at + slot + 1..at + len, at + slot);
+                self.base_len[node as usize] = (len - 1) as u16;
+                removed
+            }
+            Slab::Wide => {
+                let removed = self.upper_targets[at + slot];
+                self.upper_targets
+                    .copy_within(at + slot + 1..at + len, at + slot);
+                let list = self
+                    .upper_list(node, layer)
+                    .expect("the slice was found through this list");
+                let wide = self.wide_of(list).expect("the slab is wide");
+                self.wide_len[wide] = (len - 1) as u16;
+                removed
+            }
+            Slab::Inline => panic!(
+                "a list at layer {} is held as one word, which cannot overflow and is \
+                 not evicted from",
+                layer
+            ),
+        }
     }
 
     /// Append one node with its vector, its level and the lists the descent
@@ -1238,7 +1427,7 @@ where
         data: &[T],
         origin_id: usize,
         level: usize,
-        above: &[(u8, u32, f32)],
+        above: &[(u8, u32)],
     ) -> u32 {
         assert_eq!(
             data.len(),
@@ -1256,8 +1445,8 @@ where
         let node = u32::try_from(self.origin_ids.len())
             .expect("a node index is a u32 and the arena is checked on every append");
         assert!(
-            node < u32::MAX,
-            "the graph holds as many nodes as a u32 counts"
+            node < WORD_WIDE,
+            "the graph holds as many nodes as an upper list word names"
         );
 
         debug_assert_eq!(
@@ -1273,17 +1462,15 @@ where
         self.base_in_degree.push(0);
         self.base_targets
             .resize(self.base_targets.len() + self.base_cap(), 0);
-        self.base_dists
-            .resize(self.base_dists.len() + self.base_cap(), 0.);
 
         let mut span = level;
-        for &(layer, _, _) in above {
+        for &(layer, _) in above {
             span = span.max(layer as usize);
         }
         self.open_node(span, level);
 
-        for &(layer, target, dist) in above {
-            self.push_edge(node, layer as usize, target, dist);
+        for &(layer, target) in above {
+            self.push_edge(node, layer as usize, target);
         }
 
         self.layer_counts[level] += 1;
@@ -1316,20 +1503,25 @@ where
 
     /// One node's adjacency by layer, as the vendored `get_neighborhood_id`
     /// reports the same point's: every layer the structure carries, each entry
-    /// naming the id its target was inserted under and the distance stored
-    /// beside it. The descent residue sits at the layer it was filed at, which
-    /// is where the vendored point carries it too.
+    /// naming the id its target was inserted under and the distance from the
+    /// node to it, recomputed. The descent residue sits at the layer it was
+    /// filed at, which is where the vendored point carries it too.
     ///
-    /// This is the shape the two builders are compared in. It resolves targets
-    /// to origin ids rather than to node indices, because the two structures
+    /// This is the shape two builds are compared in. It resolves targets to
+    /// origin ids rather than to node indices, because two structures may
     /// number their nodes differently and the id is what both agree on.
-    pub(super) fn neighbourhood_ids(&self, node: u32) -> Vec<Vec<(usize, f32)>> {
+    pub(super) fn neighbourhood_ids(
+        &self,
+        store: &VectorStore<T>,
+        node: u32,
+    ) -> Vec<Vec<(usize, f32)>> {
         let mut out = vec![Vec::new(); LAYERS];
         for (layer, list) in out.iter_mut().enumerate().take(self.span(node) + 1) {
-            let targets = self.neighbours_at(node, layer);
-            let dists = self.distances(node, layer);
-            for (&target, &dist) in targets.iter().zip(dists) {
-                list.push((self.origin_ids[target as usize], dist));
+            for &target in self.neighbours_at(node, layer) {
+                list.push((
+                    self.origin_ids[target as usize],
+                    self.edge_distance(store, node, target),
+                ));
             }
         }
         out
@@ -1348,19 +1540,6 @@ where
         counts
     }
 
-    /// Record how many entries one list now holds.
-    #[inline]
-    fn set_list_len(&mut self, node: u32, layer: usize, len: usize) {
-        if layer == 0 {
-            self.base_len[node as usize] = len as u16;
-        } else {
-            let list = self
-                .upper_list(node, layer)
-                .expect("a length is set only on a list that exists");
-            self.upper_len[list] = len as u16;
-        }
-    }
-
     /// Return every buffer's spare capacity to the allocator.
     ///
     /// A graph built by insertion grows its arenas geometrically from whatever
@@ -1370,7 +1549,7 @@ where
     /// is known before the first write, which is why the same index measures
     /// smaller after a save and load round trip than it did when it was built.
     ///
-    /// Fourteen reallocations, one per buffer, each copying the live bytes. No
+    /// Thirteen reallocations, one per buffer, each copying the live bytes. No
     /// node is touched, no edge is read and no distance is evaluated, so the
     /// topology after this call is the topology before it and every search
     /// returns exactly what it returned.
@@ -1389,17 +1568,15 @@ where
         self.levels.shrink_to_fit();
         self.node_of.shrink_to_fit();
         self.base_targets.shrink_to_fit();
-        self.base_dists.shrink_to_fit();
         self.base_len.shrink_to_fit();
         self.base_in_degree.shrink_to_fit();
         self.upper_first.shrink_to_fit();
         self.upper_span.shrink_to_fit();
-        self.upper_at.shrink_to_fit();
-        self.upper_len.shrink_to_fit();
-        self.upper_cap.shrink_to_fit();
-        self.upper_in_degree.shrink_to_fit();
+        self.upper_word.shrink_to_fit();
+        self.wide_at.shrink_to_fit();
+        self.wide_len.shrink_to_fit();
+        self.wide_in_degree.shrink_to_fit();
         self.upper_targets.shrink_to_fit();
-        self.upper_dists.shrink_to_fit();
         before.saturating_sub(self.memory_bytes())
     }
 
@@ -1415,23 +1592,21 @@ where
         total += self.levels.capacity();
         total += self.node_of.capacity() * std::mem::size_of::<u32>();
         total += self.base_targets.capacity() * std::mem::size_of::<u32>();
-        total += self.base_dists.capacity() * std::mem::size_of::<f32>();
         total += self.base_len.capacity() * std::mem::size_of::<u16>();
         total += self.base_in_degree.capacity() * std::mem::size_of::<u32>();
         total += self.upper_first.capacity() * std::mem::size_of::<u32>();
         total += self.upper_span.capacity();
-        total += self.upper_at.capacity() * std::mem::size_of::<u32>();
-        total += self.upper_len.capacity() * std::mem::size_of::<u16>();
-        total += self.upper_cap.capacity() * std::mem::size_of::<u16>();
-        total += self.upper_in_degree.capacity() * std::mem::size_of::<u32>();
+        total += self.upper_word.capacity() * std::mem::size_of::<u32>();
+        total += self.wide_at.capacity() * std::mem::size_of::<u32>();
+        total += self.wide_len.capacity() * std::mem::size_of::<u16>();
+        total += self.wide_in_degree.capacity() * std::mem::size_of::<u32>();
         total += self.upper_targets.capacity() * std::mem::size_of::<u32>();
-        total += self.upper_dists.capacity() * std::mem::size_of::<f32>();
         total
     }
 
     /// Bytes of that request no node has been written into.
     ///
-    /// The same fifteen buffers priced at the gap between their capacity and
+    /// The same thirteen buffers priced at the gap between their capacity and
     /// their length, plus nothing for the struct itself, which is written in
     /// full the moment it exists. A graph built by insertion grows its arenas
     /// geometrically past whatever the creation-time reservation held, so this
@@ -1451,17 +1626,15 @@ where
         total += spare(&self.levels, self.levels.capacity());
         total += spare(&self.node_of, self.node_of.capacity());
         total += spare(&self.base_targets, self.base_targets.capacity());
-        total += spare(&self.base_dists, self.base_dists.capacity());
         total += spare(&self.base_len, self.base_len.capacity());
         total += spare(&self.base_in_degree, self.base_in_degree.capacity());
         total += spare(&self.upper_first, self.upper_first.capacity());
         total += spare(&self.upper_span, self.upper_span.capacity());
-        total += spare(&self.upper_at, self.upper_at.capacity());
-        total += spare(&self.upper_len, self.upper_len.capacity());
-        total += spare(&self.upper_cap, self.upper_cap.capacity());
-        total += spare(&self.upper_in_degree, self.upper_in_degree.capacity());
+        total += spare(&self.upper_word, self.upper_word.capacity());
+        total += spare(&self.wide_at, self.wide_at.capacity());
+        total += spare(&self.wide_len, self.wide_len.capacity());
+        total += spare(&self.wide_in_degree, self.wide_in_degree.capacity());
         total += spare(&self.upper_targets, self.upper_targets.capacity());
-        total += spare(&self.upper_dists, self.upper_dists.capacity());
         total
     }
 
@@ -1496,12 +1669,19 @@ where
     }
 
     /// One node's adjacency as a dump records it, being every list from layer
-    /// zero up to the highest layer the node carries anything at.
+    /// zero up to the highest layer the node carries anything at, each edge
+    /// carrying the distance from the node to its target, recomputed.
     ///
     /// Empty lists in the middle are kept, because a node can carry residue at
     /// a layer above one it carries nothing at, and the file records lists by
     /// position. Trailing empty lists are the writer's business to trim.
-    fn neighbourhood_into(&self, node: u32, order: &DumpOrder, out: &mut Vec<Vec<LoadedEdge>>) {
+    fn neighbourhood_into(
+        &self,
+        node: u32,
+        order: &DumpOrder,
+        store: &VectorStore<T>,
+        out: &mut Vec<Vec<LoadedEdge>>,
+    ) {
         for list in out.iter_mut() {
             list.clear();
         }
@@ -1511,12 +1691,11 @@ where
         let lists = self.span(node) + 1;
         for (layer, list) in out.iter_mut().enumerate().take(lists) {
             let targets = self.neighbours_at(node, layer);
-            let dists = self.distances(node, layer);
             list.reserve(targets.len());
-            for (&target, &distance) in targets.iter().zip(dists) {
+            for &target in targets {
                 list.push(LoadedEdge {
                     target: order.point_id(self, target),
-                    distance,
+                    distance: self.edge_distance(store, node, target),
                 });
             }
         }
@@ -1732,7 +1911,7 @@ where
         let mut scratch: Vec<Vec<LoadedEdge>> = Vec::new();
         for &node in self.order.layer(layer) {
             self.graph
-                .neighbourhood_into(node, &self.order, &mut scratch);
+                .neighbourhood_into(node, &self.order, self.store, &mut scratch);
             f(&scratch)?;
         }
         Ok(())
