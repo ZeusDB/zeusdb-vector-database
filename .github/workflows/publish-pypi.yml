@@ -252,7 +252,7 @@ jobs:
           abi3audit --strict --verbose --assume-minimum-abi3 3.10 dist/*.whl
       - name: Set up QEMU
         if: matrix.platform.docker-platform != 'linux/amd64'
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
       - name: Install and import the built wheel on two interpreters
         # Runs in a glibc container matching the wheel architecture. A native
         # wheel cannot be handed to another job, so the check runs where the
@@ -330,7 +330,7 @@ jobs:
           abi3audit --strict --verbose --assume-minimum-abi3 3.10 dist/*.whl
       - name: Set up QEMU
         if: matrix.platform.docker-platform != 'linux/amd64'
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
       - name: Install and import the built wheel on two interpreters
         # Runs in a musl container, because a musllinux wheel does not install
         # on the glibc runner that builds it. The floor and the newest release
