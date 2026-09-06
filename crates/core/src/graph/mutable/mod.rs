@@ -760,7 +760,7 @@ where
     /// that id.
     ///
     /// A removed record keeps its entry until the graph is replaced, because
-    /// removal strands a node rather than deleting it. `id_map` is the record
+    /// removal strands a node rather than deleting it. The id store is the record
     /// set and every caller consults it first, so a stranded entry is
     /// unreachable rather than wrong.
     pub(super) fn node_of(&self, origin_id: usize) -> Option<u32> {

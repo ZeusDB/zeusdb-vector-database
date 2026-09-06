@@ -73,15 +73,15 @@
 //! [`FULL_SCAN_THRESHOLD`] for the measurements and the column store in
 //! `zeusdb_vector_core` for what replaces it.
 //!
-//! **Lock order.** Every path takes `rev_map` before the index and the
+//! **Lock order.** Every path takes the id store before the index and the
 //! storage maps after it, which is the order declared on `Collection` in the
-//! parent module. A search holds `rev_map` for its whole traversal, so a
-//! mutation taking a storage map before `rev_map` deadlocks against it, and
-//! that is the inversion `remove_point_internal` used to carry.
+//! parent module. A search holds the id store for its whole traversal, so a
+//! mutation taking a storage map before it deadlocks against it, and that is
+//! the inversion `remove_point_internal` used to carry.
 
-use super::{Arm, Collection, LiveRecords, Query, StorageMode};
+use super::{Arm, Collection, Query, StorageMode};
 use crate::{
-    raw_distance_fn, reconstruction_needs_unit, rescore_candidate, take_best, RawVectors,
+    raw_distance_fn, reconstruction_needs_unit, rescore_candidate, take_best, Named, RawVectors,
     RerankPlan, SearchParams,
 };
 use rayon::prelude::*;
@@ -92,7 +92,8 @@ use std::time::Instant;
 use tracing::{debug, error, instrument, trace, warn};
 use zeusdb_vector_core::{
     matches_filter, Admit, And, Bitmap, Budget, Candidates, ColumnStore, Error, FieldLookup,
-    Filter, Fusion, Hits, IdfScope, MetadataStore, RecordId, Selection, SparseRef, VectorIndex,
+    Filter, Fusion, Hits, IdStore, IdfScope, MetadataStore, RecordId, Selection, SparseRef,
+    VectorIndex,
 };
 
 /// The target every record this file emits carries. See the parent module.
@@ -183,33 +184,36 @@ pub(super) const MAX_EF_SEARCH: usize = 2 * MAX_TOP_K;
 /// gives up hands the index a set it will traverse.
 pub(super) const FULL_SCAN_THRESHOLD: usize = 5_000;
 
-/// One search's candidates, as borrowed external ids paired with the score
-/// whichever path found them scored them at, and whether that path was exact.
+/// One search's candidates, each as its internal id and its external id
+/// borrowed from the id store, paired with the score whichever path found
+/// them scored them at, and whether that path was exact.
 ///
 /// The index returns a page of internal ids and this is that page resolved
-/// through `rev_map`, borrowing the id it finds there. Nothing is cloned until
-/// the page is cut, so an over-fetched page pays to clone the metadata and
-/// the vector of the results it returns rather than of every candidate it
-/// considered.
+/// through the id store, borrowing the name it finds there. Nothing is
+/// cloned until the page is cut, so an over-fetched page pays to clone the
+/// metadata and the vector of the results it returns rather than of every
+/// candidate it considered, and nothing is looked up twice, since the
+/// internal id the metadata and the vectors are addressed by rides beside
+/// the name.
 ///
 /// `exact` is true when every admitted record was scored, which is the scan
 /// and never the traversal. It decides the tie break; see [`Scored::cut`] and
 /// the module documentation.
 pub(super) struct Scored<'a> {
-    pub(super) items: Vec<(&'a String, f32)>,
+    pub(super) items: Vec<(Named<'a>, f32)>,
     pub(super) exact: bool,
 }
 
 impl<'a> Scored<'a> {
     /// A page every admitted record was scored for.
     #[cfg(test)]
-    fn exact(items: Vec<(&'a String, f32)>) -> Self {
+    fn exact(items: Vec<(Named<'a>, f32)>) -> Self {
         Scored { items, exact: true }
     }
 
     /// A page in the traversal's own order.
     #[cfg(test)]
-    fn traversed(items: Vec<(&'a String, f32)>) -> Self {
+    fn traversed(items: Vec<(Named<'a>, f32)>) -> Self {
         Scored {
             items,
             exact: false,
@@ -220,13 +224,14 @@ impl<'a> Scored<'a> {
     ///
     /// An id that no longer resolves is dropped, which is the liveness rule
     /// every path applies. The index searched under the live set, so this
-    /// drops nothing in practice, and `rev_map` is what turns a node into a
-    /// record so the resolution has to happen somewhere.
-    pub(super) fn resolve(hits: Hits, rev_map: &'a LiveRecords) -> Self {
+    /// drops nothing in practice, and the id store is what turns a node into
+    /// a record so the resolution has to happen somewhere.
+    pub(super) fn resolve(hits: Hits, ids: &'a IdStore) -> Self {
         let mut items = Vec::with_capacity(hits.items.len());
         for hit in hits.items {
-            if let Some(ext_id) = rev_map.get(&hit.id.slot()) {
-                items.push((ext_id, hit.score));
+            let slot = hit.id.slot();
+            if let Some(name) = ids.name(slot) {
+                items.push((Named { name, slot }, hit.score));
             }
         }
         Scored {
@@ -259,7 +264,7 @@ impl<'a> Scored<'a> {
     pub(super) fn cut(mut self, fetch_k: usize) -> Self {
         if self.exact {
             self.items
-                .sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+                .sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.name.cmp(b.0.name)));
             self.items.truncate(fetch_k);
         }
         self
@@ -429,7 +434,7 @@ impl Collection {
         &self,
         conditions: Option<&'a Filter>,
         columns: &ColumnStore,
-        rev_map: &'a LiveRecords,
+        ids: &'a IdStore,
         metadata: &'a MetadataStore,
     ) -> AdmitPlan<'a> {
         let Some(conditions) = conditions else {
@@ -450,7 +455,7 @@ impl Collection {
                         "Filtered search answered from the columns"
                     );
                     AdmitPlan::Bitmap(selected)
-                } else if rev_map.admits_every_live(&selected) {
+                } else if ids.admits_every_live(&selected) {
                     // Every live record, so the filter is no filter and the
                     // index runs under its own live set, which is the
                     // unfiltered search. Handed on as a bitmap instead, a
@@ -652,11 +657,9 @@ impl Collection {
         self.rescore_page(&mut scored, query, vectors, pq_codes, &params);
 
         let mut results = Vec::with_capacity(scored.len());
-        for (ext_id, score) in scored {
-            let metadata = vectors
-                .id_map
-                .get(ext_id)
-                .and_then(|&slot| vector_metadata.get(slot))
+        for (record, score) in scored {
+            let metadata = vector_metadata
+                .get(record.slot)
                 .map(|fields| fields.to_map())
                 .unwrap_or_default();
             // The raw vector where one exists and the reconstruction from the
@@ -665,21 +668,18 @@ impl Collection {
             // search returns no vectors at all.
             let vector_data = if params.return_vector {
                 vectors
-                    .get(ext_id.as_str())
+                    .get(record.slot)
                     .map(<[f32]>::to_vec)
                     .or_else(|| {
-                        let codes = pq_codes.get(ext_id)?;
+                        let codes = pq_codes.get(record.name)?;
                         self.dense().pq.as_ref()?.reconstruct(codes).ok()
                     })
-                    .or_else(|| {
-                        let slot = *vectors.id_map.get(ext_id)?;
-                        vectors.graph.int8_reconstruct(slot)
-                    })
+                    .or_else(|| vectors.graph.int8_reconstruct(record.slot))
             } else {
                 None
             };
 
-            results.push((ext_id.clone(), score, metadata, vector_data));
+            results.push((record.name.to_string(), score, metadata, vector_data));
         }
 
         Ok(results)
@@ -696,7 +696,7 @@ impl Collection {
     /// arm inside a query returns the page the single space search returns.
     pub(super) fn rescore_page(
         &self,
-        scored: &mut Vec<(&String, f32)>,
+        scored: &mut Vec<(Named<'_>, f32)>,
         query: &[f32],
         vectors: RawVectors<'_>,
         pq_codes: &HashMap<String, Vec<u8>>,
@@ -801,30 +801,27 @@ impl Collection {
         filter_conditions: Option<&Filter>,
         params: SearchParams,
     ) -> Result<QueryHits, Error> {
-        // Six read guards, held for the whole search, in the order every
-        // path in the crate takes them: `id_map < rev_map < index <
-        // pq_codes < vector_metadata < columns`. `id_map` is here because the raw
-        // vectors are addressed by node index now and it is what turns an
-        // external id into one; it is taken before `rev_map` because a
-        // removal holds `id_map` and then takes `rev_map`, and the reverse
-        // order here would deadlock against it. The raw vector map that
-        // used to sit between the index and `pq_codes` is gone.
-        let id_map = self.id_map.read().unwrap();
-        let rev_map = self.rev_map.read().unwrap();
+        // Five read guards, held for the whole search, in the order every
+        // path in the crate takes them: `ids < index < pq_codes <
+        // vector_metadata < columns`. The id store is what turns the nodes
+        // the index returns into records, and it is held across the
+        // traversal so the page resolves against the set the traversal ran
+        // under. The two id maps that used to sit here were one structure
+        // taken as two guards.
+        let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
         let pq_codes = self.dense().pq_codes.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
         let columns = self.columns.read().unwrap();
         let vectors = RawVectors {
-            id_map: &id_map,
             graph: index.graph(),
         };
 
-        let plan = self.admit_plan(filter_conditions, &columns, &rev_map, &vector_metadata);
-        let fetch_k = params.fetch_k(rev_map.len());
+        let plan = self.admit_plan(filter_conditions, &columns, &ids, &vector_metadata);
+        let fetch_k = params.fetch_k(ids.len());
         let budget = Self::dense_budget(&params);
         let hits = plan.run(|admit| index.search(processed_query, fetch_k, admit, &budget))?;
-        let candidates = Scored::resolve(hits, &rev_map).cut(fetch_k);
+        let candidates = Scored::resolve(hits, &ids).cut(fetch_k);
 
         self.collect_hits(
             candidates,
@@ -941,26 +938,23 @@ impl Collection {
         filter_conditions: Option<&Filter>,
         params: SearchParams,
     ) -> Result<Vec<QueryHits>, Error> {
-        // Six read guards, in the one documented order, held across every
-        // query in the batch. See `search_one` for why `id_map` is first and
-        // where the raw vector map went.
-        let id_map = self.id_map.read().unwrap();
-        let rev_map = self.rev_map.read().unwrap();
+        // Five read guards, in the one documented order, held across every
+        // query in the batch. See `search_one`.
+        let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
         let code_store = self.dense().pq_codes.read().unwrap();
         let metadata_store = self.vector_metadata.read().unwrap();
         let column_store = self.columns.read().unwrap();
         let vector_store = RawVectors {
-            id_map: &id_map,
             graph: index.graph(),
         };
 
         // The admit set is the filter's, so it is decided once for the batch.
-        let plan = self.admit_plan(filter_conditions, &column_store, &rev_map, &metadata_store);
+        let plan = self.admit_plan(filter_conditions, &column_store, &ids, &metadata_store);
 
         // The same over-fetch the single query path applies, so a batch of
         // one query returns what that query returns on its own.
-        let fetch_k = params.fetch_k(rev_map.len());
+        let fetch_k = params.fetch_k(ids.len());
         let budget = Self::dense_budget(&params);
 
         let mut all_results = Vec::with_capacity(vectors.len());
@@ -970,7 +964,7 @@ impl Collection {
             let processed_query = self.dense().process_vector_for_space(vector.clone());
 
             let hits = plan.run(|admit| index.search(&processed_query, fetch_k, admit, &budget))?;
-            let candidates = Scored::resolve(hits, &rev_map).cut(fetch_k);
+            let candidates = Scored::resolve(hits, &ids).cut(fetch_k);
 
             all_results.push(self.collect_hits(
                 candidates,
@@ -1000,32 +994,28 @@ impl Collection {
                 // FIX: Process each query vector for space
                 let processed_query = self.dense().process_vector_for_space(vector.clone());
 
-                // Six read guards per worker, in the one documented order
+                // Five read guards per worker, in the one documented order
                 // and held across the traversal. Every guard is a read, so
                 // the rule that no path forks to rayon holding a write
-                // guard is untouched. See `search_one` for why `id_map` is
-                // first and where the raw vector map went.
-                let id_map = self.id_map.read().unwrap();
-                let rev_map = self.rev_map.read().unwrap();
+                // guard is untouched. See `search_one`.
+                let ids = self.ids.read().unwrap();
                 let index = self.dense().index.read().unwrap();
                 let code_store = self.dense().pq_codes.read().unwrap();
                 let metadata_store = self.vector_metadata.read().unwrap();
                 let column_store = self.columns.read().unwrap();
                 let vector_store = RawVectors {
-                    id_map: &id_map,
                     graph: index.graph(),
                 };
 
-                let plan =
-                    self.admit_plan(filter_conditions, &column_store, &rev_map, &metadata_store);
+                let plan = self.admit_plan(filter_conditions, &column_store, &ids, &metadata_store);
 
                 // The same over-fetch the other two search paths apply.
-                let fetch_k = params.fetch_k(rev_map.len());
+                let fetch_k = params.fetch_k(ids.len());
                 let budget = Self::dense_budget(&params);
 
                 let hits =
                     plan.run(|admit| index.search(&processed_query, fetch_k, admit, &budget))?;
-                let candidates = Scored::resolve(hits, &rev_map).cut(fetch_k);
+                let candidates = Scored::resolve(hits, &ids).cut(fetch_k);
 
                 self.collect_hits(
                     candidates,
@@ -1041,12 +1031,12 @@ impl Collection {
 
     /// Raw search with no page building (for benchmarking)
     ///
-    /// Two read guards in declared order, `rev_map` then the index, and the
-    /// index guard is held across the resolution as well as the traversal.
-    /// This path takes no filter, so it takes no storage guards and the
-    /// index runs under its live set alone.
+    /// Two read guards in declared order, the id store then the index, and
+    /// the index guard is held across the resolution as well as the
+    /// traversal. This path takes no filter, so it takes no storage guards
+    /// and the index runs under its live set alone.
     pub(super) fn raw_search_no_gil(&self, query: &[f32]) -> Vec<(String, f32)> {
-        let rev_map = self.rev_map.read().unwrap();
+        let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
 
         let budget = Budget {
@@ -1063,10 +1053,10 @@ impl Collection {
                     exact: false,
                 }
             });
-        Scored::resolve(hits, &rev_map)
+        Scored::resolve(hits, &ids)
             .items
             .into_iter()
-            .map(|(ext_id, distance)| (ext_id.clone(), distance))
+            .map(|(record, distance)| (record.name.to_string(), distance))
             .collect()
     }
 
@@ -1134,22 +1124,25 @@ impl Collection {
 #[cfg(test)]
 mod tests {
     use super::Scored;
+    use crate::Named;
 
     /// An exact page is ordered by distance and then by external id, and cut.
     /// A traversal's page is returned as the traversal produced it, so a tie
-    /// the string order would reverse stays in the heap's order.
+    /// the string order would reverse stays in the heap's order. The slot
+    /// takes no part in the order: `b` holds the lower slot and sorts after
+    /// `a`.
     #[test]
     fn the_tie_break_applies_to_exact_pages_only() {
-        let a = "a".to_string();
-        let b = "b".to_string();
-        let c = "c".to_string();
+        let a = Named { name: "a", slot: 7 };
+        let b = Named { name: "b", slot: 2 };
+        let c = Named { name: "c", slot: 5 };
         // `b` before `a` at the same distance, which is the traversal's order
         // on the 12,002 record l2 corpus the tie-break probe records.
-        let items = vec![(&b, 1.0f32), (&a, 1.0), (&c, 0.5)];
+        let items = vec![(b, 1.0f32), (a, 1.0), (c, 0.5)];
 
         let exact = Scored::exact(items.clone()).cut(2);
         assert!(exact.exact);
-        assert_eq!(exact.items, vec![(&c, 0.5), (&a, 1.0)]);
+        assert_eq!(exact.items, vec![(c, 0.5), (a, 1.0)]);
 
         let traversed = Scored::traversed(items.clone()).cut(2);
         assert!(!traversed.exact);

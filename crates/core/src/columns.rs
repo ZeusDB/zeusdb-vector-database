@@ -13,7 +13,7 @@
 //! A column here is addressed by internal id, so the same bitmap answers both
 //! paths a filtered search can take. The exact scan reads the set bits and
 //! scores those records. The graph traversal tests one bit per node it reaches,
-//! in place of the node, `rev_map`, `vector_metadata`, field lookup chain that
+//! in place of the node, id store, `vector_metadata`, field lookup chain that
 //! measured at 154 nanoseconds a probe on that map.
 //!
 //! # Every operator is served, because the leaf is the same function

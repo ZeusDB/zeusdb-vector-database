@@ -1330,7 +1330,7 @@ fn restore_spaces(index: &Collection, path: &Path, manifest: &IndexManifest) -> 
         return Ok(());
     };
     let prefix = Collection::space_prefix(name);
-    let largest_id = index.rev_map().keys().max().copied().unwrap_or(0);
+    let largest_id = index.ids().highest_slot().unwrap_or(0);
     let bounds = Bounds {
         min_records: 0,
         max_records: largest_id,
@@ -1338,10 +1338,10 @@ fn restore_spaces(index: &Collection, path: &Path, manifest: &IndexManifest) -> 
     };
     let restored = PostingsIndex::restore(space.config(), &prefix, path, manifest, &bounds)?;
     let unmapped = {
-        let rev_map = index.rev_map();
+        let ids = index.ids();
         let mut unmapped = None;
         restored.live_set().for_each_while(|slot| {
-            if rev_map.contains_key(&slot) {
+            if ids.contains_slot(slot) {
                 true
             } else {
                 unmapped = Some(slot);
@@ -2025,7 +2025,7 @@ fn reconstruct_index_simple(
 
     // Step 4: The stored record data, exactly as it was written, once the
     // graph is back. Neither rebuild touches the storage maps, and the
-    // columns are built over `id_map`, which either rebuild may have added
+    // columns are built over the id store, which either rebuild may have added
     // an id to for a record the mappings did not name.
     let raw_count = vectors.len();
     let code_count = pq_codes.len();
@@ -2116,26 +2116,26 @@ fn check_int8_rows_against_mappings(
         file: INT8_ROWS_FILENAME.to_string(),
         detail,
     };
-    let rev_map = index.rev_map();
-    if let Some((id, _)) = rows.iter().find(|(id, _)| !rev_map.contains_key(id)) {
+    let ids = index.ids();
+    if let Some((id, _)) = rows.iter().find(|(id, _)| !ids.contains_slot(*id)) {
         return Err(invalid(format!(
             "names internal id {}, which mappings.bin does not hold",
             id
         )));
     }
-    if rows.len() != rev_map.len() {
+    if rows.len() != ids.len() {
         let held: std::collections::HashSet<usize> = rows.iter().map(|(id, _)| *id).collect();
-        let mut without: Vec<&String> = rev_map
+        let mut without: Vec<&str> = ids
             .iter()
             .filter(|(id, _)| !held.contains(id))
             .map(|(_, ext)| ext)
             .collect();
-        without.sort();
+        without.sort_unstable();
         return Err(invalid(format!(
             "holds {} rows and mappings.bin holds {} records; record '{}' has no row",
             rows.len(),
-            rev_map.len(),
-            without.first().map(|s| s.as_str()).unwrap_or("")
+            ids.len(),
+            without.first().copied().unwrap_or("")
         )));
     }
     debug!(target: LOG_TARGET, "{} agrees with mappings.bin ({} rows)", INT8_ROWS_FILENAME, rows.len());
@@ -2178,7 +2178,7 @@ fn restore_data_fields(
     // Before the mappings move, because this reads their keys. The floor is
     // what stops an old directory reissuing a generated id it already holds.
     let generated_floor = Collection::highest_generated_id(mappings.id_map.keys());
-    index.set_id_mappings(mappings.id_map, mappings.rev_map);
+    index.set_id_mappings(mappings.id_map, mappings.rev_map)?;
 
     // The add() method will properly:
     // - Insert vectors into index.vectors
@@ -2766,16 +2766,20 @@ fn save_config(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Resu
 fn save_mappings(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
     debug!(target: LOG_TARGET, "Saving mappings.bin...");
 
-    // Both guards end with this block. They are taken in the documented order,
-    // id_map before rev_map, and the copy they were already making is what the
-    // rest of the function works from.
+    // The two maps the file holds, built from the id store under its guard,
+    // which ends with this block. The file's shape is the two maps it has
+    // always held, and the store hands out the same pairs both ways, so a
+    // reader of either map finds what it found before. The two maps used to
+    // be cloned from the two the collection held, at the same cost.
     let mappings = {
-        let id_map = index.id_map();
-        let rev_map = index.rev_map();
-        IdMappings {
-            id_map: id_map.clone(),
-            rev_map: rev_map.map().clone(),
+        let ids = index.ids();
+        let mut id_map = HashMap::with_capacity(ids.len());
+        let mut rev_map = HashMap::with_capacity(ids.len());
+        for (internal_id, id) in ids.iter() {
+            id_map.insert(id.to_string(), internal_id);
+            rev_map.insert(internal_id, id.to_string());
         }
+        IdMappings { id_map, rev_map }
     };
     let mapping_count = mappings.id_map.len();
 
@@ -2798,19 +2802,17 @@ fn save_metadata(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Re
     debug!(target: LOG_TARGET, "Saving metadata.json...");
 
     // Both guards end with the serialize, taken in the documented order,
-    // id_map before vector_metadata. The file is keyed by external id and
-    // the store by internal id, so every record is written under the id the
-    // mappings hold for it, in increasing internal id order. `to_string_pretty`
-    // returns an owned String, so the file is written with nothing held.
+    // the id store before vector_metadata. The file is keyed by external id
+    // and the store by internal id, so every record is written under the id
+    // the id store holds for it, in increasing internal id order, which is
+    // the order the store walks in. `to_string_pretty` returns an owned
+    // String, so the file is written with nothing held.
     let (metadata_json, record_count) = {
-        let id_map = index.id_map();
+        let ids = index.ids();
         let vector_metadata = index.vector_metadata();
-        let mut ordered: Vec<(usize, &String)> =
-            id_map.iter().map(|(id, &slot)| (slot, id)).collect();
-        ordered.sort_unstable_by_key(|&(slot, _)| slot);
         let file = MetadataFile {
-            records: ordered
-                .into_iter()
+            records: ids
+                .iter()
                 .filter_map(|(slot, id)| vector_metadata.get(slot).map(|fields| (id, fields)))
                 .collect(),
         };
@@ -2832,7 +2834,7 @@ fn save_metadata(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Re
 /// external id, holding the record's fields. The same shape the file has
 /// always had, which `load_metadata` reads back into a map of maps.
 struct MetadataFile<'a> {
-    records: Vec<(&'a String, RecordFields<'a>)>,
+    records: Vec<(&'a str, RecordFields<'a>)>,
 }
 
 impl Serialize for MetadataFile<'_> {

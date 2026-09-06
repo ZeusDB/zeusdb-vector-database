@@ -20,8 +20,8 @@
 //! can run them for a recorded operation without recording it again.
 
 use super::{
-    validate_index_parameters, Collection, DenseIndex, LiveRecords, ParsedRecord, ParsedRecords,
-    SparseHalf, StorageMode, MAX_LAYER,
+    validate_index_parameters, Collection, DenseIndex, ParsedRecord, ParsedRecords, SparseHalf,
+    StorageMode, MAX_LAYER,
 };
 use crate::locks::WriteGuard;
 use crate::RawVectors;
@@ -31,9 +31,9 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, Bitmap, ColumnStore, Error, Filter, InsertParts, MetadataStore, Operation,
-    OperationKind, Prepared, RecordId, Selection, SparseVector, VectorGraph, VectorIndex,
-    JOURNAL_MAX_PAYLOAD,
+    matches_filter, Bitmap, ColumnStore, Error, Filter, IdStore, InsertParts, MetadataStore,
+    Operation, OperationKind, Prepared, RecordId, Selection, SparseVector, VectorGraph,
+    VectorIndex, JOURNAL_MAX_PAYLOAD,
 };
 use zeusdb_vector_sparse::PostingsIndex;
 
@@ -74,8 +74,7 @@ pub(super) enum InsertError {
 /// them to the per record helper. They drop in field order, which is the
 /// acquisition order, and releasing may happen in any order.
 struct RemovalGuards<'a> {
-    id_map: WriteGuard<'a, HashMap<String, usize>>,
-    rev_map: WriteGuard<'a, LiveRecords>,
+    ids: WriteGuard<'a, IdStore>,
     /// The dense index, so a removal drops the record from its live set.
     /// Taken as a write guard between the reverse map and the codes, which
     /// is its place in the order, and held for the removal alone.
@@ -128,7 +127,7 @@ impl Collection {
         let threshold = self
             .expected_size()
             .saturating_mul(EXPECTED_SIZE_OVERGROWTH_FACTOR);
-        let live_records = self.id_map.read().unwrap().len();
+        let live_records = self.ids.read().unwrap().len();
         if live_records <= threshold {
             return;
         }
@@ -162,11 +161,10 @@ impl Collection {
     ///                from the level the caller drew, choose the neighbour
     ///                lists
     ///   drop
-    /// id_map.write()
-    /// rev_map.write()
+    /// ids.write()
     /// index.write()  insert: append the node, install its lists, update the
     ///                reverse links, mark the record live, and name it in
-    ///                both id maps
+    ///                the id store
     /// ```
     ///
     /// This is the only caller that takes the index lock twice for one
@@ -174,10 +172,10 @@ impl Collection {
     /// each fill a local graph nobody else can reach and swap it in under one
     /// write guard, so they insert with no lock held at all.
     ///
-    /// # Why the two id maps are written here
+    /// # Why the id store is written here
     ///
     /// The dense index keeps its own live set and the collection keeps one
-    /// beside `rev_map`, and the two are the same set. Writing the maps in
+    /// in the id store, and the two are the same set. Writing the store in
     /// their own block above and the live bit here left the invariant false
     /// for the whole of phase one, which is where an insertion spends its
     /// time, so a reader taking no mutation guard saw the collection holding a
@@ -186,11 +184,11 @@ impl Collection {
     /// are one write, so they happen under one acquisition, which is what
     /// `remove_under_guards` already does with the same pair.
     ///
-    /// It costs nothing on the search path. A search takes `id_map`, `rev_map`
-    /// and the index read guards in that order and holds all three for its
-    /// whole traversal, so a writer waiting for the index write guard was
+    /// It costs nothing on the search path. A search takes the id store and
+    /// the index read guards in that order and holds both for its whole
+    /// traversal, so a writer waiting for the index write guard was
     /// already waiting for exactly those searches. What is new is that the
-    /// maps are held across phase two, being the fixed `m * 2 * m` memory
+    /// store is held across phase two, being the fixed `m * 2 * m` memory
     /// operations the index guard was already held across, and not across
     /// phase one.
     ///
@@ -222,9 +220,9 @@ impl Collection {
     /// # The lock order
     ///
     /// Phase one takes the index read guard with no other guard held. Phase two
-    /// takes `id_map`, `rev_map` and the index in that order, which is the
+    /// takes the id store and the index in that order, which is the
     /// order declared on `Collection` and the order `removal_guards` takes the
-    /// same three in. The metadata and the columns this record has already been
+    /// same two in. The metadata and the columns this record has already been
     /// written to were taken and released in their own block above, and they
     /// rank below the index, so nothing here is held out of order.
     ///
@@ -255,12 +253,15 @@ impl Collection {
             index.prepare_at_level(id, vector, level)?
         };
         let (codes, due) = {
-            let mut id_map = self.id_map.write().unwrap();
-            let mut rev_map = self.rev_map.write().unwrap();
+            let mut ids = self.ids.write().unwrap();
             let mut index = self.dense().index.write().unwrap();
-            index.insert(id, vector, prepared)?;
-            id_map.insert(external_id.to_string(), internal_id);
-            rev_map.insert(internal_id, external_id.to_string());
+            // The store first, and the name taken back if the graph refuses
+            // the node, so a refused record leaves nothing behind.
+            ids.insert(internal_id, external_id)?;
+            if let Err(refused) = index.insert(id, vector, prepared) {
+                ids.remove_slot(internal_id);
+                return Err(refused);
+            }
             (
                 index.graph().codes_of(internal_id).map(<[u8]>::to_vec),
                 index.due_for_timing(),
@@ -338,11 +339,11 @@ impl Collection {
     /// named. What a removal's record carries, since a record names what
     /// was removed and never a filter or a request.
     pub(super) fn held_ids(&self, requested: &[String]) -> Vec<String> {
-        let id_map = self.id_map.read().unwrap();
+        let ids = self.ids.read().unwrap();
         let mut seen: HashSet<&str> = HashSet::with_capacity(requested.len());
         requested
             .iter()
-            .filter(|id| id_map.contains_key(id.as_str()) && seen.insert(id.as_str()))
+            .filter(|id| ids.contains_name(id.as_str()) && seen.insert(id.as_str()))
             .cloned()
             .collect()
     }
@@ -379,12 +380,11 @@ impl Collection {
     /// A batch removal holds one set of these for the whole batch rather than
     /// taking and releasing five guards per id, so the guards have to be a value
     /// a helper can borrow. The order is the declared one, which matters because
-    /// a search holds `rev_map` for its whole traversal and takes `vectors`
-    /// afterwards.
+    /// a search holds the id store for its whole traversal and takes the
+    /// index afterwards.
     fn removal_guards(&self) -> RemovalGuards<'_> {
         RemovalGuards {
-            id_map: self.id_map.write().unwrap(),
-            rev_map: self.rev_map.write().unwrap(),
+            ids: self.ids.write().unwrap(),
             index: self.dense().index.write().unwrap(),
             pq_codes: self.dense().pq_codes.write().unwrap(),
             sparse: self.sparse().map(|space| space.index.write().unwrap()),
@@ -404,7 +404,7 @@ impl Collection {
         id: &str,
         storage_mode: &str,
     ) -> bool {
-        let Some(internal_id) = guards.id_map.remove(id) else {
+        let Some(internal_id) = guards.ids.remove_name(id) else {
             trace!(target: LOG_TARGET, operation = "remove_point_internal",
                 vector_id = %id,
                 "Vector not found for removal"
@@ -441,7 +441,6 @@ impl Collection {
                                                     // leaves a hole in every column exactly as it leaves a stranded node.
         guards.columns.erase(internal_id);
         guards.pq_codes.remove(id); // Remove PQ codes (if present)
-        guards.rev_map.remove(internal_id); // Remove ID mapping, and the live bit with it
 
         // The dense index strands the node and drops the record from its
         // live set, and the sparse index unlinks the record's postings where
@@ -451,7 +450,7 @@ impl Collection {
         let record = RecordId::from_slot(internal_id);
         debug_assert!(
             guards.index.holds(record),
-            "the dense index holds every record id_map holds"
+            "the dense index holds every record the id store holds"
         );
         if guards.index.holds(record) {
             let _ = guards.index.remove(record);
@@ -462,7 +461,7 @@ impl Collection {
             }
         }
         debug_assert!(
-            guards.columns.tracks(guards.id_map.len()),
+            guards.columns.tracks(guards.ids.len()),
             "a column store holds one entry per live record, and a removal writes both"
         );
 
@@ -578,12 +577,12 @@ impl Collection {
     /// record was read. What can fail is the sink, which is handed the
     /// resolved ids between the two phases.
     pub(super) fn remove_where_locked(&self, filter: &Filter) -> Result<usize, Error> {
-        // `rev_map` before `vector_metadata` before `columns`, which is the
-        // declared order, because the store and the bitmap hold internal ids
-        // and a removal names external ones. The columns guard is dropped
-        // before the metadata one is taken, since the selection owns its
-        // bitmap and borrows only the filter.
-        let rev_map = self.rev_map.read().unwrap();
+        // The id store before `vector_metadata` before `columns`, which is
+        // the declared order, because the metadata store and the bitmap hold
+        // internal ids and a removal names external ones. The columns guard
+        // is dropped before the metadata one is taken, since the selection
+        // owns its bitmap and borrows only the filter.
+        let store = self.ids.read().unwrap();
         let selection = {
             let columns = self.columns.read().unwrap();
             columns.select(filter)
@@ -591,8 +590,8 @@ impl Collection {
         let resolve = |selected: &Bitmap| {
             let mut ids = Vec::with_capacity(selected.count());
             selected.for_each(|slot| {
-                if let Some(id) = rev_map.get(&slot) {
-                    ids.push(id.clone());
+                if let Some(id) = store.name(slot) {
+                    ids.push(id.to_string());
                 }
             });
             ids
@@ -606,12 +605,12 @@ impl Collection {
                 let vector_metadata = self.vector_metadata.read().unwrap();
                 let mut ids = Vec::new();
                 bound.for_each(|slot| {
-                    if let Some(id) = rev_map.get(&slot) {
+                    if let Some(id) = store.name(slot) {
                         if vector_metadata
                             .get(slot)
                             .is_some_and(|fields| matches_filter(&fields, filter))
                         {
-                            ids.push(id.clone());
+                            ids.push(id.to_string());
                         }
                     }
                 });
@@ -624,11 +623,11 @@ impl Collection {
                 vector_metadata
                     .iter()
                     .filter(|(_, fields)| matches_filter(fields, filter))
-                    .filter_map(|(slot, _)| rev_map.get(&slot).cloned())
+                    .filter_map(|(slot, _)| store.name(slot).map(str::to_string))
                     .collect()
             }
         };
-        drop(rev_map);
+        drop(store);
 
         // The resolved ids, and never the filter, since the filter's answer
         // depends on the state it was asked against.
@@ -654,8 +653,8 @@ impl Collection {
     /// `false` for an id the index does not hold, which is what `remove_point`
     /// answers for the same question, and nothing is written in that case.
     ///
-    /// Existence is decided by `id_map` rather than by the metadata store,
-    /// because `id_map` is the record set. Every insertion path writes a
+    /// Existence is decided by the id store rather than by the metadata store,
+    /// because the id store is the record set. Every insertion path writes a
     /// metadata entry even for a record supplied without metadata, so the two
     /// agree, and keying on the authoritative one means they cannot drift.
     pub(super) fn update_metadata_locked(
@@ -663,8 +662,8 @@ impl Collection {
         id: &str,
         metadata: HashMap<String, Value>,
     ) -> bool {
-        let id_map = self.id_map.read().unwrap();
-        let Some(&internal_id) = id_map.get(id) else {
+        let ids = self.ids.read().unwrap();
+        let Some(internal_id) = ids.slot_of(id) else {
             trace!(target: LOG_TARGET, operation = "update_metadata",
                 vector_id = %id,
                 "Record not found, metadata not written"
@@ -711,7 +710,7 @@ impl Collection {
             self.live_sets_agree(),
             "the dense index's live set is the collection's"
         );
-        let live_count = self.id_map.read().unwrap().len();
+        let live_count = self.ids.read().unwrap().len();
         let (nodes_before, stranded) = {
             let index = self.dense().index.read().unwrap();
             (index.graph().nb_points(), index.stranded())
@@ -719,7 +718,7 @@ impl Collection {
         debug_assert_eq!(
             stranded,
             nodes_before.saturating_sub(live_count),
-            "the dense index's live set is id_map's"
+            "the dense index's live set is the id store's"
         );
 
         if nodes_before <= live_count {
@@ -761,7 +760,7 @@ impl Collection {
     ///
     /// **Everything except the graph survives untouched.** Each record is
     /// re-inserted under the internal id it already holds, which is what
-    /// `compact` does, so `id_map`, `rev_map`, the metadata store and every
+    /// `compact` does, so the id store, the metadata store and every
     /// column stay correct without being rewritten. A quantized index is
     /// rebuilt from its stored codes rather than re-encoded, so the codebook is
     /// not retrained and no record's code changes; a `quantized_with_raw` index
@@ -790,7 +789,7 @@ impl Collection {
         let previous_m = self.dense().m();
         let previous_expected_size = self.expected_size();
         let previous_ef_construction = self.dense().ef_construction();
-        let live_count = self.id_map.read().unwrap().len();
+        let live_count = self.ids.read().unwrap().len();
         let nodes_before = self.dense().index.read().unwrap().graph().nb_points();
 
         let nodes_after = self.rebuild_graph(m, expected_size, ef_construction)?;
@@ -839,7 +838,7 @@ impl Collection {
         expected_size: usize,
         ef_construction: usize,
     ) -> Result<usize, Error> {
-        let live_count = self.id_map.read().unwrap().len();
+        let live_count = self.ids.read().unwrap().len();
         let quantized = self.is_quantized();
         // A scalar graph is rebuilt from its own rows, which nothing else
         // holds, under the codec the graph being replaced already carries.
@@ -891,35 +890,33 @@ impl Collection {
         };
 
         // Re-insert every live record under the internal id it already holds, so the
-        // two id maps stay correct without being rewritten. A record whose source data
+        // id store stays correct without being rewritten. A record whose source data
         // is missing is collected rather than skipped, because skipping it would drop
         // it from the index silently.
         let missing: Vec<String> = {
-            let id_map = self.id_map.read().unwrap();
+            let ids = self.ids.read().unwrap();
             // The graph being replaced, which is where the vectors live. Taken
-            // after `id_map` and released with it, before `replace_graph`
+            // after the id store and released with it, before `replace_graph`
             // takes the write guard below.
             let old_index = self.dense().index.read().unwrap();
             let old_hnsw = old_index.graph();
 
-            // Internal id order, which is arrival order, rather than the order a
-            // hash map hands its entries out. Two compactions of the same index
-            // in two processes otherwise wire the replacement graph differently
-            // and answer the same query differently.
-            let mut live: Vec<(&String, usize)> = id_map
-                .iter()
-                .map(|(id, &internal)| (id, internal))
-                .collect();
-            live.sort_by_key(|&(_, internal_id)| internal_id);
+            // Internal id order, which is arrival order and the order the store
+            // walks in, rather than the order a hash map hands its entries out.
+            // Two compactions of the same index in two processes otherwise wire
+            // the replacement graph differently and answer the same query
+            // differently.
+            let live: Vec<(&str, usize)> =
+                ids.iter().map(|(internal, id)| (id, internal)).collect();
 
             if int8.is_some() {
-                let mut batch: Vec<(&[i8], usize)> = Vec::with_capacity(id_map.len());
+                let mut batch: Vec<(&[i8], usize)> = Vec::with_capacity(ids.len());
                 let mut missing = Vec::new();
 
                 for (ext_id, internal_id) in live {
                     match old_hnsw.int8_row_of(internal_id) {
                         Some(row) => batch.push((row, internal_id)),
-                        None => missing.push(ext_id.clone()),
+                        None => missing.push(ext_id.to_string()),
                     }
                 }
 
@@ -933,13 +930,13 @@ impl Collection {
                 missing
             } else if quantized {
                 let pq_codes = self.dense().pq_codes.read().unwrap();
-                let mut batch: Vec<(&Vec<u8>, usize)> = Vec::with_capacity(id_map.len());
+                let mut batch: Vec<(&Vec<u8>, usize)> = Vec::with_capacity(ids.len());
                 let mut missing = Vec::new();
 
                 for (ext_id, internal_id) in live {
                     match pq_codes.get(ext_id) {
                         Some(codes) => batch.push((codes, internal_id)),
-                        None => missing.push(ext_id.clone()),
+                        None => missing.push(ext_id.to_string()),
                     }
                 }
 
@@ -970,7 +967,7 @@ impl Collection {
                 for (ext_id, internal_id) in live {
                     match old_hnsw.raw_vector(internal_id) {
                         Some(vector) => new_hnsw.insert(vector, internal_id),
-                        None => missing.push(ext_id.clone()),
+                        None => missing.push(ext_id.to_string()),
                     }
                 }
 
@@ -1007,6 +1004,18 @@ impl Collection {
         // has just re-inserted every record.
         new_hnsw.shrink_to_fit();
         self.dense().replace_graph(new_hnsw);
+
+        // The text of every removed record, which stayed in the id store's
+        // arena until now, goes with the stranded nodes: one pass over the
+        // entries and one copy of the live text, under the store's write
+        // guard taken alone. Nothing else reclaims it short of `clear`.
+        let reclaimed_text = self.ids.write().unwrap().compact_text();
+        if reclaimed_text > 0 {
+            debug!(target: LOG_TARGET, operation = "rebuild_graph",
+                reclaimed_id_bytes = reclaimed_text,
+                "Removed records' ids reclaimed from the id store"
+            );
+        }
 
         Ok(nodes_after)
     }
@@ -1094,11 +1103,10 @@ impl Collection {
         if overwrite {
             // Phase 1: Batch identify and remove existing documents
             let (ids_to_remove, storage_analysis) = {
-                let id_map = self.id_map.read().unwrap();
+                let ids = self.ids.read().unwrap();
                 let index = self.dense().index.read().unwrap();
                 let pq_codes = self.dense().pq_codes.read().unwrap();
                 let raws = RawVectors {
-                    id_map: &id_map,
                     graph: index.graph(),
                 };
 
@@ -1110,7 +1118,7 @@ impl Collection {
 
                 for record in &parsed_data {
                     let id = &record.id;
-                    if id_map.contains_key(id) {
+                    if let Some(slot) = ids.slot_of(id) {
                         // Once per id, so the removal's record names each
                         // id once.
                         if doomed.insert(id.as_str()) {
@@ -1118,7 +1126,7 @@ impl Collection {
                         }
 
                         // Analyze what's being replaced for logging
-                        let has_raw_vector = raws.contains(id);
+                        let has_raw_vector = raws.contains(slot);
                         let has_pq_codes = pq_codes.contains_key(id);
 
                         match (has_raw_vector, has_pq_codes) {
@@ -1365,7 +1373,7 @@ impl Collection {
             metadata,
         } = record;
 
-        let is_new = !seen.contains(&id) && !self.id_map.read().unwrap().contains_key(&id);
+        let is_new = !seen.contains(&id) && !self.ids.read().unwrap().contains_name(&id);
         if !is_new {
             warn!(target: LOG_TARGET, operation = "add_single_vector",
                 vector_id = %id,
@@ -2083,16 +2091,15 @@ impl Collection {
         // The storage guards in the order declared on the struct, which is
         // the order every other multi-guard path here takes them in.
         //
-        // The dense index is one of them, between `rev_map` and the codes it
-        // ranks above and below. Emptying `rev_map` here and replacing the
+        // The dense index is one of them, between the id store and the codes
+        // it ranks above and below. Emptying the store here and replacing the
         // index afterwards left the collection's live set empty while the
         // index's still held every record, which is the same disagreement the
         // insertion path carried and which a `get_stats` running beside a
         // `clear` observed. The two sets are one set, so they empty under one
         // acquisition.
         let (removed, old_index) = {
-            let mut id_map = self.id_map.write().unwrap();
-            let mut rev_map = self.rev_map.write().unwrap();
+            let mut ids = self.ids.write().unwrap();
             let mut index = self.dense().index.write().unwrap();
             let mut pq_codes = self.dense().pq_codes.write().unwrap();
             let mut vector_metadata = self.vector_metadata.write().unwrap();
@@ -2101,9 +2108,8 @@ impl Collection {
             let mut id_counter = self.id_counter.lock().unwrap();
             let mut vector_count = self.vector_count.lock().unwrap();
 
-            let removed = id_map.len();
-            id_map.clear();
-            rev_map.clear();
+            let removed = ids.len();
+            ids.clear(self.expected_size());
             let old_index = std::mem::replace(&mut *index, replacement);
             pq_codes.clear();
             vector_metadata.clear(self.expected_size());

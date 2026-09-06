@@ -270,7 +270,11 @@ fn holds(
     expected: &Acknowledged,
     vectors: &[Vec<f32>],
 ) -> Result<usize, String> {
-    let live: BTreeSet<String> = collection.id_map().keys().cloned().collect();
+    let live: BTreeSet<String> = collection
+        .ids()
+        .iter()
+        .map(|(_, id)| id.to_string())
+        .collect();
     for (id, updated) in &expected.present {
         if !live.contains(id) {
             return Err(format!("acknowledged record {id} is missing"));

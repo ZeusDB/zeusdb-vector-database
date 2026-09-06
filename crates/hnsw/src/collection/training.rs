@@ -210,10 +210,9 @@ impl Collection {
         // `training_ids` after both, which is the order every reader that holds
         // them takes them in.
         let training_vectors = {
-            let id_map = self.id_map.read().unwrap();
+            let ids = self.ids.read().unwrap();
             let index = self.dense().index.read().unwrap();
             let vectors = RawVectors {
-                id_map: &id_map,
                 graph: index.graph(),
             };
             let training_ids = self.training_ids.read().unwrap();
@@ -234,7 +233,7 @@ impl Collection {
             let mut missing_vectors = 0;
 
             for id in training_ids.iter() {
-                if let Some(vector) = vectors.get(id.as_str()) {
+                if let Some(vector) = ids.slot_of(id).and_then(|slot| vectors.get(slot)) {
                     training_data.push(vector.to_vec());
                 } else {
                     missing_vectors += 1;
@@ -418,11 +417,10 @@ impl Collection {
         // of the same records wire the same graph, taken under the storage
         // guards and released before the graph is built.
         let (rows, encoded, clipped, released) = {
-            let id_map = self.id_map.read().unwrap();
+            let ids = self.ids.read().unwrap();
             let old_index = self.dense().index.read().unwrap();
             let old_hnsw = old_index.graph();
-            let mut live: Vec<usize> = id_map.values().copied().collect();
-            live.sort_unstable();
+            let live: Vec<usize> = ids.slots().collect();
 
             let mut rows: Vec<(Vec<i8>, usize)> = Vec::with_capacity(live.len());
             let mut encoded = 0usize;
@@ -549,26 +547,19 @@ impl Collection {
         // those stored codes exactly as `compact` does. Only an index with
         // neither raw vectors nor codes has nothing to rebuild from.
         let (vector_count, retained) = {
-            let id_map = self.id_map.read().unwrap();
+            let ids = self.ids.read().unwrap();
             let index = self.dense().index.read().unwrap();
             let hnsw = index.graph();
-            let vectors = RawVectors {
-                id_map: &id_map,
-                graph: hnsw,
-            };
+            let vectors = RawVectors { graph: hnsw };
 
             // Every live record that still has a raw vector, in internal id
-            // order. The order is fixed rather than a hash map's, because the
-            // codes are written back under it and a rebuild has to be a
-            // function of the data alone.
-            let mut live: Vec<(&String, usize)> = id_map
+            // order, which is the order the store walks in. The order is
+            // fixed rather than a hash map's, because the codes are written
+            // back under it and a rebuild has to be a function of the data
+            // alone.
+            let with_raw: Vec<(&str, &[f32])> = ids
                 .iter()
-                .map(|(id, &internal)| (id, internal))
-                .collect();
-            live.sort_unstable_by_key(|&(_, internal_id)| internal_id);
-            let with_raw: Vec<(&String, &[f32])> = live
-                .iter()
-                .filter_map(|&(id, internal_id)| {
+                .filter_map(|(internal_id, id)| {
                     hnsw.raw_vector(internal_id).map(|vector| (id, vector))
                 })
                 .collect();
@@ -609,12 +600,12 @@ impl Collection {
                 let mut pq_codes = self.dense().pq_codes.write().unwrap();
                 let retained = pq_codes
                     .keys()
-                    .filter(|id| !vectors.contains(id.as_str()))
+                    .filter(|id| !ids.slot_of(id).is_some_and(|slot| vectors.contains(slot)))
                     .count();
 
                 for (i, (id, _)) in with_raw.iter().enumerate() {
                     if i < quantized_codes.len() {
-                        pq_codes.insert((*id).clone(), quantized_codes[i].clone());
+                        pq_codes.insert(id.to_string(), quantized_codes[i].clone());
                     }
                 }
                 debug!(target: LOG_TARGET, operation = "quantization_rebuild",
@@ -630,14 +621,13 @@ impl Collection {
         // all, which keeps the storage guards free while the insertions run.
         // Copying costs one byte per subvector per record.
         let batch_data: Vec<(Vec<u8>, usize)> = {
-            let id_map = self.id_map.read().unwrap();
+            let ids = self.ids.read().unwrap();
             let pq_codes = self.dense().pq_codes.read().unwrap();
             pq_codes
                 .iter()
                 .filter_map(|(id, codes)| {
-                    id_map
-                        .get(id)
-                        .map(|&internal_id| (codes.clone(), internal_id))
+                    ids.slot_of(id)
+                        .map(|internal_id| (codes.clone(), internal_id))
                 })
                 .collect()
         };
