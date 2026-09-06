@@ -793,7 +793,7 @@ storage_mode_description: raw_only
 | `raw_vectors_memory_mb` | The raw vectors, which are held once |
 | `quantized_codes_memory_mb` | The codes, which grow with the record count |
 | `codebook_memory_mb`, `sdc_table_memory_mb`, `centroid_norm_memory_mb` | The trained tables, fixed by `dim`, `subvectors` and `bits` |
-| `index_bookkeeping_memory_mb` | The hash tables that find a record, the per-record metadata, the declared columns and the live sets |
+| `index_bookkeeping_memory_mb` | The id store that finds a record, the per-record metadata, the declared columns and the live sets |
 | `total_memory_mb` | The sum of the seven figures above, and of `sparse_memory_mb` and `dictionary_memory_mb` where the index declares a sparse space |
 | `quantization_type` | `pq`, or `none` on an unquantized index |
 | `raw_vectors_retained` | The storage mode's policy, `none_once_trained` or `all_records`. Quantized indexes only |

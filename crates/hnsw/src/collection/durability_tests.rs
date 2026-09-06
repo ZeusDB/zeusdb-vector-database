@@ -76,7 +76,11 @@ fn add(collection: &Collection, range: std::ops::Range<usize>) {
 }
 
 fn ids(collection: &Collection) -> Vec<String> {
-    let mut out: Vec<String> = collection.id_map().keys().cloned().collect();
+    let mut out: Vec<String> = collection
+        .ids()
+        .iter()
+        .map(|(_, id)| id.to_string())
+        .collect();
     out.sort();
     out
 }

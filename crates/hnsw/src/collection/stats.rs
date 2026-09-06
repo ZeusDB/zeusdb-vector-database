@@ -98,25 +98,15 @@ impl Collection {
             "the dense index's live set is the collection's"
         );
 
-        // The record count and, from the same guard, what the map itself
-        // occupies. Every `bookkeeping` term below is one structure's own
-        // storage, and none of them is the payload the five memory keys price.
-        // See `index_bookkeeping_memory_mb`.
+        // The record count and, from the same guard, what the id store
+        // occupies: the text of every id once, an entry per internal id, the
+        // forward table's buckets and tags, and the live set's words at one
+        // per sixty-four internal ids. Every `bookkeeping` term below is one
+        // structure's own storage, and none of them is the payload the five
+        // memory keys price. See `index_bookkeeping_memory_mb`.
         let (live, mut bookkeeping) = {
-            let id_map = self.id_map.read().unwrap();
-            (id_map.len(), table_bytes(&id_map) + key_text_bytes(&id_map))
-        };
-
-        // The reverse map holds a second copy of every id, as a value rather
-        // than as a key, so its text is counted again on purpose. Its live
-        // bitmap is priced from the same guard, at one word per sixty-four
-        // internal ids, being the first of the two bitmaps this sum used to
-        // leave out.
-        bookkeeping += {
-            let rev_map = self.rev_map.read().unwrap();
-            table_bytes(&rev_map)
-                + rev_map.values().map(|id| id.len()).sum::<usize>()
-                + rev_map.live_heap_bytes()
+            let ids = self.ids.read().unwrap();
+            (ids.len(), ids.heap_bytes())
         };
 
         // Nodes the graph holds, which exceeds the live record count by exactly the
@@ -697,43 +687,47 @@ impl Collection {
 
         // What the index spends on finding a record rather than on holding one.
         //
-        // Two hash tables and two copies of the id on an unquantized index,
-        // three of each on a quantized one, plus the metadata store, the
-        // declared columns, the training buffer, the index level metadata and
-        // the two live bitmaps. `id_map` holds the record's id as a key,
-        // `rev_map` holds it again as a value, and `pq_codes` holds it again
-        // as a key. A table is a power of two bucket array with one control
-        // byte per bucket, sized from the capacity the map reports, so it is
-        // between eight sevenths and sixteen sevenths of the entries it
-        // currently holds and it steps rather than growing smoothly. The `Vec`
-        // in `pq_codes` contributes only its 24 byte header here, since the
-        // bytes it points at are already priced above. The metadata store is
-        // indexed by internal id and holds no copy of the id: sixteen bytes an
-        // entry, and a forty byte field block behind a record that carries
-        // fields.
+        // The id store, plus the code map on a quantized index, the metadata
+        // store, the declared columns, the training buffer, the index level
+        // metadata and the dense index's live bitmap. The id store holds the
+        // text of every id once in one arena, an eight byte entry per internal
+        // id, a forward table of four byte buckets with a tag byte each, and
+        // the live set as bits. The table is a power of two of buckets sized as
+        // the standard map sizes its own, so it is between eight sevenths and
+        // sixteen sevenths of the records it holds and it steps rather than
+        // growing smoothly. `pq_codes` holds the id again as a key, in a
+        // 48 byte bucket, and the `Vec` in it contributes only its 24 byte
+        // header here, since the bytes it points at are already priced above.
+        // The metadata store is indexed by internal id and holds no copy of the
+        // id: sixteen bytes an entry, and a forty byte field block behind a
+        // record that carries fields.
         //
         // It is proportional to the record count and independent of the
         // dimension. Measured against a counting allocator on 100,000 records
-        // at `m` 16 with five character ids and no metadata, it reads 112.7
-        // bytes a record unquantized and 181.8 under `quantized_only`, where
-        // the difference is the third table and the third copy of the id. A
-        // record carrying two small metadata fields costs 82.5 bytes a record
-        // more, being one block of two forty byte fields and the text of the
-        // string value.
+        // at `m` 16 with five character ids and no metadata, it reads 36.6
+        // bytes a record unquantized and 105.7 under `quantized_only`, where
+        // the difference is the code map and its copy of the id. A record
+        // carrying two small metadata fields costs 82.5 bytes a record more,
+        // being one block of two forty byte fields and the text of the string
+        // value.
         //
-        // It steps with the tables' powers of two rather than holding still. At
-        // 100,000 records every table sits at 76 percent of its buckets, which
+        // It steps with the table's powers of two rather than holding still.
+        // At 100,000 records the table sits at 76 percent of its buckets, which
         // is near the cheapest point of the cycle; at 115,000 records the same
-        // structures read 176.9 bytes a record, because the tables have just
-        // doubled and sit at 44 percent. A figure quoted at one record count is
+        // structures read 41.9 bytes a record, because the table has just
+        // doubled and sits at 44 percent. A figure quoted at one record count is
         // a point on that sawtooth and not a rate.
         //
-        // Earlier versions of this comment read 197.3 bytes a record, and 265
-        // before that. The first counted a third table keyed by external id
-        // holding a `HashMap<String, Value>` per record, at 72 bytes a bucket
-        // and 244 bytes of inner table for a record with two fields, which the
-        // store indexed by internal id replaced. The second counted a
-        // `vectors` map as well, which the graph's own store replaced.
+        // Earlier versions of this comment read 112.7 bytes a record, 197.3
+        // before that, and 265 before that. The first counted two hash maps,
+        // one from the id to the internal id and one back, each with a 32 byte
+        // bucket and its own copy of the id's text in a heap block of its own,
+        // which the id store replaced. The second counted a third table keyed
+        // by external id holding a `HashMap<String, Value>` per record, at 72
+        // bytes a bucket and 244 bytes of inner table for a record with two
+        // fields, which the store indexed by internal id replaced. The third
+        // counted a `vectors` map as well, which the graph's own store
+        // replaced.
         //
         // This is a request count and not a commitment. The allocator's own
         // headers, its rounding and its fragmentation sit outside it, the same
@@ -890,7 +884,7 @@ impl Collection {
     ///
     /// `vectors=` is the live record count in every storage mode.
     pub fn info(&self) -> String {
-        let record_count = self.id_map.read().unwrap().len();
+        let record_count = self.ids.read().unwrap().len();
         // The name Python sees. The class is `HNSWIndex` there whatever the
         // engine type is called, and the README and the examples print this
         // line.

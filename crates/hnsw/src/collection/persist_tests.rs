@@ -80,10 +80,10 @@ fn term_id(collection: &Collection, term: &str) -> Option<u32> {
 
 /// Every live record's external id with its internal id, sorted.
 fn ids_of(collection: &Collection) -> Vec<(String, usize)> {
-    let map = collection.id_map();
-    let mut ids: Vec<(String, usize)> = map
+    let store = collection.ids();
+    let mut ids: Vec<(String, usize)> = store
         .iter()
-        .map(|(id, &internal)| (id.clone(), internal))
+        .map(|(internal, id)| (id.to_string(), internal))
         .collect();
     ids.sort();
     ids
@@ -698,7 +698,7 @@ fn the_raw_rebuild_fallback_keeps_every_internal_id_and_the_counter() {
             .total_errors,
         0
     );
-    assert_eq!(rebuilt.id_map().get("r900").copied(), Some(302));
+    assert_eq!(rebuilt.ids().slot_of("r900"), Some(302));
     let filter = compile_filter(&HashMap::from([("cat".to_string(), json!("b"))])).unwrap();
     assert_eq!(rebuilt.count(Some(&filter)), from_dump.count(Some(&filter)));
     let params = rebuilt.search_params(5, None, false, None).unwrap();

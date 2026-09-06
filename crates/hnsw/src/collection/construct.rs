@@ -8,7 +8,7 @@
 //! crate wrote and the loader holds it to the same rules on the way in.
 
 use super::{
-    Collection, DenseIndex, DenseSpace, Int8Scale, LiveRecords, NamedSpace, QuantizationConfig,
+    Collection, DenseIndex, DenseSpace, Int8Scale, NamedSpace, QuantizationConfig,
     QuantizationScheme, Space, SparseSpace, StorageMode, TextLayer, DEFAULT_SPACE, MAX_LAYER,
 };
 use crate::locks::{order, MutexAt, RwLockAt};
@@ -915,8 +915,7 @@ impl Collection {
                 ColumnStore::new(indexed_fields, expected_size),
             ),
             undeclared_filter_warned: AtomicBool::new(false),
-            id_map: RwLockAt::new(order::ID_MAP, HashMap::new()),
-            rev_map: RwLockAt::new(order::REV_MAP, LiveRecords::new()),
+            ids: RwLockAt::new(order::IDS, zeusdb_vector_core::IdStore::new(expected_size)),
             id_counter: MutexAt::new(order::ID_COUNTER, 0),
             generated_ids: MutexAt::new(order::GENERATED_IDS, 0),
             vector_count: MutexAt::new(order::VECTOR_COUNT, 0),

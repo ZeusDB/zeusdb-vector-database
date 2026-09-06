@@ -1301,20 +1301,17 @@ pub fn default_rerank_fetch(
     wanted.min(whole).min(live_records.max(top_k))
 }
 
-/// Where a raw vector is reached, now that there is no map of them.
+/// Where a raw vector is reached, by internal id.
 ///
-/// Two array reads and no hashing beyond the one `id_map` lookup every caller
-/// here was already doing: the external id gives the internal id, the graph
-/// turns that into a node index, and the store is addressed by node. It is a
-/// borrow of both rather than a copy of either, so a caller holds the two read
-/// guards it already held and passes this down.
-///
-/// The two are always taken `id_map` first and the graph second, which is the
-/// order every path in the crate takes them in.
+/// Two array reads and no hashing: the graph turns the internal id into a
+/// node index and the store is addressed by node. It used to take the
+/// external id and look it up in the forward map first. Every caller now
+/// holds the internal id, because the page carries it and the id store
+/// hands it out, so that lookup is gone from the read path. It is a borrow
+/// of the graph rather than a copy of anything, so a caller holds the read
+/// guard it already held and passes this down.
 #[derive(Clone, Copy)]
 pub struct RawVectors<'a> {
-    /// The external id to internal id map, which is the record set.
-    pub id_map: &'a HashMap<String, usize>,
     /// The graph, which owns the store the vectors live in.
     pub graph: &'a VectorGraph,
 }
@@ -1322,15 +1319,30 @@ pub struct RawVectors<'a> {
 impl RawVectors<'_> {
     /// One record's raw vector, or `None` where the index keeps none for it.
     #[inline]
-    pub fn get(&self, ext_id: &str) -> Option<&[f32]> {
-        self.graph.raw_vector(*self.id_map.get(ext_id)?)
+    pub fn get(&self, slot: usize) -> Option<&[f32]> {
+        self.graph.raw_vector(slot)
     }
 
     /// Whether the index keeps a raw vector for this record.
     #[inline]
-    pub fn contains(&self, ext_id: &str) -> bool {
-        self.get(ext_id).is_some()
+    pub fn contains(&self, slot: usize) -> bool {
+        self.get(slot).is_some()
     }
+}
+
+/// One record on a page: its internal id, and its external id borrowed
+/// from the id store for as long as the store's guard is held.
+///
+/// The internal id is what the metadata, the raw vectors and the scalar
+/// rows are addressed by, and the name is what the code map is keyed by,
+/// what a tie is broken on and what the caller receives. A page carries
+/// both so that nothing is looked up twice. The derived order compares the
+/// name first, and a name determines its slot, so two records order by
+/// name alone, which is the tie break an exact page and a fused list apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Named<'a> {
+    pub name: &'a str,
+    pub slot: usize,
 }
 
 /// Score one candidate against the query on the raw vector scale
@@ -1341,20 +1353,20 @@ impl RawVectors<'_> {
 /// them is still ordered by one distance.
 ///
 /// `None` means the candidate holds neither a raw vector nor codes, which no
-/// record resolving through `rev_map` can be. The callers sort such a candidate
+/// record the id store resolves can be. The callers sort such a candidate
 /// last rather than letting an unscored one displace a scored one.
 pub fn rescore_candidate(
     plan: &RerankPlan,
     query: &[f32],
-    ext_id: &str,
+    record: Named<'_>,
     vectors: RawVectors<'_>,
     pq: Option<&Arc<PQ>>,
     pq_codes: &HashMap<String, Vec<u8>>,
 ) -> Option<f32> {
-    if let Some(stored) = vectors.get(ext_id) {
+    if let Some(stored) = vectors.get(record.slot) {
         return Some((plan.distance)(query, stored));
     }
-    let reconstructed = pq?.reconstruct(pq_codes.get(ext_id)?).ok()?;
+    let reconstructed = pq?.reconstruct(pq_codes.get(record.name)?).ok()?;
     let reconstructed = prepare_reconstruction(plan.unit_reconstruction, reconstructed);
     Some((plan.distance)(query, &reconstructed))
 }
@@ -1970,19 +1982,25 @@ mod tests {
         let stored = data[7].clone();
         let codes = pq.quantize(&stored).unwrap();
 
-        // The raw vectors live in the graph now, so the fixture is a real one
+        // The raw vectors live in the graph, so the fixture is a real one
         // holding the one record that keeps its vector. "coded" has an internal
         // id and no node, which is the shape of a record a quantized_only index
-        // holds, and "absent" has no id at all.
-        let mut id_map: HashMap<String, usize> = HashMap::new();
-        id_map.insert("kept".to_string(), 1);
-        id_map.insert("coded".to_string(), 2);
+        // holds, and "absent" has an internal id nothing else knows.
+        let kept = Named {
+            name: "kept",
+            slot: 1,
+        };
+        let coded = Named {
+            name: "coded",
+            slot: 2,
+        };
+        let absent = Named {
+            name: "absent",
+            slot: 3,
+        };
         let mut graph = VectorGraph::new_raw("cosine", 8, 16, 4, 16, 64);
         graph.insert(&stored, 1);
-        let vectors = RawVectors {
-            id_map: &id_map,
-            graph: &graph,
-        };
+        let vectors = RawVectors { graph: &graph };
 
         let mut pq_codes: HashMap<String, Vec<u8>> = HashMap::new();
         pq_codes.insert("kept".to_string(), codes.clone());
@@ -1991,7 +2009,7 @@ mod tests {
         let p = plan(1);
 
         // The raw vector wins where there is one, so the score is exact.
-        let exact = rescore_candidate(&p, &query, "kept", vectors, Some(&pq), &pq_codes);
+        let exact = rescore_candidate(&p, &query, kept, vectors, Some(&pq), &pq_codes);
         assert_eq!(exact, Some(CosineDist {}.eval(&query, &stored)));
 
         // Codes alone still score, against the reconstruction, and under cosine
@@ -2001,7 +2019,7 @@ mod tests {
         // reconstruction returned a third quantity that was neither a cosine
         // distance nor a squared L2. See `prepare_reconstruction`.
         let approximate =
-            rescore_candidate(&p, &query, "coded", vectors, Some(&pq), &pq_codes).unwrap();
+            rescore_candidate(&p, &query, coded, vectors, Some(&pq), &pq_codes).unwrap();
         let reconstructed = pq.reconstruct(&codes).unwrap();
         let length: f32 = reconstructed.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(
@@ -2014,7 +2032,7 @@ mod tests {
 
         // Neither is unscoreable rather than silently zero, which is what keeps
         // an unscored candidate from displacing a scored one.
-        assert!(rescore_candidate(&p, &query, "absent", vectors, Some(&pq), &pq_codes).is_none());
-        assert!(rescore_candidate(&p, &query, "coded", vectors, None, &pq_codes).is_none());
+        assert!(rescore_candidate(&p, &query, absent, vectors, Some(&pq), &pq_codes).is_none());
+        assert!(rescore_candidate(&p, &query, coded, vectors, None, &pq_codes).is_none());
     }
 }

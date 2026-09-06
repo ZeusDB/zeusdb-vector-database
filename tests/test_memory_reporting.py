@@ -258,7 +258,10 @@ def _structure_floor_mb(index, records, dim):
     # two are different things.
     store = records * dim * 4 if int(stats["raw_vectors_stored"]) else 0
     graph_copy = records * element_bytes if quantized else 0
-    slabs = records * (2 * m + 1) * (4 + 4)
+    # A layer zero slab is `2m + 1` targets of four bytes each and no stored
+    # distance. It used to be priced at a target and a distance a slot,
+    # which the bookkeeping's margin covered until the id store shrank it.
+    slabs = records * (2 * m + 1) * 4
     return (store + graph_copy + slabs) / (1024 * 1024)
 
 
@@ -268,7 +271,7 @@ def test_the_reported_total_covers_what_the_structure_holds(storage_mode):
 
     A report that misses most of what an index holds is the defect the graph
     figure was added to fix, and this is where that is caught. Measured on this
-    fixture the report clears the floor by 1.23, 1.63 and 3.63 times across the
+    fixture the report clears the floor by 1.08, 1.32 and 3.64 times across the
     three storage modes, and the margin is the structure the floor does not
     enumerate, being the upper layer lists, the counters, the codebook, the
     centroid distance table and the bookkeeping.
@@ -364,8 +367,8 @@ def test_metadata_json_names_every_record_and_holds_an_empty_object_for_a_bare_o
 
 
 def test_the_bookkeeping_tracks_the_records_and_not_the_dimension():
-    """Two hash tables, two id copies and a metadata entry per record, and no
-    vector in any of them.
+    """One id store holding every id once, and a metadata entry per record,
+    and no vector in either of them.
 
     An eightfold dimension moves the raw vector store eightfold and must leave
     this figure where it was. Doubling the records doubles it, within the step

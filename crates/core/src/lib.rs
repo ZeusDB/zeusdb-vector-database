@@ -43,6 +43,7 @@ mod filter;
 mod frame;
 mod fusion;
 mod graph;
+mod ids;
 mod int8;
 mod journal;
 mod kill;
@@ -71,6 +72,7 @@ pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES, NB_LAYER_MAX};
 pub use graph::{
     restore_graph, restore_int8_graph, Distance, DumpBounds, GraphHit, Planned, Record, VectorGraph,
 };
+pub use ids::IdStore;
 pub use int8::Int8Codec;
 pub use journal::{
     encode_journal_header, encode_journal_record, read_journal, CommitMode, JournalContents,

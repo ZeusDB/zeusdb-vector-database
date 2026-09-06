@@ -281,9 +281,9 @@ impl Snapshot {
         collection.save(dir).unwrap();
         let path = std::path::Path::new(dir);
         let mut ids: Vec<(String, usize)> = collection
-            .id_map()
+            .ids()
             .iter()
-            .map(|(id, &internal)| (id.clone(), internal))
+            .map(|(internal, id)| (id.to_string(), internal))
             .collect();
         ids.sort();
         let views = collection
@@ -545,10 +545,7 @@ fn the_seam_hands_records_over_in_the_order_the_mutations_ran() {
             ..
         } = decode(i, *kind, payload, 4)
         {
-            assert_eq!(
-                collection.id_map().get(&id).copied(),
-                Some(internal_id as usize)
-            );
+            assert_eq!(collection.ids().slot_of(&id), Some(internal_id as usize));
             assert!(level < 16);
             let sparse = sparse.expect("a text record carries its counted terms");
             assert!(sparse.dims.windows(2).all(|w| w[0] < w[1]));
@@ -752,8 +749,8 @@ fn a_sink_that_refuses_leaves_the_collection_as_it_was() {
     // Detached, everything runs again and the next ids follow the counter.
     assert!(collection.detach_sink().is_some());
     add(&collection, vec![record(2, &vectors), record(3, &vectors)]);
-    assert_eq!(collection.id_map().get("r2").copied(), Some(3));
-    assert_eq!(collection.id_map().get("r3").copied(), Some(4));
+    assert_eq!(collection.ids().slot_of("r2"), Some(3));
+    assert_eq!(collection.ids().slot_of("r3"), Some(4));
 }
 
 /// A record whose journal payload would be above the ceiling is refused at
@@ -969,7 +966,7 @@ fn apply_refuses_a_record_that_does_not_belong_to_the_collection() {
     // And a record that does belong is applied, the id issued being the one
     // it names and the record installed at the level it names.
     collection.apply(insert(1, vec![0.5; 4], None)).unwrap();
-    assert_eq!(collection.id_map().get("r0").copied(), Some(1));
+    assert_eq!(collection.ids().slot_of("r0"), Some(1));
     assert_eq!(collection.id_counter(), 1);
     mismatch(insert(1, vec![0.5; 4], None), "already holds it");
 }

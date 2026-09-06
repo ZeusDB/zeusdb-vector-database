@@ -267,6 +267,30 @@ def test_a_forged_length_in_a_raw_artefact_is_refused(raw_index, tmp_path, name,
     assert_refused(path, tmp_path, naming=name)
 
 
+# The forward map, then a reverse map that is not its inverse. The loader
+# builds one id store from the forward map and holds the reverse map to being
+# the store's exact inverse, since the two were written from one structure.
+_TWO = varint(2) + wire_str("a") + varint(1) + wire_str("b") + varint(2)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _TWO + varint(2) + varint(1) + wire_str("a") + varint(2) + wire_str("c"),
+        _TWO + varint(1) + varint(1) + wire_str("a"),
+        varint(2) + wire_str("a") + varint(1) + wire_str("b") + varint(1) + varint(1) + varint(1) + wire_str("b"),
+    ],
+    ids=["reverse-names-another-id", "reverse-shorter", "two-names-one-internal-id"],
+)
+def test_a_mappings_file_whose_two_maps_disagree_is_refused(raw_index, tmp_path, payload):
+    """A mappings.bin whose reverse map is not the inverse of its forward map
+    describes two record sets, and the loader refuses it naming the file. The
+    two maps used to be installed as they were read, and such a file loaded
+    with `len` and `search` answering from different sets."""
+    path = forged(raw_index, tmp_path, "mappings.bin", write_bytes(payload))
+    assert_refused(path, tmp_path, naming="mappings.bin")
+
+
 @pytest.mark.parametrize(
     "name,payload",
     [

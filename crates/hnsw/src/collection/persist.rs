@@ -8,12 +8,9 @@
 //! choose. `save` and `load` are the two doors, and the binding calls both
 //! with the interpreter lock released.
 
-use super::{
-    Collection, DenseIndex, DenseOpen, LiveRecords, QuantizationConfig, StorageMode, MAX_LAYER,
-};
+use super::{Collection, DenseIndex, DenseOpen, QuantizationConfig, StorageMode, MAX_LAYER};
 use crate::journal::{Durability, JournalPolicy, Recovery};
 use crate::locks::ReadGuard;
-use crate::RawVectors;
 use crate::RerankCalibration;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -22,8 +19,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
-    ArtefactRecord, Bounds, Error, Inventory, MetadataStore, Persist, Restore, VectorGraph,
-    DUMP_FILENAME,
+    ArtefactRecord, Bounds, Error, IdStore, Inventory, MetadataStore, Persist, Restore,
+    VectorGraph, DUMP_FILENAME,
 };
 use zeusdb_vector_sparse::PostingsIndex;
 use zeusdb_vector_text::{TermDictionary, Tokenizer};
@@ -72,26 +69,24 @@ impl Collection {
     /// counter is checked against after a load. Crate private, since the
     /// only caller is the load path in `persistence`.
     pub(crate) fn count_stored_records(&self) -> usize {
-        let id_map = self.id_map.read().unwrap();
+        let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
         let pq_codes = self.dense().pq_codes.read().unwrap();
-        let raws = RawVectors {
-            id_map: &id_map,
-            graph: index.graph(),
+        let graph = index.graph();
+        let holds_raw = |id: &str| {
+            ids.slot_of(id)
+                .is_some_and(|slot| graph.raw_vector(slot).is_some())
         };
-        let with_raw = id_map
-            .keys()
-            .filter(|id| raws.contains(id.as_str()))
+        let with_raw = ids
+            .slots()
+            .filter(|&slot| graph.raw_vector(slot).is_some())
             .count();
-        let code_only = pq_codes
-            .keys()
-            .filter(|id| !raws.contains(id.as_str()))
-            .count();
+        let code_only = pq_codes.keys().filter(|id| !holds_raw(id)).count();
         // A scalar graph holds its rows and nothing else holds them, so a
         // record with a row is a record stored.
-        let with_row = id_map
-            .values()
-            .filter(|&&internal| index.graph().int8_row_of(internal).is_some())
+        let with_row = ids
+            .slots()
+            .filter(|&slot| graph.int8_row_of(slot).is_some())
             .count();
         with_raw + code_only + with_row
     }
@@ -103,12 +98,12 @@ impl Collection {
     /// a raw index writes no `vectors.bin` at all, since the graph dump already
     /// carries its store.
     pub(crate) fn collect_raw_vectors(&self) -> HashMap<String, Vec<f32>> {
-        let id_map = self.id_map.read().unwrap();
+        let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
-        let mut out = HashMap::with_capacity(id_map.len());
-        for (ext_id, &internal_id) in id_map.iter() {
+        let mut out = HashMap::with_capacity(ids.len());
+        for (internal_id, ext_id) in ids.iter() {
             if let Some(vector) = index.graph().raw_vector(internal_id) {
-                out.insert(ext_id.clone(), vector.to_vec());
+                out.insert(ext_id.to_string(), vector.to_vec());
             }
         }
         out
@@ -157,17 +152,17 @@ impl Collection {
     /// missing would rerank some records and not others.
     ///
     /// **A stranded node takes a zero vector.** Removal and overwrite leave the
-    /// node in the graph and take the record out of `id_map`, and the save
+    /// node in the graph and take the record out of the id store, and the save
     /// writes the live records alone, so the file names fewer records than the
     /// graph has nodes. The store is addressed by node, so those nodes need a
     /// slot; nothing can reach it, because every reader resolves an external id
-    /// through `id_map` first and a stranded node has none. `compact` drops the
+    /// through the id store first and a stranded node has none. `compact` drops the
     /// node and its slot together.
     pub(crate) fn restore_raw_store(
         &mut self,
         vectors: &HashMap<String, Vec<f32>>,
     ) -> Result<usize, String> {
-        let id_map = self.id_map.read().unwrap();
+        let ids = self.ids.read().unwrap();
         let mut index = self.dense().index.write().unwrap();
         let hnsw = index.graph_mut();
         if !hnsw.is_quantized() {
@@ -177,11 +172,10 @@ impl Collection {
         hnsw.open_raw_store(self.dense().dim, nodes)?;
         let mut by_internal: HashMap<usize, &Vec<f32>> = HashMap::with_capacity(vectors.len());
         for (ext_id, vector) in vectors {
-            if let Some(&internal_id) = id_map.get(ext_id) {
+            if let Some(internal_id) = ids.slot_of(ext_id) {
                 by_internal.insert(internal_id, vector);
             }
         }
-        let live: std::collections::HashSet<usize> = id_map.values().copied().collect();
         let stranded_fill = vec![0f32; self.dense().dim];
         let mut placed = 0usize;
         let mut stranded = 0usize;
@@ -192,7 +186,7 @@ impl Collection {
                     hnsw.push_raw_vector(vector)?;
                     placed += 1;
                 }
-                None if !live.contains(&internal_id) => {
+                None if !ids.contains_slot(internal_id) => {
                     hnsw.push_raw_vector(&stranded_fill)?;
                     stranded += 1;
                 }
@@ -608,7 +602,7 @@ impl Collection {
         // A save skips the graph dump entirely when the index holds nothing, so
         // any dump left in an empty index's directory belongs to an earlier
         // save and describes records this one no longer holds.
-        let live = self.id_map.read().unwrap().len();
+        let live = self.ids.read().unwrap().len();
         if live == 0 {
             return Err("the index holds no records".to_string());
         }
@@ -703,13 +697,13 @@ impl Collection {
         let mut batch: Vec<(&Vec<u8>, usize)> = Vec::with_capacity(pq_codes.len() + extra.len());
         let mut lost: Vec<(&String, &Vec<u8>)> = Vec::new();
         {
-            let id_map = self.id_map.read().unwrap();
+            let ids = self.ids.read().unwrap();
             for (id, codes) in pq_codes
                 .iter()
                 .chain(extra.iter().map(|(id, codes)| (id, codes)))
             {
-                match id_map.get(id) {
-                    Some(&internal_id) => batch.push((codes, internal_id)),
+                match ids.slot_of(id) {
+                    Some(internal_id) => batch.push((codes, internal_id)),
                     None => lost.push((id, codes)),
                 }
             }
@@ -718,11 +712,11 @@ impl Collection {
         lost.sort_by(|a, b| a.0.cmp(b.0));
         for (id, codes) in lost {
             let internal_id = self.get_next_id();
-            self.id_map.write().unwrap().insert(id.clone(), internal_id);
-            self.rev_map
+            self.ids
                 .write()
                 .unwrap()
-                .insert(internal_id, id.clone());
+                .insert(internal_id, id)
+                .map_err(|e| e.to_string())?;
             batch.push((codes, internal_id));
         }
 
@@ -805,13 +799,11 @@ impl Collection {
     /// the rows artefact, written straight into the frame's buffer so the
     /// rows are copied once. Zero on any graph that is not a scalar one.
     pub(crate) fn write_int8_rows(&self, out: &mut Vec<u8>) -> usize {
-        let id_map = self.id_map.read().unwrap();
+        let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
         let graph = index.graph();
-        let mut live: Vec<usize> = id_map.values().copied().collect();
-        live.sort_unstable();
         let mut written = 0usize;
-        for internal_id in live {
+        for internal_id in ids.slots() {
             let Some(row) = graph.int8_row_of(internal_id) else {
                 continue;
             };
@@ -836,17 +828,57 @@ impl Collection {
         self.dense().index.read().unwrap().set_saturated(values);
     }
 
-    /// Set ID mappings (for persistence loading only)
+    /// Build the id store from the two maps `mappings.bin` holds (for
+    /// persistence loading only).
+    ///
+    /// The forward map is what the store is built from, and the reverse map
+    /// is held to being its exact inverse, since the two were written from
+    /// one structure and a file whose two halves disagree describes two
+    /// record sets. The two maps used to be installed as they were read, so
+    /// such a file loaded and its two halves answered differently.
     pub(crate) fn set_id_mappings(
         &mut self,
         id_map: HashMap<String, usize>,
         rev_map: HashMap<usize, String>,
-    ) {
-        *self.id_map.write().unwrap() = id_map;
-        self.rev_map.write().unwrap().replace(rev_map);
+    ) -> Result<(), Error> {
+        let invalid = |detail: String| Error::ArtefactParseFailed {
+            name: "mappings.bin",
+            error: detail,
+        };
+        let mut store = IdStore::new(self.expected_size());
+        let highest = id_map.values().copied().max().unwrap_or(0);
+        store.reserve(id_map.len(), highest);
+        for (id, &internal_id) in &id_map {
+            store.insert(internal_id, id)?;
+        }
+        if store.len() != id_map.len() {
+            return Err(invalid(format!(
+                "the forward map names {} records under {} internal ids",
+                id_map.len(),
+                store.len()
+            )));
+        }
+        if rev_map.len() != id_map.len() {
+            return Err(invalid(format!(
+                "the forward map holds {} records and the reverse map {}",
+                id_map.len(),
+                rev_map.len()
+            )));
+        }
+        if let Some((internal_id, id)) = rev_map
+            .iter()
+            .find(|(&internal_id, id)| store.name(internal_id) != Some(id.as_str()))
+        {
+            return Err(invalid(format!(
+                "the reverse map names internal id {} as '{}' and the forward map does not",
+                internal_id, id
+            )));
+        }
+        *self.ids.write().unwrap() = store;
         // The dense index's live set is the mappings' key set, so a rebuild
         // that replays every record removes ids the index holds.
         self.sync_dense_live();
+        Ok(())
     }
 
     /// Set counters (for persistence loading only)
@@ -867,7 +899,7 @@ impl Collection {
     /// Replace the stored record data with what was read from disk
     ///
     /// For persistence loading only, and only after the graph is back, because
-    /// the columns are built over `id_map` and either rebuild fallback may add
+    /// the columns are built over the id store and either rebuild fallback may add
     /// an id for a record the mappings did not name. Writing the two maps back
     /// and building the columns from them leaves the loaded index holding
     /// exactly what was saved.
@@ -881,28 +913,28 @@ impl Collection {
         self.rebuild_columns();
     }
 
-    /// Place every record's metadata under the internal id `id_map` holds
-    /// for it.
+    /// Place every record's metadata under the internal id the id store
+    /// holds for it.
     ///
     /// `metadata.json` is keyed by external id and the store is indexed by
-    /// internal id, so each entry is resolved through `id_map`, which the
+    /// internal id, so each entry is resolved through the id store, which the
     /// mappings and either graph rebuild have filled by now. An entry naming
     /// an id the mappings do not hold has no slot to go in and is dropped,
     /// counted in the log. No reader could reach such an entry by id, since
-    /// every one resolved a record through `id_map` first; a filtered
+    /// every one resolved a record through the id store first; a filtered
     /// `count` on an undeclared field used to count it, and counts it no
     /// longer.
     ///
-    /// The guards are taken in the declared order, `id_map` then
+    /// The guards are taken in the declared order, the id store then
     /// `vector_metadata`.
     fn restore_metadata(&mut self, metadata: HashMap<String, HashMap<String, Value>>) {
-        let id_map = self.id_map.read().unwrap();
+        let ids = self.ids.read().unwrap();
         let mut store = self.vector_metadata.write().unwrap();
         store.clear(self.expected_size());
         let mut unmapped = 0usize;
         for (ext_id, fields) in metadata {
-            match id_map.get(&ext_id) {
-                Some(&internal_id) => store.insert(internal_id, fields),
+            match ids.slot_of(&ext_id) {
+                Some(internal_id) => store.insert(internal_id, fields),
                 None => unmapped += 1,
             }
         }
@@ -924,18 +956,18 @@ impl Collection {
     /// written before the declaration existed simply loads with no columns.
     ///
     /// Runs after the graph is restored and after `restore_storage_maps` has
-    /// written the metadata back, so `id_map` holds the internal id every
+    /// written the metadata back, so the id store holds the internal id every
     /// column entry is addressed by. It is a no-op on an index that declared
     /// nothing, which is every directory saved before this existed.
     /// It clears before it writes, so this is the one authority on what the
     /// columns hold rather than a second writer over an earlier one's
     /// leftovers.
     ///
-    /// The guards are taken in the declared order, `id_map` then
+    /// The guards are taken in the declared order, the id store then
     /// `vector_metadata` then `columns`, even though the loader holds `&mut
     /// self` and nothing else can be running.
     fn rebuild_columns(&mut self) {
-        let id_map = self.id_map.read().unwrap();
+        let ids = self.ids.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
         let mut columns = self.columns.write().unwrap();
         if !columns.is_declared() {
@@ -943,15 +975,15 @@ impl Collection {
         }
         columns.clear(self.expected_size());
         let empty: HashMap<String, Value> = HashMap::new();
-        for &internal_id in id_map.values() {
+        for internal_id in ids.slots() {
             match vector_metadata.get(internal_id) {
                 Some(fields) => columns.write(internal_id, &fields),
                 None => columns.write(internal_id, &empty),
             }
         }
         debug_assert!(
-            columns.tracks(id_map.len()),
-            "the rebuild writes one column entry per record in id_map"
+            columns.tracks(ids.len()),
+            "the rebuild writes one column entry per record in the id store"
         );
     }
 
@@ -1020,7 +1052,7 @@ impl Collection {
         let mut mapped: Vec<(usize, Vec<f32>)> = Vec::with_capacity(records.len());
         let mut unmapped: Vec<(String, Vec<f32>)> = Vec::new();
         {
-            let id_map = self.id_map.read().unwrap();
+            let ids = self.ids.read().unwrap();
             for (id, vector) in records {
                 if vector.len() != self.dense().dim {
                     return Err(Error::RebuildRefusedDimension {
@@ -1041,8 +1073,8 @@ impl Collection {
                     });
                 }
                 let vector = self.process_vector_for_space(vector);
-                match id_map.get(&id) {
-                    Some(&internal_id) => mapped.push((internal_id, vector)),
+                match ids.slot_of(&id) {
+                    Some(internal_id) => mapped.push((internal_id, vector)),
                     None => unmapped.push((id, vector)),
                 }
             }
@@ -1057,8 +1089,7 @@ impl Collection {
         unmapped.sort_by(|a, b| a.0.cmp(&b.0));
         for (id, vector) in unmapped {
             let internal_id = self.get_next_id();
-            self.id_map.write().unwrap().insert(id.clone(), internal_id);
-            self.rev_map.write().unwrap().insert(internal_id, id);
+            self.ids.write().unwrap().insert(internal_id, &id)?;
             mapped.push((internal_id, vector));
         }
         mapped.sort_by_key(|&(internal_id, _)| internal_id);
@@ -1160,15 +1191,10 @@ impl Collection {
         self.vector_metadata.read().unwrap()
     }
 
-    /// Get read access to the ID map (external ID -> internal ID)
-    pub(crate) fn id_map(&self) -> ReadGuard<'_, HashMap<String, usize>> {
-        self.id_map.read().unwrap()
-    }
-
-    /// Get read access to the reverse ID map (internal ID -> external ID),
-    /// with the live set beside it
-    pub(crate) fn rev_map(&self) -> ReadGuard<'_, LiveRecords> {
-        self.rev_map.read().unwrap()
+    /// Get read access to the id store, being every record's external id
+    /// with its internal id and the live set beside them
+    pub(crate) fn ids(&self) -> ReadGuard<'_, IdStore> {
+        self.ids.read().unwrap()
     }
 
     /// Get reference to the quantization configuration

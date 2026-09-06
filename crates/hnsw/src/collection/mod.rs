@@ -4,7 +4,8 @@
 //! # The two structs
 //!
 //! [`Collection`] is the record set and everything addressed by a record: the
-//! two id maps and the live set, the metadata and its columns, the counters,
+//! id store holding every record's id once with the live set, the metadata
+//! and its columns, the counters,
 //! the training buffer, the timestamps, the mutation lock and the warning
 //! flags. A [`Space`] is one vector space over those records. The dense one,
 //! [`DenseSpace`], holds the graph behind its guard as a [`DenseIndex`], the
@@ -32,7 +33,7 @@
 //!
 //! # What lives here and what does not
 //!
-//! This file holds the two structs, the live record set, the quantization
+//! This file holds the two structs, the quantization
 //! configuration and the operations that are a read of one or two guards. The
 //! rest is in a child module, and a child can read the private fields because
 //! it is a descendant of this one.
@@ -124,7 +125,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::{trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, Bitmap, ColumnStore, Error, Filter, Int8Codec, MetadataStore, Operation,
+    matches_filter, ColumnStore, Error, Filter, IdStore, Int8Codec, MetadataStore, Operation,
     OperationKind, Persist, Selection, SpaceName, SparseVector, VectorGraph, VectorIndex, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
@@ -504,126 +505,6 @@ pub struct RecordView {
 }
 
 // ============================================================================
-// THE LIVE RECORD SET
-// ============================================================================
-
-/// The internal id of every live record, resolved to its external id, and the
-/// same set of ids as a bitmap.
-///
-/// **The bitmap is what an unfiltered search runs under.** The traversal asks
-/// its predicate once for every six to eight distance evaluations, and the
-/// predicate used to be `HashMap::contains_key` on the reverse map, which at
-/// 50,000 records cost 46 of a 179 microsecond search on SIFT and 41 of 189 on
-/// GloVe. A bit test costs nothing the traversal can distinguish from no
-/// predicate at all. The page cannot move, because the bitmap holds exactly
-/// the set of keys the map holds: every write to one is a write to the other,
-/// through the four methods below, and there is no `DerefMut`.
-///
-/// Reads go through `Deref` to the map, so every path that resolved a node
-/// through `rev_map.get` still does.
-///
-/// A slot is an internal id, and internal ids are never reused, so the bitmap
-/// grows with the id counter rather than with the live count. That is one bit
-/// per id ever issued, being a third of a byte a record beside the sixty-odd
-/// the tables hold, and `index_bookkeeping_memory_mb` counts it. It used to
-/// leave it out on the grounds that the figure should be unchanged by the set,
-/// which made the figure a sum with a term missing from it.
-pub(crate) struct LiveRecords {
-    by_internal: HashMap<usize, String>,
-    live: Bitmap,
-}
-
-impl LiveRecords {
-    fn new() -> Self {
-        LiveRecords {
-            by_internal: HashMap::new(),
-            live: Bitmap::default(),
-        }
-    }
-
-    /// Record that `internal` resolves to `external`.
-    pub(crate) fn insert(&mut self, internal: usize, external: String) {
-        self.by_internal.insert(internal, external);
-        self.live.insert(internal);
-    }
-
-    /// Forget `internal`, returning the external id it resolved to.
-    pub(crate) fn remove(&mut self, internal: usize) -> Option<String> {
-        self.live.remove(internal);
-        self.by_internal.remove(&internal)
-    }
-
-    /// Forget every record.
-    pub(crate) fn clear(&mut self) {
-        self.by_internal.clear();
-        self.live.clear();
-    }
-
-    /// Replace the whole set with a map read back from disk.
-    pub(crate) fn replace(&mut self, by_internal: HashMap<usize, String>) {
-        let mut live = Bitmap::default();
-        for &internal in by_internal.keys() {
-            live.insert(internal);
-        }
-        self.by_internal = by_internal;
-        self.live = live;
-    }
-
-    /// The set as bits.
-    ///
-    /// The traversal used to run under this bitmap. It runs under the dense
-    /// index's own live set now, which is maintained on the same writes, and
-    /// this one is what that set is checked against on a debug build; see
-    /// [`Collection::live_sets_agree`].
-    #[cfg(test)]
-    pub(crate) fn live(&self) -> &Bitmap {
-        &self.live
-    }
-
-    /// Whether `other` admits every live record, by a word walk of the
-    /// intersection against the live count. What decides that a filter's
-    /// bitmap is no filter at all; see `Collection::admit_plan`.
-    pub(crate) fn admits_every_live(&self, other: &Bitmap) -> bool {
-        other.count_and(&self.live) == self.by_internal.len()
-    }
-
-    /// Whether `other` holds exactly the ids this set holds.
-    pub(crate) fn agrees_with(&self, other: &Bitmap) -> bool {
-        if self.live.count() != other.count() {
-            return false;
-        }
-        let mut agrees = true;
-        self.live.for_each_while(|slot| {
-            agrees = other.contains(slot);
-            agrees
-        });
-        agrees
-    }
-
-    /// The map itself, for the saver, which writes it whole.
-    pub(crate) fn map(&self) -> &HashMap<usize, String> {
-        &self.by_internal
-    }
-
-    /// Bytes the set's bitmap asks the allocator for, for `Collection::stats`.
-    ///
-    /// One word per sixty-four internal ids, which is a third of a byte a
-    /// record. Small, and the report is a sum, so a structure left out of it
-    /// makes the sum wrong by however little it holds.
-    pub(crate) fn live_heap_bytes(&self) -> usize {
-        self.live.heap_bytes()
-    }
-}
-
-impl std::ops::Deref for LiveRecords {
-    type Target = HashMap<usize, String>;
-    #[inline]
-    fn deref(&self) -> &HashMap<usize, String> {
-        &self.by_internal
-    }
-}
-
-// ============================================================================
 // THE SPACES
 // ============================================================================
 
@@ -760,7 +641,7 @@ pub(crate) struct DenseSpace {
     /// used to hold a second, in a `HashMap<String, Vec<f32>>` keyed by
     /// external id, written from the same local on the same insertion as the
     /// graph's. That map is gone. A raw vector is reached by
-    /// `id_map[ext] -> VectorGraph::raw_vector`, which is one hash lookup the
+    /// `IdStore::slot_of(ext) -> VectorGraph::raw_vector`, which is one hash lookup the
     /// caller was already making and then two array reads.
     ///
     /// Which store holds the raws depends on the graph. On a raw graph they
@@ -999,15 +880,15 @@ pub(crate) struct TextLayer {
 /// order, top to bottom. Releasing may happen in any order.
 ///
 /// ```text
-/// id_map < rev_map < [space 0 index < space 0 codes < space 1 index < ...]
-///        < vector_metadata < columns < training_ids < metadata
-///        < id_counter < vector_count
+/// ids < [space 0 index < space 0 codes < space 1 index < ...]
+///     < vector_metadata < columns < training_ids < metadata
+///     < id_counter < vector_count
 /// ```
 ///
 /// `hnsw` and `pq_codes` in the prose elsewhere are the first space's index
 /// and codes guards, which sit where they always did. A second space's guards
 /// sit after them, so a search over two spaces takes both between the
-/// reverse map and the metadata, in declaration order.
+/// id store and the metadata, in declaration order.
 ///
 /// **This order is checked rather than believed.** Every lock below, and every
 /// lock on a space, is a [`RwLockAt`] or a [`MutexAt`] given its rank at
@@ -1026,9 +907,9 @@ pub(crate) struct TextLayer {
 /// relaxed, PyO3's exclusive borrow kept every mutating method away from every
 /// search, so no reader and no writer were ever in flight together and the
 /// acquisition order could not matter. It matters now. A search holds
-/// `rev_map` for its whole traversal and reads the graph under it, so a removal
-/// taking the graph before `rev_map`, which is what it used to do, deadlocks
-/// against it on the first interleaving that lands.
+/// the id store for its whole traversal and reads the graph under it, so a
+/// removal taking the graph before the id store, which is what it used to do,
+/// deadlocks against it on the first interleaving that lands.
 ///
 /// `vectors` used to sit between `hnsw` and `pq_codes` here. The lock went with
 /// the field when the raw vectors moved into the graph's own store, which the
@@ -1115,10 +996,18 @@ pub struct Collection {
     /// declaration asked for.
     undeclared_filter_warned: AtomicBool,
 
-    id_map: RwLockAt<HashMap<String, usize>>,
-    /// Internal id to external id, and the live set as bits. See
-    /// [`LiveRecords`].
-    rev_map: RwLockAt<LiveRecords>,
+    /// Every record's external id, held once, with the internal id it
+    /// resolves to and the live set as bits. The record set: every
+    /// insertion path writes it, removal keys on it, and `len`, `contains`,
+    /// `list` and `count` all read it. See [`IdStore`].
+    ///
+    /// **The live set is what a filtered search checks its selection
+    /// against.** The dense index keeps its own copy, maintained on the same
+    /// writes, and the traversal runs under that one; this one is what a
+    /// debug build checks it against, see [`Collection::live_sets_agree`].
+    /// It used to be two maps under two guards, one from the id to the
+    /// internal id and one back, each holding its own copy of the text.
+    ids: RwLockAt<IdStore>,
 
     // Mutex for write-only fields
     id_counter: MutexAt<usize>,
@@ -1240,22 +1129,22 @@ impl Collection {
     /// write keeps true and a debug build checks at the points where the
     /// two are read together.
     ///
-    /// Taken in the declared order, `rev_map` then the index.
+    /// Taken in the declared order, the id store then the index.
     pub(crate) fn live_sets_agree(&self) -> bool {
-        let rev_map = self.rev_map.read().unwrap();
+        let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
-        rev_map.agrees_with(index.live_set()) && rev_map.len() == index.len()
+        ids.agrees_with(index.live_set()) && ids.len() == index.len()
     }
 
-    /// Bring the dense index's live set into step with `id_map`, which the
-    /// loader does after it restores the mappings or replaces the graph.
+    /// Bring the dense index's live set into step with the id store, which
+    /// the loader does after it restores the mappings or replaces the graph.
     ///
-    /// Taken in the declared order, `id_map` then the index, even though the
-    /// loader holds `&mut self` and nothing else can be running.
+    /// Taken in the declared order, the id store then the index, even though
+    /// the loader holds `&mut self` and nothing else can be running.
     pub(crate) fn sync_dense_live(&self) {
-        let id_map = self.id_map.read().unwrap();
+        let ids = self.ids.read().unwrap();
         let mut index = self.dense().index.write().unwrap();
-        index.set_live(id_map.values().copied());
+        index.set_live(ids.slots());
     }
 
     /// The sparse space, where one was declared.
@@ -1664,11 +1553,11 @@ impl Collection {
 
     /// The number of live records, which is `len(index)`.
     ///
-    /// Reads `id_map`, which is the record set: every insertion path writes it,
-    /// removal keys on it, and `contains`, `list` and `count` all read the same
-    /// map, so none of them can disagree with this.
+    /// Reads the id store, which is the record set: every insertion path
+    /// writes it, removal keys on it, and `contains`, `list` and `count` all
+    /// read the same store, so none of them can disagree with this.
     pub fn len(&self) -> usize {
-        self.id_map.read().unwrap().len()
+        self.ids.read().unwrap().len()
     }
 
     /// Whether the index holds no live record.
@@ -1678,15 +1567,15 @@ impl Collection {
 
     /// Whether a record with this id is in the index
     ///
-    /// Reads `id_map`, which is the record set. Every insertion path writes it,
-    /// `remove_point_internal` keys its removal on it, `add(overwrite=True)`
-    /// keys its collision test on it, and `compact` rebuilds the graph from it.
-    /// It used to read `vectors`, which under `quantized_only` holds only the
-    /// records collected before training, so this returned `false` for a record
-    /// that search returned and `remove_point` removed.
+    /// Reads the id store, which is the record set. Every insertion path
+    /// writes it, `remove_point_internal` keys its removal on it,
+    /// `add(overwrite=True)` keys its collision test on it, and `compact`
+    /// rebuilds the graph from it. It used to read `vectors`, which under
+    /// `quantized_only` holds only the records collected before training, so
+    /// this returned `false` for a record that search returned and
+    /// `remove_point` removed.
     pub fn contains(&self, id: &str) -> bool {
-        let id_map = self.id_map.read().unwrap();
-        id_map.contains_key(id)
+        self.ids.read().unwrap().contains_name(id)
     }
 
     /// Live records matching a filter, or every live record when none is given.
@@ -1705,10 +1594,10 @@ impl Collection {
     /// filter at all.
     pub fn count(&self, filter: Option<&Filter>) -> usize {
         let Some(conditions) = filter else {
-            return self.id_map.read().unwrap().len();
+            return self.ids.read().unwrap().len();
         };
         if conditions.matches_every_record() {
-            return self.id_map.read().unwrap().len();
+            return self.ids.read().unwrap().len();
         }
 
         // The columns answer this outright where every field is declared,
@@ -1781,32 +1670,31 @@ impl Collection {
         let mut records = Vec::with_capacity(ids.len());
         let mut absent: Vec<String> = Vec::new();
 
-        // Use read locks for concurrent access. `id_map` is the record set,
-        // and the graph is where the raw vectors live, so both are taken here
-        // and in that order.
-        let id_map = self.id_map.read().unwrap();
+        // Use read locks for concurrent access. The id store is the record
+        // set, and the graph is where the raw vectors live, so both are taken
+        // here and in that order.
+        let store = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
         let pq_codes = self.dense().pq_codes.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
         let raws = crate::RawVectors {
-            id_map: &id_map,
             graph: index.graph(),
         };
 
         for id in ids {
-            // Check if this ID exists in either storage
-            let exists = id_map.contains_key(&id) || pq_codes.contains_key(&id);
+            // The internal id, and whether the record exists in either storage
+            let slot = store.slot_of(&id);
+            let exists = slot.is_some() || pq_codes.contains_key(&id);
 
             if exists {
-                let metadata = id_map
-                    .get(&id)
-                    .and_then(|&slot| vector_metadata.get(slot))
+                let metadata = slot
+                    .and_then(|slot| vector_metadata.get(slot))
                     .map(|fields| fields.to_map())
                     .unwrap_or_default();
 
                 let vector = if return_vector {
                     // Priority: raw vector > PQ reconstruction
-                    if let Some(raw_vector) = raws.get(&id) {
+                    if let Some(raw_vector) = slot.and_then(|slot| raws.get(slot)) {
                         // Case 1: Raw vector available (QuantizedWithRaw mode or non-quantized)
                         Some(raw_vector.to_vec())
                     } else if let (Some(pq), Some(codes)) = (&self.dense().pq, pq_codes.get(&id)) {
@@ -1821,9 +1709,7 @@ impl Collection {
                     } else {
                         // Case 3: a scalar row, decoded through the scales,
                         // and nothing where the record holds no vector data
-                        id_map
-                            .get(&id)
-                            .and_then(|&slot| index.graph().int8_reconstruct(slot))
+                        slot.and_then(|slot| index.graph().int8_reconstruct(slot))
                     }
                 } else {
                     None
@@ -1870,7 +1756,7 @@ impl Collection {
         offset: usize,
         after: Option<&str>,
     ) -> Result<Listing, Error> {
-        let id_map = self.id_map.read().unwrap();
+        let ids = self.ids.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
 
         let cursor = match after {
@@ -1882,7 +1768,7 @@ impl Collection {
                         offset,
                     });
                 }
-                let Some(&internal) = id_map.get(id) else {
+                let Some(internal) = ids.slot_of(id) else {
                     return Err(Error::ListCursorMissing {
                         after: id.to_string(),
                     });
@@ -1891,30 +1777,22 @@ impl Collection {
             }
         };
 
-        // Only the records up to the end of the requested page need ordering, so
-        // the tail is partitioned away in linear time and the sort runs over the
-        // prefix. Paging a large index reads small pages many times, and sorting
-        // the whole record set on each of them would be the dominant cost.
-        let mut ordered: Vec<(usize, &String)> = id_map
+        // The store walks in increasing internal id order, which is the
+        // order the page is in, so the page is a window on that walk. It
+        // used to be collected out of a hash map, partitioned at the end of
+        // the page and sorted, and the page is the same either way.
+        let mut results = Vec::with_capacity(number.min(ids.len()));
+        for (internal, id) in ids
             .iter()
-            .map(|(id, &internal)| (internal, id))
             .filter(|&(internal, _)| cursor.is_none_or(|from| internal > from))
-            .collect();
-        let end = offset.saturating_add(number).min(ordered.len());
-        if end < ordered.len() {
-            ordered.select_nth_unstable_by_key(end, |&(internal, _)| internal);
-        }
-        let window = &mut ordered[..end];
-        window.sort_unstable_by_key(|&(internal, _)| internal);
-
-        let page = window.get(offset.min(end)..).unwrap_or(&[]);
-        let mut results = Vec::with_capacity(page.len());
-        for &(internal, id) in page.iter() {
+            .skip(offset)
+            .take(number)
+        {
             let metadata = vector_metadata
                 .get(internal)
                 .map(|fields| fields.to_map())
                 .unwrap_or_default();
-            results.push((id.clone(), metadata));
+            results.push((id.to_string(), metadata));
         }
         Ok(results)
     }
@@ -1983,8 +1861,6 @@ impl Collection {
 #[cfg(test)]
 mod tests {
     use super::construct::MAX_DIM;
-    use super::LiveRecords;
-    use std::collections::HashMap;
     use zeusdb_vector_core::JOURNAL_MAX_PAYLOAD;
 
     /// The journal's payload ceiling is derived from this crate's ceilings,
@@ -1998,43 +1874,5 @@ mod tests {
             JOURNAL_MAX_PAYLOAD,
             MAX_DIM * most_centroids * 4 + (1 << 20)
         );
-    }
-
-    /// The bitmap admits exactly the ids the map holds, after every kind of
-    /// write, which is what makes the unfiltered traversal's page the same
-    /// page it was under `contains_key`.
-    #[test]
-    fn the_live_set_agrees_with_the_map_through_every_write() {
-        let agrees = |records: &LiveRecords| {
-            (0..256).all(|id| records.live().contains(id) == records.contains_key(&id))
-        };
-        let mut records = LiveRecords::new();
-        assert!(agrees(&records));
-
-        // Across a word boundary, since the words grow on demand.
-        for id in [1usize, 2, 3, 64, 65, 130] {
-            records.insert(id, format!("r{id}"));
-        }
-        assert!(agrees(&records));
-        assert_eq!(records.live().count(), 6);
-        assert_eq!(records.get(&130).map(String::as_str), Some("r130"));
-
-        assert_eq!(records.remove(64), Some("r64".to_string()));
-        assert_eq!(records.remove(64), None);
-        assert!(agrees(&records));
-        assert!(!records.live().contains(64));
-
-        let mut saved = HashMap::new();
-        saved.insert(7usize, "a".to_string());
-        saved.insert(190usize, "b".to_string());
-        records.replace(saved);
-        assert!(agrees(&records));
-        assert_eq!(records.live().count(), 2);
-        assert_eq!(records.map().len(), 2);
-
-        records.clear();
-        assert!(agrees(&records));
-        assert_eq!(records.live().count(), 0);
-        assert!(records.is_empty());
     }
 }

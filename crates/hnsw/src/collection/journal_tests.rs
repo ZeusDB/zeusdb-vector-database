@@ -87,9 +87,9 @@ fn rewrite_manifest(dir: &std::path::Path, edit: impl FnOnce(&mut Value)) {
 /// Every id the collection holds, in order, with its internal id.
 fn ids(collection: &Collection) -> Vec<(String, usize)> {
     let mut out: Vec<(String, usize)> = collection
-        .id_map()
+        .ids()
         .iter()
-        .map(|(id, internal)| (id.clone(), *internal))
+        .map(|(internal, id)| (id.to_string(), internal))
         .collect();
     out.sort();
     out

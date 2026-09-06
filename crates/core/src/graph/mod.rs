@@ -186,12 +186,12 @@ fn assert_unit_for_cosine(_vector: &[f32], _site: &str) {
 ///
 /// The vendored `Neighbour` carries a third field, `p_id`, which locates the
 /// point inside the layer structure. No ZeusDB caller reads it. Every search
-/// path takes the origin id, resolves it through `rev_map`, and takes the
+/// path takes the origin id, resolves it through the id store, and takes the
 /// distance as the score when no rerank is in play, so those two fields are
 /// what the seam carries and nothing else.
 #[derive(Debug, Clone, Copy)]
 pub struct GraphHit {
-    /// The id the record was inserted under, which `rev_map` resolves.
+    /// The id the record was inserted under, which the id store resolves.
     pub internal_id: usize,
     /// Distance from the query on whatever scale the graph was built with.
     pub distance: f32,
@@ -844,7 +844,7 @@ impl VectorGraph {
         }
     }
 
-    /// One record's raw vector, by the internal id `id_map` hands out.
+    /// One record's raw vector, by the internal id the collection hands out.
     ///
     /// This is the whole of what replaced the raw vector map. It is two array
     /// reads, being the id to node inverse and then the store, and no hashing
@@ -865,7 +865,7 @@ impl VectorGraph {
         }
     }
 
-    /// One record's quantized codes, by the internal id `id_map` hands out.
+    /// One record's quantized codes, by the internal id the collection hands out.
     ///
     /// The store a quantized graph scores against holds one code per node, so
     /// this is the same two array reads `raw_vector` makes on a raw graph.
@@ -885,7 +885,7 @@ impl VectorGraph {
         }
     }
 
-    /// One record's stored row, by the internal id `id_map` hands out, being
+    /// One record's stored row, by the internal id the collection hands out, being
     /// its scalar codes and, on a cosine graph, the four bytes of its inverse
     /// norm after them. What a rebuild re-inserts without re-encoding.
     ///
@@ -901,7 +901,7 @@ impl VectorGraph {
     }
 
     /// One record's scalar codes alone, one a value, by the internal id
-    /// `id_map` hands out. `None` on every other graph, and for any id this
+    /// the collection hands out. `None` on every other graph, and for any id this
     /// graph never took.
     pub fn int8_codes_of(&self, internal_id: usize) -> Option<&[i8]> {
         match self {

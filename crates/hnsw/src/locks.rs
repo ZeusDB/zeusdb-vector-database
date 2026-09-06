@@ -77,10 +77,10 @@ use std::sync::{LockResult, Mutex, PoisonError, RwLock};
 /// The prose order is
 ///
 /// ```text
-/// id_map < rev_map < [each space's index guard, then its codes guard,
-///                     in the order the spaces were declared]
-///        < vector_metadata < columns < training_ids < metadata
-///        < id_counter < vector_count
+/// ids < [each space's index guard, then its codes guard,
+///        in the order the spaces were declared]
+///     < vector_metadata < columns < training_ids < metadata
+///     < id_counter < vector_count
 /// ```
 ///
 /// `writers` sits above all of them because the mutating Python entry points
@@ -106,13 +106,15 @@ use std::sync::{LockResult, Mutex, PoisonError, RwLock};
 pub mod order {
     /// The mutation lock, taken by a Python entry point before any guard.
     pub const WRITERS: u8 = 0;
-    pub const ID_MAP: u8 = 1;
-    pub const REV_MAP: u8 = 2;
+    /// The id store, being the record set and the live set. It used to be
+    /// two ranks, the forward map and the reverse map, and a search took
+    /// both; the store is one structure and one guard.
+    pub const IDS: u8 = 1;
 
     /// Spaces a collection may hold. Each takes two ranks in the block below
     /// and two among the leaves.
     pub const MAX_SPACES: usize = 4;
-    const SPACE_BASE: u8 = 3;
+    const SPACE_BASE: u8 = 2;
     const SPACE_STRIDE: u8 = 2;
 
     /// The guard over a space's index, being the graph of a dense space and
@@ -218,8 +220,7 @@ pub mod order {
 fn name_of(rank: u8) -> String {
     let fixed = match rank {
         order::WRITERS => Some("writers"),
-        order::ID_MAP => Some("id_map"),
-        order::REV_MAP => Some("rev_map"),
+        order::IDS => Some("ids"),
         order::VECTOR_METADATA => Some("vector_metadata"),
         order::COLUMNS => Some("columns"),
         order::TRAINING_IDS => Some("training_ids"),
@@ -536,9 +537,9 @@ mod tests {
     #[should_panic(expected = "inverts the declared lock order")]
     fn taking_a_lower_lock_under_a_higher_one_is_refused() {
         let columns: RwLockAt<u32> = RwLockAt::new(order::COLUMNS, 1);
-        let id_map: RwLockAt<u32> = RwLockAt::new(order::ID_MAP, 2);
+        let ids: RwLockAt<u32> = RwLockAt::new(order::IDS, 2);
         let _held = columns.read().unwrap();
-        let _inverted = id_map.read().unwrap();
+        let _inverted = ids.read().unwrap();
     }
 
     /// Two spaces' index guards are ordered by the spaces' declaration, so
@@ -560,14 +561,14 @@ mod tests {
     /// maps.
     #[test]
     #[cfg(debug_assertions)]
-    fn two_spaces_in_declaration_order_are_allowed_between_the_maps() {
-        let rev_map: RwLockAt<u32> = RwLockAt::new(order::REV_MAP, 0);
+    fn two_spaces_in_declaration_order_are_allowed_between_the_store_and_the_metadata() {
+        let ids: RwLockAt<u32> = RwLockAt::new(order::IDS, 0);
         let first: RwLockAt<u32> = RwLockAt::new(order::space_index(0), 1);
         let first_codes: RwLockAt<u32> = RwLockAt::new(order::space_codes(0), 1);
         let second: RwLockAt<u32> = RwLockAt::new(order::space_index(1), 2);
         let vector_metadata: RwLockAt<u32> = RwLockAt::new(order::VECTOR_METADATA, 3);
         {
-            let _a = rev_map.read().unwrap();
+            let _a = ids.read().unwrap();
             let _b = first.read().unwrap();
             let _c = first_codes.read().unwrap();
             let _d = second.read().unwrap();
@@ -575,7 +576,7 @@ mod tests {
             assert_eq!(
                 held_now(),
                 vec![
-                    "rev_map",
+                    "ids",
                     "space 0's index guard",
                     "space 0's codes or terms guard",
                     "space 1's index guard",
@@ -601,7 +602,7 @@ mod tests {
                 assert!(!seen.contains(&rank), "rank {} declared twice", rank);
                 seen.push(rank);
             }
-            assert!(order::space_index(space) > order::REV_MAP);
+            assert!(order::space_index(space) > order::IDS);
             assert!(order::space_codes(space) < order::VECTOR_METADATA);
             assert!(order::space_calibration(space) > order::VECTOR_COUNT);
             assert!(order::space_trained_at(space) < order::CREATED_AT);
@@ -617,20 +618,20 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn the_declared_order_is_allowed_and_the_set_empties() {
-        let id_map: RwLockAt<u32> = RwLockAt::new(order::ID_MAP, 1);
+        let ids: RwLockAt<u32> = RwLockAt::new(order::IDS, 1);
         let columns: RwLockAt<u32> = RwLockAt::new(order::COLUMNS, 2);
         {
-            let first = id_map.read().unwrap();
+            let first = ids.read().unwrap();
             let second = columns.write().unwrap();
             assert_eq!(*first, 1);
             assert_eq!(*second, 2);
-            assert_eq!(held_now(), vec!["id_map", "columns"]);
+            assert_eq!(held_now(), vec!["ids", "columns"]);
         }
         assert!(held_now().is_empty());
         // And the same pair again, so a release really did happen rather than
         // the first block merely ending.
-        let _again = id_map.read().unwrap();
-        assert_eq!(held_now(), vec!["id_map"]);
+        let _again = ids.read().unwrap();
+        assert_eq!(held_now(), vec!["ids"]);
     }
 
     /// Guards dropped in acquisition order are paired correctly.
@@ -642,16 +643,16 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn guards_released_in_acquisition_order_pair_correctly() {
-        let id_map: RwLockAt<u32> = RwLockAt::new(order::ID_MAP, 1);
-        let rev_map: RwLockAt<u32> = RwLockAt::new(order::REV_MAP, 2);
+        let ids: RwLockAt<u32> = RwLockAt::new(order::IDS, 1);
+        let vector_metadata: RwLockAt<u32> = RwLockAt::new(order::VECTOR_METADATA, 2);
         let columns: RwLockAt<u32> = RwLockAt::new(order::COLUMNS, 3);
 
-        let first = id_map.write().unwrap();
-        let second = rev_map.write().unwrap();
+        let first = ids.write().unwrap();
+        let second = vector_metadata.write().unwrap();
         let third = columns.write().unwrap();
-        assert_eq!(held_now(), vec!["id_map", "rev_map", "columns"]);
+        assert_eq!(held_now(), vec!["ids", "vector_metadata", "columns"]);
         drop(first);
-        assert_eq!(held_now(), vec!["rev_map", "columns"]);
+        assert_eq!(held_now(), vec!["vector_metadata", "columns"]);
         drop(second);
         drop(third);
         assert!(held_now().is_empty());

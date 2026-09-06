@@ -231,7 +231,7 @@ impl DenseIndex {
 
     /// Bytes the live set's bitmap asks the allocator for, for
     /// `Collection::stats`. The second of the two bitmaps a collection holds;
-    /// see `LiveRecords::live_heap_bytes`.
+    /// see `IdStore::heap_bytes`.
     pub(crate) fn live_heap_bytes(&self) -> usize {
         self.live.heap_bytes()
     }

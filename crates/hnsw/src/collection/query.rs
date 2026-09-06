@@ -35,7 +35,7 @@
 //! # Locks
 //!
 //! The guards a single space search takes, in the declared order,
-//! `id_map < rev_map < dense index < dense codes < sparse index <
+//! `ids < dense index < dense codes < sparse index <
 //! dictionary < vector_metadata < columns`, each space's taken only where
 //! an arm reads it and the dictionary's only where an arm carries terms. A
 //! text arm is tokenized under no guard at all, since the tokenizer may be
@@ -51,7 +51,7 @@
 
 use super::search::{AdmitPlan, Scored, MAX_TOP_K};
 use super::Collection;
-use crate::{RawVectors, SearchParams};
+use crate::{Named, RawVectors, SearchParams};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -479,8 +479,7 @@ impl Collection {
 
         // The guards, in the declared order, a space's only where an arm
         // reads it and the dictionary's only where an arm carries terms.
-        let id_map = self.id_map.read().unwrap();
-        let rev_map = self.rev_map.read().unwrap();
+        let ids = self.ids.read().unwrap();
         let dense = wants_dense.then(|| self.dense().index.read().unwrap());
         let pq_codes = wants_dense.then(|| self.dense().pq_codes.read().unwrap());
         let sparse_space = wants_sparse.then(|| {
@@ -511,10 +510,10 @@ impl Collection {
         after_resolve();
 
         // The admit set, once, for every arm.
-        let admit = self.admit_plan(query.filter, &columns, &rev_map, &vector_metadata);
+        let admit = self.admit_plan(query.filter, &columns, &ids, &vector_metadata);
         let shape = admit.shape();
         let selectivity = shape.selectivity();
-        let live = rev_map.len();
+        let live = ids.len();
 
         let planned: Vec<ArmPlan> = arms
             .iter()
@@ -550,7 +549,7 @@ impl Collection {
         }
 
         // Every arm's page, best first, under the one admit set.
-        let mut pages: Vec<Vec<(&String, f32)>> = Vec::with_capacity(arms.len());
+        let mut pages: Vec<Vec<(Named<'_>, f32)>> = Vec::with_capacity(arms.len());
         for arm in &arms {
             match arm {
                 Resolved::Dense { vector, params } => {
@@ -559,9 +558,8 @@ impl Collection {
                     let fetch_k = params.fetch_k(live);
                     let budget = Self::dense_budget(params);
                     let hits = admit.run(|admit| index.search(vector, fetch_k, admit, &budget))?;
-                    let mut page = Scored::resolve(hits, &rev_map).cut(fetch_k).items;
+                    let mut page = Scored::resolve(hits, &ids).cut(fetch_k).items;
                     let raws = RawVectors {
-                        id_map: &id_map,
                         graph: index.graph(),
                     };
                     self.rescore_page(&mut page, vector, raws, codes, params);
@@ -576,25 +574,25 @@ impl Collection {
                     };
                     let hits =
                         admit.run(|admit| index.search(vector.as_ref(), fetch, admit, &budget))?;
-                    let mut page: Vec<(&String, f32)> = Vec::with_capacity(hits.items.len());
+                    let mut page: Vec<(Named<'_>, f32)> = Vec::with_capacity(hits.items.len());
                     for hit in hits.items {
-                        if let Some(ext_id) = rev_map.get(&hit.id.slot()) {
-                            page.push((ext_id, hit.score));
+                        let slot = hit.id.slot();
+                        if let Some(name) = ids.name(slot) {
+                            page.push((Named { name, slot }, hit.score));
                         }
                     }
                     // Higher is better, and the tie goes to the external
                     // id, as an exact dense page's does.
-                    page.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                    page.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.name.cmp(b.0.name)));
                     page.truncate(fetch);
                     pages.push(page);
                 }
             }
         }
 
-        let metadata_of = |id: &String| {
-            id_map
-                .get(id)
-                .and_then(|&slot| vector_metadata.get(slot))
+        let metadata_of = |slot: usize| {
+            vector_metadata
+                .get(slot)
                 .map(|fields| fields.to_map())
                 .unwrap_or_default()
         };
@@ -604,27 +602,27 @@ impl Collection {
                 .iter()
                 .take(query.k)
                 .enumerate()
-                .map(|(position, (id, score))| QueryHit {
-                    id: (*id).clone(),
+                .map(|(position, (record, score))| QueryHit {
+                    id: record.name.to_string(),
                     score: *score,
                     contributions: vec![Contribution {
                         arm: 0,
                         rank: position + 1,
                         score: *score,
                     }],
-                    metadata: metadata_of(id),
+                    metadata: metadata_of(record.slot),
                 })
                 .collect()
         } else {
-            let slices: Vec<&[(&String, f32)]> = pages.iter().map(|p| p.as_slice()).collect();
+            let slices: Vec<&[(Named<'_>, f32)]> = pages.iter().map(|p| p.as_slice()).collect();
             fuse(query.fusion, &slices)
                 .into_iter()
                 .take(query.k)
                 .map(|fused| QueryHit {
-                    id: fused.id.clone(),
+                    id: fused.id.name.to_string(),
                     score: fused.score,
                     contributions: fused.contributions,
-                    metadata: metadata_of(fused.id),
+                    metadata: metadata_of(fused.id.slot),
                 })
                 .collect()
         };

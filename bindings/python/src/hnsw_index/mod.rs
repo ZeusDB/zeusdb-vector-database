@@ -1068,7 +1068,7 @@ impl HNSWIndex {
 
     /// `len(index)`, the number of live records.
     ///
-    /// Reads `id_map`, which is the record set: every insertion path writes it,
+    /// Reads the id store, which is the record set: every insertion path writes it,
     /// removal keys on it, and `contains`, `list` and `count` all read the same
     /// map, so none of them can disagree with this. It equals
     /// `get_vector_count()` and `get_stats()["total_vectors"]`, which are
@@ -1249,7 +1249,7 @@ impl HNSWIndex {
 
     /// One page of records, as (id, metadata), in the order they were added.
     ///
-    /// Enumerates `id_map`, which holds every live record. It used to enumerate
+    /// Enumerates the id store, which holds every live record. It used to enumerate
     /// `vectors`, which under `quantized_only` holds only the records collected
     /// before training, so every record added afterwards was missing from the
     /// listing while search still returned it.
@@ -1257,7 +1257,7 @@ impl HNSWIndex {
     /// # The order, which is what makes `offset` mean anything
     ///
     /// **Ascending internal id, which is arrival order.** This used to hand back
-    /// `id_map.keys()` directly, and a `HashMap` iterates in an order its hasher
+    /// the forward map's keys directly, and a `HashMap` iterates in an order its hasher
     /// reseeds in every process, so two calls in one process agreed and two
     /// processes did not. An offset over an order like that is not a page: it
     /// can return a record twice and miss another entirely, which is worse than
@@ -1317,7 +1317,7 @@ impl HNSWIndex {
 
     /// Check whether a record with this id is in the index
     ///
-    /// Reads `id_map`, which is the record set. Every insertion path writes it,
+    /// Reads the id store, which is the record set. Every insertion path writes it,
     /// `remove_point_internal` keys its removal on it, `add(overwrite=True)`
     /// keys its collision test on it, and `compact` rebuilds the graph from it.
     /// It used to read `vectors`, which under `quantized_only` holds only the
@@ -1585,8 +1585,8 @@ impl HNSWIndex {
     /// honest at all: every record really was re-inserted at the new width.
     ///
     /// **Everything except the graph survives untouched.** Each record is
-    /// re-inserted under the internal id it already holds, so `id_map`,
-    /// `rev_map`, the metadata store and every declared field's column stay
+    /// re-inserted under the internal id it already holds, so the id store,
+    /// the metadata store and every declared field's column stay
     /// correct without being rewritten, and the record any given id resolves to
     /// is the same before and after. A quantized index is rebuilt from its
     /// stored codes rather than re-encoded, so the codebook is not retrained and
