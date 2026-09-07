@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.11.0] - 2026-09-07
+
+### Added
+
+- **A write-ahead journal, opt-in.** `index.journal_to(path)` opens a journal beside the saved directory and records every mutation to it, so a process that stops without saving loses nothing a call had returned from. `load(path)` replays it. `checkpoint()` is `save()` into the journal's own directory and empties the journal, `journal_path` names the file, and five `journal_` keys report the policy, the checkpoint's sequence, the records a replay would apply and the file's length.
+
+- **Three durability policies.** `"call"`, the default, flushes before the call returns. `"interval"` flushes from a thread of the index's own within `interval_ms`, 10 by default. `"none"` flushes at the next checkpoint. A process that stops loses nothing under any of them. `load()` takes `durability`, `interval_ms` and `checkpoint_only`.
+
+- **Scalar quantization.** `quantization_config={"type": "int8"}` holds every value as one signed byte, on all four distance metrics, where product quantization refuses two of them. One scale per dimension is fitted at training. A trained directory writes `int8_scales.zdbint8` and `int8_rows.zdbint8`. `get_stats()` gains `quantization_scale`, `scale_memory_mb` and `quantization_saturated_values`.
+
+- **`reserved_memory_mb`**, the part of `total_memory_mb` no record has been written into, which is exactly what `shrink_to_fit()` returns.
+
+- **`rerank_requested_fetch`, `rerank_fetch_ceiling` and `rerank_fetch_capped`**, which report what the calibration asked for, the bound it is held under, and whether the bound shortened the fetch.
+
+### Changed
+
+- **Every memory key prices the capacity its structure asked the allocator for**, so `total_memory_mb` is the request rather than a sum of a capacity and a payload. `raw_vectors_memory_mb` rises on an index whose store carries slack; the vectors themselves are `raw_vectors_stored * dimension * 4`.
+
+- **The default rerank fetch is held under a ceiling**, being a tenth of the live records between a floor of 1,500 candidates and an absolute 25,000. An explicit `rerank` factor is not held under it.
+
+- **A record's metadata is held by internal id in one block per record.** A record without metadata costs 16 bytes where it cost 101, and a record with two small fields costs 99 where it cost 357.
+
+- **Every external id is held once**, in an id store indexed both ways, at 20 bytes a record where the two maps and their copies cost 96.
+
+- **The graph holds targets alone and an upper list is one word.** The graph reports 186 bytes a record at 100,000 records and `m` 16 where 0.10.0 reports 428, and a dump's bytes are unchanged.
+
+- **`get_performance_info()`** reports `search_speedup_expected` and `search_bottleneck` as what the index does behind its reader-writer lock, under the keys it had.
+
+- **`benchmark_concurrent_reads()`** builds a pool of `max_threads` threads and runs the parallel pass on it, so `threads_used` names the pool the speedup was measured over.
+
+- **The README** carries the two new sections, every `get_stats()` key, the format versions, and the level each operation record is written at.
+
+### Fixed
+
+- **A text query counts its terms under the guards its search holds**, so a `clear()` and an insert between the count and the search can no longer reissue those term ids to other terms.
+
+- **A `clear()` on a trained `quantized_with_raw` index** reserved its replacement store from `expected_size` without a byte budget, so a large declaration at a wide dimension could ask for more memory than the process could serve. The reservation now goes through the same budget the graph's arenas take.
+
+- **The training buffer releases its capacity** once the codebook is fitted.
+
+- **`load()` recovers an index a killed save left at `.zdbold`**, where only the next save did before.
+
+- **A `mappings.bin` whose two maps disagree is refused**, where it used to load with `len()` and `search()` answering from different sets.
+
+### Format
+
+A directory declares 1.1.0 as before, or 1.2.0 with scalar quantization, 2.0.0 with a sparse space, 2.1.0 with both, 3.0.0 with a journal and 3.1.0 with a journal and scalar quantization. This release reads majors 1, 2 and 3. An older release refuses a scalar or journaled directory rather than opening it wrongly.
+
 ## [0.10.0] - 2026-09-02
 
 ### Added
