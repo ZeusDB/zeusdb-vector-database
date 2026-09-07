@@ -107,11 +107,13 @@ def megabytes(stats, key):
 
 
 def verdict(measured):
-    """A stable word for a number that moves.
+    """A stable word for a number this file does not hold fixed.
 
-    Product quantization trains with an unseeded k-means, so a quantized index
-    is not reproducible and every recall figure below shifts by a few hundredths
-    from run to run. The verdict does not, which is the part worth reading.
+    Quantizer training draws from a fixed seed, so two runs on one machine
+    fit one codebook and print one figure. Nothing holds the floating point
+    arithmetic under that codebook identical across platforms, and a centroid
+    that lands differently moves every figure below it. The verdict does not,
+    which is the part worth reading.
     """
     return "good" if measured >= 0.90 else "poor"
 
@@ -237,10 +239,11 @@ def main():
     print(f"  rerank off, an ADC estimate:       {estimated:.4f}")
 
 
-# The transcript this file prints. A "..." stands for a figure that moves
-# between runs, which here is everything downstream of quantizer training,
-# because that trains with an unseeded k-means. The verdict beside each one
-# does not move.
+# The transcript this file prints. A "..." stands for a figure this file does
+# not hold fixed, which here is everything downstream of quantizer training.
+# Training draws from a fixed seed, so those figures repeat on one machine, and
+# nothing holds the floating point arithmetic under them identical across
+# platforms. The verdict beside each one does not move.
 EXPECTED_OUTPUT = """\
 3000 vectors of 64 dimensions, recall@10 over 200 queries
 compression ratio: 32x

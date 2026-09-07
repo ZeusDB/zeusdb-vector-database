@@ -834,8 +834,8 @@ mod tests {
         assert_eq!(before, after);
 
         // And the calibration over the shuffled sample is reproducible, given
-        // the codebook. The codebook itself is fitted by unseeded k-means, so
-        // it is trained once and both calibrations read it.
+        // the codebook. One codebook is fitted here and both calibrations read
+        // it, so what this holds is the calibration alone.
         let pq = PQ::new(32, 8, 6, 500, None);
         pq.train(&after).unwrap();
         let first = calibrate_rerank_from_sample(&pq, &after, raw_distance_fn("cosine")).unwrap();

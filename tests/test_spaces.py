@@ -234,7 +234,7 @@ def test_create_refuses_the_dense_rules_before_reading_the_sparse_declaration():
     with pytest.raises(ValueError, match="dim must be positive"):
         CREATE(dim=0, space="l2", m=8, ef_construction=50, expected_size=50,
                sparse={"nope": 1})
-    with pytest.raises(ValueError, match="cannot be quantized"):
+    with pytest.raises(ValueError, match="cannot be product quantized"):
         CREATE(dim=DIM, space="dot", m=8, ef_construction=50, expected_size=50,
                quantization_config={"type": "pq", "subvectors": 2, "bits": 4,
                                     "training_size": 1000},

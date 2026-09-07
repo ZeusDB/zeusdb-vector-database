@@ -817,7 +817,7 @@ impl fmt::Display for Error {
                 recovery,
             } => write!(
                 f,
-                "{}space='{}' cannot be quantized. A quantized graph scores every candidate from tables of squared L2 distances to the codebook, and {}, or drop quantization_config.{}",
+                "{}space='{}' cannot be product quantized. A product quantized graph scores every candidate from tables of squared L2 distances to the codebook, and {}, or set type='int8', which applies the metric's own arithmetic to the decoded values and takes all four spaces, or drop quantization_config.{}",
                 source, space, reason, recovery
             ),
 
