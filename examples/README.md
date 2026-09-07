@@ -27,11 +27,12 @@ Every file prints what it finds, and carries the full transcript at the foot of
 the file in a string named `EXPECTED_OUTPUT`. Run one and you should see the
 same thing.
 
-A `...` in a transcript stands for a figure that moves between runs. That is
-wall clock timing, and anything downstream of quantizer training, which trains
-with an unseeded k-means and so does not repeat. Every one of those is printed
-next to a word that does not move, such as `good` or `poor`, and the word is the
-part worth reading.
+A `...` in a transcript stands for a figure the file does not hold fixed. That
+is wall clock timing, and anything downstream of quantizer training. Training
+draws from a fixed seed, so those figures repeat on one machine, and nothing
+holds the floating point arithmetic under them identical across platforms. Every
+one of those is printed next to a word that does not move, such as `good` or
+`poor`, and the word is the part worth reading.
 
 `tests/test_examples.py` runs all six and checks each transcript, so an example
 that stops working fails the suite rather than sitting here rotting.

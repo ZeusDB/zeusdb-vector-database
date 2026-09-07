@@ -743,7 +743,9 @@ fn artefact_contents(name: &str) -> &'static str {
         "mappings.bin" => "the mapping from every external record id to its internal graph id",
         "metadata.json" => "the metadata of every record, which is what a filtered search reads",
         "vectors.bin" => "the raw vector of every record",
-        "quantization.json" => "the product quantization configuration and the training state",
+        "quantization.json" => {
+            "the quantization configuration of either scheme and the training state"
+        }
         "pq_centroids.bin" => "the trained PQ codebook, which every stored code decodes through",
         "pq_codes.bin" => "the quantized code of every record",
         INT8_SCALES_FILENAME => INT8_SCALES_CONTENTS,

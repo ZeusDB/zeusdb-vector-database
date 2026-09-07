@@ -2129,8 +2129,8 @@ def test_load_refuses_a_missing_vectors_bin_under_quantized_with_raw(tmp_path):
     # Each of the three names a different file and says what that file holds.
     expected = {
         "vectors.bin": "vectors.bin holds the raw vector of every record",
-        "quantization.json": ("quantization.json holds the product quantization "
-                              "configuration"),
+        "quantization.json": ("quantization.json holds the quantization "
+                              "configuration of either scheme"),
         "pq_codes.bin": "pq_codes.bin holds the quantized code of every record",
     }
     for name, phrase in expected.items():

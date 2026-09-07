@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The graph holds targets alone and an upper list is one word.** The graph reports 186 bytes a record at 100,000 records and `m` 16 where 0.10.0 reports 428, and a dump's bytes are unchanged.
 
+- **The refusal `dot` and `l1` raise under `type="pq"`** names product quantization, and offers `type="int8"`, which takes all four metrics. The message read `space='dot' cannot be quantized` and reads `space='dot' cannot be product quantized`.
+
 - **`get_performance_info()`** reports `search_speedup_expected` and `search_bottleneck` as what the index does behind its reader-writer lock, under the keys it had.
 
 - **`benchmark_concurrent_reads()`** builds a pool of `max_threads` threads and runs the parallel pass on it, so `threads_used` names the pool the speedup was measured over.
@@ -95,13 +97,6 @@ A directory declares 1.1.0 as before, or 1.2.0 with scalar quantization, 2.0.0 w
 - **An unfiltered search is faster** by 22 percent on SIFT-128 under `l2`, 18
   percent on GloVe-100 under `cosine` and 6.5 percent on DBpedia-1536 under
   `cosine`, measured at 50,000 records. Every result page is identical.
-
-- **A record's metadata is held by internal id** rather than in a hash map
-  keyed by the record's id. A record without metadata costs 16 bytes where it
-  cost 101, and a record with two small fields costs 99 where it cost 357,
-  measured at 100,000 records. `index_bookkeeping_memory_mb` and
-  `total_memory_mb` fall by the difference; every result page, `metadata.json`
-  and `mappings.bin` are unchanged.
 
 - **A directory holding a sparse space declares format version 2.0.0** and
   needs this release or later. A directory holding a dense space alone stays

@@ -17,11 +17,12 @@ the Rust layer straight to the file descriptor and so does not even arrive in
 document order when stdout is a pipe.
 
 A literal ``...`` in an expected line matches any run of characters. It is used
-only where a value genuinely moves between runs, which is wall clock timing and
-anything downstream of product quantization training, since that trains with an
-unseeded k-means. Every such line is paired with a stable verdict token in the
-example itself, so the assertion still fails if the behaviour changes rather
-than only the digits.
+only where a value is not held fixed, which is wall clock timing and anything
+downstream of quantizer training. Training draws from a fixed seed, so those
+figures repeat on one machine, and nothing holds the floating point arithmetic
+under them identical across platforms. Every such line is paired with a stable
+verdict token in the example itself, so the assertion still fails if the
+behaviour changes rather than only the digits.
 """
 
 import ast

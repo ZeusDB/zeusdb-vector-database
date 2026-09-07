@@ -1001,7 +1001,7 @@ def test_dot_cannot_be_quantized():
     every vector is a unit vector. For an inner product it does not, because the
     stored vector's own length enters the L2 and not the inner product.
     """
-    with pytest.raises(RuntimeError, match=r"space='dot' cannot be quantized"):
+    with pytest.raises(RuntimeError, match=r"space='dot' cannot be product quantized"):
         VectorDatabase().create(
             "hnsw", dim=16, space="dot", expected_size=20000,
             quantization_config={"type": "pq", "subvectors": 4, "bits": 8,
@@ -1026,7 +1026,7 @@ def test_a_hand_assembled_dot_directory_claiming_quantization_is_refused(tmp_pat
         "pq_config": {"dim": 16, "sub_dim": 4, "num_centroids": 256},
     }), encoding="utf-8")
 
-    with pytest.raises(ValueError, match=r"space='dot' cannot be quantized"):
+    with pytest.raises(ValueError, match=r"space='dot' cannot be product quantized"):
         VectorDatabase().load(str(path))
 
 
@@ -1044,7 +1044,7 @@ def test_l1_cannot_be_quantized():
     the pair stays refused. `validate_space_supports_quantization` records the
     figures.
     """
-    with pytest.raises(RuntimeError, match=r"space='l1' cannot be quantized"):
+    with pytest.raises(RuntimeError, match=r"space='l1' cannot be product quantized"):
         VectorDatabase().create(
             "hnsw", dim=16, space="l1", expected_size=20000,
             quantization_config={"type": "pq", "subvectors": 4, "bits": 8,
@@ -1076,7 +1076,7 @@ def test_a_hand_assembled_l1_directory_claiming_quantization_is_refused(tmp_path
         "pq_config": {"dim": 16, "sub_dim": 4, "num_centroids": 256},
     }), encoding="utf-8")
 
-    with pytest.raises(ValueError, match=r"space='l1' cannot be quantized"):
+    with pytest.raises(ValueError, match=r"space='l1' cannot be product quantized"):
         VectorDatabase().load(str(path))
 
 

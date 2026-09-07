@@ -77,9 +77,8 @@ def test_default_fetch_holds_recall_below_the_crossover(crossover_pair):
     fixture puts 60 records in a cluster, so the floor covers it several times
     over, and recall measures at 1.0000 here.
 
-    The bound is set below the level this fixture measures, because the
-    codebook is trained by an unseeded k-means and a rebuild draws a different
-    one, which moves a quantized recall figure by about 0.013.
+    The bound is set below the level this fixture measures, because nothing
+    holds a quantized recall figure identical across platforms.
     """
     pair = crossover_pair
     scores = {}
@@ -210,9 +209,8 @@ def test_default_fetch_holds_recall_where_the_corpus_term_governs(corpus_term_in
     times, so the coarse parameter is the binding one and the fine one has
     margin.
 
-    The bound sits below the measured level because the codebook is trained by
-    an unseeded k-means and a rebuild draws a different one, which moves a
-    quantized recall figure by about 0.013.
+    The bound sits below the measured level because nothing holds a quantized
+    recall figure identical across platforms.
     """
     case = corpus_term_index
     hits = 0
@@ -370,9 +368,8 @@ def test_an_explicit_rerank_factor_is_not_held_under_the_ceiling(calibrated_inde
 def test_the_calibrated_fetch_holds_recall(calibrated_index):
     """The page the calibrated default returns is the page exact search returns.
 
-    The bound sits below the level the calibration targets because the codebook
-    is trained by an unseeded k-means and a draw moves a quantized recall figure
-    by about 0.013.
+    The bound sits below the level the calibration targets because nothing
+    holds a quantized recall figure identical across platforms.
     """
     case = calibrated_index
     index, ids, data = case["index"], case["ids"], case["data"]
