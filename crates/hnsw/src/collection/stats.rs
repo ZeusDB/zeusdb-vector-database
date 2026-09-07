@@ -1020,12 +1020,25 @@ impl Collection {
     }
 
     /// The characteristics `get_performance_info` returns.
+    ///
+    /// The two search values describe the index behind its reader-writer
+    /// lock. Measured paired inside one process at 50,000 records, eight
+    /// concurrent readers ran at the single reader's latency on a
+    /// 100-dimensional index that fits in the last-level cache, and at 128
+    /// and 1,536 dimensions the per-reader latency rose with the reader
+    /// count because the traversal is bound by the memory bus at those
+    /// widths. The keys stay, because the langchain adapter forwards the map
+    /// verbatim; the values used to describe a mutex the index no longer
+    /// has.
     pub fn performance_info(&self) -> HashMap<String, String> {
         let mut info = HashMap::new();
-        info.insert("search_speedup_expected".to_string(), "1.2x-2x".to_string());
+        info.insert(
+            "search_speedup_expected".to_string(),
+            "linear_in_readers_while_the_index_fits_in_cache".to_string(),
+        );
         info.insert(
             "search_bottleneck".to_string(),
-            "hnsw_mutex_serialization".to_string(),
+            "memory_bandwidth_at_wide_dimensions".to_string(),
         );
         info.insert(
             "benefits".to_string(),
@@ -1139,17 +1152,35 @@ impl Collection {
             queries.len() as f64 / sequential_time,
         );
 
-        // Parallel benchmark
+        // Parallel benchmark, on a pool of exactly the threads reported.
+        //
+        // `par_iter` on the global pool ran on every thread rayon had, 22 on
+        // the machine this was found on, while `threads_used` reported the
+        // argument, so the speedup the adapter forwards was measured over a
+        // pool the caller never asked for. A pool of `num_threads` is built
+        // for the run and dropped with it. Zero is held to one, since rayon
+        // reads zero as its own default.
         let available_threads = rayon::current_num_threads();
         let num_threads = max_threads
             .unwrap_or(available_threads)
-            .min(available_threads);
+            .clamp(1, available_threads);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .map_err(|error| {
+                Error::Engine(format!(
+                    "Failed to start a pool of {} threads for the benchmark: {}",
+                    num_threads, error
+                ))
+            })?;
 
         let start = Instant::now();
-        let _: Vec<_> = queries
-            .par_iter()
-            .map(|query| self.raw_search_no_gil(query))
-            .collect();
+        let _: Vec<_> = pool.install(|| {
+            queries
+                .par_iter()
+                .map(|query| self.raw_search_no_gil(query))
+                .collect()
+        });
 
         let parallel_time = start.elapsed().as_secs_f64();
         results.insert("parallel_time".to_string(), parallel_time);
