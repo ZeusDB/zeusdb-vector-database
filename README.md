@@ -1845,6 +1845,8 @@ The journal is `<path>.zdbwal`, a sibling of the directory rather than a file in
 | `"interval"` | every record is in the kernel, flushed within `interval_ms`, 10 by default | nothing acknowledged is lost | up to one interval of acknowledged calls |
 | `"none"` | every record is in the kernel until the next checkpoint | nothing acknowledged is lost | everything since the last checkpoint |
 
+`get_stats()` reports five `journal_` keys on a journaled index, being the four the example prints and `journal_interval_ms`, which is present under `"interval"` alone.
+
 **Nothing checkpoints for you.** An index that is never checkpointed opens by replaying every record in its journal, each at the cost of the `add()` that wrote it, so a directory with a million records in the journal takes minutes to open where its checkpoint takes seconds. `journal_records` passing the record count is a reasonable trigger. A journaled directory declares format version 3.0.0.
 
 <br />
