@@ -94,9 +94,10 @@ impl Collection {
     /// Every raw vector the index holds, keyed by external id.
     ///
     /// Built rather than held, because there is no map of raw vectors any more.
-    /// The one caller is the save of a quantized index that keeps its raws:
-    /// a raw index writes no `vectors.bin` at all, since the graph dump already
-    /// carries its store.
+    /// The one caller is the save of an index that holds a raw vector for
+    /// every record, which is every raw index and a `quantized_with_raw` one;
+    /// see `holds_raw_vectors` for why a raw index writes the file beside the
+    /// dump that already carries its store.
     pub(crate) fn collect_raw_vectors(&self) -> HashMap<String, Vec<f32>> {
         let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
@@ -746,7 +747,7 @@ impl Collection {
     /// a live record and every live record has a row.
     pub(crate) fn rebuild_graph_from_int8_rows(
         &mut self,
-        rows: &[(usize, Vec<i8>)],
+        rows: &crate::persistence::Int8Rows,
     ) -> Result<usize, String> {
         let codec = self
             .dense()
@@ -763,7 +764,7 @@ impl Collection {
         );
         let batch: Vec<(&[i8], usize)> = rows
             .iter()
-            .map(|(internal_id, row)| (row.as_slice(), *internal_id))
+            .map(|(internal_id, row)| (row, internal_id))
             .collect();
         if !batch.is_empty() {
             new_hnsw.insert_batch_int8(&batch)?;

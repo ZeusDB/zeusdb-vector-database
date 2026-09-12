@@ -793,10 +793,10 @@ pub(crate) struct Expected {
 /// A dump parsed back into the topology a graph constructor takes, with the
 /// parameters the header carried.
 ///
-/// [`read_dump`] hands it to [`MutableGraph::from_loaded`]. It is a separate
-/// step from the construction because parsing and validating the file is a
-/// different job from building a structure out of it, and because the tests
-/// hand a single parse to more than one constructor call.
+/// The tests hand a single parse to more than one constructor call, which is
+/// why the points are collected here. The reader itself takes them from the
+/// stream one at a time; see [`read_dump`].
+#[cfg(test)]
 pub(super) struct ParsedDump<T> {
     /// `points_by_layer[l][r]` is the point at rank `r` of layer `l`.
     pub points_by_layer: Vec<Vec<LoadedPoint<T>>>,
@@ -809,8 +809,6 @@ pub(super) struct ParsedDump<T> {
     pub ef_construction: usize,
     /// As the header carried it.
     pub level_scale: f64,
-    /// Points the dump holds, which a constructor's answer is checked against.
-    pub nb_point: usize,
 }
 
 /// Read the graph back out of `dir`.
@@ -827,17 +825,21 @@ where
     T: DumpElement,
     D: Distance<T> + Send + Sync,
 {
-    let parsed = parse_dump::<T>(dir, expected)?;
-    let nb_point = parsed.nb_point;
-    let (graph, store) = MutableGraph::from_loaded(
-        parsed.points_by_layer,
-        parsed.entry,
-        parsed.m,
-        parsed.ef_construction,
-        parsed.level_scale,
+    let mut stream = open_dump::<T>(dir, expected)?;
+    let nb_point = stream.nb_point;
+    let layer_counts = stream.layer_counts.clone();
+    let (graph, store) = MutableGraph::from_points(
+        &layer_counts,
+        stream.dimension,
+        stream.entry,
+        stream.m,
+        stream.ef_construction,
+        stream.level_scale,
         dist,
+        || stream.next_point(),
     )
     .map_err(|e| format!("the graph dump could not be rebuilt: {}", e))?;
+    stream.finish()?;
 
     let restored = graph.nb_points();
     if restored != nb_point {
@@ -851,10 +853,111 @@ where
 
 /// Parse a dump into the topology and parameters it carries, building nothing.
 ///
+/// [`open_dump`] does the checking and hands the points out one at a time;
+/// this collects them, which is the shape the tests hand to more than one
+/// constructor call. The reader itself takes the stream, see [`read_dump`].
+#[cfg(test)]
+pub(super) fn parse_dump<T>(dir: &Path, expected: &Expected) -> Result<ParsedDump<T>, String>
+where
+    T: DumpElement,
+{
+    let mut stream = open_dump::<T>(dir, expected)?;
+    let mut points_by_layer: Vec<Vec<LoadedPoint<T>>> =
+        Vec::with_capacity(stream.layer_counts.len());
+    for count in stream.layer_counts.clone() {
+        let mut layer = Vec::with_capacity(count);
+        for _ in 0..count {
+            layer.push(stream.next_point()?);
+        }
+        points_by_layer.push(layer);
+    }
+    let (entry, m, ef_construction, level_scale) = (
+        stream.entry,
+        stream.m,
+        stream.ef_construction,
+        stream.level_scale,
+    );
+    stream.finish()?;
+    Ok(ParsedDump {
+        points_by_layer,
+        entry,
+        m,
+        ef_construction,
+        level_scale,
+    })
+}
+
+/// A dump opened and checked down to its adjacency, handing out its points
+/// one at a time as their vectors are read.
+///
+/// Everything before the vector region, being the header, the layer table,
+/// the origin ids and the adjacency, is parsed and checked before the first
+/// point is handed out, and [`DumpStream::finish`] reads the trailer and
+/// checks the checksum over everything read. A point's vector is one heap
+/// block, which the constructor moves into its store, so the vectors of a
+/// hundred thousand records are never held one block each all at once. Held
+/// that way they were half of what an allocator that keeps freed small blocks
+/// left the process holding after a load.
+pub(super) struct DumpStream<T> {
+    hashed: HashingReader<BufReader<File>>,
+    layer_counts: Vec<usize>,
+    origin_ids: std::vec::IntoIter<usize>,
+    adjacency: std::vec::IntoIter<Vec<Vec<LoadedEdge>>>,
+    values_raw: Vec<u8>,
+    entry: PointId,
+    m: usize,
+    ef_construction: usize,
+    level_scale: f64,
+    nb_point: usize,
+    dimension: usize,
+    _elem: std::marker::PhantomData<T>,
+}
+
+impl<T: DumpElement> DumpStream<T> {
+    /// The next point in (layer, rank) order, its vector read from the file.
+    fn next_point(&mut self) -> Result<LoadedPoint<T>, String> {
+        self.hashed.read_exact_hashed(&mut self.values_raw)?;
+        Ok(LoadedPoint {
+            origin_id: self
+                .origin_ids
+                .next()
+                .ok_or_else(|| "the graph dump ran out of origin ids".to_string())?,
+            data: T::decode(&self.values_raw),
+            neighbours: self
+                .adjacency
+                .next()
+                .ok_or_else(|| "the graph dump ran out of adjacency".to_string())?,
+        })
+    }
+
+    /// The trailer, once every point is out: the end marker and the checksum
+    /// over everything read since the header.
+    fn finish(mut self) -> Result<(), String> {
+        let mut trailer = [0u8; TRAILER_BYTES];
+        self.hashed
+            .inner
+            .read_exact(&mut trailer)
+            .map_err(|e| format!("the graph dump's trailer could not be read: {}", e))?;
+        let stored = u64::from_le_bytes(take8(&trailer, 0));
+        let end_magic = u64::from_le_bytes(take8(&trailer, 8));
+        if end_magic != MAGIC {
+            return Err("the graph dump does not end where it says it does".to_string());
+        }
+        let computed = self.hashed.sum.finish();
+        if stored != computed {
+            return Err("the graph dump's contents are corrupt".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Open a dump and check it down to its adjacency, leaving the vector region
+/// and the trailer to the stream.
+///
 /// The order is deliberate. The file's real length is established first, the
 /// header is checked against itself second, the header is checked against the
 /// index third, and only then does anything size a buffer from a field.
-pub(super) fn parse_dump<T>(dir: &Path, expected: &Expected) -> Result<ParsedDump<T>, String>
+fn open_dump<T>(dir: &Path, expected: &Expected) -> Result<DumpStream<T>, String>
 where
     T: DumpElement,
 {
@@ -1036,51 +1139,19 @@ where
 
     let adjacency = read_adjacency(&mut hashed, adjacency_bytes, nb_point, &layer_counts)?;
 
-    // The points, layer by layer, taking each one's vector as it arrives and
-    // the adjacency already parsed above.
-    let mut points_by_layer: Vec<Vec<LoadedPoint<T>>> = Vec::with_capacity(nb_layer);
-    let mut values_raw = vec![0u8; dimension * T::BYTES];
-    let mut adjacency = adjacency.into_iter();
-    let mut origin_ids = origin_ids.into_iter();
-    for count in &layer_counts {
-        let mut layer = Vec::with_capacity(*count);
-        for _ in 0..*count {
-            hashed.read_exact_hashed(&mut values_raw)?;
-            layer.push(LoadedPoint {
-                origin_id: origin_ids
-                    .next()
-                    .ok_or_else(|| "the graph dump ran out of origin ids".to_string())?,
-                data: T::decode(&values_raw),
-                neighbours: adjacency
-                    .next()
-                    .ok_or_else(|| "the graph dump ran out of adjacency".to_string())?,
-            });
-        }
-        points_by_layer.push(layer);
-    }
-
-    let mut trailer = [0u8; TRAILER_BYTES];
-    hashed
-        .inner
-        .read_exact(&mut trailer)
-        .map_err(|e| format!("the graph dump's trailer could not be read: {}", e))?;
-    let stored = u64::from_le_bytes(take8(&trailer, 0));
-    let end_magic = u64::from_le_bytes(take8(&trailer, 8));
-    if end_magic != MAGIC {
-        return Err("the graph dump does not end where it says it does".to_string());
-    }
-    let computed = hashed.sum.finish();
-    if stored != computed {
-        return Err("the graph dump's contents are corrupt".to_string());
-    }
-
-    Ok(ParsedDump {
-        points_by_layer,
+    Ok(DumpStream {
+        hashed,
+        layer_counts,
+        origin_ids: origin_ids.into_iter(),
+        adjacency: adjacency.into_iter(),
+        values_raw: vec![0u8; dimension * T::BYTES],
         entry: PointId(header.entry_layer as u8, header.entry_rank as i32),
         m: expected.m,
         ef_construction: header.ef_construction as usize,
         level_scale: header.level_scale,
         nb_point,
+        dimension,
+        _elem: std::marker::PhantomData,
     })
 }
 

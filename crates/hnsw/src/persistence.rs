@@ -1168,7 +1168,48 @@ struct QuantizationArtefacts {
     int8: Option<Arc<Int8Codec>>,
     /// Every record's scalar row from `int8_rows.zdbint8`, by internal id,
     /// ascending.
-    rows: Vec<(usize, Vec<i8>)>,
+    rows: Int8Rows,
+}
+
+/// Every row of a trained scalar directory in one block, with the internal
+/// id of each beside it, ascending
+///
+/// `int8_rows.zdbint8` holds one row a record. The loader used to hold one
+/// heap block a row on top of the file, every one of them freed at the end of
+/// the load, which is what an allocator that keeps freed small blocks left
+/// the process holding. One block holds them now, and a row is a slice of it.
+#[derive(Default)]
+pub(crate) struct Int8Rows {
+    ids: Vec<u32>,
+    data: Vec<i8>,
+    width: usize,
+}
+
+impl Int8Rows {
+    fn with_capacity(entries: usize, width: usize) -> Self {
+        Int8Rows {
+            ids: Vec::with_capacity(entries),
+            data: Vec::with_capacity(entries.saturating_mul(width)),
+            width,
+        }
+    }
+
+    fn push(&mut self, id: u32, row: &[u8]) {
+        self.ids.push(id);
+        self.data.extend(row.iter().map(|&b| b as i8));
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Every row with its internal id, ascending.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &[i8])> + '_ {
+        self.ids
+            .iter()
+            .zip(self.data.chunks_exact(self.width.max(1)))
+            .map(|(&id, row)| (id as usize, row))
+    }
 }
 
 /// Training collection state, applied once the graph is back
@@ -1470,6 +1511,147 @@ fn check_vectors_are_finite(vectors: &HashMap<String, Vec<f32>>) -> Result<(), E
     })
 }
 
+/// What the loader holds of vectors.bin
+///
+/// A raw index takes every vector back from the graph dump, which carries
+/// its store, so the file is walked for its record count and its finiteness
+/// check and nothing of it is kept. `Counted` decodes the file one record at
+/// a time through the decoder `decode_bounded` builds, so a file
+/// `load_vectors` refuses is refused with the same message. A quantized
+/// index holds the map, since a `quantized_with_raw` index places the
+/// vectors by id once the graph is back and a product quantized rebuild
+/// replays them. The rebuild fallback of a raw index reads the file again,
+/// through `hold`.
+///
+/// Held whole, the file cost one heap block a record for the whole of the
+/// load, beside the dump's own copy of every vector, and every one of those
+/// blocks was freed at the end. An allocator that keeps freed small blocks
+/// left the process holding them after the load returned.
+enum RawVectors {
+    Held(HashMap<String, Vec<f32>>),
+    Counted(usize),
+}
+
+impl RawVectors {
+    fn len(&self) -> usize {
+        match self {
+            RawVectors::Held(map) => map.len(),
+            RawVectors::Counted(count) => *count,
+        }
+    }
+
+    fn held(&self) -> Option<&HashMap<String, Vec<f32>>> {
+        match self {
+            RawVectors::Held(map) => Some(map),
+            RawVectors::Counted(_) => None,
+        }
+    }
+
+    fn into_held(self) -> HashMap<String, Vec<f32>> {
+        match self {
+            RawVectors::Held(map) => map,
+            RawVectors::Counted(_) => HashMap::new(),
+        }
+    }
+
+    /// Read the map where only the count was kept.
+    fn hold(&mut self, path: &Path, manifest: &IndexManifest) -> Result<(), Error> {
+        if let RawVectors::Counted(_) = self {
+            *self = RawVectors::Held(load_vectors(path, manifest)?);
+        }
+        Ok(())
+    }
+}
+
+/// Walk vectors.bin for its record count and its finiteness check, keeping
+/// nothing
+///
+/// Read only when the manifest names it, as `load_vectors` is. A record whose
+/// vector is not finite is named exactly as `check_vectors_are_finite` names
+/// it.
+fn count_vectors(path: &Path, manifest: &IndexManifest) -> Result<usize, Error> {
+    debug!(target: LOG_TARGET, "Loading vectors.bin...");
+
+    if !manifest_names(manifest, "vectors.bin") {
+        debug!(target: LOG_TARGET, "manifest.json does not list vectors.bin, so no raw vectors are read");
+        return Ok(0);
+    }
+
+    let vectors_data = read_artefact(path, "vectors.bin", manifest)?;
+
+    let (count, offenders) = walk_vectors(&vectors_data, "vectors.bin")?;
+    if !offenders.is_empty() {
+        return Err(Error::VectorsNotFinite {
+            offenders,
+            total: count,
+        });
+    }
+
+    debug!(target: LOG_TARGET, "vectors.bin walked ({} vectors, none kept)", count);
+    Ok(count)
+}
+
+/// Decode a map of vectors one record at a time, returning the record count
+/// and the ids whose vector holds a value that is not finite, sorted
+///
+/// The budget rung is the one `decode_bounded` picks for the same file, and
+/// the steps are the ones bincode's own map decoder takes, the container
+/// claim included, so the two refuse the same files for the same reasons.
+fn walk_vectors(data: &[u8], file: &str) -> Result<(usize, Vec<String>), Error> {
+    use bincode::config::standard;
+
+    let budget = data.len().saturating_mul(CLAIM_PER_WIRE_BYTE);
+    let walked = if budget <= 1 << 20 {
+        walk_vectors_with(data, standard().with_limit::<{ 1 << 20 }>())
+    } else if budget <= 1 << 28 {
+        walk_vectors_with(data, standard().with_limit::<{ 1 << 28 }>())
+    } else if budget <= 1 << 36 {
+        walk_vectors_with(data, standard().with_limit::<{ 1 << 36 }>())
+    } else {
+        walk_vectors_with(data, standard().with_limit::<{ 1 << 44 }>())
+    };
+
+    match walked {
+        Ok(value) => Ok(value),
+        Err(bincode::error::DecodeError::LimitExceeded) => Err(Error::DecodeLengthExceeded {
+            file: file.to_string(),
+            bytes: data.len(),
+        }),
+        Err(e) => Err(Error::DecodeFailed {
+            file: file.to_string(),
+            error: e.to_string(),
+        }),
+    }
+}
+
+/// The steps `HashMap<String, Vec<f32>>` takes to decode, one record at a
+/// time and with no map built.
+fn walk_vectors_with<C: bincode::config::Config>(
+    data: &[u8],
+    config: C,
+) -> Result<(usize, Vec<String>), bincode::error::DecodeError> {
+    use bincode::de::Decoder;
+    use bincode::Decode;
+
+    let mut decoder =
+        bincode::de::DecoderImpl::new(bincode::de::read::SliceReader::new(data), config, ());
+    let claimed = u64::decode(&mut decoder)?;
+    let len = usize::try_from(claimed)
+        .map_err(|_| bincode::error::DecodeError::OutsideUsizeRange(claimed))?;
+    decoder.claim_container_read::<(String, Vec<f32>)>(len)?;
+    let mut offenders = Vec::new();
+    for _ in 0..len {
+        decoder.unclaim_bytes_read(std::mem::size_of::<(String, Vec<f32>)>());
+        let id = String::decode(&mut decoder)?;
+        let vector = Vec::<f32>::decode(&mut decoder)?;
+        if vector.iter().any(|value| !value.is_finite()) {
+            offenders.push(id);
+        }
+    }
+    offenders.sort();
+    Ok((len, offenders))
+}
+
 /// Load manifest for validation and metadata
 fn load_manifest(path: &Path) -> Result<IndexManifest, Error> {
     debug!(target: LOG_TARGET, "Loading manifest.json...");
@@ -1638,7 +1820,7 @@ fn load_quantization(
         centroids,
         codes,
         int8: None,
-        rows: Vec::new(),
+        rows: Int8Rows::default(),
     }))
 }
 
@@ -1708,7 +1890,7 @@ fn load_int8_quantization(
             centroids: None,
             codes: HashMap::new(),
             int8: None,
-            rows: Vec::new(),
+            rows: Int8Rows::default(),
         });
     }
 
@@ -1782,9 +1964,9 @@ fn load_int8_rows(
     path: &Path,
     manifest: &IndexManifest,
     row_width: usize,
-) -> Result<Vec<(usize, Vec<i8>)>, Error> {
+) -> Result<Int8Rows, Error> {
     if !manifest_names(manifest, INT8_ROWS_FILENAME) {
-        return Ok(Vec::new());
+        return Ok(Int8Rows::default());
     }
     debug!(target: LOG_TARGET, "Loading {}...", INT8_ROWS_FILENAME);
     let invalid = |detail: String| Error::Int8ArtefactInvalid {
@@ -1826,7 +2008,7 @@ fn load_int8_rows(
             expected
         )));
     }
-    let mut rows = Vec::with_capacity(entries);
+    let mut rows = Int8Rows::with_capacity(entries, row_width);
     let mut previous: Option<u32> = None;
     for chunk in framed.payload.chunks_exact(stride) {
         let id = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
@@ -1838,7 +2020,7 @@ fn load_int8_rows(
             )));
         }
         previous = Some(id);
-        rows.push((id as usize, chunk[4..].iter().map(|&b| b as i8).collect()));
+        rows.push(id, &chunk[4..]);
     }
     debug!(target: LOG_TARGET, "{} loaded ({} rows)", INT8_ROWS_FILENAME, rows.len());
     Ok(rows)
@@ -1932,7 +2114,7 @@ fn reconstruct_index_simple(
     config: IndexConfig,
     mappings: IdMappings,
     metadata: HashMap<String, HashMap<String, Value>>,
-    vectors: HashMap<String, Vec<f32>>,
+    mut vectors: RawVectors,
     quantization: Option<QuantizationArtefacts>,
     sparse: Option<SparseDeclaration>,
     dump_bytes: Option<u64>,
@@ -1965,20 +2147,13 @@ fn reconstruct_index_simple(
     // The scalar rows, taken out rather than cloned, since the artefact is
     // the largest thing the loader holds after the dump.
     let int8_trained = quantization.as_ref().is_some_and(|q| q.int8.is_some());
-    let int8_rows: Vec<(usize, Vec<i8>)> = quantization
+    let int8_rows: Int8Rows = quantization
         .as_mut()
         .map(|q| std::mem::take(&mut q.rows))
         .unwrap_or_default();
 
     // Step 2: Restore all data fields directly (but not the graph)
-    restore_data_fields(
-        &mut index,
-        mappings,
-        metadata.clone(),
-        vectors.clone(),
-        &config,
-        quantization,
-    )?;
+    restore_data_fields(&mut index, mappings, &config, quantization)?;
 
     // Step 2a: The sparse space, once the mappings are in and before the
     // graph, for the reasons `restore_spaces` gives.
@@ -2004,6 +2179,11 @@ fn reconstruct_index_simple(
         }
         Err(reason) => {
             debug!(target: LOG_TARGET, "Rebuilding the HNSW graph, because {}", reason);
+            // Both rebuilds below replay the raw vectors, so a directory
+            // whose vectors were counted and not kept reads them now.
+            vectors.hold(path, manifest)?;
+            let empty = HashMap::new();
+            let held = vectors.held().unwrap_or(&empty);
             if int8_trained {
                 debug!(target: LOG_TARGET, "Rebuilding scalar quantized HNSW graph from the stored rows...");
                 let inserted = index
@@ -2012,10 +2192,10 @@ fn reconstruct_index_simple(
                 debug!(target: LOG_TARGET, "Scalar quantized graph rebuilt ({} rows inserted)", inserted);
             } else if index.can_use_quantization() {
                 debug!(target: LOG_TARGET, "Rebuilding quantized HNSW graph from stored PQ codes...");
-                rebuild_graph_from_codes(&mut index, &pq_codes, &vectors)?;
+                rebuild_graph_from_codes(&mut index, &pq_codes, held)?;
             } else {
                 debug!(target: LOG_TARGET, "Rebuilding HNSW graph from vectors...");
-                rebuild_graph_from_data(&mut index, &vectors, &pq_codes)?;
+                rebuild_graph_from_data(&mut index, held, &pq_codes)?;
             }
             true
         }
@@ -2048,6 +2228,7 @@ fn reconstruct_index_simple(
             .is_some_and(|config| config.storage_mode == StorageMode::QuantizedOnly);
     let vectors = if quantized_only_trained {
         let (kept, dropped): (HashMap<_, _>, HashMap<_, _>) = vectors
+            .into_held()
             .into_iter()
             .partition(|(id, _)| !pq_codes.contains_key(id));
         if !dropped.is_empty() {
@@ -2055,7 +2236,7 @@ fn reconstruct_index_simple(
                 dropped.len()
             );
         }
-        kept
+        RawVectors::Held(kept)
     } else {
         vectors
     };
@@ -2083,8 +2264,9 @@ fn reconstruct_index_simple(
     // from the graph's node count and pushes one vector per node, so at zero
     // nodes it opens an empty store and places nothing.
     if index.raw_store_is_expected() {
+        let empty = HashMap::new();
         let placed = index
-            .restore_raw_store(&vectors)
+            .restore_raw_store(vectors.held().unwrap_or(&empty))
             .map_err(Error::RestoreRawFailed)?;
         debug!(target: LOG_TARGET, "{} raw vectors restored beside the codes", placed);
     }
@@ -2110,23 +2292,20 @@ fn reconstruct_index_simple(
 /// disagreement means a file is missing or truncated and the load fails rather
 /// than producing an index that misreports what it holds.
 /// Hold the rows artefact to the mappings in both directions.
-fn check_int8_rows_against_mappings(
-    index: &Collection,
-    rows: &[(usize, Vec<i8>)],
-) -> Result<(), Error> {
+fn check_int8_rows_against_mappings(index: &Collection, rows: &Int8Rows) -> Result<(), Error> {
     let invalid = |detail: String| Error::Int8ArtefactInvalid {
         file: INT8_ROWS_FILENAME.to_string(),
         detail,
     };
     let ids = index.ids();
-    if let Some((id, _)) = rows.iter().find(|(id, _)| !ids.contains_slot(*id)) {
+    if let Some((id, _)) = rows.iter().find(|&(id, _)| !ids.contains_slot(id)) {
         return Err(invalid(format!(
             "names internal id {}, which mappings.bin does not hold",
             id
         )));
     }
     if rows.len() != ids.len() {
-        let held: std::collections::HashSet<usize> = rows.iter().map(|(id, _)| *id).collect();
+        let held: std::collections::HashSet<usize> = rows.iter().map(|(id, _)| id).collect();
         let mut without: Vec<&str> = ids
             .iter()
             .filter(|(id, _)| !held.contains(id))
@@ -2172,8 +2351,6 @@ fn check_restored_count(
 fn restore_data_fields(
     index: &mut Collection,
     mappings: IdMappings,
-    _metadata: HashMap<String, HashMap<String, Value>>,
-    _vectors: HashMap<String, Vec<f32>>,
     config: &IndexConfig,
     quantization: Option<QuantizationArtefacts>,
 ) -> Result<(), Error> {
@@ -2564,7 +2741,14 @@ pub(crate) fn load_index(
     let metadata = load_metadata(path_buf, &manifest)?;
     debug!(target: LOG_TARGET, "Metadata loaded: {} records", metadata.len());
 
-    let vectors = load_vectors(path_buf, &manifest)?;
+    // A raw index takes its vectors back from the graph dump, so its
+    // vectors.bin is walked for its count and its check and nothing of it is
+    // kept. See `RawVectors`.
+    let vectors = if manifest_names(&manifest, "quantization.json") {
+        RawVectors::Held(load_vectors(path_buf, &manifest)?)
+    } else {
+        RawVectors::Counted(count_vectors(path_buf, &manifest)?)
+    };
     debug!(target: LOG_TARGET, "Vectors loaded: {} vectors", vectors.len());
 
     let quantization = load_quantization(path_buf, &manifest, config.dim, &config.space)?;
@@ -3362,4 +3546,71 @@ pub(crate) fn is_valid_index(_path: &str) -> bool {
 #[allow(dead_code)]
 pub(crate) fn get_index_info(_path: &str) -> Option<IndexManifest> {
     None
+}
+
+#[cfg(test)]
+mod vectors_walk_tests {
+    //! The walk that counts a raw index's vectors.bin is held to the map
+    //! decode it replaced, on what it counts, what it names and what it
+    //! refuses.
+    use super::*;
+
+    fn encoded(entries: &[(&str, Vec<f32>)]) -> Vec<u8> {
+        let map: HashMap<String, Vec<f32>> = entries
+            .iter()
+            .map(|(id, vector)| (id.to_string(), vector.clone()))
+            .collect();
+        bincode::encode_to_vec(&map, bincode::config::standard()).unwrap()
+    }
+
+    #[test]
+    fn the_walk_counts_what_the_map_holds_and_names_the_same_offenders() {
+        let bytes = encoded(&[
+            ("a", vec![f32::NAN, 0.0]),
+            ("b", vec![1.0, 2.0]),
+            ("c", vec![f32::INFINITY, 1.0]),
+        ]);
+        let map: HashMap<String, Vec<f32>> = decode_bounded(&bytes, "vectors.bin").unwrap();
+        let (count, offenders) = walk_vectors(&bytes, "vectors.bin").unwrap();
+        assert_eq!(count, map.len());
+        match check_vectors_are_finite(&map) {
+            Err(Error::VectorsNotFinite {
+                offenders: named,
+                total,
+            }) => {
+                assert_eq!((offenders, count), (named, total));
+            }
+            other => panic!("the map holds two offenders and the check said {:?}", other),
+        }
+    }
+
+    #[test]
+    fn the_walk_keeps_a_clean_file_and_counts_it() {
+        let bytes = encoded(&[("a", vec![1.0, 2.0]), ("b", vec![3.0, 4.0])]);
+        assert_eq!(walk_vectors(&bytes, "vectors.bin").unwrap(), (2, vec![]));
+    }
+
+    #[test]
+    fn the_walk_refuses_a_truncated_file_as_the_map_does() {
+        let bytes = encoded(&[("a", vec![1.0, 2.0, 3.0])]);
+        let cut = &bytes[..bytes.len() - 5];
+        let map = decode_bounded::<HashMap<String, Vec<f32>>>(cut, "vectors.bin")
+            .unwrap_err()
+            .to_string();
+        let walk = walk_vectors(cut, "vectors.bin").unwrap_err().to_string();
+        assert_eq!(walk, map);
+    }
+
+    #[test]
+    fn the_walk_refuses_a_length_the_file_has_not_earned_as_the_map_does() {
+        // A few bytes declaring 2^30 records, which claim far more than the
+        // file's length earns under the budget.
+        let mut bytes = bincode::encode_to_vec(1u64 << 30, bincode::config::standard()).unwrap();
+        bytes.extend_from_slice(&[1, b'a', 0]);
+        let map = decode_bounded::<HashMap<String, Vec<f32>>>(&bytes, "vectors.bin")
+            .unwrap_err()
+            .to_string();
+        let walk = walk_vectors(&bytes, "vectors.bin").unwrap_err().to_string();
+        assert_eq!(walk, map);
+    }
 }
