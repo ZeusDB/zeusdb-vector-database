@@ -408,7 +408,48 @@ where
         level_scale: f64,
         dist_f: D,
     ) -> Result<(Self, VectorStore<T>), String> {
-        let nb_layer = points_by_layer.len();
+        let layer_counts: Vec<usize> = points_by_layer.iter().map(Vec::len).collect();
+        let dim = points_by_layer
+            .iter()
+            .find_map(|layer| layer.first())
+            .map_or(0, |point| point.data.len());
+        let mut points = points_by_layer.into_iter().flatten();
+        Self::from_points(
+            &layer_counts,
+            dim,
+            entry_point,
+            m,
+            ef_construction,
+            level_scale,
+            dist_f,
+            || {
+                points
+                    .next()
+                    .ok_or_else(|| "the graph dump ran out of points".to_string())
+            },
+        )
+    }
+
+    /// Build a graph from points handed out one at a time in (layer, rank)
+    /// order, `layer_counts[l]` of them at layer `l`, each holding `dim`
+    /// values.
+    ///
+    /// The reader hands the points straight from the file, so a point's
+    /// vector is moved into the store as it arrives rather than every vector
+    /// being held first. [`Self::from_loaded`] is the same over points already
+    /// collected.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_points(
+        layer_counts_in: &[usize],
+        dim: usize,
+        entry_point: PointId,
+        m: usize,
+        ef_construction: usize,
+        level_scale: f64,
+        dist_f: D,
+        mut next: impl FnMut() -> Result<LoadedPoint<T>, String>,
+    ) -> Result<(Self, VectorStore<T>), String> {
+        let nb_layer = layer_counts_in.len();
         if nb_layer == 0 || nb_layer > LAYERS {
             return Err(format!(
                 "a graph carries between 1 and {} layers and this one carries {}",
@@ -431,15 +472,14 @@ where
         let mut layer_counts = [0u32; LAYERS];
         let mut layer_offsets = [0u32; LAYERS + 1];
         let mut nb_point: usize = 0;
-        for (layer, points) in points_by_layer.iter().enumerate() {
-            if points.len() > i32::MAX as usize {
+        for (layer, &count) in layer_counts_in.iter().enumerate() {
+            if count > i32::MAX as usize {
                 return Err(format!(
                     "layer {} holds {} points and a rank is an i32",
-                    layer,
-                    points.len()
+                    layer, count
                 ));
             }
-            nb_point += points.len();
+            nb_point += count;
         }
         if nb_point == 0 {
             return Err("a graph holding no points has no entry point".to_string());
@@ -457,16 +497,10 @@ where
             ));
         }
         for layer in 0..LAYERS {
-            let count = points_by_layer.get(layer).map_or(0, Vec::len) as u32;
+            let count = layer_counts_in.get(layer).copied().unwrap_or(0) as u32;
             layer_counts[layer] = count;
             layer_offsets[layer + 1] = layer_offsets[layer] + count;
         }
-
-        let dim = points_by_layer
-            .iter()
-            .find_map(|layer| layer.first())
-            .map(|point| point.data.len())
-            .expect("nb_point is positive, so some layer holds a point");
 
         let base_cap = 2 * m + 1;
 
@@ -501,8 +535,9 @@ where
         let mut store = VectorStore::with_capacity(dim, nb_point);
         let mut lists: Vec<Vec<(f32, u32)>> = Vec::new();
         let mut targets: Vec<u32> = Vec::new();
-        for (layer, points) in points_by_layer.into_iter().enumerate() {
-            for (rank, point) in points.into_iter().enumerate() {
+        for (layer, &count) in layer_counts_in.iter().enumerate() {
+            for rank in 0..count {
+                let point = next()?;
                 let node = layer_offsets[layer] + rank as u32;
                 if point.data.len() != dim {
                     return Err(format!(
@@ -599,17 +634,22 @@ where
         // layer it owns no list at takes one, which is a state the vendored
         // builder does not reach and which the fixed sixteen slot counter array
         // on a vendored point would have absorbed silently.
-        let mut inbound: Vec<(u32, usize)> = Vec::new();
+        //
+        // Each edge is counted as it is read rather than collected first. A
+        // span grown on the way is a node's, and the list it opens is empty,
+        // so what the pass reads is the edges the walk installed and nothing
+        // else, in the order it would have collected them. Collecting them
+        // first held sixteen bytes an edge, which on a graph of a hundred
+        // thousand records at the default `m` was the largest block of the
+        // whole load.
         for node in 0..graph.origin_ids.len() as u32 {
             for layer in 0..=graph.span(node) {
                 for slot in 0..graph.list_len(node, layer) {
-                    inbound.push((graph.target_at(node, layer, slot), layer));
+                    let target = graph.target_at(node, layer, slot);
+                    graph.grow_span(target, layer);
+                    graph.bump_in_degree(target, layer, 1);
                 }
             }
-        }
-        for &(target, layer) in &inbound {
-            graph.grow_span(target, layer);
-            graph.bump_in_degree(target, layer, 1);
         }
 
         // Trimming makes every buffer's capacity its length, which is what lets
