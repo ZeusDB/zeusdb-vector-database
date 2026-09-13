@@ -267,6 +267,49 @@ def test_a_forged_length_in_a_raw_artefact_is_refused(raw_index, tmp_path, name,
     assert_refused(path, tmp_path, naming=name)
 
 
+def wire_vector(values):
+    return varint(len(values)) + struct.pack(f"<{len(values)}f", *values)
+
+
+def wire_record(ident, values):
+    return wire_str(ident) + wire_vector(values)
+
+
+_A = [1.0, 0.0, 0.0, 0.0]
+_B = [0.0, 1.0, 0.0, 0.0]
+_A_POISONED = [float("nan"), 0.0, 0.0, 0.0]
+
+
+@pytest.mark.parametrize(
+    "payload,opens",
+    [
+        (varint(3) + wire_record("a", _A) + wire_record("b", _B) + wire_record("a", _A), True),
+        (varint(3) + wire_record("a", _A_POISONED) + wire_record("b", _B) + wire_record("a", _A), True),
+        (varint(3) + wire_record("a", _A) + wire_record("b", _B) + wire_record("a", _A_POISONED), False),
+    ],
+    ids=["twice-clean", "first-copy-poisoned-last-clean", "last-copy-poisoned"],
+)
+def test_a_vectors_bin_holding_one_id_twice_is_read_as_a_map_holds_it(
+    raw_index, tmp_path, payload, opens
+):
+    """No save writes an id twice, since the map it encodes cannot hold one,
+    so this is a file a hand made. Every release read the file into a map,
+    which held one entry for the id, the last copy, and counted it once. The
+    loader now walks the file without building the map and gives the same
+    answer: two records, and a refusal only when the copy that came last is
+    the one that is not finite, naming the id once.
+    """
+    path = forged(raw_index, tmp_path, "vectors.bin", write_bytes(payload))
+    status, verdict, _ = load_in_child(path, tmp_path)
+    assert status == 0
+    if opens:
+        assert verdict == "LOADED 2", verdict
+    else:
+        assert verdict.startswith("REFUSED"), verdict
+        assert "in 1 of 2 records" in verdict, verdict
+        assert verdict.endswith("Affected records include: a"), verdict
+
+
 # The forward map, then a reverse map that is not its inverse. The loader
 # builds one id store from the forward map and holds the reverse map to being
 # the store's exact inverse, since the two were written from one structure.
