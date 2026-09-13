@@ -1566,10 +1566,12 @@ impl RawVectors {
 /// Walk vectors.bin for its record count and its finiteness check, keeping
 /// nothing
 ///
-/// Read only when the manifest names it, as `load_vectors` is. A record whose
-/// vector is not finite is named exactly as `check_vectors_are_finite` names
-/// it.
-fn count_vectors(path: &Path, manifest: &IndexManifest) -> Result<usize, Error> {
+/// Read only when the manifest names it, as `load_vectors` is. The count is
+/// the one the map decode gave, an id the file holds twice counted once,
+/// and a record whose vector is not finite is named exactly as
+/// `check_vectors_are_finite` names it. `records` is the count the mappings
+/// hold, which sizes what the walk keeps; see `walk_vectors_with`.
+fn count_vectors(path: &Path, manifest: &IndexManifest, records: usize) -> Result<usize, Error> {
     debug!(target: LOG_TARGET, "Loading vectors.bin...");
 
     if !manifest_names(manifest, "vectors.bin") {
@@ -1579,7 +1581,7 @@ fn count_vectors(path: &Path, manifest: &IndexManifest) -> Result<usize, Error> 
 
     let vectors_data = read_artefact(path, "vectors.bin", manifest)?;
 
-    let (count, offenders) = walk_vectors(&vectors_data, "vectors.bin")?;
+    let (count, offenders) = walk_vectors(&vectors_data, "vectors.bin", records)?;
     if !offenders.is_empty() {
         return Err(Error::VectorsNotFinite {
             offenders,
@@ -1597,18 +1599,20 @@ fn count_vectors(path: &Path, manifest: &IndexManifest) -> Result<usize, Error> 
 /// The budget rung is the one `decode_bounded` picks for the same file, and
 /// the steps are the ones bincode's own map decoder takes, the container
 /// claim included, so the two refuse the same files for the same reasons.
-fn walk_vectors(data: &[u8], file: &str) -> Result<(usize, Vec<String>), Error> {
+/// The count and the names are the map's as well; see `walk_vectors_with`,
+/// which `records`, the count the mappings hold, sizes.
+fn walk_vectors(data: &[u8], file: &str, records: usize) -> Result<(usize, Vec<String>), Error> {
     use bincode::config::standard;
 
     let budget = data.len().saturating_mul(CLAIM_PER_WIRE_BYTE);
     let walked = if budget <= 1 << 20 {
-        walk_vectors_with(data, standard().with_limit::<{ 1 << 20 }>())
+        walk_vectors_with(data, standard().with_limit::<{ 1 << 20 }>(), records)
     } else if budget <= 1 << 28 {
-        walk_vectors_with(data, standard().with_limit::<{ 1 << 28 }>())
+        walk_vectors_with(data, standard().with_limit::<{ 1 << 28 }>(), records)
     } else if budget <= 1 << 36 {
-        walk_vectors_with(data, standard().with_limit::<{ 1 << 36 }>())
+        walk_vectors_with(data, standard().with_limit::<{ 1 << 36 }>(), records)
     } else {
-        walk_vectors_with(data, standard().with_limit::<{ 1 << 44 }>())
+        walk_vectors_with(data, standard().with_limit::<{ 1 << 44 }>(), records)
     };
 
     match walked {
@@ -1625,13 +1629,69 @@ fn walk_vectors(data: &[u8], file: &str) -> Result<(usize, Vec<String>), Error> 
 }
 
 /// The steps `HashMap<String, Vec<f32>>` takes to decode, one record at a
-/// time and with no map built.
+/// time and with no map built
+///
+/// The map held one entry for an id the file named twice, the last copy,
+/// so a file holding a duplicate counted it once and judged it by the copy
+/// that came last. The walk gives the same answer without the map. Each id
+/// is hashed as it is read into a set of 64 bit hashes sized by `records`,
+/// the count the mappings hold, and a set as large as the header's count
+/// proves every id distinct, so the count is the header's. A smaller set
+/// holds a duplicate or a collision, and `count_distinct_ids` walks the
+/// file again holding every id by name, which is what the map cost and
+/// which no directory a save wrote reaches. The offenders are held by name
+/// throughout, a finite copy releasing the name a copy before it entered,
+/// so the ids named are the ids whose last copy is not finite, as the
+/// map's entries were.
 fn walk_vectors_with<C: bincode::config::Config>(
     data: &[u8],
     config: C,
+    records: usize,
 ) -> Result<(usize, Vec<String>), bincode::error::DecodeError> {
     use bincode::de::Decoder;
     use bincode::Decode;
+    use std::collections::{BTreeSet, HashSet};
+    use std::hash::{BuildHasher, RandomState};
+
+    let hasher = RandomState::new();
+    let mut decoder =
+        bincode::de::DecoderImpl::new(bincode::de::read::SliceReader::new(data), config, ());
+    let claimed = u64::decode(&mut decoder)?;
+    let len = usize::try_from(claimed)
+        .map_err(|_| bincode::error::DecodeError::OutsideUsizeRange(claimed))?;
+    decoder.claim_container_read::<(String, Vec<f32>)>(len)?;
+    let mut hashes: HashSet<u64> = HashSet::with_capacity(records);
+    let mut offenders: BTreeSet<String> = BTreeSet::new();
+    for _ in 0..len {
+        decoder.unclaim_bytes_read(std::mem::size_of::<(String, Vec<f32>)>());
+        let id = String::decode(&mut decoder)?;
+        let vector = Vec::<f32>::decode(&mut decoder)?;
+        if vector.iter().all(|value| value.is_finite()) {
+            offenders.remove(&id);
+        } else {
+            offenders.insert(id.clone());
+        }
+        hashes.insert(hasher.hash_one(&id));
+    }
+    let count = if hashes.len() == len {
+        len
+    } else {
+        count_distinct_ids(data, config)?
+    };
+    Ok((count, offenders.into_iter().collect()))
+}
+
+/// The distinct ids of a file whose id hashes repeated, held by name
+///
+/// The same steps again over the same bytes, which the walk has already
+/// taken without error, so this cannot fail where the walk did not.
+fn count_distinct_ids<C: bincode::config::Config>(
+    data: &[u8],
+    config: C,
+) -> Result<usize, bincode::error::DecodeError> {
+    use bincode::de::Decoder;
+    use bincode::Decode;
+    use std::collections::HashSet;
 
     let mut decoder =
         bincode::de::DecoderImpl::new(bincode::de::read::SliceReader::new(data), config, ());
@@ -1639,17 +1699,14 @@ fn walk_vectors_with<C: bincode::config::Config>(
     let len = usize::try_from(claimed)
         .map_err(|_| bincode::error::DecodeError::OutsideUsizeRange(claimed))?;
     decoder.claim_container_read::<(String, Vec<f32>)>(len)?;
-    let mut offenders = Vec::new();
+    let mut ids: HashSet<String> = HashSet::new();
     for _ in 0..len {
         decoder.unclaim_bytes_read(std::mem::size_of::<(String, Vec<f32>)>());
         let id = String::decode(&mut decoder)?;
-        let vector = Vec::<f32>::decode(&mut decoder)?;
-        if vector.iter().any(|value| !value.is_finite()) {
-            offenders.push(id);
-        }
+        Vec::<f32>::decode(&mut decoder)?;
+        ids.insert(id);
     }
-    offenders.sort();
-    Ok((len, offenders))
+    Ok(ids.len())
 }
 
 /// Load manifest for validation and metadata
@@ -2747,7 +2804,7 @@ pub(crate) fn load_index(
     let vectors = if manifest_names(&manifest, "quantization.json") {
         RawVectors::Held(load_vectors(path_buf, &manifest)?)
     } else {
-        RawVectors::Counted(count_vectors(path_buf, &manifest)?)
+        RawVectors::Counted(count_vectors(path_buf, &manifest, mappings.id_map.len())?)
     };
     debug!(target: LOG_TARGET, "Vectors loaded: {} vectors", vectors.len());
 
@@ -3552,52 +3609,140 @@ pub(crate) fn get_index_info(_path: &str) -> Option<IndexManifest> {
 mod vectors_walk_tests {
     //! The walk that counts a raw index's vectors.bin is held to the map
     //! decode it replaced, on what it counts, what it names and what it
-    //! refuses.
+    //! refuses, over files a save writes and files a hand has.
     use super::*;
 
+    /// The wire a map of these entries writes, in this order. A vector of
+    /// pairs encodes exactly as a map does, and unlike a map it can hold an
+    /// id twice.
     fn encoded(entries: &[(&str, Vec<f32>)]) -> Vec<u8> {
-        let map: HashMap<String, Vec<f32>> = entries
+        let pairs: Vec<(String, Vec<f32>)> = entries
             .iter()
             .map(|(id, vector)| (id.to_string(), vector.clone()))
             .collect();
-        bincode::encode_to_vec(&map, bincode::config::standard()).unwrap()
+        bincode::encode_to_vec(&pairs, bincode::config::standard()).unwrap()
+    }
+
+    /// The record count the mappings a save wrote for these entries would
+    /// hold, one per distinct id, less the ids named in `without`.
+    fn records(entries: &[(&str, Vec<f32>)], without: &[&str]) -> usize {
+        let mut ids: Vec<&str> = entries
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| !without.contains(id))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    }
+
+    /// The walk and the map decode over one file give the same count, and
+    /// the walk names what `check_vectors_are_finite` names over the map.
+    fn assert_walk_matches_map(entries: &[(&str, Vec<f32>)], records: usize) {
+        let bytes = encoded(entries);
+        let map: HashMap<String, Vec<f32>> = decode_bounded(&bytes, "vectors.bin").unwrap();
+        let (count, offenders) = walk_vectors(&bytes, "vectors.bin", records).unwrap();
+        assert_eq!(count, map.len(), "the count over {:?}", entries);
+        let named = match check_vectors_are_finite(&map) {
+            Ok(()) => vec![],
+            Err(Error::VectorsNotFinite { offenders, total }) => {
+                assert_eq!(total, count, "the total over {:?}", entries);
+                offenders
+            }
+            Err(other) => panic!("the finiteness check said {:?}", other),
+        };
+        assert_eq!(offenders, named, "the offenders over {:?}", entries);
     }
 
     #[test]
     fn the_walk_counts_what_the_map_holds_and_names_the_same_offenders() {
-        let bytes = encoded(&[
+        let entries = [
             ("a", vec![f32::NAN, 0.0]),
             ("b", vec![1.0, 2.0]),
             ("c", vec![f32::INFINITY, 1.0]),
-        ]);
-        let map: HashMap<String, Vec<f32>> = decode_bounded(&bytes, "vectors.bin").unwrap();
-        let (count, offenders) = walk_vectors(&bytes, "vectors.bin").unwrap();
-        assert_eq!(count, map.len());
-        match check_vectors_are_finite(&map) {
-            Err(Error::VectorsNotFinite {
-                offenders: named,
-                total,
-            }) => {
-                assert_eq!((offenders, count), (named, total));
-            }
-            other => panic!("the map holds two offenders and the check said {:?}", other),
-        }
+        ];
+        assert_walk_matches_map(&entries, records(&entries, &[]));
     }
 
     #[test]
     fn the_walk_keeps_a_clean_file_and_counts_it() {
-        let bytes = encoded(&[("a", vec![1.0, 2.0]), ("b", vec![3.0, 4.0])]);
-        assert_eq!(walk_vectors(&bytes, "vectors.bin").unwrap(), (2, vec![]));
+        let entries = [("a", vec![1.0, 2.0]), ("b", vec![3.0, 4.0])];
+        let bytes = encoded(&entries);
+        assert_eq!(
+            walk_vectors(&bytes, "vectors.bin", records(&entries, &[])).unwrap(),
+            (2, vec![])
+        );
+    }
+
+    #[test]
+    fn the_walk_counts_an_id_held_twice_once_as_the_map_did() {
+        let entries = [
+            ("a", vec![1.0, 0.0]),
+            ("b", vec![2.0, 0.0]),
+            ("a", vec![3.0, 0.0]),
+        ];
+        let held = records(&entries, &[]);
+        assert_eq!(held, 2);
+        assert_walk_matches_map(&entries, held);
+        let (count, _) = walk_vectors(&encoded(&entries), "vectors.bin", held).unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn the_walk_judges_an_id_held_twice_by_its_last_copy_as_the_map_did() {
+        let clean = vec![1.0, 0.0];
+        let poisoned = vec![f32::NAN, 0.0];
+        let first_poisoned = [
+            ("a", poisoned.clone()),
+            ("b", clean.clone()),
+            ("a", clean.clone()),
+        ];
+        let last_poisoned = [
+            ("a", clean.clone()),
+            ("b", clean.clone()),
+            ("a", poisoned.clone()),
+        ];
+        let both_poisoned = [
+            ("a", poisoned.clone()),
+            ("b", clean.clone()),
+            ("a", poisoned.clone()),
+        ];
+        for entries in [&first_poisoned, &last_poisoned, &both_poisoned] {
+            assert_walk_matches_map(entries, records(entries, &[]));
+        }
+        let (count, offenders) = walk_vectors(&encoded(&first_poisoned), "vectors.bin", 2).unwrap();
+        assert_eq!((count, offenders), (2, vec![]));
+        let (count, offenders) = walk_vectors(&encoded(&both_poisoned), "vectors.bin", 2).unwrap();
+        assert_eq!((count, offenders), (2, vec!["a".to_string()]));
+    }
+
+    #[test]
+    fn the_walk_counts_an_id_the_mappings_do_not_hold_as_the_map_did() {
+        // The set of hashes is sized by the mappings and grows past them.
+        let entries = [
+            ("a", vec![1.0, 0.0]),
+            ("z", vec![2.0, 0.0]),
+            ("z", vec![f32::NAN, 0.0]),
+            ("z", vec![3.0, 0.0]),
+        ];
+        let held = records(&entries, &["z"]);
+        assert_eq!(held, 1);
+        assert_walk_matches_map(&entries, held);
+        let (count, offenders) = walk_vectors(&encoded(&entries), "vectors.bin", held).unwrap();
+        assert_eq!((count, offenders), (2, vec![]));
     }
 
     #[test]
     fn the_walk_refuses_a_truncated_file_as_the_map_does() {
-        let bytes = encoded(&[("a", vec![1.0, 2.0, 3.0])]);
+        let entries = [("a", vec![1.0, 2.0, 3.0])];
+        let bytes = encoded(&entries);
         let cut = &bytes[..bytes.len() - 5];
         let map = decode_bounded::<HashMap<String, Vec<f32>>>(cut, "vectors.bin")
             .unwrap_err()
             .to_string();
-        let walk = walk_vectors(cut, "vectors.bin").unwrap_err().to_string();
+        let walk = walk_vectors(cut, "vectors.bin", records(&entries, &[]))
+            .unwrap_err()
+            .to_string();
         assert_eq!(walk, map);
     }
 
@@ -3610,7 +3755,9 @@ mod vectors_walk_tests {
         let map = decode_bounded::<HashMap<String, Vec<f32>>>(&bytes, "vectors.bin")
             .unwrap_err()
             .to_string();
-        let walk = walk_vectors(&bytes, "vectors.bin").unwrap_err().to_string();
+        let walk = walk_vectors(&bytes, "vectors.bin", 0)
+            .unwrap_err()
+            .to_string();
         assert_eq!(walk, map);
     }
 }
