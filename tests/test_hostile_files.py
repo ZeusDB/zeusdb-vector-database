@@ -385,6 +385,74 @@ def test_the_claim_budget_admits_the_densest_file_this_build_writes(tmp_path):
     assert VectorDatabase().load(str(path)).get_vector_count() == count
 
 
+
+# ============================================================================
+# THE RUNG AND THE BUDGET
+# ============================================================================
+#
+# bincode takes its byte limit as a const generic, so the budget a file's own
+# length earns picks one of four rungs rather than being passed, and the rungs
+# are a factor of 256 apart. A file one byte above a rung's top therefore earned
+# 256 times its budget, and every container length under that rung went to the
+# allocator: a 4 MiB mappings.bin declaring 2^31 entries asked for 132 GiB and
+# the child below died rather than raising. The loader now claims whatever the
+# rung carries above the budget before it decodes anything, so a container may
+# claim the budget and nothing above it.
+
+# A file one byte past the 4 MiB top of the 2^28 rung's band, so its own length
+# earns 2^28 and the decoder is built at 2^36.
+OVER_A_RUNG = (1 << 22) + 64
+THE_RUNG_ABOVE = 1 << 36
+
+
+def between_budget_and_rung(entry_bytes):
+    """A container length claiming under the rung and over the budget.
+
+    The padding is never read. A length is claimed before the entries behind it
+    are decoded, so the file ends long before the decoder asks for them.
+    """
+    head = varint((THE_RUNG_ABOVE - 4096) // entry_bytes)
+    return head + bytes(OVER_A_RUNG - len(head))
+
+
+def inner_between_budget_and_rung(entry_bytes):
+    """The same, one record in, which is where the rung left a length loose
+    once the outer container's claim had passed."""
+    head = varint(1) + wire_str("a") + varint((THE_RUNG_ABOVE - 4096) // entry_bytes)
+    return head + bytes(OVER_A_RUNG - len(head))
+
+
+@pytest.mark.parametrize(
+    "fixture,name,payload",
+    [
+        # HashMap<String, usize>, 32 bytes an entry. This one killed the child.
+        ("raw", "mappings.bin", between_budget_and_rung(32)),
+        # HashMap<String, Vec<f32>>, 48 bytes an entry, on the walk a raw index
+        # takes and on the map decode a quantized one takes.
+        ("raw", "vectors.bin", between_budget_and_rung(48)),
+        ("quantized", "vectors.bin", between_budget_and_rung(48)),
+        ("quantized", "pq_codes.bin", between_budget_and_rung(48)),
+        # Vec<Vec<Vec<f32>>>, 24 bytes an entry.
+        ("quantized", "pq_centroids.bin", between_budget_and_rung(24)),
+        # One record in: the vector's own Vec<f32>, and the code's Vec<u8>.
+        ("raw", "vectors.bin", inner_between_budget_and_rung(4)),
+        ("quantized", "vectors.bin", inner_between_budget_and_rung(4)),
+        ("quantized", "pq_codes.bin", inner_between_budget_and_rung(1)),
+    ],
+    ids=[
+        "mappings-id_map", "vectors-map-walked", "vectors-map-decoded",
+        "codes-map", "centroids-subvector-count",
+        "vectors-record-vector-walked", "vectors-record-vector-decoded",
+        "codes-record-code",
+    ],
+)
+def test_a_length_between_the_budget_and_the_rung_is_refused(
+    raw_index, quantized_index, tmp_path, fixture, name, payload
+):
+    source = raw_index if fixture == "raw" else quantized_index
+    path = forged(source, tmp_path, name, write_bytes(payload))
+    assert_refused(path, tmp_path, naming=name)
+
 # ============================================================================
 # quantization.json
 # ============================================================================
