@@ -228,14 +228,29 @@ const JOURNAL_FORMAT_MAJOR: u32 = 3;
 /// so it admits every file this build writes with margin.
 const CLAIM_PER_WIRE_BYTE: usize = 64;
 
+/// The claim a decode makes before it has read anything
+///
+/// bincode charges eight bytes for reading a length word, whatever the varint
+/// that carries it occupies on the wire, and every artefact here begins with
+/// one. A budget below that admits no decode at all, so a zero byte artefact
+/// would be refused as a length it never declared rather than as the file
+/// ending where a length was expected. The floor is that charge, and a file of
+/// one byte already earns eight times it.
+const LEADING_LENGTH_CLAIM: usize = std::mem::size_of::<u64>();
+
 /// Decode a bincode artefact under a budget the file's own length sets
 ///
-/// bincode takes its limit as a const generic, so the derived budget picks a
-/// rung rather than being passed. The rungs are a factor of 256 apart, so the
-/// effective budget is at most 256 times the derived one. That is still a
-/// multiple of the file's length rather than a free hand, and it still refuses
-/// a hostile length by many orders of magnitude: the 2^40 cases above claim at
-/// least a terabyte from files of a few tens of bytes.
+/// bincode takes its limit as a const generic, so the derived budget picks one
+/// of four rungs rather than being passed. The rungs are a factor of 256
+/// apart, so a file one byte above a rung's top earns 256 times the budget its
+/// length gives, and every container length under that rung is sized from the
+/// length the file declares. A 4 MiB file earned a 64 GiB rung, and a header
+/// on one killed the process.
+///
+/// `claim_rung_excess` closes that gap. The rung is still what the decoder is
+/// built with, because the const generic needs a constant, but whatever it
+/// carries above the derived budget is claimed before anything is decoded, so
+/// what a container may still claim is the budget and nothing more.
 ///
 /// A file long enough to need more than the top rung is one `fs::read` could
 /// not have returned, so the top rung is the last arm rather than a special
@@ -244,21 +259,29 @@ fn decode_bounded<T>(data: &[u8], file: &str) -> Result<T, Error>
 where
     T: bincode::Decode<()>,
 {
+    decode_at(data, file, claim_budget(data.len()))
+}
+
+/// The decode above under a budget given outright, so a test can measure how
+/// much of it a well formed artefact really claims.
+fn decode_at<T>(data: &[u8], file: &str, budget: usize) -> Result<T, Error>
+where
+    T: bincode::Decode<()>,
+{
     use bincode::config::standard;
 
-    let budget = data.len().saturating_mul(CLAIM_PER_WIRE_BYTE);
     let decoded = if budget <= 1 << 20 {
-        bincode::decode_from_slice::<T, _>(data, standard().with_limit::<{ 1 << 20 }>())
+        decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 20 }>(), budget)
     } else if budget <= 1 << 28 {
-        bincode::decode_from_slice::<T, _>(data, standard().with_limit::<{ 1 << 28 }>())
+        decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 28 }>(), budget)
     } else if budget <= 1 << 36 {
-        bincode::decode_from_slice::<T, _>(data, standard().with_limit::<{ 1 << 36 }>())
+        decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 36 }>(), budget)
     } else {
-        bincode::decode_from_slice::<T, _>(data, standard().with_limit::<{ 1 << 44 }>())
+        decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 44 }>(), budget)
     };
 
     match decoded {
-        Ok((value, _)) => Ok(value),
+        Ok(value) => Ok(value),
         Err(bincode::error::DecodeError::LimitExceeded) => Err(Error::DecodeLengthExceeded {
             file: file.to_string(),
             bytes: data.len(),
@@ -267,6 +290,56 @@ where
             file: file.to_string(),
             error: e.to_string(),
         }),
+    }
+}
+
+/// `T` from `data` under `budget`, whatever the rung carries above it claimed
+/// first
+///
+/// The steps are `bincode::decode_from_slice`'s own, being a decoder over the
+/// slice and one `Decode::decode` call, so a file this refuses is refused with
+/// the message that function gave. What that function returns beside the value
+/// is the bytes it read, which no caller here reads.
+fn decode_claimed<T, C>(
+    data: &[u8],
+    config: C,
+    budget: usize,
+) -> Result<T, bincode::error::DecodeError>
+where
+    T: bincode::Decode<()>,
+    C: bincode::config::Config,
+{
+    let mut decoder =
+        bincode::de::DecoderImpl::new(bincode::de::read::SliceReader::new(data), config, ());
+    claim_rung_excess(&mut decoder, budget)?;
+    T::decode(&mut decoder)
+}
+
+/// Claim whatever the decoder's rung carries above `budget`
+///
+/// bincode counts claimed bytes against the const limit and unclaims each
+/// element as it decodes it, starting the count at zero. Starting it at the
+/// rung's excess instead leaves exactly `budget` to claim, which is what a
+/// limit given at run time would have left. The limit is read back from the
+/// configuration rather than passed in, so the arm that built the decoder and
+/// the claim that tightens it cannot name different rungs.
+///
+/// bincode's limit is a const generic and both its `Config` and its `Decoder`
+/// are sealed, so there is no configuration and no decoder this crate can
+/// write to carry a budget that is not a constant. This is the claim the
+/// sealed traits still admit.
+///
+/// A file whose budget is above the top rung has nothing to claim and keeps
+/// the rung, which needs an artefact of 256 GiB.
+fn claim_rung_excess<D: bincode::de::Decoder>(
+    decoder: &mut D,
+    budget: usize,
+) -> Result<(), bincode::error::DecodeError> {
+    use bincode::config::Config;
+
+    match decoder.config().limit() {
+        Some(rung) => decoder.claim_bytes_read(rung.saturating_sub(budget)),
+        None => Ok(()),
     }
 }
 
@@ -1596,23 +1669,60 @@ fn count_vectors(path: &Path, manifest: &IndexManifest, records: usize) -> Resul
 /// Decode a map of vectors one record at a time, returning the record count
 /// and the ids whose vector holds a value that is not finite, sorted
 ///
-/// The budget rung is the one `decode_bounded` picks for the same file, and
-/// the steps are the ones bincode's own map decoder takes, the container
-/// claim included, so the two refuse the same files for the same reasons.
-/// The count and the names are the map's as well; see `walk_vectors_with`,
-/// which `records`, the count the mappings hold, sizes.
+/// The budget is the one `decode_bounded` gives the same file, the rung's
+/// excess claimed first and all, and the steps are the ones bincode's own map
+/// decoder takes, the container claim included, so the two refuse the same
+/// files for the same reasons. The count and the names are the map's as well;
+/// see `walk_vectors_with`, which `records`, the count the mappings hold,
+/// sizes.
 fn walk_vectors(data: &[u8], file: &str, records: usize) -> Result<(usize, Vec<String>), Error> {
+    walk_at(data, file, records, claim_budget(data.len()))
+}
+
+/// The claim budget a file of `bytes` earns.
+fn claim_budget(bytes: usize) -> usize {
+    bytes
+        .saturating_mul(CLAIM_PER_WIRE_BYTE)
+        .max(LEADING_LENGTH_CLAIM)
+}
+
+/// The walk above under a budget given outright, as `decode_at` is.
+fn walk_at(
+    data: &[u8],
+    file: &str,
+    records: usize,
+    budget: usize,
+) -> Result<(usize, Vec<String>), Error> {
     use bincode::config::standard;
 
-    let budget = data.len().saturating_mul(CLAIM_PER_WIRE_BYTE);
     let walked = if budget <= 1 << 20 {
-        walk_vectors_with(data, standard().with_limit::<{ 1 << 20 }>(), records)
+        walk_vectors_with(
+            data,
+            standard().with_limit::<{ 1 << 20 }>(),
+            records,
+            budget,
+        )
     } else if budget <= 1 << 28 {
-        walk_vectors_with(data, standard().with_limit::<{ 1 << 28 }>(), records)
+        walk_vectors_with(
+            data,
+            standard().with_limit::<{ 1 << 28 }>(),
+            records,
+            budget,
+        )
     } else if budget <= 1 << 36 {
-        walk_vectors_with(data, standard().with_limit::<{ 1 << 36 }>(), records)
+        walk_vectors_with(
+            data,
+            standard().with_limit::<{ 1 << 36 }>(),
+            records,
+            budget,
+        )
     } else {
-        walk_vectors_with(data, standard().with_limit::<{ 1 << 44 }>(), records)
+        walk_vectors_with(
+            data,
+            standard().with_limit::<{ 1 << 44 }>(),
+            records,
+            budget,
+        )
     };
 
     match walked {
@@ -1647,6 +1757,7 @@ fn walk_vectors_with<C: bincode::config::Config>(
     data: &[u8],
     config: C,
     records: usize,
+    budget: usize,
 ) -> Result<(usize, Vec<String>), bincode::error::DecodeError> {
     use bincode::de::Decoder;
     use bincode::Decode;
@@ -1656,6 +1767,7 @@ fn walk_vectors_with<C: bincode::config::Config>(
     let hasher = RandomState::new();
     let mut decoder =
         bincode::de::DecoderImpl::new(bincode::de::read::SliceReader::new(data), config, ());
+    claim_rung_excess(&mut decoder, budget)?;
     let claimed = u64::decode(&mut decoder)?;
     let len = usize::try_from(claimed)
         .map_err(|_| bincode::error::DecodeError::OutsideUsizeRange(claimed))?;
@@ -1676,7 +1788,7 @@ fn walk_vectors_with<C: bincode::config::Config>(
     let count = if hashes.len() == len {
         len
     } else {
-        count_distinct_ids(data, config)?
+        count_distinct_ids(data, config, budget)?
     };
     Ok((count, offenders.into_iter().collect()))
 }
@@ -1688,6 +1800,7 @@ fn walk_vectors_with<C: bincode::config::Config>(
 fn count_distinct_ids<C: bincode::config::Config>(
     data: &[u8],
     config: C,
+    budget: usize,
 ) -> Result<usize, bincode::error::DecodeError> {
     use bincode::de::Decoder;
     use bincode::Decode;
@@ -1695,6 +1808,7 @@ fn count_distinct_ids<C: bincode::config::Config>(
 
     let mut decoder =
         bincode::de::DecoderImpl::new(bincode::de::read::SliceReader::new(data), config, ());
+    claim_rung_excess(&mut decoder, budget)?;
     let claimed = u64::decode(&mut decoder)?;
     let len = usize::try_from(claimed)
         .map_err(|_| bincode::error::DecodeError::OutsideUsizeRange(claimed))?;
@@ -3759,5 +3873,231 @@ mod vectors_walk_tests {
             .unwrap_err()
             .to_string();
         assert_eq!(walk, map);
+    }
+}
+
+#[cfg(test)]
+mod claim_budget_tests {
+    //! What a bincode artefact may claim is the budget its own length earns,
+    //! whatever rung the const generic built the decoder with.
+    //!
+    //! The claim depends on the lengths a file declares and not on the values
+    //! behind them, so the well formed artefacts here are built by hand in the
+    //! shapes a save writes rather than by saving an index.
+    use super::*;
+
+    /// The varint a length is written as, which is the encoder's own.
+    fn varint(value: u64) -> Vec<u8> {
+        bincode::encode_to_vec(value, bincode::config::standard()).unwrap()
+    }
+
+    /// `head` padded with zeros to `total` bytes, so the file sits on a
+    /// chosen rung. Nothing reads the padding: the claim comes first.
+    fn padded(mut head: Vec<u8>, total: usize) -> Vec<u8> {
+        head.resize(total.max(head.len()), 0);
+        head
+    }
+
+    /// The rung `decode_bounded` builds its decoder with for a file of
+    /// `bytes`, which is what the excess claim is measured against.
+    fn rung_for(bytes: usize) -> usize {
+        let budget = bytes.saturating_mul(CLAIM_PER_WIRE_BYTE);
+        [1 << 20, 1 << 28, 1 << 36]
+            .into_iter()
+            .find(|rung| budget <= *rung)
+            .unwrap_or(1 << 44)
+    }
+
+    /// A length between the budget a file of `bytes` earns and the rung it is
+    /// decoded at, in entries of `entry` bytes each. The rungs are a factor of
+    /// 256 apart, and this is a count that fell in the gap.
+    fn between_budget_and_rung(bytes: usize, entry: usize) -> u64 {
+        let rung = rung_for(bytes);
+        assert!(
+            rung > bytes * CLAIM_PER_WIRE_BYTE,
+            "the file sits on its rung exactly"
+        );
+        ((rung - 4096) / entry) as u64
+    }
+
+    /// The refusal a file gets, as its message, or the word for having
+    /// decoded.
+    fn refusal<T: bincode::Decode<()>>(data: &[u8], file: &str) -> String {
+        match decode_bounded::<T>(data, file) {
+            Ok(_) => "decoded".to_string(),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// A count that claims more than the file's length earns and less than
+    /// the rung the decoder was built with is refused, on every artefact this
+    /// build decodes. The same bytes under the rung as the budget get past
+    /// the claim, so the refusal is the budget's and not the file's shape.
+    #[test]
+    fn a_header_above_the_budget_is_refused_where_the_rung_admitted_it() {
+        let total = 1 << 20;
+        for (file, entry) in [
+            ("mappings.bin", std::mem::size_of::<(String, usize)>()),
+            ("vectors.bin", std::mem::size_of::<(String, Vec<f32>)>()),
+            ("pq_codes.bin", std::mem::size_of::<(String, Vec<u8>)>()),
+            ("pq_centroids.bin", std::mem::size_of::<Vec<Vec<f32>>>()),
+        ] {
+            let count = between_budget_and_rung(total, entry);
+            let data = padded(varint(count), total);
+            let refused = match file {
+                "mappings.bin" => refusal::<IdMappings>(&data, file),
+                "vectors.bin" => refusal::<HashMap<String, Vec<f32>>>(&data, file),
+                "pq_codes.bin" => refusal::<HashMap<String, Vec<u8>>>(&data, file),
+                _ => refusal::<Centroids>(&data, file),
+            };
+            assert!(
+                refused.contains("declares a length its own"),
+                "{file} gave {refused}"
+            );
+        }
+        let count = between_budget_and_rung(total, std::mem::size_of::<(String, Vec<f32>)>());
+        let data = padded(varint(count), total);
+        let at_rung = decode_at::<HashMap<String, Vec<f32>>>(&data, "vectors.bin", rung_for(total));
+        assert!(
+            matches!(at_rung, Err(Error::DecodeFailed { .. })),
+            "the rung as the budget gave {at_rung:?}"
+        );
+    }
+
+    /// The same for a length inside one record, which is the length the rungs
+    /// left unguarded once the outer container's claim had passed. The walk
+    /// of a raw index's vectors.bin refuses it in the same words.
+    #[test]
+    fn an_inner_length_above_the_budget_is_refused_where_the_rung_admitted_it() {
+        let total = 1 << 20;
+        let count = between_budget_and_rung(total, std::mem::size_of::<f32>());
+        let mut head = varint(1);
+        head.extend(varint(1));
+        head.push(b'a');
+        head.extend(varint(count));
+        let data = padded(head, total);
+        let refused = refusal::<HashMap<String, Vec<f32>>>(&data, "vectors.bin");
+        assert!(
+            refused.contains("declares a length its own"),
+            "the map gave {refused}"
+        );
+        let walked = walk_vectors(&data, "vectors.bin", 0)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(walked, refused, "the walk and the map disagree");
+        let at_rung = decode_at::<HashMap<String, Vec<f32>>>(&data, "vectors.bin", rung_for(total));
+        assert!(
+            matches!(at_rung, Err(Error::DecodeFailed { .. })),
+            "the rung as the budget gave {at_rung:?}"
+        );
+    }
+
+    /// A file whose length earns its rung outright keeps the whole of it, so
+    /// the tightening takes nothing from a file already at the top of a band.
+    #[test]
+    fn a_file_that_earns_its_rung_keeps_all_of_it() {
+        let total = (1 << 20) / CLAIM_PER_WIRE_BYTE;
+        assert_eq!(rung_for(total), 1 << 20);
+        let count = ((1 << 20) / std::mem::size_of::<(String, Vec<f32>)>()) as u64;
+        let data = padded(varint(count), total);
+        assert!(
+            matches!(
+                decode_bounded::<HashMap<String, Vec<f32>>>(&data, "vectors.bin"),
+                Err(Error::DecodeFailed { .. })
+            ),
+            "a claim the rung admits was refused as a length"
+        );
+    }
+
+    /// Every artefact shape a save writes decodes on a fraction of the budget
+    /// its own length earns, so tightening the budget to that length admits
+    /// every file the rungs admitted.
+    #[test]
+    fn every_artefact_shape_a_save_writes_claims_a_fraction_of_its_budget() {
+        let standard = bincode::config::standard();
+        let ids: Vec<String> = (0..1000).map(|i| format!("r{i}")).collect();
+        let mappings = IdMappings {
+            id_map: ids.iter().cloned().zip(0..1000usize).collect(),
+            rev_map: (0..1000usize).zip(ids.iter().cloned()).collect(),
+        };
+        let one = IdMappings {
+            id_map: [("a".to_string(), 0usize)].into_iter().collect(),
+            rev_map: [(0usize, "a".to_string())].into_iter().collect(),
+        };
+        let none = IdMappings {
+            id_map: HashMap::new(),
+            rev_map: HashMap::new(),
+        };
+        let vectors: HashMap<String, Vec<f32>> =
+            ids.iter().map(|id| (id.clone(), vec![0.5f32; 8])).collect();
+        let narrow: HashMap<String, Vec<f32>> =
+            ids.iter().map(|id| (id.clone(), vec![0.5f32; 1])).collect();
+        let codes: HashMap<String, Vec<u8>> =
+            ids.iter().map(|id| (id.clone(), vec![3u8; 4])).collect();
+        let centroids: Centroids = vec![vec![vec![0.25f32; 2]; 16]; 4];
+        let wide: Centroids = vec![vec![vec![0.25f32; 1]; 2]; 1024];
+
+        /// The least multiplier of a file's own length at which it decodes.
+        macro_rules! least {
+            ($name:expr, $value:expr, $type:ty) => {{
+                let bytes = bincode::encode_to_vec(&$value, standard).unwrap();
+                let least = (1..=CLAIM_PER_WIRE_BYTE)
+                    .find(|n| {
+                        decode_at::<$type>(&bytes, "artefact", bytes.len().saturating_mul(*n))
+                            .is_ok()
+                    })
+                    .unwrap_or(usize::MAX);
+                assert!(
+                    least <= CLAIM_PER_WIRE_BYTE / 4,
+                    "{} needed {} bytes a wire byte where the budget gives {}",
+                    $name,
+                    least,
+                    CLAIM_PER_WIRE_BYTE
+                );
+                least
+            }};
+        }
+
+        let worst = [
+            least!("mappings.bin, 1000 records", mappings, IdMappings),
+            least!("mappings.bin, one record", one, IdMappings),
+            least!("mappings.bin, no record", none, IdMappings),
+            least!("vectors.bin, dim 8", vectors, HashMap<String, Vec<f32>>),
+            least!("vectors.bin, dim 1", narrow, HashMap<String, Vec<f32>>),
+            least!("pq_codes.bin, 4 subvectors", codes, HashMap<String, Vec<u8>>),
+            least!("pq_centroids.bin, 4 by 16 by 2", centroids, Centroids),
+            least!("pq_centroids.bin, 1024 by 2 by 1", wide, Centroids),
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+        assert!(worst >= 1, "nothing was measured");
+    }
+    /// A zero byte artefact earns no budget from its length, and the floor is
+    /// what keeps its refusal the one the file's shape gives rather than a
+    /// length it never declared.
+    #[test]
+    fn a_zero_byte_artefact_is_refused_as_an_end_and_not_as_a_length() {
+        assert_eq!(claim_budget(0), LEADING_LENGTH_CLAIM);
+        assert_eq!(claim_budget(1), CLAIM_PER_WIRE_BYTE);
+        for (file, refused) in [
+            ("mappings.bin", refusal::<IdMappings>(&[], "mappings.bin")),
+            (
+                "vectors.bin",
+                refusal::<HashMap<String, Vec<f32>>>(&[], "vectors.bin"),
+            ),
+            (
+                "pq_codes.bin",
+                refusal::<HashMap<String, Vec<u8>>>(&[], "pq_codes.bin"),
+            ),
+            (
+                "pq_centroids.bin",
+                refusal::<Centroids>(&[], "pq_centroids.bin"),
+            ),
+        ] {
+            assert!(refused.contains("UnexpectedEnd"), "{file} gave {refused}");
+        }
+        let walked = walk_vectors(&[], "vectors.bin", 0).unwrap_err().to_string();
+        assert!(walked.contains("UnexpectedEnd"), "the walk gave {walked}");
     }
 }
