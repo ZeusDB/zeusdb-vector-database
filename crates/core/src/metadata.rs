@@ -220,6 +220,16 @@ impl<'a> RecordFields<'a> {
             .map(move |field| (names[field.key as usize].as_str(), &field.value))
     }
 
+    /// The fields as the symbol of the name, the name and the value, in
+    /// symbol order. A symbol stands for one name until the store is
+    /// cleared, so a reader holding the store's guard may key a name on it.
+    pub fn entries(&self) -> impl Iterator<Item = (u32, &'a str, &'a Value)> + 'a {
+        let names = &self.store.names;
+        self.fields
+            .iter()
+            .map(move |field| (field.key, names[field.key as usize].as_str(), &field.value))
+    }
+
     /// The mapping the record was inserted with.
     pub fn to_map(&self) -> HashMap<String, Value> {
         self.iter()
@@ -318,6 +328,26 @@ mod tests {
         let second: Vec<&str> = store.get(1).unwrap().iter().map(|(name, _)| name).collect();
         assert_eq!(first, second);
         assert_eq!(first.len(), 2);
+
+        // The symbols rise, and one symbol is one name in both records.
+        let entries: Vec<(u32, &str)> = store
+            .get(0)
+            .unwrap()
+            .entries()
+            .map(|(symbol, name, _)| (symbol, name))
+            .collect();
+        assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert_eq!(
+            entries.iter().map(|(_, name)| *name).collect::<Vec<_>>(),
+            first
+        );
+        let again: Vec<(u32, &str)> = store
+            .get(1)
+            .unwrap()
+            .entries()
+            .map(|(symbol, name, _)| (symbol, name))
+            .collect();
+        assert_eq!(entries, again);
     }
 
     /// A record without fields costs its entry alone, and a record with

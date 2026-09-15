@@ -125,10 +125,10 @@ fn a_one_arm_dense_query_is_the_dense_search() {
                 })
                 .unwrap();
             assert_eq!(page.hits.len(), expected.len());
-            for (position, (hit, want)) in page.hits.iter().zip(&expected).enumerate() {
-                assert_eq!(hit.id, want.0);
-                assert_eq!(hit.score.to_bits(), want.1.to_bits());
-                assert_eq!(hit.metadata, want.2);
+            for (position, (hit, want)) in page.hits.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(hit.id, want.id());
+                assert_eq!(hit.score.to_bits(), want.score().to_bits());
+                assert_eq!(hit.metadata, want.metadata());
                 assert_eq!(hit.contributions.len(), 1);
                 assert_eq!(hit.contributions[0].rank, position + 1);
                 assert_eq!(hit.contributions[0].arm, 0);
@@ -176,8 +176,8 @@ fn two_arms_fuse_by_rank_and_explain_reports_the_plan() {
         let dense_page: Vec<(String, f32)> = collection
             .search_one(&vector, filter, params)
             .unwrap()
-            .into_iter()
-            .map(|hit| (hit.0, hit.1))
+            .iter()
+            .map(|hit| (hit.id().to_string(), hit.score()))
             .collect();
         let sparse_page = collection
             .search_sparse(sparse.as_ref(), filter, depth, IdfScope::Corpus)
@@ -303,8 +303,12 @@ fn a_filter_admitting_every_live_record_is_planned_as_no_filter() {
     let params = collection.search_params(10, None, false, None).unwrap();
     let direct = collection.search_one(&vector, Some(&all), params).unwrap();
     assert_eq!(
-        direct.iter().map(|h| &h.0).collect::<Vec<_>>(),
-        filtered.hits.iter().map(|h| &h.id).collect::<Vec<_>>()
+        direct.iter().map(|h| h.id()).collect::<Vec<_>>(),
+        filtered
+            .hits
+            .iter()
+            .map(|h| h.id.as_str())
+            .collect::<Vec<_>>()
     );
 
     // One record removed, so the filter admits every live record still.

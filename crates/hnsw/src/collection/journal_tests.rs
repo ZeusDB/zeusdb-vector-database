@@ -745,7 +745,7 @@ fn page(collection: &Collection) -> Vec<(String, f32)> {
     collection
         .search_one(&[1.5, 3.0], None, params)
         .unwrap()
-        .into_iter()
-        .map(|hit| (hit.0, hit.1))
+        .iter()
+        .map(|hit| (hit.id().to_string(), hit.score()))
         .collect()
 }
