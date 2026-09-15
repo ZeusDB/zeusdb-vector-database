@@ -226,6 +226,10 @@ const JOURNAL_FORMAT_MAJOR: u32 = 3;
 /// bytes for an entry that costs one byte on the wire. The three maps claim 48
 /// bytes for an entry that costs two. 64 is the next power of two above both,
 /// so it admits every file this build writes with margin.
+///
+/// What the budget bounds is the claims. What is allocated is held to the
+/// bytes the file has left, see `HeldDecode`, so a length the budget admits
+/// and the file cannot carry is not allocated.
 const CLAIM_PER_WIRE_BYTE: usize = 64;
 
 /// The claim a decode makes before it has read anything
@@ -252,32 +256,39 @@ const LEADING_LENGTH_CLAIM: usize = std::mem::size_of::<u64>();
 /// carries above the derived budget is claimed before anything is decoded, so
 /// what a container may still claim is the budget and nothing more.
 ///
+/// A claim is not an allocation. The decode is `HeldArtefact`'s, which makes
+/// every claim bincode's own decode makes and allocates nothing ahead of the
+/// bytes that carry it, so a length the budget admits and the file cannot
+/// carry is refused before it is allocated. `known` is a count the loader
+/// already holds for the artefact, and it sizes what is reserved and nothing
+/// else.
+///
 /// A file long enough to need more than the top rung is one `fs::read` could
 /// not have returned, so the top rung is the last arm rather than a special
 /// case.
-fn decode_bounded<T>(data: &[u8], file: &str) -> Result<T, Error>
+fn decode_bounded<T>(data: &[u8], file: &str, known: T::Known) -> Result<T, Error>
 where
-    T: bincode::Decode<()>,
+    T: HeldArtefact,
 {
-    decode_at(data, file, claim_budget(data.len()))
+    decode_at(data, file, claim_budget(data.len()), known)
 }
 
 /// The decode above under a budget given outright, so a test can measure how
 /// much of it a well formed artefact really claims.
-fn decode_at<T>(data: &[u8], file: &str, budget: usize) -> Result<T, Error>
+fn decode_at<T>(data: &[u8], file: &str, budget: usize, known: T::Known) -> Result<T, Error>
 where
-    T: bincode::Decode<()>,
+    T: HeldArtefact,
 {
     use bincode::config::standard;
 
     let decoded = if budget <= 1 << 20 {
-        decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 20 }>(), budget)
+        decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 20 }>(), budget, known)
     } else if budget <= 1 << 28 {
-        decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 28 }>(), budget)
+        decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 28 }>(), budget, known)
     } else if budget <= 1 << 36 {
-        decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 36 }>(), budget)
+        decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 36 }>(), budget, known)
     } else {
-        decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 44 }>(), budget)
+        decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 44 }>(), budget, known)
     };
 
     match decoded {
@@ -297,22 +308,23 @@ where
 /// first
 ///
 /// The steps are `bincode::decode_from_slice`'s own, being a decoder over the
-/// slice and one `Decode::decode` call, so a file this refuses is refused with
-/// the message that function gave. What that function returns beside the value
-/// is the bytes it read, which no caller here reads.
+/// slice and one decode, so a file this refuses is refused with the message
+/// that function gave. The reader is `TrackedSlice`, which reads as bincode's
+/// slice reader reads and says how many bytes it has left, and the decode is
+/// `HeldArtefact`'s, which claims as bincode's `Decode` claims.
 fn decode_claimed<T, C>(
     data: &[u8],
     config: C,
     budget: usize,
+    known: T::Known,
 ) -> Result<T, bincode::error::DecodeError>
 where
-    T: bincode::Decode<()>,
+    T: HeldArtefact,
     C: bincode::config::Config,
 {
-    let mut decoder =
-        bincode::de::DecoderImpl::new(bincode::de::read::SliceReader::new(data), config, ());
+    let mut decoder = bincode::de::DecoderImpl::new(TrackedSlice::new(data), config, ());
     claim_rung_excess(&mut decoder, budget)?;
-    T::decode(&mut decoder)
+    T::decode_artefact(&mut decoder, known)
 }
 
 /// Claim whatever the decoder's rung carries above `budget`
@@ -340,6 +352,456 @@ fn claim_rung_excess<D: bincode::de::Decoder>(
     match decoder.config().limit() {
         Some(rung) => decoder.claim_bytes_read(rung.saturating_sub(budget)),
         None => Ok(()),
+    }
+}
+
+// ============================================================================
+// DECODING WITHOUT RESERVING AHEAD OF THE BYTES
+// ============================================================================
+
+/// bincode's slice reader, with the bytes it has left
+///
+/// `read`, `peek_read` and `consume` are `SliceReader`'s, so a read fails where
+/// `SliceReader`'s would and names the same `additional`. `SliceReader` keeps
+/// its slice `pub(crate)`, and `Reader` is the trait bincode's decoder takes,
+/// so this is the reader a decode can ask how many bytes remain. A copy reads
+/// the same bytes again from where the original stood.
+#[derive(Clone, Copy)]
+struct TrackedSlice<'a> {
+    slice: &'a [u8],
+}
+
+impl<'a> TrackedSlice<'a> {
+    fn new(slice: &'a [u8]) -> Self {
+        TrackedSlice { slice }
+    }
+
+    fn bytes_left(&self) -> usize {
+        self.slice.len()
+    }
+
+    /// The bytes left, as the slice they are.
+    fn bytes(&self) -> &'a [u8] {
+        self.slice
+    }
+}
+
+impl bincode::de::read::Reader for TrackedSlice<'_> {
+    #[inline(always)]
+    fn read(&mut self, bytes: &mut [u8]) -> Result<(), bincode::error::DecodeError> {
+        if bytes.len() > self.slice.len() {
+            return Err(bincode::error::DecodeError::UnexpectedEnd {
+                additional: bytes.len() - self.slice.len(),
+            });
+        }
+        let (read_slice, remaining) = self.slice.split_at(bytes.len());
+        bytes.copy_from_slice(read_slice);
+        self.slice = remaining;
+        Ok(())
+    }
+
+    #[inline]
+    fn peek_read(&mut self, n: usize) -> Option<&[u8]> {
+        self.slice.get(..n)
+    }
+
+    #[inline]
+    fn consume(&mut self, n: usize) {
+        self.slice = self.slice.get(n..).unwrap_or_default();
+    }
+}
+
+/// A container's length as bincode reads one, a `u64` held to `usize`.
+fn decode_len<D: bincode::de::Decoder>(
+    decoder: &mut D,
+) -> Result<usize, bincode::error::DecodeError> {
+    use bincode::Decode;
+
+    let claimed = u64::decode(decoder)?;
+    usize::try_from(claimed).map_err(|_| bincode::error::DecodeError::OutsideUsizeRange(claimed))
+}
+
+/// What a container of `len` entries is reserved at, `left` bytes after its
+/// length
+///
+/// The least of the count it declares, the entries `left` bytes could carry at
+/// `least` bytes an entry, and `known`, a count the loader already holds for
+/// it. With no such count nothing is reserved ahead of the entries.
+fn reserved(len: usize, left: usize, least: usize, known: Option<usize>) -> usize {
+    known.map_or(0, |known| len.min(left / least).min(known))
+}
+
+/// A varint as bincode writes one, being the value and the bytes it occupied,
+/// or nothing where the bytes do not carry one
+///
+/// Read by hand for `count_distinct_keys`, which refuses nothing and claims
+/// nothing, so bincode's decoder is not wanted there.
+fn varint(bytes: &[u8]) -> Option<(u64, usize)> {
+    let word = |n: usize| bytes.get(1..1 + n);
+    match *bytes.first()? {
+        n @ 0..=250 => Some((u64::from(n), 1)),
+        251 => Some((u64::from(u16::from_le_bytes(word(2)?.try_into().ok()?)), 3)),
+        252 => Some((u64::from(u32::from_le_bytes(word(4)?.try_into().ok()?)), 5)),
+        253 => Some((u64::from_le_bytes(word(8)?.try_into().ok()?), 9)),
+        _ => None,
+    }
+}
+
+/// A hash kept as it is, for a set whose entries are hashes already
+#[derive(Default)]
+struct Hashed(u64);
+
+impl std::hash::Hasher for Hashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(*byte);
+        }
+    }
+
+    fn write_u64(&mut self, hash: u64) {
+        self.0 = hash;
+    }
+}
+
+/// The distinct keys a map of strings carries in `bytes`, counted before the
+/// map is built
+///
+/// The forward map of `mappings.bin` is the one container that no count
+/// precedes in the file and none the loader holds from elsewhere. Reserved at
+/// the count it declares, a file declaring a count its bytes do not carry
+/// reserves that count, and grown from nothing as its entries decode, its
+/// last doubling holds the old table beside the new one. The keys the bytes
+/// carry are what the map will hold and nothing a declared count can inflate.
+/// A key the bytes hold twice counts once, a key whose entry the bytes do not
+/// hold whole does not count, and the count stops where the bytes stop, where
+/// a length runs past them, or where a varint does not decode.
+///
+/// Each key is hashed once, and the set keeps the hash under `Hashed`, so it
+/// costs eight bytes an entry and hashes nothing twice. Two keys that share a
+/// hash count as one and reserve the map one entry short, which it grows for
+/// as it grows for any count that is short. Nothing here refuses, since the
+/// decode that follows refuses with bincode's words wherever it stops, and
+/// nothing here claims, so the budget is untouched.
+fn count_distinct_keys(bytes: &[u8]) -> usize {
+    use std::collections::HashSet;
+    use std::hash::{BuildHasher, BuildHasherDefault, RandomState};
+
+    let Some((declared, width)) = varint(bytes) else {
+        return 0;
+    };
+    let hasher = RandomState::new();
+    let mut keys: HashSet<u64, BuildHasherDefault<Hashed>> = HashSet::default();
+    let mut at = width;
+    for _ in 0..declared {
+        let Some((key_len, width)) = varint(&bytes[at..]) else {
+            break;
+        };
+        let Some(end) = usize::try_from(key_len)
+            .ok()
+            .and_then(|key_len| (at + width).checked_add(key_len))
+        else {
+            break;
+        };
+        let Some(key) = bytes.get(at + width..end) else {
+            break;
+        };
+        let Some((_, width)) = varint(&bytes[end..]) else {
+            break;
+        };
+        keys.insert(hasher.hash_one(key));
+        at = end + width;
+    }
+    keys.len()
+}
+
+/// A value decoded in bincode's steps, with nothing allocated ahead of the
+/// bytes that carry it
+///
+/// Every claim bincode's own `Decode` makes is made here, in the same order
+/// and against the same counter, so the claim budget refuses exactly the files
+/// it refused. What differs is the allocation after a claim. bincode sizes a
+/// container from the length the file declares as soon as the claim passes.
+/// Here a string or a byte vector is allocated only once its bytes are there,
+/// a vector of floats is reserved at no more floats than its bytes carry, a
+/// map grows past `reserved` as its entries decode, and a vector of containers
+/// past `reserved` is reserved exactly once its entries have decoded, see
+/// `decode_rest`. A value that decodes is the value bincode returns, and a
+/// refusal carries bincode's words.
+trait HeldDecode: Sized {
+    /// The fewest wire bytes one of these occupies.
+    const LEAST_WIRE_BYTES: usize;
+
+    /// What the loader knows of the values inside one of these.
+    type Inner: Copy;
+
+    fn decode_held<'a, D>(
+        decoder: &mut D,
+        inner: Self::Inner,
+    ) -> Result<Self, bincode::error::DecodeError>
+    where
+        D: bincode::de::Decoder<R = TrackedSlice<'a>>;
+}
+
+impl HeldDecode for f32 {
+    const LEAST_WIRE_BYTES: usize = 4;
+    type Inner = ();
+
+    fn decode_held<'a, D>(decoder: &mut D, _: ()) -> Result<Self, bincode::error::DecodeError>
+    where
+        D: bincode::de::Decoder<R = TrackedSlice<'a>>,
+    {
+        use bincode::Decode;
+
+        f32::decode(decoder)
+    }
+}
+
+impl HeldDecode for usize {
+    const LEAST_WIRE_BYTES: usize = 1;
+    type Inner = ();
+
+    fn decode_held<'a, D>(decoder: &mut D, _: ()) -> Result<Self, bincode::error::DecodeError>
+    where
+        D: bincode::de::Decoder<R = TrackedSlice<'a>>,
+    {
+        use bincode::Decode;
+
+        usize::decode(decoder)
+    }
+}
+
+impl HeldDecode for Vec<u8> {
+    const LEAST_WIRE_BYTES: usize = 1;
+    type Inner = ();
+
+    /// bincode reads a byte vector into a buffer of the declared length, so a
+    /// length the bytes left cannot fill is refused here with the error that
+    /// read returns, before any buffer exists.
+    fn decode_held<'a, D>(decoder: &mut D, _: ()) -> Result<Self, bincode::error::DecodeError>
+    where
+        D: bincode::de::Decoder<R = TrackedSlice<'a>>,
+    {
+        use bincode::de::read::Reader;
+
+        let len = decode_len(decoder)?;
+        decoder.claim_container_read::<u8>(len)?;
+        let left = decoder.reader().bytes_left();
+        if len > left {
+            return Err(bincode::error::DecodeError::UnexpectedEnd {
+                additional: len - left,
+            });
+        }
+        let mut bytes = vec![0u8; len];
+        decoder.reader().read(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+impl HeldDecode for String {
+    const LEAST_WIRE_BYTES: usize = 1;
+    type Inner = ();
+
+    fn decode_held<'a, D>(decoder: &mut D, _: ()) -> Result<Self, bincode::error::DecodeError>
+    where
+        D: bincode::de::Decoder<R = TrackedSlice<'a>>,
+    {
+        let bytes = Vec::<u8>::decode_held(decoder, ())?;
+        String::from_utf8(bytes).map_err(|e| bincode::error::DecodeError::Utf8 {
+            inner: e.utf8_error(),
+        })
+    }
+}
+
+impl HeldDecode for Vec<f32> {
+    const LEAST_WIRE_BYTES: usize = 1;
+    type Inner = ();
+
+    /// A float's least wire cost is its whole wire cost, so the count of floats
+    /// the bytes left can carry is an exact bound and needs no known count.
+    fn decode_held<'a, D>(decoder: &mut D, _: ()) -> Result<Self, bincode::error::DecodeError>
+    where
+        D: bincode::de::Decoder<R = TrackedSlice<'a>>,
+    {
+        decode_seq::<f32, D>(decoder, Some(usize::MAX), ())
+    }
+}
+
+impl HeldDecode for Vec<Vec<f32>> {
+    const LEAST_WIRE_BYTES: usize = 1;
+    /// The centroids a subvector holds, where the loader knows it.
+    type Inner = Option<usize>;
+
+    fn decode_held<'a, D>(
+        decoder: &mut D,
+        centroids: Option<usize>,
+    ) -> Result<Self, bincode::error::DecodeError>
+    where
+        D: bincode::de::Decoder<R = TrackedSlice<'a>>,
+    {
+        decode_seq::<Vec<f32>, D>(decoder, centroids, ())
+    }
+}
+
+/// `Vec<T>` in bincode's steps, reserved at `reserved`, the entries past that
+/// decoded by `decode_rest`.
+fn decode_seq<'a, T, D>(
+    decoder: &mut D,
+    known: Option<usize>,
+    inner: T::Inner,
+) -> Result<Vec<T>, bincode::error::DecodeError>
+where
+    T: HeldDecode,
+    D: bincode::de::Decoder<R = TrackedSlice<'a>>,
+{
+    let len = decode_len(decoder)?;
+    decoder.claim_container_read::<T>(len)?;
+    let left = decoder.reader().bytes_left();
+    let mut decoded = Vec::with_capacity(reserved(len, left, T::LEAST_WIRE_BYTES, known));
+    while decoded.len() < len {
+        if decoded.len() == decoded.capacity() {
+            return decode_rest(decoder, decoded, len, inner);
+        }
+        decoder.unclaim_bytes_read(std::mem::size_of::<T>());
+        decoded.push(T::decode_held(decoder, inner)?);
+    }
+    Ok(decoded)
+}
+
+/// The entries of a vector past what it reserved
+///
+/// A vector grown as its entries decode copies them at every doubling and
+/// holds the old buffer beside one twice its size. Here the rest are decoded
+/// once on the claimed decoder, which refuses a file where bincode's decode
+/// refuses it, and are not kept. The vector is then reserved at exactly that
+/// many and the same bytes decoded again on a decoder of their own. That
+/// decoder starts its count at nothing under the same rung and claims only
+/// what the first pass claimed for these entries, so it refuses none of them.
+fn decode_rest<'a, T, D>(
+    decoder: &mut D,
+    mut decoded: Vec<T>,
+    len: usize,
+    inner: T::Inner,
+) -> Result<Vec<T>, bincode::error::DecodeError>
+where
+    T: HeldDecode,
+    D: bincode::de::Decoder<R = TrackedSlice<'a>>,
+{
+    let from = *decoder.reader();
+    let done = decoded.len();
+    for _ in done..len {
+        decoder.unclaim_bytes_read(std::mem::size_of::<T>());
+        T::decode_held(decoder, inner)?;
+    }
+    decoded.reserve_exact(len - done);
+    let mut again = bincode::de::DecoderImpl::new(from, *decoder.config(), ());
+    for _ in done..len {
+        decoded.push(T::decode_held(&mut again, inner)?);
+    }
+    Ok(decoded)
+}
+
+/// `HashMap<K, V>` in bincode's steps, reserved at `reserved` and grown past
+/// it as its entries decode, the last copy of a key kept as bincode keeps it.
+fn decode_map<'a, K, V, D>(
+    decoder: &mut D,
+    known: Option<usize>,
+) -> Result<HashMap<K, V>, bincode::error::DecodeError>
+where
+    K: HeldDecode<Inner = ()> + Eq + std::hash::Hash,
+    V: HeldDecode<Inner = ()>,
+    D: bincode::de::Decoder<R = TrackedSlice<'a>>,
+{
+    let len = decode_len(decoder)?;
+    decoder.claim_container_read::<(K, V)>(len)?;
+    let least = K::LEAST_WIRE_BYTES + V::LEAST_WIRE_BYTES;
+    let left = decoder.reader().bytes_left();
+    let mut decoded = HashMap::with_capacity(reserved(len, left, least, known));
+    for _ in 0..len {
+        decoder.unclaim_bytes_read(std::mem::size_of::<(K, V)>());
+        let key = K::decode_held(decoder, ())?;
+        let value = V::decode_held(decoder, ())?;
+        decoded.insert(key, value);
+    }
+    Ok(decoded)
+}
+
+/// An artefact `decode_bounded` reads, with the count the loader holds for it
+trait HeldArtefact: Sized {
+    /// What the loader already knows of the artefact's size. It sizes what is
+    /// reserved and changes nothing a caller observes.
+    type Known: Copy + Default;
+
+    fn decode_artefact<'a, D>(
+        decoder: &mut D,
+        known: Self::Known,
+    ) -> Result<Self, bincode::error::DecodeError>
+    where
+        D: bincode::de::Decoder<R = TrackedSlice<'a>>;
+}
+
+impl HeldArtefact for IdMappings {
+    type Known = ();
+
+    /// The forward map first, reserved at the distinct keys its bytes carry,
+    /// then the reverse map, reserved at no more than the forward map holds.
+    fn decode_artefact<'a, D>(decoder: &mut D, _: ()) -> Result<Self, bincode::error::DecodeError>
+    where
+        D: bincode::de::Decoder<R = TrackedSlice<'a>>,
+    {
+        let distinct = count_distinct_keys(decoder.reader().bytes());
+        let id_map = decode_map(decoder, Some(distinct))?;
+        let rev_map = decode_map(decoder, Some(id_map.len()))?;
+        Ok(IdMappings { id_map, rev_map })
+    }
+}
+
+impl HeldArtefact for HashMap<String, Vec<f32>> {
+    /// The record count the mappings hold.
+    type Known = usize;
+
+    fn decode_artefact<'a, D>(
+        decoder: &mut D,
+        records: usize,
+    ) -> Result<Self, bincode::error::DecodeError>
+    where
+        D: bincode::de::Decoder<R = TrackedSlice<'a>>,
+    {
+        decode_map(decoder, Some(records))
+    }
+}
+
+impl HeldArtefact for HashMap<String, Vec<u8>> {
+    /// The record count the mappings hold.
+    type Known = usize;
+
+    fn decode_artefact<'a, D>(
+        decoder: &mut D,
+        records: usize,
+    ) -> Result<Self, bincode::error::DecodeError>
+    where
+        D: bincode::de::Decoder<R = TrackedSlice<'a>>,
+    {
+        decode_map(decoder, Some(records))
+    }
+}
+
+impl HeldArtefact for Centroids {
+    /// The subvector count and the centroids a subvector, from the
+    /// quantization.json fields `validate_quantization_fields` has held.
+    type Known = (usize, usize);
+
+    fn decode_artefact<'a, D>(
+        decoder: &mut D,
+        (subvectors, centroids): (usize, usize),
+    ) -> Result<Self, bincode::error::DecodeError>
+    where
+        D: bincode::de::Decoder<R = TrackedSlice<'a>>,
+    {
+        decode_seq::<Vec<Vec<f32>>, D>(decoder, Some(subvectors), Some(centroids))
     }
 }
 
@@ -1509,7 +1971,7 @@ fn load_mappings(path: &Path, manifest: &IndexManifest) -> Result<IdMappings, Er
 
     let mappings_data = read_artefact(path, "mappings.bin", manifest)?;
 
-    let mappings: IdMappings = decode_bounded(&mappings_data, "mappings.bin")?;
+    let mappings: IdMappings = decode_bounded(&mappings_data, "mappings.bin", ())?;
 
     debug!(target: LOG_TARGET, "mappings.bin loaded");
     Ok(mappings)
@@ -1539,7 +2001,11 @@ fn load_metadata(
 /// Read only when the manifest names it. A trained `quantized_only` index
 /// writes none, and a directory saved over one that did keeps the file the
 /// earlier save left. See `manifest_names`.
-fn load_vectors(path: &Path, manifest: &IndexManifest) -> Result<HashMap<String, Vec<f32>>, Error> {
+fn load_vectors(
+    path: &Path,
+    manifest: &IndexManifest,
+    records: usize,
+) -> Result<HashMap<String, Vec<f32>>, Error> {
     debug!(target: LOG_TARGET, "Loading vectors.bin...");
 
     if !manifest_names(manifest, "vectors.bin") {
@@ -1549,7 +2015,7 @@ fn load_vectors(path: &Path, manifest: &IndexManifest) -> Result<HashMap<String,
 
     let vectors_data = read_artefact(path, "vectors.bin", manifest)?;
 
-    let vectors: HashMap<String, Vec<f32>> = decode_bounded(&vectors_data, "vectors.bin")?;
+    let vectors: HashMap<String, Vec<f32>> = decode_bounded(&vectors_data, "vectors.bin", records)?;
 
     check_vectors_are_finite(&vectors)?;
 
@@ -1628,9 +2094,9 @@ impl RawVectors {
     }
 
     /// Read the map where only the count was kept.
-    fn hold(&mut self, path: &Path, manifest: &IndexManifest) -> Result<(), Error> {
+    fn hold(&mut self, path: &Path, manifest: &IndexManifest, records: usize) -> Result<(), Error> {
         if let RawVectors::Counted(_) = self {
-            *self = RawVectors::Held(load_vectors(path, manifest)?);
+            *self = RawVectors::Held(load_vectors(path, manifest, records)?);
         }
         Ok(())
     }
@@ -1739,7 +2205,7 @@ fn walk_at(
 }
 
 /// The steps `HashMap<String, Vec<f32>>` takes to decode, one record at a
-/// time and with no map built
+/// time and with no map built, each id and vector read by `HeldDecode`
 ///
 /// The map held one entry for an id the file named twice, the last copy,
 /// so a file holding a duplicate counted it once and judged it by the copy
@@ -1765,8 +2231,7 @@ fn walk_vectors_with<C: bincode::config::Config>(
     use std::hash::{BuildHasher, RandomState};
 
     let hasher = RandomState::new();
-    let mut decoder =
-        bincode::de::DecoderImpl::new(bincode::de::read::SliceReader::new(data), config, ());
+    let mut decoder = bincode::de::DecoderImpl::new(TrackedSlice::new(data), config, ());
     claim_rung_excess(&mut decoder, budget)?;
     let claimed = u64::decode(&mut decoder)?;
     let len = usize::try_from(claimed)
@@ -1776,8 +2241,8 @@ fn walk_vectors_with<C: bincode::config::Config>(
     let mut offenders: BTreeSet<String> = BTreeSet::new();
     for _ in 0..len {
         decoder.unclaim_bytes_read(std::mem::size_of::<(String, Vec<f32>)>());
-        let id = String::decode(&mut decoder)?;
-        let vector = Vec::<f32>::decode(&mut decoder)?;
+        let id = String::decode_held(&mut decoder, ())?;
+        let vector = Vec::<f32>::decode_held(&mut decoder, ())?;
         if vector.iter().all(|value| value.is_finite()) {
             offenders.remove(&id);
         } else {
@@ -1806,8 +2271,7 @@ fn count_distinct_ids<C: bincode::config::Config>(
     use bincode::Decode;
     use std::collections::HashSet;
 
-    let mut decoder =
-        bincode::de::DecoderImpl::new(bincode::de::read::SliceReader::new(data), config, ());
+    let mut decoder = bincode::de::DecoderImpl::new(TrackedSlice::new(data), config, ());
     claim_rung_excess(&mut decoder, budget)?;
     let claimed = u64::decode(&mut decoder)?;
     let len = usize::try_from(claimed)
@@ -1816,8 +2280,8 @@ fn count_distinct_ids<C: bincode::config::Config>(
     let mut ids: HashSet<String> = HashSet::new();
     for _ in 0..len {
         decoder.unclaim_bytes_read(std::mem::size_of::<(String, Vec<f32>)>());
-        let id = String::decode(&mut decoder)?;
-        Vec::<f32>::decode(&mut decoder)?;
+        let id = String::decode_held(&mut decoder, ())?;
+        Vec::<f32>::decode_held(&mut decoder, ())?;
         ids.insert(id);
     }
     Ok(ids.len())
@@ -1849,7 +2313,11 @@ fn load_manifest(path: &Path) -> Result<IndexManifest, Error> {
 /// Absent means the index was saved before training completed, which is a
 /// legitimate state. A present but unreadable file is a hard failure, because
 /// the alternative is a codebook that decodes every code to the zero vector.
-fn load_pq_centroids(path: &Path, manifest: &IndexManifest) -> Result<Option<Centroids>, Error> {
+fn load_pq_centroids(
+    path: &Path,
+    manifest: &IndexManifest,
+    shape: (usize, usize),
+) -> Result<Option<Centroids>, Error> {
     if !manifest_names(manifest, "pq_centroids.bin") {
         return Ok(None);
     }
@@ -1858,7 +2326,7 @@ fn load_pq_centroids(path: &Path, manifest: &IndexManifest) -> Result<Option<Cen
 
     let centroids_data = read_artefact(path, "pq_centroids.bin", manifest)?;
 
-    let centroids: Centroids = decode_bounded(&centroids_data, "pq_centroids.bin")?;
+    let centroids: Centroids = decode_bounded(&centroids_data, "pq_centroids.bin", shape)?;
 
     debug!(target: LOG_TARGET, "pq_centroids.bin loaded ({} subvectors)", centroids.len());
     Ok(Some(centroids))
@@ -1868,7 +2336,11 @@ fn load_pq_centroids(path: &Path, manifest: &IndexManifest) -> Result<Option<Cen
 ///
 /// Absent means no record has been quantized yet. In `quantized_only` these
 /// codes are the only copy of every record added after training completed.
-fn load_pq_codes(path: &Path, manifest: &IndexManifest) -> Result<HashMap<String, Vec<u8>>, Error> {
+fn load_pq_codes(
+    path: &Path,
+    manifest: &IndexManifest,
+    records: usize,
+) -> Result<HashMap<String, Vec<u8>>, Error> {
     if !manifest_names(manifest, "pq_codes.bin") {
         return Ok(HashMap::new());
     }
@@ -1877,7 +2349,7 @@ fn load_pq_codes(path: &Path, manifest: &IndexManifest) -> Result<HashMap<String
 
     let codes_data = read_artefact(path, "pq_codes.bin", manifest)?;
 
-    let codes: HashMap<String, Vec<u8>> = decode_bounded(&codes_data, "pq_codes.bin")?;
+    let codes: HashMap<String, Vec<u8>> = decode_bounded(&codes_data, "pq_codes.bin", records)?;
 
     debug!(target: LOG_TARGET, "pq_codes.bin loaded ({} records)", codes.len());
     Ok(codes)
@@ -1927,6 +2399,7 @@ fn load_quantization(
     manifest: &IndexManifest,
     dim: usize,
     space: &str,
+    records: usize,
 ) -> Result<Option<QuantizationArtefacts>, Error> {
     debug!(target: LOG_TARGET, "Loading quantization components...");
 
@@ -1983,8 +2456,9 @@ fn load_quantization(
 
     debug!(target: LOG_TARGET, "quantization.json loaded");
 
-    let centroids = load_pq_centroids(path, manifest)?;
-    let codes = load_pq_codes(path, manifest)?;
+    let shape = (quant_config.subvectors, 1usize << quant_config.bits);
+    let centroids = load_pq_centroids(path, manifest, shape)?;
+    let codes = load_pq_codes(path, manifest, records)?;
 
     Ok(Some(QuantizationArtefacts {
         config: QuantizationFile::Pq(quant_config),
@@ -2324,6 +2798,7 @@ fn reconstruct_index_simple(
         .unwrap_or_default();
 
     // Step 2: Restore all data fields directly (but not the graph)
+    let mapped_records = mappings.id_map.len();
     restore_data_fields(&mut index, mappings, &config, quantization)?;
 
     // Step 2a: The sparse space, once the mappings are in and before the
@@ -2352,7 +2827,7 @@ fn reconstruct_index_simple(
             debug!(target: LOG_TARGET, "Rebuilding the HNSW graph, because {}", reason);
             // Both rebuilds below replay the raw vectors, so a directory
             // whose vectors were counted and not kept reads them now.
-            vectors.hold(path, manifest)?;
+            vectors.hold(path, manifest, mapped_records)?;
             let empty = HashMap::new();
             let held = vectors.held().unwrap_or(&empty);
             if int8_trained {
@@ -2916,13 +3391,19 @@ pub(crate) fn load_index(
     // vectors.bin is walked for its count and its check and nothing of it is
     // kept. See `RawVectors`.
     let vectors = if manifest_names(&manifest, "quantization.json") {
-        RawVectors::Held(load_vectors(path_buf, &manifest)?)
+        RawVectors::Held(load_vectors(path_buf, &manifest, mappings.id_map.len())?)
     } else {
         RawVectors::Counted(count_vectors(path_buf, &manifest, mappings.id_map.len())?)
     };
     debug!(target: LOG_TARGET, "Vectors loaded: {} vectors", vectors.len());
 
-    let quantization = load_quantization(path_buf, &manifest, config.dim, &config.space)?;
+    let quantization = load_quantization(
+        path_buf,
+        &manifest,
+        config.dim,
+        &config.space,
+        mappings.id_map.len(),
+    )?;
     if let Some(ref quant) = quantization {
         match &quant.config {
             QuantizationFile::Pq(config) => {
@@ -3754,7 +4235,8 @@ mod vectors_walk_tests {
     /// the walk names what `check_vectors_are_finite` names over the map.
     fn assert_walk_matches_map(entries: &[(&str, Vec<f32>)], records: usize) {
         let bytes = encoded(entries);
-        let map: HashMap<String, Vec<f32>> = decode_bounded(&bytes, "vectors.bin").unwrap();
+        let map: HashMap<String, Vec<f32>> =
+            decode_bounded(&bytes, "vectors.bin", records).unwrap();
         let (count, offenders) = walk_vectors(&bytes, "vectors.bin", records).unwrap();
         assert_eq!(count, map.len(), "the count over {:?}", entries);
         let named = match check_vectors_are_finite(&map) {
@@ -3851,7 +4333,7 @@ mod vectors_walk_tests {
         let entries = [("a", vec![1.0, 2.0, 3.0])];
         let bytes = encoded(&entries);
         let cut = &bytes[..bytes.len() - 5];
-        let map = decode_bounded::<HashMap<String, Vec<f32>>>(cut, "vectors.bin")
+        let map = decode_bounded::<HashMap<String, Vec<f32>>>(cut, "vectors.bin", 1)
             .unwrap_err()
             .to_string();
         let walk = walk_vectors(cut, "vectors.bin", records(&entries, &[]))
@@ -3866,7 +4348,7 @@ mod vectors_walk_tests {
         // file's length earns under the budget.
         let mut bytes = bincode::encode_to_vec(1u64 << 30, bincode::config::standard()).unwrap();
         bytes.extend_from_slice(&[1, b'a', 0]);
-        let map = decode_bounded::<HashMap<String, Vec<f32>>>(&bytes, "vectors.bin")
+        let map = decode_bounded::<HashMap<String, Vec<f32>>>(&bytes, "vectors.bin", 0)
             .unwrap_err()
             .to_string();
         let walk = walk_vectors(&bytes, "vectors.bin", 0)
@@ -3922,8 +4404,8 @@ mod claim_budget_tests {
 
     /// The refusal a file gets, as its message, or the word for having
     /// decoded.
-    fn refusal<T: bincode::Decode<()>>(data: &[u8], file: &str) -> String {
-        match decode_bounded::<T>(data, file) {
+    fn refusal<T: HeldArtefact>(data: &[u8], file: &str) -> String {
+        match decode_bounded::<T>(data, file, T::Known::default()) {
             Ok(_) => "decoded".to_string(),
             Err(e) => e.to_string(),
         }
@@ -3957,7 +4439,8 @@ mod claim_budget_tests {
         }
         let count = between_budget_and_rung(total, std::mem::size_of::<(String, Vec<f32>)>());
         let data = padded(varint(count), total);
-        let at_rung = decode_at::<HashMap<String, Vec<f32>>>(&data, "vectors.bin", rung_for(total));
+        let at_rung =
+            decode_at::<HashMap<String, Vec<f32>>>(&data, "vectors.bin", rung_for(total), 0);
         assert!(
             matches!(at_rung, Err(Error::DecodeFailed { .. })),
             "the rung as the budget gave {at_rung:?}"
@@ -3985,7 +4468,8 @@ mod claim_budget_tests {
             .unwrap_err()
             .to_string();
         assert_eq!(walked, refused, "the walk and the map disagree");
-        let at_rung = decode_at::<HashMap<String, Vec<f32>>>(&data, "vectors.bin", rung_for(total));
+        let at_rung =
+            decode_at::<HashMap<String, Vec<f32>>>(&data, "vectors.bin", rung_for(total), 0);
         assert!(
             matches!(at_rung, Err(Error::DecodeFailed { .. })),
             "the rung as the budget gave {at_rung:?}"
@@ -4002,7 +4486,7 @@ mod claim_budget_tests {
         let data = padded(varint(count), total);
         assert!(
             matches!(
-                decode_bounded::<HashMap<String, Vec<f32>>>(&data, "vectors.bin"),
+                decode_bounded::<HashMap<String, Vec<f32>>>(&data, "vectors.bin", 0),
                 Err(Error::DecodeFailed { .. })
             ),
             "a claim the rung admits was refused as a length"
@@ -4043,8 +4527,13 @@ mod claim_budget_tests {
                 let bytes = bincode::encode_to_vec(&$value, standard).unwrap();
                 let least = (1..=CLAIM_PER_WIRE_BYTE)
                     .find(|n| {
-                        decode_at::<$type>(&bytes, "artefact", bytes.len().saturating_mul(*n))
-                            .is_ok()
+                        decode_at::<$type>(
+                            &bytes,
+                            "artefact",
+                            bytes.len().saturating_mul(*n),
+                            Default::default(),
+                        )
+                        .is_ok()
                     })
                     .unwrap_or(usize::MAX);
                 assert!(
@@ -4099,5 +4588,567 @@ mod claim_budget_tests {
         }
         let walked = walk_vectors(&[], "vectors.bin", 0).unwrap_err().to_string();
         assert!(walked.contains("UnexpectedEnd"), "the walk gave {walked}");
+    }
+}
+
+#[cfg(test)]
+mod held_decode_tests {
+    //! The decode `decode_bounded` makes, held to bincode's own over every
+    //! artefact shape a save writes, every prefix of each, and damage at every
+    //! position. What a caller observes of a decode, the value field by field or
+    //! the refusal word for word, has to be the same, and the count the loader
+    //! passes changes nothing a caller observes.
+    use super::*;
+    use bincode::error::DecodeError;
+    use std::collections::BTreeMap;
+
+    /// bincode's own decode under the same budget, a slice reader with the
+    /// rung's excess claimed and one `Decode::decode`.
+    fn bincode_decode<T: bincode::Decode<()>>(
+        data: &[u8],
+        budget: usize,
+    ) -> Result<T, DecodeError> {
+        use bincode::config::standard;
+
+        fn with<T: bincode::Decode<()>, C: bincode::config::Config>(
+            data: &[u8],
+            config: C,
+            budget: usize,
+        ) -> Result<T, DecodeError> {
+            let mut decoder = bincode::de::DecoderImpl::new(
+                bincode::de::read::SliceReader::new(data),
+                config,
+                (),
+            );
+            claim_rung_excess(&mut decoder, budget)?;
+            T::decode(&mut decoder)
+        }
+
+        if budget <= 1 << 20 {
+            with(data, standard().with_limit::<{ 1 << 20 }>(), budget)
+        } else if budget <= 1 << 28 {
+            with(data, standard().with_limit::<{ 1 << 28 }>(), budget)
+        } else if budget <= 1 << 36 {
+            with(data, standard().with_limit::<{ 1 << 36 }>(), budget)
+        } else {
+            with(data, standard().with_limit::<{ 1 << 44 }>(), budget)
+        }
+    }
+
+    /// The decode `decode_bounded` makes, under the same budget.
+    fn held<T: HeldArtefact>(
+        data: &[u8],
+        budget: usize,
+        known: T::Known,
+    ) -> Result<T, DecodeError> {
+        use bincode::config::standard;
+
+        if budget <= 1 << 20 {
+            decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 20 }>(), budget, known)
+        } else if budget <= 1 << 28 {
+            decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 28 }>(), budget, known)
+        } else if budget <= 1 << 36 {
+            decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 36 }>(), budget, known)
+        } else {
+            decode_claimed::<T, _>(data, standard().with_limit::<{ 1 << 44 }>(), budget, known)
+        }
+    }
+
+    /// What a caller observes of a value, in an order no hash seed sets, with
+    /// every float by its bits so a NaN equals itself and -0.0 is not 0.0.
+    trait Observed {
+        fn observed(&self) -> String;
+    }
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    impl Observed for IdMappings {
+        fn observed(&self) -> String {
+            format!(
+                "{:?} {:?}",
+                self.id_map.iter().collect::<BTreeMap<_, _>>(),
+                self.rev_map.iter().collect::<BTreeMap<_, _>>()
+            )
+        }
+    }
+
+    impl Observed for HashMap<String, Vec<f32>> {
+        fn observed(&self) -> String {
+            let by_bits: BTreeMap<_, _> =
+                self.iter().map(|(id, vector)| (id, bits(vector))).collect();
+            format!("{:?}", by_bits)
+        }
+    }
+
+    impl Observed for HashMap<String, Vec<u8>> {
+        fn observed(&self) -> String {
+            format!("{:?}", self.iter().collect::<BTreeMap<_, _>>())
+        }
+    }
+
+    impl Observed for Centroids {
+        fn observed(&self) -> String {
+            let by_bits: Vec<Vec<Vec<u32>>> = self
+                .iter()
+                .map(|sub| sub.iter().map(|centroid| bits(centroid)).collect())
+                .collect();
+            format!("{:?}", by_bits)
+        }
+    }
+
+    fn seen<T: Observed>(decoded: Result<T, DecodeError>) -> String {
+        match decoded {
+            Ok(value) => format!("opened {}", value.observed()),
+            Err(e) => format!("refused {:?}", e),
+        }
+    }
+
+    fn encoded<T: bincode::Encode>(value: &T) -> Vec<u8> {
+        bincode::encode_to_vec(value, bincode::config::standard()).unwrap()
+    }
+
+    /// `bytes` whole, its prefixes, and damage at its positions: each byte
+    /// overwritten with every marker a length can start with and with its top
+    /// bit flipped, removed, and preceded by the marker of a `u64`. Prefix
+    /// lengths and positions are taken every `step` bytes.
+    fn damaged(bytes: &[u8], step: usize) -> Vec<Vec<u8>> {
+        let mut inputs = vec![bytes.to_vec()];
+        for len in (0..bytes.len()).step_by(step) {
+            inputs.push(bytes[..len].to_vec());
+        }
+        for at in (0..bytes.len()).step_by(step) {
+            for value in [
+                0x00,
+                0x01,
+                0xfa,
+                0xfb,
+                0xfc,
+                0xfd,
+                0xfe,
+                0xff,
+                bytes[at] ^ 0x80,
+            ] {
+                let mut input = bytes.to_vec();
+                input[at] = value;
+                inputs.push(input);
+            }
+            let mut removed = bytes.to_vec();
+            removed.remove(at);
+            inputs.push(removed);
+            let mut inserted = bytes.to_vec();
+            inserted.insert(at, 0xfd);
+            inputs.push(inserted);
+        }
+        inputs
+    }
+
+    /// Every input decoded both ways, under the budget its length earns and
+    /// under the eight byte floor, the held decode under every count in
+    /// `knowns`. Returns how many decodes were compared.
+    fn holds_to_bincode<T>(label: &str, bytes: &[u8], knowns: &[T::Known]) -> usize
+    where
+        T: HeldArtefact + bincode::Decode<()> + Observed,
+    {
+        let step = if bytes.len() <= 512 {
+            1
+        } else {
+            bytes.len() / 128
+        };
+        let mut compared = 0;
+        for input in damaged(bytes, step) {
+            for budget in [claim_budget(input.len()), LEADING_LENGTH_CLAIM] {
+                let expected = seen(bincode_decode::<T>(&input, budget));
+                for known in knowns {
+                    let got = seen(held::<T>(&input, budget, *known));
+                    assert_eq!(
+                        got,
+                        expected,
+                        "{label}, {} bytes under a budget of {budget}",
+                        input.len()
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        compared
+    }
+
+    #[test]
+    fn mappings_decode_as_bincode_decodes_them() {
+        let ids = |names: &[&str]| IdMappings {
+            id_map: names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (name.to_string(), i))
+                .collect(),
+            rev_map: names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (i, name.to_string()))
+                .collect(),
+        };
+        let hundred: Vec<String> = (0..100).map(|i| format!("r{i}")).collect();
+        let hundred: Vec<&str> = hundred.iter().map(String::as_str).collect();
+        let long = "x".repeat(251);
+        let longer = "y".repeat(65_536);
+        let shapes = [
+            ("no record", ids(&[])),
+            ("one record", ids(&["a"])),
+            ("a hundred records", ids(&hundred)),
+            (
+                "ids that are not ASCII",
+                ids(&["\u{e9}t\u{e9}", "\u{65e5}\u{672c}", "\u{1f980}", "a\u{0}b"]),
+            ),
+            ("an id of 251 bytes", ids(&[&long, "b"])),
+            ("an id of 65,536 bytes", ids(&[&longer])),
+        ];
+        let mut compared = 0;
+        for (label, shape) in &shapes {
+            compared += holds_to_bincode::<IdMappings>(label, &encoded(shape), &[()]);
+        }
+        assert!(compared > 10_000, "{compared}");
+    }
+
+    #[test]
+    fn vectors_decode_as_bincode_decodes_them() {
+        let map = |entries: Vec<(String, Vec<f32>)>| entries.into_iter().collect::<HashMap<_, _>>();
+        let unusual = vec![
+            f32::NAN,
+            f32::INFINITY,
+            -0.0,
+            f32::MIN_POSITIVE / 2.0,
+            1.5,
+            f32::MAX,
+            -1.0,
+            0.0,
+        ];
+        let shapes = [
+            ("no record", encoded(&map(vec![]))),
+            (
+                "dim 1",
+                encoded(&map((0..20)
+                    .map(|i| (format!("r{i}"), vec![i as f32]))
+                    .collect())),
+            ),
+            (
+                "values that are not ordinary, and an empty vector",
+                encoded(&map(vec![
+                    ("a".to_string(), unusual),
+                    ("b".to_string(), vec![]),
+                ])),
+            ),
+            (
+                "a hundred records at dim 4",
+                encoded(&map((0..100)
+                    .map(|i| (format!("r{i}"), vec![0.25 * i as f32; 4]))
+                    .collect())),
+            ),
+            // A vector of pairs writes the wire a map writes and can hold an
+            // id twice.
+            (
+                "an id held twice",
+                encoded(&vec![
+                    ("a".to_string(), vec![1.0f32]),
+                    ("b".to_string(), vec![2.0]),
+                    ("a".to_string(), vec![3.0]),
+                ]),
+            ),
+        ];
+        let mut compared = 0;
+        for (label, bytes) in &shapes {
+            compared +=
+                holds_to_bincode::<HashMap<String, Vec<f32>>>(label, bytes, &[0, 1, 7, usize::MAX]);
+        }
+        assert!(compared > 10_000, "{compared}");
+    }
+
+    #[test]
+    fn codes_decode_as_bincode_decodes_them() {
+        let map = |entries: Vec<(String, Vec<u8>)>| entries.into_iter().collect::<HashMap<_, _>>();
+        let shapes = [
+            ("no record", encoded(&map(vec![]))),
+            (
+                "a hundred records of four subvectors",
+                encoded(&map((0..100u8)
+                    .map(|i| (format!("r{i}"), vec![i, i ^ 0xff, 0, 255]))
+                    .collect())),
+            ),
+            (
+                "an empty code",
+                encoded(&map(vec![("a".to_string(), vec![])])),
+            ),
+            (
+                "a code of 300 bytes",
+                encoded(&map(vec![(
+                    "a".to_string(),
+                    (0..300u32).map(|i| (i % 256) as u8).collect(),
+                )])),
+            ),
+        ];
+        let mut compared = 0;
+        for (label, bytes) in &shapes {
+            compared +=
+                holds_to_bincode::<HashMap<String, Vec<u8>>>(label, bytes, &[0, 1, 7, usize::MAX]);
+        }
+        assert!(compared > 5_000, "{compared}");
+    }
+
+    #[test]
+    fn codebooks_decode_as_bincode_decodes_them() {
+        let shapes: [(&str, Centroids); 5] = [
+            (
+                "four subvectors of sixteen centroids at width two",
+                vec![vec![vec![0.25f32; 2]; 16]; 4],
+            ),
+            (
+                "256 subvectors of two centroids at width one",
+                vec![vec![vec![-1.0f32]; 2]; 256],
+            ),
+            ("no subvector", vec![]),
+            ("subvectors of no centroid", vec![vec![]; 3]),
+            (
+                "a ragged codebook",
+                vec![vec![vec![1.0]], vec![vec![], vec![2.0, f32::NAN]]],
+            ),
+        ];
+        let knowns = [(0, 0), (4, 16), (usize::MAX, usize::MAX)];
+        let mut compared = 0;
+        for (label, shape) in &shapes {
+            compared += holds_to_bincode::<Centroids>(label, &encoded(shape), &knowns);
+        }
+        assert!(compared > 10_000, "{compared}");
+    }
+
+    #[test]
+    fn the_walk_refuses_every_damaged_file_as_the_map_decode_does() {
+        let map: HashMap<String, Vec<f32>> = (0..30)
+            .map(|i| (format!("r{i}"), vec![i as f32, f32::NAN]))
+            .collect();
+        let twice = vec![
+            ("a".to_string(), vec![f32::NAN]),
+            ("a".to_string(), vec![1.0f32]),
+        ];
+        let mut compared = 0;
+        for bytes in [encoded(&map), encoded(&twice)] {
+            for input in damaged(&bytes, 1) {
+                let decoded = decode_bounded::<HashMap<String, Vec<f32>>>(&input, "vectors.bin", 0);
+                let walked = walk_vectors(&input, "vectors.bin", 0);
+                match (decoded, walked) {
+                    (Ok(decoded), Ok((count, _))) => assert_eq!(count, decoded.len()),
+                    (Err(decoded), Err(walked)) => {
+                        assert_eq!(walked.to_string(), decoded.to_string())
+                    }
+                    (decoded, walked) => panic!(
+                        "the map gave {:?} and the walk {:?}",
+                        decoded.map(|m| m.len()),
+                        walked
+                    ),
+                }
+                compared += 1;
+            }
+        }
+        assert!(compared > 1_000, "{compared}");
+    }
+
+    /// A vector of containers past the count it was reserved at holds exactly
+    /// its entries once they decode, whatever count the loader passed.
+    #[test]
+    fn a_vector_past_its_known_count_is_reserved_at_exactly_its_entries() {
+        let codebook: Centroids = vec![vec![vec![0.5f32; 3]; 16]; 4];
+        let bytes = encoded(&codebook);
+        let budget = claim_budget(bytes.len());
+        for known in [(0, 0), (1, 1), (3, 15), (4, 16), (usize::MAX, usize::MAX)] {
+            let decoded = held::<Centroids>(&bytes, budget, known).unwrap();
+            assert_eq!(decoded, codebook, "{known:?}");
+            assert_eq!(decoded.capacity(), 4, "{known:?}");
+            assert!(
+                decoded
+                    .iter()
+                    .all(|sub| sub.capacity() == 16 && sub.iter().all(|c| c.capacity() == 3)),
+                "{known:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_container_is_reserved_at_no_more_than_its_bytes_and_its_known_count() {
+        assert_eq!(reserved(1 << 40, 10, 2, Some(usize::MAX)), 5);
+        assert_eq!(reserved(1 << 40, 10, 2, Some(3)), 3);
+        assert_eq!(reserved(4, 1000, 2, Some(usize::MAX)), 4);
+        assert_eq!(reserved(1 << 40, 1 << 30, 2, None), 0);
+        assert_eq!(reserved(9, 0, 1, Some(9)), 0);
+    }
+
+    #[test]
+    fn a_varint_reads_as_bincode_writes_it() {
+        let values = [
+            0u64,
+            1,
+            250,
+            251,
+            255,
+            256,
+            65_535,
+            65_536,
+            u64::from(u32::MAX),
+            u64::from(u32::MAX) + 1,
+            u64::MAX,
+        ];
+        for value in values {
+            let bytes = encoded(&value);
+            assert_eq!(varint(&bytes), Some((value, bytes.len())), "{value}");
+            for cut in 0..bytes.len() {
+                assert_eq!(varint(&bytes[..cut]), None, "{value} cut to {cut}");
+            }
+        }
+        assert_eq!(varint(&[254, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(varint(&[255, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(varint(&[]), None);
+    }
+
+    /// The count is the keys the bytes carry. A prefix counts the entries it
+    /// holds whole, a key held twice counts once, a count the bytes do not
+    /// carry counts what they do, and the count stops where a length runs
+    /// past the bytes or a varint does not decode.
+    #[test]
+    fn the_distinct_keys_are_counted_before_the_forward_map_is_built() {
+        let entries: Vec<(String, usize)> = (0..300).map(|i| (format!("r{i}"), i)).collect();
+        let bytes = encoded(&entries);
+        assert_eq!(count_distinct_keys(&bytes), 300);
+        let mappings = IdMappings {
+            id_map: entries.iter().cloned().collect(),
+            rev_map: entries.iter().map(|(id, i)| (*i, id.clone())).collect(),
+        };
+        assert_eq!(count_distinct_keys(&encoded(&mappings)), 300);
+        let mut end = encoded(&300u64).len();
+        for (i, entry) in entries.iter().enumerate() {
+            let next = end + encoded(entry).len();
+            assert_eq!(count_distinct_keys(&bytes[..next]), i + 1, "at entry {i}");
+            assert_eq!(
+                count_distinct_keys(&bytes[..next - 1]),
+                i,
+                "short of entry {i}"
+            );
+            end = next;
+        }
+
+        let twice = vec![
+            ("a".to_string(), 1usize),
+            ("b".to_string(), 2),
+            ("a".to_string(), 3),
+        ];
+        assert_eq!(count_distinct_keys(&encoded(&twice)), 2);
+        let mut repeated = encoded(&(1u64 << 20));
+        repeated.extend(std::iter::repeat_n([0u8, 0], 1 << 20).flatten());
+        assert_eq!(count_distinct_keys(&repeated), 1);
+
+        let mut declared = encoded(&(1u64 << 40));
+        declared.extend_from_slice(&encoded(&twice)[1..]);
+        assert_eq!(count_distinct_keys(&declared), 2);
+
+        let ab = encoded(&"ab".to_string());
+        let past = [
+            encoded(&2u64),
+            ab.clone(),
+            vec![7],
+            encoded(&(1u64 << 40)),
+            vec![0; 4],
+        ]
+        .concat();
+        assert_eq!(count_distinct_keys(&past), 1);
+        let marker = [
+            encoded(&2u64),
+            ab.clone(),
+            vec![7],
+            vec![254],
+            encoded(&"c".to_string()),
+            vec![0],
+        ]
+        .concat();
+        assert_eq!(count_distinct_keys(&marker), 1);
+        let value_marker = [encoded(&2u64), ab, vec![254], vec![0; 8]].concat();
+        assert_eq!(count_distinct_keys(&value_marker), 0);
+        assert_eq!(count_distinct_keys(&[vec![255], vec![0; 8]].concat()), 0);
+        assert_eq!(count_distinct_keys(&[]), 0);
+        assert_eq!(count_distinct_keys(&encoded(&0u64)), 0);
+    }
+
+    /// Lengths no file here carries, under the top rung's budget so every
+    /// claim passes and nothing but the bytes left stands between each length
+    /// and the allocator. bincode's own decode asks the allocator for up to
+    /// 16 TiB on each of these, which does not unwind, so this test surviving
+    /// is what it checks. The refusal is still bincode's own.
+    #[test]
+    fn a_length_the_bytes_left_cannot_carry_is_not_allocated() {
+        let top = 1usize << 44;
+        let terabyte = 1u64 << 40;
+        let id = encoded(&"a".to_string());
+        let words = |refused: DecodeError| format!("{refused:?}");
+
+        let key = [encoded(&1u64), encoded(&terabyte), b"abc".to_vec()].concat();
+        assert_eq!(
+            words(held::<IdMappings>(&key, top, ()).unwrap_err()),
+            format!("UnexpectedEnd {{ additional: {} }}", terabyte - 3)
+        );
+        let forward = [encoded(&(1u64 << 38)), vec![0xff; 4]].concat();
+        let reverse = [encoded(&0u64), encoded(&(1u64 << 38)), vec![0xff; 4]].concat();
+        for bytes in [&forward, &reverse] {
+            let refused = words(held::<IdMappings>(bytes, top, ()).unwrap_err());
+            assert!(refused.starts_with("InvalidIntegerType"), "{refused}");
+        }
+
+        let vector = [
+            encoded(&1u64),
+            id.clone(),
+            encoded(&(1u64 << 38)),
+            vec![0; 8],
+        ]
+        .concat();
+        assert_eq!(
+            words(held::<HashMap<String, Vec<f32>>>(&vector, top, usize::MAX).unwrap_err()),
+            "UnexpectedEnd { additional: 4 }"
+        );
+        let records = [encoded(&(1u64 << 38)), vec![0xff; 4]].concat();
+        let refused =
+            words(held::<HashMap<String, Vec<f32>>>(&records, top, usize::MAX).unwrap_err());
+        assert!(refused.starts_with("InvalidIntegerType"), "{refused}");
+
+        let code = [encoded(&1u64), id, encoded(&terabyte), vec![0; 8]].concat();
+        assert_eq!(
+            words(held::<HashMap<String, Vec<u8>>>(&code, top, usize::MAX).unwrap_err()),
+            format!("UnexpectedEnd {{ additional: {} }}", terabyte - 8)
+        );
+        let refused =
+            words(held::<HashMap<String, Vec<u8>>>(&records, top, usize::MAX).unwrap_err());
+        assert!(refused.starts_with("InvalidIntegerType"), "{refused}");
+
+        let subvectors = [encoded(&(1u64 << 39)), vec![0xff; 4]].concat();
+        let centroids = [encoded(&1u64), encoded(&(1u64 << 39)), vec![0xff; 4]].concat();
+        for bytes in [&subvectors, &centroids] {
+            let refused =
+                words(held::<Centroids>(bytes, top, (usize::MAX, usize::MAX)).unwrap_err());
+            assert!(refused.starts_with("InvalidIntegerType"), "{refused}");
+        }
+        let width = [
+            encoded(&1u64),
+            encoded(&1u64),
+            encoded(&terabyte),
+            vec![0; 8],
+        ]
+        .concat();
+        assert_eq!(
+            words(held::<Centroids>(&width, top, (usize::MAX, usize::MAX)).unwrap_err()),
+            "UnexpectedEnd { additional: 4 }"
+        );
+
+        let walked = walk_at(&vector, "vectors.bin", 0, top)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            walked.ends_with("UnexpectedEnd { additional: 4 }"),
+            "{walked}"
+        );
     }
 }
