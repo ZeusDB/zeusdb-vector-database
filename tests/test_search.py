@@ -1162,3 +1162,92 @@ def test_top_k_and_ef_search_have_ceilings():
     assert len(index.search(query, top_k=2, ef_search=131_072)) == 2
     # Zero stays accepted, as test_compaction.py already holds.
     assert index.search(query, top_k=0, ef_search=0) == []
+
+
+def _same(a, b):
+    """Equal in value and in type all the way down, so True is not 1 and 1 is not 1.0."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    if isinstance(a, float):
+        return struct.pack("<d", a) == struct.pack("<d", b)
+    return a == b
+
+
+@pytest.mark.parametrize("quantization", [None, {"type": "int8", "training_size": 1000}],
+                         ids=["raw", "int8"])
+def test_a_hit_carries_the_metadata_its_record_was_added_with(quantization):
+    """Every kind of value a mapping holds comes back from search as it went
+    in, type and all, at every page size, with vectors and without, on the
+    single query path, both batch paths and the exact scan.
+
+    A record added with an empty mapping and a record added with none both
+    come back with an empty mapping, and every hit's mapping is a dict of its
+    own, so changing one changes no other hit and no later search.
+    """
+    dim, n = 8, 1200
+    rng = np.random.default_rng(7)
+    vectors = rng.standard_normal((n, dim)).astype(np.float32)
+    kinds = [
+        lambda i: None,
+        lambda i: {},
+        lambda i: {"cat": ["alpha", "beta"][i % 2], "rank": i, "flag": i % 3 == 0},
+        lambda i: {"ratio": i / 7, "neg": -i, "big": 2 ** 62 + i, "none": None, "empty": ""},
+        lambda i: {"tags": ["a", i, 1.5, None, True], "nested": {"k": "v", "n": [1, {"deep": "x"}]}},
+        lambda i: {"text": "\u00e9\u4e2d\U0001f600" * (i % 4), f"only_{i}": i, "cat": "beta"},
+    ]
+    index = VectorDatabase().create("hnsw", dim=dim, space="l2", expected_size=n,
+                                    quantization_config=quantization, indexed_fields=["cat"])
+    expected = {}
+    for start in range(0, n, 100):
+        kind = kinds[(start // 100) % len(kinds)]
+        ids = [f"r{i}" for i in range(start, start + 100)]
+        metadatas = [kind(i) for i in range(start, start + 100)]
+        batch = {"ids": ids, "embeddings": vectors[start:start + 100]}
+        if metadatas[0] is not None:
+            batch["metadatas"] = metadatas
+        assert index.add(batch).is_success()
+        for record_id, metadata in zip(ids, metadatas):
+            expected[record_id] = {} if metadata is None else metadata
+    assert index.is_quantized() == (quantization is not None)
+
+    def check(page, return_vector):
+        assert len({id(hit["metadata"]) for hit in page}) == len(page)
+        keys = {"id", "score", "metadata"} | ({"vector"} if return_vector else set())
+        for hit in page:
+            assert set(hit) == keys
+            assert type(hit["score"]) is float
+            assert _same(hit["metadata"], expected[hit["id"]]), hit["id"]
+            if return_vector:
+                assert type(hit["vector"]) is list and len(hit["vector"]) == dim
+                assert all(type(value) is float for value in hit["vector"])
+
+    queries = vectors[:6] + np.float32(0.05)
+    for return_vector in (False, True):
+        for top_k in (1, 7, 100, n):
+            for query in queries:
+                page = index.search(query, top_k=top_k, return_vector=return_vector)
+                assert len(page) == top_k or top_k == n
+                check(page, return_vector)
+            # Three run in turn and six fan out.
+            for batch in (queries[:3], queries):
+                pages = index.search(np.ascontiguousarray(batch), top_k=top_k,
+                                     return_vector=return_vector)
+                assert len(pages) == len(batch)
+                for page in pages:
+                    check(page, return_vector)
+        # A declared field matching a hundred records is scanned exactly.
+        page = index.search(queries[0], top_k=50, filter={"cat": "alpha"},
+                            return_vector=return_vector)
+        assert len(page) == 50
+        assert all(hit["metadata"]["cat"] == "alpha" for hit in page)
+        check(page, return_vector)
+
+    page = index.search(queries[0], top_k=10)
+    for hit in page:
+        hit["metadata"]["added"] = 1
+    for hit in index.search(queries[0], top_k=10):
+        assert _same(hit["metadata"], expected[hit["id"]])

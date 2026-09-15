@@ -79,13 +79,13 @@
 //! mutation taking a storage map before it deadlocks against it, and that is
 //! the inversion `remove_point_internal` used to carry.
 
-use super::{Arm, Collection, Query, StorageMode};
+use super::{Arm, Collection, Query, QueryHits, StorageMode};
 use crate::{
     raw_distance_fn, reconstruction_needs_unit, rescore_candidate, take_best, Named, RawVectors,
     RerankPlan, SearchParams,
 };
 use rayon::prelude::*;
-use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -190,7 +190,7 @@ pub(super) const FULL_SCAN_THRESHOLD: usize = 5_000;
 ///
 /// The index returns a page of internal ids and this is that page resolved
 /// through the id store, borrowing the name it finds there. Nothing is
-/// cloned until the page is cut, so an over-fetched page pays to clone the
+/// copied until the page is cut, so an over-fetched page pays to copy the
 /// metadata and the vector of the results it returns rather than of every
 /// candidate it considered, and nothing is looked up twice, since the
 /// internal id the metadata and the vectors are addressed by rides beside
@@ -342,12 +342,6 @@ impl AdmitPlan<'_> {
         }
     }
 }
-
-/// Search hits for one query vector, as (external id, distance, metadata,
-/// optional raw vector). The raw vector is present only when the caller asked
-/// for it and the index still holds one, or could reconstruct one from its
-/// codes. Owned Rust, which the binding converts to a list of dicts.
-pub type QueryHits = Vec<(String, f32, HashMap<String, Value>, Option<Vec<f32>>)>;
 
 /// Search hits for one sparse query, as (external id, score), best first.
 pub type SparseHits = Vec<(String, f32)>;
@@ -656,12 +650,8 @@ impl Collection {
         let mut scored = candidates.items;
         self.rescore_page(&mut scored, query, vectors, pq_codes, &params);
 
-        let mut results = Vec::with_capacity(scored.len());
+        let mut page = QueryHits::with_capacity(scored.len());
         for (record, score) in scored {
-            let metadata = vector_metadata
-                .get(record.slot)
-                .map(|fields| fields.to_map())
-                .unwrap_or_default();
             // The raw vector where one exists and the reconstruction from the
             // codes where none does. Under `quantized_only` every record is
             // code held once training completes, so without the fallback a
@@ -669,20 +659,26 @@ impl Collection {
             let vector_data = if params.return_vector {
                 vectors
                     .get(record.slot)
-                    .map(<[f32]>::to_vec)
+                    .map(Cow::Borrowed)
                     .or_else(|| {
                         let codes = pq_codes.get(record.name)?;
-                        self.dense().pq.as_ref()?.reconstruct(codes).ok()
+                        let pq = self.dense().pq.as_ref()?;
+                        pq.reconstruct(codes).ok().map(Cow::Owned)
                     })
-                    .or_else(|| vectors.graph.int8_reconstruct(record.slot))
+                    .or_else(|| vectors.graph.int8_reconstruct(record.slot).map(Cow::Owned))
             } else {
                 None
             };
 
-            results.push((record.name.to_string(), score, metadata, vector_data));
+            page.push(
+                record.name,
+                score,
+                vector_metadata.get(record.slot),
+                vector_data.as_deref(),
+            );
         }
 
-        Ok(results)
+        Ok(page)
     }
 
     /// Rescore a page against the raw vectors where the plan reranks, and

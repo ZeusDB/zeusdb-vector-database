@@ -86,6 +86,7 @@ mod int8_tests;
 mod journal_tests;
 #[cfg(test)]
 mod mutation_tests;
+mod page;
 mod persist;
 #[cfg(test)]
 mod persist_tests;
@@ -109,10 +110,11 @@ pub(crate) use construct::{
 };
 pub(crate) use dense::{DenseIndex, DenseOpen};
 pub use insert::{Added, RebuildPlan};
+pub use page::{FieldRef, HitRef, QueryHits};
 pub use query::{
     AdmitShape, Arm, ArmPlan, Page, Plan, Query, QueryHit, DEFAULT_FETCH_PER_K, MAX_ARMS,
 };
-pub use search::{QueryHits, SparseHits};
+pub use search::SparseHits;
 pub use stats::{QuantizationReport, QuantizerReport};
 
 use crate::journal::Durability;

@@ -330,8 +330,8 @@ impl Snapshot {
             collection
                 .search_one(&queries.dense, filter, params)
                 .unwrap()
-                .into_iter()
-                .map(|hit| (hit.0, hit.1))
+                .iter()
+                .map(|hit| (hit.id().to_string(), hit.score()))
                 .collect::<Vec<_>>()
         };
         Snapshot {

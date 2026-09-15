@@ -142,7 +142,10 @@ type Page = Vec<(String, f32)>;
 fn pages(collection: &Collection) -> (Page, Page, Page) {
     let params = collection.search_params(5, None, false, None).unwrap();
     let dense = collection.search_one(&[1.5, 3.0], None, params).unwrap();
-    let dense: Page = dense.into_iter().map(|h| (h.0, h.1)).collect();
+    let dense: Page = dense
+        .iter()
+        .map(|h| (h.id().to_string(), h.score()))
+        .collect();
     let query = SparseVector {
         dims: vec![1, 14, 27],
         values: vec![1.0, 2.0, 1.0],
@@ -704,8 +707,8 @@ fn the_raw_rebuild_fallback_keeps_every_internal_id_and_the_counter() {
     let params = rebuilt.search_params(5, None, false, None).unwrap();
     let page = rebuilt.search_one(&[1.5, 3.0], None, params).unwrap();
     assert_eq!(page.len(), 5);
-    for hit in &page {
-        assert!(ids.iter().any(|(id, _)| *id == hit.0) || hit.0 == "r900");
+    for hit in page.iter() {
+        assert!(ids.iter().any(|(id, _)| *id == hit.id()) || hit.id() == "r900");
     }
 }
 

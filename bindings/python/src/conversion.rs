@@ -11,11 +11,12 @@
 //! These are free functions rather than methods. Nothing here reads any field
 //! of an index, so nothing here needs one.
 
+use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyString};
 use serde_json::Value;
 use std::collections::HashMap;
-use zeusdb_vector_hnsw::QueryHits;
+use zeusdb_vector_hnsw::{FieldRef, QueryHits};
 
 /// How deeply a Python object may nest on the way in.
 ///
@@ -164,19 +165,41 @@ pub(crate) fn value_to_python_object(value: &Value, py: Python<'_>) -> PyResult<
 }
 
 /// One query's hits as the list of dicts Python receives.
+///
+/// Each dict carries `id`, `score`, `metadata` and, where the search returned
+/// vectors, `vector`, in that order. The four keys are interned for the
+/// process and each field name is made once for the page, so a hit makes
+/// Python strings for its id and its string values alone. A value that is not
+/// a string goes through `value_to_python_object`, which is what
+/// `value_map_to_python` applies to the same value.
 pub(crate) fn hits_to_python(hits: QueryHits, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+    let id_key = intern!(py, "id");
+    let score_key = intern!(py, "score");
+    let metadata_key = intern!(py, "metadata");
+    let vector_key = intern!(py, "vector");
+    let names: Vec<Bound<'_, PyString>> =
+        hits.names().map(|name| PyString::new(py, name)).collect();
     let mut output = Vec::with_capacity(hits.len());
-    for (id, score, metadata, vector_data) in hits {
+    for hit in hits.iter() {
+        let metadata = PyDict::new(py);
+        for (name, value) in hit.fields() {
+            match value {
+                FieldRef::Text(text) => metadata.set_item(&names[name], PyString::new(py, text))?,
+                FieldRef::Other(value) => {
+                    metadata.set_item(&names[name], value_to_python_object(value, py)?)?
+                }
+            }
+        }
         let dict = PyDict::new(py);
-        dict.set_item("id", id)?;
-        dict.set_item("score", score)?;
-        dict.set_item("metadata", value_map_to_python(&metadata, py)?)?;
-        if let Some(vec) = vector_data {
+        dict.set_item(id_key, hit.id())?;
+        dict.set_item(score_key, hit.score())?;
+        dict.set_item(metadata_key, metadata)?;
+        if let Some(vector) = hit.vector() {
             // A list of Python floats, as every release has returned. Both
             // adapters read it as a list, and one of them tests for it.
-            dict.set_item("vector", vec)?;
+            dict.set_item(vector_key, vector)?;
         }
-        output.push(dict.into());
+        output.push(dict.unbind());
     }
     Ok(output)
 }

@@ -121,8 +121,8 @@ fn page(
     collection
         .search_one(&query, filter, params)
         .unwrap()
-        .into_iter()
-        .map(|hit| (hit.0, hit.1))
+        .iter()
+        .map(|hit| (hit.id().to_string(), hit.score()))
         .collect()
 }
 

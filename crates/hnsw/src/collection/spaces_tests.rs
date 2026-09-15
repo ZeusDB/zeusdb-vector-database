@@ -99,7 +99,7 @@ fn a_collection_holds_both_arms_and_answers_each() {
     // The dense arm is untouched: the nearest to the origin is r1.
     let params = collection.search_params(2, None, false, None).unwrap();
     let dense = collection.search_one(&[0.0, 0.0], None, params).unwrap();
-    assert_eq!(dense[0].0, "r1");
+    assert_eq!(dense.get(0).unwrap().id(), "r1");
 
     // The sparse arm under the live set.
     let query = SparseVector {
@@ -150,7 +150,7 @@ fn a_collection_holds_both_arms_and_answers_each() {
     let live: Vec<ParsedRecord> = records.iter().filter(|r| r.id != "r2").cloned().collect();
     assert_eq!(page, brute(&live, query.as_ref(), |_| true));
     let dense = collection.search_one(&[1.0, 0.0], None, params).unwrap();
-    assert!(dense.iter().all(|hit| hit.0 != "r2"));
+    assert!(dense.iter().all(|hit| hit.id() != "r2"));
 
     let reclaimed = collection.compact().unwrap();
     assert_eq!(reclaimed, 1, "the stranded graph node");
