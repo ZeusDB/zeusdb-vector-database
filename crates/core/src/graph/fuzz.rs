@@ -61,6 +61,7 @@ use super::mutable::MutableGraph;
 use super::Distance;
 use crate::distance::{CosineDist, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist};
 use crate::int8::Int8Codec;
+use crate::storage::FsDir;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -471,7 +472,13 @@ where
         graph.insert(&mut store, &coded, id, &mut levels);
     }
     let dir = tempfile::tempdir().unwrap();
-    write_dump(&graph.dump_view(&store), kind, dir.path()).unwrap();
+    write_dump(
+        &graph.dump_view(&store),
+        kind,
+        &FsDir::new(dir.path()),
+        DUMP_FILENAME,
+    )
+    .unwrap();
     let blob = std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap();
     Entry {
         label,
@@ -655,17 +662,27 @@ fn drive(dir: &Path, blob: &[u8], entry: &Entry) -> Outcome {
     let owned = dir.to_path_buf();
 
     let result = std::panic::catch_unwind(move || match element {
-        Element::Raw => read_dump::<f32, CosineDist>(&owned, &expected, CosineDist {})
-            .map(|_| ())
-            .err(),
-        Element::Code => read_dump::<u8, CodeDist>(&owned, &expected, CodeDist)
-            .map(|_| ())
-            .err(),
-        Element::Int8 => {
-            read_dump::<i8, Int8Dist>(&owned, &expected, int8_dist(expected.dimension))
+        Element::Raw => read_dump::<f32, CosineDist>(
+            &FsDir::new(&owned),
+            DUMP_FILENAME,
+            &expected,
+            CosineDist {},
+        )
+        .map(|_| ())
+        .err(),
+        Element::Code => {
+            read_dump::<u8, CodeDist>(&FsDir::new(&owned), DUMP_FILENAME, &expected, CodeDist)
                 .map(|_| ())
                 .err()
         }
+        Element::Int8 => read_dump::<i8, Int8Dist>(
+            &FsDir::new(&owned),
+            DUMP_FILENAME,
+            &expected,
+            int8_dist(expected.dimension),
+        )
+        .map(|_| ())
+        .err(),
     });
 
     match result {
@@ -930,14 +947,25 @@ fn a_file_under_a_legacy_name_reaches_no_parser() {
 
     // No `hnsw_index.zdbgraph`, so the two legacy files are all the directory
     // holds and the reader has to say there is no dump rather than read one.
-    match read_dump::<f32, CosineDist>(dir.path(), &entry.expected, CosineDist {}) {
+    match read_dump::<f32, CosineDist>(
+        &FsDir::new(dir.path()),
+        DUMP_FILENAME,
+        &entry.expected,
+        CosineDist {},
+    ) {
         Ok(_) => panic!("a directory holding only legacy dumps loaded"),
         Err(reason) => assert!(reason.contains("holds no ZeusDB graph dump"), "{}", reason),
     }
 
     // And the current name beside them is the one that is read.
     std::fs::write(dir.path().join(DUMP_FILENAME), &entry.blob).unwrap();
-    assert!(read_dump::<f32, CosineDist>(dir.path(), &entry.expected, CosineDist {}).is_ok());
+    assert!(read_dump::<f32, CosineDist>(
+        &FsDir::new(dir.path()),
+        DUMP_FILENAME,
+        &entry.expected,
+        CosineDist {}
+    )
+    .is_ok());
 }
 
 /// The mutator reaches the cases the hand written enumeration reached.
@@ -1037,16 +1065,25 @@ fn every_corpus_entry_round_trips() {
     for entry in corpus() {
         std::fs::write(dir.path().join(DUMP_FILENAME), &entry.blob).unwrap();
         let counts = match entry.element {
-            Element::Raw => {
-                read_dump::<f32, CosineDist>(dir.path(), &entry.expected, CosineDist {})
-                    .map(|(graph, store)| (graph.nb_points(), store.len()))
-                    .unwrap_or_else(|e| panic!("{} did not load: {}", entry.label, e))
-            }
-            Element::Code => read_dump::<u8, CodeDist>(dir.path(), &entry.expected, CodeDist)
-                .map(|(graph, store)| (graph.nb_points(), store.len()))
-                .unwrap_or_else(|e| panic!("{} did not load: {}", entry.label, e)),
+            Element::Raw => read_dump::<f32, CosineDist>(
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+                &entry.expected,
+                CosineDist {},
+            )
+            .map(|(graph, store)| (graph.nb_points(), store.len()))
+            .unwrap_or_else(|e| panic!("{} did not load: {}", entry.label, e)),
+            Element::Code => read_dump::<u8, CodeDist>(
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+                &entry.expected,
+                CodeDist,
+            )
+            .map(|(graph, store)| (graph.nb_points(), store.len()))
+            .unwrap_or_else(|e| panic!("{} did not load: {}", entry.label, e)),
             Element::Int8 => read_dump::<i8, Int8Dist>(
-                dir.path(),
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
                 &entry.expected,
                 int8_dist(entry.expected.dimension),
             )

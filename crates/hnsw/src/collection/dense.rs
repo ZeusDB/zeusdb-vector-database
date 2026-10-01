@@ -67,15 +67,14 @@
 //! `ArmPlan::cost` says. A caller reading the plan against a filtered
 //! query's wall time sees that difference, not a unit that is wrong.
 
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tracing::error;
 use zeusdb_vector_core::{
     restore_graph, restore_int8_graph, Admit, ArtefactRecord, Bitmap, Bounds, Budget, Cost, Dense,
-    DumpBounds, Error, Hit, Hits, Int8Codec, Inventory, Ledger, Persist, Planned, Prepared, Record,
-    RecordId, Restore, ScoreKind, Selectivity, VectorGraph, VectorIndex, DUMP_FILENAME, PQ,
+    Dir, DumpBounds, Error, Hit, Hits, Int8Codec, Inventory, Ledger, Persist, Planned, Prepared,
+    Record, RecordId, Restore, ScoreKind, Selectivity, VectorGraph, VectorIndex, DUMP_FILENAME, PQ,
 };
 
 use super::search::FULL_SCAN_THRESHOLD;
@@ -734,23 +733,16 @@ impl Persist for DenseIndex {
     /// seeks back to write its header, so hashing it whole would mean reading
     /// the largest artefact in the directory back off the disk for a
     /// guarantee its own two checksums already give.
-    fn write(&self, prefix: &str, dir: &Path, ledger: &mut dyn Ledger) -> Result<(), Error> {
-        let target = if prefix.is_empty() {
-            dir.to_path_buf()
-        } else {
-            let target = dir.join(prefix);
-            std::fs::create_dir_all(&target).map_err(|e| Error::ArtefactCreateFailed {
-                name: prefix.to_string(),
-                error: e.to_string(),
-            })?;
-            target
-        };
-        let filename = self.graph.dump(&target).map_err(Error::GraphDumpFailed)?;
-        let bytes = std::fs::metadata(target.join(&filename))
-            .map(|meta| meta.len())
+    fn write(&self, prefix: &str, dir: &dyn Dir, ledger: &mut dyn Ledger) -> Result<(), Error> {
+        let name = dump_name(prefix);
+        self.graph
+            .dump(dir, &name)
+            .map_err(Error::GraphDumpFailed)?;
+        let bytes = dir
+            .length(&name)
             .map_err(|e| Error::DumpLengthUnreadable(e.to_string()))?;
         ledger.record(
-            &dump_name(prefix),
+            &name,
             ArtefactRecord {
                 bytes,
                 checksum: None,
@@ -791,19 +783,13 @@ impl Restore for DenseIndex {
     fn restore(
         config: &DenseOpen,
         prefix: &str,
-        dir: &Path,
+        dir: &dyn Dir,
         inventory: &dyn Inventory,
         bounds: &Bounds,
     ) -> Result<Self, Error> {
-        let target = if prefix.is_empty() {
-            dir.to_path_buf()
-        } else {
-            dir.join(prefix)
-        };
-        if let Some(recorded) = inventory.recorded(&dump_name(prefix)) {
-            let found = std::fs::metadata(target.join(DUMP_FILENAME))
-                .map(|meta| meta.len())
-                .unwrap_or(0);
+        let name = dump_name(prefix);
+        if let Some(recorded) = inventory.recorded(&name) {
+            let found = dir.length(&name).unwrap_or(0);
             if found != recorded.bytes {
                 return Err(Error::Engine(format!(
                     "the graph dump is {} bytes and manifest.json records it as {}",
@@ -817,7 +803,8 @@ impl Restore for DenseIndex {
         };
         let (graph, _nodes) = match &config.int8 {
             Some(codec) => restore_int8_graph(
-                &target,
+                dir,
+                &name,
                 &config.metric,
                 config.m,
                 config.ef_construction,
@@ -827,7 +814,8 @@ impl Restore for DenseIndex {
             None => {
                 let pq = config.pq.as_ref().filter(|pq| pq.is_trained()).cloned();
                 restore_graph(
-                    &target,
+                    dir,
+                    &name,
                     &config.metric,
                     config.m,
                     config.ef_construction,

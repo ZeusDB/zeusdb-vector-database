@@ -96,9 +96,8 @@
 use super::mutable::MutableGraph;
 use super::Distance;
 use crate::checksum::{checksum_of, Checksum};
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use crate::storage::Dir;
+use std::io::{BufReader, BufWriter, Read, Write};
 use tracing::{info, warn};
 
 /// The target the two records this module emits carry. See `LOG_TARGET` in
@@ -581,7 +580,13 @@ pub(super) trait DumpSource<T> {
     ) -> Result<(), String>;
 }
 
-pub(super) fn write_dump<T, S>(source: &S, kind: GraphKind, dir: &Path) -> Result<(), String>
+/// Write the graph as the artefact `name` in `dir`.
+pub(super) fn write_dump<T, S>(
+    source: &S,
+    kind: GraphKind,
+    dir: &dyn Dir,
+    name: &str,
+) -> Result<(), String>
 where
     T: DumpElement,
     S: DumpSource<T> + ?Sized,
@@ -611,9 +616,9 @@ where
         return Err("the graph holds points of no width".to_string());
     }
 
-    let path = dir.join(DUMP_FILENAME);
-    let file =
-        File::create(&path).map_err(|e| format!("the graph dump could not be created: {}", e))?;
+    let file = dir
+        .create(name)
+        .map_err(|e| format!("the graph dump could not be created: {}", e))?;
     let mut out = HashingWriter::new(BufWriter::with_capacity(IO_BUFFER_BYTES, file));
 
     // The header's own bytes are not part of the payload checksum, so they are
@@ -713,19 +718,16 @@ where
     // with the header. A save interrupted before this point leaves zeros at
     // offset zero, which reads as no dump at all rather than as a short one.
     //
-    // The file is fsynced once the header is in place, as every other
-    // artefact is by `write_artefact` in persistence.rs and for the same
-    // reason. The rename that moves the staging directory into place can
-    // otherwise be recorded while these bytes are still in the page cache,
-    // and a power loss then leaves a directory whose manifest is complete and
-    // whose graph dump is short.
+    // The dump is made durable once the header is in place, as every whole
+    // artefact is by `Dir::write` and for the same reason. The rename that
+    // moves the staging directory into place can otherwise be recorded while
+    // these bytes are still in the page cache, and a power loss then leaves a
+    // directory whose manifest is complete and whose graph dump is short.
     let mut file = inner
         .into_inner()
         .map_err(|e| format!("the graph dump could not be flushed: {}", e))?;
-    file.seek(SeekFrom::Start(0))
-        .and_then(|_| file.write_all(&header.encode()))
-        .and_then(|()| file.flush())
-        .and_then(|()| file.sync_all())
+    file.write_head(&header.encode())
+        .and_then(|()| file.finish())
         .map_err(|e| format!("the graph dump's header could not be written: {}", e))?;
 
     // Only once the new dump is whole. A save over a directory written by an
@@ -733,10 +735,12 @@ where
     // and at 50,000 raw records that is 340 MB of a graph nothing will read.
     // Removing them is best effort: a directory that is readable but not
     // writable in this respect is not a reason to fail a save that succeeded.
+    // They sit beside the dump, under whatever prefix its name carries.
+    let prefix = name.rfind('/').map_or("", |slash| &name[..=slash]);
     for legacy in LEGACY_DUMP_FILENAMES {
-        let path = dir.join(legacy);
-        if path.exists() {
-            match std::fs::remove_file(&path) {
+        let legacy_name = format!("{prefix}{legacy}");
+        if dir.exists(&legacy_name) {
+            match dir.remove(&legacy_name) {
                 Ok(()) => info!(
                     target: LOG_TARGET,
                     operation = "save_hnsw_graph",
@@ -811,13 +815,14 @@ pub(super) struct ParsedDump<T> {
     pub level_scale: f64,
 }
 
-/// Read the graph back out of `dir`.
+/// Read the graph back out of the artefact `name` in `dir`.
 ///
 /// Every failure is an error and none is a panic, an exit or an allocation from
 /// a length the file has not earned. The parsing itself is [`parse_dump`], and
 /// this wraps it in the one construction call ZeusDB ships.
 pub(super) fn read_dump<T, D>(
-    dir: &Path,
+    dir: &dyn Dir,
+    name: &str,
     expected: &Expected,
     dist: D,
 ) -> Result<(MutableGraph<T, D>, super::store::VectorStore<T>), String>
@@ -825,7 +830,7 @@ where
     T: DumpElement,
     D: Distance<T> + Send + Sync,
 {
-    let mut stream = open_dump::<T>(dir, expected)?;
+    let mut stream = open_dump::<T>(dir, name, expected)?;
     let nb_point = stream.nb_point;
     let layer_counts = stream.layer_counts.clone();
     let (graph, store) = MutableGraph::from_points(
@@ -857,11 +862,15 @@ where
 /// this collects them, which is the shape the tests hand to more than one
 /// constructor call. The reader itself takes the stream, see [`read_dump`].
 #[cfg(test)]
-pub(super) fn parse_dump<T>(dir: &Path, expected: &Expected) -> Result<ParsedDump<T>, String>
+pub(super) fn parse_dump<T>(
+    dir: &dyn Dir,
+    name: &str,
+    expected: &Expected,
+) -> Result<ParsedDump<T>, String>
 where
     T: DumpElement,
 {
-    let mut stream = open_dump::<T>(dir, expected)?;
+    let mut stream = open_dump::<T>(dir, name, expected)?;
     let mut points_by_layer: Vec<Vec<LoadedPoint<T>>> =
         Vec::with_capacity(stream.layer_counts.len());
     for count in stream.layer_counts.clone() {
@@ -899,7 +908,7 @@ where
 /// that way they were half of what an allocator that keeps freed small blocks
 /// left the process holding after a load.
 pub(super) struct DumpStream<T> {
-    hashed: HashingReader<BufReader<File>>,
+    hashed: HashingReader<BufReader<Box<dyn Read>>>,
     layer_counts: Vec<usize>,
     origin_ids: std::vec::IntoIter<usize>,
     adjacency: std::vec::IntoIter<Vec<Vec<LoadedEdge>>>,
@@ -957,13 +966,12 @@ impl<T: DumpElement> DumpStream<T> {
 /// The order is deliberate. The file's real length is established first, the
 /// header is checked against itself second, the header is checked against the
 /// index third, and only then does anything size a buffer from a field.
-fn open_dump<T>(dir: &Path, expected: &Expected) -> Result<DumpStream<T>, String>
+fn open_dump<T>(dir: &dyn Dir, name: &str, expected: &Expected) -> Result<DumpStream<T>, String>
 where
     T: DumpElement,
 {
-    let path = dir.join(DUMP_FILENAME);
-    let actual_bytes = match std::fs::metadata(&path) {
-        Ok(meta) => meta.len(),
+    let actual_bytes = match dir.length(name) {
+        Ok(bytes) => bytes,
         Err(_) => return Err("the directory holds no ZeusDB graph dump".to_string()),
     };
     if actual_bytes < (HEADER_BYTES + TRAILER_BYTES) as u64 {
@@ -974,8 +982,9 @@ where
         ));
     }
 
-    let file =
-        File::open(&path).map_err(|e| format!("the graph dump could not be opened: {}", e))?;
+    let file = dir
+        .open(name)
+        .map_err(|e| format!("the graph dump could not be opened: {}", e))?;
     let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, file);
 
     let mut raw = [0u8; HEADER_BYTES];
@@ -1276,6 +1285,7 @@ fn read_adjacency<R: Read>(
 mod tests {
     use super::*;
     use crate::distance::CosineDist;
+    use crate::storage::FsDir;
     use std::collections::BTreeMap;
 
     /// Build a small graph the tests can round trip.
@@ -1377,12 +1387,18 @@ mod tests {
         write_dump(
             &built.dump_view(&built_store),
             GraphKind::Cosine,
-            dir.path(),
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
         )
         .unwrap();
         let expected = expected_for(&built, 12, 600);
-        let (read, _read_store): (MutableGraph<f32, CosineDist>, _) =
-            read_dump(dir.path(), &expected, CosineDist {}).unwrap();
+        let (read, _read_store): (MutableGraph<f32, CosineDist>, _) = read_dump(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &expected,
+            CosineDist {},
+        )
+        .unwrap();
 
         assert_eq!(read.nb_points(), built.nb_points());
         assert_eq!(read.m(), 16);
@@ -1418,13 +1434,25 @@ mod tests {
         write_dump(
             &built.dump_view(&built_store),
             GraphKind::Cosine,
-            one.path(),
+            &FsDir::new(one.path()),
+            DUMP_FILENAME,
         )
         .unwrap();
         let expected = expected_for(&built, 8, 300);
-        let (read, read_store): (MutableGraph<f32, CosineDist>, _) =
-            read_dump(one.path(), &expected, CosineDist {}).unwrap();
-        write_dump(&read.dump_view(&read_store), GraphKind::Cosine, two.path()).unwrap();
+        let (read, read_store): (MutableGraph<f32, CosineDist>, _) = read_dump(
+            &FsDir::new(one.path()),
+            DUMP_FILENAME,
+            &expected,
+            CosineDist {},
+        )
+        .unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(two.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read(one.path().join(DUMP_FILENAME)).unwrap(),
             std::fs::read(two.path().join(DUMP_FILENAME)).unwrap()
@@ -1442,12 +1470,18 @@ mod tests {
             write_dump(
                 &built.dump_view(&built_store),
                 GraphKind::Cosine,
-                dir.path(),
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
             )
             .unwrap();
             let expected = expected_for(&built, 6, 120);
-            let (read, read_store): (MutableGraph<f32, CosineDist>, _) =
-                read_dump(dir.path(), &expected, CosineDist {}).unwrap();
+            let (read, read_store): (MutableGraph<f32, CosineDist>, _) = read_dump(
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+                &expected,
+                CosineDist {},
+            )
+            .unwrap();
             assert_eq!(read.m(), m);
             assert_eq!(topology(&built, &built_store), topology(&read, &read_store));
         }
@@ -1460,7 +1494,8 @@ mod tests {
         write_dump(
             &built.dump_view(&built_store),
             GraphKind::Cosine,
-            dir.path(),
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
         )
         .unwrap();
         let path = dir.path().join(DUMP_FILENAME);
@@ -1468,7 +1503,8 @@ mod tests {
         std::fs::write(&path, mutate(blob)).unwrap();
         let expected = expected_for(&built, 6, 200);
         refused(read_dump::<f32, CosineDist>(
-            dir.path(),
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
             &expected,
             CosineDist {},
         ))
@@ -1524,7 +1560,8 @@ mod tests {
         let (built, _built_store) = sample_graph(50, 4, 16);
         let expected = expected_for(&built, 4, 50);
         let reason = refused(read_dump::<f32, CosineDist>(
-            dir.path(),
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
             &expected,
             CosineDist {},
         ));
@@ -1541,7 +1578,8 @@ mod tests {
         write_dump(
             &built.dump_view(&built_store),
             GraphKind::Cosine,
-            dir.path(),
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
         )
         .unwrap();
 
@@ -1556,7 +1594,8 @@ mod tests {
         write_dump(
             &built.dump_view(&built_store),
             GraphKind::Cosine,
-            clean.path(),
+            &FsDir::new(clean.path()),
+            DUMP_FILENAME,
         )
         .unwrap();
         assert!(clean.path().join(DUMP_FILENAME).exists());
@@ -1574,7 +1613,8 @@ mod tests {
         std::fs::write(dir.path().join(DUMP_FILENAME), &blob).unwrap();
         let expected = expected_for(&built, 4, 50);
         let reason = refused(read_dump::<f32, CosineDist>(
-            dir.path(),
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
             &expected,
             CosineDist {},
         ));
@@ -1594,7 +1634,8 @@ mod tests {
         write_dump(
             &built.dump_view(&built_store),
             GraphKind::Cosine,
-            dir.path(),
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
         )
         .unwrap();
         let path = dir.path().join(DUMP_FILENAME);
@@ -1613,7 +1654,8 @@ mod tests {
 
         let expected = expected_for(&built, 4, 80);
         let reason = refused(read_dump::<f32, CosineDist>(
-            dir.path(),
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
             &expected,
             CosineDist {},
         ));
@@ -1628,7 +1670,8 @@ mod tests {
         damaged.extend_from_slice(&blob[HEADER_BYTES..]);
         std::fs::write(&path, &damaged).unwrap();
         let reason = refused(read_dump::<f32, CosineDist>(
-            dir.path(),
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
             &expected,
             CosineDist {},
         ));
@@ -1657,7 +1700,8 @@ mod tests {
         write_dump(
             &built.dump_view(&built_store),
             GraphKind::Cosine,
-            dir.path(),
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
         )
         .unwrap();
         let path = dir.path().join(DUMP_FILENAME);
@@ -1679,7 +1723,8 @@ mod tests {
             std::fs::write(&path, &damaged).unwrap();
             let expected = expected_for(&built, 4, 80);
             refused(read_dump::<f32, CosineDist>(
-                dir.path(),
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
                 &expected,
                 CosineDist {},
             ))
@@ -1699,7 +1744,13 @@ mod tests {
         // refuses nothing a save wrote.
         std::fs::write(&path, &blob).unwrap();
         let expected = expected_for(&built, 4, 80);
-        assert!(read_dump::<f32, CosineDist>(dir.path(), &expected, CosineDist {}).is_ok());
+        assert!(read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &expected,
+            CosineDist {}
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1709,13 +1760,15 @@ mod tests {
         write_dump(
             &built.dump_view(&built_store),
             GraphKind::Cosine,
-            dir.path(),
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
         )
         .unwrap();
 
         let refuse = |expected: &Expected| {
             refused(read_dump::<f32, CosineDist>(
-                dir.path(),
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
                 expected,
                 CosineDist {},
             ))
@@ -1748,10 +1801,13 @@ mod tests {
 
         // The element type is checked as well, so a raw dump handed to the
         // quantized reader is refused rather than read at a quarter the width.
-        assert!(
-            refused(read_dump::<u8, ByteDist>(dir.path(), &base, ByteDist {}))
-                .contains("element type")
-        );
+        assert!(refused(read_dump::<u8, ByteDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &base,
+            ByteDist {}
+        ))
+        .contains("element type"));
     }
 
     /// A `u8` distance, only so the element type check has something to refuse.

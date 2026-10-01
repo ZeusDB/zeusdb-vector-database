@@ -54,7 +54,7 @@ use crate::distance::{
 };
 use crate::int8::Int8Codec;
 use crate::pq::PQ;
-use std::path::Path;
+use crate::storage::Dir;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, trace, warn};
 
@@ -1622,14 +1622,9 @@ impl VectorGraph {
         }
     }
 
-    /// Write the graph to `dir` in ZeusDB's own format.
-    ///
-    /// Returns the name of the file written, which is fixed. The vendored
-    /// writer returned a basename that was not always the one asked for,
-    /// because it appended a random suffix rather than overwriting when a
-    /// memory mapped data file was active. Nothing maps anything here and the
-    /// file is replaced outright, so the name is a constant.
-    pub fn dump(&self, dir: &Path) -> Result<String, String> {
+    /// Write the graph in ZeusDB's own format as the artefact `name` in
+    /// `dir`, replacing any artefact of that name.
+    pub fn dump(&self, dir: &dyn Dir, name: &str) -> Result<(), String> {
         let kind = self.kind();
         trace!(
             target: LOG_TARGET,
@@ -1638,16 +1633,19 @@ impl VectorGraph {
             "Writing the graph dump"
         );
         match self {
-            VectorGraph::Cosine(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
-            VectorGraph::L2(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
-            VectorGraph::L1(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
-            VectorGraph::Dot(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
-            VectorGraph::CosinePQ(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
-            VectorGraph::L2PQ(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
-            VectorGraph::L1PQ(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
-            VectorGraph::Int8(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir),
-        }?;
-        Ok(dump::DUMP_FILENAME.to_string())
+            VectorGraph::Cosine(b) => {
+                dump::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::L2(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir, name),
+            VectorGraph::L1(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir, name),
+            VectorGraph::Dot(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir, name),
+            VectorGraph::CosinePQ(b) => {
+                dump::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::L2PQ(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir, name),
+            VectorGraph::L1PQ(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir, name),
+            VectorGraph::Int8(b) => dump::write_dump(&b.graph.dump_view(&b.store), kind, dir, name),
+        }
     }
 }
 
@@ -1659,9 +1657,7 @@ impl VectorGraph {
 ///
 /// Two numbers, both read from the directory rather than from the dump, and
 /// both checked before the reader allocates from anything the file declares.
-/// They travel together because they are the same kind of claim, and because
-/// splitting them into two parameters put `restore_graph` over clippy's
-/// argument count.
+/// They travel together because they are the same kind of claim.
 #[derive(Clone, Copy)]
 pub struct DumpBounds {
     /// The live record count. The graph holds at least this many nodes and
@@ -1715,8 +1711,12 @@ pub struct DumpBounds {
 /// degree. That is what the vendored reload did through
 /// `new_with_absolute_scale`, so it is a match rather than a change. See
 /// [`Backend::restored`].
+///
+/// The dump is the artefact `name` in `dir`.
+#[allow(clippy::too_many_arguments)]
 pub fn restore_graph(
-    dir: &Path,
+    dir: &dyn Dir,
+    name: &str,
     space: &str,
     m: usize,
     ef_construction: usize,
@@ -1753,6 +1753,7 @@ pub fn restore_graph(
             };
             let restored = Backend::restored(dump::read_dump::<u8, DistPQ>(
                 dir,
+                name,
                 &expected,
                 DistPQ::new(pq, metric),
             )?);
@@ -1777,7 +1778,7 @@ pub fn restore_graph(
                         max_origin_id,
                     };
                     VectorGraph::$variant(Backend::restored(dump::read_dump::<f32, $dist>(
-                        dir, &expected, $value,
+                        dir, name, &expected, $value,
                     )?))
                 }};
             }
@@ -1816,9 +1817,10 @@ fn int8_kind(space: &str) -> GraphKind {
 /// any other element type or kind is refused on its header, and every
 /// refusal is a reason to rebuild rather than to fail, exactly as it is for
 /// the other graphs. The bounds are checked the same way, before anything
-/// is allocated from a field.
+/// is allocated from a field. The dump is the artefact `name` in `dir`.
 pub fn restore_int8_graph(
-    dir: &Path,
+    dir: &dyn Dir,
+    name: &str,
     space: &str,
     m: usize,
     ef_construction: usize,
@@ -1835,7 +1837,7 @@ pub fn restore_int8_graph(
         min_nodes: bounds.min_nodes,
         max_origin_id: bounds.max_origin_id,
     };
-    let restored = Backend::restored(dump::read_dump::<i8, Int8Dist>(dir, &expected, dist)?);
+    let restored = Backend::restored(dump::read_dump::<i8, Int8Dist>(dir, name, &expected, dist)?);
     let graph = VectorGraph::Int8(restored);
     let nodes = graph.nb_points();
     Ok((graph, nodes))

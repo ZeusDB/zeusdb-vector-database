@@ -7,10 +7,11 @@
 //! behind, being the index trait, the admit family and the persistence traits
 //! in `space` and `admit`, the fusion that combines several indexes'
 //! pages into one, the write-ahead journal's format with its reader and
-//! the operations it records, and the abort hook a crash test kills a
-//! process at. The binding takes this crate as a path dependency
-//! and reaches it through the re-exports below, so the crate's surface is
-//! this file's `pub use` list and nothing else.
+//! the operations it records, the storage a saved collection is kept in
+//! with its one implementation over the filesystem, and the abort hook a
+//! crash test kills a process at. The binding takes this crate as a path
+//! dependency and reaches it through the re-exports below, so the crate's
+//! surface is this file's `pub use` list and nothing else.
 //! Every module is private. An item a module marks `pub` that this file does
 //! not re-export is unreachable, and `unreachable_pub` below makes it a
 //! warning, which the lint gate turns into a failure, so the surface cannot
@@ -18,13 +19,13 @@
 //!
 //! # Log records
 //!
-//! The two modules that emit `tracing` records name their target as
+//! The three modules that emit `tracing` records name their target as
 //! `zeusdb_vector_database::...`, which is the package a user configures
 //! logging by, rather than taking this crate's name from `module_path!()`.
 //! The filter directive the binding installs and a `RUST_LOG` directive both
 //! match a target by prefix, so a module moving between crates must not move
-//! its records out of that prefix. See `LOG_TARGET` in `graph/mod.rs` and
-//! `graph/dump.rs`.
+//! its records out of that prefix. See `LOG_TARGET` in `graph/mod.rs`,
+//! `graph/dump.rs` and `storage/fs.rs`.
 //!
 //! # Tests
 //!
@@ -52,6 +53,7 @@ mod operation;
 mod pq;
 mod rng;
 mod space;
+mod storage;
 // Test data two test modules measure against, so it is defined once.
 #[cfg(any(test, feature = "test-support"))]
 mod test_vectors;
@@ -94,6 +96,9 @@ pub use space::{
     read_artefact, write_artefact, ArtefactRecord, Bounds, Budget, CorpusStats, Cost, Dense, Hit,
     Hits, IdfScope, Inventory, Kind, Ledger, Persist, Prepared, RecordId, Restore, ScoreKind,
     Selectivity, SpaceKind, SpaceName, Sparse, SparseRef, SparseVector, VectorIndex,
+};
+pub use storage::{
+    ArtefactWriter, Dir, FsDir, FsStorage, JournalFile, Staged, Storage, JOURNAL_SUFFIX,
 };
 
 /// What a test in another crate measures against.

@@ -27,7 +27,7 @@ use zeusdb_vector_core::{
 use crate::corpus::{self, Corpus, Rng};
 use crate::index::{PostingsIndex, SparseConfig, Unlink, Weighting};
 use crate::search::Mode;
-use zeusdb_vector_core::IdfScope;
+use zeusdb_vector_core::{FsDir, IdfScope};
 
 const MODES: [Mode; 6] = [
     Mode::Auto,
@@ -301,14 +301,21 @@ pub(crate) fn verify(regime: &str, n: usize, nq: usize) -> (usize, usize) {
     // Persist and restore, then the same pages.
     let dir = tempfile::tempdir().unwrap();
     let mut manifest = Manifest::default();
-    lazy.write("sparse.", dir.path(), &mut manifest).unwrap();
+    lazy.write("sparse.", &FsDir::new(dir.path()), &mut manifest)
+        .unwrap();
     let bounds = Bounds {
         min_records: 0,
         max_records: n,
         max_bytes: 1 << 34,
     };
-    let restored =
-        PostingsIndex::restore(lazy.config(), "sparse.", dir.path(), &manifest, &bounds).unwrap();
+    let restored = PostingsIndex::restore(
+        lazy.config(),
+        "sparse.",
+        &FsDir::new(dir.path()),
+        &manifest,
+        &bounds,
+    )
+    .unwrap();
     assert_eq!(restored.len(), lazy.len());
     assert_eq!(restored.stranded(), 0);
     check(
@@ -616,14 +623,21 @@ pub(crate) fn verify_bm25(regime: &str, n: usize, nq: usize) -> (usize, usize) {
 
     let dir = tempfile::tempdir().unwrap();
     let mut manifest = Manifest::default();
-    lazy.write("bm25.", dir.path(), &mut manifest).unwrap();
+    lazy.write("bm25.", &FsDir::new(dir.path()), &mut manifest)
+        .unwrap();
     let bounds = Bounds {
         min_records: 0,
         max_records: n,
         max_bytes: 1 << 34,
     };
-    let restored =
-        PostingsIndex::restore(lazy.config(), "bm25.", dir.path(), &manifest, &bounds).unwrap();
+    let restored = PostingsIndex::restore(
+        lazy.config(),
+        "bm25.",
+        &FsDir::new(dir.path()),
+        &manifest,
+        &bounds,
+    )
+    .unwrap();
     check_bm25(
         &mut tally,
         "restored",

@@ -30,6 +30,7 @@ use crate::distance::{CosineDist, L1Dist, L2Dist};
 use crate::distance::{DistPQ, Int8Dist, Int8Metric, PqMetric};
 use crate::int8::Int8Codec;
 use crate::pq::PQ;
+use crate::storage::FsDir;
 use std::sync::Arc;
 
 type BoxedFilter = Box<dyn Fn(&usize) -> bool>;
@@ -104,7 +105,13 @@ where
     D: Distance<T> + Send + Sync,
 {
     let dir = tempfile::tempdir().unwrap();
-    write_dump(&graph.dump_view(store), kind, dir.path()).unwrap();
+    write_dump(
+        &graph.dump_view(store),
+        kind,
+        &FsDir::new(dir.path()),
+        DUMP_FILENAME,
+    )
+    .unwrap();
     let expected = Expected {
         kind,
         dimension: graph.dim(),
@@ -115,7 +122,7 @@ where
         // is a ceiling every one of them clears.
         max_origin_id: graph.nb_points(),
     };
-    parse_dump::<T>(dir.path(), &expected).unwrap()
+    parse_dump::<T>(&FsDir::new(dir.path()), DUMP_FILENAME, &expected).unwrap()
 }
 
 // ============================================================================
@@ -513,7 +520,13 @@ where
     D: Distance<T> + Send + Sync,
 {
     let first = tempfile::tempdir().unwrap();
-    write_dump(&built.dump_view(built_store), kind, first.path()).unwrap();
+    write_dump(
+        &built.dump_view(built_store),
+        kind,
+        &FsDir::new(first.path()),
+        DUMP_FILENAME,
+    )
+    .unwrap();
     let expected = Expected {
         kind,
         dimension: built.dim(),
@@ -522,7 +535,7 @@ where
         min_nodes: 0,
         max_origin_id: built.nb_points(),
     };
-    let parsed = parse_dump::<T>(first.path(), &expected).unwrap();
+    let parsed = parse_dump::<T>(&FsDir::new(first.path()), DUMP_FILENAME, &expected).unwrap();
     let (mutable, mutable_store) = MutableGraph::from_loaded(
         parsed.points_by_layer,
         parsed.entry,
@@ -533,7 +546,13 @@ where
     )
     .unwrap();
     let second = tempfile::tempdir().unwrap();
-    write_dump(&mutable.dump_view(&mutable_store), kind, second.path()).unwrap();
+    write_dump(
+        &mutable.dump_view(&mutable_store),
+        kind,
+        &FsDir::new(second.path()),
+        DUMP_FILENAME,
+    )
+    .unwrap();
 
     let before = std::fs::read(first.path().join(DUMP_FILENAME)).unwrap();
     let after = std::fs::read(second.path().join(DUMP_FILENAME)).unwrap();
@@ -687,7 +706,7 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
     assert_eq!(nearest[0].internal_id, 8);
 
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(graph.dump(dir.path()).unwrap(), DUMP_FILENAME);
+    graph.dump(&FsDir::new(dir.path()), DUMP_FILENAME).unwrap();
     let bounds = DumpBounds {
         min_nodes: N,
         max_origin_id: N,
@@ -695,14 +714,31 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
 
     // The raw reader refuses it on the element, and the wrong space on the
     // kind, each before anything is built.
-    let as_raw = restore_graph(dir.path(), "cosine", 16, 100, DIM, None, bounds);
+    let as_raw = restore_graph(
+        &FsDir::new(dir.path()),
+        DUMP_FILENAME,
+        "cosine",
+        16,
+        100,
+        DIM,
+        None,
+        bounds,
+    );
     assert!(as_raw.is_err());
     let reason = as_raw.err().unwrap();
     assert!(
         reason.contains("element type 3") && reason.contains("holds 1"),
         "{reason}"
     );
-    let as_l2 = restore_int8_graph(dir.path(), "l2", 16, 100, codec.clone(), bounds);
+    let as_l2 = restore_int8_graph(
+        &FsDir::new(dir.path()),
+        DUMP_FILENAME,
+        "l2",
+        16,
+        100,
+        codec.clone(),
+        bounds,
+    );
     let reason = as_l2.err().unwrap();
     assert!(
         reason.contains("written for int8 cosine") && reason.contains("declares int8 l2"),
@@ -710,8 +746,16 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
     );
 
     // And it comes back as itself.
-    let (restored, nodes) =
-        restore_int8_graph(dir.path(), "cosine", 16, 100, codec.clone(), bounds).unwrap();
+    let (restored, nodes) = restore_int8_graph(
+        &FsDir::new(dir.path()),
+        DUMP_FILENAME,
+        "cosine",
+        16,
+        100,
+        codec.clone(),
+        bounds,
+    )
+    .unwrap();
     assert_eq!(nodes, N);
     assert!(restored.is_int8());
     assert_eq!(restored.int8_row_of(1), Some(rows[0].as_slice()));
@@ -733,7 +777,9 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
 
     // Written again, the dump is the same bytes.
     let again = tempfile::tempdir().unwrap();
-    restored.dump(again.path()).unwrap();
+    restored
+        .dump(&FsDir::new(again.path()), DUMP_FILENAME)
+        .unwrap();
     assert_eq!(
         std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
         std::fs::read(again.path().join(DUMP_FILENAME)).unwrap()
@@ -1131,7 +1177,7 @@ fn the_seam_reseeds_the_level_stream() {
             graph.insert(vector, id);
         }
         let dir = tempfile::tempdir().unwrap();
-        graph.dump(dir.path()).unwrap();
+        graph.dump(&FsDir::new(dir.path()), DUMP_FILENAME).unwrap();
         std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap()
     };
 
@@ -1165,7 +1211,7 @@ fn the_split_insertion_is_the_outright_insertion() {
     let data = unit_sample_vectors(600, 12, 4243);
     let dump_of = |graph: &VectorGraph| {
         let dir = tempfile::tempdir().unwrap();
-        graph.dump(dir.path()).unwrap();
+        graph.dump(&FsDir::new(dir.path()), DUMP_FILENAME).unwrap();
         std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap()
     };
     let fresh = || VectorGraph::new_raw("cosine", 12, 16, data.len(), LAYERS, 64);

@@ -81,8 +81,14 @@
 //! directory is renamed into place at the end, so a reader sees the previous
 //! index or this one and never a mixture. Replacing an existing directory needs
 //! two renames rather than one, with `<name>.zdbold` holding the previous index
-//! between them. See `StagingDir` for what that means on each platform and what
-//! a killed process leaves behind.
+//! between them. See `zeusdb_vector_core::FsStorage` for what that means on
+//! each platform and what a killed process leaves behind.
+//!
+//! Every save and load here reaches the directory through
+//! `zeusdb_vector_core::Storage` and `zeusdb_vector_core::Dir`, and makes no
+//! filesystem call of its own. A save writes into the directory
+//! `Storage::stage` opens and `Staged::commit` puts in place, and a load reads
+//! the directory `Storage::dir` names after `Storage::recover`.
 //!
 //! `manifest.json` records a length and a digest for every artefact it names
 //! and the loader checks both before anything parses them. See
@@ -93,8 +99,8 @@
 //! re-inserting every record. See `Collection::restore_graph_from_dump`.
 //!
 //! This module and `collection::persist` call each other: `save` and `load`
-//! on the collection reach `save_index`, `save_manifest`, `StagingDir` and
-//! `load_index` here, and `load_index` builds a collection and restores it
+//! on the collection reach `save_index`, `save_manifest` and `load_index`
+//! here, and `load_index` builds a collection and restores it
 //! through the setters `persist.rs` declares. That is a module cycle inside
 //! one crate, which cargo tolerates, and it is the shape the two had in the
 //! binding.
@@ -114,15 +120,14 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use zeusdb_vector_core::{
     checksum_of, frame, frame_begin, frame_finish, unframe, validate_indexed_fields,
-    ArtefactRecord, Bounds, Error, FrameEncoding, FrameKind, Int8Codec, Inventory, Persist,
-    RecordFields, Restore, SpaceName, VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME,
-    FRAME_OVERHEAD_BYTES, LEGACY_DUMP_FILENAMES, PQ,
+    ArtefactRecord, Bounds, Dir, Error, FrameEncoding, FrameKind, FsStorage, Int8Codec, Inventory,
+    Persist, RecordFields, Restore, SpaceName, Storage, VectorIndex,
+    DUMP_FILENAME as GRAPH_DUMP_FILENAME, FRAME_OVERHEAD_BYTES, LEGACY_DUMP_FILENAMES, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerConfig};
@@ -806,256 +811,6 @@ impl HeldArtefact for Centroids {
 }
 
 // ============================================================================
-// AN ATOMIC SAVE
-// ============================================================================
-
-/// Suffix of the directory a save builds before it is moved into place.
-const STAGING_SUFFIX: &str = ".zdbtmp";
-
-/// Suffix the directory being replaced is moved aside under.
-const REPLACED_SUFFIX: &str = ".zdbold";
-
-/// A sibling of `target` carrying `suffix`, so both live on the target's volume
-///
-/// A rename is only cheap, and only atomic, within one volume. Staging under
-/// the system temporary directory would put the new index on whichever volume
-/// that is, and the move into place would then be a copy of every byte.
-fn sibling(target: &Path, suffix: &str) -> Result<PathBuf, Error> {
-    let name = target.file_name().ok_or_else(|| Error::TargetHasNoName {
-        target: target.to_path_buf(),
-    })?;
-    let mut name = name.to_os_string();
-    name.push(suffix);
-    Ok(target.parent().unwrap_or_else(|| Path::new("")).join(name))
-}
-
-/// The directory a save builds, and the move that puts it in place
-///
-/// # What this buys
-///
-/// Every artefact used to be written straight into the target directory, one
-/// `fs::write` at a time. A save interrupted part way left a directory holding
-/// some of the new index and some of the old, and a save over an existing
-/// directory replaced files one at a time and removed none, so a raw index
-/// saved over a quantized one left `quantization.json`, `pq_centroids.bin` and
-/// `pq_codes.bin` behind for ever. Only `manifest_names` kept those three from
-/// being read back as part of the new index.
-///
-/// Here the save builds a directory from nothing and moves it in, so a stale
-/// artefact cannot survive and a reader sees one whole index or the other.
-///
-/// # What "moves it into place" means
-///
-/// **It is one rename where the target does not exist, and two where it does.**
-/// Neither Windows nor POSIX can rename a directory over an existing non-empty
-/// directory. `rename(2)` requires the destination to be an empty directory and
-/// `MoveFileExW` refuses `MOVEFILE_REPLACE_EXISTING` for directories outright,
-/// so `fs::rename` fails on both platforms and there is no call in the standard
-/// library that swaps two directories in one step. Linux has
-/// `renameat2(RENAME_EXCHANGE)`, which std does not expose and which Windows
-/// has no counterpart for.
-///
-/// So a save over an existing directory does this:
-///
-/// 1. rename the target aside to `<name>.zdbold`
-/// 2. rename the staging directory to the target
-/// 3. remove `<name>.zdbold`
-///
-/// Steps 1 and 2 are each atomic on both platforms. Between them the target
-/// does not exist, which is a window of two filesystem calls with no I/O
-/// between them. **A reader in that window sees no directory rather than a
-/// partial one**, which is the property that matters, and a process killed in
-/// it leaves the whole previous index at `<name>.zdbold`. `recover` puts that
-/// back on the next save. A save to a path that holds nothing yet is step 2
-/// alone, which is atomic outright.
-///
-/// If step 2 fails the target is renamed back from `<name>.zdbold`, so a failed
-/// save leaves the previous directory where it was.
-///
-/// # What a killed process leaves
-///
-/// A leftover `<name>.zdbtmp` from a save that died before the move, and a
-/// leftover `<name>.zdbold` from one that died inside the window. `recover`
-/// deals with both at the start of the next save, and neither is inside the
-/// index directory, so a load reads neither.
-///
-/// Dropping this without committing removes the staging directory, so a save
-/// that fails part way cleans up after itself inside the process that started
-/// it.
-pub(crate) struct StagingDir {
-    target: PathBuf,
-    staging: PathBuf,
-    replaced: PathBuf,
-    committed: bool,
-}
-
-impl StagingDir {
-    /// Clear what an earlier save left behind and open an empty staging
-    /// directory
-    pub(crate) fn open(target: &Path) -> Result<Self, Error> {
-        let staging = sibling(target, STAGING_SUFFIX)?;
-        let replaced = sibling(target, REPLACED_SUFFIX)?;
-
-        Self::recover(target, &staging, &replaced)?;
-
-        fs::create_dir_all(&staging).map_err(|e| Error::StagingCreateFailed {
-            staging: staging.clone(),
-            error: e.to_string(),
-        })?;
-
-        Ok(StagingDir {
-            target: target.to_path_buf(),
-            staging,
-            replaced,
-            committed: false,
-        })
-    }
-
-    /// Put right whatever a killed save left behind
-    ///
-    /// `<name>.zdbold` present with no target is the one case that holds data:
-    /// the previous save died between the two renames and that directory is the
-    /// only copy of the index. `restore_replaced` renames it back, and a load
-    /// now does the same before it opens a directory.
-    ///
-    /// `<name>.zdbold` still present after that is the previous index after a
-    /// save that finished, so it is removed. Only a save removes it, because
-    /// only a save knows the target beside it is the one it wrote.
-    fn recover(target: &Path, staging: &Path, replaced: &Path) -> Result<(), Error> {
-        if !restore_replaced(target)? && replaced.exists() {
-            remove_tree(replaced, "the previous index a finished save left aside")?;
-        }
-        if staging.exists() {
-            remove_tree(
-                staging,
-                "a staging directory an interrupted save left behind",
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Where the save writes
-    pub(crate) fn path(&self) -> &Path {
-        &self.staging
-    }
-
-    /// Move the staged directory into place
-    pub(crate) fn commit(mut self) -> Result<(), Error> {
-        sync_directory(&self.staging);
-
-        if self.target.exists() {
-            fs::rename(&self.target, &self.replaced).map_err(|e| Error::MoveAsideFailed {
-                target: self.target.clone(),
-                error: e.to_string(),
-            })?;
-
-            zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveBetweenRenames);
-
-            if let Err(e) = fs::rename(&self.staging, &self.target) {
-                // The target is empty at this point, so putting the previous
-                // index back is the same rename in reverse.
-                let restored = fs::rename(&self.replaced, &self.target).is_ok();
-                self.committed = true;
-                return Err(Error::MoveIntoPlaceFailedAfterAside {
-                    target: self.target.clone(),
-                    error: e.to_string(),
-                    restored,
-                });
-            }
-
-            remove_tree(&self.replaced, "the index this save replaced").ok();
-        } else {
-            fs::rename(&self.staging, &self.target).map_err(|e| Error::MoveIntoPlaceFailed {
-                target: self.target.clone(),
-                error: e.to_string(),
-            })?;
-        }
-
-        sync_directory(self.target.parent().unwrap_or_else(|| Path::new(".")));
-        self.committed = true;
-        Ok(())
-    }
-}
-
-impl Drop for StagingDir {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = fs::remove_dir_all(&self.staging);
-        }
-    }
-}
-
-/// Put back an index a save was killed between its two renames
-///
-/// `<name>.zdbold` present with no target is the one case that holds data:
-/// the save died between the two renames and that directory is the only copy
-/// of the index. It is renamed back rather than removed, and the caller then
-/// opens it.
-///
-/// `<name>.zdbold` present beside a target is the previous index after a
-/// save that finished, and this leaves it where it is. Only a save removes
-/// it, because only a save knows the target beside it is the one it wrote.
-///
-/// Reached from two places. `StagingDir::open`, so the next save puts the
-/// index back before it stages a new one, which is where it has always been
-/// reached from. And `load_index`, because recovery from a killed process is
-/// a load: until this ran there, a process killed in that window left the
-/// whole index beside the target and `load` reported the directory as not
-/// found, and only another save could put it back.
-///
-/// Returns whether it moved anything.
-pub(crate) fn restore_replaced(target: &Path) -> Result<bool, Error> {
-    let replaced = sibling(target, REPLACED_SUFFIX)?;
-    if !replaced.exists() || target.exists() {
-        return Ok(false);
-    }
-    fs::rename(&replaced, target).map_err(|e| Error::RecoverRenameFailed {
-        target: target.to_path_buf(),
-        replaced: replaced.clone(),
-        error: e.to_string(),
-    })?;
-    info!(target: LOG_TARGET, operation = "save_recover",
-        restored = %target.display(),
-        "An interrupted save had moved the index aside; it is back in place"
-    );
-    Ok(true)
-}
-
-/// Remove a directory tree, naming what it was in the failure
-fn remove_tree(path: &Path, what: &'static str) -> Result<(), Error> {
-    fs::remove_dir_all(path).map_err(|e| Error::RemoveTreeFailed {
-        path: path.to_path_buf(),
-        what,
-        error: e.to_string(),
-    })
-}
-
-/// Persist a directory's own entries, where the platform has a call for it
-///
-/// A file's bytes reaching the disk does not put its name in its directory. On
-/// POSIX that needs the directory's own descriptor fsynced, which is what this
-/// does, and without it a power loss can leave the renamed directory holding
-/// entries that were never recorded.
-///
-/// **Windows has no equivalent through the standard library.** `File::open`
-/// refuses a directory there, so this is a no-op, and the durability claim on
-/// Windows rests on NTFS journalling the rename rather than on anything this
-/// crate does. That difference is not observable from a gate that runs on
-/// Windows.
-///
-/// Best effort on both. A filesystem that refuses the fsync is not a reason to
-/// fail a save whose bytes are already written.
-#[cfg(unix)]
-fn sync_directory(path: &Path) {
-    if let Ok(dir) = fs::File::open(path) {
-        let _ = dir.sync_all();
-    }
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) {}
-
-// ============================================================================
 // A DIGEST PER ARTEFACT
 // ============================================================================
 
@@ -1118,32 +873,18 @@ impl zeusdb_vector_core::Ledger for SaveLedger {
 
 /// Write one artefact into the staging directory and record what went in
 ///
-/// The file is fsynced before this returns. Without it the rename that moves
-/// the staging directory into place can be recorded while the bytes it names
-/// are still in the page cache, so a power loss leaves an index directory whose
-/// manifest is complete and whose artefacts are empty. Every byte is already in
-/// memory, so the fsync is the whole cost of that durability and it is measured
-/// rather than assumed.
+/// The artefact is durable before this returns, as every `Dir::write` is.
+/// Without that the rename that moves the staging directory into place can be
+/// recorded while the bytes it names are still in the page cache, so a power
+/// loss leaves an index directory whose manifest is complete and whose
+/// artefacts are empty.
 fn write_artefact(
-    dir: &Path,
+    dir: &dyn Dir,
     name: &str,
     bytes: &[u8],
     ledger: &mut SaveLedger,
 ) -> Result<(), Error> {
-    use std::io::Write;
-
-    let path = dir.join(name);
-    let mut file = fs::File::create(&path).map_err(|e| Error::ArtefactCreateFailed {
-        name: name.to_string(),
-        error: e.to_string(),
-    })?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| Error::ArtefactWriteFailed {
-            name: name.to_string(),
-            error: e.to_string(),
-        })?;
-
+    dir.write(name, bytes)?;
     ledger.record_digest(name, bytes.len() as u64, Some(checksum_of(bytes)));
     Ok(())
 }
@@ -1189,22 +930,19 @@ fn verify_artefact(name: &str, bytes: &[u8], manifest: &IndexManifest) -> Result
 }
 
 /// Read an artefact and verify it before anything parses it
-fn read_artefact(path: &Path, name: &str, manifest: &IndexManifest) -> Result<Vec<u8>, Error> {
-    let bytes = fs::read(path.join(name)).map_err(|e| Error::ArtefactReadFailed {
-        name: name.to_string(),
-        error: e.to_string(),
-    })?;
+fn read_artefact(dir: &dyn Dir, name: &str, manifest: &IndexManifest) -> Result<Vec<u8>, Error> {
+    let bytes = dir.read(name)?;
     verify_artefact(name, &bytes, manifest)?;
     Ok(bytes)
 }
 
 /// The same, for the artefacts that are JSON
 fn read_artefact_string(
-    path: &Path,
+    dir: &dyn Dir,
     name: &str,
     manifest: &IndexManifest,
 ) -> Result<String, Error> {
-    let bytes = read_artefact(path, name, manifest)?;
+    let bytes = read_artefact(dir, name, manifest)?;
     String::from_utf8(bytes).map_err(|e| Error::ArtefactNotUtf8 {
         name: name.to_string(),
         error: e.to_string(),
@@ -1322,13 +1060,13 @@ const DICTIONARY_CONTENTS: &str =
 /// opened as a complete index built entirely from PQ reconstructions, and one
 /// that lost `quantization.json` opened as an unquantized index. Both were
 /// silent.
-fn check_files_present(path: &Path, manifest: &IndexManifest) -> Result<(), Error> {
+fn check_files_present(dir: &dyn Dir, manifest: &IndexManifest) -> Result<(), Error> {
     let missing: Vec<&str> = manifest
         .files_included
         .iter()
         .map(String::as_str)
         .filter(|name| !is_derived_artefact(name))
-        .filter(|name| !path.join(name).exists())
+        .filter(|name| !dir.exists(name))
         .collect();
 
     let Some(&first) = missing.first() else {
@@ -1815,11 +1553,11 @@ impl TrainingState {
 // ============================================================================
 
 /// Load index configuration from config.json
-fn load_config(path: &Path, manifest: &IndexManifest) -> Result<IndexConfig, Error> {
+fn load_config(dir: &dyn Dir, manifest: &IndexManifest) -> Result<IndexConfig, Error> {
     debug!(target: LOG_TARGET, "Loading config.json...");
 
-    let config_path = path.join("config.json");
-    let config_data = read_artefact_string(path, "config.json", manifest)?;
+    let config_path = dir.locate("config.json");
+    let config_data = read_artefact_string(dir, "config.json", manifest)?;
 
     let config: IndexConfig =
         serde_json::from_str(&config_data).map_err(|e| Error::ArtefactParseFailed {
@@ -1847,7 +1585,7 @@ fn load_config(path: &Path, manifest: &IndexManifest) -> Result<IndexConfig, Err
         config.m,
         config.ef_construction,
         config.expected_size,
-        &format!("{}: ", config_path.display()),
+        &format!("{}: ", config_path),
     )?;
     // `id_counter` too, which those five do not cover and which sizes an
     // allocation rather than a behaviour.
@@ -1871,19 +1609,16 @@ fn load_config(path: &Path, manifest: &IndexManifest) -> Result<IndexConfig, Err
     // built. The check refuses nothing that can exist.
     if config.id_counter > u32::MAX as usize {
         return Err(Error::IdCounterTooLarge {
-            file: config_path.display().to_string(),
+            file: config_path.clone(),
             id_counter: config.id_counter,
         });
     }
     // The declaration too, for the same reason. A config naming a field twice,
     // or naming a reserved filter key, would build a store the index could not
     // use, and the failure would surface as a filter that quietly walked.
-    validate_indexed_fields(
-        &config.indexed_fields,
-        &format!("{}: ", config_path.display()),
-    )?;
+    validate_indexed_fields(&config.indexed_fields, &format!("{}: ", config_path))?;
     // The spaces too, under the rules a declaration is held to.
-    validate_spaces(&config.spaces, &config_path.display().to_string())?;
+    validate_spaces(&config.spaces, &config_path)?;
 
     debug!(target: LOG_TARGET, "config.json loaded");
     Ok(config)
@@ -1903,7 +1638,11 @@ fn load_config(path: &Path, manifest: &IndexManifest) -> Result<IndexConfig, Err
 /// an id the mappings do not is a directory whose two artefacts came from
 /// different saves. A text layer's dictionary must hold every term id the
 /// postings carry, for the same reason.
-fn restore_spaces(index: &Collection, path: &Path, manifest: &IndexManifest) -> Result<(), Error> {
+fn restore_spaces(
+    index: &Collection,
+    dir: &dyn Dir,
+    manifest: &IndexManifest,
+) -> Result<(), Error> {
     let Some((name, space)) = index.sparse_named() else {
         return Ok(());
     };
@@ -1914,7 +1653,7 @@ fn restore_spaces(index: &Collection, path: &Path, manifest: &IndexManifest) -> 
         max_records: largest_id,
         max_bytes: u64::MAX,
     };
-    let restored = PostingsIndex::restore(space.config(), &prefix, path, manifest, &bounds)?;
+    let restored = PostingsIndex::restore(space.config(), &prefix, dir, manifest, &bounds)?;
     let unmapped = {
         let ids = index.ids();
         let mut unmapped = None;
@@ -1937,7 +1676,7 @@ fn restore_spaces(index: &Collection, path: &Path, manifest: &IndexManifest) -> 
     if space.text.is_some() {
         let dictionary_name = Collection::dictionary_name(&prefix);
         let bytes = zeusdb_vector_core::read_artefact(
-            path,
+            dir,
             &dictionary_name,
             manifest,
             DICTIONARY_CONTENTS,
@@ -1966,10 +1705,10 @@ fn restore_spaces(index: &Collection, path: &Path, manifest: &IndexManifest) -> 
 }
 
 /// Load ID mappings from mappings.bin
-fn load_mappings(path: &Path, manifest: &IndexManifest) -> Result<IdMappings, Error> {
+fn load_mappings(dir: &dyn Dir, manifest: &IndexManifest) -> Result<IdMappings, Error> {
     debug!(target: LOG_TARGET, "Loading mappings.bin...");
 
-    let mappings_data = read_artefact(path, "mappings.bin", manifest)?;
+    let mappings_data = read_artefact(dir, "mappings.bin", manifest)?;
 
     let mappings: IdMappings = decode_bounded(&mappings_data, "mappings.bin", ())?;
 
@@ -1979,12 +1718,12 @@ fn load_mappings(path: &Path, manifest: &IndexManifest) -> Result<IdMappings, Er
 
 /// Load vector metadata from metadata.json
 fn load_metadata(
-    path: &Path,
+    dir: &dyn Dir,
     manifest: &IndexManifest,
 ) -> Result<HashMap<String, HashMap<String, Value>>, Error> {
     debug!(target: LOG_TARGET, "Loading metadata.json...");
 
-    let metadata_data = read_artefact_string(path, "metadata.json", manifest)?;
+    let metadata_data = read_artefact_string(dir, "metadata.json", manifest)?;
 
     let metadata: HashMap<String, HashMap<String, Value>> = serde_json::from_str(&metadata_data)
         .map_err(|e| Error::ArtefactParseFailed {
@@ -2002,7 +1741,7 @@ fn load_metadata(
 /// writes none, and a directory saved over one that did keeps the file the
 /// earlier save left. See `manifest_names`.
 fn load_vectors(
-    path: &Path,
+    dir: &dyn Dir,
     manifest: &IndexManifest,
     records: usize,
 ) -> Result<HashMap<String, Vec<f32>>, Error> {
@@ -2013,7 +1752,7 @@ fn load_vectors(
         return Ok(HashMap::new());
     }
 
-    let vectors_data = read_artefact(path, "vectors.bin", manifest)?;
+    let vectors_data = read_artefact(dir, "vectors.bin", manifest)?;
 
     let vectors: HashMap<String, Vec<f32>> = decode_bounded(&vectors_data, "vectors.bin", records)?;
 
@@ -2094,9 +1833,14 @@ impl RawVectors {
     }
 
     /// Read the map where only the count was kept.
-    fn hold(&mut self, path: &Path, manifest: &IndexManifest, records: usize) -> Result<(), Error> {
+    fn hold(
+        &mut self,
+        dir: &dyn Dir,
+        manifest: &IndexManifest,
+        records: usize,
+    ) -> Result<(), Error> {
         if let RawVectors::Counted(_) = self {
-            *self = RawVectors::Held(load_vectors(path, manifest, records)?);
+            *self = RawVectors::Held(load_vectors(dir, manifest, records)?);
         }
         Ok(())
     }
@@ -2110,7 +1854,7 @@ impl RawVectors {
 /// and a record whose vector is not finite is named exactly as
 /// `check_vectors_are_finite` names it. `records` is the count the mappings
 /// hold, which sizes what the walk keeps; see `walk_vectors_with`.
-fn count_vectors(path: &Path, manifest: &IndexManifest, records: usize) -> Result<usize, Error> {
+fn count_vectors(dir: &dyn Dir, manifest: &IndexManifest, records: usize) -> Result<usize, Error> {
     debug!(target: LOG_TARGET, "Loading vectors.bin...");
 
     if !manifest_names(manifest, "vectors.bin") {
@@ -2118,7 +1862,7 @@ fn count_vectors(path: &Path, manifest: &IndexManifest, records: usize) -> Resul
         return Ok(0);
     }
 
-    let vectors_data = read_artefact(path, "vectors.bin", manifest)?;
+    let vectors_data = read_artefact(dir, "vectors.bin", manifest)?;
 
     let (count, offenders) = walk_vectors(&vectors_data, "vectors.bin", records)?;
     if !offenders.is_empty() {
@@ -2288,14 +2032,15 @@ fn count_distinct_ids<C: bincode::config::Config>(
 }
 
 /// Load manifest for validation and metadata
-fn load_manifest(path: &Path) -> Result<IndexManifest, Error> {
+fn load_manifest(dir: &dyn Dir) -> Result<IndexManifest, Error> {
     debug!(target: LOG_TARGET, "Loading manifest.json...");
 
-    let manifest_path = path.join("manifest.json");
+    // A manifest that is not UTF-8 is refused as a read that failed, in the
+    // words the standard library gives a text read of such a file.
     let manifest_data =
-        fs::read_to_string(&manifest_path).map_err(|e| Error::ArtefactReadFailed {
+        String::from_utf8(dir.read("manifest.json")?).map_err(|_| Error::ArtefactReadFailed {
             name: "manifest.json".to_string(),
-            error: e.to_string(),
+            error: not_utf8().to_string(),
         })?;
 
     let manifest: IndexManifest =
@@ -2308,13 +2053,21 @@ fn load_manifest(path: &Path) -> Result<IndexManifest, Error> {
     Ok(manifest)
 }
 
+/// What `std::fs::read_to_string` returns for a file that is not UTF-8.
+fn not_utf8() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "stream did not contain valid UTF-8",
+    )
+}
+
 /// Load the PQ codebook from pq_centroids.bin
 ///
 /// Absent means the index was saved before training completed, which is a
 /// legitimate state. A present but unreadable file is a hard failure, because
 /// the alternative is a codebook that decodes every code to the zero vector.
 fn load_pq_centroids(
-    path: &Path,
+    dir: &dyn Dir,
     manifest: &IndexManifest,
     shape: (usize, usize),
 ) -> Result<Option<Centroids>, Error> {
@@ -2324,7 +2077,7 @@ fn load_pq_centroids(
 
     debug!(target: LOG_TARGET, "Loading pq_centroids.bin...");
 
-    let centroids_data = read_artefact(path, "pq_centroids.bin", manifest)?;
+    let centroids_data = read_artefact(dir, "pq_centroids.bin", manifest)?;
 
     let centroids: Centroids = decode_bounded(&centroids_data, "pq_centroids.bin", shape)?;
 
@@ -2337,7 +2090,7 @@ fn load_pq_centroids(
 /// Absent means no record has been quantized yet. In `quantized_only` these
 /// codes are the only copy of every record added after training completed.
 fn load_pq_codes(
-    path: &Path,
+    dir: &dyn Dir,
     manifest: &IndexManifest,
     records: usize,
 ) -> Result<HashMap<String, Vec<u8>>, Error> {
@@ -2347,7 +2100,7 @@ fn load_pq_codes(
 
     debug!(target: LOG_TARGET, "Loading pq_codes.bin...");
 
-    let codes_data = read_artefact(path, "pq_codes.bin", manifest)?;
+    let codes_data = read_artefact(dir, "pq_codes.bin", manifest)?;
 
     let codes: HashMap<String, Vec<u8>> = decode_bounded(&codes_data, "pq_codes.bin", records)?;
 
@@ -2395,7 +2148,7 @@ fn validate_quantization_fields(
 
 /// Load quantization configuration and the codebook that goes with it
 fn load_quantization(
-    path: &Path,
+    dir: &dyn Dir,
     manifest: &IndexManifest,
     dim: usize,
     space: &str,
@@ -2403,13 +2156,13 @@ fn load_quantization(
 ) -> Result<Option<QuantizationArtefacts>, Error> {
     debug!(target: LOG_TARGET, "Loading quantization components...");
 
-    let quant_path = path.join("quantization.json");
+    let quant_path = dir.locate("quantization.json");
     if !manifest_names(manifest, "quantization.json") {
         debug!(target: LOG_TARGET, "manifest.json does not list quantization.json (non-quantized index)");
         return Ok(None);
     }
 
-    let quant_data = read_artefact_string(path, "quantization.json", manifest)?;
+    let quant_data = read_artefact_string(dir, "quantization.json", manifest)?;
 
     // Which of the two layouts the file takes, read off its `type` field
     // before either struct is parsed, so the product quantized struct still
@@ -2426,7 +2179,7 @@ fn load_quantization(
         })
         .unwrap_or(false);
     if is_int8 {
-        return load_int8_quantization(path, manifest, dim, space, &quant_path, &quant_data)
+        return load_int8_quantization(dir, manifest, dim, space, &quant_path, &quant_data)
             .map(Some);
     }
 
@@ -2434,7 +2187,7 @@ fn load_quantization(
     // manifest names quantization.json describes an index `create()` refuses.
     // No save this build makes can produce one, so it was hand assembled, and
     // building it would give an index ranking by the wrong quantity.
-    validate_space_supports_quantization(space, &format!("{}: ", path.display()))?;
+    validate_space_supports_quantization(space, &format!("{}: ", dir.locate("")))?;
 
     let quant_config: QuantizationPersistence =
         serde_json::from_str(&quant_data).map_err(|e| Error::ArtefactParseFailed {
@@ -2452,13 +2205,13 @@ fn load_quantization(
     // all three, so a directory carrying one was hand edited or written by a
     // release that did not validate its own input, and either way the file does
     // not describe an index this build can rebuild.
-    validate_quantization_fields(&quant_path.display().to_string(), &quant_config, dim)?;
+    validate_quantization_fields(&quant_path, &quant_config, dim)?;
 
     debug!(target: LOG_TARGET, "quantization.json loaded");
 
     let shape = (quant_config.subvectors, 1usize << quant_config.bits);
-    let centroids = load_pq_centroids(path, manifest, shape)?;
-    let codes = load_pq_codes(path, manifest, records)?;
+    let centroids = load_pq_centroids(dir, manifest, shape)?;
+    let codes = load_pq_codes(dir, manifest, records)?;
 
     Ok(Some(QuantizationArtefacts {
         config: QuantizationFile::Pq(quant_config),
@@ -2481,14 +2234,14 @@ fn load_quantization(
 /// `entries * (4 + width)` bytes. Every bound is checked before anything is
 /// allocated from a field.
 fn load_int8_quantization(
-    path: &Path,
+    dir: &dyn Dir,
     manifest: &IndexManifest,
     dim: usize,
     space: &str,
-    quant_path: &Path,
+    quant_path: &str,
     quant_data: &str,
 ) -> Result<QuantizationArtefacts, Error> {
-    let file = quant_path.display().to_string();
+    let file = quant_path.to_string();
     let config: Int8Persistence =
         serde_json::from_str(quant_data).map_err(|e| Error::ArtefactParseFailed {
             name: "quantization.json",
@@ -2539,9 +2292,9 @@ fn load_int8_quantization(
         });
     }
 
-    let codec = load_int8_scales(path, manifest, dim)?;
+    let codec = load_int8_scales(dir, manifest, dim)?;
     let tail = if space == "cosine" { 4 } else { 0 };
-    let rows = load_int8_rows(path, manifest, codec.dim() + tail)?;
+    let rows = load_int8_rows(dir, manifest, codec.dim() + tail)?;
     Ok(QuantizationArtefacts {
         config: QuantizationFile::Int8(config),
         centroids: None,
@@ -2553,7 +2306,7 @@ fn load_int8_quantization(
 
 /// The scales artefact, held to its bounds and handed back as the codec.
 fn load_int8_scales(
-    path: &Path,
+    dir: &dyn Dir,
     manifest: &IndexManifest,
     dim: usize,
 ) -> Result<Arc<Int8Codec>, Error> {
@@ -2571,7 +2324,7 @@ fn load_int8_scales(
         .saturating_mul(4)
         .saturating_add(FRAME_OVERHEAD_BYTES as u64);
     let bytes = zeusdb_vector_core::read_artefact(
-        path,
+        dir,
         INT8_SCALES_FILENAME,
         manifest,
         INT8_SCALES_CONTENTS,
@@ -2606,7 +2359,7 @@ fn load_int8_scales(
 /// Empty where the manifest names none, which is what a trained index
 /// holding no record writes.
 fn load_int8_rows(
-    path: &Path,
+    dir: &dyn Dir,
     manifest: &IndexManifest,
     row_width: usize,
 ) -> Result<Int8Rows, Error> {
@@ -2625,7 +2378,7 @@ fn load_int8_rows(
         .saturating_mul(stride as u64)
         .saturating_add(FRAME_OVERHEAD_BYTES as u64);
     let bytes = zeusdb_vector_core::read_artefact(
-        path,
+        dir,
         INT8_ROWS_FILENAME,
         manifest,
         INT8_ROWS_CONTENTS,
@@ -2677,7 +2430,7 @@ fn load_int8_rows(
 
 /// Write every artefact except the graph dump and the manifest into `dir`
 ///
-/// `dir` is the staging directory `StagingDir` opened, never the target, so
+/// `dir` is the staging directory `Storage::stage` opened, never the target, so
 /// nothing here can leave a half written file where a reader will find it.
 ///
 /// The manifest is no longer written here. It is written last of all, after the
@@ -2687,7 +2440,7 @@ fn load_int8_rows(
 /// no manifest at all. Staging makes it safe, because a save that fails at any
 /// point leaves the previous directory untouched and the staging directory
 /// removed.
-pub(crate) fn save_index(index: &Collection, dir: &Path) -> Result<SaveLedger, Error> {
+pub(crate) fn save_index(index: &Collection, dir: &dyn Dir) -> Result<SaveLedger, Error> {
     let mut ledger = SaveLedger::default();
 
     // Save components in order of complexity (simple -> complex)
@@ -2728,7 +2481,7 @@ pub(crate) fn save_index(index: &Collection, dir: &Path) -> Result<SaveLedger, E
 /// framed and the frame's payload checksum is what the reader verifies; see
 /// `zeusdb_vector_core::frame`. The two guards are taken one at a time and
 /// never together.
-fn save_spaces(index: &Collection, dir: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+fn save_spaces(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
     let Some((name, space)) = index.sparse_named() else {
         return Ok(());
     };
@@ -2754,7 +2507,7 @@ fn save_spaces(index: &Collection, dir: &Path, ledger: &mut SaveLedger) -> Resul
 /// Reconstruct Collection using Simple Reconstruction
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_index_simple(
-    path: &Path,
+    dir: &dyn Dir,
     manifest: &IndexManifest,
     config: IndexConfig,
     mappings: IdMappings,
@@ -2803,7 +2556,7 @@ fn reconstruct_index_simple(
 
     // Step 2a: The sparse space, once the mappings are in and before the
     // graph, for the reasons `restore_spaces` gives.
-    restore_spaces(&index, path, manifest)?;
+    restore_spaces(&index, dir, manifest)?;
 
     // The rows of a trained scalar directory, held to the mappings both
     // ways before anything is built from either: every row names a record
@@ -2818,7 +2571,7 @@ fn reconstruct_index_simple(
     // by a release this build cannot interpret falls back to the rebuild, which
     // is the path that also upgrades a graph carrying a defect the vendored
     // patches have since fixed. See `restore_graph_from_dump`.
-    let graph_rebuilt = match index.restore_graph_from_dump(path, config.id_counter, dump_bytes) {
+    let graph_rebuilt = match index.restore_graph_from_dump(dir, config.id_counter, dump_bytes) {
         Ok(nodes) => {
             debug!(target: LOG_TARGET, "HNSW graph restored from the saved dump ({} nodes)", nodes);
             false
@@ -2827,7 +2580,7 @@ fn reconstruct_index_simple(
             debug!(target: LOG_TARGET, "Rebuilding the HNSW graph, because {}", reason);
             // Both rebuilds below replay the raw vectors, so a directory
             // whose vectors were counted and not kept reads them now.
-            vectors.hold(path, manifest, mapped_records)?;
+            vectors.hold(dir, manifest, mapped_records)?;
             let empty = HashMap::new();
             let held = vectors.held().unwrap_or(&empty);
             if int8_trained {
@@ -3325,16 +3078,26 @@ pub(crate) fn load_index(
 ) -> Result<(Collection, Recovery), Error> {
     debug!(target: LOG_TARGET, "Starting index load with reconstruction from: {}", path);
 
-    let path_buf = Path::new(path);
+    let storage = FsStorage::at(Path::new(path))?;
+    load_from(&storage, path, tokenizer, policy)
+}
 
+/// The load, from the storage the directory `path` names. `path` is the
+/// caller's own words for it, which the refusals and the log quote.
+fn load_from(
+    storage: &dyn Storage,
+    path: &str,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+    policy: JournalPolicy,
+) -> Result<(Collection, Recovery), Error> {
     // A save killed between its two renames left the whole index beside the
     // target and nothing at it. Recovery from a killed process is a load, so
     // it is put back here, before the directory is looked for. See
-    // `restore_replaced`.
-    let restored_from_aside = restore_replaced(path_buf)?;
+    // `Storage::recover`.
+    let restored_from_aside = storage.recover()?;
 
     // Validate directory exists
-    if !path_buf.exists() {
+    if !storage.exists() {
         return Err(Error::IndexDirectoryNotFound {
             path: path.to_string(),
         });
@@ -3343,7 +3106,8 @@ pub(crate) fn load_index(
     // Phase 1: Load all ZeusDB components
     debug!(target: LOG_TARGET, "Phase 1: Loading ZeusDB components...");
 
-    let manifest = load_manifest(path_buf)?;
+    let dir = storage.dir();
+    let manifest = load_manifest(dir)?;
     let major = check_format_version(&manifest.format_version)?;
 
     // A manifest below the major that names a journal is a directory
@@ -3357,12 +3121,12 @@ pub(crate) fn load_index(
 
     // Before any artefact is read, so a directory missing two files names the
     // first rather than failing on whichever one a partial load reaches.
-    check_files_present(path_buf, &manifest)?;
+    check_files_present(dir, &manifest)?;
     debug!(target: LOG_TARGET, "Manifest loaded: {} vectors, format v{}",
         manifest.total_vectors, manifest.format_version
     );
 
-    let config = load_config(path_buf, &manifest)?;
+    let config = load_config(dir, &manifest)?;
     debug!(target: LOG_TARGET, "Config loaded: dim={}, space={}", config.dim, config.space);
 
     // A 1.x directory declares no space, since no release writing 1.x held
@@ -3381,24 +3145,24 @@ pub(crate) fn load_index(
         tokenizer: sparse_tokenizer,
     });
 
-    let mappings = load_mappings(path_buf, &manifest)?;
+    let mappings = load_mappings(dir, &manifest)?;
     debug!(target: LOG_TARGET, "Mappings loaded: {} ID mappings", mappings.id_map.len());
 
-    let metadata = load_metadata(path_buf, &manifest)?;
+    let metadata = load_metadata(dir, &manifest)?;
     debug!(target: LOG_TARGET, "Metadata loaded: {} records", metadata.len());
 
     // A raw index takes its vectors back from the graph dump, so its
     // vectors.bin is walked for its count and its check and nothing of it is
     // kept. See `RawVectors`.
     let vectors = if manifest_names(&manifest, "quantization.json") {
-        RawVectors::Held(load_vectors(path_buf, &manifest, mappings.id_map.len())?)
+        RawVectors::Held(load_vectors(dir, &manifest, mappings.id_map.len())?)
     } else {
-        RawVectors::Counted(count_vectors(path_buf, &manifest, mappings.id_map.len())?)
+        RawVectors::Counted(count_vectors(dir, &manifest, mappings.id_map.len())?)
     };
     debug!(target: LOG_TARGET, "Vectors loaded: {} vectors", vectors.len());
 
     let quantization = load_quantization(
-        path_buf,
+        dir,
         &manifest,
         config.dim,
         &config.space,
@@ -3438,7 +3202,7 @@ pub(crate) fn load_index(
     // Phase 2: Create empty index and restore state
     debug!(target: LOG_TARGET, "Phase 2: Creating empty index and restoring state...");
     let (mut restored_index, graph_rebuilt) = reconstruct_index_simple(
-        path_buf,
+        dir,
         &manifest,
         config,
         mappings,
@@ -3494,8 +3258,8 @@ pub(crate) fn load_index(
         JournalPolicy::Replay(durability) => durability,
     };
 
-    let wal = crate::journal::journal_path(path_buf)?;
-    if !wal.exists() {
+    let wal = storage.journal_path();
+    if !storage.journal_exists() {
         return Err(Error::JournalMissing {
             directory: path.to_string(),
             file: wal.display().to_string(),
@@ -3504,7 +3268,7 @@ pub(crate) fn load_index(
         });
     }
     let file = wal.display().to_string();
-    let bytes = crate::journal::read_journal_bytes(&wal)?;
+    let bytes = crate::journal::read_journal_bytes(storage)?;
     let contents = zeusdb_vector_core::read_journal(&bytes, &file)?;
     crate::journal::check_contents(&contents, &file, directory_id, record.sequence)?;
 
@@ -3534,8 +3298,11 @@ pub(crate) fn load_index(
     // append after it. Where the body is empty the header is restated at the
     // checkpoint's sequence plus one, which completes a truncation a crash
     // left half done.
-    let writer =
-        zeusdb_vector_core::JournalWriter::open_for_append(&wal, &contents, record.sequence + 1)?;
+    let writer = zeusdb_vector_core::JournalWriter::open_for_append(
+        storage,
+        &contents,
+        record.sequence + 1,
+    )?;
     restored_index.attach_sink(Box::new(crate::journal::JournalSink::from_writer(
         writer, durability,
     )?));
@@ -3561,7 +3328,7 @@ pub(crate) fn load_index(
 // ============================================================================
 
 /// Save index configuration as JSON
-fn save_config(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+fn save_config(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
     debug!(target: LOG_TARGET, "Saving config.json...");
 
     let config = IndexConfig {
@@ -3594,14 +3361,14 @@ fn save_config(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Resu
             error: e.to_string(),
         })?;
 
-    write_artefact(path, "config.json", config_json.as_bytes(), ledger)?;
+    write_artefact(dir, "config.json", config_json.as_bytes(), ledger)?;
 
     debug!(target: LOG_TARGET, "config.json saved");
     Ok(())
 }
 
 /// Save ID mappings using efficient binary format
-fn save_mappings(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+fn save_mappings(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
     debug!(target: LOG_TARGET, "Saving mappings.bin...");
 
     // The two maps the file holds, built from the id store under its guard,
@@ -3629,14 +3396,14 @@ fn save_mappings(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Re
             }
         })?;
 
-    write_artefact(path, "mappings.bin", &mappings_data, ledger)?;
+    write_artefact(dir, "mappings.bin", &mappings_data, ledger)?;
 
     debug!(target: LOG_TARGET, "mappings.bin saved ({} mappings)", mapping_count);
     Ok(())
 }
 
 /// Save vector metadata as JSON for external tool compatibility
-fn save_metadata(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+fn save_metadata(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
     debug!(target: LOG_TARGET, "Saving metadata.json...");
 
     // Both guards end with the serialize, taken in the documented order,
@@ -3662,7 +3429,7 @@ fn save_metadata(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Re
         error: e.to_string(),
     })?;
 
-    write_artefact(path, "metadata.json", metadata_json.as_bytes(), ledger)?;
+    write_artefact(dir, "metadata.json", metadata_json.as_bytes(), ledger)?;
 
     debug!(target: LOG_TARGET, "metadata.json saved ({} records)", record_count);
     Ok(())
@@ -3697,14 +3464,14 @@ impl Serialize for FieldsObject<'_> {
 /// Save quantization configuration and training state
 fn save_quantization_config(
     index: &Collection,
-    path: &Path,
+    dir: &dyn Dir,
     ledger: &mut SaveLedger,
 ) -> Result<(), Error> {
     if let Some(config) = index.quantization_config() {
         debug!(target: LOG_TARGET, "Saving quantization.json...");
 
         if let Some(scale) = config.scheme.int8_scale() {
-            return save_int8_quantization_config(index, config, scale, path, ledger);
+            return save_int8_quantization_config(index, config, scale, dir, ledger);
         }
         let (subvectors, bits) = config.scheme.pq_shape().unwrap_or((1, 8));
 
@@ -3769,7 +3536,7 @@ fn save_quantization_config(
             }
         })?;
 
-        write_artefact(path, "quantization.json", quant_json.as_bytes(), ledger)?;
+        write_artefact(dir, "quantization.json", quant_json.as_bytes(), ledger)?;
 
         //debug!(target: LOG_TARGET, "quantization.json saved");
         debug!(target: LOG_TARGET, "quantization.json saved with {} training IDs",
@@ -3786,7 +3553,7 @@ fn save_int8_quantization_config(
     index: &Collection,
     config: &QuantizationConfig,
     scale: crate::collection::Int8Scale,
-    path: &Path,
+    dir: &dyn Dir,
     ledger: &mut SaveLedger,
 ) -> Result<(), Error> {
     // Each guard is taken alone and released before the next, in the
@@ -3813,7 +3580,7 @@ fn save_int8_quantization_config(
             what: "quantization config",
             error: e.to_string(),
         })?;
-    write_artefact(path, "quantization.json", quant_json.as_bytes(), ledger)?;
+    write_artefact(dir, "quantization.json", quant_json.as_bytes(), ledger)?;
     debug!(target: LOG_TARGET, "quantization.json saved (int8) with {} training IDs",
         persistence.training_ids.len()
     );
@@ -3823,7 +3590,11 @@ fn save_int8_quantization_config(
 /// The scales artefact: `dim` little endian floats under a frame whose
 /// entry count is `dim`. Recorded by length alone, as every framed artefact
 /// is.
-fn save_int8_scales(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+fn save_int8_scales(
+    index: &Collection,
+    dir: &dyn Dir,
+    ledger: &mut SaveLedger,
+) -> Result<(), Error> {
     let Some(codec) = index.int8_codec() else {
         return Ok(());
     };
@@ -3838,7 +3609,7 @@ fn save_int8_scales(index: &Collection, path: &Path, ledger: &mut SaveLedger) ->
         codec.dim() as u64,
         &payload,
     );
-    zeusdb_vector_core::write_artefact(path, INT8_SCALES_FILENAME, &bytes)?;
+    zeusdb_vector_core::write_artefact(dir, INT8_SCALES_FILENAME, &bytes)?;
     ledger.record_digest(INT8_SCALES_FILENAME, bytes.len() as u64, None);
     debug!(target: LOG_TARGET, "{} saved ({} scales)", INT8_SCALES_FILENAME, codec.dim());
     Ok(())
@@ -3847,7 +3618,7 @@ fn save_int8_scales(index: &Collection, path: &Path, ledger: &mut SaveLedger) ->
 /// The rows artefact: every live record's internal id and row, ascending,
 /// written straight into the frame's buffer. Nothing is written for an index
 /// holding no record, and the manifest then names no rows artefact.
-fn save_int8_rows(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+fn save_int8_rows(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
     let stride = 4 + index.quantization_code_bytes();
     let mut out = frame_begin(
         FrameKind::Int8Rows,
@@ -3860,7 +3631,7 @@ fn save_int8_rows(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> R
     }
     debug!(target: LOG_TARGET, "Saving {}...", INT8_ROWS_FILENAME);
     let bytes = frame_finish(out, entries as u64);
-    zeusdb_vector_core::write_artefact(path, INT8_ROWS_FILENAME, &bytes)?;
+    zeusdb_vector_core::write_artefact(dir, INT8_ROWS_FILENAME, &bytes)?;
     ledger.record_digest(INT8_ROWS_FILENAME, bytes.len() as u64, None);
     debug!(target: LOG_TARGET, "{} saved ({} rows)", INT8_ROWS_FILENAME, entries);
     Ok(())
@@ -3869,7 +3640,7 @@ fn save_int8_rows(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> R
 /// Save PQ centroids for vector reconstruction
 fn save_pq_centroids(
     index: &Collection,
-    path: &Path,
+    dir: &dyn Dir,
     ledger: &mut SaveLedger,
 ) -> Result<(), Error> {
     if let Some(pq) = index.pq() {
@@ -3888,7 +3659,7 @@ fn save_pq_centroids(
                     error: e.to_string(),
                 })?;
 
-            write_artefact(path, "pq_centroids.bin", &centroids_data, ledger)?;
+            write_artefact(dir, "pq_centroids.bin", &centroids_data, ledger)?;
 
             debug!(target: LOG_TARGET, "pq_centroids.bin saved");
         }
@@ -3897,7 +3668,7 @@ fn save_pq_centroids(
 }
 
 /// Save quantized vector codes
-fn save_pq_codes(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+fn save_pq_codes(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
     // The guard ends with the serialize, so the file is written with nothing
     // held. `encode_to_vec` was already producing an owned buffer, so this
     // narrows the guard rather than adding a copy.
@@ -3918,7 +3689,7 @@ fn save_pq_codes(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Re
         error: e.to_string(),
     })?;
 
-    write_artefact(path, "pq_codes.bin", &codes_data, ledger)?;
+    write_artefact(dir, "pq_codes.bin", &codes_data, ledger)?;
 
     debug!(target: LOG_TARGET, "pq_codes.bin saved ({} vectors)", code_count);
     Ok(())
@@ -3933,7 +3704,7 @@ fn save_pq_codes(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Re
 ///
 /// A trained `quantized_only` index writes none, as before, because it holds
 /// none.
-fn save_vectors(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Result<(), Error> {
+fn save_vectors(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
     if !index.holds_raw_vectors() {
         return Ok(());
     }
@@ -3954,7 +3725,7 @@ fn save_vectors(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Res
         error: e.to_string(),
     })?;
 
-    write_artefact(path, "vectors.bin", &vectors_data, ledger)?;
+    write_artefact(dir, "vectors.bin", &vectors_data, ledger)?;
 
     debug!(target: LOG_TARGET, "vectors.bin saved ({} vectors)", vector_count);
     Ok(())
@@ -3968,7 +3739,7 @@ fn save_vectors(index: &Collection, path: &Path, ledger: &mut SaveLedger) -> Res
 /// correct any of them.
 pub(crate) fn save_manifest(
     index: &Collection,
-    path: &Path,
+    dir: &dyn Dir,
     ledger: SaveLedger,
 ) -> Result<(), Error> {
     debug!(target: LOG_TARGET, "Saving manifest.json...");
@@ -4087,7 +3858,7 @@ pub(crate) fn save_manifest(
     // Every artefact, the graph dump included, because they are all on disk by
     // the time this runs. manifest.json itself is not, so the figure counts the
     // directory without it, which the field's own comment states.
-    let total_size_mb = calculate_directory_size(path).unwrap_or(0.0);
+    let total_size_mb = calculate_directory_size(dir).unwrap_or(0.0);
 
     // The journal, where the collection holds one. Its two names come from
     // the sink itself and the sequence from the collection, which the
@@ -4140,12 +3911,7 @@ pub(crate) fn save_manifest(
     // before the staging directory is moved into place. Its own digest is
     // discarded, since nothing can verify the file that carries the digests.
     let mut discard = SaveLedger::default();
-    write_artefact(
-        path,
-        "manifest.json",
-        manifest_json.as_bytes(),
-        &mut discard,
-    )?;
+    write_artefact(dir, "manifest.json", manifest_json.as_bytes(), &mut discard)?;
 
     debug!(target: LOG_TARGET, "manifest.json saved");
     Ok(())
@@ -4157,23 +3923,8 @@ pub(crate) fn save_manifest(
 
 /// Calculate the total size of a directory in MB, the artefacts under
 /// `spaces/` included.
-fn calculate_directory_size(path: &Path) -> Result<f64, std::io::Error> {
-    fn bytes_under(path: &Path) -> Result<u64, std::io::Error> {
-        let mut total = 0u64;
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let metadata = entry.metadata()?;
-            if metadata.is_file() {
-                total += metadata.len();
-            } else if metadata.is_dir() {
-                total += bytes_under(&entry.path())?;
-            }
-        }
-        Ok(total)
-    }
-
-    let total_size = if path.is_dir() { bytes_under(path)? } else { 0 };
-    Ok(total_size as f64 / (1024.0 * 1024.0))
+fn calculate_directory_size(dir: &dyn Dir) -> Result<f64, std::io::Error> {
+    Ok(dir.total_bytes()? as f64 / (1024.0 * 1024.0))
 }
 
 // ============================================================================

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use zeusdb_vector_core::{
-    compile_filter, Error, IdfScope, SparseVector, VectorGraph, VectorIndex, DUMP_FILENAME,
+    compile_filter, Error, FsDir, IdfScope, SparseVector, VectorGraph, VectorIndex, DUMP_FILENAME,
     NB_LAYER_MAX,
 };
 use zeusdb_vector_sparse::{SparseConfig, Weighting};
@@ -187,6 +187,34 @@ fn a_dense_only_directory_stays_at_the_first_major() {
     let loaded = Collection::load(path.to_str().unwrap()).unwrap();
     assert_eq!(loaded.len(), 10);
     assert_eq!(loaded.space_configs().len(), 1);
+}
+
+/// A manifest that is not UTF-8 is refused as a read that failed, in the
+/// words `std::fs::read_to_string` gives such a file.
+#[test]
+fn a_manifest_that_is_not_utf8_is_refused_as_a_text_read_refuses_it() {
+    let collection = Collection::build(base(), None);
+    let records: Vec<ParsedRecord> = (0..3u32)
+        .map(|i| record(&format!("r{i}"), &[i as f32, 0.0], None, "a"))
+        .collect();
+    assert_eq!(
+        collection.add_records(records, vec![], false).total_errors,
+        0
+    );
+    let dir = TempDir::new();
+    let path = dir.path().join("utf8.zdb");
+    collection.save(path.to_str().unwrap()).unwrap();
+    let manifest = path.join("manifest.json");
+    std::fs::write(&manifest, b"\xff\xfe{}").unwrap();
+    let words = std::fs::read_to_string(&manifest).unwrap_err().to_string();
+    match Collection::load(path.to_str().unwrap()) {
+        Err(Error::ArtefactReadFailed { name, error }) => {
+            assert_eq!(name, "manifest.json");
+            assert_eq!(error, words);
+        }
+        Err(other) => panic!("the manifest was refused as {other}"),
+        Ok(_) => panic!("a manifest that is not UTF-8 opened"),
+    }
 }
 
 /// A collection with a sparse space writes `spaces/<name>/postings.zdbsparse`,
@@ -744,7 +772,7 @@ fn the_collections_insert_path_builds_the_graph_the_outright_insert_builds() {
     }
     let outright = dir.path().join("outright");
     std::fs::create_dir_all(&outright).unwrap();
-    graph.dump(&outright).unwrap();
+    graph.dump(&FsDir::new(&outright), DUMP_FILENAME).unwrap();
     assert_eq!(saved, std::fs::read(outright.join(DUMP_FILENAME)).unwrap());
 }
 
