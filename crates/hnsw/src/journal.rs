@@ -77,7 +77,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tracing::{debug, info};
-use zeusdb_vector_core::{CommitMode, Error, JournalDamage, JournalWriter, OperationKind};
+use zeusdb_vector_core::{
+    CommitMode, Error, FsStorage, JournalDamage, JournalWriter, OperationKind, Storage,
+};
 
 use crate::collection::OperationSink;
 use crate::flusher::Flusher;
@@ -86,7 +88,7 @@ use crate::flusher::Flusher;
 const LOG_TARGET: &str = "zeusdb_vector_database::journal";
 
 /// The suffix a collection's journal takes beside its directory.
-pub const JOURNAL_SUFFIX: &str = ".zdbwal";
+pub use zeusdb_vector_core::JOURNAL_SUFFIX;
 
 /// What a journaled collection promises about a record once the call that
 /// added it has returned. See the module's table.
@@ -146,12 +148,7 @@ impl Durability {
 /// the manifest, so a directory renamed with its journal opens under the new
 /// name. The name the manifest records is what a refusal quotes.
 pub fn journal_path(target: &Path) -> Result<PathBuf, Error> {
-    let name = target.file_name().ok_or_else(|| Error::TargetHasNoName {
-        target: target.to_path_buf(),
-    })?;
-    let mut name = name.to_os_string();
-    name.push(JOURNAL_SUFFIX);
-    Ok(target.parent().unwrap_or_else(|| Path::new("")).join(name))
+    Ok(FsStorage::at(target)?.journal_path().to_path_buf())
 }
 
 /// The directory a journal at `journal` sits beside, being
@@ -197,10 +194,14 @@ pub struct JournalSink {
 }
 
 impl JournalSink {
-    /// Create a journal at `path` for `collection_id`, replacing any file
-    /// there, with its first record at sequence one.
-    pub fn create(path: &Path, collection_id: u128, durability: Durability) -> Result<Self, Error> {
-        let writer = JournalWriter::create(path, collection_id, 1)?;
+    /// Create the journal `storage` keeps, for `collection_id`, replacing any
+    /// file there, with its first record at sequence one.
+    pub fn create(
+        storage: &dyn Storage,
+        collection_id: u128,
+        durability: Durability,
+    ) -> Result<Self, Error> {
+        let writer = JournalWriter::create(storage, collection_id, 1)?;
         Self::over(writer, durability)
     }
 
@@ -451,13 +452,16 @@ pub enum JournalPolicy {
     CheckpointOnly,
 }
 
-/// Read the journal at `path`.
-pub(crate) fn read_journal_bytes(path: &Path) -> Result<Vec<u8>, Error> {
-    let bytes = std::fs::read(path).map_err(|error| Error::JournalIoFailed {
-        path: path.to_path_buf(),
-        what: "read",
-        error: error.to_string(),
-    })?;
+/// Read the journal `storage` keeps.
+pub(crate) fn read_journal_bytes(storage: &dyn Storage) -> Result<Vec<u8>, Error> {
+    let path = storage.journal_path();
+    let bytes = storage
+        .read_journal()
+        .map_err(|error| Error::JournalIoFailed {
+            path: path.to_path_buf(),
+            what: "read",
+            error: error.to_string(),
+        })?;
     debug!(target: LOG_TARGET, "Read {} bytes of journal from {}", bytes.len(), path.display());
     Ok(bytes)
 }

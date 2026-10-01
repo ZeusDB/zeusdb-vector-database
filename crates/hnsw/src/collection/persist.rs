@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
-    ArtefactRecord, Bounds, Error, IdStore, Inventory, MetadataStore, Persist, Restore,
-    VectorGraph, DUMP_FILENAME,
+    ArtefactRecord, Bounds, Dir, Error, FsStorage, IdStore, Inventory, MetadataStore, Persist,
+    Restore, Storage, VectorGraph, DUMP_FILENAME,
 };
 use zeusdb_vector_sparse::PostingsIndex;
 use zeusdb_vector_text::{TermDictionary, Tokenizer};
@@ -209,26 +209,14 @@ impl Collection {
     }
 }
 
-/// Whether two paths name the same file, as far as this needs to know.
-///
-/// A checkpoint compares the journal it holds open with the journal the
-/// directory it is being asked to save to would sit beside. Both are ordinary
-/// paths a caller wrote, so they are made absolute first, since `index.zdb`
-/// and `./index.zdb` are the same directory and compare unequal as written.
-/// Neither is canonicalised, because the target of a first save does not
-/// exist yet and canonicalising a path that does not exist fails.
-fn same_file_path(one: &Path, two: &Path) -> bool {
-    let absolute = |path: &Path| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    absolute(one) == absolute(two)
-}
-
 impl Collection {
     /// Save the index to a directory.
     ///
     /// Four phases under one hold of the mutation lock: the artefacts, the
     /// graph dump, the manifest, and the move into place. The binding calls
     /// this with the interpreter lock released, and every phase speaks only
-    /// to `serde_json`, `bincode`, `std::fs` and `graph::dump`.
+    /// to `serde_json`, `bincode`, `graph::dump` and the storage the
+    /// directory is kept in, which is `zeusdb_vector_core::FsStorage`.
     pub fn save(&self, path: &str) -> Result<(), Error> {
         // A save reads the mappings, the metadata, the codes, the vectors and
         // the graph in five separate passes, so it needs the index to hold
@@ -273,8 +261,7 @@ impl Collection {
         // sibling and a directory whose sibling is elsewhere is one nothing
         // can open.
         if let Some(journal) = self.sink_journal_path() {
-            let wanted = crate::journal::journal_path(Path::new(path))?;
-            if !same_file_path(&journal, &wanted) {
+            if !FsStorage::at(Path::new(path))?.names_journal(&journal) {
                 return Err(Error::JournalDirectoryMismatch {
                     journal: journal.display().to_string(),
                     target: path.to_string(),
@@ -307,37 +294,8 @@ impl Collection {
         let start_time = Instant::now();
         info!(target: LOG_TARGET, operation = "save_start", path = path, "Starting index save");
 
-        let target = Path::new(path);
-
-        // Every artefact goes into a directory of its own that is moved into
-        // place at the end, so a reader sees the previous index or this one and
-        // never a mixture of the two, and a stale artefact from an earlier save
-        // cannot survive. See `persistence::StagingDir`.
-        let staging = crate::persistence::StagingDir::open(target)?;
-
-        // Phase 1: Save all ZeusDB components (already tested to work)
-        debug!(target: LOG_TARGET, operation = "save_phase1", "Saving ZeusDB components");
-        let mut ledger = crate::persistence::save_index(self, staging.path())?;
-        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterArtefacts);
-
-        // Phase 2: Save the HNSW graph in ZeusDB's own format
-        debug!(target: LOG_TARGET, operation = "save_phase2", "Saving HNSW graph");
-        self.save_hnsw_graph(staging.path(), &mut ledger)?;
-        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterDump);
-
-        // Phase 3: The manifest, last, because it records a length and a digest
-        // for every artefact above and the directory size all of them add up
-        // to.
-        debug!(target: LOG_TARGET, operation = "save_phase3", "Writing the manifest");
-        crate::persistence::save_manifest(self, staging.path(), ledger)?;
-        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterManifest);
-
-        // Phase 4: Two renames, or one where nothing is there yet.
-        debug!(target: LOG_TARGET, operation = "save_phase4",
-            "Moving the saved index into place"
-        );
-        staging.commit()?;
-        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterCommit);
+        let storage = FsStorage::at(Path::new(path))?;
+        self.save_to(&storage)?;
 
         let duration_ms = start_time.elapsed().as_millis();
         info!(target: LOG_TARGET, operation = "save_complete",
@@ -348,14 +306,48 @@ impl Collection {
         Ok(())
     }
 
+    /// The four phases, into the directory `storage` keeps.
+    fn save_to(&self, storage: &dyn Storage) -> Result<(), Error> {
+        // Every artefact goes into a directory of its own that is moved into
+        // place at the end, so a reader sees the previous index or this one and
+        // never a mixture of the two, and a stale artefact from an earlier save
+        // cannot survive. See `Storage::stage`.
+        let staging = storage.stage()?;
+
+        // Phase 1: Save all ZeusDB components (already tested to work)
+        debug!(target: LOG_TARGET, operation = "save_phase1", "Saving ZeusDB components");
+        let mut ledger = crate::persistence::save_index(self, staging.dir())?;
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterArtefacts);
+
+        // Phase 2: Save the HNSW graph in ZeusDB's own format
+        debug!(target: LOG_TARGET, operation = "save_phase2", "Saving HNSW graph");
+        self.save_hnsw_graph(staging.dir(), &mut ledger)?;
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterDump);
+
+        // Phase 3: The manifest, last, because it records a length and a digest
+        // for every artefact above and the directory size all of them add up
+        // to.
+        debug!(target: LOG_TARGET, operation = "save_phase3", "Writing the manifest");
+        crate::persistence::save_manifest(self, staging.dir(), ledger)?;
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterManifest);
+
+        // Phase 4: Two renames, or one where nothing is there yet.
+        debug!(target: LOG_TARGET, operation = "save_phase4",
+            "Moving the saved index into place"
+        );
+        staging.commit()?;
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterCommit);
+        Ok(())
+    }
+
     /// Write the HNSW graph in ZeusDB's own format. See `graph::dump`.
-    #[instrument(target = LOG_TARGET, level = "info", skip(self, ledger), fields(
+    #[instrument(target = LOG_TARGET, level = "info", skip(self, dir, ledger), fields(
         vector_count = self.vector_count(),
-        path = %path.display()
+        path = %dir.locate("")
     ))]
     fn save_hnsw_graph(
         &self,
-        path: &Path,
+        dir: &dyn Dir,
         ledger: &mut crate::persistence::SaveLedger,
     ) -> Result<(), Error> {
         debug!(target: LOG_TARGET, operation = "save_hnsw_graph_start",
@@ -380,7 +372,7 @@ impl Collection {
         // directory back off the disk for a guarantee its own two checksums
         // already give.
         let index = self.dense().index.read().unwrap();
-        match index.write("", path, ledger) {
+        match index.write("", dir, ledger) {
             Ok(()) => {
                 debug!(target: LOG_TARGET, operation = "save_hnsw_graph_complete",
                     file_created = DUMP_FILENAME,
@@ -525,14 +517,13 @@ impl Collection {
                     .to_string(),
             ));
         }
-        let target = Path::new(dir);
-        let wal = crate::journal::journal_path(target)?;
+        let storage = FsStorage::at(Path::new(dir))?;
         info!(target: LOG_TARGET, operation = "journal_open",
             directory = dir,
-            journal = %wal.display(),
+            journal = %storage.journal_path().display(),
             "Opening a journal beside the directory and writing the checkpoint it replays onto"
         );
-        let sink = crate::journal::JournalSink::create(&wal, self.collection_id(), durability)?;
+        let sink = crate::journal::JournalSink::create(&storage, self.collection_id(), durability)?;
         self.attach_sink_locked(Box::new(sink));
         self.save_locked(dir)
     }
@@ -592,7 +583,7 @@ impl Collection {
     /// still loads.
     pub(crate) fn restore_graph_from_dump(
         &mut self,
-        dir: &Path,
+        dir: &dyn Dir,
         max_origin_id: usize,
         recorded_bytes: Option<u64>,
     ) -> Result<usize, String> {

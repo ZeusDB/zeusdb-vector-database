@@ -873,10 +873,10 @@ impl HNSWIndex {
     /// `save_quantization_config`, `save_pq_centroids`, `save_pq_codes`,
     /// `save_int8_scales`, `save_int8_rows` and `save_vectors`, and every one
     /// of them speaks only to `serde_json`, `bincode`, the engine's frame and
-    /// `std::fs`. `save_hnsw_graph` reaches `graph::dump::write_dump`,
-    /// which names PyO3 nowhere, and `save_manifest` and `StagingDir::commit`
-    /// after it speak only to `serde_json` and `std::fs`. Nothing in the index
-    /// crate names Python at all.
+    /// the storage seam. `save_hnsw_graph` reaches `graph::dump::write_dump`,
+    /// which names PyO3 nowhere, and `save_manifest` and `Staged::commit`
+    /// after it speak only to `serde_json` and the storage seam. Nothing in
+    /// the index crate names Python at all.
     #[instrument(level = "info", skip(self, py), fields(
         vector_count = self.inner.vector_count(),
         has_quantization = self.inner.has_quantization(),

@@ -1,13 +1,12 @@
 //! The structure, and the trait it implements.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 use zeusdb_vector_core::{
-    Admit, Bitmap, Budget, CorpusStats, Cost, Error, Hits, Inventory, Ledger, Persist, Prepared,
-    RecordId, Restore, Selectivity, Sparse, SparseRef, SparseVector, VectorIndex,
+    Admit, Bitmap, Budget, CorpusStats, Cost, Dir, Error, Hits, Inventory, Ledger, Persist,
+    Prepared, RecordId, Restore, Selectivity, Sparse, SparseRef, SparseVector, VectorIndex,
 };
 
 use crate::calibrate::UnitCosts;
@@ -798,7 +797,7 @@ impl VectorIndex<Sparse> for PostingsIndex {
 // ---------------------------------------------------------------------------
 
 impl Persist for PostingsIndex {
-    fn write(&self, prefix: &str, dir: &Path, ledger: &mut dyn Ledger) -> Result<(), Error> {
+    fn write(&self, prefix: &str, dir: &dyn Dir, ledger: &mut dyn Ledger) -> Result<(), Error> {
         crate::persist::write(self, prefix, dir, ledger)
     }
 
@@ -813,7 +812,7 @@ impl Restore for PostingsIndex {
     fn restore(
         config: &SparseConfig,
         prefix: &str,
-        dir: &Path,
+        dir: &dyn Dir,
         inventory: &dyn Inventory,
         bounds: &zeusdb_vector_core::Bounds,
     ) -> Result<Self, Error> {

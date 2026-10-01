@@ -31,10 +31,8 @@
 //! before it. Nothing is sized from a field before the field is held to
 //! something the file has earned.
 
-use std::path::Path;
-
 use zeusdb_vector_core::{
-    frame_begin, frame_finish, read_artefact, unframe, write_artefact, ArtefactRecord, Bounds,
+    frame_begin, frame_finish, read_artefact, unframe, write_artefact, ArtefactRecord, Bounds, Dir,
     Error, FrameEncoding, FrameKind, Inventory, Ledger, RecordId, SparseRef,
 };
 
@@ -82,7 +80,7 @@ pub(crate) fn encode(index: &PostingsIndex) -> Vec<u8> {
 pub(crate) fn write(
     index: &PostingsIndex,
     prefix: &str,
-    dir: &Path,
+    dir: &dyn Dir,
     ledger: &mut dyn Ledger,
 ) -> Result<(), Error> {
     let bytes = encode(index);
@@ -104,7 +102,7 @@ pub(crate) fn write(
 pub(crate) fn restore(
     config: &SparseConfig,
     prefix: &str,
-    dir: &Path,
+    dir: &dyn Dir,
     inventory: &dyn Inventory,
     bounds: &Bounds,
 ) -> Result<PostingsIndex, Error> {
@@ -258,7 +256,8 @@ mod tests {
     use crate::index::{Unlink, Weighting};
     use std::collections::HashMap;
     use zeusdb_vector_core::{
-        frame_fuzz, Persist, Prepared, Restore, SparseVector, VectorIndex, FRAME_HEADER_BYTES,
+        frame_fuzz, FsDir, Persist, Prepared, Restore, SparseVector, VectorIndex,
+        FRAME_HEADER_BYTES,
     };
 
     #[derive(Default)]
@@ -311,7 +310,9 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let mut manifest = Manifest::default();
-        index.write("spaces/s/", dir.path(), &mut manifest).unwrap();
+        index
+            .write("spaces/s/", &FsDir::new(dir.path()), &mut manifest)
+            .unwrap();
         assert_eq!(
             index.artefact_names("spaces/s/"),
             vec!["spaces/s/postings.zdbsparse".to_string()]
@@ -328,7 +329,7 @@ mod tests {
         let restored = PostingsIndex::restore(
             index.config(),
             "spaces/s/",
-            dir.path(),
+            &FsDir::new(dir.path()),
             &manifest,
             &bounds(),
         )
@@ -360,7 +361,9 @@ mod tests {
         let index = filled();
         let dir = tempfile::tempdir().unwrap();
         let mut manifest = Manifest::default();
-        index.write("", dir.path(), &mut manifest).unwrap();
+        index
+            .write("", &FsDir::new(dir.path()), &mut manifest)
+            .unwrap();
         let path = dir.path().join("postings.zdbsparse");
         let good = std::fs::read(&path).unwrap();
         let h = FRAME_HEADER_BYTES;
@@ -375,7 +378,7 @@ mod tests {
                     checksum: None,
                 },
             );
-            PostingsIndex::restore(index.config(), "", dir.path(), &m, &bounds())
+            PostingsIndex::restore(index.config(), "", &FsDir::new(dir.path()), &m, &bounds())
         };
         let message = |bytes: &[u8]| match refused(bytes) {
             Err(Error::DecodeFailed { error, .. }) => error,
@@ -443,7 +446,13 @@ mod tests {
             ..bounds()
         };
         assert!(matches!(
-            PostingsIndex::restore(index.config(), "", dir.path(), &manifest, &tight),
+            PostingsIndex::restore(
+                index.config(),
+                "",
+                &FsDir::new(dir.path()),
+                &manifest,
+                &tight
+            ),
             Err(Error::DecodeFailed { .. })
         ));
         // Not in the manifest.
@@ -451,7 +460,7 @@ mod tests {
             PostingsIndex::restore(
                 index.config(),
                 "",
-                dir.path(),
+                &FsDir::new(dir.path()),
                 &Manifest::default(),
                 &bounds()
             ),
@@ -463,7 +472,13 @@ mod tests {
             ..bounds()
         };
         assert!(matches!(
-            PostingsIndex::restore(index.config(), "", dir.path(), &manifest, &small),
+            PostingsIndex::restore(
+                index.config(),
+                "",
+                &FsDir::new(dir.path()),
+                &manifest,
+                &small
+            ),
             Err(Error::DecodeLengthExceeded { .. })
         ));
     }

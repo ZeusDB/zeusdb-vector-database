@@ -98,12 +98,12 @@
 //! at each call, and truncates in two steps that are each durable on their
 //! own, being the body cut and synced, then the header rewritten and
 //! synced. It takes no index type, holds no index lock and knows nothing of
-//! a collection.
+//! a collection. It opens its file through the [`Storage`] it is handed,
+//! which decides where the file is, and writes it through [`JournalFile`].
 
 use crate::checksum::checksum_of;
 use crate::error::Error;
-use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use crate::storage::{JournalFile, Storage};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -602,7 +602,7 @@ pub enum CommitMode {
 #[derive(Clone, Debug)]
 pub struct JournalSyncHandle {
     path: PathBuf,
-    file: Arc<File>,
+    file: Arc<dyn JournalFile>,
 }
 
 impl JournalSyncHandle {
@@ -626,7 +626,7 @@ impl JournalSyncHandle {
 #[derive(Debug)]
 pub struct JournalWriter {
     path: PathBuf,
-    file: Arc<File>,
+    file: Arc<dyn JournalFile>,
     collection_id: u128,
     first_sequence: u64,
     next_sequence: u64,
@@ -642,10 +642,15 @@ impl JournalWriter {
         }
     }
 
-    /// Create a journal at `path` with a header and no records, replacing
-    /// any file there. Durable before it returns. `first_sequence` is at
-    /// least one, since zero is never a record's.
-    pub fn create(path: &Path, collection_id: u128, first_sequence: u64) -> Result<Self, Error> {
+    /// Create the journal `storage` keeps, with a header and no records,
+    /// replacing any file there. Durable before it returns. `first_sequence`
+    /// is at least one, since zero is never a record's.
+    pub fn create(
+        storage: &dyn Storage,
+        collection_id: u128,
+        first_sequence: u64,
+    ) -> Result<Self, Error> {
+        let path = storage.journal_path();
         if first_sequence == 0 {
             return Err(Error::JournalIoFailed {
                 path: path.to_path_buf(),
@@ -653,19 +658,14 @@ impl JournalWriter {
                 error: "sequence 0 is never a record's".into(),
             });
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(Self::io(path, "create"))?;
+        let file: Arc<dyn JournalFile> =
+            Arc::from(storage.create_journal().map_err(Self::io(path, "create"))?);
         file.write_all(&encode_journal_header(collection_id, first_sequence))
             .map_err(Self::io(path, "write the header of"))?;
         file.sync_all().map_err(Self::io(path, "sync"))?;
         Ok(JournalWriter {
             path: path.to_path_buf(),
-            file: Arc::new(file),
+            file,
             collection_id,
             first_sequence,
             next_sequence: first_sequence,
@@ -673,29 +673,28 @@ impl JournalWriter {
         })
     }
 
-    /// Open a journal the reader has read, for appending after its good
-    /// bytes. The file is cut to that length and synced first, so a torn
-    /// tail is gone before the next record lands. When the body is empty
-    /// the next record carries `next_if_empty`, and a header naming any
-    /// other first sequence is rewritten to it, which completes a
-    /// truncation a crash left half done. When the body holds records the
-    /// next record follows the last one and `next_if_empty` is not read.
+    /// Open the journal `storage` keeps, which the reader has read, for
+    /// appending after its good bytes. The file is cut to that length and
+    /// synced first, so a torn tail is gone before the next record lands.
+    /// When the body is empty the next record carries `next_if_empty`, and a
+    /// header naming any other first sequence is rewritten to it, which
+    /// completes a truncation a crash left half done. When the body holds
+    /// records the next record follows the last one and `next_if_empty` is
+    /// not read.
     pub fn open_for_append(
-        path: &Path,
+        storage: &dyn Storage,
         contents: &JournalContents<'_>,
         next_if_empty: u64,
     ) -> Result<Self, Error> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(Self::io(path, "open"))?;
+        let path = storage.journal_path();
+        let file: Arc<dyn JournalFile> =
+            Arc::from(storage.open_journal().map_err(Self::io(path, "open"))?);
         file.set_len(contents.good_bytes)
             .map_err(Self::io(path, "truncate"))?;
         file.sync_all().map_err(Self::io(path, "sync"))?;
         let mut writer = JournalWriter {
             path: path.to_path_buf(),
-            file: Arc::new(file),
+            file,
             collection_id: contents.header.collection_id,
             first_sequence: contents.header.first_sequence,
             next_sequence: contents.next_sequence(),
@@ -713,9 +712,7 @@ impl JournalWriter {
                 writer.restate_header(next_if_empty)?;
             }
         }
-        (&*writer.file)
-            .seek(SeekFrom::End(0))
-            .map_err(Self::io(path, "seek"))?;
+        writer.file.seek_end().map_err(Self::io(path, "seek"))?;
         Ok(writer)
     }
 
@@ -746,12 +743,9 @@ impl JournalWriter {
         self.next_sequence - 1
     }
 
-    /// The file's length, from the filesystem.
+    /// The file's length, from the storage.
     pub fn file_len(&self) -> Result<u64, Error> {
-        self.file
-            .metadata()
-            .map(|m| m.len())
-            .map_err(Self::io(&self.path, "measure"))
+        self.file.length().map_err(Self::io(&self.path, "measure"))
     }
 
     /// A handle for a thread that syncs on an interval.
@@ -786,7 +780,7 @@ impl JournalWriter {
             });
         };
         encode_journal_record(sequence, kind, payload, &mut self.buffer);
-        (&*self.file)
+        self.file
             .write_all(&self.buffer)
             .map_err(Self::io(&self.path, "append to"))?;
         self.next_sequence = after;
@@ -810,7 +804,7 @@ impl JournalWriter {
     ) -> Result<(), Error> {
         encode_journal_record(self.next_sequence, kind, payload, &mut self.buffer);
         let cut = bytes.min(self.buffer.len());
-        (&*self.file)
+        self.file
             .write_all(&self.buffer[..cut])
             .map_err(Self::io(&self.path, "append to"))?;
         self.file.sync_data().map_err(Self::io(&self.path, "sync"))
@@ -844,10 +838,7 @@ impl JournalWriter {
         crate::kill_at(crate::KillPoint::TruncateAfterSetLen);
         self.restate_header(self.next_sequence)?;
         crate::kill_at(crate::KillPoint::TruncateAfterHeader);
-        (&*self.file)
-            .seek(SeekFrom::End(0))
-            .map_err(Self::io(&self.path, "seek"))
-            .map(|_| ())
+        self.file.seek_end().map_err(Self::io(&self.path, "seek"))
     }
 
     /// The first step of a truncation: the body cut to the header and the
@@ -862,9 +853,8 @@ impl JournalWriter {
     /// The second step of a truncation: the header rewritten with
     /// `first_sequence` and synced. The position is left after the header.
     fn restate_header(&mut self, first_sequence: u64) -> Result<(), Error> {
-        let mut file = &*self.file;
-        file.seek(SeekFrom::Start(0))
-            .map_err(Self::io(&self.path, "seek"))?;
+        let file = &self.file;
+        file.seek_start().map_err(Self::io(&self.path, "seek"))?;
         file.write_all(&encode_journal_header(self.collection_id, first_sequence))
             .map_err(Self::io(&self.path, "write the header of"))?;
         file.sync_all().map_err(Self::io(&self.path, "sync"))?;
@@ -882,6 +872,9 @@ impl JournalWriter {
 mod tests {
     use super::*;
     use crate::frame::fuzz::{Rng, HOSTILE};
+    use crate::storage::FsStorage;
+    use std::fs::OpenOptions;
+    use std::io::Write;
 
     /// A record of the corpus: its offset, its payload length, its
     /// sequence and its kind.
@@ -1490,8 +1483,9 @@ mod tests {
     #[test]
     fn records_appended_read_back() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.zdbwal");
-        let mut w = JournalWriter::create(&path, 42, 1).unwrap();
+        let storage = FsStorage::at(&dir.path().join("t")).unwrap();
+        let path = storage.journal_path().to_path_buf();
+        let mut w = JournalWriter::create(&storage, 42, 1).unwrap();
         assert_eq!(w.sequence_reached(), 0);
         assert_eq!(w.file_len().unwrap(), 64);
         assert_eq!(w.append(OperationKind::Insert, b"one").unwrap(), 1);
@@ -1518,16 +1512,19 @@ mod tests {
     }
 
     /// A payload above the ceiling is refused at the append and appends
-    /// nothing, and a first sequence of zero is refused at the create.
+    /// nothing, and a first sequence of zero is refused at the create before
+    /// any file is made.
     #[test]
     fn the_writer_refuses_what_the_reader_would() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.zdbwal");
+        let storage = FsStorage::at(&dir.path().join("t")).unwrap();
+        let path = storage.journal_path().to_path_buf();
         assert!(matches!(
-            JournalWriter::create(&path, 1, 0),
+            JournalWriter::create(&storage, 1, 0),
             Err(Error::JournalIoFailed { what: "create", .. })
         ));
-        let mut w = JournalWriter::create(&path, 1, 1).unwrap();
+        assert!(!path.exists());
+        let mut w = JournalWriter::create(&storage, 1, 1).unwrap();
         let big = vec![0u8; JOURNAL_MAX_PAYLOAD + 1];
         assert!(matches!(
             w.append(OperationKind::Insert, &big),
@@ -1545,8 +1542,9 @@ mod tests {
     #[test]
     fn a_torn_tail_is_cut_at_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.zdbwal");
-        let mut w = JournalWriter::create(&path, 9, 1).unwrap();
+        let storage = FsStorage::at(&dir.path().join("t")).unwrap();
+        let path = storage.journal_path().to_path_buf();
+        let mut w = JournalWriter::create(&storage, 9, 1).unwrap();
         w.append(OperationKind::Insert, b"hello").unwrap();
         w.append(OperationKind::Insert, b"world").unwrap();
         w.commit(CommitMode::Sync).unwrap();
@@ -1569,7 +1567,7 @@ mod tests {
                 sequence: 3
             })
         );
-        let mut w = JournalWriter::open_for_append(&path, &contents, 1).unwrap();
+        let mut w = JournalWriter::open_for_append(&storage, &contents, 1).unwrap();
         assert_eq!(w.file_len().unwrap(), good_len);
         assert_eq!(w.next_sequence(), 3);
         w.append(OperationKind::Insert, b"again").unwrap();
@@ -1588,8 +1586,9 @@ mod tests {
     #[test]
     fn a_truncation_restates_the_first_sequence() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.zdbwal");
-        let mut w = JournalWriter::create(&path, 9, 1).unwrap();
+        let storage = FsStorage::at(&dir.path().join("t")).unwrap();
+        let path = storage.journal_path().to_path_buf();
+        let mut w = JournalWriter::create(&storage, 9, 1).unwrap();
         for i in 0..5u8 {
             w.append(OperationKind::Insert, &[i; 30]).unwrap();
         }
@@ -1618,8 +1617,9 @@ mod tests {
     #[test]
     fn a_crash_between_the_truncation_steps_is_recoverable() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.zdbwal");
-        let mut w = JournalWriter::create(&path, 9, 1).unwrap();
+        let storage = FsStorage::at(&dir.path().join("t")).unwrap();
+        let path = storage.journal_path().to_path_buf();
+        let mut w = JournalWriter::create(&storage, 9, 1).unwrap();
         for i in 0..7u8 {
             w.append(OperationKind::Insert, &[i; 30]).unwrap();
         }
@@ -1636,7 +1636,7 @@ mod tests {
         assert_eq!(contents.next_sequence(), 1);
         // The checkpoint holds 7, so the next record is 8, and the header
         // is restated to say so before anything is appended.
-        let mut w = JournalWriter::open_for_append(&path, &contents, 8).unwrap();
+        let mut w = JournalWriter::open_for_append(&storage, &contents, 8).unwrap();
         assert_eq!(w.first_sequence(), 8);
         assert_eq!(w.next_sequence(), 8);
         assert_eq!(w.sequence_reached(), 7);
@@ -1653,7 +1653,7 @@ mod tests {
         // which is why the body is cut first: a reader between the steps
         // sees records at or below the checkpoint under the old first
         // sequence, and skips them by sequence.
-        let mut w = JournalWriter::open_for_append(&path, &contents, 0).unwrap();
+        let mut w = JournalWriter::open_for_append(&storage, &contents, 0).unwrap();
         assert_eq!(w.next_sequence(), 9);
         w.append(OperationKind::Clear, &[]).unwrap();
         drop(w);
@@ -1665,7 +1665,7 @@ mod tests {
         let bytes = read_file(&path);
         let contents = read_journal(&bytes, "t").unwrap();
         assert!(matches!(
-            JournalWriter::open_for_append(&path, &contents, 0),
+            JournalWriter::open_for_append(&storage, &contents, 0),
             Err(Error::JournalIoFailed { what: "open", .. })
         ));
     }
@@ -1675,8 +1675,9 @@ mod tests {
     #[test]
     fn a_repair_cuts_at_the_corrupt_record() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.zdbwal");
-        let mut w = JournalWriter::create(&path, 9, 1).unwrap();
+        let storage = FsStorage::at(&dir.path().join("t")).unwrap();
+        let path = storage.journal_path().to_path_buf();
+        let mut w = JournalWriter::create(&storage, 9, 1).unwrap();
         for i in 0..5u8 {
             w.append(OperationKind::Insert, &[i; 40]).unwrap();
         }
@@ -1690,7 +1691,7 @@ mod tests {
         assert_eq!(contents.records.len(), 2);
         assert_eq!(contents.good_bytes, third as u64);
         assert!(contents.refusal("t").is_some());
-        let w = JournalWriter::open_for_append(&path, &contents, 1).unwrap();
+        let w = JournalWriter::open_for_append(&storage, &contents, 1).unwrap();
         assert_eq!(w.file_len().unwrap(), third as u64);
         assert_eq!(w.next_sequence(), 3);
         drop(w);

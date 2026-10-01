@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use zeusdb_vector_core::{Error, IdfScope, OperationKind};
+use zeusdb_vector_core::{Error, FsStorage, IdfScope, OperationKind};
 use zeusdb_vector_sparse::SparseConfig;
 use zeusdb_vector_text::Tokenizer;
 
@@ -295,9 +295,13 @@ fn a_commit_that_fails_refuses_its_records_and_everything_after_until_a_checkpoi
     let temp = TempDir::new();
     let path = temp.at("fault.zdb");
     let collection = Collection::build(declaration(), None);
-    let wal = journal_path(&path).unwrap();
     let sink = FailingCommit {
-        inner: JournalSink::create(&wal, collection.collection_id(), Durability::PerCall).unwrap(),
+        inner: JournalSink::create(
+            &FsStorage::at(&path).unwrap(),
+            collection.collection_id(),
+            Durability::PerCall,
+        )
+        .unwrap(),
         fail_at: 2,
         commits: 0,
     };

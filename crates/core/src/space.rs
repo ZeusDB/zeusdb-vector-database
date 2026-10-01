@@ -35,11 +35,11 @@
 
 use std::any::Any;
 use std::fmt;
-use std::path::Path;
 
 use crate::admit::Admit;
 use crate::checksum::checksum_of;
 use crate::error::Error;
+use crate::storage::Dir;
 
 // ============================================================================
 // IDENTITY
@@ -558,7 +558,7 @@ pub struct Bounds {
 pub trait Persist {
     /// Write every artefact under `prefix` into `dir`, recording each in
     /// `ledger`.
-    fn write(&self, prefix: &str, dir: &Path, ledger: &mut dyn Ledger) -> Result<(), Error>;
+    fn write(&self, prefix: &str, dir: &dyn Dir, ledger: &mut dyn Ledger) -> Result<(), Error>;
 
     /// The artefact names this index would write under `prefix`, so the
     /// collection can check a directory against its inventory before parsing.
@@ -574,7 +574,7 @@ pub trait Restore: Sized {
     fn restore(
         config: &Self::Config,
         prefix: &str,
-        dir: &Path,
+        dir: &dyn Dir,
         inventory: &dyn Inventory,
         bounds: &Bounds,
     ) -> Result<Self, Error>;
@@ -583,34 +583,14 @@ pub trait Restore: Sized {
 /// Write one artefact whole, for an index that holds its artefact in memory
 /// before it writes it.
 ///
-/// The file is fsynced before this returns, so a rename that moves the
+/// The artefact is durable before this returns, so a rename that moves the
 /// directory into place cannot be recorded while the bytes it names are still
 /// in the page cache. No digest is taken here: a framed artefact carries its
 /// own payload checksum, computed as the frame is closed, and a second pass
 /// over the buffer cost a save of a 70 MB artefact a seventh of its time. A
 /// writer that records a digest in the manifest computes one itself.
-pub fn write_artefact(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Error> {
-    use std::io::Write;
-
-    // A prefix may carry directories, which are created on the way.
-    let path = dir.join(name);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| Error::ArtefactCreateFailed {
-            name: name.to_string(),
-            error: e.to_string(),
-        })?;
-    }
-    let mut file = std::fs::File::create(&path).map_err(|e| Error::ArtefactCreateFailed {
-        name: name.to_string(),
-        error: e.to_string(),
-    })?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| Error::ArtefactWriteFailed {
-            name: name.to_string(),
-            error: e.to_string(),
-        })?;
-    Ok(())
+pub fn write_artefact(dir: &dyn Dir, name: &str, bytes: &[u8]) -> Result<(), Error> {
+    dir.write(name, bytes)
 }
 
 /// Read one artefact whole and hold it to what the inventory recorded.
@@ -621,7 +601,7 @@ pub fn write_artefact(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Error>
 /// a stray file cannot stand in for a missing one. `contents` says what the
 /// artefact holds, for the message.
 pub fn read_artefact(
-    dir: &Path,
+    dir: &dyn Dir,
     name: &str,
     inventory: &dyn Inventory,
     contents: &'static str,
@@ -639,10 +619,7 @@ pub fn read_artefact(
             bytes: usize::try_from(recorded.bytes).unwrap_or(usize::MAX),
         });
     }
-    let bytes = std::fs::read(dir.join(name)).map_err(|e| Error::ArtefactReadFailed {
-        name: name.to_string(),
-        error: e.to_string(),
-    })?;
+    let bytes = dir.read(name)?;
     if bytes.len() as u64 != recorded.bytes {
         return Err(Error::ArtefactLengthMismatch {
             name: name.to_string(),
@@ -768,9 +745,10 @@ mod tests {
     /// does not carry are each refused before parsing.
     #[test]
     fn an_artefact_round_trips_and_every_damage_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::FsDir::new(tmp.path());
         let bytes: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
-        write_artefact(dir.path(), "a.bin", &bytes).unwrap();
+        write_artefact(&dir, "a.bin", &bytes).unwrap();
         let checksum = checksum_of(&bytes);
         let mut manifest = Manifest(HashMap::new());
         manifest.record(
@@ -781,30 +759,30 @@ mod tests {
             },
         );
         assert_eq!(
-            read_artefact(dir.path(), "a.bin", &manifest, "a test artefact", 1 << 20).unwrap(),
+            read_artefact(&dir, "a.bin", &manifest, "a test artefact", 1 << 20).unwrap(),
             bytes
         );
 
         assert!(matches!(
-            read_artefact(dir.path(), "b.bin", &manifest, "a test artefact", 1 << 20),
+            read_artefact(&dir, "b.bin", &manifest, "a test artefact", 1 << 20),
             Err(Error::ArtefactsMissing { .. })
         ));
         assert!(matches!(
-            read_artefact(dir.path(), "a.bin", &manifest, "a test artefact", 10),
+            read_artefact(&dir, "a.bin", &manifest, "a test artefact", 10),
             Err(Error::DecodeLengthExceeded { .. })
         ));
 
         let mut flipped = bytes.clone();
         flipped[500] ^= 0x40;
-        std::fs::write(dir.path().join("a.bin"), &flipped).unwrap();
+        std::fs::write(tmp.path().join("a.bin"), &flipped).unwrap();
         assert!(matches!(
-            read_artefact(dir.path(), "a.bin", &manifest, "a test artefact", 1 << 20),
+            read_artefact(&dir, "a.bin", &manifest, "a test artefact", 1 << 20),
             Err(Error::ArtefactDigestMismatch { .. })
         ));
 
-        std::fs::write(dir.path().join("a.bin"), &bytes[..999]).unwrap();
+        std::fs::write(tmp.path().join("a.bin"), &bytes[..999]).unwrap();
         assert!(matches!(
-            read_artefact(dir.path(), "a.bin", &manifest, "a test artefact", 1 << 20),
+            read_artefact(&dir, "a.bin", &manifest, "a test artefact", 1 << 20),
             Err(Error::ArtefactLengthMismatch { .. })
         ));
     }
