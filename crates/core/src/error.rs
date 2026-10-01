@@ -216,6 +216,13 @@ pub enum Error {
     // ------------------------------------------------------------------
     /// An id already held, with overwrite off
     DuplicateId { id: String },
+    /// An insert where the collection has issued its last internal id, or an
+    /// overwrite needing more internal ids than the collection has left
+    InternalIdsExhausted {
+        last: usize,
+        left: usize,
+        needed: usize,
+    },
     /// Ids a strict `get_records` was asked for and the index does not hold,
     /// sorted
     RecordsAbsent { absent: Vec<String> },
@@ -652,7 +659,8 @@ impl Error {
             | SpaceUnknown { .. }
             | RecordNotHeld { .. } => Exception::Key,
 
-            TermIdsExhausted
+            InternalIdsExhausted { .. }
+            | TermIdsExhausted
             | TokenizerFailed(_)
             | TokenizerRequired { .. }
             | TokenizerMismatch { .. }
@@ -1000,6 +1008,25 @@ impl fmt::Display for Error {
             ),
 
             DuplicateId { id } => write!(f, "Vector with ID '{}' already exists", id),
+            InternalIdsExhausted { last, left: 0, .. } => write!(
+                f,
+                "This collection has issued its last internal id, {}. Internal ids are never \
+                 reused, and compact() and rebuild() keep the ones records hold, so no record \
+                 can be added until clear() empties the collection and its ids start again \
+                 from 1. Search, removal, metadata updates, save and load still work.",
+                last
+            ),
+            InternalIdsExhausted { last, left, needed } => write!(
+                f,
+                "This collection has {} internal id{} left, ending at {}, and this overwrite \
+                 needs {}, one for each record it replaces or adds, so nothing was removed. \
+                 Overwrite fewer records at a time, or clear() the collection to start its ids \
+                 again from 1.",
+                left,
+                if *left == 1 { "" } else { "s" },
+                last,
+                needed
+            ),
             RecordsAbsent { absent } => {
                 let named: Vec<&str> = absent.iter().take(10).map(String::as_str).collect();
                 write!(

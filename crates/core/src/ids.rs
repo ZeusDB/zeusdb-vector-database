@@ -52,6 +52,11 @@ const MAX_ID_LEN: u64 = (1u64 << LEN_BITS) - 1;
 const ABSENT: u64 = u64::MAX;
 /// A bucket that holds no internal id.
 const EMPTY: u32 = u32::MAX;
+/// The last internal id the store holds. A slot is a `u32` and the store
+/// keeps `u32::MAX` for the empty bucket, so the last id is the one below it.
+/// `add` issues no id past this one and a replay installs none, so neither
+/// hands the store an id it refuses.
+pub const MAX_INTERNAL_ID: usize = EMPTY as usize - 1;
 /// The most entries and the most buckets the store reserves at creation,
 /// whatever the declaration. Eight bytes an entry and five a bucket.
 const RESERVE_CAP: usize = 1 << 20;
@@ -270,12 +275,12 @@ impl IdStore {
     /// the collection takes, since every insertion checks the name first and
     /// no internal id is issued twice.
     ///
-    /// Refused where the slot, the id or the arena would pass what an entry
-    /// can name, none of which an index a `u32` node index can hold reaches.
+    /// Refused where the slot is past [`MAX_INTERNAL_ID`], or where the id
+    /// or the arena would pass what an entry can name.
     pub fn insert(&mut self, slot: usize, id: &str) -> Result<(), Error> {
         let slot32 = u32::try_from(slot)
             .ok()
-            .filter(|&value| value != EMPTY)
+            .filter(|_| slot <= MAX_INTERNAL_ID)
             .ok_or_else(|| {
                 Error::Engine(format!(
                     "internal id {} is above what the id store can hold",
@@ -681,5 +686,30 @@ mod tests {
         }
         assert_eq!(store.buckets.len(), buckets, "no rehash inside the run");
         assert_eq!(store.slot_of("1000"), Some(1500));
+    }
+
+    /// The last internal id is the one below the empty bucket, and every
+    /// slot past it is refused with the store left as it was.
+    #[test]
+    fn no_slot_past_the_last_internal_id_is_held() {
+        assert_eq!(MAX_INTERNAL_ID, 4_294_967_294);
+        let mut store = IdStore::new(4);
+        store.insert(1, "held").unwrap();
+        for slot in [MAX_INTERNAL_ID + 1, u32::MAX as usize + 1, usize::MAX] {
+            let err = store.insert(slot, "past").unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("is above what the id store can hold"),
+                "{err}"
+            );
+        }
+        assert_eq!(store.len(), 1);
+        assert!(!store.contains_name("past"));
+        assert_eq!(store.highest_slot(), Some(1));
+        assert_eq!(
+            store.entries.len(),
+            2,
+            "no entry was made for a refused slot"
+        );
     }
 }

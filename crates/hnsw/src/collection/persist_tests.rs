@@ -824,3 +824,54 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
         }
     }
 }
+
+/// The forward map's internal ids are held to the counter `config.json`
+/// records before the id store is reserved. One above it is refused naming
+/// the record and the counter, and the store is left empty. A sparse id
+/// space at or below the counter, which is what removals without a
+/// compaction leave, is taken whole.
+#[test]
+fn a_mappings_id_above_the_counter_is_refused_before_the_store_is_reserved() {
+    let build = || {
+        Collection::build(
+            Declaration::validate(4, "l2", 4, 50, 100, vec![]).unwrap(),
+            None,
+        )
+    };
+    let maps = |pairs: &[(&str, usize)]| {
+        let forward: HashMap<String, usize> = pairs
+            .iter()
+            .map(|&(id, slot)| (id.to_string(), slot))
+            .collect();
+        let reverse: HashMap<usize, String> = pairs
+            .iter()
+            .map(|&(id, slot)| (slot, id.to_string()))
+            .collect();
+        (forward, reverse)
+    };
+
+    let mut collection = build();
+    let (forward, reverse) = maps(&[("a", 1), ("b", 1 << 20)]);
+    match collection.set_id_mappings(forward, reverse, 3) {
+        Err(Error::ArtefactParseFailed { name, error }) => {
+            assert_eq!(name, "mappings.bin");
+            assert_eq!(
+                error,
+                "the forward map names internal id 1048576 for 'b' and config.json counted 3"
+            );
+        }
+        other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+    }
+    assert!(collection.ids().is_empty());
+    assert_eq!(collection.ids().highest_slot(), None);
+
+    for counter in [1000, 4000] {
+        let mut collection = build();
+        let (forward, reverse) = maps(&[("a", 1), ("b", 500), ("c", 1000)]);
+        collection
+            .set_id_mappings(forward, reverse, counter)
+            .unwrap();
+        assert_eq!(collection.ids().len(), 3);
+        assert_eq!(collection.ids().slot_of("c"), Some(1000));
+    }
+}

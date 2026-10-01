@@ -3003,7 +3003,7 @@ fn restore_data_fields(
     // Before the mappings move, because this reads their keys. The floor is
     // what stops an old directory reissuing a generated id it already holds.
     let generated_floor = Collection::highest_generated_id(mappings.id_map.keys());
-    index.set_id_mappings(mappings.id_map, mappings.rev_map)?;
+    index.set_id_mappings(mappings.id_map, mappings.rev_map, config.id_counter)?;
 
     // The add() method will properly:
     // - Insert vectors into index.vectors

@@ -14,6 +14,7 @@ import os
 
 import numpy as np
 import pytest
+from helpers import repair_manifest
 from zeusdb_vector_database import VectorDatabase
 
 DIM = 8
@@ -364,3 +365,64 @@ def test_the_journal_ceiling_applies_to_a_journaled_index_alone(tmp_path):
     add(journaled, 0, 1)
     assert len(journaled) == 1
     assert journal_keys(journaled)["journal_records"] == "1"
+
+
+# ------------------------------------------------------------
+# The last internal id
+# ------------------------------------------------------------
+LAST_INTERNAL_ID = 4_294_967_294
+
+
+@pytest.mark.parametrize("journaled", [False, True], ids=["unjournaled", "journaled"])
+def test_an_index_at_its_last_internal_id_refuses_an_add_and_still_opens(tmp_path, journaled):
+    """An index that has issued its last internal id refuses the next record,
+    an overwrite of a held one included, and what it holds stays searchable,
+    removable, savable and loadable. clear() starts the ids again.
+
+    The counter is set in config.json, which is where a long life of
+    overwrites and compactions leaves it."""
+    saved = tmp_path / "saved.zdb"
+    index = build(3)
+    index.save(str(saved))
+    drop(index)
+    config = json.loads((saved / "config.json").read_text(encoding="utf-8"))
+    config["id_counter"] = LAST_INTERNAL_ID
+    (saved / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    repair_manifest(saved, "config.json")
+
+    index = VectorDatabase().load(str(saved))
+    path = saved
+    if journaled:
+        path = tmp_path / "journaled.zdb"
+        index.journal_to(str(path))
+    journal = journal_of(path).read_bytes() if journaled else None
+
+    record = {"ids": ["r3"], "embeddings": [[0.5] * DIM], "metadatas": [{"i": 3}]}
+    result = index.add(record)
+    assert result.total_inserted == 0 and result.total_errors == 1
+    assert result.errors[0].startswith(
+        "Vector r3: RuntimeError: This collection has issued its last internal id, "
+        "4294967294."), result.errors
+    assert "clear()" in result.errors[0]
+    replacement = {"ids": ["r0"], "embeddings": [[0.25] * DIM], "metadatas": [{"i": 99}]}
+    result = index.add(replacement)
+    assert result.total_errors == 1 and "last internal id" in result.errors[0]
+    assert index.get_records(["r0"], return_vector=False)[0]["metadata"] == {"i": 0}
+    if journaled:
+        assert journal_of(path).read_bytes() == journal, "nothing reached the journal"
+
+    assert len(index.search([0.5] * DIM, top_k=3)) == 3
+    assert index.update_metadata("r2", {"i": 20})
+    assert index.remove_point("r1")
+    index.save(str(path))
+    drop(index)
+
+    reopened = VectorDatabase().load(str(path))
+    assert sorted(reopened.list(number=10)) == [("r0", {"i": 0}), ("r2", {"i": 20})]
+    assert reopened.add(record).total_errors == 1
+    assert reopened.clear() == 2
+    add(reopened, 10, 12)
+    reopened.save(str(path))
+    drop(reopened)
+    again = VectorDatabase().load(str(path))
+    assert sorted(id for id, _ in again.list(number=10)) == ["r10", "r11"]

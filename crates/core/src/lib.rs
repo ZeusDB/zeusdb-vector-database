@@ -72,7 +72,7 @@ pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES, NB_LAYER_MAX};
 pub use graph::{
     restore_graph, restore_int8_graph, Distance, DumpBounds, GraphHit, Planned, Record, VectorGraph,
 };
-pub use ids::IdStore;
+pub use ids::{IdStore, MAX_INTERNAL_ID};
 pub use int8::Int8Codec;
 pub use journal::{
     encode_journal_header, encode_journal_record, read_journal, CommitMode, JournalContents,

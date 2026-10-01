@@ -837,17 +837,39 @@ impl Collection {
     /// one structure and a file whose two halves disagree describes two
     /// record sets. The two maps used to be installed as they were read, so
     /// such a file loaded and its two halves answered differently.
+    ///
+    /// Every internal id the forward map names is held to `id_counter`, the
+    /// last id `config.json` says the index issued, before the store is
+    /// reserved. The store, the metadata, the columns and a sparse space all
+    /// hold an entry for every id up to the highest a record holds, so a file
+    /// naming one record at a high id would have the loader reserve and fill
+    /// an entry for every id below it. A save holds the mutation guard for
+    /// its whole run, so every id the file names was issued by the counter it
+    /// records. The graph dump's origin ids are held to the same counter; see
+    /// `Expected::max_origin_id`.
     pub(crate) fn set_id_mappings(
         &mut self,
         id_map: HashMap<String, usize>,
         rev_map: HashMap<usize, String>,
+        id_counter: usize,
     ) -> Result<(), Error> {
         let invalid = |detail: String| Error::ArtefactParseFailed {
             name: "mappings.bin",
             error: detail,
         };
+        let top = id_map
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)));
+        if let Some((id, &internal_id)) = top {
+            if internal_id > id_counter {
+                return Err(invalid(format!(
+                    "the forward map names internal id {} for '{}' and config.json counted {}",
+                    internal_id, id, id_counter
+                )));
+            }
+        }
+        let highest = top.map_or(0, |(_, &internal_id)| internal_id);
         let mut store = IdStore::new(self.expected_size());
-        let highest = id_map.values().copied().max().unwrap_or(0);
         store.reserve(id_map.len(), highest);
         for (id, &internal_id) in &id_map {
             store.insert(internal_id, id)?;
