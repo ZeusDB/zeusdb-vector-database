@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use zeusdb_vector_core::{Error, SparseVector, DUMP_FILENAME};
+use zeusdb_vector_core::{Error, SparseVector, DUMP_FILENAME, MAX_INTERNAL_ID};
 use zeusdb_vector_sparse::SparseConfig;
 
 use super::{Collection, Declaration, ParsedRecord};
@@ -523,6 +523,71 @@ fn a_record_that_does_not_belong_refuses_the_open_naming_its_sequence() {
         }
         other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
     }
+}
+
+// ============================================================================
+// THE LAST INTERNAL ID
+// ============================================================================
+
+/// A journaled collection that has issued its last internal id refuses the
+/// next record before the journal holds it, so its directory opens with
+/// what it held and refuses the same record again. `clear` starts the ids
+/// again from 1, and the directory opens after that too.
+#[test]
+fn a_journaled_collection_at_its_last_internal_id_refuses_an_add_and_still_opens() {
+    let temp = TempDir::new();
+    let path = temp.at("last.zdb");
+    let mut collection = Collection::build(declaration(), None);
+    add(&collection, 0..3);
+    collection.set_counters(MAX_INTERNAL_ID, 3);
+    collection
+        .journal_to(path.to_str().unwrap(), Durability::default())
+        .unwrap();
+    let wal = journal_path(&path).unwrap();
+    let journal = std::fs::read(&wal).unwrap();
+
+    let refused = |collection: &Collection, record: ParsedRecord, overwrite: bool| {
+        let added = collection.add_records(vec![record], vec![], overwrite);
+        assert_eq!(added.total_errors, 1);
+        assert!(
+            added.errors[0].contains("has issued its last internal id, 4294967294"),
+            "{}",
+            added.errors[0]
+        );
+    };
+    refused(&collection, record(3), false);
+    refused(&collection, record(0), true);
+    assert_eq!(
+        std::fs::read(&wal).unwrap(),
+        journal,
+        "nothing reached the journal"
+    );
+    assert_eq!(collection.id_counter(), MAX_INTERNAL_ID);
+    assert!(collection.contains("r0"));
+
+    // A removal still records and replays.
+    collection.remove_points(&["r1".to_string()]).unwrap();
+    let before = ids(&collection);
+    drop(collection);
+
+    let (recovered, report) =
+        Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
+    assert_eq!(report.replayed, 1, "the removal alone");
+    assert_eq!(ids(&recovered), before);
+    assert_eq!(recovered.id_counter(), MAX_INTERNAL_ID);
+    refused(&recovered, record(3), false);
+
+    // clear() starts the ids again, and what follows it replays.
+    recovered.clear().unwrap();
+    add(&recovered, 10..12);
+    let after = vec![("r10".to_string(), 1), ("r11".to_string(), 2)];
+    assert_eq!(ids(&recovered), after);
+    drop(recovered);
+    let (again, report) =
+        Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
+    assert_eq!(report.replayed, 4, "the removal, the clear and two inserts");
+    assert_eq!(ids(&again), after);
+    assert_eq!(again.id_counter(), 2);
 }
 
 // ============================================================================

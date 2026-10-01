@@ -33,7 +33,7 @@ use tracing::{debug, error, info, instrument, trace, warn};
 use zeusdb_vector_core::{
     matches_filter, Bitmap, ColumnStore, Error, Filter, IdStore, InsertParts, MetadataStore,
     Operation, OperationKind, Prepared, RecordId, Selection, SparseVector, VectorGraph,
-    VectorIndex, JOURNAL_MAX_PAYLOAD,
+    VectorIndex, JOURNAL_MAX_PAYLOAD, MAX_INTERNAL_ID,
 };
 use zeusdb_vector_sparse::PostingsIndex;
 
@@ -315,6 +315,13 @@ impl Collection {
             "no id was issued after the one taken back"
         );
         *counter = issued - 1;
+    }
+
+    /// How many internal ids the counter can issue before it passes the
+    /// last one the id store holds. Every caller holds `writers`, so nothing
+    /// issues an id between the read and what the caller does with it.
+    fn ids_left(&self) -> usize {
+        MAX_INTERNAL_ID.saturating_sub(*self.id_counter.lock().unwrap())
     }
 
     /// Issue the next internal id only if it is `expected`, which is what a
@@ -1062,7 +1069,7 @@ impl Collection {
     ///   `draw_level` and the sink's `append`
     /// - `install`, and the three paths below it, `add_raw_vector`,
     ///   `add_with_id_collection` and `add_quantized_vector`
-    /// - `is_quantized`, `segment_limit`
+    /// - `is_quantized`, `segment_limit`, `ids_left`
     /// - `maybe_trigger_training`, `train_quantization_from_ids` and
     ///   `rebuild_with_quantization_locked`
     /// - `PQ::is_trained`, `quantize`, `quantize_batch` and `train`, plus the
@@ -1142,6 +1149,26 @@ impl Collection {
             }; // Release all read locks here
 
             if !ids_to_remove.is_empty() {
+                // Every record of the batch takes a fresh internal id, the
+                // ones replacing a held record included, so a batch needing
+                // more ids than the collection has left is refused before
+                // anything is removed. Admitted as far as the ids went, it
+                // would remove records it could not put back.
+                let left = self.ids_left();
+                if parsed_data.len() > left {
+                    for record in &parsed_data {
+                        errors.push(InsertError::Vector {
+                            id: record.id.clone(),
+                            err: Error::InternalIdsExhausted {
+                                last: MAX_INTERNAL_ID,
+                                left,
+                                needed: parsed_data.len(),
+                            },
+                        });
+                    }
+                    return (inserted_ids, errors);
+                }
+
                 info!(target: LOG_TARGET, operation = "overwrite_preparation",
                     documents_to_remove = ids_to_remove.len(),
                     storage_analysis = format!(
@@ -1346,19 +1373,20 @@ impl Collection {
     ///
     /// Every check that can refuse the record runs first, being the
     /// duplicate check against the index and against the batch so far, the
-    /// terms counted into ids where the sparse half is terms, which hands
-    /// each new term to the sink as it is issued, and the sparse rules under
-    /// the space's weighting. Where a sink is attached the record is then
-    /// encoded and held to the sink's ceiling while nothing has been issued
-    /// for it, so a record too large to journal is refused with the counter
-    /// and the level stream where they were. Only then is the level drawn
-    /// and the internal id issued, both written into the encoded record, and
-    /// the record handed over. A sink that refuses it takes the id back,
-    /// since nothing else issues one under the mutation guard, so the
-    /// refusal leaves the counter where it was; the draw it consumed moves
-    /// the stream, which the next record's own draw records.
+    /// id ceiling, the terms counted into ids where the sparse half is
+    /// terms, which hands each new term to the sink as it is issued, and the
+    /// sparse rules under the space's weighting. Where a sink is attached the
+    /// record is then encoded and held to the sink's ceiling while nothing
+    /// has been issued for it, so a record too large to journal is refused
+    /// with the counter and the level stream where they were. Only then is
+    /// the level drawn and the internal id issued, both written into the
+    /// encoded record, and the record handed over. A sink that refuses it
+    /// takes the id back, since nothing else issues one under the mutation
+    /// guard, so the refusal leaves the counter where it was; the draw it
+    /// consumed moves the stream, which the next record's own draw records.
     ///
-    /// With no sink attached nothing is encoded and no ceiling applies.
+    /// With no sink attached nothing is encoded and the sink's ceiling does
+    /// not apply. The id ceiling applies either way.
     fn admit(
         &self,
         record: ParsedRecord,
@@ -1382,6 +1410,23 @@ impl Collection {
             );
             return Err(InsertError::Vector {
                 err: Error::DuplicateId { id: id.clone() },
+                id,
+            });
+        }
+
+        // The id ceiling, before anything is counted, encoded, drawn or
+        // issued for the record. Issued, an id past the last one the id store
+        // holds would reach the sink and then be refused at install, and a
+        // replay of that record would refuse the open. Refused here, the
+        // record leaves the counter, the level stream, the dictionary and the
+        // sink where they were, journaled or not.
+        if self.ids_left() == 0 {
+            return Err(InsertError::Vector {
+                err: Error::InternalIdsExhausted {
+                    last: MAX_INTERNAL_ID,
+                    left: 0,
+                    needed: 1,
+                },
                 id,
             });
         }

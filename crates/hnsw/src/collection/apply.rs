@@ -24,7 +24,7 @@
 use super::insert::Admitted;
 use super::{validate_index_parameters, Collection};
 use std::collections::HashMap;
-use zeusdb_vector_core::{Error, Operation, SparseVector};
+use zeusdb_vector_core::{Error, Operation, SparseVector, MAX_INTERNAL_ID};
 
 impl Collection {
     /// Apply one recorded operation to the collection.
@@ -197,11 +197,12 @@ impl Collection {
     ) -> Result<(), Error> {
         let mismatch = |detail: String| Error::JournalReplayMismatch { detail };
 
-        // The internal id, held under the ceiling the index's ids have
-        // before it is compared with the counter.
+        // The internal id, held to the last one the index's id store holds
+        // before it is compared with the counter, so a record naming an id
+        // the store refuses is refused here, before anything is issued.
         let expected = usize::try_from(internal_id)
             .ok()
-            .filter(|&value| value <= u32::MAX as usize)
+            .filter(|&value| value <= MAX_INTERNAL_ID)
             .ok_or_else(|| {
                 mismatch(format!(
                     "the record names internal id {} for '{}', above the id ceiling",

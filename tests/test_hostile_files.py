@@ -334,6 +334,44 @@ def test_a_mappings_file_whose_two_maps_disagree_is_refused(raw_index, tmp_path,
     assert_refused(path, tmp_path, naming="mappings.bin")
 
 
+# One record at an internal id above the counter config.json records, with
+# both maps consistent. The id store, the metadata and the columns hold an
+# entry for every id up to the highest a record holds, so the loader reserved
+# and filled one for every id below it before anything refused the file, and
+# at 2^40 asked the allocator for eight tebibytes.
+@pytest.mark.parametrize("slot", [3, 1 << 24, 1 << 40], ids=["one-above", "2^24", "2^40"])
+def test_a_mappings_id_above_the_counter_is_refused(raw_index, tmp_path, slot):
+    payload = (varint(2) + wire_str("a") + varint(1) + wire_str("b") + varint(slot)
+               + varint(2) + varint(1) + wire_str("a") + varint(slot) + wire_str("b"))
+    path = forged(raw_index, tmp_path, "mappings.bin", write_bytes(payload))
+    assert_refused(
+        path, tmp_path,
+        naming=f"the forward map names internal id {slot} for 'b' and config.json counted 2",
+    )
+
+
+def test_a_directory_whose_ids_are_sparse_still_opens(tmp_path):
+    """Removals without a compaction leave the held ids sparse, and the
+    highest removed, so the counter config.json records is above every id the
+    mappings name. Such a directory opens and issues ids after its counter."""
+    index = VectorDatabase().create("hnsw", dim=4, expected_size=64)
+    vectors = np.random.default_rng(5).standard_normal((40, 4)).astype(np.float32)
+    index.add({"ids": [f"r{i}" for i in range(40)], "embeddings": vectors})
+    removed = [f"r{i}" for i in range(40) if i % 9 != 0]
+    assert index.remove_points(removed) == [], "every id was held"
+    assert len(index) == 5
+    path = tmp_path / "sparse.zdb"
+    index.save(str(path))
+    config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    assert config["id_counter"] == 40
+
+    loaded = VectorDatabase().load(str(path))
+    assert sorted(id for id, _ in loaded.list(number=100)) == ["r0", "r18", "r27", "r36", "r9"]
+    assert loaded.add({"id": "late", "values": [0.5, 0.5, 0.5, 0.5]}).is_success()
+    loaded.save(str(path))
+    assert json.loads((path / "config.json").read_text(encoding="utf-8"))["id_counter"] == 41
+
+
 @pytest.mark.parametrize(
     "name,payload",
     [

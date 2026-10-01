@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 
 use zeusdb_vector_core::{
     compile_filter, test_support::clustered, Error, IdfScope, JournalRecord, Operation,
-    OperationKind, SparseVector, DUMP_FILENAME,
+    OperationKind, SparseVector, DUMP_FILENAME, MAX_INTERNAL_ID,
 };
 use zeusdb_vector_sparse::{SparseConfig, Weighting};
 use zeusdb_vector_text::{SimpleTokenizer, Tokenizer};
@@ -810,6 +810,95 @@ fn an_oversized_record_is_refused_before_the_counter_moves() {
     assert_eq!(recording.len(), 40);
 }
 
+/// A collection that has issued its last internal id refuses the next
+/// record at the door, before the sink is reached, and an overwrite that
+/// needs more ids than are left is refused before anything is removed. The
+/// counter, the level stream, the dictionary and every map stay where they
+/// were.
+///
+/// The sink refuses everything, so a record that reached it would carry the
+/// sink's words rather than the ceiling's.
+#[test]
+fn the_last_internal_id_is_refused_before_the_sink_is_reached() {
+    let vectors = clustered(40, 4, 0x0018_0a01);
+    let declaration = || {
+        Declaration::validate(4, "l2", 4, 50, 100, vec!["cat".to_string()])
+            .unwrap()
+            .with_text("text", SparseConfig::default(), Arc::new(SimpleTokenizer))
+            .unwrap()
+    };
+    let mut collection = Collection::build(declaration(), None);
+    add(&collection, vec![record(0, &vectors), record(1, &vectors)]);
+    collection.set_counters(MAX_INTERNAL_ID, 2);
+    assert!(collection.attach_sink(Box::new(Refusing)).is_none());
+
+    let exhausted = |errors: &[String], count: usize| {
+        assert_eq!(errors.len(), count, "{errors:?}");
+        for error in errors {
+            assert!(
+                error.contains(
+                    "RuntimeError: This collection has issued its last internal id, 4294967294."
+                ),
+                "{error}"
+            );
+            assert!(error.contains("clear()"), "{error}");
+        }
+    };
+    let added = collection.add_records(
+        vec![record(2, &vectors), text_record(&collection, 3, &vectors)],
+        vec![],
+        false,
+    );
+    assert!(added.inserted.is_empty());
+    exhausted(&added.errors, 2);
+    // An overwrite of a held record, refused before its removal is handed
+    // to the sink.
+    let added = collection.add_records(vec![record(0, &vectors)], vec![], true);
+    exhausted(&added.errors, 1);
+    assert_eq!(collection.len(), 2);
+    assert_eq!(collection.id_counter(), MAX_INTERNAL_ID);
+    assert_eq!(
+        collection.term_count(),
+        Some(0),
+        "no term of the refused record was counted"
+    );
+
+    // One id left, and an overwrite of two held records needs two.
+    collection.set_counters(MAX_INTERNAL_ID - 1, 2);
+    let added =
+        collection.add_records(vec![record(0, &vectors), record(1, &vectors)], vec![], true);
+    assert_eq!(added.total_errors, 2);
+    for error in &added.errors {
+        assert!(
+            error.contains(
+                "This collection has 1 internal id left, ending at 4294967294, and this \
+                 overwrite needs 2"
+            ),
+            "{error}"
+        );
+    }
+    assert_eq!(collection.len(), 2);
+    assert!(collection.contains("r0") && collection.contains("r1"));
+    assert_eq!(collection.id_counter(), MAX_INTERNAL_ID - 1);
+
+    // Detached, with the counter put back where the two records left it,
+    // the records after them draw the levels a collection that never met the
+    // ceiling draws, so no refusal consumed a draw.
+    assert!(collection.detach_sink().is_some());
+    collection.set_counters(2, 2);
+    add(&collection, (2..40).map(|i| record(i, &vectors)).collect());
+    let plain = Collection::build(declaration(), None);
+    add(&plain, (0..40).map(|i| record(i, &vectors)).collect());
+    let dir = TempDir::new();
+    collection.save(&dir.sub("refused.zdb")).unwrap();
+    plain.save(&dir.sub("plain.zdb")).unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join("refused.zdb").join(DUMP_FILENAME)).unwrap(),
+        std::fs::read(dir.path().join("plain.zdb").join(DUMP_FILENAME)).unwrap(),
+        "the refusals consumed no draw"
+    );
+}
+
 // ============================================================================
 // APPLY'S CHECKS
 // ============================================================================
@@ -859,6 +948,10 @@ fn apply_refuses_a_record_that_does_not_belong_to_the_collection() {
     // The internal id against the counter, and under the id ceiling.
     mismatch(insert(5, vec![0.0; 4], None), "would issue 1");
     mismatch(insert(0, vec![0.0; 4], None), "would issue 1");
+    mismatch(
+        insert(u32::MAX as u64, vec![0.0; 4], None),
+        "above the id ceiling",
+    );
     mismatch(
         insert(u32::MAX as u64 + 1, vec![0.0; 4], None),
         "above the id ceiling",
