@@ -277,9 +277,8 @@ class VectorDatabase:
                       from such an index records the tokenizer as external and
                       opens only through load(path, tokenizer=<the callable>).
                   A directory saved from an index holding a sparse space
-                  declares format version 2.0.0 and needs this release or later
-                  to open; a directory holding the dense space alone is what
-                  earlier releases wrote and opens where it did.
+                  lists sparse among the features its manifest records, and
+                  text as well where the space takes text.
 
                   A filter naming only declared fields is answered from the
                   columns. A filter naming anything else returns exactly the same

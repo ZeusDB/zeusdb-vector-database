@@ -160,8 +160,8 @@ fn pages(collection: &Collection) -> (Page, Page, Page) {
     (dense, sparse, filtered)
 }
 
-/// A dense-only directory keeps the flat names, declares the version every
-/// save does, and its config.json carries no `spaces` field.
+/// A dense-only directory keeps the flat names, lists no space among its
+/// features, and its config.json carries no `spaces` field.
 #[test]
 fn a_dense_only_directory_keeps_the_flat_names() {
     let collection = Collection::build(base(), None);
@@ -176,7 +176,7 @@ fn a_dense_only_directory_keeps_the_flat_names() {
     let path = dir.path().join("dense.zdb");
     collection.save(path.to_str().unwrap()).unwrap();
     let m = manifest(&path);
-    assert_eq!(m["format_version"], "4.0.0");
+    assert_eq!(m["features"], json!({"identity": "compatible"}));
     assert!(!m["files_included"]
         .as_array()
         .unwrap()
@@ -219,8 +219,8 @@ fn a_manifest_that_is_not_utf8_is_refused_as_a_text_read_refuses_it() {
 
 /// A collection with a sparse space writes `spaces/<name>/postings.zdbsparse`,
 /// names it in the manifest by length alone, declares the space in
-/// config.json by value, is a 2.0.0 directory, and reopens to the same
-/// three pages.
+/// config.json by value, lists `sparse` among its features, and reopens to
+/// the same three pages.
 #[test]
 fn a_sparse_space_round_trips_through_the_directory() {
     let declaration = base()
@@ -245,7 +245,10 @@ fn a_sparse_space_round_trips_through_the_directory() {
     collection.save(path.to_str().unwrap()).unwrap();
 
     let m = manifest(&path);
-    assert_eq!(m["format_version"], "4.0.0");
+    assert_eq!(
+        m["features"],
+        json!({"identity": "compatible", "sparse": "incompatible"})
+    );
     let names: Vec<&str> = m["files_included"]
         .as_array()
         .unwrap()
@@ -350,7 +353,10 @@ fn a_text_layer_round_trips_with_its_dictionary() {
     let path = dir.path().join("text.zdb");
     collection.save(path.to_str().unwrap()).unwrap();
     let m = manifest(&path);
-    assert_eq!(m["format_version"], "4.0.0");
+    assert_eq!(
+        m["features"],
+        json!({"identity": "compatible", "sparse": "incompatible", "text": "incompatible"})
+    );
     assert!(path.join("spaces/text/terms.zdbdict").exists());
     let digest = &m["file_digests"]["spaces/text/terms.zdbdict"];
     assert!(digest.get("checksum").is_none());
@@ -824,7 +830,10 @@ fn every_mutating_path_keeps_the_saved_shape_correct() {
     let cleared = dir.path().join("cleared.zdb");
     collection.save(cleared.to_str().unwrap()).unwrap();
     let m = manifest(&cleared);
-    assert_eq!(m["format_version"], "4.0.0");
+    assert_eq!(
+        m["features"],
+        json!({"identity": "compatible", "sparse": "incompatible", "text": "incompatible"})
+    );
     assert!(cleared.join("spaces/text/postings.zdbsparse").exists());
     let loaded = Collection::load(cleared.to_str().unwrap()).unwrap();
     assert_eq!(loaded.len(), 0);

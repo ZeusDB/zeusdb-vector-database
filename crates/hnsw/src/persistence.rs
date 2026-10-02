@@ -25,15 +25,23 @@
 //! my_index.zdb.zdbwal         # the journal, where the collection held one
 //! ```
 //!
-//! ## The format version
+//! ## The format version and the features
 //!
-//! Every directory this build saves declares `4.0.0`. It is a major because
-//! the four binary artefacts, `mappings.bin`, `vectors.bin`, `pq_codes.bin`
-//! and `pq_centroids.bin`, are written inside the frame
-//! `zeusdb_vector_core::frame` describes, where every earlier release wrote
-//! them in bincode's wire and reads nothing else. A release reading 1.x to
-//! 3.x alone refuses such a directory at its version check, with a message
-//! naming the newer release. `framed` holds the four payloads.
+//! Every directory this build saves declares `4.0.0` and lists the features
+//! it holds under `features`, each with the mark a build that does not know
+//! it reads. See `features` for what a feature is and what each mark means.
+//!
+//! The version is a major for the base every 4.x directory shares and for the
+//! manifest's own shape, `features` included, which a reader must know before
+//! it can read a feature. It is a major because the four binary artefacts,
+//! `mappings.bin`, `vectors.bin`, `pq_codes.bin` and `pq_centroids.bin`, are
+//! written inside the frame `zeusdb_vector_core::frame` describes, where every
+//! earlier release wrote them in bincode's wire and reads nothing else. A
+//! release reading 1.x to 3.x alone refuses such a directory at its version
+//! check, with a message naming the newer release. `framed` holds the four
+//! payloads. A feature does not move the version. A later feature is a name
+//! in `features`, and a build that does not know it refuses the directory by
+//! that name unless the directory marks it compatible.
 //!
 //! This build reads every major an earlier release wrote. A directory holding
 //! a dense space alone was written at `1.1.0`, one holding a sparse space at
@@ -44,8 +52,8 @@
 //! word. A dense space declared with scalar quantization moved each to its
 //! next minor, `1.2.0`, `2.1.0` or `3.1.0`, since a reader that knows the
 //! product quantized fields alone refuses such a directory on the first one
-//! its `quantization.json` lacks. None of the three moves the version any
-//! more, because every release that reads 4.x reads all of them.
+//! its `quantization.json` lacks. No directory below 4.0.0 lists features,
+//! and what one holds is read from its version and its files, as it was.
 //!
 //! The four binary artefacts of a directory are read in one layout, decided
 //! from `mappings.bin`, which every directory holds. At 4.x it is the frame.
@@ -144,6 +152,7 @@ use zeusdb_vector_core::{
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerConfig};
 
+mod features;
 mod framed;
 mod legacy;
 
@@ -161,11 +170,15 @@ const LOG_TARGET: &str = "zeusdb_vector_database::persistence";
 /// A major, because the four binary artefacts are framed; see the module
 /// documentation. A sparse space, a journal and scalar quantization each
 /// moved the version an earlier release wrote, and none moves this one,
-/// since every release that reads 4.x reads all three.
+/// since a directory lists what it holds under `features`.
 const FORMAT_VERSION: &str = "4.0.0";
 
 /// The first major whose four binary artefacts are framed.
 const FRAMED_FORMAT_MAJOR: u32 = 4;
+
+/// The first major whose saves list their features. Below it no release
+/// listed them, and the version decides what a directory holds.
+const FEATURES_FORMAT_MAJOR: u32 = 4;
 
 /// The two artefacts of a trained scalar quantized index.
 const INT8_SCALES_FILENAME: &str = "int8_scales.zdbint8";
@@ -542,6 +555,19 @@ fn manifest_names(manifest: &IndexManifest, name: &str) -> bool {
 pub(crate) struct IndexManifest {
     pub(crate) format_version: String,
 
+    /// The features the directory holds, each with the mark a build that
+    /// does not know it reads: `compatible` where such a build may open the
+    /// directory without it, `incompatible` where it may not. See
+    /// `features`.
+    ///
+    /// Written by every save, in name order. Absent from a directory saved
+    /// before the record existed, which opens as it did and lists its
+    /// features at its next save. serde ignores a field it does not know, so
+    /// a build that predates the record opens a directory carrying it, and a
+    /// save there drops it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) features: Option<BTreeMap<String, String>>,
+
     /// What the directory is: its collection, its generation, its snapshot
     /// and the snapshot it was saved from. See `IdentityManifest`.
     ///
@@ -592,10 +618,11 @@ pub(crate) struct IndexManifest {
     /// held one.
     ///
     /// Absent from the file where none was held. Present, it names the
-    /// journal a load replays. A release reading 1.x and 2.x alone would
-    /// ignore it and open the checkpoint without the journal's mutations and
-    /// without a word, which the 3.x major stopped and the 4.x major still
-    /// stops; see the module documentation.
+    /// journal a load replays, and `features` lists `journal`. A release
+    /// reading 1.x and 2.x alone would ignore it and open the checkpoint
+    /// without the journal's mutations and without a word, which the 3.x
+    /// major stopped and the 4.x major still stops; see the module
+    /// documentation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) journal: Option<JournalManifest>,
 }
@@ -758,7 +785,9 @@ pub(crate) struct IndexConfig {
     /// directory's `config.json` is byte for byte what it was before the
     /// field existed. A release reading 1.x alone would ignore it and open
     /// the collection without its sparse space, which the 2.x major stopped
-    /// and the 4.x major still stops; see the module documentation.
+    /// and the 4.x major still stops; see the module documentation. Present,
+    /// `features` lists `sparse`, and `text` where the space declares a
+    /// tokenizer.
     /// A list rather than one record, so a further space is a further entry
     /// rather than a further field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -902,8 +931,11 @@ pub(crate) struct PQConfig {
 /// training state, and none of the product quantized fields.
 ///
 /// A reader that knows the product quantized layout alone refuses this file
-/// on its first missing field, which is what lets the format version move by
-/// a minor rather than a major; see the module documentation.
+/// on its first missing field, which is what let the format version move by
+/// a minor rather than a major before directories listed their features; see
+/// the module documentation. A directory that lists them names `int8`, so a
+/// build that does not know scalar quantization refuses it by that name
+/// before this file is read.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Int8Persistence {
     pub(crate) r#type: String,
@@ -2725,6 +2757,13 @@ fn load_from(
     let manifest = load_manifest(dir)?;
     let major = check_format_version(&manifest.format_version)?;
 
+    // The features the directory lists, before any artefact is read, so a
+    // directory holding one this build does not know is refused by its name
+    // rather than read without it. See `features`.
+    if let Some(record) = manifest.features.as_ref() {
+        features::read(record)?;
+    }
+
     // A manifest below the major that names a journal is a directory
     // assembled by hand, since no release writing that format wrote the
     // field. The same rule the sparse space's declaration takes below.
@@ -2815,6 +2854,27 @@ fn load_from(
                 );
             }
         }
+    }
+
+    // At 4.x the features a manifest lists are the ones the directory holds,
+    // held now that every part they name has been read and before anything
+    // is built from them. Below 4.x no release listed features, and the
+    // version decides what a directory holds.
+    if let Some(record) = manifest
+        .features
+        .as_ref()
+        .filter(|_| major >= FEATURES_FORMAT_MAJOR)
+    {
+        let quantizer = quantization.as_ref().map(|quant| &quant.config);
+        let held = features::Held {
+            identity: manifest.identity.is_some(),
+            int8: matches!(quantizer, Some(QuantizationFile::Int8(_))),
+            journal: manifest.journal.is_some(),
+            pq: matches!(quantizer, Some(QuantizationFile::Pq(_))),
+            sparse: !config.spaces.is_empty(),
+            text: config.spaces.iter().any(|space| space.tokenizer.is_some()),
+        };
+        features::check_held(record, held)?;
     }
 
     // The graph dump itself is read inside the reconstruction, which needs the
@@ -3496,8 +3556,23 @@ pub(crate) fn save_manifest(
             collection_id: crate::journal::id_hex(collection_id),
         });
 
+    // What the directory holds, each by the condition the part's own writer
+    // tests: the identity this function records, the journal record above,
+    // quantization.json in the layout its writer chooses, and the space
+    // config.json declares.
+    let space = index.sparse_named().map(|(_, space)| space);
+    let held = features::Held {
+        identity: true,
+        int8: index.has_quantization() && int8,
+        journal: journal.is_some(),
+        pq: index.has_quantization() && !int8,
+        sparse: space.is_some(),
+        text: space.is_some_and(|space| space.text.is_some()),
+    };
+
     let manifest = IndexManifest {
         format_version: FORMAT_VERSION.to_string(),
+        features: Some(held.record()),
         identity: Some(IdentityManifest::of(identity)),
         zeusdb_version: env!("CARGO_PKG_VERSION").to_string(),
         created_at: index.created_at(),

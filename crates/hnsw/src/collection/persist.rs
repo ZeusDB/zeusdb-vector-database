@@ -549,7 +549,8 @@ impl Collection {
     /// directory this build refuses to open. Then the sink is attached. Then
     /// the save runs as a checkpoint, which syncs a journal with no records,
     /// records sequence zero, writes a manifest naming the file at format
-    /// 4.0.0, and truncates a journal that is already empty.
+    /// 4.0.0 with `journal` among its features, and truncates a journal that
+    /// is already empty.
     ///
     /// # The collection it names
     ///

@@ -413,7 +413,7 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
 
     manifest = json.loads((save_dir / "manifest.json").read_text(encoding="utf-8"))
     assert sorted(manifest) == [
-        "compression_info", "created_at", "file_digests", "files_excluded",
+        "compression_info", "created_at", "features", "file_digests", "files_excluded",
         "files_included", "format_version", "has_quantization", "identity",
         "index_type", "quantization_trained", "saved_at", "storage_mode",
         "total_size_mb", "total_vectors", "zeusdb_version",
@@ -432,7 +432,10 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
 
     # The one version every save declares. The four binary artefacts are
     # framed, which a release reading 1.x to 3.x alone refuses at the version.
+    # What the directory holds is in its features, which for a raw dense index
+    # is its identity alone.
     assert manifest["format_version"] == "4.0.0"
+    assert manifest["features"] == {"identity": "compatible"}
     assert manifest["index_type"] == "HNSW"
     assert manifest["total_vectors"] == 3
     assert manifest["has_quantization"] is False

@@ -515,6 +515,18 @@ pub enum Error {
     FormatVersionJournal { format_version: String },
     /// The `identity` record in `manifest.json` names a value no save writes
     IdentityInvalid { detail: String },
+    /// `manifest.json` lists features this build does not know and does not
+    /// mark them compatible, in name order, with the features this build
+    /// knows as the message spells them
+    FeatureUnsupported {
+        features: Vec<String>,
+        known: &'static str,
+    },
+    /// The `features` record in `manifest.json` marks a feature this build
+    /// knows otherwise than this build does, or lists other features than the
+    /// directory holds, with the marks this build gives as the message spells
+    /// them
+    FeaturesInvalid { detail: String, marks: &'static str },
     /// Files the manifest names and the directory does not hold, in manifest
     /// order, with what the first of them holds
     ArtefactsMissing {
@@ -672,7 +684,9 @@ impl Error {
             | SpaceRecordInvalid { .. }
             | FormatVersionSpaces { .. }
             | FormatVersionJournal { .. }
-            | IdentityInvalid { .. } => Exception::Runtime,
+            | IdentityInvalid { .. }
+            | FeatureUnsupported { .. }
+            | FeaturesInvalid { .. } => Exception::Runtime,
 
             ArtefactReadFailed { .. }
             | ArtefactsMissing { .. }
@@ -731,6 +745,17 @@ impl Error {
             | JournalCommitFailed { .. }
             | NotJournaled => Exception::Runtime,
         }
+    }
+}
+
+/// Names quoted and joined as a sentence lists them, being `'a'`, `'a' and
+/// 'b'` or `'a', 'b' and 'c'`.
+fn quoted_list(names: &[String]) -> String {
+    let quoted: Vec<String> = names.iter().map(|name| format!("'{}'", name)).collect();
+    match quoted.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {}", rest.join(", "), last),
+        Some((last, _)) => last.clone(),
+        None => String::new(),
     }
 }
 
@@ -1511,6 +1536,31 @@ impl fmt::Display for Error {
                  the id of its snapshot and, where it has one, the id of the snapshot it was \
                  saved from, every id as 32 hexadecimal digits.",
                 detail
+            ),
+            FeatureUnsupported { features, known } => {
+                let (noun, pronoun) = if features.len() == 1 {
+                    ("feature", "it")
+                } else {
+                    ("features", "them")
+                };
+                write!(
+                    f,
+                    "The directory holds the {} {}, which this build does not know. Its \
+                     manifest does not mark {} compatible, so a build without {} cannot open \
+                     the directory. This build knows {}. The directory was written by a newer \
+                     release of zeusdb-vector-database, so upgrade the package to open it.",
+                    noun,
+                    quoted_list(features),
+                    pronoun,
+                    pronoun,
+                    known
+                )
+            }
+            FeaturesInvalid { detail, marks } => write!(
+                f,
+                "manifest.json lists features that do not describe the directory: {}. A saved \
+                 directory lists every feature it holds and no other, and this build marks {}.",
+                detail, marks
             ),
             TokenizerRequired { space } => write!(
                 f,
