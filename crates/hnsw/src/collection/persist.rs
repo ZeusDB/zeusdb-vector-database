@@ -8,7 +8,9 @@
 //! choose. `save` and `load` are the two doors, and the binding calls both
 //! with the interpreter lock released.
 
-use super::{Collection, DenseIndex, DenseOpen, QuantizationConfig, StorageMode, MAX_LAYER};
+use super::{
+    Collection, DenseIndex, DenseOpen, Identity, QuantizationConfig, StorageMode, MAX_LAYER,
+};
 use crate::journal::{Durability, JournalPolicy, Recovery};
 use crate::locks::ReadGuard;
 use crate::RerankCalibration;
@@ -273,6 +275,19 @@ impl Collection {
                 });
             }
         }
+        // The manifest names the collection twice where the sink names a
+        // journal, in its identity and in its journal record, and a load
+        // refuses a manifest whose two disagree. A sink naming another
+        // collection is refused here, before anything is written.
+        if let Some((file, journal_id)) = self.sink_journal_names() {
+            if journal_id != self.collection_id {
+                return Err(Error::JournalNotThisCollection {
+                    file,
+                    journal_id: crate::journal::id_hex(journal_id),
+                    directory_id: crate::journal::id_hex(self.collection_id),
+                });
+            }
+        }
         // Every record handed over is on the device before the directory
         // that will claim them is written.
         if let Some(reached) = self.sync_sink_locked()? {
@@ -313,6 +328,10 @@ impl Collection {
 
     /// The four phases, into the directory `storage` keeps.
     fn save_to(&self, storage: &dyn Storage) -> Result<(), Error> {
+        // What the directory will be, settled before anything is written, so
+        // a collection whose generation cannot move writes nothing.
+        let identity = self.next_identity()?;
+
         // Every artefact goes into a directory of its own that is moved into
         // place at the end, so a reader sees the previous index or this one and
         // never a mixture of the two, and a stale artefact from an earlier save
@@ -333,7 +352,7 @@ impl Collection {
         // for every artefact above and the directory size all of them add up
         // to.
         debug!(target: LOG_TARGET, operation = "save_phase3", "Writing the manifest");
-        crate::persistence::save_manifest(self, staging.dir(), ledger)?;
+        crate::persistence::save_manifest(self, staging.dir(), ledger, &identity)?;
         zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterManifest);
 
         // Phase 4: Two renames, or one where nothing is there yet.
@@ -341,8 +360,30 @@ impl Collection {
             "Moving the saved index into place"
         );
         staging.commit()?;
+        // The directory is in place, so it is the one this collection last
+        // committed. A save that failed before here left the lineage where
+        // it was, and the next one records the same generation again.
+        self.set_lineage(&identity);
         zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterCommit);
         Ok(())
+    }
+
+    /// What the next save records: this collection's id, one generation on
+    /// from the directory it last committed or read, a snapshot drawn now,
+    /// and that directory's snapshot as the parent.
+    ///
+    /// Refused only at the largest generation a manifest can hold, which no
+    /// collection reaches by saving and a directory reaches only by an edit.
+    fn next_identity(&self) -> Result<Identity, Error> {
+        let current = self.identity();
+        current.next(super::construct::draw_id()).ok_or_else(|| {
+            Error::Engine(format!(
+                "This collection was read from a directory recording generation {}, the \
+                 largest a manifest can hold, so no save can record the one after it. No \
+                 release writes that generation, so the directory's manifest was edited.",
+                current.generation
+            ))
+        })
     }
 
     /// Write the HNSW graph in ZeusDB's own format. See `graph::dump`.
@@ -508,7 +549,18 @@ impl Collection {
     /// directory this build refuses to open. Then the sink is attached. Then
     /// the save runs as a checkpoint, which syncs a journal with no records,
     /// records sequence zero, writes a manifest naming the file at format
-    /// 3.0.0, and truncates a journal that is already empty.
+    /// 4.0.0, and truncates a journal that is already empty.
+    ///
+    /// # The collection it names
+    ///
+    /// The journal's header carries this collection's id, and the checkpoint
+    /// records the same id in the manifest's identity and in its journal
+    /// record, so the three agree by construction; a load holds the journal
+    /// to the identity and refuses a manifest whose two ids disagree. The
+    /// checkpoint is a save like any other, so it records the next
+    /// generation, with the directory the collection last committed or read
+    /// as its parent. The journal's sequence restarts at one here and the
+    /// generation does not.
     ///
     /// A process killed between the file and the save leaves a journal with
     /// no directory, which nothing opens and the next call replaces.

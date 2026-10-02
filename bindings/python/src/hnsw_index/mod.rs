@@ -924,8 +924,10 @@ impl HNSWIndex {
     /// refused records may have reached the file and a replay would install
     /// them. See `checkpoint`.
     ///
-    /// A directory saved with a journal declares format version 3.0.0 and opens
-    /// on this release or later. `load` holds the journal open until the index
+    /// A directory saved with a journal declares format version 4.0.0 and opens
+    /// on this release or later. The checkpoint this writes is a save, so it
+    /// moves `identity`'s generation on by one, and the journal's header names
+    /// `identity`'s collection id. `load` holds the journal open until the index
     /// is dropped, and a file deleted or moved under a live index is one the
     /// directory can no longer replay, so drop the index before touching the
     /// file. A record whose journal entry would exceed 65 MiB is refused on a
@@ -987,6 +989,37 @@ impl HNSWIndex {
         self.inner
             .journal_status()
             .map(|status| status.path.display().to_string())
+    }
+
+    /// Python property: `index.identity`
+    ///
+    /// What this index is, as every directory it saves records it under
+    /// `identity` in `manifest.json`. A dict of four keys.
+    ///
+    /// - `collection_id`: the index's id, 32 hexadecimal digits, drawn when
+    ///   the index is created and kept through every save and load. The
+    ///   journal of a journaled index names the same id in its header.
+    /// - `generation`: the saves the index had committed when it wrote, or
+    ///   read, its last directory. 0 on an index never saved and never read
+    ///   from a directory recording one, and every save writes one more.
+    /// - `snapshot`: the id of the directory the index last saved or read,
+    ///   drawn at that save, or `None`.
+    /// - `parent`: the snapshot that directory was saved from, or `None`.
+    ///
+    /// Of two directories of one index the higher generation is the later
+    /// save, and a directory whose `parent` is another's `snapshot` was saved
+    /// from that one. Two directories naming one parent under two snapshots
+    /// were saved from one state twice. `clear()` keeps all four.
+    #[getter]
+    pub fn identity(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let identity = self.inner.identity();
+        let hex = |id: u128| format!("{:032x}", id);
+        let dict = PyDict::new(py);
+        dict.set_item("collection_id", hex(identity.collection_id))?;
+        dict.set_item("generation", identity.generation)?;
+        dict.set_item("snapshot", identity.snapshot.map(hex))?;
+        dict.set_item("parent", identity.parent.map(hex))?;
+        Ok(dict.into())
     }
 
     /// Python property: `index.dim`

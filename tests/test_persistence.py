@@ -414,9 +414,9 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
     manifest = json.loads((save_dir / "manifest.json").read_text(encoding="utf-8"))
     assert sorted(manifest) == [
         "compression_info", "created_at", "file_digests", "files_excluded",
-        "files_included", "format_version", "has_quantization", "index_type",
-        "quantization_trained", "saved_at", "storage_mode", "total_size_mb",
-        "total_vectors", "zeusdb_version",
+        "files_included", "format_version", "has_quantization", "identity",
+        "index_type", "quantization_trained", "saved_at", "storage_mode",
+        "total_size_mb", "total_vectors", "zeusdb_version",
     ]
 
     # Every artefact files_included names, with the length it was written at.

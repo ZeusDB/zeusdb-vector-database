@@ -51,9 +51,9 @@ mod rerank;
 
 pub use collection::{
     Added, AdmitShape, Arm, ArmPlan, Collection, Declaration, DenseConfig, FieldRef, HitRef,
-    Int8Scale, JournalStatus, Listing, OperationSink, Page, ParsedRecord, ParsedRecords, Plan,
-    QuantizationConfig, QuantizationReport, QuantizationScheme, QuantizerReport, Query, QueryHit,
-    QueryHits, RebuildPlan, RecordView, SpaceConfig, SparseHalf, SparseHits, StorageMode,
+    Identity, Int8Scale, JournalStatus, Listing, OperationSink, Page, ParsedRecord, ParsedRecords,
+    Plan, QuantizationConfig, QuantizationReport, QuantizationScheme, QuantizerReport, Query,
+    QueryHit, QueryHits, RebuildPlan, RecordView, SpaceConfig, SparseHalf, SparseHits, StorageMode,
     TextConfig, DEFAULT_FETCH_PER_K, DEFAULT_SPACE, MAX_ARMS,
 };
 #[cfg(test)]

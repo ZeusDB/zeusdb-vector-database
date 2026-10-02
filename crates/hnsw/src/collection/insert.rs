@@ -2044,6 +2044,14 @@ impl Collection {
     /// because nothing is left for a reissued id to collide with and
     /// restarting keeps the internal ids in step with the fresh graph's node
     /// indices. The generated id counter does not; see the field.
+    ///
+    /// **Identity is kept whole.** The collection id, the generation and
+    /// the snapshot it was last saved as or read from are the collection's,
+    /// and a clear is a mutation of the collection rather than a new one: a
+    /// journaled collection records it in the journal whose header names
+    /// that id, so the next checkpoint must name it too. The next save is
+    /// the next generation, so a directory saved before the clear reads as
+    /// the earlier one.
     pub fn clear(&self) -> Result<usize, Error> {
         let _writers = self.writers.lock().unwrap();
         let replacement = self.replacement_for_clear()?;

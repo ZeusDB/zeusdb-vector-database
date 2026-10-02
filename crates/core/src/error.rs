@@ -513,6 +513,8 @@ pub enum Error {
     /// A manifest below 3.x that names a journal, which no release writing
     /// that format could have produced
     FormatVersionJournal { format_version: String },
+    /// The `identity` record in `manifest.json` names a value no save writes
+    IdentityInvalid { detail: String },
     /// Files the manifest names and the directory does not hold, in manifest
     /// order, with what the first of them holds
     ArtefactsMissing {
@@ -669,7 +671,8 @@ impl Error {
             | TermIdBeyondDictionary { .. }
             | SpaceRecordInvalid { .. }
             | FormatVersionSpaces { .. }
-            | FormatVersionJournal { .. } => Exception::Runtime,
+            | FormatVersionJournal { .. }
+            | IdentityInvalid { .. } => Exception::Runtime,
 
             ArtefactReadFailed { .. }
             | ArtefactsMissing { .. }
@@ -1500,6 +1503,14 @@ impl fmt::Display for Error {
                  release writing that format holds. A directory saved with a journal \
                  declares format_version 3.0.0 or later.",
                 format_version
+            ),
+            IdentityInvalid { detail } => write!(
+                f,
+                "manifest.json records an identity this build cannot read: {}. A saved \
+                 directory records the id of its collection, its generation counting from 1, \
+                 the id of its snapshot and, where it has one, the id of the snapshot it was \
+                 saved from, every id as 32 hexadecimal digits.",
+                detail
             ),
             TokenizerRequired { space } => write!(
                 f,

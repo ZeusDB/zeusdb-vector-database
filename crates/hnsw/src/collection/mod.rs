@@ -78,6 +78,8 @@ mod crash_tests;
 mod dense;
 #[cfg(test)]
 mod durability_tests;
+#[cfg(test)]
+mod identity_tests;
 mod input;
 mod insert;
 #[cfg(test)]
@@ -352,6 +354,72 @@ impl JournalStatus {
         self.sequence_reached
             .saturating_sub(self.checkpoint_sequence)
     }
+}
+
+/// What a collection is, as every directory it saves records it and as a
+/// caller reads it back.
+///
+/// `collection_id` names the collection for its life. It is drawn when the
+/// collection is built, every save records it and a load takes it back, so
+/// a collection and every directory it writes carry one id, and the journal
+/// beside a journaled directory carries it in its header.
+///
+/// `generation` counts the saves the collection has committed. A new
+/// collection is at 0, its first save writes 1, and every save writes one
+/// more than the generation of the directory the collection last committed
+/// or read, so of two directories of one collection the higher generation
+/// is the later save. It is not the journal's sequence, which counts
+/// records, restarts when `journal_to` opens a journal, and does not move
+/// between two checkpoints with nothing between them.
+///
+/// `snapshot` names the directory the collection last committed or read.
+/// Every save draws a new one, so two saves are two snapshots even of the
+/// same records, and a copy of a directory carries the snapshot of the
+/// directory it was copied from.
+///
+/// `parent` names the snapshot that directory was saved from. A copy left
+/// behind by a later save is therefore the parent the later directory
+/// names, and two directories naming one parent under two snapshots are two
+/// saves from one state.
+///
+/// `snapshot` is absent on a collection that has neither been saved nor
+/// read from a directory that records one. `parent` is absent on a
+/// collection's first save and on the first save after reading a directory
+/// that records no identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Identity {
+    /// The collection, for its life.
+    pub collection_id: u128,
+    /// The saves the collection had committed when it wrote, or read, the
+    /// directory `snapshot` names.
+    pub generation: u64,
+    /// The directory the collection last committed or read.
+    pub snapshot: Option<u128>,
+    /// The snapshot that directory was saved from.
+    pub parent: Option<u128>,
+}
+
+impl Identity {
+    /// The identity the next save of a collection at this one records,
+    /// under the snapshot `drawn`. `None` where the generation is the
+    /// largest one a manifest can hold.
+    pub(crate) fn next(&self, drawn: u128) -> Option<Identity> {
+        Some(Identity {
+            collection_id: self.collection_id,
+            generation: self.generation.checked_add(1)?,
+            snapshot: Some(drawn),
+            parent: self.snapshot,
+        })
+    }
+}
+
+/// The part of [`Identity`] a save moves, behind one guard; see the field
+/// on [`Collection`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Lineage {
+    generation: u64,
+    snapshot: Option<u128>,
+    parent: Option<u128>,
 }
 
 /// Layers every graph this crate builds is created with.
@@ -937,7 +1005,8 @@ pub(crate) struct TextLayer {
 /// `sink` is the last leaf, below every rank above. A mutation takes it with
 /// `writers` held and nothing else, and an interning takes it with the
 /// dictionary's write guard held, so anything may be held while it is taken
-/// and nothing is taken under it.
+/// and nothing is taken under it. `journal_sequence` and `lineage` rank
+/// below it, and each is taken alone.
 ///
 /// Taking the same guard twice on one thread is forbidden even for reads.
 /// The standard library queues readers behind a waiting writer, so a second
@@ -1064,15 +1133,16 @@ pub struct Collection {
     sink: MutexAt<SinkSlot>,
 
     /// The collection this is, drawn once when it is built and carried for
-    /// its life.
+    /// its life; see [`Identity`].
     ///
-    /// It exists to pair a directory with the journal beside it. A save of a
-    /// journaled collection records this in `manifest.json` and the journal's
-    /// own header carries it too, so a journal from another index is refused
-    /// by content rather than by name. A load takes it from the manifest
-    /// where one is recorded and draws a fresh one where none is, so it is
-    /// stable across a save and a load of a journaled directory and is not
-    /// carried by a directory that has never held a journal.
+    /// Every save records it in `manifest.json`, and a journaled
+    /// collection's journal carries it in its own header too, so a journal
+    /// from another index is refused by content rather than by name. A load
+    /// takes it from the manifest's identity where the manifest records one
+    /// and from its journal record where only that does, and keeps the one
+    /// drawn at assembly where neither does, which is a directory saved
+    /// before the identity was recorded. The next save records that one, so
+    /// such a directory is named from its next save on.
     ///
     /// Not a lock. It is drawn once when the collection is built and
     /// replaced once, through an exclusive borrow, by a load that reads one
@@ -1087,6 +1157,15 @@ pub struct Collection {
     /// records it, so a recovery replays every record above it and skips
     /// every record at or below it.
     journal_sequence: MutexAt<u64>,
+
+    /// The generation, snapshot and parent of the directory this collection
+    /// last committed or read; see [`Identity`].
+    ///
+    /// Written by a save once its directory is committed, so a save that
+    /// fails leaves it where it was, and by a load from the manifest it
+    /// read. Read by the save that writes the next manifest, under
+    /// `writers`, and by [`Collection::identity`].
+    lineage: MutexAt<Lineage>,
 
     // ID-based training collection
     training_ids: RwLockAt<Vec<String>>, // Just IDs, not vectors
@@ -1272,16 +1351,41 @@ impl Collection {
         slot.attached.replace(sink)
     }
 
-    /// The id that pairs this collection with the journal beside its
-    /// directory. See the field.
+    /// The collection's id, which every directory it saves records and the
+    /// journal beside a journaled one carries. See the field.
     pub fn collection_id(&self) -> u128 {
         self.collection_id
     }
 
     /// Take the id a directory's manifest recorded, so a collection loaded
-    /// from a journaled directory is the collection its journal names.
+    /// from a directory is the collection the directory names.
     pub(crate) fn set_collection_id(&mut self, id: u128) {
         self.collection_id = id;
+    }
+
+    /// What this collection is: its id, and the generation, snapshot and
+    /// parent of the directory it last committed or read. See [`Identity`].
+    pub fn identity(&self) -> Identity {
+        let lineage = *self.lineage.lock().unwrap();
+        Identity {
+            collection_id: self.collection_id,
+            generation: lineage.generation,
+            snapshot: lineage.snapshot,
+            parent: lineage.parent,
+        }
+    }
+
+    /// Record `identity` as the directory this collection last committed or
+    /// read, which a save does once its directory is committed and a load
+    /// does from the manifest it read. The id is the field's and is set
+    /// apart from this.
+    pub(crate) fn set_lineage(&self, identity: &Identity) {
+        debug_assert_eq!(identity.collection_id, self.collection_id);
+        *self.lineage.lock().unwrap() = Lineage {
+            generation: identity.generation,
+            snapshot: identity.snapshot,
+            parent: identity.parent,
+        };
     }
 
     /// The sequence the checkpoint in the collection's directory holds.
