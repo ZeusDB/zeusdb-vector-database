@@ -441,9 +441,9 @@ pub enum Error {
     // ------------------------------------------------------------------
     // The saved directory
     // ------------------------------------------------------------------
-    /// A container in a bincode artefact declares more than the file holds
+    /// A container in an artefact declares more than the file holds
     DecodeLengthExceeded { file: String, bytes: usize },
-    /// A bincode artefact did not decode
+    /// A binary artefact did not decode
     DecodeFailed { file: String, error: String },
     /// The save target has no final path component
     TargetHasNoName { target: PathBuf },

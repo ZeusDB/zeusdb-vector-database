@@ -78,7 +78,6 @@ rand_chacha = "0.10"
 # run time component, so it adds nothing to the wheel beyond the code it
 # generates.
 wide = "1"
-bincode = "2.0.1"
 chrono = { version = "0.4.41", features = ["serde"] } # <-- For timestamps
 # Modern structured logging
 tracing = "0.1"

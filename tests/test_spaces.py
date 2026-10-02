@@ -1123,7 +1123,7 @@ def test_a_dense_only_directory_stays_what_it_was(tmp_path):
     path = tmp_path / "dense.zdb"
     index.save(str(path))
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["format_version"] == "1.1.0"
+    assert manifest["format_version"] == "4.0.0"
     assert not (path / "spaces").exists()
     assert "spaces" not in json.loads((path / "config.json").read_text(encoding="utf-8"))
     loaded = VectorDatabase().load(str(path))
@@ -1140,7 +1140,7 @@ def test_a_dense_and_sparse_directory_round_trips(tmp_path):
     path = tmp_path / "both.zdb"
     index.save(str(path))
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["format_version"] == "2.0.0"
+    assert manifest["format_version"] == "4.0.0"
     assert "spaces/terms/postings.zdbsparse" in manifest["files_included"]
     assert "checksum" not in manifest["file_digests"]["spaces/terms/postings.zdbsparse"]
     assert (path / "spaces" / "terms" / "postings.zdbsparse").exists()
@@ -1176,7 +1176,7 @@ def test_a_text_directory_round_trips_with_its_dictionary(tmp_path):
     path = tmp_path / "text.zdb"
     index.save(str(path))
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["format_version"] == "2.0.0"
+    assert manifest["format_version"] == "4.0.0"
     assert "spaces/text/terms.zdbdict" in manifest["files_included"]
     config = json.loads((path / "config.json").read_text(encoding="utf-8"))
     assert config["spaces"][0]["tokenizer"] == "simple"
@@ -1380,7 +1380,7 @@ def test_clear_compact_and_removal_keep_the_sparse_space_correct(tmp_path):
     cleared = tmp_path / "cleared.zdb"
     index.save(str(cleared))
     manifest = json.loads((cleared / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["format_version"] == "2.0.0"
+    assert manifest["format_version"] == "4.0.0"
     loaded = VectorDatabase().load(str(cleared))
     assert len(loaded) == 0
     loaded.add({"id": "fresh", "vector": vec(1), "text": "fresh start"})

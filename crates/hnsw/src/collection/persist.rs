@@ -91,23 +91,28 @@ impl Collection {
         with_raw + code_only + with_row
     }
 
-    /// Every raw vector the index holds, keyed by external id.
+    /// Hand every raw vector the index holds to `write`, with its internal
+    /// id, in increasing internal id, and the record count beside them.
     ///
-    /// Built rather than held, because there is no map of raw vectors any more.
-    /// The one caller is the save of an index that holds a raw vector for
-    /// every record, which is every raw index and a `quantized_with_raw` one;
-    /// see `holds_raw_vectors` for why a raw index writes the file beside the
-    /// dump that already carries its store.
-    pub(crate) fn collect_raw_vectors(&self) -> HashMap<String, Vec<f32>> {
+    /// The id store's guard and the index's are held for the call and in that
+    /// order, so `write` sees one instant of both. The one caller is the save
+    /// of an index that holds a raw vector for every record, which is every
+    /// raw index and a `quantized_with_raw` one; see `holds_raw_vectors` for
+    /// why a raw index writes the file beside the dump that already carries
+    /// its store.
+    pub(crate) fn with_raw_vectors<R>(
+        &self,
+        write: impl FnOnce(&mut dyn Iterator<Item = (usize, &[f32])>, usize) -> R,
+    ) -> R {
         let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
-        let mut out = HashMap::with_capacity(ids.len());
-        for (internal_id, ext_id) in ids.iter() {
-            if let Some(vector) = index.graph().raw_vector(internal_id) {
-                out.insert(ext_id.to_string(), vector.to_vec());
-            }
-        }
-        out
+        let graph = index.graph();
+        let mut records = ids.slots().filter_map(|internal_id| {
+            graph
+                .raw_vector(internal_id)
+                .map(|vector| (internal_id, vector))
+        });
+        write(&mut records, ids.len())
     }
 
     /// Whether this index should hold a raw store beside its codes.
@@ -215,7 +220,7 @@ impl Collection {
     /// Four phases under one hold of the mutation lock: the artefacts, the
     /// graph dump, the manifest, and the move into place. The binding calls
     /// this with the interpreter lock released, and every phase speaks only
-    /// to `serde_json`, `bincode`, `graph::dump` and the storage the
+    /// to `serde_json`, the engine's frame, `graph::dump` and the storage the
     /// directory is kept in, which is `zeusdb_vector_core::FsStorage`.
     pub fn save(&self, path: &str) -> Result<(), Error> {
         // A save reads the mappings, the metadata, the codes, the vectors and
@@ -820,79 +825,18 @@ impl Collection {
         self.dense().index.read().unwrap().set_saturated(values);
     }
 
-    /// Build the id store from the two maps `mappings.bin` holds (for
-    /// persistence loading only).
+    /// Install the id store `mappings.bin` built (for persistence loading
+    /// only).
     ///
-    /// The forward map is what the store is built from, and the reverse map
-    /// is held to being its exact inverse, since the two were written from
-    /// one structure and a file whose two halves disagree describes two
-    /// record sets. The two maps used to be installed as they were read, so
-    /// such a file loaded and its two halves answered differently.
-    ///
-    /// Every internal id the forward map names is held to `id_counter`, the
-    /// last id `config.json` says the index issued, before the store is
-    /// reserved. The store, the metadata, the columns and a sparse space all
-    /// hold an entry for every id up to the highest a record holds, so a file
-    /// naming one record at a high id would have the loader reserve and fill
-    /// an entry for every id below it. A save holds the mutation guard for
-    /// its whole run, so every id the file names was issued by the counter it
-    /// records. The graph dump's origin ids are held to the same counter; see
-    /// `Expected::max_origin_id`.
-    pub(crate) fn set_id_mappings(
-        &mut self,
-        id_map: HashMap<String, usize>,
-        rev_map: HashMap<usize, String>,
-        id_counter: usize,
-    ) -> Result<(), Error> {
-        let invalid = |detail: String| Error::ArtefactParseFailed {
-            name: "mappings.bin",
-            error: detail,
-        };
-        let top = id_map
-            .iter()
-            .max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)));
-        if let Some((id, &internal_id)) = top {
-            if internal_id > id_counter {
-                return Err(invalid(format!(
-                    "the forward map names internal id {} for '{}' and config.json counted {}",
-                    internal_id, id, id_counter
-                )));
-            }
-        }
-        let highest = top.map_or(0, |(_, &internal_id)| internal_id);
-        let mut store = IdStore::new(self.expected_size());
-        store.reserve(id_map.len(), highest);
-        for (id, &internal_id) in &id_map {
-            store.insert(internal_id, id)?;
-        }
-        if store.len() != id_map.len() {
-            return Err(invalid(format!(
-                "the forward map names {} records under {} internal ids",
-                id_map.len(),
-                store.len()
-            )));
-        }
-        if rev_map.len() != id_map.len() {
-            return Err(invalid(format!(
-                "the forward map holds {} records and the reverse map {}",
-                id_map.len(),
-                rev_map.len()
-            )));
-        }
-        if let Some((internal_id, id)) = rev_map
-            .iter()
-            .find(|(&internal_id, id)| store.name(internal_id) != Some(id.as_str()))
-        {
-            return Err(invalid(format!(
-                "the reverse map names internal id {} as '{}' and the forward map does not",
-                internal_id, id
-            )));
-        }
+    /// The loader builds it, holds it to the counter `config.json` records
+    /// and, for a directory written before format 4.0.0, holds the reverse map
+    /// to being the forward map's exact inverse, before the collection exists;
+    /// see `persistence::load_ids`. It is taken whole.
+    pub(crate) fn set_id_store(&mut self, store: IdStore) {
         *self.ids.write().unwrap() = store;
         // The dense index's live set is the mappings' key set, so a rebuild
         // that replays every record removes ids the index holds.
         self.sync_dense_live();
-        Ok(())
     }
 
     /// Set counters (for persistence loading only)

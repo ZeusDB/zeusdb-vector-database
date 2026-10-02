@@ -316,7 +316,7 @@ def test_every_mutation_keeps_the_scales():
 # The directory
 # ------------------------------------------------------------------
 
-def test_a_scalar_directory_carries_its_artefacts_at_the_scalar_minor(tmp_path):
+def test_a_scalar_directory_carries_its_two_artefacts(tmp_path):
     index, data = _trained("cosine")
     path = tmp_path / "scalar.zdb"
     index.save(str(path))
@@ -324,7 +324,7 @@ def test_a_scalar_directory_carries_its_artefacts_at_the_scalar_minor(tmp_path):
     assert names == ["config.json", "hnsw_index.zdbgraph", "int8_rows.zdbint8", "int8_scales.zdbint8",
                      "manifest.json", "mappings.bin", "metadata.json", "quantization.json"]
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["format_version"] == "1.2.0"
+    assert manifest["format_version"] == "4.0.0"
     assert manifest["quantization_trained"] is True
     assert "int8_scales.zdbint8" in manifest["files_included"]
     assert "int8_rows.zdbint8" in manifest["files_included"]
@@ -373,7 +373,7 @@ def test_a_collecting_scalar_directory_trains_after_it_is_loaded(tmp_path):
     path = tmp_path / "collecting.zdb"
     index.save(str(path))
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["format_version"] == "1.2.0"
+    assert manifest["format_version"] == "4.0.0"
     assert "vectors.bin" in manifest["files_included"]
     assert "int8_scales.zdbint8" not in manifest["files_included"]
     loaded = VectorDatabase().load(str(path))
@@ -410,7 +410,7 @@ def _relabel(path, version):
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
-def test_the_scalar_minor_sits_on_each_major(tmp_path):
+def test_a_scalar_directory_declares_the_one_version(tmp_path):
     vdb = VectorDatabase()
     data = _vectors()
     with warnings.catch_warnings():
@@ -420,22 +420,23 @@ def test_the_scalar_minor_sits_on_each_major(tmp_path):
     spaced.add({"ids": [f"r{i}" for i in range(N)], "vectors": data})
     spaced.save(str(tmp_path / "spaced.zdb"))
     manifest = json.loads((tmp_path / "spaced.zdb" / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["format_version"] == "2.1.0"
+    assert manifest["format_version"] == "4.0.0"
     assert vdb.load(str(tmp_path / "spaced.zdb")).is_quantized()
 
     journaled, _ = _trained("l2")
     journaled.journal_to(str(tmp_path / "journaled.zdb"))
     manifest = json.loads((tmp_path / "journaled.zdb" / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["format_version"] == "3.1.0"
+    assert manifest["format_version"] == "4.0.0"
 
-    # This build reads any 1.x, so the older minor over a scalar directory
-    # opens here; the older reader's refusal is held outside the suite.
+    # This build reads any 1.x and reads a frame wherever it finds one, so an
+    # earlier label over a scalar directory opens here; the older reader's
+    # refusal is held outside the suite.
     plain, _ = _trained("l2")
     plain.save(str(tmp_path / "plain.zdb"))
     _relabel(tmp_path / "plain.zdb", "1.1.0")
     assert vdb.load(str(tmp_path / "plain.zdb")).is_quantized()
-    _relabel(tmp_path / "plain.zdb", "4.0.0")
-    with pytest.raises(RuntimeError, match="format version 4.0.0 cannot be opened"):
+    _relabel(tmp_path / "plain.zdb", "5.0.0")
+    with pytest.raises(RuntimeError, match="format version 5.0.0 cannot be opened"):
         vdb.load(str(tmp_path / "plain.zdb"))
 
 
@@ -506,7 +507,7 @@ def test_the_journal_replays_a_scalar_training(tmp_path):
     assert [[(h["id"], h["score"]) for h in recovered.search(data[i], top_k=5)]
             for i in range(0, N, 130)] == pages
     manifest = json.loads((tmp_path / "journal.zdb" / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["format_version"] == "3.1.0"
+    assert manifest["format_version"] == "4.0.0"
 
 
 def test_a_scalar_index_loads_in_the_hostile_test_layout(tmp_path):

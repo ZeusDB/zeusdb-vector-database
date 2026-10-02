@@ -8,7 +8,7 @@ import warnings
 
 import numpy as np
 import pytest
-from helpers import artefact_digest, repair_manifest
+from helpers import artefact_digest, as_old_wire, frame, reframe, repair_manifest, unframe
 from zeusdb_vector_database import VectorDatabase
 
 # ------------------------------------------------------------
@@ -111,18 +111,15 @@ QO_COUNT = 1010
 
 
 def _zero_codebook_bytes(subvectors, centroids, sub_dim):
-    """Encode an all-zero codebook the way bincode's standard config does.
+    """An all-zero codebook inside its frame, as save_pq_centroids writes one.
 
-    Varint lengths followed by little endian f32 payloads, which is the layout
-    save_pq_centroids writes for a Vec<Vec<Vec<f32>>>. Building the file rather
-    than blanking the real one keeps the length prefixes intact, so the loader
-    sees a well formed codebook whose only problem is its content.
+    The subvectors as the frame's entry count, the centroid count and width,
+    then every value. Building the file rather than blanking the real one keeps
+    the frame and its shape intact, so the loader sees a well formed codebook
+    whose only problem is its content.
     """
-    def varint(n):
-        return bytes([n]) if n < 251 else bytes([251]) + n.to_bytes(2, "little")
-
-    centroid = varint(sub_dim) + b"\x00" * (4 * sub_dim)
-    return varint(subvectors) + (varint(centroids) + centroid * centroids) * subvectors
+    payload = struct.pack("<2I", centroids, sub_dim) + b"\x00" * (4 * subvectors * centroids * sub_dim)
+    return frame(4, subvectors, payload)
 
 
 @pytest.fixture(scope="module")
@@ -423,20 +420,19 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
     ]
 
     # Every artefact files_included names, with the length it was written at.
-    # The graph dump carries a length alone, because it holds a checksum over
-    # its own header and another over its own payload and the loader verifies
-    # both, so a manifest digest for it would mean reading the largest file in
-    # the directory back for a guarantee it already gives.
+    # The graph dump and the framed artefacts carry a length alone, because
+    # each holds a checksum over its own header and another over its own
+    # payload and the loader verifies both, so a manifest digest for them
+    # would mean reading the largest files in the directory back for a
+    # guarantee they already give.
     assert sorted(manifest["file_digests"]) == sorted(manifest["files_included"])
     for name, entry in manifest["file_digests"].items():
         assert entry["bytes"] == os.path.getsize(save_dir / name), name
-        assert ("checksum" in entry) is (name != "hnsw_index.zdbgraph"), name
+        assert ("checksum" in entry) is name.endswith(".json"), name
 
-    # 1.1.0 rather than 1.0.0 because config.json gained the index level
-    # metadata field. A directory holding a dense space alone stays at 1.x,
-    # so it opens on every release that reads 1.x; only a directory holding
-    # a sparse space declares 2.0.0. The loader reads both majors.
-    assert manifest["format_version"] == "1.1.0"
+    # The one version every save declares. The four binary artefacts are
+    # framed, which a release reading 1.x to 3.x alone refuses at the version.
+    assert manifest["format_version"] == "4.0.0"
     assert manifest["index_type"] == "HNSW"
     assert manifest["total_vectors"] == 3
     assert manifest["has_quantization"] is False
@@ -822,9 +818,11 @@ def test_persistence_rejects_unusable_codebook(tmp_path, quantized_only_saved):
     zeroed = tmp_path / "zero_codebook.zdb"
     shutil.copytree(quantized_only_saved["path"], zeroed)
     zero_bytes = _zero_codebook_bytes(subvectors=4, centroids=256, sub_dim=2)
-    # Same length as the real codebook, which is the check that the encoding
-    # above matches what save_pq_centroids writes.
-    assert len(zero_bytes) == len((zeroed / "pq_centroids.bin").read_bytes())
+    # The same length and shape as the real codebook, which is the check that
+    # the frame above matches what save_pq_centroids writes.
+    real = (zeroed / "pq_centroids.bin").read_bytes()
+    assert len(zero_bytes) == len(real)
+    assert zero_bytes[:64] == real[:64]
     (zeroed / "pq_centroids.bin").write_bytes(zero_bytes)
     repair_manifest(zeroed, "pq_centroids.bin")
     with pytest.raises(RuntimeError, match=r"all-zero codebook"):
@@ -847,17 +845,19 @@ def test_persistence_rejects_unusable_codebook(tmp_path, quantized_only_saved):
 def test_persistence_reads_previous_format(tmp_path, quantized_only_saved):
     """Format 1.0.0, written by 0.3.0 through 0.4.1, still opens.
 
-    The fixture is built by saving with this build and then reversing two of
-    the save side changes since, being the index level metadata field in
-    config.json and the format version in manifest.json. The third difference
-    is that those releases also wrote the training records to vectors.bin for
-    a trained quantized_only index; that file's handling is covered by
+    The fixture is built by saving with this build and then reversing three of
+    the save side changes since, being the four binary artefacts in bincode's
+    wire rather than the frame, the index level metadata field in config.json,
+    and the format version in manifest.json. The fourth difference is that
+    those releases also wrote the training records to vectors.bin for a
+    trained quantized_only index; that file's handling is covered by
     test_persistence_drops_raw_vectors_from_an_old_quantized_only_directory,
     which loads a directory that carries one.
     """
     vdb = VectorDatabase()
     legacy = tmp_path / "legacy.zdb"
     shutil.copytree(quantized_only_saved["path"], legacy)
+    as_old_wire(legacy, "1.0.0")
 
     config = json.loads((legacy / "config.json").read_text(encoding="utf-8"))
     had_metadata = config.pop("metadata")
@@ -885,11 +885,14 @@ def test_persistence_reads_previous_format(tmp_path, quantized_only_saved):
     # because it was never written. An empty map is the honest answer.
     assert loaded.get_all_metadata() == {}
 
-    # Saving it again upgrades the directory in place.
+    # Saving it again upgrades the directory, its four binary artefacts framed
+    # and every one of them what a save of the original index wrote.
     upgraded = tmp_path / "upgraded.zdb"
     loaded.save(str(upgraded))
     assert json.loads((upgraded / "manifest.json").read_text(
-        encoding="utf-8"))["format_version"] == "1.1.0"
+        encoding="utf-8"))["format_version"] == "4.0.0"
+    for name in ("mappings.bin", "pq_codes.bin", "pq_centroids.bin"):
+        assert (upgraded / name).read_bytes() == (quantized_only_saved["path"] / name).read_bytes(), name
     assert "metadata" in json.loads((upgraded / "config.json").read_text(encoding="utf-8"))
     assert vdb.load(str(upgraded)).get_vector_count() == QO_COUNT
 
@@ -982,9 +985,9 @@ def test_persistence_drops_raw_vectors_from_an_old_quantized_only_directory(tmp_
 def test_persistence_format_version_gate(tmp_path):
     """A later minor is read, a major this build does not know is refused.
 
-    Minor bumps are additive by construction, so any 1.x, any 2.x and any 3.x
-    is accepted. A different major means the layout changed in a way this
-    build cannot reason about, and guessing at it is how a format loses data
+    Minor bumps are additive by construction, so any 1.x, 2.x, 3.x and 4.x is
+    accepted. A different major means the layout changed in a way this build
+    cannot reason about, and guessing at it is how a format loses data
     quietly.
     """
     vdb = VectorDatabase()
@@ -1004,17 +1007,19 @@ def test_persistence_format_version_gate(tmp_path):
     assert vdb.load(str(with_version("1.0.0", "v100.zdb"))).get_vector_count() == 1
     assert vdb.load(str(with_version("1.9.3", "v193.zdb"))).get_vector_count() == 1
 
-    # A 2.x label on a dense-only directory is read as well: 2.0.0 is what a
-    # directory holding a sparse space declares. A 3.x label is read too:
-    # 3.0.0 is what a directory saved beside a journal declares. A fourth
-    # major is what the loader refuses.
+    # A 2.x and a 3.x label are read as well, being what a release before
+    # 4.0.0 wrote for a sparse space and for a journal, and the frames under
+    # them are read since a frame is read wherever it is found. A fifth major
+    # is what the loader refuses.
     assert vdb.load(str(with_version("2.0.0", "v200.zdb"))).get_vector_count() == 1
     assert vdb.load(str(with_version("2.4.1", "v241.zdb"))).get_vector_count() == 1
     assert vdb.load(str(with_version("3.0.0", "v300.zdb"))).get_vector_count() == 1
     assert vdb.load(str(with_version("3.2.5", "v325.zdb"))).get_vector_count() == 1
+    assert vdb.load(str(with_version("4.0.0", "v400.zdb"))).get_vector_count() == 1
+    assert vdb.load(str(with_version("4.7.1", "v471.zdb"))).get_vector_count() == 1
 
-    with pytest.raises(RuntimeError, match=r"format version 4.0.0 cannot be opened"):
-        vdb.load(str(with_version("4.0.0", "v400.zdb")))
+    with pytest.raises(RuntimeError, match=r"format version 5.0.0 cannot be opened"):
+        vdb.load(str(with_version("5.0.0", "v500.zdb")))
 
     with pytest.raises(RuntimeError, match=r"not a version this build can interpret"):
         vdb.load(str(with_version("banana", "vbanana.zdb")))
@@ -1193,9 +1198,9 @@ def test_load_refuses_a_saved_index_holding_a_non_finite_value(tmp_path):
     rebuild does not run. vectors.bin is checked as it is read, so the refusal
     holds whichever graph path the directory takes.
 
-    The directory is poisoned by patching the float in vectors.bin, because
-    add() no longer accepts one, which is the point of the other half of this
-    change.
+    The directory is poisoned by patching the float in vectors.bin and
+    framing the payload again, because add() no longer accepts one, which is
+    the point of the other half of this change.
     """
     marker_value = 123456.75  # exactly representable in f32 and unique here
     vdb = VectorDatabase()
@@ -1207,10 +1212,10 @@ def test_load_refuses_a_saved_index_holding_a_non_finite_value(tmp_path):
     index.save(str(save_dir))
 
     vectors_bin = save_dir / "vectors.bin"
-    blob = vectors_bin.read_bytes()
+    _, _, payload = unframe(vectors_bin.read_bytes())
     marker = struct.pack("<f", marker_value)
-    assert blob.count(marker) == 1
-    vectors_bin.write_bytes(blob.replace(marker, struct.pack("<f", float("nan"))))
+    assert payload.count(marker) == 1
+    reframe(vectors_bin, payload.replace(marker, struct.pack("<f", float("nan"))))
     repair_manifest(save_dir, "vectors.bin")
 
     with pytest.raises(RuntimeError, match="holds a NaN or an infinity"):
@@ -1589,9 +1594,8 @@ def test_save_after_load_rewrites_the_same_graph(quantized_reload, tmp_path):
     second = VectorDatabase().load(str(again))
     assert _pages(second, fixture["queries"]) == fixture["pages_before"]
 
-    # The graph dump itself is reproduced byte for byte, which the JSON and the
-    # bincode maps around it cannot be, since they carry a save timestamp and a
-    # hash map's iteration order.
+    # The graph dump itself is reproduced byte for byte, which manifest.json
+    # cannot be, since it carries a save timestamp.
     for name in names:
         assert (again / name).read_bytes() == (fixture["path"] / name).read_bytes()
 
@@ -2693,8 +2697,10 @@ def test_an_index_moved_aside_by_a_killed_save_is_put_back_by_a_load(tmp_path):
 
 
 @pytest.mark.parametrize("quantized", [False, True])
-def test_every_artefact_carries_a_length_and_a_digest(tmp_path, quantized):
-    """The manifest records both, and both agree with the file on disk."""
+def test_every_artefact_carries_a_length_and_every_json_one_a_digest(tmp_path, quantized):
+    """The manifest records a length for each and a digest for each JSON one,
+    and both agree with the file on disk. A framed artefact and the graph dump
+    verify their own bytes."""
     path, _, _ = _saved(tmp_path, "digested.zdb", quantized=quantized)
     manifest = _read_manifest(path)
     digests = manifest["file_digests"]
@@ -2702,7 +2708,7 @@ def test_every_artefact_carries_a_length_and_a_digest(tmp_path, quantized):
     assert sorted(digests) == sorted(manifest["files_included"])
     for name, entry in digests.items():
         assert entry["bytes"] == os.path.getsize(path / name), name
-        if name == "hnsw_index.zdbgraph":
+        if not name.endswith(".json"):
             assert "checksum" not in entry
         else:
             assert len(entry["checksum"]) == 16
@@ -2725,16 +2731,20 @@ def test_an_artefact_edited_to_the_same_length_is_refused(tmp_path, name):
     A one byte edit that keeps the length loaded in silence before the digest
     existed: an edit inside metadata.json came back as that record's metadata
     and a flipped byte inside vectors.bin came back as that record's vector.
+    A JSON artefact is refused by its digest and a framed one by the checksum
+    over its payload.
     """
     path, _, _ = _saved(tmp_path, "edited.zdb")
     target = path / name
     raw = bytearray(target.read_bytes())
-    at = len(raw) - 6
+    framed = not name.endswith(".json")
+    at = 66 if framed else len(raw) - 6
     raw[at] ^= 0x40
     assert len(raw) == os.path.getsize(target)
     target.write_bytes(bytes(raw))
 
-    with pytest.raises(RuntimeError, match=rf"{name}.*digest recorded beside it"):
+    refusal = r": the frame's payload is corrupt" if framed else r".*digest recorded beside it"
+    with pytest.raises(RuntimeError, match=rf"{name}{refusal}"):
         VectorDatabase().load(str(path))
 
 

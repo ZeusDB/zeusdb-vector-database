@@ -160,10 +160,10 @@ fn pages(collection: &Collection) -> (Page, Page, Page) {
     (dense, sparse, filtered)
 }
 
-/// A dense-only directory keeps the flat names and the 1.1.0 version, and
-/// its config.json carries no `spaces` field, so it is what 0.9.0 wrote.
+/// A dense-only directory keeps the flat names, declares the version every
+/// save does, and its config.json carries no `spaces` field.
 #[test]
-fn a_dense_only_directory_stays_at_the_first_major() {
+fn a_dense_only_directory_keeps_the_flat_names() {
     let collection = Collection::build(base(), None);
     let records: Vec<ParsedRecord> = (0..10u32)
         .map(|i| record(&format!("r{i}"), &[i as f32, 0.0], None, "a"))
@@ -176,7 +176,7 @@ fn a_dense_only_directory_stays_at_the_first_major() {
     let path = dir.path().join("dense.zdb");
     collection.save(path.to_str().unwrap()).unwrap();
     let m = manifest(&path);
-    assert_eq!(m["format_version"], "1.1.0");
+    assert_eq!(m["format_version"], "4.0.0");
     assert!(!m["files_included"]
         .as_array()
         .unwrap()
@@ -245,7 +245,7 @@ fn a_sparse_space_round_trips_through_the_directory() {
     collection.save(path.to_str().unwrap()).unwrap();
 
     let m = manifest(&path);
-    assert_eq!(m["format_version"], "2.0.0");
+    assert_eq!(m["format_version"], "4.0.0");
     let names: Vec<&str> = m["files_included"]
         .as_array()
         .unwrap()
@@ -350,7 +350,7 @@ fn a_text_layer_round_trips_with_its_dictionary() {
     let path = dir.path().join("text.zdb");
     collection.save(path.to_str().unwrap()).unwrap();
     let m = manifest(&path);
-    assert_eq!(m["format_version"], "2.0.0");
+    assert_eq!(m["format_version"], "4.0.0");
     assert!(path.join("spaces/text/terms.zdbdict").exists());
     let digest = &m["file_digests"]["spaces/text/terms.zdbdict"];
     assert!(digest.get("checksum").is_none());
@@ -456,7 +456,7 @@ fn an_external_tokenizer_must_be_handed_back() {
 }
 
 /// The version rule in both directions, as this build sees it. A 1.x
-/// manifest declaring a space is refused, a 3.x manifest is refused naming
+/// manifest declaring a space is refused, a 5.x manifest is refused naming
 /// the majors this build reads, and a 2.x dense-only manifest opens.
 #[test]
 fn the_version_rule_holds_in_both_directions() {
@@ -480,21 +480,20 @@ fn the_version_rule_holds_in_both_directions() {
         other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
     }
 
-    // A later major, refused with the majors this build reads. Three is a
-    // major this build writes and reads, so the refusal starts at four; see
-    // the journal in persistence.rs.
+    // A later major, refused with the majors this build reads. Four is the
+    // major this build writes and reads, so the refusal starts at five.
     let future = dir.path().join("future.zdb");
     copy_dir(&path, &future);
-    rewrite_manifest(&future, |m| m["format_version"] = json!("4.0.0"));
+    rewrite_manifest(&future, |m| m["format_version"] = json!("5.0.0"));
     let message = Collection::load(future.to_str().unwrap())
         .err()
         .unwrap()
         .to_string();
     assert!(
-        message.contains("format version 4.0.0 cannot be opened"),
+        message.contains("format version 5.0.0 cannot be opened"),
         "{message}"
     );
-    assert!(message.contains("1.x, 2.x and 3.x"), "{message}");
+    assert!(message.contains("1.x, 2.x, 3.x and 4.x"), "{message}");
     assert!(message.contains("newer"), "{message}");
 
     // A 2.x label on a dense-only directory opens, since the minor and the
@@ -825,7 +824,7 @@ fn every_mutating_path_keeps_the_saved_shape_correct() {
     let cleared = dir.path().join("cleared.zdb");
     collection.save(cleared.to_str().unwrap()).unwrap();
     let m = manifest(&cleared);
-    assert_eq!(m["format_version"], "2.0.0");
+    assert_eq!(m["format_version"], "4.0.0");
     assert!(cleared.join("spaces/text/postings.zdbsparse").exists());
     let loaded = Collection::load(cleared.to_str().unwrap()).unwrap();
     assert_eq!(loaded.len(), 0);
@@ -850,56 +849,5 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
         } else {
             std::fs::copy(entry.path(), target).unwrap();
         }
-    }
-}
-
-/// The forward map's internal ids are held to the counter `config.json`
-/// records before the id store is reserved. One above it is refused naming
-/// the record and the counter, and the store is left empty. A sparse id
-/// space at or below the counter, which is what removals without a
-/// compaction leave, is taken whole.
-#[test]
-fn a_mappings_id_above_the_counter_is_refused_before_the_store_is_reserved() {
-    let build = || {
-        Collection::build(
-            Declaration::validate(4, "l2", 4, 50, 100, vec![]).unwrap(),
-            None,
-        )
-    };
-    let maps = |pairs: &[(&str, usize)]| {
-        let forward: HashMap<String, usize> = pairs
-            .iter()
-            .map(|&(id, slot)| (id.to_string(), slot))
-            .collect();
-        let reverse: HashMap<usize, String> = pairs
-            .iter()
-            .map(|&(id, slot)| (slot, id.to_string()))
-            .collect();
-        (forward, reverse)
-    };
-
-    let mut collection = build();
-    let (forward, reverse) = maps(&[("a", 1), ("b", 1 << 20)]);
-    match collection.set_id_mappings(forward, reverse, 3) {
-        Err(Error::ArtefactParseFailed { name, error }) => {
-            assert_eq!(name, "mappings.bin");
-            assert_eq!(
-                error,
-                "the forward map names internal id 1048576 for 'b' and config.json counted 3"
-            );
-        }
-        other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
-    }
-    assert!(collection.ids().is_empty());
-    assert_eq!(collection.ids().highest_slot(), None);
-
-    for counter in [1000, 4000] {
-        let mut collection = build();
-        let (forward, reverse) = maps(&[("a", 1), ("b", 500), ("c", 1000)]);
-        collection
-            .set_id_mappings(forward, reverse, counter)
-            .unwrap();
-        assert_eq!(collection.ids().len(), 3);
-        assert_eq!(collection.ids().slot_of("c"), Some(1000));
     }
 }
