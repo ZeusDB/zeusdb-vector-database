@@ -131,7 +131,7 @@ fn opening_a_journal_writes_the_empty_checkpoint_it_replays_onto() {
     );
 
     let m = manifest(&path);
-    assert_eq!(m["format_version"], json!("3.0.0"));
+    assert_eq!(m["format_version"], json!("4.0.0"));
     assert_eq!(m["journal"]["file"], json!("fresh.zdb.zdbwal"));
     assert_eq!(m["journal"]["sequence"], json!(0));
     assert_eq!(
@@ -141,8 +141,8 @@ fn opening_a_journal_writes_the_empty_checkpoint_it_replays_onto() {
     assert_eq!(collection.journal_sequence(), 0);
 }
 
-/// A save of a collection holding no journal is what it was: the first
-/// major, and no `journal` field in the manifest at all.
+/// A save of a collection holding no journal declares the version every
+/// save does and carries no `journal` field in the manifest at all.
 #[test]
 fn a_directory_saved_without_a_journal_carries_no_journal_field() {
     let temp = TempDir::new();
@@ -152,7 +152,7 @@ fn a_directory_saved_without_a_journal_carries_no_journal_field() {
     collection.save(path.to_str().unwrap()).unwrap();
 
     let m = manifest(&path);
-    assert_eq!(m["format_version"], json!("1.1.0"));
+    assert_eq!(m["format_version"], json!("4.0.0"));
     assert!(
         m.as_object().unwrap().get("journal").is_none(),
         "the field is absent rather than null"
@@ -619,39 +619,41 @@ fn a_manifest_below_the_third_major_that_names_a_journal_is_refused() {
     ));
 }
 
-/// The third major reads what the first two did, and a fourth is refused
-/// with the majors this build reads.
+/// Every major this build reads opens a directory it wrote, and a fifth is
+/// refused with the majors this build reads.
 #[test]
-fn the_third_major_is_read_and_a_fourth_is_not() {
+fn every_major_up_to_the_fourth_is_read_and_a_fifth_is_not() {
     let temp = TempDir::new();
     let path = temp.at("majors.zdb");
     let collection = Collection::build(declaration(), None);
     add(&collection, 0..8);
     collection.save(path.to_str().unwrap()).unwrap();
 
-    // A 3.x label on a directory with no journal opens, since a 3.x reader
-    // reads everything the earlier majors wrote.
+    // A 3.x label on a directory with no journal opens, since its four
+    // binary artefacts are read in the frame wherever one is found.
     rewrite_manifest(&path, |m| m["format_version"] = json!("3.0.0"));
     assert_eq!(Collection::load(path.to_str().unwrap()).unwrap().len(), 8);
     rewrite_manifest(&path, |m| m["format_version"] = json!("3.7.2"));
     assert!(Collection::load(path.to_str().unwrap()).is_ok());
+    rewrite_manifest(&path, |m| m["format_version"] = json!("4.9.0"));
+    assert!(Collection::load(path.to_str().unwrap()).is_ok());
 
-    rewrite_manifest(&path, |m| m["format_version"] = json!("4.0.0"));
+    rewrite_manifest(&path, |m| m["format_version"] = json!("5.0.0"));
     let message = Collection::load(path.to_str().unwrap())
         .err()
         .unwrap()
         .to_string();
     assert!(
-        message.contains("format version 4.0.0 cannot be opened"),
+        message.contains("format version 5.0.0 cannot be opened"),
         "{message}"
     );
-    assert!(message.contains("1.x, 2.x and 3.x"), "{message}");
+    assert!(message.contains("1.x, 2.x, 3.x and 4.x"), "{message}");
 }
 
-/// A journaled collection holding a sparse space still declares the third
-/// major, since the journal's is the later of the two.
+/// A journaled collection holding a sparse space declares the version every
+/// save does, and recovers to the records it held.
 #[test]
-fn a_journaled_directory_with_a_space_takes_the_third_major() {
+fn a_journaled_directory_with_a_space_declares_the_one_version() {
     let temp = TempDir::new();
     let path = temp.at("spaced.zdb");
     let declaration = declaration()
@@ -677,7 +679,7 @@ fn a_journaled_directory_with_a_space_takes_the_third_major() {
     let before = ids(&collection);
     drop(collection);
 
-    assert_eq!(manifest(&path)["format_version"], json!("3.0.0"));
+    assert_eq!(manifest(&path)["format_version"], json!("4.0.0"));
     let (recovered, _) =
         Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
     assert_eq!(ids(&recovered), before);

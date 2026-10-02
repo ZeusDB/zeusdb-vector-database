@@ -584,8 +584,8 @@ fn every_mutation_keeps_the_codec_and_the_rows() {
 // ============================================================================
 
 /// A trained scalar directory carries the scales and the rows beside the
-/// dump, at the scalar minor, and comes back page for page; a second save
-/// of the loaded index writes the same bytes. An untrained one carries the
+/// dump, and comes back page for page; a second save of the loaded index
+/// writes the same bytes. An untrained one carries the
 /// declaration and the raw vectors, and trains after it is loaded.
 #[test]
 fn a_scalar_directory_round_trips_with_its_two_artefacts() {
@@ -597,7 +597,7 @@ fn a_scalar_directory_round_trips_with_its_two_artefacts() {
     let path = Path::new(&path);
 
     let manifest = read_json(&path.join("manifest.json"));
-    assert_eq!(manifest["format_version"], "1.2.0");
+    assert_eq!(manifest["format_version"], "4.0.0");
     let files: Vec<&str> = manifest["files_included"]
         .as_array()
         .unwrap()
@@ -697,7 +697,7 @@ fn a_scalar_directory_round_trips_with_its_two_artefacts() {
     untrained.save(&path).unwrap();
     let path = Path::new(&path);
     let manifest = read_json(&path.join("manifest.json"));
-    assert_eq!(manifest["format_version"], "1.2.0");
+    assert_eq!(manifest["format_version"], "4.0.0");
     let files: Vec<&str> = manifest["files_included"]
         .as_array()
         .unwrap()
@@ -903,9 +903,10 @@ fn every_scales_and_rows_bound_is_refused_by_name() {
     assert!(Collection::load(source.to_str().unwrap()).is_ok());
 }
 
-/// The scalar minor on each major, and this build's own direction of the
-/// version rule: a scalar directory labelled at the older minor still opens
-/// here, and a later major is refused.
+/// A scalar directory declares the version every save does whatever else
+/// it holds, and this build's own direction of the version rule: a scalar
+/// directory labelled at an earlier major still opens here, and a later
+/// major is refused.
 #[test]
 fn the_version_rule_holds_for_a_scalar_directory() {
     let vectors = clustered(1100, 8, 0x0157_000a);
@@ -916,7 +917,7 @@ fn the_version_rule_holds_for_a_scalar_directory() {
     dense.save(&dense_path).unwrap();
     assert_eq!(
         read_json(&Path::new(&dense_path).join("manifest.json"))["format_version"],
-        "1.2.0"
+        "4.0.0"
     );
 
     let d = declaration(8, "l2")
@@ -930,7 +931,7 @@ fn the_version_rule_holds_for_a_scalar_directory() {
     spaced.save(&spaced_path).unwrap();
     assert_eq!(
         read_json(&Path::new(&spaced_path).join("manifest.json"))["format_version"],
-        "2.1.0"
+        "4.0.0"
     );
     assert!(Collection::load(&spaced_path).unwrap().is_quantized());
 
@@ -941,13 +942,13 @@ fn the_version_rule_holds_for_a_scalar_directory() {
         .unwrap();
     assert_eq!(
         read_json(&Path::new(&journaled_path).join("manifest.json"))["format_version"],
-        "3.1.0"
+        "4.0.0"
     );
     drop(journaled);
     assert!(Collection::load(&journaled_path).unwrap().is_quantized());
 
-    // An untrained scalar directory carries the minor too, since its
-    // quantization.json already takes the scalar layout.
+    // An untrained scalar directory too, whose quantization.json already
+    // takes the scalar layout.
     let d = declaration(8, "l2");
     let collecting = Collection::build(d.clone(), Some(scalar(&d, 1000)));
     add(&collecting, records(&collecting, &vectors, 0..10));
@@ -955,11 +956,12 @@ fn the_version_rule_holds_for_a_scalar_directory() {
     collecting.save(&collecting_path).unwrap();
     assert_eq!(
         read_json(&Path::new(&collecting_path).join("manifest.json"))["format_version"],
-        "1.2.0"
+        "4.0.0"
     );
 
-    // This build reads any 1.x, so the older minor over a scalar directory
-    // opens here, and a later major is refused with the majors it reads.
+    // This build reads any 1.x and reads a frame wherever it finds one, so
+    // an earlier label over a scalar directory opens here, and a later major
+    // is refused with the majors it reads.
     let relabel = |name: &str, version: &str| -> String {
         let target = PathBuf::from(dir.sub(name));
         copy_dir(Path::new(&dense_path), &target);
@@ -972,13 +974,13 @@ fn the_version_rule_holds_for_a_scalar_directory() {
     assert!(Collection::load(&relabel("older-minor.zdb", "1.1.0"))
         .unwrap()
         .is_quantized());
-    let message = Collection::load(&relabel("future.zdb", "4.0.0"))
+    let message = Collection::load(&relabel("future.zdb", "5.0.0"))
         .err()
         .unwrap()
         .to_string();
     assert!(
-        message.contains("format version 4.0.0 cannot be opened"),
+        message.contains("format version 5.0.0 cannot be opened"),
         "{message}"
     );
-    assert!(message.contains("1.x, 2.x and 3.x"), "{message}");
+    assert!(message.contains("1.x, 2.x, 3.x and 4.x"), "{message}");
 }

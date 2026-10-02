@@ -11,10 +11,14 @@ file's own bytes could carry is a limit, and a length nothing bounds is a
 defect.
 
 The forged files are written by hand rather than by the library, because the
-library cannot write them. `mappings.bin`, `vectors.bin`, `pq_codes.bin` and
-`pq_centroids.bin` are bincode, so the container length is a varint this file
-encodes itself; `config.json` and `quantization.json` are JSON and are edited in
-place.
+library cannot write them. A directory this build saves holds `mappings.bin`,
+`vectors.bin`, `pq_codes.bin` and `pq_centroids.bin` inside a frame, so a forged
+count or width is written into the payload and the frame is built again around
+it, which carries the forgery past both of its checksums to the payload's
+reader. A directory a release before 4.0.0 saved holds the same four in
+bincode's wire, where a container length is a varint this file encodes itself,
+and those forgeries run on a copy of a saved directory rewritten in that wire.
+`config.json` and `quantization.json` are JSON and are edited in place.
 """
 
 import json
@@ -26,7 +30,7 @@ import sys
 
 import numpy as np
 import pytest
-from helpers import artefact_digest, repair_manifest
+from helpers import FRAME_KINDS, artefact_digest, as_old_wire, frame, reframe, repair_manifest, unframe
 from zeusdb_vector_database import VectorDatabase
 
 # A length no file could carry and every unbounded container aborted on.
@@ -93,6 +97,24 @@ def quantized_index(tmp_path_factory):
     index.add({"ids": [f"r{i}" for i in range(1050)], "embeddings": vectors})
     assert index.is_quantized(), "the fixture must train, or the codebook files are absent"
     index.save(str(path))
+    return path
+
+
+@pytest.fixture(scope="module")
+def old_raw_index(raw_index, tmp_path_factory):
+    """The raw index as a release before 4.0.0 wrote it, at 1.1.0."""
+    path = tmp_path_factory.mktemp("old-raw") / "index"
+    shutil.copytree(raw_index, path)
+    as_old_wire(path, "1.1.0")
+    return path
+
+
+@pytest.fixture(scope="module")
+def old_quantized_index(quantized_index, tmp_path_factory):
+    """The quantized index as a release before 4.0.0 wrote it, at 1.1.0."""
+    path = tmp_path_factory.mktemp("old-quantized") / "index"
+    shutil.copytree(quantized_index, path)
+    as_old_wire(path, "1.1.0")
     return path
 
 
@@ -188,31 +210,41 @@ def assert_refused(path, tmp_path, *, naming):
 # ============================================================================
 
 
-def test_the_digest_repairer_agrees_with_the_saved_manifest(raw_index, quantized_index):
-    """Every digest a real save wrote, recomputed here from the file.
+def test_the_digest_repairer_agrees_with_the_saved_manifest(
+    raw_index, quantized_index, old_raw_index, old_quantized_index
+):
+    """Every digest a real save wrote, recomputed here from the file, and every
+    framed artefact it wrote, framed again here from its payload.
 
-    Without this the repair above could be silently wrong, and every case in
-    this file would then be asserting that a wrong digest is refused rather than
-    that the field validator it names does its job.
+    Without this the repairs above could be silently wrong, and every case in
+    this file would then be asserting that a wrong digest or a wrong checksum
+    is refused rather than that the field validator it names does its job.
     """
-    checked = 0
-    for directory in (raw_index, quantized_index):
+    checked = framed = 0
+    for directory in (raw_index, quantized_index, old_raw_index, old_quantized_index):
         manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
         digests = manifest["file_digests"]
-        assert digests, "a save records a digest per artefact"
+        assert digests, "a save records a length per artefact"
         for name, entry in digests.items():
             data = (directory / name).read_bytes()
             assert entry["bytes"] == len(data), name
             if "checksum" in entry:
                 assert entry["checksum"] == artefact_digest(data), name
                 checked += 1
-    assert checked >= 8, f"only {checked} digests were compared"
+            if manifest["format_version"] == "4.0.0" and name in FRAME_KINDS:
+                kind, entries, payload = unframe(data)
+                assert kind == FRAME_KINDS[name], name
+                assert frame(kind, entries, payload) == data, name
+                framed += 1
+    assert checked >= 16, f"only {checked} digests were compared"
+    assert framed >= 6, f"only {framed} frames were compared"
 
 
-def test_a_forged_file_whose_digest_is_not_repaired_is_refused(raw_index, tmp_path):
-    """The digest check itself, which every other case here has to get past."""
+def test_a_forged_file_whose_digest_is_not_repaired_is_refused(old_raw_index, tmp_path):
+    """The digest check itself, which every forgery of an old directory has to
+    get past."""
     target = tmp_path / "unrepaired"
-    shutil.copytree(raw_index, target)
+    shutil.copytree(old_raw_index, target)
     raw = bytearray((target / "vectors.bin").read_bytes())
     raw[-4] ^= 0x40
     (target / "vectors.bin").write_bytes(bytes(raw))
@@ -223,27 +255,45 @@ def test_a_forged_file_whose_digest_is_not_repaired_is_refused(raw_index, tmp_pa
     assert "vectors.bin" in verdict and "digest" in verdict, verdict
 
 
-def test_an_untouched_directory_still_loads(raw_index, tmp_path):
+def test_a_forged_frame_whose_checksum_is_not_repaired_is_refused(raw_index, tmp_path):
+    """The frame's payload checksum itself, which every forgery of a framed
+    artefact has to get past. The manifest records a framed artefact by its
+    length alone, so it is the frame that refuses."""
+    target = tmp_path / "unrepaired"
+    shutil.copytree(raw_index, target)
+    raw = bytearray((target / "vectors.bin").read_bytes())
+    raw[70] ^= 0x40
+    (target / "vectors.bin").write_bytes(bytes(raw))
+
+    status, verdict, _ = load_in_child(target, tmp_path)
+    assert status == 0
+    assert verdict.startswith("REFUSED"), verdict
+    assert "vectors.bin: the frame's payload is corrupt" in verdict, verdict
+
+
+def test_an_untouched_directory_still_loads(raw_index, old_raw_index, tmp_path):
     """Nothing below means anything if the unforged directory does not load."""
-    status, verdict, _ = load_in_child(raw_index, tmp_path)
-    assert status == 0
-    assert verdict == "LOADED 2", verdict
+    for directory in (raw_index, old_raw_index):
+        status, verdict, _ = load_in_child(directory, tmp_path)
+        assert status == 0
+        assert verdict == "LOADED 2", verdict
 
 
-def test_an_untouched_quantized_directory_still_loads(quantized_index, tmp_path):
-    status, verdict, _ = load_in_child(quantized_index, tmp_path)
-    assert status == 0
-    assert verdict == "LOADED 1050", verdict
+def test_an_untouched_quantized_directory_still_loads(quantized_index, old_quantized_index, tmp_path):
+    for directory in (quantized_index, old_quantized_index):
+        status, verdict, _ = load_in_child(directory, tmp_path)
+        assert status == 0
+        assert verdict == "LOADED 1050", verdict
 
 
 # ============================================================================
-# THE BINCODE ARTEFACTS
+# THE FOUR ARTEFACTS IN THE OLD WIRE
 # ============================================================================
 #
-# Four files, ten container lengths. `bincode::config::standard()` carries no
-# byte limit, so `claim_container_read` compiled to nothing and every one of
-# these went straight to the allocator. The bound is a claim budget derived from
-# the file's own length; see `CLAIM_PER_WIRE_BYTE`.
+# Four files, ten container lengths, in a directory a release before 4.0.0
+# wrote. The reader of that wire holds every length to the bytes the file has
+# left, at the fewest bytes one entry can occupy, before anything is sized from
+# it.
 
 
 @pytest.mark.parametrize(
@@ -262,8 +312,8 @@ def test_an_untouched_quantized_directory_still_loads(quantized_index, tmp_path)
         "vectors-map-length", "vectors-record-vector-length",
     ],
 )
-def test_a_forged_length_in_a_raw_artefact_is_refused(raw_index, tmp_path, name, payload):
-    path = forged(raw_index, tmp_path, name, write_bytes(payload))
+def test_a_forged_length_in_a_raw_artefact_is_refused(old_raw_index, tmp_path, name, payload):
+    path = forged(old_raw_index, tmp_path, name, write_bytes(payload))
     assert_refused(path, tmp_path, naming=name)
 
 
@@ -290,16 +340,17 @@ _A_POISONED = [float("nan"), 0.0, 0.0, 0.0]
     ids=["twice-clean", "first-copy-poisoned-last-clean", "last-copy-poisoned"],
 )
 def test_a_vectors_bin_holding_one_id_twice_is_read_as_a_map_holds_it(
-    raw_index, tmp_path, payload, opens
+    old_raw_index, tmp_path, payload, opens
 ):
     """No save writes an id twice, since the map it encodes cannot hold one,
     so this is a file a hand made. Every release read the file into a map,
     which held one entry for the id, the last copy, and counted it once. The
-    loader now walks the file without building the map and gives the same
+    loader walks the file without building the map and gives the same
     answer: two records, and a refusal only when the copy that came last is
-    the one that is not finite, naming the id once.
+    the one that is not finite, naming the id once. A framed file names each
+    record by internal id in increasing order, so it cannot hold one twice.
     """
-    path = forged(raw_index, tmp_path, "vectors.bin", write_bytes(payload))
+    path = forged(old_raw_index, tmp_path, "vectors.bin", write_bytes(payload))
     status, verdict, _ = load_in_child(path, tmp_path)
     assert status == 0
     if opens:
@@ -325,12 +376,13 @@ _TWO = varint(2) + wire_str("a") + varint(1) + wire_str("b") + varint(2)
     ],
     ids=["reverse-names-another-id", "reverse-shorter", "two-names-one-internal-id"],
 )
-def test_a_mappings_file_whose_two_maps_disagree_is_refused(raw_index, tmp_path, payload):
+def test_a_mappings_file_whose_two_maps_disagree_is_refused(old_raw_index, tmp_path, payload):
     """A mappings.bin whose reverse map is not the inverse of its forward map
     describes two record sets, and the loader refuses it naming the file. The
     two maps used to be installed as they were read, and such a file loaded
-    with `len` and `search` answering from different sets."""
-    path = forged(raw_index, tmp_path, "mappings.bin", write_bytes(payload))
+    with `len` and `search` answering from different sets. A framed file holds
+    one list, so it has no second map to disagree."""
+    path = forged(old_raw_index, tmp_path, "mappings.bin", write_bytes(payload))
     assert_refused(path, tmp_path, naming="mappings.bin")
 
 
@@ -340,13 +392,25 @@ def test_a_mappings_file_whose_two_maps_disagree_is_refused(raw_index, tmp_path,
 # and filled one for every id below it before anything refused the file, and
 # at 2^40 asked the allocator for eight tebibytes.
 @pytest.mark.parametrize("slot", [3, 1 << 24, 1 << 40], ids=["one-above", "2^24", "2^40"])
-def test_a_mappings_id_above_the_counter_is_refused(raw_index, tmp_path, slot):
+def test_a_mappings_id_above_the_counter_is_refused(old_raw_index, tmp_path, slot):
     payload = (varint(2) + wire_str("a") + varint(1) + wire_str("b") + varint(slot)
                + varint(2) + varint(1) + wire_str("a") + varint(slot) + wire_str("b"))
-    path = forged(raw_index, tmp_path, "mappings.bin", write_bytes(payload))
+    path = forged(old_raw_index, tmp_path, "mappings.bin", write_bytes(payload))
     assert_refused(
         path, tmp_path,
         naming=f"the forward map names internal id {slot} for 'b' and config.json counted 2",
+    )
+
+
+@pytest.mark.parametrize("slot", [3, 1 << 24, (1 << 32) - 1], ids=["one-above", "2^24", "u32-max"])
+def test_a_framed_mappings_id_above_the_counter_is_refused(raw_index, tmp_path, slot):
+    """The same counter, held in a framed file, whose internal ids are four
+    bytes wide, so the highest it can name is the last a u32 holds."""
+    payload = (struct.pack("<2I", 1, slot) + struct.pack("<2I", 1, 1) + b"ab")
+    path = forged(raw_index, tmp_path, "mappings.bin", write_bytes(frame(1, 2, payload)))
+    assert_refused(
+        path, tmp_path,
+        naming=f"the record 'b' holds internal id {slot} and config.json counted 2",
     )
 
 
@@ -389,18 +453,18 @@ def test_a_directory_whose_ids_are_sparse_still_opens(tmp_path):
     ],
 )
 def test_a_forged_length_in_a_quantized_artefact_is_refused(
-    quantized_index, tmp_path, name, payload
+    old_quantized_index, tmp_path, name, payload
 ):
-    path = forged(quantized_index, tmp_path, name, write_bytes(payload))
+    path = forged(old_quantized_index, tmp_path, name, write_bytes(payload))
     assert_refused(path, tmp_path, naming=name)
 
 
-def test_the_claim_budget_admits_the_densest_file_this_build_writes(tmp_path):
-    """A budget derived from a file's length has to still admit a real file.
+def test_the_densest_file_this_build_writes_still_opens(tmp_path):
+    """A bound derived from a file's length has to still admit a real file.
 
     The densest legitimate case is short ids and narrow vectors, which is where
-    the ratio of bytes claimed to bytes on the wire is largest. A budget that
-    refused this would have made the bound a regression rather than a fix.
+    an entry's bytes are fewest. A bound that refused this would have made the
+    bound a regression rather than a fix, in either layout.
     """
     count = 2000
     ids = [f"{i:04d}" for i in range(count)]
@@ -417,65 +481,59 @@ def test_the_claim_budget_admits_the_densest_file_this_build_writes(tmp_path):
     path = tmp_path / "dense"
     index.save(str(path))
 
-    # The codebook here is twenty bytes, which is the smallest file the budget
-    # is ever asked about.
+    # The codebook here is two floats inside its frame, which is the smallest
+    # file the loader is ever asked about.
     assert (path / "pq_centroids.bin").stat().st_size < 200
     assert VectorDatabase().load(str(path)).get_vector_count() == count
+    old = tmp_path / "dense-old"
+    shutil.copytree(path, old)
+    as_old_wire(old, "1.1.0")
+    assert VectorDatabase().load(str(old)).get_vector_count() == count
 
 
 
 # ============================================================================
-# THE RUNG AND THE BUDGET
+# A LENGTH ITS FILE CANNOT CARRY
 # ============================================================================
 #
-# bincode takes its byte limit as a const generic, so the budget a file's own
-# length earns picks one of four rungs rather than being passed, and the rungs
-# are a factor of 256 apart. A file one byte above a rung's top therefore earned
-# 256 times its budget, and every container length under that rung went to the
-# allocator: a 4 MiB mappings.bin declaring 2^31 entries asked for 132 GiB and
-# the child below died rather than raising. The loader now claims whatever the
-# rung carries above the budget before it decodes anything, so a container may
-# claim the budget and nothing above it.
+# Each file below is a little over 4 MiB of the old wire, and one container in
+# it declares far more entries than its bytes could hold. The loader refuses
+# each before anything is sized from it, and the child refuses rather than
+# dying.
 
-# A file one byte past the 4 MiB top of the 2^28 rung's band, so its own length
-# earns 2^28 and the decoder is built at 2^36.
-OVER_A_RUNG = (1 << 22) + 64
-THE_RUNG_ABOVE = 1 << 36
+FILE_BYTES = (1 << 22) + 64
+DECLARED_BYTES = 1 << 36
 
 
-def between_budget_and_rung(entry_bytes):
-    """A container length claiming under the rung and over the budget.
-
-    The padding is never read. A length is claimed before the entries behind it
-    are decoded, so the file ends long before the decoder asks for them.
-    """
-    head = varint((THE_RUNG_ABOVE - 4096) // entry_bytes)
-    return head + bytes(OVER_A_RUNG - len(head))
+def declaring_too_many(entry_bytes):
+    """A file whose outermost container declares `DECLARED_BYTES` worth of
+    entries of `entry_bytes` each. The padding behind it is never read."""
+    head = varint((DECLARED_BYTES - 4096) // entry_bytes)
+    return head + bytes(FILE_BYTES - len(head))
 
 
-def inner_between_budget_and_rung(entry_bytes):
-    """The same, one record in, which is where the rung left a length loose
-    once the outer container's claim had passed."""
-    head = varint(1) + wire_str("a") + varint((THE_RUNG_ABOVE - 4096) // entry_bytes)
-    return head + bytes(OVER_A_RUNG - len(head))
+def one_record_in_declaring_too_many(entry_bytes):
+    """The same, declared by the first record's own container."""
+    head = varint(1) + wire_str("a") + varint((DECLARED_BYTES - 4096) // entry_bytes)
+    return head + bytes(FILE_BYTES - len(head))
 
 
 @pytest.mark.parametrize(
     "fixture,name,payload",
     [
-        # HashMap<String, usize>, 32 bytes an entry. This one killed the child.
-        ("raw", "mappings.bin", between_budget_and_rung(32)),
-        # HashMap<String, Vec<f32>>, 48 bytes an entry, on the walk a raw index
-        # takes and on the map decode a quantized one takes.
-        ("raw", "vectors.bin", between_budget_and_rung(48)),
-        ("quantized", "vectors.bin", between_budget_and_rung(48)),
-        ("quantized", "pq_codes.bin", between_budget_and_rung(48)),
-        # Vec<Vec<Vec<f32>>>, 24 bytes an entry.
-        ("quantized", "pq_centroids.bin", between_budget_and_rung(24)),
-        # One record in: the vector's own Vec<f32>, and the code's Vec<u8>.
-        ("raw", "vectors.bin", inner_between_budget_and_rung(4)),
-        ("quantized", "vectors.bin", inner_between_budget_and_rung(4)),
-        ("quantized", "pq_codes.bin", inner_between_budget_and_rung(1)),
+        # The forward map's entries.
+        ("raw", "mappings.bin", declaring_too_many(32)),
+        # The vector map's entries, on the walk a raw index takes and on the
+        # map a quantized one reads.
+        ("raw", "vectors.bin", declaring_too_many(48)),
+        ("quantized", "vectors.bin", declaring_too_many(48)),
+        ("quantized", "pq_codes.bin", declaring_too_many(48)),
+        # The codebook's subvectors.
+        ("quantized", "pq_centroids.bin", declaring_too_many(24)),
+        # One record in: the vector's own length, and the code's.
+        ("raw", "vectors.bin", one_record_in_declaring_too_many(4)),
+        ("quantized", "vectors.bin", one_record_in_declaring_too_many(4)),
+        ("quantized", "pq_codes.bin", one_record_in_declaring_too_many(1)),
     ],
     ids=[
         "mappings-id_map", "vectors-map-walked", "vectors-map-decoded",
@@ -484,12 +542,82 @@ def inner_between_budget_and_rung(entry_bytes):
         "codes-record-code",
     ],
 )
-def test_a_length_between_the_budget_and_the_rung_is_refused(
-    raw_index, quantized_index, tmp_path, fixture, name, payload
+def test_a_four_mebibyte_file_naming_a_length_it_cannot_carry_is_refused(
+    old_raw_index, old_quantized_index, tmp_path, fixture, name, payload
 ):
-    source = raw_index if fixture == "raw" else quantized_index
+    source = old_raw_index if fixture == "raw" else old_quantized_index
     path = forged(source, tmp_path, name, write_bytes(payload))
     assert_refused(path, tmp_path, naming=name)
+
+
+# ============================================================================
+# THE FOUR ARTEFACTS IN THE FRAME
+# ============================================================================
+#
+# A frame holds a payload to the length its header declares, and a payload
+# holds every count and width to the bytes it has. Each forgery below writes a
+# hostile count or width into a well formed payload and frames it again, so
+# both checksums verify and the payload's own reader is what refuses.
+
+def edit_payload(edit):
+    """A forgery that rewrites a framed artefact's payload or entry count."""
+    def mutate(path):
+        kind, entries, payload = unframe(path.read_bytes())
+        payload, entries = edit(bytearray(payload), entries)
+        path.write_bytes(frame(kind, entries, bytes(payload)))
+    return mutate
+
+
+def set_u32(at, value):
+    def edit(payload, entries):
+        payload[at:at + 4] = struct.pack("<I", value)
+        return payload, entries
+    return edit
+
+
+def set_entries(value):
+    return lambda payload, entries: (payload, value)
+
+
+@pytest.mark.parametrize(
+    "fixture,name,edit,naming",
+    [
+        ("raw", "mappings.bin", set_entries(HUGE), "records take at least"),
+        ("raw", "mappings.bin", set_entries((1 << 64) - 1), "records take at least"),
+        ("raw", "mappings.bin", set_u32(8, 0xFFFFFFFF), "the ids' lengths sum to"),
+        ("raw", "mappings.bin", set_u32(4, 0), "and the ids are strictly increasing"),
+        ("raw", "vectors.bin", set_entries(HUGE), "rows of"),
+        ("raw", "vectors.bin", set_u32(0, 0xFFFFFFFF), "and config.json declares dim 4"),
+        ("raw", "vectors.bin", set_u32(24, 0xFFFFFFF0), "which mappings.bin does not hold"),
+        ("quantized", "vectors.bin", set_entries(HUGE), "rows of"),
+        ("quantized", "pq_codes.bin", set_entries(HUGE), "rows of"),
+        ("quantized", "pq_codes.bin", set_u32(0, 0xFFFFFFFF), "quantization.json declares 4 subvectors"),
+        ("quantized", "pq_centroids.bin", set_entries(HUGE), "a codebook of"),
+        ("quantized", "pq_centroids.bin", set_u32(0, 0xFFFFFFFF), "a codebook of"),
+        ("quantized", "pq_centroids.bin", set_u32(4, 0xFFFFFFFF), "a codebook of"),
+    ],
+    ids=[
+        "mappings-entries-2^40", "mappings-entries-u64-max", "mappings-id-length",
+        "mappings-ids-not-increasing", "vectors-entries-raw", "vectors-width",
+        "vectors-foreign-id", "vectors-entries-quantized", "codes-entries", "codes-width",
+        "centroids-subvectors", "centroids-count", "centroids-width",
+    ],
+)
+def test_a_forged_count_in_a_framed_artefact_is_refused(
+    raw_index, quantized_index, tmp_path, fixture, name, edit, naming
+):
+    source = raw_index if fixture == "raw" else quantized_index
+    path = forged(source, tmp_path, name, edit_payload(edit))
+    assert_refused(path, tmp_path, naming=naming)
+
+
+def test_a_framed_codebook_of_no_values_naming_a_huge_count_is_refused(quantized_index, tmp_path):
+    """A codebook whose centroids hold no value takes no bytes however many
+    subvectors it names, so its bytes agree with a count of 2^40. Its shape is
+    held to quantization.json before anything is sized from it."""
+    payload = struct.pack("<2I", 0, 0)
+    path = forged(quantized_index, tmp_path, "pq_centroids.bin", write_bytes(frame(4, HUGE, payload)))
+    assert_refused(path, tmp_path, naming="codebook is 1099511627776x0x0, expected 4x16x2")
 
 # ============================================================================
 # quantization.json

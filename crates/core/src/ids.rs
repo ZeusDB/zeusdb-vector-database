@@ -464,6 +464,11 @@ impl IdStore {
         self.dead_text
     }
 
+    /// Bytes of id text the records the store holds carry, end to end.
+    pub fn text_bytes(&self) -> usize {
+        self.text.len() - self.dead_text
+    }
+
     /// Bytes the store asked the allocator for: the arena at its capacity,
     /// the entries at theirs, the table's buckets and tags, and the live
     /// set's words.

@@ -90,11 +90,18 @@ pub const FRAME_OVERHEAD_BYTES: usize = FRAME_HEADER_BYTES + FRAME_TRAILER_BYTES
 
 /// What a framed payload holds.
 ///
-/// **The numbers are on disk. Never reuse one and never change one.** One to
-/// four are reserved for the id mappings, the raw vectors, the quantized
-/// codes and the codebook, which are not framed by this build.
+/// **The numbers are on disk. Never reuse one and never change one.**
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
+    /// Every record's internal id and external id, being `mappings.bin`.
+    IdMappings = 1,
+    /// Every record's internal id and raw vector, being `vectors.bin`.
+    RawVectors = 2,
+    /// Every coded record's internal id and product quantized code, being
+    /// `pq_codes.bin`.
+    PqCodes = 3,
+    /// The product quantized codebook, being `pq_centroids.bin`.
+    PqCodebook = 4,
     /// A sparse space's postings, being every live record's id and vector.
     SparsePostings = 5,
     /// A text layer's term dictionary, being every term in id order.
@@ -113,6 +120,10 @@ impl FrameKind {
 
     fn from_code(code: u8) -> Option<Self> {
         match code {
+            1 => Some(FrameKind::IdMappings),
+            2 => Some(FrameKind::RawVectors),
+            3 => Some(FrameKind::PqCodes),
+            4 => Some(FrameKind::PqCodebook),
             5 => Some(FrameKind::SparsePostings),
             6 => Some(FrameKind::TermDictionary),
             7 => Some(FrameKind::Int8Scales),
@@ -124,6 +135,10 @@ impl FrameKind {
     /// How the kind names itself in a message.
     pub fn label(self) -> &'static str {
         match self {
+            FrameKind::IdMappings => "id mappings",
+            FrameKind::RawVectors => "raw vectors",
+            FrameKind::PqCodes => "product quantized codes",
+            FrameKind::PqCodebook => "product quantized codebook",
             FrameKind::SparsePostings => "sparse postings",
             FrameKind::TermDictionary => "term dictionary",
             FrameKind::Int8Scales => "scalar quantization scales",
@@ -134,8 +149,7 @@ impl FrameKind {
 
 /// How a framed payload is encoded.
 ///
-/// **The numbers are on disk.** One is reserved for a bincode payload, which
-/// this build does not frame.
+/// **The numbers are on disk.** One is reserved and no payload takes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameEncoding {
     /// The engine's own layout, being fixed-width little-endian fields whose
@@ -545,6 +559,42 @@ mod tests {
         let back = unframe(&empty, FrameKind::TermDictionary, "t").unwrap();
         assert_eq!(back.entries, 0);
         assert!(back.payload.is_empty());
+    }
+
+    /// Every kind round-trips its code, frames and unframes as itself, and
+    /// is refused where another kind was expected. A code no kind holds is
+    /// refused by number.
+    #[test]
+    fn every_kind_reads_back_as_itself_and_no_other() {
+        let kinds = [
+            FrameKind::IdMappings,
+            FrameKind::RawVectors,
+            FrameKind::PqCodes,
+            FrameKind::PqCodebook,
+            FrameKind::SparsePostings,
+            FrameKind::TermDictionary,
+            FrameKind::Int8Scales,
+            FrameKind::Int8Rows,
+        ];
+        for (at, kind) in kinds.iter().enumerate() {
+            assert_eq!(kind.code() as usize, at + 1);
+            assert_eq!(FrameKind::from_code(kind.code()), Some(*kind));
+            let bytes = frame(*kind, FrameEncoding::Engine, 1, &[at as u8]);
+            assert_eq!(unframe(&bytes, *kind, "t").unwrap().payload, &[at as u8]);
+            let other = kinds[(at + 1) % kinds.len()];
+            let refused = refused(&bytes, other);
+            assert!(refused.contains(kind.label()), "{refused}");
+            assert!(refused.contains(other.label()), "{refused}");
+        }
+        let mut bytes = frame(FrameKind::IdMappings, FrameEncoding::Engine, 0, &[]);
+        for code in [0u8, 9, 255] {
+            bytes[16] = code;
+            fuzz::restamp_header(&mut bytes);
+            assert!(
+                refused(&bytes, FrameKind::IdMappings).contains(&format!("kind {code}")),
+                "{code}"
+            );
+        }
     }
 
     /// The first seventeen bytes mean what the graph dump's mean, so a
