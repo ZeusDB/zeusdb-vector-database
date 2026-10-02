@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.12.0] - 2026-10-03
+
+### Added
+
+- **Every saved directory lists its features.** `manifest.json` names under `features` each part of the directory a release can be built without and marks it `compatible` or `incompatible`, being `identity` on every save, and `int8`, `journal`, `pq`, `sparse` and `text` where the directory holds them. `load()` reads the list before any artefact. A feature this release does not know is refused by its name, unless the directory marks it `compatible`, in which case the directory opens without it, a `warn` log record names it, and the next save leaves it out. A known feature listed under another mark is refused, and at format 4.0.0 the features listed must be the ones the directory holds.
+
+- **Every saved directory records its identity, and `HNSWIndex.identity` reports it.** `manifest.json` records under `identity` the index's collection id, kept through every save and load, its generation, being the saves the index has committed, a snapshot id drawn at the save, and the snapshot the directory was saved from. `index.identity` reports the four for the directory the index last saved or read, and `clear()` keeps them. A journaled directory's identity, its journal record and its journal's header name one collection. A directory that records no identity opens under the id its journal names, or one drawn when it is opened, and its next save records it at generation 1.
+
+### Changed
+
+- **`mappings.bin`, `vectors.bin`, `pq_codes.bin` and `pq_centroids.bin` are framed.** Each is written inside a frame carrying its own header and payload checksums, verified on every load, and `manifest.json` records its length alone. `mappings.bin` holds each record's internal id and id, and `vectors.bin` and `pq_codes.bin` one row per record, in increasing internal id. The codebook is held to the shape `quantization.json` describes before it is built.
+
+- **Two saves of the same records write the same `metadata.json` and `config.json`.** `metadata.json` writes each record's fields in name order, and `config.json` its metadata map in key order.
+
+- **A damaged directory from before 4.0.0 whose artefact declares a length its bytes cannot carry raises `ValueError`**, whatever the length, before anything is sized from it. A declared length small enough to pass the budget the file's size allows raised `RuntimeError` once decoding reached the end of the file.
+
+- **A directory from before 4.0.0 whose artefact continues past its last entry is refused**, naming the artefact and the bytes past its end.
+
+- **A `search()` hit's metadata keys come back in one order**, the same for every hit and every record of an index.
+
+- **A `search()` page is built in arrays.** Every id, string metadata value and field name on a page is held in one text buffer, every field in one list and every returned vector in one list of floats, and each field name becomes a Python string once a page.
+
+- **`load()` reads a raw index's `vectors.bin` for its record count and its finiteness check without holding it**, and into a map only when the graph is rebuilt rather than restored from its dump. A scalar index's rows are held in one block, and the graph dump hands its points to the graph one at a time and counts each inbound edge as it reads it.
+
+- **The format version is read only as `MAJOR.MINOR.PATCH`**, three runs of ASCII digits joined by dots, with no sign, no leading zero on a part of more than one digit, and nothing before or after. A `format_version` of any other shape is refused as a version this release cannot interpret.
+
+- **The README** carries two new sections, on a directory's identity and its features, and describes format 4.0.0 in place of the table of earlier versions. The docstrings of `create()` and `journal_to()` name the features a directory lists.
+
+### Fixed
+
+- **`add()` refuses a record once the index has issued its last internal id**, 4,294,967,294, before the record's id is issued or its journal record written, and the record's error names the last id and `clear()` as what starts the ids again. An overwrite whose batch needs more ids than are left is refused before any record it replaces is removed, and a journal replay is held to the same bound. Every other operation runs at the last id, and `clear()` starts the ids again from 1.
+
+- **`load()` refuses a `mappings.bin` naming an internal id above the `id_counter` its `config.json` records**, before the id store is sized.
+
+### Internal
+
+- **The workspace does not depend on bincode.** The engine reads the wire format releases before 4.0.0 wrote with a reader of its own. `deny.toml` ignores no advisory, RUSTSEC-2025-0141 included, and the dependabot configuration holds no rule for bincode.
+
+- **Saving, loading and the journal reach the filesystem through one storage interface in the core crate**, being a directory of named artefacts, the place a collection is kept with its staged directory and its journal, and a streamed artefact.
+
+### Format
+
+Every directory this release saves declares format version 4.0.0 and lists its features. This release reads 1.x, 2.x, 3.x and 4.x, so a directory an earlier release saved opens here as it opens on 0.11.0, and saving it again writes 4.0.0. 0.5.0 to 0.11.0 refuse a 4.0.0 directory at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
+
 ## [0.11.0] - 2026-09-08
 
 ### Added

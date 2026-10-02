@@ -7,6 +7,9 @@
 //! prefix and every length its bytes cannot carry, and to whole directories
 //! this build saved and rewrote as an earlier release would have written
 //! them.
+//!
+//! The format version a directory declares, held to the form every release
+//! has written it in.
 
 use super::*;
 use crate::collection::{Declaration, ParsedRecord};
@@ -1239,6 +1242,78 @@ fn the_layout_follows_mappings_bin_below_4_and_is_the_frame_from_4() {
         "{message}"
     );
     assert!(message.contains("frame"), "{message}");
+}
+
+/// A format version is read only as `MAJOR.MINOR.PATCH`. Every version a
+/// release wrote opens, being 1.0.0 to 3.1.0 and the 4.0.0 this build writes,
+/// and so does a later minor or patch under any of those majors. A major this
+/// build does not read is refused by its major, and every other shape is
+/// refused as a version this build cannot interpret.
+#[test]
+fn a_format_version_is_read_only_as_major_minor_patch() {
+    let temp = TempDir::new();
+    let collection = filled(None, 60);
+    let path = temp.at("versioned.zdb");
+    collection.save(path.to_str().unwrap()).unwrap();
+    let saved = read_json(&path.join("manifest.json"));
+    let load = |version: &str| {
+        let mut manifest = saved.clone();
+        manifest["format_version"] = json!(version);
+        write_json(&path.join("manifest.json"), &manifest);
+        Collection::load(path.to_str().unwrap())
+    };
+
+    for version in [
+        "1.0.0", "1.1.0", "1.2.0", "2.0.0", "2.1.0", "3.0.0", "3.1.0", "4.0.0", "1.9.3", "2.3.0",
+        "2.4.1", "3.2.5", "3.7.2", "4.7.1", "4.9.0",
+    ] {
+        let loaded = load(version).unwrap_or_else(|e| panic!("{version}: {e}"));
+        assert_eq!(everything(&loaded), everything(&collection), "{version}");
+    }
+
+    for (version, newer) in [("5.0.0", true), ("0.9.0", false)] {
+        match load(version) {
+            Err(Error::FormatVersionUnsupported {
+                format_version,
+                newer: refused_as_newer,
+                ..
+            }) => assert_eq!(
+                (format_version.as_str(), refused_as_newer),
+                (version, newer)
+            ),
+            other => panic!("{version}: {:?}", other.map(|_| ())),
+        }
+    }
+
+    for version in [
+        "4",
+        "4.banana",
+        "+4.0.0",
+        "04.0.0",
+        "4.0.0-rc1",
+        " 4.0.0",
+        "abc",
+        "",
+        "banana",
+        "4.0",
+        "4.0.0.0",
+        "4..0",
+        "4.0.0 ",
+        "4.00.0",
+        "4.0.01",
+        "4.+0.0",
+        "\u{664}.0.0",
+    ] {
+        assert_eq!(
+            refused(load(version)),
+            format!(
+                "manifest.json declares format_version '{version}', which is not a version \
+                 this build can interpret. A ZeusDB index directory declares a dotted version \
+                 such as 4.0.0."
+            ),
+            "{version:?}"
+        );
+    }
 }
 
 /// A framed artefact a hand assembled from another directory is refused by

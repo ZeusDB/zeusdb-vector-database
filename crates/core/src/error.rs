@@ -496,7 +496,7 @@ pub enum Error {
     ArtefactNotUtf8 { name: String, error: String },
     /// A JSON artefact did not parse
     ArtefactParseFailed { name: &'static str, error: String },
-    /// `format_version` is not a dotted version
+    /// `format_version` is not `MAJOR.MINOR.PATCH` in ASCII digits
     FormatVersionUnparsable {
         format_version: String,
         current: &'static str,
