@@ -64,8 +64,8 @@ def drop(index):
 def test_a_directory_saved_without_a_journal_is_the_directory_it_always_was(tmp_path):
     """create() and save() write what they wrote before the journal existed.
 
-    No journal file, no journal record in the manifest, the format version
-    every save declares, and nothing about a journal in the stats or the info
+    No journal file, no journal record in the manifest, no journal among the
+    features it lists, and nothing about a journal in the stats or the info
     line.
     """
     index = build(5)
@@ -73,7 +73,7 @@ def test_a_directory_saved_without_a_journal_is_the_directory_it_always_was(tmp_
     index.save(str(path))
     assert sorted(p.name for p in tmp_path.iterdir()) == ["plain.zdb"]
     m = manifest(path)
-    assert m["format_version"] == "4.0.0"
+    assert m["features"] == {"identity": "compatible"}
     assert "journal" not in m
     assert index.journal_path is None
     assert journal_keys(index) == {}
@@ -94,7 +94,7 @@ def test_journal_to_writes_the_checkpoint_and_the_sibling(tmp_path):
     assert path.is_dir() and wal.is_file()
     assert wal.stat().st_size == JOURNAL_HEADER_BYTES
     m = manifest(path)
-    assert m["format_version"] == "4.0.0"
+    assert m["features"] == {"identity": "compatible", "journal": "incompatible"}
     assert m["journal"]["file"] == "j.zdb.zdbwal"
     assert m["journal"]["sequence"] == 0
     assert len(m["journal"]["collection_id"]) == 32

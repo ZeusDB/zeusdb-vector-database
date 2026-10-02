@@ -388,7 +388,8 @@ fn clear_keeps_the_identity_whole() {
 /// A directory with no identity opens as it always did: unjournaled, it
 /// takes the id drawn at assembly, which differs from load to load, at
 /// generation 0. Its next save records that id at generation 1 with no
-/// parent, and from then on it is one collection.
+/// parent, and from then on it is one collection. A directory saved before
+/// the record existed lists no features either, so both are removed.
 #[test]
 fn a_directory_recording_no_identity_is_named_at_its_next_save() {
     let temp = TempDir::new();
@@ -399,6 +400,7 @@ fn a_directory_recording_no_identity_is_named_at_its_next_save() {
     drop(collection);
     rewrite_manifest(&path, |m| {
         m.as_object_mut().unwrap().remove("identity");
+        m.as_object_mut().unwrap().remove("features");
     });
 
     let first = load(&path);
@@ -419,7 +421,8 @@ fn a_directory_recording_no_identity_is_named_at_its_next_save() {
 }
 
 /// A journaled directory with no identity takes its journal record's id, as
-/// it always did, and its next checkpoint records that id.
+/// it always did, and its next checkpoint records that id. Saved before the
+/// record existed, it lists no features either.
 #[test]
 fn a_journaled_directory_recording_no_identity_takes_its_journal_records_id() {
     let temp = TempDir::new();
@@ -433,6 +436,7 @@ fn a_journaled_directory_recording_no_identity_takes_its_journal_records_id() {
     drop(collection);
     rewrite_manifest(&path, |m| {
         m.as_object_mut().unwrap().remove("identity");
+        m.as_object_mut().unwrap().remove("features");
     });
 
     let (recovered, report) =

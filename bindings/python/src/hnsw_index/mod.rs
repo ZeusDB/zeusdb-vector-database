@@ -924,14 +924,15 @@ impl HNSWIndex {
     /// refused records may have reached the file and a replay would install
     /// them. See `checkpoint`.
     ///
-    /// A directory saved with a journal declares format version 4.0.0 and opens
-    /// on this release or later. The checkpoint this writes is a save, so it
-    /// moves `identity`'s generation on by one, and the journal's header names
-    /// `identity`'s collection id. `load` holds the journal open until the index
-    /// is dropped, and a file deleted or moved under a live index is one the
-    /// directory can no longer replay, so drop the index before touching the
-    /// file. A record whose journal entry would exceed 65 MiB is refused on a
-    /// journaled index and accepted on one without a journal.
+    /// A directory saved with a journal lists `journal` among the features its
+    /// manifest records, and opens on this release or later. The checkpoint
+    /// this writes is a save, so it moves `identity`'s generation on by one,
+    /// and the journal's header names `identity`'s collection id. `load` holds
+    /// the journal open until the index is dropped, and a file deleted or moved
+    /// under a live index is one the directory can no longer replay, so drop
+    /// the index before touching the file. A record whose journal entry would
+    /// exceed 65 MiB is refused on a journaled index and accepted on one
+    /// without a journal.
     ///
     /// Raises ValueError for a durability that is not one of the three, for
     /// `interval_ms` under any other durability, or for `interval_ms` of 0, and

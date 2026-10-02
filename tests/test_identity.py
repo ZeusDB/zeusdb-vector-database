@@ -228,8 +228,9 @@ def test_clear_keeps_the_identity(tmp_path):
 @pytest.mark.parametrize("version", ["1.1.0", "4.0.0"])
 def test_a_directory_recording_no_identity_is_named_at_its_next_save(tmp_path, version):
     """1.1.0 in the old wire, as 0.11.0 wrote it, and 4.0.0 framed, as the
-    build before the record wrote it. Each opens at generation 0 under an id
-    drawn for it, and its next save records that id at generation 1."""
+    build before the record wrote it, which listed no features either. Each
+    opens at generation 0 under an id drawn for it, and its next save records
+    that id at generation 1."""
     index = build(10)
     path = tmp_path / "older.zdb"
     index.save(str(path))
@@ -238,6 +239,7 @@ def test_a_directory_recording_no_identity_is_named_at_its_next_save(tmp_path, v
         as_old_wire(path, version)
     m = manifest(path)
     del m["identity"]
+    m.pop("features", None)
     (path / "manifest.json").write_text(json.dumps(m, indent=2), encoding="utf-8")
 
     first, second = load(path), load(path)

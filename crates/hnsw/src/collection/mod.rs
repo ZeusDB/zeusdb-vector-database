@@ -79,6 +79,8 @@ mod dense;
 #[cfg(test)]
 mod durability_tests;
 #[cfg(test)]
+mod features_tests;
+#[cfg(test)]
 mod identity_tests;
 mod input;
 mod insert;

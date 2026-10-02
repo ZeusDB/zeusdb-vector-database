@@ -131,7 +131,10 @@ fn opening_a_journal_writes_the_empty_checkpoint_it_replays_onto() {
     );
 
     let m = manifest(&path);
-    assert_eq!(m["format_version"], json!("4.0.0"));
+    assert_eq!(
+        m["features"],
+        json!({"identity": "compatible", "journal": "incompatible"})
+    );
     assert_eq!(m["journal"]["file"], json!("fresh.zdb.zdbwal"));
     assert_eq!(m["journal"]["sequence"], json!(0));
     assert_eq!(
@@ -141,8 +144,8 @@ fn opening_a_journal_writes_the_empty_checkpoint_it_replays_onto() {
     assert_eq!(collection.journal_sequence(), 0);
 }
 
-/// A save of a collection holding no journal declares the version every
-/// save does and carries no `journal` field in the manifest at all.
+/// A save of a collection holding no journal lists no journal among its
+/// features and carries no `journal` field in the manifest at all.
 #[test]
 fn a_directory_saved_without_a_journal_carries_no_journal_field() {
     let temp = TempDir::new();
@@ -152,7 +155,7 @@ fn a_directory_saved_without_a_journal_carries_no_journal_field() {
     collection.save(path.to_str().unwrap()).unwrap();
 
     let m = manifest(&path);
-    assert_eq!(m["format_version"], json!("4.0.0"));
+    assert_eq!(m["features"], json!({"identity": "compatible"}));
     assert!(
         m.as_object().unwrap().get("journal").is_none(),
         "the field is absent rather than null"
@@ -650,10 +653,10 @@ fn every_major_up_to_the_fourth_is_read_and_a_fifth_is_not() {
     assert!(message.contains("1.x, 2.x, 3.x and 4.x"), "{message}");
 }
 
-/// A journaled collection holding a sparse space declares the version every
-/// save does, and recovers to the records it held.
+/// A journaled collection holding a sparse space lists both among its
+/// features, and recovers to the records it held.
 #[test]
-fn a_journaled_directory_with_a_space_declares_the_one_version() {
+fn a_journaled_directory_with_a_space_lists_both_features() {
     let temp = TempDir::new();
     let path = temp.at("spaced.zdb");
     let declaration = declaration()
@@ -679,7 +682,10 @@ fn a_journaled_directory_with_a_space_declares_the_one_version() {
     let before = ids(&collection);
     drop(collection);
 
-    assert_eq!(manifest(&path)["format_version"], json!("4.0.0"));
+    assert_eq!(
+        manifest(&path)["features"],
+        json!({"identity": "compatible", "journal": "incompatible", "sparse": "incompatible"})
+    );
     let (recovered, _) =
         Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
     assert_eq!(ids(&recovered), before);

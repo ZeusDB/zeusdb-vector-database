@@ -597,7 +597,10 @@ fn a_scalar_directory_round_trips_with_its_two_artefacts() {
     let path = Path::new(&path);
 
     let manifest = read_json(&path.join("manifest.json"));
-    assert_eq!(manifest["format_version"], "4.0.0");
+    assert_eq!(
+        manifest["features"],
+        json!({"identity": "compatible", "int8": "incompatible"})
+    );
     let files: Vec<&str> = manifest["files_included"]
         .as_array()
         .unwrap()
@@ -697,7 +700,10 @@ fn a_scalar_directory_round_trips_with_its_two_artefacts() {
     untrained.save(&path).unwrap();
     let path = Path::new(&path);
     let manifest = read_json(&path.join("manifest.json"));
-    assert_eq!(manifest["format_version"], "4.0.0");
+    assert_eq!(
+        manifest["features"],
+        json!({"identity": "compatible", "int8": "incompatible"})
+    );
     let files: Vec<&str> = manifest["files_included"]
         .as_array()
         .unwrap()
@@ -903,8 +909,8 @@ fn every_scales_and_rows_bound_is_refused_by_name() {
     assert!(Collection::load(source.to_str().unwrap()).is_ok());
 }
 
-/// A scalar directory declares the version every save does whatever else
-/// it holds, and this build's own direction of the version rule: a scalar
+/// A scalar directory lists `int8` among its features whatever else it
+/// holds, and this build's own direction of the version rule: a scalar
 /// directory labelled at an earlier major still opens here, and a later
 /// major is refused.
 #[test]
@@ -916,8 +922,8 @@ fn the_version_rule_holds_for_a_scalar_directory() {
     let dense_path = dir.sub("dense.zdb");
     dense.save(&dense_path).unwrap();
     assert_eq!(
-        read_json(&Path::new(&dense_path).join("manifest.json"))["format_version"],
-        "4.0.0"
+        read_json(&Path::new(&dense_path).join("manifest.json"))["features"],
+        json!({"identity": "compatible", "int8": "incompatible"})
     );
 
     let d = declaration(8, "l2")
@@ -930,8 +936,8 @@ fn the_version_rule_holds_for_a_scalar_directory() {
     let spaced_path = dir.sub("spaced.zdb");
     spaced.save(&spaced_path).unwrap();
     assert_eq!(
-        read_json(&Path::new(&spaced_path).join("manifest.json"))["format_version"],
-        "4.0.0"
+        read_json(&Path::new(&spaced_path).join("manifest.json"))["features"],
+        json!({"identity": "compatible", "int8": "incompatible", "sparse": "incompatible"})
     );
     assert!(Collection::load(&spaced_path).unwrap().is_quantized());
 
@@ -941,8 +947,8 @@ fn the_version_rule_holds_for_a_scalar_directory() {
         .journal_to(&journaled_path, Durability::default())
         .unwrap();
     assert_eq!(
-        read_json(&Path::new(&journaled_path).join("manifest.json"))["format_version"],
-        "4.0.0"
+        read_json(&Path::new(&journaled_path).join("manifest.json"))["features"],
+        json!({"identity": "compatible", "int8": "incompatible", "journal": "incompatible"})
     );
     drop(journaled);
     assert!(Collection::load(&journaled_path).unwrap().is_quantized());
@@ -955,8 +961,8 @@ fn the_version_rule_holds_for_a_scalar_directory() {
     let collecting_path = dir.sub("collecting.zdb");
     collecting.save(&collecting_path).unwrap();
     assert_eq!(
-        read_json(&Path::new(&collecting_path).join("manifest.json"))["format_version"],
-        "4.0.0"
+        read_json(&Path::new(&collecting_path).join("manifest.json"))["features"],
+        json!({"identity": "compatible", "int8": "incompatible"})
     );
 
     // This build reads any 1.x and reads a frame wherever it finds one, so
