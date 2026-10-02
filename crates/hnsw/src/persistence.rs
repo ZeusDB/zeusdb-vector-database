@@ -406,15 +406,24 @@ pub(crate) fn recorded_dump_length(manifest: &IndexManifest, name: &str) -> Opti
 
 /// Refuse a directory this build cannot interpret, and return the major it
 /// declares.
+///
+/// A version is read only as `MAJOR.MINOR.PATCH`: three runs of ASCII digits
+/// joined by dots, with no sign, no leading zero on a part of more than one
+/// digit, and nothing before or after. Any other string is refused, as is a
+/// major too large for a `u32`.
 fn check_format_version(format_version: &str) -> Result<u32, Error> {
-    let major = format_version
-        .split('.')
-        .next()
-        .and_then(|major| major.parse::<u32>().ok())
-        .ok_or_else(|| Error::FormatVersionUnparsable {
-            format_version: format_version.to_string(),
-            current: FORMAT_VERSION,
-        })?;
+    let unparsable = || Error::FormatVersionUnparsable {
+        format_version: format_version.to_string(),
+        current: FORMAT_VERSION,
+    };
+    let parts: Vec<&str> = format_version.split('.').collect();
+    let &[major, minor, patch] = parts.as_slice() else {
+        return Err(unparsable());
+    };
+    if ![major, minor, patch].into_iter().all(is_version_part) {
+        return Err(unparsable());
+    }
+    let major = major.parse::<u32>().map_err(|_| unparsable())?;
 
     if !SUPPORTED_FORMAT_MAJORS.contains(&major) {
         return Err(Error::FormatVersionUnsupported {
@@ -425,6 +434,14 @@ fn check_format_version(format_version: &str) -> Result<u32, Error> {
     }
 
     Ok(major)
+}
+
+/// Whether `part` is one part of a format version: a run of ASCII digits that
+/// starts with `0` only when it is `0` alone.
+fn is_version_part(part: &str) -> bool {
+    !part.is_empty()
+        && part.bytes().all(|byte| byte.is_ascii_digit())
+        && (part == "0" || !part.starts_with('0'))
 }
 
 // ============================================================================

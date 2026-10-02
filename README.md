@@ -1562,7 +1562,7 @@ Recall at 10 against exact search on 100,000 records, and resident memory on 50,
 | sift-128 | 128 | 0.9988, 42.4 MiB | 0.4038, 29.5 MiB | 0.9827, 24.4 MiB |
 | glove-100 | 100 | 0.8858, 37.0 MiB | 0.2647, 30.1 MiB | 0.8788, 23.4 MiB |
 
-A scalar index gives up two hundredths of recall for a third to two thirds of the memory, and searching it is no slower than searching an unquantized one. A trained index writes `int8_scales.zdbint8` and `int8_rows.zdbint8` in place of the two `pq_` files, and its directory declares format version 1.2.0.
+A scalar index gives up two hundredths of recall for a third to two thirds of the memory, and searching it is no slower than searching an unquantized one. A trained index writes `int8_scales.zdbint8` and `int8_rows.zdbint8` in place of the two `pq_` files.
 
 **A value beyond the range its dimension's sample reached is clipped, not refused.** `quantization_saturated_values` counts every clipped value, and a rate that climbs as records arrive says the sample no longer covers the data.
 
@@ -1579,7 +1579,7 @@ The persistence system supports:
 ✅ **Quantization support**, both raw and quantized storage modes, including the trained codebook or scales
 ✅ **Training state recovery**, so an index saved mid-collection resumes collecting
 ✅ **Sparse spaces**, the postings and the term dictionary, under `spaces/<name>/`
-✅ **Format versioning**, so a directory this build cannot interpret is refused rather than misread
+✅ **A format version and a list of features**, so a directory holding something this build cannot read is refused, naming it, rather than misread
 ✅ **Atomic saves**, so a reader sees the whole previous index or the whole new one
 ✅ **A digest per artefact**, checked on load, so a file that has changed since it was written is refused
 ✅ **A journal**, opened beside the directory on request, so every mutation since the last save is replayed when the directory opens
@@ -1696,9 +1696,9 @@ The `.save()` method creates a directory containing all index components:
 
 ```
 my_index.zdb/
-├── manifest.json           # Index metadata, file inventory and, if journaled, the journal record
+├── manifest.json           # Index metadata, its features and identity, the file inventory and, if journaled, the journal record
 ├── config.json             # HNSW configuration and index level metadata
-├── mappings.bin            # ID mappings (binary format)
+├── mappings.bin            # Every record's id and internal id (framed binary)
 ├── metadata.json           # Per-record metadata (JSON format)
 ├── vectors.bin             # Raw vectors (whenever the index holds any)
 ├── quantization.json       # Quantization configuration and training state (if enabled)
@@ -1717,13 +1717,13 @@ my_index.zdb.zdbwal         # The journal, beside the directory (if journaled)
 
 `<name>` is the space's `name`, which defaults to `sparse`. `terms.zdbdict` is written only where the space was declared with a tokenizer. The journal is a sibling of the directory rather than a file inside it, and [Journaling an Index](#-journaling-an-index---journal_to) says why.
 
-`manifest.json` lists every file the save wrote under `files_included` and is the last file written, so it is the inventory of what the directory does hold. Beside the list, `file_digests` records each artefact's length and a digest of its contents, and for a journaled index a `journal` record names the sibling file, the collection id both share and the sequence the checkpoint holds.
+`manifest.json` lists every file the save wrote under `files_included` and is the last file written, so it is the inventory of what the directory does hold. Beside the list, `file_digests` records each artefact's length and, for each JSON artefact, a digest of its contents, and for a journaled index a `journal` record names the sibling file, the collection id both share and the sequence the checkpoint holds. `features` names what the directory holds, see [What a Directory Holds](#-what-a-directory-holds---features), and `identity` names the index it belongs to, its place among that index's saves and the save it came from, see [Identifying a Directory](#-identifying-a-directory---identity).
 
 A directory saved by 0.6.0 or earlier holds `hnsw_index.hnsw.graph` and `hnsw_index.hnsw.data` in place of `hnsw_index.zdbgraph`. Opening it still works: the graph is rebuilt once from the stored records, and the next `.save()` writes the single file.
 
 **`load()` refuses a directory that does not hold what its manifest names.** It checks `files_included` before it reads anything, and the graph dump is the one exempt artefact, because every record carries what the graph is built from. A directory missing any other file will not open, and the refusal names the file and says what it held. Restore it from a copy; the missing file cannot be rebuilt from the ones that remain. A file the manifest does not name is neither read nor complained about.
 
-**It also refuses a file that is present and has changed.** Each artefact is checked against the length and digest `file_digests` records for it, before anything parses it, so a file edited in place is refused with its name and both digests in the message. The graph dump, the two scalar artefacts and a sparse space's two files carry their own header and payload checksums instead, so the manifest records only their length. A dump that disagrees is rebuilt rather than refused, and any of the others is refused by its own frame.
+**It also refuses a file that is present and has changed.** Each artefact is checked against the length `file_digests` records for it, and each JSON artefact against its digest, before anything parses it, so a file edited in place is refused with its name in the message, and a JSON artefact's refusal names both digests. Every binary artefact, being `mappings.bin`, `vectors.bin`, the two `pq_` files, the two scalar artefacts, a sparse space's two files and the graph dump, carries its own header and payload checksums, so the manifest records only its length. A dump that disagrees is rebuilt rather than refused, and any of the others is refused by its own frame.
 
 A directory saved before 0.8.0 carries no digests, so nothing is verified and it loads exactly as it did.
 
@@ -1847,7 +1847,88 @@ The journal is `<path>.zdbwal`, a sibling of the directory rather than a file in
 
 `get_stats()` reports five `journal_` keys on a journaled index, being the four the example prints and `journal_interval_ms`, which is present under `"interval"` alone.
 
-**Nothing checkpoints for you.** An index that is never checkpointed opens by replaying every record in its journal, each at the cost of the `add()` that wrote it, so a directory with a million records in the journal takes minutes to open where its checkpoint takes seconds. `journal_records` passing the record count is a reasonable trigger. A journaled directory declares format version 3.0.0.
+**Nothing checkpoints for you.** An index that is never checkpointed opens by replaying every record in its journal, each at the cost of the `add()` that wrote it, so a directory with a million records in the journal takes minutes to open where its checkpoint takes seconds. `journal_records` passing the record count is a reasonable trigger. A checkpoint is a save, so each one moves `identity`'s generation on by one, while the journal's own sequence counts records.
+
+### 🪪 Identifying a Directory - .identity
+
+Every save records what the directory is, under `identity` in `manifest.json`, and an index reports the same four values as its `identity` property.
+
+| Key | What it is |
+|---|---|
+| `collection_id` | The index's id, 32 hexadecimal digits, drawn when the index is created and kept through every save and load. A journaled index's journal names the same id in its header |
+| `generation` | How many saves the index had made when it wrote, or read, its last directory. A new index is at 0, its first save writes 1, and each save writes one more |
+| `snapshot` | The id of the directory the index last saved or read, drawn at that save, or `None` before the first |
+| `parent` | The `snapshot` that directory was saved from, or `None` on a first save |
+
+```python
+index = vdb.create("hnsw", dim=4, expected_size=100)
+index.add({"ids": ["a", "b"], "embeddings": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]})
+print(index.identity["generation"], index.identity["snapshot"])
+
+index.save("identified.zdb")
+first = index.identity
+print(first["generation"], first["parent"])
+
+loaded = vdb.load("identified.zdb")
+print(loaded.identity == first)
+
+loaded.save("identified.zdb")
+print(loaded.identity["generation"], loaded.identity["parent"] == first["snapshot"])
+print(loaded.identity["collection_id"] == first["collection_id"])
+```
+
+*Output*
+
+```
+0 None
+1 None
+True
+2 True
+True
+```
+
+Of two directories of one index, the higher `generation` is the later save. A copy taken before the last save is one generation behind the directory saved after it, and that directory names the copy's `snapshot` as its `parent`. Two directories naming the same `parent` under different snapshots were each saved from the same state, which is what a copy opened and saved in its own place looks like. `clear()` keeps all four, since a cleared index is the same index, and `get_stats()` does not carry them.
+
+A directory saved by 0.11.0 or earlier records no identity and opens as it always did. A journaled one takes the id its journal names, and any other is given one when it is opened. Its next save records that id at generation 1.
+
+### 📋 What a Directory Holds - features
+
+Every save lists what the directory holds under `features` in `manifest.json`, each feature marked `compatible` or `incompatible`, and `load()` reads the list before anything else in the directory.
+
+```python
+import json
+
+index = vdb.create("hnsw", dim=4, expected_size=100)
+index.add({"ids": ["a", "b"], "embeddings": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]})
+index.save("plain.zdb")
+
+texts = vdb.create("hnsw", dim=4, expected_size=100, sparse={"name": "text", "tokenizer": "simple"})
+texts.add({"ids": ["a"], "embeddings": [[1.0, 0.0, 0.0, 0.0]], "texts": ["hello world"]})
+texts.journal_to("texts.zdb")
+
+for path in ("plain.zdb", "texts.zdb"):
+    with open(f"{path}/manifest.json") as f:
+        manifest = json.load(f)
+    print(path, manifest["format_version"], manifest["features"])
+```
+
+*Output*
+
+```
+plain.zdb 4.0.0 {'identity': 'compatible'}
+texts.zdb 4.0.0 {'identity': 'compatible', 'journal': 'incompatible', 'sparse': 'incompatible', 'text': 'incompatible'}
+```
+
+| Feature | Listed when the directory holds | Mark |
+|---|---|---|
+| `identity` | its identity, which every save records | compatible |
+| `pq` | product quantization, trained or not | incompatible |
+| `int8` | scalar quantization, trained or not | incompatible |
+| `sparse` | a sparse space | incompatible |
+| `text` | a text layer on that space | incompatible |
+| `journal` | a journal beside the directory | incompatible |
+
+A release that meets a feature it does not know refuses the directory with a message naming the feature, unless the directory marks it `compatible`, in which case the release opens the directory without it and its next save leaves the feature out. A later feature is a new name in this list rather than a new format version, so a directory holding nothing a release does not know keeps opening on that release. A directory saved by 0.11.0 or earlier lists no features and opens as it did.
 
 <br />
 
@@ -1863,20 +1944,9 @@ The journal is `<path>.zdbwal`, a sibling of the directory rather than a file in
 
 - **Same volume.** The staging directory is a sibling of the target, so both are on the target's volume and the move is a rename rather than a copy.
 
-- **Version compatibility.** The manifest records a format version, and this build reads any 1.x, 2.x or 3.x. What it writes depends on what the directory holds:
+- **Version compatibility.** Every directory this release saves declares format version 4.0.0 and lists its features, see [What a Directory Holds](#-what-a-directory-holds---features). This release reads any 1.x, 2.x, 3.x or 4.x, so a directory an earlier release saved opens here, and saving it again writes 4.0.0. A 4.0.0 directory holds `mappings.bin`, `vectors.bin` and the two `pq_` files inside a frame with checksums of its own, where earlier releases wrote them in the bincode crate's encoding, so 0.5.0 to 0.11.0 refuse it at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
 
-  | Directory holds | Version written | Opens on |
-  |---|---|---|
-  | a dense space alone | 1.1.0 | every release that reads 1.x |
-  | a dense space with scalar quantization | 1.2.0 | this release or later |
-  | a sparse space | 2.0.0 | 0.10.0 or later |
-  | a sparse space and scalar quantization | 2.1.0 | this release or later |
-  | a journal | 3.0.0 | this release or later |
-  | a journal and scalar quantization | 3.1.0 | this release or later |
-
-  A different major version is refused with a message naming the newer release. The scalar versions are minors because an older reader refuses such a directory on the first field of its `quantization.json` it does not know, rather than opening it wrongly.
-
-- **Integrity checks on load.** Four run, in this order: the format version, then `files_included` against the directory, then each artefact against its recorded length and digest, then the restored record count against the count in `config.json`. A directory holding a sparse space adds two, being every record the space holds against the id mappings, and every term id the postings carry against the length of the dictionary. A journaled directory adds the journal's own, being the collection id in its header against the manifest's, its first record against the sequence the checkpoint holds, a record in its middle whose bytes changed after it was written, and every replayed record against the index it lands on. A trained scalar directory adds the bounds of its two artefacts, being one finite positive scale per declared dimension, and one row per record the mappings hold in increasing internal id order.
+- **Integrity checks on load.** Five run, in this order: the format version, then the features against the ones this release knows, then `files_included` against the directory, then each artefact against its recorded length and, for a JSON artefact, its digest, a binary artefact verifying its own checksums as it is read, then the restored record count against the count in `config.json`. Once `config.json` and `quantization.json` are read, the features a 4.0.0 directory lists are held to what it holds. A directory holding a sparse space adds two, being every record the space holds against the id mappings, and every term id the postings carry against the length of the dictionary. A journaled directory adds the journal's own, being the collection id in its header against the manifest's, its first record against the sequence the checkpoint holds, a record in its middle whose bytes changed after it was written, and every replayed record against the index it lands on. A directory recording an identity adds its own, being every id 32 hexadecimal digits and the generation 1 or more, and, where it is journaled, the collection id its journal record names against the identity's. A trained scalar directory adds the bounds of its two artefacts, being one finite positive scale per declared dimension, and one row per record the mappings hold in increasing internal id order. A 4.0.0 directory adds the bounds of its binary artefacts, being every internal id `vectors.bin` and `pq_codes.bin` name one that `mappings.bin` holds, one vector of the declared width for every record `mappings.bin` holds where the directory holds `vectors.bin`, one code of the declared width for each record coded, and a codebook of the shape `quantization.json` describes.
 
 - **`save()` and `load()` are silent.** Every step they used to print to stdout is a `debug` log line instead, so a library caller sees nothing on stdout. Set `ZEUSDB_LOG_LEVEL=debug` to see the steps.
 
