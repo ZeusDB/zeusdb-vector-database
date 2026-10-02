@@ -164,6 +164,11 @@ pub mod order {
     /// holds, written by a checkpoint under `writers` and read by the save
     /// that writes the manifest naming it.
     pub const JOURNAL_SEQUENCE: u8 = AFTER_LEAVES + 3;
+    /// A leaf. The generation, snapshot and parent of the directory the
+    /// collection last committed or read, written by a save after its
+    /// commit and by a load, and read by the save that writes the next
+    /// manifest and by a caller asking for the collection's identity.
+    pub const LINEAGE: u8 = AFTER_LEAVES + 4;
 
     /// The first space's four ranks, by the names the collection's
     /// documentation uses for them.
@@ -181,7 +186,7 @@ pub mod order {
     /// Compiled under `cfg(test)` alone, because the test is its only reader and
     /// a release build otherwise warns that it is never used.
     #[cfg(test)]
-    pub const HIGHEST: u8 = JOURNAL_SEQUENCE;
+    pub const HIGHEST: u8 = LINEAGE;
 
     /// Which space a rank in the space block or the leaf block belongs to,
     /// and which of its guards it is. `None` for a collection rank.
@@ -231,6 +236,7 @@ fn name_of(rank: u8) -> String {
         order::GENERATED_IDS => Some("generated_ids"),
         order::JOURNAL => Some("journal"),
         order::JOURNAL_SEQUENCE => Some("journal_sequence"),
+        order::LINEAGE => Some("lineage"),
         _ => None,
     };
     if let Some(name) = fixed {

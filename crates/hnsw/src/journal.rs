@@ -163,14 +163,21 @@ pub fn directory_of(journal: &Path) -> Option<PathBuf> {
     Some(journal.parent().unwrap_or_else(|| Path::new("")).join(stem))
 }
 
-/// A collection id as the manifest spells it, being 32 lower case
-/// hexadecimal digits.
-pub(crate) fn collection_id_hex(id: u128) -> String {
+/// An id as the manifest spells it, being 32 lower case hexadecimal digits.
+/// Every id the manifest carries takes it: a collection's, a snapshot's and
+/// a parent's.
+pub(crate) fn id_hex(id: u128) -> String {
     format!("{:032x}", id)
 }
 
-/// A collection id read back from the manifest's spelling.
-pub(crate) fn collection_id_from_hex(hex: &str) -> Option<u128> {
+/// An id read back from the manifest's spelling, being 32 hexadecimal digits
+/// and nothing else, so the id read back is the id written. `from_str_radix`
+/// alone reads three digits, or a sign before the digits, as a whole id, and
+/// a collection would then report an id its directory does not spell.
+pub(crate) fn id_from_hex(hex: &str) -> Option<u128> {
+    if hex.len() != 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
     u128::from_str_radix(hex, 16).ok()
 }
 
@@ -484,8 +491,8 @@ pub(crate) fn check_contents(
     if contents.header.collection_id != directory_id {
         return Err(Error::JournalNotThisCollection {
             file: file.to_string(),
-            journal_id: collection_id_hex(contents.header.collection_id),
-            directory_id: collection_id_hex(directory_id),
+            journal_id: id_hex(contents.header.collection_id),
+            directory_id: id_hex(directory_id),
         });
     }
     if contents.header.first_sequence > checkpoint_sequence + 1 {
@@ -526,11 +533,31 @@ mod tests {
             u128::MAX,
             0x0123_4567_89ab_cdef_0123_4567_89ab_cdef,
         ] {
-            let hex = collection_id_hex(id);
+            let hex = id_hex(id);
             assert_eq!(hex.len(), 32);
-            assert_eq!(collection_id_from_hex(&hex), Some(id));
+            assert_eq!(id_from_hex(&hex), Some(id));
         }
-        assert_eq!(collection_id_from_hex("not hexadecimal"), None);
+        assert_eq!(id_from_hex("not hexadecimal"), None);
+    }
+
+    /// Fewer digits, more digits, a sign or anything that is not a digit
+    /// is refused, so an id read back is spelled as it was written. Either
+    /// case of digit is read, as the refusal's words promise.
+    #[test]
+    fn an_id_is_32_hexadecimal_digits_and_nothing_else() {
+        let written = id_hex(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+        assert_eq!(id_from_hex("abc"), None);
+        assert_eq!(id_from_hex(""), None);
+        assert_eq!(id_from_hex(&written[1..]), None);
+        assert_eq!(id_from_hex(&format!("{written}0")), None);
+        assert_eq!(id_from_hex(&format!("+{}", &written[1..])), None);
+        assert_eq!(id_from_hex(&format!("{} ", &written[1..])), None);
+        assert_eq!(id_from_hex(&format!("g{}", &written[1..])), None);
+        assert_eq!(
+            id_from_hex(&written.to_uppercase()),
+            id_from_hex(&written),
+            "upper case digits are hexadecimal digits"
+        );
     }
 
     #[test]

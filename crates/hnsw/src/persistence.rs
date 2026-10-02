@@ -63,6 +63,21 @@
 //! before it hands the collection back. See `crate::journal` for where the
 //! file lives and why, and for what is refused.
 //!
+//! ## Identity
+//!
+//! `manifest.json` records what the directory is under `identity`: the
+//! collection it belongs to, its generation, being the saves that
+//! collection has committed with this one, the snapshot it is, drawn at
+//! this save, and the snapshot it was saved from where there was one. A
+//! load takes all four back, so a directory loaded and saved keeps its
+//! collection and moves one generation on, and a copy left behind by a
+//! later save is the snapshot the later directory names as its parent. A
+//! journaled directory's identity and journal record name one collection,
+//! which is the one its journal's header names. A directory saved before
+//! the record existed opens as it did, under the id its journal record
+//! names or the one drawn at assembly, and its next save records it. See
+//! `crate::Identity`.
+//!
 //! `config.json` declares the sparse space under `spaces`, by value: the
 //! space's name, its unlink policy, its lazy threshold, its weighting with
 //! the weighting's parameters, and its tokenizer where it takes text. The
@@ -526,6 +541,17 @@ fn manifest_names(manifest: &IndexManifest, name: &str) -> bool {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct IndexManifest {
     pub(crate) format_version: String,
+
+    /// What the directory is: its collection, its generation, its snapshot
+    /// and the snapshot it was saved from. See `IdentityManifest`.
+    ///
+    /// Written by every save. Absent from a directory saved before the
+    /// record existed, which opens as it did and gains it at its next save.
+    /// serde ignores a field it does not know, so a build that predates the
+    /// record opens a directory carrying it, and a save there drops it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) identity: Option<IdentityManifest>,
+
     pub(crate) zeusdb_version: String,
     pub(crate) created_at: String,
     pub(crate) saved_at: String,
@@ -590,6 +616,68 @@ pub(crate) struct JournalManifest {
     pub(crate) file: String,
     pub(crate) sequence: u64,
     pub(crate) collection_id: String,
+}
+
+/// How `manifest.json` names what the directory is. See `crate::Identity`.
+///
+/// Every id is 32 hexadecimal digits, the spelling `journal::id_hex`
+/// writes. `generation` is 1 or more, since a collection's first save
+/// writes 1. `parent` is absent from the file where the collection was
+/// saved from no recorded snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct IdentityManifest {
+    pub(crate) collection_id: String,
+    pub(crate) generation: u64,
+    pub(crate) snapshot: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) parent: Option<String>,
+}
+
+impl IdentityManifest {
+    /// The record a save writes for `identity`, which carries the snapshot
+    /// the save drew.
+    fn of(identity: &crate::Identity) -> Self {
+        IdentityManifest {
+            collection_id: crate::journal::id_hex(identity.collection_id),
+            generation: identity.generation,
+            snapshot: crate::journal::id_hex(
+                identity
+                    .snapshot
+                    .expect("the identity a save records carries the snapshot it drew"),
+            ),
+            parent: identity.parent.map(crate::journal::id_hex),
+        }
+    }
+
+    /// The identity this record names, held to the spelling and the range
+    /// a save writes.
+    fn read(&self) -> Result<crate::Identity, Error> {
+        let id = |field: &str, value: &str| {
+            crate::journal::id_from_hex(value).ok_or_else(|| Error::IdentityInvalid {
+                detail: format!(
+                    "its {} is '{}', which is not 32 hexadecimal digits",
+                    field, value
+                ),
+            })
+        };
+        let collection_id = id("collection_id", &self.collection_id)?;
+        let snapshot = id("snapshot", &self.snapshot)?;
+        let parent = match self.parent.as_deref() {
+            Some(parent) => Some(id("parent", parent)?),
+            None => None,
+        };
+        if self.generation == 0 {
+            return Err(Error::IdentityInvalid {
+                detail: "its generation is 0, and a collection's first save records 1".to_string(),
+            });
+        }
+        Ok(crate::Identity {
+            collection_id,
+            generation: self.generation,
+            snapshot: Some(snapshot),
+            parent,
+        })
+    }
 }
 
 /// The manifest is what an index reads its artefacts' recorded lengths from.
@@ -2646,6 +2734,14 @@ fn load_from(
         });
     }
 
+    // What the directory is, where its manifest records it, held to what a
+    // save writes before any artefact is read.
+    let identity = manifest
+        .identity
+        .as_ref()
+        .map(IdentityManifest::read)
+        .transpose()?;
+
     // Before any artefact is read, so a directory missing two files names the
     // first rather than failing on whichever one a partial load reaches.
     check_files_present(dir, &manifest)?;
@@ -2745,6 +2841,16 @@ fn load_from(
     // load and save claimed to have been created then.
     restored_index.set_created_at(manifest.created_at);
 
+    // The collection the directory names, at the generation and snapshot it
+    // records, so its next save is the next generation of the same
+    // collection. A directory recording none keeps the id drawn at
+    // assembly, or takes its journal record's below, and its lineage stays
+    // at a collection never saved.
+    if let Some(identity) = identity {
+        restored_index.set_collection_id(identity.collection_id);
+        restored_index.set_lineage(&identity);
+    }
+
     debug!(target: LOG_TARGET, "Index reconstruction completed successfully!");
 
     // Phase 3: The journal beside the directory, where the manifest names
@@ -2756,7 +2862,7 @@ fn load_from(
         return Ok((restored_index, recovery));
     };
 
-    let Some(directory_id) = crate::journal::collection_id_from_hex(&record.collection_id) else {
+    let Some(journal_id) = crate::journal::id_from_hex(&record.collection_id) else {
         return Err(Error::JournalManifestInvalid {
             detail: format!(
                 "its collection_id is '{}', which is not 32 hexadecimal digits",
@@ -2764,7 +2870,15 @@ fn load_from(
             ),
         });
     };
-    restored_index.set_collection_id(directory_id);
+    // The collection the journal must belong to is the identity's where the
+    // manifest records one, and the journal record's where only that does.
+    let directory_id = match identity {
+        Some(identity) => identity.collection_id,
+        None => {
+            restored_index.set_collection_id(journal_id);
+            journal_id
+        }
+    };
     restored_index.set_journal_sequence(record.sequence);
 
     let durability = match policy {
@@ -2797,6 +2911,18 @@ fn load_from(
     let bytes = crate::journal::read_journal_bytes(storage)?;
     let contents = zeusdb_vector_core::read_journal(&bytes, &file)?;
     crate::journal::check_contents(&contents, &file, directory_id, record.sequence)?;
+    // No save writes the identity and the journal record apart, so a
+    // manifest whose two name two collections was assembled by hand, and
+    // replaying would be choosing one of them.
+    if journal_id != directory_id {
+        return Err(Error::JournalManifestInvalid {
+            detail: format!(
+                "its collection_id is '{}' and the directory's identity names collection '{}'",
+                record.collection_id,
+                crate::journal::id_hex(directory_id)
+            ),
+        });
+    }
 
     // Every record above the sequence the checkpoint holds, applied at the
     // values it names. `apply` refuses to run with a sink attached, which is
@@ -3234,11 +3360,13 @@ fn save_vectors(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> R
 /// It names every other artefact, records the length and digest of each, and
 /// records the directory size. All three are facts about files that are already
 /// on disk, which is why it is written last and why there is no second pass to
-/// correct any of them.
+/// correct any of them. It records `identity` too, which the save settled
+/// before its first artefact.
 pub(crate) fn save_manifest(
     index: &Collection,
     dir: &dyn Dir,
     ledger: SaveLedger,
+    identity: &crate::Identity,
 ) -> Result<(), Error> {
     debug!(target: LOG_TARGET, "Saving manifest.json...");
 
@@ -3365,11 +3493,12 @@ pub(crate) fn save_manifest(
         .map(|(file, collection_id)| JournalManifest {
             file,
             sequence: index.journal_sequence(),
-            collection_id: crate::journal::collection_id_hex(collection_id),
+            collection_id: crate::journal::id_hex(collection_id),
         });
 
     let manifest = IndexManifest {
         format_version: FORMAT_VERSION.to_string(),
+        identity: Some(IdentityManifest::of(identity)),
         zeusdb_version: env!("CARGO_PKG_VERSION").to_string(),
         created_at: index.created_at(),
         saved_at: Utc::now().to_rfc3339(),
