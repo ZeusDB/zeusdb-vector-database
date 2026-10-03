@@ -104,6 +104,13 @@ impl<T> VectorStore<T> {
         self.data.get(at..at + self.dim)
     }
 
+    /// Every stored value, node by node, for a test that compares two
+    /// stores.
+    #[cfg(test)]
+    pub(crate) fn values(&self) -> &[T] {
+        &self.data
+    }
+
     /// Bytes the block has asked the allocator for, the header included.
     pub(crate) fn memory_bytes(&self) -> usize {
         std::mem::size_of::<Self>() + self.data.capacity() * std::mem::size_of::<T>()

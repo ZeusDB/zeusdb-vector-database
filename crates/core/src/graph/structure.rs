@@ -1244,3 +1244,65 @@ fn the_split_insertion_is_the_outright_insertion() {
         "the sample drew above the base layer, so the levels did some work"
     );
 }
+
+/// The graph the loader's collection starts from asks the allocator for
+/// nothing, and given the declared reservation afterwards it holds what one
+/// built with the reservation holds, buffer for buffer, and builds the same
+/// graph from the same records.
+///
+/// Through the seam, which is what the loader calls. One declaration the
+/// budget reserves in full and one it caps.
+#[test]
+fn a_graph_reserved_after_it_is_built_holds_what_new_reserves() {
+    fn arrays(graph: &VectorGraph) -> (super::mutable::GraphArrays, usize, usize) {
+        match graph {
+            VectorGraph::L2(b) => (
+                b.graph.arrays(),
+                b.store.memory_bytes(),
+                b.store.reserved_bytes(),
+            ),
+            _ => unreachable!("the graphs here are l2 graphs"),
+        }
+    }
+
+    for (dim, m, declared) in [(8usize, 4usize, 5_000usize), (64, 32, 1_000_000)] {
+        let unreserved = VectorGraph::new_raw_unreserved("l2", dim, m, declared, LAYERS, 64);
+        let (shape, store_bytes, store_reserved) = arrays(&unreserved);
+        assert!(
+            shape.buffers.iter().all(|(_, capacity, _)| *capacity == 0),
+            "{:?}",
+            shape.buffers
+        );
+        assert_eq!(store_bytes, std::mem::size_of::<VectorStore<f32>>());
+        assert_eq!(store_reserved, 0);
+        assert_eq!(unreserved.links_reserved_bytes(), 0);
+
+        let mut later = VectorGraph::new_raw_unreserved("l2", dim, m, declared, LAYERS, 64);
+        later.reserve_declared(declared);
+        let mut built = VectorGraph::new_raw("l2", dim, m, declared, LAYERS, 64);
+        assert!(built.links_reserved_bytes() > 0);
+        assert_eq!(
+            arrays(&later),
+            arrays(&built),
+            "dim {} declared {}",
+            dim,
+            declared
+        );
+        assert_eq!(later.links_memory_bytes(), built.links_memory_bytes());
+
+        for id in 0..300usize {
+            let vector: Vec<f32> = (0..dim)
+                .map(|d| ((id * 31 + d * 7) % 97) as f32 * 0.01)
+                .collect();
+            later.insert(&vector, id + 1);
+            built.insert(&vector, id + 1);
+        }
+        assert_eq!(
+            arrays(&later),
+            arrays(&built),
+            "dim {} declared {}",
+            dim,
+            declared
+        );
+    }
+}

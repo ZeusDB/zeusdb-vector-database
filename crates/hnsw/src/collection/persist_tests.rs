@@ -860,3 +860,106 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
         }
     }
 }
+
+/// The dense graph's request and slack, its store's, and the raw vectors'.
+fn graph_reservation(collection: &Collection) -> (usize, usize, usize, usize, usize) {
+    let index = collection.dense().index.read().unwrap();
+    let graph = index.graph();
+    (
+        graph.links_memory_bytes(),
+        graph.links_reserved_bytes(),
+        graph.store_memory_bytes(),
+        graph.store_reserved_bytes(),
+        graph.raw_vectors_memory_bytes(),
+    )
+}
+
+/// A directory holding no record keeps the graph the loader built its
+/// collection around, and the load gives it the reservation a created
+/// collection's graph holds. The metadata and column stores come back at the
+/// declared reservation as well, whether or not a field is declared.
+///
+/// A save of a collection holding nothing writes no graph dump, so the load
+/// reads none and takes the rebuild over no record.
+#[test]
+fn a_loaded_empty_collection_reserves_what_a_created_one_does() {
+    for fields in [vec!["cat".to_string()], vec![]] {
+        let declaration = Declaration::validate(16, "l2", 8, 64, 5_000, fields.clone()).unwrap();
+        let created = Collection::build(declaration, None);
+        let dir = TempDir::new();
+        let path = dir.path().join("empty.zdb");
+        created.save(path.to_str().unwrap()).unwrap();
+        assert!(!path.join(DUMP_FILENAME).exists());
+        let loaded = Collection::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(loaded.vector_count(), 0);
+
+        assert!(graph_reservation(&created).1 > 0);
+        assert_eq!(
+            graph_reservation(&loaded),
+            graph_reservation(&created),
+            "fields {:?}",
+            fields
+        );
+        let loaded_metadata = loaded.vector_metadata.read().unwrap().heap_bytes();
+        let created_metadata = created.vector_metadata.read().unwrap().heap_bytes();
+        assert_eq!(loaded_metadata, created_metadata, "fields {:?}", fields);
+        let loaded_columns = loaded.columns.read().unwrap().heap_bytes();
+        let created_columns = created.columns.read().unwrap().heap_bytes();
+        assert_eq!(loaded_columns, created_columns, "fields {:?}", fields);
+        let (loaded_stats, created_stats) = (loaded.stats(), created.stats());
+        for key in [
+            "graph_memory_mb",
+            "raw_vectors_memory_mb",
+            "reserved_memory_mb",
+        ] {
+            assert_eq!(
+                loaded_stats[key], created_stats[key],
+                "{} fields {:?}",
+                key, fields
+            );
+        }
+    }
+}
+
+/// The collection the loader builds before it reads a directory reserves
+/// nothing for the declared size, in its graph or in its metadata, id or
+/// column store, where a created collection reserves for it in all four. Its
+/// graph, given the declared reservation, is the one a created collection
+/// holds.
+#[test]
+fn the_collection_a_load_starts_from_reserves_nothing() {
+    let fields = vec!["cat".to_string()];
+    let empty = Collection::new_empty(16, "l2".to_string(), 8, 64, 100_000, fields.clone(), None);
+    let created = Collection::build(
+        Declaration::validate(16, "l2", 8, 64, 100_000, fields).unwrap(),
+        None,
+    );
+    // Each guard in a statement of its own, in the declared order.
+    let stores = |collection: &Collection| {
+        let ids = collection.ids.read().unwrap().heap_bytes();
+        let metadata = collection.vector_metadata.read().unwrap().heap_bytes();
+        let columns = collection.columns.read().unwrap().heap_bytes();
+        (metadata, ids, columns)
+    };
+
+    let (_, links_slack, _, store_slack, _) = graph_reservation(&empty);
+    assert_eq!(links_slack + store_slack, 0);
+    let (metadata, ids, columns) = stores(&empty);
+    assert!(
+        metadata <= 16 && ids <= 16 && columns < 1024,
+        "{:?}",
+        stores(&empty)
+    );
+
+    let (_, links_slack, _, store_slack, _) = graph_reservation(&created);
+    assert!(links_slack + store_slack > 1 << 20);
+    let (metadata, ids, columns) = stores(&created);
+    assert!(
+        metadata > 1 << 20 && ids > 1 << 20 && columns > 100_000,
+        "{:?}",
+        stores(&created)
+    );
+
+    empty.reserve_dense_graph();
+    assert_eq!(graph_reservation(&empty), graph_reservation(&created));
+}
