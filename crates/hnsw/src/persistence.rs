@@ -2671,6 +2671,9 @@ fn rebuild_graph_from_data(
 ) -> Result<(), Error> {
     if vectors.is_empty() && pq_codes.is_empty() {
         debug!(target: LOG_TARGET, "No records to rebuild (empty index)");
+        // The collection keeps the graph it was built with, which reserves
+        // nothing until it is given the declared reservation here.
+        index.reserve_dense_graph();
         return Ok(());
     }
 

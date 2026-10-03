@@ -114,7 +114,9 @@
 //! These are plain integers because the mutator is serialised.
 
 use super::dump::EachNeighbourhood;
-use super::dump::{LoadedEdge, LoadedPoint, PointId};
+#[cfg(test)]
+use super::dump::LoadedPoint;
+use super::dump::{AdjacencyWalk, LoadedEdge, PointId};
 use super::store::VectorStore;
 use super::traverse::{self, Topology, LAYERS};
 use super::{Distance, GraphHit};
@@ -400,6 +402,7 @@ where
     ///
     /// Nodes are numbered in the order the dump streams them, which is layer
     /// major, so a loaded graph's node indices match the dump's exactly.
+    #[cfg(test)]
     pub(super) fn from_loaded(
         points_by_layer: Vec<Vec<LoadedPoint<T>>>,
         entry_point: PointId,
@@ -432,12 +435,14 @@ where
 
     /// Build a graph from points handed out one at a time in (layer, rank)
     /// order, `layer_counts[l]` of them at layer `l`, each holding `dim`
-    /// values.
+    /// values and its lists, every list a block of its own.
     ///
-    /// The reader hands the points straight from the file, so a point's
-    /// vector is moved into the store as it arrives rather than every vector
-    /// being held first. [`Self::from_loaded`] is the same over points already
-    /// collected.
+    /// A point's vector goes into the store as it arrives. The tests build
+    /// through this, and [`Self::from_loaded`] is the same over points already
+    /// collected. The reader builds through [`Self::from_adjacency`], which
+    /// applies the same rules in the same order and installs every list the
+    /// same way.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_points(
         layer_counts_in: &[usize],
@@ -449,88 +454,18 @@ where
         dist_f: D,
         mut next: impl FnMut() -> Result<LoadedPoint<T>, String>,
     ) -> Result<(Self, VectorStore<T>), String> {
-        let nb_layer = layer_counts_in.len();
-        if nb_layer == 0 || nb_layer > LAYERS {
-            return Err(format!(
-                "a graph carries between 1 and {} layers and this one carries {}",
-                LAYERS, nb_layer
-            ));
-        }
-        if m == 0 || m > 256 {
-            return Err(format!(
-                "max_nb_connection is between 1 and 256 and this graph declares {}",
-                m
-            ));
-        }
-        if !level_scale.is_finite() || level_scale <= 0. {
-            return Err(format!(
-                "the level scale is a positive finite number and this graph declares {}",
-                level_scale
-            ));
-        }
-
-        let mut layer_counts = [0u32; LAYERS];
-        let mut layer_offsets = [0u32; LAYERS + 1];
-        let mut nb_point: usize = 0;
-        for (layer, &count) in layer_counts_in.iter().enumerate() {
-            if count > i32::MAX as usize {
-                return Err(format!(
-                    "layer {} holds {} points and a rank is an i32",
-                    layer, count
-                ));
-            }
-            nb_point += count;
-        }
-        if nb_point == 0 {
-            return Err("a graph holding no points has no entry point".to_string());
-        }
-        if nb_point > u32::MAX as usize {
-            return Err(format!(
-                "the graph holds {} points and a node index is a u32",
-                nb_point
-            ));
-        }
-        if nb_point >= WORD_WIDE as usize {
-            return Err(format!(
-                "the graph holds {} points and an upper list word names a node below {}",
-                nb_point, WORD_WIDE
-            ));
-        }
-        for layer in 0..LAYERS {
-            let count = layer_counts_in.get(layer).copied().unwrap_or(0) as u32;
-            layer_counts[layer] = count;
-            layer_offsets[layer + 1] = layer_offsets[layer] + count;
-        }
-
-        let base_cap = 2 * m + 1;
-
-        let mut graph = MutableGraph {
+        let (layer_counts, layer_offsets, nb_point) =
+            loading_layout(layer_counts_in, m, level_scale)?;
+        let mut graph = Self::loading_shell(
+            layer_counts,
+            nb_point,
             dim,
             m,
             ef_construction,
             level_scale,
-            entry: 0,
-            entry_level: 0,
-            layer_counts,
-            origin_ids: Vec::with_capacity(nb_point),
-            levels: Vec::with_capacity(nb_point),
-            node_of: Vec::new(),
-            base_targets: vec![0u32; nb_point * base_cap],
-            base_len: vec![0u16; nb_point],
-            base_in_degree: vec![0u32; nb_point],
-            upper_first: Vec::with_capacity(nb_point),
-            upper_span: Vec::with_capacity(nb_point),
-            upper_word: Vec::new(),
-            wide_at: Vec::new(),
-            wide_len: Vec::new(),
-            wide_in_degree: Vec::new(),
-            upper_targets: Vec::new(),
-            overflows: 0,
-            saves: 0,
-            fallbacks: 0,
             dist_f,
-            _elem: std::marker::PhantomData,
-        };
+            Vec::with_capacity(nb_point),
+        );
 
         let mut store = VectorStore::with_capacity(dim, nb_point);
         let mut lists: Vec<Vec<(f32, u32)>> = Vec::new();
@@ -563,91 +498,219 @@ where
                 graph.note_origin(point.origin_id, node);
                 store.append(point.data);
 
-                // Every edge is checked wherever it sits, and each list is
-                // ordered by its stored distances with the same stable sort the
-                // vendored constructor applies, so ties keep their dump order
-                // there and here.
                 lists.clear();
                 for list in point.neighbours.into_iter() {
                     let mut edges: Vec<(f32, u32)> = Vec::with_capacity(list.len());
-                    for edge in &list {
-                        edges.push((edge.distance, edge_target(edge, &layer_offsets)?));
-                    }
-                    edges.sort_by(|a, b| {
-                        a.0.partial_cmp(&b.0)
-                            .expect("every distance was checked finite by edge_target")
-                    });
+                    ordered_list(&list, &layer_offsets, &mut edges)?;
                     lists.push(edges);
                 }
-
-                // The span the dump asks for, which is the highest layer the
-                // point carries anything at and at least its own level. The
-                // vendored point carries sixteen lists whatever its level, so a
-                // span above the level is a property of the file rather than a
-                // malformation.
-                let mut span = layer;
-                for (list_layer, list) in lists.iter().enumerate() {
-                    if !list.is_empty() {
-                        span = span.max(list_layer);
-                    }
-                }
-                graph.open_node(span, layer);
-
-                for (list_layer, list) in lists.iter().enumerate() {
-                    if list.is_empty() {
-                        continue;
-                    }
-                    // A list above its owner's level is one word, which holds
-                    // one entry, so a loaded one carrying more is promoted
-                    // rather than refused. Refusal is for a list past the cap
-                    // its layer allows at all.
-                    let cap = if list_layer == 0 {
-                        base_cap
-                    } else {
-                        graph.upper_cap_full()
-                    };
-                    if list.len() > cap {
-                        return Err(format!(
-                            "the point at layer {} rank {} carries {} neighbours at layer {} \
-                             and a list holds {}",
-                            layer,
-                            rank,
-                            list.len(),
-                            list_layer,
-                            cap
-                        ));
-                    }
-                    targets.clear();
-                    targets.extend(list.iter().map(|&(_, target)| target));
-                    graph.install_loaded_list(node, list_layer, &targets);
-                }
+                graph.install_point(node, layer, rank, &lists, &mut targets)?;
             }
         }
-        // The inbound counters, rebuilt from the edges just installed exactly as
-        // `Hnsw::from_loaded_points` rebuilds its own. Every edge counts at the
-        // layer its own list sits at, the lists above a node's level included,
-        // because the vendored install site counts those too and the overflow
-        // pop guard then reads the total.
+        graph.finish_loading(entry_point, &layer_offsets)?;
+        Ok((graph, store))
+    }
+
+    /// Build the graph a dump's adjacency describes, walked point by point in
+    /// (layer, rank) order, `layer_counts[l]` points at layer `l`, the points
+    /// taking `origin_ids` in the same order.
+    ///
+    /// Every list goes from the region's bytes into the slab its node owns,
+    /// ordered by the file's distances, through buffers kept from one point to
+    /// the next, so the walk allocates nothing a list. The rules are the ones
+    /// the tests' `from_points` applies, in the same order and in the same words,
+    /// and a refusal reaches the loader's rebuild path as every other refusal
+    /// does.
+    ///
+    /// The vectors are not part of it. The reader streams them into the store
+    /// once the region's block is gone, so the region and the store are never
+    /// held together.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_adjacency(
+        layer_counts_in: &[usize],
+        dim: usize,
+        entry_point: PointId,
+        m: usize,
+        ef_construction: usize,
+        level_scale: f64,
+        dist_f: D,
+        origin_ids: Vec<usize>,
+        mut walk: AdjacencyWalk<'_>,
+    ) -> Result<Self, String> {
+        let (layer_counts, layer_offsets, nb_point) =
+            loading_layout(layer_counts_in, m, level_scale)?;
+        if origin_ids.len() != nb_point {
+            return Err(format!(
+                "the graph holds {} points and {} origin ids",
+                nb_point,
+                origin_ids.len()
+            ));
+        }
+        let mut graph = Self::loading_shell(
+            layer_counts,
+            nb_point,
+            dim,
+            m,
+            ef_construction,
+            level_scale,
+            dist_f,
+            origin_ids,
+        );
+
+        let mut carried: Vec<Vec<LoadedEdge>> = Vec::new();
+        let mut lists: Vec<Vec<(f32, u32)>> = Vec::new();
+        let mut targets: Vec<u32> = Vec::new();
+        for (layer, &count) in layer_counts_in.iter().enumerate() {
+            for rank in 0..count {
+                let node = layer_offsets[layer] + rank as u32;
+                let list_count = walk.next_point(&mut carried);
+                if list_count > LAYERS {
+                    return Err(format!(
+                        "the point at layer {} rank {} carries adjacency for {} layers and \
+                         a point carries at most {}",
+                        layer, rank, list_count, LAYERS
+                    ));
+                }
+                graph.levels.push(layer as u8);
+                let origin_id = graph.origin_ids[node as usize];
+                graph.note_origin(origin_id, node);
+
+                while lists.len() < list_count {
+                    lists.push(Vec::new());
+                }
+                for (list, edges) in carried.iter().zip(lists.iter_mut()).take(list_count) {
+                    ordered_list(list, &layer_offsets, edges)?;
+                }
+                graph.install_point(node, layer, rank, &lists[..list_count], &mut targets)?;
+            }
+        }
+        graph.finish_loading(entry_point, &layer_offsets)?;
+        Ok(graph)
+    }
+
+    /// The graph a loading constructor fills: the per node arrays sized for
+    /// `nb_point` nodes, the layer zero slab whole, and the upper regions
+    /// empty, since a span is a property of the file and is not known until
+    /// the walk reaches the node.
+    #[allow(clippy::too_many_arguments)]
+    fn loading_shell(
+        layer_counts: [u32; LAYERS],
+        nb_point: usize,
+        dim: usize,
+        m: usize,
+        ef_construction: usize,
+        level_scale: f64,
+        dist_f: D,
+        origin_ids: Vec<usize>,
+    ) -> Self {
+        let base_cap = 2 * m + 1;
+        MutableGraph {
+            dim,
+            m,
+            ef_construction,
+            level_scale,
+            entry: 0,
+            entry_level: 0,
+            layer_counts,
+            origin_ids,
+            levels: Vec::with_capacity(nb_point),
+            node_of: Vec::new(),
+            base_targets: vec![0u32; nb_point * base_cap],
+            base_len: vec![0u16; nb_point],
+            base_in_degree: vec![0u32; nb_point],
+            upper_first: Vec::with_capacity(nb_point),
+            upper_span: Vec::with_capacity(nb_point),
+            upper_word: Vec::new(),
+            wide_at: Vec::new(),
+            wide_len: Vec::new(),
+            wide_in_degree: Vec::new(),
+            upper_targets: Vec::new(),
+            overflows: 0,
+            saves: 0,
+            fallbacks: 0,
+            dist_f,
+            _elem: std::marker::PhantomData,
+        }
+    }
+
+    /// Open one node's lists and install the ordered ones its point carries.
+    ///
+    /// The span is the highest layer the point carries an entry at, and at
+    /// least its own level, so a node carrying entries above its level owns
+    /// lists there, as a built graph's nodes do. A list above its owner's
+    /// level holding one entry is one word, and one holding more is promoted,
+    /// which is the state a built graph holds an old entry point's list in. A
+    /// list longer than the cap its layer allows is refused, since no build
+    /// produces one.
+    fn install_point(
+        &mut self,
+        node: u32,
+        layer: usize,
+        rank: usize,
+        lists: &[Vec<(f32, u32)>],
+        targets: &mut Vec<u32>,
+    ) -> Result<(), String> {
+        let mut span = layer;
+        for (list_layer, list) in lists.iter().enumerate() {
+            if !list.is_empty() {
+                span = span.max(list_layer);
+            }
+        }
+        self.open_node(span, layer);
+
+        for (list_layer, list) in lists.iter().enumerate() {
+            if list.is_empty() {
+                continue;
+            }
+            let cap = if list_layer == 0 {
+                self.base_cap()
+            } else {
+                self.upper_cap_full()
+            };
+            if list.len() > cap {
+                return Err(format!(
+                    "the point at layer {} rank {} carries {} neighbours at layer {} \
+                     and a list holds {}",
+                    layer,
+                    rank,
+                    list.len(),
+                    list_layer,
+                    cap
+                ));
+            }
+            targets.clear();
+            targets.extend(list.iter().map(|&(_, target)| target));
+            self.install_loaded_list(node, list_layer, targets);
+        }
+        Ok(())
+    }
+
+    /// The inbound counters, the trims and the entry point, which close both
+    /// loading constructors.
+    fn finish_loading(
+        &mut self,
+        entry_point: PointId,
+        layer_offsets: &[u32; LAYERS + 1],
+    ) -> Result<(), String> {
+        // The inbound counters, rebuilt from the edges just installed. Every
+        // edge counts at the layer its own list sits at, the lists above a
+        // node's level included, because an insertion counts those too and
+        // the overflow pop guard reads the total.
         //
-        // A second pass rather than a bump beside each install, because an edge
-        // may name a node the walk has not reached yet. A target named at a
-        // layer it owns no list at takes one, which is a state the vendored
-        // builder does not reach and which the fixed sixteen slot counter array
-        // on a vendored point would have absorbed silently.
+        // A second pass rather than a bump beside each install, because an
+        // edge may name a node the walk has not reached yet. A target named at
+        // a layer it owns no list at takes one there.
         //
         // Each edge is counted as it is read rather than collected first. A
         // span grown on the way is a node's, and the list it opens is empty,
         // so what the pass reads is the edges the walk installed and nothing
-        // else, in the order it would have collected them. Collecting them
-        // first held sixteen bytes an edge, which on a graph of a hundred
-        // thousand records at the default `m` was the largest block of the
-        // whole load.
-        for node in 0..graph.origin_ids.len() as u32 {
-            for layer in 0..=graph.span(node) {
-                for slot in 0..graph.list_len(node, layer) {
-                    let target = graph.target_at(node, layer, slot);
-                    graph.grow_span(target, layer);
-                    graph.bump_in_degree(target, layer, 1);
+        // else, in the order it would have collected them.
+        for node in 0..self.origin_ids.len() as u32 {
+            for layer in 0..=self.span(node) {
+                for slot in 0..self.list_len(node, layer) {
+                    let target = self.target_at(node, layer, slot);
+                    self.grow_span(target, layer);
+                    self.bump_in_degree(target, layer, 1);
                 }
             }
         }
@@ -658,16 +721,16 @@ where
         // because a span is a property of the file, and the counters' pass
         // above promotes the lists the entry point chain named, so the trim
         // comes after it.
-        graph.node_of.shrink_to_fit();
-        graph.upper_word.shrink_to_fit();
-        graph.wide_at.shrink_to_fit();
-        graph.wide_len.shrink_to_fit();
-        graph.wide_in_degree.shrink_to_fit();
-        graph.upper_targets.shrink_to_fit();
+        self.node_of.shrink_to_fit();
+        self.upper_word.shrink_to_fit();
+        self.wide_at.shrink_to_fit();
+        self.wide_len.shrink_to_fit();
+        self.wide_in_degree.shrink_to_fit();
+        self.upper_targets.shrink_to_fit();
 
         let entry_layer = entry_point.0 as usize;
         let entry_span = if entry_layer < LAYERS {
-            layer_counts[entry_layer]
+            self.layer_counts[entry_layer]
         } else {
             0
         };
@@ -677,10 +740,9 @@ where
                 entry_point.0, entry_point.1
             ));
         }
-        graph.entry = layer_offsets[entry_layer] + entry_point.1 as u32;
-        graph.entry_level = entry_point.0;
-
-        Ok((graph, store))
+        self.entry = layer_offsets[entry_layer] + entry_point.1 as u32;
+        self.entry_level = entry_point.0;
+        Ok(())
     }
 
     /// An empty graph, ready to be built by insertion.
@@ -724,6 +786,26 @@ where
         expected_size: usize,
         dist_f: D,
     ) -> Result<(Self, VectorStore<T>), String> {
+        let (mut graph, mut store) =
+            Self::unreserved(dim, m, ef_construction, level_scale, dist_f)?;
+        graph.reserve_declared(&mut store, expected_size);
+        Ok((graph, store))
+    }
+
+    /// An empty graph that has asked the allocator for nothing, and is in
+    /// every other respect the graph [`MutableGraph::new`] builds.
+    ///
+    /// A collection the loader fills from a directory starts from one, since a
+    /// load replaces the graph whenever the directory holds a record, and
+    /// [`MutableGraph::reserve_declared`] gives it the reservation where the
+    /// collection keeps it.
+    pub(super) fn unreserved(
+        dim: usize,
+        m: usize,
+        ef_construction: usize,
+        level_scale: f64,
+        dist_f: D,
+    ) -> Result<(Self, VectorStore<T>), String> {
         if dim == 0 {
             return Err("a graph holds vectors of at least one value".to_string());
         }
@@ -739,18 +821,6 @@ where
                 level_scale
             ));
         }
-        let base_cap = 2 * m + 1;
-        // The expected span, which is what sizes the word arena. Almost every
-        // node ends up owning a list at every layer from one up to the entry
-        // level, because the descent files one there, so the arena is sized by
-        // the entry level a graph of `expected_size` points reaches rather than
-        // by the far smaller expected level. It is a property of the declared
-        // size rather than of the reservation, so it is taken before the cap.
-        let span = expected_span(m, expected_size);
-        let reserved = reserved_records::<T>(dim, m, span, expected_size);
-        let words = reserved * span;
-        let wide = reserved.div_ceil(wide_lists_per(m));
-        let store = VectorStore::with_capacity(dim, reserved);
         Ok((
             MutableGraph {
                 dim,
@@ -760,27 +830,61 @@ where
                 entry: 0,
                 entry_level: 0,
                 layer_counts: [0u32; LAYERS],
-                origin_ids: Vec::with_capacity(reserved),
-                levels: Vec::with_capacity(reserved),
-                node_of: Vec::with_capacity(reserved + 1),
-                base_targets: Vec::with_capacity(reserved * base_cap),
-                base_len: Vec::with_capacity(reserved),
-                base_in_degree: Vec::with_capacity(reserved),
-                upper_first: Vec::with_capacity(reserved),
-                upper_span: Vec::with_capacity(reserved),
-                upper_word: Vec::with_capacity(words),
-                wide_at: Vec::with_capacity(wide),
-                wide_len: Vec::with_capacity(wide),
-                wide_in_degree: Vec::with_capacity(wide),
-                upper_targets: Vec::with_capacity(wide * (m + 1)),
+                origin_ids: Vec::new(),
+                levels: Vec::new(),
+                node_of: Vec::new(),
+                base_targets: Vec::new(),
+                base_len: Vec::new(),
+                base_in_degree: Vec::new(),
+                upper_first: Vec::new(),
+                upper_span: Vec::new(),
+                upper_word: Vec::new(),
+                wide_at: Vec::new(),
+                wide_len: Vec::new(),
+                wide_in_degree: Vec::new(),
+                upper_targets: Vec::new(),
                 overflows: 0,
                 saves: 0,
                 fallbacks: 0,
                 dist_f,
                 _elem: std::marker::PhantomData,
             },
-            store,
+            VectorStore::with_capacity(dim, 0),
         ))
+    }
+
+    /// Reserve what `expected_size` declares, on a graph that holds no node.
+    ///
+    /// Buffer for buffer the request [`MutableGraph::new`] makes, so a graph
+    /// built without a reservation and given one here holds exactly what one
+    /// built with it holds.
+    ///
+    /// The expected span is what sizes the word arena. Almost every node ends
+    /// up owning a list at every layer from one up to the entry level, because
+    /// the descent files one there, so the arena is sized by the entry level a
+    /// graph of `expected_size` points reaches rather than by the far smaller
+    /// expected level. It is a property of the declared size rather than of
+    /// the reservation, so it is taken before the cap.
+    pub(super) fn reserve_declared(&mut self, store: &mut VectorStore<T>, expected_size: usize) {
+        let span = expected_span(self.m, expected_size);
+        let reserved = reserved_records::<T>(self.dim, self.m, span, expected_size);
+        let words = reserved * span;
+        let wide = reserved.div_ceil(wide_lists_per(self.m));
+        let base_cap = self.base_cap();
+        store.reserve_for(reserved);
+        reserve_exactly(&mut self.origin_ids, reserved);
+        reserve_exactly(&mut self.levels, reserved);
+        reserve_exactly(&mut self.node_of, reserved + 1);
+        reserve_exactly(&mut self.base_targets, reserved * base_cap);
+        reserve_exactly(&mut self.base_len, reserved);
+        reserve_exactly(&mut self.base_in_degree, reserved);
+        reserve_exactly(&mut self.upper_first, reserved);
+        reserve_exactly(&mut self.upper_span, reserved);
+        reserve_exactly(&mut self.upper_word, words);
+        reserve_exactly(&mut self.wide_at, wide);
+        reserve_exactly(&mut self.wide_len, wide);
+        reserve_exactly(&mut self.wide_in_degree, wide);
+        reserve_exactly(&mut self.upper_targets, wide * (self.m + 1));
     }
 
     /// Record where an internal id landed.
@@ -956,6 +1060,54 @@ where
             }
         }
         out
+    }
+
+    /// Every buffer the graph holds with its capacity, and every scalar, as
+    /// plain values, so two graphs can be held to being one graph, buffer for
+    /// buffer.
+    #[cfg(test)]
+    pub(super) fn arrays(&self) -> GraphArrays {
+        macro_rules! buffer {
+            ($field:ident) => {
+                (
+                    stringify!($field),
+                    self.$field.capacity(),
+                    self.$field
+                        .iter()
+                        .map(|&value| value as u64)
+                        .collect::<Vec<u64>>(),
+                )
+            };
+        }
+        GraphArrays {
+            scalars: vec![
+                self.dim as u64,
+                self.m as u64,
+                self.ef_construction as u64,
+                self.level_scale.to_bits(),
+                self.entry as u64,
+                self.entry_level as u64,
+                self.overflows,
+                self.saves,
+                self.fallbacks,
+            ],
+            layer_counts: self.layer_counts.to_vec(),
+            buffers: vec![
+                buffer!(origin_ids),
+                buffer!(levels),
+                buffer!(node_of),
+                buffer!(base_targets),
+                buffer!(base_len),
+                buffer!(base_in_degree),
+                buffer!(upper_first),
+                buffer!(upper_span),
+                buffer!(upper_word),
+                buffer!(wide_at),
+                buffer!(wide_len),
+                buffer!(wide_in_degree),
+                buffer!(upper_targets),
+            ],
+        }
     }
 
     /// Values per stored vector.
@@ -1993,4 +2145,108 @@ fn edge_target(edge: &LoadedEdge, layer_offsets: &[u32; LAYERS + 1]) -> Result<u
         ));
     }
     Ok(layer_offsets[target_layer] + edge.target.1 as u32)
+}
+
+/// The rules both loading constructors apply before anything is sized, and
+/// what they give: each layer's node count, where each layer's run starts in
+/// node order with a sentinel after the last, and the node count.
+///
+/// A rank is an `i32` in a dump and a node index a `u32`, and an upper list
+/// word names a node below [`WORD_WIDE`], so a layer table past any of those
+/// is refused here rather than wrapped later.
+fn loading_layout(
+    layer_counts_in: &[usize],
+    m: usize,
+    level_scale: f64,
+) -> Result<([u32; LAYERS], [u32; LAYERS + 1], usize), String> {
+    let nb_layer = layer_counts_in.len();
+    if nb_layer == 0 || nb_layer > LAYERS {
+        return Err(format!(
+            "a graph carries between 1 and {} layers and this one carries {}",
+            LAYERS, nb_layer
+        ));
+    }
+    if m == 0 || m > 256 {
+        return Err(format!(
+            "max_nb_connection is between 1 and 256 and this graph declares {}",
+            m
+        ));
+    }
+    if !level_scale.is_finite() || level_scale <= 0. {
+        return Err(format!(
+            "the level scale is a positive finite number and this graph declares {}",
+            level_scale
+        ));
+    }
+
+    let mut layer_counts = [0u32; LAYERS];
+    let mut layer_offsets = [0u32; LAYERS + 1];
+    let mut nb_point: usize = 0;
+    for (layer, &count) in layer_counts_in.iter().enumerate() {
+        if count > i32::MAX as usize {
+            return Err(format!(
+                "layer {} holds {} points and a rank is an i32",
+                layer, count
+            ));
+        }
+        nb_point += count;
+    }
+    if nb_point == 0 {
+        return Err("a graph holding no points has no entry point".to_string());
+    }
+    if nb_point > u32::MAX as usize {
+        return Err(format!(
+            "the graph holds {} points and a node index is a u32",
+            nb_point
+        ));
+    }
+    if nb_point >= WORD_WIDE as usize {
+        return Err(format!(
+            "the graph holds {} points and an upper list word names a node below {}",
+            nb_point, WORD_WIDE
+        ));
+    }
+    for layer in 0..LAYERS {
+        let count = layer_counts_in.get(layer).copied().unwrap_or(0) as u32;
+        layer_counts[layer] = count;
+        layer_offsets[layer + 1] = layer_offsets[layer] + count;
+    }
+    Ok((layer_counts, layer_offsets, nb_point))
+}
+
+/// One list as the file holds it, each entry resolved to the node it names
+/// and the list ordered by the file's distances with a stable sort, so entries
+/// at an equal distance keep the order the file holds them in. Every distance
+/// is checked finite on the way. The structure holds targets alone, so the
+/// distances are dropped once the list is installed.
+fn ordered_list(
+    list: &[LoadedEdge],
+    layer_offsets: &[u32; LAYERS + 1],
+    edges: &mut Vec<(f32, u32)>,
+) -> Result<(), String> {
+    edges.clear();
+    for edge in list {
+        edges.push((edge.distance, edge_target(edge, layer_offsets)?));
+    }
+    edges.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .expect("every distance was checked finite by edge_target")
+    });
+    Ok(())
+}
+
+/// Grow `buffer` to hold `capacity` entries without reallocating and to hold
+/// no more, which is the request `Vec::with_capacity` makes for an empty one.
+fn reserve_exactly<E>(buffer: &mut Vec<E>, capacity: usize) {
+    buffer.reserve_exact(capacity.saturating_sub(buffer.len()));
+}
+
+/// What [`MutableGraph::arrays`] hands back: the scalars, the layer table,
+/// and every buffer with its capacity, its entries widened to `u64`.
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(super) struct GraphArrays {
+    pub(super) scalars: Vec<u64>,
+    pub(super) layer_counts: Vec<u32>,
+    pub(super) buffers: Vec<(&'static str, usize, Vec<u64>)>,
 }

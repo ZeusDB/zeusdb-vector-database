@@ -977,14 +977,18 @@ impl Collection {
     /// The guards are taken in the declared order, the id store then
     /// `vector_metadata` then `columns`, even though the loader holds `&mut
     /// self` and nothing else can be running.
+    ///
+    /// The store is cleared to the declared reservation first whether or not
+    /// a field is declared, since the loader's collection starts from one that
+    /// reserves nothing and a collection declaring no field keeps it.
     fn rebuild_columns(&mut self) {
         let ids = self.ids.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
         let mut columns = self.columns.write().unwrap();
+        columns.clear(self.expected_size());
         if !columns.is_declared() {
             return;
         }
-        columns.clear(self.expected_size());
         let empty: HashMap<String, Value> = HashMap::new();
         for internal_id in ids.slots() {
             match vector_metadata.get(internal_id) {
@@ -996,6 +1000,23 @@ impl Collection {
             columns.tracks(ids.len()),
             "the rebuild writes one column entry per record in the id store"
         );
+    }
+
+    /// Give the dense graph the reservation the declared size asks for (for
+    /// persistence loading only).
+    ///
+    /// The loader's collection starts from a graph that reserves nothing,
+    /// because a load replaces it whenever the directory holds a record. A
+    /// load that restores no graph and rebuilds none keeps it, and this gives
+    /// it what a created collection's graph reserves.
+    pub(crate) fn reserve_dense_graph(&self) {
+        let expected_size = self.expected_size();
+        self.dense()
+            .index
+            .write()
+            .unwrap()
+            .graph_mut()
+            .reserve_declared(expected_size);
     }
 
     /// Set quantization config (for persistence loading only)

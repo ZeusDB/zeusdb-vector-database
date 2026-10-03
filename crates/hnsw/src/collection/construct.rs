@@ -788,6 +788,7 @@ impl Collection {
             pq_instance,
             hnsw,
             sparse,
+            expected_size,
         )
     }
 
@@ -799,6 +800,14 @@ impl Collection {
     /// value before it reaches here, through the same rules `validate`
     /// applies, and builds the sparse declaration from the space
     /// `config.json` recorded and the tokenizer handed to `load`.
+    ///
+    /// Nothing in it is reserved for `expected_size`. The load replaces the
+    /// id store whole, clears the metadata store and the column store to the
+    /// declared reservation as it fills them, and replaces the graph with the
+    /// restored one or a rebuilt one, so a reservation made here would be
+    /// held through the read of the graph dump and then discarded. The one
+    /// graph a load keeps, where the directory holds no record, is given the
+    /// declared reservation there; see `Collection::reserve_dense_graph`.
     pub(crate) fn new_empty(
         dim: usize,
         space: String,
@@ -809,7 +818,7 @@ impl Collection {
         sparse: Option<SparseDeclaration>,
     ) -> Self {
         let space_normalized = space.to_lowercase();
-        let hnsw = VectorGraph::new_raw(
+        let hnsw = VectorGraph::new_raw_unreserved(
             &space_normalized,
             dim,
             m,
@@ -833,6 +842,7 @@ impl Collection {
             None,
             hnsw,
             sparse,
+            0,
         )
     }
 
@@ -843,6 +853,10 @@ impl Collection {
     /// first space's four ranks. A sparse space, where one was declared,
     /// is second and takes the second space's index rank. Every lock is
     /// given its rank here, beside the field it guards.
+    ///
+    /// `reserve` is the records the metadata, id and column stores reserve
+    /// for, which is the declared size for a collection built to be filled by
+    /// its caller and zero for the one the loader fills.
     #[allow(clippy::too_many_arguments)]
     fn assemble(
         dim: usize,
@@ -855,6 +869,7 @@ impl Collection {
         pq: Option<Arc<PQ>>,
         hnsw: VectorGraph,
         sparse: Option<SparseDeclaration>,
+        reserve: usize,
     ) -> Self {
         let keeps_raw = quantization_config
             .as_ref()
@@ -908,14 +923,11 @@ impl Collection {
             metadata: MutexAt::new(order::METADATA, HashMap::new()),
             vector_metadata: RwLockAt::new(
                 order::VECTOR_METADATA,
-                zeusdb_vector_core::MetadataStore::new(expected_size),
+                zeusdb_vector_core::MetadataStore::new(reserve),
             ),
-            columns: RwLockAt::new(
-                order::COLUMNS,
-                ColumnStore::new(indexed_fields, expected_size),
-            ),
+            columns: RwLockAt::new(order::COLUMNS, ColumnStore::new(indexed_fields, reserve)),
             undeclared_filter_warned: AtomicBool::new(false),
-            ids: RwLockAt::new(order::IDS, zeusdb_vector_core::IdStore::new(expected_size)),
+            ids: RwLockAt::new(order::IDS, zeusdb_vector_core::IdStore::new(reserve)),
             id_counter: MutexAt::new(order::ID_COUNTER, 0),
             generated_ids: MutexAt::new(order::GENERATED_IDS, 0),
             vector_count: MutexAt::new(order::VECTOR_COUNT, 0),

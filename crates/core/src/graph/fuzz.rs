@@ -53,8 +53,8 @@
 //! budget for a soak run by hand and is absent in CI.
 
 use super::dump::{
-    read_dump, write_dump, DumpElement, Expected, GraphKind, DUMP_FILENAME, LEGACY_DUMP_FILENAMES,
-    NB_LAYER_MAX,
+    read_dump, read_dump_reference, write_dump, DumpElement, Expected, GraphKind, DUMP_FILENAME,
+    LEGACY_DUMP_FILENAMES, NB_LAYER_MAX,
 };
 use super::levels::LevelGenerator;
 use super::mutable::MutableGraph;
@@ -62,6 +62,7 @@ use super::Distance;
 use crate::distance::{CosineDist, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist};
 use crate::int8::Int8Codec;
 use crate::storage::FsDir;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -1092,4 +1093,147 @@ fn every_corpus_entry_round_trips() {
         };
         assert_eq!(counts.0, counts.1, "{} lost vectors", entry.label);
     }
+}
+
+/// Cases the check against the reference runs, per corpus entry, beside the entry as
+/// written.
+///
+/// A quarter of the property test's budget, since every case is read twice,
+/// drawn from a stream of its own. `ZEUSDB_FUZZ_CASES` raises it with the
+/// property test's.
+const REFERENCE_CASES_PER_ENTRY: usize = 250;
+
+/// The dump in `dir` read by the reader and by the reference, which decodes
+/// every list into a block of its own and builds a point at a time.
+///
+/// `Ok(true)` where both load and the two graphs agree buffer for buffer and
+/// capacity for capacity and the two stores value for value, `Ok(false)`
+/// where both refuse in the same words, and what differs otherwise, a panic
+/// on either side included.
+fn read_as_the_points<T, D>(
+    dir: &Path,
+    expected: &Expected,
+    dist: impl Fn() -> D,
+) -> Result<bool, String>
+where
+    T: DumpElement,
+    D: Distance<T> + Send + Sync,
+{
+    let read = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        read_dump::<T, D>(&FsDir::new(dir), DUMP_FILENAME, expected, dist())
+    }));
+    let reference = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        read_dump_reference::<T, D>(&FsDir::new(dir), DUMP_FILENAME, expected, dist())
+    }));
+    match (read, reference) {
+        (Ok(Ok((graph, store))), Ok(Ok((reference_graph, reference_store)))) => {
+            if graph.arrays() != reference_graph.arrays() {
+                return Err("the two graphs differ".to_string());
+            }
+            let mut values = Vec::new();
+            let mut reference_values = Vec::new();
+            T::encode(store.values(), &mut values);
+            T::encode(reference_store.values(), &mut reference_values);
+            if values != reference_values || store.memory_bytes() != reference_store.memory_bytes()
+            {
+                return Err("the two stores differ".to_string());
+            }
+            Ok(true)
+        }
+        (Ok(Err(reason)), Ok(Err(reference_reason))) => {
+            if reason == reference_reason {
+                Ok(false)
+            } else {
+                Err(format!(
+                    "refused as {:?} where the reference refused as {:?}",
+                    reason, reference_reason
+                ))
+            }
+        }
+        (Ok(Ok(_)), Ok(Err(reference_reason))) => Err(format!(
+            "loaded where the reference refused as {:?}",
+            reference_reason
+        )),
+        (Ok(Err(reason)), Ok(Ok(_))) => Err(format!(
+            "refused as {:?} where the reference loaded",
+            reason
+        )),
+        (Err(_), _) => Err("the reader panicked".to_string()),
+        (_, Err(_)) => Err("the reference panicked".to_string()),
+    }
+}
+
+/// The reader against the reference, outcome for outcome, over each corpus
+/// entry as written and over mutations of it.
+///
+/// Every case either loads under both to the same graph and the same store,
+/// or is refused by both in the same words. Neither the loaded share nor the
+/// refused share may be empty, so the check is not made over one outcome
+/// alone.
+#[test]
+fn every_mutation_reads_as_the_points_read_it() {
+    let budget: usize = std::env::var("ZEUSDB_FUZZ_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(REFERENCE_CASES_PER_ENTRY);
+    let dir = tempfile::tempdir().unwrap();
+    let mut rng = Rng(SEED ^ 0x0188_0188);
+    let mut differing: Vec<String> = Vec::new();
+    let mut loaded = 0usize;
+    let mut refused = 0usize;
+
+    {
+        let _quiet = Quiet::new();
+        for entry in corpus() {
+            for case in 0..=budget {
+                // Case zero is the entry as written.
+                let ops = if case == 0 {
+                    Vec::new()
+                } else {
+                    draw_case(&mut rng, entry.blob.len())
+                };
+                std::fs::write(dir.path().join(DUMP_FILENAME), mutate(&entry.blob, &ops)).unwrap();
+                let outcome = match entry.element {
+                    Element::Raw => {
+                        read_as_the_points::<f32, _>(dir.path(), &entry.expected, || CosineDist {})
+                    }
+                    Element::Code => {
+                        read_as_the_points::<u8, _>(dir.path(), &entry.expected, || CodeDist)
+                    }
+                    Element::Int8 => {
+                        read_as_the_points::<i8, _>(dir.path(), &entry.expected, || {
+                            int8_dist(entry.expected.dimension)
+                        })
+                    }
+                };
+                match outcome {
+                    Ok(true) => loaded += 1,
+                    Ok(false) => refused += 1,
+                    Err(difference) => differing.push(format!(
+                        "\n  {} case {}: {}\n    ops {:?}",
+                        entry.label, case, difference, ops
+                    )),
+                }
+            }
+        }
+    }
+
+    println!(
+        "fuzz against the points: {} cases, {} loaded by both, {} refused by both in the same words",
+        loaded + refused + differing.len(),
+        loaded,
+        refused
+    );
+    assert!(
+        differing.is_empty(),
+        "the reader and the points parted on {} cases:{}",
+        differing.len(),
+        differing.join("")
+    );
+    assert!(
+        loaded > 0 && refused > 0,
+        "{} loaded and {} refused",
+        loaded,
+        refused
+    );
 }

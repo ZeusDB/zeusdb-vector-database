@@ -267,6 +267,37 @@ where
         }
     }
 
+    /// An empty graph like [`Backend::sized`] builds, at the default scale
+    /// for its degree, that has asked the allocator for nothing.
+    /// [`Backend::reserve_declared`] gives it the reservation `sized` takes.
+    fn unreserved(
+        dim: usize,
+        m: usize,
+        max_layer: usize,
+        ef_construction: usize,
+        dist_f: D,
+    ) -> Self {
+        let dim = dim.max(1);
+        let m = m.clamp(2, 256);
+        let maxlevel = max_layer.clamp(1, LAYERS);
+        let scale = LevelGenerator::default_scale(m);
+        let (graph, store) = MutableGraph::unreserved(dim, m, ef_construction, scale, dist_f)
+            .expect("the arguments were clamped into the range MutableGraph::unreserved accepts");
+        Backend {
+            graph,
+            store,
+            raw: None,
+            levels: Mutex::new(LevelGenerator::new(scale, maxlevel)),
+        }
+    }
+
+    /// Take the reservation [`Backend::sized`] takes for `expected_size`, on
+    /// a graph that holds no node.
+    fn reserve_declared(&mut self, expected_size: usize) {
+        self.graph
+            .reserve_declared(&mut self.store, expected_size.max(1));
+    }
+
     /// A graph read back from a dump, with a generator at the scale the dump
     /// recorded.
     ///
@@ -438,6 +469,53 @@ impl VectorGraph {
         max_layer: usize,
         ef_construction: usize,
     ) -> Self {
+        Self::raw(
+            space,
+            dim,
+            m,
+            expected_size,
+            max_layer,
+            ef_construction,
+            true,
+        )
+    }
+
+    /// A raw graph built and logged as [`VectorGraph::new_raw`] builds and
+    /// logs one, holding no reservation until [`VectorGraph::reserve_declared`]
+    /// gives it one.
+    ///
+    /// The loader builds the collection it fills around one, since a load
+    /// replaces the graph whenever the directory holds a record.
+    pub fn new_raw_unreserved(
+        space: &str,
+        dim: usize,
+        m: usize,
+        expected_size: usize,
+        max_layer: usize,
+        ef_construction: usize,
+    ) -> Self {
+        Self::raw(
+            space,
+            dim,
+            m,
+            expected_size,
+            max_layer,
+            ef_construction,
+            false,
+        )
+    }
+
+    /// The raw graph for `space`, reserved for `expected_size` where `reserve`
+    /// is set.
+    fn raw(
+        space: &str,
+        dim: usize,
+        m: usize,
+        expected_size: usize,
+        max_layer: usize,
+        ef_construction: usize,
+        reserve: bool,
+    ) -> Self {
         info!(
             target: LOG_TARGET,
             operation = "hnsw_creation",
@@ -453,14 +531,11 @@ impl VectorGraph {
 
         macro_rules! raw {
             ($variant:ident, $dist:expr) => {
-                VectorGraph::$variant(Backend::sized(
-                    dim,
-                    m,
-                    max_layer,
-                    ef_construction,
-                    expected_size,
-                    $dist,
-                ))
+                VectorGraph::$variant(if reserve {
+                    Backend::sized(dim, m, max_layer, ef_construction, expected_size, $dist)
+                } else {
+                    Backend::unreserved(dim, m, max_layer, ef_construction, $dist)
+                })
             };
         }
         match space {
@@ -1373,6 +1448,23 @@ impl VectorGraph {
             }
         };
         links + before.saturating_sub(self.store_memory_bytes() + self.raw_memory_bytes())
+    }
+
+    /// Take the reservation `expected_size` declares, which is what
+    /// [`VectorGraph::new_raw`] takes at construction, on a graph
+    /// [`VectorGraph::new_raw_unreserved`] built and nothing has been
+    /// inserted into.
+    pub fn reserve_declared(&mut self, expected_size: usize) {
+        match self {
+            VectorGraph::Cosine(b) => b.reserve_declared(expected_size),
+            VectorGraph::L2(b) => b.reserve_declared(expected_size),
+            VectorGraph::L1(b) => b.reserve_declared(expected_size),
+            VectorGraph::Dot(b) => b.reserve_declared(expected_size),
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                b.reserve_declared(expected_size)
+            }
+            VectorGraph::Int8(b) => b.reserve_declared(expected_size),
+        }
     }
 
     /// Whether this graph scores against codes rather than against the
