@@ -18,7 +18,10 @@
 //! writes, and it is what lets the index answer `len`, `holds`, `stranded`
 //! and a removal of an id it never held without reaching into the
 //! collection. A search under a set admitting everything runs under this
-//! bitmap alone, which is the traversal an unfiltered search has always run.
+//! bitmap alone where the graph holds a node the bitmap does not, being the
+//! node a removal or an overwrite leaves behind, and under no predicate at
+//! all while every node is live, since the bitmap would then admit every
+//! node it is asked about.
 //!
 //! # The two paths
 //!
@@ -54,8 +57,8 @@
 //! at width 100 a search at `ef` 200 cost as much as eleven thousand kernel
 //! evaluations and visited about a thousand nodes. Both units are timed
 //! over records scattered across the store, under a bitmap test per
-//! candidate as every search the collection runs pays, and the search is
-//! asked for a vector the graph does not hold. An exact scan is priced per
+//! candidate as a filtered search pays, and the search is asked for a
+//! vector the graph does not hold. An exact scan is priced per
 //! record from the kernel. A filtered traversal grows as the admitted share
 //! falls, from two measured points. An index too small to time takes a
 //! compiled-in floor for each.
@@ -150,6 +153,16 @@ pub(crate) struct DenseIndex {
     /// The records this index holds a node for and has not removed.
     live: Bitmap,
     live_count: usize,
+    /// Whether every node the graph holds was inserted under an id the live
+    /// set holds, so the live bit admits every node a traversal can reach.
+    ///
+    /// Computed by one pass over the nodes whenever the graph or the live
+    /// set is replaced whole. `insert` leaves it as it is, since the node it
+    /// adds is filed under an id that becomes live in the same call, and
+    /// `remove` clears it, since the removed record's node stays in the
+    /// graph. It sits beside the bitmap and the graph under the same guard,
+    /// so a search reads the three as one.
+    every_node_live: bool,
     metric: String,
     dim: usize,
     pq: Option<Arc<PQ>>,
@@ -182,6 +195,7 @@ impl DenseIndex {
             graph,
             live: Bitmap::default(),
             live_count: 0,
+            every_node_live: false,
             metric: metric.to_string(),
             dim,
             pq,
@@ -193,6 +207,7 @@ impl DenseIndex {
             },
             saturated: AtomicU64::new(0),
         };
+        index.every_node_live = every_node_live(&index.graph, &index.live);
         index.calibrate();
         index
     }
@@ -246,6 +261,7 @@ impl DenseIndex {
         }
         self.live = live;
         self.live_count = count;
+        self.every_node_live = every_node_live(&self.graph, &self.live);
     }
 
     /// Swap the graph and keep everything else, which is what a compaction,
@@ -253,13 +269,15 @@ impl DenseIndex {
     ///
     /// `timed` is what [`DenseIndex::time_graph`] measured on the replacement
     /// before the caller took the write guard, so the guard is held for the
-    /// swap alone and never across a timing run. `None` takes the floor.
+    /// swap and one pass over the replacement's nodes, and never across a
+    /// timing run. `None` takes the floor.
     pub(crate) fn replace_graph(
         &mut self,
         graph: VectorGraph,
         timed: Option<(f64, f64)>,
     ) -> VectorGraph {
         let old = std::mem::replace(&mut self.graph, graph);
+        self.every_node_live = every_node_live(&self.graph, &self.live);
         self.set_units(timed);
         old
     }
@@ -443,7 +461,8 @@ impl DenseIndex {
     ///
     /// Three predicates, each monomorphised into the traversal by the
     /// graph's generic parameter. A set admitting everything is the live
-    /// bit alone, which is the unfiltered search. A bitmap is its bit and
+    /// bit alone, which is the unfiltered search, and no predicate at all
+    /// while every node the graph holds is live. A bitmap is its bit and
     /// then the live bit, in that order so a rejected node costs one word
     /// read. Anything else is the live bit and then the table call.
     fn traverse(&self, query: &[f32], k: usize, ef: usize, admit: &dyn Admit) -> Hits {
@@ -455,8 +474,14 @@ impl DenseIndex {
         };
         let live = &self.live;
         let searched = if admit.admits_all() {
-            let admits = |id: &usize| live.contains(*id);
-            self.graph.search(query, k, ef, Some(&admits))
+            if self.every_node_live {
+                // The live bit would admit every node the traversal can
+                // reach, so the search runs without a predicate.
+                self.graph.search(query, k, ef, None::<&fn(&usize) -> bool>)
+            } else {
+                let admits = |id: &usize| live.contains(*id);
+                self.graph.search(query, k, ef, Some(&admits))
+            }
         } else if let Some(bitmap) = admit.as_bitmap() {
             let admits = |id: &usize| bitmap.contains(*id) && live.contains(*id);
             self.graph.search(query, k, ef, Some(&admits))
@@ -642,6 +667,7 @@ impl VectorIndex<Dense> for DenseIndex {
         }
         self.live.remove(id.slot());
         self.live_count -= 1;
+        self.every_node_live = false;
         Ok(())
     }
 
@@ -719,6 +745,11 @@ impl VectorIndex<Dense> for DenseIndex {
             },
         }
     }
+}
+
+/// Whether every node `graph` holds was inserted under an id `live` holds.
+fn every_node_live(graph: &VectorGraph, live: &Bitmap) -> bool {
+    (0..graph.nb_points() as u32).all(|node| live.contains(graph.origin_id_at(node)))
 }
 
 /// The dump's name under a prefix.
@@ -925,6 +956,128 @@ mod tests {
             vec![1, 2, 3, 4],
             "the stranded node routes and is never returned"
         );
+    }
+
+    /// One page as internal ids and score bits.
+    fn bits_of(hits: &Hits) -> Vec<(u32, u32)> {
+        hits.items
+            .iter()
+            .map(|hit| (hit.id.0, hit.score.to_bits()))
+            .collect()
+    }
+
+    /// The page a traversal returns under the live bit, asked of the graph
+    /// directly.
+    fn under_the_live_bit(
+        index: &DenseIndex,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Vec<(u32, u32)> {
+        let live = index.live_set();
+        index
+            .graph()
+            .search(query, k, ef, Some(&|id: &usize| live.contains(*id)))
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.internal_id as u32, hit.distance.to_bits()))
+            .collect()
+    }
+
+    /// Whether any page of the graph asked with no predicate at all names
+    /// one of `removed`.
+    fn unchecked_page_names_one_of(
+        index: &DenseIndex,
+        queries: &[[f32; 2]],
+        removed: &[u32],
+    ) -> bool {
+        queries.iter().any(|query| {
+            index
+                .graph()
+                .search(query, 10, 40, None::<&fn(&usize) -> bool>)
+                .unwrap()
+                .iter()
+                .any(|hit| removed.contains(&(hit.internal_id as u32)))
+        })
+    }
+
+    /// An unfiltered search leaves the live bit out only while every node
+    /// the graph holds is live, and returns the page the live bit gives
+    /// either way. Once a record is removed its node stays, the bit is
+    /// checked again, and the removed record is never returned although a
+    /// traversal with no predicate would return it.
+    #[test]
+    fn an_unfiltered_search_checks_the_live_bit_once_a_node_is_dead() {
+        let vectors: Vec<Vec<f32>> = (0..300)
+            .map(|i| vec![(i as f32 * 0.37).sin(), (i as f32 * 0.11).cos()])
+            .collect();
+        let queries: Vec<[f32; 2]> = (0..40)
+            .map(|i| [(i as f32 * 0.53).cos(), (i as f32 * 0.29).sin()])
+            .collect();
+        let budget = Budget {
+            ef: Some(40),
+            ..Budget::default()
+        };
+        let mut index = index_of(&vectors);
+        assert!(index.every_node_live, "built by insertion alone");
+        for query in &queries {
+            let page = index.search(query, 10, &Candidates::All, &budget).unwrap();
+            assert_eq!(bits_of(&page), under_the_live_bit(&index, query, 10, 40));
+        }
+
+        let removed: Vec<u32> = (1..=300).filter(|id| id % 3 == 0).collect();
+        for &id in &removed {
+            index.remove(RecordId(id)).unwrap();
+        }
+        assert!(!index.every_node_live, "a removal leaves its node behind");
+        assert!(
+            unchecked_page_names_one_of(&index, &queries, &removed),
+            "the removed records sit where these queries reach them"
+        );
+        for query in &queries {
+            let page = index.search(query, 10, &Candidates::All, &budget).unwrap();
+            assert!(page.items.iter().all(|hit| !removed.contains(&hit.id.0)));
+            assert_eq!(bits_of(&page), under_the_live_bit(&index, query, 10, 40));
+        }
+    }
+
+    /// The flag is the fact the skip rests on, and it is computed whenever
+    /// the graph or the live set is replaced whole. A live set naming every
+    /// node but one, and one id no node carries, leaves the node count and
+    /// the live count equal, and the flag still says a node is dead.
+    #[test]
+    fn every_node_live_is_recomputed_when_the_graph_or_the_live_set_is_replaced() {
+        let vectors: Vec<Vec<f32>> = (0..100)
+            .map(|i| vec![(i as f32 * 0.37).sin(), (i as f32 * 0.11).cos()])
+            .collect();
+        let mut index = index_of(&vectors);
+        index.remove(RecordId(7)).unwrap();
+        assert!(!index.every_node_live);
+
+        // The same live set handed back whole is read from the graph again,
+        // and the removed record's node is still there.
+        let held: Vec<usize> = (1..=100).filter(|&id| id != 7).collect();
+        index.set_live(held.iter().copied());
+        assert!(!index.every_node_live);
+
+        // As many live ids as nodes, one of them an id no node carries.
+        index.set_live(held.iter().copied().chain(std::iter::once(500)));
+        assert_eq!(index.stranded(), 0);
+        assert!(!index.every_node_live, "node 7's id is not live");
+
+        // A graph holding the live records alone.
+        index.set_live(held.iter().copied());
+        let mut rebuilt = VectorGraph::new_raw("l2", 2, 4, 64, NB_LAYER_MAX as usize, 50);
+        for &id in &held {
+            rebuilt.insert(&vectors[id - 1], id);
+        }
+        index.replace_graph(rebuilt, None);
+        assert!(index.every_node_live);
+        let page = index
+            .search(&[0.0, 0.0], 10, &Candidates::All, &Budget::default())
+            .unwrap();
+        assert_eq!(page.items.len(), 10);
+        assert!(page.items.iter().all(|hit| hit.id.0 != 7));
     }
 
     /// The cost is priced in nanoseconds from the two units, is exact under

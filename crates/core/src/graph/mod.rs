@@ -1079,9 +1079,9 @@ impl VectorGraph {
     /// The query is the midpoint of two points scattered across the store,
     /// normalised on a cosine graph, rather than a stored point itself, so
     /// the search is for a vector the graph does not hold, which is what a
-    /// query is. The predicate is in place because every search the
-    /// collection runs carries one, being its live set at least, and the
-    /// test is paid once per candidate. Measured at width 100 over 50,000
+    /// query is. The predicate is in place because a filtered search and a
+    /// search over a graph holding a removed record's node carry one, and
+    /// the test is paid once per candidate. Measured at width 100 over 50,000
     /// points, this figure sits within 3 percent of a search the collection
     /// runs on the same graph; a stored point as the query, with no
     /// predicate, sat within 10 percent of it, so the two changes are for
