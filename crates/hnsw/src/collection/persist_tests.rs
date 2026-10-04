@@ -19,6 +19,7 @@ use zeusdb_vector_sparse::{SparseConfig, Weighting};
 use zeusdb_vector_text::{SimpleTokenizer, Tokenizer, TokenizerConfig};
 
 use super::{Collection, Declaration, ParsedRecord, SpaceConfig, SparseHalf};
+use crate::journal::Durability;
 
 /// A directory under the system's temporary directory, removed on drop.
 struct TempDir(std::path::PathBuf);
@@ -962,4 +963,131 @@ fn the_collection_a_load_starts_from_reserves_nothing() {
 
     empty.reserve_dense_graph();
     assert_eq!(graph_reservation(&empty), graph_reservation(&created));
+}
+
+/// Save `collection` as `name`, recover the directory, require the graph to
+/// be the one its dump holds rather than a rebuild, and save the recovered
+/// collection again to the same dump bytes. Hands back the recovered one.
+fn reads_its_dump_and_writes_it_back(collection: &Collection, name: &str) -> Collection {
+    let dir = TempDir::new();
+    let path = dir.path().join(name);
+    collection.save(path.to_str().unwrap()).unwrap();
+    let (loaded, recovery) =
+        Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
+    assert!(
+        !recovery.graph_rebuilt,
+        "{} was rebuilt rather than read from its dump",
+        name
+    );
+    let again = dir.path().join(format!("again-{}", name));
+    loaded.save(again.to_str().unwrap()).unwrap();
+    assert_eq!(
+        std::fs::read(path.join(DUMP_FILENAME)).unwrap(),
+        std::fs::read(again.join(DUMP_FILENAME)).unwrap(),
+        "{}",
+        name
+    );
+    loaded
+}
+
+/// The page a dense query gives, as an external id and a score per hit.
+fn dense_page(collection: &Collection, query: &[f32]) -> Page {
+    let params = collection.search_params(5, None, false, None).unwrap();
+    collection
+        .search_one(query, None, params)
+        .unwrap()
+        .iter()
+        .map(|h| (h.id().to_string(), h.score()))
+        .collect()
+}
+
+/// A directory of one record reads its dump, one node under the only id the
+/// counter issued, and a save after the load writes the same dump.
+#[test]
+fn a_directory_of_one_record_reads_its_dump_and_writes_it_back() {
+    let collection = Collection::build(base(), None);
+    assert_eq!(
+        collection
+            .add_records(vec![record("r0", &[0.5, 1.5], None, "a")], vec![], false)
+            .total_errors,
+        0
+    );
+    let loaded = reads_its_dump_and_writes_it_back(&collection, "one.zdb");
+    assert_eq!(loaded.id_counter(), 1);
+    assert_eq!(loaded.dense().index.read().unwrap().graph().nb_points(), 1);
+    assert_eq!(
+        dense_page(&loaded, &[0.5, 1.5]),
+        dense_page(&collection, &[0.5, 1.5])
+    );
+}
+
+/// A directory whose graph holds a node for every id its counter issued,
+/// three of them stranded by two removals and an overwrite, reads its dump
+/// with every node in place, and a save after the load writes the same dump.
+#[test]
+fn a_directory_holding_removed_and_overwritten_records_reads_its_dump_and_writes_it_back() {
+    let collection = Collection::build(base(), None);
+    let records: Vec<ParsedRecord> = (0..300u32)
+        .map(|i| {
+            record(
+                &format!("r{i}"),
+                &[(i % 17) as f32 * 0.3, (i % 11) as f32 * 0.7],
+                None,
+                if i % 2 == 0 { "a" } else { "b" },
+            )
+        })
+        .collect();
+    assert_eq!(
+        collection.add_records(records, vec![], false).total_errors,
+        0
+    );
+    assert!(collection.remove_point("r10".to_string()).unwrap());
+    assert!(collection.remove_point("r11".to_string()).unwrap());
+    let overwritten = record("r5", &[9.0, 9.0], None, "b");
+    assert_eq!(
+        collection
+            .add_records(vec![overwritten], vec![], true)
+            .total_errors,
+        0
+    );
+    assert_eq!(collection.id_counter(), 301);
+
+    let loaded = reads_its_dump_and_writes_it_back(&collection, "removed.zdb");
+    assert_eq!(
+        loaded.dense().index.read().unwrap().graph().nb_points(),
+        301
+    );
+    assert_eq!(loaded.len(), 298);
+    assert_eq!(loaded.stats()["stranded_graph_nodes"], "3");
+    assert_eq!(ids_of(&loaded), ids_of(&collection));
+    assert_eq!(
+        dense_page(&loaded, &[1.5, 3.0]),
+        dense_page(&collection, &[1.5, 3.0])
+    );
+}
+
+/// A directory at the largest `m` and the smallest dimension reads its dump,
+/// and a save after the load writes the same dump.
+#[test]
+fn a_directory_at_the_largest_m_and_the_smallest_dimension_reads_its_dump_and_writes_it_back() {
+    let declaration = Declaration::validate(1, "l2", 256, 64, 300, vec![]).unwrap();
+    let collection = Collection::build(declaration, None);
+    let records: Vec<ParsedRecord> = (0..300u32)
+        .map(|i| ParsedRecord {
+            id: format!("r{i}"),
+            vector: vec![((i * 37) % 101) as f32 * 0.01],
+            sparse: None,
+            metadata: HashMap::new(),
+        })
+        .collect();
+    assert_eq!(
+        collection.add_records(records, vec![], false).total_errors,
+        0
+    );
+    let loaded = reads_its_dump_and_writes_it_back(&collection, "wide.zdb");
+    assert_eq!((loaded.m(), loaded.dim()), (256, 1));
+    assert_eq!(
+        dense_page(&loaded, &[0.42]),
+        dense_page(&collection, &[0.42])
+    );
 }
