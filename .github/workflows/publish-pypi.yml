@@ -252,7 +252,7 @@ jobs:
           abi3audit --strict --verbose --assume-minimum-abi3 3.10 dist/*.whl
       - name: Set up QEMU
         if: matrix.platform.docker-platform != 'linux/amd64'
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Install and import the built wheel on two interpreters
         # Runs in a glibc container matching the wheel architecture. A native
         # wheel cannot be handed to another job, so the check runs where the
@@ -330,7 +330,7 @@ jobs:
           abi3audit --strict --verbose --assume-minimum-abi3 3.10 dist/*.whl
       - name: Set up QEMU
         if: matrix.platform.docker-platform != 'linux/amd64'
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Install and import the built wheel on two interpreters
         # Runs in a musl container, because a musllinux wheel does not install
         # on the glibc runner that builds it. The floor and the newest release
@@ -529,7 +529,7 @@ jobs:
       # unreachable and the action's README says such a pin will eventually
       # be garbage-collected. master is permanent. On master the channel is a
       # required input, so it is passed here and the meaning is unchanged.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-08-05
         with:
           toolchain: stable
       - name: Build sdist
