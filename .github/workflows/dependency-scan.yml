@@ -67,7 +67,7 @@ jobs:
       # A prebuilt binary from cargo-deny's own GitHub releases, onto
       # $CARGO_HOME/bin. The two run steps below need to redirect SARIF to a
       # file and to handle each exit code separately.
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-deny
 
@@ -115,7 +115,7 @@ jobs:
         if: >-
           github.event_name != 'pull_request'
           || github.event.pull_request.head.repo.full_name == github.repository
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           sarif_file: ${{ runner.temp }}/cargo-deny.sarif
           # Names this analysis, so a second SARIF source added later reports
