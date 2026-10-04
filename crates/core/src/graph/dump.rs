@@ -793,6 +793,10 @@ pub(crate) struct Expected {
     /// dump was issued by the counter before it was read. It is a required
     /// field of `IndexConfig`, so every directory this build can open carries
     /// one.
+    ///
+    /// It bounds the node count as well. No two nodes are filed under one id,
+    /// so a dump holds at most one node for each id from zero to this one, and
+    /// the per node arrays and the layer zero slab are sized by that count.
     pub max_origin_id: usize,
 }
 
@@ -803,6 +807,7 @@ pub(crate) struct Expected {
 /// why the points are collected here. The reader itself builds the graph from
 /// the adjacency region's bytes; see [`read_dump`].
 #[cfg(test)]
+#[derive(Clone)]
 pub(super) struct ParsedDump<T> {
     /// `points_by_layer[l][r]` is the point at rank `r` of layer `l`.
     pub points_by_layer: Vec<Vec<LoadedPoint<T>>>,
@@ -849,7 +854,7 @@ where
         nb_point,
         dimension,
     } = open_dump::<T>(dir, name, expected)?;
-    let walk = check_adjacency(&region, nb_point, &layer_counts)?;
+    let walk = check_adjacency(&region, nb_point, &layer_counts, m)?;
     let graph = MutableGraph::from_adjacency(
         &layer_counts,
         dimension,
@@ -1032,7 +1037,7 @@ where
         nb_point,
         dimension,
     } = open_dump::<T>(dir, name, expected)?;
-    let adjacency = read_adjacency(&region, nb_point, &layer_counts)?;
+    let adjacency = read_adjacency(&region, nb_point, &layer_counts, m)?;
     Ok(DumpStream {
         hashed,
         layer_counts,
@@ -1215,6 +1220,22 @@ where
         ));
     }
 
+    // The node count against the ids the directory has issued. Every node is
+    // filed under an id at or below the counter, and no two under the same
+    // one, which the origin ids are held to below, so the dump holds at most
+    // one node for each id from zero to the counter. The per node arrays and
+    // the layer zero slab are sized by the node count, so it is held to the
+    // counter before anything past the header is read. A counter at the top
+    // of the range allows any count, so the sum is checked rather than
+    // wrapped.
+    let nodes_the_ids_allow = (expected.max_origin_id as u64).checked_add(1);
+    if nodes_the_ids_allow.is_some_and(|allowed| header.nb_point > allowed) {
+        return Err(format!(
+            "the graph dump holds {} nodes and config.json counted {}",
+            header.nb_point, expected.max_origin_id
+        ));
+    }
+
     // Every allocation from here on is bounded by a file that really is this
     // long, so the header can no longer ask for memory it has not accounted for.
     let mut hashed = HashingReader::new(reader);
@@ -1272,6 +1293,21 @@ where
     }
     drop(origin_raw);
 
+    // No two nodes are filed under one origin id. The graph's id-to-node array
+    // is the inverse of the origin ids, which it can only be where each id
+    // names one node, so a repeated id is refused before anything is built.
+    // The check runs over a sorted copy, which takes what the region the ids
+    // were read from took and is released before the adjacency is read.
+    let mut sorted = origin_ids.clone();
+    sorted.sort_unstable();
+    if let Some(pair) = sorted.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(format!(
+            "the graph dump names origin id {} for more than one node",
+            pair[0]
+        ));
+    }
+    drop(sorted);
+
     // The adjacency region, read whole. Its length is part of the size
     // agreement, so the block is one the file has the bytes for, and nothing
     // is built from it until `check_adjacency` has accepted all of it.
@@ -1317,7 +1353,10 @@ fn entry_at(region: &[u8], at: usize) -> (usize, usize, f32) {
 /// Every count is checked against the bytes the region has left before
 /// anything reads past it, so a list count of four billion is refused on
 /// arithmetic, and no count, nor any sum of them, sizes anything here or in
-/// the constructor that walks the region afterwards. Every target is checked
+/// the constructor that walks the region afterwards. Every count is held to
+/// the slots a list at its layer has in the graph, being `2m + 1` at layer zero
+/// and `m + 1` above, so a list the graph cannot hold is refused here rather
+/// than once the graph's arrays are allocated. Every target is checked
 /// against the layer table, so an edge naming a node that is not there is
 /// caught here rather than inside the constructor, every distance is checked
 /// finite, and the region must end where its last point does.
@@ -1325,7 +1364,12 @@ fn check_adjacency<'a>(
     region: &'a [u8],
     nb_point: usize,
     layer_counts: &[usize],
+    m: usize,
 ) -> Result<AdjacencyWalk<'a>, String> {
+    // Saturating, since `m` is held to its range by the constructor, which
+    // runs after this, and an `m` it refuses must not overflow here first.
+    let base_cap = m.saturating_mul(2).saturating_add(1);
+    let upper_cap = m.saturating_add(1);
     let mut at = 0usize;
     for point in 0..nb_point {
         if at >= region.len() {
@@ -1366,6 +1410,13 @@ fn check_adjacency<'a>(
                     edge_count,
                     layer,
                     (region.len() - at) / EDGE_BYTES
+                ));
+            }
+            let cap = if layer == 0 { base_cap } else { upper_cap };
+            if edge_count > cap {
+                return Err(format!(
+                    "node {} declares {} neighbours at layer {} and a list there holds {}",
+                    point, edge_count, layer, cap
                 ));
             }
             for _ in 0..edge_count {
@@ -1460,7 +1511,10 @@ fn read_adjacency(
     region: &[u8],
     nb_point: usize,
     layer_counts: &[usize],
+    m: usize,
 ) -> Result<Vec<Vec<Vec<LoadedEdge>>>, String> {
+    let base_cap = m.saturating_mul(2).saturating_add(1);
+    let upper_cap = m.saturating_add(1);
     let mut at = 0usize;
     let mut out: Vec<Vec<Vec<LoadedEdge>>> = Vec::with_capacity(nb_point);
     for point in 0..nb_point {
@@ -1503,6 +1557,13 @@ fn read_adjacency(
                     edge_count,
                     layer,
                     (region.len() - at) / EDGE_BYTES
+                ));
+            }
+            let cap = if layer == 0 { base_cap } else { upper_cap };
+            if edge_count > cap {
+                return Err(format!(
+                    "node {} declares {} neighbours at layer {} and a list there holds {}",
+                    point, edge_count, layer, cap
                 ));
             }
             let mut edges = Vec::with_capacity(edge_count);
@@ -2188,15 +2249,16 @@ mod tests {
     /// refused on the region's length, before anything is sized.
     ///
     /// Two forgeries, each with the payload checksum repaired, so nothing but
-    /// the region's own length can refuse them. In the first every list the
-    /// dump records declares 2^32 - 1 entries, several hundred lists of them,
-    /// a declared total past 2^40 entries that no allocation from the counts
-    /// could have been asked for and survived. In the second the first list
-    /// declares exactly as many entries as the rest of the region could hold,
-    /// so that count passes, every count after it is read out of entry bytes,
-    /// and the total runs past the region. Both are refused by the region
-    /// check, which runs before the graph's constructor sizes anything, and the
-    /// reference refuses both in the same words.
+    /// the region check can refuse them. In the first every list the dump
+    /// records declares 2^32 - 1 entries, several hundred lists of them, a
+    /// declared total past 2^40 entries that no allocation from the counts
+    /// could have been asked for and survived, and the first list is refused
+    /// on the region's length. In the second the first list declares exactly
+    /// as many entries as the rest of the region could hold, a count the
+    /// region's length admits and the slots a list has in the graph do not,
+    /// so it is refused on those. Both are refused by the region check, which
+    /// runs before the graph's constructor sizes anything, and the reference
+    /// refuses both in the same words.
     #[test]
     fn a_dump_declaring_more_neighbours_than_its_bytes_carry_is_refused_before_anything_is_sized() {
         let dir = tempfile::tempdir().unwrap();
@@ -2440,5 +2502,377 @@ mod tests {
             );
         }
         assert!(deepest > 6, "the deepest graph holds {} layers", deepest);
+    }
+
+    /// A parsed dump as a source the writer takes, so a test can alter one
+    /// thing no save writes and leave every length and both checksums to the
+    /// writer.
+    impl DumpSource<f32> for ParsedDump<f32> {
+        fn nb_point(&self) -> usize {
+            self.points_by_layer.iter().map(Vec::len).sum()
+        }
+
+        fn entry(&self) -> Option<PointId> {
+            Some(self.entry)
+        }
+
+        fn layer_nb_point(&self, layer: usize) -> usize {
+            self.points_by_layer.get(layer).map_or(0, Vec::len)
+        }
+
+        fn dimension(&self) -> usize {
+            self.points_by_layer
+                .iter()
+                .flatten()
+                .next()
+                .map_or(0, |point| point.data.len())
+        }
+
+        fn max_nb_connection(&self) -> usize {
+            self.m
+        }
+
+        fn ef_construction(&self) -> usize {
+            self.ef_construction
+        }
+
+        fn level_scale(&self) -> f64 {
+            self.level_scale
+        }
+
+        fn each_origin_id(
+            &self,
+            layer: usize,
+            f: &mut dyn FnMut(usize) -> Result<(), String>,
+        ) -> Result<(), String> {
+            for point in self.points_by_layer.get(layer).into_iter().flatten() {
+                f(point.origin_id)?;
+            }
+            Ok(())
+        }
+
+        fn each_neighbourhood(&self, layer: usize, f: EachNeighbourhood<'_>) -> Result<(), String> {
+            for point in self.points_by_layer.get(layer).into_iter().flatten() {
+                f(&point.neighbours)?;
+            }
+            Ok(())
+        }
+
+        fn each_vector(
+            &self,
+            layer: usize,
+            f: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+        ) -> Result<(), String> {
+            for point in self.points_by_layer.get(layer).into_iter().flatten() {
+                f(&point.data)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// `parsed` written into a directory of its own.
+    fn written(parsed: &ParsedDump<f32>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        write_dump::<f32, _>(
+            parsed,
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        dir
+    }
+
+    /// The dump `graph` writes, parsed back under `expected`.
+    ///
+    /// Written back unaltered, the parse is the file it came from, byte for
+    /// byte, so a forgery made from it differs from a save in what a test
+    /// alters and in nothing else.
+    fn parse_written(
+        graph: &MutableGraph<f32, CosineDist>,
+        store: &super::super::store::VectorStore<f32>,
+        expected: &Expected,
+    ) -> ParsedDump<f32> {
+        let dir = tempfile::tempdir().unwrap();
+        write_dump(
+            &graph.dump_view(store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let parsed = parse_dump::<f32>(&FsDir::new(dir.path()), DUMP_FILENAME, expected).unwrap();
+        let again = written(&parsed);
+        assert_eq!(
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(again.path().join(DUMP_FILENAME)).unwrap(),
+            "a parse written back is not the file it was parsed from"
+        );
+        parsed
+    }
+
+    /// The reader's refusal of the dump in `dir`, which the reference gives
+    /// in the same words.
+    fn refused_by_both(dir: &std::path::Path, expected: &Expected) -> String {
+        let reason = refused(read_dump::<f32, CosineDist>(
+            &FsDir::new(dir),
+            DUMP_FILENAME,
+            expected,
+            CosineDist {},
+        ));
+        let reference = refused(read_dump_reference::<f32, CosineDist>(
+            &FsDir::new(dir),
+            DUMP_FILENAME,
+            expected,
+            CosineDist {},
+        ));
+        assert_eq!(reason, reference);
+        reason
+    }
+
+    /// `graph` written, read back at the counter its own ids reach to the
+    /// reference's graph and to the written graph's topology, and written
+    /// again to the same bytes.
+    fn round_trips_at_its_counter(
+        graph: &MutableGraph<f32, CosineDist>,
+        store: &super::super::store::VectorStore<f32>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        write_dump(
+            &graph.dump_view(store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let expected = expected_for(graph, graph.dim(), graph.nb_points());
+        let ((read, read_store), (reference, reference_store)) = read_both(dir.path(), &expected);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(store_bytes(&read_store), store_bytes(&reference_store));
+        assert_eq!(topology(graph, store), topology(&read, &read_store));
+
+        let again = tempfile::tempdir().unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(again.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(again.path().join(DUMP_FILENAME)).unwrap()
+        );
+    }
+
+    /// A dump holding more nodes than the ids its directory issued is refused
+    /// on its header, before its layers or its ids are read.
+    ///
+    /// No two nodes are filed under one id and none above the counter, so a
+    /// dump holds at most one node for each id from zero to the counter. Read
+    /// at the counter its own ids reach, the dump loads. Read one below, it is
+    /// refused in the node count's words rather than in those of the id above
+    /// the counter, which only reading the ids would find. One point under
+    /// the only id the counter issued, with two more filed under it at the
+    /// top layer, is refused the same way, and a counter too large to add one
+    /// to bounds nothing rather than wrapping.
+    #[test]
+    fn a_dump_holding_more_nodes_than_its_counter_allows_is_refused_on_its_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let (built, built_store) = sample_graph(40, 4, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let at_the_counter = expected_for(&built, 4, 40);
+        assert_eq!(at_the_counter.max_origin_id, 39);
+        assert!(read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &at_the_counter,
+            CosineDist {}
+        )
+        .is_ok());
+        let below = Expected {
+            max_origin_id: 38,
+            ..at_the_counter
+        };
+        assert_eq!(
+            refused_by_both(dir.path(), &below),
+            "the graph dump holds 40 nodes and config.json counted 38"
+        );
+        let unbounded = Expected {
+            max_origin_id: usize::MAX,
+            ..at_the_counter
+        };
+        assert!(read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &unbounded,
+            CosineDist {}
+        )
+        .is_ok());
+
+        let (one, one_store) = sample_graph(1, 4, 16);
+        let only = expected_for(&one, 4, 1);
+        let mut forged = parse_written(&one, &one_store, &only);
+        let point = forged
+            .points_by_layer
+            .iter()
+            .flatten()
+            .next()
+            .unwrap()
+            .clone();
+        let top = NB_LAYER_MAX as usize - 1;
+        forged.points_by_layer[top].push(point.clone());
+        forged.points_by_layer[top].push(point);
+        assert_eq!(
+            refused_by_both(written(&forged).path(), &only),
+            "the graph dump holds 3 nodes and config.json counted 0"
+        );
+    }
+
+    /// One origin id named for two nodes is refused before anything is built.
+    ///
+    /// The graph's id-to-node array is the inverse of the origin ids, so each
+    /// id names one node. The second point's id is overwritten with the
+    /// first's and nothing else is altered, so the node count still fits the
+    /// counter and the refusal is the repeated id's, not the constructor's.
+    /// The same two ids exchanged name one node each, and load.
+    #[test]
+    fn a_dump_naming_one_origin_id_for_two_nodes_is_refused_before_the_graph_is_built() {
+        let (built, built_store) = sample_graph(40, 4, 16);
+        let expected = expected_for(&built, 4, 40);
+        let parsed = parse_written(&built, &built_store, &expected);
+        let first = parsed.points_by_layer[0][0].origin_id;
+        let second = parsed.points_by_layer[0][1].origin_id;
+
+        let mut repeated = parsed.clone();
+        repeated.points_by_layer[0][1].origin_id = first;
+        assert_eq!(
+            refused_by_both(written(&repeated).path(), &expected),
+            format!(
+                "the graph dump names origin id {} for more than one node",
+                first
+            )
+        );
+
+        let mut exchanged = parsed.clone();
+        exchanged.points_by_layer[0][0].origin_id = second;
+        exchanged.points_by_layer[0][1].origin_id = first;
+        let dir = written(&exchanged);
+        let ((read, read_store), (reference, reference_store)) = read_both(dir.path(), &expected);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(store_bytes(&read_store), store_bytes(&reference_store));
+        assert_eq!(read.origin_id_of(0), second);
+        assert_eq!(read.origin_id_of(1), first);
+    }
+
+    /// A list longer than the slots its layer has in the graph is refused
+    /// before the graph is built, at layer zero and above.
+    ///
+    /// At `m` 2 a list holds 5 at layer zero and 3 above, the overflow slot
+    /// included. One list at each is given exactly that many entries and
+    /// loads, and one more and is refused in the region check's words, which
+    /// the reference gives too, rather than by the constructor. An `m` too
+    /// large to double is refused by the constructor's own range rule, the
+    /// slots saturating on the way rather than wrapping.
+    #[test]
+    fn a_list_longer_than_its_layer_holds_is_refused_before_the_graph_is_built() {
+        let (built, built_store) = sample_graph(300, 4, 2);
+        let expected = expected_for(&built, 4, 300);
+        let parsed = parse_written(&built, &built_store, &expected);
+        let layer_zero = parsed.points_by_layer[0].len();
+        assert!(parsed.points_by_layer[1].len() > 4);
+
+        // The first point of `layer` given a list of `count` entries there,
+        // each naming another point of the same layer.
+        let with_list = |layer: usize, count: usize| {
+            let mut forged = parsed.clone();
+            let point = &mut forged.points_by_layer[layer][0];
+            let lists = point.neighbours.len().max(layer + 1);
+            point.neighbours.resize(lists, Vec::new());
+            point.neighbours[layer] = (1..=count)
+                .map(|rank| LoadedEdge {
+                    target: PointId(layer as u8, rank as i32),
+                    distance: 0.5,
+                })
+                .collect();
+            written(&forged)
+        };
+
+        for (layer, node, slots) in [(0usize, 0usize, 5usize), (1, layer_zero, 3)] {
+            let full = with_list(layer, slots);
+            let ((read, _), (reference, _)) = read_both(full.path(), &expected);
+            assert_eq!(read.arrays(), reference.arrays(), "layer {}", layer);
+            assert_eq!(read.neighbours_at(node as u32, layer).len(), slots);
+
+            let past = with_list(layer, slots + 1);
+            assert_eq!(
+                refused_by_both(past.path(), &expected),
+                format!(
+                    "node {} declares {} neighbours at layer {} and a list there holds {}",
+                    node,
+                    slots + 1,
+                    layer,
+                    slots
+                )
+            );
+        }
+
+        let mut wide = parsed.clone();
+        wide.m = usize::MAX;
+        let reason = refused_by_both(
+            written(&wide).path(),
+            &Expected {
+                m: usize::MAX,
+                ..expected
+            },
+        );
+        assert!(
+            reason.starts_with(
+                "the graph dump could not be rebuilt: max_nb_connection is between 1 and 256"
+            ),
+            "{}",
+            reason
+        );
+    }
+
+    /// A graph holding an empty list at or below its owner's level reads back
+    /// to the reference's graph and writes the same bytes.
+    ///
+    /// A node's list at a layer is filled from a search at that layer when the
+    /// node arrives, and a layer at which no node yet has its top level yields
+    /// nothing, so a node can keep an empty list at a layer at or below its own
+    /// level. The deep graph a small `m` builds holds such lists. The rules
+    /// hold a list to its slots and an empty one to nothing, and the read is at
+    /// the counter the graph's own ids reach, the tightest the node count
+    /// allows.
+    #[test]
+    fn a_graph_holding_empty_upper_lists_reads_back_and_writes_the_same_bytes() {
+        let (built, built_store) = sample_graph(300, 4, 2);
+        let empty = (0..built.nb_points() as u32)
+            .filter(|&node| {
+                (1..=built.level(node) as usize)
+                    .any(|layer| built.neighbours_at(node, layer).is_empty())
+            })
+            .count();
+        assert!(
+            empty > 0,
+            "no node holds an empty list at or below its level"
+        );
+        round_trips_at_its_counter(&built, &built_store);
+    }
+
+    /// The largest `m` at the smallest dimension reads back to the
+    /// reference's graph and writes the same bytes.
+    #[test]
+    fn the_largest_m_at_the_smallest_dimension_reads_back_and_writes_the_same_bytes() {
+        let (built, built_store) = sample_graph(300, 1, 256);
+        assert_eq!((built.m(), built.dim()), (256, 1));
+        round_trips_at_its_counter(&built, &built_store);
     }
 }
