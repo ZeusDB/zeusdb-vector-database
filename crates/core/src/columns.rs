@@ -49,8 +49,10 @@
 //! A disjunction with an undeclared branch is the last of those, since that
 //! branch could match anything and a union with the live set is the live set.
 
+use crate::bitmap::Bitmap;
 use crate::error::Error;
 use crate::filter::{field_test_matches, FieldLookup, FieldTest, Filter, Presence};
+use crate::idmap::{IdMap, Vacant};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -68,10 +70,17 @@ pub(crate) const MAX_INDEXED_FIELDS: usize = 32;
 /// and the dictionary itself rounds to nothing.
 const DICTIONARY_FLOOR: usize = 4_096;
 
-/// The code a slot carries when it holds no value for this field, either
-/// because the record does not carry the field or because no record occupies
-/// the slot.
+/// The code a slot carries where no record occupies it, being the absent
+/// value of the column's map.
 const ABSENT: u32 = u32::MAX;
+
+/// The code a slot carries where its record does not carry the field.
+///
+/// Apart from [`ABSENT`] so that a column holds an entry for every record the
+/// store holds, and its map's count is the store's record count whatever share
+/// of the records carries the field. A dictionary code is below both, since a
+/// dictionary holds fewer values than there are internal ids.
+const MISSING: u32 = ABSENT - 1;
 
 /// The three keys that name a group rather than a field, repeated here so that
 /// a declaration naming one is refused at `create()` rather than building a
@@ -79,160 +88,44 @@ const ABSENT: u32 = u32::MAX;
 const GROUP_KEYS: [&str; 3] = ["$and", "$or", "$not"];
 
 // ============================================================================
-// THE BITMAP
-// ============================================================================
-
-/// A set of internal ids, one bit each.
-///
-/// Sized to the store's slot count rather than to the record count, because a
-/// slot is an internal id and internal ids are never reused. At 100,000 records
-/// that is 12.5 kilobytes, so a filter of a dozen leaves allocates less than
-/// the page it returns.
-#[derive(Clone, Default)]
-pub struct Bitmap {
-    words: Vec<u64>,
-}
-
-impl Bitmap {
-    fn zeros(slots: usize) -> Self {
-        Bitmap {
-            words: vec![0; slots.div_ceil(64)],
-        }
-    }
-
-    /// An empty set whose words already reach `slots`, so a test of any id
-    /// below that reads a word rather than falling off the end. What a
-    /// measurement of the bit test's cost wants, since the set that admits
-    /// nothing and holds no words answers without a read.
-    pub fn with_slots(slots: usize) -> Self {
-        Self::zeros(slots)
-    }
-
-    #[inline]
-    fn set(&mut self, slot: usize) {
-        self.words[slot >> 6] |= 1u64 << (slot & 63);
-    }
-
-    /// Put an internal id in the set, growing the words to reach it.
-    ///
-    /// The three methods below are what a set maintained beside a map needs,
-    /// being the live record set the collection keeps under its reverse map.
-    /// The columns never call them: every bitmap a column builds is sized to
-    /// the store at once by [`Bitmap::zeros`] and filled by [`Bitmap::set`].
-    pub fn insert(&mut self, slot: usize) {
-        let index = slot >> 6;
-        if index >= self.words.len() {
-            self.words.resize(index + 1, 0);
-        }
-        self.words[index] |= 1u64 << (slot & 63);
-    }
-
-    /// Take an internal id out of the set. An id beyond the words was never in
-    /// it, so there is nothing to clear.
-    pub fn remove(&mut self, slot: usize) {
-        if let Some(word) = self.words.get_mut(slot >> 6) {
-            *word &= !(1u64 << (slot & 63));
-        }
-    }
-
-    /// Empty the set, keeping its allocation for the ids about to refill it.
-    pub fn clear(&mut self) {
-        self.words.iter_mut().for_each(|word| *word = 0);
-    }
-
-    /// Whether an internal id is in the set.
-    ///
-    /// Total over every `usize`, so the traversal predicate can ask it about a
-    /// node the store has never heard of and get `false` rather than a panic.
-    #[inline]
-    pub fn contains(&self, slot: usize) -> bool {
-        self.words
-            .get(slot >> 6)
-            .is_some_and(|word| word >> (slot & 63) & 1 == 1)
-    }
-
-    pub fn count(&self) -> usize {
-        self.words.iter().map(|w| w.count_ones() as usize).sum()
-    }
-
-    /// How many internal ids are in both sets, by a walk over the shorter
-    /// word range. A postings index counts the records a filter admits
-    /// among those it holds with this, rather than by testing each admitted
-    /// id.
-    pub fn count_and(&self, other: &Bitmap) -> usize {
-        self.words
-            .iter()
-            .zip(&other.words)
-            .map(|(mine, theirs)| (mine & theirs).count_ones() as usize)
-            .sum()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.words.iter().all(|word| *word == 0)
-    }
-
-    fn intersect(&mut self, other: &Bitmap) {
-        for (mine, theirs) in self.words.iter_mut().zip(&other.words) {
-            *mine &= *theirs;
-        }
-    }
-
-    fn union(&mut self, other: &Bitmap) {
-        for (mine, theirs) in self.words.iter_mut().zip(&other.words) {
-            *mine |= *theirs;
-        }
-    }
-
-    /// `live` without `self`.
-    ///
-    /// The complement is taken within the live set rather than over the whole
-    /// word range, so a `$not` never selects a slot that holds no record. Every
-    /// other bitmap here is already a subset of the live set, because a slot
-    /// with no record carries [`ABSENT`] in every column and no leaf matches
-    /// that.
-    fn complement_within(&self, live: &Bitmap) -> Bitmap {
-        let mut out = Bitmap {
-            words: vec![0; self.words.len()],
-        };
-        for (index, word) in out.words.iter_mut().enumerate() {
-            *word = live.words.get(index).copied().unwrap_or(0) & !self.words[index];
-        }
-        out
-    }
-
-    /// Every internal id in the set, in increasing order.
-    pub fn for_each<F: FnMut(usize)>(&self, mut visit: F) {
-        self.for_each_while(|slot| {
-            visit(slot);
-            true
-        });
-    }
-
-    /// The same walk, stopping at the first slot the visitor declines.
-    ///
-    /// The bounded scan needs it. That scan gives up once too many records have
-    /// matched, and a bound holding every slot in the store would otherwise be
-    /// walked to the end after the give-up had already been decided.
-    pub fn for_each_while<F: FnMut(usize) -> bool>(&self, mut visit: F) {
-        for (index, mut word) in self.words.iter().copied().enumerate() {
-            while word != 0 {
-                if !visit(index * 64 + word.trailing_zeros() as usize) {
-                    return;
-                }
-                word &= word - 1;
-            }
-        }
-    }
-
-    /// Bytes the words ask the allocator for.
-    pub fn heap_bytes(&self) -> usize {
-        self.words.capacity() * 8
-    }
-}
-
-// ============================================================================
 // ONE COLUMN
 // ============================================================================
+
+/// What a plain column holds at one slot.
+///
+/// The size of the `Option<Value>` a slot held before a column told a record
+/// without the field apart from a slot no record occupies, which the constant
+/// below holds it to.
+#[derive(Clone)]
+enum PlainCell {
+    /// No record occupies the slot.
+    NoRecord,
+    /// The slot's record does not carry the field.
+    Missing,
+    /// The slot's record carries the field with this value.
+    Held(Value),
+}
+
+const _: () = assert!(std::mem::size_of::<PlainCell>() == std::mem::size_of::<Option<Value>>());
+
+impl Vacant for PlainCell {
+    fn vacant() -> Self {
+        PlainCell::NoRecord
+    }
+
+    fn is_vacant(&self) -> bool {
+        matches!(self, PlainCell::NoRecord)
+    }
+}
+
+impl PlainCell {
+    fn value(&self) -> Option<&Value> {
+        match self {
+            PlainCell::Held(value) => Some(value),
+            PlainCell::NoRecord | PlainCell::Missing => None,
+        }
+    }
+}
 
 /// One declared field's values, addressed by internal id.
 ///
@@ -241,6 +134,10 @@ impl Bitmap {
 /// it holds [`DICTIONARY_FLOOR`] distinct values across no more than twice that
 /// many slots, which is the point where the dictionary stops saving anything
 /// and starts costing.
+///
+/// Either way the column holds an entry for every record the store holds,
+/// [`MISSING`] or [`PlainCell::Missing`] where the record does not carry the
+/// field, so its map follows the store's records; see [`IdMap`].
 enum Column {
     /// Low cardinality. Four bytes a record, plus one copy of each distinct
     /// value however many records carry it.
@@ -249,7 +146,7 @@ enum Column {
     /// codes, so a `contains` over a field holding five distinct strings does
     /// five substring searches rather than one per record.
     Dictionary {
-        codes: Vec<u32>,
+        codes: IdMap<u32>,
         dict: Vec<Value>,
         /// Live records per dictionary entry. Zero means the entry is free and
         /// its code is on `free`. Without this a field whose values change on
@@ -264,13 +161,30 @@ enum Column {
     /// Measured smaller and faster than a dictionary once nearly every record
     /// holds a distinct value, because there the dictionary holds one entry per
     /// record as well as one code per record and its lookup table holds a third.
-    Plain { values: Vec<Option<Value>> },
+    Plain { values: IdMap<PlainCell> },
+}
+
+/// Take one record's reference off a dictionary entry, freeing the entry
+/// where it was the last.
+fn release_code(
+    dict: &mut [Value],
+    refs: &mut [u32],
+    free: &mut Vec<u32>,
+    lookup: &mut HashMap<Value, u32>,
+    code: u32,
+) {
+    refs[code as usize] -= 1;
+    if refs[code as usize] == 0 {
+        let released = std::mem::replace(&mut dict[code as usize], Value::Null);
+        lookup.remove(&released);
+        free.push(code);
+    }
 }
 
 impl Column {
     fn new(expected_size: usize) -> Self {
         Column::Dictionary {
-            codes: Vec::with_capacity(expected_size.saturating_add(1)),
+            codes: IdMap::with_capacity(expected_size.saturating_add(1)),
             dict: Vec::new(),
             refs: Vec::new(),
             free: Vec::new(),
@@ -278,14 +192,12 @@ impl Column {
         }
     }
 
-    /// Put one value, or its absence, at one slot.
+    /// Put one value, or its absence, at one slot a record occupies.
     fn write(&mut self, slot: usize, value: Option<&Value>) {
         match self {
             Column::Plain { values } => {
-                if values.len() <= slot {
-                    values.resize(slot + 1, None);
-                }
-                values[slot] = value.cloned();
+                let cell = value.map_or(PlainCell::Missing, |value| PlainCell::Held(value.clone()));
+                values.insert(slot, cell);
                 return;
             }
             Column::Dictionary {
@@ -295,12 +207,8 @@ impl Column {
                 free,
                 lookup,
             } => {
-                if codes.len() <= slot {
-                    codes.resize(slot + 1, ABSENT);
-                }
-                let previous = codes[slot];
-                codes[slot] = match value {
-                    None => ABSENT,
+                let code = match value {
+                    None => MISSING,
                     Some(value) => match lookup.get(value) {
                         Some(&code) => {
                             refs[code as usize] += 1;
@@ -324,13 +232,8 @@ impl Column {
                         }
                     },
                 };
-                if previous != ABSENT {
-                    refs[previous as usize] -= 1;
-                    if refs[previous as usize] == 0 {
-                        let released = std::mem::replace(&mut dict[previous as usize], Value::Null);
-                        lookup.remove(&released);
-                        free.push(previous);
-                    }
+                if let Some(previous) = codes.insert(slot, code).filter(|&code| code != MISSING) {
+                    release_code(dict, refs, free, lookup, previous);
                 }
             }
         }
@@ -340,11 +243,32 @@ impl Column {
         }
     }
 
+    /// Forget the record at one slot. Leaves the dictionary's size and the
+    /// column's extent as they were, so it never trades the column.
+    fn erase(&mut self, slot: usize) {
+        match self {
+            Column::Plain { values } => {
+                values.remove(slot);
+            }
+            Column::Dictionary {
+                codes,
+                dict,
+                refs,
+                free,
+                lookup,
+            } => {
+                if let Some(previous) = codes.remove(slot).filter(|&code| code != MISSING) {
+                    release_code(dict, refs, free, lookup, previous);
+                }
+            }
+        }
+    }
+
     fn dictionary_has_stopped_paying(&self) -> bool {
         match self {
             Column::Plain { .. } => false,
             Column::Dictionary { codes, dict, .. } => {
-                dict.len() >= DICTIONARY_FLOOR && dict.len() * 2 >= codes.len()
+                dict.len() >= DICTIONARY_FLOOR && dict.len() * 2 >= codes.extent()
             }
         }
     }
@@ -353,14 +277,13 @@ impl Column {
         let Column::Dictionary { codes, dict, .. } = self else {
             return;
         };
-        let mut values = Vec::with_capacity(codes.len());
-        for &code in codes.iter() {
-            values.push(if code == ABSENT {
-                None
+        let values = codes.map(|&code| {
+            if code == MISSING {
+                PlainCell::Missing
             } else {
-                Some(dict[code as usize].clone())
-            });
-        }
+                PlainCell::Held(dict[code as usize].clone())
+            }
+        });
         *self = Column::Plain { values };
     }
 
@@ -368,22 +291,22 @@ impl Column {
     /// record.
     fn read(&self, slot: usize) -> Option<&Value> {
         match self {
-            Column::Plain { values } => values.get(slot).and_then(Option::as_ref),
+            Column::Plain { values } => values.get(slot).and_then(PlainCell::value),
             Column::Dictionary { codes, dict, .. } => match codes.get(slot).copied() {
-                Some(code) if code != ABSENT => dict.get(code as usize),
+                Some(code) if code != MISSING => dict.get(code as usize),
                 _ => None,
             },
         }
     }
 
-    /// One leaf of a filter, as the set of internal ids whose value matches.
-    fn select(&self, test: &FieldTest, slots: usize) -> Bitmap {
-        let mut out = Bitmap::zeros(slots);
+    /// One leaf of a filter, as the set of internal ids whose value matches,
+    /// put into `out`, an empty set in the store's form.
+    fn select(&self, test: &FieldTest, mut out: Bitmap) -> Bitmap {
         match self {
             Column::Plain { values } => {
-                for (slot, value) in values.iter().enumerate().take(slots) {
-                    if value
-                        .as_ref()
+                for (slot, cell) in values.iter() {
+                    if cell
+                        .value()
                         .is_some_and(|value| field_test_matches(value, test))
                     {
                         out.set(slot);
@@ -407,9 +330,24 @@ impl Column {
                 if !any {
                     return out;
                 }
-                for (slot, &code) in codes.iter().enumerate().take(slots) {
-                    if code != ABSENT && matching[code as usize] {
-                        out.set(slot);
+                // A flat column is walked as the vector it is, which is the
+                // loop a dense collection has always run, and a paged one
+                // through the entries it holds. A code below `MISSING` names
+                // a value.
+                match codes.as_flat() {
+                    Some(flat) => {
+                        for (slot, &code) in flat.iter().enumerate() {
+                            if code < MISSING && matching[code as usize] {
+                                out.set(slot);
+                            }
+                        }
+                    }
+                    None => {
+                        for (slot, &code) in codes.iter() {
+                            if code != MISSING && matching[code as usize] {
+                                out.set(slot);
+                            }
+                        }
                     }
                 }
             }
@@ -417,28 +355,36 @@ impl Column {
         out
     }
 
-    /// Every slot this column holds a value for, whatever that value is
+    /// Every slot whose record carries the field, whatever its value, put
+    /// into `out`.
     ///
-    /// This is what answers `exists` and `is_missing`. It reports a slot no
-    /// record occupies as absent too, which is why the caller intersects with
-    /// the live set rather than trusting it alone.
-    fn present(&self, slots: usize) -> Bitmap {
-        let mut out = Bitmap::zeros(slots);
+    /// This is what answers `exists` and `is_missing`. The caller intersects
+    /// with the live set rather than trusting it alone, as it always has.
+    fn present(&self, mut out: Bitmap) -> Bitmap {
         match self {
             Column::Plain { values } => {
-                for (slot, value) in values.iter().enumerate().take(slots) {
-                    if value.is_some() {
+                for (slot, cell) in values.iter() {
+                    if cell.value().is_some() {
                         out.set(slot);
                     }
                 }
             }
-            Column::Dictionary { codes, .. } => {
-                for (slot, &code) in codes.iter().enumerate().take(slots) {
-                    if code != ABSENT {
-                        out.set(slot);
+            Column::Dictionary { codes, .. } => match codes.as_flat() {
+                Some(flat) => {
+                    for (slot, &code) in flat.iter().enumerate() {
+                        if code < MISSING {
+                            out.set(slot);
+                        }
                     }
                 }
-            }
+                None => {
+                    for (slot, &code) in codes.iter() {
+                        if code != MISSING {
+                            out.set(slot);
+                        }
+                    }
+                }
+            },
         }
         out
     }
@@ -446,8 +392,12 @@ impl Column {
     fn heap_bytes(&self) -> usize {
         match self {
             Column::Plain { values } => {
-                values.capacity() * std::mem::size_of::<Option<Value>>()
-                    + values.iter().flatten().map(value_payload).sum::<usize>()
+                values.heap_bytes()
+                    + values
+                        .iter()
+                        .filter_map(|(_, cell)| cell.value())
+                        .map(value_payload)
+                        .sum::<usize>()
             }
             Column::Dictionary {
                 codes,
@@ -456,7 +406,7 @@ impl Column {
                 free,
                 lookup,
             } => {
-                codes.capacity() * 4
+                codes.heap_bytes()
                     + dict.capacity() * std::mem::size_of::<Value>()
                     + refs.capacity() * 4
                     + free.capacity() * 4
@@ -667,7 +617,8 @@ pub struct ColumnStore {
     /// records a filter does not select. Every other bitmap is a subset of this
     /// one by construction.
     live: Bitmap,
-    /// Highest occupied internal id plus one, which is how far any walk goes.
+    /// Highest occupied internal id plus one, which is how far the words of
+    /// every bitmap a filter builds reach while the live set is flat.
     slots: usize,
     records: usize,
 }
@@ -686,7 +637,7 @@ impl ColumnStore {
             names,
             columns,
             index_of,
-            live: Bitmap::zeros(expected_size.saturating_add(1)),
+            live: Bitmap::reserved(expected_size.saturating_add(1)),
             slots: 0,
             records: 0,
         }
@@ -718,12 +669,16 @@ impl ColumnStore {
         if self.names.is_empty() {
             return;
         }
-        self.reserve(slot);
+        if slot >= self.slots {
+            self.slots = slot + 1;
+        }
         for (position, name) in self.names.iter().enumerate() {
             self.columns[position].write(slot, metadata.field(name));
         }
         if !self.live.contains(slot) {
-            self.live.set(slot);
+            // The live set's words grow to the next power of two of what the
+            // slot needs, which is the growth the store has always given it.
+            self.live.hold_with(slot, usize::next_power_of_two);
             self.records += 1;
         }
     }
@@ -734,9 +689,9 @@ impl ColumnStore {
             return;
         }
         for column in self.columns.iter_mut() {
-            column.write(slot, None);
+            column.erase(slot);
         }
-        self.live.words[slot >> 6] &= !(1u64 << (slot & 63));
+        self.live.release(slot);
         self.records -= 1;
     }
 
@@ -746,14 +701,24 @@ impl ColumnStore {
         *self = ColumnStore::new(names, expected_size);
     }
 
-    fn reserve(&mut self, slot: usize) {
-        if slot >= self.slots {
-            self.slots = slot + 1;
+    /// Settle every paged column and the live set once a load has written
+    /// every record, so a paged store holds the same bytes whatever order
+    /// built it. A flat one is left as it is.
+    pub fn settle(&mut self) {
+        for column in self.columns.iter_mut() {
+            match column {
+                Column::Dictionary { codes, .. } => codes.settle(),
+                Column::Plain { values } => values.settle(),
+            }
         }
-        let needed = self.slots.div_ceil(64);
-        if self.live.words.len() < needed {
-            self.live.words.resize(needed.next_power_of_two(), 0);
-        }
+        self.live.settle();
+    }
+
+    /// An empty set in the live set's form, being words reaching every slot
+    /// the store has written while the live set is flat and the paged form
+    /// once it is paged. Every bitmap a filter builds starts from one.
+    fn blank(&self) -> Bitmap {
+        Bitmap::blank_like(&self.live, self.slots)
     }
 
     /// What a filter's declared fields can say about which records match.
@@ -828,8 +793,8 @@ impl ColumnStore {
     ///
     /// A declared leaf is exact, because [`Column::select`] and
     /// `crate::filter::field_matches` both end in `field_test_matches`, a
-    /// record that does not carry the field holds [`ABSENT`] and never matches,
-    /// and a slot holding no record holds `ABSENT` in every column.
+    /// record that does not carry the field holds [`MISSING`] and never
+    /// matches, and a slot holding no record holds no entry in any column.
     ///
     /// An undeclared leaf is bracketed by nothing and by the live set, which
     /// holds for any filter whatever.
@@ -848,9 +813,9 @@ impl ColumnStore {
     fn bound(&self, filter: &Filter) -> Bounds {
         match filter {
             Filter::Field { name, test } => match self.index_of.get(name) {
-                Some(&position) => Bounds::Exact(self.columns[position].select(test, self.slots)),
+                Some(&position) => Bounds::Exact(self.columns[position].select(test, self.blank())),
                 None => Bounds::Range {
-                    lower: Bitmap::zeros(self.slots),
+                    lower: self.blank(),
                     upper: self.live_set(),
                 },
             },
@@ -863,10 +828,10 @@ impl ColumnStore {
                     let live = self.live_set();
                     let held = match want {
                         Presence::Present | Presence::Absent => {
-                            self.columns[position].present(self.slots)
+                            self.columns[position].present(self.blank())
                         }
                         Presence::Null | Presence::NotNull => self.columns[position]
-                            .select(&FieldTest::Equals(Value::Null), self.slots),
+                            .select(&FieldTest::Equals(Value::Null), self.blank()),
                     };
                     let mut out = live;
                     match want {
@@ -876,7 +841,7 @@ impl ColumnStore {
                     Bounds::Exact(out)
                 }
                 None => Bounds::Range {
-                    lower: Bitmap::zeros(self.slots),
+                    lower: self.blank(),
                     upper: self.live_set(),
                 },
             },
@@ -905,7 +870,7 @@ impl ColumnStore {
             Filter::Any(branches) => {
                 // An empty disjunction holds for no record, which is what
                 // `Iterator::any` answers over no branches.
-                let mut accumulated = Bounds::Exact(Bitmap::zeros(self.slots));
+                let mut accumulated = Bounds::Exact(self.blank());
                 for branch in branches {
                     accumulated = accumulated.united(self.bound(branch));
                 }
@@ -935,10 +900,11 @@ impl ColumnStore {
     }
 
     fn live_set(&self) -> Bitmap {
-        let mut out = Bitmap::zeros(self.slots);
-        let shared = out.words.len().min(self.live.words.len());
-        out.words[..shared].copy_from_slice(&self.live.words[..shared]);
-        out
+        if self.live.is_flat() {
+            self.live.prefix(self.slots)
+        } else {
+            self.live.clone()
+        }
     }
 
     /// **The invariant that ties a column to a record**, asserted by every path
@@ -982,6 +948,16 @@ impl ColumnStore {
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub fn tracks(&self, records: usize) -> bool {
         self.names.is_empty() || self.records == records
+    }
+
+    /// Whether every column and the live set are flat, one slot per
+    /// internal id up to the largest, rather than paged; see [`IdMap`].
+    pub fn is_flat(&self) -> bool {
+        self.live.is_flat()
+            && self.columns.iter().all(|column| match column {
+                Column::Dictionary { codes, .. } => codes.is_flat(),
+                Column::Plain { values } => values.is_flat(),
+            })
     }
 
     pub fn heap_bytes(&self) -> usize {
@@ -1540,5 +1516,91 @@ mod tests {
             selected(&store, &field("cat", FieldTest::Equals(json!("a")))),
             Vec::<usize>::new()
         );
+    }
+
+    /// A store over records spread far apart pages its columns and its live
+    /// set out, costs what its records cost rather than four bytes a field
+    /// and a bit for every slot below the largest, and answers every filter
+    /// shape as the walk over the records does, before and after records are
+    /// erased and rewritten: declared leaves, negations and presence exactly,
+    /// and a conjunction with an undeclared branch by a bound that holds every
+    /// record the walk finds.
+    #[test]
+    fn a_store_over_scattered_slots_selects_what_the_walk_selects() {
+        let slot = |k: usize| 1 + k * 70_001;
+        let records: Records = (0..400usize)
+            .map(|k| {
+                let mut fields = vec![
+                    ("cat", json!(["a", "b", "c", "d"][k % 4])),
+                    ("price", json!(k % 50)),
+                ];
+                match k % 3 {
+                    0 => fields.push(("tag", json!(null))),
+                    1 => fields.push(("tag", json!("t"))),
+                    _ => {}
+                }
+                (slot(k), record(&fields))
+            })
+            .collect();
+        let mut store = store_of(&["cat", "tag"], &records);
+        assert!(!store.is_flat());
+        let largest = slot(399);
+        assert!(
+            store.heap_bytes() < 256 * 1024,
+            "{} bytes, where a flat store would hold over {}",
+            store.heap_bytes(),
+            largest * 8
+        );
+
+        let presence = |want: Presence| Filter::Presence {
+            name: "tag".to_string(),
+            want,
+        };
+        let shapes = || {
+            vec![
+                cat("a"),
+                Filter::Not(Box::new(cat("a"))),
+                Filter::Any(vec![cat("a"), cat("c")]),
+                Filter::All(vec![cat("b"), Filter::Not(Box::new(cat("b")))]),
+                presence(Presence::Present),
+                presence(Presence::Absent),
+                presence(Presence::Null),
+                presence(Presence::NotNull),
+                Filter::Not(Box::new(Filter::All(vec![
+                    cat("d"),
+                    presence(Presence::Present),
+                ]))),
+                Filter::All(vec![cat("c"), cheap()]),
+                Filter::Not(Box::new(Filter::Any(vec![cat("a"), cheap()]))),
+            ]
+        };
+        let check = |store: &ColumnStore, records: &Records| {
+            for shape in shapes() {
+                let expected = walked(store, records, &shape);
+                match store.select(&shape) {
+                    Selection::Exact(bitmap) => assert_eq!(bits(&bitmap), expected),
+                    Selection::Narrowed(bitmap, _) => {
+                        let bound = bits(&bitmap);
+                        assert!(expected.iter().all(|slot| bound.contains(slot)));
+                    }
+                    Selection::Whole(_) => {}
+                }
+            }
+        };
+        check(&store, &records);
+
+        for k in (0..400usize).step_by(7) {
+            store.erase(slot(k));
+        }
+        let mut rewritten = records.clone();
+        for (at, (slot, fields)) in rewritten.iter_mut().enumerate() {
+            if at % 11 == 5 && at % 7 != 0 {
+                *fields = record(&[("cat", json!("e"))]);
+                store.write(*slot, fields);
+            }
+        }
+        assert_eq!(store.record_count(), 400 - 400usize.div_ceil(7));
+        check(&store, &rewritten);
+        assert!(store.tracks(400 - 400usize.div_ceil(7)));
     }
 }

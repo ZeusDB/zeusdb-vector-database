@@ -81,6 +81,8 @@ mod durability_tests;
 #[cfg(test)]
 mod features_tests;
 #[cfg(test)]
+mod id_range_tests;
+#[cfg(test)]
 mod identity_tests;
 mod input;
 mod insert;
@@ -1089,16 +1091,16 @@ pub struct Collection {
     ///
     /// **Separate from `id_counter`, and it is not reset by `clear`.** It used
     /// to be the same counter, which meant two things at once. `clear` resets
-    /// `id_counter` deliberately, because the graph's id-to-node array is one
-    /// dense slot per internal id issued and an index cleared and refilled
-    /// repeatedly would grow it without bound. That reset handed out `vec_1` a
-    /// second time, so an external reference to the first record now named a
-    /// different one and nothing said so.
+    /// `id_counter` deliberately, so that an index cleared and refilled
+    /// repeatedly holds its records under dense ids rather than under ids
+    /// that climb without bound. That reset handed out `vec_1` a second time,
+    /// so an external reference to the first record now named a different one
+    /// and nothing said so.
     ///
     /// Splitting them lets each keep the property it needs. `id_counter` still
-    /// resets, so the dense array still shrinks. This one never goes backwards,
-    /// so a generated id is issued once in the life of an index and survives a
-    /// save and load. See `config.json`'s `generated_ids`.
+    /// resets, so a refilled index's ids are dense again. This one never goes
+    /// backwards, so a generated id is issued once in the life of an index and
+    /// survives a save and load. See `config.json`'s `generated_ids`.
     ///
     /// It also stops a generated id burning an internal one. `generate_id` used
     /// to call `get_next_id`, so a batch of three records with no ids of their

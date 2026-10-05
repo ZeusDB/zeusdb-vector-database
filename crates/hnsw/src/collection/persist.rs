@@ -942,6 +942,9 @@ impl Collection {
         let ids = self.ids.read().unwrap();
         let mut store = self.vector_metadata.write().unwrap();
         store.clear(self.expected_size());
+        // The map yields the records in no fixed order, so the store's form
+        // is decided from the records the id store holds before the run.
+        store.plan(ids.len(), ids.highest_slot().unwrap_or(0));
         let mut unmapped = 0usize;
         for (ext_id, fields) in metadata {
             match ids.slot_of(&ext_id) {
@@ -949,6 +952,7 @@ impl Collection {
                 None => unmapped += 1,
             }
         }
+        store.settle();
         if unmapped > 0 {
             debug!(target: LOG_TARGET, operation = "restore_metadata",
                 unmapped = unmapped,
@@ -996,6 +1000,7 @@ impl Collection {
                 None => columns.write(internal_id, &empty),
             }
         }
+        columns.settle();
         debug_assert!(
             columns.tracks(ids.len()),
             "the rebuild writes one column entry per record in the id store"

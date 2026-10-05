@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use zeusdb_vector_core::{
-    Admit, Bitmap, CorpusStats, Error, Hit, Hits, IdfScope, RecordId, ScoreKind, SparseRef,
+    Admit, Bitmap, CorpusStats, Error, Hit, Hits, IdMap, IdfScope, RecordId, ScoreKind, SparseRef,
 };
 
 use crate::index::{PostingsIndex, Weighting};
@@ -75,6 +75,189 @@ thread_local! {
     };
 }
 
+/// What a scan sums each touched record's contributions into.
+///
+/// The slot per id above while the record table is flat, which is what a
+/// scan has always summed into, and a table of the ids the scan touches once
+/// the record table is paged, so a scan over ids spread far apart holds
+/// memory for the records it touches rather than for the range their ids
+/// span. Both keep one rule: a record's sum starts at its first contribution,
+/// and a sum that is NaN counts as not yet started, so its record is listed
+/// as touched again, which is what the slot per id has always done.
+trait Accumulator: Sized + 'static {
+    /// Run `f` on this thread's accumulator of this kind.
+    fn with<R>(f: impl FnOnce(&mut Self) -> R) -> R;
+    /// Make ready for a scan over ids below `slots`.
+    fn ready(&mut self, slots: usize);
+    /// Add one contribution to the sum of `id`.
+    fn add(&mut self, id: u32, s: f32);
+    /// The sum of `id`, which the scan touched.
+    fn sum(&self, id: u32) -> f32;
+    /// The ids the scan touched, in the order of their first contributions.
+    fn touched(&self) -> &[u32];
+    /// Clear what the scan touched.
+    fn reset(&mut self, slots: usize);
+}
+
+impl Accumulator for Scratch {
+    fn with<R>(f: impl FnOnce(&mut Self) -> R) -> R {
+        SCRATCH.with(|scratch| f(&mut scratch.borrow_mut()))
+    }
+
+    fn ready(&mut self, slots: usize) {
+        Scratch::ready(self, slots);
+    }
+
+    #[inline(always)]
+    fn add(&mut self, id: u32, s: f32) {
+        let a = &mut self.acc[id as usize];
+        if a.is_nan() {
+            *a = s;
+            self.touched.push(id);
+        } else {
+            *a += s;
+        }
+    }
+
+    #[inline(always)]
+    fn sum(&self, id: u32) -> f32 {
+        self.acc[id as usize]
+    }
+
+    fn touched(&self) -> &[u32] {
+        &self.touched
+    }
+
+    fn reset(&mut self, slots: usize) {
+        Scratch::reset(self, slots);
+    }
+}
+
+/// A bucket of the touched-id table that holds no id. No record holds this
+/// id, since the last internal id is the one below it.
+const NO_ID: u32 = u32::MAX;
+
+/// Buckets the touched-id table opens with.
+const TABLE_MIN: usize = 1_024;
+
+/// The accumulator a scan over a paged record table sums into: an open
+/// addressing table of the ids it touches, at most half full, each beside
+/// its sum. It holds memory for the ids a scan touches, and keeps its
+/// buckets from one scan to the next as the slot per id does.
+struct Table {
+    /// The id in each bucket, or [`NO_ID`].
+    keys: Vec<u32>,
+    /// Each bucket's sum.
+    sums: Vec<f32>,
+    /// The buckets the scan filled, so a reset empties those alone.
+    filled: Vec<u32>,
+    touched: Vec<u32>,
+}
+
+thread_local! {
+    static TABLE: RefCell<Table> = const {
+        RefCell::new(Table {
+            keys: Vec::new(),
+            sums: Vec::new(),
+            filled: Vec::new(),
+            touched: Vec::new(),
+        })
+    };
+}
+
+impl Table {
+    /// The bucket the probe for `id` starts at: the high bits of a
+    /// Fibonacci product, which spread consecutive ids over the table.
+    #[inline]
+    fn start(&self, id: u32) -> usize {
+        let shift = 64 - self.keys.len().trailing_zeros();
+        ((id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize
+    }
+
+    /// The bucket holding `id`, or the empty one its probe ends at.
+    #[inline]
+    fn find(&self, id: u32) -> usize {
+        let mask = self.keys.len() - 1;
+        let mut at = self.start(id);
+        loop {
+            let key = self.keys[at];
+            if key == id || key == NO_ID {
+                return at;
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    /// Double the buckets and move every filled one across.
+    fn grow(&mut self) {
+        let size = (self.keys.len() * 2).max(TABLE_MIN);
+        let keys = std::mem::replace(&mut self.keys, vec![NO_ID; size]);
+        let sums = std::mem::replace(&mut self.sums, vec![0.0; size]);
+        let filled = std::mem::take(&mut self.filled);
+        for at in filled {
+            let at = at as usize;
+            let to = self.find(keys[at]);
+            self.keys[to] = keys[at];
+            self.sums[to] = sums[at];
+            self.filled.push(to as u32);
+        }
+    }
+}
+
+impl Accumulator for Table {
+    fn with<R>(f: impl FnOnce(&mut Self) -> R) -> R {
+        TABLE.with(|table| f(&mut table.borrow_mut()))
+    }
+
+    fn ready(&mut self, _slots: usize) {
+        if self.keys.is_empty() {
+            self.grow();
+        }
+        self.touched.clear();
+    }
+
+    #[inline]
+    fn add(&mut self, id: u32, s: f32) {
+        if (self.filled.len() + 1) * 2 > self.keys.len() {
+            self.grow();
+        }
+        let at = self.find(id);
+        if self.keys[at] == NO_ID {
+            self.keys[at] = id;
+            self.sums[at] = s;
+            self.filled.push(at as u32);
+            self.touched.push(id);
+        } else if self.sums[at].is_nan() {
+            self.sums[at] = s;
+            self.touched.push(id);
+        } else {
+            self.sums[at] += s;
+        }
+    }
+
+    #[inline]
+    fn sum(&self, id: u32) -> f32 {
+        let at = self.find(id);
+        if self.keys[at] == id {
+            self.sums[at]
+        } else {
+            f32::NAN
+        }
+    }
+
+    fn touched(&self) -> &[u32] {
+        &self.touched
+    }
+
+    fn reset(&mut self, _slots: usize) {
+        for &at in &self.filled {
+            self.keys[at as usize] = NO_ID;
+        }
+        self.filled.clear();
+        self.touched.clear();
+    }
+}
+
 impl Scratch {
     fn ready(&mut self, slots: usize) {
         if self.acc.len() < slots {
@@ -125,22 +308,42 @@ impl Scorer for DotScorer {
     }
 }
 
+/// Where a scorer reads a record's length: the flat table's slice, indexed
+/// by id as the scan always read it, or the paged table.
+trait Lengths {
+    fn length(&self, id: u32) -> f32;
+}
+
+impl Lengths for [f32] {
+    #[inline(always)]
+    fn length(&self, id: u32) -> f32 {
+        self[id as usize]
+    }
+}
+
+impl Lengths for IdMap<f32> {
+    #[inline]
+    fn length(&self, id: u32) -> f32 {
+        self.get(id as usize).copied().unwrap_or(0.0)
+    }
+}
+
 /// The saturated, length-normalised term frequency, with the query value
 /// already carrying the term's rarity and the `k1 + 1` numerator, so the
 /// per-posting work is one gather of the record's length, one multiply-add
 /// and one division.
-struct Bm25Scorer<'a> {
-    lengths: &'a [f32],
+struct Bm25Scorer<'a, L: Lengths + ?Sized> {
+    lengths: &'a L,
     /// `k1 * (1 - b)`.
     c0: f32,
     /// `k1 * b / mean_length`.
     c1: f32,
 }
 
-impl Scorer for Bm25Scorer<'_> {
+impl<L: Lengths + ?Sized> Scorer for Bm25Scorer<'_, L> {
     #[inline(always)]
     fn score(&self, id: u32, tf: f32, query: f32) -> f32 {
-        query * tf / (tf + self.c0 + self.c1 * self.lengths[id as usize])
+        query * tf / (tf + self.c0 + self.c1 * self.lengths.length(id))
     }
 }
 
@@ -223,8 +426,8 @@ impl PostingsIndex {
 
     /// Term-at-a-time accumulation with a per-posting predicate. Generic so
     /// the monomorphised, closure and trait-object arms share one body, and
-    /// over the scoring rule.
-    fn scan_per_posting<S: Scorer, P: Fn(u32) -> bool>(
+    /// over the scoring rule and the accumulator.
+    fn scan_per_posting<A: Accumulator, S: Scorer, P: Fn(u32) -> bool>(
         &self,
         scorer: &S,
         query: SparseRef<'_>,
@@ -232,10 +435,8 @@ impl PostingsIndex {
         boundary_ties: bool,
         admits: P,
     ) -> Vec<Hit> {
-        SCRATCH.with(|scratch| {
-            let mut scratch = scratch.borrow_mut();
-            scratch.ready(self.slots());
-            let Scratch { acc, touched } = &mut *scratch;
+        A::with(|acc| {
+            acc.ready(self.slots());
             for (d, &qw) in query.dims.iter().zip(query.values) {
                 let Some(&slot) = self.slots_by_dim.get(d) else {
                     continue;
@@ -244,25 +445,18 @@ impl PostingsIndex {
                     if !admits(p.id) {
                         continue;
                     }
-                    let a = &mut acc[p.id as usize];
-                    let s = scorer.score(p.id, p.weight, qw);
-                    if a.is_nan() {
-                        *a = s;
-                        touched.push(p.id);
-                    } else {
-                        *a += s;
-                    }
+                    acc.add(p.id, scorer.score(p.id, p.weight, qw));
                 }
             }
-            let page = select(acc, touched, k, boundary_ties, |_| true);
-            scratch.reset(self.slots());
+            let page = select(|id| acc.sum(id), acc.touched(), k, boundary_ties, |_| true);
+            acc.reset(self.slots());
             page
         })
     }
 
     /// Term-at-a-time accumulation, the predicate asked once per touched
     /// record after the accumulation.
-    fn scan_per_candidate<S: Scorer>(
+    fn scan_per_candidate<A: Accumulator, S: Scorer>(
         &self,
         scorer: &S,
         query: SparseRef<'_>,
@@ -270,30 +464,25 @@ impl PostingsIndex {
         boundary_ties: bool,
         admit: &dyn Admit,
     ) -> Vec<Hit> {
-        SCRATCH.with(|scratch| {
-            let mut scratch = scratch.borrow_mut();
-            scratch.ready(self.slots());
-            let Scratch { acc, touched } = &mut *scratch;
+        A::with(|acc| {
+            acc.ready(self.slots());
             for (d, &qw) in query.dims.iter().zip(query.values) {
                 let Some(&slot) = self.slots_by_dim.get(d) else {
                     continue;
                 };
                 for p in &self.lists[slot as usize].postings {
-                    let a = &mut acc[p.id as usize];
-                    let s = scorer.score(p.id, p.weight, qw);
-                    if a.is_nan() {
-                        *a = s;
-                        touched.push(p.id);
-                    } else {
-                        *a += s;
-                    }
+                    acc.add(p.id, scorer.score(p.id, p.weight, qw));
                 }
             }
             let dead = &self.dead;
-            let page = select(acc, touched, k, boundary_ties, |id| {
-                !dead.contains(id as usize) && admit.admits(RecordId(id))
-            });
-            scratch.reset(self.slots());
+            let page = select(
+                |id| acc.sum(id),
+                acc.touched(),
+                k,
+                boundary_ties,
+                |id| !dead.contains(id as usize) && admit.admits(RecordId(id)),
+            );
+            acc.reset(self.slots());
             page
         })
     }
@@ -355,20 +544,40 @@ impl PostingsIndex {
         idf: IdfScope,
     ) -> Result<Hits, Error> {
         query.validate()?;
+        // A flat record table runs the scan over the slot per id it always
+        // had, and a paged one over a table of the ids the scan touches.
+        let flat = self.records.is_flat();
         let items = match self.config.weighting {
-            Weighting::Dot => self.run(&DotScorer, mode, query, k, admit, boundary_ties),
+            Weighting::Dot if flat => {
+                self.run::<Scratch, _>(&DotScorer, mode, query, k, admit, boundary_ties)
+            }
+            Weighting::Dot => {
+                self.run::<Table, _>(&DotScorer, mode, query, k, admit, boundary_ties)
+            }
             Weighting::Bm25 { k1, b } => {
                 let weighted = self.weigh(query, admit, idf, k1, b);
-                let scorer = Bm25Scorer {
-                    lengths: &self.lengths,
-                    c0: weighted.c0,
-                    c1: weighted.c1,
-                };
                 let query = SparseRef {
                     dims: &weighted.dims,
                     values: &weighted.values,
                 };
-                self.run(&scorer, mode, query, k, admit, boundary_ties)
+                match self.lengths.as_flat() {
+                    Some(lengths) if flat => {
+                        let scorer = Bm25Scorer {
+                            lengths,
+                            c0: weighted.c0,
+                            c1: weighted.c1,
+                        };
+                        self.run::<Scratch, _>(&scorer, mode, query, k, admit, boundary_ties)
+                    }
+                    _ => {
+                        let scorer = Bm25Scorer {
+                            lengths: &self.lengths,
+                            c0: weighted.c0,
+                            c1: weighted.c1,
+                        };
+                        self.run::<Table, _>(&scorer, mode, query, k, admit, boundary_ties)
+                    }
+                }
             }
         };
         Ok(Hits {
@@ -378,7 +587,7 @@ impl PostingsIndex {
         })
     }
 
-    fn run<S: Scorer>(
+    fn run<A: Accumulator, S: Scorer>(
         &self,
         scorer: &S,
         mode: Mode,
@@ -390,28 +599,34 @@ impl PostingsIndex {
         let has_dead = self.dead_records > 0;
         let dead = &self.dead;
         match mode {
-            Mode::Floor => self.scan_per_posting(scorer, query, k, boundary_ties, |_| true),
-            Mode::PerPosting => self.scan_per_posting(scorer, query, k, boundary_ties, |id| {
-                !dead.contains(id as usize) && admit.admits(RecordId(id))
-            }),
-            Mode::BitmapPerPosting => {
-                self.scan_bitmap(scorer, query, k, boundary_ties, admit, has_dead)
+            Mode::Floor => {
+                self.scan_per_posting::<A, _, _>(scorer, query, k, boundary_ties, |_| true)
             }
-            Mode::PerCandidate => self.scan_per_candidate(scorer, query, k, boundary_ties, admit),
+            Mode::PerPosting => {
+                self.scan_per_posting::<A, _, _>(scorer, query, k, boundary_ties, |id| {
+                    !dead.contains(id as usize) && admit.admits(RecordId(id))
+                })
+            }
+            Mode::BitmapPerPosting => {
+                self.scan_bitmap::<A, _>(scorer, query, k, boundary_ties, admit, has_dead)
+            }
+            Mode::PerCandidate => {
+                self.scan_per_candidate::<A, _>(scorer, query, k, boundary_ties, admit)
+            }
             Mode::Enumerate => {
                 match self.enumerate_driven(scorer, query, k, boundary_ties, admit) {
                     Some(items) => items,
-                    None => self.scan_per_candidate(scorer, query, k, boundary_ties, admit),
+                    None => self.scan_per_candidate::<A, _>(scorer, query, k, boundary_ties, admit),
                 }
             }
-            Mode::Auto => self.auto(scorer, query, k, boundary_ties, admit, has_dead),
+            Mode::Auto => self.auto::<A, _>(scorer, query, k, boundary_ties, admit, has_dead),
         }
     }
 
     /// The bitmap-monomorphised scan, with the dead test only where a record
     /// has been removed since the last compaction. Falls back to the table
     /// where the admit set is not a bitmap.
-    fn scan_bitmap<S: Scorer>(
+    fn scan_bitmap<A: Accumulator, S: Scorer>(
         &self,
         scorer: &S,
         query: SparseRef<'_>,
@@ -422,18 +637,26 @@ impl PostingsIndex {
     ) -> Vec<Hit> {
         let dead: &Bitmap = &self.dead;
         match (admit.as_bitmap(), has_dead) {
-            (Some(bitmap), false) => self.scan_per_posting(scorer, query, k, boundary_ties, |id| {
-                bitmap.contains(id as usize)
-            }),
-            (Some(bitmap), true) => self.scan_per_posting(scorer, query, k, boundary_ties, |id| {
-                bitmap.contains(id as usize) && !dead.contains(id as usize)
-            }),
-            (None, false) => self.scan_per_posting(scorer, query, k, boundary_ties, |id| {
-                admit.admits(RecordId(id))
-            }),
-            (None, true) => self.scan_per_posting(scorer, query, k, boundary_ties, |id| {
-                !dead.contains(id as usize) && admit.admits(RecordId(id))
-            }),
+            (Some(bitmap), false) => {
+                self.scan_per_posting::<A, _, _>(scorer, query, k, boundary_ties, |id| {
+                    bitmap.contains(id as usize)
+                })
+            }
+            (Some(bitmap), true) => {
+                self.scan_per_posting::<A, _, _>(scorer, query, k, boundary_ties, |id| {
+                    bitmap.contains(id as usize) && !dead.contains(id as usize)
+                })
+            }
+            (None, false) => {
+                self.scan_per_posting::<A, _, _>(scorer, query, k, boundary_ties, |id| {
+                    admit.admits(RecordId(id))
+                })
+            }
+            (None, true) => {
+                self.scan_per_posting::<A, _, _>(scorer, query, k, boundary_ties, |id| {
+                    !dead.contains(id as usize) && admit.admits(RecordId(id))
+                })
+            }
         }
     }
 
@@ -458,7 +681,7 @@ impl PostingsIndex {
     /// answers no hint and is not a bitmap is, the scan paid one indirect
     /// call per posting for a predicate that is always true, and ran
     /// slower under no filter than under a bitmap admitting everything.
-    fn auto<S: Scorer>(
+    fn auto<A: Accumulator, S: Scorer>(
         &self,
         scorer: &S,
         query: SparseRef<'_>,
@@ -470,20 +693,22 @@ impl PostingsIndex {
         if admit.admits_all() {
             let dead = &self.dead;
             return if has_dead {
-                self.scan_per_posting(scorer, query, k, boundary_ties, |id| {
+                self.scan_per_posting::<A, _, _>(scorer, query, k, boundary_ties, |id| {
                     !dead.contains(id as usize)
                 })
             } else {
-                self.scan_per_posting(scorer, query, k, boundary_ties, |_| true)
+                self.scan_per_posting::<A, _, _>(scorer, query, k, boundary_ties, |_| true)
             };
         }
         let Some(admitted) = admit.len_hint() else {
             let dead = &self.dead;
             return match (admit.as_bitmap(), has_dead) {
-                (None, false) => self.scan_per_posting(scorer, query, k, boundary_ties, |id| {
-                    admit.admits(RecordId(id))
-                }),
-                _ => self.scan_bitmap(
+                (None, false) => {
+                    self.scan_per_posting::<A, _, _>(scorer, query, k, boundary_ties, |id| {
+                        admit.admits(RecordId(id))
+                    })
+                }
+                _ => self.scan_bitmap::<A, _>(
                     scorer,
                     query,
                     k,
@@ -498,7 +723,7 @@ impl PostingsIndex {
                 return items;
             }
         }
-        self.scan_bitmap(scorer, query, k, boundary_ties, admit, has_dead)
+        self.scan_bitmap::<A, _>(scorer, query, k, boundary_ties, admit, has_dead)
     }
 
     // -----------------------------------------------------------------------
@@ -730,10 +955,11 @@ impl TopK {
     }
 }
 
-/// Select the page from the accumulator over the touched records that pass
-/// `admits`, keeping the boundary tie group where asked.
-fn select<P: Fn(u32) -> bool>(
-    acc: &[f32],
+/// Select the page from the accumulator, read through `sum_of`, over the
+/// touched records that pass `admits`, keeping the boundary tie group
+/// where asked.
+fn select<G: Fn(u32) -> f32, P: Fn(u32) -> bool>(
+    sum_of: G,
     touched: &[u32],
     k: usize,
     boundary_ties: bool,
@@ -741,7 +967,7 @@ fn select<P: Fn(u32) -> bool>(
 ) -> Vec<Hit> {
     let mut top = TopK::new(k);
     for &id in touched {
-        let score = acc[id as usize];
+        let score = sum_of(id);
         if score != 0.0 && admits(id) {
             top.offer(score, id);
         }
@@ -755,7 +981,7 @@ fn select<P: Fn(u32) -> bool>(
         let mut extra: Vec<u32> = touched
             .iter()
             .copied()
-            .filter(|&id| acc[id as usize] == boundary && id > last_id && admits(id))
+            .filter(|&id| sum_of(id) == boundary && id > last_id && admits(id))
             .collect();
         extra.sort_unstable();
         page.extend(extra.into_iter().map(|id| Cand {
@@ -1153,5 +1379,190 @@ mod tests {
         assert!(corpus.items[1].score < global.items[1].score);
         let ratio = corpus.items[1].score / global.items[1].score;
         assert!(ratio < 0.2, "ratio {ratio}");
+    }
+
+    /// A space whose records sit under ids spread far apart holds its record
+    /// table, its lengths and its dead set paged, and answers in every mode,
+    /// under every admit shape, both weightings and every unlink policy, the
+    /// page the same records under dense ids answer, each id mapped across and
+    /// the score bits equal, before and after removals and a compaction.
+    #[test]
+    fn a_space_over_scattered_ids_answers_what_dense_ids_answer() {
+        let far = |id: u32| 7 + (id - 1) * 97_003;
+        let record = |i: u32| -> SparseVector {
+            let mut dims: Vec<u32> = (0..6).map(|j| (i * 7 + j * 11) % 60).collect();
+            dims.sort_unstable();
+            dims.dedup();
+            let values = dims.iter().map(|&d| 1.0 + ((d + i) % 4) as f32).collect();
+            SparseVector { dims, values }
+        };
+        let queries: Vec<SparseVector> = (0..12u32)
+            .map(|q| {
+                let dims = record(q * 13 + 5).dims;
+                SparseVector {
+                    values: vec![1.0; dims.len()],
+                    dims,
+                }
+            })
+            .collect();
+        for weighting in [Weighting::Dot, Weighting::BM25] {
+            for unlink in [Unlink::Strand, Unlink::Lazy, Unlink::Eager] {
+                let config = SparseConfig {
+                    unlink,
+                    weighting,
+                    ..SparseConfig::default()
+                };
+                let mut dense = PostingsIndex::new(config.clone());
+                let mut scattered = PostingsIndex::new(config);
+                for id in 1..=400u32 {
+                    let v = record(id);
+                    dense
+                        .insert(RecordId(id), v.as_ref(), Prepared::none())
+                        .unwrap();
+                    scattered
+                        .insert(RecordId(far(id)), v.as_ref(), Prepared::none())
+                        .unwrap();
+                }
+                assert!(dense.records.is_flat());
+                assert!(!scattered.records.is_flat() && !scattered.lengths.is_flat());
+                let check = |dense: &PostingsIndex, scattered: &PostingsIndex, label: &str| {
+                    let held: Vec<u32> = (1..=400u32)
+                        .filter(|&id| dense.holds(RecordId(id)))
+                        .collect();
+                    let mut third = Bitmap::default();
+                    let mut third_far = Bitmap::paged();
+                    for &id in held.iter().filter(|&&id| id % 3 != 1) {
+                        third.insert(id as usize);
+                        third_far.insert(far(id) as usize);
+                    }
+                    let fifty =
+                        Candidates::Sorted(held.iter().take(50).map(|&id| RecordId(id)).collect());
+                    let fifty_far = Candidates::Sorted(
+                        held.iter().take(50).map(|&id| RecordId(far(id))).collect(),
+                    );
+                    let admits: [(&dyn Admit, &dyn Admit); 3] = [
+                        (&Candidates::All, &Candidates::All),
+                        (&third, &third_far),
+                        (&fifty, &fifty_far),
+                    ];
+                    for (admit, admit_far) in admits {
+                        for mode in MODES {
+                            for q in &queries {
+                                let want: Vec<(u32, u32)> = dense
+                                    .search_mode(mode, q.as_ref(), 10, admit, true)
+                                    .unwrap()
+                                    .items
+                                    .iter()
+                                    .map(|hit| (far(hit.id.0), hit.score.to_bits()))
+                                    .collect();
+                                let got: Vec<(u32, u32)> = scattered
+                                    .search_mode(mode, q.as_ref(), 10, admit_far, true)
+                                    .unwrap()
+                                    .items
+                                    .iter()
+                                    .map(|hit| (hit.id.0, hit.score.to_bits()))
+                                    .collect();
+                                assert_eq!(got, want, "{label} {weighting:?} {unlink:?} {mode:?}");
+                            }
+                        }
+                    }
+                };
+                check(&dense, &scattered, "as built");
+                for id in (1..=400u32).step_by(7) {
+                    dense.remove(RecordId(id)).unwrap();
+                    scattered.remove(RecordId(far(id))).unwrap();
+                }
+                assert!(
+                    !scattered.dead.is_flat(),
+                    "the dead set takes the table's form"
+                );
+                check(&dense, &scattered, "after removals");
+                dense.compact();
+                scattered.compact();
+                check(&dense, &scattered, "after a compaction");
+                assert_eq!(scattered.slots(), far(400) as usize + 1);
+                assert_eq!(dense.slots(), 401);
+                // Each record sits alone in its page, so each costs a page's
+                // header and its entry, beside four bytes a page of the range,
+                // where a flat table would cost twelve bytes an id below the
+                // largest.
+                let held = scattered.len();
+                let pages = far(400) as usize / zeusdb_vector_core::PAGE_IDS + 1;
+                let paged = scattered.heap_bytes();
+                assert!(
+                    paged.records <= 4 * pages + held * (80 + 2 + 8) + 256,
+                    "{paged:?}"
+                );
+                assert!(
+                    paged.lengths <= 4 * pages + held * (80 + 2 + 4) + 256,
+                    "{paged:?}"
+                );
+                assert!(paged.records + paged.lengths < scattered.slots() / 100);
+            }
+        }
+    }
+
+    /// A record whose sum turns NaN partway through a scan counts as not yet
+    /// started at its next contribution and is listed as touched again,
+    /// under the slot per id and under the table of touched ids alike, so the
+    /// page over scattered ids is the page over dense ids, the record twice on
+    /// it in both. Two finite products overflow to infinities of opposite
+    /// sign, and their sum is NaN.
+    #[test]
+    fn a_sum_that_turns_nan_restarts_alike_in_both_accumulators() {
+        let rows: [(&[u32], &[f32]); 3] = [
+            (&[1, 2, 3], &[3.0e38, 3.0e38, 1.0]),
+            (&[1, 3], &[1.0, 2.0]),
+            (&[2, 3], &[1.0, 0.5]),
+        ];
+        let query = SparseVector {
+            dims: vec![1, 2, 3],
+            values: vec![2.0, -2.0, 1.0],
+        };
+        let far = |id: u32| 9 + (id - 1) * 1_000_003;
+        let mut dense = PostingsIndex::new(SparseConfig::default());
+        let mut scattered = PostingsIndex::new(SparseConfig::default());
+        for (k, (dims, values)) in rows.iter().enumerate() {
+            let v = SparseVector {
+                dims: dims.to_vec(),
+                values: values.to_vec(),
+            };
+            let id = k as u32 + 1;
+            dense
+                .insert(RecordId(id), v.as_ref(), Prepared::none())
+                .unwrap();
+            scattered
+                .insert(RecordId(far(id)), v.as_ref(), Prepared::none())
+                .unwrap();
+        }
+        assert!(!scattered.records.is_flat());
+        for mode in [
+            Mode::Auto,
+            Mode::PerPosting,
+            Mode::PerCandidate,
+            Mode::BitmapPerPosting,
+            Mode::Floor,
+        ] {
+            let want: Vec<(u32, u32)> = dense
+                .search_mode(mode, query.as_ref(), 10, &Candidates::All, false)
+                .unwrap()
+                .items
+                .iter()
+                .map(|hit| (far(hit.id.0), hit.score.to_bits()))
+                .collect();
+            let got: Vec<(u32, u32)> = scattered
+                .search_mode(mode, query.as_ref(), 10, &Candidates::All, false)
+                .unwrap()
+                .items
+                .iter()
+                .map(|hit| (hit.id.0, hit.score.to_bits()))
+                .collect();
+            assert_eq!(got, want, "{mode:?}");
+            assert_eq!(
+                got.iter().filter(|(id, _)| *id == far(1)).count(),
+                2,
+                "{mode:?}: the record whose sum restarted is listed twice"
+            );
+        }
     }
 }

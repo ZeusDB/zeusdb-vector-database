@@ -890,6 +890,21 @@ impl VectorGraph {
         }
     }
 
+    /// Whether the graph's id-to-node map is flat, one slot per internal id
+    /// up to the largest, rather than paged; see [`crate::IdMap`].
+    pub fn id_map_is_flat(&self) -> bool {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.id_map_is_flat(),
+            VectorGraph::L2(b) => b.graph.id_map_is_flat(),
+            VectorGraph::L1(b) => b.graph.id_map_is_flat(),
+            VectorGraph::Dot(b) => b.graph.id_map_is_flat(),
+            VectorGraph::CosinePQ(b) => b.graph.id_map_is_flat(),
+            VectorGraph::L2PQ(b) => b.graph.id_map_is_flat(),
+            VectorGraph::L1PQ(b) => b.graph.id_map_is_flat(),
+            VectorGraph::Int8(b) => b.graph.id_map_is_flat(),
+        }
+    }
+
     /// The node one internal id sits at, or `None` where this graph never took
     /// it.
     pub(crate) fn node_of(&self, internal_id: usize) -> Option<u32> {

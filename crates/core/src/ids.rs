@@ -26,16 +26,20 @@
 //! caller's ids hash as they did under the two maps.
 //!
 //! Internal ids are never reused and `compact` re-inserts every record under
-//! the id it already holds, so the entry vector grows with the id counter and
-//! a removed record leaves an eight byte hole until `clear`. Its text stays
+//! the id it already holds, so the ids the store holds spread over a range
+//! far larger than its records. The entries sit in an [`IdMap`], flat while
+//! the ids are dense, which is the vector indexed by id the store always
+//! held, and in pages once they are sparse, so the entries cost what the
+//! records cost however far the ids spread. A removed record's text stays
 //! in the arena until [`IdStore::compact_text`] rewrites the arena without
-//! it, which the collection runs when it rebuilds the graph. The vector is
-//! reserved for the declared record count, under a cap, and grows by doubling
+//! it, which the collection runs when it rebuilds the graph. The entries are
+//! reserved for the declared record count, under a cap, and grow by doubling
 //! past it, which is the rule the metadata store and the graph's per node
 //! arrays follow.
 
-use crate::columns::Bitmap;
+use crate::bitmap::Bitmap;
 use crate::error::Error;
+use crate::idmap::IdMap;
 use std::hash::{BuildHasher, RandomState};
 
 /// Bits of an entry that hold the text's offset. Sixty-four gibibytes of id
@@ -95,9 +99,9 @@ pub struct IdStore {
     /// The text of every id, end to end. Each id was appended whole, so
     /// every offset an entry names is a character boundary.
     text: String,
-    /// One entry per internal id issued: the offset and the length of its
-    /// text, or [`ABSENT`].
-    entries: Vec<u64>,
+    /// One entry per record, by internal id: the offset and the length of
+    /// its text. [`ABSENT`] is the map's absent value.
+    entries: IdMap<u64>,
     /// The forward table, a power of two of buckets each holding an internal
     /// id or [`EMPTY`], probed linearly.
     buckets: Vec<u32>,
@@ -123,7 +127,7 @@ impl IdStore {
         let buckets = buckets_for(expected_size.min(RESERVE_CAP));
         IdStore {
             text: String::new(),
-            entries: Vec::with_capacity(entries),
+            entries: IdMap::with_capacity(entries),
             buckets: vec![EMPTY; buckets],
             tags: vec![0; buckets],
             hasher: RandomState::new(),
@@ -135,16 +139,40 @@ impl IdStore {
 
     /// Make room for `records` more entries and for the slot `highest`
     /// before a run of insertions, which is what the loader knows in
-    /// advance.
+    /// advance. The entries and the live set take the form the run's final
+    /// shape gives, flat with room up to `highest` where the ids are dense
+    /// and paged where they are not, whatever order the run comes in.
     pub fn reserve(&mut self, records: usize, highest: usize) {
-        let entries = highest.saturating_add(1);
-        if entries > self.entries.len() {
-            self.entries.reserve(entries - self.entries.len());
-        }
+        self.entries.reserve(records, highest);
+        self.live.plan(records, highest);
         let wanted = buckets_for(self.held.saturating_add(records));
         if wanted > self.buckets.len() {
             self.rehash(wanted);
         }
+    }
+
+    /// Settle the entries and the live set once a load has written every
+    /// record, so a paged store holds the same bytes whatever order the
+    /// records came in. A flat store is left as it is.
+    pub fn settle(&mut self) {
+        self.entries.settle();
+        self.live.settle();
+    }
+
+    /// Whether the entries are flat, one slot per internal id up to the
+    /// largest, rather than paged; see [`IdMap`]. The live set reports its
+    /// own form through [`IdStore::live`].
+    pub fn is_flat(&self) -> bool {
+        self.entries.is_flat()
+    }
+
+    /// The entry at a slot a bucket names, which holds a record.
+    #[inline]
+    fn entry(&self, slot: usize) -> u64 {
+        *self
+            .entries
+            .get(slot)
+            .expect("every bucket names a slot that holds a record")
     }
 
     #[inline]
@@ -173,7 +201,7 @@ impl IdStore {
             if slot == EMPTY {
                 return None;
             }
-            if self.tags[at] == tag && self.text_of(self.entries[slot as usize]) == id {
+            if self.tags[at] == tag && self.text_of(self.entry(slot as usize)) == id {
                 return Some(at);
             }
             at = (at + 1) & mask;
@@ -196,10 +224,7 @@ impl IdStore {
     fn rehash(&mut self, buckets: usize) {
         let mut new_buckets = vec![EMPTY; buckets];
         let mut new_tags = vec![0u8; buckets];
-        for (slot, &entry) in self.entries.iter().enumerate() {
-            if entry == ABSENT {
-                continue;
-            }
+        for (slot, &entry) in self.entries.iter() {
             let hash = self.hash(self.text_of(entry));
             Self::place(&mut new_buckets, &mut new_tags, slot as u32, hash);
         }
@@ -227,7 +252,7 @@ impl IdStore {
             if slot == EMPTY {
                 break;
             }
-            let ideal = (self.hash(self.text_of(self.entries[slot as usize])) as usize) & mask;
+            let ideal = (self.hash(self.text_of(self.entry(slot as usize))) as usize) & mask;
             // The entry at `next` may fill the hole at `at` unless its own
             // bucket lies cyclically in (at, next], where a probe for it
             // would still find it.
@@ -247,10 +272,13 @@ impl IdStore {
 
     /// Forget the entry at `slot`, which is present.
     fn forget(&mut self, slot: usize) {
-        let (_, len) = unpack(self.entries[slot]);
-        self.entries[slot] = ABSENT;
+        let entry = self
+            .entries
+            .remove(slot)
+            .expect("a slot is forgotten only where it holds a record");
+        let (_, len) = unpack(entry);
         self.dead_text += len;
-        self.live.remove(slot);
+        self.live.release(slot);
         self.held -= 1;
     }
 
@@ -303,18 +331,17 @@ impl IdStore {
             self.erase_bucket(at);
             self.forget(old);
         }
-        if self.entries.get(slot).is_some_and(|&entry| entry != ABSENT) {
+        if self.entries.contains(slot) {
             self.remove_slot(slot);
         }
         self.grow_if_needed();
         let offset = self.push_text(id);
-        if slot >= self.entries.len() {
-            self.entries.resize(slot + 1, ABSENT);
-        }
-        self.entries[slot] = pack(offset, id.len());
+        let entry = pack(offset, id.len());
+        debug_assert_ne!(entry, ABSENT, "an entry is never all ones");
+        self.entries.insert(slot, entry);
         let hash = self.hash(id);
         Self::place(&mut self.buckets, &mut self.tags, slot32, hash);
-        self.live.insert(slot);
+        self.live.hold(slot);
         self.held += 1;
         Ok(())
     }
@@ -333,9 +360,6 @@ impl IdStore {
         let Some(&entry) = self.entries.get(slot) else {
             return false;
         };
-        if entry == ABSENT {
-            return false;
-        }
         let at = self
             .find(self.text_of(entry))
             .expect("every present entry is in the table");
@@ -365,9 +389,6 @@ impl IdStore {
     #[inline]
     pub fn name(&self, slot: usize) -> Option<&str> {
         let entry = *self.entries.get(slot)?;
-        if entry == ABSENT {
-            return None;
-        }
         Some(self.text_of(entry))
     }
 
@@ -392,23 +413,17 @@ impl IdStore {
     pub fn iter(&self) -> impl Iterator<Item = (usize, &str)> + '_ {
         self.entries
             .iter()
-            .enumerate()
-            .filter(|(_, &entry)| entry != ABSENT)
             .map(|(slot, &entry)| (slot, self.text_of(entry)))
     }
 
     /// Every record's internal id, in increasing order.
     pub fn slots(&self) -> impl Iterator<Item = usize> + '_ {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, &entry)| entry != ABSENT)
-            .map(|(slot, _)| slot)
+        self.entries.iter().map(|(slot, _)| slot)
     }
 
     /// The largest internal id that holds a record.
     pub fn highest_slot(&self) -> Option<usize> {
-        self.entries.iter().rposition(|&entry| entry != ABSENT)
+        self.entries.highest()
     }
 
     /// The set of internal ids that hold a record, as bits.
@@ -445,10 +460,7 @@ impl IdStore {
         }
         let before = self.text.len();
         let mut text = String::with_capacity(before - self.dead_text);
-        for entry in self.entries.iter_mut() {
-            if *entry == ABSENT {
-                continue;
-            }
+        for (_, entry) in self.entries.iter_mut() {
             let (offset, len) = unpack(*entry);
             let start = text.len();
             text.push_str(&self.text[offset..offset + len]);
@@ -471,10 +483,10 @@ impl IdStore {
 
     /// Bytes the store asked the allocator for: the arena at its capacity,
     /// the entries at theirs, the table's buckets and tags, and the live
-    /// set's words.
+    /// set.
     pub fn heap_bytes(&self) -> usize {
         self.text.capacity()
-            + self.entries.capacity() * std::mem::size_of::<u64>()
+            + self.entries.heap_bytes()
             + self.buckets.capacity() * std::mem::size_of::<u32>()
             + self.tags.capacity()
             + self.live.heap_bytes()
@@ -484,6 +496,7 @@ impl IdStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::idmap::PAGE_IDS;
 
     /// What goes in comes back both ways, the empty id included, and a
     /// name the store does not hold resolves to nothing.
@@ -663,7 +676,7 @@ mod tests {
     #[test]
     fn the_report_prices_the_arena_the_entries_and_the_table() {
         let store = IdStore::new(7);
-        assert_eq!(store.entries.capacity(), 8);
+        assert_eq!(store.entries.heap_bytes(), 8 * 8);
         assert_eq!(store.buckets.len(), 8);
         assert_eq!(store.heap_bytes(), 8 * 8 + 8 * 4 + 8);
         let mut store = IdStore::new(100_000);
@@ -685,7 +698,8 @@ mod tests {
         store.reserve(1000, 1500);
         let buckets = store.buckets.len();
         assert!(buckets * 7 / 8 >= 1000);
-        assert!(store.entries.capacity() >= 1501);
+        assert!(store.entries.is_flat());
+        assert!(store.entries.heap_bytes() >= 1501 * 8);
         for slot in 1..=1000usize {
             store.insert(slot + 500, &format!("{slot}")).unwrap();
         }
@@ -712,9 +726,78 @@ mod tests {
         assert!(!store.contains_name("past"));
         assert_eq!(store.highest_slot(), Some(1));
         assert_eq!(
-            store.entries.len(),
+            store.entries.extent(),
             2,
             "no entry was made for a refused slot"
+        );
+    }
+
+    /// A store whose records sit under ids spread far apart pages its
+    /// entries and its live set out, costs what its records cost rather than
+    /// a slot for every id below the largest, and answers every name, slot,
+    /// walk and removal as a store over dense ids does.
+    #[test]
+    fn a_store_over_scattered_ids_costs_what_its_records_cost() {
+        let slots: Vec<usize> = (0..500usize).map(|k| 7 + k * 40_009).collect();
+        let largest = *slots.last().unwrap();
+        let mut store = IdStore::new(16);
+        store.reserve(slots.len(), largest);
+        for &slot in &slots {
+            store.insert(slot, &format!("r{slot}")).unwrap();
+        }
+        store.settle();
+        assert!(!store.entries.is_flat());
+        assert!(!store.live.is_flat());
+        let pages = largest / PAGE_IDS + 1;
+        // A table entry a page of the range, a header a page and two arrays a
+        // page, against the 160 megabytes eight bytes an id below the largest
+        // would cost.
+        let bound = 4 * pages + 2 * pages * 128 + 500 * (2 + 8 + 2);
+        let ids_bytes = store.entries.heap_bytes() + store.live.heap_bytes();
+        assert!(ids_bytes < bound, "{ids_bytes} >= {bound}");
+        for &slot in &slots {
+            let name = format!("r{slot}");
+            assert_eq!(store.slot_of(&name), Some(slot));
+            assert_eq!(store.name(slot), Some(name.as_str()));
+            assert!(store.contains_slot(slot));
+            assert!(!store.contains_slot(slot + 1));
+        }
+        assert_eq!(store.highest_slot(), Some(largest));
+        assert_eq!(store.slots().collect::<Vec<_>>(), slots);
+        for &slot in slots.iter().step_by(2) {
+            assert!(store.remove_slot(slot));
+        }
+        assert_eq!(store.len(), 250);
+        assert_eq!(store.live().count(), 250);
+        let kept: Vec<usize> = slots.iter().copied().skip(1).step_by(2).collect();
+        assert_eq!(store.slots().collect::<Vec<_>>(), kept);
+        assert!(store.compact_text() > 0);
+        for &slot in &kept {
+            assert_eq!(store.name(slot), Some(format!("r{slot}").as_str()));
+        }
+        store.insert(largest + 1, "after").unwrap();
+        assert_eq!(store.slot_of("after"), Some(largest + 1));
+        assert_eq!(store.highest_slot(), Some(largest + 1));
+    }
+
+    /// A store whose ids are dense keeps the flat form, so its entries and its
+    /// live set are the vector and the words the store always held.
+    #[test]
+    fn a_store_over_dense_ids_keeps_its_flat_form() {
+        let mut store = IdStore::new(1_000);
+        for slot in 1..=20_000usize {
+            store.insert(slot, &format!("r{slot}")).unwrap();
+        }
+        for slot in (1..=20_000usize).step_by(3) {
+            store.remove_slot(slot);
+        }
+        assert!(store.entries.is_flat());
+        assert!(store.live.is_flat());
+        let mut entries: Vec<u64> = Vec::with_capacity(1_001);
+        entries.resize(20_001, ABSENT);
+        assert_eq!(
+            store.entries.as_flat().map(<[u64]>::len),
+            Some(entries.len())
         );
     }
 }

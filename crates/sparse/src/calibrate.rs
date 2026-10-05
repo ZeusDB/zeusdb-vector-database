@@ -125,9 +125,24 @@ impl PostingsIndex {
         // terms rather than its first few.
         let mut queries: Vec<SparseVector> = Vec::with_capacity(SAMPLE_RECORDS);
         let mut wide: Vec<SparseVector> = Vec::with_capacity(SAMPLE_RECORDS);
-        let step = (self.records.len() / SAMPLE_RECORDS).max(1);
-        let mut at = 0usize;
-        while queries.len() < SAMPLE_RECORDS && at < self.records.len() {
+        // Ids spaced across the table's extent while it is flat, and across
+        // the records it holds once it is paged, where a step over the
+        // extent would land on ids no record holds.
+        let candidates: Vec<usize> = if self.records.is_flat() {
+            let step = (self.slots() / SAMPLE_RECORDS).max(1);
+            (0..self.slots()).step_by(step).collect()
+        } else {
+            let step = (self.records.len() / SAMPLE_RECORDS).max(1);
+            self.records
+                .iter()
+                .map(|(id, _)| id)
+                .step_by(step)
+                .collect()
+        };
+        for at in candidates {
+            if queries.len() >= SAMPLE_RECORDS {
+                break;
+            }
             if let Some(v) = self.slot_of(zeusdb_vector_core::RecordId::from_slot(at)) {
                 let v = self.forward(v);
                 let cut = |width: usize| -> SparseVector {
@@ -142,7 +157,6 @@ impl PostingsIndex {
                 queries.push(cut(QUERY_DIMS));
                 wide.push(cut(WIDE_QUERY_DIMS));
             }
-            at += step;
         }
         if queries.len() < 2 {
             self.units = UnitCosts::FLOOR;
@@ -156,17 +170,19 @@ impl PostingsIndex {
         // An empty set whose words reach every slot, so a rejected posting
         // costs the word read a real bitmap costs and not the bounds check
         // an unsized set answers with.
-        let nothing = Bitmap::with_slots(self.records.len());
         let all = zeusdb_vector_core::Candidates::All;
         // A set admitting half the slots at random, so the bit test's
         // outcome cannot be predicted from the last one's, and a set of a
-        // few hundred slots at random for the enumerate-driven path.
-        let (half, few) = {
-            let mut half = Bitmap::with_slots(self.records.len());
+        // few hundred slots at random for the enumerate-driven path. Over
+        // every slot of a flat table, and over the records a paged table
+        // holds, in the paged form a filter over such a table takes.
+        let (nothing, half, few) = if self.records.is_flat() {
+            let nothing = Bitmap::with_slots(self.slots());
+            let mut half = Bitmap::with_slots(self.slots());
             let mut few = Bitmap::default();
             let mut state = 0x9E37_79B9_7F4A_7C15u64;
-            let stride = (self.records.len() / ENUMERATE_SAMPLE).max(1);
-            for slot in 0..self.records.len() {
+            let stride = (self.slots() / ENUMERATE_SAMPLE).max(1);
+            for slot in 0..self.slots() {
                 state ^= state << 13;
                 state ^= state >> 7;
                 state ^= state << 17;
@@ -177,7 +193,24 @@ impl PostingsIndex {
                     few.insert(slot);
                 }
             }
-            (half, few)
+            (nothing, half, few)
+        } else {
+            let mut half = Bitmap::paged();
+            let mut few = Bitmap::paged();
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            let stride = (self.records.len() / ENUMERATE_SAMPLE).max(1);
+            for (rank, (slot, _)) in self.records.iter().enumerate() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                if state & 1 == 1 {
+                    half.insert(slot);
+                }
+                if rank.is_multiple_of(stride) && few.count() < ENUMERATE_SAMPLE {
+                    few.insert(slot);
+                }
+            }
+            (Bitmap::paged(), half, few)
         };
         let few_count = few.count().max(1);
 

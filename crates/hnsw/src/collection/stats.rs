@@ -99,11 +99,12 @@ impl Collection {
         );
 
         // The record count and, from the same guard, what the id store
-        // occupies: the text of every id once, an entry per internal id, the
-        // forward table's buckets and tags, and the live set's words at one
-        // per sixty-four internal ids. Every `bookkeeping` term below is one
-        // structure's own storage, and none of them is the payload the five
-        // memory keys price. See `index_bookkeeping_memory_mb`.
+        // occupies: the text of every id once, the forward table's buckets
+        // and tags, and an entry and a live bit per internal id, flat while
+        // the ids are dense and paged once they are sparse. Every
+        // `bookkeeping` term below is one structure's own storage, and none
+        // of them is the payload the five memory keys price. See
+        // `index_bookkeeping_memory_mb`.
         let (live, mut bookkeeping) = {
             let ids = self.ids.read().unwrap();
             (ids.len(), ids.heap_bytes())
@@ -185,12 +186,13 @@ impl Collection {
             )
         };
 
-        // The metadata store holds one sixteen byte entry per internal id
-        // issued, priced at the capacity it reserved, one block of forty bytes
-        // a field behind each record that carries fields, the text of every
-        // string value, and the field names once each, in a list and in the
-        // table that finds a name's symbol. A record added without metadata
-        // costs its entry alone.
+        // The metadata store holds a sixteen byte entry per internal id, in
+        // one vector priced at the capacity it reserved while the ids are
+        // dense and in pages once they are sparse. Behind the entries are
+        // one block of forty bytes a field for each record that carries
+        // fields, the text of every string value, and the field names once
+        // each, in a list and in the table that finds a name's symbol. A
+        // record added without metadata costs its entry alone.
         bookkeeping += {
             let vector_metadata = self.vector_metadata.read().unwrap();
             let names = vector_metadata.key_table();
@@ -703,13 +705,15 @@ impl Collection {
         // record that carries fields.
         //
         // It is proportional to the record count and independent of the
-        // dimension. Measured against a counting allocator on 100,000 records
-        // at `m` 16 with five character ids and no metadata, it reads 36.6
-        // bytes a record unquantized and 105.7 under `quantized_only`, where
-        // the difference is the code map and its copy of the id. A record
-        // carrying two small metadata fields costs 82.5 bytes a record more,
-        // being one block of two forty byte fields and the text of the string
-        // value.
+        // dimension. The structures indexed by internal id are flat while the
+        // ids are dense and paged once removals leave them sparse, so they
+        // follow the records held and not the largest id. Measured against a
+        // counting allocator on 100,000 records at `m` 16 with five character
+        // ids and no metadata, it reads 36.6 bytes a record unquantized and
+        // 105.7 under `quantized_only`, where the difference is the code map
+        // and its copy of the id. A record carrying two small metadata fields
+        // costs 82.5 bytes a record more, being one block of two forty byte
+        // fields and the text of the string value.
         //
         // It steps with the table's powers of two rather than holding still.
         // At 100,000 records the table sits at 76 percent of its buckets, which

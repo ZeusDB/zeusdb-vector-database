@@ -131,6 +131,7 @@ use super::dump::{AdjacencyWalk, LoadedEdge, PointId};
 use super::store::VectorStore;
 use super::traverse::{self, Topology, LAYERS};
 use super::{Distance, GraphHit};
+use crate::idmap::IdMap;
 
 mod insert;
 
@@ -140,9 +141,6 @@ pub use insert::Planned;
 
 /// Naming no upper list, which is every node whose span is zero.
 const NO_UPPER: u32 = u32::MAX;
-
-/// Naming no node, which is every internal id this graph never took.
-const NO_NODE: u32 = u32::MAX;
 
 /// An upper list word holding no entry.
 const WORD_EMPTY: u32 = u32::MAX;
@@ -326,16 +324,18 @@ pub(super) struct MutableGraph<T, D> {
     origin_ids: Vec<usize>,
     /// Each node's top level.
     levels: Vec<u8>,
-    /// The node each internal id sits at, indexed by that id, and
-    /// [`NO_NODE`] where the graph never took one.
+    /// The node each internal id sits at, by that id, with no entry where
+    /// the graph never took one.
     ///
     /// The inverse of [`Self::origin_ids`], written by the same append that
     /// writes it, so the two cannot drift. It is what turns the external id a
     /// caller asks about into the node index the store is addressed by. Held
     /// here rather than beside the index because it changes exactly when the
     /// graph changes, which means it is covered by the graph's own lock and
-    /// there is no second structure to keep in step.
-    node_of: Vec<u32>,
+    /// there is no second structure to keep in step. An [`IdMap`], so it
+    /// costs what the nodes cost however far apart their ids are: one `u32`
+    /// a slot while the ids are dense, and pages once they are sparse.
+    node_of: IdMap<u32>,
 
     /// Layer zero targets, node `n` at `[n * base_cap, ..)`.
     base_targets: Vec<u32>,
@@ -625,7 +625,7 @@ where
             layer_counts,
             origin_ids,
             levels: Vec::with_capacity(nb_point),
-            node_of: Vec::new(),
+            node_of: IdMap::new(),
             base_targets: vec![0u32; nb_point * base_cap],
             base_len: vec![0u16; nb_point],
             base_in_degree: vec![0u32; nb_point],
@@ -849,7 +849,7 @@ where
                 layer_counts: [0u32; LAYERS],
                 origin_ids: Vec::new(),
                 levels: Vec::new(),
-                node_of: Vec::new(),
+                node_of: IdMap::new(),
                 base_targets: Vec::new(),
                 base_len: Vec::new(),
                 base_in_degree: Vec::new(),
@@ -891,7 +891,7 @@ where
         store.reserve_for(reserved);
         reserve_exactly(&mut self.origin_ids, reserved);
         reserve_exactly(&mut self.levels, reserved);
-        reserve_exactly(&mut self.node_of, reserved + 1);
+        self.node_of.reserve_exact(reserved + 1);
         reserve_exactly(&mut self.base_targets, reserved * base_cap);
         reserve_exactly(&mut self.base_len, reserved);
         reserve_exactly(&mut self.base_in_degree, reserved);
@@ -911,10 +911,7 @@ where
     /// itself rather than by the id less one, which costs one slot and spares
     /// every caller an off-by-one about an id space that starts at one.
     fn note_origin(&mut self, origin_id: usize, node: u32) {
-        if self.node_of.len() <= origin_id {
-            self.node_of.resize(origin_id + 1, NO_NODE);
-        }
-        self.node_of[origin_id] = node;
+        self.node_of.insert(origin_id, node);
     }
 
     /// The node one internal id sits at, or `None` where this graph never took
@@ -925,10 +922,20 @@ where
     /// set and every caller consults it first, so a stranded entry is
     /// unreachable rather than wrong.
     pub(super) fn node_of(&self, origin_id: usize) -> Option<u32> {
-        match self.node_of.get(origin_id) {
-            None | Some(&NO_NODE) => None,
-            Some(&node) => Some(node),
-        }
+        self.node_of.get(origin_id).copied()
+    }
+
+    /// Whether the id-to-node map is flat, one slot per internal id up to the
+    /// largest, rather than paged.
+    pub(super) fn id_map_is_flat(&self) -> bool {
+        self.node_of.is_flat()
+    }
+
+    /// Bytes the id-to-node map holds, for a test that holds the rest of
+    /// the graph to a formula apart from it.
+    #[cfg(test)]
+    pub(super) fn id_map_bytes(&self) -> usize {
+        self.node_of.heap_bytes()
     }
 
     /// Slots one layer zero list holds, being the vendored threshold plus the
@@ -1112,7 +1119,10 @@ where
             buffers: vec![
                 buffer!(origin_ids),
                 buffer!(levels),
-                buffer!(node_of),
+                {
+                    let (capacity, values) = self.node_of.snapshot(|&node| node as u64);
+                    ("node_of", capacity, values)
+                },
                 buffer!(base_targets),
                 buffer!(base_len),
                 buffer!(base_in_degree),
@@ -1824,7 +1834,7 @@ where
         let mut total = std::mem::size_of::<Self>();
         total += self.origin_ids.capacity() * std::mem::size_of::<usize>();
         total += self.levels.capacity();
-        total += self.node_of.capacity() * std::mem::size_of::<u32>();
+        total += self.node_of.heap_bytes();
         total += self.base_targets.capacity() * std::mem::size_of::<u32>();
         total += self.base_len.capacity() * std::mem::size_of::<u16>();
         total += self.base_in_degree.capacity() * std::mem::size_of::<u32>();
@@ -1858,7 +1868,7 @@ where
         let mut total = 0;
         total += spare(&self.origin_ids, self.origin_ids.capacity());
         total += spare(&self.levels, self.levels.capacity());
-        total += spare(&self.node_of, self.node_of.capacity());
+        total += self.node_of.spare_bytes();
         total += spare(&self.base_targets, self.base_targets.capacity());
         total += spare(&self.base_len, self.base_len.capacity());
         total += spare(&self.base_in_degree, self.base_in_degree.capacity());

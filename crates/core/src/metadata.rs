@@ -1,11 +1,11 @@
 //! The per record metadata, held by internal id.
 //!
-//! One entry per internal id the collection has issued, and a record's fields
-//! in one block behind it. A record that carries no metadata costs its entry
-//! and nothing else, which is sixteen bytes, and a record that carries fields
-//! costs one block of forty bytes a field beside the text of its string
-//! values. Field names are interned once for the whole store, so a record
-//! holds a four byte symbol for each name rather than its own copy of it.
+//! One entry per record, by internal id, and a record's fields in one block
+//! behind it. A record that carries no metadata costs its entry and nothing
+//! else, which is sixteen bytes, and a record that carries fields costs one
+//! block of forty bytes a field beside the text of its string values. Field
+//! names are interned once for the whole store, so a record holds a four
+//! byte symbol for each name rather than its own copy of it.
 //!
 //! This replaced a `HashMap<String, HashMap<String, Value>>` keyed by external
 //! id. That map held a third copy of every id and a 72 byte bucket per record
@@ -21,12 +21,16 @@
 //! from and read into the same shape it always was.
 //!
 //! Internal ids are never reused, and `compact` re-inserts every record under
-//! the id it already holds, so the entry vector grows with the id counter and
-//! a removed record leaves a sixteen byte hole until `clear`. The vector is
-//! reserved for the declared record count, under a cap, and grows by doubling
-//! past it, which is the rule the graph's per node arrays follow.
+//! the id it already holds, so the ids the store holds spread over a range
+//! far larger than its records. The entries sit in an [`IdMap`], flat while
+//! the ids are dense, which is the vector indexed by id the store always
+//! held, and in pages once they are sparse, so the store costs what its
+//! records cost however far the ids spread. The entries are reserved for the
+//! declared record count, under a cap, and grow by doubling past it, which is
+//! the rule the graph's per node arrays follow.
 
 use crate::filter::FieldLookup;
+use crate::idmap::IdMap;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -50,14 +54,12 @@ pub struct MetadataStore {
     names: Vec<String>,
     /// Field name to symbol.
     symbols: HashMap<String, u32>,
-    /// One slot per internal id issued. `None` is a record that holds no
-    /// entry, which is a removed record or one no insertion has reached.
+    /// One entry per record, by internal id. `None` is the map's absent
+    /// value, being a removed record or one no insertion has reached.
     /// `Some` of an empty block is a record inserted with no fields, which
     /// is distinct: a filter judges an empty mapping and never judges an
     /// absent one.
-    records: Vec<Option<Box<[Field]>>>,
-    /// How many slots hold an entry.
-    held: usize,
+    records: IdMap<Option<Box<[Field]>>>,
 }
 
 impl MetadataStore {
@@ -70,8 +72,7 @@ impl MetadataStore {
         MetadataStore {
             names: Vec::new(),
             symbols: HashMap::new(),
-            records: Vec::with_capacity(expected_size.saturating_add(1).min(RESERVE_CAP)),
-            held: 0,
+            records: IdMap::with_capacity(expected_size.saturating_add(1).min(RESERVE_CAP)),
         }
     }
 
@@ -99,31 +100,38 @@ impl MetadataStore {
         // Symbol order, so a lookup can bisect and two records with the same
         // fields lay them out the same way.
         fields.sort_unstable_by_key(|field| field.key);
-        if slot >= self.records.len() {
-            self.records.resize_with(slot + 1, || None);
-        }
-        if self.records[slot].is_none() {
-            self.held += 1;
-        }
-        self.records[slot] = Some(fields.into_boxed_slice());
+        self.records.insert(slot, Some(fields.into_boxed_slice()));
     }
 
     /// Forget the record at `slot`, reporting whether it held an entry.
     pub fn remove(&mut self, slot: usize) -> bool {
-        match self.records.get_mut(slot) {
-            Some(entry) if entry.is_some() => {
-                *entry = None;
-                self.held -= 1;
-                true
-            }
-            _ => false,
-        }
+        self.records.remove(slot).is_some()
     }
 
     /// Forget every record and every field name, keeping a reservation for
     /// `expected_size` records.
     pub fn clear(&mut self, expected_size: usize) {
         *self = MetadataStore::new(expected_size);
+    }
+
+    /// Decide the form for a run of `records` insertions whose largest
+    /// internal id is `highest`, from the run's final shape rather than the
+    /// order the run comes in, which a load's run does not keep.
+    pub fn plan(&mut self, records: usize, highest: usize) {
+        self.records.plan(records, highest);
+    }
+
+    /// Settle the entries once a load has written every record, so a paged
+    /// store holds the same bytes whatever order the records came in. A flat
+    /// store is left as it is.
+    pub fn settle(&mut self) {
+        self.records.settle();
+    }
+
+    /// Whether the entries are flat, one slot per internal id up to the
+    /// largest, rather than paged; see [`IdMap`].
+    pub fn is_flat(&self) -> bool {
+        self.records.is_flat()
     }
 
     /// The record at `slot`, or `None` where it holds no entry.
@@ -138,17 +146,17 @@ impl MetadataStore {
 
     /// How many records hold an entry.
     pub fn len(&self) -> usize {
-        self.held
+        self.records.len()
     }
 
     /// Whether no record holds an entry.
     pub fn is_empty(&self) -> bool {
-        self.held == 0
+        self.records.is_empty()
     }
 
     /// Every record holding an entry, in increasing internal id order.
     pub fn iter(&self) -> impl Iterator<Item = (usize, RecordFields<'_>)> + '_ {
-        self.records.iter().enumerate().filter_map(|(slot, entry)| {
+        self.records.iter().filter_map(|(slot, entry)| {
             entry.as_deref().map(|fields| {
                 (
                     slot,
@@ -169,16 +177,16 @@ impl MetadataStore {
 
     /// Bytes the store asked the allocator for, apart from the key table.
     ///
-    /// The entry vector at capacity, every record's block at its length, the
+    /// The entries at their capacity, every record's block at its length, the
     /// text of every string value and the name list with its text. A `Value`
     /// is thirty-two bytes wherever it sits and a string is the one variant
     /// that also owns text.
     pub fn heap_bytes(&self) -> usize {
-        let entries = self.records.capacity() * std::mem::size_of::<Option<Box<[Field]>>>();
+        let entries = self.records.heap_bytes();
         let blocks: usize = self
             .records
             .iter()
-            .filter_map(|entry| entry.as_deref())
+            .filter_map(|(_, entry)| entry.as_deref())
             .map(|fields| {
                 std::mem::size_of_val(fields)
                     + fields
@@ -375,5 +383,37 @@ mod tests {
         store.clear(7);
         assert_eq!(store.heap_bytes(), empty);
         assert!(store.is_empty());
+    }
+
+    /// A store whose records sit under ids spread far apart costs what its
+    /// records cost, being a page's header and an entry a record beside the
+    /// table, rather than sixteen bytes for every id below the largest, and
+    /// reads back every record as a store over dense ids does.
+    #[test]
+    fn a_store_over_scattered_ids_costs_what_its_records_cost() {
+        let slots: Vec<usize> = (0..300usize).map(|k| 3 + k * 70_001).collect();
+        let largest = *slots.last().unwrap();
+        let mut store = MetadataStore::new(16);
+        store.plan(slots.len(), largest);
+        for &slot in slots.iter().rev() {
+            store.insert(slot, record(&[("n", json!(slot))]));
+        }
+        store.settle();
+        assert!(!store.records.is_flat());
+        let pages = largest / crate::idmap::PAGE_IDS + 1;
+        let blocks = 300 * 40;
+        let bound = 4 * pages + 300 * 128 + 300 * (2 + 16) + blocks + 64;
+        let entries = store.records.heap_bytes();
+        assert!(entries < bound, "{entries} >= {bound}");
+        assert_eq!(store.len(), 300);
+        for &slot in &slots {
+            assert_eq!(store.get(slot).unwrap().field("n"), Some(&json!(slot)));
+            assert!(store.get(slot + 1).is_none());
+        }
+        let walked: Vec<usize> = store.iter().map(|(slot, _)| slot).collect();
+        assert_eq!(walked, slots);
+        assert!(store.remove(slots[7]));
+        assert!(!store.remove(slots[7]));
+        assert_eq!(store.len(), 299);
     }
 }

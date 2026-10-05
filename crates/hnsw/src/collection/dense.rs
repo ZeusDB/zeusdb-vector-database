@@ -150,7 +150,9 @@ struct DensePlan {
 /// The value under a dense space's graph guard.
 pub(crate) struct DenseIndex {
     graph: VectorGraph,
-    /// The records this index holds a node for and has not removed.
+    /// The records this index holds a node for and has not removed. A
+    /// record set, so it is flat while the ids it holds are dense and paged
+    /// once they are sparse; see `Bitmap::hold`.
     live: Bitmap,
     live_count: usize,
     /// Whether every node the graph holds was inserted under an id the live
@@ -256,9 +258,10 @@ impl DenseIndex {
         let mut live = Bitmap::default();
         let mut count = 0;
         for id in ids {
-            live.insert(id);
+            live.hold(id);
             count += 1;
         }
+        live.settle();
         self.live = live;
         self.live_count = count;
         self.every_node_live = every_node_live(&self.graph, &self.live);
@@ -654,7 +657,7 @@ impl VectorIndex<Dense> for DenseIndex {
             };
             self.graph.install(record, id.slot(), planned);
         }
-        self.live.insert(id.slot());
+        self.live.hold(id.slot());
         self.live_count += 1;
         Ok(())
     }
@@ -665,7 +668,7 @@ impl VectorIndex<Dense> for DenseIndex {
         if !self.live.contains(id.slot()) {
             return Err(Error::RecordNotHeld { id: id.0 });
         }
-        self.live.remove(id.slot());
+        self.live.release(id.slot());
         self.live_count -= 1;
         self.every_node_live = false;
         Ok(())

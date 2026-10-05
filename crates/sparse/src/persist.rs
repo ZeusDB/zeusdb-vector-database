@@ -58,10 +58,10 @@ pub(crate) fn encode(index: &PostingsIndex) -> Vec<u8> {
         FrameEncoding::Engine,
         8 + index.live_nnz * NONZERO_BYTES + index.live * RECORD_HEADER_BYTES,
     );
-    payload.extend((index.records.len() as u32).to_le_bytes());
+    payload.extend((index.slots() as u32).to_le_bytes());
     payload.extend((index.live as u32).to_le_bytes());
-    for (id, slot) in index.records.iter().enumerate() {
-        if !slot.held() || index.dead.contains(id) {
+    for (id, slot) in index.records.iter() {
+        if index.dead.contains(id) {
             continue;
         }
         let v = index.forward(*slot);
@@ -162,9 +162,13 @@ pub(crate) fn decode(
         )));
     }
     let mut index = PostingsIndex::new(config.clone());
-    // Bounded by the collection's largest id, above.
-    index.records.reserve(slots);
-    index.lengths.reserve(slots);
+    // Bounded by the collection's largest id, above. Flat with room for
+    // every slot where the live records fill enough of them, and paged
+    // where they do not, so a sparse id range costs what its records cost.
+    if slots > 0 {
+        index.records.reserve(live, slots - 1);
+        index.lengths.reserve(live, slots - 1);
+    }
     let mut dims: Vec<u32> = Vec::new();
     let mut values: Vec<f32> = Vec::new();
     let mut last_id: Option<u32> = None;
@@ -223,6 +227,7 @@ pub(crate) fn decode(
             payload.len() - consumed
         )));
     }
+    index.settle();
     index.calibrate();
     Ok(index)
 }
@@ -547,5 +552,54 @@ mod tests {
         // A mutated artefact that still decodes is one whose mutation landed
         // on a value rather than a count or an id.
         let _ = accepted;
+    }
+
+    /// A space over ids spread far apart writes the slot count a flat one
+    /// writes, being one past the largest id ever inserted, reads back to
+    /// paged tables that cost what its records cost, and writes the same
+    /// bytes again.
+    #[test]
+    fn a_space_over_scattered_ids_round_trips_with_its_slot_count() {
+        let far = |k: u32| 3 + k * 1_000_003;
+        let mut index = PostingsIndex::new(SparseConfig {
+            unlink: Unlink::Strand,
+            ..SparseConfig::default()
+        });
+        for k in 0..60u32 {
+            let v = SparseVector {
+                dims: vec![k % 7, 10 + k % 5],
+                values: vec![1.0, 2.0 + k as f32],
+            };
+            index
+                .insert(RecordId(far(k)), v.as_ref(), Prepared::none())
+                .unwrap();
+        }
+        index.remove(RecordId(far(30))).unwrap();
+        assert!(!index.records.is_flat());
+        let bytes = encode(&index);
+        let framed = unframe(&bytes, FrameKind::SparsePostings, "postings").unwrap();
+        let word = |at: usize| {
+            u32::from_le_bytes([
+                framed.payload[at],
+                framed.payload[at + 1],
+                framed.payload[at + 2],
+                framed.payload[at + 3],
+            ])
+        };
+        assert_eq!(word(0), far(59) + 1, "the slot count");
+        assert_eq!(word(4), 59, "the live records");
+        let bounds = Bounds {
+            min_records: 0,
+            max_records: far(59) as usize,
+            max_bytes: 1 << 30,
+        };
+        let restored = decode(&bytes, index.config(), &bounds, "postings").unwrap();
+        assert!(!restored.records.is_flat());
+        assert_eq!(encode(&restored), bytes);
+        for k in 0..60u32 {
+            assert_eq!(restored.holds(RecordId(far(k))), k != 30);
+        }
+        let heap = restored.heap_bytes();
+        assert!(heap.records + heap.lengths < 64 * 1024, "{heap:?}");
     }
 }

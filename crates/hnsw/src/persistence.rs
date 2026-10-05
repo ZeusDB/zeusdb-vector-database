@@ -1137,20 +1137,19 @@ fn load_config(dir: &dyn Dir, manifest: &IndexManifest) -> Result<IndexConfig, E
         config.expected_size,
         &format!("{}: ", config_path),
     )?;
-    // `id_counter` too, which those five do not cover and which sizes an
-    // allocation rather than a behaviour.
+    // `id_counter` too, which those five do not cover and which bounds every
+    // internal id the collection issues.
     //
-    // The internal id a record is inserted under is the index into the graph's
-    // id-to-node array, so that array is `id_counter + 1` slots of four bytes.
-    // A hand edited config declaring 2^40 loaded without complaint, and the
-    // next `add` asked the allocator for 4,398,046,511,112 bytes and **aborted
-    // the process**. An allocation failure does not unwind, so no `catch_unwind`
-    // sees one and a Python caller gets a dead interpreter with no traceback.
+    // The internal id a record is inserted under keys the graph's id-to-node
+    // map, the id store and every artefact keyed by id, each of which holds
+    // an id that fits in a `u32`. A counter past that names ids none of them
+    // can hold, so a hand edited config declaring 2^40 is refused here,
+    // before the next `add` issues an id from it.
     //
     // It is the same root cause as the graph dump's origin id, seen from the
-    // other side: one dense array, two unvalidated sources for its index. The
-    // dump's side is checked in `graph::dump::parse_dump` against this same
-    // field, so bounding it here bounds both.
+    // other side: two unvalidated sources for an internal id. The dump's side
+    // is checked in `graph::dump::parse_dump` against this same field, so
+    // bounding it here bounds both.
     //
     // The ceiling is `u32::MAX` because a node index is a `u32` and both graph
     // constructors refuse a graph holding more points than that. Every id was
@@ -1315,6 +1314,7 @@ fn framed_ids(bytes: &[u8], config: &IndexConfig) -> Result<IdStore, Error> {
     for (internal_id, id) in records.iter() {
         store.insert(internal_id, id)?;
     }
+    store.settle();
     if store.len() != records.len() {
         return Err(invalid(format!(
             "{} records hold {} distinct ids, so an id is held under two internal ids",
@@ -1354,6 +1354,7 @@ fn bincode_ids(bytes: &[u8], config: &IndexConfig) -> Result<IdStore, Error> {
     for (id, &internal_id) in &id_map {
         store.insert(internal_id, id)?;
     }
+    store.settle();
     if store.len() != id_map.len() {
         return Err(invalid(format!(
             "the forward map names {} records under {} internal ids",

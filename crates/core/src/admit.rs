@@ -16,7 +16,7 @@
 //! order lets an index score the members directly rather than traverse or
 //! scan, which is what the exact scan under a selective filter does.
 
-use crate::columns::Bitmap;
+use crate::bitmap::Bitmap;
 use crate::space::{Hits, RecordId};
 
 /// Which records a search may return.

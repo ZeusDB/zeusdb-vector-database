@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 use zeusdb_vector_core::{
-    Admit, Bitmap, Budget, CorpusStats, Cost, Dir, Error, Hits, Inventory, Ledger, Persist,
-    Prepared, RecordId, Restore, Selectivity, Sparse, SparseRef, SparseVector, VectorIndex,
+    Admit, Bitmap, Budget, CorpusStats, Cost, Dir, Error, Hits, IdMap, Inventory, Ledger, Persist,
+    Prepared, RecordId, Restore, Selectivity, Sparse, SparseRef, SparseVector, Vacant, VectorIndex,
 };
 
 use crate::calibrate::UnitCosts;
@@ -235,6 +235,19 @@ impl Slot {
     }
 }
 
+/// A slot no record holds, being the absent value of the record table.
+impl Vacant for Slot {
+    #[inline]
+    fn vacant() -> Self {
+        NEVER_HELD
+    }
+
+    #[inline]
+    fn is_vacant(&self) -> bool {
+        !self.held()
+    }
+}
+
 /// Heap bytes the structure holds, by capacity, split by part. The
 /// allocator's own overhead sits outside it.
 #[derive(Clone, Copy, Debug, Default)]
@@ -271,17 +284,27 @@ pub struct PostingsIndex {
     /// The forward arena. A removed record's span is stranded until `compact`.
     pub(crate) fwd_dims: Vec<u32>,
     pub(crate) fwd_values: Vec<f32>,
-    /// By record id. Grows with the id counter, not the live count.
-    pub(crate) records: Vec<Slot>,
+    /// Where each record's vector sits in the forward arena, by record id,
+    /// from its insert until the compaction after its removal. Flat while the
+    /// ids the space holds are dense and paged once they are sparse, so it
+    /// costs what the records cost; see `IdMap`. Its extent is one past the
+    /// largest id ever inserted, which the artefact records as its slot
+    /// count.
+    pub(crate) records: IdMap<Slot>,
     /// Each record's length, being the sum of its values, by record id and
-    /// parallel to `records`. What a term frequency weighting normalises
-    /// by, read once per posting the scan admits. Kept under every
-    /// weighting, since it costs four bytes a slot and one sum an insert.
-    pub(crate) lengths: Vec<f32>,
-    /// Records removed and not yet compacted out.
+    /// entry for entry with `records`, so in the same form. What a term
+    /// frequency weighting normalises by, read once per posting the scan
+    /// admits. Kept under every weighting, since it costs four bytes a
+    /// record and one sum an insert.
+    pub(crate) lengths: IdMap<f32>,
+    /// Records removed and not yet compacted out. Held in the form of
+    /// `records`, since it holds a few of them and its own count says
+    /// nothing about the range their ids span.
     pub(crate) dead: Bitmap,
     /// Records held and not removed, being what `holds` answers, as a set a
-    /// filter's bitmap can be intersected with in a walk over words.
+    /// filter's bitmap can be intersected with in a walk over words. It holds
+    /// every record the space holds, so it takes the form its own count
+    /// gives.
     pub(crate) live_set: Bitmap,
     pub(crate) dead_records: usize,
     pub(crate) live: usize,
@@ -308,8 +331,8 @@ impl PostingsIndex {
             lists: Vec::new(),
             fwd_dims: Vec::new(),
             fwd_values: Vec::new(),
-            records: Vec::new(),
-            lengths: Vec::new(),
+            records: IdMap::new(),
+            lengths: IdMap::new(),
             dead: Bitmap::default(),
             live_set: Bitmap::default(),
             dead_records: 0,
@@ -329,8 +352,8 @@ impl PostingsIndex {
         let nnz = records.saturating_mul(nnz_per_record);
         index.fwd_dims.reserve(nnz);
         index.fwd_values.reserve(nnz);
-        index.records.reserve(records.saturating_add(1));
-        index.lengths.reserve(records.saturating_add(1));
+        index.records.reserve(records, records);
+        index.lengths.reserve(records, records);
         index
     }
 
@@ -350,7 +373,8 @@ impl PostingsIndex {
 
     /// The length of one live record, being the sum of its values.
     pub fn length_of(&self, id: RecordId) -> Option<f32> {
-        self.slot_of(id).map(|_| self.lengths[id.slot()])
+        self.slot_of(id)
+            .and_then(|_| self.lengths.get(id.slot()).copied())
     }
 
     /// The live set, being every record `holds` answers true for.
@@ -406,10 +430,39 @@ impl PostingsIndex {
         self.units
     }
 
-    /// Slots the record table holds, being one past the largest id ever
-    /// inserted. The scratch accumulator is sized to it.
+    /// One past the largest id ever inserted, which the artefact records as
+    /// its slot count, and which sizes the scratch accumulator while the
+    /// record table is flat.
     pub(crate) fn slots(&self) -> usize {
-        self.records.len()
+        self.records.extent()
+    }
+
+    /// Put the dead set in the record table's form. It holds a few of the
+    /// table's records, so its own count says nothing about the range their
+    /// ids span, and it follows the table instead.
+    fn follow_records(&mut self) {
+        if !self.records.is_flat() {
+            self.dead.page_out();
+        }
+    }
+
+    /// Settle every table and set once a restore has inserted every
+    /// record, so a paged index holds the same bytes whatever built it. A
+    /// flat one is left as it is.
+    pub(crate) fn settle(&mut self) {
+        self.records.settle();
+        self.lengths.settle();
+        self.live_set.settle();
+        self.dead.settle();
+    }
+
+    /// Whether the record table, the lengths and the two sets are flat, one
+    /// slot per record id up to the largest, rather than paged.
+    pub fn is_flat(&self) -> bool {
+        self.records.is_flat()
+            && self.lengths.is_flat()
+            && self.live_set.is_flat()
+            && self.dead.is_flat()
     }
 
     /// Heap bytes the structure holds, by capacity, split by part.
@@ -424,8 +477,8 @@ impl PostingsIndex {
         // per bucket, at a load factor of 7/8.
         let map = self.slots_by_dim.capacity() * (std::mem::size_of::<(u32, u32)>() + 1);
         let forward = self.fwd_dims.capacity() * 4 + self.fwd_values.capacity() * 4;
-        let records = self.records.capacity() * std::mem::size_of::<Slot>();
-        let lengths = self.lengths.capacity() * 4;
+        let records = self.records.heap_bytes();
+        let lengths = self.lengths.heap_bytes();
         let dead = self.dead.heap_bytes() + self.live_set.heap_bytes();
         HeapBytes {
             lists_postings,
@@ -450,11 +503,7 @@ impl PostingsIndex {
 
     pub(crate) fn slot_of(&self, id: RecordId) -> Option<Slot> {
         let slot = *self.records.get(id.slot())?;
-        if slot.held() && !self.dead.contains(id.slot()) {
-            Some(slot)
-        } else {
-            None
-        }
+        (!self.dead.contains(id.slot())).then_some(slot)
     }
 
     pub(crate) fn forward(&self, slot: Slot) -> SparseRef<'_> {
@@ -507,13 +556,10 @@ impl PostingsIndex {
         let mut dims = Vec::with_capacity(self.live_nnz);
         let mut values = Vec::with_capacity(self.live_nnz);
         let mut live_length = 0f64;
-        for (id, slot) in self.records.iter_mut().enumerate() {
-            if !slot.held() {
-                continue;
-            }
+        let mut gone: Vec<usize> = Vec::with_capacity(self.dead_records);
+        for (id, slot) in self.records.iter_mut() {
             if self.dead.contains(id) {
-                *slot = NEVER_HELD;
-                self.lengths[id] = 0.0;
+                gone.push(id);
                 continue;
             }
             let (s, e) = (slot.start as usize, (slot.start + slot.len) as usize);
@@ -521,7 +567,11 @@ impl PostingsIndex {
             dims.extend_from_slice(&self.fwd_dims[s..e]);
             values.extend_from_slice(&self.fwd_values[s..e]);
             slot.start = start;
-            live_length += self.lengths[id] as f64;
+            live_length += self.lengths.get(id).copied().unwrap_or(0.0) as f64;
+        }
+        for id in gone {
+            self.records.remove(id);
+            self.lengths.remove(id);
         }
         self.fwd_dims = dims;
         self.fwd_values = values;
@@ -532,6 +582,7 @@ impl PostingsIndex {
         self.records.shrink_to_fit();
         self.lengths.shrink_to_fit();
         self.slots_by_dim.shrink_to_fit();
+        self.follow_records();
         debug_assert_eq!(self.dead_postings, 0);
         debug!(
             target: LOG_TARGET,
@@ -553,11 +604,7 @@ impl PostingsIndex {
     ) -> Result<(), Error> {
         self.config.weighting.validate_record(vector)?;
         let slot_index = id.slot();
-        if slot_index >= self.records.len() {
-            self.records.resize(slot_index + 1, NEVER_HELD);
-            self.lengths.resize(slot_index + 1, 0.0);
-        }
-        if self.records[slot_index].held() && !self.dead.contains(slot_index) {
+        if self.records.contains(slot_index) && !self.dead.contains(slot_index) {
             return Err(Error::RecordAlreadyHeld { id: id.0 });
         }
         if self.dead.contains(slot_index) {
@@ -572,14 +619,18 @@ impl PostingsIndex {
         let start = self.fwd_dims.len() as u32;
         self.fwd_dims.extend_from_slice(vector.dims);
         self.fwd_values.extend_from_slice(vector.values);
-        self.records[slot_index] = Slot {
-            start,
-            len: nnz as u32,
-        };
+        self.records.insert(
+            slot_index,
+            Slot {
+                start,
+                len: nnz as u32,
+            },
+        );
         let length = vector.values.iter().map(|&v| v as f64).sum::<f64>() as f32;
-        self.lengths[slot_index] = length;
+        self.lengths.insert(slot_index, length);
         self.live_length += length as f64;
-        self.live_set.insert(slot_index);
+        self.live_set.hold(slot_index);
+        self.follow_records();
 
         for (&d, &w) in vector.dims.iter().zip(vector.values) {
             let slot = match self.slots_by_dim.get(&d) {
@@ -631,11 +682,11 @@ impl PostingsIndex {
             return Err(Error::RecordNotHeld { id: id.0 });
         };
         self.dead.insert(id.slot());
-        self.live_set.remove(id.slot());
+        self.live_set.release(id.slot());
         self.dead_records += 1;
         self.live -= 1;
         self.live_nnz -= slot.len as usize;
-        self.live_length -= self.lengths[id.slot()] as f64;
+        self.live_length -= self.lengths.get(id.slot()).copied().unwrap_or(0.0) as f64;
         let (s, e) = (slot.start as usize, (slot.start + slot.len) as usize);
         match self.config.unlink {
             Unlink::Strand => {
