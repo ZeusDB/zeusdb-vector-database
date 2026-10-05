@@ -94,6 +94,17 @@
 //! no traversal reaches a node above its level except through the entry point
 //! chain, so it stays one word for the life of the graph.
 //!
+//! A loaded node's list at or below its level that the dump leaves empty is
+//! one empty word too. Install site 2 writes only the new node's lists, so
+//! nothing fills such a list wholesale after a load, and it is promoted the
+//! first time its owner is named at that layer, which is before anything is
+//! pushed into it, exactly as a list above the level is. So a list at or below
+//! its owner's level is wide unless it holds no entry and no list names its
+//! owner there, and the storage a load builds follows the entries the dump
+//! holds rather than the levels it declares: a declared level costs a word a
+//! layer, and a wide list exists only where the dump fills a list or an entry
+//! names its owner.
+//!
 //! Keeping these lists is not a choice. The vendored
 //! descent increments the pivot's inbound counter at the layer it files the edge
 //! at, and the overflow pop guard reads that counter, so a build that skips them
@@ -637,7 +648,10 @@ where
     ///
     /// The span is the highest layer the point carries an entry at, and at
     /// least its own level, so a node carrying entries above its level owns
-    /// lists there, as a built graph's nodes do. A list above its owner's
+    /// lists there, as a built graph's nodes do. A list at or below its
+    /// owner's level that the point fills is wide, as insertion opens it, and
+    /// one the point leaves empty is an empty word, so the level the dump files
+    /// a node at costs a word a layer and no slot. A list above its owner's
     /// level holding one entry is one word, and one holding more is promoted,
     /// which is the state a built graph holds an old entry point's list in. A
     /// list longer than the cap its layer allows is refused, since no build
@@ -656,7 +670,9 @@ where
                 span = span.max(list_layer);
             }
         }
-        self.open_node(span, layer);
+        self.open_node(span, |list_layer| {
+            list_layer <= layer && lists.get(list_layer).is_some_and(|list| !list.is_empty())
+        });
 
         for (list_layer, list) in lists.iter().enumerate() {
             if list.is_empty() {
@@ -719,8 +735,9 @@ where
         // `memory_bytes` be checked against the counts rather than believed. The
         // upper regions are the ones whose size is not known before the walk,
         // because a span is a property of the file, and the counters' pass
-        // above promotes the lists the entry point chain named, so the trim
-        // comes after it.
+        // above promotes every word an entry names, being the entry point
+        // chain's lists above their level and any empty list at or below its
+        // owner's level, so the trim comes after it.
         self.node_of.shrink_to_fit();
         self.upper_word.shrink_to_fit();
         self.wide_at.shrink_to_fit();
@@ -1231,10 +1248,15 @@ where
     }
 
     /// Open one node's upper lists, giving it a word at every layer from one up
-    /// to `span`. A list at or below `level` is opened wide, because install
-    /// site 2 fills it wholesale; one above `level` is an empty word, which is
-    /// what 99.95 percent of them ever need.
-    fn open_node(&mut self, span: usize, level: usize) {
+    /// to `span`. A layer `wide` names is opened wide and every other is an
+    /// empty word, which is all nearly every list above a node's level ever
+    /// needs.
+    ///
+    /// Insertion opens wide every list at or below the new node's level,
+    /// because install site 2 fills it wholesale. A load opens wide only the
+    /// ones the dump fills, since nothing fills the rest wholesale afterwards
+    /// and a word is promoted the first time its owner is named.
+    fn open_node(&mut self, span: usize, wide: impl Fn(usize) -> bool) {
         if span == 0 {
             self.upper_first.push(NO_UPPER);
             self.upper_span.push(0);
@@ -1243,7 +1265,7 @@ where
         self.upper_first.push(self.upper_word.len() as u32);
         self.upper_span.push(span as u8);
         for layer in 1..=span {
-            let word = if layer <= level {
+            let word = if wide(layer) {
                 WORD_WIDE | self.open_wide()
             } else {
                 WORD_EMPTY
@@ -1312,7 +1334,9 @@ where
     ///
     /// This is what a second entry needs and what an inbound counter needs,
     /// since both live on the wide descriptor. It fires for the old entry
-    /// points' lists above their level and for nothing else on a build.
+    /// points' lists above their level and for nothing else on a build, and
+    /// on a load also for an empty list at or below its owner's level that an
+    /// entry names.
     fn promote(&mut self, list: usize) -> usize {
         let word = self.upper_word[list];
         assert!(
@@ -1659,7 +1683,7 @@ where
         for &(layer, _) in above {
             span = span.max(layer as usize);
         }
-        self.open_node(span, level);
+        self.open_node(span, |layer| layer <= level);
 
         for &(layer, target) in above {
             self.push_edge(node, layer as usize, target);
@@ -1730,6 +1754,24 @@ where
             }
         }
         counts
+    }
+
+    /// Every inbound counter the graph holds that is above zero, keyed by the
+    /// origin id of the node it counts into and the layer, so a test can hold
+    /// two graphs that number their nodes differently to the same counts, and
+    /// either to what [`Self::counted_in_degree`] counts from the lists.
+    #[cfg(test)]
+    pub(super) fn in_degrees(&self) -> std::collections::BTreeMap<(usize, usize), u32> {
+        let mut out = std::collections::BTreeMap::new();
+        for node in 0..self.origin_ids.len() as u32 {
+            for layer in 0..=self.span(node) {
+                let count = self.in_degree(node, layer);
+                if count > 0 {
+                    out.insert((self.origin_ids[node as usize], layer), count);
+                }
+            }
+        }
+        out
     }
 
     /// Return every buffer's spare capacity to the allocator.
