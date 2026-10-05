@@ -12,8 +12,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use zeusdb_vector_core::{
-    compile_filter, Error, FsDir, IdfScope, SparseVector, VectorGraph, VectorIndex, DUMP_FILENAME,
-    NB_LAYER_MAX,
+    compile_filter, Error, FsDir, IdfScope, Operation, SparseVector, VectorGraph, VectorIndex,
+    DUMP_FILENAME, NB_LAYER_MAX,
 };
 use zeusdb_vector_sparse::{SparseConfig, Weighting};
 use zeusdb_vector_text::{SimpleTokenizer, Tokenizer, TokenizerConfig};
@@ -1090,4 +1090,234 @@ fn a_directory_at_the_largest_m_and_the_smallest_dimension_reads_its_dump_and_wr
         dense_page(&loaded, &[0.42]),
         dense_page(&collection, &[0.42])
     );
+}
+
+/// Lists at or below their owners' levels that a graph dump leaves empty, the
+/// trailing ones the writer trims included, read off the file.
+fn empty_lists_at_or_below_levels(dump: &[u8]) -> usize {
+    let word = |at: usize| u64::from_le_bytes(dump[at..at + 8].try_into().unwrap()) as usize;
+    let count = |at: usize| u32::from_le_bytes(dump[at..at + 4].try_into().unwrap()) as usize;
+    let layers = NB_LAYER_MAX as usize;
+    let mut at = 96 + 4 * layers + 8 * word(40);
+    let mut empty = 0;
+    for level in 0..layers {
+        for _ in 0..count(96 + 4 * level) {
+            let lists = dump[at] as usize;
+            at += 1;
+            for layer in 0..lists {
+                let entries = count(at);
+                at += 4 + 9 * entries;
+                if (1..=level).contains(&layer) && entries == 0 {
+                    empty += 1;
+                }
+            }
+            empty += (lists.max(1)..=level).count();
+        }
+    }
+    empty
+}
+
+/// The largest origin id a graph dump names, read off the file.
+fn largest_origin_id(dump: &[u8]) -> u64 {
+    let nodes = u64::from_le_bytes(dump[40..48].try_into().unwrap()) as usize;
+    let first = 96 + 4 * NB_LAYER_MAX as usize;
+    (0..nodes)
+        .map(|node| {
+            let at = first + 8 * node;
+            u64::from_le_bytes(dump[at..at + 8].try_into().unwrap())
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Four values set by one record's number, the same every run.
+fn spread(i: u32) -> Vec<f32> {
+    let x = i as f32;
+    vec![
+        (x * 0.37).sin(),
+        (x * 0.11).cos(),
+        (x * 0.23).sin(),
+        (x * 0.07).cos(),
+    ]
+}
+
+/// A collection's dense pages over `queries`, and the graph dump a save of it
+/// writes.
+fn answers(collection: &Collection, queries: &[Vec<f32>]) -> (Vec<Page>, Vec<u8>) {
+    let pages = queries
+        .iter()
+        .map(|query| dense_page(collection, query))
+        .collect();
+    let dir = TempDir::new();
+    let path = dir.path().join("answers.zdb");
+    collection.save(path.to_str().unwrap()).unwrap();
+    (pages, std::fs::read(path.join(DUMP_FILENAME)).unwrap())
+}
+
+/// A collection whose saved graph holds empty lists at or below its levels,
+/// read back from its dump and then changed, answers and writes what the
+/// collection that saved it answers and writes after the same changes.
+///
+/// At `m` 2 the levels drawn over three hundred records put a node more than
+/// one layer above every earlier one, so its lists at the layers between stay
+/// empty, and the load holds each as a word. Both collections then take the
+/// same inserts at recorded levels through `apply`, reaching every layer the
+/// graph holds and two above it, a removal, an overwrite and a compaction.
+/// After each step the two answer the same pages and a save of each writes
+/// the same dump, and so do the two after a save and a load of each.
+#[test]
+fn a_collection_changed_after_its_load_matches_the_collection_that_saved_it() {
+    let declaration = Declaration::validate(4, "l2", 2, 64, 400, vec![]).unwrap();
+    let built = Collection::build(declaration, None);
+    let records: Vec<ParsedRecord> = (0..300u32)
+        .map(|i| ParsedRecord {
+            id: format!("r{i}"),
+            vector: spread(i),
+            sparse: None,
+            metadata: HashMap::new(),
+        })
+        .collect();
+    assert_eq!(built.add_records(records, vec![], false).total_errors, 0);
+    let dir = TempDir::new();
+    let path = dir.path().join("deep.zdb");
+    built.save(path.to_str().unwrap()).unwrap();
+    assert!(
+        empty_lists_at_or_below_levels(&std::fs::read(path.join(DUMP_FILENAME)).unwrap()) > 0,
+        "the saved graph holds no empty list at or below a level"
+    );
+    let (loaded, recovery) =
+        Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
+    assert!(
+        !recovery.graph_rebuilt,
+        "the graph was rebuilt rather than read from its dump"
+    );
+
+    let queries: Vec<Vec<f32>> = (1_000..1_012u32).map(spread).collect();
+    let same = |label: &str| {
+        let (built_pages, built_dump) = answers(&built, &queries);
+        let (loaded_pages, loaded_dump) = answers(&loaded, &queries);
+        assert_eq!(loaded_pages, built_pages, "{}", label);
+        assert!(loaded_dump == built_dump, "{}: the two dumps differ", label);
+    };
+    let apply = |operation: Operation| {
+        built.apply(operation.clone()).unwrap();
+        loaded.apply(operation).unwrap();
+    };
+    same("after the load");
+
+    let mut issued = built.id_counter();
+    assert_eq!(loaded.id_counter(), issued);
+    for k in 0..40u32 {
+        issued += 1;
+        apply(Operation::Insert {
+            id: format!("n{k}"),
+            internal_id: issued as u64,
+            level: (k * 5 % 12) as u8,
+            vector: spread(2_000 + k),
+            metadata: serde_json::Map::new(),
+            sparse: None,
+        });
+    }
+    same("after inserts at recorded levels");
+
+    let removed: Vec<String> = (0..300u32)
+        .step_by(9)
+        .map(|i| format!("r{i}"))
+        .chain(["n3".to_string(), "n17".to_string()])
+        .collect();
+    apply(Operation::Remove { ids: removed });
+    apply(Operation::Remove {
+        ids: vec!["r1".to_string()],
+    });
+    issued += 1;
+    apply(Operation::Insert {
+        id: "r1".to_string(),
+        internal_id: issued as u64,
+        level: 3,
+        vector: spread(3_000),
+        metadata: serde_json::Map::new(),
+        sparse: None,
+    });
+    same("after a removal and an overwrite");
+
+    apply(Operation::Compact);
+    same("after a compaction");
+
+    let built_again = reads_its_dump_and_writes_it_back(&built, "built.zdb");
+    let loaded_again = reads_its_dump_and_writes_it_back(&loaded, "loaded.zdb");
+    let (built_pages, built_dump) = answers(&built_again, &queries);
+    let (loaded_pages, loaded_dump) = answers(&loaded_again, &queries);
+    assert_eq!(loaded_pages, built_pages);
+    assert!(
+        loaded_dump == built_dump,
+        "after a save and a load: the two dumps differ"
+    );
+    assert_eq!(ids_of(&loaded_again), ids_of(&built_again));
+}
+
+/// A directory whose counter is above every id its files name reads its
+/// dump, holds what was saved, issues the counter's next id, and writes the
+/// same dump again.
+///
+/// Removing the newest records and compacting drops their stranded nodes and
+/// keeps the counter, so `config.json` counts ids that neither the id map nor
+/// the graph dump names. Nothing a directory holds bounds the counter
+/// tighter, and the load reads the dump as it reads one at its counter.
+#[test]
+fn a_directory_whose_counter_is_above_its_largest_id_reads_its_dump_and_writes_it_back() {
+    let collection = Collection::build(base(), None);
+    let records: Vec<ParsedRecord> = (0..300u32)
+        .map(|i| {
+            record(
+                &format!("r{i}"),
+                &[(i % 17) as f32 * 0.3, (i % 11) as f32 * 0.7],
+                None,
+                if i % 2 == 0 { "a" } else { "b" },
+            )
+        })
+        .collect();
+    assert_eq!(
+        collection.add_records(records, vec![], false).total_errors,
+        0
+    );
+    for i in 250..300 {
+        assert!(collection.remove_point(format!("r{i}")).unwrap());
+    }
+    collection.compact().unwrap();
+    assert_eq!(collection.id_counter(), 300);
+
+    let dir = TempDir::new();
+    let path = dir.path().join("counted.zdb");
+    collection.save(path.to_str().unwrap()).unwrap();
+    assert_eq!(config(&path)["id_counter"], json!(300));
+    assert_eq!(
+        largest_origin_id(&std::fs::read(path.join(DUMP_FILENAME)).unwrap()),
+        250
+    );
+    assert_eq!(
+        ids_of(&collection)
+            .iter()
+            .map(|(_, internal)| *internal)
+            .max(),
+        Some(250)
+    );
+
+    let loaded = reads_its_dump_and_writes_it_back(&collection, "counted.zdb");
+    assert_eq!(loaded.id_counter(), 300);
+    assert_eq!(
+        loaded.dense().index.read().unwrap().graph().nb_points(),
+        250
+    );
+    assert_eq!(ids_of(&loaded), ids_of(&collection));
+    assert_eq!(
+        dense_page(&loaded, &[1.5, 3.0]),
+        dense_page(&collection, &[1.5, 3.0])
+    );
+    assert_eq!(
+        loaded
+            .add_records(vec![record("late", &[0.4, 0.8], None, "a")], vec![], false)
+            .total_errors,
+        0
+    );
+    assert!(ids_of(&loaded).contains(&("late".to_string(), 301)));
 }

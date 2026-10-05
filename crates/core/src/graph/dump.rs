@@ -1628,7 +1628,7 @@ mod tests {
     use super::*;
     use crate::distance::CosineDist;
     use crate::storage::FsDir;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// Build a small graph the tests can round trip.
     fn sample_graph(
@@ -2874,5 +2874,519 @@ mod tests {
         let (built, built_store) = sample_graph(300, 1, 256);
         assert_eq!((built.m(), built.dim()), (256, 1));
         round_trips_at_its_counter(&built, &built_store);
+    }
+
+    /// What the graph a load builds from `parsed` holds, from the dump's
+    /// content alone.
+    struct LoadedShape {
+        /// Nodes, each with its per node arrays and its layer zero slots.
+        nodes: usize,
+        /// The largest origin id, which the id-to-node array reaches.
+        largest_id: usize,
+        /// Upper words, being each node's span, the higher of its level and
+        /// the highest layer its lists fill, and the run the in-degree pass
+        /// appends whenever an entry names a node above its span.
+        words: usize,
+        /// Wide lists, being every list above layer zero that the dump fills
+        /// at or below its owner's level or fills with two or more entries
+        /// above it, and every node an entry names above layer zero, each node
+        /// and layer once.
+        wide: usize,
+        /// The wide lists the graph would hold were every list at or below
+        /// its owner's level opened wide whatever it holds.
+        wide_if_every_owned_list_were: usize,
+    }
+
+    fn loaded_shape(parsed: &ParsedDump<f32>) -> LoadedShape {
+        let mut first = Vec::with_capacity(parsed.points_by_layer.len());
+        let mut points: Vec<&LoadedPoint<f32>> = Vec::new();
+        let mut levels: Vec<usize> = Vec::new();
+        for (layer, layer_points) in parsed.points_by_layer.iter().enumerate() {
+            first.push(points.len());
+            for point in layer_points {
+                points.push(point);
+                levels.push(layer);
+            }
+        }
+        let node = |target: PointId| first[target.0 as usize] + target.1 as usize;
+        let mut spans: Vec<usize> = points
+            .iter()
+            .zip(&levels)
+            .map(|(point, &level)| {
+                point
+                    .neighbours
+                    .iter()
+                    .rposition(|list| !list.is_empty())
+                    .map_or(level, |highest| highest.max(level))
+            })
+            .collect();
+        let mut words: usize = spans.iter().sum();
+        let mut wide = BTreeSet::new();
+        for (owner, point) in points.iter().enumerate() {
+            for (layer, list) in point.neighbours.iter().enumerate().skip(1) {
+                if !list.is_empty() && (layer <= levels[owner] || list.len() >= 2) {
+                    wide.insert((owner, layer));
+                }
+            }
+        }
+        // The in-degree pass, in its order: every entry of every list up to
+        // the span its owner holds when the pass reaches it.
+        for owner in 0..points.len() {
+            for layer in 0..=spans[owner] {
+                for edge in points[owner].neighbours.get(layer).into_iter().flatten() {
+                    let target = node(edge.target);
+                    if layer > spans[target] {
+                        spans[target] = layer;
+                        words += layer;
+                    }
+                    if layer > 0 {
+                        wide.insert((target, layer));
+                    }
+                }
+            }
+        }
+        let mut owned = wide.clone();
+        for (owner, &level) in levels.iter().enumerate() {
+            for layer in 1..=level {
+                owned.insert((owner, layer));
+            }
+        }
+        LoadedShape {
+            nodes: points.len(),
+            largest_id: points
+                .iter()
+                .map(|point| point.origin_id)
+                .max()
+                .unwrap_or(0),
+            words,
+            wide: wide.len(),
+            wide_if_every_owned_list_were: owned.len(),
+        }
+    }
+
+    /// The bytes the graph a load builds from `parsed` asks the allocator
+    /// for. Each node holds its origin id, level, layer zero length and
+    /// counter, first word and span, and `2m + 1` layer zero slots, the
+    /// id-to-node array four bytes an id up to the largest, each upper word
+    /// four bytes, and each wide list a ten byte descriptor and `m + 1` slots.
+    fn loaded_bytes(parsed: &ParsedDump<f32>) -> usize {
+        let shape = loaded_shape(parsed);
+        let m = parsed.m;
+        std::mem::size_of::<MutableGraph<f32, CosineDist>>()
+            + shape.nodes * (8 * m + 24)
+            + 4 * (shape.largest_id + 1)
+            + 4 * shape.words
+            + (4 * m + 14) * shape.wide
+    }
+
+    /// One node inserted alone at the top layer loads to the graph its save
+    /// wrote, holding a word a layer and no wide list.
+    ///
+    /// Insertion opens the node's lists at every layer up to its level wide,
+    /// because install site 2 fills them wholesale, and with no other node
+    /// nothing fills them, so the save records no list for it. A load opens
+    /// each as an empty word. The graph holds the built one's lists, its
+    /// storage is what the dump's content gives, it is the same graph read at
+    /// the largest counter, and it writes the same bytes again.
+    #[test]
+    fn a_node_alone_at_the_top_layer_loads_to_the_graph_its_save_wrote() {
+        let top = NB_LAYER_MAX as usize - 1;
+        let scale = super::super::levels::LevelGenerator::default_scale(16);
+        let (mut built, mut built_store) =
+            MutableGraph::new(4, 16, 64, scale, 1, CosineDist {}).unwrap();
+        let vector = [0.1f32, 0.2, 0.3, 0.4];
+        let planned = built.plan_insertion(&built_store, &vector, top);
+        built.install_insertion(&mut built_store, &vector, 1, planned);
+        assert_eq!(built.level(0) as usize, top);
+        assert_eq!(built.nb_wide_lists(), top);
+
+        let dir = tempfile::tempdir().unwrap();
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let expected = Expected {
+            max_origin_id: 1,
+            ..expected_for(&built, 4, 1)
+        };
+        let ((read, read_store), (reference, reference_store)) = read_both(dir.path(), &expected);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(store_bytes(&read_store), store_bytes(&reference_store));
+        assert_eq!(topology(&built, &built_store), topology(&read, &read_store));
+        assert_eq!(read.entry_level() as usize, top);
+        assert_eq!((read.nb_upper_lists(), read.nb_wide_lists()), (top, 0));
+        let parsed = parse_dump::<f32>(&FsDir::new(dir.path()), DUMP_FILENAME, &expected).unwrap();
+        assert_eq!(loaded_shape(&parsed).wide_if_every_owned_list_were, top);
+        assert_eq!(read.memory_bytes(), loaded_bytes(&parsed));
+
+        let largest = Expected {
+            max_origin_id: u32::MAX as usize,
+            ..expected
+        };
+        let (at_largest, _) = read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &largest,
+            CosineDist {},
+        )
+        .unwrap();
+        assert_eq!(at_largest.arrays(), read.arrays());
+
+        let again = tempfile::tempdir().unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(again.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(again.path().join(DUMP_FILENAME)).unwrap()
+        );
+    }
+
+    /// Lists at or below their owners' levels that the dump leaves empty load
+    /// as words, and as wide lists where an entry names their owner.
+    ///
+    /// The deep graph a small `m` builds holds such lists, at layers no node
+    /// had reached when their owner arrived. Insertion opened them wide. A
+    /// load opens each as an empty word and the in-degree pass promotes the
+    /// ones an entry names, since the counter lives on the wide descriptor,
+    /// so the load holds one wide list fewer for each empty list nothing
+    /// names. Its storage is what the dump's content gives, it holds the
+    /// written graph's topology, and it writes the same bytes again.
+    #[test]
+    fn empty_lists_at_or_below_a_level_load_as_words_unless_an_entry_names_them() {
+        let (built, built_store) = sample_graph(300, 4, 2);
+        let (mut named, mut unnamed) = (0usize, 0usize);
+        for layer in 1..NB_LAYER_MAX as usize {
+            let counted = built.counted_in_degree(layer);
+            for node in 0..built.nb_points() as u32 {
+                if layer <= built.level(node) as usize
+                    && built.neighbours_at(node, layer).is_empty()
+                {
+                    if counted[node as usize] > 0 {
+                        named += 1;
+                    } else {
+                        unnamed += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            named > 0 && unnamed > 0,
+            "{} empty lists an entry names and {} nothing names",
+            named,
+            unnamed
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let expected = expected_for(&built, 4, 300);
+        let ((read, read_store), (reference, _)) = read_both(dir.path(), &expected);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(topology(&built, &built_store), topology(&read, &read_store));
+        let parsed = parse_dump::<f32>(&FsDir::new(dir.path()), DUMP_FILENAME, &expected).unwrap();
+        let shape = loaded_shape(&parsed);
+        assert_eq!(read.nb_wide_lists(), shape.wide);
+        assert_eq!(shape.wide_if_every_owned_list_were - shape.wide, unnamed);
+        assert_eq!(read.nb_upper_lists(), shape.words);
+        assert_eq!(read.memory_bytes(), loaded_bytes(&parsed));
+
+        let again = tempfile::tempdir().unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(again.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(again.path().join(DUMP_FILENAME)).unwrap()
+        );
+    }
+
+    /// A node the dump files at the top layer with no entry above layer zero
+    /// costs a word a layer and no wide list, at the largest `m` and the
+    /// smallest dimension, whatever counter the dump is read at.
+    ///
+    /// Three nodes are added at the top layer of a dump a save wrote, under
+    /// fresh ids, each a copy of a point's vector carrying one layer zero
+    /// entry at the distance a save records. Their lists above layer zero are
+    /// empty and nothing names them there, so the load gives them fifteen
+    /// words each and no wide list, where opening every list at or below a
+    /// level wide gives them fifteen wide lists each. The graph's storage is
+    /// what the dump's content gives, the same at the tightest counter and at
+    /// the largest, and a save of it writes the forged file again.
+    #[test]
+    fn a_node_filed_high_with_no_upper_entry_costs_a_word_a_layer() {
+        let top = NB_LAYER_MAX as usize - 1;
+        let (built, built_store) = sample_graph(300, 1, 256);
+        assert_eq!((built.m(), built.dim()), (256, 1));
+        let expected = expected_for(&built, 1, 300);
+        let parsed = parse_written(&built, &built_store, &expected);
+        let plain = written(&parsed);
+        let (base, _) = read_dump::<f32, CosineDist>(
+            &FsDir::new(plain.path()),
+            DUMP_FILENAME,
+            &expected,
+            CosineDist {},
+        )
+        .unwrap();
+
+        let mut forged = parsed.clone();
+        let donor = forged.points_by_layer[0][0].clone();
+        for k in 0..3usize {
+            let target = &forged.points_by_layer[0][k + 1];
+            let mut point = donor.clone();
+            point.origin_id = 300 + k;
+            point.neighbours = vec![vec![LoadedEdge {
+                target: PointId(0, k as i32 + 1),
+                distance: CosineDist {}.eval(&donor.data, &target.data),
+            }]];
+            forged.points_by_layer[top].push(point);
+        }
+        let dir = written(&forged);
+        let tight = Expected {
+            max_origin_id: 302,
+            ..expected
+        };
+        let ((read, read_store), (reference, _)) = read_both(dir.path(), &tight);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(read.nb_points(), 303);
+        assert_eq!(read.nb_wide_lists(), base.nb_wide_lists());
+        assert_eq!(read.nb_upper_lists(), base.nb_upper_lists() + 3 * top);
+        let reparsed = parse_dump::<f32>(&FsDir::new(dir.path()), DUMP_FILENAME, &tight).unwrap();
+        let shape = loaded_shape(&reparsed);
+        assert_eq!(shape.wide_if_every_owned_list_were - shape.wide, 3 * top);
+        assert_eq!(read.memory_bytes(), loaded_bytes(&reparsed));
+
+        let largest = Expected {
+            max_origin_id: u32::MAX as usize,
+            ..tight
+        };
+        let (at_largest, _) = read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &largest,
+            CosineDist {},
+        )
+        .unwrap();
+        assert_eq!(at_largest.arrays(), read.arrays());
+
+        let again = tempfile::tempdir().unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(again.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(again.path().join(DUMP_FILENAME)).unwrap()
+        );
+    }
+
+    /// A loaded graph holding empty lists at or below its levels, changed by
+    /// insertion, gives the dumps and the pages the graph that wrote it gives
+    /// after the same insertions.
+    ///
+    /// Insertion does not depend on the form a list takes, and a load builds
+    /// the lists and the inbound counts of the graph that wrote the dump, so
+    /// the graph that never left memory is what the loaded one has to match.
+    /// Both take the same insertions at chosen levels, since a loaded graph
+    /// draws from a fresh stream, reaching every layer the graph holds and two
+    /// above it, so the lists the load held as words are counted into and
+    /// filled. Before the insertions and after them, every inbound counter of
+    /// each graph is the count of the lists naming its node, and the two hold
+    /// the same counts. After each insertion the two dumps are the same bytes.
+    /// Then the two answer the same pages, unfiltered and with ids filtered out
+    /// as a removal does, they evicted the same entries, a graph rebuilt from
+    /// the live points of each is the same graph, and each written and read
+    /// back is the same graph answering the same pages.
+    #[test]
+    fn a_loaded_graph_changed_after_the_load_matches_the_graph_that_wrote_it() {
+        type Graph = MutableGraph<f32, CosineDist>;
+        type Store = super::super::store::VectorStore<f32>;
+        fn dump_of(graph: &Graph, store: &Store) -> Vec<u8> {
+            let dir = tempfile::tempdir().unwrap();
+            write_dump(
+                &graph.dump_view(store),
+                GraphKind::Cosine,
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+            )
+            .unwrap();
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap()
+        }
+        fn spread(state: &mut u64) -> Vec<f32> {
+            (0..4)
+                .map(|_| {
+                    *state ^= *state << 13;
+                    *state ^= *state >> 7;
+                    *state ^= *state << 17;
+                    (*state >> 40) as f32 / 16_777_216.0 - 0.5
+                })
+                .collect()
+        }
+        // The lists naming each node at each layer, by origin id and layer,
+        // counted from the lists themselves.
+        fn counted(graph: &Graph) -> BTreeMap<(usize, usize), u32> {
+            let mut out = BTreeMap::new();
+            for layer in 0..NB_LAYER_MAX as usize {
+                for (node, &count) in graph.counted_in_degree(layer).iter().enumerate() {
+                    if count > 0 {
+                        out.insert((graph.origin_id_of(node as u32), layer), count);
+                    }
+                }
+            }
+            out
+        }
+        // Every id that is not three more than a multiple of seven, as a
+        // removal leaves the live set.
+        let live = |id: &usize| id % 7 != 3;
+        let pages = |graph: &Graph, store: &Store| -> Vec<Vec<(usize, u32)>> {
+            let mut state = 0xbb67_ae85_84ca_a73bu64;
+            let mut out = Vec::new();
+            for _ in 0..24 {
+                let query = spread(&mut state);
+                for page in [
+                    graph.search(store, &query, 10, 32, None::<&fn(&usize) -> bool>),
+                    graph.search(store, &query, 10, 32, Some(&live)),
+                ] {
+                    out.push(
+                        page.iter()
+                            .map(|hit| (hit.internal_id, hit.distance.to_bits()))
+                            .collect(),
+                    );
+                }
+            }
+            out
+        };
+
+        let (mut built, mut built_store) = sample_graph(300, 4, 2);
+        let dir = tempfile::tempdir().unwrap();
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let (mut read, mut read_store): (Graph, Store) = read_dump(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &expected_for(&built, 4, 300),
+            CosineDist {},
+        )
+        .unwrap();
+        // The lists the load holds as words at or below their owners'
+        // levels, by origin id and layer.
+        let mut words: Vec<(usize, usize)> = Vec::new();
+        for layer in 1..NB_LAYER_MAX as usize {
+            let counted = read.counted_in_degree(layer);
+            for node in 0..read.nb_points() as u32 {
+                if layer <= read.level(node) as usize
+                    && read.neighbours_at(node, layer).is_empty()
+                    && counted[node as usize] == 0
+                {
+                    words.push((read.origin_id_of(node), layer));
+                }
+            }
+        }
+        assert!(!words.is_empty(), "the load holds no list as a word");
+        assert_eq!(read.in_degrees(), counted(&read));
+        assert_eq!(read.in_degrees(), built.in_degrees());
+        let (built_guard, read_guard) = (built.guard_stats(), read.guard_stats());
+
+        let top = built.entry_level() as usize;
+        let mut state = 0x6a09_e667_f3bc_c909u64;
+        for k in 0..48usize {
+            let vector = spread(&mut state);
+            let level = (k * 7) % (top + 3);
+            for (graph, store) in [(&mut built, &mut built_store), (&mut read, &mut read_store)] {
+                let planned = graph.plan_insertion(store, &vector, level);
+                graph.install_insertion(store, &vector, 300 + k, planned);
+            }
+            assert_eq!(
+                dump_of(&built, &built_store),
+                dump_of(&read, &read_store),
+                "after insertion {} at level {}",
+                k,
+                level
+            );
+        }
+        let filled = words
+            .iter()
+            .filter(|&&(id, layer)| {
+                let node = read.node_of(id).expect("every origin id has a node");
+                !read.neighbours_at(node, layer).is_empty()
+            })
+            .count();
+        assert!(
+            filled > 0,
+            "no insertion reached a list the load held as a word"
+        );
+        assert_eq!(built.in_degrees(), counted(&built));
+        assert_eq!(read.in_degrees(), counted(&read));
+        assert_eq!(read.in_degrees(), built.in_degrees());
+
+        let evicted = |now: (u64, u64, u64), then: (u64, u64, u64)| {
+            (now.0 - then.0, now.1 - then.1, now.2 - then.2)
+        };
+        let built_evictions = evicted(built.guard_stats(), built_guard);
+        assert_eq!(built_evictions, evicted(read.guard_stats(), read_guard));
+        assert!(built_evictions.0 > 0, "no insertion overflowed a list");
+        let built_pages = pages(&built, &built_store);
+        assert_eq!(built_pages, pages(&read, &read_store));
+
+        let rebuilt = |graph: &Graph, store: &Store| {
+            let scale = super::super::levels::LevelGenerator::default_scale(2);
+            let mut levels =
+                super::super::levels::LevelGenerator::new(scale, NB_LAYER_MAX as usize);
+            let (mut fresh, mut fresh_store) =
+                MutableGraph::new(4, 2, 64, scale, 1, CosineDist {}).unwrap();
+            for id in (0..348usize).filter(live) {
+                let node = graph.node_of(id).expect("every inserted id has a node");
+                fresh.insert(&mut fresh_store, store.get(node), id, &mut levels);
+            }
+            dump_of(&fresh, &fresh_store)
+        };
+        assert_eq!(rebuilt(&built, &built_store), rebuilt(&read, &read_store));
+
+        let reread = |graph: &Graph, store: &Store| {
+            let dir = tempfile::tempdir().unwrap();
+            write_dump(
+                &graph.dump_view(store),
+                GraphKind::Cosine,
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+            )
+            .unwrap();
+            read_dump::<f32, CosineDist>(
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+                &expected_for(graph, 4, 348),
+                CosineDist {},
+            )
+            .unwrap()
+        };
+        let (built_again, built_again_store) = reread(&built, &built_store);
+        let (read_again, read_again_store) = reread(&read, &read_store);
+        assert_eq!(built_again.arrays(), read_again.arrays());
+        assert_eq!(pages(&built_again, &built_again_store), built_pages);
+        assert_eq!(pages(&read_again, &read_again_store), built_pages);
     }
 }

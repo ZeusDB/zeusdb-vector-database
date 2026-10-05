@@ -342,9 +342,12 @@ fn the_mutable_memory_figure_is_exact() {
         wide * (M + 1),
         "every wide list holds m + 1 slots and nothing else holds a slot"
     );
-    // Every list at or below its owner's level is wide, every list above it
-    // is one word until the entry point chain promotes it, and a descent
-    // residue list is one word holding its one edge.
+    // A loaded list at or below its owner's level is wide unless it holds no
+    // entry and no entry names its owner there, every list above it is one
+    // word until the entry point chain promotes it, and a descent residue list
+    // is one word holding its one edge. This fixture holds no empty list at or
+    // below a level, so every list at or below its owner's level is wide here,
+    // which the count against the levels below relies on.
     let (empty, single, wide_words) = mutable.word_census();
     assert_eq!(empty + single + wide_words, lists);
     assert!(
