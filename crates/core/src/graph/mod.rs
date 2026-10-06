@@ -52,6 +52,7 @@
 use crate::distance::{
     CosineDist, DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric,
 };
+use crate::idmap::IdCursor;
 use crate::int8::Int8Codec;
 use crate::pq::PQ;
 use crate::storage::Dir;
@@ -1064,6 +1065,64 @@ impl VectorGraph {
     /// node removal has stranded, since the node stays.
     pub fn holds(&self, internal_id: usize) -> bool {
         self.node_of(internal_id).is_some()
+    }
+
+    /// A cursor over the id-to-node map. It answers what the map answers at
+    /// every internal id, and reads a run of ids in increasing order with one
+    /// resolution of each page of a paged map; see [`IdCursor`].
+    pub fn node_cursor(&self) -> IdCursor<'_, u32> {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.node_cursor(),
+            VectorGraph::L2(b) => b.graph.node_cursor(),
+            VectorGraph::L1(b) => b.graph.node_cursor(),
+            VectorGraph::Dot(b) => b.graph.node_cursor(),
+            VectorGraph::CosinePQ(b) => b.graph.node_cursor(),
+            VectorGraph::L2PQ(b) => b.graph.node_cursor(),
+            VectorGraph::L1PQ(b) => b.graph.node_cursor(),
+            VectorGraph::Int8(b) => b.graph.node_cursor(),
+        }
+    }
+
+    /// One node's raw vector, being the read [`VectorGraph::raw_vector`]
+    /// makes once it has the record's node.
+    pub fn raw_vector_at(&self, node: u32) -> Option<&[f32]> {
+        match self {
+            VectorGraph::Cosine(b) => b.store.try_get(node),
+            VectorGraph::L2(b) => b.store.try_get(node),
+            VectorGraph::L1(b) => b.store.try_get(node),
+            VectorGraph::Dot(b) => b.store.try_get(node),
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                b.raw.as_ref()?.try_get(node)
+            }
+            VectorGraph::Int8(_) => None,
+        }
+    }
+
+    /// One node's quantized codes, being the read [`VectorGraph::codes_of`]
+    /// makes once it has the record's node.
+    pub fn codes_at(&self, node: u32) -> Option<&[u8]> {
+        match self {
+            VectorGraph::Cosine(_)
+            | VectorGraph::L2(_)
+            | VectorGraph::L1(_)
+            | VectorGraph::Dot(_)
+            | VectorGraph::Int8(_) => None,
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
+                b.store.try_get(node)
+            }
+        }
+    }
+
+    /// The distance from `query` to one node's scalar row, being what
+    /// [`VectorGraph::int8_distance`] scores once it has the record's node.
+    pub fn int8_distance_at(&self, query: &[f32], node: u32) -> Option<f32> {
+        match self {
+            VectorGraph::Int8(b) => {
+                let row = b.store.try_get(node)?;
+                Some(b.graph.distance().query_distance(query, row))
+            }
+            _ => None,
+        }
     }
 
     /// Time one distance evaluation on this graph's own store, in

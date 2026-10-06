@@ -41,6 +41,16 @@
 //! Two flat sets combine word by word as they always have. A paged set
 //! combines page by page, each page through a scratch of one page's words,
 //! and the result is paged.
+//!
+//! # Reads in increasing order, and fills
+//!
+//! A [`BitCursor`] answers what [`Bitmap::contains`] answers at every id, and
+//! keeps the page it read last as [`crate::idmap::IdCursor`] does, so ids
+//! read in increasing order resolve each page once. A fill puts ids into an
+//! empty set in increasing order: a flat set takes each id as
+//! [`Bitmap::set`] does, and a paged set builds each page once its ids are
+//! in, in the kind and with the content that putting them in one at a time
+//! gives.
 
 use crate::idmap::{count, Bits, PAGE_IDS, SHORT_LIMIT, SUMMARY_WORDS};
 
@@ -56,8 +66,13 @@ const NO_PAGE: u32 = u32::MAX;
 /// The extent in ids at or below which a record set never pages out.
 pub(crate) const BIT_FLOOR: usize = PAGE_IDS;
 
-/// Ids of its extent a flat record set may hold for each id when it grows.
-pub(crate) const BIT_RATIO: usize = 64;
+/// Bytes of words a flat record set may cost for each id it holds when it
+/// grows.
+const RECORD_SET_BYTES: usize = 16;
+
+/// Ids of its extent a flat record set may hold for each id when it grows,
+/// being the ids whose bits cost [`RECORD_SET_BYTES`].
+pub(crate) const BIT_RATIO: usize = RECORD_SET_BYTES * 8;
 
 /// Bits of its span a page held as words may hold for each id.
 pub(crate) const BIT_PAGE_RATIO: usize = 16;
@@ -167,6 +182,26 @@ fn ranked_span(words: &[u64]) -> usize {
     };
     let group = at * 64 + 63 - summary[at].leading_zeros() as usize;
     group * 64 + 64 - last.leading_zeros() as usize
+}
+
+/// Whether putting `offsets`, which increase, into an empty page one at a
+/// time leaves it as words, and how many: [`BitPage::insert`]'s rules run
+/// over the offsets alone. `None` where it leaves the page sparse.
+fn words_of_increasing(offsets: &[u16]) -> Option<usize> {
+    let mut words: Option<usize> = None;
+    for (at, &offset) in offsets.iter().enumerate() {
+        let index = offset as usize >> 6;
+        let held = at + 1;
+        if let Some(span) = words {
+            if index >= span {
+                words = BitPage::stays_dense(index + 1, held).then_some(index + 1);
+            }
+        }
+        if words.is_none() && BitPage::dense_for(index + 1, held) {
+            words = Some(index + 1);
+        }
+    }
+    words
 }
 
 /// One page of a paged set.
@@ -475,6 +510,37 @@ impl BitPage {
         }
     }
 
+    /// The page that putting `offsets`, which increase and are not empty,
+    /// into an empty page one at a time leaves, in its kind and with its
+    /// content: words to its span, its offsets, or the rank index, which is
+    /// a function of the offsets alone.
+    fn from_increasing(number: u32, offsets: &[u16]) -> BitPage {
+        let mut page = BitPage {
+            number,
+            held: u32::try_from(offsets.len()).expect("a page holds at most 65,536 ids"),
+            dense: false,
+            words: Vec::new(),
+            offsets: Vec::new(),
+        };
+        match words_of_increasing(offsets) {
+            Some(span) => {
+                let mut words = vec![0u64; span];
+                for &offset in offsets {
+                    words[offset as usize >> 6] |= 1u64 << (offset & 63);
+                }
+                page.words = words;
+                page.dense = true;
+            }
+            None if offsets.len() > SHORT_LIMIT => {
+                let (words, counts) = rank_index(offsets.iter().map(|&offset| offset as usize));
+                page.words = words;
+                page.offsets = counts;
+            }
+            None => page.offsets = offsets.to_vec(),
+        }
+        page
+    }
+
     /// A page built from one page of words, in the kind its content gives,
     /// or `None` where it holds nothing.
     fn from_words(number: u32, words: &[u64; PAGE_WORDS]) -> Option<BitPage> {
@@ -621,6 +687,200 @@ impl BitPages {
     }
 }
 
+/// Reads of a set at ids in increasing order, each answering what
+/// [`Bitmap::contains`] answers at the same id. See the module.
+pub struct BitCursor<'a> {
+    /// The set's words while it is flat.
+    words: &'a [u64],
+    /// The pages, once the set is paged.
+    pages: Option<&'a BitPages>,
+    /// The number of the page the cursor stands in, or `usize::MAX` before
+    /// its first read of a paged set.
+    number: usize,
+    /// That page, where the set holds one.
+    page: Option<&'a BitPage>,
+    /// The offset read last in the page.
+    last: usize,
+    /// On a short page, the place of the first offset not below `last`.
+    at: usize,
+    /// On a ranked page, the summary word read last, or `usize::MAX`, with
+    /// the word and its count of held groups.
+    word: usize,
+    summary: u64,
+    held: u16,
+    /// On a ranked page, the group read last, or `usize::MAX`, and its word,
+    /// zero where the page holds no id in it.
+    group: usize,
+    members: u64,
+}
+
+impl<'a> BitCursor<'a> {
+    fn new(words: &'a [u64], pages: Option<&'a BitPages>) -> Self {
+        BitCursor {
+            words,
+            pages,
+            number: usize::MAX,
+            page: None,
+            last: 0,
+            at: 0,
+            word: usize::MAX,
+            summary: 0,
+            held: 0,
+            group: usize::MAX,
+            members: 0,
+        }
+    }
+
+    /// Whether the set holds `slot`. Total over every `usize`, in any order.
+    /// Only a read in another page than the last resolves a page.
+    #[inline]
+    pub fn contains(&mut self, slot: usize) -> bool {
+        let Some(pages) = self.pages else {
+            return self
+                .words
+                .get(slot >> 6)
+                .is_some_and(|word| word >> (slot & 63) & 1 == 1);
+        };
+        let number = slot >> PAGE_SHIFT;
+        let offset = slot & (PAGE_IDS - 1);
+        if number != self.number {
+            self.enter(pages, number);
+        } else if offset < self.last {
+            self.at = 0;
+        }
+        self.last = offset;
+        let Some(page) = self.page else {
+            return false;
+        };
+        if page.dense {
+            page.words
+                .get(offset >> 6)
+                .is_some_and(|word| word >> (offset & 63) & 1 == 1)
+        } else if page.ranked() {
+            self.ranked_holds(page, offset)
+        } else {
+            self.short_holds(page, offset)
+        }
+    }
+
+    /// Stand in page `number`, which the set may hold no id in.
+    #[cold]
+    #[inline(never)]
+    fn enter(&mut self, pages: &'a BitPages, number: usize) {
+        self.number = number;
+        self.page = pages.page(number);
+        self.at = 0;
+        self.word = usize::MAX;
+        self.group = usize::MAX;
+    }
+
+    /// Whether a short page holds `offset`, the position moving forward past
+    /// every offset below it.
+    #[inline]
+    fn short_holds(&mut self, page: &BitPage, offset: usize) -> bool {
+        let key = offset as u16;
+        while page.offsets.get(self.at).is_some_and(|&held| held < key) {
+            self.at += 1;
+        }
+        page.offsets.get(self.at) == Some(&key)
+    }
+
+    /// Whether a ranked page holds `offset`, as [`BitPage::contains`] answers,
+    /// reading a summary word only for a summary word other than the last and
+    /// a group's word only for a group other than the last.
+    #[inline]
+    fn ranked_holds(&mut self, page: &BitPage, offset: usize) -> bool {
+        let group = offset >> 6;
+        if group != self.group {
+            let word = group >> 6;
+            if word != self.word {
+                self.summary = page.words[word];
+                self.held = page.offsets[word];
+                self.word = word;
+            }
+            self.group = group;
+            let bit = 1u64 << (group & 63);
+            self.members = if self.summary & bit == 0 {
+                0
+            } else {
+                page.words[SUMMARY_WORDS
+                    + usize::from(self.held)
+                    + (self.summary & (bit - 1)).count_ones() as usize]
+            };
+        }
+        self.members >> (offset & 63) & 1 == 1
+    }
+}
+
+/// Ids put into an empty set in increasing order. See the module.
+pub(crate) struct Fill<'a> {
+    set: &'a mut Bitmap,
+    /// The number of the page whose offsets are gathered, or `usize::MAX`.
+    number: usize,
+    /// That page's offsets, in increasing order.
+    offsets: Vec<u16>,
+    /// The id put in last.
+    last: Option<usize>,
+}
+
+impl Fill<'_> {
+    /// Put `slot` in. An id at or below the last one put in goes in through
+    /// [`Bitmap::set`], so the set holds every id put in whatever the order.
+    #[inline]
+    pub(crate) fn push(&mut self, slot: usize) {
+        if self.set.paged.is_none() {
+            self.set.set(slot);
+            return;
+        }
+        if self.last.is_some_and(|last| slot <= last) {
+            self.flush();
+            self.set.set(slot);
+            return;
+        }
+        self.last = Some(slot);
+        let number = slot >> PAGE_SHIFT;
+        if number != self.number {
+            self.flush();
+            self.number = number;
+        }
+        self.offsets.push((slot & (PAGE_IDS - 1)) as u16);
+    }
+
+    /// Build the gathered page and append it, or, where the set already
+    /// holds a page at or past it, put its ids in one at a time.
+    fn flush(&mut self) {
+        if self.offsets.is_empty() {
+            return;
+        }
+        let number = self.number;
+        let pages = self
+            .set
+            .paged
+            .as_deref_mut()
+            .expect("only a paged set gathers offsets");
+        let appends = pages
+            .pages
+            .last()
+            .is_none_or(|last| (last.number as usize) < number);
+        if appends {
+            let page_number = u32::try_from(number).expect("a page number fits in a u32");
+            pages.push(BitPage::from_increasing(page_number, &self.offsets));
+            self.set.held += self.offsets.len();
+        } else {
+            for &offset in &self.offsets {
+                self.set.set((number << PAGE_SHIFT) + offset as usize);
+            }
+        }
+        self.offsets.clear();
+    }
+}
+
+impl Drop for Fill<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 /// One page of a set as the algebra reads it.
 enum View<'a> {
     Empty,
@@ -640,6 +900,12 @@ impl View<'_> {
         }
     }
 }
+
+/// A set's form as [`Bitmap::snapshot`] gives it: a flat set's words, or the
+/// table and each page's number, kind (0 words, 1 short, 2 ranked), words and
+/// offsets.
+#[cfg(test)]
+pub(crate) type SetForm = (Vec<u64>, Vec<u32>, Vec<(u32, u8, Vec<u64>, Vec<u16>)>);
 
 /// A set of internal ids, one bit each. See the module.
 #[derive(Clone, Default)]
@@ -705,6 +971,24 @@ impl Bitmap {
     /// Whether the set is flat.
     pub fn is_flat(&self) -> bool {
         self.paged.is_none()
+    }
+
+    /// A cursor that reads the set at ids in increasing order; see
+    /// [`BitCursor`].
+    pub fn cursor(&self) -> BitCursor<'_> {
+        BitCursor::new(&self.words, self.paged.as_deref())
+    }
+
+    /// A fill of this set, which holds no id, in increasing id order. The
+    /// last page goes in when the fill is dropped. See the module.
+    pub(crate) fn fill(&mut self) -> Fill<'_> {
+        debug_assert_eq!(self.held, 0, "a fill starts from an empty set");
+        Fill {
+            set: self,
+            number: usize::MAX,
+            offsets: Vec::new(),
+            last: None,
+        }
     }
 
     /// Put an id in a set built at its full size by [`Bitmap::zeros`], or in
@@ -1082,6 +1366,34 @@ impl Bitmap {
     /// Bytes the set asks the allocator for.
     pub fn heap_bytes(&self) -> usize {
         self.words.capacity() * 8 + self.paged.as_deref().map_or(0, BitPages::heap_bytes)
+    }
+
+    /// The form as plain values, for a test that holds two sets to one form:
+    /// a flat set's words, or the table and each page's number, kind and
+    /// content, capacities aside.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> SetForm {
+        match self.paged.as_deref() {
+            None => (self.words.clone(), Vec::new(), Vec::new()),
+            Some(pages) => (
+                Vec::new(),
+                pages.table.clone(),
+                pages
+                    .pages
+                    .iter()
+                    .map(|page| {
+                        let kind = if page.dense {
+                            0
+                        } else if page.ranked() {
+                            2
+                        } else {
+                            1
+                        };
+                        (page.number, kind, page.words.clone(), page.offsets.clone())
+                    })
+                    .collect(),
+            ),
+        }
     }
 
     /// A flat set whose words reach `slots`, holding this flat set's ids
@@ -1724,5 +2036,232 @@ mod tests {
                 + pages.pages.capacity() * std::mem::size_of::<BitPage>()
                 + formulas.iter().sum::<usize>()
         );
+    }
+
+    /// The ids a cursor test reads around `slots`: each id and its two
+    /// neighbours, the first and last offset of pages 0 to 10, and an id past
+    /// every page, in increasing order.
+    fn read_at(slots: &[usize]) -> Vec<usize> {
+        let mut at: Vec<usize> = slots
+            .iter()
+            .flat_map(|&slot| [slot.saturating_sub(1), slot, slot + 1])
+            .collect();
+        for page in 0..11 {
+            at.extend([page * PAGE_IDS, page * PAGE_IDS + PAGE_IDS - 1]);
+        }
+        at.push(1 << 30);
+        at.sort_unstable();
+        at.dedup();
+        at
+    }
+
+    /// A cursor answers what `contains` answers at every id, over a flat set
+    /// and over pages of every kind: held and absent ids, every page's first
+    /// and last offset, pages the set holds no id in, in increasing order,
+    /// with every id read twice, falling back every few ids, scrambled, in
+    /// decreasing order, and in turn between pages at the same offsets.
+    #[test]
+    fn a_cursor_reads_what_contains_reads_in_every_page_kind() {
+        let slots = every_kind();
+        let mut paged = Bitmap::paged();
+        for &slot in &slots {
+            paged.insert(slot);
+        }
+        paged.settle();
+        let kinds: Vec<Option<u8>> = [3, 5, 6, 9]
+            .iter()
+            .map(|&page| kind_of(&paged, page * PAGE_IDS))
+            .collect();
+        assert_eq!(kinds, vec![Some(2), Some(1), Some(0), Some(2)]);
+        let mut flat = Bitmap::default();
+        for slot in (1..9_000usize).filter(|slot| slot % 3 != 0) {
+            flat.insert(slot);
+        }
+        assert!(flat.is_flat());
+
+        let at = read_at(&slots);
+        let twice: Vec<usize> = at.iter().flat_map(|&slot| [slot, slot]).collect();
+        let falling: Vec<usize> = at.iter().rev().copied().collect();
+        let back: Vec<usize> = at
+            .chunks(7)
+            .flat_map(|chunk| chunk.iter().rev().copied())
+            .collect();
+        let mixed = scrambled(&at, 21);
+        let turns: Vec<usize> = (0..PAGE_IDS)
+            .step_by(97)
+            .flat_map(|offset| [3, 9, 6].map(|page| page * PAGE_IDS + offset))
+            .collect();
+        for set in [&paged, &flat] {
+            for order in [&at, &twice, &falling, &back, &mixed, &turns] {
+                let mut cursor = set.cursor();
+                for &slot in order.iter() {
+                    assert_eq!(cursor.contains(slot), set.contains(slot), "{slot}");
+                }
+            }
+        }
+    }
+
+    /// A record set held at one id in `gap` from id 0, `count` ids, in
+    /// increasing order.
+    fn held_every(gap: usize, count: usize) -> Bitmap {
+        let mut set = Bitmap::default();
+        for k in 0..count {
+            set.hold(k * gap);
+        }
+        set
+    }
+
+    /// A record set stays flat while it holds one id in its ratio of ids.
+    /// Held at one id in 127 and in 128 it stays flat and at one in 129 it
+    /// pages out past one page. A plan keeps it flat to 128 ids an id and no
+    /// further. A release pages it out only once it holds fewer than one id
+    /// in twice its ratio. Fed ids whose gaps straddle its ratio from several
+    /// starts, it changes form at most once.
+    #[test]
+    fn a_record_set_stays_flat_to_its_ratio() {
+        assert_eq!(BIT_RATIO, 128);
+        let count = 4_000;
+        assert!(held_every(BIT_RATIO - 1, count).is_flat());
+        assert!(held_every(BIT_RATIO, count).is_flat());
+        assert!(!held_every(BIT_RATIO + 1, count).is_flat());
+
+        for (highest, flat) in [
+            (BIT_RATIO * count - 1, true),
+            (BIT_RATIO * count + 63, false),
+        ] {
+            let mut set = Bitmap::default();
+            set.plan(count, highest);
+            assert_eq!(set.is_flat(), flat, "planned to {highest}");
+            for k in 0..count {
+                set.hold(k * BIT_RATIO);
+            }
+            set.hold(highest);
+            assert_eq!(set.is_flat(), flat, "held to {highest}");
+        }
+
+        let extent = 4 * PAGE_IDS;
+        let mut set = Bitmap::default();
+        for slot in 0..extent {
+            set.hold(slot);
+        }
+        let mut held = extent;
+        for slot in (0..extent).filter(|slot| slot % (2 * BIT_RATIO) != 0) {
+            set.release(slot);
+            held -= 1;
+            assert_eq!(set.is_flat(), 2 * BIT_RATIO * held >= extent, "{held} held");
+        }
+        assert!(set.is_flat(), "one id in twice the ratio stays flat");
+        set.release(0);
+        assert!(!set.is_flat(), "one fewer pages out");
+
+        for gaps in [
+            [BIT_RATIO + 1, BIT_RATIO - 1],
+            [BIT_RATIO + 1, BIT_RATIO + 1],
+        ] {
+            for start in [0usize, 1, 63, 64, 127] {
+                let mut set = Bitmap::default();
+                let (mut slot, mut changes, mut last) = (start, 0, true);
+                for k in 0..count {
+                    set.hold(slot);
+                    changes += usize::from(set.is_flat() != last);
+                    last = set.is_flat();
+                    slot += gaps[k % 2];
+                }
+                assert!(
+                    changes <= 1,
+                    "gaps {gaps:?} from {start}, {changes} changes"
+                );
+                assert_eq!(set.count(), count);
+            }
+        }
+    }
+
+    /// The set one `set` at a time builds from `slots` in `blank`.
+    fn one_at_a_time(mut blank: Bitmap, slots: &[usize]) -> Bitmap {
+        for &slot in slots {
+            blank.set(slot);
+        }
+        blank
+    }
+
+    /// The set a fill builds from `slots` in `blank`.
+    fn filled(mut blank: Bitmap, slots: &[usize]) -> Bitmap {
+        {
+            let mut fill = blank.fill();
+            for &slot in slots {
+                fill.push(slot);
+            }
+        }
+        blank
+    }
+
+    /// A set filled in increasing order holds what one `set` at a time puts
+    /// in, in the same form: a flat set's words, and a paged set's table and
+    /// each page's number, kind, words and offsets. The runs cross every
+    /// change of kind one insertion at a time makes: words from the fourth id,
+    /// words that turn short, words that turn ranked, a short page that turns
+    /// ranked, a ranked page that turns to words late, gaps that cross both
+    /// ratios, a few ids in many pages, and random sets at four densities.
+    #[test]
+    fn a_set_filled_in_increasing_order_takes_the_form_one_set_at_a_time_gives() {
+        let mut runs: Vec<Vec<usize>> = vec![
+            (0..200).chain(4_000..4_100).chain(60_000..60_500).collect(),
+            (0..9).chain([1_000, 5_000, 9_000]).collect(),
+            (0..40).chain((1..200).map(|k| 40 + k * 300)).collect(),
+            (0..33).map(|k| k * 1_500).chain(50_000..60_000).collect(),
+            (0..40).map(|k| k * 100_003 + 11).collect(),
+        ];
+        let (mut slot, mut gaps) = (0usize, Vec::new());
+        for k in 0..6_000usize {
+            gaps.push(slot);
+            slot += 1 + (k * 7) % 70;
+        }
+        runs.push(gaps);
+        let mut stream = Stream(0xABCD);
+        for density in [3usize, 20, 100, 900] {
+            runs.push(
+                (0..5 * PAGE_IDS)
+                    .filter(|_| (stream.next() as usize).is_multiple_of(density))
+                    .collect(),
+            );
+        }
+        let mut kinds = BTreeSet::new();
+        for slots in &runs {
+            let range = slots.last().map_or(0, |&slot| slot + 1);
+            for paged in [true, false] {
+                let blank = || {
+                    if paged {
+                        Bitmap::paged()
+                    } else {
+                        Bitmap::zeros(range)
+                    }
+                };
+                let reference = one_at_a_time(blank(), slots);
+                let filled = filled(blank(), slots);
+                assert_eq!(filled.snapshot(), reference.snapshot(), "paged {paged}");
+                assert_eq!(filled.held, reference.held);
+                assert_eq!(ids(&filled), *slots);
+                kinds.extend(reference.snapshot().2.iter().map(|page| page.1));
+            }
+        }
+        assert_eq!(
+            kinds,
+            BTreeSet::from([0, 1, 2]),
+            "every page kind is reached"
+        );
+
+        let mut set = Bitmap::paged();
+        {
+            let mut fill = set.fill();
+            for slot in [5usize, 9, 3, 9, PAGE_IDS + 2, 7] {
+                fill.push(slot);
+            }
+        }
+        assert_eq!(
+            ids(&set),
+            vec![3, 5, 7, 9, PAGE_IDS + 2],
+            "ids out of order all go in"
+        );
+        assert_eq!(set.count(), 5);
     }
 }

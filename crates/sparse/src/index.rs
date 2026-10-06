@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 use zeusdb_vector_core::{
-    Admit, Bitmap, Budget, CorpusStats, Cost, Dir, Error, Hits, IdMap, Inventory, Ledger, Persist,
-    Prepared, RecordId, Restore, Selectivity, Sparse, SparseRef, SparseVector, Vacant, VectorIndex,
+    lookup_ratio, Admit, Bitmap, Budget, CorpusStats, Cost, Dir, Error, Hits, IdMap, Inventory,
+    Ledger, Persist, Prepared, RecordId, Restore, Selectivity, Sparse, SparseRef, SparseVector,
+    Vacant, VectorIndex,
 };
 
 use crate::calibrate::UnitCosts;
@@ -223,6 +224,11 @@ pub(crate) struct Slot {
     pub(crate) len: u32,
 }
 
+/// Ids of its extent the record table and the lengths hold flat for each
+/// record: the ratio of a map a search looks up, for the table's eight-byte
+/// entries. The lengths take it too, so the two keep one form.
+pub(crate) const RECORD_RATIO: usize = lookup_ratio(std::mem::size_of::<Slot>());
+
 const NEVER_HELD: Slot = Slot {
     start: 0,
     len: u32::MAX,
@@ -289,14 +295,14 @@ pub struct PostingsIndex {
     /// ids the space holds are dense and paged once they are sparse, so it
     /// costs what the records cost; see `IdMap`. Its extent is one past the
     /// largest id ever inserted, which the artefact records as its slot
-    /// count.
-    pub(crate) records: IdMap<Slot>,
+    /// count. It stays flat to [`RECORD_RATIO`] ids a record.
+    pub(crate) records: IdMap<Slot, RECORD_RATIO>,
     /// Each record's length, being the sum of its values, by record id and
     /// entry for entry with `records`, so in the same form. What a term
     /// frequency weighting normalises by, read once per posting the scan
     /// admits. Kept under every weighting, since it costs four bytes a
     /// record and one sum an insert.
-    pub(crate) lengths: IdMap<f32>,
+    pub(crate) lengths: IdMap<f32, RECORD_RATIO>,
     /// Records removed and not yet compacted out. Held in the form of
     /// `records`, since it holds a few of them and its own count says
     /// nothing about the range their ids span.
@@ -880,6 +886,34 @@ mod tests {
         SparseVector {
             dims: dims.to_vec(),
             values: values.to_vec(),
+        }
+    }
+
+    /// The record table and the lengths stay flat together while the space
+    /// holds one record in eight ids or more past the floor, and page out
+    /// together below that.
+    #[test]
+    fn the_record_table_and_lengths_stay_flat_to_their_ratio() {
+        assert_eq!(RECORD_RATIO, 8);
+        for (gap, flat) in [
+            (RECORD_RATIO - 1, true),
+            (RECORD_RATIO, true),
+            (RECORD_RATIO + 1, false),
+        ] {
+            let mut index = PostingsIndex::new(SparseConfig::default());
+            for k in 0..2_000u32 {
+                let vector = sparse(&[1 + k % 5], &[1.0]);
+                index
+                    .insert_record(RecordId(k * gap as u32), vector.as_ref())
+                    .unwrap();
+            }
+            assert_eq!(index.records.is_flat(), flat, "records, one id in {gap}");
+            assert_eq!(index.lengths.is_flat(), flat, "lengths, one id in {gap}");
+            assert_eq!(
+                index.dead.is_flat(),
+                flat,
+                "the dead set follows the records"
+            );
         }
     }
 

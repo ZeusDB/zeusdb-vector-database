@@ -301,16 +301,33 @@ impl Column {
 
     /// One leaf of a filter, as the set of internal ids whose value matches,
     /// put into `out`, an empty set in the store's form.
+    ///
+    /// A flat column is walked as the vector it is, every slot in turn. A
+    /// paged one is walked page by page through the entries it holds, and
+    /// its matches fill `out`, which builds each page of a paged result once
+    /// its ids are in.
     fn select(&self, test: &FieldTest, mut out: Bitmap) -> Bitmap {
         match self {
             Column::Plain { values } => {
-                for (slot, cell) in values.iter() {
-                    if cell
-                        .value()
-                        .is_some_and(|value| field_test_matches(value, test))
-                    {
-                        out.set(slot);
+                if values.is_flat() {
+                    for (slot, cell) in values.iter() {
+                        if cell
+                            .value()
+                            .is_some_and(|value| field_test_matches(value, test))
+                        {
+                            out.set(slot);
+                        }
                     }
+                } else {
+                    let mut fill = out.fill();
+                    values.for_each(|slot, cell| {
+                        if cell
+                            .value()
+                            .is_some_and(|value| field_test_matches(value, test))
+                        {
+                            fill.push(slot);
+                        }
+                    });
                 }
             }
             Column::Dictionary {
@@ -330,10 +347,7 @@ impl Column {
                 if !any {
                     return out;
                 }
-                // A flat column is walked as the vector it is, which is the
-                // loop a dense collection has always run, and a paged one
-                // through the entries it holds. A code below `MISSING` names
-                // a value.
+                // A code below `MISSING` names a value.
                 match codes.as_flat() {
                     Some(flat) => {
                         for (slot, &code) in flat.iter().enumerate() {
@@ -343,11 +357,12 @@ impl Column {
                         }
                     }
                     None => {
-                        for (slot, &code) in codes.iter() {
+                        let mut fill = out.fill();
+                        codes.for_each(|slot, &code| {
                             if code != MISSING && matching[code as usize] {
-                                out.set(slot);
+                                fill.push(slot);
                             }
-                        }
+                        });
                     }
                 }
             }
@@ -359,14 +374,24 @@ impl Column {
     /// into `out`.
     ///
     /// This is what answers `exists` and `is_missing`. The caller intersects
-    /// with the live set rather than trusting it alone, as it always has.
+    /// with the live set rather than trusting it alone, as it always has. A
+    /// column is walked as [`Column::select`] walks it.
     fn present(&self, mut out: Bitmap) -> Bitmap {
         match self {
             Column::Plain { values } => {
-                for (slot, cell) in values.iter() {
-                    if cell.value().is_some() {
-                        out.set(slot);
+                if values.is_flat() {
+                    for (slot, cell) in values.iter() {
+                        if cell.value().is_some() {
+                            out.set(slot);
+                        }
                     }
+                } else {
+                    let mut fill = out.fill();
+                    values.for_each(|slot, cell| {
+                        if cell.value().is_some() {
+                            fill.push(slot);
+                        }
+                    });
                 }
             }
             Column::Dictionary { codes, .. } => match codes.as_flat() {
@@ -378,11 +403,12 @@ impl Column {
                     }
                 }
                 None => {
-                    for (slot, &code) in codes.iter() {
+                    let mut fill = out.fill();
+                    codes.for_each(|slot, &code| {
                         if code != MISSING {
-                            out.set(slot);
+                            fill.push(slot);
                         }
-                    }
+                    });
                 }
             },
         }
@@ -1602,5 +1628,86 @@ mod tests {
         assert_eq!(store.record_count(), 400 - 400usize.div_ceil(7));
         check(&store, &rewritten);
         assert!(store.tracks(400 - 400usize.div_ceil(7)));
+    }
+
+    /// The set a walk that puts each match into `blank` one `set` at a time
+    /// builds over `column`, every match in increasing id order: the values
+    /// `test` matches, or every value present where there is no test.
+    fn one_match_at_a_time(column: &Column, test: Option<&FieldTest>, mut blank: Bitmap) -> Bitmap {
+        let matches = |value: &Value| test.is_none_or(|test| field_test_matches(value, test));
+        match column {
+            Column::Plain { values } => {
+                for (slot, cell) in values.iter() {
+                    if cell.value().is_some_and(matches) {
+                        blank.set(slot);
+                    }
+                }
+            }
+            Column::Dictionary { codes, dict, .. } => {
+                for (slot, &code) in codes.iter() {
+                    if code != MISSING && matches(&dict[code as usize]) {
+                        blank.set(slot);
+                    }
+                }
+            }
+        }
+        blank
+    }
+
+    /// A paged column, dictionary and plain, selects and finds present the
+    /// same set in the same form that putting each match in one at a time
+    /// gives, into a paged blank and into a flat one: the table and each
+    /// page's number, kind, words and offsets, or the words. The column's
+    /// pages are dense, short and ranked, and the results reach every page
+    /// kind.
+    #[test]
+    fn a_paged_column_selects_the_set_and_form_one_match_at_a_time_gives() {
+        let mut slots: Vec<usize> = (1..3_000).collect();
+        slots.extend((0..20).map(|k| 2 * crate::idmap::PAGE_IDS + k * 3_001));
+        slots.extend((0..2_000).map(|k| 3 * crate::idmap::PAGE_IDS + k * 29));
+        slots.extend((0..600).map(|k| 6 * crate::idmap::PAGE_IDS + k * 7));
+        let value = |slot: usize| json!(["a", "b", "c", "d", "e"][slot % 5]);
+        let mut dictionary = Column::new(0);
+        let mut plain = Column::Plain {
+            values: IdMap::new(),
+        };
+        for &slot in &slots {
+            let held = (slot % 7 != 0).then(|| value(slot));
+            dictionary.write(slot, held.as_ref());
+            plain.write(slot, held.as_ref());
+        }
+        assert!(matches!(&dictionary, Column::Dictionary { codes, .. } if !codes.is_flat()));
+        assert!(matches!(&plain, Column::Plain { values } if !values.is_flat()));
+
+        let tests = [
+            FieldTest::Equals(json!("b")),
+            FieldTest::Operators(vec![(crate::filter::Op::In, json!(["a", "e"]))]),
+            FieldTest::Equals(json!("z")),
+        ];
+        let range = slots.last().map_or(0, |&slot| slot + 1);
+        let mut kinds = std::collections::BTreeSet::new();
+        for column in [&dictionary, &plain] {
+            for paged in [true, false] {
+                let blank = || {
+                    if paged {
+                        Bitmap::paged()
+                    } else {
+                        Bitmap::zeros(range)
+                    }
+                };
+                for test in &tests {
+                    let got = column.select(test, blank());
+                    let want = one_match_at_a_time(column, Some(test), blank());
+                    assert_eq!(got.snapshot(), want.snapshot(), "paged {paged}");
+                    assert_eq!(bits(&got), bits(&want));
+                    kinds.extend(want.snapshot().2.iter().map(|page| page.1));
+                }
+                let got = column.present(blank());
+                let want = one_match_at_a_time(column, None, blank());
+                assert_eq!(got.snapshot(), want.snapshot(), "present, paged {paged}");
+                assert_eq!(bits(&got), bits(&want));
+            }
+        }
+        assert_eq!(kinds, std::collections::BTreeSet::from([0, 1, 2]));
     }
 }

@@ -62,7 +62,7 @@ mod storage;
 mod test_vectors;
 
 pub use admit::{Admit, And, Candidates};
-pub use bitmap::Bitmap;
+pub use bitmap::{BitCursor, Bitmap};
 pub use checksum::checksum_of;
 pub use columns::{validate_indexed_fields, ColumnStore, Selection};
 pub use distance::{CosineDist, DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric};
@@ -78,7 +78,7 @@ pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES, NB_LAYER_MAX};
 pub use graph::{
     restore_graph, restore_int8_graph, Distance, DumpBounds, GraphHit, Planned, Record, VectorGraph,
 };
-pub use idmap::{IdMap, Vacant, PAGE_IDS};
+pub use idmap::{lookup_ratio, IdCursor, IdMap, Vacant, LOOKUP_BYTES, PAGE_IDS};
 pub use ids::{IdStore, MAX_INTERNAL_ID};
 pub use int8::Int8Codec;
 pub use journal::{

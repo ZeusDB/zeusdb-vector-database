@@ -321,7 +321,7 @@ impl Lengths for [f32] {
     }
 }
 
-impl Lengths for IdMap<f32> {
+impl<const RATIO: usize> Lengths for IdMap<f32, RATIO> {
     #[inline]
     fn length(&self, id: u32) -> f32 {
         self.get(id as usize).copied().unwrap_or(0.0)

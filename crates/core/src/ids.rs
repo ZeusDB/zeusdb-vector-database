@@ -39,7 +39,7 @@
 
 use crate::bitmap::Bitmap;
 use crate::error::Error;
-use crate::idmap::IdMap;
+use crate::idmap::{lookup_ratio, IdMap};
 use std::hash::{BuildHasher, RandomState};
 
 /// Bits of an entry that hold the text's offset. Sixty-four gibibytes of id
@@ -56,6 +56,10 @@ const MAX_ID_LEN: u64 = (1u64 << LEN_BITS) - 1;
 const ABSENT: u64 = u64::MAX;
 /// A bucket that holds no internal id.
 const EMPTY: u32 = u32::MAX;
+
+/// Ids of its extent the entries hold flat for each record: the ratio of a
+/// map a search looks up, for their eight-byte entries.
+const ENTRY_RATIO: usize = lookup_ratio(std::mem::size_of::<u64>());
 /// The last internal id the store holds. A slot is a `u32` and the store
 /// keeps `u32::MAX` for the empty bucket, so the last id is the one below it.
 /// `add` issues no id past this one and a replay installs none, so neither
@@ -100,8 +104,9 @@ pub struct IdStore {
     /// every offset an entry names is a character boundary.
     text: String,
     /// One entry per record, by internal id: the offset and the length of
-    /// its text. [`ABSENT`] is the map's absent value.
-    entries: IdMap<u64>,
+    /// its text. [`ABSENT`] is the map's absent value. It stays flat to
+    /// [`ENTRY_RATIO`] ids a record.
+    entries: IdMap<u64, ENTRY_RATIO>,
     /// The forward table, a power of two of buckets each holding an internal
     /// id or [`EMPTY`], probed linearly.
     buckets: Vec<u32>,
@@ -497,6 +502,30 @@ impl IdStore {
 mod tests {
     use super::*;
     use crate::idmap::PAGE_IDS;
+
+    /// The entries stay flat while the store holds one record in eight ids or
+    /// more past the floor, grown in increasing order and by a run's plan,
+    /// and page out below that.
+    #[test]
+    fn the_entries_stay_flat_to_their_ratio() {
+        assert_eq!(ENTRY_RATIO, 8);
+        for (gap, flat) in [
+            (ENTRY_RATIO - 1, true),
+            (ENTRY_RATIO, true),
+            (ENTRY_RATIO + 1, false),
+        ] {
+            let mut grown = IdStore::new(10);
+            let mut planned = IdStore::new(10);
+            planned.reserve(2_000, 1_999 * gap);
+            for k in 0..2_000usize {
+                grown.insert(k * gap, &format!("r{k}")).unwrap();
+                planned.insert(k * gap, &format!("r{k}")).unwrap();
+            }
+            assert_eq!(grown.entries.is_flat(), flat, "grown, one id in {gap}");
+            assert_eq!(planned.entries.is_flat(), flat, "planned, one id in {gap}");
+            assert_eq!(grown.len(), 2_000);
+        }
+    }
 
     /// What goes in comes back both ways, the empty id included, and a
     /// name the store does not hold resolves to nothing.

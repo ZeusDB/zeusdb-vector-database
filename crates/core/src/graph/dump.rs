@@ -3390,6 +3390,39 @@ mod tests {
         assert_eq!(pages(&read_again, &read_again_store), built_pages);
     }
 
+    /// A graph keeps its id-to-node map flat while it holds one node in its
+    /// ratio of ids or more and pages it below that: nodes inserted under ids
+    /// one less than the ratio apart and the ratio apart keep it flat past the
+    /// floor, and one more than the ratio apart page it out.
+    #[test]
+    fn a_graph_keeps_its_id_to_node_map_flat_to_its_ratio() {
+        use crate::graph::mutable::NODE_RATIO;
+        let (dim, m, nodes) = (4, 8, 600usize);
+        let scale = super::super::levels::LevelGenerator::default_scale(m);
+        assert_eq!(NODE_RATIO, 16);
+        for (gap, flat) in [
+            (NODE_RATIO - 1, true),
+            (NODE_RATIO, true),
+            (NODE_RATIO + 1, false),
+        ] {
+            let mut levels =
+                super::super::levels::LevelGenerator::new(scale, NB_LAYER_MAX as usize);
+            let (mut graph, mut store) =
+                MutableGraph::new(dim, m, 64, scale, 16, CosineDist {}).unwrap();
+            for k in 0..nodes {
+                let vector = [1.0 + k as f32, 0.5, 0.25, (k % 7) as f32];
+                graph.insert(&mut store, &vector, k * gap, &mut levels);
+            }
+            assert_eq!(graph.id_map_is_flat(), flat, "nodes {gap} ids apart");
+            for k in 0..nodes {
+                assert_eq!(
+                    graph.node_of(k * gap).map(|node| graph.origin_id_of(node)),
+                    Some(k * gap)
+                );
+            }
+        }
+    }
+
     /// A graph whose nodes sit under ids spread far apart, as a collection's
     /// do after churn, holds its id-to-node map paged as built and as read
     /// back. The reader builds the reference's graph buffer for buffer and

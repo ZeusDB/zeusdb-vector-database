@@ -454,10 +454,12 @@ fn every_record_removed_with_the_counter_kept_then_new_records() {
 ///
 /// The two take the same operations at the same internal ids and differ in
 /// their declared size alone, which keeps every map of the larger one flat
-/// within its reservation while the smaller one's maps page out. Every record
-/// set stays flat in both, its extent being under one page, and a loaded
-/// graph's id-to-node map pages out in both, since a load reserves nothing
-/// for it.
+/// within its reservation while the smaller one's metadata and columns page
+/// out. The smaller one's id store entries stay flat as built, since a
+/// removal pages them out only below one record in twice their ratio, and a
+/// load's plan pages them. Every record set stays flat in both, its extent
+/// being under one page, and the graph's id-to-node map stays flat in both,
+/// its records filling one id in ten, within its ratio.
 #[test]
 fn a_paged_collection_answers_and_writes_what_a_flat_one_does() {
     let temp = TempDir::new();
@@ -469,12 +471,12 @@ fn a_paged_collection_answers_and_writes_what_a_flat_one_does() {
         collection.compact().unwrap();
     }
     let maps_paged = Forms {
-        ids: false,
+        ids: true,
         ids_live: true,
         metadata: false,
         columns: false,
         dense_live: true,
-        id_map: false,
+        id_map: true,
         sparse: None,
     };
     assert_eq!(forms(&paged), maps_paged);
@@ -496,7 +498,14 @@ fn a_paged_collection_answers_and_writes_what_a_flat_one_does() {
 
     let paged = reload(&paged, &temp, "paged.zdb");
     let flat = reload(&flat, &temp, "flat.zdb");
-    assert_eq!(forms(&paged), maps_paged, "loaded");
+    assert_eq!(
+        forms(&paged),
+        Forms {
+            ids: false,
+            ..maps_paged
+        },
+        "loaded"
+    );
     let loaded_flat = forms(&flat);
     assert!(loaded_flat.ids && loaded_flat.metadata && loaded_flat.columns);
     same(&paged, &flat, "after a load");
@@ -608,4 +617,33 @@ fn a_journal_replays_into_a_collection_whose_ids_are_sparse() {
     assert!(!report.graph_rebuilt);
     assert_eq!((ids_of(&again), pages(&again), again.id_counter()), before);
     assert!(!forms(&again).ids && !forms(&again).id_map);
+}
+
+/// A collection keeps its graph's id-to-node map flat while it holds one
+/// record in sixteen ids or more and pages it below that, as built and
+/// compacted and after a load: one record in eleven keeps it flat and one in
+/// twenty pages it. Each answers the pages a collection holding the same
+/// records with every map flat answers, its filtered searches scoring their
+/// admitted records exactly, in increasing id order.
+#[test]
+fn a_collection_keeps_its_id_to_node_map_flat_to_its_ratio() {
+    let temp = TempDir::new();
+    for (every, flat_map) in [(11u32, true), (20, false)] {
+        let thinned = Collection::build(declaration(100, false), None);
+        let held = Collection::build(declaration(13_000, false), None);
+        for collection in [&thinned, &held] {
+            for batch in 0..120u32 {
+                let records = batch * 100..(batch + 1) * 100;
+                add(collection, records.clone(), false);
+                remove(collection, records, |i| i % every != every - 1);
+            }
+            collection.compact().unwrap();
+        }
+        assert_eq!(forms(&thinned).id_map, flat_map, "one in {every}");
+        assert_eq!(forms(&held), all_flat(false), "one in {every}, declared");
+        assert_eq!(pages(&thinned), pages(&held), "one in {every}");
+        let loaded = reload(&thinned, &temp, &format!("ratio-{every}.zdb"));
+        assert_eq!(forms(&loaded).id_map, flat_map, "loaded, one in {every}");
+        assert_eq!(pages(&loaded), pages(&held), "loaded, one in {every}");
+    }
 }

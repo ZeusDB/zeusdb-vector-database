@@ -131,7 +131,7 @@ use super::dump::{AdjacencyWalk, LoadedEdge, PointId};
 use super::store::VectorStore;
 use super::traverse::{self, Topology, LAYERS};
 use super::{Distance, GraphHit};
-use crate::idmap::IdMap;
+use crate::idmap::{lookup_ratio, IdCursor, IdMap};
 
 mod insert;
 
@@ -175,6 +175,10 @@ const WORD_WIDE: u32 = 1 << 31;
 /// geometrically, so a 50,000 record build at dimension 1,536 crosses it twice
 /// and moves roughly 400 MB in total, against a build that takes 70 seconds.
 pub(super) const RESERVE_BYTES: usize = 1 << 27;
+
+/// Ids of its extent the id-to-node map holds flat for each node: the ratio
+/// of a map a search looks up, for its four-byte entries.
+pub(super) const NODE_RATIO: usize = lookup_ratio(std::mem::size_of::<u32>());
 
 /// Records the reservation is taken for, being `expected_size` or as many as
 /// [`RESERVE_BYTES`] holds, whichever is smaller.
@@ -334,8 +338,9 @@ pub(super) struct MutableGraph<T, D> {
     /// graph changes, which means it is covered by the graph's own lock and
     /// there is no second structure to keep in step. An [`IdMap`], so it
     /// costs what the nodes cost however far apart their ids are: one `u32`
-    /// a slot while the ids are dense, and pages once they are sparse.
-    node_of: IdMap<u32>,
+    /// a slot while the ids are dense, and pages once they are sparse. It
+    /// stays flat to [`NODE_RATIO`] ids a node.
+    node_of: IdMap<u32, NODE_RATIO>,
 
     /// Layer zero targets, node `n` at `[n * base_cap, ..)`.
     base_targets: Vec<u32>,
@@ -929,6 +934,12 @@ where
     /// largest, rather than paged.
     pub(super) fn id_map_is_flat(&self) -> bool {
         self.node_of.is_flat()
+    }
+
+    /// A cursor over the id-to-node map, for reads at ids in increasing
+    /// order; see [`IdCursor`].
+    pub(super) fn node_cursor(&self) -> IdCursor<'_, u32> {
+        self.node_of.cursor()
     }
 
     /// Bytes the id-to-node map holds, for a test that holds the rest of

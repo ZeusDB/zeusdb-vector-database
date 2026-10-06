@@ -57,11 +57,16 @@
 //!
 //! The map's extent is one past the largest id it has written. A growth past
 //! the map's capacity, its reservation, a planned run's extent and
-//! [`FLAT_FLOOR`] stays flat while the extent is at most [`FLAT_RATIO`] times
+//! [`FLAT_FLOOR`] stays flat while the extent is at most the map's ratio times
 //! the entries. A removal pages the map out where its extent is past the floor
 //! and the reservation and is more than twice that ratio times the entries,
 //! which leaves a margin between the two rules. A paged map stays paged until
 //! its owner replaces it.
+//!
+//! The ratio is the map's second parameter, [`FLAT_RATIO`] where its owner
+//! names none. A map that takes [`lookup_ratio`] of its entry's size stays
+//! flat while its vector costs at most [`LOOKUP_BYTES`] for each entry it
+//! holds.
 //!
 //! # A lookup
 //!
@@ -69,6 +74,14 @@
 //! read the vector took. Only an id past the vector goes on to the table and
 //! the page. A dense page answers in one read, a short page by a bisection of
 //! at most [`SHORT_LIMIT`] offsets, and a ranked page in three reads.
+//!
+//! # Reads in increasing order
+//!
+//! An [`IdCursor`] answers what [`IdMap::get`] answers at every id, and keeps
+//! the page it read last, so ids read in increasing order resolve each page
+//! once. Within the page it reads a dense page by offset, moves a position
+//! forward over a short page's offsets, and reads a ranked page from the
+//! summary word and the group it read last where the id falls in them.
 
 /// Bits of an internal id below its page number.
 const PAGE_SHIFT: u32 = 16;
@@ -85,8 +98,19 @@ const NO_PAGE: u32 = u32::MAX;
 /// The extent at or below which a flat map never pages out.
 pub(crate) const FLAT_FLOOR: usize = 4_096;
 
-/// Ids of its extent a flat map may hold for each entry when it grows.
+/// Ids of its extent a flat map may hold for each entry when it grows, where
+/// its owner names no other ratio.
 pub(crate) const FLAT_RATIO: usize = 4;
+
+/// Bytes of vector a flat map that a search looks up may cost for each entry
+/// it holds when it grows.
+pub const LOOKUP_BYTES: usize = 64;
+
+/// The ratio of a map that a search looks up, for entries of `bytes` bytes:
+/// the ids whose slots cost [`LOOKUP_BYTES`].
+pub const fn lookup_ratio(bytes: usize) -> usize {
+    LOOKUP_BYTES / bytes
+}
 
 /// Offsets of its span a dense page may hold for each entry.
 pub(crate) const PAGE_RATIO: usize = 4;
@@ -683,6 +707,170 @@ impl<T: Vacant> Page<T> {
             )
         }
     }
+
+    /// The entries [`Page::iter`] yields, in the same order, each kind by
+    /// its own loop. A ranked page is read through its summary words' set
+    /// bits and then each held group's set bits, its values in order.
+    fn for_each(&self, visit: &mut impl FnMut(usize, &T)) {
+        let base = self.base();
+        if self.dense {
+            for (offset, value) in self.values.iter().enumerate() {
+                if !value.is_vacant() {
+                    visit(base + offset, value);
+                }
+            }
+        } else if self.ranked {
+            let mut values = self.values.iter();
+            let mut index = SUMMARY_WORDS;
+            for word in 0..SUMMARY_WORDS {
+                let mut summary = record(&self.offsets, word).0;
+                while summary != 0 {
+                    let group = word * 64 + summary.trailing_zeros() as usize;
+                    summary &= summary - 1;
+                    let mut members = record(&self.offsets, index).0;
+                    index += 1;
+                    while members != 0 {
+                        let offset = group * 64 + members.trailing_zeros() as usize;
+                        members &= members - 1;
+                        if let Some(value) = values.next() {
+                            visit(base + offset, value);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (&offset, value) in self.offsets.iter().zip(&self.values) {
+                visit(base + offset as usize, value);
+            }
+        }
+    }
+}
+
+/// Reads of a map at ids in increasing order, each answering what
+/// [`IdMap::get`] answers at the same id. See the module.
+pub struct IdCursor<'a, T> {
+    /// The map's vector while it is flat.
+    flat: &'a [T],
+    /// The pages, once the map is paged.
+    pages: Option<&'a Pages<T>>,
+    /// The number of the page the cursor stands in, or `usize::MAX` before
+    /// its first read of a paged map.
+    number: usize,
+    /// That page, where the map holds one.
+    page: Option<&'a Page<T>>,
+    /// The offset read last in the page.
+    last: usize,
+    /// On a short page, the place of the first offset not below `last`.
+    at: usize,
+    /// On a ranked page, the summary word read last, or `usize::MAX`, and its
+    /// rank record.
+    word: usize,
+    summary: u64,
+    held: u16,
+    /// On a ranked page, the group read last, or `usize::MAX`, and its rank
+    /// record, a word of zero where the page holds no entry in it.
+    group: usize,
+    members: u64,
+    before: u16,
+}
+
+impl<'a, T: Vacant> IdCursor<'a, T> {
+    fn new(flat: &'a [T], pages: Option<&'a Pages<T>>) -> Self {
+        IdCursor {
+            flat,
+            pages,
+            number: usize::MAX,
+            page: None,
+            last: 0,
+            at: 0,
+            word: usize::MAX,
+            summary: 0,
+            held: 0,
+            group: usize::MAX,
+            members: 0,
+            before: 0,
+        }
+    }
+
+    /// The entry at `id`. Total over every `usize`, in any order. Only a
+    /// read in another page than the last resolves a page.
+    #[inline]
+    pub fn get(&mut self, id: usize) -> Option<&'a T> {
+        let Some(pages) = self.pages else {
+            return self.flat.get(id).filter(|value| !value.is_vacant());
+        };
+        let number = id >> PAGE_SHIFT;
+        let offset = id & OFFSET_MASK;
+        if number != self.number {
+            self.enter(pages, number);
+        } else if offset < self.last {
+            self.at = 0;
+        }
+        self.last = offset;
+        let page = self.page?;
+        if page.dense {
+            page.values.get(offset).filter(|value| !value.is_vacant())
+        } else if page.ranked {
+            let at = self.ranked_place(page, offset)?;
+            Some(&page.values[at])
+        } else {
+            let at = self.short_place(page, offset)?;
+            Some(&page.values[at])
+        }
+    }
+
+    /// Stand in page `number`, which the map may hold no entry in.
+    #[cold]
+    #[inline(never)]
+    fn enter(&mut self, pages: &'a Pages<T>, number: usize) {
+        self.number = number;
+        self.page = pages.page(number);
+        self.at = 0;
+        self.word = usize::MAX;
+        self.group = usize::MAX;
+    }
+
+    /// The place among a short page's values of the entry at `offset`, the
+    /// position moving forward past every offset below it.
+    #[inline]
+    fn short_place(&mut self, page: &Page<T>, offset: usize) -> Option<usize> {
+        let key = offset as u16;
+        while page.offsets.get(self.at).is_some_and(|&held| held < key) {
+            self.at += 1;
+        }
+        (page.offsets.get(self.at) == Some(&key)).then_some(self.at)
+    }
+
+    /// The place among a ranked page's values of the entry at `offset`, as
+    /// [`Page::ranked_place`] gives it, reading a summary record only for a
+    /// summary word other than the last and a group record only for a group
+    /// other than the last.
+    #[inline]
+    fn ranked_place(&mut self, page: &Page<T>, offset: usize) -> Option<usize> {
+        let group = offset >> 6;
+        if group != self.group {
+            let word = group >> 6;
+            if word != self.word {
+                (self.summary, self.held) = record(&page.offsets, word);
+                self.word = word;
+            }
+            self.group = group;
+            let bit = 1u64 << (group & 63);
+            if self.summary & bit == 0 {
+                self.members = 0;
+            } else {
+                let index = SUMMARY_WORDS
+                    + usize::from(self.held)
+                    + (self.summary & (bit - 1)).count_ones() as usize;
+                (self.members, self.before) = record(&page.offsets, index);
+            }
+        }
+        let low = 1u64 << (offset & 63);
+        if self.members & low == 0 {
+            return None;
+        }
+        Some(usize::from(self.before) + (self.members & (low - 1)).count_ones() as usize)
+    }
 }
 
 /// The paged form: the table, the arena and the extent.
@@ -789,9 +977,10 @@ impl<T: Vacant> Pages<T> {
     }
 }
 
-/// A value for each internal id a structure holds. See the module.
+/// A value for each internal id a structure holds, flat while its extent is
+/// at most `RATIO` ids for each entry. See the module.
 #[derive(Clone)]
-pub struct IdMap<T> {
+pub struct IdMap<T, const RATIO: usize = FLAT_RATIO> {
     /// Every entry by id while the map is flat. Empty once it is paged.
     flat: Vec<T>,
     /// The pages, once the map is paged.
@@ -806,7 +995,7 @@ pub struct IdMap<T> {
     planned: usize,
 }
 
-impl<T> Default for IdMap<T> {
+impl<T, const RATIO: usize> Default for IdMap<T, RATIO> {
     fn default() -> Self {
         IdMap {
             flat: Vec::new(),
@@ -818,7 +1007,7 @@ impl<T> Default for IdMap<T> {
     }
 }
 
-impl<T: Vacant> IdMap<T> {
+impl<T: Vacant, const RATIO: usize> IdMap<T, RATIO> {
     /// An empty flat map that has asked the allocator for nothing.
     pub fn new() -> Self {
         Self::default()
@@ -857,7 +1046,7 @@ impl<T: Vacant> IdMap<T> {
         let extent = highest.saturating_add(1);
         let held = self.held.saturating_add(records);
         if extent <= FLAT_FLOOR.max(self.reserved).max(self.flat.capacity())
-            || extent <= FLAT_RATIO.saturating_mul(held)
+            || extent <= RATIO.saturating_mul(held)
         {
             self.planned = self.planned.max(extent);
         } else {
@@ -989,11 +1178,11 @@ impl<T: Vacant> IdMap<T> {
 
     /// Whether a flat map may grow to `extent`: inside its allocation, its
     /// reservation, a planned run or the floor, or while it holds at least
-    /// one entry in [`FLAT_RATIO`] of the extent once the entry is in.
+    /// one entry in `RATIO` ids of the extent once the entry is in.
     fn flat_may_reach(&self, extent: usize) -> bool {
         extent <= self.flat.capacity()
             || extent <= FLAT_FLOOR.max(self.reserved).max(self.planned)
-            || extent <= FLAT_RATIO.saturating_mul(self.held + 1)
+            || extent <= RATIO.saturating_mul(self.held + 1)
     }
 
     /// Take the entry at `id` out and hand it back.
@@ -1007,7 +1196,7 @@ impl<T: Vacant> IdMap<T> {
             self.held -= 1;
             let extent = self.flat.len();
             if extent > FLAT_FLOOR.max(self.reserved)
-                && (2 * FLAT_RATIO).saturating_mul(self.held) < extent
+                && (2 * RATIO).saturating_mul(self.held) < extent
             {
                 self.page_out();
             }
@@ -1081,6 +1270,32 @@ impl<T: Vacant> IdMap<T> {
         flat.chain(paged)
     }
 
+    /// Every entry as its id and its value, in increasing id order, as
+    /// [`IdMap::iter`] yields them. A paged map is walked page by page, each
+    /// page kind by its own loop.
+    pub fn for_each(&self, mut visit: impl FnMut(usize, &T)) {
+        match self.paged.as_deref() {
+            None => {
+                for (id, value) in self.flat.iter().enumerate() {
+                    if !value.is_vacant() {
+                        visit(id, value);
+                    }
+                }
+            }
+            Some(pages) => {
+                for page in &pages.pages {
+                    page.for_each(&mut visit);
+                }
+            }
+        }
+    }
+
+    /// A cursor that reads the map at ids in increasing order; see
+    /// [`IdCursor`].
+    pub fn cursor(&self) -> IdCursor<'_, T> {
+        IdCursor::new(&self.flat, self.paged.as_deref())
+    }
+
     /// Every entry as its id and its value to change in place, in increasing
     /// id order.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut T)> + '_ {
@@ -1099,7 +1314,7 @@ impl<T: Vacant> IdMap<T> {
     /// A map of the same ids in the same form, each value through `f`. A
     /// flat map's vector is allocated at its length, which is what a vector
     /// built by pushing each mapped slot holds.
-    pub fn map<U: Vacant>(&self, mut f: impl FnMut(&T) -> U) -> IdMap<U> {
+    pub fn map<U: Vacant>(&self, mut f: impl FnMut(&T) -> U) -> IdMap<U, RATIO> {
         let mut flat = Vec::with_capacity(self.flat.len());
         for value in &self.flat {
             flat.push(if value.is_vacant() {
@@ -1809,5 +2024,190 @@ mod tests {
         costs_its_formula(7u32);
         costs_its_formula(7u64);
         costs_its_formula(Some(Box::new(7u8)));
+    }
+
+    /// The ids a cursor test reads around `ids`: each id and its two
+    /// neighbours, the first and last offset of pages 0 to 10, and an id past
+    /// every page, in increasing order.
+    fn read_at(ids: &[usize]) -> Vec<usize> {
+        let mut at: Vec<usize> = ids
+            .iter()
+            .flat_map(|&id| [id.saturating_sub(1), id, id + 1])
+            .collect();
+        for page in 0..11 {
+            at.extend([page * PAGE_IDS, page * PAGE_IDS + PAGE_IDS - 1]);
+        }
+        at.push(1 << 30);
+        at.sort_unstable();
+        at.dedup();
+        at
+    }
+
+    /// A cursor answers what `get` answers at every id, over a flat map and
+    /// over pages of every kind: held and absent ids, every page's first and
+    /// last offset, pages the map holds no entry in, in increasing order, with
+    /// every id read twice, falling back every few ids, scrambled, in
+    /// decreasing order, and in turn between pages at the same offsets.
+    #[test]
+    fn a_cursor_reads_what_a_lookup_reads_in_every_page_kind() {
+        let ids = every_kind();
+        let mut paged: IdMap<u64> = IdMap::new();
+        paged.page_out();
+        for &id in &ids {
+            paged.insert(id, 3 * id as u64 + 1);
+        }
+        paged.settle();
+        let kinds: Vec<Option<u8>> = [3, 5, 6, 9]
+            .iter()
+            .map(|&page| kind_of(&paged, page * PAGE_IDS))
+            .collect();
+        assert_eq!(kinds, vec![Some(2), Some(1), Some(0), Some(2)]);
+        let mut flat: IdMap<u64> = IdMap::new();
+        for id in (1..9_000usize).filter(|id| id % 3 != 0) {
+            flat.insert(id, id as u64);
+        }
+        assert!(flat.is_flat());
+
+        let at = read_at(&ids);
+        let twice: Vec<usize> = at.iter().flat_map(|&id| [id, id]).collect();
+        let falling: Vec<usize> = at.iter().rev().copied().collect();
+        let back: Vec<usize> = at
+            .chunks(7)
+            .flat_map(|chunk| chunk.iter().rev().copied())
+            .collect();
+        let mixed = scrambled(&at, 21);
+        let turns: Vec<usize> = (0..PAGE_IDS)
+            .step_by(97)
+            .flat_map(|offset| [3, 9, 6].map(|page| page * PAGE_IDS + offset))
+            .collect();
+        for map in [&paged, &flat] {
+            for order in [&at, &twice, &falling, &back, &mixed, &turns] {
+                let mut cursor = map.cursor();
+                for &id in order.iter() {
+                    assert_eq!(cursor.get(id), map.get(id), "{id}");
+                }
+            }
+        }
+    }
+
+    /// The ratio of a map of four-byte entries that a search looks up.
+    const FOUR: usize = lookup_ratio(4);
+
+    /// The ratio of a map of eight-byte entries that a search looks up.
+    const EIGHT: usize = lookup_ratio(8);
+
+    /// A map at ratio `R` holding `value` at one id in `gap` from id 0,
+    /// `count` entries, inserted in increasing order.
+    fn grown<T: Vacant + Clone, const R: usize>(gap: usize, count: usize, value: T) -> IdMap<T, R> {
+        let mut map = IdMap::new();
+        for k in 0..count {
+            map.insert(k * gap, value.clone());
+        }
+        map
+    }
+
+    /// A map that a search looks up stays flat while it holds one entry in
+    /// its ratio of ids. Grown at one id in `r - 1` and in `r` it stays flat
+    /// and at one in `r + 1` it pages out past the floor, for four-byte and
+    /// eight-byte entries. A plan keeps it flat to `r` ids an entry and no
+    /// further. A removal pages it out only once it holds fewer than one entry
+    /// in twice its ratio. Fed ids whose gaps straddle its ratio from every
+    /// start, it changes form at most once.
+    #[test]
+    fn a_map_a_search_looks_up_stays_flat_to_its_ratio() {
+        assert_eq!((FOUR, EIGHT), (16, 8));
+        let count = 2 * FLAT_FLOOR;
+        assert!(grown::<u32, FOUR>(FOUR - 1, count, 7).is_flat());
+        assert!(grown::<u32, FOUR>(FOUR, count, 7).is_flat());
+        assert!(!grown::<u32, FOUR>(FOUR + 1, count, 7).is_flat());
+        assert!(grown::<u64, EIGHT>(EIGHT - 1, count, 7).is_flat());
+        assert!(grown::<u64, EIGHT>(EIGHT, count, 7).is_flat());
+        assert!(!grown::<u64, EIGHT>(EIGHT + 1, count, 7).is_flat());
+        assert!(!grown::<u32, FLAT_RATIO>(FLAT_RATIO + 1, count, 7).is_flat());
+
+        for (gap, flat) in [(FOUR, true), (FOUR + 1, false)] {
+            let mut map: IdMap<u32, FOUR> = IdMap::new();
+            map.plan(count, gap * count - 1);
+            for k in 0..count {
+                map.insert(k * gap, 7);
+            }
+            assert_eq!(map.is_flat(), flat, "planned at one id in {gap}");
+        }
+
+        let extent = 4 * FLAT_FLOOR;
+        let mut map: IdMap<u32, FOUR> = IdMap::new();
+        for id in 0..extent {
+            map.insert(id, 7);
+        }
+        let mut held = extent;
+        for id in (0..extent).filter(|id| id % (2 * FOUR) != 0) {
+            map.remove(id);
+            held -= 1;
+            assert_eq!(map.is_flat(), 2 * FOUR * held >= extent, "{held} held");
+        }
+        assert!(map.is_flat(), "one entry in twice the ratio stays flat");
+        map.remove(0);
+        assert!(!map.is_flat(), "one fewer pages out");
+
+        for gaps in [[FOUR + 1, FOUR - 1], [FOUR + 1, FOUR + 1]] {
+            for start in 0..FOUR {
+                let mut map: IdMap<u32, FOUR> = IdMap::new();
+                let (mut id, mut changes, mut last) = (start, 0, true);
+                for k in 0..count {
+                    map.insert(id, 7);
+                    changes += usize::from(map.is_flat() != last);
+                    last = map.is_flat();
+                    id += gaps[k % 2];
+                }
+                assert!(
+                    changes <= 1,
+                    "gaps {gaps:?} from {start}, {changes} changes"
+                );
+                assert_eq!(map.len(), count);
+            }
+        }
+    }
+
+    /// A map that a search looks up, grown flat at its ratio, costs at most
+    /// four times `LOOKUP_BYTES` for each entry it holds and one more while its
+    /// vector has spare room, and at most `LOOKUP_BYTES` for each once its
+    /// vector is at its length.
+    #[test]
+    fn a_map_a_search_looks_up_costs_its_bound_while_flat() {
+        let count = 2 * FLAT_FLOOR;
+        let mut four: IdMap<u32, FOUR> = grown(FOUR, count, 7);
+        let mut eight: IdMap<u64, EIGHT> = grown(EIGHT, count, 7);
+        assert!(four.is_flat() && eight.is_flat());
+        assert!(four.heap_bytes() <= 4 * LOOKUP_BYTES * (four.len() + 1));
+        assert!(eight.heap_bytes() <= 4 * LOOKUP_BYTES * (eight.len() + 1));
+        four.shrink_to_fit();
+        eight.shrink_to_fit();
+        assert_eq!(four.heap_bytes(), 4 * four.extent());
+        assert_eq!(eight.heap_bytes(), 8 * eight.extent());
+        assert!(four.heap_bytes() <= LOOKUP_BYTES * (four.len() + 1));
+        assert!(eight.heap_bytes() <= LOOKUP_BYTES * (eight.len() + 1));
+    }
+
+    /// `for_each` walks what `iter` walks, in the same order, over a flat map
+    /// and over pages of every kind, as inserted and once settled.
+    #[test]
+    fn for_each_walks_what_iter_walks() {
+        let mut paged: IdMap<u64> = IdMap::new();
+        paged.page_out();
+        for &id in &every_kind() {
+            paged.insert(id, id as u64 + 5);
+        }
+        let mut flat: IdMap<u64> = IdMap::new();
+        for id in (2..5_000usize).step_by(3) {
+            flat.insert(id, id as u64);
+        }
+        for map in [&mut paged, &mut flat] {
+            for _ in 0..2 {
+                let mut walked = Vec::new();
+                map.for_each(|id, &value| walked.push((id, value)));
+                assert_eq!(walked, entries(map));
+                map.settle();
+            }
+        }
     }
 }

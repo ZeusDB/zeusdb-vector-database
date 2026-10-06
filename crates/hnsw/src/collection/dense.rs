@@ -424,20 +424,84 @@ impl DenseIndex {
         }
     }
 
-    /// Score every enumerated id the index holds and cut the page.
-    fn score_exact(&self, query: &[f32], ids: &[RecordId], k: usize, boundary_ties: bool) -> Hits {
-        let distance = raw_distance_fn(&self.metric);
-        let needs_unit = reconstruction_needs_unit(&self.metric);
-        let mut scored: Vec<(f32, u32)> = ids
-            .iter()
-            .filter(|id| self.live.contains(id.slot()))
+    /// The distance [`DenseIndex::exact_distance`] gives, from the record's
+    /// node, which is `None` where the graph took none for it.
+    fn exact_distance_at(
+        &self,
+        query: &[f32],
+        node: Option<u32>,
+        distance: fn(&[f32], &[f32]) -> f32,
+        needs_unit: bool,
+    ) -> f32 {
+        let Some(node) = node else {
+            return f32::INFINITY;
+        };
+        if let Some(stored) = self.graph.raw_vector_at(node) {
+            return distance(query, stored);
+        }
+        if let Some(scored) = self.graph.int8_distance_at(query, node) {
+            return scored;
+        }
+        let reconstructed = self
+            .graph
+            .codes_at(node)
+            .and_then(|codes| self.pq.as_ref()?.reconstruct(codes).ok());
+        match reconstructed {
+            Some(reconstructed) => {
+                distance(query, &prepare_reconstruction(needs_unit, reconstructed))
+            }
+            None => f32::INFINITY,
+        }
+    }
+
+    /// The scores [`DenseIndex::score_exact`] gives, read through a cursor
+    /// over the live set and one over the graph's id-to-node map at `ids`,
+    /// which increase, so a paged structure resolves each page once for the
+    /// run of ids in it. The node the cursor gives is scored through the
+    /// graph's node-based reads, so the map is read once a record.
+    fn score_in_order(
+        &self,
+        query: &[f32],
+        ids: &[RecordId],
+        distance: fn(&[f32], &[f32]) -> f32,
+        needs_unit: bool,
+    ) -> Vec<(f32, u32)> {
+        let mut live = self.live.cursor();
+        let mut nodes = self.graph.node_cursor();
+        ids.iter()
+            .filter(|id| live.contains(id.slot()))
             .map(|id| {
+                let node = nodes.get(id.slot()).copied();
                 (
-                    self.exact_distance(query, id.slot(), distance, needs_unit),
+                    self.exact_distance_at(query, node, distance, needs_unit),
                     id.0,
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    /// Score every enumerated id the index holds and cut the page.
+    ///
+    /// The ids come in increasing order. Where the live set and the graph's
+    /// id-to-node map are both flat each record is read from them directly,
+    /// and where either is paged both are read through cursors; see
+    /// [`DenseIndex::score_in_order`].
+    fn score_exact(&self, query: &[f32], ids: &[RecordId], k: usize, boundary_ties: bool) -> Hits {
+        let distance = raw_distance_fn(&self.metric);
+        let needs_unit = reconstruction_needs_unit(&self.metric);
+        let mut scored: Vec<(f32, u32)> = if self.live.is_flat() && self.graph.id_map_is_flat() {
+            ids.iter()
+                .filter(|id| self.live.contains(id.slot()))
+                .map(|id| {
+                    (
+                        self.exact_distance(query, id.slot(), distance, needs_unit),
+                        id.0,
+                    )
+                })
+                .collect()
+        } else {
+            self.score_in_order(query, ids, distance, needs_unit)
+        };
         scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         let mut end = k.min(scored.len());
         if boundary_ties && end > 0 && end < scored.len() {
@@ -1121,5 +1185,147 @@ mod tests {
         assert!(units.measured);
         assert!(units.distance_ns > 0.0 && units.distance_ns.is_finite());
         assert!(units.ef_ns > units.distance_ns);
+    }
+
+    /// An index over `graph` holding `vectors[k]` under id `1 + k * gap`,
+    /// with every seventh record removed, its node staying in the graph.
+    fn spread_index(
+        graph: VectorGraph,
+        pq: Option<Arc<PQ>>,
+        keeps_raw: bool,
+        vectors: &[Vec<f32>],
+        gap: u32,
+    ) -> DenseIndex {
+        let dim = vectors[0].len();
+        let mut index = DenseIndex::new(graph, "l2", dim, pq, keeps_raw);
+        for (k, v) in vectors.iter().enumerate() {
+            let id = RecordId(1 + k as u32 * gap);
+            let prepared = index.prepare(id, v).unwrap();
+            index.insert(id, v, prepared).unwrap();
+        }
+        for k in (0..vectors.len() as u32).step_by(7) {
+            index.remove(RecordId(1 + k * gap)).unwrap();
+        }
+        index
+    }
+
+    /// Over an index whose live set and id-to-node map are paged, the scan
+    /// in increasing order scores exactly what a lookup per record scores,
+    /// bit for bit and in the same order: held records in several pages,
+    /// removed records whose nodes stay, ids the graph never took and a page
+    /// it holds nothing in, on a raw graph, a scalar quantized graph, and a
+    /// product quantized graph without raw vectors and with them. The cut page is the
+    /// one the lookup per record gives, and an index whose structures are
+    /// flat scores what the scan in increasing order scores.
+    #[test]
+    fn the_scan_in_increasing_order_scores_what_a_lookup_per_record_scores() {
+        let (count, dim, gap) = (300usize, 8usize, 1_009u32);
+        let vectors = zeusdb_vector_core::test_support::clustered(count, dim, 194);
+        let codec = Arc::new(Int8Codec::fit(dim, &vectors).unwrap());
+        let pq = Arc::new(PQ::new(dim, 4, 4, 16, None));
+        pq.train(&vectors).unwrap();
+        let layers = NB_LAYER_MAX as usize;
+        let mut with_raw = VectorGraph::new_pq("l2", 8, 64, layers, 50, pq.clone());
+        with_raw.open_raw_store(dim, 64).unwrap();
+        let indexes = [
+            (
+                "raw",
+                spread_index(
+                    VectorGraph::new_raw("l2", dim, 8, 64, layers, 50),
+                    None,
+                    false,
+                    &vectors,
+                    gap,
+                ),
+            ),
+            (
+                "int8",
+                spread_index(
+                    VectorGraph::new_int8("l2", 8, 64, layers, 50, codec),
+                    None,
+                    false,
+                    &vectors,
+                    gap,
+                ),
+            ),
+            (
+                "pq",
+                spread_index(
+                    VectorGraph::new_pq("l2", 8, 64, layers, 50, pq.clone()),
+                    Some(pq.clone()),
+                    false,
+                    &vectors,
+                    gap,
+                ),
+            ),
+            (
+                "pq with raw",
+                spread_index(with_raw, Some(pq), true, &vectors, gap),
+            ),
+        ];
+        let mut ids: Vec<RecordId> = (0..count as u32)
+            .flat_map(|k| [RecordId(1 + k * gap), RecordId(2 + k * gap)])
+            .chain([RecordId(10 * zeusdb_vector_core::PAGE_IDS as u32 + 3)])
+            .collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        let distance = raw_distance_fn("l2");
+        let needs_unit = reconstruction_needs_unit("l2");
+        for (kind, index) in &indexes {
+            assert!(
+                !index.live.is_flat() && !index.graph.id_map_is_flat(),
+                "{kind}"
+            );
+            for q in [3usize, 77, 150] {
+                let query = &vectors[q];
+                let looked_up: Vec<(f32, u32)> = ids
+                    .iter()
+                    .filter(|id| index.live.contains(id.slot()))
+                    .map(|id| {
+                        (
+                            index.exact_distance(query, id.slot(), distance, needs_unit),
+                            id.0,
+                        )
+                    })
+                    .collect();
+                let in_order = index.score_in_order(query, &ids, distance, needs_unit);
+                let bits = |scored: &[(f32, u32)]| -> Vec<(u32, u32)> {
+                    scored
+                        .iter()
+                        .map(|&(score, id)| (score.to_bits(), id))
+                        .collect()
+                };
+                assert_eq!(bits(&in_order), bits(&looked_up), "{kind} query {q}");
+                assert_eq!(in_order.len(), count - count.div_ceil(7));
+
+                let mut cut = looked_up.clone();
+                cut.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                cut.truncate(10);
+                let page = index.score_exact(query, &ids, 10, false);
+                let page: Vec<(u32, u32)> = page
+                    .items
+                    .iter()
+                    .map(|hit| (hit.score.to_bits(), hit.id.0))
+                    .collect();
+                assert_eq!(page, bits(&cut), "{kind} query {q}");
+            }
+        }
+
+        let flat = index_of(&[vec![1.0, 0.0], vec![0.0, 1.0], vec![2.0, 2.0]]);
+        assert!(flat.live.is_flat() && flat.graph.id_map_is_flat());
+        let ids = [RecordId(1), RecordId(2), RecordId(3), RecordId(9)];
+        let looked_up: Vec<(f32, u32)> = ids
+            .iter()
+            .map(|id| {
+                (
+                    flat.exact_distance(&[0.5, 0.5], id.slot(), distance, needs_unit),
+                    id.0,
+                )
+            })
+            .filter(|&(_, id)| id != 9)
+            .collect();
+        assert_eq!(
+            flat.score_in_order(&[0.5, 0.5], &ids, distance, needs_unit),
+            looked_up
+        );
     }
 }
