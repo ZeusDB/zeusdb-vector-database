@@ -13,11 +13,17 @@
 //!
 //! The id range in pages of [`PAGE_IDS`] ids, as [`crate::idmap`] lays it
 //! out: a table of four bytes a page of the range naming each page's place in
-//! an arena kept in page order. A page holds its ids as words or as its
-//! offsets in increasing order. A page of offsets turns to words once its
-//! span is at most [`BIT_PAGE_RATIO`] times its ids, where the words cost no
-//! more than two bytes an id, and a page of words turns to offsets once its
-//! span passes twice that, so a page between the two keeps its kind.
+//! an arena kept in page order. A page holds its ids in one of three kinds:
+//! words; a short page's offsets in increasing order, at most
+//! [`SHORT_LIMIT`] of them; or, where it holds more, the rank index
+//! [`crate::idmap`] describes without its counts of entries before each
+//! group, which answers whether it holds an id in two dependent reads. A
+//! sparse page turns to words once its span is at most [`BIT_PAGE_RATIO`]
+//! times its ids, where the words cost no more than two bytes an id, and a
+//! page of words turns sparse once its span passes twice that, so a page
+//! between the two keeps its kind. A short page turns ranked once it holds
+//! more than [`SHORT_LIMIT`] ids and a ranked page turns short once it holds
+//! half that or fewer, as a map's page does.
 //!
 //! # Which sets page out
 //!
@@ -36,7 +42,7 @@
 //! combines page by page, each page through a scratch of one page's words,
 //! and the result is paged.
 
-use crate::idmap::PAGE_IDS;
+use crate::idmap::{count, Bits, PAGE_IDS, SHORT_LIMIT, SUMMARY_WORDS};
 
 /// Bits of an internal id below its page number.
 const PAGE_SHIFT: u32 = PAGE_IDS.trailing_zeros();
@@ -64,6 +70,105 @@ fn whole_words(ids: usize) -> usize {
     ids.div_ceil(64).saturating_mul(64)
 }
 
+/// A set page's rank index over `offsets`, which increase: the summary
+/// words and then each held group's word, and the held groups before each
+/// summary word. Both at their exact size.
+fn rank_index(offsets: impl Iterator<Item = usize> + Clone) -> (Vec<u64>, Vec<u16>) {
+    let mut groups = 0;
+    let mut last = usize::MAX;
+    for offset in offsets.clone() {
+        if offset >> 6 != last {
+            last = offset >> 6;
+            groups += 1;
+        }
+    }
+    let mut words = Vec::with_capacity(SUMMARY_WORDS + groups);
+    words.resize(SUMMARY_WORDS, 0);
+    let mut last = usize::MAX;
+    for offset in offsets {
+        let group = offset >> 6;
+        if group != last {
+            words[group >> 6] |= 1u64 << (group & 63);
+            words.push(0);
+            last = group;
+        }
+        if let Some(word) = words.last_mut() {
+            *word |= 1u64 << (offset & 63);
+        }
+    }
+    let mut counts = Vec::with_capacity(SUMMARY_WORDS);
+    let mut held = 0;
+    for &word in &words[..SUMMARY_WORDS] {
+        counts.push(count(held));
+        held += word.count_ones() as usize;
+    }
+    (words, counts)
+}
+
+/// Where group `group` sits among a ranked page's held groups, from the
+/// page's summary words and their counts: `Ok` with its place where the
+/// page holds the group, `Err` with the place it would take where it does
+/// not.
+#[inline]
+fn group_place(words: &[u64], counts: &[u16], group: usize) -> Result<usize, usize> {
+    let word = words[group >> 6];
+    let bit = 1u64 << (group & 63);
+    let place = usize::from(counts[group >> 6]) + (word & (bit - 1)).count_ones() as usize;
+    if word & bit == 0 {
+        Err(place)
+    } else {
+        Ok(place)
+    }
+}
+
+/// Mark group `group` held in a ranked page's summary, and count it before
+/// every later summary word.
+fn summary_hold(words: &mut [u64], counts: &mut [u16], group: usize) {
+    words[group >> 6] |= 1u64 << (group & 63);
+    for before in &mut counts[(group >> 6) + 1..SUMMARY_WORDS] {
+        *before += 1;
+    }
+}
+
+/// Clear group `group` from a ranked page's summary, and from the count
+/// before every later summary word.
+fn summary_release(words: &mut [u64], counts: &mut [u16], group: usize) {
+    words[group >> 6] &= !(1u64 << (group & 63));
+    for before in &mut counts[(group >> 6) + 1..SUMMARY_WORDS] {
+        *before -= 1;
+    }
+}
+
+/// The groups a ranked page holds, by number, in increasing order, which is
+/// the order of their words after the summary.
+fn held_groups(summary: &[u64]) -> impl Iterator<Item = usize> + Clone + '_ {
+    summary
+        .iter()
+        .enumerate()
+        .flat_map(|(at, &word)| Bits(word).map(move |bit| at * 64 + bit))
+}
+
+/// Every offset a ranked page holds, in increasing order, from its summary
+/// and group words.
+fn ranked_offsets(words: &[u64]) -> impl Iterator<Item = usize> + Clone + '_ {
+    let (summary, groups) = words.split_at(SUMMARY_WORDS);
+    held_groups(summary)
+        .zip(groups)
+        .flat_map(|(group, &word)| Bits(word).map(move |bit| group * 64 + bit))
+}
+
+/// One past the largest offset a ranked page holds, from its summary and
+/// group words. Its last group word belongs to its largest group.
+fn ranked_span(words: &[u64]) -> usize {
+    let (summary, groups) = words.split_at(SUMMARY_WORDS);
+    let (Some(at), Some(&last)) = (summary.iter().rposition(|&word| word != 0), groups.last())
+    else {
+        return 0;
+    };
+    let group = at * 64 + 63 - summary[at].leading_zeros() as usize;
+    group * 64 + 64 - last.leading_zeros() as usize
+}
+
 /// One page of a paged set.
 #[derive(Clone)]
 struct BitPage {
@@ -73,9 +178,12 @@ struct BitPage {
     held: u32,
     /// Whether the page holds words rather than offsets.
     dense: bool,
-    /// A dense page's words, the first `words.len() * 64` offsets.
+    /// A dense page's words, the first `words.len() * 64` offsets. A ranked
+    /// page's summary words, then each held group's word. Empty on a short
+    /// page.
     words: Vec<u64>,
-    /// A sparse page's offsets, strictly increasing.
+    /// A short page's offsets, strictly increasing. A ranked page's counts of
+    /// the held groups before each summary word. Empty on a dense page.
     offsets: Vec<u16>,
 }
 
@@ -94,6 +202,11 @@ impl BitPage {
         (self.number as usize) << PAGE_SHIFT
     }
 
+    /// Whether the page is sparse and carries the rank index.
+    fn ranked(&self) -> bool {
+        !self.dense && !self.words.is_empty()
+    }
+
     /// Words a dense form of the page would hold, being up to its largest
     /// offset.
     fn span_words(&self) -> usize {
@@ -102,6 +215,8 @@ impl BitPage {
                 .iter()
                 .rposition(|&word| word != 0)
                 .map_or(0, |at| at + 1)
+        } else if self.ranked() {
+            ranked_span(&self.words).div_ceil(64)
         } else {
             self.offsets
                 .last()
@@ -121,19 +236,33 @@ impl BitPage {
         words * 64 <= (2 * BIT_PAGE_RATIO).saturating_mul(held)
     }
 
+    /// Whether the page holds `offset`. A ranked page answers in two
+    /// dependent reads, the summary word with its count and then the group's
+    /// word.
     fn contains(&self, offset: usize) -> bool {
         if self.dense {
             self.words
                 .get(offset >> 6)
                 .is_some_and(|word| word >> (offset & 63) & 1 == 1)
+        } else if self.ranked() {
+            let (summary, groups) = self.words.split_at(SUMMARY_WORDS);
+            let group = offset >> 6;
+            let word = summary[group >> 6];
+            let bit = 1u64 << (group & 63);
+            word & bit != 0 && {
+                let place = usize::from(self.offsets[group >> 6])
+                    + (word & (bit - 1)).count_ones() as usize;
+                groups[place] >> (offset & 63) & 1 == 1
+            }
         } else {
             self.offsets.binary_search(&(offset as u16)).is_ok()
         }
     }
 
     /// Put an offset in, reporting whether it was new. A page of words that
-    /// would grow past twice its ratio turns to offsets first, and a page of
-    /// offsets whose span the ratio covers after the insert turns to words.
+    /// would grow past twice its ratio turns sparse first. After the insert a
+    /// sparse page whose span the ratio covers turns to words, and a short
+    /// page holding more than [`SHORT_LIMIT`] ids turns ranked.
     fn insert(&mut self, offset: usize) -> bool {
         let index = offset >> 6;
         if self.dense
@@ -150,6 +279,8 @@ impl BitPage {
             let was = self.words[index] & mask != 0;
             self.words[index] |= mask;
             !was
+        } else if self.ranked() {
+            self.ranked_insert(offset)
         } else {
             match self.offsets.binary_search(&(offset as u16)) {
                 Ok(_) => false,
@@ -162,13 +293,40 @@ impl BitPage {
         if added {
             self.held += 1;
         }
-        if !self.dense && Self::dense_for(self.span_words(), self.held as usize) {
-            self.make_dense();
+        if !self.dense {
+            if Self::dense_for(self.span_words(), self.held as usize) {
+                self.make_dense();
+            } else if !self.ranked() && self.held as usize > SHORT_LIMIT {
+                self.make_ranked();
+            }
         }
         added
     }
 
-    /// Take an offset out, reporting whether it was there.
+    /// [`BitPage::insert`] on a ranked page, the group opened where the page
+    /// holds none in it.
+    fn ranked_insert(&mut self, offset: usize) -> bool {
+        let group = offset >> 6;
+        let low = 1u64 << (offset & 63);
+        match group_place(&self.words, &self.offsets, group) {
+            Ok(place) => {
+                let word = &mut self.words[SUMMARY_WORDS + place];
+                let added = *word & low == 0;
+                *word |= low;
+                added
+            }
+            Err(place) => {
+                self.words.insert(SUMMARY_WORDS + place, low);
+                summary_hold(&mut self.words, &mut self.offsets, group);
+                true
+            }
+        }
+    }
+
+    /// Take an offset out, reporting whether it was there. A page of words
+    /// left holding fewer than one id in twice its ratio turns sparse, and a
+    /// ranked page left holding half of [`SHORT_LIMIT`] ids or fewer turns
+    /// short.
     fn remove(&mut self, offset: usize) -> bool {
         let removed = if self.dense {
             match self.words.get_mut(offset >> 6) {
@@ -180,6 +338,8 @@ impl BitPage {
                 }
                 None => false,
             }
+        } else if self.ranked() {
+            self.ranked_remove(offset)
         } else {
             match self.offsets.binary_search(&(offset as u16)) {
                 Ok(at) => {
@@ -196,36 +356,89 @@ impl BitPage {
                 && !Self::stays_dense(self.words.len(), self.held as usize)
             {
                 self.make_sparse();
+            } else if self.ranked() && self.held as usize <= SHORT_LIMIT / 2 {
+                self.make_short();
             }
         }
         removed
     }
 
-    fn make_sparse(&mut self) {
-        let mut offsets = Vec::with_capacity(self.held as usize);
-        for (index, &word) in self.words.iter().enumerate() {
-            let mut word = word;
-            while word != 0 {
-                offsets.push((index * 64 + word.trailing_zeros() as usize) as u16);
-                word &= word - 1;
-            }
+    /// [`BitPage::remove`] on a ranked page, the group closed where it
+    /// empties.
+    fn ranked_remove(&mut self, offset: usize) -> bool {
+        let group = offset >> 6;
+        let Ok(place) = group_place(&self.words, &self.offsets, group) else {
+            return false;
+        };
+        let low = 1u64 << (offset & 63);
+        let word = self.words[SUMMARY_WORDS + place];
+        if word & low == 0 {
+            return false;
         }
-        self.words = Vec::new();
-        self.offsets = offsets;
+        if word == low {
+            self.words.remove(SUMMARY_WORDS + place);
+            summary_release(&mut self.words, &mut self.offsets, group);
+        } else {
+            self.words[SUMMARY_WORDS + place] = word & !low;
+        }
+        true
+    }
+
+    /// Turn a page of words sparse: short where it holds at most
+    /// [`SHORT_LIMIT`] ids, ranked where it holds more.
+    fn make_sparse(&mut self) {
+        let words = std::mem::take(&mut self.words);
+        let offsets = words
+            .iter()
+            .enumerate()
+            .flat_map(|(index, &word)| Bits(word).map(move |bit| index * 64 + bit));
+        if self.held as usize > SHORT_LIMIT {
+            let (index, counts) = rank_index(offsets);
+            self.words = index;
+            self.offsets = counts;
+        } else {
+            let mut short = Vec::with_capacity(self.held as usize);
+            short.extend(offsets.map(|offset| offset as u16));
+            self.offsets = short;
+        }
         self.dense = false;
     }
 
+    /// Turn a sparse page to words.
     fn make_dense(&mut self) {
         let mut words = vec![0u64; self.span_words()];
-        for &offset in &self.offsets {
-            words[offset as usize >> 6] |= 1u64 << (offset & 63);
+        if self.ranked() {
+            let (summary, groups) = self.words.split_at(SUMMARY_WORDS);
+            for (group, &word) in held_groups(summary).zip(groups) {
+                words[group] = word;
+            }
+        } else {
+            for &offset in &self.offsets {
+                words[offset as usize >> 6] |= 1u64 << (offset & 63);
+            }
         }
         self.words = words;
         self.offsets = Vec::new();
         self.dense = true;
     }
 
-    /// The kind the page's content gives, at its exact capacity.
+    /// Turn a short page ranked, its offsets becoming the rank index.
+    fn make_ranked(&mut self) {
+        let (words, counts) = rank_index(self.offsets.iter().map(|&offset| offset as usize));
+        self.words = words;
+        self.offsets = counts;
+    }
+
+    /// Turn a ranked page short, its rank index becoming its offsets.
+    fn make_short(&mut self) {
+        let mut offsets = Vec::with_capacity(self.held as usize);
+        offsets.extend(ranked_offsets(&self.words).map(|offset| offset as u16));
+        self.words = Vec::new();
+        self.offsets = offsets;
+    }
+
+    /// The kind the page's content gives, at its exact capacity: words where
+    /// the ratio covers its span, otherwise short or ranked by its ids.
     fn settle(&mut self) {
         let dense = Self::dense_for(self.span_words(), self.held as usize);
         if self.dense && !dense {
@@ -236,6 +449,10 @@ impl BitPage {
         if self.dense {
             let span = self.span_words();
             self.words.truncate(span);
+        } else if self.ranked() && self.held as usize <= SHORT_LIMIT {
+            self.make_short();
+        } else if !self.ranked() && self.held as usize > SHORT_LIMIT {
+            self.make_ranked();
         }
         self.words.shrink_to_fit();
         self.offsets.shrink_to_fit();
@@ -246,6 +463,11 @@ impl BitPage {
         into.fill(0);
         if self.dense {
             into[..self.words.len()].copy_from_slice(&self.words);
+        } else if self.ranked() {
+            let (summary, groups) = self.words.split_at(SUMMARY_WORDS);
+            for (group, &word) in held_groups(summary).zip(groups) {
+                into[group] = word;
+            }
         } else {
             for &offset in &self.offsets {
                 into[offset as usize >> 6] |= 1u64 << (offset & 63);
@@ -289,6 +511,12 @@ impl BitPage {
                     word &= word - 1;
                 }
             }
+        } else if self.ranked() {
+            for offset in ranked_offsets(&self.words) {
+                if !visit(base + offset) {
+                    return false;
+                }
+            }
         } else {
             for &offset in &self.offsets {
                 if !visit(base + offset as usize) {
@@ -314,9 +542,11 @@ struct BitPages {
 }
 
 impl BitPages {
+    /// Page `number`, where the set holds one. [`NO_PAGE`] is past every
+    /// place an arena can hold, so the arena's own bound answers for it.
     fn page(&self, number: usize) -> Option<&BitPage> {
         let at = *self.table.get(number)?;
-        (at != NO_PAGE).then(|| &self.pages[at as usize])
+        self.pages.get(at as usize)
     }
 
     fn open(&mut self, number: usize) -> usize {
@@ -1197,5 +1427,302 @@ mod tests {
                 assert_eq!(set.count(), highest + 1);
             }
         }
+    }
+
+    /// The kind of the page holding `slot`: 0 words, 1 short, 2 ranked.
+    fn kind_of(set: &Bitmap, slot: usize) -> Option<u8> {
+        let page = set.paged.as_deref()?.page(slot >> PAGE_SHIFT)?;
+        Some(if page.dense {
+            0
+        } else if page.ranked() {
+            2
+        } else {
+            1
+        })
+    }
+
+    /// `slots` in an order a seed fixes.
+    fn scrambled(slots: &[usize], seed: u64) -> Vec<usize> {
+        let mut out = slots.to_vec();
+        let mut stream = Stream(seed);
+        for i in (1..out.len()).rev() {
+            let j = (stream.next() as usize) % (i + 1);
+            out.swap(i, j);
+        }
+        out
+    }
+
+    /// Ids that put a page in each kind once settled: page 3 ranked, ids
+    /// seven apart below one in sixteen with a whole group of 64 and the
+    /// page's last group whole; page 5 short, its first and last offsets
+    /// among 20; page 6 words, 3,000 in a row; page 9 ranked, the first and
+    /// last offset of every summary word's run of 4,096 among 72.
+    fn every_kind() -> Vec<usize> {
+        let mut slots: Vec<usize> = Vec::new();
+        slots.extend((0..2_000).map(|k| 3 * PAGE_IDS + k * 31));
+        slots.extend((0..64).map(|k| 3 * PAGE_IDS + 62_016 + k));
+        slots.extend((0..64).map(|k| 3 * PAGE_IDS + 65_472 + k));
+        slots.extend([5 * PAGE_IDS, 5 * PAGE_IDS + 65_535]);
+        slots.extend((1..19).map(|k| 5 * PAGE_IDS + k * 3_001));
+        slots.extend((0..3_000).map(|k| 6 * PAGE_IDS + 100 + k));
+        slots.extend(
+            (0..16)
+                .flat_map(|w| [w * 4_096, w * 4_096 + 4_095])
+                .map(|o| 9 * PAGE_IDS + o),
+        );
+        slots.extend((0..40).map(|k| 9 * PAGE_IDS + 777 + k * 1_500));
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
+    /// Every question the set answers, against the model.
+    fn agrees(set: &Bitmap, model: &BTreeSet<usize>, probe: &[usize]) {
+        assert_eq!(ids(set), model.iter().copied().collect::<Vec<_>>());
+        assert_eq!(set.count(), model.len());
+        assert_eq!(set.held, model.len());
+        for &slot in probe {
+            assert_eq!(set.contains(slot), model.contains(&slot), "{slot}");
+        }
+        let mut words = [0u64; PAGE_WORDS];
+        for (number, page) in set.paged.as_deref().unwrap().pages.iter().enumerate() {
+            page.expand(&mut words);
+            let expanded: Vec<usize> = (0..PAGE_IDS)
+                .filter(|&offset| words[offset >> 6] >> (offset & 63) & 1 == 1)
+                .map(|offset| page.base() + offset)
+                .collect();
+            let held: Vec<usize> = model
+                .range(page.base()..page.base() + PAGE_IDS)
+                .copied()
+                .collect();
+            assert_eq!(expanded, held, "page {number} expanded");
+        }
+    }
+
+    /// Every page kind answers what a sorted set answers: ids put in in
+    /// increasing and in scrambled order, put in again, thinned until a
+    /// ranked page turns short and a page of words sparse, and put back,
+    /// with a settle between each step and none after the last. Each page
+    /// expands to the words it stands for.
+    #[test]
+    fn each_page_kind_answers_what_a_sorted_set_answers_in_any_order() {
+        let slots = every_kind();
+        let mut probe: Vec<usize> = slots
+            .iter()
+            .flat_map(|&slot| [slot, slot + 1, slot.saturating_sub(1)])
+            .collect();
+        probe.extend([0, PAGE_IDS, 4 * PAGE_IDS, 10 * PAGE_IDS, 1 << 30]);
+        for seed in [None, Some(11u64), Some(12)] {
+            let feed = match seed {
+                Some(seed) => scrambled(&slots, seed),
+                None => slots.clone(),
+            };
+            let mut set = Bitmap::paged();
+            let mut model = BTreeSet::new();
+            for &slot in &feed {
+                set.insert(slot);
+                model.insert(slot);
+            }
+            agrees(&set, &model, &probe);
+            set.settle();
+            agrees(&set, &model, &probe);
+            let kinds: Vec<Option<u8>> = [3, 5, 6, 9]
+                .iter()
+                .map(|&page| kind_of(&set, page * PAGE_IDS))
+                .collect();
+            assert_eq!(kinds, vec![Some(2), Some(1), Some(0), Some(2)], "{seed:?}");
+            for &slot in feed.iter().step_by(3) {
+                set.insert(slot);
+            }
+            agrees(&set, &model, &probe);
+
+            let kept = |slot: usize| match slot / PAGE_IDS {
+                5 => false,
+                6 => slot % 50 == 3,
+                _ => slot % 10 == 3,
+            };
+            let thin: Vec<usize> = feed.iter().copied().filter(|&slot| !kept(slot)).collect();
+            for &slot in &thin {
+                set.remove(slot);
+                model.remove(&slot);
+                set.remove(slot);
+            }
+            agrees(&set, &model, &probe);
+            assert_eq!(
+                kind_of(&set, 5 * PAGE_IDS),
+                None,
+                "an emptied page is freed"
+            );
+            assert_eq!(
+                (kind_of(&set, 6 * PAGE_IDS), kind_of(&set, 9 * PAGE_IDS)),
+                (Some(2), Some(1)),
+                "words thinned turn sparse and a ranked page short, {seed:?}"
+            );
+            set.settle();
+            agrees(&set, &model, &probe);
+
+            for &slot in thin.iter().rev() {
+                set.insert(slot);
+                model.insert(slot);
+            }
+            agrees(&set, &model, &probe);
+        }
+    }
+
+    /// A sparse page settles short at the short limit and below it and
+    /// ranked above it: 31, 32, 33 and 34 ids spread over a page. It settles
+    /// to words where its span is sixteen bits an id and ranked one word
+    /// past that. A ranked page thinned to 17 ids stays ranked and turns
+    /// short at 16, and refilled to 32 it stays short and turns ranked at 33.
+    #[test]
+    fn a_sparse_page_takes_its_kind_at_and_about_the_short_limit() {
+        for (held, kind) in [(31usize, 1u8), (32, 1), (33, 2), (34, 2)] {
+            let mut set = Bitmap::paged();
+            for k in 0..held {
+                set.insert(k * 1_000);
+            }
+            set.settle();
+            assert_eq!(kind_of(&set, 0), Some(kind), "{held} ids");
+            assert_eq!(set.count(), held);
+        }
+        for (last, kind) in [(1_599usize, 0u8), (1_600, 2)] {
+            let mut set = Bitmap::paged();
+            for slot in 0..99 {
+                set.insert(slot);
+            }
+            set.insert(last);
+            set.settle();
+            assert_eq!(kind_of(&set, 0), Some(kind), "100 ids over {}", last + 1);
+            assert!(set.contains(last) && !set.contains(99));
+        }
+        let mut set = Bitmap::paged();
+        for k in 0..33 {
+            set.insert(k * 1_000);
+        }
+        assert_eq!(kind_of(&set, 0), Some(2), "33 ids are ranked");
+        for k in 0..16 {
+            set.remove(k * 1_000);
+        }
+        assert_eq!(kind_of(&set, 16_000), Some(2), "17 ids stay ranked");
+        set.remove(16_000);
+        assert_eq!(kind_of(&set, 17_000), Some(1), "16 ids turn short");
+        for k in 0..16 {
+            set.insert(k * 1_000);
+        }
+        assert_eq!(kind_of(&set, 0), Some(1), "32 ids stay short");
+        set.insert(16_000);
+        assert_eq!(kind_of(&set, 0), Some(2), "33 ids turn ranked");
+        assert_eq!(ids(&set), (0..33).map(|k| k * 1_000).collect::<Vec<_>>());
+    }
+
+    /// A page fed ids at either limit changes kind at most once, in
+    /// increasing and in scrambled offsets: insertions and removals in turn
+    /// about 32 and 33 ids, from a short page, and about 16 and 17, from a
+    /// ranked one.
+    #[test]
+    fn a_page_fed_at_the_short_limit_changes_kind_at_most_once() {
+        let offsets: Vec<usize> = (0..300).map(|k| k * 211).collect();
+        for seed in [None, Some(5u64), Some(6)] {
+            let feed = match seed {
+                Some(seed) => scrambled(&offsets, seed),
+                None => offsets.clone(),
+            };
+            let anchor = feed[0];
+            let mut set = Bitmap::paged();
+            for &offset in &feed[..32] {
+                set.insert(offset);
+            }
+            let mut kinds = vec![kind_of(&set, anchor)];
+            for &offset in &feed[32..232] {
+                set.insert(offset);
+                kinds.push(kind_of(&set, anchor));
+                set.remove(offset);
+                kinds.push(kind_of(&set, anchor));
+            }
+            let changes = kinds.windows(2).filter(|pair| pair[0] != pair[1]).count();
+            assert_eq!(kinds[0], Some(1), "{seed:?}");
+            assert!(
+                changes <= 1,
+                "about 32 and 33 from {seed:?}: {changes} changes"
+            );
+
+            for &offset in &feed[1..16] {
+                set.remove(offset);
+            }
+            assert_eq!(set.count(), 17);
+            let mut kinds = vec![kind_of(&set, anchor)];
+            for &offset in &feed[232..300] {
+                set.remove(feed[16]);
+                kinds.push(kind_of(&set, anchor));
+                set.insert(feed[16]);
+                kinds.push(kind_of(&set, anchor));
+                set.insert(offset);
+                kinds.push(kind_of(&set, anchor));
+                set.remove(offset);
+                kinds.push(kind_of(&set, anchor));
+            }
+            let changes = kinds.windows(2).filter(|pair| pair[0] != pair[1]).count();
+            assert_eq!(kinds[0], Some(2), "{seed:?}");
+            assert!(
+                changes <= 1,
+                "about 16 and 17 from {seed:?}: {changes} changes"
+            );
+            assert_eq!(set.count(), 17);
+        }
+    }
+
+    /// A settled page of words costs 8 bytes a word up to its span, a short
+    /// page 2 bytes an id and a ranked page `160 + 8 G` bytes, `G` being the
+    /// groups of 64 offsets it holds an id in. The set costs its pages, their
+    /// headers, the table and the paged form's block.
+    #[test]
+    fn each_page_kind_costs_its_formula() {
+        assert!(
+            std::mem::size_of::<BitPage>() <= 64,
+            "a page's header holds the same fields in every kind"
+        );
+        let mut set = Bitmap::paged();
+        for slot in (0..1_000).step_by(2) {
+            set.insert(slot);
+        }
+        let short: Vec<usize> = (0..20).map(|k| PAGE_IDS + k * 3_001).collect();
+        for &slot in &short {
+            set.insert(slot);
+        }
+        let ranked: Vec<usize> = (0..1_000)
+            .map(|k| 2 * PAGE_IDS + k * 47 + k % 3)
+            .chain((0..64).map(|k| 2 * PAGE_IDS + 60_032 + k))
+            .collect();
+        for &slot in &ranked {
+            set.insert(slot);
+        }
+        set.settle();
+        let groups = {
+            let mut groups: Vec<usize> = ranked
+                .iter()
+                .map(|&slot| (slot & (PAGE_IDS - 1)) >> 6)
+                .collect();
+            groups.dedup();
+            groups.len()
+        };
+        let kinds: Vec<u8> = (0..3)
+            .map(|page| kind_of(&set, page * PAGE_IDS).unwrap())
+            .collect();
+        assert_eq!(kinds, vec![0, 1, 2]);
+        let pages = set.paged.as_deref().unwrap();
+        let formulas = [
+            8 * 1_000usize.div_ceil(64),
+            2 * short.len(),
+            160 + 8 * groups,
+        ];
+        let bytes: Vec<usize> = pages.pages.iter().map(BitPage::heap_bytes).collect();
+        assert_eq!(bytes, formulas, "{groups} groups");
+        assert_eq!(
+            set.heap_bytes(),
+            std::mem::size_of::<BitPages>()
+                + pages.table.capacity() * 4
+                + pages.pages.capacity() * std::mem::size_of::<BitPage>()
+                + formulas.iter().sum::<usize>()
+        );
     }
 }
