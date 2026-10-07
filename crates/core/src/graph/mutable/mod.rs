@@ -926,8 +926,14 @@ where
     /// removal strands a node rather than deleting it. The id store is the record
     /// set and every caller consults it first, so a stranded entry is
     /// unreachable rather than wrong.
+    #[cfg(test)]
     pub(super) fn node_of(&self, origin_id: usize) -> Option<u32> {
         self.node_of.get(origin_id).copied()
+    }
+
+    /// The id-to-node map.
+    pub(super) fn id_map(&self) -> &IdMap<u32, NODE_RATIO> {
+        &self.node_of
     }
 
     /// Whether the id-to-node map is flat, one slot per internal id up to the

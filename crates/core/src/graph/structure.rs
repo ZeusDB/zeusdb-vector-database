@@ -1309,3 +1309,35 @@ fn a_graph_reserved_after_it_is_built_holds_what_new_reserves() {
         );
     }
 }
+
+/// A raw graph answers each internal id's vector with the vector its node
+/// holds, at every id: held, vacant and past the id-to-node map's flat
+/// vector, on a flat map and on a paged one. Ids from one, as the collection
+/// issues them.
+#[test]
+fn a_raw_vector_by_id_is_the_vector_its_node_holds() {
+    const DIM: usize = 8;
+    let count = 400;
+    let vectors = sample_vectors(count, DIM, 0x0195);
+    let mut forms = Vec::new();
+    for gap in [1usize, 3, 40] {
+        let mut graph = VectorGraph::new_raw_unreserved("l2", DIM, 8, count, LAYERS, 50);
+        for (k, vector) in vectors.iter().enumerate() {
+            graph.insert(vector, 1 + k * gap);
+        }
+        forms.push(graph.id_map_is_flat());
+        let past = 1 + count * gap + 70_000;
+        for id in (0..past).chain([usize::MAX]) {
+            let read = graph.node_of(id).and_then(|node| graph.raw_vector_at(node));
+            assert_eq!(graph.raw_vector(id), read, "gap {gap}, id {id}");
+        }
+        for (k, vector) in vectors.iter().enumerate() {
+            assert_eq!(
+                graph.raw_vector(1 + k * gap),
+                Some(vector.as_slice()),
+                "gap {gap}"
+            );
+        }
+    }
+    assert_eq!(forms, [true, true, false]);
+}

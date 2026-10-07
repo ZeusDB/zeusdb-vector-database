@@ -85,6 +85,16 @@ fn whole_words(ids: usize) -> usize {
     ids.div_ceil(64).saturating_mul(64)
 }
 
+/// Whether the words of a flat set hold `slot`, the answer
+/// [`Bitmap::contains`] gives on the set [`Bitmap::as_flat`] took them from.
+/// Total over every `usize`.
+#[inline]
+pub fn word_holds(words: &[u64], slot: usize) -> bool {
+    words
+        .get(slot >> 6)
+        .is_some_and(|word| word >> (slot & 63) & 1 == 1)
+}
+
 /// A set page's rank index over `offsets`, which increase: the summary
 /// words and then each held group's word, and the held groups before each
 /// summary word. Both at their exact size.
@@ -973,6 +983,25 @@ impl Bitmap {
         self.paged.is_none()
     }
 
+    /// The words of a flat set, a bit for each id below their extent, and
+    /// `None` once the set is paged; see [`word_holds`].
+    pub fn as_flat(&self) -> Option<&[u64]> {
+        self.paged.is_none().then_some(self.words.as_slice())
+    }
+
+    /// Put ids into a flat set that holds none through `put`, which sets
+    /// their bits in the set's words and returns how many it set. A paged set
+    /// is left as it is and `put` does not run. Returns whether it ran.
+    pub(crate) fn put_flat(&mut self, put: impl FnOnce(&mut [u64]) -> usize) -> bool {
+        if self.paged.is_some() {
+            return false;
+        }
+        debug_assert_eq!(self.held, 0, "a put starts from an empty set");
+        self.held += put(&mut self.words);
+        debug_assert_eq!(self.held, self.count(), "a put counts every id it sets");
+        true
+    }
+
     /// A cursor that reads the set at ids in increasing order; see
     /// [`BitCursor`].
     pub fn cursor(&self) -> BitCursor<'_> {
@@ -1060,17 +1089,19 @@ impl Bitmap {
     }
 
     /// [`Bitmap::hold`], a flat set growing to the words `grow` gives for the
-    /// words it needs.
+    /// words it needs. The growth is inside the set's allocation where the
+    /// allocation holds the length it grows to.
     pub fn hold_with(&mut self, slot: usize, grow: impl FnOnce(usize) -> usize) {
         if self.paged.is_none() {
             let needed = (slot >> 6) + 1;
             if needed > self.words.len() {
+                let length = grow(needed).max(needed);
                 let extent = needed.saturating_mul(64);
-                let stays = needed <= self.words.capacity()
+                let stays = length <= self.words.capacity()
                     || extent <= BIT_FLOOR.max(self.reserved).max(self.planned)
                     || extent <= BIT_RATIO.saturating_mul(self.held + 1);
                 if stays {
-                    self.words.resize(grow(needed).max(needed), 0);
+                    self.words.resize(length, 0);
                 } else {
                     self.page_out();
                 }
@@ -2263,5 +2294,100 @@ mod tests {
             "ids out of order all go in"
         );
         assert_eq!(set.count(), 5);
+    }
+
+    /// A flat set's words answer what the set answers at every id: the ids it
+    /// holds and their neighbours, each word's edges, ids past its words and
+    /// the largest id. A paged set gives no words.
+    #[test]
+    fn the_words_of_a_flat_set_answer_what_the_set_answers() {
+        let held = [0usize, 1, 63, 64, 65, 127, 128, 1_000, 4_095];
+        let mut set = Bitmap::default();
+        for &slot in &held {
+            set.insert(slot);
+        }
+        let words = set.as_flat().expect("a set grown by insertion is flat");
+        let mut asked: BTreeSet<usize> = BTreeSet::from([4_096, 4_097, 1 << 20, usize::MAX]);
+        for &slot in &held {
+            asked.extend(slot.saturating_sub(1)..=slot + 1);
+        }
+        for slot in asked {
+            assert_eq!(word_holds(words, slot), set.contains(slot), "at {slot}");
+        }
+        let mut paged = Bitmap::paged();
+        paged.insert(7);
+        assert!(paged.as_flat().is_none());
+    }
+
+    /// A put sets the ids it is given in an empty flat set's words and counts
+    /// them into the set, and leaves a paged set as it is without running.
+    #[test]
+    fn a_put_fills_a_flat_set_and_leaves_a_paged_one() {
+        let slots = [3usize, 64, 200, 4_000];
+        let mut set = Bitmap::zeros(4_096);
+        assert!(set.put_flat(|words| {
+            for &slot in &slots {
+                words[slot >> 6] |= 1 << (slot & 63);
+            }
+            slots.len()
+        }));
+        assert_eq!(ids(&set), slots);
+        assert_eq!(set.held, slots.len());
+        assert_eq!(set.count(), slots.len());
+
+        let mut paged = Bitmap::paged();
+        assert!(!paged.put_flat(|_| unreachable!("a paged set takes no put")));
+        assert!(paged.is_empty());
+    }
+
+    /// A record set that grows to a power of two of words, as the column
+    /// store's live set does, stays flat to its ratio and no further, from a
+    /// reservation whose words are not a power of two. Held at one id in 127
+    /// and in 128 it stays flat, at one in 129 it pages out once it is past
+    /// one page and its reservation, and ids whose gaps straddle the ratio
+    /// change its form at most once.
+    #[test]
+    fn a_set_grown_to_powers_of_two_stays_flat_to_its_ratio() {
+        let reserved = 50_001usize;
+        assert!(!reserved.div_ceil(64).is_power_of_two());
+        let grown = |gap: usize, count: usize| {
+            let mut set = Bitmap::reserved(reserved);
+            for k in 0..count {
+                set.hold_with(k * gap, usize::next_power_of_two);
+            }
+            set
+        };
+        let count = 4_000;
+        assert!(grown(BIT_RATIO - 1, count).is_flat());
+        assert!(grown(BIT_RATIO, count).is_flat());
+        let past = grown(BIT_RATIO + 1, count);
+        assert!(!past.is_flat());
+        assert_eq!(past.count(), count);
+        let within = BIT_FLOOR.max(reserved) / (BIT_RATIO + 1);
+        assert!(
+            grown(BIT_RATIO + 1, within).is_flat(),
+            "within one page and the reservation"
+        );
+
+        for gaps in [
+            [BIT_RATIO + 1, BIT_RATIO - 1],
+            [BIT_RATIO + 1, BIT_RATIO + 1],
+        ] {
+            for start in [0usize, 1, 63, 64, 127] {
+                let mut set = Bitmap::reserved(reserved);
+                let (mut slot, mut changes, mut last) = (start, 0, true);
+                for k in 0..count {
+                    set.hold_with(slot, usize::next_power_of_two);
+                    changes += usize::from(set.is_flat() != last);
+                    last = set.is_flat();
+                    slot += gaps[k % 2];
+                }
+                assert!(
+                    changes <= 1,
+                    "gaps {gaps:?} from {start}, {changes} changes"
+                );
+                assert_eq!(set.count(), count);
+            }
+        }
     }
 }

@@ -1087,6 +1087,14 @@ impl<T: Vacant, const RATIO: usize> IdMap<T, RATIO> {
         self.paged.is_none().then_some(self.flat.as_slice())
     }
 
+    /// The flat vector, the absent value in each slot with no entry. It is
+    /// empty once the map is paged, so an id at or past its length is read
+    /// through [`IdMap::get`].
+    #[inline]
+    pub fn flat_slots(&self) -> &[T] {
+        &self.flat
+    }
+
     /// One past the largest id the map has written.
     pub fn extent(&self) -> usize {
         match self.paged.as_deref() {

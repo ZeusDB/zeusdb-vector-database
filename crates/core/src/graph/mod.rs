@@ -52,7 +52,7 @@
 use crate::distance::{
     CosineDist, DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric,
 };
-use crate::idmap::IdCursor;
+use crate::idmap::{IdCursor, IdMap, Vacant};
 use crate::int8::Int8Codec;
 use crate::pq::PQ;
 use crate::storage::Dir;
@@ -95,10 +95,10 @@ mod traverse;
 
 use dump::{Expected, GraphKind};
 use levels::LevelGenerator;
-use mutable::MutableGraph;
 /// What phase one of an insertion hands to phase two. Opaque outside the
 /// graph, and nameable so a caller can carry it between the two guards.
 pub use mutable::Planned;
+use mutable::{MutableGraph, NODE_RATIO};
 use store::VectorStore;
 use traverse::LAYERS;
 
@@ -906,19 +906,29 @@ impl VectorGraph {
         }
     }
 
+    /// The id-to-node map, which every variant holds in its graph.
+    fn id_map(&self) -> &IdMap<u32, NODE_RATIO> {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.id_map(),
+            VectorGraph::L2(b) => b.graph.id_map(),
+            VectorGraph::L1(b) => b.graph.id_map(),
+            VectorGraph::Dot(b) => b.graph.id_map(),
+            VectorGraph::CosinePQ(b) => b.graph.id_map(),
+            VectorGraph::L2PQ(b) => b.graph.id_map(),
+            VectorGraph::L1PQ(b) => b.graph.id_map(),
+            VectorGraph::Int8(b) => b.graph.id_map(),
+        }
+    }
+
     /// The node one internal id sits at, or `None` where this graph never took
     /// it.
+    ///
+    /// A removed record keeps its entry until the graph is replaced, because
+    /// removal strands a node rather than deleting it. The id store is the
+    /// record set and every caller consults it first, so a stranded entry is
+    /// unreachable rather than wrong.
     pub(crate) fn node_of(&self, internal_id: usize) -> Option<u32> {
-        match self {
-            VectorGraph::Cosine(b) => b.graph.node_of(internal_id),
-            VectorGraph::L2(b) => b.graph.node_of(internal_id),
-            VectorGraph::L1(b) => b.graph.node_of(internal_id),
-            VectorGraph::Dot(b) => b.graph.node_of(internal_id),
-            VectorGraph::CosinePQ(b) => b.graph.node_of(internal_id),
-            VectorGraph::L2PQ(b) => b.graph.node_of(internal_id),
-            VectorGraph::L1PQ(b) => b.graph.node_of(internal_id),
-            VectorGraph::Int8(b) => b.graph.node_of(internal_id),
-        }
+        self.id_map().get(internal_id).copied()
     }
 
     /// The internal id one node was inserted under.
@@ -937,23 +947,25 @@ impl VectorGraph {
 
     /// One record's raw vector, by the internal id the collection hands out.
     ///
-    /// This is the whole of what replaced the raw vector map. It is two array
-    /// reads, being the id to node inverse and then the store, and no hashing
-    /// at all. `None` where the index keeps no raw vector for that record,
-    /// which is every record of a trained `quantized_only` index and any id
-    /// this graph never took.
+    /// Two array reads where the id-to-node map's flat vector reaches the
+    /// id, being the map's slot and then the store, and no hashing at all. An
+    /// id past the flat vector, which on a paged map is every id, is read by
+    /// [`VectorGraph::raw_vector_past_flat`]. `None` where the index keeps no
+    /// raw vector for that record, which is every record of a trained
+    /// `quantized_only` index and any id this graph never took.
     pub fn raw_vector(&self, internal_id: usize) -> Option<&[f32]> {
-        let node = self.node_of(internal_id)?;
-        match self {
-            VectorGraph::Cosine(b) => b.store.try_get(node),
-            VectorGraph::L2(b) => b.store.try_get(node),
-            VectorGraph::L1(b) => b.store.try_get(node),
-            VectorGraph::Dot(b) => b.store.try_get(node),
-            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
-                b.raw.as_ref()?.try_get(node)
-            }
-            VectorGraph::Int8(_) => None,
+        match self.id_map().flat_slots().get(internal_id) {
+            Some(&node) if !node.is_vacant() => self.raw_vector_at(node),
+            Some(_) => None,
+            None => self.raw_vector_past_flat(internal_id),
         }
+    }
+
+    /// [`VectorGraph::raw_vector`] at an id past the id-to-node map's flat
+    /// vector, through the map's own lookup.
+    #[inline(never)]
+    fn raw_vector_past_flat(&self, internal_id: usize) -> Option<&[f32]> {
+        self.raw_vector_at(self.node_of(internal_id)?)
     }
 
     /// One record's quantized codes, by the internal id the collection hands out.

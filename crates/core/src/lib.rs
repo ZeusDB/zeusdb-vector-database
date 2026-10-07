@@ -62,7 +62,7 @@ mod storage;
 mod test_vectors;
 
 pub use admit::{Admit, And, Candidates};
-pub use bitmap::{BitCursor, Bitmap};
+pub use bitmap::{word_holds, BitCursor, Bitmap};
 pub use checksum::checksum_of;
 pub use columns::{validate_indexed_fields, ColumnStore, Selection};
 pub use distance::{CosineDist, DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric};

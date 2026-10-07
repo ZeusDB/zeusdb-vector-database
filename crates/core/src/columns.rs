@@ -52,7 +52,7 @@
 use crate::bitmap::Bitmap;
 use crate::error::Error;
 use crate::filter::{field_test_matches, FieldLookup, FieldTest, Filter, Presence};
-use crate::idmap::{IdMap, Vacant};
+use crate::idmap::{IdMap, Vacant, FLAT_RATIO};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -302,11 +302,13 @@ impl Column {
     /// One leaf of a filter, as the set of internal ids whose value matches,
     /// put into `out`, an empty set in the store's form.
     ///
-    /// A flat column is walked as the vector it is, every slot in turn. A
-    /// paged one is walked page by page through the entries it holds, and
-    /// its matches fill `out`, which builds each page of a paged result once
-    /// its ids are in.
-    fn select(&self, test: &FieldTest, mut out: Bitmap) -> Bitmap {
+    /// A flat dictionary column is walked through the store's `records`
+    /// where they are given and slot by slot otherwise; see
+    /// [`put_flat_codes`]. A flat plain column is walked as the vector it is,
+    /// every slot in turn. A paged column is walked page by page through the
+    /// entries it holds, and its matches fill `out`, which builds each page
+    /// of a paged result once its ids are in.
+    fn select(&self, test: &FieldTest, mut out: Bitmap, records: Option<&[u64]>) -> Bitmap {
         match self {
             Column::Plain { values } => {
                 if values.is_flat() {
@@ -347,15 +349,12 @@ impl Column {
                 if !any {
                     return out;
                 }
-                // A code below `MISSING` names a value.
+                // A code below the dictionary's length names a value.
+                // `MISSING` and `ABSENT` are past it, so they name none.
                 match codes.as_flat() {
-                    Some(flat) => {
-                        for (slot, &code) in flat.iter().enumerate() {
-                            if code < MISSING && matching[code as usize] {
-                                out.set(slot);
-                            }
-                        }
-                    }
+                    Some(flat) => put_flat_codes(flat, records, &mut out, |code| {
+                        matching.get(code as usize) == Some(&true)
+                    }),
                     None => {
                         let mut fill = out.fill();
                         codes.for_each(|slot, &code| {
@@ -376,7 +375,7 @@ impl Column {
     /// This is what answers `exists` and `is_missing`. The caller intersects
     /// with the live set rather than trusting it alone, as it always has. A
     /// column is walked as [`Column::select`] walks it.
-    fn present(&self, mut out: Bitmap) -> Bitmap {
+    fn present(&self, mut out: Bitmap, records: Option<&[u64]>) -> Bitmap {
         match self {
             Column::Plain { values } => {
                 if values.is_flat() {
@@ -395,13 +394,7 @@ impl Column {
                 }
             }
             Column::Dictionary { codes, .. } => match codes.as_flat() {
-                Some(flat) => {
-                    for (slot, &code) in flat.iter().enumerate() {
-                        if code < MISSING {
-                            out.set(slot);
-                        }
-                    }
-                }
+                Some(flat) => put_flat_codes(flat, records, &mut out, |code| code < MISSING),
                 None => {
                     let mut fill = out.fill();
                     codes.for_each(|slot, &code| {
@@ -443,6 +436,73 @@ impl Column {
             }
         }
     }
+}
+
+/// Put into `out` each slot of a flat dictionary column whose code `takes`
+/// accepts, and count them into its ids. `takes` never accepts [`ABSENT`],
+/// the code of a slot no record occupies.
+///
+/// Where `records` gives the words of the store's live set, the walk visits
+/// the records and reads each one's code, so it takes one step a record
+/// whatever the records' spread. Otherwise it reads every slot's code. A
+/// paged `out` takes its slots one at a time.
+fn put_flat_codes(
+    codes: &[u32],
+    records: Option<&[u64]>,
+    out: &mut Bitmap,
+    takes: impl Fn(u32) -> bool,
+) {
+    let put = out.put_flat(|words| match records {
+        Some(records) => put_by_records(codes, records, words, &takes),
+        None => put_by_slots(codes, words, &takes),
+    });
+    if !put {
+        for (slot, &code) in codes.iter().enumerate() {
+            if takes(code) {
+                out.set(slot);
+            }
+        }
+    }
+}
+
+/// Set in `words` the bit of each slot whose code in `codes` `takes`
+/// accepts, and return how many it set. `words` holds no bit and reaches
+/// every slot of `codes`.
+#[inline(never)]
+fn put_by_slots(codes: &[u32], words: &mut [u64], takes: impl Fn(u32) -> bool) -> usize {
+    let mut put = 0;
+    for (slot, &code) in codes.iter().enumerate() {
+        if takes(code) {
+            words[slot >> 6] |= 1 << (slot & 63);
+            put += 1;
+        }
+    }
+    put
+}
+
+/// Set in `words` the bit of each slot `records` holds whose code in
+/// `codes` `takes` accepts, and return how many it set. `words` holds no bit
+/// and reaches every slot `records` holds.
+#[inline(never)]
+fn put_by_records(
+    codes: &[u32],
+    records: &[u64],
+    words: &mut [u64],
+    takes: impl Fn(u32) -> bool,
+) -> usize {
+    let mut put = 0;
+    for (index, &word) in records.iter().enumerate() {
+        let mut held = word;
+        while held != 0 {
+            let slot = index * 64 + held.trailing_zeros() as usize;
+            held &= held - 1;
+            if codes.get(slot).is_some_and(|&code| takes(code)) {
+                words[slot >> 6] |= 1 << (slot & 63);
+                put += 1;
+            }
+        }
+    }
+    put
 }
 
 /// What a value owns on the heap beyond the 32 bytes of the `Value` itself.
@@ -747,6 +807,17 @@ impl ColumnStore {
         Bitmap::blank_like(&self.live, self.slots)
     }
 
+    /// The words of a flat live set whose records are fewer than one in
+    /// [`FLAT_RATIO`] of the store's slots, for a flat column's walk to
+    /// visit the records rather than every slot, and `None` otherwise.
+    fn sparse_records(&self) -> Option<&[u64]> {
+        if self.records.saturating_mul(FLAT_RATIO) < self.slots {
+            self.live.as_flat()
+        } else {
+            None
+        }
+    }
+
     /// What a filter's declared fields can say about which records match.
     ///
     /// Three answers, and the caller does different work for each. See
@@ -839,7 +910,11 @@ impl ColumnStore {
     fn bound(&self, filter: &Filter) -> Bounds {
         match filter {
             Filter::Field { name, test } => match self.index_of.get(name) {
-                Some(&position) => Bounds::Exact(self.columns[position].select(test, self.blank())),
+                Some(&position) => Bounds::Exact(self.columns[position].select(
+                    test,
+                    self.blank(),
+                    self.sparse_records(),
+                )),
                 None => Bounds::Range {
                     lower: self.blank(),
                     upper: self.live_set(),
@@ -854,10 +929,13 @@ impl ColumnStore {
                     let live = self.live_set();
                     let held = match want {
                         Presence::Present | Presence::Absent => {
-                            self.columns[position].present(self.blank())
+                            self.columns[position].present(self.blank(), self.sparse_records())
                         }
-                        Presence::Null | Presence::NotNull => self.columns[position]
-                            .select(&FieldTest::Equals(Value::Null), self.blank()),
+                        Presence::Null | Presence::NotNull => self.columns[position].select(
+                            &FieldTest::Equals(Value::Null),
+                            self.blank(),
+                            self.sparse_records(),
+                        ),
                     };
                     let mut out = live;
                     match want {
@@ -1696,18 +1774,110 @@ mod tests {
                     }
                 };
                 for test in &tests {
-                    let got = column.select(test, blank());
+                    let got = column.select(test, blank(), None);
                     let want = one_match_at_a_time(column, Some(test), blank());
                     assert_eq!(got.snapshot(), want.snapshot(), "paged {paged}");
                     assert_eq!(bits(&got), bits(&want));
                     kinds.extend(want.snapshot().2.iter().map(|page| page.1));
                 }
-                let got = column.present(blank());
+                let got = column.present(blank(), None);
                 let want = one_match_at_a_time(column, None, blank());
                 assert_eq!(got.snapshot(), want.snapshot(), "present, paged {paged}");
                 assert_eq!(bits(&got), bits(&want));
             }
         }
         assert_eq!(kinds, std::collections::BTreeSet::from([0, 1, 2]));
+    }
+
+    /// A flat dictionary column answers the same set in the same form
+    /// whether its walk visits the store's records or every slot, into a flat
+    /// result and into a paged one, and the store visits the records exactly
+    /// where they are fewer than one in `FLAT_RATIO` of its slots. Records
+    /// lack the field or hold null, slots hold no record and records are
+    /// erased, at spreads on both sides of the ratio, for equality,
+    /// membership, a value no record holds, null, presence and absence, each
+    /// against the walk of the records' metadata.
+    #[test]
+    fn a_flat_column_walked_by_its_records_answers_what_its_slots_answer() {
+        let values = ["a", "b", "c", "d", "e"];
+        let tests = || {
+            [
+                FieldTest::Equals(json!("b")),
+                FieldTest::Operators(vec![(crate::filter::Op::In, json!(["a", "e"]))]),
+                FieldTest::Equals(json!("z")),
+                FieldTest::Equals(Value::Null),
+            ]
+        };
+        let mut chosen = std::collections::BTreeSet::new();
+        for gap in [1usize, 2, 3, 4, 5, 11, 300] {
+            let count = 600;
+            let mut records: Records = (0..count)
+                .map(|k| {
+                    let metadata = if k % 7 == 3 {
+                        record(&[("lang", json!("en"))])
+                    } else if k % 11 == 5 {
+                        record(&[("cat", Value::Null)])
+                    } else {
+                        record(&[("cat", json!(values[k % 5]))])
+                    };
+                    (7 + k * gap, metadata)
+                })
+                .collect();
+            let mut store = ColumnStore::new(vec!["cat".to_string()], 7 + count * gap);
+            for (slot, metadata) in &records {
+                store.write(*slot, metadata);
+            }
+            for (slot, _) in records.iter().step_by(13) {
+                store.erase(*slot);
+            }
+            records.retain(|(slot, _)| store.live.contains(*slot));
+            assert!(
+                matches!(&store.columns[0], Column::Dictionary { codes, .. } if codes.is_flat())
+            );
+            assert!(store.live.is_flat());
+            let sparse = store.records * FLAT_RATIO < store.slots;
+            assert_eq!(store.sparse_records().is_some(), sparse, "gap {gap}");
+            chosen.insert(sparse);
+
+            let column = &store.columns[0];
+            let records_of = store.live.as_flat();
+            for test in tests() {
+                let by_records = column.select(&test, store.blank(), records_of);
+                let by_slots = column.select(&test, store.blank(), None);
+                assert_eq!(by_records.snapshot(), by_slots.snapshot(), "gap {gap}");
+                let paged = column.select(&test, Bitmap::paged(), records_of);
+                assert_eq!(bits(&paged), bits(&by_slots), "gap {gap}");
+                let filter = field("cat", test);
+                assert_eq!(
+                    selected(&store, &filter),
+                    walked(&store, &records, &filter),
+                    "gap {gap}"
+                );
+            }
+            let by_records = column.present(store.blank(), records_of);
+            let by_slots = column.present(store.blank(), None);
+            assert_eq!(
+                by_records.snapshot(),
+                by_slots.snapshot(),
+                "present, gap {gap}"
+            );
+            for want in [
+                Presence::Present,
+                Presence::Absent,
+                Presence::Null,
+                Presence::NotNull,
+            ] {
+                let filter = Filter::Presence {
+                    name: "cat".to_string(),
+                    want,
+                };
+                assert_eq!(
+                    selected(&store, &filter),
+                    walked(&store, &records, &filter),
+                    "gap {gap}"
+                );
+            }
+        }
+        assert_eq!(chosen, std::collections::BTreeSet::from([false, true]));
     }
 }

@@ -74,6 +74,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tracing::error;
+use zeusdb_vector_core::word_holds;
 use zeusdb_vector_core::{
     restore_graph, restore_int8_graph, Admit, ArtefactRecord, Bitmap, Bounds, Budget, Cost, Dense,
     Dir, DumpBounds, Error, Hit, Hits, Int8Codec, Inventory, Ledger, Persist, Planned, Prepared,
@@ -489,18 +490,18 @@ impl DenseIndex {
     fn score_exact(&self, query: &[f32], ids: &[RecordId], k: usize, boundary_ties: bool) -> Hits {
         let distance = raw_distance_fn(&self.metric);
         let needs_unit = reconstruction_needs_unit(&self.metric);
-        let mut scored: Vec<(f32, u32)> = if self.live.is_flat() && self.graph.id_map_is_flat() {
-            ids.iter()
-                .filter(|id| self.live.contains(id.slot()))
+        let mut scored: Vec<(f32, u32)> = match self.live.as_flat() {
+            Some(live) if self.graph.id_map_is_flat() => ids
+                .iter()
+                .filter(|id| word_holds(live, id.slot()))
                 .map(|id| {
                     (
                         self.exact_distance(query, id.slot(), distance, needs_unit),
                         id.0,
                     )
                 })
-                .collect()
-        } else {
-            self.score_in_order(query, ids, distance, needs_unit)
+                .collect(),
+            _ => self.score_in_order(query, ids, distance, needs_unit),
         };
         scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         let mut end = k.min(scored.len());
@@ -1327,5 +1328,53 @@ mod tests {
             flat.score_in_order(&[0.5, 0.5], &ids, distance, needs_unit),
             looked_up
         );
+    }
+
+    /// Over an index whose live set and id-to-node map are flat, the scan
+    /// scores exactly what a lookup per record scores, bit for bit and in the
+    /// same order: held records, removed records whose nodes stay and ids the
+    /// graph never took, at one record in every id and in three.
+    #[test]
+    fn the_scan_over_flat_structures_scores_what_a_lookup_per_record_scores() {
+        let (count, dim) = (300usize, 8usize);
+        let vectors = zeusdb_vector_core::test_support::clustered(count, dim, 195);
+        let layers = NB_LAYER_MAX as usize;
+        let distance = raw_distance_fn("l2");
+        let needs_unit = reconstruction_needs_unit("l2");
+        for gap in [1u32, 3] {
+            let graph = VectorGraph::new_raw("l2", dim, 8, 64, layers, 50);
+            let index = spread_index(graph, None, false, &vectors, gap);
+            assert!(
+                index.live.is_flat() && index.graph.id_map_is_flat(),
+                "gap {gap}"
+            );
+            let ids: Vec<RecordId> = (1..=3 + count as u32 * gap).map(RecordId).collect();
+            for q in [3usize, 150] {
+                let query = &vectors[q];
+                let mut looked_up: Vec<(f32, u32)> = ids
+                    .iter()
+                    .filter(|id| index.live.contains(id.slot()))
+                    .map(|id| {
+                        (
+                            index.exact_distance(query, id.slot(), distance, needs_unit),
+                            id.0,
+                        )
+                    })
+                    .collect();
+                assert_eq!(looked_up.len(), count - count.div_ceil(7));
+                looked_up.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                let page = index.score_exact(query, &ids, looked_up.len(), false);
+                let page: Vec<(u32, u32)> = page
+                    .items
+                    .iter()
+                    .map(|hit| (hit.score.to_bits(), hit.id.0))
+                    .collect();
+                let want: Vec<(u32, u32)> = looked_up
+                    .iter()
+                    .map(|&(score, id)| (score.to_bits(), id))
+                    .collect();
+                assert_eq!(page, want, "gap {gap} query {q}");
+            }
+        }
     }
 }
