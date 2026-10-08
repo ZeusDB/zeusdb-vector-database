@@ -1210,15 +1210,16 @@ impl Collection {
         }
     }
 
-    /// Whether the dense index's live set is the collection's, which every
-    /// write keeps true and a debug build checks at the points where the
-    /// two are read together.
+    /// Whether the dense index's live set is the collection's, and its live
+    /// set by node is that set read node by node, which every write keeps
+    /// true and a debug build checks at the points where the two are read
+    /// together.
     ///
     /// Taken in the declared order, the id store then the index.
     pub(crate) fn live_sets_agree(&self) -> bool {
         let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
-        ids.agrees_with(index.live_set()) && ids.len() == index.len()
+        ids.agrees_with(index.live_set()) && ids.len() == index.len() && index.live_nodes_agree()
     }
 
     /// Bring the dense index's live set into step with the id store, which

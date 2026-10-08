@@ -129,7 +129,7 @@ use super::dump::EachNeighbourhood;
 use super::dump::LoadedPoint;
 use super::dump::{AdjacencyWalk, LoadedEdge, PointId};
 use super::store::VectorStore;
-use super::traverse::{self, Topology, LAYERS};
+use super::traverse::{self, NodeFilter, Topology, LAYERS};
 use super::{Distance, GraphHit};
 use crate::idmap::{lookup_ratio, IdCursor, IdMap};
 
@@ -1915,7 +1915,7 @@ where
         filter: Option<&F>,
     ) -> Vec<GraphHit>
     where
-        F: Fn(&usize) -> bool,
+        F: NodeFilter,
     {
         if self.origin_ids.is_empty() {
             return Vec::new();

@@ -17,11 +17,13 @@
 //! set the collection keeps beside its reverse map, maintained on the same
 //! writes, and it is what lets the index answer `len`, `holds`, `stranded`
 //! and a removal of an id it never held without reaching into the
-//! collection. A search under a set admitting everything runs under this
-//! bitmap alone where the graph holds a node the bitmap does not, being the
-//! node a removal or an overwrite leaves behind, and under no predicate at
-//! all while every node is live, since the bitmap would then admit every
-//! node it is asked about.
+//! collection. Beside it the index keeps the same set by graph node, one
+//! bit for each node the graph holds, set where the node's id is live, so a
+//! traversal reads liveness in one word by node and reads no id. A search
+//! under a set admitting everything runs under that bit alone where the
+//! graph holds a node the live set does not, being the node a removal or an
+//! overwrite leaves behind, and under no predicate at all while every node
+//! is live, since the bit would then admit every node it is asked about.
 //!
 //! # The two paths
 //!
@@ -77,8 +79,9 @@ use tracing::error;
 use zeusdb_vector_core::word_holds;
 use zeusdb_vector_core::{
     restore_graph, restore_int8_graph, Admit, ArtefactRecord, Bitmap, Bounds, Budget, Cost, Dense,
-    Dir, DumpBounds, Error, Hit, Hits, Int8Codec, Inventory, Ledger, Persist, Planned, Prepared,
-    Record, RecordId, Restore, ScoreKind, Selectivity, VectorGraph, VectorIndex, DUMP_FILENAME, PQ,
+    Dir, DumpBounds, Error, Hit, Hits, IdThenNode, Int8Codec, Inventory, Ledger, NodeBits,
+    NodeThenId, Persist, Planned, Prepared, Record, RecordId, Restore, ScoreKind, Selectivity,
+    VectorGraph, VectorIndex, DUMP_FILENAME, PQ,
 };
 
 use super::search::FULL_SCAN_THRESHOLD;
@@ -156,6 +159,17 @@ pub(crate) struct DenseIndex {
     /// once they are sparse; see `Bitmap::hold`.
     live: Bitmap,
     live_count: usize,
+    /// The live set by graph node: one bit for each node the graph holds,
+    /// set where the id the node was inserted under is one `live` holds.
+    /// The words reach every node and no further, so they cost one bit a
+    /// node, removed nodes included.
+    ///
+    /// Derived from `live` and the graph, and kept in step with both. Every
+    /// replacement of either computes it again in one pass over the nodes,
+    /// `insert` grows the words to the graph's nodes and sets the new node's
+    /// bit, and `remove` clears the bit of the node it strands. Nothing of it
+    /// is persisted.
+    live_nodes: Vec<u64>,
     /// Whether every node the graph holds was inserted under an id the live
     /// set holds, so the live bit admits every node a traversal can reach.
     ///
@@ -198,6 +212,7 @@ impl DenseIndex {
             graph,
             live: Bitmap::default(),
             live_count: 0,
+            live_nodes: Vec::new(),
             every_node_live: false,
             metric: metric.to_string(),
             dim,
@@ -210,7 +225,7 @@ impl DenseIndex {
             },
             saturated: AtomicU64::new(0),
         };
-        index.every_node_live = every_node_live(&index.graph, &index.live);
+        (index.live_nodes, index.every_node_live) = live_nodes(&index.graph, &index.live);
         index.calibrate();
         index
     }
@@ -246,11 +261,20 @@ impl DenseIndex {
         &self.live
     }
 
-    /// Bytes the live set's bitmap asks the allocator for, for
+    /// Whether the live set by node is the one the live set and the graph
+    /// give node by node, and the flag claims no more than they do. Every
+    /// write keeps this true, and a debug build checks it with the live sets.
+    pub(crate) fn live_nodes_agree(&self) -> bool {
+        let (words, every) = live_nodes(&self.graph, &self.live);
+        words == self.live_nodes && (every || !self.every_node_live)
+    }
+
+    /// Bytes the live set asks the allocator for, by id and by node, for
     /// `Collection::stats`. The second of the two bitmaps a collection holds;
-    /// see `IdStore::heap_bytes`.
+    /// see `IdStore::heap_bytes`. The words by node cost eight bytes for
+    /// every 64 nodes they can hold.
     pub(crate) fn live_heap_bytes(&self) -> usize {
-        self.live.heap_bytes()
+        self.live.heap_bytes() + self.live_nodes.capacity() * std::mem::size_of::<u64>()
     }
 
     /// Replace the live set with the ids the collection holds, which the
@@ -265,7 +289,7 @@ impl DenseIndex {
         live.settle();
         self.live = live;
         self.live_count = count;
-        self.every_node_live = every_node_live(&self.graph, &self.live);
+        (self.live_nodes, self.every_node_live) = live_nodes(&self.graph, &self.live);
     }
 
     /// Swap the graph and keep everything else, which is what a compaction,
@@ -281,7 +305,7 @@ impl DenseIndex {
         timed: Option<(f64, f64)>,
     ) -> VectorGraph {
         let old = std::mem::replace(&mut self.graph, graph);
-        self.every_node_live = every_node_live(&self.graph, &self.live);
+        (self.live_nodes, self.every_node_live) = live_nodes(&self.graph, &self.live);
         self.set_units(timed);
         old
     }
@@ -527,12 +551,16 @@ impl DenseIndex {
 
     /// Run the traversal under one predicate.
     ///
-    /// Three predicates, each monomorphised into the traversal by the
-    /// graph's generic parameter. A set admitting everything is the live
-    /// bit alone, which is the unfiltered search, and no predicate at all
-    /// while every node the graph holds is live. A bitmap is its bit and
-    /// then the live bit, in that order so a rejected node costs one word
-    /// read. Anything else is the live bit and then the table call.
+    /// Four predicates, each monomorphised into the traversal by the
+    /// graph's generic parameter. Each reads liveness by node from the live
+    /// set by node, one word and no id. A set admitting everything is the
+    /// live bit alone, which is the unfiltered search, and no predicate at
+    /// all while every node the graph holds is live. A flat bitmap is its
+    /// bit and then the live bit, in that order so a rejected node costs one
+    /// word read. A paged bitmap, and the paged bitmap of a conjunction, is
+    /// read once into the nodes it admits for the query; see
+    /// [`DenseIndex::admitted_nodes`]. Anything else is the live bit and then
+    /// the table call.
     fn traverse(&self, query: &[f32], k: usize, ef: usize, admit: &dyn Admit) -> Hits {
         let quantized = self.graph.is_quantized();
         let operation = if quantized {
@@ -540,22 +568,39 @@ impl DenseIndex {
         } else {
             "raw_search"
         };
-        let live = &self.live;
+        let live = NodeBits(&self.live_nodes);
+        let admitted: Vec<u64>;
         let searched = if admit.admits_all() {
             if self.every_node_live {
                 // The live bit would admit every node the traversal can
                 // reach, so the search runs without a predicate.
                 self.graph.search(query, k, ef, None::<&fn(&usize) -> bool>)
             } else {
-                let admits = |id: &usize| live.contains(*id);
-                self.graph.search(query, k, ef, Some(&admits))
+                self.graph.search(query, k, ef, Some(&live))
             }
         } else if let Some(bitmap) = admit.as_bitmap() {
-            let admits = |id: &usize| bitmap.contains(*id) && live.contains(*id);
-            self.graph.search(query, k, ef, Some(&admits))
+            match bitmap.as_flat() {
+                Some(words) => {
+                    let held = |id: &usize| word_holds(words, *id);
+                    self.graph
+                        .search(query, k, ef, Some(&IdThenNode(&held, live)))
+                }
+                None => {
+                    admitted = self.admitted_nodes(bitmap);
+                    self.graph.search(query, k, ef, Some(&NodeBits(&admitted)))
+                }
+            }
         } else {
-            let admits = |id: &usize| live.contains(*id) && admit.admits(RecordId::from_slot(*id));
-            self.graph.search(query, k, ef, Some(&admits))
+            let (nodes, rest) = match admit.bitmap_and() {
+                Some((bitmap, rest)) if !bitmap.is_flat() => {
+                    admitted = self.admitted_nodes(bitmap);
+                    (NodeBits(&admitted), rest)
+                }
+                _ => (live, admit),
+            };
+            let admits = |id: &usize| rest.admits(RecordId::from_slot(*id));
+            self.graph
+                .search(query, k, ef, Some(&NodeThenId(nodes, &admits)))
         };
         let graph_hits = searched.unwrap_or_else(|e| {
             error!(target: LOG_TARGET, operation = operation, error = %e, "Graph search failed");
@@ -587,6 +632,44 @@ impl DenseIndex {
             items,
             kind: ScoreKind::Distance,
             exact: false,
+        }
+    }
+
+    /// The nodes a traversal under the paged set `ids` admits, one bit each
+    /// by node number: the live nodes whose id `ids` holds.
+    ///
+    /// Built for one query, so the traversal reads one word by node for
+    /// each candidate where it would read a page by id. It costs a word for
+    /// every 64 nodes the graph holds, allocated and zeroed, and a step of a
+    /// cursor over the id-to-node map for each id `ids` holds. The ids come
+    /// in increasing order, so the cursor resolves each page of a paged map
+    /// once.
+    fn admitted_nodes(&self, ids: &Bitmap) -> Vec<u64> {
+        let mut admitted = vec![0u64; self.live_nodes.len()];
+        let mut nodes = self.graph.node_cursor();
+        ids.for_each(|id| {
+            if let Some(&node) = nodes.get(id) {
+                let at = node as usize >> 6;
+                if let (Some(word), Some(live)) = (admitted.get_mut(at), self.live_nodes.get(at)) {
+                    *word |= live & (1u64 << (node & 63));
+                }
+            }
+        });
+        admitted
+    }
+
+    /// Set the bit of the node `id` sits at, once its insertion is in, the
+    /// words first grown to reach every node the graph holds. An id the
+    /// graph took no node for sets no bit.
+    fn hold_node(&mut self, id: usize) {
+        let words = self.graph.nb_points().div_ceil(64);
+        if self.live_nodes.len() < words {
+            self.live_nodes.resize(words, 0);
+        }
+        if let Some(node) = self.graph.node_of(id) {
+            if let Some(word) = self.live_nodes.get_mut(node as usize >> 6) {
+                *word |= 1u64 << (node & 63);
+            }
         }
     }
 
@@ -724,17 +807,24 @@ impl VectorIndex<Dense> for DenseIndex {
         }
         self.live.hold(id.slot());
         self.live_count += 1;
+        self.hold_node(id.slot());
         Ok(())
     }
 
-    /// Strands the node. The graph keeps it, since a stranded node still
-    /// routes a traversal, and `compact` rebuilds the graph without it.
+    /// Strands the node and clears its bit by node. The graph keeps the
+    /// node, since a stranded node still routes a traversal, and `compact`
+    /// rebuilds the graph without it.
     fn remove(&mut self, id: RecordId) -> Result<(), Error> {
         if !self.live.contains(id.slot()) {
             return Err(Error::RecordNotHeld { id: id.0 });
         }
         self.live.release(id.slot());
         self.live_count -= 1;
+        if let Some(node) = self.graph.node_of(id.slot()) {
+            if let Some(word) = self.live_nodes.get_mut(node as usize >> 6) {
+                *word &= !(1u64 << (node & 63));
+            }
+        }
         self.every_node_live = false;
         Ok(())
     }
@@ -815,9 +905,20 @@ impl VectorIndex<Dense> for DenseIndex {
     }
 }
 
-/// Whether every node `graph` holds was inserted under an id `live` holds.
-fn every_node_live(graph: &VectorGraph, live: &Bitmap) -> bool {
-    (0..graph.nb_points() as u32).all(|node| live.contains(graph.origin_id_at(node)))
+/// The live set of `graph` by node: one bit for each node it holds, by node
+/// number, set where the node was inserted under an id `live` holds, in words
+/// that reach every node and no further. And whether every node is live.
+fn live_nodes(graph: &VectorGraph, live: &Bitmap) -> (Vec<u64>, bool) {
+    let nodes = graph.nb_points();
+    let mut words = vec![0u64; nodes.div_ceil(64)];
+    let mut held = 0;
+    for node in 0..nodes as u32 {
+        if live.contains(graph.origin_id_at(node)) {
+            words[node as usize >> 6] |= 1u64 << (node & 63);
+            held += 1;
+        }
+    }
+    (words, held == nodes)
 }
 
 /// The dump's name under a prefix.
@@ -938,7 +1039,7 @@ impl Restore for DenseIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeusdb_vector_core::{Candidates, NB_LAYER_MAX};
+    use zeusdb_vector_core::{And, Candidates, NB_LAYER_MAX};
 
     fn index_of(vectors: &[Vec<f32>]) -> DenseIndex {
         let graph = VectorGraph::new_raw("l2", 2, 4, 64, NB_LAYER_MAX as usize, 50);
@@ -1375,6 +1476,223 @@ mod tests {
                     .collect();
                 assert_eq!(page, want, "gap {gap} query {q}");
             }
+        }
+    }
+
+    /// Whether the live set by node reaches every node the graph holds and
+    /// no further, and holds each node exactly where the live set holds the
+    /// id the node was inserted under.
+    fn read_node_by_node(index: &DenseIndex) -> bool {
+        index.live_nodes.len() == index.graph.nb_points().div_ceil(64)
+            && (0..index.graph.nb_points() as u32).all(|node| {
+                NodeBits(&index.live_nodes).holds(node)
+                    == index.live.contains(index.graph.origin_id_at(node))
+            })
+    }
+
+    /// The live set by node is the live set read node by node through every
+    /// write and every replacement: insertions, removals that strand their
+    /// nodes, an overwrite under a new id, the live set handed back whole, a
+    /// graph rebuilt from the live records, and a graph opened whole, over
+    /// ids dense enough to keep the live set flat and sparse enough to page
+    /// it. A wholesale computation holds one word for every 64 nodes.
+    #[test]
+    fn the_live_nodes_follow_every_write_and_every_replacement() {
+        let (count, dim) = (300usize, 8usize);
+        let vectors = zeusdb_vector_core::test_support::clustered(count + 1, dim, 196);
+        let layers = NB_LAYER_MAX as usize;
+        let rebuilt_from = |index: &DenseIndex, vector_of: &dyn Fn(usize) -> usize| {
+            let mut graph = VectorGraph::new_raw("l2", dim, 8, 64, layers, 50);
+            index
+                .live
+                .for_each(|id| graph.insert(&vectors[vector_of(id)], id));
+            graph
+        };
+        for gap in [1u32, 1_009] {
+            let graph = VectorGraph::new_raw("l2", dim, 8, 64, layers, 50);
+            let mut index = spread_index(graph, None, false, &vectors[..count], gap);
+            assert_eq!(index.live.is_flat(), gap == 1, "gap {gap}");
+            assert!(read_node_by_node(&index), "built, gap {gap}");
+            assert!(!index.every_node_live && index.live_nodes_agree());
+
+            // An overwrite takes the record out under its id and puts it back
+            // under a new one, and the old node stays.
+            let old = RecordId(1 + 3 * gap);
+            let new = RecordId(1 + count as u32 * gap);
+            index.remove(old).unwrap();
+            let prepared = index.prepare(new, &vectors[count]).unwrap();
+            index.insert(new, &vectors[count], prepared).unwrap();
+            assert!(read_node_by_node(&index), "overwritten, gap {gap}");
+            let stranded = index.graph.node_of(old.slot()).unwrap();
+            let moved = index.graph.node_of(new.slot()).unwrap();
+            assert!(!NodeBits(&index.live_nodes).holds(stranded));
+            assert!(NodeBits(&index.live_nodes).holds(moved));
+            assert!(index.live_nodes_agree());
+
+            let vector_of = |id: usize| {
+                if id == new.slot() {
+                    count
+                } else {
+                    (id - 1) / gap as usize
+                }
+            };
+            let mut held = Vec::new();
+            index.live.for_each(|id| held.push(id));
+            index.set_live(held.iter().copied());
+            assert!(read_node_by_node(&index), "handed back, gap {gap}");
+            let words = index.graph.nb_points().div_ceil(64);
+            assert_eq!(
+                index.live_heap_bytes(),
+                index.live.heap_bytes() + words * 8,
+                "gap {gap}"
+            );
+
+            index.replace_graph(rebuilt_from(&index, &vector_of), None);
+            assert!(read_node_by_node(&index), "replaced, gap {gap}");
+            assert!(index.every_node_live && index.live_nodes_agree());
+
+            // A graph opened whole holds no live node until the live set is
+            // handed over.
+            let mut opened =
+                DenseIndex::new(rebuilt_from(&index, &vector_of), "l2", dim, None, false);
+            assert!(read_node_by_node(&opened) && opened.live_nodes_agree());
+            assert!(opened.live_nodes.iter().all(|&word| word == 0));
+            opened.set_live(held.iter().copied());
+            assert!(read_node_by_node(&opened) && opened.every_node_live);
+        }
+    }
+
+    /// One traversal's page, as internal ids and score bits.
+    fn traversed(index: &DenseIndex, query: &[f32], admit: &dyn Admit) -> Vec<(u32, u32)> {
+        bits_of(&index.traverse(query, 10, 40, admit))
+    }
+
+    /// The page the graph answers under a test by id.
+    fn by_id(index: &DenseIndex, query: &[f32], admits: impl Fn(usize) -> bool) -> Vec<(u32, u32)> {
+        index
+            .graph()
+            .search(query, 10, 40, Some(&|id: &usize| admits(*id)))
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.internal_id as u32, hit.distance.to_bits()))
+            .collect()
+    }
+
+    /// Records whose id is not a multiple of three.
+    struct NotThird;
+
+    impl Admit for NotThird {
+        fn admits(&self, id: RecordId) -> bool {
+            !id.0.is_multiple_of(3)
+        }
+
+        fn len_hint(&self) -> Option<usize> {
+            None
+        }
+    }
+
+    /// A set admitting every record, a filter's bitmap flat and paged, a
+    /// conjunction of either with a predicate in both orders, and a
+    /// predicate alone each traverse to the page the graph answers under the
+    /// same test with the live bit read by id, through removed nodes that a
+    /// traversal with no predicate returns. The live set is flat, paged by
+    /// its own density, and paged out with its records unchanged, and its
+    /// form changes no page.
+    #[test]
+    fn a_traversal_through_removed_nodes_answers_what_the_test_by_id_answers() {
+        let (count, dim) = (400usize, 8usize);
+        let vectors = zeusdb_vector_core::test_support::clustered(count, dim, 1_960);
+        let queries = zeusdb_vector_core::test_support::clustered(12, dim, 1_961);
+        let layers = NB_LAYER_MAX as usize;
+        let mut pages = Vec::new();
+        for (gap, page_out) in [(1u32, false), (1, true), (1_009, false)] {
+            let graph = VectorGraph::new_raw("l2", dim, 8, 64, layers, 50);
+            let mut index = spread_index(graph, None, false, &vectors, gap);
+            for k in 0..count as u32 {
+                if k % 3 != 1 && k % 7 != 0 {
+                    index.remove(RecordId(1 + k * gap)).unwrap();
+                }
+            }
+            if page_out {
+                index.live.page_out();
+            }
+            assert_eq!(index.live.is_flat(), gap == 1 && !page_out);
+            let live = index.live_set().clone();
+            assert!(
+                queries.iter().any(|query| index
+                    .graph()
+                    .search(query, 10, 40, None::<&fn(&usize) -> bool>)
+                    .unwrap()
+                    .iter()
+                    .any(|hit| !live.contains(hit.internal_id))),
+                "a removed record sits where these queries reach it"
+            );
+            let mut flat = Bitmap::with_slots(1 + count * gap as usize);
+            let mut paged = Bitmap::paged();
+            for k in (0..count as u32).filter(|k| k % 2 == 0) {
+                flat.insert(1 + (k * gap) as usize);
+                paged.insert(1 + (k * gap) as usize);
+            }
+            assert!(flat.is_flat() && !paged.is_flat());
+            let mut answered = Vec::new();
+            for query in &queries {
+                let page = traversed(&index, query, &Candidates::All);
+                assert_eq!(page, by_id(&index, query, |id| live.contains(id)));
+                answered.push(page);
+                for bitmap in [&flat, &paged] {
+                    let want = by_id(&index, query, |id| bitmap.contains(id) && live.contains(id));
+                    assert_eq!(traversed(&index, query, bitmap), want, "gap {gap}");
+                    let want = by_id(&index, query, |id| {
+                        live.contains(id) && bitmap.contains(id) && !id.is_multiple_of(3)
+                    });
+                    assert_eq!(traversed(&index, query, &And(bitmap, &NotThird)), want);
+                    assert_eq!(traversed(&index, query, &And(&NotThird, bitmap)), want);
+                    answered.push(want);
+                }
+                let want = by_id(&index, query, |id| {
+                    live.contains(id) && !id.is_multiple_of(3)
+                });
+                assert_eq!(traversed(&index, query, &NotThird), want);
+            }
+            if gap == 1 {
+                pages.push(answered);
+            }
+        }
+        assert_eq!(pages[0], pages[1], "the live set's form changes no page");
+    }
+
+    /// The nodes a paged set admits are the live nodes whose id it holds,
+    /// node by node, for a set holding live records, removed records and ids
+    /// no node carries, over a flat and a paged id-to-node map.
+    #[test]
+    fn the_nodes_a_paged_set_admits_are_the_live_nodes_whose_id_it_holds() {
+        let (count, dim) = (300usize, 8usize);
+        let vectors = zeusdb_vector_core::test_support::clustered(count, dim, 1_962);
+        let layers = NB_LAYER_MAX as usize;
+        for gap in [1u32, 1_009] {
+            let graph = VectorGraph::new_raw("l2", dim, 8, 64, layers, 50);
+            let index = spread_index(graph, None, false, &vectors, gap);
+            assert_eq!(index.graph.id_map_is_flat(), gap == 1);
+            let mut ids = Bitmap::paged();
+            for k in (0..count as u32).filter(|k| k % 3 != 2) {
+                ids.insert(1 + (k * gap) as usize);
+                ids.insert(2 + (k * gap) as usize);
+            }
+            ids.insert(10 * zeusdb_vector_core::PAGE_IDS + 7);
+            let admitted = index.admitted_nodes(&ids);
+            assert_eq!(admitted.len(), index.live_nodes.len());
+            let mut held = 0;
+            for node in 0..index.graph.nb_points() as u32 {
+                let id = index.graph.origin_id_at(node);
+                let want = ids.contains(id) && index.live.contains(id);
+                assert_eq!(
+                    NodeBits(&admitted).holds(node),
+                    want,
+                    "gap {gap} node {node}"
+                );
+                held += usize::from(want);
+            }
+            assert!(held > 100, "gap {gap}");
         }
     }
 }

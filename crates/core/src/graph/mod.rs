@@ -101,6 +101,7 @@ pub use mutable::Planned;
 use mutable::{MutableGraph, NODE_RATIO};
 use store::VectorStore;
 use traverse::LAYERS;
+pub use traverse::{IdThenNode, NodeBits, NodeFilter, NodeThenId};
 
 /// How far apart two points of type `T` are.
 ///
@@ -691,7 +692,8 @@ impl VectorGraph {
     /// unfiltered behaviour.
     ///
     /// It is taken by generic reference rather than as a trait object so the
-    /// closure the caller passes is monomorphised into the traversal.
+    /// predicate the caller passes, a closure over ids or a [`NodeFilter`]
+    /// that reads the node, is monomorphised into the traversal.
     pub fn search<F>(
         &self,
         query: &[f32],
@@ -700,7 +702,7 @@ impl VectorGraph {
         filter: Option<&F>,
     ) -> Result<Vec<GraphHit>, String>
     where
-        F: Fn(&usize) -> bool,
+        F: NodeFilter,
     {
         match self {
             // Raw vector search
@@ -927,7 +929,7 @@ impl VectorGraph {
     /// removal strands a node rather than deleting it. The id store is the
     /// record set and every caller consults it first, so a stranded entry is
     /// unreachable rather than wrong.
-    pub(crate) fn node_of(&self, internal_id: usize) -> Option<u32> {
+    pub fn node_of(&self, internal_id: usize) -> Option<u32> {
         self.id_map().get(internal_id).copied()
     }
 

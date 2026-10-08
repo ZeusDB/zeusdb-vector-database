@@ -76,7 +76,8 @@ pub use frame::{
 pub use fusion::{fuse, Contribution, FusedHit, Fusion, DEFAULT_RRF_K};
 pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES, NB_LAYER_MAX};
 pub use graph::{
-    restore_graph, restore_int8_graph, Distance, DumpBounds, GraphHit, Planned, Record, VectorGraph,
+    restore_graph, restore_int8_graph, Distance, DumpBounds, GraphHit, IdThenNode, NodeBits,
+    NodeFilter, NodeThenId, Planned, Record, VectorGraph,
 };
 pub use idmap::{lookup_ratio, IdCursor, IdMap, Vacant, LOOKUP_BYTES, PAGE_IDS};
 pub use ids::{IdStore, MAX_INTERNAL_ID};

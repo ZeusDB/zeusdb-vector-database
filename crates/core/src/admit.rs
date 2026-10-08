@@ -47,6 +47,13 @@ pub trait Admit: Sync {
         let _ = visit;
         false
     }
+
+    /// Where this set is a bitmap conjoined with another set, the bitmap and
+    /// the other set, so an index can read the bitmap in a form of its own
+    /// and ask the other set alone.
+    fn bitmap_and(&self) -> Option<(&Bitmap, &dyn Admit)> {
+        None
+    }
 }
 
 impl Admit for Bitmap {
@@ -170,6 +177,16 @@ impl Admit for And<'_> {
         }
         test.enumerate(&mut |id| !drive.admits(id) || visit(id))
     }
+
+    /// The side that is a bitmap, the first where both are, and the other
+    /// side.
+    fn bitmap_and(&self) -> Option<(&Bitmap, &dyn Admit)> {
+        match (self.0.as_bitmap(), self.1.as_bitmap()) {
+            (Some(bitmap), _) => Some((bitmap, self.1)),
+            (None, Some(bitmap)) => Some((bitmap, self.0)),
+            (None, None) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -266,5 +283,25 @@ mod tests {
         assert_eq!(seen, vec![0, 2]);
 
         assert_eq!(ids(&And(&Even, &Candidates::All)), None);
+    }
+
+    /// A conjunction hands over the side that is a bitmap and the other
+    /// side, in either order, and a set that is no such conjunction hands
+    /// over nothing.
+    #[test]
+    fn a_conjunction_hands_over_its_bitmap_and_the_other_side() {
+        let mut bitmap = Bitmap::default();
+        for slot in [2usize, 4, 7] {
+            bitmap.insert(slot);
+        }
+        for both in [And(&bitmap, &Even), And(&Even, &bitmap)] {
+            let (held, rest) = both.bitmap_and().expect("one side is a bitmap");
+            assert!(std::ptr::eq(held, &bitmap));
+            assert!(rest.admits(RecordId(4)) && rest.admits(RecordId(6)));
+            assert!(!rest.admits(RecordId(7)), "the other side is the predicate");
+        }
+        assert!(And(&Even, &Candidates::All).bitmap_and().is_none());
+        assert!(bitmap.bitmap_and().is_none());
+        assert!(Candidates::All.bitmap_and().is_none());
     }
 }

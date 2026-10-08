@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use zeusdb_vector_core::{compile_filter, IdfScope, Operation, SparseVector, DUMP_FILENAME};
 use zeusdb_vector_sparse::SparseConfig;
 
-use super::{Collection, Declaration, ParsedRecord, SparseHalf};
+use super::{Collection, Declaration, Int8Scale, ParsedRecord, SparseHalf, StorageMode};
 use crate::journal::Durability;
 
 /// A directory under the system's temporary directory, removed on drop
@@ -645,5 +645,136 @@ fn a_collection_keeps_its_id_to_node_map_flat_to_its_ratio() {
         let loaded = reload(&thinned, &temp, &format!("ratio-{every}.zdb"));
         assert_eq!(forms(&loaded).id_map, flat_map, "loaded, one in {every}");
         assert_eq!(pages(&loaded), pages(&held), "loaded, one in {every}");
+    }
+}
+
+/// Records `ids` of `vectors`, each with the fields `fields` gives.
+fn wide_records(vectors: &[Vec<f32>], ids: impl IntoIterator<Item = usize>) -> Vec<ParsedRecord> {
+    ids.into_iter()
+        .map(|i| ParsedRecord {
+            id: format!("r{i}"),
+            vector: vectors[i].clone(),
+            sparse: None,
+            metadata: fields(i as u32),
+        })
+        .collect()
+}
+
+/// Copy the directory `from` to `to`, with every file and subdirectory.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// The dense index's live set by node follows every path that changes the
+/// graph or the live set, over ids past the record sets' first page, so the
+/// live set by id is paged: insertions, removals that strand their nodes, an
+/// overwrite, a journal replayed onto its checkpoint, a compaction, a load of
+/// a checkpoint from its dump, a loaded collection then changed and loaded
+/// again, a load that rebuilds the graph, and `clear`. A raw graph, a product
+/// quantized graph and a scalar
+/// quantized graph take the same steps, the two quantized ones training part
+/// way through.
+#[test]
+fn the_live_nodes_follow_every_path_that_changes_the_graph_or_the_live_set() {
+    let temp = TempDir::new();
+    let vectors = zeusdb_vector_core::test_support::clustered(1_700, 16, 196);
+    let put = |collection: &Collection, ids: Vec<usize>, overwrite: bool| {
+        let added = collection.add_records(wide_records(&vectors, ids), vec![], overwrite);
+        assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    };
+    for kind in ["raw", "pq", "int8"] {
+        let declaration =
+            Declaration::validate(16, "l2", 8, 40, 100, vec!["cat".to_string()]).unwrap();
+        let quantization = match kind {
+            "pq" => Some(
+                declaration
+                    .quantization(4, 4, 1_000, None, StorageMode::QuantizedWithRaw)
+                    .unwrap(),
+            ),
+            "int8" => Some(
+                declaration
+                    .scalar_quantization(
+                        Int8Scale::PER_DIMENSION,
+                        1_000,
+                        None,
+                        StorageMode::QuantizedOnly,
+                    )
+                    .unwrap(),
+            ),
+            _ => None,
+        };
+        let mut collection = Collection::build(declaration, quantization);
+        // The counter as churn leaves it, so every record's id is past the
+        // record sets' first page.
+        collection.set_counters(200_000, 0);
+        let path = temp.at(&format!("live-nodes-{kind}.zdb"));
+        collection
+            .journal_to(path.to_str().unwrap(), Durability::default())
+            .unwrap();
+        let agree = |collection: &Collection, step: &str| {
+            assert!(collection.live_sets_agree(), "{kind}: {step}");
+        };
+
+        put(&collection, (0..600).collect(), false);
+        agree(&collection, "built");
+        collection.checkpoint().unwrap();
+        remove(&collection, 0..600, |i| i % 3 != 0);
+        agree(&collection, "removed");
+        put(&collection, (0..90).step_by(3).collect(), true);
+        agree(&collection, "overwritten");
+        put(&collection, (600..1_500).collect(), false);
+        agree(&collection, "added past the training set");
+        assert_eq!(collection.is_quantized(), kind != "raw", "{kind}");
+        assert!(
+            !forms(&collection).dense_live,
+            "{kind}: the live set by id pages"
+        );
+        drop(collection);
+
+        let (recovered, report) =
+            Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
+        assert!(report.replayed > 0 && !report.graph_rebuilt, "{kind}");
+        agree(&recovered, "replayed");
+        recovered.compact().unwrap();
+        agree(&recovered, "compacted");
+        recovered.checkpoint().unwrap();
+        drop(recovered);
+
+        // The checkpoint copied without its journal, which is the whole of
+        // the collection once the journal is cut back to it.
+        let copy = temp.at(&format!("live-nodes-{kind}-copy.zdb"));
+        copy_tree(&path, &copy);
+        let loaded = Collection::load_checkpoint_only(copy.to_str().unwrap(), None).unwrap();
+        agree(&loaded, "loaded");
+        remove(&loaded, 600..1_500, |i| i % 5 == 0);
+        put(&loaded, (1_500..1_600).collect(), false);
+        put(&loaded, (601..700).step_by(5).collect(), true);
+        agree(&loaded, "loaded then changed");
+        loaded.compact().unwrap();
+        agree(&loaded, "loaded, changed and compacted");
+        let loaded = reload(&loaded, &temp, &format!("live-nodes-{kind}-again.zdb"));
+        agree(&loaded, "loaded again");
+
+        let rebuilt_path = temp.at(&format!("live-nodes-{kind}-rebuilt.zdb"));
+        loaded.save(rebuilt_path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(rebuilt_path.join(DUMP_FILENAME)).unwrap();
+        let rebuilt = Collection::load(rebuilt_path.to_str().unwrap()).unwrap();
+        agree(&rebuilt, "loaded through a rebuild");
+        remove(&rebuilt, 1_500..1_600, |i| i % 2 == 0);
+        agree(&rebuilt, "rebuilt then removed");
+
+        rebuilt.clear().unwrap();
+        agree(&rebuilt, "cleared");
+        put(&rebuilt, (0..50).collect(), false);
+        agree(&rebuilt, "cleared then added");
     }
 }

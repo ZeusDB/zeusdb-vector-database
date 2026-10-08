@@ -16,6 +16,7 @@
 
 use super::dump::NB_LAYER_MAX;
 use super::{Distance, GraphHit};
+use crate::bitmap::word_holds;
 use std::collections::BinaryHeap;
 
 /// Layers every graph carries, which is the vendored crate's fixed count.
@@ -62,6 +63,67 @@ pub(super) trait Topology {
 
     /// One node's neighbour list at one layer, empty where it has none.
     fn neighbours(&self, node: u32, layer: usize) -> &[u32];
+}
+
+/// What a traversal admits, asked once for each candidate it pushes and once
+/// for each point of the page it cuts.
+///
+/// A test reads the candidate's node, the id the node was inserted under, or
+/// both. `origin` reads the id, so a test by node alone reads no id. A test by
+/// id is any `Fn(&usize) -> bool`, and the traversal reads the node's id for
+/// it.
+pub trait NodeFilter {
+    /// Whether the traversal admits `node`, whose id `origin` reads.
+    fn admits(&self, node: u32, origin: impl FnOnce() -> usize) -> bool;
+}
+
+impl<F: Fn(&usize) -> bool> NodeFilter for F {
+    #[inline]
+    fn admits(&self, _node: u32, origin: impl FnOnce() -> usize) -> bool {
+        self(&origin())
+    }
+}
+
+/// The nodes a set of words holds, one bit each by node number. A node past
+/// the words is not held.
+#[derive(Clone, Copy)]
+pub struct NodeBits<'a>(pub &'a [u64]);
+
+impl NodeBits<'_> {
+    /// Whether the words hold `node`, in one word read.
+    #[inline]
+    pub fn holds(&self, node: u32) -> bool {
+        word_holds(self.0, node as usize)
+    }
+}
+
+impl NodeFilter for NodeBits<'_> {
+    #[inline]
+    fn admits(&self, node: u32, _origin: impl FnOnce() -> usize) -> bool {
+        self.holds(node)
+    }
+}
+
+/// A test by id and then a test by node. A node the first test rejects costs
+/// no read of the second.
+pub struct IdThenNode<'a, F>(pub &'a F, pub NodeBits<'a>);
+
+impl<F: Fn(&usize) -> bool> NodeFilter for IdThenNode<'_, F> {
+    #[inline]
+    fn admits(&self, node: u32, origin: impl FnOnce() -> usize) -> bool {
+        (self.0)(&origin()) && self.1.holds(node)
+    }
+}
+
+/// A test by node and then a test by id. A node the first test rejects costs
+/// no read of its id.
+pub struct NodeThenId<'a, F>(pub NodeBits<'a>, pub &'a F);
+
+impl<F: Fn(&usize) -> bool> NodeFilter for NodeThenId<'_, F> {
+    #[inline]
+    fn admits(&self, node: u32, origin: impl FnOnce() -> usize) -> bool {
+        self.0.holds(node) && (self.1)(&origin())
+    }
 }
 
 /// A heap entry: one node ordered by its distance to the query.
@@ -258,7 +320,8 @@ where
 /// A neighbour is a `u32` read from the graph's own arena, so the traversal
 /// allocates nothing per edge where the vendored one allocates an `Arc` per
 /// heap entry. The visited set is a bitset rather than a `HashMap` of `Arc`s.
-/// The predicate is a monomorphised `Fn` rather than a `&dyn FilterT`. And two
+/// The predicate is a monomorphised [`NodeFilter`] rather than a
+/// `&dyn FilterT`, so a test by node reads no id. And two
 /// vendored checks have no equivalent because the states they answer cannot
 /// exist here: the empty-graph early return, since neither constructor accepts
 /// a graph of no points, and `search_layer`'s negative-rank check, since a node
@@ -278,7 +341,7 @@ pub(super) fn search<G, F>(
 ) -> Vec<GraphHit>
 where
     G: Topology + ?Sized,
-    F: Fn(&usize) -> bool,
+    F: NodeFilter,
 {
     let dist_f = graph.distance();
     let entry = graph.entry();
@@ -315,7 +378,7 @@ where
         Some(admits) => {
             for point in &neighbours[..last] {
                 let origin_id = graph.origin_id(point.node);
-                if admits(&origin_id) {
+                if admits.admits(point.node, || origin_id) {
                     hits.push(GraphHit {
                         internal_id: origin_id,
                         distance: point.dist_to_ref,
@@ -354,7 +417,7 @@ pub(super) fn search_layer<G, F>(
 ) -> BinaryHeap<OrderedNode>
 where
     G: Topology + ?Sized,
-    F: Fn(&usize) -> bool,
+    F: NodeFilter,
 {
     let dist_f = graph.distance();
     let skiplist_size = ef.max(2);
@@ -377,7 +440,7 @@ where
     });
     let entry_admitted = match filter {
         None => true,
-        Some(admits) => admits(&graph.origin_id(entry)),
+        Some(admits) => admits.admits(entry, || graph.origin_id(entry)),
     };
     if entry_admitted {
         return_points.push(OrderedNode {
@@ -432,7 +495,7 @@ where
                     });
                     let admitted = match filter {
                         None => true,
-                        Some(admits) => admits(&graph.origin_id(e)),
+                        Some(admits) => admits.admits(e, || graph.origin_id(e)),
                     };
                     if admitted {
                         return_points.push(OrderedNode {
@@ -448,4 +511,47 @@ where
         }
     }
     return_points
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// Each predicate answers what its tests answer, in its order, and reads
+    /// the node's id only where a test by id runs.
+    #[test]
+    fn each_predicate_answers_what_its_tests_answer_and_reads_the_id_only_for_a_test_by_id() {
+        let words = [0b1011u64, 1u64 << 63, 1];
+        let bits = NodeBits(&words);
+        let even = |id: &usize| id.is_multiple_of(2);
+        let reads = Cell::new(0usize);
+        for node in 0..200u32 {
+            let id = node as usize * 3 + 1;
+            let origin = || {
+                reads.set(reads.get() + 1);
+                id
+            };
+            let held = node < 192 && (words[node as usize >> 6] >> (node & 63)) & 1 == 1;
+            let kept = id.is_multiple_of(2);
+
+            reads.set(0);
+            assert_eq!(bits.admits(node, origin), held, "node {node}");
+            assert_eq!(reads.get(), 0, "a test by node reads no id");
+            assert_eq!(even.admits(node, origin), kept);
+            assert_eq!(reads.get(), 1);
+
+            reads.set(0);
+            assert_eq!(IdThenNode(&even, bits).admits(node, origin), kept && held);
+            assert_eq!(reads.get(), 1, "the test by id runs first");
+
+            reads.set(0);
+            assert_eq!(NodeThenId(bits, &even).admits(node, origin), held && kept);
+            assert_eq!(
+                reads.get(),
+                usize::from(held),
+                "a node the bit rejects reads no id"
+            );
+        }
+    }
 }

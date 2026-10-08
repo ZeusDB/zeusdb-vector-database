@@ -164,8 +164,9 @@ impl Collection {
                 holds_raw,
                 raw,
                 reserved,
-                // The second of the two bitmaps, priced from the guard that is
-                // already open on the structure holding it.
+                // The second of the two bitmaps, by id and by node, priced
+                // from the guard that is already open on the structure
+                // holding it.
                 index.live_heap_bytes(),
                 // The scalar row's width and the values the encode has
                 // clipped, from the same guard, for the keys below.
@@ -205,7 +206,8 @@ impl Collection {
         // without `indexed_fields`.
         bookkeeping += self.columns.read().unwrap().heap_bytes();
 
-        // The dense index's live set, captured with the graph above.
+        // The dense index's live set by id and by node, captured with the
+        // graph above.
         bookkeeping += dense_live_bytes;
 
         let training_id_count = {
