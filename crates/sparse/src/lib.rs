@@ -34,7 +34,10 @@
 //! # Search
 //!
 //! Term-at-a-time accumulation into a dense scratch buffer with a bounded
-//! top-k heap. An admit set that is a bitmap is tested by a loop
+//! top-k heap. The buffer and every set a scan tests are indexed by the
+//! record's key, its id while the record table is flat and its rank among
+//! the ids the table holds once it is paged, so each is flat at every
+//! density. An admit set that is a bitmap is tested by a loop
 //! monomorphised over the bit, since the trait-object call is a third of the
 //! scan when asked once per posting. A small admit set drives the search
 //! instead, being scored record by record from the forward arena, and the

@@ -204,11 +204,13 @@ impl SparseConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub(crate) struct Posting {
-    pub(crate) id: u32,
+    /// The record's key; see [`PostingsIndex`].
+    pub(crate) key: u32,
     pub(crate) weight: f32,
 }
 
-/// One dimension's postings, sorted by record id.
+/// One dimension's postings, sorted by key, which is the order of the
+/// records' ids.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PostingList {
     pub(crate) postings: Vec<Posting>,
@@ -254,6 +256,21 @@ impl Vacant for Slot {
     }
 }
 
+/// Ids of its extent the rank map holds flat for each record: the ratio of a
+/// map a search looks up, for its four-byte entries.
+const RANK_RATIO: usize = lookup_ratio(std::mem::size_of::<u32>());
+
+/// The rank of each record the record table holds, among the ids it holds,
+/// kept while the table is paged. Ranks run from zero in increasing id order,
+/// so they hold no gap and order the records as their ids do.
+#[derive(Clone, Default)]
+pub(crate) struct Ranks {
+    /// The id at each rank, strictly increasing.
+    pub(crate) ids: Vec<u32>,
+    /// The rank of each id the record table holds.
+    pub(crate) of: IdMap<u32, RANK_RATIO>,
+}
+
 /// Heap bytes the structure holds, by capacity, split by part. The
 /// allocator's own overhead sits outside it.
 #[derive(Clone, Copy, Debug, Default)]
@@ -267,6 +284,9 @@ pub struct HeapBytes {
     pub lengths: usize,
     /// The dead set and the live set together.
     pub dead: usize,
+    /// The ids by rank and the map from an id to its rank, once the record
+    /// table is paged.
+    pub ranks: usize,
 }
 
 impl HeapBytes {
@@ -278,10 +298,22 @@ impl HeapBytes {
             + self.records
             + self.lengths
             + self.dead
+            + self.ranks
     }
 }
 
 /// The index.
+///
+/// # Keys
+///
+/// The index holds each record's postings, length and dead bit under a key.
+/// While the record table is flat, the key is the record's id. Once the
+/// table is paged, the key is the record's rank among the ids the table
+/// holds, kept in [`Ranks`]. Ranks are dense whatever range the ids span, so
+/// the scan's accumulator, the dead set, the lengths and the set of admitted
+/// records a search builds are flat vectors over the keys at every density.
+/// Ranks run in the order of the ids, so a page selected by key is the page
+/// selected by id.
 pub struct PostingsIndex {
     pub(crate) config: SparseConfig,
     /// Dimension to slot in `lists`.
@@ -297,21 +329,24 @@ pub struct PostingsIndex {
     /// largest id ever inserted, which the artefact records as its slot
     /// count. It stays flat to [`RECORD_RATIO`] ids a record.
     pub(crate) records: IdMap<Slot, RECORD_RATIO>,
-    /// Each record's length, being the sum of its values, by record id and
-    /// entry for entry with `records`, so in the same form. What a term
-    /// frequency weighting normalises by, read once per posting the scan
-    /// admits. Kept under every weighting, since it costs four bytes a
-    /// record and one sum an insert.
+    /// Each record's length, being the sum of its values, by key: entry for
+    /// entry with `records` while keys are ids, so in the same form, and
+    /// flat by rank once keys are ranks. What a term frequency weighting
+    /// normalises by, read once per posting the scan admits. Kept under every
+    /// weighting, since it costs four bytes a record and one sum an insert.
     pub(crate) lengths: IdMap<f32, RECORD_RATIO>,
-    /// Records removed and not yet compacted out. Held in the form of
-    /// `records`, since it holds a few of them and its own count says
-    /// nothing about the range their ids span.
+    /// Records removed and not yet compacted out, by key. The set is flat in
+    /// every form: while keys are ids the record table is flat, and ranks
+    /// hold no gap.
     pub(crate) dead: Bitmap,
     /// Records held and not removed, being what `holds` answers, as a set a
     /// filter's bitmap can be intersected with in a walk over words. It holds
     /// every record the space holds, so it takes the form its own count
     /// gives.
     pub(crate) live_set: Bitmap,
+    /// The records' ranks once the record table is paged, and `None` while
+    /// it is flat; see the keys above.
+    pub(crate) ranks: Option<Ranks>,
     pub(crate) dead_records: usize,
     pub(crate) live: usize,
     pub(crate) live_nnz: usize,
@@ -341,6 +376,7 @@ impl PostingsIndex {
             lengths: IdMap::new(),
             dead: Bitmap::default(),
             live_set: Bitmap::default(),
+            ranks: None,
             dead_records: 0,
             live: 0,
             live_nnz: 0,
@@ -379,8 +415,8 @@ impl PostingsIndex {
 
     /// The length of one live record, being the sum of its values.
     pub fn length_of(&self, id: RecordId) -> Option<f32> {
-        self.slot_of(id)
-            .and_then(|_| self.lengths.get(id.slot()).copied())
+        self.live_slot(id)
+            .and_then(|(key, _)| self.lengths.get(key).copied())
     }
 
     /// The live set, being every record `holds` answers true for.
@@ -437,19 +473,173 @@ impl PostingsIndex {
     }
 
     /// One past the largest id ever inserted, which the artefact records as
-    /// its slot count, and which sizes the scratch accumulator while the
-    /// record table is flat.
+    /// its slot count, and which is the key count while keys are ids.
     pub(crate) fn slots(&self) -> usize {
         self.records.extent()
     }
 
-    /// Put the dead set in the record table's form. It holds a few of the
-    /// table's records, so its own count says nothing about the range their
-    /// ids span, and it follows the table instead.
-    fn follow_records(&mut self) {
-        if !self.records.is_flat() {
-            self.dead.page_out();
+    /// One past the largest key: the slot count while keys are ids, and the
+    /// records the table holds once keys are ranks. What sizes the scratch
+    /// accumulator and every set over the keys.
+    pub(crate) fn keys(&self) -> usize {
+        match &self.ranks {
+            None => self.slots(),
+            Some(ranks) => ranks.ids.len(),
         }
+    }
+
+    /// The ids by rank once keys are ranks, and `None` while keys are ids.
+    pub(crate) fn rank_ids(&self) -> Option<&[u32]> {
+        self.ranks.as_ref().map(|ranks| ranks.ids.as_slice())
+    }
+
+    /// The key of `id`, which the record table holds.
+    pub(crate) fn key_of(&self, id: usize) -> Option<usize> {
+        match &self.ranks {
+            None => Some(id),
+            Some(ranks) => ranks.of.get(id).map(|&rank| rank as usize),
+        }
+    }
+
+    /// The id a key stands for.
+    #[inline]
+    pub(crate) fn id_at(&self, key: u32) -> u32 {
+        match &self.ranks {
+            None => key,
+            Some(ranks) => ranks.ids[key as usize],
+        }
+    }
+
+    /// Move the keys onto ranks the first time the record table is found
+    /// paged. Each record takes its rank in id order, and every posting, the
+    /// lengths and the dead set move from the ids to the ranks in one pass.
+    /// A flat table, and a table already on ranks, are left as they are.
+    pub(crate) fn follow_records(&mut self) {
+        if self.records.is_flat() || self.ranks.is_some() {
+            return;
+        }
+        let held = self.records.len();
+        let mut ranks = Ranks::default();
+        ranks.ids.reserve_exact(held);
+        let mut lengths = IdMap::with_capacity(held);
+        let mut dead = Bitmap::default();
+        for (rank, (id, _)) in self.records.iter().enumerate() {
+            ranks.ids.push(id as u32);
+            ranks.of.insert(id, rank as u32);
+            if let Some(&length) = self.lengths.get(id) {
+                lengths.insert(rank, length);
+            }
+            if self.dead.contains(id) {
+                dead.insert(rank);
+            }
+        }
+        ranks.of.settle();
+        // Each list runs in increasing id order, so one cursor a list reads
+        // the ranks in order.
+        for list in &mut self.lists {
+            let mut of = ranks.of.cursor();
+            for posting in &mut list.postings {
+                posting.key = *of
+                    .get(posting.key as usize)
+                    .expect("the record table holds every posting's record");
+            }
+        }
+        self.lengths = lengths;
+        self.dead = dead;
+        self.ranks = Some(ranks);
+    }
+
+    /// Room for `records` more records under ranks, their ids up to
+    /// `highest`, once keys are ranks: the ids by rank, the rank map and the
+    /// lengths. Nothing while keys are ids.
+    pub(crate) fn reserve_ranks(&mut self, records: usize, highest: usize) {
+        if let Some(ranks) = &mut self.ranks {
+            ranks.ids.reserve_exact(records);
+            ranks.of.reserve(records, highest);
+            self.lengths.reserve_exact(ranks.ids.len() + records);
+        }
+    }
+
+    /// The key of `id`, which the record table holds. While keys are ids,
+    /// the key is the id. Once keys are ranks, the key is the id's rank, and
+    /// an id past every id held takes the next rank.
+    fn key_for(&mut self, id: usize) -> usize {
+        let Some(ranks) = self.ranks.as_mut() else {
+            return id;
+        };
+        if let Some(&rank) = ranks.of.get(id) {
+            return rank as usize;
+        }
+        if ranks.ids.last().is_some_and(|&last| last as usize > id) {
+            return self.rank_between(id);
+        }
+        let rank = ranks.ids.len();
+        ranks.ids.push(id as u32);
+        ranks.of.insert(id, rank as u32);
+        rank
+    }
+
+    /// Give `id`, which falls below the largest id the table holds, the rank
+    /// its place in id order gives, every key at or past that rank moving up
+    /// by one. The engine never takes this path, since it never inserts an id
+    /// below one it holds, and the structure keeps its ranks in id order if a
+    /// caller does.
+    fn rank_between(&mut self, id: usize) -> usize {
+        let ranks = self.ranks.as_mut().expect("keys are ranks");
+        let rank = ranks.ids.partition_point(|&held| (held as usize) < id);
+        ranks.ids.insert(rank, id as u32);
+        for (_, held) in ranks.of.iter_mut() {
+            if *held as usize >= rank {
+                *held += 1;
+            }
+        }
+        ranks.of.insert(id, rank as u32);
+        let up = |key: usize| if key >= rank { key + 1 } else { key };
+        for list in &mut self.lists {
+            for posting in &mut list.postings {
+                posting.key = up(posting.key as usize) as u32;
+            }
+        }
+        let mut lengths = IdMap::with_capacity(ranks.ids.len());
+        for (key, &length) in self.lengths.iter() {
+            lengths.insert(up(key), length);
+        }
+        self.lengths = lengths;
+        let mut dead = Bitmap::default();
+        self.dead.for_each(|key| dead.insert(up(key)));
+        self.dead = dead;
+        rank
+    }
+
+    /// Move every key onto the ranks of the records a compaction leaves.
+    /// `renumbered` gives the new rank of each old rank, and `u32::MAX` for a
+    /// record the compaction removed. Every posting left belongs to a
+    /// surviving record, since the compaction has rewritten each list that
+    /// held a dead posting.
+    fn renumber(&mut self, renumbered: &[u32]) {
+        for list in &mut self.lists {
+            for posting in &mut list.postings {
+                posting.key = renumbered[posting.key as usize];
+                debug_assert_ne!(posting.key, u32::MAX, "a posting of a removed record");
+            }
+        }
+        let survivors = self.records.len();
+        let mut lengths = IdMap::with_capacity(survivors);
+        for (old, &length) in self.lengths.iter() {
+            let new = renumbered[old];
+            if new != u32::MAX {
+                lengths.insert(new as usize, length);
+            }
+        }
+        self.lengths = lengths;
+        let mut ranks = Ranks::default();
+        ranks.ids.reserve_exact(survivors);
+        for (rank, (id, _)) in self.records.iter().enumerate() {
+            ranks.ids.push(id as u32);
+            ranks.of.insert(id, rank as u32);
+        }
+        ranks.of.settle();
+        self.ranks = Some(ranks);
     }
 
     /// Settle every table and set once a restore has inserted every
@@ -460,15 +650,57 @@ impl PostingsIndex {
         self.lengths.settle();
         self.live_set.settle();
         self.dead.settle();
+        if let Some(ranks) = &mut self.ranks {
+            ranks.of.settle();
+        }
     }
 
     /// Whether the record table, the lengths and the two sets are flat, one
-    /// slot per record id up to the largest, rather than paged.
+    /// slot per record id up to the largest, rather than paged. The lengths
+    /// and the dead set are keyed by key and flat in every form, so this is
+    /// the form of the record table and the live set.
     pub fn is_flat(&self) -> bool {
         self.records.is_flat()
             && self.lengths.is_flat()
             && self.live_set.is_flat()
             && self.dead.is_flat()
+    }
+
+    /// Whether the keys agree with the record table. While the table is flat
+    /// keys are ids, and the lengths and the dead set are flat. Once it is
+    /// paged, the ids by rank are the table's ids in increasing order, the
+    /// rank map gives each its rank, and every posting, length and dead bit
+    /// is held under a rank, each list in increasing key order. Every write
+    /// keeps it true, and a debug build checks it after a compaction and a
+    /// load.
+    pub fn keys_agree(&self) -> bool {
+        let flat_state = self.lengths.is_flat() && self.dead.is_flat();
+        let Some(ranks) = &self.ranks else {
+            return self.records.is_flat() && flat_state;
+        };
+        let mut held = 0usize;
+        let ordered = self.records.iter().all(|(id, _)| {
+            let at = held;
+            held += 1;
+            ranks.ids.get(at) == Some(&(id as u32)) && ranks.of.get(id) == Some(&(at as u32))
+        });
+        let mut dead_within = true;
+        self.dead.for_each(|key| dead_within &= key < held);
+        let lists_within = self.lists.iter().all(|list| {
+            list.postings.iter().all(|p| (p.key as usize) < held)
+                && list
+                    .postings
+                    .windows(2)
+                    .all(|pair| pair[0].key < pair[1].key)
+        });
+        !self.records.is_flat()
+            && flat_state
+            && ordered
+            && held == ranks.ids.len()
+            && held == ranks.of.len()
+            && self.lengths.extent() <= held
+            && dead_within
+            && lists_within
     }
 
     /// Heap bytes the structure holds, by capacity, split by part.
@@ -486,6 +718,9 @@ impl PostingsIndex {
         let records = self.records.heap_bytes();
         let lengths = self.lengths.heap_bytes();
         let dead = self.dead.heap_bytes() + self.live_set.heap_bytes();
+        let ranks = self.ranks.as_ref().map_or(0, |ranks| {
+            ranks.ids.capacity() * std::mem::size_of::<u32>() + ranks.of.heap_bytes()
+        });
         HeapBytes {
             lists_postings,
             lists_headers,
@@ -494,6 +729,7 @@ impl PostingsIndex {
             records,
             lengths,
             dead,
+            ranks,
         }
     }
 
@@ -508,8 +744,14 @@ impl PostingsIndex {
     }
 
     pub(crate) fn slot_of(&self, id: RecordId) -> Option<Slot> {
+        self.live_slot(id).map(|(_, slot)| slot)
+    }
+
+    /// A live record's key and the span of its vector.
+    pub(crate) fn live_slot(&self, id: RecordId) -> Option<(usize, Slot)> {
         let slot = *self.records.get(id.slot())?;
-        (!self.dead.contains(id.slot())).then_some(slot)
+        let key = self.key_of(id.slot())?;
+        (!self.dead.contains(key)).then_some((key, slot))
     }
 
     pub(crate) fn forward(&self, slot: Slot) -> SparseRef<'_> {
@@ -525,7 +767,7 @@ impl PostingsIndex {
         let dead = &self.dead;
         let list = &mut self.lists[slot as usize];
         let before = list.postings.len();
-        list.postings.retain(|p| !dead.contains(p.id as usize));
+        list.postings.retain(|p| !dead.contains(p.key as usize));
         let removed = before - list.postings.len();
         list.dead = 0;
         self.postings_total -= removed;
@@ -558,26 +800,42 @@ impl PostingsIndex {
             self.lists[slot as usize].postings.shrink_to_fit();
         }
         // The forward arena, rebuilt in id order, and the length total
-        // summed again from the records that survive.
+        // summed again from the records that survive. Under ranks a record's
+        // key is its place in that order, and the survivors take the ranks
+        // their own order gives.
+        let ranked = self.ranks.is_some();
         let mut dims = Vec::with_capacity(self.live_nnz);
         let mut values = Vec::with_capacity(self.live_nnz);
         let mut live_length = 0f64;
         let mut gone: Vec<usize> = Vec::with_capacity(self.dead_records);
-        for (id, slot) in self.records.iter_mut() {
-            if self.dead.contains(id) {
+        let mut renumbered: Vec<u32> = Vec::new();
+        for (rank, (id, slot)) in self.records.iter_mut().enumerate() {
+            let key = if ranked { rank } else { id };
+            if self.dead.contains(key) {
                 gone.push(id);
+                if ranked {
+                    renumbered.push(u32::MAX);
+                }
                 continue;
+            }
+            if ranked {
+                renumbered.push((rank - gone.len()) as u32);
             }
             let (s, e) = (slot.start as usize, (slot.start + slot.len) as usize);
             let start = dims.len() as u32;
             dims.extend_from_slice(&self.fwd_dims[s..e]);
             values.extend_from_slice(&self.fwd_values[s..e]);
             slot.start = start;
-            live_length += self.lengths.get(id).copied().unwrap_or(0.0) as f64;
+            live_length += self.lengths.get(key).copied().unwrap_or(0.0) as f64;
         }
-        for id in gone {
+        for &id in &gone {
             self.records.remove(id);
-            self.lengths.remove(id);
+            if !ranked {
+                self.lengths.remove(id);
+            }
+        }
+        if ranked {
+            self.renumber(&renumbered);
         }
         self.fwd_dims = dims;
         self.fwd_values = values;
@@ -590,6 +848,7 @@ impl PostingsIndex {
         self.slots_by_dim.shrink_to_fit();
         self.follow_records();
         debug_assert_eq!(self.dead_postings, 0);
+        debug_assert!(self.keys_agree(), "the keys follow the record table");
         debug!(
             target: LOG_TARGET,
             operation = "compact",
@@ -610,15 +869,20 @@ impl PostingsIndex {
     ) -> Result<(), Error> {
         self.config.weighting.validate_record(vector)?;
         let slot_index = id.slot();
-        if self.records.contains(slot_index) && !self.dead.contains(slot_index) {
-            return Err(Error::RecordAlreadyHeld { id: id.0 });
-        }
-        if self.dead.contains(slot_index) {
+        let held = if self.records.contains(slot_index) {
+            self.key_of(slot_index)
+        } else {
+            None
+        };
+        if let Some(key) = held {
+            if !self.dead.contains(key) {
+                return Err(Error::RecordAlreadyHeld { id: id.0 });
+            }
             // A removed id being re-inserted. The engine never does this,
             // since it never reuses an id, but the structure stays correct if
             // a caller does: the old span and its postings are already
-            // counted dead, and the record starts again.
-            self.dead.remove(slot_index);
+            // counted dead, and the record starts again under its key.
+            self.dead.remove(key);
             self.dead_records -= 1;
         }
         let nnz = vector.dims.len();
@@ -633,10 +897,12 @@ impl PostingsIndex {
             },
         );
         let length = vector.values.iter().map(|&v| v as f64).sum::<f64>() as f32;
-        self.lengths.insert(slot_index, length);
         self.live_length += length as f64;
         self.live_set.hold(slot_index);
         self.follow_records();
+        let key = self.key_for(slot_index);
+        self.lengths.insert(key, length);
+        let key = key as u32;
 
         for (&d, &w) in vector.dims.iter().zip(vector.values) {
             let slot = match self.slots_by_dim.get(&d) {
@@ -650,30 +916,16 @@ impl PostingsIndex {
             };
             let list = &mut self.lists[slot as usize].postings;
             match list.last() {
-                Some(last) if last.id >= id.0 => {
+                Some(last) if last.key >= key => {
                     // The engine never takes this path. It exists so the
-                    // sorted-by-id property is the structure's and not the
+                    // sorted-by-key property is the structure's and not the
                     // caller's.
-                    match list.binary_search_by_key(&id.0, |p| p.id) {
-                        Ok(at) => {
-                            list[at] = Posting {
-                                id: id.0,
-                                weight: w,
-                            }
-                        }
-                        Err(at) => list.insert(
-                            at,
-                            Posting {
-                                id: id.0,
-                                weight: w,
-                            },
-                        ),
+                    match list.binary_search_by_key(&key, |p| p.key) {
+                        Ok(at) => list[at] = Posting { key, weight: w },
+                        Err(at) => list.insert(at, Posting { key, weight: w }),
                     }
                 }
-                _ => list.push(Posting {
-                    id: id.0,
-                    weight: w,
-                }),
+                _ => list.push(Posting { key, weight: w }),
             }
         }
         self.live += 1;
@@ -684,15 +936,15 @@ impl PostingsIndex {
 
     /// The whole of a removal, under the configured policy.
     fn remove_record(&mut self, id: RecordId) -> Result<(), Error> {
-        let Some(slot) = self.slot_of(id) else {
+        let Some((key, slot)) = self.live_slot(id) else {
             return Err(Error::RecordNotHeld { id: id.0 });
         };
-        self.dead.insert(id.slot());
+        self.dead.insert(key);
         self.live_set.release(id.slot());
         self.dead_records += 1;
         self.live -= 1;
         self.live_nnz -= slot.len as usize;
-        self.live_length -= self.lengths.get(id.slot()).copied().unwrap_or(0.0) as f64;
+        self.live_length -= self.lengths.get(key).copied().unwrap_or(0.0) as f64;
         let (s, e) = (slot.start as usize, (slot.start + slot.len) as usize);
         match self.config.unlink {
             Unlink::Strand => {
@@ -728,7 +980,7 @@ impl PostingsIndex {
                     let d = self.fwd_dims[i];
                     let list_slot = self.slots_by_dim[&d];
                     let list = &mut self.lists[list_slot as usize].postings;
-                    if let Ok(pos) = list.binary_search_by_key(&id.0, |p| p.id) {
+                    if let Ok(pos) = list.binary_search_by_key(&(key as u32), |p| p.key) {
                         list.remove(pos);
                         self.postings_total -= 1;
                     }
@@ -889,9 +1141,10 @@ mod tests {
         }
     }
 
-    /// The record table and the lengths stay flat together while the space
-    /// holds one record in eight ids or more past the floor, and page out
-    /// together below that.
+    /// The record table stays flat while the space holds one record in
+    /// eight ids or more past the floor, and pages out below that, where the
+    /// keys move onto ranks and the lengths and the dead set stay flat by
+    /// rank.
     #[test]
     fn the_record_table_and_lengths_stay_flat_to_their_ratio() {
         assert_eq!(RECORD_RATIO, 8);
@@ -908,12 +1161,9 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(index.records.is_flat(), flat, "records, one id in {gap}");
-            assert_eq!(index.lengths.is_flat(), flat, "lengths, one id in {gap}");
-            assert_eq!(
-                index.dead.is_flat(),
-                flat,
-                "the dead set follows the records"
-            );
+            assert!(index.lengths.is_flat(), "lengths, one id in {gap}");
+            assert!(index.dead.is_flat(), "the dead set, one id in {gap}");
+            assert_eq!(index.ranks.is_none(), flat, "the keys follow the records");
         }
     }
 
@@ -1043,7 +1293,7 @@ mod tests {
                 .unwrap();
         }
         let slot = index.slots_by_dim[&7] as usize;
-        let ids: Vec<u32> = index.lists[slot].postings.iter().map(|p| p.id).collect();
+        let ids: Vec<u32> = index.lists[slot].postings.iter().map(|p| p.key).collect();
         assert_eq!(ids, vec![1, 2, 5, 9]);
     }
 
@@ -1067,5 +1317,227 @@ mod tests {
         // scan of the common list.
         let narrow = index.cost(common.as_ref(), 10, Some(&Selectivity::exact(10)));
         assert!(narrow.work_ns < whole.work_ns);
+    }
+
+    /// A space moves its keys onto ranks the first time its record table
+    /// pages, with removed records among them, under every policy and both
+    /// weightings, and keeps them in agreement with the table through
+    /// insertions past it, removals, a removed id taken again under the eager
+    /// policy, an id below the largest, a compaction, a save and a restore and
+    /// insertions after it. At each step it answers what a space whose table
+    /// stays flat answers for the same records, under ids in the same order,
+    /// each id mapped across and the score bits equal.
+    #[test]
+    fn the_keys_follow_every_write_that_changes_the_record_table() {
+        use crate::search::Mode;
+        // The first 300 ids are dense; past them each lies a thousand ids
+        // from the last, so the table pages part way through. The flat twin
+        // takes every record at twice its number, which leaves the odd ids
+        // free for an insertion between two records.
+        let spread = |k: u32| if k <= 300 { k } else { 300 + (k - 300) * 1_000 };
+        let twin = |k: u32| 2 * k;
+        let vector = |k: u32, shift: u32| -> SparseVector {
+            let mut dims: Vec<u32> = (0..5).map(|j| (k * 3 + j * 7 + shift) % 40).collect();
+            dims.sort_unstable();
+            dims.dedup();
+            let values = dims.iter().map(|&d| 1.0 + (d % 4) as f32).collect();
+            SparseVector { dims, values }
+        };
+        let mut queries: Vec<SparseVector> = (0..8u32)
+            .map(|q| {
+                let dims = vector(q * 17 + 1, 0).dims;
+                SparseVector {
+                    values: vec![1.0; dims.len()],
+                    dims,
+                }
+            })
+            .collect();
+        queries.push(SparseVector {
+            dims: (0..40).collect(),
+            values: vec![1.0; 40],
+        });
+        let modes = [
+            Mode::Auto,
+            Mode::PerPosting,
+            Mode::PerCandidate,
+            Mode::BitmapPerPosting,
+            Mode::Enumerate,
+        ];
+        for unlink in [Unlink::Strand, Unlink::Lazy, Unlink::Eager] {
+            for weighting in [Weighting::Dot, Weighting::BM25] {
+                let config = SparseConfig {
+                    unlink,
+                    weighting,
+                    ..SparseConfig::default()
+                };
+                let mut ranked = PostingsIndex::new(config.clone());
+                let mut flat = PostingsIndex::new(config.clone());
+                // The twin id of each id the ranked space holds or held.
+                let mut across: HashMap<u32, u32> = HashMap::new();
+                let put = |ranked: &mut PostingsIndex,
+                           flat: &mut PostingsIndex,
+                           across: &mut HashMap<u32, u32>,
+                           id: u32,
+                           twin_id: u32,
+                           v: &SparseVector| {
+                    ranked
+                        .insert(RecordId(id), v.as_ref(), Prepared::none())
+                        .unwrap();
+                    flat.insert(RecordId(twin_id), v.as_ref(), Prepared::none())
+                        .unwrap();
+                    across.insert(id, twin_id);
+                };
+                let check = |ranked: &PostingsIndex,
+                             flat: &PostingsIndex,
+                             across: &HashMap<u32, u32>,
+                             step: &str| {
+                    let label = format!("{unlink:?} {weighting:?} {step}");
+                    assert!(ranked.keys_agree() && flat.keys_agree(), "{label}");
+                    assert!(flat.ranks.is_none(), "{label}");
+                    assert_eq!(ranked.len(), flat.len(), "{label}");
+                    let mut filter = Bitmap::paged();
+                    let mut twin_filter = Bitmap::default();
+                    for (&id, &twin_id) in across {
+                        if twin_id % 3 != 0 {
+                            filter.insert(id as usize);
+                            twin_filter.insert(twin_id as usize);
+                        }
+                    }
+                    let admits: [(&dyn Admit, &dyn Admit); 2] = [
+                        (&Candidates::All, &Candidates::All),
+                        (&filter, &twin_filter),
+                    ];
+                    for (admit, twin_admit) in admits {
+                        for mode in modes {
+                            for q in &queries {
+                                let want: Vec<(u32, u32)> = flat
+                                    .search_mode(mode, q.as_ref(), 10, twin_admit, true)
+                                    .unwrap()
+                                    .items
+                                    .iter()
+                                    .map(|hit| (hit.id.0, hit.score.to_bits()))
+                                    .collect();
+                                let got: Vec<(u32, u32)> = ranked
+                                    .search_mode(mode, q.as_ref(), 10, admit, true)
+                                    .unwrap()
+                                    .items
+                                    .iter()
+                                    .map(|hit| (across[&hit.id.0], hit.score.to_bits()))
+                                    .collect();
+                                assert_eq!(got, want, "{label} {mode:?}");
+                            }
+                        }
+                    }
+                    for (&id, &twin_id) in across {
+                        assert_eq!(
+                            ranked.holds(RecordId(id)),
+                            flat.holds(RecordId(twin_id)),
+                            "{label} {id}"
+                        );
+                        assert_eq!(
+                            ranked.length_of(RecordId(id)),
+                            flat.length_of(RecordId(twin_id)),
+                            "{label} {id}"
+                        );
+                    }
+                };
+                for k in 1..=300u32 {
+                    put(
+                        &mut ranked,
+                        &mut flat,
+                        &mut across,
+                        spread(k),
+                        twin(k),
+                        &vector(k, 0),
+                    );
+                }
+                for k in (4..=300u32).step_by(4) {
+                    ranked.remove(RecordId(spread(k))).unwrap();
+                    flat.remove(RecordId(twin(k))).unwrap();
+                }
+                assert!(ranked.ranks.is_none(), "dense ids keep the keys on ids");
+                check(&ranked, &flat, &across, "flat, with removed records");
+                for k in 301..=600u32 {
+                    put(
+                        &mut ranked,
+                        &mut flat,
+                        &mut across,
+                        spread(k),
+                        twin(k),
+                        &vector(k, 0),
+                    );
+                }
+                assert!(
+                    ranked.ranks.is_some(),
+                    "the table paged and the keys followed"
+                );
+                check(&ranked, &flat, &across, "paged part way through");
+                // The newest record stays, since a restore reads the slot
+                // count back from the records it holds.
+                for k in (305..600u32).step_by(5) {
+                    ranked.remove(RecordId(spread(k))).unwrap();
+                    flat.remove(RecordId(twin(k))).unwrap();
+                }
+                check(&ranked, &flat, &across, "removed under ranks");
+                // A removed id taken again keeps its key. Under the policies
+                // that leave a removed record's postings in place, the old
+                // postings stay counted dead while the new record takes them
+                // up, which a compaction's check of the dead count refuses on
+                // either form, so the step runs under the eager policy alone.
+                if unlink == Unlink::Eager {
+                    for k in [8u32, 310] {
+                        put(
+                            &mut ranked,
+                            &mut flat,
+                            &mut across,
+                            spread(k),
+                            twin(k),
+                            &vector(k, 3),
+                        );
+                    }
+                    check(&ranked, &flat, &across, "a removed id taken again");
+                }
+                put(
+                    &mut ranked,
+                    &mut flat,
+                    &mut across,
+                    spread(450) + 1,
+                    twin(450) + 1,
+                    &vector(450, 5),
+                );
+                check(&ranked, &flat, &across, "an id below the largest");
+                ranked.compact();
+                flat.compact();
+                check(&ranked, &flat, &across, "compacted");
+                let bounds = zeusdb_vector_core::Bounds {
+                    min_records: 0,
+                    max_records: spread(600) as usize,
+                    max_bytes: 1 << 30,
+                };
+                let bytes = crate::persist::encode(&ranked);
+                ranked =
+                    crate::persist::decode(&bytes, ranked.config(), &bounds, "postings").unwrap();
+                let twin_bytes = crate::persist::encode(&flat);
+                flat = crate::persist::decode(&twin_bytes, flat.config(), &bounds, "postings")
+                    .unwrap();
+                assert_eq!(
+                    crate::persist::encode(&ranked),
+                    bytes,
+                    "a restore writes its bytes"
+                );
+                check(&ranked, &flat, &across, "restored");
+                for k in 601..=640u32 {
+                    put(
+                        &mut ranked,
+                        &mut flat,
+                        &mut across,
+                        spread(k),
+                        twin(k),
+                        &vector(k, 0),
+                    );
+                }
+                check(&ranked, &flat, &across, "added after the restore");
+            }
+        }
     }
 }

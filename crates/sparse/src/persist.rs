@@ -60,8 +60,11 @@ pub(crate) fn encode(index: &PostingsIndex) -> Vec<u8> {
     );
     payload.extend((index.slots() as u32).to_le_bytes());
     payload.extend((index.live as u32).to_le_bytes());
-    for (id, slot) in index.records.iter() {
-        if index.dead.contains(id) {
+    // A record's key is its id, or its place in id order once keys are
+    // ranks.
+    let ranked = index.ranks.is_some();
+    for (rank, (id, slot)) in index.records.iter().enumerate() {
+        if index.dead.contains(if ranked { rank } else { id }) {
             continue;
         }
         let v = index.forward(*slot);
@@ -168,6 +171,10 @@ pub(crate) fn decode(
     if slots > 0 {
         index.records.reserve(live, slots - 1);
         index.lengths.reserve(live, slots - 1);
+        // A table the plan pages keys its records by rank as they arrive,
+        // each one past the last, with room for every one.
+        index.follow_records();
+        index.reserve_ranks(live, slots - 1);
     }
     let mut dims: Vec<u32> = Vec::new();
     let mut values: Vec<f32> = Vec::new();
@@ -228,6 +235,7 @@ pub(crate) fn decode(
         )));
     }
     index.settle();
+    debug_assert!(index.keys_agree(), "the keys follow the record table");
     index.calibrate();
     Ok(index)
 }

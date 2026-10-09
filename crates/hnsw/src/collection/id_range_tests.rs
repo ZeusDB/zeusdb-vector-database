@@ -175,8 +175,8 @@ fn all_flat(sparse: bool) -> Forms {
 }
 
 /// Bytes the structures that hold a record's entries hold: the id store, the
-/// dense index's live set, the graph's links, the sparse space's tables and
-/// sets, the metadata store and the columns. Each guard is taken alone.
+/// dense index's live set, the graph's links, the sparse space's tables, sets
+/// and ranks, the metadata store and the columns. Each guard is taken alone.
 fn keyed_bytes(collection: &Collection) -> usize {
     let ids = collection.ids().heap_bytes();
     let (live, links) = {
@@ -185,7 +185,7 @@ fn keyed_bytes(collection: &Collection) -> usize {
     };
     let sparse = collection.sparse().map_or(0, |space| {
         let heap = space.index.read().unwrap().heap_bytes();
-        heap.records + heap.lengths + heap.dead
+        heap.records + heap.lengths + heap.dead + heap.ranks
     });
     let metadata = collection.vector_metadata.read().unwrap().heap_bytes();
     let columns = collection.columns.read().unwrap().heap_bytes();
@@ -776,5 +776,183 @@ fn the_live_nodes_follow_every_path_that_changes_the_graph_or_the_live_set() {
         agree(&rebuilt, "cleared");
         put(&rebuilt, (0..50).collect(), false);
         agree(&rebuilt, "cleared then added");
+    }
+}
+
+/// The sparse pages a collection answers, as an external id and score bits a
+/// hit: three queries with no filter and under a filter on the declared
+/// field, through the sparse arm alone and fused with a dense arm.
+fn sparse_pages(collection: &Collection, dense: &[Vec<f32>]) -> Vec<Page> {
+    use super::{Arm, Query};
+    let filter = compile_filter(&HashMap::from([("cat".to_string(), json!("b"))])).unwrap();
+    let mut out: Vec<Page> = Vec::new();
+    for q in 0..3u32 {
+        let query = SparseVector {
+            dims: vec![q, 9 + q, 30 + q],
+            values: vec![1.0, 2.0, 1.0],
+        };
+        for filter in [None, Some(&filter)] {
+            let hits = collection
+                .search_sparse(query.as_ref(), filter, 10, IdfScope::Corpus)
+                .unwrap();
+            out.push(
+                hits.iter()
+                    .map(|(id, score)| (id.clone(), score.to_bits()))
+                    .collect(),
+            );
+            let arms = [
+                Arm::Dense {
+                    vector: &dense[q as usize],
+                    ef: None,
+                    rerank: None,
+                },
+                Arm::Sparse {
+                    vector: query.as_ref(),
+                    idf: IdfScope::Corpus,
+                },
+            ];
+            let mut fused = Query::new(&arms, 10);
+            fused.filter = filter;
+            let page = collection.query(&fused).unwrap();
+            out.push(
+                page.hits
+                    .iter()
+                    .map(|hit| (hit.id.clone(), hit.score.to_bits()))
+                    .collect(),
+            );
+        }
+    }
+    out
+}
+
+/// A sparse space's keys follow every path that changes it, over ids past
+/// the record table's floor, so its record table pages and its keys are
+/// ranks: insertions, removals, an overwrite, a journal replayed onto its
+/// checkpoint, a compaction, a load of a checkpoint from its dump, a loaded
+/// collection then changed and loaded again, a load that rebuilds the graph,
+/// and `clear`. At each step it answers what the same collection over dense
+/// ids answers, through the sparse arm and fused with a dense arm, with no
+/// filter and under a filter on the declared field. A raw graph and a
+/// product quantized graph take the same steps, the quantized one training
+/// part way through.
+#[test]
+fn the_sparse_keys_follow_every_path_that_changes_the_sparse_space() {
+    let temp = TempDir::new();
+    let vectors = zeusdb_vector_core::test_support::clustered(1_700, 16, 197);
+    let sparse_of = |i: usize| -> SparseHalf {
+        let mut dims: Vec<u32> = (0..5).map(|j| ((i * 7 + j * 11) % 64) as u32).collect();
+        dims.sort_unstable();
+        dims.dedup();
+        let values = dims.iter().map(|&d| 1.0 + (d % 4) as f32).collect();
+        SparseHalf::Vector(SparseVector { dims, values })
+    };
+    let put = |collection: &Collection, ids: Vec<usize>, overwrite: bool| {
+        let records: Vec<ParsedRecord> = ids
+            .into_iter()
+            .map(|i| ParsedRecord {
+                id: format!("r{i}"),
+                vector: vectors[i].clone(),
+                sparse: Some(sparse_of(i)),
+                metadata: fields(i as u32),
+            })
+            .collect();
+        let added = collection.add_records(records, vec![], overwrite);
+        assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    };
+    for kind in ["raw", "pq"] {
+        let mut runs: Vec<Vec<(String, Vec<Page>)>> = Vec::new();
+        for spread in [true, false] {
+            let declaration = Declaration::validate(16, "l2", 8, 40, 100, vec!["cat".to_string()])
+                .unwrap()
+                .with_sparse(
+                    "terms",
+                    SparseConfig {
+                        weighting: zeusdb_vector_sparse::Weighting::BM25,
+                        ..SparseConfig::default()
+                    },
+                )
+                .unwrap();
+            let quantization = (kind == "pq").then(|| {
+                declaration
+                    .quantization(4, 4, 1_000, None, StorageMode::QuantizedWithRaw)
+                    .unwrap()
+            });
+            let mut collection = Collection::build(declaration, quantization);
+            if spread {
+                collection.set_counters(200_000, 0);
+            }
+            let path = temp.at(&format!("sparse-keys-{kind}-{spread}.zdb"));
+            collection
+                .journal_to(path.to_str().unwrap(), Durability::default())
+                .unwrap();
+            let mut steps: Vec<(String, Vec<Page>)> = Vec::new();
+            let mut step = |collection: &Collection, name: &str| {
+                {
+                    let index = collection.sparse().unwrap().index.read().unwrap();
+                    assert!(index.keys_agree(), "{kind} {spread}: {name}");
+                    // `clear` sets the counter back, so the records after it
+                    // sit under dense ids in both collections.
+                    if index.live_set().count() > 0 && !name.starts_with("cleared") {
+                        assert_eq!(index.is_flat(), !spread, "{kind} {spread}: {name}");
+                    }
+                }
+                steps.push((name.to_string(), sparse_pages(collection, &vectors)));
+            };
+
+            put(&collection, (0..600).collect(), false);
+            step(&collection, "built");
+            collection.checkpoint().unwrap();
+            remove(&collection, 0..599, |i| i % 3 != 0);
+            step(&collection, "removed");
+            put(&collection, (0..90).step_by(3).collect(), true);
+            step(&collection, "overwritten");
+            put(&collection, (600..1_500).collect(), false);
+            step(&collection, "added past the training set");
+            assert_eq!(collection.is_quantized(), kind != "raw", "{kind}");
+            drop(collection);
+
+            let (recovered, report) =
+                Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
+            assert!(report.replayed > 0 && !report.graph_rebuilt, "{kind}");
+            step(&recovered, "replayed");
+            recovered.compact().unwrap();
+            step(&recovered, "compacted");
+            recovered.checkpoint().unwrap();
+            drop(recovered);
+
+            let copy = temp.at(&format!("sparse-keys-{kind}-{spread}-copy.zdb"));
+            copy_tree(&path, &copy);
+            let loaded = Collection::load_checkpoint_only(copy.to_str().unwrap(), None).unwrap();
+            step(&loaded, "loaded");
+            remove(&loaded, 600..1_499, |i| i % 5 == 0);
+            put(&loaded, (1_500..1_600).collect(), false);
+            put(&loaded, (601..700).step_by(5).collect(), true);
+            step(&loaded, "loaded then changed");
+            loaded.compact().unwrap();
+            step(&loaded, "loaded, changed and compacted");
+            let loaded = reload(
+                &loaded,
+                &temp,
+                &format!("sparse-keys-{kind}-{spread}-again.zdb"),
+            );
+            step(&loaded, "loaded again");
+
+            let rebuilt_path = temp.at(&format!("sparse-keys-{kind}-{spread}-rebuilt.zdb"));
+            loaded.save(rebuilt_path.to_str().unwrap()).unwrap();
+            std::fs::remove_file(rebuilt_path.join(DUMP_FILENAME)).unwrap();
+            let rebuilt = Collection::load(rebuilt_path.to_str().unwrap()).unwrap();
+            step(&rebuilt, "loaded through a rebuild");
+            remove(&rebuilt, 1_500..1_599, |i| i % 2 == 0);
+            step(&rebuilt, "rebuilt then removed");
+
+            rebuilt.clear().unwrap();
+            step(&rebuilt, "cleared");
+            put(&rebuilt, (0..50).collect(), false);
+            step(&rebuilt, "cleared then added");
+            runs.push(steps);
+        }
+        for ((name, spread), (_, dense)) in runs[0].iter().zip(&runs[1]) {
+            assert_eq!(spread, dense, "{kind}: {name}");
+        }
     }
 }
