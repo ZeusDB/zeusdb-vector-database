@@ -1272,12 +1272,11 @@ where
         let mut word = [0u8; 8];
         word.copy_from_slice(entry);
         let id = u64::from_le_bytes(word);
-        // The ceiling, and the last allocation in the load that a field could
-        // otherwise size without the file having earned it. The graph keys its
-        // id-to-node array by the id, so one point naming 2^59 asks for two
-        // exabytes and aborts the process on the allocation. Everything above
-        // is bounded by the size agreement; this one is bounded by the counter
-        // the same save wrote. See [`Expected::max_origin_id`].
+        // The ceiling. A point's origin id names its record's position, and
+        // the dense index keeps a node for each position, so an id past the
+        // counter the same save wrote names no record the directory holds.
+        // Everything above is bounded by the size agreement; this one is
+        // bounded by that counter. See [`Expected::max_origin_id`].
         if id > expected.max_origin_id as u64 {
             return Err(format!(
                 "the graph dump names origin id {} and config.json counted {}",
@@ -1293,9 +1292,10 @@ where
     }
     drop(origin_raw);
 
-    // No two nodes are filed under one origin id. The graph's id-to-node array
-    // is the inverse of the origin ids, which it can only be where each id
-    // names one node, so a repeated id is refused before anything is built.
+    // No two nodes are filed under one origin id. The dense index's node for
+    // each position is the inverse of the origin ids, which it can only be
+    // where each id names one node, so a repeated id is refused before
+    // anything is built.
     // The check runs over a sorted copy, which takes what the region the ids
     // were read from took and is released before the adjacency is read.
     let mut sorted = origin_ids.clone();
@@ -2024,9 +2024,9 @@ mod tests {
     ///
     /// Found by [`super::fuzz`] on its first run, as a splice that dropped 46
     /// bytes of vector data over the origin id region with both checksums
-    /// repaired. The structure keys its id-to-node array by the origin id, so
-    /// one point declaring 2^59 asked for 3.4 exabytes and **the process
-    /// aborted on the allocation**, which no `catch_unwind` can see and which in
+    /// repaired. The structure then keyed an id-to-node array by the origin
+    /// id, so one point declaring 2^59 asked for 3.4 exabytes and **the
+    /// process aborted on the allocation**, which no `catch_unwind` can see and which in
     /// a Python process kills the interpreter with no traceback. That is the
     /// failure mode the vendored reader's `std::process::exit(1)` was replaced
     /// to remove.
@@ -2737,8 +2737,8 @@ mod tests {
 
     /// One origin id named for two nodes is refused before anything is built.
     ///
-    /// The graph's id-to-node array is the inverse of the origin ids, so each
-    /// id names one node. The second point's id is overwritten with the
+    /// The dense index's node for each position is the inverse of the origin
+    /// ids, so each id names one node. The second point's id is overwritten with the
     /// first's and nothing else is altered, so the node count still fits the
     /// counter and the refusal is the repeated id's, not the constructor's.
     /// The same two ids exchanged name one node each, and load.
@@ -2881,8 +2881,6 @@ mod tests {
     struct LoadedShape {
         /// Nodes, each with its per node arrays and its layer zero slots.
         nodes: usize,
-        /// The largest origin id, which the id-to-node array reaches.
-        largest_id: usize,
         /// Upper words, being each node's span, the higher of its level and
         /// the highest layer its lists fill, and the run the in-degree pass
         /// appends whenever an entry names a node above its span.
@@ -2953,11 +2951,6 @@ mod tests {
         }
         LoadedShape {
             nodes: points.len(),
-            largest_id: points
-                .iter()
-                .map(|point| point.origin_id)
-                .max()
-                .unwrap_or(0),
             words,
             wide: wide.len(),
             wide_if_every_owned_list_were: owned.len(),
@@ -2965,16 +2958,15 @@ mod tests {
     }
 
     /// The bytes the graph a load builds from `parsed` asks the allocator
-    /// for. Each node holds its origin id, level, layer zero length and
-    /// counter, first word and span, and `2m + 1` layer zero slots, the
-    /// id-to-node array four bytes an id up to the largest, each upper word
-    /// four bytes, and each wide list a ten byte descriptor and `m + 1` slots.
+    /// for. Each node holds its origin id, its record's position, level,
+    /// layer zero length and counter, first word and span, and `2m + 1` layer
+    /// zero slots, each upper word four bytes, and each wide list a ten byte
+    /// descriptor and `m + 1` slots.
     fn loaded_bytes(parsed: &ParsedDump<f32>) -> usize {
         let shape = loaded_shape(parsed);
         let m = parsed.m;
         std::mem::size_of::<MutableGraph<f32, CosineDist>>()
-            + shape.nodes * (8 * m + 24)
-            + 4 * (shape.largest_id + 1)
+            + shape.nodes * (8 * m + 28)
             + 4 * shape.words
             + (4 * m + 14) * shape.wide
     }
@@ -2996,7 +2988,7 @@ mod tests {
             MutableGraph::new(4, 16, 64, scale, 1, CosineDist {}).unwrap();
         let vector = [0.1f32, 0.2, 0.3, 0.4];
         let planned = built.plan_insertion(&built_store, &vector, top);
-        built.install_insertion(&mut built_store, &vector, 1, planned);
+        built.install_insertion(&mut built_store, &vector, 1, 1, planned);
         assert_eq!(built.level(0) as usize, top);
         assert_eq!(built.nb_wide_lists(), top);
 
@@ -3268,7 +3260,7 @@ mod tests {
                 ] {
                     out.push(
                         page.iter()
-                            .map(|hit| (hit.internal_id, hit.distance.to_bits()))
+                            .map(|hit| (hit.position, hit.distance.to_bits()))
                             .collect(),
                     );
                 }
@@ -3318,7 +3310,7 @@ mod tests {
             let level = (k * 7) % (top + 3);
             for (graph, store) in [(&mut built, &mut built_store), (&mut read, &mut read_store)] {
                 let planned = graph.plan_insertion(store, &vector, level);
-                graph.install_insertion(store, &vector, 300 + k, planned);
+                graph.install_insertion(store, &vector, 300 + k, (300 + k) as u32, planned);
             }
             assert_eq!(
                 dump_of(&built, &built_store),
@@ -3331,7 +3323,7 @@ mod tests {
         let filled = words
             .iter()
             .filter(|&&(id, layer)| {
-                let node = read.node_of(id).expect("every origin id has a node");
+                let node = node_with_origin(&read, id).expect("every origin id has a node");
                 !read.neighbours_at(node, layer).is_empty()
             })
             .count();
@@ -3359,7 +3351,7 @@ mod tests {
             let (mut fresh, mut fresh_store) =
                 MutableGraph::new(4, 2, 64, scale, 1, CosineDist {}).unwrap();
             for id in (0..348usize).filter(live) {
-                let node = graph.node_of(id).expect("every inserted id has a node");
+                let node = node_with_origin(graph, id).expect("every inserted id has a node");
                 fresh.insert(&mut fresh_store, store.get(node), id, &mut levels);
             }
             dump_of(&fresh, &fresh_store)
@@ -3388,5 +3380,98 @@ mod tests {
         assert_eq!(built_again.arrays(), read_again.arrays());
         assert_eq!(pages(&built_again, &built_again_store), built_pages);
         assert_eq!(pages(&read_again, &read_again_store), built_pages);
+    }
+
+    /// The node a graph took for one origin id, found by a pass over the
+    /// nodes, since the graph keeps no map from an id to its node.
+    fn node_with_origin<T, D>(graph: &MutableGraph<T, D>, id: usize) -> Option<u32>
+    where
+        T: Clone + Send + Sync,
+        D: crate::graph::Distance<T> + Send + Sync,
+    {
+        (0..graph.nb_points() as u32).find(|&node| graph.origin_id_of(node) == id)
+    }
+
+    /// A graph over scattered internal ids reads back from its dump with each
+    /// node's position the place its origin id names, costs what its nodes
+    /// cost whatever the ids, reads the same at the largest counter, and
+    /// writes the same bytes again.
+    #[test]
+    fn a_graph_over_scattered_ids_reads_back_with_its_map_paged() {
+        let (dim, m, nodes) = (6, 8, 600usize);
+        let far = |k: usize| 3 + k * 70_001;
+        let scale = super::super::levels::LevelGenerator::default_scale(m);
+        let mut levels = super::super::levels::LevelGenerator::new(scale, NB_LAYER_MAX as usize);
+        let (mut built, mut built_store) =
+            MutableGraph::new(dim, m, 64, scale, 16, CosineDist {}).unwrap();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for k in 0..nodes {
+            let vector: Vec<f32> = (0..dim)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / 16_777_216.0 - 0.5
+                })
+                .collect();
+            built.insert(&mut built_store, &vector, far(k), &mut levels);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let largest = far(nodes - 1);
+        let mut expected = expected_for(&built, dim, nodes);
+        expected.max_origin_id = largest;
+        let ((read, read_store), (reference, reference_store)) = read_both(dir.path(), &expected);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(store_bytes(&read_store), store_bytes(&reference_store));
+        assert_eq!(topology(&built, &built_store), topology(&read, &read_store));
+        let mut seen: Vec<usize> = (0..nodes as u32)
+            .map(|node| {
+                assert_eq!(read.record_of(node) as usize, read.origin_id_of(node));
+                read.origin_id_of(node)
+            })
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..nodes).map(far).collect::<Vec<_>>());
+
+        let parsed = parse_dump::<f32>(&FsDir::new(dir.path()), DUMP_FILENAME, &expected).unwrap();
+        assert_eq!(
+            read.memory_bytes(),
+            loaded_bytes(&parsed),
+            "the graph costs its nodes, whatever ids they carry"
+        );
+
+        let at_ceiling = Expected {
+            max_origin_id: u32::MAX as usize,
+            ..expected
+        };
+        let (at_largest, _) = read_dump(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &at_ceiling,
+            CosineDist {},
+        )
+        .unwrap();
+        assert_eq!(at_largest.arrays(), read.arrays());
+
+        let again = tempfile::tempdir().unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(again.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(again.path().join(DUMP_FILENAME)).unwrap()
+        );
     }
 }

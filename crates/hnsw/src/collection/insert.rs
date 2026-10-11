@@ -24,7 +24,6 @@ use super::{
     StorageMode, MAX_LAYER,
 };
 use crate::locks::WriteGuard;
-use crate::RawVectors;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -32,7 +31,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
 use zeusdb_vector_core::{
     matches_filter, Bitmap, ColumnStore, Error, Filter, IdStore, InsertParts, MetadataStore,
-    Operation, OperationKind, Prepared, RecordId, Selection, SparseVector, VectorGraph,
+    Operation, OperationKind, Position, Prepared, RecordId, Selection, SparseVector, VectorGraph,
     VectorIndex, JOURNAL_MAX_PAYLOAD, MAX_INTERNAL_ID,
 };
 use zeusdb_vector_sparse::PostingsIndex;
@@ -240,6 +239,12 @@ impl Collection {
     /// caller can key them by external id for the paths that reach a record
     /// by name. They are read under the write guard the install took, so a
     /// search sees the node and its codes together or neither.
+    ///
+    /// # The position
+    ///
+    /// A record's position is its slot in the id store, which is its internal
+    /// id, so the index files the node under the slot the store names the
+    /// record at.
     fn insert_one(
         &self,
         external_id: &str,
@@ -248,6 +253,7 @@ impl Collection {
         level: usize,
     ) -> Result<Option<Vec<u8>>, Error> {
         let id = RecordId::from_slot(internal_id);
+        let at = Position::from_slot(internal_id);
         let prepared = {
             let index = self.dense().index.read().unwrap();
             index.prepare_at_level(id, vector, level)?
@@ -258,12 +264,15 @@ impl Collection {
             // The store first, and the name taken back if the graph refuses
             // the node, so a refused record leaves nothing behind.
             ids.insert(internal_id, external_id)?;
-            if let Err(refused) = index.insert(id, vector, prepared) {
+            if let Err(refused) = index.insert(at, id, vector, prepared) {
                 ids.remove_slot(internal_id);
                 return Err(refused);
             }
             (
-                index.graph().codes_of(internal_id).map(<[u8]>::to_vec),
+                index
+                    .node_of(at)
+                    .and_then(|node| index.graph().codes_at(node))
+                    .map(<[u8]>::to_vec),
                 index.due_for_timing(),
             )
         };
@@ -281,12 +290,14 @@ impl Collection {
         Ok(codes)
     }
 
-    /// Put one record into the sparse space, under its own guard, taken
-    /// alone.
+    /// Put one record into the sparse space at its position, which is its
+    /// slot in the id store, with its internal id beside it, under the
+    /// space's own guard, taken alone.
     fn insert_sparse(&self, internal_id: usize, vector: &SparseVector) -> Result<(), Error> {
         let space = self.sparse().ok_or(Error::NoSparseSpace)?;
         let mut index = space.index.write().unwrap();
         index.insert(
+            Position::from_slot(internal_id),
             RecordId::from_slot(internal_id),
             vector.as_ref(),
             Prepared::none(),
@@ -454,7 +465,7 @@ impl Collection {
         // the record filled that space. Each is asked whether it holds the
         // record first, since a record may leave the sparse space empty and
         // an index refuses to remove an id it does not hold.
-        let record = RecordId::from_slot(internal_id);
+        let record = Position::from_slot(internal_id);
         debug_assert!(
             guards.index.holds(record),
             "the dense index holds every record the id store holds"
@@ -917,12 +928,16 @@ impl Collection {
                 ids.iter().map(|(internal, id)| (id, internal)).collect();
 
             if int8.is_some() {
-                let mut batch: Vec<(&[i8], usize)> = Vec::with_capacity(ids.len());
+                let mut batch: Vec<(&[i8], usize, Position)> = Vec::with_capacity(ids.len());
                 let mut missing = Vec::new();
 
                 for (ext_id, internal_id) in live {
-                    match old_hnsw.int8_row_of(internal_id) {
-                        Some(row) => batch.push((row, internal_id)),
+                    let at = Position::from_slot(internal_id);
+                    match old_index
+                        .node_of(at)
+                        .and_then(|node| old_hnsw.int8_row_at(node))
+                    {
+                        Some(row) => batch.push((row, internal_id, at)),
                         None => missing.push(ext_id.to_string()),
                     }
                 }
@@ -937,12 +952,14 @@ impl Collection {
                 missing
             } else if quantized {
                 let pq_codes = self.dense().pq_codes.read().unwrap();
-                let mut batch: Vec<(&Vec<u8>, usize)> = Vec::with_capacity(ids.len());
+                let mut batch: Vec<(&Vec<u8>, usize, Position)> = Vec::with_capacity(ids.len());
                 let mut missing = Vec::new();
 
                 for (ext_id, internal_id) in live {
                     match pq_codes.get(ext_id) {
-                        Some(codes) => batch.push((codes, internal_id)),
+                        Some(codes) => {
+                            batch.push((codes, internal_id, Position::from_slot(internal_id)))
+                        }
                         None => missing.push(ext_id.to_string()),
                     }
                 }
@@ -960,7 +977,7 @@ impl Collection {
                 // way, so they are re-addressed node by node.
                 if missing.is_empty() && old_hnsw.holds_raw() {
                     if let Some(dim) = old_hnsw.raw_dim() {
-                        new_hnsw.adopt_raw_from(old_hnsw, dim).map_err(|e| {
+                        new_hnsw.adopt_raw_from(old_hnsw, old_index.node_at(), dim).map_err(|e| {
                             error!(target: LOG_TARGET, operation = "rebuild_graph", error = %e, "Failed to carry the raw vectors over");
                             Error::AdoptRawFailed(e)
                         })?;
@@ -972,8 +989,12 @@ impl Collection {
                 let mut missing = Vec::new();
 
                 for (ext_id, internal_id) in live {
-                    match old_hnsw.raw_vector(internal_id) {
-                        Some(vector) => new_hnsw.insert(vector, internal_id),
+                    let at = Position::from_slot(internal_id);
+                    match old_index
+                        .node_of(at)
+                        .and_then(|node| old_hnsw.raw_vector_at(node))
+                    {
+                        Some(vector) => new_hnsw.insert(vector, internal_id, at),
                         None => missing.push(ext_id.to_string()),
                     }
                 }
@@ -1113,9 +1134,7 @@ impl Collection {
                 let ids = self.ids.read().unwrap();
                 let index = self.dense().index.read().unwrap();
                 let pq_codes = self.dense().pq_codes.read().unwrap();
-                let raws = RawVectors {
-                    graph: index.graph(),
-                };
+                let raws = index.raw_vectors();
 
                 let mut ids_to_remove = Vec::new();
                 let mut doomed: HashSet<&str> = HashSet::new();

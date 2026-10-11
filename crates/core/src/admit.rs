@@ -12,19 +12,22 @@
 //! per posting. Measured on a postings scan the call is 28 to 33 percent of
 //! the whole loop, so an admit set that is a bitmap hands it over through
 //! `as_bitmap` and the index runs a loop monomorphised over the bit test.
-//! `enumerate` is the other door. An admit set that can walk itself in id
-//! order lets an index score the members directly rather than traverse or
-//! scan, which is what the exact scan under a selective filter does.
+//! `enumerate` is the other door. An admit set that can walk itself in
+//! position order lets an index score the members directly rather than
+//! traverse or scan, which is what the exact scan under a selective filter
+//! does.
+//!
+//! Every set names records by their position.
 
-use crate::columns::Bitmap;
-use crate::space::{Hits, RecordId};
+use crate::bitmap::Bitmap;
+use crate::space::{Hits, Position};
 
 /// Which records a search may return.
 pub trait Admit: Sync {
-    fn admits(&self, id: RecordId) -> bool;
+    fn admits(&self, at: Position) -> bool;
 
-    /// How many ids this admits, where known. `None` means unknown, which is
-    /// what a predicate over metadata answers.
+    /// How many positions this admits, where known. `None` means unknown,
+    /// which is what a predicate over metadata answers.
     fn len_hint(&self) -> Option<usize>;
 
     /// Whether this set admits every record, which a caller with no filter
@@ -40,10 +43,10 @@ pub trait Admit: Sync {
         None
     }
 
-    /// Walk every admitted id in increasing order, stopping when `visit`
-    /// returns false. Returns false if this set cannot enumerate itself, in
-    /// which case `visit` was never called.
-    fn enumerate(&self, visit: &mut dyn FnMut(RecordId) -> bool) -> bool {
+    /// Walk every admitted position in increasing order, stopping when
+    /// `visit` returns false. Returns false if this set cannot enumerate
+    /// itself, in which case `visit` was never called.
+    fn enumerate(&self, visit: &mut dyn FnMut(Position) -> bool) -> bool {
         let _ = visit;
         false
     }
@@ -51,8 +54,8 @@ pub trait Admit: Sync {
 
 impl Admit for Bitmap {
     #[inline]
-    fn admits(&self, id: RecordId) -> bool {
-        self.contains(id.slot())
+    fn admits(&self, at: Position) -> bool {
+        self.contains(at.slot())
     }
 
     fn len_hint(&self) -> Option<usize> {
@@ -63,8 +66,8 @@ impl Admit for Bitmap {
         Some(self)
     }
 
-    fn enumerate(&self, visit: &mut dyn FnMut(RecordId) -> bool) -> bool {
-        self.for_each_while(|slot| visit(RecordId::from_slot(slot)));
+    fn enumerate(&self, visit: &mut dyn FnMut(Position) -> bool) -> bool {
+        self.for_each_while(|slot| visit(Position::from_slot(slot)));
         true
     }
 }
@@ -77,26 +80,26 @@ pub enum Candidates {
     #[default]
     All,
     Bitmap(Bitmap),
-    /// Strictly increasing record ids.
-    Sorted(Vec<RecordId>),
+    /// Strictly increasing positions.
+    Sorted(Vec<Position>),
 }
 
 impl Candidates {
     /// Turn a page into a candidate set, which is how one arm feeds the next.
     pub fn from_hits(hits: &Hits) -> Self {
-        let mut ids: Vec<RecordId> = hits.items.iter().map(|h| h.id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        Candidates::Sorted(ids)
+        let mut positions: Vec<Position> = hits.items.iter().map(|h| h.position).collect();
+        positions.sort_unstable();
+        positions.dedup();
+        Candidates::Sorted(positions)
     }
 }
 
 impl Admit for Candidates {
-    fn admits(&self, id: RecordId) -> bool {
+    fn admits(&self, at: Position) -> bool {
         match self {
             Candidates::All => true,
-            Candidates::Bitmap(b) => b.contains(id.slot()),
-            Candidates::Sorted(ids) => ids.binary_search(&id).is_ok(),
+            Candidates::Bitmap(b) => b.contains(at.slot()),
+            Candidates::Sorted(positions) => positions.binary_search(&at).is_ok(),
         }
     }
 
@@ -108,7 +111,7 @@ impl Admit for Candidates {
         match self {
             Candidates::All => None,
             Candidates::Bitmap(b) => Some(b.count()),
-            Candidates::Sorted(ids) => Some(ids.len()),
+            Candidates::Sorted(positions) => Some(positions.len()),
         }
     }
 
@@ -119,13 +122,13 @@ impl Admit for Candidates {
         }
     }
 
-    fn enumerate(&self, visit: &mut dyn FnMut(RecordId) -> bool) -> bool {
+    fn enumerate(&self, visit: &mut dyn FnMut(Position) -> bool) -> bool {
         match self {
             Candidates::All => false,
             Candidates::Bitmap(b) => b.enumerate(visit),
-            Candidates::Sorted(ids) => {
-                for &id in ids {
-                    if !visit(id) {
+            Candidates::Sorted(positions) => {
+                for &at in positions {
+                    if !visit(at) {
                         break;
                     }
                 }
@@ -140,8 +143,8 @@ impl Admit for Candidates {
 pub struct And<'a>(pub &'a dyn Admit, pub &'a dyn Admit);
 
 impl Admit for And<'_> {
-    fn admits(&self, id: RecordId) -> bool {
-        self.0.admits(id) && self.1.admits(id)
+    fn admits(&self, at: Position) -> bool {
+        self.0.admits(at) && self.1.admits(at)
     }
 
     fn admits_all(&self) -> bool {
@@ -159,16 +162,16 @@ impl Admit for And<'_> {
 
     /// Drive from whichever side is smaller and can enumerate, and test the
     /// other. Returns false only when neither side can enumerate.
-    fn enumerate(&self, visit: &mut dyn FnMut(RecordId) -> bool) -> bool {
+    fn enumerate(&self, visit: &mut dyn FnMut(Position) -> bool) -> bool {
         let (drive, test): (&dyn Admit, &dyn Admit) = match (self.0.len_hint(), self.1.len_hint()) {
             (Some(a), Some(b)) if b < a => (self.1, self.0),
             (None, Some(_)) => (self.1, self.0),
             _ => (self.0, self.1),
         };
-        if drive.enumerate(&mut |id| !test.admits(id) || visit(id)) {
+        if drive.enumerate(&mut |at| !test.admits(at) || visit(at)) {
             return true;
         }
-        test.enumerate(&mut |id| !drive.admits(id) || visit(id))
+        test.enumerate(&mut |at| !drive.admits(at) || visit(at))
     }
 }
 
@@ -179,8 +182,8 @@ mod tests {
     fn ids(admit: &dyn Admit) -> Option<Vec<u32>> {
         let mut out = Vec::new();
         admit
-            .enumerate(&mut |id| {
-                out.push(id.0);
+            .enumerate(&mut |at| {
+                out.push(at.0);
                 true
             })
             .then_some(out)
@@ -189,8 +192,8 @@ mod tests {
     struct Even;
 
     impl Admit for Even {
-        fn admits(&self, id: RecordId) -> bool {
-            id.0.is_multiple_of(2)
+        fn admits(&self, at: Position) -> bool {
+            at.0.is_multiple_of(2)
         }
         fn len_hint(&self) -> Option<usize> {
             None
@@ -205,8 +208,8 @@ mod tests {
         for slot in [3usize, 64, 65, 200] {
             bitmap.insert(slot);
         }
-        assert!(bitmap.admits(RecordId(64)));
-        assert!(!bitmap.admits(RecordId(4)));
+        assert!(bitmap.admits(Position(64)));
+        assert!(!bitmap.admits(Position(4)));
         assert_eq!(bitmap.len_hint(), Some(4));
         assert!(bitmap.as_bitmap().is_some());
         assert_eq!(ids(&bitmap), Some(vec![3, 64, 65, 200]));
@@ -216,14 +219,14 @@ mod tests {
     /// says, and a page becomes a sorted, deduplicated set.
     #[test]
     fn candidates_answer_by_shape() {
-        assert!(Candidates::All.admits(RecordId(9)));
+        assert!(Candidates::All.admits(Position(9)));
         assert!(Candidates::All.admits_all());
         assert_eq!(Candidates::All.len_hint(), None);
         assert_eq!(ids(&Candidates::All), None);
 
-        let sorted = Candidates::Sorted(vec![RecordId(2), RecordId(5), RecordId(9)]);
-        assert!(sorted.admits(RecordId(5)));
-        assert!(!sorted.admits(RecordId(6)));
+        let sorted = Candidates::Sorted(vec![Position(2), Position(5), Position(9)]);
+        assert!(sorted.admits(Position(5)));
+        assert!(!sorted.admits(Position(6)));
         assert!(!sorted.admits_all());
         assert_eq!(sorted.len_hint(), Some(3));
         assert!(sorted.as_bitmap().is_none());
@@ -232,8 +235,8 @@ mod tests {
         let hits = Hits {
             items: [9u32, 2, 9, 5]
                 .iter()
-                .map(|&id| crate::space::Hit {
-                    id: RecordId(id),
+                .map(|&at| crate::space::Hit {
+                    position: Position(at),
                     score: 0.0,
                 })
                 .collect(),
@@ -254,13 +257,13 @@ mod tests {
         let both = And(&Even, &bitmap);
         assert_eq!(ids(&both), Some(vec![0, 2, 4, 6, 8]));
         assert_eq!(both.len_hint(), Some(10));
-        assert!(both.admits(RecordId(4)));
-        assert!(!both.admits(RecordId(5)));
-        assert!(!both.admits(RecordId(12)));
+        assert!(both.admits(Position(4)));
+        assert!(!both.admits(Position(5)));
+        assert!(!both.admits(Position(12)));
 
         let mut seen = Vec::new();
-        assert!(both.enumerate(&mut |id| {
-            seen.push(id.0);
+        assert!(both.enumerate(&mut |at| {
+            seen.push(at.0);
             seen.len() < 2
         }));
         assert_eq!(seen, vec![0, 2]);

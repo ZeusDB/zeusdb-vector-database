@@ -250,7 +250,7 @@ compression ratio: 32x
 
 stored per mode
   mode                    raw  codes  raw MB  code MB  fixed MB  graph MB  total
-  no quantization        3000      0    0.73     0.00      0.00      0.51   1.36
+  no quantization        3000      0    0.73     0.00      0.00      0.51   1.37
   quantized_only            0   3000    0.00     0.02      1.06      0...   ...
   quantized_with_raw     3000   3000    0.73     0.02      1.06      0...   ...
 

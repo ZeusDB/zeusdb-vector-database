@@ -169,8 +169,8 @@ where
     }
 
     #[inline]
-    fn origin_id(&self, node: u32) -> usize {
-        self.graph.origin_id_of(node)
+    fn position(&self, node: u32) -> usize {
+        self.graph.record_of(node) as usize
     }
 
     #[inline]
@@ -189,7 +189,8 @@ where
     /// The whole insertion, both phases and the draw, for a caller holding the
     /// graph outright. The cutover splits this at the two phase boundary and
     /// puts the index locks around each; until then this is what the tests
-    /// build with and what the measurement times.
+    /// build with and what the measurement times. The record's position is
+    /// the place its origin id names, as a graph read from a dump files it.
     pub(in crate::graph) fn insert(
         &mut self,
         store: &mut VectorStore<T>,
@@ -199,7 +200,8 @@ where
     ) {
         let level = levels.generate();
         let planned = self.plan_insertion(store, data, level);
-        self.install_insertion(store, data, origin_id, planned);
+        let position = super::loaded_position(origin_id);
+        self.install_insertion(store, data, origin_id, position, planned);
     }
 
     /// Phase one, whichever shape the insertion takes.
@@ -220,17 +222,20 @@ where
         }
     }
 
-    /// Phase two, whichever shape the insertion takes.
+    /// Phase two, whichever shape the insertion takes. The node takes
+    /// `origin_id` as the id the dump records and `position` as the place of
+    /// the record it holds.
     pub(in crate::graph) fn install_insertion(
         &mut self,
         store: &mut VectorStore<T>,
         data: &[T],
         origin_id: usize,
+        position: u32,
         planned: Planned,
     ) {
         match planned {
-            Planned::First { level } => self.insert_first(store, data, origin_id, level),
-            Planned::Descended(plan) => self.install(store, data, origin_id, plan),
+            Planned::First { level } => self.insert_first(store, data, origin_id, position, level),
+            Planned::Descended(plan) => self.install(store, data, origin_id, position, plan),
         }
     }
 
@@ -249,6 +254,7 @@ where
         store: &mut VectorStore<T>,
         data: &[T],
         origin_id: usize,
+        position: u32,
         level: usize,
     ) {
         assert_eq!(
@@ -256,7 +262,7 @@ where
             0,
             "the first insertion is into an empty graph"
         );
-        let node = self.append_node(store, data, origin_id, level, &[]);
+        let node = self.append_node(store, data, origin_id, position, level, &[]);
         self.set_entry(node, level);
     }
 
@@ -421,6 +427,7 @@ where
         store: &mut VectorStore<T>,
         data: &[T],
         origin_id: usize,
+        position: u32,
         plan: Insertion,
     ) {
         let Insertion {
@@ -441,7 +448,7 @@ where
             self.nb_points()
         );
 
-        let node = self.append_node(store, data, origin_id, level, &residue);
+        let node = self.append_node(store, data, origin_id, position, level, &residue);
 
         // Install site 1's bookkeeping. The edges themselves went in with the
         // node, because the residue region is append only and this is the one

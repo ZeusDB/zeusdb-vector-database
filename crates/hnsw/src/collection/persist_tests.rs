@@ -12,8 +12,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use zeusdb_vector_core::{
-    compile_filter, Error, FsDir, IdfScope, Operation, SparseVector, VectorGraph, VectorIndex,
-    DUMP_FILENAME, NB_LAYER_MAX,
+    compile_filter, Error, FsDir, IdfScope, Operation, Position, SparseVector, VectorGraph,
+    VectorIndex, DUMP_FILENAME, NB_LAYER_MAX,
 };
 use zeusdb_vector_sparse::{SparseConfig, Weighting};
 use zeusdb_vector_text::{SimpleTokenizer, Tokenizer, TokenizerConfig};
@@ -722,9 +722,10 @@ fn the_raw_rebuild_fallback_keeps_every_internal_id_and_the_counter() {
         let index = rebuilt.dense().index.read().unwrap();
         assert_eq!(index.graph().nb_points(), 298);
         for &(_, internal_id) in &ids {
-            assert!(index.graph().holds(internal_id));
+            assert!(index.holds(Position::from_slot(internal_id)));
         }
-        assert!(!index.graph().holds(6));
+        assert!(!index.holds(Position(6)));
+        assert!((0..298).all(|node| index.graph().origin_id_at(node) != 6));
     }
 
     // The next record takes the id after the saved counter, and the rebuilt
@@ -774,7 +775,7 @@ fn the_collections_insert_path_builds_the_graph_the_outright_insert_builds() {
 
     let mut graph = VectorGraph::new_raw("l2", 2, 4, 100, NB_LAYER_MAX as usize, 50);
     for (i, vector) in vectors.iter().enumerate() {
-        graph.insert(vector, i + 1);
+        graph.insert(vector, i + 1, Position::from_slot(i + 1));
     }
     let outright = dir.path().join("outright");
     std::fs::create_dir_all(&outright).unwrap();

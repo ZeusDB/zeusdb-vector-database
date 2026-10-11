@@ -163,9 +163,9 @@ impl Collection {
                 holds_raw,
                 raw,
                 reserved,
-                // The second of the two bitmaps, priced from the guard that is
-                // already open on the structure holding it.
-                index.live_heap_bytes(),
+                // The dense index's node for each position, priced from the
+                // guard that is already open on the structure holding it.
+                index.node_at_heap_bytes(),
                 // The scalar row's width and the values the encode has
                 // clipped, from the same guard, for the keys below.
                 hnsw.int8_row_width(),
@@ -203,7 +203,8 @@ impl Collection {
         // without `indexed_fields`.
         bookkeeping += self.columns.read().unwrap().heap_bytes();
 
-        // The dense index's live set, captured with the graph above.
+        // The dense index's node for each position, captured with the graph
+        // above.
         bookkeeping += dense_live_bytes;
 
         let training_id_count = {
@@ -689,10 +690,10 @@ impl Collection {
         //
         // The id store, plus the code map on a quantized index, the metadata
         // store, the declared columns, the training buffer, the index level
-        // metadata and the dense index's live bitmap. The id store holds the
-        // text of every id once in one arena, an eight byte entry per internal
-        // id, a forward table of four byte buckets with a tag byte each, and
-        // the live set as bits. The table is a power of two of buckets sized as
+        // metadata and the dense index's node for each position. The id store
+        // holds the text of every id once in one arena, an eight byte entry
+        // per internal id, a forward table of four byte buckets with a tag
+        // byte each, and the live set as bits. The table is a power of two of buckets sized as
         // the standard map sizes its own, so it is between eight sevenths and
         // sixteen sevenths of the records it holds and it steps rather than
         // growing smoothly. `pq_codes` holds the id again as a key, in a

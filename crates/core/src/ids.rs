@@ -34,7 +34,7 @@
 //! past it, which is the rule the metadata store and the graph's per node
 //! arrays follow.
 
-use crate::columns::Bitmap;
+use crate::bitmap::Bitmap;
 use crate::error::Error;
 use std::hash::{BuildHasher, RandomState};
 

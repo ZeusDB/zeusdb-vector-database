@@ -16,12 +16,18 @@
 //! and a new family of vector is a new marker and a new implementor with no
 //! change here.
 //!
-//! # Ids
+//! # Ids and positions
 //!
 //! A [`RecordId`] is the collection's internal id, allocated from a counter
-//! that never goes backwards and never reuses a value. Every posting list a
-//! sparse index keeps stays sorted by tail append because of that, and every
-//! per-record structure a dense index keeps is addressed by it.
+//! that never goes backwards and never reuses a value. It is the name a record
+//! has in the journal and in every artefact.
+//!
+//! A [`Position`] is where a record sits in every per-record structure, and it
+//! is what crosses the seam: an index is told a record's position when it takes
+//! the record, an admit set names positions, and a page names positions.
+//! Positions follow internal id order, so every posting list a sparse index
+//! keeps stays sorted by tail append, and a walk over positions visits the
+//! records in the order a walk over internal ids visits them.
 //!
 //! # Cost
 //!
@@ -71,6 +77,42 @@ impl RecordId {
     #[inline]
     pub fn from_slot(slot: usize) -> Self {
         RecordId(u32::try_from(slot).unwrap_or(u32::MAX))
+    }
+}
+
+/// A record's position, being its place in every per-record structure.
+///
+/// Positions follow internal id order: of two records held, the one with the
+/// lower internal id has the lower position. A position is never written to
+/// disk. Every structure a search reads for a record is a plain vector
+/// addressed by it, and a graph node names the position of the record it was
+/// inserted for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Position(pub u32);
+
+impl Position {
+    /// The empty marker, being a node that holds no record or a position
+    /// that holds no record.
+    ///
+    /// It lies past the extent of every per-record structure, so every test
+    /// by position answers no for it without a check of its own: a bitmap
+    /// reads its word with `get`, and a vector by position reads its entry
+    /// with `get`.
+    pub const NONE: u32 = u32::MAX;
+
+    /// The position as an index into a per-record structure.
+    #[inline]
+    pub fn slot(self) -> usize {
+        self.0 as usize
+    }
+
+    /// The position at a structure's index.
+    ///
+    /// Saturates rather than wrapping, so an index no `u32` can name becomes
+    /// the empty marker rather than a collision with a held record.
+    #[inline]
+    pub fn from_slot(slot: usize) -> Self {
+        Position(u32::try_from(slot).unwrap_or(Self::NONE))
     }
 }
 
@@ -349,7 +391,7 @@ pub enum ScoreKind {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hit {
-    pub id: RecordId,
+    pub position: Position,
     pub score: f32,
 }
 
@@ -358,7 +400,7 @@ pub struct Hit {
 /// `exact` is true when the page is exact by construction, being that every
 /// admitted record that could enter it was scored and the page is the best
 /// of them under the index's own tie rule, which is score and then
-/// `RecordId`. A term-at-a-time scan that never touches a record sharing no
+/// `Position`, being internal id order. A term-at-a-time scan that never touches a record sharing no
 /// term with the query is still exact, because that record's score is an
 /// implicit zero. A safe early termination keeps it true. Only a give-up
 /// budget would set it false, and a graph traversal, whose page is
@@ -416,12 +458,12 @@ pub trait VectorIndex<K: Kind>: Persist + Send + Sync {
         self.len() == 0
     }
 
-    /// Whether this index holds a vector for `id`.
+    /// Whether this index holds a vector for the record at `at`.
     ///
     /// A record may leave any space empty, so the collection asks this before
-    /// it removes a record from a space, because `remove` refuses an id the
-    /// index does not hold.
-    fn holds(&self, id: RecordId) -> bool;
+    /// it removes a record from a space, because `remove` refuses a position
+    /// the index does not hold.
+    fn holds(&self, at: Position) -> bool;
 
     /// The read-only half of an insertion. A graph descends and chooses the
     /// neighbour lists here, under the collection's read guard, which is what
@@ -432,27 +474,28 @@ pub trait VectorIndex<K: Kind>: Persist + Send + Sync {
         Ok(Prepared::none())
     }
 
-    /// Install one record's vector, with what `prepare` produced for it.
-    /// Called under the collection's write guard, held for this call alone.
+    /// Install one record's vector at its position `at`, with its internal
+    /// id beside it, and with what `prepare` produced for it. Called under the
+    /// collection's write guard, held for this call alone.
     ///
-    /// An id the index already holds is refused. The collection removes a
-    /// record before it re-adds one under a new id and never reuses an id,
-    /// so a second insert under one id is a caller error rather than an
-    /// update.
+    /// A position the index already holds is refused. The collection removes a
+    /// record before it re-adds one under a new id at a new position, so a
+    /// second insert at one position is a caller error rather than an update.
     fn insert(
         &mut self,
+        at: Position,
         id: RecordId,
         vector: K::Vector<'_>,
         prepared: Prepared,
     ) -> Result<(), Error>;
 
-    /// Forget a record. Errs on an id the index does not hold.
+    /// Forget the record at `at`. Errs on a position the index does not hold.
     ///
     /// What the index does with the record's entries is its own business. A
-    /// graph strands the node and relies on the admit set never naming the id
-    /// again. A postings index may leave the postings in place and count them,
-    /// and `stranded` reports what either has left behind.
-    fn remove(&mut self, id: RecordId) -> Result<(), Error>;
+    /// graph strands the node and relies on the admit set never naming the
+    /// position again. A postings index may leave the postings in place and
+    /// count them, and `stranded` reports what either has left behind.
+    fn remove(&mut self, at: Position) -> Result<(), Error>;
 
     /// Entries removal has left behind and a compaction would reclaim, being
     /// stranded nodes for a graph and dead postings for a postings index. The
@@ -464,12 +507,12 @@ pub trait VectorIndex<K: Kind>: Persist + Send + Sync {
     /// The stored vector, where the index keeps one it can hand back. A
     /// quantized graph holding codes alone returns `None`, and a caller that
     /// needs the vector back asks `recover`.
-    fn vector(&self, id: RecordId) -> Option<K::Vector<'_>>;
+    fn vector(&self, at: Position) -> Option<K::Vector<'_>>;
 
     /// The vector as the caller would want it back, built where `vector`
     /// cannot borrow one. A quantized graph reconstructs from its codes here.
-    fn recover(&self, id: RecordId) -> Option<K::Owned> {
-        let _ = id;
+    fn recover(&self, at: Position) -> Option<K::Owned> {
+        let _ = at;
         None
     }
 

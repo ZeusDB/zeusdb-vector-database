@@ -1140,8 +1140,9 @@ fn load_config(dir: &dyn Dir, manifest: &IndexManifest) -> Result<IndexConfig, E
     // `id_counter` too, which those five do not cover and which sizes an
     // allocation rather than a behaviour.
     //
-    // The internal id a record is inserted under is the index into the graph's
-    // id-to-node array, so that array is `id_counter + 1` slots of four bytes.
+    // The internal id a record is inserted under is its position, the index
+    // into the dense index's node for each position, so that vector is
+    // `id_counter + 1` slots of four bytes.
     // A hand edited config declaring 2^40 loaded without complaint, and the
     // next `add` asked the allocator for 4,398,046,511,112 bytes and **aborted
     // the process**. An allocation failure does not unwind, so no `catch_unwind`

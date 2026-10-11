@@ -92,7 +92,7 @@ use std::time::Instant;
 use tracing::{debug, error, instrument, trace, warn};
 use zeusdb_vector_core::{
     matches_filter, Admit, And, Bitmap, Budget, Candidates, ColumnStore, Error, FieldLookup,
-    Filter, Fusion, Hits, IdStore, IdfScope, MetadataStore, RecordId, Selection, SparseRef,
+    Filter, Fusion, Hits, IdStore, IdfScope, MetadataStore, Position, Selection, SparseRef,
     VectorIndex,
 };
 
@@ -188,7 +188,7 @@ pub(super) const FULL_SCAN_THRESHOLD: usize = 5_000;
 /// borrowed from the id store, paired with the score whichever path found
 /// them scored them at, and whether that path was exact.
 ///
-/// The index returns a page of internal ids and this is that page resolved
+/// The index returns a page of positions and this is that page resolved
 /// through the id store, borrowing the name it finds there. Nothing is
 /// copied until the page is cut, so an over-fetched page pays to copy the
 /// metadata and the vector of the results it returns rather than of every
@@ -229,7 +229,7 @@ impl<'a> Scored<'a> {
     pub(super) fn resolve(hits: Hits, ids: &'a IdStore) -> Self {
         let mut items = Vec::with_capacity(hits.items.len());
         for hit in hits.items {
-            let slot = hit.id.slot();
+            let slot = hit.position.slot();
             if let Some(name) = ids.name(slot) {
                 items.push((Named { name, slot }, hit.score));
             }
@@ -274,8 +274,9 @@ impl<'a> Scored<'a> {
 /// The metadata predicate, as an admit set.
 ///
 /// What a filter that cannot be answered from the columns alone reads. It
-/// reads the node's entry in the store by internal id, which is the liveness
-/// check since a removed record holds none, and judges the filter on it. A
+/// reads the record's entry in the store by its position, which is the
+/// liveness check since a removed record holds none, and judges the filter on
+/// it. A
 /// record with no metadata entry does not match, which is the rule
 /// `collect_hits` applied when the filter ran there. It cannot count itself
 /// and cannot enumerate itself, so the index asks it one node at a time.
@@ -300,8 +301,8 @@ impl MetadataAdmit<'_> {
 
 impl Admit for MetadataAdmit<'_> {
     #[inline]
-    fn admits(&self, id: RecordId) -> bool {
-        match self.metadata.get(id.slot()) {
+    fn admits(&self, at: Position) -> bool {
+        match self.metadata.get(at.slot()) {
             Some(fields) => self.judge(&fields),
             None => false,
         }
@@ -324,7 +325,7 @@ impl Admit for MetadataAdmit<'_> {
 pub(super) enum AdmitPlan<'a> {
     All,
     Bitmap(Bitmap),
-    Matched(Vec<RecordId>),
+    Matched(Vec<Position>),
     Bounded(Bitmap, MetadataAdmit<'a>),
     Predicate(MetadataAdmit<'a>),
 }
@@ -488,7 +489,7 @@ impl Collection {
             Selection::Narrowed(bound, undeclared) => {
                 let candidates = bound.count();
                 self.warn_undeclared_filter_field(columns, undeclared, Some(candidates));
-                let mut matched: Vec<RecordId> = Vec::new();
+                let mut matched: Vec<Position> = Vec::new();
                 let mut gave_up = false;
                 bound.for_each_while(|slot| {
                     let Some(fields) = metadata.get(slot) else {
@@ -502,7 +503,7 @@ impl Collection {
                             gave_up = true;
                             return false;
                         }
-                        matched.push(RecordId::from_slot(slot));
+                        matched.push(Position::from_slot(slot));
                     }
                     true
                 });
@@ -527,7 +528,7 @@ impl Collection {
             }
             Selection::Whole(undeclared) => {
                 self.warn_undeclared_filter_field(columns, undeclared, None);
-                let mut matched: Vec<RecordId> = Vec::new();
+                let mut matched: Vec<Position> = Vec::new();
                 for (slot, fields) in metadata.iter() {
                     if predicate.judge(&fields) {
                         if matched.len() == FULL_SCAN_THRESHOLD {
@@ -536,7 +537,7 @@ impl Collection {
                             // scored yet.
                             return AdmitPlan::Predicate(predicate);
                         }
-                        matched.push(RecordId::from_slot(slot));
+                        matched.push(Position::from_slot(slot));
                     }
                 }
                 // The walk arrives in increasing internal id order, which is
@@ -665,7 +666,7 @@ impl Collection {
                         let pq = self.dense().pq.as_ref()?;
                         pq.reconstruct(codes).ok().map(Cow::Owned)
                     })
-                    .or_else(|| vectors.graph.int8_reconstruct(record.slot).map(Cow::Owned))
+                    .or_else(|| vectors.index.int8_reconstruct(record.slot).map(Cow::Owned))
             } else {
                 None
             };
@@ -809,9 +810,7 @@ impl Collection {
         let pq_codes = self.dense().pq_codes.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
         let columns = self.columns.read().unwrap();
-        let vectors = RawVectors {
-            graph: index.graph(),
-        };
+        let vectors = index.raw_vectors();
 
         let plan = self.admit_plan(filter_conditions, &columns, &ids, &vector_metadata);
         let fetch_k = params.fetch_k(ids.len());
@@ -941,9 +940,7 @@ impl Collection {
         let code_store = self.dense().pq_codes.read().unwrap();
         let metadata_store = self.vector_metadata.read().unwrap();
         let column_store = self.columns.read().unwrap();
-        let vector_store = RawVectors {
-            graph: index.graph(),
-        };
+        let vector_store = index.raw_vectors();
 
         // The admit set is the filter's, so it is decided once for the batch.
         let plan = self.admit_plan(filter_conditions, &column_store, &ids, &metadata_store);
@@ -999,9 +996,7 @@ impl Collection {
                 let code_store = self.dense().pq_codes.read().unwrap();
                 let metadata_store = self.vector_metadata.read().unwrap();
                 let column_store = self.columns.read().unwrap();
-                let vector_store = RawVectors {
-                    graph: index.graph(),
-                };
+                let vector_store = index.raw_vectors();
 
                 let plan = self.admit_plan(filter_conditions, &column_store, &ids, &metadata_store);
 

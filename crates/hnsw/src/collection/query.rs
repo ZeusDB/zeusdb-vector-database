@@ -51,7 +51,7 @@
 
 use super::search::{AdmitPlan, Scored, MAX_TOP_K};
 use super::Collection;
-use crate::{Named, RawVectors, SearchParams};
+use crate::{Named, SearchParams};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -559,9 +559,7 @@ impl Collection {
                     let budget = Self::dense_budget(params);
                     let hits = admit.run(|admit| index.search(vector, fetch_k, admit, &budget))?;
                     let mut page = Scored::resolve(hits, &ids).cut(fetch_k).items;
-                    let raws = RawVectors {
-                        graph: index.graph(),
-                    };
+                    let raws = index.raw_vectors();
                     self.rescore_page(&mut page, vector, raws, codes, params);
                     pages.push(page);
                 }
@@ -576,7 +574,7 @@ impl Collection {
                         admit.run(|admit| index.search(vector.as_ref(), fetch, admit, &budget))?;
                     let mut page: Vec<(Named<'_>, f32)> = Vec::with_capacity(hits.items.len());
                     for hit in hits.items {
-                        let slot = hit.id.slot();
+                        let slot = hit.position.slot();
                         if let Some(name) = ids.name(slot) {
                             page.push((Named { name, slot }, hit.score));
                         }

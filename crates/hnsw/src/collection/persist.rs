@@ -22,7 +22,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
     ArtefactRecord, Bounds, Dir, Error, FsStorage, IdStore, Inventory, MetadataStore, Persist,
-    Restore, Storage, VectorGraph, DUMP_FILENAME,
+    Position, Restore, Storage, VectorGraph, DUMP_FILENAME,
 };
 use zeusdb_vector_sparse::PostingsIndex;
 use zeusdb_vector_text::{TermDictionary, Tokenizer};
@@ -75,20 +75,19 @@ impl Collection {
         let index = self.dense().index.read().unwrap();
         let pq_codes = self.dense().pq_codes.read().unwrap();
         let graph = index.graph();
-        let holds_raw = |id: &str| {
-            ids.slot_of(id)
-                .is_some_and(|slot| graph.raw_vector(slot).is_some())
-        };
-        let with_raw = ids
-            .slots()
-            .filter(|&slot| graph.raw_vector(slot).is_some())
-            .count();
+        let raws = index.raw_vectors();
+        let holds_raw = |id: &str| ids.slot_of(id).is_some_and(|slot| raws.get(slot).is_some());
+        let with_raw = ids.slots().filter(|&slot| raws.get(slot).is_some()).count();
         let code_only = pq_codes.keys().filter(|id| !holds_raw(id)).count();
         // A scalar graph holds its rows and nothing else holds them, so a
         // record with a row is a record stored.
         let with_row = ids
             .slots()
-            .filter(|&slot| graph.int8_row_of(slot).is_some())
+            .filter(|&slot| {
+                index
+                    .node_of(Position::from_slot(slot))
+                    .is_some_and(|node| graph.int8_row_at(node).is_some())
+            })
             .count();
         with_raw + code_only + with_row
     }
@@ -108,12 +107,10 @@ impl Collection {
     ) -> R {
         let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
-        let graph = index.graph();
-        let mut records = ids.slots().filter_map(|internal_id| {
-            graph
-                .raw_vector(internal_id)
-                .map(|vector| (internal_id, vector))
-        });
+        let raws = index.raw_vectors();
+        let mut records = ids
+            .slots()
+            .filter_map(|internal_id| raws.get(internal_id).map(|vector| (internal_id, vector)));
         write(&mut records, ids.len())
     }
 
@@ -679,12 +676,25 @@ impl Collection {
             max_records: max_origin_id,
             max_bytes: u64::MAX,
         };
-        let index = DenseIndex::restore(&open, "", dir, &DumpLength(recorded_bytes), &bounds)
+        let mut index = DenseIndex::restore(&open, "", dir, &DumpLength(recorded_bytes), &bounds)
             .map_err(|e| e.to_string())?;
         let nodes = index.graph().nb_points();
 
+        // Every record the mappings hold has a node in a dump this index
+        // wrote, so a dump that names no node for one is refused before it is
+        // installed, and the caller rebuilds, as it does for every other
+        // refusal of a dump.
+        let unplaced = {
+            let ids = self.ids.read().unwrap();
+            index.set_live(ids.slots())
+        };
+        if unplaced > 0 {
+            return Err(format!(
+                "the graph dump names no node for {} of the records mappings.bin holds",
+                unplaced
+            ));
+        }
         dense.replace_index(index);
-        self.sync_dense_live();
         Ok(nodes)
     }
 
@@ -744,7 +754,8 @@ impl Collection {
             pq,
         );
 
-        let mut batch: Vec<(&Vec<u8>, usize)> = Vec::with_capacity(pq_codes.len() + extra.len());
+        let mut batch: Vec<(&Vec<u8>, usize, Position)> =
+            Vec::with_capacity(pq_codes.len() + extra.len());
         let mut lost: Vec<(&String, &Vec<u8>)> = Vec::new();
         {
             let ids = self.ids.read().unwrap();
@@ -753,7 +764,9 @@ impl Collection {
                 .chain(extra.iter().map(|(id, codes)| (id, codes)))
             {
                 match ids.slot_of(id) {
-                    Some(internal_id) => batch.push((codes, internal_id)),
+                    Some(internal_id) => {
+                        batch.push((codes, internal_id, Position::from_slot(internal_id)))
+                    }
                     None => lost.push((id, codes)),
                 }
             }
@@ -767,18 +780,29 @@ impl Collection {
                 .unwrap()
                 .insert(internal_id, id)
                 .map_err(|e| e.to_string())?;
-            batch.push((codes, internal_id));
+            batch.push((codes, internal_id, Position::from_slot(internal_id)));
         }
 
         // Insert in internal id order, which is arrival order, rather than in
         // the order a hash map hands the codes out. Two rebuilds of one
         // directory otherwise wire the graph differently in each process.
-        batch.sort_by_key(|&(_, internal_id)| internal_id);
+        batch.sort_by_key(|&(_, internal_id, _)| internal_id);
 
         // Filled before it is installed, and installed under one write guard, so
         // the graph the index holds is never a partly rebuilt one.
         if !batch.is_empty() {
             new_hnsw.insert_batch_pq(&batch)?;
+        }
+        // Every record the index holds takes a node, so a record the codes
+        // did not reach refuses the rebuild before anything is swapped, rather
+        // than leaving a held record outside the graph.
+        let held = self.ids.read().unwrap().len();
+        if new_hnsw.nb_points() != held {
+            return Err(format!(
+                "the rebuild from codes built {} nodes for the {} records the index holds",
+                new_hnsw.nb_points(),
+                held
+            ));
         }
         self.dense().replace_graph(new_hnsw);
         self.sync_dense_live();
@@ -811,9 +835,9 @@ impl Collection {
             self.dense().ef_construction(),
             codec,
         );
-        let batch: Vec<(&[i8], usize)> = rows
+        let batch: Vec<(&[i8], usize, Position)> = rows
             .iter()
-            .map(|(internal_id, row)| (row, internal_id))
+            .map(|(internal_id, row)| (row, internal_id, Position::from_slot(internal_id)))
             .collect();
         if !batch.is_empty() {
             new_hnsw.insert_batch_int8(&batch)?;
@@ -854,7 +878,10 @@ impl Collection {
         let graph = index.graph();
         let mut written = 0usize;
         for internal_id in ids.slots() {
-            let Some(row) = graph.int8_row_of(internal_id) else {
+            let Some(row) = index
+                .node_of(Position::from_slot(internal_id))
+                .and_then(|node| graph.int8_row_at(node))
+            else {
                 continue;
             };
             let id =
@@ -1015,7 +1042,6 @@ impl Collection {
             .index
             .write()
             .unwrap()
-            .graph_mut()
             .reserve_declared(expected_size);
     }
 
@@ -1136,7 +1162,7 @@ impl Collection {
             dense.ef_construction(),
         );
         for (internal_id, vector) in &mapped {
-            new_hnsw.insert(vector, *internal_id);
+            new_hnsw.insert(vector, *internal_id, Position::from_slot(*internal_id));
         }
 
         // Filled before it is installed, and installed under one write guard,

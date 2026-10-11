@@ -33,7 +33,7 @@
 
 use zeusdb_vector_core::{
     frame_begin, frame_finish, read_artefact, unframe, write_artefact, ArtefactRecord, Bounds, Dir,
-    Error, FrameEncoding, FrameKind, Inventory, Ledger, RecordId, SparseRef,
+    Error, FrameEncoding, FrameKind, Inventory, Ledger, Position, RecordId, SparseRef,
 };
 
 use crate::index::{PostingsIndex, SparseConfig};
@@ -58,7 +58,7 @@ pub(crate) fn encode(index: &PostingsIndex) -> Vec<u8> {
         FrameEncoding::Engine,
         8 + index.live_nnz * NONZERO_BYTES + index.live * RECORD_HEADER_BYTES,
     );
-    payload.extend((index.records.len() as u32).to_le_bytes());
+    payload.extend((index.slot_count() as u32).to_le_bytes());
     payload.extend((index.live as u32).to_le_bytes());
     for (id, slot) in index.records.iter().enumerate() {
         if !slot.held() || index.dead.contains(id) {
@@ -209,6 +209,7 @@ pub(crate) fn decode(
         consumed += nnz * NONZERO_BYTES;
         index
             .insert_record(
+                Position(id),
                 RecordId(id),
                 SparseRef {
                     dims: &dims,
@@ -293,7 +294,7 @@ mod tests {
             let values: Vec<f32> = dims.iter().map(|d| *d as f32 * 0.5).collect();
             let v = SparseVector { dims, values };
             index
-                .insert(RecordId(id), v.as_ref(), Prepared::none())
+                .insert(Position(id), RecordId(id), v.as_ref(), Prepared::none())
                 .unwrap();
         }
         index
@@ -306,7 +307,7 @@ mod tests {
     fn a_round_trip_keeps_every_live_record_and_drops_the_dead() {
         let mut index = filled();
         for id in [3u32, 17, 50] {
-            index.remove(RecordId(id)).unwrap();
+            index.remove(Position(id)).unwrap();
         }
         let dir = tempfile::tempdir().unwrap();
         let mut manifest = Manifest::default();
@@ -342,7 +343,7 @@ mod tests {
         assert!(restored.max_dim() <= index.max_dim());
         assert_eq!(restored.max_dim(), Some(49 * 3 + 4 * 11));
         for id in 1..=50u32 {
-            assert_eq!(restored.recover(RecordId(id)), index.recover(RecordId(id)));
+            assert_eq!(restored.recover(Position(id)), index.recover(Position(id)));
         }
         // An empty index writes a frame around an eight byte payload.
         let empty = PostingsIndex::new(SparseConfig::default());
@@ -493,7 +494,7 @@ mod tests {
             values: vec![1.0, 0.0],
         };
         index
-            .insert(RecordId(1), v.as_ref(), Prepared::none())
+            .insert(Position(1), RecordId(1), v.as_ref(), Prepared::none())
             .unwrap();
         let bytes = encode(&index);
         assert!(decode(&bytes, index.config(), &bounds(), "p").is_ok());
@@ -547,5 +548,57 @@ mod tests {
         // A mutated artefact that still decodes is one whose mutation landed
         // on a value rather than a count or an id.
         let _ = accepted;
+    }
+
+    /// A space over scattered positions writes the slot count the scalar
+    /// holds, being one past the largest internal id inserted, with its newest
+    /// record kept, and reads back to the same bytes and the same records.
+    #[test]
+    fn a_space_over_scattered_ids_round_trips_with_its_slot_count() {
+        use zeusdb_vector_core::{unframe, FrameKind};
+        let far = |k: u32| 3 + k * 1_009;
+        let mut index = PostingsIndex::new(SparseConfig {
+            unlink: Unlink::Strand,
+            ..SparseConfig::default()
+        });
+        for k in 0..60u32 {
+            let v = SparseVector {
+                dims: vec![k % 7, 10 + k % 5],
+                values: vec![1.0, 2.0 + k as f32],
+            };
+            index
+                .insert(
+                    Position(far(k)),
+                    RecordId(far(k)),
+                    v.as_ref(),
+                    Prepared::none(),
+                )
+                .unwrap();
+        }
+        index.remove(Position(far(30))).unwrap();
+        assert_eq!(index.slot_count(), far(59) as usize + 1);
+        let bytes = encode(&index);
+        let framed = unframe(&bytes, FrameKind::SparsePostings, "postings").unwrap();
+        let word = |at: usize| {
+            u32::from_le_bytes([
+                framed.payload[at],
+                framed.payload[at + 1],
+                framed.payload[at + 2],
+                framed.payload[at + 3],
+            ])
+        };
+        assert_eq!(word(0), far(59) + 1, "the slot count");
+        assert_eq!(word(4), 59, "the live records");
+        let bounds = Bounds {
+            min_records: 0,
+            max_records: far(59) as usize,
+            max_bytes: 1 << 30,
+        };
+        let restored = decode(&bytes, index.config(), &bounds, "postings").unwrap();
+        assert_eq!(restored.slot_count(), far(59) as usize + 1);
+        assert_eq!(encode(&restored), bytes);
+        for k in 0..60u32 {
+            assert_eq!(restored.holds(Position(far(k))), k != 30);
+        }
     }
 }

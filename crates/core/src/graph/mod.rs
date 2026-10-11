@@ -54,6 +54,7 @@ use crate::distance::{
 };
 use crate::int8::Int8Codec;
 use crate::pq::PQ;
+use crate::space::Position;
 use crate::storage::Dir;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, trace, warn};
@@ -186,13 +187,14 @@ fn assert_unit_for_cosine(_vector: &[f32], _site: &str) {
 ///
 /// The vendored `Neighbour` carries a third field, `p_id`, which locates the
 /// point inside the layer structure. No ZeusDB caller reads it. Every search
-/// path takes the origin id, resolves it through the id store, and takes the
-/// distance as the score when no rerank is in play, so those two fields are
-/// what the seam carries and nothing else.
+/// path takes the record's position, resolves it through the id store, and
+/// takes the distance as the score when no rerank is in play, so those two
+/// fields are what the seam carries and nothing else.
 #[derive(Debug, Clone, Copy)]
 pub struct GraphHit {
-    /// The id the record was inserted under, which the id store resolves.
-    pub internal_id: usize,
+    /// The position of the record the node holds, which the id store
+    /// resolves.
+    pub position: usize,
     /// Distance from the query on whatever scale the graph was built with.
     pub distance: f32,
 }
@@ -337,9 +339,9 @@ where
     }
 
     /// Phase two. Writes what phase one decided.
-    fn install(&mut self, data: &[T], origin_id: usize, planned: Planned) {
+    fn install(&mut self, data: &[T], origin_id: usize, position: u32, planned: Planned) {
         self.graph
-            .install_insertion(&mut self.store, data, origin_id, planned);
+            .install_insertion(&mut self.store, data, origin_id, position, planned);
     }
 
     /// Append one raw vector to the side store a `quantized_with_raw` graph
@@ -378,10 +380,10 @@ where
     }
 
     /// The draw and both phases, for a caller holding the graph outright.
-    fn insert(&mut self, data: &[T], origin_id: usize) {
+    fn insert(&mut self, data: &[T], origin_id: usize, position: u32) {
         let level = self.draw_level();
         let planned = self.plan_at_level(data, level);
-        self.install(data, origin_id, planned);
+        self.install(data, origin_id, position, planned);
     }
 }
 
@@ -890,18 +892,71 @@ impl VectorGraph {
         }
     }
 
-    /// The node one internal id sits at, or `None` where this graph never took
-    /// it.
-    pub(crate) fn node_of(&self, internal_id: usize) -> Option<u32> {
+    /// Every node's position, indexed by node, being the place of the record
+    /// the node holds, or [`Position::NONE`] for a stranded node.
+    pub fn records(&self) -> &[u32] {
         match self {
-            VectorGraph::Cosine(b) => b.graph.node_of(internal_id),
-            VectorGraph::L2(b) => b.graph.node_of(internal_id),
-            VectorGraph::L1(b) => b.graph.node_of(internal_id),
-            VectorGraph::Dot(b) => b.graph.node_of(internal_id),
-            VectorGraph::CosinePQ(b) => b.graph.node_of(internal_id),
-            VectorGraph::L2PQ(b) => b.graph.node_of(internal_id),
-            VectorGraph::L1PQ(b) => b.graph.node_of(internal_id),
-            VectorGraph::Int8(b) => b.graph.node_of(internal_id),
+            VectorGraph::Cosine(b) => b.graph.records(),
+            VectorGraph::L2(b) => b.graph.records(),
+            VectorGraph::L1(b) => b.graph.records(),
+            VectorGraph::Dot(b) => b.graph.records(),
+            VectorGraph::CosinePQ(b) => b.graph.records(),
+            VectorGraph::L2PQ(b) => b.graph.records(),
+            VectorGraph::L1PQ(b) => b.graph.records(),
+            VectorGraph::Int8(b) => b.graph.records(),
+        }
+    }
+
+    /// Nodes the graph's positions by node have room for, which is the
+    /// reservation a declared size took, so the index can reserve its own
+    /// vector by position to match.
+    pub fn record_capacity(&self) -> usize {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.record_capacity(),
+            VectorGraph::L2(b) => b.graph.record_capacity(),
+            VectorGraph::L1(b) => b.graph.record_capacity(),
+            VectorGraph::Dot(b) => b.graph.record_capacity(),
+            VectorGraph::CosinePQ(b) => b.graph.record_capacity(),
+            VectorGraph::L2PQ(b) => b.graph.record_capacity(),
+            VectorGraph::L1PQ(b) => b.graph.record_capacity(),
+            VectorGraph::Int8(b) => b.graph.record_capacity(),
+        }
+    }
+
+    /// The position of the record one node holds, or [`Position::NONE`]
+    /// where the node is stranded.
+    pub fn record_of_at(&self, node: u32) -> u32 {
+        self.records()[node as usize]
+    }
+
+    /// Every node's origin id, and every node's position to write, indexed by
+    /// node, for a pass that files the records a load holds.
+    pub fn numbering_mut(&mut self) -> (&[usize], &mut [u32]) {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.numbering_mut(),
+            VectorGraph::L2(b) => b.graph.numbering_mut(),
+            VectorGraph::L1(b) => b.graph.numbering_mut(),
+            VectorGraph::Dot(b) => b.graph.numbering_mut(),
+            VectorGraph::CosinePQ(b) => b.graph.numbering_mut(),
+            VectorGraph::L2PQ(b) => b.graph.numbering_mut(),
+            VectorGraph::L1PQ(b) => b.graph.numbering_mut(),
+            VectorGraph::Int8(b) => b.graph.numbering_mut(),
+        }
+    }
+
+    /// File the record at `position` under `node`, or strand the node with
+    /// [`Position::NONE`]. The dense index calls this under its write guard,
+    /// beside its own entry for the position.
+    pub fn set_record_of(&mut self, node: u32, position: u32) {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.set_record_of(node, position),
+            VectorGraph::L2(b) => b.graph.set_record_of(node, position),
+            VectorGraph::L1(b) => b.graph.set_record_of(node, position),
+            VectorGraph::Dot(b) => b.graph.set_record_of(node, position),
+            VectorGraph::CosinePQ(b) => b.graph.set_record_of(node, position),
+            VectorGraph::L2PQ(b) => b.graph.set_record_of(node, position),
+            VectorGraph::L1PQ(b) => b.graph.set_record_of(node, position),
+            VectorGraph::Int8(b) => b.graph.set_record_of(node, position),
         }
     }
 
@@ -919,15 +974,13 @@ impl VectorGraph {
         }
     }
 
-    /// One record's raw vector, by the internal id the collection hands out.
+    /// One node's raw vector.
     ///
-    /// This is the whole of what replaced the raw vector map. It is two array
-    /// reads, being the id to node inverse and then the store, and no hashing
-    /// at all. `None` where the index keeps no raw vector for that record,
-    /// which is every record of a trained `quantized_only` index and any id
-    /// this graph never took.
-    pub fn raw_vector(&self, internal_id: usize) -> Option<&[f32]> {
-        let node = self.node_of(internal_id)?;
+    /// One array read, the store addressed by node, and no hashing at all. The
+    /// dense index turns a record's position into its node first. `None` where
+    /// the index keeps no raw vector for that node, which is every node of a
+    /// trained `quantized_only` index, and for a node this graph does not hold.
+    pub fn raw_vector_at(&self, node: u32) -> Option<&[f32]> {
         match self {
             VectorGraph::Cosine(b) => b.store.try_get(node),
             VectorGraph::L2(b) => b.store.try_get(node),
@@ -940,14 +993,13 @@ impl VectorGraph {
         }
     }
 
-    /// One record's quantized codes, by the internal id the collection hands out.
+    /// One node's quantized codes.
     ///
     /// The store a quantized graph scores against holds one code per node, so
-    /// this is the same two array reads `raw_vector` makes on a raw graph.
-    /// `None` on a raw graph, which holds no codes, and for any id this graph
-    /// never took.
-    pub fn codes_of(&self, internal_id: usize) -> Option<&[u8]> {
-        let node = self.node_of(internal_id)?;
+    /// this is the same read `raw_vector_at` makes on a raw graph. `None` on a
+    /// raw graph, which holds no codes, and for a node this graph does not
+    /// hold.
+    pub fn codes_at(&self, node: u32) -> Option<&[u8]> {
         match self {
             VectorGraph::Cosine(_)
             | VectorGraph::L2(_)
@@ -960,28 +1012,25 @@ impl VectorGraph {
         }
     }
 
-    /// One record's stored row, by the internal id the collection hands out, being
-    /// its scalar codes and, on a cosine graph, the four bytes of its inverse
-    /// norm after them. What a rebuild re-inserts without re-encoding.
+    /// One node's stored row, being its scalar codes and, on a cosine graph,
+    /// the four bytes of its inverse norm after them. What a rebuild re-inserts
+    /// without re-encoding.
     ///
-    /// The same two array reads `codes_of` makes on a product quantized
-    /// graph. `None` on every other graph, and for any id this graph never
-    /// took.
-    pub fn int8_row_of(&self, internal_id: usize) -> Option<&[i8]> {
-        let node = self.node_of(internal_id)?;
+    /// The same read `codes_at` makes on a product quantized graph. `None` on
+    /// every other graph, and for a node this graph does not hold.
+    pub fn int8_row_at(&self, node: u32) -> Option<&[i8]> {
         match self {
             VectorGraph::Int8(b) => b.store.try_get(node),
             _ => None,
         }
     }
 
-    /// One record's scalar codes alone, one a value, by the internal id
-    /// the collection hands out. `None` on every other graph, and for any id this
-    /// graph never took.
-    pub fn int8_codes_of(&self, internal_id: usize) -> Option<&[i8]> {
+    /// One node's scalar codes alone, one a value. `None` on every other
+    /// graph, and for a node this graph does not hold.
+    pub fn int8_codes_at(&self, node: u32) -> Option<&[i8]> {
         match self {
             VectorGraph::Int8(b) => {
-                let row = self.int8_row_of(internal_id)?;
+                let row = b.store.try_get(node)?;
                 Some(b.graph.distance().codes_of_row(row))
             }
             _ => None,
@@ -1016,39 +1065,33 @@ impl VectorGraph {
         }
     }
 
-    /// The distance from `query` to one record's row on the metric this
-    /// graph declared, being the number a traversal scores the record with,
-    /// so an exact scan over scalar rows scores what a traversal scores bit
-    /// for bit. `None` on every other graph, and for any id this graph never
-    /// took.
-    pub fn int8_distance(&self, query: &[f32], internal_id: usize) -> Option<f32> {
+    /// The distance from `query` to one node's row on the metric this graph
+    /// declared, being the number a traversal scores the node with, so an
+    /// exact scan over scalar rows scores what a traversal scores bit for
+    /// bit. `None` on every other graph, and for a node this graph does not
+    /// hold.
+    pub fn int8_distance_at(&self, query: &[f32], node: u32) -> Option<f32> {
         match self {
             VectorGraph::Int8(b) => {
-                let row = self.int8_row_of(internal_id)?;
+                let row = b.store.try_get(node)?;
                 Some(b.graph.distance().query_distance(query, row))
             }
             _ => None,
         }
     }
 
-    /// The vector one record's row stands for, which on a cosine graph is
-    /// the decoded vector at unit length, being the vector the graph scores
-    /// as; see [`Int8Dist::reconstruct`]. `None` on every other graph, and
-    /// for any id this graph never took.
-    pub fn int8_reconstruct(&self, internal_id: usize) -> Option<Vec<f32>> {
+    /// The vector one node's row stands for, which on a cosine graph is the
+    /// decoded vector at unit length, being the vector the graph scores as;
+    /// see [`Int8Dist::reconstruct`]. `None` on every other graph, and for a
+    /// node this graph does not hold.
+    pub fn int8_reconstruct_at(&self, node: u32) -> Option<Vec<f32>> {
         match self {
             VectorGraph::Int8(b) => {
-                let row = self.int8_row_of(internal_id)?;
+                let row = b.store.try_get(node)?;
                 b.graph.distance().reconstruct(row).ok()
             }
             _ => None,
         }
-    }
-
-    /// Whether this graph took a node under this internal id. True for a
-    /// node removal has stranded, since the node stays.
-    pub fn holds(&self, internal_id: usize) -> bool {
-        self.node_of(internal_id).is_some()
     }
 
     /// Time one distance evaluation on this graph's own store, in
@@ -1331,18 +1374,28 @@ impl VectorGraph {
     /// `quantized_with_raw` index, both of which build a replacement graph
     /// whose node numbering is its own. The raws are re-addressed rather than
     /// re-derived, so nothing is quantized, reconstructed or lost, and a record
-    /// the source cannot supply is an error rather than a gap.
-    pub fn adopt_raw_from(&mut self, source: &VectorGraph, dim: usize) -> Result<usize, String> {
+    /// the source cannot supply is an error rather than a gap. Each node of
+    /// this graph names its record's position, and `source_node_at` is the
+    /// source's node at each position.
+    pub fn adopt_raw_from(
+        &mut self,
+        source: &VectorGraph,
+        source_node_at: &[u32],
+        dim: usize,
+    ) -> Result<usize, String> {
         let nodes = self.nb_points();
         self.open_raw_store(dim, nodes)?;
         for node in 0..nodes as u32 {
-            let internal_id = self.origin_id_at(node);
-            let vector = source.raw_vector(internal_id).ok_or_else(|| {
-                format!(
-                    "record with internal id {} has no raw vector to carry over",
-                    internal_id
-                )
-            })?;
+            let position = self.record_of_at(node);
+            let vector = source_node_at
+                .get(position as usize)
+                .and_then(|&old| source.raw_vector_at(old))
+                .ok_or_else(|| {
+                    format!(
+                        "record with internal id {} has no raw vector to carry over",
+                        self.origin_id_at(node)
+                    )
+                })?;
             match self {
                 VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                     b.raw
@@ -1608,20 +1661,23 @@ impl VectorGraph {
     /// Phase two of one insertion: append the node and write its edges.
     ///
     /// Runs under the write guard, and takes the plan the read guarded phase
-    /// produced. The record must be the one that was planned.
-    pub fn install(&mut self, record: Record<'_>, id: usize, planned: Planned) {
+    /// produced. The record must be the one that was planned. The node takes
+    /// `id` as the internal id the dump records and `at` as the position of
+    /// the record it holds.
+    pub fn install(&mut self, record: Record<'_>, id: usize, at: Position, planned: Planned) {
+        let position = at.0;
         match (self, record) {
-            (VectorGraph::Cosine(b), Record::Raw(v)) => b.install(v, id, planned),
-            (VectorGraph::L2(b), Record::Raw(v)) => b.install(v, id, planned),
-            (VectorGraph::L1(b), Record::Raw(v)) => b.install(v, id, planned),
-            (VectorGraph::Dot(b), Record::Raw(v)) => b.install(v, id, planned),
+            (VectorGraph::Cosine(b), Record::Raw(v)) => b.install(v, id, position, planned),
+            (VectorGraph::L2(b), Record::Raw(v)) => b.install(v, id, position, planned),
+            (VectorGraph::L1(b), Record::Raw(v)) => b.install(v, id, position, planned),
+            (VectorGraph::Dot(b), Record::Raw(v)) => b.install(v, id, position, planned),
             (VectorGraph::CosinePQ(b), Record::Codes { codes, raw })
             | (VectorGraph::L2PQ(b), Record::Codes { codes, raw })
             | (VectorGraph::L1PQ(b), Record::Codes { codes, raw }) => {
-                b.install(codes, id, planned);
+                b.install(codes, id, position, planned);
                 b.push_raw(raw);
             }
-            (VectorGraph::Int8(b), Record::Int8(codes)) => b.install(codes, id, planned),
+            (VectorGraph::Int8(b), Record::Int8(codes)) => b.install(codes, id, position, planned),
             // Unreachable, because a plan the element type refused is `None`
             // and the caller then installs nothing.
             _ => error!(
@@ -1634,25 +1690,26 @@ impl VectorGraph {
         }
     }
 
-    /// Insert one raw vector, the draw and both phases, for a caller holding
-    /// the graph outright.
+    /// Insert one raw vector under internal id `id` at position `at`, the
+    /// draw and both phases, for a caller holding the graph outright.
     ///
     /// The three rebuild paths, being `compact`, the quantization rebuild and
     /// the persistence rebuild, each build a fresh graph off to the side and
     /// swap it in under one write guard, so the graph they insert into is a
     /// local nobody else can reach. They need no phase split and no lock.
-    pub fn insert(&mut self, vector: &[f32], id: usize) {
+    pub fn insert(&mut self, vector: &[f32], id: usize, at: Position) {
         let level = self.draw_level();
         if let Some(planned) = self.plan_at_level(Record::Raw(vector), level) {
-            self.install(Record::Raw(vector), id, planned);
+            self.install(Record::Raw(vector), id, at, planned);
         }
     }
 
     /// Insertion is sequential whatever the batch size. Every caller is a
     /// one-time structural rebuild, at training completion, in `compact` or in
     /// the persistence loader, and each of them sorts its batch by internal id
-    /// so that two rebuilds of the same records wire the same graph.
-    pub fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize)]) -> Result<(), String> {
+    /// so that two rebuilds of the same records wire the same graph. Each entry
+    /// is the codes, the internal id and the record's position.
+    pub fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize, Position)]) -> Result<(), String> {
         debug!(
             target: LOG_TARGET,
             operation = "batch_insert_pq",
@@ -1662,8 +1719,8 @@ impl VectorGraph {
 
         match self {
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
-                for (codes, id) in data {
-                    b.insert(codes.as_slice(), *id);
+                for (codes, id, at) in data {
+                    b.insert(codes.as_slice(), *id, at.0);
                 }
 
                 Ok(())
@@ -1677,7 +1734,8 @@ impl VectorGraph {
     /// build a fresh graph off to the side. Every caller sorts its batch by
     /// internal id so that two rebuilds of the same records wire the same
     /// graph, as [`VectorGraph::insert_batch_pq`] requires of its callers.
-    pub fn insert_batch_int8(&mut self, data: &[(&[i8], usize)]) -> Result<(), String> {
+    /// Each entry is the row, the internal id and the record's position.
+    pub fn insert_batch_int8(&mut self, data: &[(&[i8], usize, Position)]) -> Result<(), String> {
         debug!(
             target: LOG_TARGET,
             operation = "batch_insert_int8",
@@ -1686,8 +1744,8 @@ impl VectorGraph {
         );
         match self {
             VectorGraph::Int8(b) => {
-                for (codes, id) in data {
-                    b.insert(codes, *id);
+                for (codes, id, at) in data {
+                    b.insert(codes, *id, at.0);
                 }
                 Ok(())
             }

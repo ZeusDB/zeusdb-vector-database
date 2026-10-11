@@ -90,6 +90,8 @@ mod int8_tests;
 mod journal_tests;
 #[cfg(test)]
 mod mutation_tests;
+#[cfg(test)]
+mod numbering_tests;
 mod page;
 mod persist;
 #[cfg(test)]
@@ -132,7 +134,8 @@ use std::sync::{Arc, OnceLock};
 use tracing::{trace, warn};
 use zeusdb_vector_core::{
     matches_filter, ColumnStore, Error, Filter, IdStore, Int8Codec, MetadataStore, Operation,
-    OperationKind, Persist, Selection, SpaceName, SparseVector, VectorGraph, VectorIndex, PQ,
+    OperationKind, Persist, Position, Selection, SpaceName, SparseVector, VectorGraph, VectorIndex,
+    PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{count_record_with, TermDictionary, Tokenizer, TokenizerConfig};
@@ -1089,9 +1092,9 @@ pub struct Collection {
     ///
     /// **Separate from `id_counter`, and it is not reset by `clear`.** It used
     /// to be the same counter, which meant two things at once. `clear` resets
-    /// `id_counter` deliberately, because the graph's id-to-node array is one
-    /// dense slot per internal id issued and an index cleared and refilled
-    /// repeatedly would grow it without bound. That reset handed out `vec_1` a
+    /// `id_counter` deliberately, because the dense index's node for each
+    /// position is one dense slot per internal id issued and an index cleared
+    /// and refilled repeatedly would grow it without bound. That reset handed out `vec_1` a
     /// second time, so an external reference to the first record now named a
     /// different one and nothing said so.
     ///
@@ -1216,7 +1219,11 @@ impl Collection {
     pub(crate) fn live_sets_agree(&self) -> bool {
         let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
-        ids.agrees_with(index.live_set()) && ids.len() == index.len()
+        ids.len() == index.len()
+            && ids
+                .slots()
+                .all(|slot| index.holds(Position::from_slot(slot)))
+            && index.numbering_agrees()
     }
 
     /// Bring the dense index's live set into step with the id store, which
@@ -1785,9 +1792,7 @@ impl Collection {
         let index = self.dense().index.read().unwrap();
         let pq_codes = self.dense().pq_codes.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
-        let raws = crate::RawVectors {
-            graph: index.graph(),
-        };
+        let raws = index.raw_vectors();
 
         for id in ids {
             // The internal id, and whether the record exists in either storage
@@ -1817,7 +1822,7 @@ impl Collection {
                     } else {
                         // Case 3: a scalar row, decoded through the scales,
                         // and nothing where the record holds no vector data
-                        slot.and_then(|slot| index.graph().int8_reconstruct(slot))
+                        slot.and_then(|slot| index.int8_reconstruct(slot))
                     }
                 } else {
                     None

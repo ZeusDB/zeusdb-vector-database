@@ -11,17 +11,22 @@
 //! and an installation under a write guard, which is the two-phase insertion
 //! the graph was built for.
 //!
-//! # The live set
+//! # The numbering
 //!
-//! The index keeps its own bitmap of the records it holds. It is the same
-//! set the collection keeps beside its reverse map, maintained on the same
-//! writes, and it is what lets the index answer `len`, `holds`, `stranded`
-//! and a removal of an id it never held without reaching into the
-//! collection. A search under a set admitting everything runs under this
-//! bitmap alone where the graph holds a node the bitmap does not, being the
-//! node a removal or an overwrite leaves behind, and under no predicate at
-//! all while every node is live, since the bitmap would then admit every
-//! node it is asked about.
+//! A record has a position, which every per-record structure is addressed by,
+//! and a node, which the graph is addressed by. Two plain vectors join them.
+//! The graph keeps each node's position, with an empty marker for a node a
+//! removal or an overwrite has stranded, and the index keeps `node_at`, each
+//! position's node, with the same marker for a position that holds no record.
+//! The two are written together, under this value's write guard, at every
+//! insert, removal and replacement of the graph, and `node_at` is the index's
+//! live set: it is what lets the index answer `len`, `holds`, `stranded` and a
+//! removal of a position it never held without reaching into the collection.
+//!
+//! A search under a set admitting everything runs with no predicate at all
+//! while every node holds a record, and otherwise under a test of each
+//! candidate's position against the empty marker, which is one comparison of
+//! a value the traversal has already read.
 //!
 //! # The two paths
 //!
@@ -76,12 +81,17 @@ use std::sync::Arc;
 use tracing::error;
 use zeusdb_vector_core::{
     restore_graph, restore_int8_graph, Admit, ArtefactRecord, Bitmap, Bounds, Budget, Cost, Dense,
-    Dir, DumpBounds, Error, Hit, Hits, Int8Codec, Inventory, Ledger, Persist, Planned, Prepared,
-    Record, RecordId, Restore, ScoreKind, Selectivity, VectorGraph, VectorIndex, DUMP_FILENAME, PQ,
+    Dir, DumpBounds, Error, Hit, Hits, Int8Codec, Inventory, Ledger, Persist, Planned, Position,
+    Prepared, Record, RecordId, Restore, ScoreKind, Selectivity, VectorGraph, VectorIndex,
+    DUMP_FILENAME, PQ,
 };
 
+/// The empty marker, being a position that holds no record or a node that
+/// holds none.
+const NONE: u32 = Position::NONE;
+
 use super::search::FULL_SCAN_THRESHOLD;
-use crate::{prepare_reconstruction, raw_distance_fn, reconstruction_needs_unit};
+use crate::{prepare_reconstruction, raw_distance_fn, reconstruction_needs_unit, RawVectors};
 
 /// The target every record this file emits carries, being the search
 /// module's, since the records here are the ones the traversal emitted from
@@ -150,18 +160,19 @@ struct DensePlan {
 /// The value under a dense space's graph guard.
 pub(crate) struct DenseIndex {
     graph: VectorGraph,
-    /// The records this index holds a node for and has not removed.
-    live: Bitmap,
+    /// The node of the record at each position, and [`NONE`] for a position
+    /// that holds no record. The index's live set; see the module.
+    node_at: Vec<u32>,
     live_count: usize,
-    /// Whether every node the graph holds was inserted under an id the live
-    /// set holds, so the live bit admits every node a traversal can reach.
+    /// Whether every node the graph holds holds a record this index holds,
+    /// so no node a traversal can reach carries the empty marker.
     ///
-    /// Computed by one pass over the nodes whenever the graph or the live
-    /// set is replaced whole. `insert` leaves it as it is, since the node it
-    /// adds is filed under an id that becomes live in the same call, and
-    /// `remove` clears it, since the removed record's node stays in the
-    /// graph. It sits beside the bitmap and the graph under the same guard,
-    /// so a search reads the three as one.
+    /// Computed by one pass over the nodes whenever the graph or the
+    /// numbering is replaced whole. `insert` leaves it as it is, since the
+    /// node it adds holds the record it is filed for, and `remove` clears it,
+    /// since the removed record's node stays in the graph. It sits beside the
+    /// numbering and the graph under the same guard, so a search reads the
+    /// three as one.
     every_node_live: bool,
     metric: String,
     dim: usize,
@@ -180,10 +191,19 @@ pub(crate) struct DenseIndex {
     saturated: AtomicU64,
 }
 
+// The case of `DenseIndex::traverse` the last traversal on this thread ran,
+// from 1 for no predicate to 4 for the marker's test and the table call, and
+// the bytes its predicate closure captures. Read by the test that holds each
+// closure to what it needs; nothing outside the tests sees it.
+#[cfg(test)]
+thread_local! {
+    static PREDICATE_BYTES: std::cell::Cell<(u8, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 impl DenseIndex {
-    /// Wrap a graph. The live set starts empty and the unit cost is timed on
-    /// the graph's store, or taken from the floor where the store is too
-    /// small.
+    /// Wrap a graph. The index holds no record until `set_live` or an insert
+    /// files one, and the unit cost is timed on the graph's store, or taken
+    /// from the floor where the store is too small.
     pub(crate) fn new(
         graph: VectorGraph,
         metric: &str,
@@ -191,9 +211,10 @@ impl DenseIndex {
         pq: Option<Arc<PQ>>,
         keeps_raw: bool,
     ) -> Self {
+        let node_at = Vec::with_capacity(reserved_positions(&graph));
         let mut index = DenseIndex {
             graph,
-            live: Bitmap::default(),
+            node_at,
             live_count: 0,
             every_node_live: false,
             metric: metric.to_string(),
@@ -207,7 +228,7 @@ impl DenseIndex {
             },
             saturated: AtomicU64::new(0),
         };
-        index.every_node_live = every_node_live(&index.graph, &index.live);
+        index.every_node_live = every_node_live(&index.graph, &index.node_at);
         index.calibrate();
         index
     }
@@ -237,49 +258,174 @@ impl DenseIndex {
         &mut self.graph
     }
 
-    /// The live set, for a caller that wants to check it against the
-    /// collection's.
-    pub(crate) fn live_set(&self) -> &Bitmap {
-        &self.live
+    /// Take the reservation `expected_size` declares, on an index that holds
+    /// no record: the graph's, and the vector by position sized to match.
+    pub(crate) fn reserve_declared(&mut self, expected_size: usize) {
+        self.graph.reserve_declared(expected_size);
+        let wanted = reserved_positions(&self.graph);
+        self.node_at
+            .reserve_exact(wanted.saturating_sub(self.node_at.len()));
     }
 
-    /// Bytes the live set's bitmap asks the allocator for, for
-    /// `Collection::stats`. The second of the two bitmaps a collection holds;
-    /// see `IdStore::heap_bytes`.
-    pub(crate) fn live_heap_bytes(&self) -> usize {
-        self.live.heap_bytes()
+    /// The node of the record at each position, and [`NONE`] where a position
+    /// holds no record. What a caller holding the index's guard reads a
+    /// record's vector through.
+    pub(crate) fn node_at(&self) -> &[u32] {
+        &self.node_at
     }
 
-    /// Replace the live set with the ids the collection holds, which the
-    /// loader does once the id mappings are back.
-    pub(crate) fn set_live<I: IntoIterator<Item = usize>>(&mut self, ids: I) {
-        let mut live = Bitmap::default();
-        let mut count = 0;
-        for id in ids {
-            live.insert(id);
-            count += 1;
+    /// Where a record's raw vector is reached by its position, for a caller
+    /// holding this value's guard.
+    pub(crate) fn raw_vectors(&self) -> RawVectors<'_> {
+        RawVectors { index: self }
+    }
+
+    /// One record's raw vector, by its position. The node `node_at` names
+    /// for the position and the store's vector for that node, in one call.
+    /// `None` where the position holds no record, and where the index keeps
+    /// no raw vector, which is every record of a trained `quantized_only`
+    /// index. A position that holds no record, and a position past the
+    /// table, reach the store as the node [`NONE`], which no graph holds, so
+    /// the store answers `None` for them.
+    #[inline(never)]
+    pub(crate) fn raw_vector(&self, at: usize) -> Option<&[f32]> {
+        self.graph
+            .raw_vector_at(self.node_at.get(at).copied().unwrap_or(NONE))
+    }
+
+    /// The vector one record's scalar row stands for, by its position, in
+    /// one call. `None` where the position holds no record, and on every
+    /// graph but a scalar quantized one. A position that holds no record, and
+    /// a position past the table, reach the store as the node [`NONE`], which
+    /// no graph holds, so the store answers `None` for them.
+    pub(crate) fn int8_reconstruct(&self, at: usize) -> Option<Vec<f32>> {
+        self.graph
+            .int8_reconstruct_at(self.node_at.get(at).copied().unwrap_or(NONE))
+    }
+
+    /// The node of the record at `at`, where this index holds one.
+    #[inline]
+    pub(crate) fn node_of(&self, at: Position) -> Option<u32> {
+        match self.node_at.get(at.slot()) {
+            Some(&node) if node != NONE => Some(node),
+            _ => None,
         }
-        self.live = live;
-        self.live_count = count;
-        self.every_node_live = every_node_live(&self.graph, &self.live);
     }
 
-    /// Swap the graph and keep everything else, which is what a compaction,
-    /// a rebuild and the training transition do.
+    /// Bytes the numbering's vector by position asks the allocator for, for
+    /// `Collection::stats`. The graph's vector by node is priced with the
+    /// graph.
+    pub(crate) fn node_at_heap_bytes(&self) -> usize {
+        self.node_at.capacity() * std::mem::size_of::<u32>()
+    }
+
+    /// File the records the collection holds, at the positions `positions`
+    /// gives, under the nodes of the graph the index holds, which the loader
+    /// does once the id mappings are back.
     ///
-    /// `timed` is what [`DenseIndex::time_graph`] measured on the replacement
-    /// before the caller took the write guard, so the guard is held for the
-    /// swap and one pass over the replacement's nodes, and never across a
-    /// timing run. `None` takes the floor.
+    /// A record's position is its internal id, so the node a record sits at
+    /// is the node whose origin id is that position. Every node whose record
+    /// the collection does not hold is stranded. Returns how many of the
+    /// positions no node holds, which is zero for a graph built from the
+    /// records and every one of them for the empty graph a load starts from.
+    pub(crate) fn set_live<I: IntoIterator<Item = usize>>(&mut self, positions: I) -> usize {
+        let mut held = Bitmap::default();
+        let mut count = 0;
+        let mut extent = 0;
+        for at in positions {
+            held.insert(at);
+            count += 1;
+            extent = extent.max(at + 1);
+        }
+        let mut node_at = vec![NONE; extent];
+        let mut placed = 0;
+        let mut every = true;
+        let (origins, records) = self.graph.numbering_mut();
+        for (node, (&origin, record)) in origins.iter().zip(records.iter_mut()).enumerate() {
+            if held.contains(origin) {
+                node_at[origin] = node as u32;
+                *record = origin as u32;
+                placed += 1;
+            } else {
+                *record = NONE;
+                every = false;
+            }
+        }
+        self.node_at = node_at;
+        self.live_count = placed;
+        self.every_node_live = every;
+        count - placed
+    }
+
+    /// Swap the graph and keep the records, which is what a compaction, a
+    /// rebuild and the training transition do.
+    ///
+    /// The replacement was built from the records the collection holds, each
+    /// node filed at its record's position, so `node_at` and the live count
+    /// are read back from the replacement's own numbering in the same pass
+    /// that decides whether every node holds a record. `node_at` is built
+    /// anew at the extent the records reach, with the reservation the
+    /// replacement holds for its nodes, as the map from an id to its node was
+    /// built anew with the graph it belonged to: a training rebuild keeps the
+    /// declared size, and a compaction, whose graph is shrunk first, keeps
+    /// the extent alone. `timed` is what [`DenseIndex::time_graph`]
+    /// measured on the replacement before the caller took the write guard, so
+    /// the guard is held for the swap and one pass over the replacement's
+    /// nodes, and never across a timing run. `None` takes the floor.
     pub(crate) fn replace_graph(
         &mut self,
         graph: VectorGraph,
         timed: Option<(f64, f64)>,
     ) -> VectorGraph {
         let old = std::mem::replace(&mut self.graph, graph);
-        self.every_node_live = every_node_live(&self.graph, &self.live);
+        let records = self.graph.records();
+        let extent = records
+            .iter()
+            .filter(|&&position| position != NONE)
+            .map(|&position| position as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut node_at = Vec::with_capacity(extent.max(reserved_by(&self.graph)));
+        node_at.resize(extent, NONE);
+        let mut placed = 0;
+        let mut every = true;
+        for (node, &position) in records.iter().enumerate() {
+            if position == NONE {
+                every = false;
+                continue;
+            }
+            node_at[position as usize] = node as u32;
+            placed += 1;
+        }
+        self.node_at = node_at;
+        self.live_count = placed;
+        self.every_node_live = every;
         self.set_units(timed);
         old
+    }
+
+    /// Whether the two directions of the numbering agree: every position
+    /// held names a node that names it back, every other node is stranded,
+    /// the live count is the positions held, and the flag the unfiltered
+    /// search reads is true exactly where no node is stranded.
+    pub(crate) fn numbering_agrees(&self) -> bool {
+        let records = self.graph.records();
+        let mut held = 0;
+        for (at, &node) in self.node_at.iter().enumerate() {
+            if node == NONE {
+                continue;
+            }
+            held += 1;
+            if records.get(node as usize) != Some(&(at as u32)) {
+                return false;
+            }
+        }
+        let filed = records.iter().filter(|&&position| position != NONE).count();
+        let every = filed == records.len();
+        let back = records.iter().enumerate().all(|(node, &position)| {
+            position == NONE || self.node_at.get(position as usize) == Some(&(node as u32))
+        });
+        back && held == self.live_count && filed == held && every == self.every_node_live
     }
 
     /// Time the two units on a graph that is not yet installed, so a
@@ -387,31 +533,32 @@ impl DenseIndex {
         }
     }
 
-    /// The distance from `query` to one record, on the raw scale.
+    /// The distance from `query` to the record one node holds, on the raw
+    /// scale.
     ///
     /// The stored raw vector where the graph holds one and the reconstruction
     /// from the record's codes where it does not, normalised first where the
     /// space requires it. A record holding neither cannot exist, since every
     /// insertion writes one or the other, and is sorted last.
-    fn exact_distance(
+    fn exact_distance_at(
         &self,
         query: &[f32],
-        id: usize,
+        node: u32,
         distance: fn(&[f32], &[f32]) -> f32,
         needs_unit: bool,
     ) -> f32 {
-        if let Some(stored) = self.graph.raw_vector(id) {
+        if let Some(stored) = self.graph.raw_vector_at(node) {
             return distance(query, stored);
         }
         // A scalar row is scored through the graph's own kernel, so the exact
         // scan and the traversal agree bit for bit and the page is on the
         // scale the kernel already puts it on.
-        if let Some(scored) = self.graph.int8_distance(query, id) {
+        if let Some(scored) = self.graph.int8_distance_at(query, node) {
             return scored;
         }
         let reconstructed = self
             .graph
-            .codes_of(id)
+            .codes_at(node)
             .and_then(|codes| self.pq.as_ref()?.reconstruct(codes).ok());
         match reconstructed {
             Some(reconstructed) => {
@@ -421,18 +568,29 @@ impl DenseIndex {
         }
     }
 
-    /// Score every enumerated id the index holds and cut the page.
-    fn score_exact(&self, query: &[f32], ids: &[RecordId], k: usize, boundary_ties: bool) -> Hits {
+    /// Score every enumerated position the index holds and cut the page.
+    ///
+    /// The positions arrive in increasing order. Each reads its node from
+    /// `node_at`, skips a position that holds no record, and is scored from
+    /// the node's vector, scalar row or codes.
+    fn score_exact(
+        &self,
+        query: &[f32],
+        positions: &[Position],
+        k: usize,
+        boundary_ties: bool,
+    ) -> Hits {
         let distance = raw_distance_fn(&self.metric);
         let needs_unit = reconstruction_needs_unit(&self.metric);
-        let mut scored: Vec<(f32, u32)> = ids
+        let node_at = &self.node_at;
+        let mut scored: Vec<(f32, u32)> = positions
             .iter()
-            .filter(|id| self.live.contains(id.slot()))
-            .map(|id| {
-                (
-                    self.exact_distance(query, id.slot(), distance, needs_unit),
-                    id.0,
-                )
+            .filter_map(|at| match node_at.get(at.slot()) {
+                Some(&node) if node != NONE => Some((
+                    self.exact_distance_at(query, node, distance, needs_unit),
+                    at.0,
+                )),
+                _ => None,
             })
             .collect();
         scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -447,8 +605,8 @@ impl DenseIndex {
         Hits {
             items: scored
                 .into_iter()
-                .map(|(score, id)| Hit {
-                    id: RecordId(id),
+                .map(|(score, at)| Hit {
+                    position: Position(at),
                     score,
                 })
                 .collect(),
@@ -460,11 +618,14 @@ impl DenseIndex {
     /// Run the traversal under one predicate.
     ///
     /// Three predicates, each monomorphised into the traversal by the
-    /// graph's generic parameter. A set admitting everything is the live
-    /// bit alone, which is the unfiltered search, and no predicate at all
-    /// while every node the graph holds is live. A bitmap is its bit and
-    /// then the live bit, in that order so a rejected node costs one word
-    /// read. Anything else is the live bit and then the table call.
+    /// graph's generic parameter, and each asked about the position the
+    /// traversal reads for a candidate, which is the empty marker for a
+    /// stranded node. A set admitting everything is the test of that marker,
+    /// which is the unfiltered search, and no predicate at all while every
+    /// node the graph holds holds a record. A bitmap is its bit alone, since
+    /// the marker lies past every word. Anything else is the marker's test and
+    /// then the table call. The marker is a constant in each closure, so a
+    /// closure captures the admit set it asks and nothing else.
     fn traverse(&self, query: &[f32], k: usize, ef: usize, admit: &dyn Admit) -> Hits {
         let quantized = self.graph.is_quantized();
         let operation = if quantized {
@@ -472,21 +633,29 @@ impl DenseIndex {
         } else {
             "raw_search"
         };
-        let live = &self.live;
         let searched = if admit.admits_all() {
             if self.every_node_live {
-                // The live bit would admit every node the traversal can
-                // reach, so the search runs without a predicate.
+                // Every node the traversal can reach holds a record, so the
+                // search runs without a predicate.
+                #[cfg(test)]
+                PREDICATE_BYTES.with(|bytes| bytes.set((1, 0)));
                 self.graph.search(query, k, ef, None::<&fn(&usize) -> bool>)
             } else {
-                let admits = |id: &usize| live.contains(*id);
+                let admits = |at: &usize| *at != NONE as usize;
+                #[cfg(test)]
+                PREDICATE_BYTES.with(|bytes| bytes.set((2, std::mem::size_of_val(&admits))));
                 self.graph.search(query, k, ef, Some(&admits))
             }
         } else if let Some(bitmap) = admit.as_bitmap() {
-            let admits = |id: &usize| bitmap.contains(*id) && live.contains(*id);
+            let admits = |at: &usize| bitmap.contains(*at);
+            #[cfg(test)]
+            PREDICATE_BYTES.with(|bytes| bytes.set((3, std::mem::size_of_val(&admits))));
             self.graph.search(query, k, ef, Some(&admits))
         } else {
-            let admits = |id: &usize| live.contains(*id) && admit.admits(RecordId::from_slot(*id));
+            let admits =
+                |at: &usize| *at != NONE as usize && admit.admits(Position::from_slot(*at));
+            #[cfg(test)]
+            PREDICATE_BYTES.with(|bytes| bytes.set((4, std::mem::size_of_val(&admits))));
             self.graph.search(query, k, ef, Some(&admits))
         };
         let graph_hits = searched.unwrap_or_else(|e| {
@@ -496,7 +665,7 @@ impl DenseIndex {
         let mut items: Vec<Hit> = graph_hits
             .into_iter()
             .map(|hit| Hit {
-                id: RecordId::from_slot(hit.internal_id),
+                position: Position::from_slot(hit.position),
                 score: hit.distance,
             })
             .collect();
@@ -611,8 +780,9 @@ impl VectorIndex<Dense> for DenseIndex {
         self.live_count
     }
 
-    fn holds(&self, id: RecordId) -> bool {
-        self.live.contains(id.slot())
+    #[inline]
+    fn holds(&self, at: Position) -> bool {
+        self.node_of(at).is_some()
     }
 
     /// Phase one for a caller holding no level of its own: draws one and
@@ -624,17 +794,25 @@ impl VectorIndex<Dense> for DenseIndex {
         self.prepare_at_level(id, vector, level)
     }
 
-    /// Phase two. Appends the node and installs its lists under the write
-    /// guard. A caller that skipped `prepare` has the draw and both phases
-    /// run here.
+    /// Phase two. Appends the node, files the record's position under it
+    /// and the node under the position, and installs its lists under the
+    /// write guard. A caller that skipped `prepare` has the draw and both
+    /// phases run here.
     ///
     /// A plan the graph refused, because the record's element type is not
-    /// the graph's, installs nothing and is logged by the graph, which is
-    /// what the two-phase insertion has always done with it; the record is
-    /// still counted held, since the collection holds it.
-    fn insert(&mut self, id: RecordId, vector: &[f32], prepared: Prepared) -> Result<(), Error> {
-        if self.live.contains(id.slot()) {
-            return Err(Error::RecordAlreadyHeld { id: id.0 });
+    /// the graph's, is a refusal: nothing is installed and the record is not
+    /// held, so every record the index holds has a node. The graph logs the
+    /// cause. No caller reaches it, since the plan takes the record's form
+    /// from the graph.
+    fn insert(
+        &mut self,
+        at: Position,
+        id: RecordId,
+        vector: &[f32],
+        prepared: Prepared,
+    ) -> Result<(), Error> {
+        if self.holds(at) {
+            return Err(Error::RecordAlreadyHeld { id: at.0 });
         }
         let plan = match prepared.take::<DensePlan>() {
             Some(plan) => plan,
@@ -643,29 +821,40 @@ impl VectorIndex<Dense> for DenseIndex {
                 self.plan_at_level(id, vector, level)?
             }
         };
-        if let Some(planned) = plan.planned {
-            let record = match (&plan.codes, &plan.row) {
-                (Some(codes), _) => Record::Codes {
-                    codes,
-                    raw: self.keeps_raw.then_some(vector),
-                },
-                (None, Some(row)) => Record::Int8(row),
-                (None, None) => Record::Raw(vector),
-            };
-            self.graph.install(record, id.slot(), planned);
+        let Some(planned) = plan.planned else {
+            return Err(Error::Engine(format!(
+                "the graph refused the record with internal id {}, whose form is not the graph's",
+                id.0
+            )));
+        };
+        let record = match (&plan.codes, &plan.row) {
+            (Some(codes), _) => Record::Codes {
+                codes,
+                raw: self.keeps_raw.then_some(vector),
+            },
+            (None, Some(row)) => Record::Int8(row),
+            (None, None) => Record::Raw(vector),
+        };
+        let node = self.graph.nb_points() as u32;
+        self.graph.install(record, id.slot(), at, planned);
+        let slot = at.slot();
+        if slot >= self.node_at.len() {
+            self.node_at.resize(slot + 1, NONE);
         }
-        self.live.insert(id.slot());
+        self.node_at[slot] = node;
         self.live_count += 1;
         Ok(())
     }
 
     /// Strands the node. The graph keeps it, since a stranded node still
-    /// routes a traversal, and `compact` rebuilds the graph without it.
-    fn remove(&mut self, id: RecordId) -> Result<(), Error> {
-        if !self.live.contains(id.slot()) {
-            return Err(Error::RecordNotHeld { id: id.0 });
-        }
-        self.live.remove(id.slot());
+    /// routes a traversal, and `compact` rebuilds the graph without it. The
+    /// position and the node both take the empty marker.
+    fn remove(&mut self, at: Position) -> Result<(), Error> {
+        let Some(node) = self.node_of(at) else {
+            return Err(Error::RecordNotHeld { id: at.0 });
+        };
+        self.node_at[at.slot()] = NONE;
+        self.graph.set_record_of(node, NONE);
         self.live_count -= 1;
         self.every_node_live = false;
         Ok(())
@@ -677,26 +866,21 @@ impl VectorIndex<Dense> for DenseIndex {
         self.graph.nb_points().saturating_sub(self.live_count)
     }
 
-    fn vector(&self, id: RecordId) -> Option<&[f32]> {
-        if !self.live.contains(id.slot()) {
-            return None;
-        }
-        self.graph.raw_vector(id.slot())
+    fn vector(&self, at: Position) -> Option<&[f32]> {
+        self.graph.raw_vector_at(self.node_of(at)?)
     }
 
     /// The raw vector where the graph holds one and the reconstruction from
     /// the record's codes where it does not.
-    fn recover(&self, id: RecordId) -> Option<Vec<f32>> {
-        if let Some(raw) = self.vector(id) {
+    fn recover(&self, at: Position) -> Option<Vec<f32>> {
+        let node = self.node_of(at)?;
+        if let Some(raw) = self.graph.raw_vector_at(node) {
             return Some(raw.to_vec());
         }
-        if !self.live.contains(id.slot()) {
-            return None;
-        }
-        if let Some(decoded) = self.graph.int8_reconstruct(id.slot()) {
+        if let Some(decoded) = self.graph.int8_reconstruct_at(node) {
             return Some(decoded);
         }
-        let codes = self.graph.codes_of(id.slot())?;
+        let codes = self.graph.codes_at(node)?;
         self.pq.as_ref()?.reconstruct(codes).ok()
     }
 
@@ -710,12 +894,12 @@ impl VectorIndex<Dense> for DenseIndex {
         let ef = budget.ef.unwrap_or_else(|| self.default_ef(k));
         if let Some(admitted) = admit.len_hint() {
             if admitted <= FULL_SCAN_THRESHOLD {
-                let mut ids = Vec::with_capacity(admitted);
-                if admit.enumerate(&mut |id| {
-                    ids.push(id);
+                let mut positions = Vec::with_capacity(admitted);
+                if admit.enumerate(&mut |at| {
+                    positions.push(at);
                     true
                 }) {
-                    return Ok(self.score_exact(query, &ids, k, budget.boundary_ties));
+                    return Ok(self.score_exact(query, &positions, k, budget.boundary_ties));
                 }
             }
         }
@@ -747,9 +931,37 @@ impl VectorIndex<Dense> for DenseIndex {
     }
 }
 
-/// Whether every node `graph` holds was inserted under an id `live` holds.
-fn every_node_live(graph: &VectorGraph, live: &Bitmap) -> bool {
-    (0..graph.nb_points() as u32).all(|node| live.contains(graph.origin_id_at(node)))
+/// The positions an index over `graph` reserves, being one past the nodes the
+/// graph reserved for, since a position is an internal id and ids start at
+/// one, which is the reservation the declared size took for the map from an
+/// id to its node. Nothing where the graph already holds a node, since the
+/// records are filed from the graph then.
+fn reserved_positions(graph: &VectorGraph) -> usize {
+    if graph.nb_points() == 0 {
+        reserved_by(graph)
+    } else {
+        0
+    }
+}
+
+/// The positions the reservation `graph` holds for its nodes covers, being
+/// one past it, as the map from an id to its node was reserved one past the
+/// nodes, and nothing where the graph reserves nothing.
+fn reserved_by(graph: &VectorGraph) -> usize {
+    match graph.record_capacity() {
+        0 => 0,
+        nodes => nodes + 1,
+    }
+}
+
+/// Whether every node `graph` holds holds a record at a position `node_at`
+/// files it under.
+fn every_node_live(graph: &VectorGraph, node_at: &[u32]) -> bool {
+    graph
+        .records()
+        .iter()
+        .enumerate()
+        .all(|(node, &at)| at != NONE && node_at.get(at as usize) == Some(&(node as u32)))
 }
 
 /// The dump's name under a prefix.
@@ -809,8 +1021,9 @@ impl Restore for DenseIndex {
     /// because a self-consistent dump from a different save of an index of
     /// the same shape would otherwise pass the dump's own checksums. Every
     /// error is a reason to rebuild rather than to fail, which the caller
-    /// decides. The live set comes back empty and the caller fills it from
-    /// the id mappings, which the dump does not carry.
+    /// decides. The index comes back holding no record and the caller files
+    /// the records from the id mappings, which the dump does not carry; see
+    /// [`DenseIndex::set_live`].
     fn restore(
         config: &DenseOpen,
         prefix: &str,
@@ -870,17 +1083,70 @@ impl Restore for DenseIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeusdb_vector_core::{Candidates, NB_LAYER_MAX};
+    use zeusdb_vector_core::{And, Candidates, NB_LAYER_MAX};
+
+    /// Insert one record at the position its internal id names.
+    fn put(index: &mut DenseIndex, id: u32, vector: &[f32]) {
+        let prepared = index.prepare(RecordId(id), vector).unwrap();
+        index
+            .insert(Position(id), RecordId(id), vector, prepared)
+            .unwrap();
+    }
 
     fn index_of(vectors: &[Vec<f32>]) -> DenseIndex {
         let graph = VectorGraph::new_raw("l2", 2, 4, 64, NB_LAYER_MAX as usize, 50);
         let mut index = DenseIndex::new(graph, "l2", 2, None, false);
         for (i, v) in vectors.iter().enumerate() {
-            let id = RecordId(i as u32 + 1);
-            let prepared = index.prepare(id, v).unwrap();
-            index.insert(id, v, prepared).unwrap();
+            put(&mut index, i as u32 + 1, v);
         }
         index
+    }
+
+    /// The case each traversal ran and the bytes its predicate closure
+    /// captures, for a set admitting everything with every node holding a
+    /// record, the same once a node is stranded, a bitmap, and any other set.
+    /// `CEILING` is what the four cases captured when each closure carried
+    /// the live set by id beside its admit set, and `HERE` is what each
+    /// captures with the marker a constant. A closure's captures are held
+    /// across the whole traversal it is monomorphised into, so none may
+    /// capture more than the ceiling in its case.
+    #[test]
+    fn each_predicate_captures_no_more_than_its_ceiling() {
+        const CEILING: [(u8, usize); 4] = [(1, 0), (2, 8), (3, 16), (4, 24)];
+        const HERE: [(u8, usize); 4] = [(1, 0), (2, 0), (3, 8), (4, 16)];
+        let vectors: Vec<Vec<f32>> = (0..300)
+            .map(|i| vec![(i as f32 * 0.37).sin(), (i as f32 * 0.11).cos()])
+            .collect();
+        let mut index = index_of(&vectors);
+        let query = [0.1f32, 0.2];
+        let measure = |index: &DenseIndex, admit: &dyn Admit| {
+            PREDICATE_BYTES.with(|bytes| bytes.set((0, 0)));
+            let _ = index.traverse(&query, 10, 40, admit);
+            PREDICATE_BYTES.with(|bytes| bytes.get())
+        };
+        let every = measure(&index, &Candidates::All);
+        index.remove(Position(7)).unwrap();
+        let stranded = measure(&index, &Candidates::All);
+        let mut bitmap = Bitmap::default();
+        for at in 1..=300 {
+            bitmap.insert(at);
+        }
+        let filtered = measure(&index, &bitmap);
+        let sorted = Candidates::Sorted((1..=300u32).map(Position).collect());
+        let other = measure(&index, &sorted);
+
+        let measured = [every, stranded, filtered, other];
+        assert_eq!(measured, HERE);
+        for (case, (here, ceiling)) in measured.iter().zip(CEILING).enumerate() {
+            assert_eq!(here.0, ceiling.0, "case {} ran", case + 1);
+            assert!(
+                here.1 <= ceiling.1,
+                "case {} captures {} bytes, over its ceiling of {}",
+                case + 1,
+                here.1,
+                ceiling.1
+            );
+        }
     }
 
     /// A held id is refused, an unknown id cannot be removed, and the live
@@ -891,19 +1157,19 @@ mod tests {
         assert_eq!(index.len(), 3);
         assert_eq!(index.stranded(), 0);
         assert!(matches!(
-            index.insert(RecordId(2), &[5.0, 5.0], Prepared::none()),
+            index.insert(Position(2), RecordId(2), &[5.0, 5.0], Prepared::none()),
             Err(Error::RecordAlreadyHeld { id: 2 })
         ));
         assert!(matches!(
-            index.remove(RecordId(9)),
+            index.remove(Position(9)),
             Err(Error::RecordNotHeld { id: 9 })
         ));
-        index.remove(RecordId(2)).unwrap();
+        index.remove(Position(2)).unwrap();
         assert_eq!(index.len(), 2);
         assert_eq!(index.stranded(), 1);
-        assert!(!index.holds(RecordId(2)));
-        assert!(index.vector(RecordId(2)).is_none());
-        assert_eq!(index.recover(RecordId(3)), Some(vec![0.0, 1.0]));
+        assert!(!index.holds(Position(2)));
+        assert!(index.vector(Position(2)).is_none());
+        assert_eq!(index.recover(Position(3)), Some(vec![0.0, 1.0]));
         // The node stays, so the graph still holds three.
         assert_eq!(index.graph().nb_points(), 3);
     }
@@ -920,15 +1186,15 @@ mod tests {
             vec![0.0, -1.0],
             vec![3.0, 0.0],
         ]);
-        index.remove(RecordId(5)).unwrap();
+        index.remove(Position(5)).unwrap();
         let query = [0.0f32, 0.0];
 
-        let sorted = Candidates::Sorted(vec![RecordId(1), RecordId(2), RecordId(3), RecordId(5)]);
+        let sorted = Candidates::Sorted(vec![Position(1), Position(2), Position(3), Position(5)]);
         let page = index
             .search(&query, 2, &sorted, &Budget::default())
             .unwrap();
         assert!(page.exact);
-        let ids: Vec<u32> = page.items.iter().map(|h| h.id.0).collect();
+        let ids: Vec<u32> = page.items.iter().map(|h| h.position.0).collect();
         assert_eq!(ids, vec![1, 2]);
 
         let page = index
@@ -942,14 +1208,14 @@ mod tests {
                 },
             )
             .unwrap();
-        let ids: Vec<u32> = page.items.iter().map(|h| h.id.0).collect();
+        let ids: Vec<u32> = page.items.iter().map(|h| h.position.0).collect();
         assert_eq!(ids, vec![1, 2, 3], "the removed record 5 is never scored");
 
         let page = index
             .search(&query, 10, &Candidates::All, &Budget::default())
             .unwrap();
         assert!(!page.exact);
-        let mut ids: Vec<u32> = page.items.iter().map(|h| h.id.0).collect();
+        let mut ids: Vec<u32> = page.items.iter().map(|h| h.position.0).collect();
         ids.sort_unstable();
         assert_eq!(
             ids,
@@ -958,54 +1224,54 @@ mod tests {
         );
     }
 
-    /// One page as internal ids and score bits.
+    /// One page as positions and score bits.
     fn bits_of(hits: &Hits) -> Vec<(u32, u32)> {
         hits.items
             .iter()
-            .map(|hit| (hit.id.0, hit.score.to_bits()))
+            .map(|hit| (hit.position.0, hit.score.to_bits()))
             .collect()
     }
 
-    /// The page a traversal returns under the live bit, asked of the graph
-    /// directly.
+    /// The page a traversal returns under the live test, being whether the
+    /// index holds the position, asked of the graph directly.
     fn under_the_live_bit(
         index: &DenseIndex,
         query: &[f32],
         k: usize,
         ef: usize,
     ) -> Vec<(u32, u32)> {
-        let live = index.live_set();
         index
             .graph()
-            .search(query, k, ef, Some(&|id: &usize| live.contains(*id)))
+            .search(
+                query,
+                k,
+                ef,
+                Some(&|at: &usize| index.holds(Position::from_slot(*at))),
+            )
             .unwrap()
             .into_iter()
-            .map(|hit| (hit.internal_id as u32, hit.distance.to_bits()))
+            .map(|hit| (hit.position as u32, hit.distance.to_bits()))
             .collect()
     }
 
-    /// Whether any page of the graph asked with no predicate at all names
-    /// one of `removed`.
-    fn unchecked_page_names_one_of(
-        index: &DenseIndex,
-        queries: &[[f32; 2]],
-        removed: &[u32],
-    ) -> bool {
+    /// Whether any page of the graph asked with no predicate at all names a
+    /// stranded node, which is a node whose record was removed.
+    fn unchecked_page_names_a_stranded_node(index: &DenseIndex, queries: &[[f32; 2]]) -> bool {
         queries.iter().any(|query| {
             index
                 .graph()
                 .search(query, 10, 40, None::<&fn(&usize) -> bool>)
                 .unwrap()
                 .iter()
-                .any(|hit| removed.contains(&(hit.internal_id as u32)))
+                .any(|hit| hit.position == NONE as usize)
         })
     }
 
-    /// An unfiltered search leaves the live bit out only while every node
-    /// the graph holds is live, and returns the page the live bit gives
-    /// either way. Once a record is removed its node stays, the bit is
-    /// checked again, and the removed record is never returned although a
-    /// traversal with no predicate would return it.
+    /// An unfiltered search leaves the live test out only while every node
+    /// the graph holds holds a record, and returns the page the live test
+    /// gives either way. Once a record is removed its node stays, the test
+    /// is made again, and the removed record is never returned although a
+    /// traversal with no predicate would reach its node.
     #[test]
     fn an_unfiltered_search_checks_the_live_bit_once_a_node_is_dead() {
         let vectors: Vec<Vec<f32>> = (0..300)
@@ -1027,57 +1293,67 @@ mod tests {
 
         let removed: Vec<u32> = (1..=300).filter(|id| id % 3 == 0).collect();
         for &id in &removed {
-            index.remove(RecordId(id)).unwrap();
+            index.remove(Position(id)).unwrap();
         }
         assert!(!index.every_node_live, "a removal leaves its node behind");
         assert!(
-            unchecked_page_names_one_of(&index, &queries, &removed),
+            unchecked_page_names_a_stranded_node(&index, &queries),
             "the removed records sit where these queries reach them"
         );
         for query in &queries {
             let page = index.search(query, 10, &Candidates::All, &budget).unwrap();
-            assert!(page.items.iter().all(|hit| !removed.contains(&hit.id.0)));
+            assert!(page
+                .items
+                .iter()
+                .all(|hit| !removed.contains(&hit.position.0)));
             assert_eq!(bits_of(&page), under_the_live_bit(&index, query, 10, 40));
         }
     }
 
     /// The flag is the fact the skip rests on, and it is computed whenever
-    /// the graph or the live set is replaced whole. A live set naming every
-    /// node but one, and one id no node carries, leaves the node count and
-    /// the live count equal, and the flag still says a node is dead.
+    /// the graph or the numbering is replaced whole. A set of records naming
+    /// every node but one, and one position no node carries, leaves a node
+    /// stranded, reports the position no node holds, and the flag says a
+    /// node is dead.
     #[test]
     fn every_node_live_is_recomputed_when_the_graph_or_the_live_set_is_replaced() {
         let vectors: Vec<Vec<f32>> = (0..100)
             .map(|i| vec![(i as f32 * 0.37).sin(), (i as f32 * 0.11).cos()])
             .collect();
         let mut index = index_of(&vectors);
-        index.remove(RecordId(7)).unwrap();
+        index.remove(Position(7)).unwrap();
         assert!(!index.every_node_live);
 
-        // The same live set handed back whole is read from the graph again,
+        // The same records handed back whole are read from the graph again,
         // and the removed record's node is still there.
         let held: Vec<usize> = (1..=100).filter(|&id| id != 7).collect();
-        index.set_live(held.iter().copied());
+        assert_eq!(index.set_live(held.iter().copied()), 0);
         assert!(!index.every_node_live);
+        assert!(index.numbering_agrees());
 
-        // As many live ids as nodes, one of them an id no node carries.
-        index.set_live(held.iter().copied().chain(std::iter::once(500)));
-        assert_eq!(index.stranded(), 0);
-        assert!(!index.every_node_live, "node 7's id is not live");
+        // As many records as nodes, one of them at a position no node holds.
+        assert_eq!(
+            index.set_live(held.iter().copied().chain(std::iter::once(500))),
+            1,
+            "position 500 has no node"
+        );
+        assert!(!index.every_node_live, "node 7's record is not held");
+        assert!(index.numbering_agrees());
 
         // A graph holding the live records alone.
         index.set_live(held.iter().copied());
         let mut rebuilt = VectorGraph::new_raw("l2", 2, 4, 64, NB_LAYER_MAX as usize, 50);
         for &id in &held {
-            rebuilt.insert(&vectors[id - 1], id);
+            rebuilt.insert(&vectors[id - 1], id, Position::from_slot(id));
         }
         index.replace_graph(rebuilt, None);
         assert!(index.every_node_live);
+        assert!(index.numbering_agrees());
         let page = index
             .search(&[0.0, 0.0], 10, &Candidates::All, &Budget::default())
             .unwrap();
         assert_eq!(page.items.len(), 10);
-        assert!(page.items.iter().all(|hit| hit.id.0 != 7));
+        assert!(page.items.iter().all(|hit| hit.position.0 != 7));
     }
 
     /// The cost is priced in nanoseconds from the two units, is exact under
@@ -1118,5 +1394,468 @@ mod tests {
         assert!(units.measured);
         assert!(units.distance_ns > 0.0 && units.distance_ns.is_finite());
         assert!(units.ef_ns > units.distance_ns);
+    }
+
+    /// An index over `vectors`, the record `k` at the position and internal
+    /// id `1 + k * gap`, with every seventh record removed so its node is
+    /// stranded.
+    fn spread_index(
+        graph: VectorGraph,
+        pq: Option<Arc<PQ>>,
+        keeps_raw: bool,
+        vectors: &[Vec<f32>],
+        gap: u32,
+    ) -> DenseIndex {
+        let dim = vectors[0].len();
+        let mut index = DenseIndex::new(graph, "l2", dim, pq, keeps_raw);
+        for (k, v) in vectors.iter().enumerate() {
+            put(&mut index, 1 + k as u32 * gap, v);
+        }
+        for k in (0..vectors.len() as u32).step_by(7) {
+            index.remove(Position(1 + k * gap)).unwrap();
+        }
+        index
+    }
+
+    /// The node a graph took for one internal id, found by a pass over its
+    /// nodes rather than through the numbering under test.
+    fn node_with_origin(graph: &VectorGraph, id: usize) -> Option<u32> {
+        (0..graph.nb_points() as u32).find(|&node| graph.origin_id_at(node) == id)
+    }
+
+    /// Every position the index holds names a node that names it back, the
+    /// removed and the overwritten records' nodes are stranded, and the
+    /// numbering agrees after every write, a handing back of the records, a
+    /// replacement of the graph, and an opening of a graph whole.
+    #[test]
+    fn the_numbering_follows_every_write_and_every_replacement() {
+        let (count, dim) = (300usize, 8usize);
+        let vectors = zeusdb_vector_core::test_support::clustered(count + 1, dim, 196);
+        let layers = NB_LAYER_MAX as usize;
+        let rebuilt_from = |index: &DenseIndex, vector_of: &dyn Fn(usize) -> usize| {
+            let mut graph = VectorGraph::new_raw("l2", dim, 8, 64, layers, 50);
+            for (at, &node) in index.node_at().iter().enumerate() {
+                if node != NONE {
+                    graph.insert(&vectors[vector_of(at)], at, Position::from_slot(at));
+                }
+            }
+            graph
+        };
+        for gap in [1u32, 1_009] {
+            let graph = VectorGraph::new_raw("l2", dim, 8, 64, layers, 50);
+            let mut index = spread_index(graph, None, false, &vectors[..count], gap);
+            assert!(
+                !index.every_node_live && index.numbering_agrees(),
+                "gap {gap}"
+            );
+            for k in 0..count as u32 {
+                let id = 1 + k * gap;
+                let node = node_with_origin(index.graph(), id as usize).unwrap();
+                let held = k % 7 != 0;
+                assert_eq!(index.holds(Position(id)), held);
+                assert_eq!(index.node_of(Position(id)), held.then_some(node));
+                let filed = if held { id } else { NONE };
+                assert_eq!(index.graph().record_of_at(node), filed, "gap {gap} id {id}");
+            }
+
+            // An overwrite takes the record out at its position and puts it
+            // back at a new one, and the old node stays, stranded.
+            let old = 1 + 3 * gap;
+            let new = 1 + count as u32 * gap;
+            let stranded = index.node_of(Position(old)).unwrap();
+            index.remove(Position(old)).unwrap();
+            put(&mut index, new, &vectors[count]);
+            let moved = index.node_of(Position(new)).unwrap();
+            assert_eq!(index.graph().record_of_at(stranded), NONE);
+            assert_eq!(index.graph().record_of_at(moved), new);
+            assert_eq!(index.node_at()[old as usize], NONE);
+            assert!(index.numbering_agrees(), "overwritten, gap {gap}");
+
+            let vector_of = |at: usize| {
+                if at == new as usize {
+                    count
+                } else {
+                    (at - 1) / gap as usize
+                }
+            };
+            let held: Vec<usize> = (0..index.node_at().len())
+                .filter(|&at| index.node_at()[at] != NONE)
+                .collect();
+            assert_eq!(index.set_live(held.iter().copied()), 0);
+            assert!(index.numbering_agrees(), "handed back, gap {gap}");
+            assert_eq!(index.graph().record_of_at(stranded), NONE);
+            assert_eq!(
+                index.node_at_heap_bytes(),
+                index.node_at().len() * 4,
+                "gap {gap}"
+            );
+
+            index.replace_graph(rebuilt_from(&index, &vector_of), None);
+            assert!(
+                index.every_node_live && index.numbering_agrees(),
+                "replaced, gap {gap}"
+            );
+            assert_eq!(index.len(), held.len());
+
+            // A graph opened whole holds no record until the records are
+            // handed over.
+            let mut opened =
+                DenseIndex::new(rebuilt_from(&index, &vector_of), "l2", dim, None, false);
+            assert!(opened.is_empty() && !opened.every_node_live);
+            assert!(held
+                .iter()
+                .all(|&at| !opened.holds(Position::from_slot(at))));
+            assert_eq!(opened.set_live(held.iter().copied()), 0);
+            assert!(opened.every_node_live && opened.numbering_agrees());
+        }
+    }
+
+    /// A replacement graph hands its reservation to `node_at`, as a training
+    /// rebuild's graph held the declared size for the map from an id to its
+    /// node, and a shrunk replacement hands over the extent alone, as a
+    /// compaction's did.
+    #[test]
+    fn a_replacement_hands_its_reservation_to_the_numbering() {
+        let (count, dim, declared) = (40usize, 8usize, 500usize);
+        let vectors = zeusdb_vector_core::test_support::clustered(count, dim, 202);
+        let layers = NB_LAYER_MAX as usize;
+        let rebuilt = || {
+            let mut graph = VectorGraph::new_raw("l2", dim, 8, declared, layers, 50);
+            for (k, vector) in vectors.iter().enumerate() {
+                graph.insert(vector, k + 1, Position::from_slot(k + 1));
+            }
+            graph
+        };
+        let graph = VectorGraph::new_raw("l2", dim, 8, declared, layers, 50);
+        let mut index = DenseIndex::new(graph, "l2", dim, None, false);
+        for (k, vector) in vectors.iter().enumerate() {
+            put(&mut index, k as u32 + 1, vector);
+        }
+
+        let graph = rebuilt();
+        let reserved = graph.record_capacity();
+        assert!(reserved >= declared, "the graph holds its declaration");
+        index.replace_graph(graph, None);
+        assert_eq!(index.node_at().len(), count + 1);
+        assert_eq!(index.node_at_heap_bytes(), (reserved + 1) * 4);
+        assert!(index.every_node_live && index.numbering_agrees());
+
+        let mut shrunk = rebuilt();
+        shrunk.shrink_to_fit();
+        index.replace_graph(shrunk, None);
+        assert_eq!(index.node_at_heap_bytes(), (count + 1) * 4);
+        assert!(index.every_node_live && index.numbering_agrees());
+    }
+
+    fn traversed(index: &DenseIndex, query: &[f32], admit: &dyn Admit) -> Vec<(u32, u32)> {
+        bits_of(&index.traverse(query, 10, 40, admit))
+    }
+
+    /// The page of a graph traversed under a test of each candidate's
+    /// internal id, which a graph whose every node holds its record reports
+    /// as the position.
+    fn by_id(twin: &DenseIndex, query: &[f32], admits: impl Fn(usize) -> bool) -> Vec<(u32, u32)> {
+        twin.graph()
+            .search(query, 10, 40, Some(&|id: &usize| admits(*id)))
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.position as u32, hit.distance.to_bits()))
+            .collect()
+    }
+
+    struct NotThird;
+
+    impl Admit for NotThird {
+        fn admits(&self, at: Position) -> bool {
+            !at.0.is_multiple_of(3)
+        }
+
+        fn len_hint(&self) -> Option<usize> {
+            None
+        }
+    }
+
+    /// Each predicate of the traversal answers what the same graph answers
+    /// under the test by internal id that a predicate made before records had
+    /// positions, read through the nodes' origin ids. The reference is a twin
+    /// built from the same records in the same order with nothing removed, so
+    /// it is the same graph node for node and every node reports its id, and
+    /// its closures are those tests: the live bit by id, a bitmap's bit and
+    /// the live bit by id, and the live bit by id and the table call.
+    #[test]
+    fn a_traversal_through_removed_nodes_answers_what_the_test_by_id_answers() {
+        let (count, dim) = (400usize, 8usize);
+        let vectors = zeusdb_vector_core::test_support::clustered(count, dim, 1_960);
+        let queries = zeusdb_vector_core::test_support::clustered(12, dim, 1_961);
+        let layers = NB_LAYER_MAX as usize;
+        for gap in [1u32, 1_009] {
+            let graph = VectorGraph::new_raw("l2", dim, 8, 64, layers, 50);
+            let mut index = spread_index(graph, None, false, &vectors, gap);
+            let mut twin = DenseIndex::new(
+                VectorGraph::new_raw("l2", dim, 8, 64, layers, 50),
+                "l2",
+                dim,
+                None,
+                false,
+            );
+            for (k, v) in vectors.iter().enumerate() {
+                put(&mut twin, 1 + k as u32 * gap, v);
+            }
+            for k in 0..count as u32 {
+                if k % 3 != 1 && k % 7 != 0 {
+                    index.remove(Position(1 + k * gap)).unwrap();
+                }
+            }
+            let mut live = Bitmap::default();
+            for k in (0..count as u32).filter(|k| k % 3 == 1 && k % 7 != 0) {
+                live.insert((1 + k * gap) as usize);
+            }
+            assert!(twin.every_node_live && !index.every_node_live);
+            assert!(
+                queries.iter().any(|query| index
+                    .graph()
+                    .search(query, 10, 40, None::<&fn(&usize) -> bool>)
+                    .unwrap()
+                    .iter()
+                    .any(|hit| !live.contains(hit.position))),
+                "a removed record sits where these queries reach it"
+            );
+            let mut bitmap = Bitmap::with_slots(1 + count * gap as usize);
+            for k in (0..count as u32).filter(|k| k % 2 == 0) {
+                bitmap.insert(1 + (k * gap) as usize);
+            }
+            for query in &queries {
+                let page = traversed(&index, query, &Candidates::All);
+                assert_eq!(
+                    page,
+                    by_id(&twin, query, |id| live.contains(id)),
+                    "gap {gap}"
+                );
+                let want = by_id(&twin, query, |id| bitmap.contains(id) && live.contains(id));
+                assert_eq!(traversed(&index, query, &bitmap), want, "gap {gap}");
+                let want = by_id(&twin, query, |id| {
+                    live.contains(id) && bitmap.contains(id) && !id.is_multiple_of(3)
+                });
+                assert_eq!(traversed(&index, query, &And(&bitmap, &NotThird)), want);
+                assert_eq!(traversed(&index, query, &And(&NotThird, &bitmap)), want);
+                let want = by_id(&twin, query, |id| {
+                    live.contains(id) && !id.is_multiple_of(3)
+                });
+                assert_eq!(traversed(&index, query, &NotThird), want);
+            }
+        }
+    }
+
+    /// The exact scan by position scores what a lookup per record scores,
+    /// the node found by a pass over the graph's origin ids rather than
+    /// through the numbering, through positions that hold no record, on raw,
+    /// scalar and product quantized graphs, with and without raw vectors.
+    #[test]
+    fn the_scan_in_increasing_order_scores_what_a_lookup_per_record_scores() {
+        let (count, dim, gap) = (300usize, 8usize, 1_009u32);
+        let vectors = zeusdb_vector_core::test_support::clustered(count, dim, 194);
+        let codec = Arc::new(Int8Codec::fit(dim, &vectors).unwrap());
+        let pq = Arc::new(PQ::new(dim, 4, 4, 16, None));
+        pq.train(&vectors).unwrap();
+        let layers = NB_LAYER_MAX as usize;
+        let mut with_raw = VectorGraph::new_pq("l2", 8, 64, layers, 50, pq.clone());
+        with_raw.open_raw_store(dim, 64).unwrap();
+        let indexes = [
+            (
+                "raw",
+                spread_index(
+                    VectorGraph::new_raw("l2", dim, 8, 64, layers, 50),
+                    None,
+                    false,
+                    &vectors,
+                    gap,
+                ),
+            ),
+            (
+                "int8",
+                spread_index(
+                    VectorGraph::new_int8("l2", 8, 64, layers, 50, codec),
+                    None,
+                    false,
+                    &vectors,
+                    gap,
+                ),
+            ),
+            (
+                "pq",
+                spread_index(
+                    VectorGraph::new_pq("l2", 8, 64, layers, 50, pq.clone()),
+                    Some(pq.clone()),
+                    false,
+                    &vectors,
+                    gap,
+                ),
+            ),
+            (
+                "pq with raw",
+                spread_index(with_raw, Some(pq), true, &vectors, gap),
+            ),
+        ];
+        let mut positions: Vec<Position> = (0..count as u32)
+            .flat_map(|k| [Position(1 + k * gap), Position(2 + k * gap)])
+            .chain([Position(1 + count as u32 * gap + 7), Position(NONE)])
+            .collect();
+        positions.sort_unstable();
+        let distance = raw_distance_fn("l2");
+        let needs_unit = reconstruction_needs_unit("l2");
+        for (kind, index) in &indexes {
+            for q in [3usize, 77, 150] {
+                let query = &vectors[q];
+                let mut looked_up: Vec<(f32, u32)> = positions
+                    .iter()
+                    .filter(|at| {
+                        at.0 != NONE && (at.0 - 1) % gap == 0 && ((at.0 - 1) / gap) % 7 != 0
+                    })
+                    .map(|at| {
+                        let node = node_with_origin(index.graph(), at.slot()).unwrap();
+                        (
+                            index.exact_distance_at(query, node, distance, needs_unit),
+                            at.0,
+                        )
+                    })
+                    .collect();
+                assert_eq!(looked_up.len(), count - count.div_ceil(7), "{kind}");
+                looked_up.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                let bits = |scored: &[(f32, u32)]| -> Vec<(u32, u32)> {
+                    scored
+                        .iter()
+                        .map(|&(score, at)| (score.to_bits(), at))
+                        .collect()
+                };
+                for k in [10usize, count] {
+                    let page = index.score_exact(query, &positions, k, false);
+                    let page: Vec<(u32, u32)> = page
+                        .items
+                        .iter()
+                        .map(|hit| (hit.score.to_bits(), hit.position.0))
+                        .collect();
+                    let mut cut = looked_up.clone();
+                    cut.truncate(k);
+                    assert_eq!(page, bits(&cut), "{kind} query {q} k {k}");
+                }
+            }
+        }
+    }
+
+    /// A record's raw vector, read by its position through `node_at`, is the
+    /// vector its node holds, at every gap between positions, and a position
+    /// that holds no record, the empty marker included, reads none.
+    #[test]
+    fn a_raw_vector_by_id_is_the_vector_its_node_holds() {
+        let (count, dim) = (400usize, 8usize);
+        let vectors = zeusdb_vector_core::test_support::clustered(count, dim, 0x0195);
+        let layers = NB_LAYER_MAX as usize;
+        for gap in [1u32, 3, 40] {
+            let graph = VectorGraph::new_raw_unreserved("l2", dim, 8, count, layers, 50);
+            let mut index = DenseIndex::new(graph, "l2", dim, None, false);
+            for (k, vector) in vectors.iter().enumerate() {
+                put(&mut index, 1 + k as u32 * gap, vector);
+            }
+            let raws = index.raw_vectors();
+            let past = 1 + count * gap as usize + 70_000;
+            for at in (0..past).chain([NONE as usize, usize::MAX]) {
+                let read = index
+                    .node_of(Position::from_slot(at))
+                    .and_then(|node| index.graph().raw_vector_at(node));
+                assert_eq!(raws.get(at), read, "gap {gap}, position {at}");
+            }
+            for (k, vector) in vectors.iter().enumerate() {
+                let at = 1 + k * gap as usize;
+                assert_eq!(raws.get(at), Some(vector.as_slice()), "gap {gap}");
+                let node = node_with_origin(index.graph(), at).unwrap();
+                assert_eq!(index.graph().raw_vector_at(node), Some(vector.as_slice()));
+            }
+        }
+    }
+
+    /// A removal leaves a hole, a position whose `node_at` entry is
+    /// [`NONE`], and leaves its node stranded with the node's raw vector
+    /// still in the store. The hole reads no raw vector, on a raw graph and
+    /// on a product quantized graph that keeps its raw vectors, at every gap
+    /// between positions, and so does a position between two records that
+    /// never held one. Every position that holds a record reads its own
+    /// vector.
+    #[test]
+    fn a_hole_reads_no_raw_vector_though_its_node_keeps_one() {
+        let (count, dim) = (300usize, 8usize);
+        let vectors = zeusdb_vector_core::test_support::clustered(count, dim, 0x0203);
+        let pq = Arc::new(PQ::new(dim, 4, 4, 16, None));
+        pq.train(&vectors).unwrap();
+        let layers = NB_LAYER_MAX as usize;
+        for gap in [1u32, 1_009] {
+            let mut with_raw = VectorGraph::new_pq("l2", 8, 64, layers, 50, pq.clone());
+            with_raw.open_raw_store(dim, 64).unwrap();
+            let raw = VectorGraph::new_raw("l2", dim, 8, 64, layers, 50);
+            let indexes = [
+                ("raw", spread_index(raw, None, false, &vectors, gap)),
+                (
+                    "pq with raw",
+                    spread_index(with_raw, Some(pq.clone()), true, &vectors, gap),
+                ),
+            ];
+            for (kind, index) in &indexes {
+                let mut holes = 0;
+                for (k, vector) in vectors.iter().enumerate() {
+                    let at = 1 + k * gap as usize;
+                    let node = node_with_origin(index.graph(), at).unwrap();
+                    let stored = index.graph().raw_vector_at(node);
+                    assert_eq!(stored, Some(vector.as_slice()), "{kind} gap {gap} at {at}");
+                    if k % 7 == 0 {
+                        assert_eq!(index.node_at()[at], NONE, "{kind} gap {gap} at {at}");
+                        assert_eq!(index.raw_vector(at), None, "{kind} gap {gap} hole {at}");
+                        holes += 1;
+                    } else {
+                        assert_eq!(index.raw_vector(at), stored, "{kind} gap {gap} at {at}");
+                    }
+                    if gap > 1 && k + 1 < count {
+                        assert_eq!(index.node_at()[at + 1], NONE, "{kind} gap {gap}");
+                        assert_eq!(index.raw_vector(at + 1), None, "{kind} gap {gap}");
+                    }
+                }
+                assert_eq!(holes, count.div_ceil(7), "{kind} gap {gap}");
+            }
+        }
+    }
+
+    /// The same hole on a scalar quantized graph. A removal leaves the
+    /// position's `node_at` entry [`NONE`] and the stranded node's row still
+    /// in the store. The hole reconstructs no vector, at every gap between
+    /// positions, and nor does a position between two records that never
+    /// held one. Every position that holds a record reconstructs what its
+    /// node's row stands for.
+    #[test]
+    fn a_hole_reconstructs_no_vector_though_its_node_keeps_its_row() {
+        let (count, dim) = (300usize, 8usize);
+        let vectors = zeusdb_vector_core::test_support::clustered(count, dim, 0x0204);
+        let codec = Arc::new(Int8Codec::fit(dim, &vectors).unwrap());
+        let layers = NB_LAYER_MAX as usize;
+        for gap in [1u32, 1_009] {
+            let graph = VectorGraph::new_int8("l2", 8, 64, layers, 50, codec.clone());
+            let index = spread_index(graph, None, false, &vectors, gap);
+            let mut holes = 0;
+            for k in 0..count {
+                let at = 1 + k * gap as usize;
+                let node = node_with_origin(index.graph(), at).unwrap();
+                let stored = index.graph().int8_reconstruct_at(node);
+                assert!(stored.is_some(), "gap {gap} at {at}");
+                if k % 7 == 0 {
+                    assert_eq!(index.node_at()[at], NONE, "gap {gap} at {at}");
+                    assert_eq!(index.int8_reconstruct(at), None, "gap {gap} hole {at}");
+                    holes += 1;
+                } else {
+                    assert_eq!(index.int8_reconstruct(at), stored, "gap {gap} at {at}");
+                }
+                if gap > 1 && k + 1 < count {
+                    assert_eq!(index.node_at()[at + 1], NONE, "gap {gap}");
+                    assert_eq!(index.int8_reconstruct(at + 1), None, "gap {gap}");
+                }
+            }
+            assert_eq!(holes, count.div_ceil(7), "gap {gap}");
+        }
     }
 }

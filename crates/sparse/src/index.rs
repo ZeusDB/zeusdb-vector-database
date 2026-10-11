@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 use zeusdb_vector_core::{
     Admit, Bitmap, Budget, CorpusStats, Cost, Dir, Error, Hits, Inventory, Ledger, Persist,
-    Prepared, RecordId, Restore, Selectivity, Sparse, SparseRef, SparseVector, VectorIndex,
+    Position, Prepared, RecordId, Restore, Selectivity, Sparse, SparseRef, SparseVector,
+    VectorIndex,
 };
 
 use crate::calibrate::UnitCosts;
@@ -199,15 +200,16 @@ impl SparseConfig {
     }
 }
 
-/// One posting. Eight bytes. The weight is the value as given.
+/// One posting. Eight bytes. The key is the record's position and the weight
+/// is the value as given.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub(crate) struct Posting {
-    pub(crate) id: u32,
+    pub(crate) key: u32,
     pub(crate) weight: f32,
 }
 
-/// One dimension's postings, sorted by record id.
+/// One dimension's postings, sorted by key.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PostingList {
     pub(crate) postings: Vec<Posting>,
@@ -271,13 +273,17 @@ pub struct PostingsIndex {
     /// The forward arena. A removed record's span is stranded until `compact`.
     pub(crate) fwd_dims: Vec<u32>,
     pub(crate) fwd_values: Vec<f32>,
-    /// By record id. Grows with the id counter, not the live count.
+    /// By position.
     pub(crate) records: Vec<Slot>,
-    /// Each record's length, being the sum of its values, by record id and
+    /// Each record's length, being the sum of its values, by position and
     /// parallel to `records`. What a term frequency weighting normalises
     /// by, read once per posting the scan admits. Kept under every
     /// weighting, since it costs four bytes a slot and one sum an insert.
     pub(crate) lengths: Vec<f32>,
+    /// One past the largest internal id inserted since the index was made,
+    /// restored or cleared, which the artefact records as its slot count and
+    /// a load holds to the collection's largest id.
+    pub(crate) slot_count: usize,
     /// Records removed and not yet compacted out.
     pub(crate) dead: Bitmap,
     /// Records held and not removed, being what `holds` answers, as a set a
@@ -310,6 +316,7 @@ impl PostingsIndex {
             fwd_values: Vec::new(),
             records: Vec::new(),
             lengths: Vec::new(),
+            slot_count: 0,
             dead: Bitmap::default(),
             live_set: Bitmap::default(),
             dead_records: 0,
@@ -349,8 +356,8 @@ impl PostingsIndex {
     }
 
     /// The length of one live record, being the sum of its values.
-    pub fn length_of(&self, id: RecordId) -> Option<f32> {
-        self.slot_of(id).map(|_| self.lengths[id.slot()])
+    pub fn length_of(&self, at: Position) -> Option<f32> {
+        self.slot_of(at).map(|_| self.lengths[at.slot()])
     }
 
     /// The live set, being every record `holds` answers true for.
@@ -406,10 +413,47 @@ impl PostingsIndex {
         self.units
     }
 
-    /// Slots the record table holds, being one past the largest id ever
-    /// inserted. The scratch accumulator is sized to it.
+    /// Slots the record table holds, being one past the largest position
+    /// ever inserted. The scratch accumulator is sized to it.
     pub(crate) fn slots(&self) -> usize {
         self.records.len()
+    }
+
+    /// The slot count the artefact records; see the field.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slot_count
+    }
+
+    /// Whether every posting is keyed by a position the record table holds a
+    /// record at, live or dead, each list in strictly increasing key order,
+    /// the dead set lies inside the records held, the length table is the
+    /// record table's length, and the slot count reaches past every record.
+    /// Every write keeps it true.
+    pub fn keys_agree(&self) -> bool {
+        let held = |key: usize| self.records.get(key).is_some_and(Slot::held);
+        let lists = self.lists.iter().all(|list| {
+            list.postings.iter().all(|p| held(p.key as usize))
+                && list
+                    .postings
+                    .windows(2)
+                    .all(|pair| pair[0].key < pair[1].key)
+        });
+        let mut dead = 0usize;
+        let mut dead_within = true;
+        self.dead.for_each(|at| {
+            dead += 1;
+            dead_within &= held(at);
+        });
+        let live = (0..self.records.len())
+            .filter(|&at| held(at) && !self.dead.contains(at))
+            .count();
+        lists
+            && dead_within
+            && dead == self.dead_records
+            && live == self.live
+            && self.live_set.count() == self.live
+            && self.lengths.len() == self.records.len()
+            && self.slot_count >= self.records.len()
     }
 
     /// Heap bytes the structure holds, by capacity, split by part.
@@ -448,9 +492,9 @@ impl PostingsIndex {
             .sum()
     }
 
-    pub(crate) fn slot_of(&self, id: RecordId) -> Option<Slot> {
-        let slot = *self.records.get(id.slot())?;
-        if slot.held() && !self.dead.contains(id.slot()) {
+    pub(crate) fn slot_of(&self, at: Position) -> Option<Slot> {
+        let slot = *self.records.get(at.slot())?;
+        if slot.held() && !self.dead.contains(at.slot()) {
             Some(slot)
         } else {
             None
@@ -470,7 +514,7 @@ impl PostingsIndex {
         let dead = &self.dead;
         let list = &mut self.lists[slot as usize];
         let before = list.postings.len();
-        list.postings.retain(|p| !dead.contains(p.id as usize));
+        list.postings.retain(|p| !dead.contains(p.key as usize));
         let removed = before - list.postings.len();
         list.dead = 0;
         self.postings_total -= removed;
@@ -486,7 +530,7 @@ impl PostingsIndex {
     }
 
     /// Rewrite every list and the forward arena without the dead records,
-    /// keeping every live record's id, and return every buffer's spare
+    /// keeping every live record's position, and return every buffer's spare
     /// capacity to the allocator.
     ///
     /// What the collection's `compact` calls for a sparse space. A third of
@@ -502,18 +546,18 @@ impl PostingsIndex {
             }
             self.lists[slot as usize].postings.shrink_to_fit();
         }
-        // The forward arena, rebuilt in id order, and the length total
+        // The forward arena, rebuilt in position order, and the length total
         // summed again from the records that survive.
         let mut dims = Vec::with_capacity(self.live_nnz);
         let mut values = Vec::with_capacity(self.live_nnz);
         let mut live_length = 0f64;
-        for (id, slot) in self.records.iter_mut().enumerate() {
+        for (at, slot) in self.records.iter_mut().enumerate() {
             if !slot.held() {
                 continue;
             }
-            if self.dead.contains(id) {
+            if self.dead.contains(at) {
                 *slot = NEVER_HELD;
-                self.lengths[id] = 0.0;
+                self.lengths[at] = 0.0;
                 continue;
             }
             let (s, e) = (slot.start as usize, (slot.start + slot.len) as usize);
@@ -521,7 +565,7 @@ impl PostingsIndex {
             dims.extend_from_slice(&self.fwd_dims[s..e]);
             values.extend_from_slice(&self.fwd_values[s..e]);
             slot.start = start;
-            live_length += self.lengths[id] as f64;
+            live_length += self.lengths[at] as f64;
         }
         self.fwd_dims = dims;
         self.fwd_values = values;
@@ -545,26 +589,29 @@ impl PostingsIndex {
         self.calibrate();
     }
 
-    /// Insert one record, with the check every caller wants.
+    /// Insert one record at its position `at`, with its internal id `id`
+    /// beside it for the slot count, with the check every caller wants.
     pub(crate) fn insert_record(
         &mut self,
+        at: Position,
         id: RecordId,
         vector: SparseRef<'_>,
     ) -> Result<(), Error> {
         self.config.weighting.validate_record(vector)?;
-        let slot_index = id.slot();
+        let slot_index = at.slot();
         if slot_index >= self.records.len() {
             self.records.resize(slot_index + 1, NEVER_HELD);
             self.lengths.resize(slot_index + 1, 0.0);
         }
         if self.records[slot_index].held() && !self.dead.contains(slot_index) {
-            return Err(Error::RecordAlreadyHeld { id: id.0 });
+            return Err(Error::RecordAlreadyHeld { id: at.0 });
         }
+        self.slot_count = self.slot_count.max(id.slot() + 1);
         if self.dead.contains(slot_index) {
-            // A removed id being re-inserted. The engine never does this,
-            // since it never reuses an id, but the structure stays correct if
-            // a caller does: the old span and its postings are already
-            // counted dead, and the record starts again.
+            // A removed position being re-inserted. The engine never does
+            // this, since it never reuses a position, but the structure stays
+            // correct if a caller does: the old span and its postings are
+            // already counted dead, and the record starts again.
             self.dead.remove(slot_index);
             self.dead_records -= 1;
         }
@@ -593,28 +640,28 @@ impl PostingsIndex {
             };
             let list = &mut self.lists[slot as usize].postings;
             match list.last() {
-                Some(last) if last.id >= id.0 => {
+                Some(last) if last.key >= at.0 => {
                     // The engine never takes this path. It exists so the
-                    // sorted-by-id property is the structure's and not the
+                    // sorted-by-key property is the structure's and not the
                     // caller's.
-                    match list.binary_search_by_key(&id.0, |p| p.id) {
-                        Ok(at) => {
-                            list[at] = Posting {
-                                id: id.0,
+                    match list.binary_search_by_key(&at.0, |p| p.key) {
+                        Ok(found) => {
+                            list[found] = Posting {
+                                key: at.0,
                                 weight: w,
                             }
                         }
-                        Err(at) => list.insert(
-                            at,
+                        Err(found) => list.insert(
+                            found,
                             Posting {
-                                id: id.0,
+                                key: at.0,
                                 weight: w,
                             },
                         ),
                     }
                 }
                 _ => list.push(Posting {
-                    id: id.0,
+                    key: at.0,
                     weight: w,
                 }),
             }
@@ -626,16 +673,16 @@ impl PostingsIndex {
     }
 
     /// The whole of a removal, under the configured policy.
-    fn remove_record(&mut self, id: RecordId) -> Result<(), Error> {
-        let Some(slot) = self.slot_of(id) else {
-            return Err(Error::RecordNotHeld { id: id.0 });
+    fn remove_record(&mut self, at: Position) -> Result<(), Error> {
+        let Some(slot) = self.slot_of(at) else {
+            return Err(Error::RecordNotHeld { id: at.0 });
         };
-        self.dead.insert(id.slot());
-        self.live_set.remove(id.slot());
+        self.dead.insert(at.slot());
+        self.live_set.remove(at.slot());
         self.dead_records += 1;
         self.live -= 1;
         self.live_nnz -= slot.len as usize;
-        self.live_length -= self.lengths[id.slot()] as f64;
+        self.live_length -= self.lengths[at.slot()] as f64;
         let (s, e) = (slot.start as usize, (slot.start + slot.len) as usize);
         match self.config.unlink {
             Unlink::Strand => {
@@ -671,7 +718,7 @@ impl PostingsIndex {
                     let d = self.fwd_dims[i];
                     let list_slot = self.slots_by_dim[&d];
                     let list = &mut self.lists[list_slot as usize].postings;
-                    if let Ok(pos) = list.binary_search_by_key(&id.0, |p| p.id) {
+                    if let Ok(pos) = list.binary_search_by_key(&at.0, |p| p.key) {
                         list.remove(pos);
                         self.postings_total -= 1;
                     }
@@ -687,8 +734,8 @@ impl VectorIndex<Sparse> for PostingsIndex {
         self.live
     }
 
-    fn holds(&self, id: RecordId) -> bool {
-        self.slot_of(id).is_some()
+    fn holds(&self, at: Position) -> bool {
+        self.slot_of(at).is_some()
     }
 
     /// Nothing to plan. A postings insert reads nothing from the index before
@@ -703,19 +750,20 @@ impl VectorIndex<Sparse> for PostingsIndex {
     /// instead and times itself once at the end.
     fn insert(
         &mut self,
+        at: Position,
         id: RecordId,
         vector: SparseRef<'_>,
         _prepared: Prepared,
     ) -> Result<(), Error> {
-        self.insert_record(id, vector)?;
+        self.insert_record(at, id, vector)?;
         if self.live.is_power_of_two() && self.live >= crate::calibrate::CALIBRATION_MIN_RECORDS {
             self.calibrate();
         }
         Ok(())
     }
 
-    fn remove(&mut self, id: RecordId) -> Result<(), Error> {
-        self.remove_record(id)
+    fn remove(&mut self, at: Position) -> Result<(), Error> {
+        self.remove_record(at)
     }
 
     /// Dead postings, which is what a compaction reclaims here.
@@ -723,12 +771,12 @@ impl VectorIndex<Sparse> for PostingsIndex {
         self.dead_postings
     }
 
-    fn vector(&self, id: RecordId) -> Option<SparseRef<'_>> {
-        self.slot_of(id).map(|slot| self.forward(slot))
+    fn vector(&self, at: Position) -> Option<SparseRef<'_>> {
+        self.slot_of(at).map(|slot| self.forward(slot))
     }
 
-    fn recover(&self, id: RecordId) -> Option<SparseVector> {
-        self.vector(id).map(|v| SparseVector {
+    fn recover(&self, at: Position) -> Option<SparseVector> {
+        self.vector(at).map(|v| SparseVector {
             dims: v.dims.to_vec(),
             values: v.values.to_vec(),
         })
@@ -844,16 +892,22 @@ mod tests {
             ..SparseConfig::default()
         });
         assert!(matches!(
-            index.insert(RecordId(1), sparse(&[1, 2], &[1.0, 0.5]).as_ref(), none()),
+            index.insert(Position(1), RecordId(1), sparse(&[1, 2], &[1.0, 0.5]).as_ref(), none()),
             Err(Error::SparseValueNotWhole { index: 1, value }) if value == 0.5
         ));
         assert!(matches!(
-            index.insert(RecordId(1), sparse(&[1, 2], &[1.0, -0.5]).as_ref(), none()),
+            index.insert(
+                Position(1),
+                RecordId(1),
+                sparse(&[1, 2], &[1.0, -0.5]).as_ref(),
+                none()
+            ),
             Err(Error::SparseValueNotPositive { index: 1, .. })
         ));
         assert_eq!(index.len(), 0);
         index
             .insert(
+                Position(1),
                 RecordId(1),
                 sparse(&[1, 2], &[3.0, 1_000_000.0]).as_ref(),
                 none(),
@@ -861,8 +915,13 @@ mod tests {
             .unwrap();
         assert_eq!(index.len(), 1);
         let mut dot = PostingsIndex::new(SparseConfig::default());
-        dot.insert(RecordId(1), sparse(&[1, 2], &[1.0, 0.5]).as_ref(), none())
-            .unwrap();
+        dot.insert(
+            Position(1),
+            RecordId(1),
+            sparse(&[1, 2], &[1.0, 0.5]).as_ref(),
+            none(),
+        )
+        .unwrap();
         assert_eq!(dot.len(), 1);
     }
 
@@ -873,33 +932,33 @@ mod tests {
         let mut index = PostingsIndex::new(SparseConfig::default());
         let a = sparse(&[1, 4, 9], &[1.0, 2.0, 3.0]);
         index
-            .insert(RecordId(1), a.as_ref(), Prepared::none())
+            .insert(Position(1), RecordId(1), a.as_ref(), Prepared::none())
             .unwrap();
         assert!(matches!(
-            index.insert(RecordId(1), a.as_ref(), Prepared::none()),
+            index.insert(Position(1), RecordId(1), a.as_ref(), Prepared::none()),
             Err(Error::RecordAlreadyHeld { id: 1 })
         ));
         assert!(matches!(
-            index.remove(RecordId(2)),
+            index.remove(Position(2)),
             Err(Error::RecordNotHeld { id: 2 })
         ));
-        assert!(index.holds(RecordId(1)));
-        assert!(!index.holds(RecordId(2)));
+        assert!(index.holds(Position(1)));
+        assert!(!index.holds(Position(2)));
         assert_eq!(index.len(), 1);
         assert_eq!(index.stranded(), 0);
 
-        index.remove(RecordId(1)).unwrap();
-        assert!(!index.holds(RecordId(1)));
+        index.remove(Position(1)).unwrap();
+        assert!(!index.holds(Position(1)));
         assert_eq!(index.len(), 0);
         // Under the lazy policy a single record's three postings sit on three
         // lists of one posting each, so every list crosses the threshold at
         // once and is rewritten on the spot.
         assert_eq!(index.stranded(), 0);
         assert!(matches!(
-            index.remove(RecordId(1)),
+            index.remove(Position(1)),
             Err(Error::RecordNotHeld { id: 1 })
         ));
-        assert!(index.vector(RecordId(1)).is_none());
+        assert!(index.vector(Position(1)).is_none());
     }
 
     /// Stranding leaves the postings and counts them, and a compaction takes
@@ -913,11 +972,11 @@ mod tests {
         for id in 1..=10u32 {
             let v = sparse(&[1, id + 10], &[1.0, id as f32]);
             index
-                .insert(RecordId(id), v.as_ref(), Prepared::none())
+                .insert(Position(id), RecordId(id), v.as_ref(), Prepared::none())
                 .unwrap();
         }
         for id in [2u32, 5, 9] {
-            index.remove(RecordId(id)).unwrap();
+            index.remove(Position(id)).unwrap();
         }
         assert_eq!(index.len(), 7);
         assert_eq!(index.stranded(), 6);
@@ -930,9 +989,9 @@ mod tests {
         assert_eq!(index.dead_records(), 0);
         for id in 1..=10u32 {
             let removed = [2u32, 5, 9].contains(&id);
-            assert_eq!(index.holds(RecordId(id)), !removed);
+            assert_eq!(index.holds(Position(id)), !removed);
             if !removed {
-                let v = index.recover(RecordId(id)).unwrap();
+                let v = index.recover(Position(id)).unwrap();
                 assert_eq!(v, sparse(&[1, id + 10], &[1.0, id as f32]));
             }
         }
@@ -942,7 +1001,7 @@ mod tests {
             .search(q.as_ref(), 3, &Candidates::All, &Budget::default())
             .unwrap();
         assert!(hits.exact);
-        assert_eq!(hits.items[0].id, RecordId(3));
+        assert_eq!(hits.items[0].position, Position(3));
         assert_eq!(hits.items[0].score, 4.0);
     }
 
@@ -954,11 +1013,11 @@ mod tests {
         for id in [5u32, 2, 9, 1] {
             let v = sparse(&[7], &[id as f32]);
             index
-                .insert(RecordId(id), v.as_ref(), Prepared::none())
+                .insert(Position(id), RecordId(id), v.as_ref(), Prepared::none())
                 .unwrap();
         }
         let slot = index.slots_by_dim[&7] as usize;
-        let ids: Vec<u32> = index.lists[slot].postings.iter().map(|p| p.id).collect();
+        let ids: Vec<u32> = index.lists[slot].postings.iter().map(|p| p.key).collect();
         assert_eq!(ids, vec![1, 2, 5, 9]);
     }
 
@@ -970,7 +1029,7 @@ mod tests {
         for id in 1..=2000u32 {
             let v = sparse(&[1, 2 + id % 50], &[1.0, 1.0]);
             index
-                .insert(RecordId(id), v.as_ref(), Prepared::none())
+                .insert(Position(id), RecordId(id), v.as_ref(), Prepared::none())
                 .unwrap();
         }
         let common = sparse(&[1], &[1.0]);
@@ -982,5 +1041,85 @@ mod tests {
         // scan of the common list.
         let narrow = index.cost(common.as_ref(), 10, Some(&Selectivity::exact(10)));
         assert!(narrow.work_ns < whole.work_ns);
+    }
+
+    /// Every posting stays keyed by a position the table holds a record at,
+    /// each list in increasing order, through inserts in and out of order,
+    /// removals under every policy, a compaction, a restore and inserts after
+    /// each, and the slot count follows the largest internal id inserted.
+    #[test]
+    fn the_keys_follow_every_write_that_changes_the_record_table() {
+        use crate::persist::{decode, encode};
+        let record = |i: u32| {
+            let mut dims: Vec<u32> = (0..4).map(|j| (i * 5 + j * 7) % 30).collect();
+            dims.sort_unstable();
+            dims.dedup();
+            let values = dims.iter().map(|&d| 1.0 + (d % 3) as f32).collect();
+            SparseVector { dims, values }
+        };
+        let at = |k: u32| 2 + k * 37;
+        for unlink in [Unlink::Strand, Unlink::Lazy, Unlink::Eager] {
+            let mut index = PostingsIndex::new(SparseConfig {
+                unlink,
+                ..SparseConfig::default()
+            });
+            for k in (0..120u32).rev().filter(|k| k % 4 == 1) {
+                let v = record(k);
+                index
+                    .insert(
+                        Position(at(k)),
+                        RecordId(at(k)),
+                        v.as_ref(),
+                        Prepared::none(),
+                    )
+                    .unwrap();
+            }
+            assert!(index.keys_agree(), "{unlink:?}: out of order");
+            for k in (0..120u32).filter(|k| k % 4 != 1) {
+                let v = record(k);
+                index
+                    .insert(
+                        Position(at(k)),
+                        RecordId(at(k)),
+                        v.as_ref(),
+                        Prepared::none(),
+                    )
+                    .unwrap();
+            }
+            assert!(index.keys_agree(), "{unlink:?}: in order");
+            assert_eq!(index.slot_count(), at(119) as usize + 1);
+            for k in (0..120u32).filter(|k| k % 3 == 0) {
+                index.remove(Position(at(k))).unwrap();
+                assert!(index.keys_agree(), "{unlink:?}: removed {k}");
+            }
+            index.compact();
+            assert!(index.keys_agree(), "{unlink:?}: compacted");
+            assert_eq!(index.slot_count(), at(119) as usize + 1);
+            let bounds = zeusdb_vector_core::Bounds {
+                min_records: 0,
+                max_records: at(119) as usize,
+                max_bytes: 1 << 30,
+            };
+            let mut restored =
+                decode(&encode(&index), index.config(), &bounds, "postings").unwrap();
+            assert!(restored.keys_agree(), "{unlink:?}: restored");
+            for index in [&mut index, &mut restored] {
+                let v = record(500);
+                index
+                    .insert(
+                        Position(at(130)),
+                        RecordId(at(130)),
+                        v.as_ref(),
+                        Prepared::none(),
+                    )
+                    .unwrap();
+                assert!(index.keys_agree(), "{unlink:?}: added after");
+                assert_eq!(index.slot_count(), at(130) as usize + 1);
+            }
+            for k in 0..120u32 {
+                assert_eq!(index.holds(Position(at(k))), k % 3 != 0);
+                assert_eq!(restored.holds(Position(at(k))), k % 3 != 0);
+            }
+        }
     }
 }

@@ -8,7 +8,7 @@
 //! does so.
 
 use super::{Collection, QuantizationConfig, StorageMode, MAX_LAYER};
-use crate::{calibrate_rerank_from_sample, raw_distance_fn, RawVectors, RerankCalibration};
+use crate::{calibrate_rerank_from_sample, raw_distance_fn, RerankCalibration};
 use chrono::Utc;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
-use zeusdb_vector_core::{Error, Int8Codec, Operation, SeededRng, VectorGraph, PQ};
+use zeusdb_vector_core::{Error, Int8Codec, Operation, Position, SeededRng, VectorGraph, PQ};
 
 /// The target every record this file emits carries. See the parent module.
 const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::training";
@@ -212,9 +212,7 @@ impl Collection {
         let training_vectors = {
             let ids = self.ids.read().unwrap();
             let index = self.dense().index.read().unwrap();
-            let vectors = RawVectors {
-                graph: index.graph(),
-            };
+            let vectors = index.raw_vectors();
             let training_ids = self.training_ids.read().unwrap();
 
             // ADD EARLY CHECK:
@@ -427,9 +425,10 @@ impl Collection {
             let mut clipped = 0u64;
             let mut missing = 0usize;
             for internal_id in live {
-                if let Some(row) = old_hnsw.int8_row_of(internal_id) {
+                let node = old_index.node_of(Position::from_slot(internal_id));
+                if let Some(row) = node.and_then(|node| old_hnsw.int8_row_at(node)) {
                     rows.push((row.to_vec(), internal_id));
-                } else if let Some(vector) = old_hnsw.raw_vector(internal_id) {
+                } else if let Some(vector) = node.and_then(|node| old_hnsw.raw_vector_at(node)) {
                     let row = new_hnsw.int8_encode(vector)?;
                     clipped += codec.saturated(vector) as u64;
                     rows.push((row, internal_id));
@@ -452,9 +451,15 @@ impl Collection {
         };
 
         if !rows.is_empty() {
-            let batch: Vec<(&[i8], usize)> = rows
+            let batch: Vec<(&[i8], usize, Position)> = rows
                 .iter()
-                .map(|(row, internal_id)| (row.as_slice(), *internal_id))
+                .map(|(row, internal_id)| {
+                    (
+                        row.as_slice(),
+                        *internal_id,
+                        Position::from_slot(*internal_id),
+                    )
+                })
                 .collect();
             new_hnsw.insert_batch_int8(&batch).map_err(|e| {
                 error!(target: LOG_TARGET, operation = "int8_rebuild", error = %e, "Failed to insert scalar rows");
@@ -549,8 +554,7 @@ impl Collection {
         let (vector_count, retained) = {
             let ids = self.ids.read().unwrap();
             let index = self.dense().index.read().unwrap();
-            let hnsw = index.graph();
-            let vectors = RawVectors { graph: hnsw };
+            let vectors = index.raw_vectors();
 
             // Every live record that still has a raw vector, in internal id
             // order, which is the order the store walks in. The order is
@@ -559,9 +563,7 @@ impl Collection {
             // alone.
             let with_raw: Vec<(&str, &[f32])> = ids
                 .iter()
-                .filter_map(|(internal_id, id)| {
-                    hnsw.raw_vector(internal_id).map(|vector| (id, vector))
-                })
+                .filter_map(|(internal_id, id)| vectors.get(internal_id).map(|vector| (id, vector)))
                 .collect();
 
             if with_raw.is_empty() {
@@ -650,15 +652,34 @@ impl Collection {
         );
 
         if !batch_data.is_empty() {
-            let batch: Vec<(&Vec<u8>, usize)> = batch_data
+            let batch: Vec<(&Vec<u8>, usize, Position)> = batch_data
                 .iter()
-                .map(|(codes, internal_id)| (codes, *internal_id))
+                .map(|(codes, internal_id)| {
+                    (codes, *internal_id, Position::from_slot(*internal_id))
+                })
                 .collect();
             new_hnsw.insert_batch_pq(&batch)
                 .map_err(|e| {
                     error!(target: LOG_TARGET, operation = "quantization_rebuild", error = %e, "Failed to insert quantized vectors");
                     format!("Failed to insert quantized vectors: {}", e)
                 })?;
+        }
+
+        // Every record the index holds takes a node, so a held record the
+        // codes did not reach refuses the rebuild before anything is swapped,
+        // rather than leaving it outside the graph.
+        let held = self.ids.read().unwrap().len();
+        if new_hnsw.nb_points() != held {
+            error!(target: LOG_TARGET, operation = "quantization_rebuild",
+                nodes = new_hnsw.nb_points(),
+                held_records = held,
+                "Refusing the rebuild, some held records have no codes"
+            );
+            return Err(format!(
+                "the quantized rebuild built {} nodes for the {} records the index holds",
+                new_hnsw.nb_points(),
+                held
+            ));
         }
 
         // The raw vectors survive the transition, where the storage mode keeps
@@ -684,7 +705,7 @@ impl Collection {
             let held = old_hnsw.raw_count();
             if keeps_raw && old_hnsw.holds_raw() {
                 new_hnsw
-                    .adopt_raw_from(old_hnsw, self.dense().dim)
+                    .adopt_raw_from(old_hnsw, old_index.node_at(), self.dense().dim)
                     .map_err(|e| format!("Failed to carry the raw vectors over: {}", e))?;
                 // The store that carries them is opened at the number of
                 // records present now, which is the training sample, and the

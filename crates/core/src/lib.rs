@@ -36,6 +36,7 @@
 #![warn(unreachable_pub)]
 
 mod admit;
+mod bitmap;
 mod checksum;
 mod columns;
 mod distance;
@@ -59,8 +60,9 @@ mod storage;
 mod test_vectors;
 
 pub use admit::{Admit, And, Candidates};
+pub use bitmap::Bitmap;
 pub use checksum::checksum_of;
-pub use columns::{validate_indexed_fields, Bitmap, ColumnStore, Selection};
+pub use columns::{validate_indexed_fields, ColumnStore, Selection};
 pub use distance::{CosineDist, DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric};
 pub use error::{Error, Exception};
 pub use filter::{compile_filter, matches_filter, FieldLookup, Filter};
@@ -94,8 +96,8 @@ pub use pq::PQ;
 pub use rng::SeededRng;
 pub use space::{
     read_artefact, write_artefact, ArtefactRecord, Bounds, Budget, CorpusStats, Cost, Dense, Hit,
-    Hits, IdfScope, Inventory, Kind, Ledger, Persist, Prepared, RecordId, Restore, ScoreKind,
-    Selectivity, SpaceKind, SpaceName, Sparse, SparseRef, SparseVector, VectorIndex,
+    Hits, IdfScope, Inventory, Kind, Ledger, Persist, Position, Prepared, RecordId, Restore,
+    ScoreKind, Selectivity, SpaceKind, SpaceName, Sparse, SparseRef, SparseVector, VectorIndex,
 };
 pub use storage::{
     ArtefactWriter, Dir, FsDir, FsStorage, JournalFile, Staged, Storage, JOURNAL_SUFFIX,
