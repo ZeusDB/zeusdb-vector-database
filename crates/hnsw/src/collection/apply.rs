@@ -69,7 +69,7 @@ impl Collection {
             ));
         }
         let mismatch = |detail: String| Error::JournalReplayMismatch { detail };
-        match operation {
+        let applied = match operation {
             Operation::Insert {
                 id,
                 internal_id,
@@ -182,7 +182,12 @@ impl Collection {
                 .rebuild_with_quantization_locked()
                 .map(|_| ())
                 .map_err(Error::Engine),
-        }
+        };
+        debug_assert!(
+            self.positions_agree(),
+            "an applied record leaves every structure at the positions the records hold"
+        );
+        applied
     }
 
     /// The `Insert` arm of `apply`, with the mutation guard held.

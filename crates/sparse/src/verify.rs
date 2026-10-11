@@ -312,6 +312,7 @@ pub(crate) fn verify(regime: &str, n: usize, nq: usize) -> (usize, usize) {
         min_records: 0,
         max_records: n,
         max_bytes: 1 << 34,
+        ids_by_position: crate::identity_positions(n),
     };
     let restored = PostingsIndex::restore(
         lazy.config(),
@@ -634,6 +635,7 @@ pub(crate) fn verify_bm25(regime: &str, n: usize, nq: usize) -> (usize, usize) {
         min_records: 0,
         max_records: n,
         max_bytes: 1 << 34,
+        ids_by_position: crate::identity_positions(n),
     };
     let restored = PostingsIndex::restore(
         lazy.config(),

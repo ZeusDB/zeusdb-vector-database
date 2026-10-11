@@ -81,6 +81,8 @@ mod durability_tests;
 #[cfg(test)]
 mod features_tests;
 #[cfg(test)]
+mod id_range_tests;
+#[cfg(test)]
 mod identity_tests;
 mod input;
 mod insert;
@@ -96,6 +98,8 @@ mod page;
 mod persist;
 #[cfg(test)]
 mod persist_tests;
+#[cfg(test)]
+mod positions_tests;
 mod query;
 #[cfg(test)]
 mod query_tests;
@@ -819,27 +823,14 @@ impl DenseSpace {
         }
     }
 
-    /// Install a replacement graph, and drop the old one outside the guard
+    /// Install a graph the loader rebuilt, and drop the old one outside the
+    /// guard, for the reason `Collection::replace_dense_graph` gives.
     ///
-    /// The three paths that replace the whole backend, `compact`, the
-    /// quantization rebuild and the persistence rebuild, all used to write
-    /// `*hnsw_guard = new_hnsw` directly. That assignment drops the old graph
-    /// while the write guard is still held, and dropping a graph is not a quiet
-    /// operation. `PointIndexation::drop` in the vendored crate clears each
-    /// layer with `into_par_iter().for_each(...)`, so the drop forks to rayon.
-    ///
-    /// A rayon fork under the graph's write guard deadlocks whenever the pool is
-    /// occupied by search tasks. `batch_search_parallel` fans a batch of more
-    /// than five queries across the pool and each task takes a read guard, so
-    /// once a writer is queued every worker blocks behind it. The fork then has
-    /// no worker to run on and the writer never reaches the point of releasing.
-    /// The rule is that no path forks to rayon while holding a write guard, and
-    /// this is a fork that rule is easy to miss on, because it is hidden inside
-    /// an assignment rather than written as a call.
-    ///
-    /// Moving the old value out and dropping it after the guard is released
-    /// keeps the swap to a pointer move under the guard. The replacement's
-    /// unit cost is timed before the guard is taken, for the same reason.
+    /// The loader files every record at consecutive positions from the
+    /// mappings before it rebuilds, and the rebuilt graph files each record
+    /// at the position it holds, so there is no hole to close and the index's
+    /// guard alone is taken. The metadata and the columns are restored after
+    /// the graph, so the structures do not agree until the load is done.
     pub(crate) fn replace_graph(&self, new_hnsw: VectorGraph) {
         let timed = DenseIndex::time_graph(&new_hnsw);
         let old = {
@@ -851,7 +842,7 @@ impl DenseSpace {
 
     /// Replace the whole index, which the loader does with the index it
     /// restored from a dump. The old graph is dropped outside the guard, for
-    /// the reason `replace_graph` gives.
+    /// the reason `Collection::replace_dense_graph` gives.
     ///
     /// `clear` swaps the index itself rather than calling this, because it has
     /// to empty the collection's live set and the index's under one
@@ -1039,15 +1030,15 @@ pub struct Collection {
     // Index-level metadata (simple, infrequently accessed)
     metadata: MutexAt<HashMap<String, String>>,
 
-    /// Every record's metadata, indexed by internal id. See
+    /// Every record's metadata, indexed by position. See
     /// [`MetadataStore`] for what a record with and without fields costs.
     vector_metadata: RwLockAt<MetadataStore>,
 
-    /// One column per field declared at `create()`, addressed by internal id.
+    /// One column per field declared at `create()`, addressed by position.
     ///
     /// **This is what a filtered search reads instead of walking every
     /// record.** A filter naming only declared fields compiles to a bitmap over
-    /// internal ids, which both the exact scan and the graph traversal consume,
+    /// positions, which both the exact scan and the graph traversal consume,
     /// and `vector_metadata` is then read only for the records the page
     /// returns. A filter naming an undeclared field cannot be answered here.
     /// Where the declared fields still bound which records could match, the
@@ -1072,15 +1063,16 @@ pub struct Collection {
     /// declaration asked for.
     undeclared_filter_warned: AtomicBool,
 
-    /// Every record's external id, held once, with the internal id it
+    /// Every record's external id, held once, with the position it
     /// resolves to and the live set as bits. The record set: every
     /// insertion path writes it, removal keys on it, and `len`, `contains`,
-    /// `list` and `count` all read it. See [`IdStore`].
+    /// `list` and `count` all read it. Its extent is the position the next
+    /// record takes. See [`IdStore`].
     ///
     /// **The live set is what a filtered search checks its selection
     /// against.** The dense index keeps its own copy, maintained on the same
     /// writes, and the traversal runs under that one; this one is what a
-    /// debug build checks it against, see [`Collection::live_sets_agree`].
+    /// debug build checks it against, see [`Collection::positions_agree`].
     /// It used to be two maps under two guards, one from the id to the
     /// internal id and one back, each holding its own copy of the text.
     ids: RwLockAt<IdStore>,
@@ -1211,19 +1203,105 @@ impl Collection {
         }
     }
 
-    /// Whether the dense index's live set is the collection's, which every
-    /// write keeps true and a debug build checks at the points where the
-    /// two are read together.
+    /// Whether the positions, the records and the nodes agree across every
+    /// per-record structure, which every write keeps true and a debug build
+    /// checks after a close-up, a load and an applied record, and where
+    /// `get_stats` and `compact` read the structures together.
     ///
-    /// Taken in the declared order, the id store then the index.
-    pub(crate) fn live_sets_agree(&self) -> bool {
+    /// One walk over every position and every node. Every record held has
+    /// one position below the extent and none shares one. The id store, the
+    /// dense index's `node_at` and the column store hold one set of positions,
+    /// and the sparse space's live records lie inside it. Each position held
+    /// names a node that names it back, and their internal ids rise with the
+    /// positions. Every other node is stranded, and the flag the unfiltered
+    /// search reads says whether any is. A hole holds no metadata, no node and
+    /// no column entry. `node_at` and the id store reach the extent, every
+    /// other structure reaches no further, and the extent is within the
+    /// graph's nodes. The id store's table names each record held once, and
+    /// the sparse space's keys are positions it holds, each list in order.
+    ///
+    /// Taken in the declared order, the id store, the index, the sparse
+    /// index, the metadata, then the columns.
+    pub(crate) fn positions_agree(&self) -> bool {
         let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
-        ids.len() == index.len()
-            && ids
-                .slots()
-                .all(|slot| index.holds(Position::from_slot(slot)))
+        let sparse = self.sparse().map(|space| space.index.read().unwrap());
+        let metadata = self.vector_metadata.read().unwrap();
+        let columns = self.columns.read().unwrap();
+        let extent = ids.extent();
+        let node_at = index.node_at();
+        let graph = index.graph();
+        if node_at.len() != extent
+            || metadata.extent() > extent
+            || columns.extent() > extent
+            || sparse
+                .as_ref()
+                .is_some_and(|sparse| sparse.extent() > extent)
+            || extent > graph.nb_points()
+            || extent >= 1 << 31
+        {
+            return false;
+        }
+        let mut held = 0usize;
+        let mut last_id: Option<usize> = None;
+        for (at, &node) in node_at.iter().enumerate() {
+            let named = ids.contains_slot(at);
+            if named != (node != Position::NONE) {
+                return false;
+            }
+            if columns.is_declared() && columns.holds(at) != named {
+                return false;
+            }
+            if !named {
+                if metadata.get(at).is_some() {
+                    return false;
+                }
+                continue;
+            }
+            held += 1;
+            if graph.record_of_at(node) != at as u32 {
+                return false;
+            }
+            let id = graph.origin_id_at(node);
+            if last_id.is_some_and(|last| id <= last) {
+                return false;
+            }
+            last_id = Some(id);
+        }
+        let sparse_within = sparse.as_ref().is_none_or(|sparse| {
+            sparse.keys_agree() && sparse.live_set().count_and(ids.live()) == sparse.len()
+        });
+        held == ids.len()
+            && held == index.len()
+            && ids.table_agrees()
             && index.numbering_agrees()
+            && columns.tracks(held)
+            && sparse_within
+    }
+
+    /// Every record's internal id and external id, in increasing internal
+    /// id, which is position order. The internal id is the one the record's
+    /// node was inserted under, so this is what every artefact names the
+    /// record by.
+    #[cfg(test)]
+    pub(crate) fn internal_ids(&self) -> Vec<(usize, String)> {
+        let ids = self.ids.read().unwrap();
+        let index = self.dense().index.read().unwrap();
+        ids.iter()
+            .filter_map(|(at, id)| {
+                index
+                    .internal_id_at(at)
+                    .map(|internal| (internal, id.to_string()))
+            })
+            .collect()
+    }
+
+    /// The internal id the record under `id` holds, where it is held.
+    #[cfg(test)]
+    pub(crate) fn internal_id_of(&self, id: &str) -> Option<usize> {
+        let ids = self.ids.read().unwrap();
+        let index = self.dense().index.read().unwrap();
+        ids.slot_of(id).and_then(|at| index.internal_id_at(at))
     }
 
     /// Bring the dense index's live set into step with the id store, which
@@ -1721,8 +1799,8 @@ impl Collection {
         // and the metadata decides among them, which is the same count over
         // fewer reads. The columns guard is released before the metadata
         // guard is taken, since the selection owns its bitmap, and the store
-        // is indexed by the internal ids the bitmap holds, so nothing else
-        // is read. A removed record holds no entry, which is the liveness
+        // is indexed by the positions the bitmap holds, so nothing else is
+        // read. A removed record holds no entry, which is the liveness
         // check.
         let selection = {
             let columns = self.columns.read().unwrap();

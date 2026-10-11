@@ -69,6 +69,28 @@ impl Bitmap {
         self.words.iter_mut().for_each(|word| *word = 0);
     }
 
+    /// Make the set exactly the positions below `count`, in words that reach
+    /// `count` or `floor`, whichever is further, and no further, and give
+    /// back the words past them. What a close-up leaves, since it moves every
+    /// record held to the front, and `floor` is the reservation the set was
+    /// made with.
+    pub(crate) fn hold_first(&mut self, count: usize, floor: usize) {
+        let needed = count.max(floor).div_ceil(64);
+        self.words.resize(needed, 0);
+        self.words.shrink_to_fit();
+        let full = count / 64;
+        let partial = count % 64;
+        for (index, word) in self.words.iter_mut().enumerate() {
+            *word = if index < full {
+                u64::MAX
+            } else if index == full && partial != 0 {
+                (1u64 << partial) - 1
+            } else {
+                0
+            };
+        }
+    }
+
     /// Whether a position is in the set.
     ///
     /// Total over every `usize`, so the traversal predicate can ask it about a
@@ -318,5 +340,32 @@ mod tests {
         wide.insert(Position::NONE as usize - 1);
         assert!(wide.contains(Position::NONE as usize - 1));
         assert!(!wide.contains(Position::NONE as usize));
+    }
+
+    /// A set a close-up leaves holds exactly the positions below the record
+    /// count, in words that reach the count or the reservation and no
+    /// further, whatever it held before.
+    #[test]
+    fn a_closed_up_set_holds_the_first_positions_in_its_words() {
+        for (count, floor) in [
+            (0usize, 0usize),
+            (1, 0),
+            (64, 0),
+            (65, 0),
+            (130, 0),
+            (5, 1_001),
+            (2_000, 1_001),
+        ] {
+            let mut set = Bitmap::default();
+            for slot in (0..10_000).step_by(3) {
+                set.insert(slot);
+            }
+            set.hold_first(count, floor);
+            assert_eq!(set.words.len(), count.max(floor).div_ceil(64));
+            assert_eq!(set.heap_bytes(), set.words.len() * 8);
+            assert_eq!(set.count(), count);
+            assert!((0..count).all(|slot| set.contains(slot)));
+            assert!((count..10_100).all(|slot| !set.contains(slot)));
+        }
     }
 }

@@ -8,9 +8,9 @@
 //! that writes either numbering, being additions, removals, overwrites, the
 //! training transition, a journal's replay, compaction, a load from the dump,
 //! a load through a rebuild and a clear, and check the numbering after each.
-//! They run once with the counter as churn leaves it, so the records sit at
-//! scattered positions, and once from a counter at zero, and the two answer
-//! every query alike.
+//! They run once with the counter as churn leaves it, so the records' internal
+//! ids sit far past their positions, and once from a counter at zero, and the
+//! two answer every query alike.
 
 use std::collections::HashMap;
 
@@ -137,15 +137,15 @@ fn the_live_nodes_follow_every_path_that_changes_the_graph_or_the_live_set() {
             _ => None,
         };
         let mut collection = Collection::build(declaration, quantization);
-        // The counter as churn leaves it, so every record sits at a position
-        // far past the first.
+        // The counter as churn leaves it, so every record's internal id sits
+        // far past its position.
         collection.set_counters(200_000, 0);
         let path = temp.at(&format!("numbering-{kind}.zdb"));
         collection
             .journal_to(path.to_str().unwrap(), Durability::default())
             .unwrap();
         let agree = |collection: &Collection, step: &str| {
-            assert!(collection.live_sets_agree(), "{kind}: {step}");
+            assert!(collection.positions_agree(), "{kind}: {step}");
         };
 
         put(&collection, (0..600).collect(), false);
@@ -247,8 +247,8 @@ fn sparse_pages(collection: &Collection, dense: &[Vec<f32>]) -> Vec<Page> {
 
 /// Every posting is keyed by a position the sparse space holds a record at,
 /// in increasing order on every list, through every path that changes the
-/// sparse space, and a collection whose records sit at scattered positions
-/// answers every sparse and fused query what one at consecutive positions
+/// sparse space, and a collection whose internal ids are scattered answers
+/// every sparse and fused query what one whose ids are consecutive
 /// answers.
 #[test]
 fn the_sparse_keys_follow_every_path_that_changes_the_sparse_space() {
@@ -306,7 +306,7 @@ fn the_sparse_keys_follow_every_path_that_changes_the_sparse_space() {
                     let index = collection.sparse().unwrap().index.read().unwrap();
                     assert!(index.keys_agree(), "{kind} {spread}: {name}");
                 }
-                assert!(collection.live_sets_agree(), "{kind} {spread}: {name}");
+                assert!(collection.positions_agree(), "{kind} {spread}: {name}");
                 steps.push((name.to_string(), sparse_pages(collection, &vectors)));
             };
 

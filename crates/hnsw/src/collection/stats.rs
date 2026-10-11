@@ -94,8 +94,8 @@ impl Collection {
     /// derived from the captured values by the same rules the helpers apply.
     pub fn stats(&self) -> HashMap<String, String> {
         debug_assert!(
-            self.live_sets_agree(),
-            "the dense index's live set is the collection's"
+            self.positions_agree(),
+            "every per-record structure agrees with the positions the records hold"
         );
 
         // The record count and, from the same guard, what the id store
@@ -154,7 +154,11 @@ impl Collection {
                 };
             let nodes = hnsw.nb_points();
             let raw = hnsw.raw_vectors_memory_bytes();
-            let reserved = graph_reserved + hnsw.raw_vectors_reserved_bytes();
+            // The numbering's slack is the graph's to return, as the map from
+            // an id to its node gave its slack back with the graph it sat in,
+            // so it is priced here as well as in the bookkeeping it sits in.
+            let reserved =
+                graph_reserved + hnsw.raw_vectors_reserved_bytes() + index.node_at_reserved_bytes();
             let holds_raw = hnsw.holds_raw();
             (
                 nodes,
@@ -692,14 +696,15 @@ impl Collection {
         // store, the declared columns, the training buffer, the index level
         // metadata and the dense index's node for each position. The id store
         // holds the text of every id once in one arena, an eight byte entry
-        // per internal id, a forward table of four byte buckets with a tag
-        // byte each, and the live set as bits. The table is a power of two of buckets sized as
-        // the standard map sizes its own, so it is between eight sevenths and
-        // sixteen sevenths of the records it holds and it steps rather than
-        // growing smoothly. `pq_codes` holds the id again as a key, in a
+        // per position, a forward table of four byte buckets with a tag byte
+        // each, and the live set as bits. The table is a power of two of
+        // buckets sized as the standard map sizes its own, so it is between
+        // eight sevenths and sixteen sevenths of the records it holds and it
+        // steps rather than growing smoothly. `pq_codes` holds the id again
+        // as a key, in a
         // 48 byte bucket, and the `Vec` in it contributes only its 24 byte
         // header here, since the bytes it points at are already priced above.
-        // The metadata store is indexed by internal id and holds no copy of the
+        // The metadata store is indexed by position and holds no copy of the
         // id: sixteen bytes an entry, and a forty byte field block behind a
         // record that carries fields.
         //
@@ -733,8 +738,10 @@ impl Collection {
         // This is a request count and not a commitment. The allocator's own
         // headers, its rounding and its fragmentation sit outside it, the same
         // way they sit outside `graph_memory_mb`; see
-        // `VectorGraph::memory_bytes`. Nothing here is reserved and unwritten,
-        // so none of it appears under `reserved_memory_mb`.
+        // `VectorGraph::memory_bytes`. The one part of it that can be
+        // reserved and unwritten is the dense index's node for each position,
+        // whose slack `shrink_to_fit()` returns with the graph's, so that
+        // slack appears under `reserved_memory_mb` and nothing else here does.
         let bookkeeping_mb = bookkeeping as f64 / (1024.0 * 1024.0);
         total_memory_mb += bookkeeping_mb;
         stats.insert(
@@ -835,8 +842,9 @@ impl Collection {
         // block, which no arithmetic here can see.
         //
         // It is exactly the figure `shrink_to_fit()` returns, in bytes, since
-        // both are the same fifteen buffers and the same stores priced at the
-        // gap between their capacity and their length. A caller who reads a
+        // both are the same fifteen buffers, the same stores and the dense
+        // index's node for each position priced at the gap between their
+        // capacity and their length. A caller who reads a
         // large figure here and is finished inserting can call that and get it
         // back. The hash tables contribute nothing, because hashbrown sizes a
         // table at a power of two from its length and shrinking recomputes the

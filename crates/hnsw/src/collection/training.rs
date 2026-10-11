@@ -411,9 +411,10 @@ impl Collection {
             codec.clone(),
         );
 
-        // Every live record's row, in internal id order so that two rebuilds
-        // of the same records wire the same graph, taken under the storage
-        // guards and released before the graph is built.
+        // Every live record's row, in position order, which is internal id
+        // order, so that two rebuilds of the same records wire the same graph,
+        // each with the internal id its node was inserted under, taken under
+        // the storage guards and released before the graph is built.
         let (rows, encoded, clipped, released) = {
             let ids = self.ids.read().unwrap();
             let old_index = self.dense().index.read().unwrap();
@@ -424,8 +425,10 @@ impl Collection {
             let mut encoded = 0usize;
             let mut clipped = 0u64;
             let mut missing = 0usize;
-            for internal_id in live {
-                let node = old_index.node_of(Position::from_slot(internal_id));
+            let origin_ids = old_hnsw.origin_ids();
+            for at in live {
+                let node = old_index.node_of(Position::from_slot(at));
+                let internal_id = node.map_or(0, |node| origin_ids[node as usize]);
                 if let Some(row) = node.and_then(|node| old_hnsw.int8_row_at(node)) {
                     rows.push((row.to_vec(), internal_id));
                 } else if let Some(vector) = node.and_then(|node| old_hnsw.raw_vector_at(node)) {
@@ -450,15 +453,15 @@ impl Collection {
             (rows, encoded, clipped, old_hnsw.raw_count())
         };
 
+        // Every record held has a row, so the row at index `k` is the record
+        // at the `k`th position held, which is the position the close-up
+        // installing the graph moves it to.
         if !rows.is_empty() {
             let batch: Vec<(&[i8], usize, Position)> = rows
                 .iter()
-                .map(|(row, internal_id)| {
-                    (
-                        row.as_slice(),
-                        *internal_id,
-                        Position::from_slot(*internal_id),
-                    )
+                .enumerate()
+                .map(|(k, (row, internal_id))| {
+                    (row.as_slice(), *internal_id, Position::from_slot(k))
                 })
                 .collect();
             new_hnsw.insert_batch_int8(&batch).map_err(|e| {
@@ -468,9 +471,9 @@ impl Collection {
         }
 
         // Built in full before it is installed, and the old graph dropped
-        // outside the guard; see `replace_graph`. The clipped count is
+        // outside the guards; see `replace_dense_graph`. The clipped count is
         // added once the index holds the graph the rows are in.
-        self.dense().replace_graph(new_hnsw);
+        self.replace_dense_graph(new_hnsw);
         if clipped > 0 {
             self.dense().index.read().unwrap().add_saturated(clipped);
         }
@@ -556,14 +559,14 @@ impl Collection {
             let index = self.dense().index.read().unwrap();
             let vectors = index.raw_vectors();
 
-            // Every live record that still has a raw vector, in internal id
-            // order, which is the order the store walks in. The order is
-            // fixed rather than a hash map's, because the codes are written
-            // back under it and a rebuild has to be a function of the data
-            // alone.
+            // Every live record that still has a raw vector, in position
+            // order, which is internal id order and the order the store walks
+            // in. The order is fixed rather than a hash map's, because the
+            // codes are written back under it and a rebuild has to be a
+            // function of the data alone.
             let with_raw: Vec<(&str, &[f32])> = ids
                 .iter()
-                .filter_map(|(internal_id, id)| vectors.get(internal_id).map(|vector| (id, vector)))
+                .filter_map(|(at, id)| vectors.get(at).map(|vector| (id, vector)))
                 .collect();
 
             if with_raw.is_empty() {
@@ -621,26 +624,31 @@ impl Collection {
 
         // The codes are copied out so the graph is built with no lock held at
         // all, which keeps the storage guards free while the insertions run.
-        // Copying costs one byte per subvector per record.
-        let batch_data: Vec<(Vec<u8>, usize)> = {
+        // Copying costs one byte per subvector per record. Each carries the
+        // record's position and the internal id its node was inserted under.
+        let batch_data: Vec<(Vec<u8>, usize, usize)> = {
             let ids = self.ids.read().unwrap();
+            let old_index = self.dense().index.read().unwrap();
             let pq_codes = self.dense().pq_codes.read().unwrap();
+            let internal = old_index.ids_by_position();
             pq_codes
                 .iter()
                 .filter_map(|(id, codes)| {
-                    ids.slot_of(id)
-                        .map(|internal_id| (codes.clone(), internal_id))
+                    let at = ids.slot_of(id)?;
+                    let internal_id = internal.get(at)?;
+                    Some((codes.clone(), at, internal_id))
                 })
                 .collect()
         };
 
-        // Internal id order, which is arrival order, rather than the order a
-        // hash map hands its entries out. The level generator is seeded and the
-        // codebook is trained under a seed, so insertion order was the one
-        // remaining draw deciding how this graph is wired. `compact` and the
-        // persistence rebuild already sort for the same reason.
+        // Position order, which is internal id order and arrival order,
+        // rather than the order a hash map hands its entries out. The level
+        // generator is seeded and the codebook is trained under a seed, so
+        // insertion order was the one remaining draw deciding how this graph
+        // is wired. `compact` and the persistence rebuild take the same order
+        // for the same reason.
         let mut batch_data = batch_data;
-        batch_data.sort_unstable_by_key(|&(_, internal_id)| internal_id);
+        batch_data.sort_unstable_by_key(|&(_, at, _)| at);
 
         let mut new_hnsw = VectorGraph::new_pq(
             &self.dense().metric,
@@ -651,12 +659,14 @@ impl Collection {
             pq.clone(),
         );
 
+        // Each record at its place among the records held, counting from
+        // zero, which is the position the close-up installing the graph moves
+        // it to. A held record the codes did not reach is refused below.
         if !batch_data.is_empty() {
             let batch: Vec<(&Vec<u8>, usize, Position)> = batch_data
                 .iter()
-                .map(|(codes, internal_id)| {
-                    (codes, *internal_id, Position::from_slot(*internal_id))
-                })
+                .enumerate()
+                .map(|(k, (codes, _, internal_id))| (codes, *internal_id, Position::from_slot(k)))
                 .collect();
             new_hnsw.insert_batch_pq(&batch)
                 .map_err(|e| {
@@ -704,8 +714,14 @@ impl Collection {
             let old_hnsw = old_index.graph();
             let held = old_hnsw.raw_count();
             if keeps_raw && old_hnsw.holds_raw() {
+                // Each record's raw vector from the node it held in the graph
+                // being replaced, by the position the replacement files it at.
+                let source: Vec<u32> = batch_data
+                    .iter()
+                    .map(|&(_, at, _)| old_index.node_at()[at])
+                    .collect();
                 new_hnsw
-                    .adopt_raw_from(old_hnsw, old_index.node_at(), self.dense().dim)
+                    .adopt_raw_from(old_hnsw, &source, self.dense().dim)
                     .map_err(|e| format!("Failed to carry the raw vectors over: {}", e))?;
                 // The store that carries them is opened at the number of
                 // records present now, which is the training sample, and the
@@ -729,9 +745,9 @@ impl Collection {
         // partly filled one. It used to see the empty new graph for as long as
         // the insertions took.
         //
-        // The old graph is moved out and dropped after the guard is released.
-        // See `replace_graph`.
-        self.dense().replace_graph(new_hnsw);
+        // The old graph is moved out and dropped after the guards are released.
+        // See `replace_dense_graph`.
+        self.replace_dense_graph(new_hnsw);
         let released = if vector_count > 0 && !keeps_raw {
             released
         } else {

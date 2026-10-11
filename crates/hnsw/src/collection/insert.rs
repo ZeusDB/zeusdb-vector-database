@@ -152,18 +152,22 @@ impl Collection {
         );
     }
 
-    /// Put one record into the dense index and name it in the record set, in
-    /// the two phases the graph splits an insertion into.
+    /// Put one record into the dense index, name it in the record set and
+    /// write its metadata and columns, in the two phases the graph splits an
+    /// insertion into.
     ///
     /// ```text
-    /// index.read()   prepare: quantize where the graph holds codes, descend
-    ///                from the level the caller drew, choose the neighbour
-    ///                lists
+    /// index.read()          prepare: quantize where the graph holds codes,
+    ///                       descend from the level the caller drew, choose
+    ///                       the neighbour lists
     ///   drop
     /// ids.write()
-    /// index.write()  insert: append the node, install its lists, update the
-    ///                reverse links, mark the record live, and name it in
-    ///                the id store
+    /// index.write()
+    /// vector_metadata.write()
+    /// columns.write()       insert: name the record at the next position,
+    ///                       append the node, install its lists, update the
+    ///                       reverse links, file the node at the position,
+    ///                       and write the metadata and the columns there
     /// ```
     ///
     /// This is the only caller that takes the index lock twice for one
@@ -212,18 +216,19 @@ impl Collection {
     /// survives it, and `VectorGraph::install` asserts the node count the plan
     /// was made against rather than taking that argument on trust.
     ///
-    /// The record is named in the maps after the index has accepted it, so an
-    /// insertion the index refuses leaves the record set untouched rather than
-    /// naming a record the graph does not hold.
+    /// The record is named in the id store first, and the store forgets the
+    /// position again if the index refuses the record, so an insertion the
+    /// index refuses leaves every structure as it was and takes no position.
+    /// The metadata and the columns are written only once the index has
+    /// accepted the record, in the same block, so a reader sees the four
+    /// structures change together.
     ///
     /// # The lock order
     ///
     /// Phase one takes the index read guard with no other guard held. Phase two
-    /// takes the id store and the index in that order, which is the
-    /// order declared on `Collection` and the order `removal_guards` takes the
-    /// same two in. The metadata and the columns this record has already been
-    /// written to were taken and released in their own block above, and they
-    /// rank below the index, so nothing here is held out of order.
+    /// takes the id store, the index, the metadata and the columns in that
+    /// order, which is the order declared on `Collection` and the order
+    /// `removal_guards` takes the same four in.
     ///
     /// # The level
     ///
@@ -242,33 +247,49 @@ impl Collection {
     ///
     /// # The position
     ///
-    /// A record's position is its slot in the id store, which is its internal
-    /// id, so the index files the node under the slot the store names the
-    /// record at.
+    /// A record takes the next position, being the id store's extent, which
+    /// every per-record structure files it at. Positions follow internal id
+    /// order, since the record's id is the largest issued. Returns the
+    /// position, which the caller files the record's sparse half at.
     fn insert_one(
         &self,
         external_id: &str,
         vector: &[f32],
+        metadata: HashMap<String, Value>,
         internal_id: usize,
         level: usize,
-    ) -> Result<Option<Vec<u8>>, Error> {
+    ) -> Result<(Position, Option<Vec<u8>>), Error> {
         let id = RecordId::from_slot(internal_id);
-        let at = Position::from_slot(internal_id);
         let prepared = {
             let index = self.dense().index.read().unwrap();
             index.prepare_at_level(id, vector, level)?
         };
-        let (codes, due) = {
+        let (at, codes, due) = {
             let mut ids = self.ids.write().unwrap();
             let mut index = self.dense().index.write().unwrap();
-            // The store first, and the name taken back if the graph refuses
-            // the node, so a refused record leaves nothing behind.
-            ids.insert(internal_id, external_id)?;
+            let mut vector_metadata = self.vector_metadata.write().unwrap();
+            let mut columns = self.columns.write().unwrap();
+            // The store first, and the position taken back if the graph
+            // refuses the node, so a refused record leaves nothing behind.
+            let slot = ids.extent();
+            let at = Position::from_slot(slot);
+            ids.insert(slot, external_id)?;
             if let Err(refused) = index.insert(at, id, vector, prepared) {
-                ids.remove_slot(internal_id);
+                ids.retract(slot);
                 return Err(refused);
             }
+            // The metadata, and the declared fields of it in their columns, in
+            // one block and one order, because the two are the same write seen
+            // from two directions and a search that saw one without the other
+            // would return a record the filter had not admitted.
+            columns.write(slot, &metadata);
+            debug_assert!(
+                columns.agrees_with(slot, &metadata),
+                "every declared field's column holds what the record's metadata holds"
+            );
+            vector_metadata.insert(slot, metadata);
             (
+                at,
                 index
                     .node_of(at)
                     .and_then(|node| index.graph().codes_at(node))
@@ -287,17 +308,22 @@ impl Collection {
             };
             self.dense().index.write().unwrap().set_units(timed);
         }
-        Ok(codes)
+        Ok((at, codes))
     }
 
-    /// Put one record into the sparse space at its position, which is its
-    /// slot in the id store, with its internal id beside it, under the
-    /// space's own guard, taken alone.
-    fn insert_sparse(&self, internal_id: usize, vector: &SparseVector) -> Result<(), Error> {
+    /// Put one record into the sparse space at its position, the one the
+    /// dense insertion filed it at, with its internal id beside it for the
+    /// space's slot count, under the space's own guard, taken alone.
+    fn insert_sparse(
+        &self,
+        at: Position,
+        internal_id: usize,
+        vector: &SparseVector,
+    ) -> Result<(), Error> {
         let space = self.sparse().ok_or(Error::NoSparseSpace)?;
         let mut index = space.index.write().unwrap();
         index.insert(
-            Position::from_slot(internal_id),
+            at,
             RecordId::from_slot(internal_id),
             vector.as_ref(),
             Prepared::none(),
@@ -411,6 +437,99 @@ impl Collection {
         }
     }
 
+    /// Close up the positions, under every write guard a removal takes: the
+    /// one routine that moves every per-record structure so the records held
+    /// sit at the positions below their count, in their order.
+    ///
+    /// `old_of_new` lists the positions the id store holds, in increasing
+    /// order, and `new_of_old` maps each to its rank and each hole to the
+    /// empty marker. Both are transient, four bytes a position. Where a
+    /// replacement graph is handed in, built off to the side with the record
+    /// at old position `old_of_new[k]` inserted at `k`, the index swaps it in
+    /// and `node_at` becomes the identity over the records, which is what a
+    /// compaction, a rebuild and a training transition do; the graph it
+    /// replaces is handed back for the caller to drop with no guard held.
+    /// Where none is, the index moves its own numbering and the graph keeps
+    /// every node. Then the sparse space, which drops the postings of the
+    /// records it holds dead, the id store, the metadata and the columns move
+    /// their entries the same way, each giving back what it holds past the
+    /// records or the reservation for `expected_size`, and the id store
+    /// rewrites its text without the removed ids. With no hole there is
+    /// nothing to move. Returns the graph replaced, and the bytes of id text
+    /// the id store let go of.
+    fn close_up_under_guards(
+        guards: &mut RemovalGuards<'_>,
+        replacement: Option<(VectorGraph, Option<(f64, f64)>)>,
+        expected_size: usize,
+    ) -> (Option<VectorGraph>, usize) {
+        let extent = guards.ids.extent();
+        let old_of_new: Vec<u32> = guards.ids.slots().map(|at| at as u32).collect();
+        let holes = old_of_new.len() < extent;
+        let replaced = match replacement {
+            Some((graph, timed)) => Some(guards.index.replace_graph(graph, timed)),
+            None => {
+                if holes {
+                    guards.index.close_up(&old_of_new);
+                }
+                None
+            }
+        };
+        let mut reclaimed_text = 0;
+        if holes {
+            let mut new_of_old = vec![Position::NONE; extent];
+            for (k, &old) in old_of_new.iter().enumerate() {
+                new_of_old[old as usize] = k as u32;
+            }
+            if let Some(sparse) = guards.sparse.as_mut() {
+                sparse.close_up(&old_of_new, &new_of_old);
+            }
+            reclaimed_text = guards.ids.close_up(&old_of_new, &new_of_old, expected_size);
+            guards.vector_metadata.close_up(&old_of_new, expected_size);
+            guards.columns.close_up(&old_of_new, expected_size);
+        }
+        (replaced, reclaimed_text)
+    }
+
+    /// Install a replacement graph built from the records held in position
+    /// order, closing the positions up under every write guard, and drop the
+    /// old graph outside them.
+    ///
+    /// The paths that replace the whole backend, `compact`, `rebuild`, both
+    /// training transitions and the persistence rebuilds, all used to write
+    /// `*hnsw_guard = new_hnsw` directly. That assignment drops the old graph
+    /// while the write guard is still held, and dropping a graph is not a quiet
+    /// operation. `PointIndexation::drop` in the vendored crate clears each
+    /// layer with `into_par_iter().for_each(...)`, so the drop forks to rayon.
+    ///
+    /// A rayon fork under the graph's write guard deadlocks whenever the pool is
+    /// occupied by search tasks. `batch_search_parallel` fans a batch of more
+    /// than five queries across the pool and each task takes a read guard, so
+    /// once a writer is queued every worker blocks behind it. The fork then has
+    /// no worker to run on and the writer never reaches the point of releasing.
+    /// The rule is that no path forks to rayon while holding a write guard, and
+    /// this is a fork that rule is easy to miss on, because it is hidden inside
+    /// an assignment rather than written as a call.
+    ///
+    /// Moving the old value out and dropping it after the guards are released
+    /// keeps the swap to a pointer move and the close-up's one pass under
+    /// them. The replacement's unit cost is timed before the guards are
+    /// taken, for the same reason. The caller holds `writers`. Returns the
+    /// bytes of id text the close-up let go of.
+    pub(super) fn replace_dense_graph(&self, graph: VectorGraph) -> usize {
+        let timed = DenseIndex::time_graph(&graph);
+        let expected_size = self.expected_size();
+        let (old, reclaimed_text) = {
+            let mut guards = self.removal_guards();
+            Self::close_up_under_guards(&mut guards, Some((graph, timed)), expected_size)
+        };
+        drop(old);
+        debug_assert!(
+            self.positions_agree(),
+            "the close-up leaves every structure at the positions the records hold"
+        );
+        reclaimed_text
+    }
+
     /// Remove one record with the guards already held.
     ///
     /// `storage_mode` is passed in rather than read, because reading it reaches
@@ -422,13 +541,20 @@ impl Collection {
         id: &str,
         storage_mode: &str,
     ) -> bool {
-        let Some(internal_id) = guards.ids.remove_name(id) else {
+        // The position the record held, which becomes a hole in every
+        // per-record structure until the next close-up. A hole is never
+        // filled again, since positions only grow between close-ups.
+        let Some(slot) = guards.ids.remove_name(id) else {
             trace!(target: LOG_TARGET, operation = "remove_point_internal",
                 vector_id = %id,
                 "Vector not found for removal"
             );
             return false;
         };
+        // The record's node, read before it is stranded. The log below names
+        // the record by the internal id the node was inserted under, which
+        // the node keeps, and reads it only where the record is written.
+        let node = guards.index.node_of(Position::from_slot(slot));
 
         // Track what we're removing for logging.
         //
@@ -451,21 +577,20 @@ impl Collection {
         // removal strands the record's graph node rather than deleting it, and
         // the vector goes with the node when `compact` rebuilds the graph
         // without it. That is what removal already did to the node itself.
-        guards.vector_metadata.remove(internal_id); // Remove metadata
-                                                    //
-                                                    // The columns are addressed by internal id, so the slot is cleared
-                                                    // rather than reclaimed. Internal ids are never reused, which is what
-                                                    // the graph's own node arena already assumes, so a removed record
-                                                    // leaves a hole in every column exactly as it leaves a stranded node.
-        guards.columns.erase(internal_id);
+        guards.vector_metadata.remove(slot); // Remove metadata
+                                             //
+                                             // The columns are addressed by position, so the slot is cleared
+                                             // rather than reclaimed, and a removed record leaves a hole in
+                                             // every column exactly as it leaves a stranded node.
+        guards.columns.erase(slot);
         guards.pq_codes.remove(id); // Remove PQ codes (if present)
 
         // The dense index strands the node and drops the record from its
         // live set, and the sparse index unlinks the record's postings where
         // the record filled that space. Each is asked whether it holds the
         // record first, since a record may leave the sparse space empty and
-        // an index refuses to remove an id it does not hold.
-        let record = Position::from_slot(internal_id);
+        // an index refuses to remove a position it does not hold.
+        let record = Position::from_slot(slot);
         debug_assert!(
             guards.index.holds(record),
             "the dense index holds every record the id store holds"
@@ -524,7 +649,7 @@ impl Collection {
 
         debug!(target: LOG_TARGET, operation = "remove_point_internal",
             vector_id = %id,
-            internal_id = internal_id,
+            internal_id = node.map_or(0, |node| guards.index.graph().origin_id_at(node)),
             had_raw_vector = had_raw_vector,
             had_pq_codes = had_pq_codes,
             storage_mode = storage_mode,
@@ -681,7 +806,7 @@ impl Collection {
         metadata: HashMap<String, Value>,
     ) -> bool {
         let ids = self.ids.read().unwrap();
-        let Some(internal_id) = ids.slot_of(id) else {
+        let Some(slot) = ids.slot_of(id) else {
             trace!(target: LOG_TARGET, operation = "update_metadata",
                 vector_id = %id,
                 "Record not found, metadata not written"
@@ -693,12 +818,12 @@ impl Collection {
         // Wholesale here too. Every declared field is rewritten, so a key the
         // caller left out is cleared from its column rather than left holding
         // the value the record used to carry.
-        columns.write(internal_id, &metadata);
+        columns.write(slot, &metadata);
         debug_assert!(
-            columns.agrees_with(internal_id, &metadata),
+            columns.agrees_with(slot, &metadata),
             "every declared field's column holds what the record's metadata holds"
         );
-        vector_metadata.insert(internal_id, metadata);
+        vector_metadata.insert(slot, metadata);
         trace!(target: LOG_TARGET, operation = "update_metadata",
             vector_id = %id,
             "Metadata replaced"
@@ -725,8 +850,8 @@ impl Collection {
         }
 
         debug_assert!(
-            self.live_sets_agree(),
-            "the dense index's live set is the collection's"
+            self.positions_agree(),
+            "every per-record structure agrees with the positions the records hold"
         );
         let live_count = self.ids.read().unwrap().len();
         let (nodes_before, stranded) = {
@@ -907,37 +1032,41 @@ impl Collection {
             )
         };
 
-        // Re-insert every live record under the internal id it already holds, so the
-        // id store stays correct without being rewritten. A record whose source data
-        // is missing is collected rather than skipped, because skipping it would drop
-        // it from the index silently.
+        // Re-insert every live record under the internal id it already holds,
+        // at its place among the records held, counting from zero, so the
+        // replacement's node for each record is that place and the close-up
+        // that installs it moves every per-record structure there. A record
+        // whose source data is missing is collected rather than skipped,
+        // because skipping it would drop it from the index silently.
         let missing: Vec<String> = {
             let ids = self.ids.read().unwrap();
             // The graph being replaced, which is where the vectors live. Taken
-            // after the id store and released with it, before `replace_graph`
-            // takes the write guard below.
+            // after the id store and released with it, before the close-up
+            // takes the write guards below.
             let old_index = self.dense().index.read().unwrap();
             let old_hnsw = old_index.graph();
+            let origin_ids = old_hnsw.origin_ids();
 
-            // Internal id order, which is arrival order and the order the store
-            // walks in, rather than the order a hash map hands its entries out.
-            // Two compactions of the same index in two processes otherwise wire
-            // the replacement graph differently and answer the same query
-            // differently.
-            let live: Vec<(&str, usize)> =
-                ids.iter().map(|(internal, id)| (id, internal)).collect();
+            // Position order, which is internal id order, arrival order and
+            // the order the store walks in, rather than the order a hash map
+            // hands its entries out. Two compactions of the same index in two
+            // processes otherwise wire the replacement graph differently and
+            // answer the same query differently.
+            let live: Vec<(&str, usize)> = ids.iter().map(|(at, id)| (id, at)).collect();
 
             if int8.is_some() {
                 let mut batch: Vec<(&[i8], usize, Position)> = Vec::with_capacity(ids.len());
                 let mut missing = Vec::new();
 
-                for (ext_id, internal_id) in live {
-                    let at = Position::from_slot(internal_id);
-                    match old_index
-                        .node_of(at)
-                        .and_then(|node| old_hnsw.int8_row_at(node))
-                    {
-                        Some(row) => batch.push((row, internal_id, at)),
+                for (k, &(ext_id, at)) in live.iter().enumerate() {
+                    match old_index.node_of(Position::from_slot(at)).and_then(|node| {
+                        old_hnsw
+                            .int8_row_at(node)
+                            .map(|row| (row, origin_ids[node as usize]))
+                    }) {
+                        Some((row, internal_id)) => {
+                            batch.push((row, internal_id, Position::from_slot(k)))
+                        }
                         None => missing.push(ext_id.to_string()),
                     }
                 }
@@ -952,15 +1081,16 @@ impl Collection {
                 missing
             } else if quantized {
                 let pq_codes = self.dense().pq_codes.read().unwrap();
+                let internal = old_index.ids_by_position();
                 let mut batch: Vec<(&Vec<u8>, usize, Position)> = Vec::with_capacity(ids.len());
                 let mut missing = Vec::new();
 
-                for (ext_id, internal_id) in live {
-                    match pq_codes.get(ext_id) {
-                        Some(codes) => {
-                            batch.push((codes, internal_id, Position::from_slot(internal_id)))
+                for (k, &(ext_id, at)) in live.iter().enumerate() {
+                    match (pq_codes.get(ext_id), internal.get(at)) {
+                        (Some(codes), Some(internal_id)) => {
+                            batch.push((codes, internal_id, Position::from_slot(k)))
                         }
-                        None => missing.push(ext_id.to_string()),
+                        _ => missing.push(ext_id.to_string()),
                     }
                 }
 
@@ -974,10 +1104,15 @@ impl Collection {
                 // The raw vectors a `quantized_with_raw` index keeps beside its
                 // codes are carried over rather than rebuilt, since nothing
                 // else holds them. The replacement numbers its nodes its own
-                // way, so they are re-addressed node by node.
+                // way, so they are re-addressed node by node, each from the
+                // node the record held in the graph being replaced.
                 if missing.is_empty() && old_hnsw.holds_raw() {
                     if let Some(dim) = old_hnsw.raw_dim() {
-                        new_hnsw.adopt_raw_from(old_hnsw, old_index.node_at(), dim).map_err(|e| {
+                        let source: Vec<u32> = live
+                            .iter()
+                            .map(|&(_, at)| old_index.node_at()[at])
+                            .collect();
+                        new_hnsw.adopt_raw_from(old_hnsw, &source, dim).map_err(|e| {
                             error!(target: LOG_TARGET, operation = "rebuild_graph", error = %e, "Failed to carry the raw vectors over");
                             Error::AdoptRawFailed(e)
                         })?;
@@ -988,13 +1123,15 @@ impl Collection {
             } else {
                 let mut missing = Vec::new();
 
-                for (ext_id, internal_id) in live {
-                    let at = Position::from_slot(internal_id);
-                    match old_index
-                        .node_of(at)
-                        .and_then(|node| old_hnsw.raw_vector_at(node))
-                    {
-                        Some(vector) => new_hnsw.insert(vector, internal_id, at),
+                for (k, &(ext_id, at)) in live.iter().enumerate() {
+                    match old_index.node_of(Position::from_slot(at)).and_then(|node| {
+                        old_hnsw
+                            .raw_vector_at(node)
+                            .map(|vector| (vector, origin_ids[node as usize]))
+                    }) {
+                        Some((vector, internal_id)) => {
+                            new_hnsw.insert(vector, internal_id, Position::from_slot(k))
+                        }
                         None => missing.push(ext_id.to_string()),
                     }
                 }
@@ -1031,13 +1168,13 @@ impl Collection {
         // the write guard costs one copy of the live bytes against a rebuild that
         // has just re-inserted every record.
         new_hnsw.shrink_to_fit();
-        self.dense().replace_graph(new_hnsw);
 
         // The text of every removed record, which stayed in the id store's
         // arena until now, goes with the stranded nodes: one pass over the
-        // entries and one copy of the live text, under the store's write
-        // guard taken alone. Nothing else reclaims it short of `clear`.
-        let reclaimed_text = self.ids.write().unwrap().compact_text();
+        // entries and one copy of the live text, which the close-up makes
+        // under the guards it holds. Nothing else reclaims it short of
+        // `clear`.
+        let reclaimed_text = self.replace_dense_graph(new_hnsw);
         if reclaimed_text > 0 {
             debug!(target: LOG_TARGET, operation = "rebuild_graph",
                 reclaimed_id_bytes = reclaimed_text,
@@ -1516,9 +1653,10 @@ impl Collection {
         })
     }
 
-    /// The second pass over one admitted record: the metadata and the
-    /// columns written, the vector put into the graph at the level admission
-    /// drew, and the sparse half into its space, all under the internal id
+    /// The second pass over one admitted record: the vector put into the
+    /// graph at the level admission drew, the record named at the next
+    /// position with its metadata and columns written there, and the sparse
+    /// half into its space at the same position, all under the internal id
     /// admission issued. Routed by the storage state as `add` has always
     /// routed, being raw storage, raw storage while collecting for training,
     /// or quantized storage.
@@ -1541,21 +1679,23 @@ impl Collection {
         );
 
         // Clean 3-Path Architecture
-        if !self.has_quantization() {
+        let at = if !self.has_quantization() {
             // Path A: Raw storage (no quantization config)
-            self.add_raw_vector(&id, vector, metadata, internal_id, level)?;
+            self.add_raw_vector(&id, vector, metadata, internal_id, level)?
         } else if !self.is_quantized() {
             // Path B: Raw storage + ID collection for training
-            self.add_with_id_collection(&id, vector, metadata, internal_id, level)?;
+            self.add_with_id_collection(&id, vector, metadata, internal_id, level)?
         } else {
             // Path C: Quantized storage (PQ trained and active)
-            self.add_quantized_vector(&id, vector, metadata, internal_id, level)?;
-        }
+            self.add_quantized_vector(&id, vector, metadata, internal_id, level)?
+        };
 
-        // The sparse half, under the same internal id, once the dense half
-        // and the maps are in.
+        // The sparse half, at the same position and under the same internal
+        // id, once the dense half and the maps are in. Training, which an
+        // install can set off, runs after the record's last write, so the
+        // position is the one the record still holds.
         if let Some(sparse) = sparse {
-            self.insert_sparse(internal_id, &sparse)?;
+            self.insert_sparse(at, internal_id, &sparse)?;
         }
 
         Ok(())
@@ -1573,31 +1713,16 @@ impl Collection {
         metadata: HashMap<String, Value>,
         internal_id: usize,
         level: usize,
-    ) -> Result<(), Error> {
-        // Store metadata, and the declared fields of it in their columns.
-        //
-        // One block and one order, because the two are the same write seen from
-        // two directions and a search that saw one without the other would
-        // return a record the filter had not admitted.
-        {
-            let mut vector_metadata = self.vector_metadata.write().unwrap();
-            let mut columns = self.columns.write().unwrap();
-            columns.write(internal_id, &metadata);
-            debug_assert!(
-                columns.agrees_with(internal_id, &metadata),
-                "every declared field's column holds what the record's metadata holds"
-            );
-            vector_metadata.insert(internal_id, metadata);
-        }
-
-        // Insert the processed vector into the graph and name the record in
-        // both id maps, in the two phases the graph splits an insertion into,
-        // at the level admission drew. See `insert_one`. The maps are written
-        // there rather than here so that the record enters the collection's
-        // live set and the index's under one acquisition. This is the only
-        // copy of the vector the index keeps: the store the graph is addressed
-        // against holds it, and there is no second map to write.
-        self.insert_one(id, &vector, internal_id, level)?; // Already normalized
+    ) -> Result<Position, Error> {
+        // Insert the processed vector into the graph, name the record in the
+        // id store, and write its metadata and the declared fields of it in
+        // their columns, in the two phases the graph splits an insertion into,
+        // at the level admission drew. See `insert_one`. The four are written
+        // there, under one acquisition, so that the record enters the
+        // collection's live set, the index's and the columns' together. This
+        // is the only copy of the vector the index keeps: the store the graph
+        // is addressed against holds it, and there is no second map to write.
+        let (at, _) = self.insert_one(id, &vector, metadata, internal_id, level)?; // Already normalized
 
         trace!(target: LOG_TARGET, operation = "add_raw_vector_complete",
             vector_id = %id,
@@ -1605,7 +1730,7 @@ impl Collection {
             "Raw vector added successfully"
         );
 
-        Ok(())
+        Ok(at)
     }
 
     /// Path B: ID collection for consistent training
@@ -1620,9 +1745,9 @@ impl Collection {
         metadata: HashMap<String, Value>,
         internal_id: usize,
         level: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<Position, Error> {
         // 1. Store vector normally (single storage)
-        self.add_raw_vector(id, vector, metadata, internal_id, level)?;
+        let at = self.add_raw_vector(id, vector, metadata, internal_id, level)?;
 
         // 2. Collect ID for training (minimal memory overhead)
         //
@@ -1686,7 +1811,7 @@ impl Collection {
             }
         }
 
-        Ok(())
+        Ok(at)
     }
 
     /// Path C: Quantized storage with configurable raw vector retention
@@ -1701,33 +1826,17 @@ impl Collection {
         metadata: HashMap<String, Value>,
         internal_id: usize,
         level: usize,
-    ) -> Result<(), Error> {
-        // Store metadata, and the declared fields of it in their columns.
-        //
-        // One block and one order, because the two are the same write seen from
-        // two directions and a search that saw one without the other would
-        // return a record the filter had not admitted.
-        {
-            let mut vector_metadata = self.vector_metadata.write().unwrap();
-            let mut columns = self.columns.write().unwrap();
-            columns.write(internal_id, &metadata);
-            debug_assert!(
-                columns.agrees_with(internal_id, &metadata),
-                "every declared field's column holds what the record's metadata holds"
-            );
-            vector_metadata.insert(internal_id, metadata);
-        }
-
-        // Quantize and insert, and name the record in both id maps, in the two
-        // phases the graph splits an insertion into, at the level admission
-        // drew. The index quantizes in the first phase, under the read guard,
-        // and installs the codes in the second, carrying the raw vector
-        // beside them where the storage mode keeps one, because the node the
-        // codes are installed at is the node the raw has to sit at. The maps
-        // are written in the second phase, so that the record enters the
-        // collection's live set and the index's under one acquisition. See
-        // `insert_one`.
-        let codes = self.insert_one(id, &vector, internal_id, level)?;
+    ) -> Result<Position, Error> {
+        // Quantize and insert, name the record in the id store and write its
+        // metadata and columns, in the two phases the graph splits an
+        // insertion into, at the level admission drew. The index quantizes in
+        // the first phase, under the read guard, and installs the codes in the
+        // second, carrying the raw vector beside them where the storage mode
+        // keeps one, because the node the codes are installed at is the node
+        // the raw has to sit at. The maps are written in the second phase, so
+        // that the record enters the collection's live set, the index's and
+        // the columns' under one acquisition. See `insert_one`.
+        let (at, codes) = self.insert_one(id, &vector, metadata, internal_id, level)?;
 
         // Store the product quantized codes, keyed by external id for the
         // paths that reach a record by name. A scalar graph holds its row in
@@ -1745,7 +1854,7 @@ impl Collection {
             "Quantized vector added successfully"
         );
 
-        Ok(())
+        Ok(at)
     }
 
     /// The whole of `add` once parsing is over.
@@ -1981,12 +2090,13 @@ impl Collection {
         self.compact_locked()
     }
 
-    /// Return the graph's spare buffer capacity to the allocator, reporting
-    /// the bytes released. See `VectorGraph::shrink_to_fit`.
+    /// Return the graph's spare buffer capacity and the dense index's
+    /// numbering's to the allocator, reporting the bytes released. See
+    /// `VectorGraph::shrink_to_fit` and `DenseIndex::shrink_to_fit`.
     pub fn shrink_to_fit(&self) -> usize {
         let _writers = self.writers.lock().unwrap();
         let mut index = self.dense().index.write().unwrap();
-        index.graph_mut().shrink_to_fit()
+        index.shrink_to_fit()
     }
 
     /// Resolve a rebuild request against the configuration the index holds.

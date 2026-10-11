@@ -22,7 +22,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
     ArtefactRecord, Bounds, Dir, Error, FsStorage, IdStore, Inventory, MetadataStore, Persist,
-    Position, Restore, Storage, VectorGraph, DUMP_FILENAME,
+    Position, PositionWalk, Restore, Storage, VectorGraph, DUMP_FILENAME,
 };
 use zeusdb_vector_sparse::PostingsIndex;
 use zeusdb_vector_text::{TermDictionary, Tokenizer};
@@ -96,7 +96,9 @@ impl Collection {
     /// id, in increasing internal id, and the record count beside them.
     ///
     /// The id store's guard and the index's are held for the call and in that
-    /// order, so `write` sees one instant of both. The one caller is the save
+    /// order, so `write` sees one instant of both. The records are walked in
+    /// position order, which is internal id order, and each is named by the
+    /// internal id its node was inserted under. The one caller is the save
     /// of an index that holds a raw vector for every record, which is every
     /// raw index and a `quantized_with_raw` one; see `holds_raw_vectors` for
     /// why a raw index writes the file beside the dump that already carries
@@ -108,9 +110,11 @@ impl Collection {
         let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
         let raws = index.raw_vectors();
-        let mut records = ids
-            .slots()
-            .filter_map(|internal_id| raws.get(internal_id).map(|vector| (internal_id, vector)));
+        let internal = index.ids_by_position();
+        let mut records = ids.slots().filter_map(|at| {
+            let vector = raws.get(at)?;
+            Some((internal.get(at)?, vector))
+        });
         write(&mut records, ids.len())
     }
 
@@ -151,9 +155,9 @@ impl Collection {
     ///
     /// The graph comes back from its dump with its own node numbering, which is
     /// the dump's layer major order rather than the order the records arrived
-    /// in, so the vectors read from `vectors.bin` are placed by internal id
-    /// rather than by position. A live record the file does not name is an
-    /// error, because a `quantized_with_raw` index whose raws are partly
+    /// in, so the vectors read from `vectors.bin` are placed by the position
+    /// each node files its record at. A live record the file does not name is
+    /// an error, because a `quantized_with_raw` index whose raws are partly
     /// missing would rerank some records and not others.
     ///
     /// **A stranded node takes a zero vector.** Removal and overwrite leave the
@@ -175,30 +179,30 @@ impl Collection {
         }
         let nodes = hnsw.nb_points();
         hnsw.open_raw_store(self.dense().dim, nodes)?;
-        let mut by_internal: HashMap<usize, &Vec<f32>> = HashMap::with_capacity(vectors.len());
+        let mut by_position: HashMap<usize, &Vec<f32>> = HashMap::with_capacity(vectors.len());
         for (ext_id, vector) in vectors {
-            if let Some(internal_id) = ids.slot_of(ext_id) {
-                by_internal.insert(internal_id, vector);
+            if let Some(at) = ids.slot_of(ext_id) {
+                by_position.insert(at, vector);
             }
         }
         let stranded_fill = vec![0f32; self.dense().dim];
         let mut placed = 0usize;
         let mut stranded = 0usize;
         for node in 0..nodes as u32 {
-            let internal_id = hnsw.origin_id_at(node);
-            match by_internal.get(&internal_id) {
-                Some(vector) => {
+            let at = hnsw.record_of_at(node);
+            match by_position.get(&(at as usize)) {
+                Some(vector) if at != Position::NONE => {
                     hnsw.push_raw_vector(vector)?;
                     placed += 1;
                 }
-                None if !ids.contains_slot(internal_id) => {
+                _ if at == Position::NONE => {
                     hnsw.push_raw_vector(&stranded_fill)?;
                     stranded += 1;
                 }
-                None => {
+                _ => {
                     return Err(format!(
                         "live record with internal id {} has no raw vector in vectors.bin",
-                        internal_id
+                        hnsw.origin_id_at(node)
                     ))
                 }
             }
@@ -629,7 +633,9 @@ impl Collection {
     ///
     /// For persistence loading only, and only after `restore_data_fields` has
     /// installed the id mappings and the product quantizer, because both decide
-    /// what the dump is checked against.
+    /// what the dump is checked against. `positions` is the internal id of the
+    /// record at each position, which the mappings gave, and the reader files
+    /// each node at the position of the id it carries.
     ///
     /// Returns the number of graph nodes restored, or the reason the dump
     /// cannot be used. Every reason is a fallback rather than a failure: the
@@ -641,6 +647,7 @@ impl Collection {
         dir: &dyn Dir,
         max_origin_id: usize,
         recorded_bytes: Option<u64>,
+        positions: &[u32],
     ) -> Result<usize, String> {
         if rebuild_requested() {
             return Err(format!("{} asked for the rebuild", REBUILD_ENV));
@@ -675,15 +682,17 @@ impl Collection {
             min_records: live,
             max_records: max_origin_id,
             max_bytes: u64::MAX,
+            ids_by_position: positions,
         };
         let mut index = DenseIndex::restore(&open, "", dir, &DumpLength(recorded_bytes), &bounds)
             .map_err(|e| e.to_string())?;
         let nodes = index.graph().nb_points();
 
         // Every record the mappings hold has a node in a dump this index
-        // wrote, so a dump that names no node for one is refused before it is
-        // installed, and the caller rebuilds, as it does for every other
-        // refusal of a dump.
+        // wrote, and the reader refused a dump that names no node for one, so
+        // every position takes a node here. The count is held anyway, and a
+        // dump short of one is refused before it is installed, and the caller
+        // rebuilds, as it does for every other refusal of a dump.
         let unplaced = {
             let ids = self.ids.read().unwrap();
             index.set_live(ids.slots())
@@ -711,13 +720,16 @@ impl Collection {
     /// trained index holds codes for every record, so that path only runs on a
     /// directory that lost pq_codes.bin while keeping its raw vectors. A record
     /// missing from mappings.bin is assigned a fresh internal id for the same
-    /// reason: every record must come back.
+    /// reason: every record must come back. It takes the next position, and
+    /// its id joins `positions`, the internal id of the record at each
+    /// position.
     ///
     /// Returns (records inserted, quantized from raw, remapped).
     pub(crate) fn rebuild_graph_from_codes(
         &mut self,
         pq_codes: &HashMap<String, Vec<u8>>,
         vectors: &HashMap<String, Vec<f32>>,
+        positions: &mut Vec<u32>,
     ) -> Result<(usize, usize, usize), String> {
         let pq = match &self.dense().pq {
             Some(pq) if pq.is_trained() => pq.clone(),
@@ -764,8 +776,8 @@ impl Collection {
                 .chain(extra.iter().map(|(id, codes)| (id, codes)))
             {
                 match ids.slot_of(id) {
-                    Some(internal_id) => {
-                        batch.push((codes, internal_id, Position::from_slot(internal_id)))
+                    Some(at) => {
+                        batch.push((codes, positions[at] as usize, Position::from_slot(at)))
                     }
                     None => lost.push((id, codes)),
                 }
@@ -775,12 +787,14 @@ impl Collection {
         lost.sort_by(|a, b| a.0.cmp(b.0));
         for (id, codes) in lost {
             let internal_id = self.get_next_id();
-            self.ids
-                .write()
-                .unwrap()
-                .insert(internal_id, id)
-                .map_err(|e| e.to_string())?;
-            batch.push((codes, internal_id, Position::from_slot(internal_id)));
+            let at = {
+                let mut ids = self.ids.write().unwrap();
+                let at = ids.extent();
+                ids.insert(at, id).map_err(|e| e.to_string())?;
+                at
+            };
+            positions.push(internal_id as u32);
+            batch.push((codes, internal_id, Position::from_slot(at)));
         }
 
         // Insert in internal id order, which is arrival order, rather than in
@@ -817,10 +831,12 @@ impl Collection {
     /// into a fresh scalar graph under the codec the loader installed, in
     /// internal id order, and no vector is decoded on the way. The caller has
     /// already held every row to the mappings both ways, so every row names
-    /// a live record and every live record has a row.
+    /// a live record and every live record has a row, and each row is filed
+    /// at the position `positions` gives its internal id.
     pub(crate) fn rebuild_graph_from_int8_rows(
         &mut self,
         rows: &crate::persistence::Int8Rows,
+        positions: &[u32],
     ) -> Result<usize, String> {
         let codec = self
             .dense()
@@ -835,10 +851,19 @@ impl Collection {
             self.dense().ef_construction(),
             codec,
         );
+        let mut walk = PositionWalk::new(positions);
         let batch: Vec<(&[i8], usize, Position)> = rows
             .iter()
-            .map(|(internal_id, row)| (row, internal_id, Position::from_slot(internal_id)))
-            .collect();
+            .map(|(internal_id, row)| {
+                let at = walk.position_of(internal_id).ok_or_else(|| {
+                    format!(
+                        "the row of internal id {} names a record mappings.bin does not hold",
+                        internal_id
+                    )
+                })?;
+                Ok((row, internal_id, Position::from_slot(at)))
+            })
+            .collect::<Result<_, String>>()?;
         if !batch.is_empty() {
             new_hnsw.insert_batch_int8(&batch)?;
         }
@@ -872,15 +897,18 @@ impl Collection {
     /// internal id order, and return how many were written. The payload of
     /// the rows artefact, written straight into the frame's buffer so the
     /// rows are copied once. Zero on any graph that is not a scalar one.
+    /// The records are walked in position order, which is internal id order,
+    /// and each is named by the internal id its node was inserted under.
     pub(crate) fn write_int8_rows(&self, out: &mut Vec<u8>) -> usize {
         let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
         let graph = index.graph();
+        let origin_ids = graph.origin_ids();
         let mut written = 0usize;
-        for internal_id in ids.slots() {
-            let Some(row) = index
-                .node_of(Position::from_slot(internal_id))
-                .and_then(|node| graph.int8_row_at(node))
+        for at in ids.slots() {
+            let Some((row, internal_id)) = index
+                .node_of(Position::from_slot(at))
+                .and_then(|node| Some((graph.int8_row_at(node)?, origin_ids[node as usize])))
             else {
                 continue;
             };
@@ -951,11 +979,11 @@ impl Collection {
         self.rebuild_columns();
     }
 
-    /// Place every record's metadata under the internal id the id store
-    /// holds for it.
+    /// Place every record's metadata at the position the id store holds for
+    /// it.
     ///
     /// `metadata.json` is keyed by external id and the store is indexed by
-    /// internal id, so each entry is resolved through the id store, which the
+    /// position, so each entry is resolved through the id store, which the
     /// mappings and either graph rebuild have filled by now. An entry naming
     /// an id the mappings do not hold has no slot to go in and is dropped,
     /// counted in the log. No reader could reach such an entry by id, since
@@ -972,7 +1000,7 @@ impl Collection {
         let mut unmapped = 0usize;
         for (ext_id, fields) in metadata {
             match ids.slot_of(&ext_id) {
-                Some(internal_id) => store.insert(internal_id, fields),
+                Some(at) => store.insert(at, fields),
                 None => unmapped += 1,
             }
         }
@@ -994,7 +1022,7 @@ impl Collection {
     /// written before the declaration existed simply loads with no columns.
     ///
     /// Runs after the graph is restored and after `restore_storage_maps` has
-    /// written the metadata back, so the id store holds the internal id every
+    /// written the metadata back, so the id store holds the position every
     /// column entry is addressed by. It is a no-op on an index that declared
     /// nothing, which is every directory saved before this existed.
     /// It clears before it writes, so this is the one authority on what the
@@ -1017,10 +1045,10 @@ impl Collection {
             return;
         }
         let empty: HashMap<String, Value> = HashMap::new();
-        for internal_id in ids.slots() {
-            match vector_metadata.get(internal_id) {
-                Some(fields) => columns.write(internal_id, &fields),
-                None => columns.write(internal_id, &empty),
+        for at in ids.slots() {
+            match vector_metadata.get(at) {
+                Some(fields) => columns.write(at, &fields),
+                None => columns.write(at, &empty),
             }
         }
         debug_assert!(
@@ -1090,9 +1118,10 @@ impl Collection {
     ///
     /// A record the mappings do not name is given a fresh id, as the
     /// quantized fallback gives one, taken in external id order so the ids
-    /// are handed out the same way in every process. Ascending internal id
-    /// is arrival order, so the rebuild is as close to the original build as
-    /// a rebuild can get, and two rebuilds of one directory are one graph.
+    /// are handed out the same way in every process, and the next position,
+    /// its id joining `positions`. Ascending internal id is arrival order and
+    /// position order, so the rebuild is as close to the original build as a
+    /// rebuild can get, and two rebuilds of one directory are one graph.
     ///
     /// What is reproduced exactly from the path this replaced is
     /// `extract_single_vector`'s validation and its call to
@@ -1106,8 +1135,9 @@ impl Collection {
     pub(crate) fn rebuild_from_records(
         &self,
         records: Vec<(String, Vec<f32>)>,
+        positions: &mut Vec<u32>,
     ) -> Result<usize, Error> {
-        let mut mapped: Vec<(usize, Vec<f32>)> = Vec::with_capacity(records.len());
+        let mut mapped: Vec<(usize, usize, Vec<f32>)> = Vec::with_capacity(records.len());
         let mut unmapped: Vec<(String, Vec<f32>)> = Vec::new();
         {
             let ids = self.ids.read().unwrap();
@@ -1132,7 +1162,7 @@ impl Collection {
                 }
                 let vector = self.process_vector_for_space(vector);
                 match ids.slot_of(&id) {
-                    Some(internal_id) => mapped.push((internal_id, vector)),
+                    Some(at) => mapped.push((at, positions[at] as usize, vector)),
                     None => unmapped.push((id, vector)),
                 }
             }
@@ -1147,10 +1177,16 @@ impl Collection {
         unmapped.sort_by(|a, b| a.0.cmp(&b.0));
         for (id, vector) in unmapped {
             let internal_id = self.get_next_id();
-            self.ids.write().unwrap().insert(internal_id, &id)?;
-            mapped.push((internal_id, vector));
+            let at = {
+                let mut ids = self.ids.write().unwrap();
+                let at = ids.extent();
+                ids.insert(at, &id)?;
+                at
+            };
+            positions.push(internal_id as u32);
+            mapped.push((at, internal_id, vector));
         }
-        mapped.sort_by_key(|&(internal_id, _)| internal_id);
+        mapped.sort_by_key(|&(_, internal_id, _)| internal_id);
 
         let dense = self.dense();
         let mut new_hnsw = VectorGraph::new_raw(
@@ -1161,8 +1197,8 @@ impl Collection {
             MAX_LAYER,
             dense.ef_construction(),
         );
-        for (internal_id, vector) in &mapped {
-            new_hnsw.insert(vector, *internal_id, Position::from_slot(*internal_id));
+        for (at, internal_id, vector) in &mapped {
+            new_hnsw.insert(vector, *internal_id, Position::from_slot(*at));
         }
 
         // Filled before it is installed, and installed under one write guard,
@@ -1250,9 +1286,17 @@ impl Collection {
     }
 
     /// Get read access to the id store, being every record's external id
-    /// with its internal id and the live set beside them
+    /// with its position and the live set beside them
     pub(crate) fn ids(&self) -> ReadGuard<'_, IdStore> {
         self.ids.read().unwrap()
+    }
+
+    /// Get read access to the dense index, which names each record held by
+    /// the internal id its node was inserted under, for a save that writes
+    /// records by internal id. Taken after the id store and before any space's
+    /// codes or index, which is its place in the order.
+    pub(crate) fn dense_index(&self) -> ReadGuard<'_, DenseIndex> {
+        self.dense().index.read().unwrap()
     }
 
     /// Get reference to the quantization configuration

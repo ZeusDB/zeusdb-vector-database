@@ -415,7 +415,9 @@ where
     /// first, which is the rule the vendored constructor applied to them.
     ///
     /// Nodes are numbered in the order the dump streams them, which is layer
-    /// major, so a loaded graph's node indices match the dump's exactly.
+    /// major, so a loaded graph's node indices match the dump's exactly. Each
+    /// node takes the rank of its origin id as its position, which is the
+    /// graph whose every node holds a record.
     #[cfg(test)]
     pub(super) fn from_loaded(
         points_by_layer: Vec<Vec<LoadedPoint<T>>>,
@@ -430,6 +432,17 @@ where
             .iter()
             .find_map(|layer| layer.first())
             .map_or(0, |point| point.data.len());
+        let origins: Vec<usize> = points_by_layer
+            .iter()
+            .flatten()
+            .map(|point| point.origin_id)
+            .collect();
+        let mut order: Vec<u32> = (0..origins.len() as u32).collect();
+        order.sort_by_key(|&node| origins[node as usize]);
+        let mut record_of = vec![Position::NONE; origins.len()];
+        for (rank, &node) in order.iter().enumerate() {
+            record_of[node as usize] = rank as u32;
+        }
         let mut points = points_by_layer.into_iter().flatten();
         Self::from_points(
             &layer_counts,
@@ -439,6 +452,7 @@ where
             ef_construction,
             level_scale,
             dist_f,
+            record_of,
             || {
                 points
                     .next()
@@ -449,7 +463,8 @@ where
 
     /// Build a graph from points handed out one at a time in (layer, rank)
     /// order, `layer_counts[l]` of them at layer `l`, each holding `dim`
-    /// values and its lists, every list a block of its own.
+    /// values and its lists, every list a block of its own, each node filed
+    /// at the position `record_of` gives it.
     ///
     /// A point's vector goes into the store as it arrives. The tests build
     /// through this, and [`Self::from_loaded`] is the same over points already
@@ -466,10 +481,18 @@ where
         ef_construction: usize,
         level_scale: f64,
         dist_f: D,
+        record_of: Vec<u32>,
         mut next: impl FnMut() -> Result<LoadedPoint<T>, String>,
     ) -> Result<(Self, VectorStore<T>), String> {
         let (layer_counts, layer_offsets, nb_point) =
             loading_layout(layer_counts_in, m, level_scale)?;
+        if record_of.len() != nb_point {
+            return Err(format!(
+                "the graph holds {} points and {} positions",
+                nb_point,
+                record_of.len()
+            ));
+        }
         let mut graph = Self::loading_shell(
             layer_counts,
             nb_point,
@@ -479,6 +502,7 @@ where
             level_scale,
             dist_f,
             Vec::with_capacity(nb_point),
+            record_of,
         );
 
         let mut store = VectorStore::with_capacity(dim, nb_point);
@@ -509,7 +533,6 @@ where
                 }
                 graph.origin_ids.push(point.origin_id);
                 graph.levels.push(layer as u8);
-                graph.record_of.push(loaded_position(point.origin_id));
                 store.append(point.data);
 
                 lists.clear();
@@ -527,7 +550,8 @@ where
 
     /// Build the graph a dump's adjacency describes, walked point by point in
     /// (layer, rank) order, `layer_counts[l]` points at layer `l`, the points
-    /// taking `origin_ids` in the same order.
+    /// taking `origin_ids` in the same order and the positions `record_of`
+    /// gives them, which the reader numbered against the mappings.
     ///
     /// Every list goes from the region's bytes into the slab its node owns,
     /// ordered by the file's distances, through buffers kept from one point to
@@ -549,6 +573,7 @@ where
         level_scale: f64,
         dist_f: D,
         origin_ids: Vec<usize>,
+        record_of: Vec<u32>,
         mut walk: AdjacencyWalk<'_>,
     ) -> Result<Self, String> {
         let (layer_counts, layer_offsets, nb_point) =
@@ -560,6 +585,11 @@ where
                 origin_ids.len()
             ));
         }
+        debug_assert_eq!(
+            record_of.len(),
+            nb_point,
+            "the reader numbers every node it reads an origin id for"
+        );
         let mut graph = Self::loading_shell(
             layer_counts,
             nb_point,
@@ -569,6 +599,7 @@ where
             level_scale,
             dist_f,
             origin_ids,
+            record_of,
         );
 
         let mut carried: Vec<Vec<LoadedEdge>> = Vec::new();
@@ -601,9 +632,9 @@ where
     }
 
     /// The graph a loading constructor fills: the per node arrays sized for
-    /// `nb_point` nodes, the layer zero slab whole, and the upper regions
-    /// empty, since a span is a property of the file and is not known until
-    /// the walk reaches the node.
+    /// `nb_point` nodes, the layer zero slab whole, the positions the reader
+    /// numbered, and the upper regions empty, since a span is a property of
+    /// the file and is not known until the walk reaches the node.
     #[allow(clippy::too_many_arguments)]
     fn loading_shell(
         layer_counts: [u32; LAYERS],
@@ -614,19 +645,9 @@ where
         level_scale: f64,
         dist_f: D,
         origin_ids: Vec<usize>,
+        record_of: Vec<u32>,
     ) -> Self {
         let base_cap = 2 * m + 1;
-        // The positions of a graph read from a dump. The origin ids the dump
-        // carries name the records' places, and the index strands every node
-        // whose record it does not hold once the mappings are back. A shell
-        // filled point by point starts empty and takes each node's position as
-        // its point arrives.
-        let mut record_of = Vec::with_capacity(nb_point);
-        record_of.extend(
-            origin_ids
-                .iter()
-                .map(|&origin_id| loaded_position(origin_id)),
-        );
         MutableGraph {
             dim,
             m,
@@ -940,10 +961,10 @@ where
         self.record_of[node as usize] = position;
     }
 
-    /// Every node's origin id, and every node's position to write, for a pass
-    /// that files the records a load holds.
-    pub(super) fn numbering_mut(&mut self) -> (&[usize], &mut [u32]) {
-        (&self.origin_ids, &mut self.record_of)
+    /// Every node's position, indexed by node, to write, for a pass that
+    /// files the records a load holds.
+    pub(super) fn records_mut(&mut self) -> &mut [u32] {
+        &mut self.record_of
     }
 
     /// Slots one layer zero list holds, being the vendored threshold plus the
@@ -1171,6 +1192,11 @@ where
     /// the same graph agree on where their node indices do not.
     pub(super) fn origin_id_of(&self, node: u32) -> usize {
         self.origin_ids[node as usize]
+    }
+
+    /// Every node's origin id, indexed by node.
+    pub(super) fn origin_ids(&self) -> &[usize] {
+        &self.origin_ids
     }
 
     /// Where the traversal starts, as (layer, rank), which is what a dump
@@ -2293,10 +2319,11 @@ fn ordered_list(
     Ok(())
 }
 
-/// The position a node read from a dump files its record at, being the place
-/// its origin id names. An origin id no `u32` can name names no place, so the
-/// node is stranded.
-fn loaded_position(origin_id: usize) -> u32 {
+/// The position a node the graph's own insert builds files its record at,
+/// being the place its origin id names. Only the graph's tests build that
+/// way; an index hands every insertion the position its record holds. An
+/// origin id no `u32` can name names no place, so the node is stranded.
+fn origin_position(origin_id: usize) -> u32 {
     u32::try_from(origin_id).unwrap_or(Position::NONE)
 }
 

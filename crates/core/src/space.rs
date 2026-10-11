@@ -116,6 +116,49 @@ impl Position {
     }
 }
 
+/// A cursor over the internal ids of the records a collection holds, in
+/// position order, which finds the position of each id an input names in
+/// increasing order.
+///
+/// Every artefact lists its records in increasing internal id, so a load
+/// finds each record's position by stepping forward. Where the input names
+/// every record the step is one comparison, and where it skips records, as a
+/// space a record may leave empty does, the cursor searches what is left of
+/// the list rather than stepping through it.
+pub struct PositionWalk<'a> {
+    ids: &'a [u32],
+    next: usize,
+}
+
+impl<'a> PositionWalk<'a> {
+    pub fn new(ids: &'a [u32]) -> Self {
+        PositionWalk { ids, next: 0 }
+    }
+
+    /// The position of `id`, which is above every id asked before, or `None`
+    /// where the list does not hold it.
+    pub fn position_of(&mut self, id: usize) -> Option<usize> {
+        match self.ids.get(self.next) {
+            Some(&held) if held as usize == id => {}
+            Some(&held) if held as usize > id => return None,
+            Some(_) => {
+                self.next += self.ids[self.next..].partition_point(|&held| (held as usize) < id);
+                if self
+                    .ids
+                    .get(self.next)
+                    .is_none_or(|&held| held as usize != id)
+                {
+                    return None;
+                }
+            }
+            None => return None,
+        }
+        let at = self.next;
+        self.next += 1;
+        Some(at)
+    }
+}
+
 /// The name of one space in a collection. Never empty.
 ///
 /// The default space is a name the binding supplies, and it is an ordinary
@@ -582,17 +625,28 @@ pub trait Inventory {
 }
 
 /// Ceilings the collection derives from its own artefacts before an index
-/// sizes anything from a file it is restoring.
+/// sizes anything from a file it is restoring, and the positions the
+/// restored entries are filed at.
 ///
 /// `min_records` is the live record count, which a graph must hold at least
 /// as many nodes as. `max_records` is the largest internal id the collection
 /// has ever issued, which no restored entry may exceed. `max_bytes` bounds
 /// any single allocation an artefact asks for.
+///
+/// `ids_by_position` is the internal id of the record at each position, in
+/// increasing order, being the records the collection's mappings hold. An
+/// artefact names a record by its internal id, and the restored entry is
+/// filed at the position that id holds here. Every artefact lists its
+/// records in increasing internal id, so each lookup is a step forward
+/// through this list. An index restored on its own, with no collection
+/// around it, files every id at the position it names by passing every id
+/// from zero up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Bounds {
+pub struct Bounds<'a> {
     pub min_records: usize,
     pub max_records: usize,
     pub max_bytes: u64,
+    pub ids_by_position: &'a [u32],
 }
 
 /// An index writes its own artefacts into a directory the collection owns,
@@ -619,7 +673,7 @@ pub trait Restore: Sized {
         prefix: &str,
         dir: &dyn Dir,
         inventory: &dyn Inventory,
-        bounds: &Bounds,
+        bounds: &Bounds<'_>,
     ) -> Result<Self, Error>;
 }
 

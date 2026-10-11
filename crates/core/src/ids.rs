@@ -1,12 +1,12 @@
 //! Every record's external id, held once.
 //!
-//! The text of every id sits end to end in one arena. An entry per internal
-//! id names where its text starts and how long it is, so resolving a node to
-//! its id is two array reads and a slice. A forward table finds the internal
-//! id of a name: open addressing over `u32` buckets, each holding an internal
-//! id, with one byte of the hash beside each bucket so a probe compares the
-//! text only where the byte agrees. Beside them is the live set as bits,
-//! which is what a filtered search checks its selection against.
+//! The text of every id sits end to end in one arena. An entry per position
+//! names where its text starts and how long it is, so resolving a record to
+//! its id is two array reads and a slice. A forward table finds the position
+//! of a name: open addressing over `u32` buckets, each holding a position,
+//! with one byte of the hash beside each bucket so a probe compares the text
+//! only where the byte agrees. Beside them is the live set as bits, which is
+//! what a filtered search checks its selection against.
 //!
 //! This replaced two hash maps, one from the id to the internal id and one
 //! back, each holding its own copy of the text in its own heap block and a
@@ -25,14 +25,16 @@
 //! The hasher is the standard library's, seeded afresh for every store, so a
 //! caller's ids hash as they did under the two maps.
 //!
-//! Internal ids are never reused and `compact` re-inserts every record under
-//! the id it already holds, so the entry vector grows with the id counter and
-//! a removed record leaves an eight byte hole until `clear`. Its text stays
-//! in the arena until [`IdStore::compact_text`] rewrites the arena without
-//! it, which the collection runs when it rebuilds the graph. The vector is
-//! reserved for the declared record count, under a cap, and grows by doubling
-//! past it, which is the rule the metadata store and the graph's per node
-//! arrays follow.
+//! A record takes the next position when it is inserted, and positions follow
+//! internal id order, so the entry vector grows with the records inserted
+//! since the last close-up and a removed record leaves an eight byte hole
+//! until the next one. [`IdStore::close_up`] moves every record to the front
+//! in one pass, rewrites the table's positions through the same map and
+//! gives back the entries past the records. A removed record's text stays in
+//! the arena until [`IdStore::compact_text`] rewrites the arena without it,
+//! which the close-up does. The vector is reserved for the declared record
+//! count, under a cap, and grows by doubling past it, which is the rule the
+//! metadata store and the graph's per node arrays follow.
 
 use crate::bitmap::Bitmap;
 use crate::error::Error;
@@ -50,16 +52,24 @@ const MAX_TEXT: u64 = (1u64 << OFFSET_BITS) - 2;
 const MAX_ID_LEN: u64 = (1u64 << LEN_BITS) - 1;
 /// An entry for a slot that holds no record.
 const ABSENT: u64 = u64::MAX;
-/// A bucket that holds no internal id.
+/// A bucket that holds no position.
 const EMPTY: u32 = u32::MAX;
-/// The last internal id the store holds. A slot is a `u32` and the store
-/// keeps `u32::MAX` for the empty bucket, so the last id is the one below it.
-/// `add` issues no id past this one and a replay installs none, so neither
-/// hands the store an id it refuses.
+/// The last internal id a collection issues. A slot is a `u32` and the store
+/// keeps `u32::MAX` for the empty bucket, so the last slot is the one below
+/// it, and an internal id is held to the same ceiling so that every number
+/// naming a record fits the same width. `add` issues no id past this one, a
+/// replay installs none and a load refuses one, so the store is never handed
+/// a slot it refuses.
 pub const MAX_INTERNAL_ID: usize = EMPTY as usize - 1;
 /// The most entries and the most buckets the store reserves at creation,
 /// whatever the declaration. Eight bytes an entry and five a bucket.
 const RESERVE_CAP: usize = 1 << 20;
+
+/// Entries the store reserves for `expected_size` records: one more than the
+/// declaration, under the cap.
+fn reserved_entries(expected_size: usize) -> usize {
+    expected_size.saturating_add(1).min(RESERVE_CAP)
+}
 
 /// Buckets a table holds for `records` entries at seven eighths full, which
 /// is the count the standard map holds for the same entries.
@@ -95,16 +105,17 @@ pub struct IdStore {
     /// The text of every id, end to end. Each id was appended whole, so
     /// every offset an entry names is a character boundary.
     text: String,
-    /// One entry per internal id issued: the offset and the length of its
-    /// text, or [`ABSENT`].
+    /// One entry per position assigned since the last close-up: the offset
+    /// and the length of its text, or [`ABSENT`] at a hole. Its length is the
+    /// position the next record takes.
     entries: Vec<u64>,
-    /// The forward table, a power of two of buckets each holding an internal
-    /// id or [`EMPTY`], probed linearly.
+    /// The forward table, a power of two of buckets each holding a position
+    /// or [`EMPTY`], probed linearly.
     buckets: Vec<u32>,
     /// One byte of the hash per bucket, read before the text is.
     tags: Vec<u8>,
     hasher: RandomState,
-    /// The set of internal ids that hold a record.
+    /// The set of positions that hold a record.
     live: Bitmap,
     /// How many entries hold a record.
     held: usize,
@@ -115,11 +126,11 @@ pub struct IdStore {
 impl IdStore {
     /// An empty store reserved for `expected_size` records, under the cap.
     ///
-    /// One entry more than the declaration, because internal ids are issued
-    /// from one and the entry is the id, so a declaration filled exactly
-    /// reaches entry `expected_size` and would double the vector for it.
+    /// One entry more than the declaration, which is the reservation the
+    /// store took while an entry was an internal id issued from one, kept so
+    /// that a declaration costs what it always cost.
     pub fn new(expected_size: usize) -> Self {
-        let entries = expected_size.saturating_add(1).min(RESERVE_CAP);
+        let entries = reserved_entries(expected_size);
         let buckets = buckets_for(expected_size.min(RESERVE_CAP));
         IdStore {
             text: String::new(),
@@ -136,6 +147,9 @@ impl IdStore {
     /// Make room for `records` more entries and for the slot `highest`
     /// before a run of insertions, which is what the loader knows in
     /// advance.
+    ///
+    /// The loader files the records at consecutive positions from zero, so
+    /// `highest` is one below the record count.
     pub fn reserve(&mut self, records: usize, highest: usize) {
         let entries = highest.saturating_add(1);
         if entries > self.entries.len() {
@@ -273,7 +287,7 @@ impl IdStore {
     /// forgotten, and a slot that already holds a name is freed first, so a
     /// name and a slot always pair one to one. Neither happens on any path
     /// the collection takes, since every insertion checks the name first and
-    /// no internal id is issued twice.
+    /// takes the next position, being [`IdStore::extent`].
     ///
     /// Refused where the slot is past [`MAX_INTERNAL_ID`], or where the id
     /// or the arena would pass what an entry can name.
@@ -319,7 +333,8 @@ impl IdStore {
         Ok(())
     }
 
-    /// Forget the record named `id`, returning the internal id it held.
+    /// Forget the record named `id`, returning the position it held, which
+    /// becomes a hole.
     pub fn remove_name(&mut self, id: &str) -> Option<usize> {
         let at = self.find(id)?;
         let slot = self.buckets[at] as usize;
@@ -344,12 +359,67 @@ impl IdStore {
         true
     }
 
+    /// Forget the record the last insertion filed at `slot`, being the
+    /// position before [`IdStore::extent`], and take the position back, so
+    /// the next insertion files its record there. What an insertion does
+    /// when the index refuses the record it has just named, so a refusal
+    /// leaves no hole. Its text stays in the arena as removed text, as a
+    /// removal's does.
+    pub fn retract(&mut self, slot: usize) {
+        if self.remove_slot(slot) && slot + 1 == self.entries.len() {
+            self.entries.truncate(slot);
+        }
+    }
+
     /// Forget every record, keeping a reservation for `expected_size`.
     pub fn clear(&mut self, expected_size: usize) {
         *self = IdStore::new(expected_size);
     }
 
-    /// The internal id of `id`, where the store holds it.
+    /// The position the next record takes, being one past the last position
+    /// assigned since the last close-up, holes included.
+    #[inline]
+    pub fn extent(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Move every record held to the front, keeping their order, so the
+    /// record at `old_of_new[k]` is at `k` and the store reaches no further
+    /// than the records it holds.
+    ///
+    /// `old_of_new` lists the positions held in increasing order and
+    /// `new_of_old` is its inverse, each hole there holding
+    /// [`crate::Position::NONE`]. Each entry moves with its text where it
+    /// is, each bucket's position is rewritten through `new_of_old`, and the
+    /// live set becomes the positions below the record count. No name is
+    /// hashed again, since a bucket's place follows its text and not its
+    /// position. The entries give back what they hold past the records or
+    /// the reservation for `expected_size`, whichever is more, and the arena
+    /// is rewritten without the removed text, which returns the bytes it let
+    /// go of; see [`IdStore::compact_text`].
+    pub fn close_up(
+        &mut self,
+        old_of_new: &[u32],
+        new_of_old: &[u32],
+        expected_size: usize,
+    ) -> usize {
+        debug_assert_eq!(old_of_new.len(), self.held);
+        for (k, &old) in old_of_new.iter().enumerate() {
+            self.entries[k] = self.entries[old as usize];
+        }
+        self.entries.truncate(old_of_new.len());
+        self.entries
+            .shrink_to(old_of_new.len().max(reserved_entries(expected_size)));
+        for bucket in self.buckets.iter_mut() {
+            if *bucket != EMPTY {
+                *bucket = new_of_old[*bucket as usize];
+            }
+        }
+        self.live.hold_first(old_of_new.len(), 0);
+        self.compact_text()
+    }
+
+    /// The position of `id`, where the store holds it.
     #[inline]
     pub fn slot_of(&self, id: &str) -> Option<usize> {
         self.find(id).map(|at| self.buckets[at] as usize)
@@ -387,8 +457,8 @@ impl IdStore {
         self.held == 0
     }
 
-    /// Every record as its internal id and its external id, in increasing
-    /// internal id order.
+    /// Every record as its position and its external id, in increasing
+    /// position, which is internal id order.
     pub fn iter(&self) -> impl Iterator<Item = (usize, &str)> + '_ {
         self.entries
             .iter()
@@ -397,7 +467,7 @@ impl IdStore {
             .map(|(slot, &entry)| (slot, self.text_of(entry)))
     }
 
-    /// Every record's internal id, in increasing order.
+    /// Every record's position, in increasing order.
     pub fn slots(&self) -> impl Iterator<Item = usize> + '_ {
         self.entries
             .iter()
@@ -406,14 +476,35 @@ impl IdStore {
             .map(|(slot, _)| slot)
     }
 
-    /// The largest internal id that holds a record.
+    /// The largest position that holds a record.
     pub fn highest_slot(&self) -> Option<usize> {
         self.entries.iter().rposition(|&entry| entry != ABSENT)
     }
 
-    /// The set of internal ids that hold a record, as bits.
+    /// The set of positions that hold a record, as bits.
     pub fn live(&self) -> &Bitmap {
         &self.live
+    }
+
+    /// Whether the forward table names every record held exactly once and
+    /// names nothing else: each bucket holds a position that holds a record,
+    /// found again by its own text, and the buckets in use are the records
+    /// held. A debug check, since every write keeps it true.
+    pub fn table_agrees(&self) -> bool {
+        let mut named = 0usize;
+        for (at, &slot) in self.buckets.iter().enumerate() {
+            if slot == EMPTY {
+                continue;
+            }
+            named += 1;
+            let Some(&entry) = self.entries.get(slot as usize) else {
+                return false;
+            };
+            if entry == ABSENT || self.find(self.text_of(entry)) != Some(at) {
+                return false;
+            }
+        }
+        named == self.held && self.live.count() == self.held
     }
 
     /// Whether `other` admits every live record, by a word walk of the
@@ -437,7 +528,7 @@ impl IdStore {
     }
 
     /// Rewrite the arena without the text of removed records, returning the
-    /// bytes it let go of. Every entry keeps its internal id; only its offset
+    /// bytes it let go of. Every entry keeps its position; only its offset
     /// moves. Costs one pass over the entries and one copy of the live text.
     pub fn compact_text(&mut self) -> usize {
         if self.dead_text == 0 {
@@ -716,5 +807,114 @@ mod tests {
             2,
             "no entry was made for a refused slot"
         );
+    }
+
+    /// The positions held in increasing order and the map from each old
+    /// position to its new one, as a close-up is handed them.
+    fn closing(store: &IdStore) -> (Vec<u32>, Vec<u32>) {
+        let old_of_new: Vec<u32> = store.slots().map(|slot| slot as u32).collect();
+        let mut new_of_old = vec![crate::Position::NONE; store.extent()];
+        for (k, &old) in old_of_new.iter().enumerate() {
+            new_of_old[old as usize] = k as u32;
+        }
+        (old_of_new, new_of_old)
+    }
+
+    /// A store most of whose records were removed keeps them at scattered
+    /// positions until the close-up, which moves every record to the front
+    /// in its order, rewrites the table to the new positions, drops the
+    /// removed text and leaves the entries and the live set costing what the
+    /// records cost rather than a slot for every position the store reached.
+    /// Every name, position, walk and removal then answers as a store built
+    /// from those records does, and the next record takes the position after
+    /// the last.
+    #[test]
+    fn a_store_over_scattered_ids_costs_what_its_records_cost() {
+        let total = 20_000usize;
+        let mut store = IdStore::new(16);
+        for slot in 0..total {
+            store.insert(slot, &format!("r{slot}")).unwrap();
+        }
+        let kept: Vec<usize> = (0..total).filter(|slot| slot % 40 == 7).collect();
+        for slot in (0..total).filter(|slot| slot % 40 != 7) {
+            assert!(store.remove_slot(slot));
+        }
+        assert_eq!(store.len(), kept.len());
+        assert_eq!(store.extent(), total, "a removal leaves a hole");
+        assert!(store.dead_text() > 0);
+
+        let (old_of_new, new_of_old) = closing(&store);
+        let reclaimed = store.close_up(&old_of_new, &new_of_old, 16);
+        assert!(reclaimed > 0, "the close-up drops the removed text");
+        assert_eq!(store.dead_text(), 0);
+        assert_eq!(store.extent(), kept.len());
+        assert!(store.table_agrees());
+
+        // Eight bytes an entry and a bit a position, for the records held.
+        assert_eq!(store.entries.capacity(), kept.len());
+        assert_eq!(store.live.heap_bytes(), kept.len().div_ceil(64) * 8);
+        assert_eq!(store.text.capacity(), store.text_bytes());
+
+        for (k, &old) in kept.iter().enumerate() {
+            let name = format!("r{old}");
+            assert_eq!(store.slot_of(&name), Some(k));
+            assert_eq!(store.name(k), Some(name.as_str()));
+            assert!(store.contains_slot(k));
+        }
+        assert!(!store.contains_slot(kept.len()));
+        assert_eq!(store.name(kept.len()), None);
+        assert_eq!(
+            store.slots().collect::<Vec<_>>(),
+            (0..kept.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(store.highest_slot(), Some(kept.len() - 1));
+
+        for k in (0..kept.len()).step_by(2) {
+            assert!(store.remove_slot(k));
+        }
+        assert_eq!(store.len(), kept.len() / 2);
+        assert_eq!(store.live().count(), kept.len() / 2);
+        assert!(store.table_agrees());
+        store.insert(store.extent(), "after").unwrap();
+        assert_eq!(store.slot_of("after"), Some(kept.len()));
+    }
+
+    /// A close-up keeps the reservation the declaration made, however few
+    /// records it leaves, and gives back only what lies past it.
+    #[test]
+    fn a_close_up_keeps_the_declared_reservation() {
+        let mut store = IdStore::new(1_000);
+        for slot in 0..5_000usize {
+            store.insert(slot, &format!("r{slot}")).unwrap();
+        }
+        for slot in 10..5_000usize {
+            assert!(store.remove_slot(slot));
+        }
+        let (old_of_new, new_of_old) = closing(&store);
+        store.close_up(&old_of_new, &new_of_old, 1_000);
+        assert_eq!(store.extent(), 10);
+        assert_eq!(store.entries.capacity(), 1_001);
+        assert!(store.table_agrees());
+    }
+
+    /// A position taken back after the insertion that filed it leaves the
+    /// store as it was before the insertion, and the next record takes the
+    /// same position.
+    #[test]
+    fn a_retracted_position_is_taken_again() {
+        let mut store = IdStore::new(4);
+        store.insert(0, "a").unwrap();
+        store.insert(1, "b").unwrap();
+        assert!(store.remove_slot(0));
+        store.insert(2, "refused").unwrap();
+        store.retract(2);
+        assert_eq!(store.extent(), 2);
+        assert_eq!(store.len(), 1);
+        assert!(!store.contains_name("refused"));
+        assert!(!store.contains_slot(2));
+        assert!(store.table_agrees());
+        store.insert(store.extent(), "next").unwrap();
+        assert_eq!(store.slot_of("next"), Some(2));
+        assert_eq!(store.slot_of("b"), Some(1));
     }
 }

@@ -190,7 +190,7 @@ where
     /// graph outright. The cutover splits this at the two phase boundary and
     /// puts the index locks around each; until then this is what the tests
     /// build with and what the measurement times. The record's position is
-    /// the place its origin id names, as a graph read from a dump files it.
+    /// the place its origin id names.
     pub(in crate::graph) fn insert(
         &mut self,
         store: &mut VectorStore<T>,
@@ -200,7 +200,7 @@ where
     ) {
         let level = levels.generate();
         let planned = self.plan_insertion(store, data, level);
-        let position = super::loaded_position(origin_id);
+        let position = super::origin_position(origin_id);
         self.install_insertion(store, data, origin_id, position, planned);
     }
 

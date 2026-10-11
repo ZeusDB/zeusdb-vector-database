@@ -81,10 +81,10 @@ fn term_id(collection: &Collection, term: &str) -> Option<u32> {
 
 /// Every live record's external id with its internal id, sorted.
 fn ids_of(collection: &Collection) -> Vec<(String, usize)> {
-    let store = collection.ids();
-    let mut ids: Vec<(String, usize)> = store
-        .iter()
-        .map(|(internal, id)| (id.to_string(), internal))
+    let mut ids: Vec<(String, usize)> = collection
+        .internal_ids()
+        .into_iter()
+        .map(|(internal, id)| (id, internal))
         .collect();
     ids.sort();
     ids
@@ -658,7 +658,7 @@ fn the_graph_rebuild_fallback_carries_the_sparse_space() {
     assert_eq!(after.1, before.1);
     assert_eq!(after.2, before.2);
     assert_eq!(loaded.sparse().unwrap().index.read().unwrap().len(), 40);
-    assert!(loaded.live_sets_agree());
+    assert!(loaded.positions_agree());
     assert_eq!(ids_of(&loaded), ids_of(&collection));
     assert_eq!(loaded.id_counter(), collection.id_counter());
 }
@@ -714,18 +714,23 @@ fn the_raw_rebuild_fallback_keeps_every_internal_id_and_the_counter() {
     assert_eq!(ids_of(&rebuilt), ids);
     assert_eq!(rebuilt.id_counter(), 301);
     assert_eq!(rebuilt.len(), 298);
-    assert!(rebuilt.live_sets_agree());
+    assert!(rebuilt.positions_agree());
 
     // The rebuilt graph holds one node per live record, under those ids, and
-    // none for the id the overwrite retired.
+    // none for the id the overwrite retired. The records hold the first 298
+    // positions.
     {
         let index = rebuilt.dense().index.read().unwrap();
         assert_eq!(index.graph().nb_points(), 298);
+        let held: Vec<usize> = (0..298)
+            .map(|node| index.graph().origin_id_at(node))
+            .collect();
         for &(_, internal_id) in &ids {
-            assert!(index.holds(Position::from_slot(internal_id)));
+            assert!(held.contains(&internal_id));
         }
-        assert!(!index.holds(Position(6)));
-        assert!((0..298).all(|node| index.graph().origin_id_at(node) != 6));
+        assert!(!held.contains(&6));
+        assert!((0..298).all(|at| index.holds(Position::from_slot(at))));
+        assert!(!index.holds(Position::from_slot(298)));
     }
 
     // The next record takes the id after the saved counter, and the rebuilt
@@ -736,7 +741,8 @@ fn the_raw_rebuild_fallback_keeps_every_internal_id_and_the_counter() {
             .total_errors,
         0
     );
-    assert_eq!(rebuilt.ids().slot_of("r900"), Some(302));
+    assert_eq!(rebuilt.internal_id_of("r900"), Some(302));
+    assert_eq!(rebuilt.ids().slot_of("r900"), Some(298));
     let filter = compile_filter(&HashMap::from([("cat".to_string(), json!("b"))])).unwrap();
     assert_eq!(rebuilt.count(Some(&filter)), from_dump.count(Some(&filter)));
     let params = rebuilt.search_params(5, None, false, None).unwrap();

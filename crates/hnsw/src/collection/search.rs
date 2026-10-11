@@ -418,7 +418,7 @@ impl Collection {
     /// **The distances are computed after the walk and not during it.** Every
     /// distance a fused walk evaluated before giving up would be thrown away,
     /// and at 1,536 dimensions that is thousands of six kilobyte reads charged
-    /// to every broad filtered search. The walk collects internal ids alone,
+    /// to every broad filtered search. The walk collects positions alone,
     /// the index scores them, and the give-up path is free of distance work
     /// entirely.
     ///

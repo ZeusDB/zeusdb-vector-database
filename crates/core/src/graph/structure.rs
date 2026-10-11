@@ -663,12 +663,13 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
     // cosine graph, encoded through the graph's own codec.
     let rows: Vec<Vec<i8>> = unit.iter().map(|v| graph.int8_encode(v).unwrap()).collect();
     assert!(rows.iter().all(|row| row.len() == DIM + 4));
-    // Internal ids from one, as the collection issues them, each at the
-    // position its id names. The first record is node zero.
+    // Internal ids from one, as the collection issues them, each record at
+    // its place among them, counting from zero. The first record is node
+    // zero.
     let batch: Vec<(&[i8], usize, Position)> = rows
         .iter()
         .enumerate()
-        .map(|(i, c)| (c.as_slice(), i + 1, Position::from_slot(i + 1)))
+        .map(|(i, c)| (c.as_slice(), i + 1, Position::from_slot(i)))
         .collect();
     graph.insert_batch_int8(&batch).unwrap();
     assert_eq!(graph.nb_points(), N);
@@ -705,13 +706,17 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
     let norm: f32 = twin.iter().map(|x| x * x).sum::<f32>().sqrt();
     let twin: Vec<f32> = twin.iter().map(|x| x / norm).collect();
     let nearest = graph.search(&twin, 1, 100, Some(&admits)).unwrap();
-    assert_eq!(nearest[0].position, 8);
+    assert_eq!(nearest[0].position, 7);
 
     let dir = tempfile::tempdir().unwrap();
     graph.dump(&FsDir::new(dir.path()), DUMP_FILENAME).unwrap();
+    // The mappings hold every record, so each node comes back at the place
+    // its id holds among them, which is the position it was built at.
+    let held: Vec<u32> = (1..=N as u32).collect();
     let bounds = DumpBounds {
         min_nodes: N,
         max_origin_id: N,
+        positions: Some(&held),
     };
 
     // The raw reader refuses it on the element, and the wrong space on the

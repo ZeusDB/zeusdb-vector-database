@@ -1,7 +1,7 @@
-//! The per record metadata, held by internal id.
+//! The per record metadata, held by position.
 //!
-//! One entry per internal id the collection has issued, and a record's fields
-//! in one block behind it. A record that carries no metadata costs its entry
+//! One entry per position assigned since the last close-up, and a record's
+//! fields in one block behind it. A record that carries no metadata costs its entry
 //! and nothing else, which is sixteen bytes, and a record that carries fields
 //! costs one block of forty bytes a field beside the text of its string
 //! values. Field names are interned once for the whole store, so a record
@@ -12,19 +12,20 @@
 //! whether the record carried anything or not, and a record with two small
 //! fields paid a four bucket inner table of 56 byte buckets, 244 bytes, for
 //! sixteen bytes of payload. Every reader of a record's metadata already held
-//! the internal id or reached the forward map first, so nothing needed the
-//! external key.
+//! the record's position or reached the forward map first, so nothing needed
+//! the external key.
 //!
 //! **What comes back is the same mapping.** [`RecordFields::to_map`] rebuilds
 //! the `HashMap<String, Value>` a caller handed in, and [`FieldLookup`] lets a
 //! filter read a field without rebuilding anything. `metadata.json` is written
 //! from and read into the same shape it always was.
 //!
-//! Internal ids are never reused, and `compact` re-inserts every record under
-//! the id it already holds, so the entry vector grows with the id counter and
-//! a removed record leaves a sixteen byte hole until `clear`. The vector is
-//! reserved for the declared record count, under a cap, and grows by doubling
-//! past it, which is the rule the graph's per node arrays follow.
+//! A record takes the next position when it is inserted, so the entry vector
+//! grows with the records inserted since the last close-up and a removed
+//! record leaves a sixteen byte hole until the next one, which
+//! [`MetadataStore::close_up`] makes. The vector is reserved for the declared
+//! record count, under a cap, and grows by doubling past it, which is the
+//! rule the graph's per node arrays follow.
 
 use crate::filter::FieldLookup;
 use serde_json::Value;
@@ -44,14 +45,14 @@ struct Field {
     value: Value,
 }
 
-/// Every record's metadata, indexed by internal id.
+/// Every record's metadata, indexed by position.
 pub struct MetadataStore {
     /// Field names in the order first seen, indexed by symbol.
     names: Vec<String>,
     /// Field name to symbol.
     symbols: HashMap<String, u32>,
-    /// One slot per internal id issued. `None` is a record that holds no
-    /// entry, which is a removed record or one no insertion has reached.
+    /// One slot per position. `None` is a position that holds no entry,
+    /// which is a hole a removal left or one no insertion has reached.
     /// `Some` of an empty block is a record inserted with no fields, which
     /// is distinct: a filter judges an empty mapping and never judges an
     /// absent one.
@@ -63,9 +64,9 @@ pub struct MetadataStore {
 impl MetadataStore {
     /// An empty store reserved for `expected_size` records, under the cap.
     ///
-    /// One slot more than the declaration, because internal ids are issued
-    /// from one and the slot is the id, so a declaration filled exactly
-    /// reaches slot `expected_size` and would double the vector for it.
+    /// One slot more than the declaration, which is the reservation the
+    /// store took while a slot was an internal id issued from one, kept so
+    /// that a declaration costs what it always cost.
     pub fn new(expected_size: usize) -> Self {
         MetadataStore {
             names: Vec::new(),
@@ -126,6 +127,35 @@ impl MetadataStore {
         *self = MetadataStore::new(expected_size);
     }
 
+    /// Move every record held to the front, keeping their order, so the
+    /// record at `old_of_new[k]` is at `k` and the store reaches no further
+    /// than the records it holds. `old_of_new` lists the positions held in
+    /// increasing order. Each block moves where it is; nothing is copied.
+    /// The vector then gives back what it holds past the records or the
+    /// reservation for `expected_size`, whichever is more.
+    pub fn close_up(&mut self, old_of_new: &[u32], expected_size: usize) {
+        for (k, &old) in old_of_new.iter().enumerate() {
+            // A record past the slots is one no insertion reached, which
+            // holds no entry, and nothing is past it either.
+            if k >= self.records.len() {
+                break;
+            }
+            let entry = self.records.get_mut(old as usize).and_then(Option::take);
+            self.records[k] = entry;
+        }
+        self.records.truncate(old_of_new.len());
+        self.records.shrink_to(
+            old_of_new
+                .len()
+                .max(expected_size.saturating_add(1).min(RESERVE_CAP)),
+        );
+    }
+
+    /// One past the last position the store holds a slot for.
+    pub fn extent(&self) -> usize {
+        self.records.len()
+    }
+
     /// The record at `slot`, or `None` where it holds no entry.
     #[inline]
     pub fn get(&self, slot: usize) -> Option<RecordFields<'_>> {
@@ -146,7 +176,8 @@ impl MetadataStore {
         self.held == 0
     }
 
-    /// Every record holding an entry, in increasing internal id order.
+    /// Every record holding an entry, in increasing position, which is
+    /// internal id order.
     pub fn iter(&self) -> impl Iterator<Item = (usize, RecordFields<'_>)> + '_ {
         self.records.iter().enumerate().filter_map(|(slot, entry)| {
             entry.as_deref().map(|fields| {
@@ -375,5 +406,62 @@ mod tests {
         store.clear(7);
         assert_eq!(store.heap_bytes(), empty);
         assert!(store.is_empty());
+    }
+
+    /// A store most of whose records were removed keeps them at scattered
+    /// positions until the close-up, which moves every record's block to the
+    /// front in its order and leaves the entries costing what the records
+    /// cost, sixteen bytes a record beside its block, rather than sixteen
+    /// for every position the store reached. Every record reads back at its
+    /// new position, the walk visits them in order and a removal answers as
+    /// before.
+    #[test]
+    fn a_store_over_scattered_ids_costs_what_its_records_cost() {
+        let total = 21_000usize;
+        let mut store = MetadataStore::new(16);
+        for slot in 0..total {
+            store.insert(slot, record(&[("n", json!(slot))]));
+        }
+        let kept: Vec<usize> = (0..total).filter(|slot| slot % 70 == 3).collect();
+        for slot in (0..total).filter(|slot| slot % 70 != 3) {
+            assert!(store.remove(slot));
+        }
+        assert_eq!(store.len(), kept.len());
+        assert_eq!(store.extent(), total, "a removal leaves a hole");
+
+        let old_of_new: Vec<u32> = kept.iter().map(|&slot| slot as u32).collect();
+        store.close_up(&old_of_new, 16);
+        assert_eq!(store.extent(), kept.len());
+        assert_eq!(store.records.capacity(), kept.len());
+        let blocks = kept.len() * 40;
+        let names = store.names.capacity() * std::mem::size_of::<String>() + "n".len();
+        assert_eq!(store.heap_bytes(), kept.len() * 16 + blocks + names);
+
+        for (k, &old) in kept.iter().enumerate() {
+            assert_eq!(store.get(k).unwrap().field("n"), Some(&json!(old)));
+        }
+        assert!(store.get(kept.len()).is_none());
+        let walked: Vec<usize> = store.iter().map(|(slot, _)| slot).collect();
+        assert_eq!(walked, (0..kept.len()).collect::<Vec<_>>());
+        assert!(store.remove(7));
+        assert!(!store.remove(7));
+        assert_eq!(store.len(), kept.len() - 1);
+    }
+
+    /// A close-up keeps the reservation the declaration made, and a record
+    /// past the last one any insertion reached holds no entry to move.
+    #[test]
+    fn a_close_up_keeps_the_declared_reservation() {
+        let mut store = MetadataStore::new(100);
+        for slot in 0..3_000usize {
+            store.insert(slot, record(&[("n", json!(slot))]));
+        }
+        for slot in 5..3_000usize {
+            assert!(store.remove(slot));
+        }
+        store.close_up(&[0, 1, 2, 3, 4], 100);
+        assert_eq!(store.extent(), 5);
+        assert_eq!(store.records.capacity(), 101);
+        assert_eq!(store.get(4).unwrap().field("n"), Some(&json!(4)));
     }
 }

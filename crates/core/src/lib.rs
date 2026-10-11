@@ -96,8 +96,9 @@ pub use pq::PQ;
 pub use rng::SeededRng;
 pub use space::{
     read_artefact, write_artefact, ArtefactRecord, Bounds, Budget, CorpusStats, Cost, Dense, Hit,
-    Hits, IdfScope, Inventory, Kind, Ledger, Persist, Position, Prepared, RecordId, Restore,
-    ScoreKind, Selectivity, SpaceKind, SpaceName, Sparse, SparseRef, SparseVector, VectorIndex,
+    Hits, IdfScope, Inventory, Kind, Ledger, Persist, Position, PositionWalk, Prepared, RecordId,
+    Restore, ScoreKind, Selectivity, SpaceKind, SpaceName, Sparse, SparseRef, SparseVector,
+    VectorIndex,
 };
 pub use storage::{
     ArtefactWriter, Dir, FsDir, FsStorage, JournalFile, Staged, Storage, JOURNAL_SUFFIX,

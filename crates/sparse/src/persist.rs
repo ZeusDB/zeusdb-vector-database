@@ -30,10 +30,20 @@
 //! eight bytes a nonzero. Each `id` is held below `slots` and above the one
 //! before it. Nothing is sized from a field before the field is held to
 //! something the file has earned.
+//!
+//! # Ids and positions
+//!
+//! The index keys every record by its position and the artefact names every
+//! record by its internal id, so the save is handed each position's internal
+//! id and the restore each internal id's position, being the collection's
+//! mappings in position order. Positions follow internal id order, so the
+//! records the save writes in position order are in increasing internal id,
+//! and the restore finds each record's position by a step forward.
 
 use zeusdb_vector_core::{
     frame_begin, frame_finish, read_artefact, unframe, write_artefact, ArtefactRecord, Bounds, Dir,
-    Error, FrameEncoding, FrameKind, Inventory, Ledger, Position, RecordId, SparseRef,
+    Error, FrameEncoding, FrameKind, Inventory, Ledger, Position, PositionWalk, RecordId,
+    SparseRef,
 };
 
 use crate::index::{PostingsIndex, SparseConfig};
@@ -51,8 +61,16 @@ pub(crate) fn artefact_name(prefix: &str) -> String {
     format!("{prefix}postings.zdbsparse")
 }
 
-/// The artefact's bytes, frame included, built in one buffer.
+/// The artefact's bytes, frame included, built in one buffer, each record
+/// named by its position, as an index filled on its own keys them.
+#[cfg(test)]
 pub(crate) fn encode(index: &PostingsIndex) -> Vec<u8> {
+    encode_with(index, &|at| at as u32)
+}
+
+/// The artefact's bytes, frame included, built in one buffer, the record at
+/// each position named by the internal id `id_of` gives it.
+pub(crate) fn encode_with(index: &PostingsIndex, id_of: &dyn Fn(usize) -> u32) -> Vec<u8> {
     let mut payload = frame_begin(
         FrameKind::SparsePostings,
         FrameEncoding::Engine,
@@ -60,12 +78,12 @@ pub(crate) fn encode(index: &PostingsIndex) -> Vec<u8> {
     );
     payload.extend((index.slot_count() as u32).to_le_bytes());
     payload.extend((index.live as u32).to_le_bytes());
-    for (id, slot) in index.records.iter().enumerate() {
-        if !slot.held() || index.dead.contains(id) {
+    for (at, slot) in index.records.iter().enumerate() {
+        if !slot.held() || index.dead.contains(at) {
             continue;
         }
         let v = index.forward(*slot);
-        payload.extend((id as u32).to_le_bytes());
+        payload.extend(id_of(at).to_le_bytes());
         payload.extend((v.dims.len() as u32).to_le_bytes());
         for d in v.dims {
             payload.extend(d.to_le_bytes());
@@ -82,8 +100,9 @@ pub(crate) fn write(
     prefix: &str,
     dir: &dyn Dir,
     ledger: &mut dyn Ledger,
+    id_of: &dyn Fn(usize) -> u32,
 ) -> Result<(), Error> {
-    let bytes = encode(index);
+    let bytes = encode_with(index, id_of);
     let name = artefact_name(prefix);
     // The frame carries a checksum over the payload and the reader verifies
     // it, so the manifest records the length alone, as it does for the
@@ -113,6 +132,14 @@ pub(crate) fn restore(
 
 /// An index from the artefact's bytes, refusing each way they can be wrong
 /// by name. `file` names the artefact in the message.
+///
+/// Each record is filed at the position `bounds.ids_by_position` gives its
+/// internal id. A record whose id the list does not hold has no position, so
+/// it is held to its vector's rules as every record is and is not filed, and
+/// once the whole payload has been read the first such id is refused as
+/// [`Error::SparseRecordUnmapped`], with the space left for the caller to
+/// name. Nothing is sized from the slot count, which is the largest id and
+/// not a count of records.
 pub(crate) fn decode(
     bytes: &[u8],
     config: &SparseConfig,
@@ -162,9 +189,14 @@ pub(crate) fn decode(
         )));
     }
     let mut index = PostingsIndex::new(config.clone());
-    // Bounded by the collection's largest id, above.
-    index.records.reserve(slots);
-    index.lengths.reserve(slots);
+    // The positions of the ids below the slot count, which is as far as a
+    // record of this payload can reach.
+    let positions = bounds.ids_by_position;
+    let reach = positions.partition_point(|&id| (id as usize) < slots);
+    index.records.reserve(reach);
+    index.lengths.reserve(reach);
+    let mut walk = PositionWalk::new(positions);
+    let mut unmapped: Option<u32> = None;
     let mut dims: Vec<u32> = Vec::new();
     let mut values: Vec<f32> = Vec::new();
     let mut last_id: Option<u32> = None;
@@ -207,22 +239,34 @@ pub(crate) fn decode(
             values.push(f32_of(take(4)?));
         }
         consumed += nnz * NONZERO_BYTES;
-        index
-            .insert_record(
-                Position(id),
-                RecordId(id),
-                SparseRef {
-                    dims: &dims,
-                    values: &values,
-                },
-            )
-            .map_err(|e| corrupt(format!("record {}: {}", id, e)))?;
+        let vector = SparseRef {
+            dims: &dims,
+            values: &values,
+        };
+        match walk.position_of(id as usize) {
+            Some(at) => index
+                .insert_record(Position::from_slot(at), RecordId(id), vector)
+                .map_err(|e| corrupt(format!("record {}: {}", id, e)))?,
+            None => {
+                config
+                    .weighting
+                    .validate_record(vector)
+                    .map_err(|e| corrupt(format!("record {}: {}", id, e)))?;
+                unmapped.get_or_insert(id);
+            }
+        }
     }
     if consumed != payload.len() {
         return Err(corrupt(format!(
             "{} bytes follow the last record the payload declares",
             payload.len() - consumed
         )));
+    }
+    if let Some(id) = unmapped {
+        return Err(Error::SparseRecordUnmapped {
+            space: String::new(),
+            id,
+        });
     }
     index.calibrate();
     Ok(index)
@@ -276,11 +320,12 @@ mod tests {
         }
     }
 
-    fn bounds() -> Bounds {
+    fn bounds() -> Bounds<'static> {
         Bounds {
             min_records: 0,
             max_records: 1 << 20,
             max_bytes: 1 << 30,
+            ids_by_position: crate::identity_positions(1 << 20),
         }
     }
 
@@ -593,12 +638,119 @@ mod tests {
             min_records: 0,
             max_records: far(59) as usize,
             max_bytes: 1 << 30,
+            ids_by_position: crate::identity_positions(far(59) as usize),
         };
         let restored = decode(&bytes, index.config(), &bounds, "postings").unwrap();
         assert_eq!(restored.slot_count(), far(59) as usize + 1);
         assert_eq!(encode(&restored), bytes);
         for k in 0..60u32 {
             assert_eq!(restored.holds(Position(far(k))), k != 30);
+        }
+    }
+
+    /// A space whose records sit at dense positions, each saved under the
+    /// internal id its position names, writes the bytes a space keyed by the
+    /// internal ids themselves writes, and reads them back with each record
+    /// at the position the mappings give its id, to the same bytes again.
+    /// The refusals are the ones a space keyed by internal id met: a slot
+    /// count past the largest id the mappings hold, which a save makes once
+    /// the newest record with a sparse half is gone, and a record whose id
+    /// the mappings do not hold, named once the payload is read whole.
+    #[test]
+    fn a_space_at_dense_positions_writes_and_reads_the_bytes_ids_write() {
+        let far = |k: u32| 3 + k * 1_009;
+        let config = SparseConfig {
+            unlink: Unlink::Lazy,
+            weighting: Weighting::Bm25 { k1: 1.2, b: 0.75 },
+            ..SparseConfig::default()
+        };
+        let vector = |k: u32| SparseVector {
+            dims: vec![k % 7, 10 + k % 5, 20 + k % 3],
+            values: vec![1.0, 2.0 + (k % 4) as f32, 3.0],
+        };
+        let mut by_id = PostingsIndex::new(config.clone());
+        let mut by_position = PostingsIndex::new(config.clone());
+        for k in 0..60u32 {
+            by_id
+                .insert(
+                    Position(far(k)),
+                    RecordId(far(k)),
+                    vector(k).as_ref(),
+                    Prepared::none(),
+                )
+                .unwrap();
+            by_position
+                .insert(
+                    Position(k),
+                    RecordId(far(k)),
+                    vector(k).as_ref(),
+                    Prepared::none(),
+                )
+                .unwrap();
+        }
+        for k in [30u32, 41] {
+            by_id.remove(Position(far(k))).unwrap();
+            by_position.remove(Position(k)).unwrap();
+        }
+        let ids: Vec<u32> = (0..60u32)
+            .filter(|k| *k != 30 && *k != 41)
+            .map(far)
+            .collect();
+        let positions_of = |at: usize| far(at as u32);
+        let bytes = encode(&by_id);
+        assert_eq!(encode_with(&by_position, &positions_of), bytes);
+
+        fn bounds(ids: &[u32]) -> Bounds<'_> {
+            Bounds {
+                min_records: 0,
+                max_records: *ids.last().unwrap() as usize,
+                max_bytes: 1 << 30,
+                ids_by_position: ids,
+            }
+        }
+        let restored = decode(&bytes, &config, &bounds(&ids), "postings").unwrap();
+        assert_eq!(restored.len(), 58);
+        assert_eq!(restored.extent(), 58);
+        assert!(restored.keys_agree());
+        for (at, &id) in ids.iter().enumerate() {
+            let k = (id - 3) / 1_009;
+            let want: f32 = vector(k).values.iter().sum();
+            assert_eq!(restored.length_of(Position(at as u32)), Some(want), "{at}");
+        }
+        assert_eq!(encode_with(&restored, &|at| ids[at]), bytes);
+
+        // The newest record goes, the slot count stays, and the mappings no
+        // longer reach it.
+        by_id.remove(Position(far(59))).unwrap();
+        by_position.remove(Position(59)).unwrap();
+        let bytes = encode(&by_id);
+        assert_eq!(encode_with(&by_position, &positions_of), bytes);
+        let fewer: Vec<u32> = ids.iter().copied().filter(|&id| id != far(59)).collect();
+        let refused = decode(&bytes, &config, &bounds(&fewer), "postings")
+            .err()
+            .expect("a slot count past the mappings is refused");
+        assert_eq!(
+            refused.to_string(),
+            Error::DecodeFailed {
+                file: "postings".to_string(),
+                error: format!(
+                    "the payload declares {} record slots and the collection holds ids up to {}",
+                    far(59) + 1,
+                    far(58)
+                ),
+            }
+            .to_string()
+        );
+
+        // A record the mappings do not hold is read, held to its rules, and
+        // named once the payload is read whole.
+        let bytes = encode(&by_id);
+        let mut missing = fewer.clone();
+        missing.push(far(59));
+        missing.retain(|&id| id != far(10));
+        match decode(&bytes, &config, &bounds(&missing), "postings") {
+            Err(Error::SparseRecordUnmapped { id, .. }) => assert_eq!(id, far(10)),
+            other => panic!("{:?}", other.map(|index| index.len())),
         }
     }
 }

@@ -252,7 +252,7 @@ struct Snapshot {
     id_counter: usize,
     vector_count: usize,
     generated_ids: usize,
-    live_sets_agree: bool,
+    positions_agree: bool,
     records: Vec<RecordSnapshot>,
     codes: Vec<(String, Vec<u8>)>,
     training_ids: Vec<String>,
@@ -281,9 +281,9 @@ impl Snapshot {
         collection.save(dir).unwrap();
         let path = std::path::Path::new(dir);
         let mut ids: Vec<(String, usize)> = collection
-            .ids()
-            .iter()
-            .map(|(internal, id)| (id.to_string(), internal))
+            .internal_ids()
+            .into_iter()
+            .map(|(internal, id)| (id, internal))
             .collect();
         ids.sort();
         let views = collection
@@ -339,7 +339,7 @@ impl Snapshot {
             id_counter: collection.id_counter(),
             vector_count: collection.vector_count(),
             generated_ids: collection.generated_ids(),
-            live_sets_agree: collection.live_sets_agree(),
+            positions_agree: collection.positions_agree(),
             records,
             codes,
             training_ids,
@@ -383,7 +383,7 @@ impl Snapshot {
         cmp!(id_counter);
         cmp!(vector_count);
         cmp!(generated_ids);
-        cmp!(live_sets_agree);
+        cmp!(positions_agree);
         cmp!(records);
         cmp!(codes);
         cmp!(training_ids);
@@ -545,7 +545,7 @@ fn the_seam_hands_records_over_in_the_order_the_mutations_ran() {
             ..
         } = decode(i, *kind, payload, 4)
         {
-            assert_eq!(collection.ids().slot_of(&id), Some(internal_id as usize));
+            assert_eq!(collection.internal_id_of(&id), Some(internal_id as usize));
             assert!(level < 16);
             let sparse = sparse.expect("a text record carries its counted terms");
             assert!(sparse.dims.windows(2).all(|w| w[0] < w[1]));
@@ -749,8 +749,8 @@ fn a_sink_that_refuses_leaves_the_collection_as_it_was() {
     // Detached, everything runs again and the next ids follow the counter.
     assert!(collection.detach_sink().is_some());
     add(&collection, vec![record(2, &vectors), record(3, &vectors)]);
-    assert_eq!(collection.ids().slot_of("r2"), Some(3));
-    assert_eq!(collection.ids().slot_of("r3"), Some(4));
+    assert_eq!(collection.internal_id_of("r2"), Some(3));
+    assert_eq!(collection.internal_id_of("r3"), Some(4));
 }
 
 /// A record whose journal payload would be above the ceiling is refused at
@@ -1059,7 +1059,7 @@ fn apply_refuses_a_record_that_does_not_belong_to_the_collection() {
     // And a record that does belong is applied, the id issued being the one
     // it names and the record installed at the level it names.
     collection.apply(insert(1, vec![0.5; 4], None)).unwrap();
-    assert_eq!(collection.ids().slot_of("r0"), Some(1));
+    assert_eq!(collection.internal_id_of("r0"), Some(1));
     assert_eq!(collection.id_counter(), 1);
     mismatch(insert(1, vec![0.5; 4], None), "already holds it");
 }

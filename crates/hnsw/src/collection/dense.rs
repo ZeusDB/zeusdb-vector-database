@@ -41,7 +41,8 @@
 //!
 //! # The tie rule
 //!
-//! An exact page is ordered by distance and then by internal id, and it is
+//! An exact page is ordered by distance and then by position, which is
+//! internal id order, and it is
 //! cut to `k` keeping every record tied at the distance of the last member
 //! where the caller asked for that. The collection orders equal distances by
 //! external id string, a rule that predates this seam and that every recorded
@@ -89,6 +90,24 @@ use zeusdb_vector_core::{
 /// The empty marker, being a position that holds no record or a node that
 /// holds none.
 const NONE: u32 = Position::NONE;
+
+/// The internal id of the record at each position, borrowed from the dense
+/// index: its node for each position and the graph's origin id for each
+/// node. See [`DenseIndex::ids_by_position`].
+pub(crate) struct IdsByPosition<'a> {
+    node_at: &'a [u32],
+    origin_ids: &'a [usize],
+}
+
+impl IdsByPosition<'_> {
+    /// The internal id of the record at `at`, where the index holds one.
+    pub(crate) fn get(&self, at: usize) -> Option<usize> {
+        match self.node_at.get(at) {
+            Some(&node) if node != NONE => Some(self.origin_ids[node as usize]),
+            _ => None,
+        }
+    }
+}
 
 use super::search::FULL_SCAN_THRESHOLD;
 use crate::{prepare_reconstruction, raw_distance_fn, reconstruction_needs_unit, RawVectors};
@@ -304,7 +323,6 @@ impl DenseIndex {
     }
 
     /// The node of the record at `at`, where this index holds one.
-    #[inline]
     pub(crate) fn node_of(&self, at: Position) -> Option<u32> {
         match self.node_at.get(at.slot()) {
             Some(&node) if node != NONE => Some(node),
@@ -319,15 +337,51 @@ impl DenseIndex {
         self.node_at.capacity() * std::mem::size_of::<u32>()
     }
 
+    /// Bytes of that request no position has been written into, which
+    /// [`DenseIndex::shrink_to_fit`] returns to the allocator.
+    pub(crate) fn node_at_reserved_bytes(&self) -> usize {
+        (self.node_at.capacity() - self.node_at.len()) * std::mem::size_of::<u32>()
+    }
+
+    /// The internal id of the record at `at`, being the id its node was
+    /// inserted under, where this index holds one, for a test reading one
+    /// record. A pass over many records takes
+    /// [`DenseIndex::ids_by_position`] once.
+    #[cfg(test)]
+    pub(crate) fn internal_id_at(&self, at: usize) -> Option<usize> {
+        self.ids_by_position().get(at)
+    }
+
+    /// The internal id of the record at each position, read as two plain
+    /// reads a position, `node_at` and then the graph's origin ids.
+    pub(crate) fn ids_by_position(&self) -> IdsByPosition<'_> {
+        IdsByPosition {
+            node_at: &self.node_at,
+            origin_ids: self.graph.origin_ids(),
+        }
+    }
+
+    /// Return the graph's spare capacity and the numbering's to the
+    /// allocator, and report the bytes released. `node_at` gives back its
+    /// slack here, as the map from an id to its node gave back its slack
+    /// with the graph it sat in.
+    pub(crate) fn shrink_to_fit(&mut self) -> usize {
+        let before = self.node_at_heap_bytes();
+        self.node_at.shrink_to_fit();
+        let numbering = before - self.node_at_heap_bytes();
+        self.graph.shrink_to_fit() + numbering
+    }
+
     /// File the records the collection holds, at the positions `positions`
-    /// gives, under the nodes of the graph the index holds, which the loader
-    /// does once the id mappings are back.
+    /// gives, under the nodes the graph files them at, which the loader does
+    /// once the id mappings are back.
     ///
-    /// A record's position is its internal id, so the node a record sits at
-    /// is the node whose origin id is that position. Every node whose record
-    /// the collection does not hold is stranded. Returns how many of the
-    /// positions no node holds, which is zero for a graph built from the
-    /// records and every one of them for the empty graph a load starts from.
+    /// The graph's own numbering names each node's position, as the reader
+    /// numbered a dump against the mappings or a rebuild inserted each record
+    /// at its position. A node whose position is not among `positions` is
+    /// stranded. Returns how many of the positions no node holds, which is
+    /// zero for a graph built or read from the records and every one of them
+    /// for the empty graph a load starts from.
     pub(crate) fn set_live<I: IntoIterator<Item = usize>>(&mut self, positions: I) -> usize {
         let mut held = Bitmap::default();
         let mut count = 0;
@@ -340,11 +394,10 @@ impl DenseIndex {
         let mut node_at = vec![NONE; extent];
         let mut placed = 0;
         let mut every = true;
-        let (origins, records) = self.graph.numbering_mut();
-        for (node, (&origin, record)) in origins.iter().zip(records.iter_mut()).enumerate() {
-            if held.contains(origin) {
-                node_at[origin] = node as u32;
-                *record = origin as u32;
+        for (node, record) in self.graph.records_mut().iter_mut().enumerate() {
+            let at = *record as usize;
+            if *record != NONE && held.contains(at) && node_at[at] == NONE {
+                node_at[at] = node as u32;
                 placed += 1;
             } else {
                 *record = NONE;
@@ -355,6 +408,26 @@ impl DenseIndex {
         self.live_count = placed;
         self.every_node_live = every;
         count - placed
+    }
+
+    /// The index's half of a close-up, where the graph stays: the node of
+    /// the record at `old_of_new[k]` moves to `k` in `node_at`, and the graph
+    /// files that node's record at `k`. `old_of_new` lists the positions held
+    /// in increasing order. A stranded node keeps the empty marker, so no
+    /// node changes and `every_node_live` holds what it held. `node_at` gives
+    /// back what it holds past the records or the reservation the graph
+    /// holds for its nodes, whichever is more. The graph's positions are
+    /// written through one borrow of them rather than a call a node.
+    pub(crate) fn close_up(&mut self, old_of_new: &[u32]) {
+        let records = self.graph.records_mut();
+        for (k, &old) in old_of_new.iter().enumerate() {
+            let node = self.node_at[old as usize];
+            self.node_at[k] = node;
+            records[node as usize] = k as u32;
+        }
+        self.node_at.truncate(old_of_new.len());
+        self.node_at
+            .shrink_to(old_of_new.len().max(reserved_by(&self.graph)));
     }
 
     /// Swap the graph and keep the records, which is what a compaction, a
@@ -405,12 +478,14 @@ impl DenseIndex {
     }
 
     /// Whether the two directions of the numbering agree: every position
-    /// held names a node that names it back, every other node is stranded,
-    /// the live count is the positions held, and the flag the unfiltered
-    /// search reads is true exactly where no node is stranded.
+    /// held names a node that names it back, the nodes of the positions held
+    /// carry internal ids rising with their positions, every other node is
+    /// stranded, the live count is the positions held, and the flag the
+    /// unfiltered search reads is true exactly where no node is stranded.
     pub(crate) fn numbering_agrees(&self) -> bool {
         let records = self.graph.records();
         let mut held = 0;
+        let mut last_id: Option<usize> = None;
         for (at, &node) in self.node_at.iter().enumerate() {
             if node == NONE {
                 continue;
@@ -419,6 +494,11 @@ impl DenseIndex {
             if records.get(node as usize) != Some(&(at as u32)) {
                 return false;
             }
+            let id = self.graph.origin_id_at(node);
+            if last_id.is_some_and(|last| id <= last) {
+                return false;
+            }
+            last_id = Some(id);
         }
         let filed = records.iter().filter(|&&position| position != NONE).count();
         let every = filed == records.len();
@@ -691,6 +771,69 @@ impl DenseIndex {
         }
     }
 
+    /// The traversal under `admit`, whatever the admit set's size, for a
+    /// test that compares each predicate's page with a reference.
+    #[cfg(test)]
+    pub(crate) fn traverse_under(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        admit: &dyn Admit,
+    ) -> Hits {
+        self.traverse(query, k, ef, admit)
+    }
+
+    /// The page this graph answers under a test of each candidate's internal
+    /// id, read through the nodes' origin ids, as `(internal id, score)`.
+    ///
+    /// For the traversal every node names its internal id where it names
+    /// its position, and the positions are put back after it, so the
+    /// traversal is the one the graph ran before records had positions and
+    /// `admits` is asked about internal ids alone, stranded nodes included.
+    /// The scores are put on the scale `traverse` reports.
+    #[cfg(test)]
+    pub(crate) fn traverse_by_id(
+        &mut self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        admits: &dyn Fn(usize) -> bool,
+    ) -> Vec<(usize, f32)> {
+        let positions = self.graph.records().to_vec();
+        let ids: Vec<u32> = (0..positions.len() as u32)
+            .map(|node| self.graph.origin_id_at(node) as u32)
+            .collect();
+        self.graph.records_mut().copy_from_slice(&ids);
+        let hits = self
+            .graph
+            .search(query, k, ef, Some(&|id: &usize| admits(*id)))
+            .unwrap();
+        self.graph.records_mut().copy_from_slice(&positions);
+        let rooted = self.graph.is_pq() && self.metric == "l2";
+        hits.into_iter()
+            .map(|hit| {
+                let score = if rooted {
+                    hit.distance.max(0.0).sqrt()
+                } else {
+                    hit.distance
+                };
+                (hit.position, score)
+            })
+            .collect()
+    }
+
+    /// The score the exact scan gives the record one node holds.
+    #[cfg(test)]
+    pub(crate) fn exact_distance_of_node(&self, query: &[f32], node: u32) -> f32 {
+        self.exact_distance_at(
+            query,
+            node,
+            raw_distance_fn(&self.metric),
+            reconstruction_needs_unit(&self.metric),
+        )
+    }
+
     /// Draw the level the next record's node takes, advancing the graph's
     /// level stream by one draw. See `VectorGraph::draw_level`.
     pub(crate) fn draw_level(&self) -> usize {
@@ -780,7 +923,6 @@ impl VectorIndex<Dense> for DenseIndex {
         self.live_count
     }
 
-    #[inline]
     fn holds(&self, at: Position) -> bool {
         self.node_of(at).is_some()
     }
@@ -931,11 +1073,10 @@ impl VectorIndex<Dense> for DenseIndex {
     }
 }
 
-/// The positions an index over `graph` reserves, being one past the nodes the
-/// graph reserved for, since a position is an internal id and ids start at
-/// one, which is the reservation the declared size took for the map from an
-/// id to its node. Nothing where the graph already holds a node, since the
-/// records are filed from the graph then.
+/// The positions an index over `graph` reserves, being the nodes the graph
+/// reserved for, since positions count from zero and every position names a
+/// node. Nothing where the graph already holds a node, since the records are
+/// filed from the graph then.
 fn reserved_positions(graph: &VectorGraph) -> usize {
     if graph.nb_points() == 0 {
         reserved_by(graph)
@@ -945,13 +1086,9 @@ fn reserved_positions(graph: &VectorGraph) -> usize {
 }
 
 /// The positions the reservation `graph` holds for its nodes covers, being
-/// one past it, as the map from an id to its node was reserved one past the
-/// nodes, and nothing where the graph reserves nothing.
+/// one a node.
 fn reserved_by(graph: &VectorGraph) -> usize {
-    match graph.record_capacity() {
-        0 => 0,
-        nodes => nodes + 1,
-    }
+    graph.record_capacity()
 }
 
 /// Whether every node `graph` holds holds a record at a position `node_at`
@@ -1021,15 +1158,17 @@ impl Restore for DenseIndex {
     /// because a self-consistent dump from a different save of an index of
     /// the same shape would otherwise pass the dump's own checksums. Every
     /// error is a reason to rebuild rather than to fail, which the caller
-    /// decides. The index comes back holding no record and the caller files
-    /// the records from the id mappings, which the dump does not carry; see
-    /// [`DenseIndex::set_live`].
+    /// decides. The reader numbers the nodes against the mappings the bounds
+    /// carry, so each node names its record's position or is stranded, and a
+    /// dump naming no node for a record the mappings hold is refused. The
+    /// index comes back holding no record and the caller files the records at
+    /// those positions; see [`DenseIndex::set_live`].
     fn restore(
         config: &DenseOpen,
         prefix: &str,
         dir: &dyn Dir,
         inventory: &dyn Inventory,
-        bounds: &Bounds,
+        bounds: &Bounds<'_>,
     ) -> Result<Self, Error> {
         let name = dump_name(prefix);
         if let Some(recorded) = inventory.recorded(&name) {
@@ -1044,6 +1183,7 @@ impl Restore for DenseIndex {
         let dump_bounds = DumpBounds {
             min_nodes: bounds.min_records,
             max_origin_id: bounds.max_records,
+            positions: Some(bounds.ids_by_position),
         };
         let (graph, _nodes) = match &config.int8 {
             Some(codec) => restore_int8_graph(
@@ -1513,7 +1653,8 @@ mod tests {
     /// A replacement graph hands its reservation to `node_at`, as a training
     /// rebuild's graph held the declared size for the map from an id to its
     /// node, and a shrunk replacement hands over the extent alone, as a
-    /// compaction's did.
+    /// compaction's did. Positions start at zero, so the declaration's
+    /// records need no slot past it.
     #[test]
     fn a_replacement_hands_its_reservation_to_the_numbering() {
         let (count, dim, declared) = (40usize, 8usize, 500usize);
@@ -1522,29 +1663,105 @@ mod tests {
         let rebuilt = || {
             let mut graph = VectorGraph::new_raw("l2", dim, 8, declared, layers, 50);
             for (k, vector) in vectors.iter().enumerate() {
-                graph.insert(vector, k + 1, Position::from_slot(k + 1));
+                graph.insert(vector, k + 1, Position::from_slot(k));
             }
             graph
         };
         let graph = VectorGraph::new_raw("l2", dim, 8, declared, layers, 50);
         let mut index = DenseIndex::new(graph, "l2", dim, None, false);
         for (k, vector) in vectors.iter().enumerate() {
-            put(&mut index, k as u32 + 1, vector);
+            let id = RecordId(k as u32 + 1);
+            let prepared = index.prepare(id, vector).unwrap();
+            index
+                .insert(Position::from_slot(k), id, vector, prepared)
+                .unwrap();
         }
 
         let graph = rebuilt();
         let reserved = graph.record_capacity();
         assert!(reserved >= declared, "the graph holds its declaration");
         index.replace_graph(graph, None);
-        assert_eq!(index.node_at().len(), count + 1);
-        assert_eq!(index.node_at_heap_bytes(), (reserved + 1) * 4);
+        assert_eq!(index.node_at().len(), count);
+        assert_eq!(index.node_at_heap_bytes(), reserved * 4);
         assert!(index.every_node_live && index.numbering_agrees());
 
         let mut shrunk = rebuilt();
         shrunk.shrink_to_fit();
         index.replace_graph(shrunk, None);
-        assert_eq!(index.node_at_heap_bytes(), (count + 1) * 4);
+        assert_eq!(index.node_at_heap_bytes(), count * 4);
         assert!(index.every_node_live && index.numbering_agrees());
+    }
+
+    /// The index's own close-up, where the graph stays, moves the node of
+    /// each record held to the record's new position in `node_at` and files
+    /// the node there in the graph, in order, keeps every stranded node
+    /// stranded and the flag that says so, and gives back what `node_at`
+    /// held past the records or the graph's reservation. A traversal then
+    /// answers what the same graph answers under the test by internal id.
+    #[test]
+    fn the_index_closes_up_its_numbering_where_the_graph_stays() {
+        let (count, dim) = (300usize, 8usize);
+        let vectors = zeusdb_vector_core::test_support::clustered(count, dim, 204);
+        let queries = zeusdb_vector_core::test_support::clustered(8, dim, 2_040);
+        let graph = VectorGraph::new_raw("l2", dim, 8, 16, NB_LAYER_MAX as usize, 50);
+        let mut index = DenseIndex::new(graph, "l2", dim, None, false);
+        for (k, vector) in vectors.iter().enumerate() {
+            let id = RecordId(k as u32 + 1);
+            let prepared = index.prepare(id, vector).unwrap();
+            index
+                .insert(Position::from_slot(k), id, vector, prepared)
+                .unwrap();
+        }
+        for k in (0..count).filter(|k| k % 4 != 2) {
+            index.remove(Position::from_slot(k)).unwrap();
+        }
+        let kept: Vec<u32> = (0..count as u32).filter(|k| k % 4 == 2).collect();
+        let capacity_before = index.node_at.capacity();
+        index.close_up(&kept);
+
+        assert_eq!(index.node_at().len(), kept.len());
+        assert!(index.node_at.capacity() <= capacity_before);
+        assert!(
+            index.node_at.capacity() <= kept.len().max(reserved_by(index.graph())),
+            "node_at keeps no more than the records or the graph's reservation"
+        );
+        assert!(index.numbering_agrees());
+        assert!(!index.every_node_live, "the stranded nodes stay stranded");
+        assert_eq!(index.len(), kept.len());
+        assert_eq!(index.stranded(), count - kept.len());
+        assert_eq!(index.graph().nb_points(), count, "no node moves");
+        for (rank, &old) in kept.iter().enumerate() {
+            let node = index.node_of(Position::from_slot(rank)).unwrap();
+            assert_eq!(node, old, "the node is the one the record held");
+            assert_eq!(index.graph().origin_id_at(node), old as usize + 1);
+            assert_eq!(index.graph().record_of_at(node), rank as u32);
+            assert_eq!(
+                index.raw_vector(rank).unwrap(),
+                vectors[old as usize].as_slice()
+            );
+        }
+        assert!(index.node_of(Position::from_slot(kept.len())).is_none());
+
+        let held: Vec<usize> = kept.iter().map(|&k| k as usize + 1).collect();
+        for query in &queries {
+            let page: Vec<(usize, u32)> = index
+                .traverse_under(query, 10, 40, &Candidates::All)
+                .items
+                .iter()
+                .map(|hit| {
+                    (
+                        index.internal_id_at(hit.position.slot()).unwrap(),
+                        hit.score.to_bits(),
+                    )
+                })
+                .collect();
+            let reference: Vec<(usize, u32)> = index
+                .traverse_by_id(query, 10, 40, &|id| held.binary_search(&id).is_ok())
+                .into_iter()
+                .map(|(id, score)| (id, score.to_bits()))
+                .collect();
+            assert_eq!(page, reference);
+        }
     }
 
     fn traversed(index: &DenseIndex, query: &[f32], admit: &dyn Admit) -> Vec<(u32, u32)> {

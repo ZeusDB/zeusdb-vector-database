@@ -929,18 +929,18 @@ impl VectorGraph {
         self.records()[node as usize]
     }
 
-    /// Every node's origin id, and every node's position to write, indexed by
-    /// node, for a pass that files the records a load holds.
-    pub fn numbering_mut(&mut self) -> (&[usize], &mut [u32]) {
+    /// Every node's position to write, indexed by node, for a pass that
+    /// files the records a load holds.
+    pub fn records_mut(&mut self) -> &mut [u32] {
         match self {
-            VectorGraph::Cosine(b) => b.graph.numbering_mut(),
-            VectorGraph::L2(b) => b.graph.numbering_mut(),
-            VectorGraph::L1(b) => b.graph.numbering_mut(),
-            VectorGraph::Dot(b) => b.graph.numbering_mut(),
-            VectorGraph::CosinePQ(b) => b.graph.numbering_mut(),
-            VectorGraph::L2PQ(b) => b.graph.numbering_mut(),
-            VectorGraph::L1PQ(b) => b.graph.numbering_mut(),
-            VectorGraph::Int8(b) => b.graph.numbering_mut(),
+            VectorGraph::Cosine(b) => b.graph.records_mut(),
+            VectorGraph::L2(b) => b.graph.records_mut(),
+            VectorGraph::L1(b) => b.graph.records_mut(),
+            VectorGraph::Dot(b) => b.graph.records_mut(),
+            VectorGraph::CosinePQ(b) => b.graph.records_mut(),
+            VectorGraph::L2PQ(b) => b.graph.records_mut(),
+            VectorGraph::L1PQ(b) => b.graph.records_mut(),
+            VectorGraph::Int8(b) => b.graph.records_mut(),
         }
     }
 
@@ -957,6 +957,21 @@ impl VectorGraph {
             VectorGraph::L2PQ(b) => b.graph.set_record_of(node, position),
             VectorGraph::L1PQ(b) => b.graph.set_record_of(node, position),
             VectorGraph::Int8(b) => b.graph.set_record_of(node, position),
+        }
+    }
+
+    /// Every node's internal id, indexed by node, for a pass over many
+    /// nodes that reads each with one plain read.
+    pub fn origin_ids(&self) -> &[usize] {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.origin_ids(),
+            VectorGraph::L2(b) => b.graph.origin_ids(),
+            VectorGraph::L1(b) => b.graph.origin_ids(),
+            VectorGraph::Dot(b) => b.graph.origin_ids(),
+            VectorGraph::CosinePQ(b) => b.graph.origin_ids(),
+            VectorGraph::L2PQ(b) => b.graph.origin_ids(),
+            VectorGraph::L1PQ(b) => b.graph.origin_ids(),
+            VectorGraph::Int8(b) => b.graph.origin_ids(),
         }
     }
 
@@ -1375,8 +1390,9 @@ impl VectorGraph {
     /// whose node numbering is its own. The raws are re-addressed rather than
     /// re-derived, so nothing is quantized, reconstructed or lost, and a record
     /// the source cannot supply is an error rather than a gap. Each node of
-    /// this graph names its record's position, and `source_node_at` is the
-    /// source's node at each position.
+    /// this graph names the position it files its record at, and
+    /// `source_node_at` names, for each such position, the node of the same
+    /// record in `source`.
     pub fn adopt_raw_from(
         &mut self,
         source: &VectorGraph,
@@ -1803,22 +1819,31 @@ impl VectorGraph {
 // RESTORING THE SAVED GRAPH
 // ============================================================================
 
-/// What the directory says the dump has to sit within.
+/// What the directory says the dump has to sit within, and the records its
+/// nodes are filed for.
 ///
 /// Two numbers, both read from the directory rather than from the dump, and
 /// both checked before the reader allocates from anything the file declares.
-/// They travel together because they are the same kind of claim.
+/// They travel together because they are the same kind of claim. Beside them
+/// is the list of records the mappings hold, which numbers the nodes.
 #[derive(Clone, Copy)]
-pub struct DumpBounds {
+pub struct DumpBounds<'a> {
     /// The live record count. The graph holds at least this many nodes and
     /// holds more whenever a removal or an overwrite has stranded one.
     pub min_nodes: usize,
     /// `config.json`'s `id_counter`, being the largest internal id the index
     /// has ever issued.
     ///
-    /// **This is what bounds the loaded graph's memory.** See
-    /// `dump::Expected::max_origin_id`, which is where it is checked and why.
+    /// See `dump::Expected::max_origin_id`, which is where it is checked and
+    /// why.
     pub max_origin_id: usize,
+    /// The internal id of the record at each position, in increasing order,
+    /// being the records the mappings hold. A node whose origin id it holds
+    /// takes that id's position, any other node is stranded, and an id it
+    /// holds that no node carries refuses the dump. `None` files every node
+    /// at the rank of its origin id, which is the graph whose every node
+    /// holds a record.
+    pub positions: Option<&'a [u32]>,
 }
 
 /// Restore the saved graph for one index configuration
@@ -1872,11 +1897,12 @@ pub fn restore_graph(
     ef_construction: usize,
     dim: usize,
     pq: Option<Arc<PQ>>,
-    bounds: DumpBounds,
+    bounds: DumpBounds<'_>,
 ) -> Result<(VectorGraph, usize), String> {
     let DumpBounds {
         min_nodes,
         max_origin_id,
+        positions,
     } = bounds;
     let graph = match pq {
         Some(pq) => {
@@ -1901,11 +1927,12 @@ pub fn restore_graph(
                 GraphKind::CosinePq => PqMetric::Cosine,
                 _ => PqMetric::SquaredL2,
             };
-            let restored = Backend::restored(dump::read_dump::<u8, DistPQ>(
+            let restored = Backend::restored(dump::read_dump_at::<u8, DistPQ>(
                 dir,
                 name,
                 &expected,
                 DistPQ::new(pq, metric),
+                positions,
             )?);
             match kind {
                 GraphKind::L2Pq => VectorGraph::L2PQ(restored),
@@ -1927,8 +1954,8 @@ pub fn restore_graph(
                         min_nodes,
                         max_origin_id,
                     };
-                    VectorGraph::$variant(Backend::restored(dump::read_dump::<f32, $dist>(
-                        dir, name, &expected, $value,
+                    VectorGraph::$variant(Backend::restored(dump::read_dump_at::<f32, $dist>(
+                        dir, name, &expected, $value, positions,
                     )?))
                 }};
             }
@@ -1975,7 +2002,7 @@ pub fn restore_int8_graph(
     m: usize,
     ef_construction: usize,
     codec: Arc<Int8Codec>,
-    bounds: DumpBounds,
+    bounds: DumpBounds<'_>,
 ) -> Result<(VectorGraph, usize), String> {
     let kind = int8_kind(space);
     let dist = Int8Dist::new(codec, Int8Metric::from_space(space));
@@ -1987,7 +2014,13 @@ pub fn restore_int8_graph(
         min_nodes: bounds.min_nodes,
         max_origin_id: bounds.max_origin_id,
     };
-    let restored = Backend::restored(dump::read_dump::<i8, Int8Dist>(dir, name, &expected, dist)?);
+    let restored = Backend::restored(dump::read_dump_at::<i8, Int8Dist>(
+        dir,
+        name,
+        &expected,
+        dist,
+        bounds.positions,
+    )?);
     let graph = VectorGraph::Int8(restored);
     let nodes = graph.nb_points();
     Ok((graph, nodes))
