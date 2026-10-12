@@ -439,6 +439,16 @@ struct Lineage {
 /// rather than a tuning knob.
 const MAX_LAYER: usize = zeusdb_vector_core::NB_LAYER_MAX as usize;
 
+/// The holes a collection keeps between close-ups whatever its size.
+///
+/// A removal leaves a hole at the position of the record it removes, which
+/// costs one entry in each per-record structure until the positions are
+/// closed up. A removal batch that leaves more holes than this and more than
+/// the records held closes them up before it lets its guards go, so after
+/// every mutation the holes number at most this or the records held,
+/// whichever is more.
+const HOLE_ALLOWANCE: usize = 4_096;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageMode {
     #[default]
@@ -1217,8 +1227,10 @@ impl Collection {
     /// search reads says whether any is. A hole holds no metadata, no node and
     /// no column entry. `node_at` and the id store reach the extent, every
     /// other structure reaches no further, and the extent is within the
-    /// graph's nodes. The id store's table names each record held once, and
-    /// the sparse space's keys are positions it holds, each list in order.
+    /// graph's nodes. The holes number at most [`HOLE_ALLOWANCE`] or the
+    /// records held, whichever is more. The id store's table names each
+    /// record held once, and the sparse space's keys are positions it holds,
+    /// each list in order.
     ///
     /// Taken in the declared order, the id store, the index, the sparse
     /// index, the metadata, then the columns.
@@ -1273,6 +1285,7 @@ impl Collection {
         });
         held == ids.len()
             && held == index.len()
+            && extent - held <= HOLE_ALLOWANCE.max(held)
             && ids.table_agrees()
             && index.numbering_agrees()
             && columns.tracks(held)

@@ -5,7 +5,9 @@
 //! three `add_*` paths below `insert_parsed_records` are chosen by whether the
 //! index is quantized and whether it is still collecting for training. Removal
 //! is logical, and `compact` reclaims the graph nodes that removal and
-//! replacement leave behind.
+//! replacement leave behind. A removal batch that leaves more holes than the
+//! allowance and the records held closes the positions up before it lets its
+//! guards go, and the graph keeps its nodes.
 //!
 //! Every mutating operation the binding calls takes `writers` here, first and
 //! before any guard, and the helpers under it never do.
@@ -21,7 +23,7 @@
 
 use super::{
     validate_index_parameters, Collection, DenseIndex, ParsedRecord, ParsedRecords, SparseHalf,
-    StorageMode, MAX_LAYER,
+    StorageMode, HOLE_ALLOWANCE, MAX_LAYER,
 };
 use crate::locks::WriteGuard;
 use serde_json::Value;
@@ -83,6 +85,14 @@ struct RemovalGuards<'a> {
     sparse: Option<WriteGuard<'a, PostingsIndex>>,
     vector_metadata: WriteGuard<'a, MetadataStore>,
     columns: WriteGuard<'a, ColumnStore>,
+}
+
+// How many times the close-up on removal has run on this thread. Read by the
+// tests that hold it to the points it must run at; nothing outside the tests
+// sees it.
+#[cfg(test)]
+thread_local! {
+    pub(super) static CLOSE_UPS_ON_REMOVAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One record past the door and not yet installed.
@@ -530,6 +540,39 @@ impl Collection {
         reclaimed_text
     }
 
+    /// The close-up on removal, run once a removal batch is done, under the
+    /// guards the batch already holds. Returns whether it ran.
+    ///
+    /// Where the holes exceed both [`HOLE_ALLOWANCE`] and the records held,
+    /// every per-record structure is closed up by the routine a compaction
+    /// runs, the sparse space dropping the postings of the records it holds
+    /// dead, and the graph keeps every node. Otherwise nothing moves. The
+    /// pass reads every position held, every bucket and every live posting
+    /// once, and it runs after at least as many removals since the last
+    /// close-up as the allowance or the records held, whichever is more.
+    ///
+    /// A batch is what one removal's record names, so a replay of the
+    /// record closes up at the same point as the removal that wrote it.
+    fn close_up_after_removal(guards: &mut RemovalGuards<'_>, expected_size: usize) -> bool {
+        let held = guards.ids.len();
+        let holes = guards.ids.extent() - held;
+        if holes <= HOLE_ALLOWANCE.max(held) {
+            return false;
+        }
+        let start = Instant::now();
+        let (_, reclaimed_text) = Self::close_up_under_guards(guards, None, expected_size);
+        #[cfg(test)]
+        CLOSE_UPS_ON_REMOVAL.with(|count| count.set(count.get() + 1));
+        debug!(target: LOG_TARGET, operation = "close_up_on_removal",
+            holes = holes,
+            live_records = held,
+            reclaimed_id_bytes = reclaimed_text,
+            duration_ms = start.elapsed().as_millis(),
+            "Positions closed up after a removal"
+        );
+        true
+    }
+
     /// Remove one record with the guards already held.
     ///
     /// `storage_mode` is passed in rather than read, because reading it reaches
@@ -662,12 +705,27 @@ impl Collection {
     /// Internal remove_point method that can be called without Python bindings
     /// This is the core method that properly removes all traces of a document
     /// Enhanced internal remove_point method with comprehensive PQ support
+    ///
+    /// A batch of one record, so the close-up on removal runs after it where
+    /// it is due, under the same guards.
     pub(super) fn remove_point_internal(&self, id: String) -> Result<bool, String> {
         // Read before the guards are taken, because it reaches the graph lock and
         // the declared order puts the graph above every map held below.
         let storage_mode = self.storage_mode();
-        let mut guards = self.removal_guards();
-        Ok(self.remove_under_guards(&mut guards, &id, &storage_mode))
+        let expected_size = self.expected_size();
+        let (removed, closed) = {
+            let mut guards = self.removal_guards();
+            let removed = self.remove_under_guards(&mut guards, &id, &storage_mode);
+            (
+                removed,
+                Self::close_up_after_removal(&mut guards, expected_size),
+            )
+        };
+        debug_assert!(
+            !closed || self.positions_agree(),
+            "the close-up on removal leaves every structure at the positions the records hold"
+        );
+        Ok(removed)
     }
 
     /// Remove a batch of records under one set of guards.
@@ -683,19 +741,31 @@ impl Collection {
     /// which is the whole reason this exists beside `remove_point_internal`.
     /// What that changes for a reader is that the batch is atomic against every
     /// search: none of them sees the index part way through it.
+    ///
+    /// The close-up on removal runs once the batch is done, where it is due,
+    /// under the same guards, and never part way through the batch.
     pub(super) fn remove_points_internal(&self, ids: &[String]) -> Vec<String> {
         let storage_mode = self.storage_mode();
-        let mut guards = self.removal_guards();
-        let mut handled: HashSet<&str> = HashSet::with_capacity(ids.len());
-        let mut missing = Vec::new();
-        for id in ids {
-            if !handled.insert(id.as_str()) {
-                continue;
+        let expected_size = self.expected_size();
+        let (missing, closed) = {
+            let mut guards = self.removal_guards();
+            let mut handled: HashSet<&str> = HashSet::with_capacity(ids.len());
+            let mut missing = Vec::new();
+            for id in ids {
+                if !handled.insert(id.as_str()) {
+                    continue;
+                }
+                if !self.remove_under_guards(&mut guards, id, &storage_mode) {
+                    missing.push(id.clone());
+                }
             }
-            if !self.remove_under_guards(&mut guards, id, &storage_mode) {
-                missing.push(id.clone());
-            }
-        }
+            let closed = Self::close_up_after_removal(&mut guards, expected_size);
+            (missing, closed)
+        };
+        debug_assert!(
+            !closed || self.positions_agree(),
+            "the close-up on removal leaves every structure at the positions the records hold"
+        );
         missing
     }
 
@@ -840,11 +910,16 @@ impl Collection {
         // reclaim is its own whatever the graph holds. A removed record
         // leaves its span in the forward arena even after the lazy rewrite
         // has taken its postings out of every list, so the test is whether
-        // any record is dead rather than whether any posting is. The figure
-        // `compact` reports is the graph's, as it always was.
+        // any record is dead rather than whether any posting is. A close-up
+        // drops the dead records' postings and keeps their spans, so the
+        // test is also whether the arena holds a span no live record owns.
+        // The figure `compact` reports is the graph's, as it always was.
         if let Some(space) = self.sparse() {
-            let dead = space.index.read().unwrap().dead_records();
-            if dead > 0 {
+            let stranded = {
+                let index = space.index.read().unwrap();
+                index.dead_records() > 0 || index.holds_removed_spans()
+            };
+            if stranded {
                 space.index.write().unwrap().compact();
             }
         }
@@ -1220,8 +1295,9 @@ impl Collection {
     /// The complete set of functions reachable from here, verified by reading
     /// each one rather than by inference:
     ///
-    /// - `remove_point_internal`, and through it `get_storage_mode`,
-    ///   `has_quantization` and `can_use_quantization`
+    /// - `remove_points_internal`, and through it `get_storage_mode`,
+    ///   `has_quantization`, `can_use_quantization` and the close-up on
+    ///   removal
     /// - `admit`, and through it `count_record_terms`, the text layer's
     ///   dictionary, `Operation::encode_insert`, `get_next_id`,
     ///   `draw_level` and the sink's `append`
@@ -1346,38 +1422,29 @@ impl Collection {
                 }
 
                 // Batch remove existing documents (handles both raw and PQ data)
+                //
+                // One batch under one set of guards, which is how a replay
+                // applies the removal's record, so the close-up on removal
+                // runs at the same point in both.
+                let missing = self.remove_points_internal(&ids_to_remove);
+                debug_assert!(
+                    missing.is_empty(),
+                    "every id came from the id store under the mutation guard"
+                );
                 let mut removed_count = 0;
-                let mut removal_errors = 0;
-
-                for id in ids_to_remove {
-                    match self.remove_point_internal(id.clone()) {
-                        Ok(was_removed) => {
-                            if was_removed {
-                                removed_count += 1;
-                                trace!(target: LOG_TARGET, operation = "overwrite_removal",
-                                    vector_id = %id,
-                                    "Removed existing vector/codes for overwrite"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            removal_errors += 1;
-                            warn!(target: LOG_TARGET, operation = "overwrite_removal",
-                                vector_id = %id,
-                                error = %e,
-                                "Failed to remove existing vector for overwrite"
-                            );
-                            errors.push(InsertError::Counted(format!(
-                                "Failed to remove existing {}: {}",
-                                id, e
-                            )));
-                        }
+                for id in &ids_to_remove {
+                    if !missing.contains(id) {
+                        removed_count += 1;
+                        trace!(target: LOG_TARGET, operation = "overwrite_removal",
+                            vector_id = %id,
+                            "Removed existing vector/codes for overwrite"
+                        );
                     }
                 }
 
                 info!(target: LOG_TARGET, operation = "overwrite_removal_complete",
                     removed_count = removed_count,
-                    removal_errors = removal_errors,
+                    removal_errors = 0,
                     "Completed removal phase for overwrite"
                 );
             }

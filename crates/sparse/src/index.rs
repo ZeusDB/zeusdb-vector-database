@@ -399,6 +399,14 @@ impl PostingsIndex {
         self.dead_records
     }
 
+    /// Whether the forward arena holds the span of a record the index no
+    /// longer holds live, which only [`PostingsIndex::compact`] rewrites it
+    /// without. A removal leaves its record's span there, and so does a
+    /// close-up, which drops the dead records' postings and keeps their spans.
+    pub fn holds_removed_spans(&self) -> bool {
+        self.fwd_dims.len() > self.live_nnz
+    }
+
     /// Mean live nonzeros per live record.
     pub fn mean_nnz(&self) -> f64 {
         if self.live == 0 {
@@ -1265,6 +1273,10 @@ mod tests {
                 assert!(index.keys_agree(), "{label}");
                 assert_eq!(index.dead_postings(), 0, "{label}");
                 assert_eq!(index.dead_records(), 0, "{label}");
+                assert!(
+                    index.holds_removed_spans(),
+                    "{label}: the arena keeps the removed spans"
+                );
                 assert_eq!(index.slot_count(), slots, "{label}");
                 let last = kept.iter().rposition(|&k| held(k)).unwrap() + 1;
                 assert_eq!(index.extent(), last, "{label}");
@@ -1326,6 +1338,13 @@ mod tests {
                     .unwrap();
                 assert!(index.keys_agree(), "{label}: added after");
                 assert_eq!(index.slot_count(), id(total) as usize + 1);
+                assert!(!twin.holds_removed_spans(), "{label}");
+                index.compact();
+                assert!(
+                    !index.holds_removed_spans(),
+                    "{label}: a compaction rewrites the arena"
+                );
+                assert!(index.keys_agree(), "{label}: compacted");
             }
         }
     }

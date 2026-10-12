@@ -3,37 +3,48 @@
 //! A record's position names it in every per-record structure. Positions run
 //! from zero in internal id order, with no gap but the holes removals leave,
 //! and a compaction, a rebuild, the training rebuild, a load and a clear
-//! close them. One seeded generator drives random sequences of writes on a
-//! collection of up to 2,000 records at dimension 8, beside a reference model
-//! that holds, for each external id, the internal id, the vector, the fields
-//! and the sparse half the record was given. Each run declares one field and
-//! a sparse space, and the runs cover raw, product quantized with and without
-//! raw vectors, and scalar quantized declarations, each with a training size
-//! the sequence crosses.
+//! close them, as does a removal batch that leaves more holes than 4,096 and
+//! the records held. One seeded generator drives random sequences of writes
+//! on a collection of up to 2,000 records at dimension 8, beside a reference
+//! model that holds, for each external id, the internal id, the vector, the
+//! fields and the sparse half the record was given, and the holes each
+//! removal batch leaves. Each run declares one field and a sparse space, and
+//! the runs cover raw, product quantized with and without raw vectors, and
+//! scalar quantized declarations, each with a training size the sequence
+//! crosses. The writes include churn, overwrites of most of the records call
+//! after call, so the close-up on removal runs in every sequence and in the
+//! replay of a journal.
 //!
 //! After every step the collection answers what the model answers. Its
-//! positions agree, its records, ids, fields and sparse halves are the
-//! model's, `count`, `list` and `get_records` are the model's, every exact
-//! path is brute force over the model, and every traversal returns the page
-//! the same graph returns under a test by internal id that the model answers,
-//! read through the nodes' origin ids. After every save the artefacts list
-//! the model's records in increasing internal id, a load answers the same,
-//! and a second save writes the same bytes. After a recovery from a
-//! checkpoint and a journal, the recovered collection answers and saves what
-//! the live one does. After every compaction, rebuild and load, every
-//! per-record structure reaches the records held and no further.
+//! positions agree, its holes and its close-ups on removal are the model's,
+//! its records, ids, fields and sparse halves are the model's, `count`,
+//! `list` and `get_records` are the model's, every exact path is brute force
+//! over the model, and every traversal returns the page the same graph
+//! returns under a test by internal id that the model answers, read through
+//! the nodes' origin ids. After every save the artefacts list the model's
+//! records in increasing internal id, a load answers the same, and a second
+//! save writes the same bytes. After a recovery from a checkpoint and a
+//! journal, the recovered collection holds the holes the model replays and
+//! answers and saves what the live one does. After every compaction, rebuild
+//! and load, every per-record structure reaches the records held and no
+//! further.
+
+#![allow(clippy::disallowed_types)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use zeusdb_vector_core::{
-    compile_filter, matches_filter, unframe, Filter, FrameKind, IdfScope, Position, SparseVector,
-    VectorIndex,
+    compile_filter, matches_filter, unframe, Error, Filter, FrameKind, IdfScope, JournalRecord,
+    Operation, OperationKind, Position, SparseVector, VectorIndex,
 };
-use zeusdb_vector_sparse::{SparseConfig, Weighting};
+use zeusdb_vector_sparse::{SparseConfig, Unlink, Weighting};
 
-use super::{Collection, Declaration, Int8Scale, ParsedRecord, SparseHalf, StorageMode};
+use super::{
+    Collection, Declaration, Int8Scale, OperationSink, ParsedRecord, SparseHalf, StorageMode,
+};
 use crate::journal::Durability;
 
 /// A directory under the system's temporary directory, removed on drop
@@ -120,6 +131,20 @@ const TERMS: u32 = 48;
 /// The page size every search asks for, and the traversal width.
 const K: usize = 10;
 const EF: usize = 40;
+/// The holes a collection keeps whatever its size. A removal batch that
+/// leaves more than this and more than the records held closes them up.
+const ALLOWANCE: usize = 4_096;
+
+/// The close-ups on removal this thread has run, live and in replays.
+fn close_ups() -> usize {
+    super::insert::CLOSE_UPS_ON_REMOVAL.with(|count| count.get())
+}
+
+/// The positions below the extent that hold no record.
+fn holes(collection: &Collection) -> usize {
+    let ids = collection.ids.read().unwrap();
+    ids.extent() - ids.len()
+}
 
 /// What a run declares besides the field and the sparse space.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -148,6 +173,24 @@ struct Model {
     /// One past the largest internal id a sparse half was inserted under
     /// since the space was made or cleared, which the artefact records.
     sparse_slots: usize,
+    /// The positions the collection holds no record at. A removal batch
+    /// adds one for each record it removes and closes them all up where
+    /// they pass the allowance and the records held, and a compaction, a
+    /// rebuild, a training, a load and a clear close them up.
+    holes: usize,
+    /// The close-ups on removal the collection has run.
+    passes: usize,
+    /// While a journal is attached, what a recovery from its last
+    /// checkpoint replays: the checkpoint loads with no holes, and the
+    /// journal's removal batches follow the same rule.
+    replay: Option<Replayed>,
+}
+
+/// The holes and the close-ups on removal of a replay since its checkpoint.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Replayed {
+    holes: usize,
+    passes: usize,
 }
 
 impl Model {
@@ -201,6 +244,41 @@ impl Model {
         self.held.clear();
         self.counter = 0;
         self.sparse_slots = 0;
+        self.closed_up();
+    }
+
+    /// One removal batch, which removed `removed` records the model has
+    /// already let go of, live and in a replay of the journal. A batch that
+    /// leaves more holes than the allowance and the records held closes
+    /// them up once it is done.
+    fn removal_batch(&mut self, removed: usize) {
+        let held = self.len();
+        let batch = |holes: &mut usize, passes: &mut usize| {
+            *holes += removed;
+            let pass = *holes > ALLOWANCE.max(held);
+            if pass {
+                *holes = 0;
+                *passes += 1;
+            }
+            pass
+        };
+        if batch(&mut self.holes, &mut self.passes) {
+            tally("close-up on removal");
+        }
+        if let Some(replay) = &mut self.replay {
+            if batch(&mut replay.holes, &mut replay.passes) {
+                tally("close-up on removal in a journal");
+            }
+        }
+    }
+
+    /// Every position closed up, which a compaction, a rebuild, a training
+    /// and a clear do, live and in a replay.
+    fn closed_up(&mut self) {
+        self.holes = 0;
+        if let Some(replay) = &mut self.replay {
+            replay.holes = 0;
+        }
     }
 }
 
@@ -561,17 +639,28 @@ fn pages(collection: &Collection, probe: &Probe) -> Vec<Page> {
     out
 }
 
-/// Everything asked after every step.
+/// Everything asked after every step, of a collection that holds `holes`
+/// holes.
 fn check(
     collection: &Collection,
     model: &Model,
+    holes: usize,
     kind: Kind,
     weighting: &Weighting,
     probe: &Probe,
     step: &str,
 ) {
     assert!(collection.positions_agree(), "{step}: the positions agree");
-    if collection.ids.read().unwrap().extent() > model.len() {
+    let (extent, held) = {
+        let ids = collection.ids.read().unwrap();
+        (ids.extent(), ids.len())
+    };
+    assert_eq!(extent - held, holes, "{step}: the holes");
+    assert!(
+        extent - held <= ALLOWANCE.max(held),
+        "{step}: the holes are within the allowance or the records held"
+    );
+    if extent > model.len() {
         tally("a state with holes");
     }
     tally_most("most records held", model.len());
@@ -1002,6 +1091,12 @@ struct Run {
     step: usize,
     /// Saves whose load was refused for the sparse slot count.
     refusals: usize,
+    /// The thread's close-ups on removal when the run began.
+    close_ups_before: usize,
+    /// The close-ups on removal the recoveries replayed.
+    replayed: usize,
+    /// The journals that churned.
+    journal_churns: usize,
 }
 
 impl Run {
@@ -1065,6 +1160,7 @@ impl Run {
             let name = self.held_names(1).pop().unwrap();
             assert!(collection.remove_point(name.clone()).unwrap());
             self.forget(&name);
+            self.model.removal_batch(1);
         }
         let name = self.fresh_name();
         let mut record = record(&mut self.rng, name);
@@ -1072,11 +1168,23 @@ impl Run {
             dims: vec![self.rng.below(TERMS as usize) as u32],
             values: vec![2.0],
         }));
+        let was = collection.is_quantized();
         let added = collection.add_records(vec![record.clone()], vec![], false);
         assert_eq!(added.total_errors, 0, "{}", self.label("make loadable"));
         self.model.insert(&record);
+        self.trained_if(was, collection);
         assert!(self.loadable());
         self.check(collection, "made loadable");
+    }
+
+    /// Close the model's positions up where the collection trained during
+    /// the last write, since the training rebuild closes them up.
+    fn trained_if(&mut self, was: bool, collection: &Collection) -> bool {
+        let trained = !was && collection.is_quantized();
+        if trained {
+            self.model.closed_up();
+        }
+        trained
     }
 
     /// A name no record holds: a new one, or now and then one a removal
@@ -1141,20 +1249,84 @@ impl Run {
         if self.model.len() < MOST && self.rng.chance(50) {
             names.push(self.fresh_name());
         }
+        self.overwrite_names(collection, names, "overwrite");
+    }
+
+    /// Add a record under each of `names` with overwrite set: one removal
+    /// batch of the names held, then the inserts.
+    fn overwrite_names(&mut self, collection: &Collection, names: Vec<String>, what: &str) {
         let records: Vec<ParsedRecord> = names
             .into_iter()
             .map(|name| record(&mut self.rng, name))
             .collect();
+        let was = collection.is_quantized();
         let added = collection.add_records(records.clone(), vec![], true);
         assert_eq!(
             added.total_errors,
             0,
             "{}: {:?}",
-            self.label("overwrite"),
+            self.label(what),
             added.errors
         );
+        let removed = records
+            .iter()
+            .filter(|record| self.model.held.remove(&record.id).is_some())
+            .count();
+        self.model.removal_batch(removed);
         for record in &records {
             self.model.insert(record);
+        }
+        self.trained_if(was, collection);
+    }
+
+    /// Churn: overwrite most of the held records, call after call, until a
+    /// removal batch has closed the positions up, and where a journal is
+    /// attached until a replay of it would close them up too. A collection
+    /// holding fewer than a thousand records takes fresh ones first, so a
+    /// few calls pass the allowance. The holes are held to the model's
+    /// after every call.
+    fn churn(&mut self, collection: &Collection) {
+        if self.model.len() < 1_000 {
+            let size = 1_000 - self.model.len();
+            let mut records: Vec<ParsedRecord> = Vec::with_capacity(size);
+            for _ in 0..size {
+                let name = self.fresh_name();
+                if records.iter().any(|r| r.id == name) {
+                    continue;
+                }
+                records.push(record(&mut self.rng, name));
+            }
+            let was = collection.is_quantized();
+            let added = collection.add_records(records.clone(), vec![], false);
+            assert_eq!(added.total_errors, 0, "{}", self.label("churn"));
+            for record in &records {
+                self.model.insert(record);
+            }
+            self.trained_if(was, collection);
+        }
+        if self.model.replay.is_some() {
+            self.journal_churns += 1;
+        }
+        let passes = self.model.passes;
+        let replayed = self.model.replay.map(|replay| replay.passes);
+        loop {
+            let all: Vec<String> = self.model.held.keys().cloned().collect();
+            let names: Vec<String> = all.into_iter().filter(|_| self.rng.chance(85)).collect();
+            self.overwrite_names(collection, names, "churn");
+            assert_eq!(
+                holes(collection),
+                self.model.holes,
+                "{}: the holes after a churning call",
+                self.label("churn")
+            );
+            let live = self.model.passes > passes;
+            let replay = match (replayed, self.model.replay) {
+                (Some(before), Some(now)) => now.passes > before,
+                _ => true,
+            };
+            if live && replay {
+                break;
+            }
         }
     }
 
@@ -1175,6 +1347,7 @@ impl Run {
                 let held = self.model.held.contains_key(&name);
                 assert_eq!(collection.remove_point(name.clone()).unwrap(), held);
                 self.forget(&name);
+                self.model.removal_batch(usize::from(held));
             }
             1 => {
                 let mut names = self.held_names(100);
@@ -1189,6 +1362,7 @@ impl Run {
                 for name in &names {
                     self.forget(name);
                 }
+                self.model.removal_batch(names.len() - 1);
             }
             _ => {
                 let filter = match self.rng.below(3) {
@@ -1212,6 +1386,7 @@ impl Run {
                 for name in &gone {
                     self.forget(name);
                 }
+                self.model.removal_batch(gone.len());
             }
         }
     }
@@ -1239,6 +1414,7 @@ impl Run {
         let plan = collection.plan_rebuild(Some(degree), None, None).unwrap();
         collection.rebuild(plan).unwrap();
         assert_eq!(collection.m(), degree);
+        self.model.closed_up();
     }
 
     /// One write, chosen by weight, applied to the collection and the model.
@@ -1251,15 +1427,19 @@ impl Run {
         if roll < insert_weight {
             let was = collection.is_quantized();
             self.insert(collection);
-            let trained = !was && collection.is_quantized();
+            let trained = self.trained_if(was, collection);
             return ("insert", trained.then_some(false));
         }
         match self.rng.below(100) {
-            0..=19 => {
+            0..=16 => {
                 self.overwrite(collection);
                 ("overwrite", None)
             }
-            20..=49 => {
+            17..=24 => {
+                self.churn(collection);
+                ("churn", (self.model.holes == 0).then_some(false))
+            }
+            25..=49 => {
                 self.remove(collection);
                 ("remove", None)
             }
@@ -1270,6 +1450,7 @@ impl Run {
             65..=79 => {
                 let stranded = collection.dense().index.read().unwrap().stranded();
                 collection.compact().unwrap();
+                self.model.closed_up();
                 ("compact", Some(stranded > 0))
             }
             80..=89 => {
@@ -1294,9 +1475,16 @@ impl Run {
     }
 
     fn check(&self, collection: &Collection, what: &str) {
+        assert_eq!(
+            close_ups() - self.close_ups_before,
+            self.model.passes + self.replayed,
+            "{}: the close-ups on removal",
+            self.label(what)
+        );
         check(
             collection,
             &self.model,
+            self.model.holes,
             self.kind,
             &self.weighting,
             &self.probe,
@@ -1328,6 +1516,8 @@ impl Run {
         let before = pages(&collection, &self.probe);
         let loaded = Collection::load(dir.to_str().unwrap()).unwrap();
         tally("load");
+        // The load files the records at the first positions, with no hole.
+        self.model.closed_up();
         self.check(&loaded, "loaded");
         check_extents(&loaded, self.model.len(), false, &self.label("loaded"));
         assert_eq!(
@@ -1363,25 +1553,57 @@ impl Run {
         collection
             .journal_to(dir.to_str().unwrap(), Durability::default())
             .unwrap();
+        // The checkpoint loads with no hole, so a replay starts from none.
+        self.model.replay = Some(Replayed::default());
         let writes = 2 + self.rng.below(6);
+        // A churn after the first write, and so after any checkpoint, in
+        // the first journal of a sequence and now and then in a later one,
+        // so a recovery closes up on removal in every sequence.
+        let churn_at = (self.journal_churns == 0 || self.rng.chance(40))
+            .then(|| 1 + self.rng.below(writes - 1));
         for k in 0..writes {
             self.step += 1;
-            let (what, _) = self.write(collection, true);
+            let what = if Some(k) == churn_at {
+                self.churn(collection);
+                "churn"
+            } else {
+                self.write(collection, true).0
+            };
             tally(what);
             self.check(collection, what);
             if k == 0 && self.loadable() && self.rng.chance(30) {
                 collection.checkpoint().unwrap();
+                self.model.replay = Some(Replayed::default());
             }
         }
         assert!(collection.detach_sink().is_some());
+        let replay = self.model.replay.take().unwrap();
         let label = self.label("recovered");
         let live_pages = pages(collection, &self.probe);
         let live_dir = self.temp.at(&format!("journal-{}-live", self.step));
         collection.save(live_dir.to_str().unwrap()).unwrap();
+        let before = close_ups();
         let (recovered, _) =
             Collection::recover(dir.to_str().unwrap(), None, Durability::default()).unwrap();
         tally("recovery");
-        self.check(&recovered, "recovered");
+        assert_eq!(
+            close_ups() - before,
+            replay.passes,
+            "{label}: the close-ups on removal the replay ran"
+        );
+        self.replayed += replay.passes;
+        if replay.passes > 0 {
+            tally("close-up on removal in a recovery");
+        }
+        check(
+            &recovered,
+            &self.model,
+            replay.holes,
+            self.kind,
+            &self.weighting,
+            &self.probe,
+            &label,
+        );
         assert_eq!(
             pages(&recovered, &self.probe),
             live_pages,
@@ -1421,6 +1643,9 @@ fn run(kind: Kind, weighting: Weighting, seed: u64, steps: usize) {
         probe,
         step: 0,
         refusals: 0,
+        close_ups_before: close_ups(),
+        replayed: 0,
+        journal_churns: 0,
     };
     let (declaration, quantization) = run.declaration();
     let mut collection = Collection::build(declaration, quantization);
@@ -1455,6 +1680,11 @@ fn run(kind: Kind, weighting: Weighting, seed: u64, steps: usize) {
         saves > 0 && journals > 0,
         "{kind:?}: the sequence saved and journaled"
     );
+    assert_eq!(
+        close_ups() - run.close_ups_before,
+        run.model.passes + run.replayed,
+        "{kind:?}: every close-up on removal was one the model ran"
+    );
     if kind != Kind::Raw {
         assert!(trained, "{kind:?}: the sequence crossed the training size");
     }
@@ -1469,6 +1699,10 @@ fn run(kind: Kind, weighting: Weighting, seed: u64, steps: usize) {
         "rebuild",
         "load",
         "recovery",
+        "churn",
+        "close-up on removal",
+        "close-up on removal in a journal",
+        "close-up on removal in a recovery",
         "a state with holes",
         "traversal with no predicate",
         "traversal past stranded nodes",
@@ -1853,4 +2087,535 @@ fn each_rebuild_refuses_a_record_without_source_data() {
         ),
         "{refused}"
     );
+}
+
+// ============================================================================
+// THE CLOSE-UP ON REMOVAL
+// ============================================================================
+
+/// A collection of `n` records `r0` onward, each with a sparse half under
+/// `weighting` and the sparse policy `unlink`, at a small degree, so the
+/// thousands of records a close-up on removal needs build quickly.
+fn many(n: usize, unlink: Unlink, weighting: Weighting) -> Collection {
+    let declaration = Declaration::validate(DIM, "l2", 4, 16, 100, vec!["cat".to_string()])
+        .unwrap()
+        .with_sparse(
+            "terms",
+            SparseConfig {
+                unlink,
+                weighting,
+                ..SparseConfig::default()
+            },
+        )
+        .unwrap();
+    let collection = Collection::build(declaration, None);
+    put(&collection, 0..n);
+    collection
+}
+
+/// The external ids of the records `records` names.
+fn named(records: impl Iterator<Item = usize>) -> Vec<String> {
+    records.map(|i| format!("r{i}")).collect()
+}
+
+/// Remove the records `records` names in one batch, every one of them held.
+fn remove_batch(collection: &Collection, records: impl Iterator<Item = usize>) {
+    let missing = collection.remove_points(&named(records)).unwrap();
+    assert!(missing.is_empty(), "{missing:?}");
+}
+
+/// The extent and the records held.
+fn reach_and_held(collection: &Collection) -> (usize, usize) {
+    let ids = collection.ids.read().unwrap();
+    (ids.extent(), ids.len())
+}
+
+/// The close-up on removal runs at the removal batch that first leaves more
+/// holes than 4,096 and more than the records held, and at no batch before.
+/// Below 4,096 records held the allowance decides: 5,000 records close up at
+/// the 4,097th removal, with 903 held, and the 4,096th does not. Above it the
+/// records held decide: 10,000 close up at the 5,001st, with 4,999 held, and
+/// the 5,000th, which leaves as many holes as records, does not, and those
+/// 4,999 close up again 4,097 removals later. Batches walk to a hundred
+/// short of each boundary and single removals cross it, with the holes read
+/// after every call. The records keep their order at the first positions,
+/// the graph keeps every node, and every structure reaches the records held.
+#[test]
+fn the_close_up_on_removal_runs_once_the_holes_pass_the_bound_and_not_before() {
+    for (records, batch, crossing) in [(5_000usize, 100usize, 4_097usize), (10_000, 500, 5_001)] {
+        let collection = many(records, Unlink::Lazy, Weighting::Dot);
+        let start = close_ups();
+        let mut removed = 0;
+        while removed < crossing - 100 {
+            let to = (removed + batch).min(crossing - 100);
+            remove_batch(&collection, removed..to);
+            removed = to;
+            assert_eq!(holes(&collection), removed, "{records}: after {removed}");
+            assert_eq!(close_ups(), start, "{records}: no close-up after {removed}");
+        }
+        while removed + 1 < crossing {
+            assert!(collection.remove_point(format!("r{removed}")).unwrap());
+            removed += 1;
+            assert_eq!(holes(&collection), removed, "{records}: after {removed}");
+            assert_eq!(close_ups(), start, "{records}: no close-up after {removed}");
+        }
+        assert!(collection.remove_point(format!("r{removed}")).unwrap());
+        let held = records - crossing;
+        assert_eq!(
+            close_ups(),
+            start + 1,
+            "{records}: the close-up after {crossing}"
+        );
+        assert_eq!(reach_and_held(&collection), (held, held));
+        assert!(collection.positions_agree());
+        check_extents(&collection, held, false, "closed up on removal");
+        {
+            let index = collection.dense().index.read().unwrap();
+            assert_eq!(
+                index.graph().nb_points(),
+                records,
+                "the graph keeps every node"
+            );
+            assert_eq!(index.stranded(), crossing);
+        }
+        for (at, (internal, name)) in collection.internal_ids().iter().enumerate() {
+            assert_eq!(*internal, crossing + at + 1, "the order is kept");
+            assert_eq!(collection.ids().slot_of(name), Some(at), "{name}");
+        }
+        if held > ALLOWANCE {
+            remove_batch(&collection, crossing..crossing + ALLOWANCE);
+            assert_eq!(
+                (holes(&collection), close_ups()),
+                (ALLOWANCE, start + 1),
+                "{records}: the allowance reached again and not passed"
+            );
+            let next = format!("r{}", crossing + ALLOWANCE);
+            assert!(collection.remove_point(next).unwrap());
+            assert_eq!(
+                (holes(&collection), close_ups()),
+                (0, start + 2),
+                "{records}: the second close-up"
+            );
+            assert!(collection.positions_agree());
+        }
+    }
+}
+
+/// One removal batch that passes the bound twice part way through closes
+/// up once, after it. Removing 11,000 of 12,000 records one record a batch
+/// would have closed up after the 6,001st removal and again after the
+/// 10,098th. As one batch it leaves 11,000 holes against 1,000 records,
+/// which the one close-up at its end takes away.
+#[test]
+fn a_removal_batch_that_passes_the_bound_twice_closes_up_once_after_it() {
+    let (records, gone) = (12_000usize, 11_000usize);
+    let mut part_way = Vec::new();
+    let mut open = 0usize;
+    for removed in 1..=gone {
+        open += 1;
+        if open > ALLOWANCE.max(records - removed) {
+            part_way.push(removed);
+            open = 0;
+        }
+    }
+    assert_eq!(part_way, vec![6_001, 10_098]);
+    let collection = many(records, Unlink::Strand, Weighting::Dot);
+    let start = close_ups();
+    remove_batch(&collection, 0..gone);
+    assert_eq!(
+        close_ups(),
+        start + 1,
+        "one close-up, once the batch is done"
+    );
+    let held = records - gone;
+    assert_eq!(reach_and_held(&collection), (held, held));
+    check_extents(&collection, held, false, "closed up after the batch");
+    assert!(collection.positions_agree());
+    let sparse = collection.sparse().unwrap().index.read().unwrap();
+    assert_eq!((sparse.dead_records(), sparse.dead_postings()), (0, 0));
+}
+
+/// Every path that removes records closes up once its batch leaves more
+/// holes than the bound: a removal by id, a batch of ids, a delete by ids,
+/// `remove_where` and an overwrite. Each starts from the same 5,000 records
+/// read back from one save, removes 4,096 in one batch, which reaches the
+/// allowance and does not pass it, and then removes one record more by the
+/// path. After the close-up the sparse space holds no removed record, and
+/// an overwrite's new record takes the position after the records held.
+#[test]
+fn every_removal_path_closes_up_once_its_batch_passes_the_bound() {
+    let temp = TempDir::new();
+    let dir = temp.at("five-thousand");
+    many(5_000, Unlink::Strand, Weighting::Dot)
+        .save(dir.to_str().unwrap())
+        .unwrap();
+    for path in [
+        "remove_point",
+        "remove_points",
+        "delete",
+        "remove_where",
+        "overwrite",
+    ] {
+        let collection = Collection::load(dir.to_str().unwrap()).unwrap();
+        let start = close_ups();
+        remove_batch(&collection, 0..ALLOWANCE);
+        assert_eq!(
+            (holes(&collection), close_ups()),
+            (ALLOWANCE, start),
+            "{path}"
+        );
+        let next = format!("r{ALLOWANCE}");
+        match path {
+            "remove_point" => assert!(collection.remove_point(next.clone()).unwrap()),
+            "remove_points" => assert_eq!(
+                collection
+                    .remove_points(&[next.clone(), "absent".to_string()])
+                    .unwrap(),
+                vec!["absent".to_string()]
+            ),
+            "delete" => assert_eq!(
+                collection
+                    .delete_ids(&[next.clone(), next.clone()])
+                    .unwrap(),
+                1
+            ),
+            "remove_where" => {
+                let filter =
+                    compile_filter(&HashMap::from([("i".to_string(), json!(ALLOWANCE))])).unwrap();
+                assert_eq!(collection.remove_where(&filter).unwrap(), 1);
+            }
+            _ => {
+                let mut record = numbered(ALLOWANCE);
+                record.vector = vec![0.5; DIM];
+                let added = collection.add_records(vec![record], vec![], true);
+                assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+            }
+        }
+        let held = 5_000 - ALLOWANCE - usize::from(path != "overwrite");
+        assert_eq!(close_ups(), start + 1, "{path}: one close-up");
+        assert_eq!(reach_and_held(&collection), (held, held), "{path}");
+        assert!(collection.positions_agree(), "{path}");
+        check_extents(&collection, held, false, path);
+        {
+            let sparse = collection.sparse().unwrap().index.read().unwrap();
+            assert_eq!(
+                (sparse.dead_records(), sparse.dead_postings(), sparse.len()),
+                (0, 0, held),
+                "{path}"
+            );
+        }
+        if path == "overwrite" {
+            assert_eq!(
+                collection.ids().slot_of(&next),
+                Some(held - 1),
+                "the new record takes the last position"
+            );
+            assert_eq!(collection.internal_id_of(&next), Some(5_001));
+        } else {
+            assert!(!collection.contains(&next), "{path}");
+        }
+    }
+}
+
+/// The close-up on removal drops the postings of every record removed since
+/// the last close-up, under each sparse policy and weighting, and empties the
+/// dead set, which `get_stats` reports: the postings left are the records
+/// held, each term's document frequency counts them, and the arm answers
+/// what a collection built from the records held alone answers. The forward
+/// arena keeps the removed spans until a compaction rewrites it.
+#[test]
+fn the_close_up_on_removal_drops_the_postings_of_the_records_removed() {
+    let queries = [
+        SparseVector {
+            dims: vec![1, 3, 21, 24],
+            values: vec![1.0, 2.0, 1.0, 3.0],
+        },
+        SparseVector {
+            dims: vec![0, 5, 10, 20, 26],
+            values: vec![2.0, 1.0, 1.0, 1.0, 2.0],
+        },
+    ];
+    for unlink in [Unlink::Strand, Unlink::Lazy, Unlink::Eager] {
+        for weighting in [Weighting::Dot, Weighting::Bm25 { k1: 1.2, b: 0.75 }] {
+            let label = format!("{unlink:?} {weighting:?}");
+            let collection = many(6_000, unlink, weighting);
+            let gone: Vec<usize> = (0..6_000)
+                .filter(|i| i % 6 != 0)
+                .take(ALLOWANCE + 1)
+                .collect();
+            remove_batch(&collection, gone[..ALLOWANCE].iter().copied());
+            let (dead_postings, arena) = {
+                let sparse = collection.sparse().unwrap().index.read().unwrap();
+                assert_eq!(sparse.dead_records(), ALLOWANCE, "{label}");
+                (sparse.dead_postings(), sparse.heap_bytes().forward)
+            };
+            match unlink {
+                Unlink::Strand => assert_eq!(dead_postings, 2 * ALLOWANCE, "{label}"),
+                Unlink::Eager => assert_eq!(dead_postings, 0, "{label}"),
+                Unlink::Lazy => {}
+            }
+            assert_eq!(
+                collection.stats()["sparse_dead_postings"],
+                dead_postings.to_string(),
+                "{label}"
+            );
+
+            let start = close_ups();
+            let last = format!("r{}", gone[ALLOWANCE]);
+            assert!(collection.remove_point(last).unwrap());
+            assert_eq!(close_ups(), start + 1, "{label}");
+            let mut removed = vec![false; 6_000];
+            for &i in &gone {
+                removed[i] = true;
+            }
+            let kept: Vec<usize> = (0..6_000).filter(|&i| !removed[i]).collect();
+            {
+                let sparse = collection.sparse().unwrap().index.read().unwrap();
+                assert_eq!(
+                    (sparse.dead_records(), sparse.dead_postings()),
+                    (0, 0),
+                    "{label}"
+                );
+                assert_eq!(sparse.len(), kept.len(), "{label}");
+                assert_eq!(
+                    sparse.postings_total(),
+                    2 * kept.len(),
+                    "{label}: the postings of the records held"
+                );
+                for d in 0..27u32 {
+                    let want = kept
+                        .iter()
+                        .filter(|&&i| i % 11 == d as usize || 20 + i % 7 == d as usize)
+                        .count();
+                    assert_eq!(sparse.df(d), want, "{label}: df of {d}");
+                }
+                assert!(sparse.keys_agree(), "{label}");
+                assert_eq!(
+                    sparse.heap_bytes().forward,
+                    arena,
+                    "{label}: the arena keeps the removed spans"
+                );
+            }
+            let stats = collection.stats();
+            assert_eq!(stats["sparse_dead_postings"], "0", "{label}");
+            assert_eq!(
+                stats["sparse_postings"],
+                (2 * kept.len()).to_string(),
+                "{label}"
+            );
+
+            let twin = many(0, unlink, weighting);
+            put(&twin, kept.iter().copied());
+            let scopes = match weighting {
+                Weighting::Bm25 { .. } => vec![IdfScope::Corpus, IdfScope::Global],
+                _ => vec![IdfScope::Corpus],
+            };
+            let page = |collection: &Collection, query: &SparseVector, idf: IdfScope| {
+                bits(
+                    collection
+                        .search_sparse(query.as_ref(), None, K, idf)
+                        .unwrap(),
+                )
+            };
+            for query in &queries {
+                for &idf in &scopes {
+                    assert_eq!(
+                        page(&collection, query, idf),
+                        page(&twin, query, idf),
+                        "{label}: {idf:?}"
+                    );
+                }
+            }
+
+            collection.compact().unwrap();
+            let sparse = collection.sparse().unwrap().index.read().unwrap();
+            assert!(
+                sparse.heap_bytes().forward < arena,
+                "{label}: a compaction rewrites the arena"
+            );
+        }
+    }
+}
+
+/// Every record a sink has been handed, as its kind and its bytes.
+type Recorded = Vec<(OperationKind, Vec<u8>)>;
+
+/// A sink that keeps every record it is handed, shared with the test.
+#[derive(Clone, Debug, Default)]
+struct Recording(Arc<Mutex<Recorded>>);
+
+impl Recording {
+    fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+}
+
+impl OperationSink for Recording {
+    fn append(&mut self, kind: OperationKind, payload: &[u8]) -> Result<(), Error> {
+        self.0.lock().unwrap().push((kind, payload.to_vec()));
+        Ok(())
+    }
+
+    fn commit(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// A replay closes up at the points the live collection did. A collection
+/// of 5,000 records is saved, and then passes the bound three times, by a
+/// removal by id, by an overwrite and by a delete, with a batch, inserts
+/// and `remove_where` between, while a sink keeps every record. The save
+/// loaded again, with every record applied to it one at a time, holds at the
+/// end of each step the extent, the records and the close-ups the live
+/// collection held, and in the end every record at the position the live
+/// collection holds it at, and answers the same pages.
+#[test]
+fn a_replay_closes_up_at_the_points_the_live_collection_did() {
+    let temp = TempDir::new();
+    let checkpoint = temp.at("checkpoint");
+    let bm25 = Weighting::Bm25 { k1: 1.2, b: 0.75 };
+    let live = many(5_000, Unlink::Strand, bm25);
+    live.save(checkpoint.to_str().unwrap()).unwrap();
+    let recording = Recording::default();
+    assert!(live.attach_sink(Box::new(recording.clone())).is_none());
+    let start = close_ups();
+    let mut steps: Vec<(&str, usize, (usize, usize), usize)> = Vec::new();
+    let mut mark = |what: &'static str| {
+        steps.push((
+            what,
+            recording.len(),
+            reach_and_held(&live),
+            close_ups() - start,
+        ));
+    };
+    let overwrite = |records: std::ops::Range<usize>| {
+        let records: Vec<ParsedRecord> = records
+            .map(|i| {
+                let mut record = numbered(i);
+                record.vector[0] += 0.125;
+                record
+            })
+            .collect();
+        let added = live.add_records(records, vec![], true);
+        assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    };
+
+    remove_batch(&live, 0..ALLOWANCE);
+    mark("a batch reaching the allowance");
+    assert!(live.remove_point(format!("r{ALLOWANCE}")).unwrap());
+    mark("a removal by id passing it");
+    put(&live, 5_000..9_500);
+    mark("4,500 new records");
+    overwrite(5_000..7_500);
+    mark("an overwrite");
+    overwrite(5_000..7_500);
+    mark("an overwrite passing the bound");
+    let filter =
+        compile_filter(&HashMap::from([("i".to_string(), json!({"gte": 7_500}))])).unwrap();
+    assert_eq!(live.remove_where(&filter).unwrap(), 2_000);
+    mark("remove_where");
+    assert_eq!(live.delete_ids(&named(5_000..7_500)).unwrap(), 2_500);
+    mark("a delete passing the bound");
+    assert!(live.detach_sink().is_some());
+    assert_eq!(
+        steps.iter().map(|step| step.3).collect::<Vec<_>>(),
+        vec![0, 1, 1, 1, 2, 2, 3]
+    );
+    assert_eq!(
+        steps.iter().map(|step| step.2).collect::<Vec<_>>(),
+        vec![
+            (5_000, 904),
+            (903, 903),
+            (5_403, 5_403),
+            (7_903, 5_403),
+            (5_403, 5_403),
+            (5_403, 3_403),
+            (903, 903),
+        ]
+    );
+
+    let replayed = Collection::load(checkpoint.to_str().unwrap()).unwrap();
+    let records = recording.0.lock().unwrap().clone();
+    let replay_start = close_ups();
+    let mut applied = 0;
+    for &(what, upto, reach, passes) in &steps {
+        while applied < upto {
+            let (kind, payload) = &records[applied];
+            let record = JournalRecord {
+                sequence: applied as u64 + 1,
+                kind: *kind,
+                offset: 0,
+                payload,
+            };
+            replayed
+                .apply(Operation::decode(&record, DIM, "recorded").unwrap())
+                .unwrap();
+            applied += 1;
+        }
+        assert_eq!(
+            (reach_and_held(&replayed), close_ups() - replay_start),
+            (reach, passes),
+            "{what}"
+        );
+    }
+    // Each collection's guard taken alone, since a thread holds one id store
+    // guard at a time.
+    for (_, name) in live.internal_ids() {
+        let replayed_at = replayed.ids().slot_of(&name);
+        let live_at = live.ids().slot_of(&name);
+        assert_eq!(replayed_at, live_at, "{name}");
+    }
+    let probe = Probe::new(&mut Rng(0x5eed_0205), &bm25);
+    assert_eq!(pages(&replayed, &probe), pages(&live, &probe));
+}
+
+/// A recovery replays a journal onto a checkpoint that loads with no hole,
+/// so where the live collection held holes when it wrote the checkpoint, the
+/// two close up at different removals and hold their records at different
+/// positions. Nothing depends on a position: the recovered collection holds
+/// the same records under the same internal ids, answers the same pages and
+/// writes the same artefacts.
+#[test]
+fn positions_after_a_recovery_may_differ_and_nothing_depends_on_them() {
+    let temp = TempDir::new();
+    let dir = temp.at("journaled");
+    let bm25 = Weighting::Bm25 { k1: 1.2, b: 0.75 };
+    let live = many(5_000, Unlink::Strand, bm25);
+    remove_batch(&live, 0..3_000);
+    assert_eq!(holes(&live), 3_000);
+    live.journal_to(dir.to_str().unwrap(), Durability::default())
+        .unwrap();
+    let start = close_ups();
+    // 4,100 holes live, past the bound, and 1,100 in a replay from the
+    // checkpoint, within it.
+    remove_batch(&live, 3_000..4_100);
+    assert_eq!((holes(&live), close_ups()), (0, start + 1));
+    put(&live, 5_000..5_100);
+    assert!(live.detach_sink().is_some());
+
+    let replay_start = close_ups();
+    let (recovered, report) =
+        Collection::recover(dir.to_str().unwrap(), None, Durability::default()).unwrap();
+    assert_eq!(report.replayed, 101, "one removal and a hundred inserts");
+    assert_eq!(
+        close_ups(),
+        replay_start,
+        "the replay stays within the bound"
+    );
+    assert_eq!(holes(&recovered), 1_100);
+    assert!(recovered.positions_agree());
+    assert_eq!(live.ids().slot_of("r4100"), Some(0));
+    assert_eq!(recovered.ids().slot_of("r4100"), Some(1_100));
+    assert_eq!(recovered.internal_ids(), live.internal_ids());
+    let probe = Probe::new(&mut Rng(0x5eed_0206), &bm25);
+    assert_eq!(pages(&recovered, &probe), pages(&live, &probe));
+    assert!(recovered.detach_sink().is_some());
+    let (a, b) = (temp.at("live"), temp.at("recovered"));
+    live.save(a.to_str().unwrap()).unwrap();
+    recovered.save(b.to_str().unwrap()).unwrap();
+    let (a, b) = (saved_files(&a), saved_files(&b));
+    assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>());
+    for (name, bytes) in &a {
+        assert!(bytes == &b[name], "{name} differs from the live save");
+    }
 }

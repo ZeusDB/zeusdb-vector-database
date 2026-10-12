@@ -186,6 +186,22 @@ fn keyed_bytes(collection: &Collection) -> usize {
     ids + numbering + links + sparse + metadata + columns
 }
 
+/// Bytes the structures by position hold, being the id store, the metadata,
+/// the columns and the sparse space's tables and sets: `keyed_bytes` less
+/// the graph's links, which follow its nodes, and less the dense index's
+/// `node_at`, whose capacity follows the graph's reservation for its nodes.
+/// Each guard is taken alone.
+fn by_position_bytes(collection: &Collection) -> usize {
+    let (numbering, links) = {
+        let index = collection.dense().index.read().unwrap();
+        (
+            index.node_at_heap_bytes(),
+            index.graph().links_memory_bytes(),
+        )
+    };
+    keyed_bytes(collection) - numbering - links
+}
+
 /// One page, as an external id and score bits per hit.
 type Page = Vec<(String, u32)>;
 
@@ -336,6 +352,89 @@ fn a_sparse_range_after_removals_and_a_compaction_costs_what_its_records_cost() 
         assert_eq!(
             saved(&loaded, &temp, &format!("thinned-again-{sparse}.zdb")),
             first
+        );
+    }
+}
+
+/// A collection that removes most of its records without compacting holds
+/// every per-record structure within twice its records plus 4,096
+/// positions. 12,000 records are removed in batches of one to 2,000 records,
+/// by id and by batch, down to 600, and never compacted. After every batch
+/// every structure reaches at most twice the records held or the records
+/// held and 4,096, whichever is more, where a slot per id would keep 12,000,
+/// and the positions have closed up on removal along the way. The structures
+/// by position then cost the same collection's compacted bytes and at most
+/// 64 bytes for each position past the records, the id store's table, sized
+/// for the most records it held, being the same in both. `node_at` reaches
+/// the positions, and its capacity past them is what `shrink_to_fit` gives
+/// back.
+#[test]
+fn a_collection_that_removes_most_of_its_records_without_compacting_costs_what_its_records_cost() {
+    let (records, kept) = (12_000u32, 600usize);
+    // A permutation of the records, so each batch removes records spread
+    // over the positions.
+    let order: Vec<u32> = (0..records).map(|k| (k * 7_919) % records).collect();
+    let sizes = [
+        1usize, 2_000, 37, 1_500, 600, 3, 900, 250, 1_200, 1, 700, 64,
+    ];
+    for sparse in [false, true] {
+        let collection = Collection::build(declaration(100, sparse), None);
+        add(&collection, 0..records, sparse);
+        let (mut at, mut batch, mut closed) = (0usize, 0usize, 0usize);
+        while at < records as usize - kept {
+            let size = sizes[batch % sizes.len()].min(records as usize - kept - at);
+            batch += 1;
+            let gone = &order[at..at + size];
+            if size == 1 {
+                assert!(collection.remove_point(format!("r{}", gone[0])).unwrap());
+            } else {
+                remove(&collection, gone.iter().copied(), |_| true);
+            }
+            at += size;
+            let held = records as usize - at;
+            let bound = (2 * held).max(held + 4_096);
+            let reach = extents(&collection);
+            for (name, extent) in [
+                ("the id store", reach.ids),
+                ("node_at", reach.node_at),
+                ("the metadata", reach.metadata),
+                ("the columns", reach.columns),
+                ("the sparse space", reach.sparse.unwrap_or(0)),
+            ] {
+                assert!(
+                    extent <= bound,
+                    "{name} reaches {extent} positions for {held} records"
+                );
+            }
+            if reach.ids == held {
+                closed += 1;
+            }
+        }
+        assert!(closed > 0, "the positions closed up on removal");
+        let positions = extents(&collection).ids;
+        assert!(positions <= (2 * kept).max(kept + 4_096));
+        let bytes = by_position_bytes(&collection);
+        let pages_before = pages(&collection);
+
+        {
+            let mut index = collection.dense().index.write().unwrap();
+            assert_eq!(index.node_at().len(), positions);
+            index.shrink_to_fit();
+            assert_eq!(
+                index.node_at_heap_bytes(),
+                positions * std::mem::size_of::<u32>(),
+                "node_at gives back its capacity past the positions"
+            );
+        }
+        assert_eq!(pages(&collection), pages_before);
+
+        collection.compact().unwrap();
+        assert_eq!(extents(&collection), reach(kept, sparse), "compacted");
+        let compacted = by_position_bytes(&collection);
+        assert!(
+            bytes <= compacted + 64 * (positions - kept),
+            "{bytes} bytes against {compacted} compacted, for {positions} positions and {kept} \
+             records"
         );
     }
 }
