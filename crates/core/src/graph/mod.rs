@@ -944,6 +944,40 @@ impl VectorGraph {
         }
     }
 
+    /// Trade every node's position for `records`, one a node, which a
+    /// close-up built off to the side while the graph kept its nodes, so the
+    /// graph files each node's record where `records` does and `records`
+    /// holds what the graph held. A move alone.
+    pub fn swap_records(&mut self, records: &mut Vec<u32>) {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.swap_records(records),
+            VectorGraph::L2(b) => b.graph.swap_records(records),
+            VectorGraph::L1(b) => b.graph.swap_records(records),
+            VectorGraph::Dot(b) => b.graph.swap_records(records),
+            VectorGraph::CosinePQ(b) => b.graph.swap_records(records),
+            VectorGraph::L2PQ(b) => b.graph.swap_records(records),
+            VectorGraph::L1PQ(b) => b.graph.swap_records(records),
+            VectorGraph::Int8(b) => b.graph.swap_records(records),
+        }
+    }
+
+    /// Nodes the reservation for `expected_size` covers, being what a graph
+    /// of this kind, width and degree declared at that size reserves for
+    /// each per-node array, under the byte budget its arenas are held to.
+    pub fn declared_records(&self, expected_size: usize) -> usize {
+        let expected_size = expected_size.max(1);
+        match self {
+            VectorGraph::Cosine(b) => b.graph.declared_records(expected_size),
+            VectorGraph::L2(b) => b.graph.declared_records(expected_size),
+            VectorGraph::L1(b) => b.graph.declared_records(expected_size),
+            VectorGraph::Dot(b) => b.graph.declared_records(expected_size),
+            VectorGraph::CosinePQ(b) => b.graph.declared_records(expected_size),
+            VectorGraph::L2PQ(b) => b.graph.declared_records(expected_size),
+            VectorGraph::L1PQ(b) => b.graph.declared_records(expected_size),
+            VectorGraph::Int8(b) => b.graph.declared_records(expected_size),
+        }
+    }
+
     /// File the record at `position` under `node`, or strand the node with
     /// [`Position::NONE`]. The dense index calls this under its write guard,
     /// beside its own entry for the position.

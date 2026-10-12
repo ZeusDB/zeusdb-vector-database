@@ -69,6 +69,16 @@ impl Bitmap {
         self.words.iter_mut().for_each(|word| *word = 0);
     }
 
+    /// A set of exactly the positions below `count`, in words that reach
+    /// `count` or `floor`, whichever is further, and no further. What a
+    /// close-up built off to the side holds, being the set
+    /// [`Bitmap::hold_first`] leaves.
+    pub(crate) fn first(count: usize, floor: usize) -> Bitmap {
+        let mut set = Bitmap::default();
+        set.hold_first(count, floor);
+        set
+    }
+
     /// Make the set exactly the positions below `count`, in words that reach
     /// `count` or `floor`, whichever is further, and no further, and give
     /// back the words past them. What a close-up leaves, since it moves every
@@ -178,6 +188,13 @@ impl Bitmap {
     /// Bytes the words ask the allocator for.
     pub fn heap_bytes(&self) -> usize {
         self.words.capacity() * 8
+    }
+
+    /// The words and their capacity, for a test that holds two sets to be
+    /// the same words. Absent from every build that is not a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn words_held(&self) -> (&[u64], usize) {
+        (&self.words, self.words.capacity())
     }
 }
 

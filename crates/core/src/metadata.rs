@@ -23,9 +23,10 @@
 //! A record takes the next position when it is inserted, so the entry vector
 //! grows with the records inserted since the last close-up and a removed
 //! record leaves a sixteen byte hole until the next one, which
-//! [`MetadataStore::close_up`] makes. The vector is reserved for the declared
-//! record count, under a cap, and grows by doubling past it, which is the
-//! rule the graph's per node arrays follow.
+//! [`MetadataStore::closed_up`] builds off to the side and
+//! [`MetadataStore::swap_parts`] puts in. The vector is reserved for the
+//! declared record count, under a cap, and grows by doubling past it, which
+//! is the rule the graph's per node arrays follow.
 
 use crate::filter::FieldLookup;
 use serde_json::Value;
@@ -40,6 +41,7 @@ const RESERVE_CAP: usize = 1 << 20;
 /// One field of one record: the symbol of its name and its value.
 ///
 /// Forty bytes, being a `Value` at thirty-two and a symbol padded to eight.
+#[derive(Clone)]
 struct Field {
     key: u32,
     value: Value,
@@ -59,6 +61,15 @@ pub struct MetadataStore {
     records: Vec<Option<Box<[Field]>>>,
     /// How many slots hold an entry.
     held: usize,
+}
+
+/// What a close-up replaces in a metadata store, built off to the side by
+/// [`MetadataStore::closed_up`] and swapped in by
+/// [`MetadataStore::swap_parts`]. The swap trades the parts with the store's
+/// own, so once it has run the value holds the store's old entries, for the
+/// caller to drop with no guard held.
+pub struct MetadataParts {
+    records: Vec<Option<Box<[Field]>>>,
 }
 
 impl MetadataStore {
@@ -133,6 +144,11 @@ impl MetadataStore {
     /// increasing order. Each block moves where it is; nothing is copied.
     /// The vector then gives back what it holds past the records or the
     /// reservation for `expected_size`, whichever is more.
+    ///
+    /// The close-up a collection runs is [`MetadataStore::closed_up`] and
+    /// [`MetadataStore::swap_parts`]. This is the same pass made in place,
+    /// kept for the tests that hold the two to the same result.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn close_up(&mut self, old_of_new: &[u32], expected_size: usize) {
         for (k, &old) in old_of_new.iter().enumerate() {
             // A record past the slots is one no insertion reached, which
@@ -149,6 +165,59 @@ impl MetadataStore {
                 .len()
                 .max(expected_size.saturating_add(1).min(RESERVE_CAP)),
         );
+    }
+
+    /// The entries [`MetadataStore::close_up`] leaves, built from this store
+    /// and leaving it as it is, so a reader goes on reading the store while
+    /// they are made.
+    ///
+    /// The entry at `old_of_new[k]` is copied to `k`, block and all, as far
+    /// as the store reaches, and a record past the slots holds no entry.
+    /// The vector takes the capacity the pass in place leaves it: what it
+    /// holds, or the records or the reservation for `expected_size` where
+    /// that is less. Both copies of every block exist until the caller
+    /// drops the parts the swap hands back.
+    pub fn closed_up(&self, old_of_new: &[u32], expected_size: usize) -> MetadataParts {
+        let held = old_of_new.len();
+        let kept = held.max(expected_size.saturating_add(1).min(RESERVE_CAP));
+        let mut records = Vec::with_capacity(self.records.capacity().min(kept));
+        records.extend(
+            old_of_new[..held.min(self.records.len())]
+                .iter()
+                .map(|&old| self.records.get(old as usize).cloned().flatten()),
+        );
+        MetadataParts { records }
+    }
+
+    /// Trade this store's entries for `parts`, which
+    /// [`MetadataStore::closed_up`] built from it, so the store holds the
+    /// closed-up entries and `parts` the store's old ones. A move alone.
+    pub fn swap_parts(&mut self, parts: &mut MetadataParts) {
+        std::mem::swap(&mut self.records, &mut parts.records);
+    }
+
+    /// Every part of the store, each with its capacity, for a test that
+    /// holds two stores to be the same entries. Absent from every build
+    /// that is not a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn layout(&self) -> Vec<(&'static str, usize, String)> {
+        let records: Vec<Option<Vec<(u32, String)>>> = self
+            .records
+            .iter()
+            .map(|entry| {
+                entry.as_deref().map(|fields| {
+                    fields
+                        .iter()
+                        .map(|field| (field.key, field.value.to_string()))
+                        .collect()
+                })
+            })
+            .collect();
+        vec![
+            ("records", self.records.capacity(), format!("{records:?}")),
+            ("names", self.names.capacity(), format!("{:?}", self.names)),
+            ("held", 0, self.held.to_string()),
+        ]
     }
 
     /// One past the last position the store holds a slot for.

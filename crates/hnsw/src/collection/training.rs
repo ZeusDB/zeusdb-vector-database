@@ -8,6 +8,7 @@
 //! does so.
 
 use super::{Collection, QuantizationConfig, StorageMode, MAX_LAYER};
+use crate::locks::Locked;
 use crate::{calibrate_rerank_from_sample, raw_distance_fn, RerankCalibration};
 use chrono::Utc;
 use rand::seq::SliceRandom;
@@ -43,11 +44,11 @@ const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::training";
 const TRAINING_SAMPLE_SEED: u64 = 0x5A_EE_5D_B0_5E_ED_57_01;
 impl Collection {
     /// TRAINING TRIGGER: Uses threshold flag for race condition safety
-    #[instrument(target = LOG_TARGET, level = "info", skip(self), fields(
+    #[instrument(target = LOG_TARGET, level = "info", skip(self, writers), fields(
         threshold_reached = self.training_threshold_reached.load(Ordering::Acquire),
         has_quantization = self.has_quantization()
     ))]
-    pub(super) fn maybe_trigger_training(&self) -> Result<(), String> {
+    pub(super) fn maybe_trigger_training(&self, writers: &Locked<'_, ()>) -> Result<(), String> {
         // Check atomic flag first (fast path)
         if !self.training_threshold_reached.load(Ordering::Acquire) {
             return Ok(());
@@ -78,9 +79,9 @@ impl Collection {
         .map_err(|e| e.to_string())?;
         self.commit_records().map_err(|e| e.to_string())?;
         if config.is_int8() {
-            self.train_int8_from_ids(completed_at)
+            self.train_int8_from_ids(writers, completed_at)
         } else {
-            self.train_quantization_from_ids(completed_at)
+            self.train_quantization_from_ids(writers, completed_at)
         }
     }
 
@@ -93,11 +94,15 @@ impl Collection {
     /// recorded training hands the stamp that training took. Everything else
     /// training produces is a function of the records that reached the
     /// threshold, since every draw is seeded and every order is fixed.
-    #[instrument(target = LOG_TARGET, level = "info", skip(self, completed_at), fields(
+    #[instrument(target = LOG_TARGET, level = "info", skip(self, writers, completed_at), fields(
         has_pq = self.dense().pq.is_some(),
         has_config = self.dense().quantization_config.is_some()
     ))]
-    pub(super) fn train_quantization_from_ids(&self, completed_at: String) -> Result<(), String> {
+    pub(super) fn train_quantization_from_ids(
+        &self,
+        writers: &Locked<'_, ()>,
+        completed_at: String,
+    ) -> Result<(), String> {
         let start_time = Instant::now();
 
         let pq = self.dense().pq.as_ref().ok_or("PQ not available")?.clone();
@@ -172,7 +177,7 @@ impl Collection {
         );
         let rebuild_start = Instant::now();
         let rebuild_success = self
-            .rebuild_with_quantization_locked()
+            .rebuild_with_quantization_locked(writers)
             .map_err(|e| format!("Failed to rebuild with quantization: {}", e))?;
         let rebuild_duration = rebuild_start.elapsed();
 
@@ -305,8 +310,12 @@ impl Collection {
     /// rebuilt over every stored raw vector's row. There is no rerank
     /// calibration, since a scalar index keeps no raw vector to rerank
     /// against.
-    #[instrument(target = LOG_TARGET, level = "info", skip(self, completed_at))]
-    pub(super) fn train_int8_from_ids(&self, completed_at: String) -> Result<(), String> {
+    #[instrument(target = LOG_TARGET, level = "info", skip(self, writers, completed_at))]
+    pub(super) fn train_int8_from_ids(
+        &self,
+        writers: &Locked<'_, ()>,
+        completed_at: String,
+    ) -> Result<(), String> {
         let start_time = Instant::now();
         let config = self
             .dense()
@@ -364,7 +373,7 @@ impl Collection {
         );
         let rebuild_start = Instant::now();
         let rebuilt = self
-            .rebuild_with_int8_locked()
+            .rebuild_with_int8_locked(writers)
             .map_err(|e| format!("Failed to rebuild with quantization: {}", e))?;
         let rebuild_duration = rebuild_start.elapsed();
 
@@ -392,7 +401,10 @@ impl Collection {
     /// replacement's store and the raw vectors go with the graph that held
     /// them, which is the whole of how `quantized_only` sheds them. The
     /// values the encode clipped are added to the index's count.
-    pub(super) fn rebuild_with_int8_locked(&self) -> Result<bool, String> {
+    pub(super) fn rebuild_with_int8_locked(
+        &self,
+        writers: &Locked<'_, ()>,
+    ) -> Result<bool, String> {
         let start_time = Instant::now();
         let Some(codec) = self.dense().int8_codec().cloned() else {
             warn!(target: LOG_TARGET, operation = "rebuild_quantization",
@@ -473,7 +485,7 @@ impl Collection {
         // Built in full before it is installed, and the old graph dropped
         // outside the guards; see `replace_dense_graph`. The clipped count is
         // added once the index holds the graph the rows are in.
-        self.replace_dense_graph(new_hnsw);
+        self.replace_dense_graph(writers, new_hnsw);
         if clipped > 0 {
             self.dense().index.read().unwrap().add_saturated(clipped);
         }
@@ -520,9 +532,12 @@ impl Collection {
     /// Errors are `String`, which `rebuild_with_quantization` turns into the
     /// `Error::Engine` the binding raises as the `RuntimeError` it always
     /// raised, and the training path formats into its own message.
-    pub(super) fn rebuild_with_quantization_locked(&self) -> Result<bool, String> {
+    pub(super) fn rebuild_with_quantization_locked(
+        &self,
+        writers: &Locked<'_, ()>,
+    ) -> Result<bool, String> {
         if self.dense().declares_int8() {
-            return self.rebuild_with_int8_locked();
+            return self.rebuild_with_int8_locked(writers);
         }
 
         let start_time = Instant::now();
@@ -747,7 +762,7 @@ impl Collection {
         //
         // The old graph is moved out and dropped after the guards are released.
         // See `replace_dense_graph`.
-        self.replace_dense_graph(new_hnsw);
+        self.replace_dense_graph(writers, new_hnsw);
         let released = if vector_count > 0 && !keeps_raw {
             released
         } else {
@@ -782,10 +797,10 @@ impl Collection {
     /// turns out to rebuild, since a replay of the record decides that the
     /// same way.
     pub fn rebuild_with_quantization(&self) -> Result<bool, Error> {
-        let _writers = self.writers.lock().unwrap();
+        let writers = self.writers.lock().unwrap();
         self.record(|| Operation::RebuildQuantized)?;
         self.commit_records()?;
-        self.rebuild_with_quantization_locked()
+        self.rebuild_with_quantization_locked(&writers)
             .map_err(Error::Engine)
     }
 

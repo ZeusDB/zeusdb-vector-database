@@ -28,13 +28,15 @@
 //! A record takes the next position when it is inserted, and positions follow
 //! internal id order, so the entry vector grows with the records inserted
 //! since the last close-up and a removed record leaves an eight byte hole
-//! until the next one. [`IdStore::close_up`] moves every record to the front
-//! in one pass, rewrites the table's positions through the same map and
-//! gives back the entries past the records. A removed record's text stays in
-//! the arena until [`IdStore::compact_text`] rewrites the arena without it,
-//! which the close-up does. The vector is reserved for the declared record
-//! count, under a cap, and grows by doubling past it, which is the rule the
-//! metadata store and the graph's per node arrays follow.
+//! until the next one. [`IdStore::closed_up`] builds, in one pass and with
+//! the store left as it is, the entries with every record moved to the front,
+//! the table with its positions rewritten through the same map and an arena
+//! without the text of removed records, and [`IdStore::swap_parts`] puts
+//! them in. Until then a removed record's text stays in the arena. The
+//! entries give back what they hold past the records or the reservation. The
+//! vector is reserved for the declared record count, under a cap, and grows
+//! by doubling past it, which is the rule the metadata store and the graph's
+//! per node arrays follow.
 
 use crate::bitmap::Bitmap;
 use crate::error::Error;
@@ -121,6 +123,29 @@ pub struct IdStore {
     held: usize,
     /// Bytes of the arena that belong to removed records.
     dead_text: usize,
+}
+
+/// What a close-up replaces in an id store, built off to the side by
+/// [`IdStore::closed_up`] and swapped in by [`IdStore::swap_parts`]. The
+/// swap trades the parts with the store's own, so once it has run the value
+/// holds the store's old parts, for the caller to drop with no guard held.
+/// The table's tags, the hasher and the record count do not change at a
+/// close-up and are not among them.
+pub struct IdParts {
+    text: String,
+    entries: Vec<u64>,
+    buckets: Vec<u32>,
+    live: Bitmap,
+    dead_text: usize,
+}
+
+impl IdParts {
+    /// Bytes of the arena that belong to removed records. Once swapped in,
+    /// these are the store's old parts, and the figure is the id text the
+    /// close-up let go of, which [`IdStore::close_up`] returns.
+    pub fn removed_text(&self) -> usize {
+        self.dead_text
+    }
 }
 
 impl IdStore {
@@ -397,6 +422,11 @@ impl IdStore {
     /// the reservation for `expected_size`, whichever is more, and the arena
     /// is rewritten without the removed text, which returns the bytes it let
     /// go of; see [`IdStore::compact_text`].
+    ///
+    /// The close-up a collection runs is [`IdStore::closed_up`] and
+    /// [`IdStore::swap_parts`]. This is the same pass made in place, kept
+    /// for the tests that hold the two to the same result.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn close_up(
         &mut self,
         old_of_new: &[u32],
@@ -417,6 +447,105 @@ impl IdStore {
         }
         self.live.hold_first(old_of_new.len(), 0);
         self.compact_text()
+    }
+
+    /// The parts [`IdStore::close_up`] leaves, built from this store and
+    /// leaving it as it is, so a reader goes on reading the store while they
+    /// are made.
+    ///
+    /// The entry at `old_of_new[k]` goes to `k`. Where the arena holds
+    /// removed text, each record's text is copied into a new arena without
+    /// it and its entry names the new offset; otherwise the arena is copied
+    /// as it is. Each bucket's position is rewritten through `new_of_old`,
+    /// and the live set is the positions below the record count. Each part
+    /// takes the capacity the pass in place leaves it: the entries keep what
+    /// they hold, or the records or the reservation for `expected_size`
+    /// where that is less, a rewritten arena holds the live text and no
+    /// more, and the buckets and an arena copied as it is keep what they
+    /// hold.
+    pub fn closed_up(
+        &self,
+        old_of_new: &[u32],
+        new_of_old: &[u32],
+        expected_size: usize,
+    ) -> IdParts {
+        debug_assert_eq!(old_of_new.len(), self.held);
+        let held = old_of_new.len();
+        let kept = held.max(reserved_entries(expected_size));
+        let mut entries = Vec::with_capacity(self.entries.capacity().min(kept));
+        let text = if self.dead_text == 0 {
+            entries.extend(old_of_new.iter().map(|&old| self.entries[old as usize]));
+            let mut text = String::with_capacity(self.text.capacity());
+            text.push_str(&self.text);
+            text
+        } else {
+            let mut text = String::with_capacity(self.text.len() - self.dead_text);
+            for &old in old_of_new {
+                let (offset, len) = unpack(self.entries[old as usize]);
+                entries.push(pack(text.len(), len));
+                text.push_str(&self.text[offset..offset + len]);
+            }
+            text
+        };
+        let mut buckets = Vec::with_capacity(self.buckets.capacity());
+        buckets.extend(self.buckets.iter().map(|&bucket| {
+            if bucket == EMPTY {
+                EMPTY
+            } else {
+                new_of_old[bucket as usize]
+            }
+        }));
+        IdParts {
+            text,
+            entries,
+            buckets,
+            live: Bitmap::first(held, 0),
+            dead_text: 0,
+        }
+    }
+
+    /// Trade this store's parts for `parts`, which [`IdStore::closed_up`]
+    /// built from it, so the store holds the closed-up parts and `parts`
+    /// holds the store's old ones. Moves alone, so a caller holding the
+    /// store's write guard holds it for the swap and nothing else.
+    pub fn swap_parts(&mut self, parts: &mut IdParts) {
+        std::mem::swap(&mut self.text, &mut parts.text);
+        std::mem::swap(&mut self.entries, &mut parts.entries);
+        std::mem::swap(&mut self.buckets, &mut parts.buckets);
+        std::mem::swap(&mut self.live, &mut parts.live);
+        std::mem::swap(&mut self.dead_text, &mut parts.dead_text);
+    }
+
+    /// Every part of the store, each with its capacity, for a test that
+    /// holds two stores to be the same bytes. Absent from every build that
+    /// is not a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn layout(&self) -> Vec<(&'static str, usize, String)> {
+        vec![
+            (
+                "text",
+                self.text.capacity(),
+                format!("{:?}", self.text.as_bytes()),
+            ),
+            (
+                "entries",
+                self.entries.capacity(),
+                format!("{:?}", self.entries),
+            ),
+            (
+                "buckets",
+                self.buckets.capacity(),
+                format!("{:?}", self.buckets),
+            ),
+            ("tags", self.tags.capacity(), format!("{:?}", self.tags)),
+            (
+                "live",
+                self.live.words.capacity(),
+                format!("{:?}", self.live.words),
+            ),
+            ("held", 0, self.held.to_string()),
+            ("dead_text", 0, self.dead_text.to_string()),
+        ]
     }
 
     /// The position of `id`, where the store holds it.

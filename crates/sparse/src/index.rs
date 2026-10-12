@@ -304,6 +304,25 @@ pub struct PostingsIndex {
     pub(crate) units: UnitCosts,
 }
 
+/// What a close-up replaces in a postings index, built off to the side by
+/// [`PostingsIndex::closed_up`] and swapped in by
+/// [`PostingsIndex::swap_parts`]: the lists, the record table, the lengths,
+/// the live and dead sets and the counts the dropped dead postings move. The
+/// swap trades the parts with the index's own, so once it has run the value
+/// holds the index's old parts, for the caller to drop with no guard held.
+/// The forward arena, the dimension map, the live counts and the slot count
+/// do not change at a close-up and are not among them.
+pub struct PostingsParts {
+    lists: Vec<PostingList>,
+    records: Vec<Slot>,
+    lengths: Vec<f32>,
+    live_set: Bitmap,
+    dead: Bitmap,
+    dead_records: usize,
+    postings_total: usize,
+    dead_postings: usize,
+}
+
 impl PostingsIndex {
     /// An empty index. Its unit costs are the compiled-in floor until it is
     /// large enough to time; see [`PostingsIndex::calibrate`].
@@ -619,6 +638,11 @@ impl PostingsIndex {
     /// lengths and the live set move with the records and give back what
     /// they hold past them, as a compaction gives back its slack. The slot
     /// count is the largest internal id inserted, which nothing here moves.
+    ///
+    /// The close-up a collection runs is [`PostingsIndex::closed_up`] and
+    /// [`PostingsIndex::swap_parts`]. This is the same pass made in place,
+    /// kept for the tests that hold the two to the same result.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn close_up(&mut self, old_of_new: &[u32], new_of_old: &[u32]) {
         if self.dead_records > 0 {
             for slot in 0..self.lists.len() as u32 {
@@ -661,6 +685,157 @@ impl PostingsIndex {
                 self.live_set.insert(at);
             }
         }
+    }
+
+    /// The parts [`PostingsIndex::close_up`] leaves, built from this index
+    /// and leaving it as it is, so a search goes on reading the index while
+    /// they are made.
+    ///
+    /// Every list is copied with each posting's key rewritten through
+    /// `new_of_old`, which keeps it sorted, and where the index holds a dead
+    /// record, a list counting a dead posting is copied without the dead
+    /// postings, which the posting counts lose. The record table and the
+    /// lengths are copied with the record at `old_of_new[k]` at `k`, up to
+    /// the last record held, and the live set is rebuilt over them. The dead
+    /// set is empty. Each part takes the capacity the pass in place leaves
+    /// it: the list headers and each list what they hold, and the record
+    /// table, the lengths and the live set the records they reach.
+    pub fn closed_up(&self, old_of_new: &[u32], new_of_old: &[u32]) -> PostingsParts {
+        let purge = self.dead_records > 0;
+        let mut removed = 0usize;
+        let mut lists = Vec::with_capacity(self.lists.capacity());
+        for list in &self.lists {
+            let drop_dead = purge && list.dead > 0;
+            let mut postings = Vec::with_capacity(list.postings.capacity());
+            for posting in &list.postings {
+                if drop_dead && self.dead.contains(posting.key as usize) {
+                    removed += 1;
+                    continue;
+                }
+                postings.push(Posting {
+                    key: new_of_old[posting.key as usize],
+                    weight: posting.weight,
+                });
+            }
+            lists.push(PostingList {
+                postings,
+                dead: if drop_dead { 0 } else { list.dead },
+            });
+        }
+        let reach = old_of_new.len().min(self.records.len());
+        let extent = old_of_new[..reach]
+            .iter()
+            .rposition(|&old| self.records.get(old as usize).is_some_and(Slot::held))
+            .map_or(0, |last| last + 1);
+        let mut records = Vec::with_capacity(extent);
+        let mut lengths = Vec::with_capacity(extent);
+        for &old in &old_of_new[..extent] {
+            match self.records.get(old as usize) {
+                Some(&slot) => {
+                    records.push(slot);
+                    lengths.push(self.lengths[old as usize]);
+                }
+                None => {
+                    records.push(NEVER_HELD);
+                    lengths.push(0.0);
+                }
+            }
+        }
+        let mut live_set = Bitmap::with_slots(extent);
+        for (at, slot) in records.iter().enumerate() {
+            if slot.held() {
+                live_set.insert(at);
+            }
+        }
+        debug_assert_eq!(
+            self.dead_postings, removed,
+            "a close-up drops every dead posting"
+        );
+        PostingsParts {
+            lists,
+            records,
+            lengths,
+            live_set,
+            dead: Bitmap::default(),
+            dead_records: 0,
+            postings_total: self.postings_total - removed,
+            dead_postings: self.dead_postings - removed,
+        }
+    }
+
+    /// Trade this index's parts for `parts`, which
+    /// [`PostingsIndex::closed_up`] built from it, so the index holds the
+    /// closed-up parts and `parts` the index's old ones. Moves alone, so a
+    /// caller holding the index's write guard holds it for the swap and
+    /// nothing else.
+    pub fn swap_parts(&mut self, parts: &mut PostingsParts) {
+        std::mem::swap(&mut self.lists, &mut parts.lists);
+        std::mem::swap(&mut self.records, &mut parts.records);
+        std::mem::swap(&mut self.lengths, &mut parts.lengths);
+        std::mem::swap(&mut self.live_set, &mut parts.live_set);
+        std::mem::swap(&mut self.dead, &mut parts.dead);
+        std::mem::swap(&mut self.dead_records, &mut parts.dead_records);
+        std::mem::swap(&mut self.postings_total, &mut parts.postings_total);
+        std::mem::swap(&mut self.dead_postings, &mut parts.dead_postings);
+    }
+
+    /// Every part of the index, each with its capacity, for a test that
+    /// holds two indexes to be the same postings and tables. Absent from
+    /// every build that is not a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn layout(&self) -> Vec<(&'static str, usize, String)> {
+        let lists: Vec<String> = self
+            .lists
+            .iter()
+            .map(|list| {
+                let postings: Vec<(u32, u32)> = list
+                    .postings
+                    .iter()
+                    .map(|posting| (posting.key, posting.weight.to_bits()))
+                    .collect();
+                format!(
+                    "capacity {} dead {} {postings:?}",
+                    list.postings.capacity(),
+                    list.dead
+                )
+            })
+            .collect();
+        let records: Vec<(u32, u32)> = self
+            .records
+            .iter()
+            .map(|slot| (slot.start, slot.len))
+            .collect();
+        let lengths: Vec<u32> = self.lengths.iter().map(|length| length.to_bits()).collect();
+        let (dead, dead_capacity) = self.dead.words_held();
+        let (live, live_capacity) = self.live_set.words_held();
+        vec![
+            ("lists", self.lists.capacity(), format!("{lists:?}")),
+            ("records", self.records.capacity(), format!("{records:?}")),
+            ("lengths", self.lengths.capacity(), format!("{lengths:?}")),
+            ("dead", dead_capacity, format!("{dead:?}")),
+            ("live_set", live_capacity, format!("{live:?}")),
+            (
+                "fwd_dims",
+                self.fwd_dims.capacity(),
+                format!("{:?}", self.fwd_dims),
+            ),
+            (
+                "counts",
+                0,
+                format!(
+                    "{:?}",
+                    (
+                        self.slot_count,
+                        self.dead_records,
+                        self.live,
+                        self.live_nnz,
+                        self.live_length.to_bits(),
+                        self.postings_total,
+                        self.dead_postings
+                    )
+                ),
+            ),
+        ]
     }
 
     /// Insert one record at its position `at`, with its internal id `id`

@@ -60,7 +60,7 @@ impl Collection {
     /// ordinary refusal for a value the ordinary path would refuse, and
     /// whatever the body returns for a body that fails.
     pub fn apply(&self, operation: Operation) -> Result<(), Error> {
-        let _writers = self.writers.lock().unwrap();
+        let writers = self.writers.lock().unwrap();
         if self.sink_attached() {
             return Err(Error::Engine(
                 "A recorded operation cannot be applied while a sink is attached, since a \
@@ -77,14 +77,16 @@ impl Collection {
                 vector,
                 metadata,
                 sparse,
-            } => self.apply_insert(
-                id,
-                internal_id,
-                level,
-                vector,
-                metadata.into_iter().collect(),
-                sparse,
-            ),
+            } => self
+                .apply_insert(
+                    id,
+                    internal_id,
+                    level,
+                    vector,
+                    metadata.into_iter().collect(),
+                    sparse,
+                )
+                .and_then(|()| self.maybe_trigger_training(&writers).map_err(Error::Engine)),
             Operation::Remove { ids } => {
                 let held = self.held_ids(&ids);
                 if held.len() != ids.len() {
@@ -98,7 +100,7 @@ impl Collection {
                         absent
                     )));
                 }
-                let missing = self.remove_points_internal(&ids);
+                let missing = self.remove_points_internal(&writers, &ids);
                 debug_assert!(missing.is_empty(), "every id was held a moment ago");
                 Ok(())
             }
@@ -115,7 +117,7 @@ impl Collection {
                 Ok(())
             }
             Operation::Clear => self.clear_locked().map(|_| ()),
-            Operation::Compact => self.compact_locked().map(|_| ()),
+            Operation::Compact => self.compact_locked(&writers).map(|_| ()),
             Operation::Rebuild {
                 m,
                 expected_size,
@@ -140,7 +142,7 @@ impl Collection {
                     expected_size,
                     "",
                 )?;
-                self.rebuild_locked(m, expected_size, ef_construction)
+                self.rebuild_locked(&writers, m, expected_size, ef_construction)
                     .map(|_| ())
             }
             Operation::Intern { term_id, term } => {
@@ -179,7 +181,7 @@ impl Collection {
                 Ok(())
             }
             Operation::RebuildQuantized => self
-                .rebuild_with_quantization_locked()
+                .rebuild_with_quantization_locked(&writers)
                 .map(|_| ())
                 .map_err(Error::Engine),
         };
@@ -190,7 +192,8 @@ impl Collection {
         applied
     }
 
-    /// The `Insert` arm of `apply`, with the mutation guard held.
+    /// The `Insert` arm of `apply`, with the mutation guard held, up to the
+    /// training trigger, which the arm sets off once this returns.
     fn apply_insert(
         &self,
         id: String,
@@ -257,6 +260,6 @@ impl Collection {
             let mut count = self.vector_count.lock().unwrap();
             *count += 1;
         }
-        self.maybe_trigger_training().map_err(Error::Engine)
+        Ok(())
     }
 }

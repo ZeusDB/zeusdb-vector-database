@@ -36,3 +36,7 @@ tracing = { workspace = true }
 # cargo applies a dev-dependency's features to this crate's test targets and
 # to nothing else, so the wheel is built without them.
 zeusdb-vector-core = { workspace = true, features = ["test-support"] }
+# The sparse index again, with its test support turned on, for the tests in
+# src/collection that hold the close-up built off to the side to the one
+# made in place.
+zeusdb-vector-sparse = { workspace = true, features = ["test-support"] }

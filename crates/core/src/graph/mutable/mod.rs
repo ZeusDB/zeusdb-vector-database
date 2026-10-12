@@ -967,6 +967,21 @@ where
         &mut self.record_of
     }
 
+    /// Trade every node's position for `records`, one a node, which a
+    /// close-up built off to the side, so the graph files each node's record
+    /// where `records` does and `records` holds what the graph held.
+    pub(super) fn swap_records(&mut self, records: &mut Vec<u32>) {
+        debug_assert_eq!(records.len(), self.record_of.len(), "one position a node");
+        std::mem::swap(&mut self.record_of, records);
+    }
+
+    /// Nodes the reservation `expected_size` declares covers, being what
+    /// [`MutableGraph::reserve_declared`] reserves each per-node array for.
+    pub(super) fn declared_records(&self, expected_size: usize) -> usize {
+        let span = expected_span(self.m, expected_size);
+        reserved_records::<T>(self.dim, self.m, span, expected_size)
+    }
+
     /// Slots one layer zero list holds, being the vendored threshold plus the
     /// overflow slot the guarded pop needs.
     #[inline]

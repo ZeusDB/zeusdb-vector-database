@@ -41,6 +41,7 @@
 //! | module | what it covers |
 //! |---|---|
 //! | `apply` | a journaled operation applied at the values its record names |
+//! | `close_up_tests` | the close-up built off to the side, against the one made in place and beside searches, counts and writes |
 //! | `construct` | building a collection and validating the declaration |
 //! | `crash_tests` | what a killed process leaves, and what opening it recovers |
 //! | `durability_tests` | the three policies, the interval thread, and what a failed commit leaves |
@@ -72,6 +73,8 @@
 //! attribute in it passes that constant.
 
 mod apply;
+#[cfg(test)]
+mod close_up_tests;
 mod construct;
 #[cfg(test)]
 mod crash_tests;
@@ -118,7 +121,7 @@ pub use construct::Declaration;
 pub(crate) use construct::{
     validate_index_parameters, validate_space_supports_quantization, SparseDeclaration,
 };
-pub(crate) use dense::{DenseIndex, DenseOpen};
+pub(crate) use dense::{DenseIndex, DenseOpen, DenseParts};
 pub use insert::{Added, RebuildPlan};
 pub use page::{FieldRef, HitRef, QueryHits};
 pub use query::{
@@ -444,10 +447,18 @@ const MAX_LAYER: usize = zeusdb_vector_core::NB_LAYER_MAX as usize;
 /// A removal leaves a hole at the position of the record it removes, which
 /// costs one entry in each per-record structure until the positions are
 /// closed up. A removal batch that leaves more holes than this and more than
-/// the records held closes them up before it lets its guards go, so after
-/// every mutation the holes number at most this or the records held,
-/// whichever is more.
+/// the records held closes them up once it has let its guards go and before
+/// the mutation returns, so after every mutation the holes number at most
+/// this or the records held, whichever is more.
 const HOLE_ALLOWANCE: usize = 4_096;
+
+// What `count` calls on this thread once it has made its selection and
+// before it walks, where a test set it. Nothing outside the tests sees it.
+#[cfg(test)]
+thread_local! {
+    static COUNT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageMode {
@@ -1216,7 +1227,8 @@ impl Collection {
     /// Whether the positions, the records and the nodes agree across every
     /// per-record structure, which every write keeps true and a debug build
     /// checks after a close-up, a load and an applied record, and where
-    /// `get_stats` and `compact` read the structures together.
+    /// `compact` reads the structures together. `get_stats` checks all of it
+    /// but the bound on holes.
     ///
     /// One walk over every position and every node. Every record held has
     /// one position below the extent and none shares one. The id store, the
@@ -1233,8 +1245,26 @@ impl Collection {
     /// each list in order.
     ///
     /// Taken in the declared order, the id store, the index, the sparse
-    /// index, the metadata, then the columns.
+    /// index, the metadata, then the columns. The bound on holes holds once
+    /// every mutation is done, so this is the check for a caller holding
+    /// `writers`; a reader holding none asks
+    /// [`Collection::positions_agree_any_holes`].
     pub(crate) fn positions_agree(&self) -> bool {
+        self.positions_agree_with(true)
+    }
+
+    /// [`Collection::positions_agree`] with the holes left unbounded, for a
+    /// reader that holds no `writers`, which `get_stats` is. A removal batch
+    /// lets its guards go before its close-up builds its copies, so such a
+    /// reader can land between the batch and the swap, where the holes pass
+    /// the bound by design. Every other check still holds there, since the
+    /// copies are made off to the side and swapped in whole.
+    pub(crate) fn positions_agree_any_holes(&self) -> bool {
+        self.positions_agree_with(false)
+    }
+
+    /// The walk both checks make, the bound on holes held where `bounded`.
+    fn positions_agree_with(&self, bounded: bool) -> bool {
         let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
         let sparse = self.sparse().map(|space| space.index.read().unwrap());
@@ -1285,7 +1315,7 @@ impl Collection {
         });
         held == ids.len()
             && held == index.len()
-            && extent - held <= HOLE_ALLOWANCE.max(held)
+            && (!bounded || extent - held <= HOLE_ALLOWANCE.max(held))
             && ids.table_agrees()
             && index.numbering_agrees()
             && columns.tracks(held)
@@ -1810,19 +1840,31 @@ impl Collection {
         // as a population count over the bitmap rather than a walk. Where
         // one field has no column the declared ones bound the candidates
         // and the metadata decides among them, which is the same count over
-        // fewer reads. The columns guard is released before the metadata
-        // guard is taken, since the selection owns its bitmap, and the store
-        // is indexed by the positions the bitmap holds, so nothing else is
-        // read. A removed record holds no entry, which is the liveness
-        // check.
-        let selection = {
-            let columns = self.columns.read().unwrap();
-            columns.select(conditions)
-        };
+        // fewer reads. The bound holds positions, and a close-up moves the
+        // records to other positions, so the bound is read in the metadata
+        // under the hold it was selected under: the metadata's guard first
+        // and the columns' second, which is the declared order and the
+        // order a search takes them in, both held from the selection to the
+        // end of the walk. A removed record holds no entry, which is the
+        // liveness check. The two other arms read no position under the
+        // columns' guard, so the exact count lets both guards go and the
+        // walk over every record holds the metadata's alone.
+        let vector_metadata = self.vector_metadata.read().unwrap();
+        let columns = self.columns.read().unwrap();
+        let selection = columns.select(conditions);
+        #[cfg(test)]
+        COUNT_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
         match selection {
-            Selection::Exact(selected) => selected.count(),
+            Selection::Exact(selected) => {
+                drop(columns);
+                drop(vector_metadata);
+                selected.count()
+            }
             Selection::Narrowed(bound, _) => {
-                let vector_metadata = self.vector_metadata.read().unwrap();
                 let mut counted = 0;
                 bound.for_each(|slot| {
                     if vector_metadata
@@ -1835,7 +1877,7 @@ impl Collection {
                 counted
             }
             Selection::Whole(_) => {
-                let vector_metadata = self.vector_metadata.read().unwrap();
+                drop(columns);
                 vector_metadata
                     .iter()
                     .filter(|(_, fields)| matches_filter(fields, conditions))

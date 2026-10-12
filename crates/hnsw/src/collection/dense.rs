@@ -418,6 +418,11 @@ impl DenseIndex {
     /// back what it holds past the records or the reservation the graph
     /// holds for its nodes, whichever is more. The graph's positions are
     /// written through one borrow of them rather than a call a node.
+    ///
+    /// The close-up a collection runs is [`DenseIndex::closed_up`] and
+    /// [`DenseIndex::swap_parts`]. This is the same pass made in place,
+    /// kept for the tests that hold the two to the same result.
+    #[cfg(test)]
     pub(crate) fn close_up(&mut self, old_of_new: &[u32]) {
         let records = self.graph.records_mut();
         for (k, &old) in old_of_new.iter().enumerate() {
@@ -428,6 +433,102 @@ impl DenseIndex {
         self.node_at.truncate(old_of_new.len());
         self.node_at
             .shrink_to(old_of_new.len().max(reserved_by(&self.graph)));
+    }
+
+    /// The index's half of a close-up where the graph stays, built from the
+    /// index and leaving it as it is, so a search goes on traversing it
+    /// while the parts are made.
+    ///
+    /// `node_at` with the node of the record at `old_of_new[k]` at `k`, and
+    /// a copy of the graph's position for each node with that node's record
+    /// filed at `k`. A stranded node keeps the empty marker, so no node
+    /// changes and the live count and `every_node_live` hold what they hold.
+    /// The copy of the positions by node keeps the capacity the graph's
+    /// holds. `node_at` keeps what it holds, or the records or the
+    /// reservation a graph of this kind declared at `expected_size` takes
+    /// for its nodes, whichever is more, where that is less, which is the
+    /// reservation the map from an id to its node held for the declared
+    /// size, one slot less, since positions count from zero.
+    pub(crate) fn closed_up(&self, old_of_new: &[u32], expected_size: usize) -> DenseParts {
+        let kept = old_of_new
+            .len()
+            .max(self.graph.declared_records(expected_size));
+        let mut node_at = Vec::with_capacity(self.node_at.capacity().min(kept));
+        let mut records = Vec::with_capacity(self.graph.record_capacity());
+        records.extend_from_slice(self.graph.records());
+        for (k, &old) in old_of_new.iter().enumerate() {
+            let node = self.node_at[old as usize];
+            node_at.push(node);
+            records[node as usize] = k as u32;
+        }
+        DenseParts::Numbering { node_at, records }
+    }
+
+    /// The index's half of a close-up that installs `graph`, built off to
+    /// the side: the replacement with `node_at`, the live count and the flag
+    /// the unfiltered search reads, read from its own numbering as
+    /// [`DenseIndex::replace_graph`] reads them, and the units `timed`
+    /// gives, which [`DenseIndex::time_graph`] measured on the replacement.
+    pub(crate) fn replaced(&self, graph: VectorGraph, timed: Option<(f64, f64)>) -> DenseParts {
+        let (node_at, live_count, every_node_live) = numbering_of(&graph);
+        let units = units_of(&graph, self.pq.as_ref(), self.dim, timed);
+        DenseParts::Graph {
+            graph: Box::new(graph),
+            node_at,
+            live_count,
+            every_node_live,
+            units,
+        }
+    }
+
+    /// Trade this index's parts for `parts`, which
+    /// [`DenseIndex::closed_up`] or [`DenseIndex::replaced`] built from it,
+    /// so the index holds the new parts and `parts` its old ones, the old
+    /// graph among them where a graph was replaced. Moves alone, so a
+    /// caller holding the index's write guard holds it for the swap and
+    /// nothing else, and drops the old parts with no guard held.
+    pub(crate) fn swap_parts(&mut self, parts: &mut DenseParts) {
+        match parts {
+            DenseParts::Numbering { node_at, records } => {
+                std::mem::swap(&mut self.node_at, node_at);
+                self.graph.swap_records(records);
+            }
+            DenseParts::Graph {
+                graph,
+                node_at,
+                live_count,
+                every_node_live,
+                units,
+            } => {
+                std::mem::swap(&mut self.graph, graph.as_mut());
+                std::mem::swap(&mut self.node_at, node_at);
+                std::mem::swap(&mut self.live_count, live_count);
+                std::mem::swap(&mut self.every_node_live, every_node_live);
+                std::mem::swap(&mut self.units, units);
+            }
+        }
+    }
+
+    /// The numbering and its capacity, the counts the index keeps and the
+    /// units, for a test that holds two indexes to be the same numbering.
+    #[cfg(test)]
+    pub(crate) fn layout(&self) -> Vec<(&'static str, usize, String)> {
+        vec![
+            (
+                "node_at",
+                self.node_at.capacity(),
+                format!("{:?}", self.node_at),
+            ),
+            (
+                "records",
+                self.graph.record_capacity(),
+                format!("{:?}", self.graph.records()),
+            ),
+            ("nodes", 0, self.graph.nb_points().to_string()),
+            ("live_count", 0, self.live_count.to_string()),
+            ("every_node_live", 0, self.every_node_live.to_string()),
+            ("units", 0, format!("{:?}", self.units)),
+        ]
     }
 
     /// Swap the graph and keep the records, which is what a compaction, a
@@ -451,25 +552,7 @@ impl DenseIndex {
         timed: Option<(f64, f64)>,
     ) -> VectorGraph {
         let old = std::mem::replace(&mut self.graph, graph);
-        let records = self.graph.records();
-        let extent = records
-            .iter()
-            .filter(|&&position| position != NONE)
-            .map(|&position| position as usize + 1)
-            .max()
-            .unwrap_or(0);
-        let mut node_at = Vec::with_capacity(extent.max(reserved_by(&self.graph)));
-        node_at.resize(extent, NONE);
-        let mut placed = 0;
-        let mut every = true;
-        for (node, &position) in records.iter().enumerate() {
-            if position == NONE {
-                every = false;
-                continue;
-            }
-            node_at[position as usize] = node as u32;
-            placed += 1;
-        }
+        let (node_at, placed, every) = numbering_of(&self.graph);
         self.node_at = node_at;
         self.live_count = placed;
         self.every_node_live = every;
@@ -579,30 +662,7 @@ impl DenseIndex {
 
     /// Keep the timed units, or the floor where there are none.
     pub(crate) fn set_units(&mut self, timed: Option<(f64, f64)>) {
-        match timed {
-            Some((distance_ns, ef_ns)) => {
-                self.units = DenseUnits {
-                    distance_ns,
-                    ef_ns,
-                    measured: true,
-                };
-            }
-            None => {
-                // A scalar kernel decodes every value inside the distance and
-                // measured no slower than the raw kernel at every width, so it
-                // takes the raw floor.
-                let distance_ns = if self.graph.is_pq() {
-                    10.0 + 1.5 * self.pq.as_ref().map_or(8, |pq| pq.subvectors()) as f64
-                } else {
-                    115.0 + 0.6 * self.dim as f64
-                };
-                self.units = DenseUnits {
-                    distance_ns,
-                    ef_ns: distance_ns * FLOOR_VISITS_PER_EF,
-                    measured: false,
-                };
-            }
-        }
+        self.units = units_of(&self.graph, self.pq.as_ref(), self.dim, timed);
     }
 
     /// The traversal width a search takes when the caller names none.
@@ -1089,6 +1149,86 @@ fn reserved_positions(graph: &VectorGraph) -> usize {
 /// one a node.
 fn reserved_by(graph: &VectorGraph) -> usize {
     graph.record_capacity()
+}
+
+/// The units a search over `graph` is priced with: the timed ones, or the
+/// floor where there are none.
+fn units_of(
+    graph: &VectorGraph,
+    pq: Option<&Arc<PQ>>,
+    dim: usize,
+    timed: Option<(f64, f64)>,
+) -> DenseUnits {
+    match timed {
+        Some((distance_ns, ef_ns)) => DenseUnits {
+            distance_ns,
+            ef_ns,
+            measured: true,
+        },
+        None => {
+            // A scalar kernel decodes every value inside the distance and
+            // measured no slower than the raw kernel at every width, so it
+            // takes the raw floor.
+            let distance_ns = if graph.is_pq() {
+                10.0 + 1.5 * pq.map_or(8, |pq| pq.subvectors()) as f64
+            } else {
+                115.0 + 0.6 * dim as f64
+            };
+            DenseUnits {
+                distance_ns,
+                ef_ns: distance_ns * FLOOR_VISITS_PER_EF,
+                measured: false,
+            }
+        }
+    }
+}
+
+/// `node_at`, the live count and whether every node holds a record, for a
+/// graph built from the records a collection holds, each node filed at its
+/// record's position. `node_at` is built at the extent the records reach,
+/// with the reservation the graph holds for its nodes, as the map from an id
+/// to its node was built anew with the graph it belonged to.
+fn numbering_of(graph: &VectorGraph) -> (Vec<u32>, usize, bool) {
+    let records = graph.records();
+    let extent = records
+        .iter()
+        .filter(|&&position| position != NONE)
+        .map(|&position| position as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut node_at = Vec::with_capacity(extent.max(reserved_by(graph)));
+    node_at.resize(extent, NONE);
+    let mut placed = 0;
+    let mut every = true;
+    for (node, &position) in records.iter().enumerate() {
+        if position == NONE {
+            every = false;
+            continue;
+        }
+        node_at[position as usize] = node as u32;
+        placed += 1;
+    }
+    (node_at, placed, every)
+}
+
+/// The dense index's half of a close-up built off to the side, which
+/// [`DenseIndex::swap_parts`] trades for the index's own.
+pub(crate) enum DenseParts {
+    /// The graph keeps its nodes: `node_at` and the graph's position for
+    /// each node.
+    Numbering {
+        node_at: Vec<u32>,
+        records: Vec<u32>,
+    },
+    /// A replacement graph, with what the index reads from it. The graph is
+    /// boxed, so the parts move a pointer to it rather than its struct.
+    Graph {
+        graph: Box<VectorGraph>,
+        node_at: Vec<u32>,
+        live_count: usize,
+        every_node_live: bool,
+        units: DenseUnits,
+    },
 }
 
 /// Whether every node `graph` holds holds a record at a position `node_at`

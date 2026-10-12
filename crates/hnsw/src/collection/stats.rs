@@ -93,8 +93,10 @@ impl Collection {
     /// storage mode, the training progress and the vectors still needed are
     /// derived from the captured values by the same rules the helpers apply.
     pub fn stats(&self) -> HashMap<String, String> {
+        // With the holes unbounded, since this takes no `writers` and can
+        // land between a removal batch and its close-up.
         debug_assert!(
-            self.positions_agree(),
+            self.positions_agree_any_holes(),
             "every per-record structure agrees with the positions the records hold"
         );
 

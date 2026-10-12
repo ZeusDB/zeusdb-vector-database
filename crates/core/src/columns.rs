@@ -218,7 +218,9 @@ impl Column {
     /// further than the records held. A hole holds no value and its code was
     /// released when the record went, so no count moves. The column then
     /// gives back what it holds past the records or `reserved` slots,
-    /// whichever is more.
+    /// whichever is more. Kept for the tests that hold
+    /// [`Column::closed_up`] to it.
+    #[cfg(any(test, feature = "test-support"))]
     fn close_up(&mut self, old_of_new: &[u32], reserved: usize) {
         let kept = old_of_new.len().max(reserved);
         match self {
@@ -236,6 +238,76 @@ impl Column {
                 }
                 codes.truncate(old_of_new.len());
                 codes.shrink_to(kept);
+            }
+        }
+    }
+
+    /// The codes or the values [`Column::close_up`] leaves, built from this
+    /// column and leaving it as it is: the slot at `old_of_new[k]` copied to
+    /// `k`, in a vector that keeps what the column's holds, or the records
+    /// or `reserved` slots where that is less. A plain column's values are
+    /// copied, so both copies exist until the caller drops the old ones.
+    /// The dictionary, its counts and its lookup do not change at a
+    /// close-up and are not copied.
+    fn closed_up(&self, old_of_new: &[u32], reserved: usize) -> Cells {
+        let kept = old_of_new.len().max(reserved);
+        match self {
+            Column::Plain { values } => {
+                let mut moved = Vec::with_capacity(values.capacity().min(kept));
+                moved.extend(
+                    old_of_new
+                        .iter()
+                        .map(|&old| values.get(old as usize).cloned().flatten()),
+                );
+                Cells::Values(moved)
+            }
+            Column::Dictionary { codes, .. } => {
+                let mut moved = Vec::with_capacity(codes.capacity().min(kept));
+                moved.extend(old_of_new.iter().map(|&old| codes[old as usize]));
+                Cells::Codes(moved)
+            }
+        }
+    }
+
+    /// Trade this column's codes or values for `cells`, which
+    /// [`Column::closed_up`] built from it. A column keeps its form between
+    /// the two, since only a write trades a dictionary for a plain column
+    /// and the writers are kept out from the one to the other.
+    fn swap_cells(&mut self, cells: &mut Cells) {
+        match (self, cells) {
+            (Column::Plain { values }, Cells::Values(moved)) => std::mem::swap(values, moved),
+            (Column::Dictionary { codes, .. }, Cells::Codes(moved)) => std::mem::swap(codes, moved),
+            _ => unreachable!("a column keeps its form from its close-up's copy to the swap"),
+        }
+    }
+
+    /// Every part of the column, each with its capacity, for
+    /// [`ColumnStore::layout`].
+    #[cfg(any(test, feature = "test-support"))]
+    fn layout(&self) -> Vec<(&'static str, usize, String)> {
+        match self {
+            Column::Plain { values } => {
+                let shown: Vec<Option<String>> = values
+                    .iter()
+                    .map(|value| value.as_ref().map(Value::to_string))
+                    .collect();
+                vec![("values", values.capacity(), format!("{shown:?}"))]
+            }
+            Column::Dictionary {
+                codes,
+                dict,
+                refs,
+                free,
+                lookup,
+            } => {
+                let shown: Vec<String> = dict.iter().map(Value::to_string).collect();
+                vec![
+                    ("codes", codes.capacity(), format!("{codes:?}")),
+                    ("dict", dict.capacity(), format!("{shown:?}")),
+                    ("refs", refs.capacity(), format!("{refs:?}")),
+                    ("free", free.capacity(), format!("{free:?}")),
+                    ("lookup", lookup.capacity(), lookup.len().to_string()),
+                ]
             }
         }
     }
@@ -343,6 +415,24 @@ impl Column {
             }
         }
     }
+}
+
+/// One column's part of a close-up built off to the side, in the form the
+/// column holds.
+enum Cells {
+    Codes(Vec<u32>),
+    Values(Vec<Option<Value>>),
+}
+
+/// What a close-up replaces in a column store, built off to the side by
+/// [`ColumnStore::closed_up`] and swapped in by [`ColumnStore::swap_parts`]:
+/// every column's codes or values, the live set and the extent. The swap
+/// trades the parts with the store's own, so once it has run the value holds
+/// the store's old parts, for the caller to drop with no guard held.
+pub struct ColumnParts {
+    cells: Vec<Cells>,
+    live: Bitmap,
+    slots: usize,
 }
 
 /// Set in `words` the bit of each slot whose code in `codes` `takes`
@@ -642,6 +732,11 @@ impl ColumnStore {
     /// below the record count. Each column and the live set give back what
     /// they hold past the records or the reservation for `expected_size`,
     /// whichever is more.
+    ///
+    /// The close-up a collection runs is [`ColumnStore::closed_up`] and
+    /// [`ColumnStore::swap_parts`]. This is the same pass made in place,
+    /// kept for the tests that hold the two to the same result.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn close_up(&mut self, old_of_new: &[u32], expected_size: usize) {
         if self.names.is_empty() {
             return;
@@ -653,6 +748,62 @@ impl ColumnStore {
         }
         self.live.hold_first(old_of_new.len(), reserved);
         self.slots = old_of_new.len();
+    }
+
+    /// The parts [`ColumnStore::close_up`] leaves, built from this store
+    /// and leaving it as it is, so a reader goes on reading the store while
+    /// they are made: every column's codes or values with the record at
+    /// `old_of_new[k]` at `k`, the live set as the positions below the
+    /// record count, and the extent at the record count, each part at the
+    /// capacity the pass in place leaves it. `None` on a store with no
+    /// declaration, which a close-up leaves as it is.
+    pub fn closed_up(&self, old_of_new: &[u32], expected_size: usize) -> Option<ColumnParts> {
+        if self.names.is_empty() {
+            return None;
+        }
+        debug_assert_eq!(old_of_new.len(), self.records);
+        let reserved = expected_size.saturating_add(1);
+        Some(ColumnParts {
+            cells: self
+                .columns
+                .iter()
+                .map(|column| column.closed_up(old_of_new, reserved))
+                .collect(),
+            live: Bitmap::first(old_of_new.len(), reserved),
+            slots: old_of_new.len(),
+        })
+    }
+
+    /// Trade this store's parts for `parts`, which
+    /// [`ColumnStore::closed_up`] built from it, so the store holds the
+    /// closed-up parts and `parts` the store's old ones. Moves alone.
+    pub fn swap_parts(&mut self, parts: &mut ColumnParts) {
+        for (column, cells) in self.columns.iter_mut().zip(parts.cells.iter_mut()) {
+            column.swap_cells(cells);
+        }
+        std::mem::swap(&mut self.live, &mut parts.live);
+        std::mem::swap(&mut self.slots, &mut parts.slots);
+    }
+
+    /// Every part of the store, each with its capacity, for a test that
+    /// holds two stores to be the same codes and values. Absent from every
+    /// build that is not a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn layout(&self) -> Vec<(&'static str, usize, String)> {
+        let mut out = vec![
+            ("names", self.names.capacity(), format!("{:?}", self.names)),
+            (
+                "live",
+                self.live.words.capacity(),
+                format!("{:?}", self.live.words),
+            ),
+            ("slots", 0, self.slots.to_string()),
+            ("records", 0, self.records.to_string()),
+        ];
+        for column in &self.columns {
+            out.extend(column.layout());
+        }
+        out
     }
 
     /// How far any walk goes, being one past the highest position written

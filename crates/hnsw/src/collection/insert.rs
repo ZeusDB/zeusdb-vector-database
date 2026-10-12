@@ -6,11 +6,27 @@
 //! index is quantized and whether it is still collecting for training. Removal
 //! is logical, and `compact` reclaims the graph nodes that removal and
 //! replacement leave behind. A removal batch that leaves more holes than the
-//! allowance and the records held closes the positions up before it lets its
+//! allowance and the records held closes the positions up once it has let its
 //! guards go, and the graph keeps its nodes.
 //!
 //! Every mutating operation the binding calls takes `writers` here, first and
-//! before any guard, and the helpers under it never do.
+//! before any guard, and the helpers under it never do. A helper that closes
+//! the positions up borrows the guard from its caller, so the close-up is
+//! seen to run under it.
+//!
+//! # The close-up
+//!
+//! One routine moves every per-record structure so the records held sit at
+//! the positions below their count, for a removal batch that passes the bound,
+//! a compaction, a rebuild at a new degree and both training rebuilds. It
+//! runs in two phases under `writers`, which keeps every other writer out, so
+//! nothing it reads can change between them. The first builds new copies of
+//! the structures under read guards, which searches share, so a search runs
+//! on the structures as they are for as long as the copies take. The second
+//! takes every write guard in the declared order and trades the copies for
+//! the structures, a move of each, so a search waits for the moves alone and
+//! sees every structure before the close-up or every structure after it. The
+//! structures it replaced are dropped once the guards are let go.
 //!
 //! # The seam
 //!
@@ -22,21 +38,21 @@
 //! can run them for a recorded operation without recording it again.
 
 use super::{
-    validate_index_parameters, Collection, DenseIndex, ParsedRecord, ParsedRecords, SparseHalf,
-    StorageMode, HOLE_ALLOWANCE, MAX_LAYER,
+    validate_index_parameters, Collection, DenseIndex, DenseParts, ParsedRecord, ParsedRecords,
+    SparseHalf, StorageMode, HOLE_ALLOWANCE, MAX_LAYER,
 };
-use crate::locks::WriteGuard;
+use crate::locks::{Locked, WriteGuard};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, Bitmap, ColumnStore, Error, Filter, IdStore, InsertParts, MetadataStore,
-    Operation, OperationKind, Position, Prepared, RecordId, Selection, SparseVector, VectorGraph,
-    VectorIndex, JOURNAL_MAX_PAYLOAD, MAX_INTERNAL_ID,
+    matches_filter, Bitmap, ColumnParts, ColumnStore, Error, Filter, IdParts, IdStore, InsertParts,
+    MetadataParts, MetadataStore, Operation, OperationKind, Position, Prepared, RecordId,
+    Selection, SparseVector, VectorGraph, VectorIndex, JOURNAL_MAX_PAYLOAD, MAX_INTERNAL_ID,
 };
-use zeusdb_vector_sparse::PostingsIndex;
+use zeusdb_vector_sparse::{PostingsIndex, PostingsParts};
 
 /// The target every record this file emits carries. See the parent module.
 const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::insert";
@@ -93,6 +109,158 @@ struct RemovalGuards<'a> {
 #[cfg(test)]
 thread_local! {
     pub(super) static CLOSE_UPS_ON_REMOVAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The points a close-up passes, for a test that holds a close-up at one of
+/// them or counts what overlapped it. Nothing outside the tests sees them.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CloseUpPoint {
+    /// Every read guard the build takes is held, and the copies are about
+    /// to be made.
+    Building,
+    /// The copies are made and the read guards let go.
+    Built,
+    /// Every write guard is held, and the copies are about to go in.
+    Swapping,
+    /// The copies are in and the write guards let go.
+    Swapped,
+}
+
+/// What a test sets for this thread's close-ups to call at each point.
+#[cfg(test)]
+pub(super) type CloseUpHook = Box<dyn FnMut(CloseUpPoint)>;
+
+// What this thread's close-ups call at each point, where a test set it.
+#[cfg(test)]
+thread_local! {
+    pub(super) static CLOSE_UP_HOOK: std::cell::RefCell<Option<CloseUpHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Every structure a close-up moves, each as its parts with their
+/// capacities, for the test that holds the close-up built off to the side
+/// to the one made in place.
+#[cfg(test)]
+pub(super) type Layouts = Vec<(&'static str, Vec<(&'static str, usize, String)>)>;
+
+/// The layouts of the structures the guards hold.
+#[cfg(test)]
+fn layouts(guards: &RemovalGuards<'_>) -> Layouts {
+    let mut out = vec![
+        ("ids", guards.ids.layout()),
+        ("index", guards.index.layout()),
+        ("metadata", guards.vector_metadata.layout()),
+        ("columns", guards.columns.layout()),
+    ];
+    if let Some(sparse) = guards.sparse.as_ref() {
+        out.push(("sparse", sparse.layout()));
+    }
+    out
+}
+
+/// Call this thread's close-up hook, where a test set one.
+#[cfg(test)]
+fn reach(point: CloseUpPoint) {
+    CLOSE_UP_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(point);
+        }
+    });
+}
+
+/// Every structure's part of one close-up, built off to the side and then
+/// traded for the structures' own under every write guard.
+///
+/// A part is absent where the close-up leaves its structure as it is: every
+/// store where no position holds a hole, the dense index where no position
+/// holds a hole and no graph replaces its own, the sparse index where the
+/// collection declares no sparse space, and the column store where it
+/// declares no field. Once the swap has run, each part holds what its
+/// structure held, for the caller to drop with no guard held.
+pub(super) struct ClosedUp {
+    index: Option<DenseParts>,
+    sparse: Option<PostingsParts>,
+    ids: Option<IdParts>,
+    metadata: Option<MetadataParts>,
+    columns: Option<ColumnParts>,
+}
+
+impl ClosedUp {
+    /// Build every part from the structures as the read guards hold them.
+    ///
+    /// The positions held are listed in increasing order, `old_of_new`, and
+    /// mapped to their ranks, `new_of_old`, a hole mapping to the empty
+    /// marker. Both are transient, four bytes a position. Where `replacement`
+    /// is given, built off to the side with the record at old position
+    /// `old_of_new[k]` filed at `k`, the dense index's part is that graph and
+    /// the numbering read from it; where it is not, the graph keeps every
+    /// node and the index's part is its numbering moved. Each store's part
+    /// is what its close-up leaves, the sparse space dropping the postings
+    /// of the records it holds dead and the id store its removed text, each
+    /// at the capacity the pass in place leaves it.
+    fn build(
+        ids: &IdStore,
+        index: &DenseIndex,
+        sparse: Option<&PostingsIndex>,
+        metadata: &MetadataStore,
+        columns: &ColumnStore,
+        replacement: Option<(VectorGraph, Option<(f64, f64)>)>,
+        expected_size: usize,
+    ) -> ClosedUp {
+        let extent = ids.extent();
+        let old_of_new: Vec<u32> = ids.slots().map(|at| at as u32).collect();
+        let holes = old_of_new.len() < extent;
+        let index = match replacement {
+            Some((graph, timed)) => Some(index.replaced(graph, timed)),
+            None => holes.then(|| index.closed_up(&old_of_new, expected_size)),
+        };
+        if !holes {
+            return ClosedUp {
+                index,
+                sparse: None,
+                ids: None,
+                metadata: None,
+                columns: None,
+            };
+        }
+        let mut new_of_old = vec![Position::NONE; extent];
+        for (k, &old) in old_of_new.iter().enumerate() {
+            new_of_old[old as usize] = k as u32;
+        }
+        ClosedUp {
+            index,
+            sparse: sparse.map(|sparse| sparse.closed_up(&old_of_new, &new_of_old)),
+            ids: Some(ids.closed_up(&old_of_new, &new_of_old, expected_size)),
+            metadata: Some(metadata.closed_up(&old_of_new, expected_size)),
+            columns: columns.closed_up(&old_of_new, expected_size),
+        }
+    }
+
+    /// Trade every part for its structure's own, under the write guards the
+    /// caller holds. Moves alone.
+    fn swap_into(&mut self, guards: &mut RemovalGuards<'_>) {
+        if let Some(index) = self.index.as_mut() {
+            guards.index.swap_parts(index);
+        }
+        if let (Some(sparse), Some(parts)) = (guards.sparse.as_mut(), self.sparse.as_mut()) {
+            sparse.swap_parts(parts);
+        }
+        if let Some(ids) = self.ids.as_mut() {
+            guards.ids.swap_parts(ids);
+        }
+        if let Some(metadata) = self.metadata.as_mut() {
+            guards.vector_metadata.swap_parts(metadata);
+        }
+        if let Some(columns) = self.columns.as_mut() {
+            guards.columns.swap_parts(columns);
+        }
+    }
+
+    /// Bytes of id text the close-up let go of, read once the swap has run.
+    fn removed_text(&self) -> usize {
+        self.ids.as_ref().map_or(0, IdParts::removed_text)
+    }
 }
 
 /// One record past the door and not yet installed.
@@ -467,6 +635,12 @@ impl Collection {
     /// rewrites its text without the removed ids. With no hole there is
     /// nothing to move. Returns the graph replaced, and the bytes of id text
     /// the id store let go of.
+    ///
+    /// The close-up a collection runs is [`Collection::close_up`], which
+    /// builds the same structures off to the side and swaps them in. This
+    /// is the pass made in place under every write guard, kept for the tests
+    /// that hold the two to the same result.
+    #[cfg(test)]
     fn close_up_under_guards(
         guards: &mut RemovalGuards<'_>,
         replacement: Option<(VectorGraph, Option<(f64, f64)>)>,
@@ -500,9 +674,132 @@ impl Collection {
         (replaced, reclaimed_text)
     }
 
+    /// Both close-ups from the state the collection holds, for the test that
+    /// holds them to one result, under every write guard for the whole of it.
+    ///
+    /// The close-up built off to the side runs first: its parts are built
+    /// from the structures as the guards hold them and swapped in, and every
+    /// structure's layout is read. A second swap then trades the old parts
+    /// back, which puts every structure back as it was, since the parts hold
+    /// exactly what the structures held. The close-up made in place then
+    /// runs from that state, with the replacement graph the parts held,
+    /// where one was given, and the layouts are read again. Both take the
+    /// units `timed` gives. Returns the two layouts, aside then in place,
+    /// and the bytes of id text each let go of. The collection is left as
+    /// the close-up in place leaves it.
+    #[cfg(test)]
+    pub(super) fn close_up_both_ways(
+        &self,
+        replacement: Option<VectorGraph>,
+        timed: Option<(f64, f64)>,
+    ) -> ((Layouts, usize), (Layouts, usize)) {
+        let expected_size = self.expected_size();
+        let mut guards = self.removal_guards();
+        let mut parts = ClosedUp::build(
+            &guards.ids,
+            &guards.index,
+            guards.sparse.as_deref(),
+            &guards.vector_metadata,
+            &guards.columns,
+            replacement.map(|graph| (graph, timed)),
+            expected_size,
+        );
+        parts.swap_into(&mut guards);
+        let aside = (layouts(&guards), parts.removed_text());
+        parts.swap_into(&mut guards);
+        let replacement = match parts.index.take() {
+            Some(DenseParts::Graph { graph, .. }) => Some((*graph, timed)),
+            _ => None,
+        };
+        let (old, removed_text) =
+            Self::close_up_under_guards(&mut guards, replacement, expected_size);
+        let in_place = (layouts(&guards), removed_text);
+        drop(guards);
+        drop(old);
+        (aside, in_place)
+    }
+
+    /// Close the positions up, so the records held sit at the positions below
+    /// their count in their order: the one routine a removal batch past the
+    /// bound, a compaction, a rebuild at a new degree and both training
+    /// rebuilds run. Returns the bytes of id text the id store let go of.
+    ///
+    /// `writers` is the caller's hold on the mutation guard, borrowed so the
+    /// two phases are seen to run under one hold of it. Nothing else writes
+    /// while it is held, so nothing the build reads can change before the
+    /// swap.
+    ///
+    /// The build takes the read guards in the declared order, being the id
+    /// store, the dense index, the sparse index, the metadata and the
+    /// columns, and makes every structure's part off to the side with them
+    /// held; see [`ClosedUp::build`]. A search shares those guards, so it
+    /// runs throughout on the structures as they are. Where `replacement`
+    /// is given, built off to the side with the record at the `k`th position
+    /// held filed at `k`, the dense index's part is that graph; where it is
+    /// not, the graph keeps every node.
+    ///
+    /// The swap takes every write guard a removal takes, in the declared
+    /// order, trades every part for its structure's own, and lets the
+    /// guards go. A search therefore sees every structure as it was or every
+    /// structure closed up and never a mix, and waits for the trade alone.
+    /// What the structures held, the graph a replacement replaced among it,
+    /// is dropped once the guards are let go. Dropping a graph forks to
+    /// rayon, and a fork under a write guard deadlocks against a batch
+    /// search holding the pool; see [`Collection::replace_dense_graph`].
+    fn close_up(
+        &self,
+        _writers: &Locked<'_, ()>,
+        replacement: Option<(VectorGraph, Option<(f64, f64)>)>,
+        expected_size: usize,
+    ) -> usize {
+        let mut parts = self.build_close_up(replacement, expected_size);
+        #[cfg(test)]
+        reach(CloseUpPoint::Built);
+        self.swap_close_up(&mut parts);
+        #[cfg(test)]
+        reach(CloseUpPoint::Swapped);
+        let removed_text = parts.removed_text();
+        drop(parts);
+        removed_text
+    }
+
+    /// The build phase of [`Collection::close_up`], under read guards
+    /// taken in the declared order and let go on return.
+    fn build_close_up(
+        &self,
+        replacement: Option<(VectorGraph, Option<(f64, f64)>)>,
+        expected_size: usize,
+    ) -> ClosedUp {
+        let ids = self.ids.read().unwrap();
+        let index = self.dense().index.read().unwrap();
+        let sparse = self.sparse().map(|space| space.index.read().unwrap());
+        let metadata = self.vector_metadata.read().unwrap();
+        let columns = self.columns.read().unwrap();
+        #[cfg(test)]
+        reach(CloseUpPoint::Building);
+        ClosedUp::build(
+            &ids,
+            &index,
+            sparse.as_deref(),
+            &metadata,
+            &columns,
+            replacement,
+            expected_size,
+        )
+    }
+
+    /// The swap phase of [`Collection::close_up`], under every write guard
+    /// a removal takes, taken in the declared order and let go on return.
+    fn swap_close_up(&self, parts: &mut ClosedUp) {
+        let mut guards = self.removal_guards();
+        #[cfg(test)]
+        reach(CloseUpPoint::Swapping);
+        parts.swap_into(&mut guards);
+    }
+
     /// Install a replacement graph built from the records held in position
-    /// order, closing the positions up under every write guard, and drop the
-    /// old graph outside them.
+    /// order, closing the positions up, and drop the old graph once every
+    /// guard is let go.
     ///
     /// The paths that replace the whole backend, `compact`, `rebuild`, both
     /// training transitions and the persistence rebuilds, all used to write
@@ -520,19 +817,19 @@ impl Collection {
     /// this is a fork that rule is easy to miss on, because it is hidden inside
     /// an assignment rather than written as a call.
     ///
-    /// Moving the old value out and dropping it after the guards are released
-    /// keeps the swap to a pointer move and the close-up's one pass under
-    /// them. The replacement's unit cost is timed before the guards are
-    /// taken, for the same reason. The caller holds `writers`. Returns the
+    /// The close-up builds the replacement's numbering and every other
+    /// structure off to the side and trades them in under the guards, so the
+    /// swap is a set of moves and the old graph goes out with the parts it
+    /// hands back. The replacement's unit cost is timed before any guard is
+    /// taken, for the same reason. `writers` is the caller's. Returns the
     /// bytes of id text the close-up let go of.
-    pub(super) fn replace_dense_graph(&self, graph: VectorGraph) -> usize {
+    pub(super) fn replace_dense_graph(
+        &self,
+        writers: &Locked<'_, ()>,
+        graph: VectorGraph,
+    ) -> usize {
         let timed = DenseIndex::time_graph(&graph);
-        let expected_size = self.expected_size();
-        let (old, reclaimed_text) = {
-            let mut guards = self.removal_guards();
-            Self::close_up_under_guards(&mut guards, Some((graph, timed)), expected_size)
-        };
-        drop(old);
+        let reclaimed_text = self.close_up(writers, Some((graph, timed)), self.expected_size());
         debug_assert!(
             self.positions_agree(),
             "the close-up leaves every structure at the positions the records hold"
@@ -540,27 +837,32 @@ impl Collection {
         reclaimed_text
     }
 
-    /// The close-up on removal, run once a removal batch is done, under the
-    /// guards the batch already holds. Returns whether it ran.
+    /// The close-up on removal, run once a removal batch is done and has let
+    /// its guards go, under the `writers` the caller holds. Returns whether
+    /// it ran.
     ///
     /// Where the holes exceed both [`HOLE_ALLOWANCE`] and the records held,
     /// every per-record structure is closed up by the routine a compaction
     /// runs, the sparse space dropping the postings of the records it holds
     /// dead, and the graph keeps every node. Otherwise nothing moves. The
-    /// pass reads every position held, every bucket and every live posting
+    /// build reads every position held, every bucket and every live posting
     /// once, and it runs after at least as many removals since the last
     /// close-up as the allowance or the records held, whichever is more.
+    /// Between the batch and the swap a reader sees the batch's holes, which
+    /// may pass the bound; see [`Collection::positions_agree_any_holes`].
     ///
     /// A batch is what one removal's record names, so a replay of the
     /// record closes up at the same point as the removal that wrote it.
-    fn close_up_after_removal(guards: &mut RemovalGuards<'_>, expected_size: usize) -> bool {
-        let held = guards.ids.len();
-        let holes = guards.ids.extent() - held;
+    fn close_up_after_removal(&self, writers: &Locked<'_, ()>, expected_size: usize) -> bool {
+        let (held, holes) = {
+            let ids = self.ids.read().unwrap();
+            (ids.len(), ids.extent() - ids.len())
+        };
         if holes <= HOLE_ALLOWANCE.max(held) {
             return false;
         }
         let start = Instant::now();
-        let (_, reclaimed_text) = Self::close_up_under_guards(guards, None, expected_size);
+        let reclaimed_text = self.close_up(writers, None, expected_size);
         #[cfg(test)]
         CLOSE_UPS_ON_REMOVAL.with(|count| count.set(count.get() + 1));
         debug!(target: LOG_TARGET, operation = "close_up_on_removal",
@@ -707,20 +1009,21 @@ impl Collection {
     /// Enhanced internal remove_point method with comprehensive PQ support
     ///
     /// A batch of one record, so the close-up on removal runs after it where
-    /// it is due, under the same guards.
-    pub(super) fn remove_point_internal(&self, id: String) -> Result<bool, String> {
+    /// it is due, once its guards are let go.
+    pub(super) fn remove_point_internal(
+        &self,
+        writers: &Locked<'_, ()>,
+        id: String,
+    ) -> Result<bool, String> {
         // Read before the guards are taken, because it reaches the graph lock and
         // the declared order puts the graph above every map held below.
         let storage_mode = self.storage_mode();
         let expected_size = self.expected_size();
-        let (removed, closed) = {
+        let removed = {
             let mut guards = self.removal_guards();
-            let removed = self.remove_under_guards(&mut guards, &id, &storage_mode);
-            (
-                removed,
-                Self::close_up_after_removal(&mut guards, expected_size),
-            )
+            self.remove_under_guards(&mut guards, &id, &storage_mode)
         };
+        let closed = self.close_up_after_removal(writers, expected_size);
         debug_assert!(
             !closed || self.positions_agree(),
             "the close-up on removal leaves every structure at the positions the records hold"
@@ -742,12 +1045,16 @@ impl Collection {
     /// What that changes for a reader is that the batch is atomic against every
     /// search: none of them sees the index part way through it.
     ///
-    /// The close-up on removal runs once the batch is done, where it is due,
-    /// under the same guards, and never part way through the batch.
-    pub(super) fn remove_points_internal(&self, ids: &[String]) -> Vec<String> {
+    /// The close-up on removal runs once the batch is done and its guards
+    /// are let go, where it is due, and never part way through the batch.
+    pub(super) fn remove_points_internal(
+        &self,
+        writers: &Locked<'_, ()>,
+        ids: &[String],
+    ) -> Vec<String> {
         let storage_mode = self.storage_mode();
         let expected_size = self.expected_size();
-        let (missing, closed) = {
+        let missing = {
             let mut guards = self.removal_guards();
             let mut handled: HashSet<&str> = HashSet::with_capacity(ids.len());
             let mut missing = Vec::new();
@@ -759,9 +1066,9 @@ impl Collection {
                     missing.push(id.clone());
                 }
             }
-            let closed = Self::close_up_after_removal(&mut guards, expected_size);
-            (missing, closed)
+            missing
         };
+        let closed = self.close_up_after_removal(writers, expected_size);
         debug_assert!(
             !closed || self.positions_agree(),
             "the close-up on removal leaves every structure at the positions the records hold"
@@ -789,7 +1096,11 @@ impl Collection {
     /// group shape the engine cannot evaluate was rejected there, before any
     /// record was read. What can fail is the sink, which is handed the
     /// resolved ids between the two phases.
-    pub(super) fn remove_where_locked(&self, filter: &Filter) -> Result<usize, Error> {
+    pub(super) fn remove_where_locked(
+        &self,
+        writers: &Locked<'_, ()>,
+        filter: &Filter,
+    ) -> Result<usize, Error> {
         // The id store before `vector_metadata` before `columns`, which is
         // the declared order, because the metadata store and the bitmap hold
         // internal ids and a removal names external ones. The columns guard
@@ -847,7 +1158,7 @@ impl Collection {
         self.record_removal(&doomed)?;
 
         let total = doomed.len();
-        let missing = self.remove_points_internal(&doomed);
+        let missing = self.remove_points_internal(writers, &doomed);
         debug_assert!(
             missing.is_empty(),
             "every id came from the metadata store under the mutation guard, so none of them can have been absent by the time it was removed"
@@ -903,7 +1214,7 @@ impl Collection {
 
     /// The body of `compact`, with the mutation guard held by the caller and
     /// the record already handed over.
-    pub(super) fn compact_locked(&self) -> Result<usize, Error> {
+    pub(super) fn compact_locked(&self, writers: &Locked<'_, ()>) -> Result<usize, Error> {
         let start_time = Instant::now();
 
         // The sparse space first, where there is one, since what it has to
@@ -950,6 +1261,7 @@ impl Collection {
 
         let quantized = self.is_quantized();
         let nodes_after = self.rebuild_graph(
+            writers,
             self.dense().m(),
             self.expected_size(),
             self.dense().ef_construction(),
@@ -998,6 +1310,7 @@ impl Collection {
     /// guard is held by the caller and the record already handed over.
     pub(super) fn rebuild_locked(
         &self,
+        writers: &Locked<'_, ()>,
         m: usize,
         expected_size: usize,
         ef_construction: usize,
@@ -1010,7 +1323,7 @@ impl Collection {
         let live_count = self.ids.read().unwrap().len();
         let nodes_before = self.dense().index.read().unwrap().graph().nb_points();
 
-        let nodes_after = self.rebuild_graph(m, expected_size, ef_construction)?;
+        let nodes_after = self.rebuild_graph(writers, m, expected_size, ef_construction)?;
 
         self.dense().m.store(m, Ordering::Release);
         self.expected_size.store(expected_size, Ordering::Release);
@@ -1049,13 +1362,43 @@ impl Collection {
     /// index whose records cannot be rebuilt from therefore still reports the
     /// configuration its graph actually has.
     ///
-    /// The caller holds `writers`.
+    /// The caller holds `writers` and lends it here.
     fn rebuild_graph(
         &self,
+        writers: &Locked<'_, ()>,
         m: usize,
         expected_size: usize,
         ef_construction: usize,
     ) -> Result<usize, Error> {
+        let new_hnsw = self.replacement_graph(m, expected_size, ef_construction)?;
+        let nodes_after = new_hnsw.nb_points();
+
+        // The text of every removed record, which stayed in the id store's
+        // arena until now, goes with the stranded nodes: one pass over the
+        // entries and one copy of the live text, which the close-up makes
+        // off to the side. Nothing else reclaims it short of `clear`.
+        let reclaimed_text = self.replace_dense_graph(writers, new_hnsw);
+        if reclaimed_text > 0 {
+            debug!(target: LOG_TARGET, operation = "rebuild_graph",
+                reclaimed_id_bytes = reclaimed_text,
+                "Removed records' ids reclaimed from the id store"
+            );
+        }
+
+        Ok(nodes_after)
+    }
+
+    /// The replacement `rebuild_graph` installs: every record held
+    /// re-inserted at one degree, in position order, under the internal id
+    /// it holds, with the slack of its arenas given back. Refused, with
+    /// nothing built, where a record held has no source data. The caller
+    /// holds `writers`, so nothing it reads can change before the install.
+    pub(super) fn replacement_graph(
+        &self,
+        m: usize,
+        expected_size: usize,
+        ef_construction: usize,
+    ) -> Result<VectorGraph, Error> {
         let live_count = self.ids.read().unwrap().len();
         let quantized = self.is_quantized();
         // A scalar graph is rebuilt from its own rows, which nothing else
@@ -1117,7 +1460,7 @@ impl Collection {
             let ids = self.ids.read().unwrap();
             // The graph being replaced, which is where the vectors live. Taken
             // after the id store and released with it, before the close-up
-            // takes the write guards below.
+            // that installs the replacement takes any guard.
             let old_index = self.dense().index.read().unwrap();
             let old_hnsw = old_index.graph();
             let origin_ids = old_hnsw.origin_ids();
@@ -1235,29 +1578,13 @@ impl Collection {
             });
         }
 
-        let nodes_after = new_hnsw.nb_points();
-
         // The replacement was built by insertion, so its arenas carry the same
         // geometric slack the graph being replaced carried. Compaction exists to
         // return memory, and returning it while still holding the graph outside
         // the write guard costs one copy of the live bytes against a rebuild that
         // has just re-inserted every record.
         new_hnsw.shrink_to_fit();
-
-        // The text of every removed record, which stayed in the id store's
-        // arena until now, goes with the stranded nodes: one pass over the
-        // entries and one copy of the live text, which the close-up makes
-        // under the guards it holds. Nothing else reclaims it short of
-        // `clear`.
-        let reclaimed_text = self.replace_dense_graph(new_hnsw);
-        if reclaimed_text > 0 {
-            debug!(target: LOG_TARGET, operation = "rebuild_graph",
-                reclaimed_id_bytes = reclaimed_text,
-                "Removed records' ids reclaimed from the id store"
-            );
-        }
-
-        Ok(nodes_after)
+        Ok(new_hnsw)
     }
 
     /// The insertion phase of `add`, run with the interpreter lock released
@@ -1334,6 +1661,7 @@ impl Collection {
     /// reaches PyO3's boundary.
     pub(super) fn insert_parsed_records(
         &self,
+        writers: &Locked<'_, ()>,
         parsed_data: Vec<ParsedRecord>,
         overwrite: bool,
     ) -> (Vec<String>, Vec<InsertError>) {
@@ -1426,7 +1754,7 @@ impl Collection {
                 // One batch under one set of guards, which is how a replay
                 // applies the removal's record, so the close-up on removal
                 // runs at the same point in both.
-                let missing = self.remove_points_internal(&ids_to_remove);
+                let missing = self.remove_points_internal(writers, &ids_to_remove);
                 debug_assert!(
                     missing.is_empty(),
                     "every id came from the id store under the mutation guard"
@@ -1542,7 +1870,7 @@ impl Collection {
                         }
 
                         // Check training trigger (graceful failure handling)
-                        if let Err(training_error) = self.maybe_trigger_training() {
+                        if let Err(training_error) = self.maybe_trigger_training(writers) {
                             warn!(target: LOG_TARGET, operation = "training_trigger",
                                 error = %training_error,
                                 vector_id = %id_for_error,
@@ -2004,8 +2332,8 @@ impl Collection {
         );
 
         let (inserted_ids, insert_errors) = {
-            let _writers = self.writers.lock().unwrap();
-            self.insert_parsed_records(parsed_data, overwrite)
+            let writers = self.writers.lock().unwrap();
+            self.insert_parsed_records(&writers, parsed_data, overwrite)
         };
         let total_inserted = inserted_ids.len();
 
@@ -2070,10 +2398,11 @@ impl Collection {
     /// handed to the sink before the record goes, and a sink that refuses it
     /// refuses the call.
     pub fn remove_point(&self, id: String) -> Result<bool, Error> {
-        let _writers = self.writers.lock().unwrap();
+        let writers = self.writers.lock().unwrap();
         let held = self.held_ids(std::slice::from_ref(&id));
         self.record_removal(&held)?;
-        self.remove_point_internal(id).map_err(Error::Engine)
+        self.remove_point_internal(&writers, id)
+            .map_err(Error::Engine)
     }
 
     /// Remove a batch of records under one acquisition of the mutation guard,
@@ -2081,10 +2410,10 @@ impl Collection {
     /// `remove_points_internal`. The record names the ids the index held,
     /// each once, and is handed over before any goes.
     pub fn remove_points(&self, ids: &[String]) -> Result<Vec<String>, Error> {
-        let _writers = self.writers.lock().unwrap();
+        let writers = self.writers.lock().unwrap();
         let held = self.held_ids(ids);
         self.record_removal(&held)?;
-        Ok(self.remove_points_internal(ids))
+        Ok(self.remove_points_internal(&writers, ids))
     }
 
     /// Remove the records these ids name and report how many went.
@@ -2097,10 +2426,10 @@ impl Collection {
         let distinct_count = distinct.len();
 
         let missing = {
-            let _writers = self.writers.lock().unwrap();
+            let writers = self.writers.lock().unwrap();
             let held = self.held_ids(requested);
             self.record_removal(&held)?;
-            self.remove_points_internal(requested)
+            self.remove_points_internal(&writers, requested)
         };
 
         Ok(distinct_count - missing.len())
@@ -2119,8 +2448,8 @@ impl Collection {
         if conditions.matches_every_record() {
             return Err(Error::RemoveWhereMatchesEverything);
         }
-        let _writers = self.writers.lock().unwrap();
-        self.remove_where_locked(conditions)
+        let writers = self.writers.lock().unwrap();
+        self.remove_where_locked(&writers, conditions)
     }
 
     /// Replace one record's metadata without touching its vector. See
@@ -2151,10 +2480,10 @@ impl Collection {
     /// not the graph turns out to hold a stranded node, since the decision is
     /// the body's and a replay of the record makes it the same way.
     pub fn compact(&self) -> Result<usize, Error> {
-        let _writers = self.writers.lock().unwrap();
+        let writers = self.writers.lock().unwrap();
         self.record(|| Operation::Compact)?;
         self.commit_records()?;
-        self.compact_locked()
+        self.compact_locked(&writers)
     }
 
     /// Return the graph's spare buffer capacity and the dense index's
@@ -2212,14 +2541,14 @@ impl Collection {
         if plan.rearm_overgrowth {
             self.overgrowth_warned.store(false, Ordering::Release);
         }
-        let _writers = self.writers.lock().unwrap();
+        let writers = self.writers.lock().unwrap();
         self.record(|| Operation::Rebuild {
             m: plan.m as u64,
             expected_size: plan.expected_size as u64,
             ef_construction: plan.ef_construction as u64,
         })?;
         self.commit_records()?;
-        self.rebuild_locked(plan.m, plan.expected_size, plan.ef_construction)
+        self.rebuild_locked(&writers, plan.m, plan.expected_size, plan.ef_construction)
     }
 
     /// Empty the index, keeping its configuration, and report how many

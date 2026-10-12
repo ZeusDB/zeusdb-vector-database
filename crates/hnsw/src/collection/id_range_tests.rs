@@ -189,8 +189,9 @@ fn keyed_bytes(collection: &Collection) -> usize {
 /// Bytes the structures by position hold, being the id store, the metadata,
 /// the columns and the sparse space's tables and sets: `keyed_bytes` less
 /// the graph's links, which follow its nodes, and less the dense index's
-/// `node_at`, whose capacity follows the graph's reservation for its nodes.
-/// Each guard is taken alone.
+/// `node_at`, whose capacity a compaction takes from the replacement graph's
+/// reservation for its nodes and a close-up on removal from the records and
+/// the declared size. Each guard is taken alone.
 fn by_position_bytes(collection: &Collection) -> usize {
     let (numbering, links) = {
         let index = collection.dense().index.read().unwrap();

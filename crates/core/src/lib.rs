@@ -62,7 +62,7 @@ mod test_vectors;
 pub use admit::{Admit, And, Candidates};
 pub use bitmap::Bitmap;
 pub use checksum::checksum_of;
-pub use columns::{validate_indexed_fields, ColumnStore, Selection};
+pub use columns::{validate_indexed_fields, ColumnParts, ColumnStore, Selection};
 pub use distance::{CosineDist, DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric};
 pub use error::{Error, Exception};
 pub use filter::{compile_filter, matches_filter, FieldLookup, Filter};
@@ -76,7 +76,7 @@ pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES, NB_LAYER_MAX};
 pub use graph::{
     restore_graph, restore_int8_graph, Distance, DumpBounds, GraphHit, Planned, Record, VectorGraph,
 };
-pub use ids::{IdStore, MAX_INTERNAL_ID};
+pub use ids::{IdParts, IdStore, MAX_INTERNAL_ID};
 pub use int8::Int8Codec;
 pub use journal::{
     encode_journal_header, encode_journal_record, read_journal, CommitMode, JournalContents,
@@ -90,7 +90,7 @@ pub use journal::{
 pub use kill::{
     arm as kill_arm, armed_at as kill_armed_at, at as kill_at, disarm as kill_disarm, KillPoint,
 };
-pub use metadata::{MetadataStore, RecordFields};
+pub use metadata::{MetadataParts, MetadataStore, RecordFields};
 pub use operation::{InsertParts, Operation};
 pub use pq::PQ;
 pub use rng::SeededRng;

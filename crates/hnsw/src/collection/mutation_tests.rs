@@ -427,7 +427,12 @@ fn training_is_stamped_with_the_stamp_it_is_handed() {
     handed.set_pq(Some(Arc::new(PQ::new(8, 4, 4, 1000, None))));
     handed.set_training_ids((0..1000).map(|i| format!("r{i}")).collect());
     let given = "2001-02-03T04:05:06+00:00".to_string();
-    handed.train_quantization_from_ids(given.clone()).unwrap();
+    {
+        let writers = handed.writers.lock().unwrap();
+        handed
+            .train_quantization_from_ids(&writers, given.clone())
+            .unwrap();
+    }
     assert!(handed.is_quantized());
     assert_eq!(handed.training_completed_at(), Some(given));
     assert_eq!(handed.storage_mode(), "quantized_active");

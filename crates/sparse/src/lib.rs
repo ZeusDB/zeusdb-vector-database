@@ -81,8 +81,8 @@ mod verify;
 
 pub use calibrate::UnitCosts;
 pub use index::{
-    HeapBytes, PostingsIndex, SparseConfig, Unlink, Weighting, DEFAULT_BM25_B, DEFAULT_BM25_K1,
-    DEFAULT_LAZY_THRESHOLD_PERCENT,
+    HeapBytes, PostingsIndex, PostingsParts, SparseConfig, Unlink, Weighting, DEFAULT_BM25_B,
+    DEFAULT_BM25_K1, DEFAULT_LAZY_THRESHOLD_PERCENT,
 };
 pub use search::Mode;
 
