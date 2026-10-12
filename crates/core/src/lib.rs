@@ -90,6 +90,8 @@ pub use journal::{
 pub use kill::{
     arm as kill_arm, armed_at as kill_armed_at, at as kill_at, disarm as kill_disarm, KillPoint,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use metadata::{MetadataCopy, MoveHook, METADATA_MOVE_HOOK};
 pub use metadata::{MetadataParts, MetadataStore, RecordFields};
 pub use operation::{InsertParts, Operation};
 pub use pq::PQ;

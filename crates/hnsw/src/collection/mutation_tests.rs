@@ -428,7 +428,7 @@ fn training_is_stamped_with_the_stamp_it_is_handed() {
     handed.set_training_ids((0..1000).map(|i| format!("r{i}")).collect());
     let given = "2001-02-03T04:05:06+00:00".to_string();
     {
-        let writers = handed.writers.lock().unwrap();
+        let writers = handed.hold_writers();
         handed
             .train_quantization_from_ids(&writers, given.clone())
             .unwrap();

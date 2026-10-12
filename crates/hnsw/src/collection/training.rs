@@ -7,8 +7,8 @@
 //! vectors at the end of that rebuild, which is the single point where the mode
 //! does so.
 
+use super::insert::MutationGuard;
 use super::{Collection, QuantizationConfig, StorageMode, MAX_LAYER};
-use crate::locks::Locked;
 use crate::{calibrate_rerank_from_sample, raw_distance_fn, RerankCalibration};
 use chrono::Utc;
 use rand::seq::SliceRandom;
@@ -48,7 +48,7 @@ impl Collection {
         threshold_reached = self.training_threshold_reached.load(Ordering::Acquire),
         has_quantization = self.has_quantization()
     ))]
-    pub(super) fn maybe_trigger_training(&self, writers: &Locked<'_, ()>) -> Result<(), String> {
+    pub(super) fn maybe_trigger_training(&self, writers: &MutationGuard<'_>) -> Result<(), String> {
         // Check atomic flag first (fast path)
         if !self.training_threshold_reached.load(Ordering::Acquire) {
             return Ok(());
@@ -100,7 +100,7 @@ impl Collection {
     ))]
     pub(super) fn train_quantization_from_ids(
         &self,
-        writers: &Locked<'_, ()>,
+        writers: &MutationGuard<'_>,
         completed_at: String,
     ) -> Result<(), String> {
         let start_time = Instant::now();
@@ -313,7 +313,7 @@ impl Collection {
     #[instrument(target = LOG_TARGET, level = "info", skip(self, writers, completed_at))]
     pub(super) fn train_int8_from_ids(
         &self,
-        writers: &Locked<'_, ()>,
+        writers: &MutationGuard<'_>,
         completed_at: String,
     ) -> Result<(), String> {
         let start_time = Instant::now();
@@ -403,7 +403,7 @@ impl Collection {
     /// values the encode clipped are added to the index's count.
     pub(super) fn rebuild_with_int8_locked(
         &self,
-        writers: &Locked<'_, ()>,
+        writers: &MutationGuard<'_>,
     ) -> Result<bool, String> {
         let start_time = Instant::now();
         let Some(codec) = self.dense().int8_codec().cloned() else {
@@ -534,7 +534,7 @@ impl Collection {
     /// raised, and the training path formats into its own message.
     pub(super) fn rebuild_with_quantization_locked(
         &self,
-        writers: &Locked<'_, ()>,
+        writers: &MutationGuard<'_>,
     ) -> Result<bool, String> {
         if self.dense().declares_int8() {
             return self.rebuild_with_int8_locked(writers);
@@ -797,7 +797,7 @@ impl Collection {
     /// turns out to rebuild, since a replay of the record decides that the
     /// same way.
     pub fn rebuild_with_quantization(&self) -> Result<bool, Error> {
-        let writers = self.writers.lock().unwrap();
+        let writers = self.hold_writers();
         self.record(|| Operation::RebuildQuantized)?;
         self.commit_records()?;
         self.rebuild_with_quantization_locked(&writers)

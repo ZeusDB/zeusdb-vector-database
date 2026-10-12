@@ -27,6 +27,12 @@
 //! [`MetadataStore::swap_parts`] puts in. The vector is reserved for the
 //! declared record count, under a cap, and grows by doubling past it, which
 //! is the rule the graph's per node arrays follow.
+//!
+//! **A close-up moves the blocks rather than copying them.** Its new
+//! entries stay empty until the swap, which moves each block the close-up
+//! keeps from its old entry into its new one under the store's write
+//! guard, so no block is cloned and each has one owner throughout. See
+//! [`MetadataParts`].
 
 use crate::filter::FieldLookup;
 use serde_json::Value;
@@ -63,13 +69,73 @@ pub struct MetadataStore {
     held: usize,
 }
 
-/// What a close-up replaces in a metadata store, built off to the side by
-/// [`MetadataStore::closed_up`] and swapped in by
-/// [`MetadataStore::swap_parts`]. The swap trades the parts with the store's
-/// own, so once it has run the value holds the store's old entries, for the
-/// caller to drop with no guard held.
+/// What a close-up replaces in a metadata store, made ready off to the side
+/// by [`MetadataStore::closed_up`] and swapped in by
+/// [`MetadataStore::swap_parts`].
+///
+/// The new entries, one for each record the close-up keeps and each empty,
+/// and the old position each takes its block from. The store holds every
+/// block until the swap, so a reader goes on reading the store's entries
+/// while the parts are made, and no block is allocated or cloned. The swap
+/// moves each block into its new entry and trades the entries with the
+/// store's own, so once it has run the value holds the store's old entries,
+/// every one of them empty, for the caller to drop with no guard held.
 pub struct MetadataParts {
     records: Vec<Option<Box<[Field]>>>,
+    from: Vec<u32>,
+}
+
+/// What [`MetadataStore::closed_up_copied`] builds: the store's kept
+/// entries at their new positions, every block cloned. Kept for the tests
+/// that hold the close-up that moves the blocks to the one that copied
+/// them.
+#[cfg(any(test, feature = "test-support"))]
+pub struct MetadataCopy {
+    records: Vec<Option<Box<[Field]>>>,
+}
+
+/// What a test sets for this thread's metadata trades to call as they move
+/// the blocks; see [`METADATA_MOVE_HOOK`].
+#[cfg(any(test, feature = "test-support"))]
+pub type MoveHook = Box<dyn FnMut(usize, usize)>;
+
+// What this thread's metadata trades call before each block moves, with the
+// new entry's position and the count of new entries, where a test set it.
+// Nothing outside the tests sees it.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    pub static METADATA_MOVE_HOOK: std::cell::RefCell<Option<MoveHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Trade the entry at `k` in `new` with the entry at `from[k]` in `old`,
+/// for every entry `new` holds, in increasing position. A position past the
+/// entries `old` holds is one no insertion reached, which holds no entry,
+/// and its entry in `new` is left as it is.
+///
+/// Where every entry of `new` is empty, as the close-up makes them, each
+/// trade moves a block from its old entry into its new one and leaves the
+/// old entry empty: an owned move, with nothing cloned and nothing to drop.
+/// Where every entry `from` names in `old` is empty, as the swap leaves
+/// them, the trades move each block back.
+fn move_blocks(old: &mut [Option<Box<[Field]>>], new: &mut [Option<Box<[Field]>>], from: &[u32]) {
+    let moves = new.iter_mut().zip(from);
+    #[cfg(any(test, feature = "test-support"))]
+    let count = moves.len();
+    #[cfg(any(test, feature = "test-support"))]
+    let moves = moves.enumerate().map(|(k, pair)| {
+        METADATA_MOVE_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(k, count);
+            }
+        });
+        pair
+    });
+    for (entry, &at) in moves {
+        if let Some(source) = old.get_mut(at as usize) {
+            std::mem::swap(entry, source);
+        }
+    }
 }
 
 impl MetadataStore {
@@ -167,17 +233,83 @@ impl MetadataStore {
         );
     }
 
-    /// The entries [`MetadataStore::close_up`] leaves, built from this store
-    /// and leaving it as it is, so a reader goes on reading the store while
-    /// they are made.
+    /// The entries [`MetadataStore::close_up`] leaves, made ready from this
+    /// store and leaving it as it is, so a reader goes on reading the store
+    /// while they are made; [`MetadataStore::swap_parts`] fills them.
     ///
-    /// The entry at `old_of_new[k]` is copied to `k`, block and all, as far
-    /// as the store reaches, and a record past the slots holds no entry.
-    /// The vector takes the capacity the pass in place leaves it: what it
-    /// holds, or the records or the reservation for `expected_size` where
-    /// that is less. Both copies of every block exist until the caller
-    /// drops the parts the swap hands back.
-    pub fn closed_up(&self, old_of_new: &[u32], expected_size: usize) -> MetadataParts {
+    /// One new entry for each record held, as far as the store reaches, and
+    /// each empty: the swap moves the block of the entry at `old_of_new[k]`
+    /// into the entry at `k`, and a record past the slots holds no entry.
+    /// `old_of_new` is kept as the positions the swap moves the blocks from.
+    /// The empty entries are written here, under the read guard, so the
+    /// first write to the new vector's memory falls in the build and not in
+    /// the swap, which runs under the write guard. No block is allocated or
+    /// cloned. The vector takes the capacity the pass in place leaves it:
+    /// what it holds, or the records or the reservation for `expected_size`
+    /// where that is less.
+    pub fn closed_up(&self, old_of_new: Vec<u32>, expected_size: usize) -> MetadataParts {
+        let held = old_of_new.len();
+        let kept = held.max(expected_size.saturating_add(1).min(RESERVE_CAP));
+        let mut records = Vec::with_capacity(self.records.capacity().min(kept));
+        records.resize_with(held.min(self.records.len()), || None);
+        debug_assert_eq!(
+            old_of_new[..records.len()]
+                .iter()
+                .filter(|&&old| self.records.get(old as usize).is_some_and(Option::is_some))
+                .count(),
+            self.held,
+            "the swap moves every block the store holds"
+        );
+        MetadataParts {
+            records,
+            from: old_of_new,
+        }
+    }
+
+    /// Trade this store's entries for `parts`, which
+    /// [`MetadataStore::closed_up`] made from it, so the store holds the
+    /// closed-up entries and `parts` the store's old ones.
+    ///
+    /// Each block the close-up keeps first moves from its old entry into its
+    /// new one, in increasing position, which leaves the old entry empty;
+    /// nothing is cloned, allocated or freed. The entries are then traded
+    /// whole. The caller holds the store's write guard, so no reader sees a
+    /// block between its two entries, and has kept every writer out since
+    /// the parts were made, so each old entry still holds the block its new
+    /// entry takes.
+    pub fn swap_parts(&mut self, parts: &mut MetadataParts) {
+        move_blocks(&mut self.records, &mut parts.records, &parts.from);
+        std::mem::swap(&mut self.records, &mut parts.records);
+    }
+
+    /// Put the store back as it was before [`MetadataStore::swap_parts`]
+    /// traded `parts` in: the entries are traded back whole, and each block
+    /// then moves from its new entry back into its old one. A move alone,
+    /// for a test that runs a second close-up from the same state. Absent
+    /// from every build that is not a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn swap_parts_back(&mut self, parts: &mut MetadataParts) {
+        std::mem::swap(&mut self.records, &mut parts.records);
+        move_blocks(&mut self.records, &mut parts.records, &parts.from);
+    }
+
+    /// Where each entry's block sits in memory, or `None` for an entry that
+    /// holds none, for a test that holds a close-up to moving each block
+    /// rather than copying it. Absent from every build that is not a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn blocks(&self) -> Vec<Option<usize>> {
+        self.records
+            .iter()
+            .map(|entry| entry.as_deref().map(|fields| fields.as_ptr().addr()))
+            .collect()
+    }
+
+    /// The entries a close-up leaves, built as the close-up off to the side
+    /// first built them, every block cloned before any swap. Kept for the
+    /// tests that hold the close-up that moves the blocks to the same
+    /// result.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn closed_up_copied(&self, old_of_new: &[u32], expected_size: usize) -> MetadataCopy {
         let held = old_of_new.len();
         let kept = held.max(expected_size.saturating_add(1).min(RESERVE_CAP));
         let mut records = Vec::with_capacity(self.records.capacity().min(kept));
@@ -186,14 +318,14 @@ impl MetadataStore {
                 .iter()
                 .map(|&old| self.records.get(old as usize).cloned().flatten()),
         );
-        MetadataParts { records }
+        MetadataCopy { records }
     }
 
-    /// Trade this store's entries for `parts`, which
-    /// [`MetadataStore::closed_up`] built from it, so the store holds the
-    /// closed-up entries and `parts` the store's old ones. A move alone.
-    pub fn swap_parts(&mut self, parts: &mut MetadataParts) {
-        std::mem::swap(&mut self.records, &mut parts.records);
+    /// Trade this store's entries for `copy`, which
+    /// [`MetadataStore::closed_up_copied`] built from it. A move alone.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn swap_copy(&mut self, copy: &mut MetadataCopy) {
+        std::mem::swap(&mut self.records, &mut copy.records);
     }
 
     /// Every part of the store, each with its capacity, for a test that
@@ -532,5 +664,128 @@ mod tests {
         assert_eq!(store.extent(), 5);
         assert_eq!(store.records.capacity(), 101);
         assert_eq!(store.get(4).unwrap().field("n"), Some(&json!(4)));
+    }
+
+    /// The close-up moves the blocks. Readers on other threads read the
+    /// store while the parts are made and see it as it was, and a part
+    /// dropped before its swap moves nothing. The swap leaves each new entry
+    /// holding the very block its old entry held, so no block is cloned, and
+    /// the old entries it hands back empty, and the store then holds every
+    /// entry, capacity and figure the close-up that cloned the blocks and the
+    /// pass in place leave. Traded back, the store is as it was, blocks
+    /// included, and a second swap closes it up again. A record held past
+    /// the store's slots holds no entry, as in the pass in place.
+    #[test]
+    fn a_close_up_moves_each_block_at_the_swap_and_copies_none() {
+        // The names interned first, so every store filled here gives them
+        // the same symbols whatever order a mapping hands them out in.
+        let fill = || {
+            let mut store = MetadataStore::new(16);
+            store.symbol("n".to_string());
+            store.symbol("s".to_string());
+            for slot in 0..90usize {
+                store.insert(
+                    slot,
+                    record(&[("n", json!(slot)), ("s", json!(format!("v{slot}")))]),
+                );
+            }
+            for slot in (0..90usize).filter(|slot| slot % 3 != 1) {
+                assert!(store.remove(slot));
+            }
+            store
+        };
+        let kept: Vec<u32> = (0..90u32).filter(|slot| slot % 3 == 1).collect();
+        let held = |store: &MetadataStore| -> Vec<(usize, HashMap<String, Value>)> {
+            store
+                .iter()
+                .map(|(slot, fields)| (slot, fields.to_map()))
+                .collect()
+        };
+
+        let mut store = fill();
+        let before = held(&store);
+        let blocks = store.blocks();
+        let mut parts = std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..3)
+                .map(|_| {
+                    scope.spawn(|| {
+                        for _ in 0..4 {
+                            assert_eq!(held(&store), before);
+                        }
+                    })
+                })
+                .collect();
+            let parts = store.closed_up(kept.clone(), 16);
+            for reader in readers {
+                reader.join().unwrap();
+            }
+            parts
+        });
+        drop(store.closed_up(kept.clone(), 16));
+        assert_eq!(
+            held(&store),
+            before,
+            "a part dropped before its swap moves nothing"
+        );
+        assert_eq!(store.blocks(), blocks);
+
+        store.swap_parts(&mut parts);
+        let moved: Vec<Option<usize>> = kept.iter().map(|&old| blocks[old as usize]).collect();
+        assert!(moved.iter().all(Option::is_some));
+        assert_eq!(
+            store.blocks(),
+            moved,
+            "each new entry holds the very block its old entry held"
+        );
+        assert_eq!(parts.records.len(), 90);
+        assert!(
+            parts.records.iter().all(Option::is_none),
+            "the old entries are handed back empty"
+        );
+        let after: Vec<(usize, HashMap<String, Value>)> = before
+            .iter()
+            .enumerate()
+            .map(|(k, (_, fields))| (k, fields.clone()))
+            .collect();
+        assert_eq!(held(&store), after);
+        let mut copied = fill();
+        let mut copy = copied.closed_up_copied(&kept, 16);
+        copied.swap_copy(&mut copy);
+        drop(copy);
+        let mut in_place = fill();
+        in_place.close_up(&kept, 16);
+        assert!(store.layout() == copied.layout());
+        assert!(store.layout() == in_place.layout());
+        assert_eq!(store.heap_bytes(), copied.heap_bytes());
+        assert_eq!(store.records.capacity(), 30);
+        assert_eq!(store.len(), kept.len());
+
+        store.swap_parts_back(&mut parts);
+        assert_eq!(held(&store), before, "traded back, the store is as it was");
+        assert_eq!(store.blocks(), blocks);
+        assert!(parts.records.iter().all(Option::is_none));
+        store.swap_parts(&mut parts);
+        assert_eq!(held(&store), after, "a second swap closes it up again");
+        drop(parts);
+        assert_eq!(held(&store), after);
+        assert_eq!(store.blocks(), moved);
+
+        // Positions 0 and 2 hold a record each, and the record at 4 lies
+        // past the store's three slots, as a record no insertion gave an
+        // entry would.
+        let short = || {
+            let mut store = MetadataStore::new(2);
+            store.insert(0, record(&[("n", json!(0))]));
+            store.insert(2, record(&[("n", json!(2))]));
+            store
+        };
+        let mut store = short();
+        let blocks = store.blocks();
+        let mut parts = store.closed_up(vec![0, 2, 4], 2);
+        store.swap_parts(&mut parts);
+        assert_eq!(store.blocks(), vec![blocks[0], blocks[2], None]);
+        let mut in_place = short();
+        in_place.close_up(&[0, 2, 4], 2);
+        assert!(store.layout() == in_place.layout());
     }
 }

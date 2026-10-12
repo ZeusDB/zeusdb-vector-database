@@ -8,7 +8,8 @@
 //! declaration. The rest run beside a close-up on other threads: searches and
 //! counts answer for the state before the change they overlap or the state
 //! after it and for nothing else, a search runs while the build is held open
-//! and waits while the swap is, a second writer waits for the whole of it,
+//! and waits while the swap is, the metadata's move of its blocks included,
+//! a second writer waits for the whole of it,
 //! and a count under a filter the columns only bound reads its bound in the
 //! metadata under the same hold.
 
@@ -21,11 +22,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use zeusdb_vector_core::{
-    compile_filter, matches_filter, Filter, IdfScope, Selection, SparseVector,
+    compile_filter, matches_filter, Filter, IdfScope, Selection, SparseVector, METADATA_MOVE_HOOK,
 };
 use zeusdb_vector_sparse::{SparseConfig, Unlink, Weighting};
 
-use super::insert::{CloseUpPoint, CLOSE_UP_HOOK};
+use crate::locks::held_now;
+
+use super::insert::{CloseUpPoint, Layouts, CLOSE_UP_HOOK};
 use super::{
     Collection, Declaration, DenseIndex, Int8Scale, ParsedRecord, SparseHalf, StorageMode,
     COUNT_HOOK,
@@ -338,6 +341,116 @@ fn the_close_up_built_aside_leaves_what_the_close_up_in_place_leaves() {
     assert!(empty.remove_point(String::new()).unwrap());
     assert_eq!(empty.ids().dead_text(), 0);
     both_ways(&empty, false, "removed ids with no text");
+}
+
+/// Run the close-up and the routine that copied every part from the
+/// collection's state, and hold every structure each leaves to the other,
+/// part for part, value for value and capacity for capacity, with no part
+/// excepted. The collection is left closed up.
+fn both_copies(collection: &Collection, replace: bool, label: &str) {
+    let graph = replace.then(|| {
+        collection
+            .replacement_graph(
+                collection.m(),
+                collection.expected_size(),
+                collection.ef_construction(),
+            )
+            .unwrap()
+    });
+    let timed = graph.as_ref().and_then(DenseIndex::time_graph);
+    let ((closed, closed_text), (copied, copied_text)) =
+        collection.close_up_both_copies(graph, timed);
+    assert_eq!(closed_text, copied_text, "{label}: the id text let go of");
+    assert_eq!(
+        closed.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        copied.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        "{label}"
+    );
+    for ((name, parts), (_, other_parts)) in closed.iter().zip(&copied) {
+        assert_eq!(parts.len(), other_parts.len(), "{label}: {name}");
+        for (part, other) in parts.iter().zip(other_parts) {
+            assert!(
+                part == other,
+                "{label}: {name}'s {} differs: capacity {} against {}",
+                part.0,
+                part.1,
+                other.1
+            );
+        }
+    }
+    assert!(collection.positions_agree(), "{label}");
+}
+
+/// From the same states as the test above, under raw, product quantized
+/// with and without raw vectors, and scalar quantized declarations, each
+/// with a sparse space under every removal policy and both weightings, the
+/// close-up leaves every structure the routine that copied every block of
+/// metadata, every record's id text on its own and every posting on its own
+/// leaves, each at the same capacity: the id store's entries, buckets,
+/// tags, live set and text, the metadata's entries, every column's codes or
+/// values with the column store's live set and extent, the dense index's
+/// numbering and the graph's positions by node, and the sparse space's
+/// lists, record table, lengths, live and dead sets and counts.
+#[test]
+fn the_close_up_leaves_what_the_close_up_that_copied_every_part_leaves() {
+    for (kind, unlink, weighting, expected) in [
+        (Kind::Raw, Unlink::Lazy, Weighting::Dot, 100usize),
+        (Kind::Raw, Unlink::Strand, Weighting::BM25, 50_000),
+        (Kind::PqWithRaw, Unlink::Eager, Weighting::Dot, 100),
+        (Kind::PqOnly, Unlink::Strand, Weighting::BM25, 2_000),
+        (Kind::Int8, Unlink::Lazy, Weighting::BM25, 100),
+    ] {
+        let label = format!("{kind:?} {unlink:?} {weighting:?} {expected}");
+        let collection = collection(kind, expected, &["cat"], unlink, weighting);
+        add(&collection, 0..800);
+        remove(&collection, (0..800).filter(|i| i % 3 == 1));
+        both_copies(&collection, false, &format!("{label}: holes, untrained"));
+        remove(&collection, (0..800).filter(|i| i % 5 == 2 && i % 3 != 1));
+        both_copies(&collection, true, &format!("{label}: replaced, untrained"));
+        add(&collection, 800..1_700);
+        if kind != Kind::Raw {
+            assert!(collection.is_quantized(), "{label}");
+        }
+        remove(&collection, (800..1_700).filter(|i| i % 4 == 3));
+        both_copies(&collection, false, &format!("{label}: holes"));
+        remove(
+            &collection,
+            (800..1_700).filter(|i| i % 7 == 1 && i % 4 != 3),
+        );
+        both_copies(&collection, true, &format!("{label}: replaced"));
+        both_copies(
+            &collection,
+            true,
+            &format!("{label}: replaced with no hole"),
+        );
+        remove(
+            &collection,
+            (0..1_700).filter(|i| collection.contains(&format!("r{i}"))),
+        );
+        assert_eq!(collection.len(), 0, "{label}");
+        both_copies(
+            &collection,
+            false,
+            &format!("{label}: every record removed"),
+        );
+    }
+
+    let plain = collection(Kind::Raw, 100, &["cat", "u"], Unlink::Lazy, Weighting::Dot);
+    add(&plain, 0..4_400);
+    remove(&plain, (0..4_400).filter(|i| i % 6 == 5));
+    both_copies(&plain, false, "plain column: holes");
+    remove(&plain, (0..4_400).filter(|i| i % 9 == 4 && i % 6 != 5));
+    both_copies(&plain, true, "plain column: replaced");
+
+    let empty = collection(Kind::Raw, 100, &["cat"], Unlink::Lazy, Weighting::Dot);
+    let mut named = record(0);
+    named.id = String::new();
+    let added = empty.add_records(vec![named], vec![], false);
+    assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    add(&empty, 1..300);
+    assert!(empty.remove_point(String::new()).unwrap());
+    assert_eq!(empty.ids().dead_text(), 0);
+    both_copies(&empty, false, "removed ids with no text");
 }
 
 // ============================================================================
@@ -880,6 +993,642 @@ fn searches_run_while_the_build_is_held_and_wait_only_for_the_swap() {
             ended - started
         );
     });
+}
+
+/// One answer as each record's id and its fields, in the order the call
+/// gave them: a dense search unfiltered for probe 0, a dense search under
+/// the declared field for probe 1, and every record `list` walks for probe
+/// 2.
+fn fielded(collection: &Collection, probe: usize) -> Vec<(String, BTreeMap<String, Value>)> {
+    if probe == 2 {
+        return collection
+            .list(usize::MAX, 0, None)
+            .unwrap()
+            .into_iter()
+            .map(|(id, fields)| (id, fields.into_iter().collect()))
+            .collect();
+    }
+    let declared = filter(json!({"cat": "b"}));
+    let params = collection.search_params(K, Some(EF), false, None).unwrap();
+    collection
+        .search_one(
+            &record(1_000_000 + probe).vector,
+            (probe == 1).then_some(&declared),
+            params,
+        )
+        .unwrap()
+        .iter()
+        .map(|hit| (hit.id().to_string(), hit.metadata().into_iter().collect()))
+        .collect()
+}
+
+/// Whether every record an answer names carries the fields that record
+/// was given.
+fn own_fields(answer: &[(String, BTreeMap<String, Value>)]) -> bool {
+    answer.iter().all(|(id, fields)| {
+        let i: usize = id[1..].parse().unwrap();
+        *fields == record(i).metadata.into_iter().collect::<BTreeMap<_, _>>()
+    })
+}
+
+/// The swap is held open inside the metadata's move pass, by a hook the
+/// tests alone compile, with half the blocks it keeps in their new entries
+/// and half still in their old ones. There the thread running the close-up
+/// holds what it holds as the swap begins, `writers` and every write guard a
+/// removal takes, by the lock registry's own count. A search begun while the
+/// move is held waits until the swap lets the guards go, and then answers
+/// what the collection answers at rest once the close-up is done. Searches
+/// on three threads run throughout: each answers what the collection
+/// answers at rest before the removal or after it, and each begun once the
+/// move was held waits for the swap and answers the state after it. Every
+/// record those states name carries its own fields, so no search read a
+/// block at a position it was not moved to.
+#[test]
+fn searches_wait_for_the_move_pass_and_then_see_the_whole_new_state() {
+    let make = || {
+        let collection = collection(Kind::Raw, 100, &["cat"], Unlink::Lazy, Weighting::Dot);
+        add(&collection, 0..6_000);
+        remove(&collection, 0..ALLOWANCE);
+        collection
+    };
+    // The states at rest, from a twin with nothing held: before the last
+    // removal, and once it and its close-up are done.
+    let twin = make();
+    let at_rest = |collection: &Collection| -> Vec<String> {
+        (0..3)
+            .map(|probe| {
+                let answer = fielded(collection, probe);
+                assert!(own_fields(&answer), "probe {probe} at rest");
+                format!("{answer:?}")
+            })
+            .collect()
+    };
+    let before = at_rest(&twin);
+    remove(&twin, ALLOWANCE..=ALLOWANCE);
+    assert_eq!(holes(&twin), 0, "the twin closed up");
+    let after = at_rest(&twin);
+    assert_ne!(
+        before[2], after[2],
+        "the removal changes what `list` answers"
+    );
+
+    let collection = make();
+    let wait = Duration::from_millis(300);
+    let limit = Duration::from_secs(20);
+    let stop = AtomicBool::new(false);
+    let answered = AtomicUsize::new(0);
+    // Until the threads beside the close-up have given `count` answers, or
+    // the limit passes.
+    let until_answered = |count: usize| {
+        let from = Instant::now();
+        while answered.load(Ordering::SeqCst) < count && from.elapsed() < limit {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    // Each answer the threads beside the close-up gave: its probe, its span,
+    // whether it was the state before and whether it was the state after,
+    // and the answer itself where it was neither.
+    type Beside = (usize, Span, bool, bool, Option<String>);
+    let (asked, swap_held, move_held, at, points, released, waited) = std::thread::scope(|scope| {
+        let stop_on_drop = StopOnDrop(&stop);
+        let searchers: Vec<_> = (0..3)
+            .map(|thread| {
+                let (collection, stop, answered) = (&collection, &stop, &answered);
+                let (before, after) = (&before, &after);
+                scope.spawn(move || {
+                    let mut out: Vec<Beside> = Vec::new();
+                    let mut probe = thread;
+                    while !stop.load(Ordering::SeqCst) {
+                        let start = Instant::now();
+                        let answer = fielded(collection, probe);
+                        let span = (start, Instant::now());
+                        let answer = format!("{answer:?}");
+                        let (was_before, was_after) =
+                            (answer == before[probe], answer == after[probe]);
+                        let kept = (!was_before && !was_after).then_some(answer);
+                        out.push((probe, span, was_before, was_after, kept));
+                        answered.fetch_add(1, Ordering::SeqCst);
+                        probe = (probe + 1) % 3;
+                    }
+                    out
+                })
+            })
+            .collect();
+        // Every probe answered at least twice before the removal.
+        until_answered(6);
+
+        let (swapping_tx, swapping) = mpsc::channel::<Vec<String>>();
+        let (moving_tx, moving) = mpsc::channel::<(Vec<String>, usize, usize)>();
+        let (points_tx, points) = mpsc::channel::<Vec<(String, Instant)>>();
+        let (go, go_rx) = mpsc::channel::<()>();
+        let remover = {
+            let collection = &collection;
+            scope.spawn(move || {
+                let marks: Rc<RefCell<Vec<(String, Instant)>>> = Rc::default();
+                {
+                    let marks = marks.clone();
+                    CLOSE_UP_HOOK.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move |point| {
+                            marks
+                                .borrow_mut()
+                                .push((format!("{point:?}"), Instant::now()));
+                            if point == CloseUpPoint::Swapping {
+                                let _ = swapping_tx.send(held_now());
+                            }
+                        }));
+                    });
+                }
+                {
+                    let marks = marks.clone();
+                    METADATA_MOVE_HOOK.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move |k, count| {
+                            if k == count / 2 {
+                                marks.borrow_mut().push(("Moving".into(), Instant::now()));
+                                let _ = moving_tx.send((held_now(), k, count));
+                                let _ = go_rx.recv_timeout(Duration::from_secs(20));
+                                marks.borrow_mut().push(("Moved".into(), Instant::now()));
+                            }
+                        }));
+                    });
+                }
+                let removed = collection.remove_point(format!("r{ALLOWANCE}")).unwrap();
+                METADATA_MOVE_HOOK.with(|hook| *hook.borrow_mut() = None);
+                CLOSE_UP_HOOK.with(|hook| *hook.borrow_mut() = None);
+                let _ = points_tx.send(marks.borrow().clone());
+                removed
+            })
+        };
+
+        let swap_held = swapping.recv_timeout(limit).expect("the swap begins");
+        let (move_held, k, count) = moving
+            .recv_timeout(limit)
+            .expect("the swap moves the metadata's blocks");
+        // A search begun while the move is held.
+        let (waited_tx, waited) = mpsc::channel();
+        {
+            let collection = &collection;
+            scope.spawn(move || {
+                let started = Instant::now();
+                let answers: Vec<_> = (0..3).map(|probe| fielded(collection, probe)).collect();
+                let _ = waited_tx.send((answers, started, Instant::now()));
+            });
+        }
+        assert!(
+            waited.recv_timeout(wait).is_err(),
+            "a search waits while the move holds the write guards"
+        );
+        let released = Instant::now();
+        go.send(()).unwrap();
+        assert!(remover.join().unwrap());
+        let waited = waited
+            .recv_timeout(limit)
+            .expect("the search answers once the swap lets the guards go");
+        let points = points.recv_timeout(limit).expect("the close-up's points");
+        // Every probe answered at least twice more once the close-up is
+        // done.
+        until_answered(answered.load(Ordering::SeqCst) + 6);
+        drop(stop_on_drop);
+        let asked: Vec<Beside> = searchers
+            .into_iter()
+            .flat_map(|searcher| searcher.join().expect("no search fails"))
+            .collect();
+        (
+            asked,
+            swap_held,
+            move_held,
+            (k, count),
+            points,
+            released,
+            waited,
+        )
+    });
+
+    // The move is held inside the swap, partway through the blocks, under
+    // what the swap holds.
+    let (k, count) = at;
+    assert!(
+        0 < k && k < count,
+        "the hold falls inside the move: {k} of {count}"
+    );
+    assert_eq!(count, 6_000 - ALLOWANCE - 1, "one new entry a record held");
+    assert_eq!(
+        move_held, swap_held,
+        "the move runs under the swap's guards"
+    );
+    for name in ["writers", "ids", "vector_metadata", "columns"] {
+        assert!(
+            move_held.iter().any(|held| held == name),
+            "{name} is held through the move: {move_held:?}"
+        );
+    }
+    let place = |name: &str| points.iter().position(|(point, _)| point == name).unwrap();
+    assert!(place("Swapping") < place("Moving"));
+    assert!(place("Moving") < place("Moved"));
+    assert!(place("Moved") < place("Swapped"));
+    let hold_from = points[place("Moving")].1;
+
+    // The search begun while the move was held waited for the swap, and
+    // answered the state after it.
+    let (answers, started, ended) = waited;
+    assert!(started < released && ended > released, "the search waited");
+    for (probe, answer) in answers.iter().enumerate() {
+        assert!(own_fields(answer), "probe {probe} after the hold");
+        assert_eq!(format!("{answer:?}"), after[probe], "probe {probe}");
+    }
+
+    // Every answer beside the close-up was a whole state, and each begun once
+    // the move was held waited for the swap to let the guards go and saw the
+    // state after it.
+    let mut over_hold = 0usize;
+    let mut lists = (0usize, 0usize);
+    for (probe, (start, end), was_before, was_after, kept) in &asked {
+        assert!(
+            *was_before || *was_after,
+            "probe {probe} answered neither state: {}",
+            kept.as_deref().unwrap_or_default()
+        );
+        if *probe == 2 {
+            lists.0 += usize::from(*was_before);
+            lists.1 += usize::from(*was_after);
+        }
+        if *start > hold_from {
+            assert!(
+                *end > released,
+                "probe {probe} began once the move was held and ended before the swap let go"
+            );
+            assert!(*was_after, "probe {probe} began once the move was held");
+            over_hold += usize::from(*start < released);
+        }
+    }
+    assert!(over_hold > 0, "searches began while the move was held");
+    assert!(lists.0 > 0 && lists.1 > 0, "`list` answered both states");
+    assert_eq!(holes(&collection), 0);
+    assert!(collection.positions_agree());
+    eprintln!(
+        "the move held at block {k} of {count} for {:?}: {} answers beside it, {over_hold} \
+         begun during it, `list` {} times before the removal and {} after; the search begun \
+         during it waited {:?}",
+        released - hold_from,
+        asked.len(),
+        lists.0,
+        lists.1,
+        ended - started
+    );
+}
+
+/// The old structures are dropped once `writers` is let go, with no guard
+/// held. While their drop is held open by the hook, the dropping thread
+/// holds no guard by the lock registry's own count, another thread takes
+/// `writers` and every write guard a removal takes, a second writer adds a
+/// record and returns, and searches answer. The call that ran the close-up
+/// returns only once the drop is done.
+#[test]
+fn a_second_writer_goes_while_the_old_structures_drop() {
+    let collection = collection(Kind::Raw, 100, &["cat"], Unlink::Lazy, Weighting::Dot);
+    add(&collection, 0..6_000);
+    remove(&collection, 0..ALLOWANCE);
+    let probes = Probes::new();
+    let wait = Duration::from_secs(20);
+
+    std::thread::scope(|scope| {
+        let (dropping_tx, dropping) = mpsc::channel::<Vec<String>>();
+        let (dropped_tx, dropped) = mpsc::channel::<Vec<String>>();
+        let (go, go_rx) = mpsc::channel::<()>();
+        let (returned_tx, returned) = mpsc::channel::<Instant>();
+        let remover = {
+            let collection = &collection;
+            scope.spawn(move || {
+                CLOSE_UP_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |point| match point {
+                        CloseUpPoint::Dropping => {
+                            let _ = dropping_tx.send(held_now());
+                            let _ = go_rx.recv();
+                        }
+                        CloseUpPoint::Dropped => {
+                            let _ = dropped_tx.send(held_now());
+                        }
+                        _ => {}
+                    }));
+                });
+                let removed = collection.remove_point(format!("r{ALLOWANCE}")).unwrap();
+                returned_tx.send(Instant::now()).unwrap();
+                CLOSE_UP_HOOK.with(|hook| *hook.borrow_mut() = None);
+                removed
+            })
+        };
+
+        let held = dropping
+            .recv_timeout(wait)
+            .expect("the close-up drops what it replaced");
+        assert_eq!(
+            held,
+            Vec::<String>::new(),
+            "no guard is held as the drop begins"
+        );
+        assert_eq!(holes(&collection), 0, "the swap ran before the drop");
+
+        // Every guard is free: another thread takes them all.
+        let (taken_tx, taken) = mpsc::channel::<()>();
+        {
+            let collection = &collection;
+            scope.spawn(move || {
+                let writers = collection.writers.lock().unwrap();
+                let ids = collection.ids.write().unwrap();
+                let index = collection.dense().index.write().unwrap();
+                let codes = collection.dense().pq_codes.write().unwrap();
+                let sparse = collection
+                    .sparse()
+                    .map(|space| space.index.write().unwrap());
+                let metadata = collection.vector_metadata.write().unwrap();
+                let columns = collection.columns.write().unwrap();
+                drop((columns, metadata, sparse, codes, index, ids, writers));
+                taken_tx.send(()).unwrap();
+            });
+        }
+        taken
+            .recv_timeout(wait)
+            .expect("another thread takes writers and every write guard during the drop");
+
+        // A second writer goes and returns, and a search answers.
+        let (wrote_tx, wrote) = mpsc::channel::<usize>();
+        {
+            let collection = &collection;
+            scope.spawn(move || {
+                let added = collection.add_records(vec![record(50_000)], vec![], false);
+                wrote_tx.send(added.total_errors).unwrap();
+            });
+        }
+        assert_eq!(
+            wrote
+                .recv_timeout(wait)
+                .expect("a second writer completes a call during the drop"),
+            0
+        );
+        let (answered_tx, answered) = mpsc::channel::<Vec<String>>();
+        {
+            let (collection, probes) = (&collection, &probes);
+            scope.spawn(move || answered_tx.send(probes.all(collection)).unwrap());
+        }
+        answered
+            .recv_timeout(wait)
+            .expect("searches answer during the drop");
+        assert!(
+            returned.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the call that ran the close-up waits for its drop"
+        );
+
+        let released = Instant::now();
+        go.send(()).unwrap();
+        assert_eq!(
+            dropped.recv_timeout(wait).expect("the drop finishes"),
+            Vec::<String>::new(),
+            "no guard is held as the drop ends"
+        );
+        assert!(remover.join().unwrap());
+        assert!(
+            returned.recv().unwrap() > released,
+            "the call returned after the drop"
+        );
+    });
+    assert!(collection.contains("r50000"));
+    assert_eq!(collection.len(), 6_000 - ALLOWANCE);
+    assert!(collection.positions_agree());
+}
+
+/// Every structure a close-up moves, as [`Collection::structure_layouts`]
+/// reads it, with what two collections holding the same records hold
+/// differently put in a form they share. Each id store hashes with a seed of
+/// its own, so its table places the same positions in other buckets under
+/// other tags: its buckets are read as the positions they hold, and its tags
+/// by capacity alone. Each metadata store gives the field names symbols in
+/// the order its first record handed them over: its entries are read by name
+/// through the store's own reader, and its names as a sorted set. The dense
+/// index's units are clock readings each collection takes on its own graph,
+/// and are read by their place alone.
+fn unseeded(collection: &Collection) -> Layouts {
+    let records: Vec<Option<BTreeMap<String, Value>>> = {
+        let metadata = collection.vector_metadata.read().unwrap();
+        (0..metadata.extent())
+            .map(|at| {
+                metadata
+                    .get(at)
+                    .map(|fields| fields.to_map().into_iter().collect())
+            })
+            .collect()
+    };
+    let mut layouts = collection.structure_layouts();
+    for (name, parts) in layouts.iter_mut() {
+        for part in parts.iter_mut() {
+            match (*name, part.0) {
+                ("ids", "buckets") => {
+                    let mut held: Vec<u64> = part.2[1..part.2.len() - 1]
+                        .split(", ")
+                        .filter_map(|value| value.parse::<u64>().ok())
+                        .filter(|&value| value != u64::from(u32::MAX))
+                        .collect();
+                    held.sort_unstable();
+                    part.2 = format!("{held:?}");
+                }
+                ("ids", "tags") | ("index", "units") => part.2.clear(),
+                ("metadata", "records") => part.2 = format!("{records:?}"),
+                ("metadata", "names") => {
+                    let mut names: Vec<&str> = part.2[1..part.2.len() - 1].split(", ").collect();
+                    names.sort_unstable();
+                    part.2 = format!("{names:?}");
+                }
+                _ => {}
+            }
+        }
+    }
+    layouts
+}
+
+/// A second close-up runs whole while the first one's drop is held open.
+/// The first removal batch passes the bound, closes up and stops as its old
+/// structures begin to drop; a second batch then passes the bound again and
+/// closes up, its own drop included, while the first drop waits. Searches on
+/// three threads run throughout, and each answers what the collection
+/// answers at rest in one of the states its span covers. Once both are done,
+/// every structure equals a twin's that ran the same two batches one after
+/// the other with nothing held, part for part and capacity for capacity.
+#[test]
+fn a_second_close_up_runs_while_the_first_ones_drop_is_held() {
+    let make = || {
+        let collection = collection(Kind::Raw, 100, &["cat"], Unlink::Lazy, Weighting::Dot);
+        add(&collection, 0..12_000);
+        collection
+    };
+    // Each batch passes the bound: 6,001 holes against 5,999 records, then
+    // 4,100 holes against 1,899.
+    let first: Vec<usize> = (0..12_000).filter(|i| i % 2 == 0 || *i < 2).collect();
+    let second: Vec<usize> = (3..12_000).step_by(2).take(4_100).collect();
+    assert_eq!(first.len(), 6_001);
+    let probes = Probes::new();
+    let twin = make();
+    let mut states = vec![probes.all(&twin)];
+    remove(&twin, first.iter().copied());
+    states.push(probes.all(&twin));
+    remove(&twin, second.iter().copied());
+    states.push(probes.all(&twin));
+    assert_eq!(holes(&twin), 0, "the twin closed up twice");
+
+    let collection = make();
+    let epochs = Epochs::new();
+    let mut marks: Vec<(CloseUpPoint, Instant)> = Vec::new();
+    let asked: Vec<Asked> = std::thread::scope(|scope| {
+        let stop = epochs.stop_on_drop();
+        let searchers: Vec<_> = (0..3)
+            .map(|thread| {
+                let (collection, probes, epochs) = (&collection, &probes, &epochs);
+                scope.spawn(move || {
+                    let mut out = Vec::new();
+                    let mut probe = thread;
+                    while !epochs.stopped() {
+                        if let Some((first, last, start, end, answer)) =
+                            epochs.ask(|| probes.ask(collection, probe))
+                        {
+                            out.push(Asked {
+                                probe,
+                                epochs: (first, last),
+                                span: (start, end),
+                                answer,
+                            });
+                            probe = (probe + 1) % probes.len();
+                        }
+                    }
+                    out
+                })
+            })
+            .collect();
+
+        let (dropping_tx, dropping) = mpsc::channel::<()>();
+        let (go, go_rx) = mpsc::channel::<()>();
+        epochs.epoch.fetch_add(1, Ordering::SeqCst);
+        let remover = {
+            let (collection, first) = (&collection, &first);
+            scope.spawn(move || {
+                let mut held_once = false;
+                CLOSE_UP_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |point| {
+                        if matches!(point, CloseUpPoint::Building | CloseUpPoint::Swapping) {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        if point == CloseUpPoint::Dropping && !held_once {
+                            held_once = true;
+                            let _ = dropping_tx.send(());
+                            let _ = go_rx.recv();
+                        }
+                    }));
+                });
+                remove(collection, first.iter().copied());
+                CLOSE_UP_HOOK.with(|hook| *hook.borrow_mut() = None);
+            })
+        };
+        dropping
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the first close-up drops what it replaced");
+        // The first batch and its close-up are in; only its drop is left.
+        epochs.epoch.fetch_add(1, Ordering::SeqCst);
+
+        // The second batch on a thread of its own, held to a limit, so a
+        // close-up whose drop keeps `writers` fails the test rather than
+        // leaving this thread waiting for it while the first drop waits for
+        // this thread.
+        epochs.epoch.fetch_add(1, Ordering::SeqCst);
+        let (done_tx, done) = mpsc::channel::<Vec<(CloseUpPoint, Instant)>>();
+        {
+            let (collection, second) = (&collection, &second);
+            scope.spawn(move || {
+                let kept: Marks = Rc::default();
+                {
+                    let kept = kept.clone();
+                    CLOSE_UP_HOOK.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move |point| {
+                            kept.borrow_mut().push((point, Instant::now()));
+                            if matches!(point, CloseUpPoint::Building | CloseUpPoint::Swapping) {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                        }));
+                    });
+                }
+                remove(collection, second.iter().copied());
+                CLOSE_UP_HOOK.with(|hook| *hook.borrow_mut() = None);
+                let _ = done_tx.send(kept.borrow().clone());
+            });
+        }
+        marks.extend(
+            done.recv_timeout(Duration::from_secs(20))
+                .expect("the second close-up runs whole while the first one's drop is held"),
+        );
+        epochs.epoch.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !remover.is_finished(),
+            "the first call waits on its held drop while the second close-up runs"
+        );
+
+        go.send(()).unwrap();
+        remover.join().unwrap();
+        drop(stop);
+        searchers
+            .into_iter()
+            .flat_map(|searcher| searcher.join().expect("no search fails"))
+            .collect()
+    });
+
+    assert_eq!(
+        marks.iter().map(|(point, _)| *point).collect::<Vec<_>>(),
+        [
+            CloseUpPoint::Building,
+            CloseUpPoint::Built,
+            CloseUpPoint::Swapping,
+            CloseUpPoint::Swapped,
+            CloseUpPoint::Dropping,
+            CloseUpPoint::Dropped,
+        ],
+        "the second close-up ran whole, its drop included, during the first one's drop"
+    );
+    // The second close-up's build and swap, from the point each begins to
+    // the point it ends.
+    let second_phases = [(marks[0].1, marks[1].1), (marks[2].1, marks[3].1)];
+    let mut during = 0usize;
+    let mut over_second = 0usize;
+    for asked in &asked {
+        assert!(
+            answered_a_state(asked, &states),
+            "probe {} in epochs {:?} answered {} where the states it spans answer {:?}",
+            asked.probe,
+            asked.epochs,
+            asked.answer,
+            (asked.epochs.0 / 2..=asked.epochs.1.div_ceil(2))
+                .map(|state| &states[state][asked.probe])
+                .collect::<Vec<_>>()
+        );
+        during += usize::from(asked.epochs.1 >= 2 && asked.epochs.0 <= 3);
+        over_second += usize::from(overlaps(asked.span, &second_phases));
+    }
+    assert!(during > 0, "searches ran while the first drop was held");
+    assert!(over_second > 0, "searches overlapped the second close-up");
+    assert_eq!(holes(&collection), 0);
+    assert!(collection.positions_agree());
+    let (ours, theirs) = (unseeded(&collection), unseeded(&twin));
+    assert_eq!(ours.len(), theirs.len());
+    for ((name, parts), (_, other_parts)) in ours.iter().zip(&theirs) {
+        assert_eq!(parts.len(), other_parts.len(), "{name}");
+        for (part, other) in parts.iter().zip(other_parts) {
+            assert!(
+                part == other,
+                "{name}'s {} differs from the twin's: capacity {} against {}",
+                part.0,
+                part.1,
+                other.1
+            );
+        }
+    }
+    eprintln!(
+        "{} answers beside the two close-ups, {during} while the first drop was held, \
+         {over_second} over the second close-up's build or swap",
+        asked.len()
+    );
 }
 
 // ============================================================================

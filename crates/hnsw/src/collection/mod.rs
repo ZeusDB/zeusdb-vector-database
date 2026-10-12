@@ -1139,7 +1139,9 @@ pub struct Collection {
     /// mutation of what a save writes is ordered against every other. An
     /// internal caller reaching a mutating helper is already inside the
     /// guard, so the helpers never take it and cannot deadlock against the
-    /// caller that owns it.
+    /// caller that owns it. An operation whose body may close the positions
+    /// up holds it through `insert::MutationGuard`, which drops what the
+    /// close-up replaced once the guard is let go.
     writers: MutexAt<()>,
 
     /// Where every mutation's record goes, once something is attached, and

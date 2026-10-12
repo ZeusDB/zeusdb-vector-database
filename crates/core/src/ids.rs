@@ -516,6 +516,20 @@ impl IdStore {
         std::mem::swap(&mut self.dead_text, &mut parts.dead_text);
     }
 
+    /// Every record's position, in increasing order, read from the live set
+    /// a word at a time into a vector sized for the records held. These are
+    /// the positions [`IdStore::slots`] reads from the entries, since every
+    /// write keeps the two in step; a close-up lists them first.
+    pub fn held_positions(&self) -> Vec<u32> {
+        let mut held = Vec::with_capacity(self.held);
+        self.live.for_each(|slot| held.push(slot as u32));
+        debug_assert!(
+            held.iter().map(|&at| at as usize).eq(self.slots()),
+            "the live set holds exactly the positions whose entries are present"
+        );
+        held
+    }
+
     /// Every part of the store, each with its capacity, for a test that
     /// holds two stores to be the same bytes. Absent from every build that
     /// is not a test.

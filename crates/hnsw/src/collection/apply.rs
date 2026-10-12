@@ -60,7 +60,7 @@ impl Collection {
     /// ordinary refusal for a value the ordinary path would refuse, and
     /// whatever the body returns for a body that fails.
     pub fn apply(&self, operation: Operation) -> Result<(), Error> {
-        let writers = self.writers.lock().unwrap();
+        let writers = self.hold_writers();
         if self.sink_attached() {
             return Err(Error::Engine(
                 "A recorded operation cannot be applied while a sink is attached, since a \
