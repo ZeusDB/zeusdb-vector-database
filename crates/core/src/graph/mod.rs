@@ -978,22 +978,6 @@ impl VectorGraph {
         }
     }
 
-    /// File the record at `position` under `node`, or strand the node with
-    /// [`Position::NONE`]. The dense index calls this under its write guard,
-    /// beside its own entry for the position.
-    pub fn set_record_of(&mut self, node: u32, position: u32) {
-        match self {
-            VectorGraph::Cosine(b) => b.graph.set_record_of(node, position),
-            VectorGraph::L2(b) => b.graph.set_record_of(node, position),
-            VectorGraph::L1(b) => b.graph.set_record_of(node, position),
-            VectorGraph::Dot(b) => b.graph.set_record_of(node, position),
-            VectorGraph::CosinePQ(b) => b.graph.set_record_of(node, position),
-            VectorGraph::L2PQ(b) => b.graph.set_record_of(node, position),
-            VectorGraph::L1PQ(b) => b.graph.set_record_of(node, position),
-            VectorGraph::Int8(b) => b.graph.set_record_of(node, position),
-        }
-    }
-
     /// Every node's internal id, indexed by node, for a pass over many
     /// nodes that reads each with one plain read.
     pub fn origin_ids(&self) -> &[usize] {

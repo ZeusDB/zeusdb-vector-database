@@ -487,14 +487,25 @@ impl IdStore {
             }
             text
         };
+        // Eight buckets at a time. A group whose eight are all empty, which
+        // the AND of the eight shows, is copied as it is, and every other
+        // bucket takes its record's new position. An empty bucket's marker
+        // lies past every position, so the bound of `new_of_old` answers for
+        // it.
+        let rewrite = |bucket: u32| {
+            debug_assert!(bucket == EMPTY || (bucket as usize) < new_of_old.len());
+            new_of_old.get(bucket as usize).copied().unwrap_or(EMPTY)
+        };
         let mut buckets = Vec::with_capacity(self.buckets.capacity());
-        buckets.extend(self.buckets.iter().map(|&bucket| {
-            if bucket == EMPTY {
-                EMPTY
+        let mut groups = self.buckets.chunks_exact(8);
+        for group in &mut groups {
+            if group.iter().fold(EMPTY, |all, &bucket| all & bucket) == EMPTY {
+                buckets.extend_from_slice(group);
             } else {
-                new_of_old[bucket as usize]
+                buckets.extend(group.iter().map(|&bucket| rewrite(bucket)));
             }
-        }));
+        }
+        buckets.extend(groups.remainder().iter().map(|&bucket| rewrite(bucket)));
         IdParts {
             text,
             entries,
@@ -718,6 +729,70 @@ impl IdStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table a close-up builds aside is the table the pass in place
+    /// leaves and the table a rewrite of each bucket through the map gives,
+    /// on tables from nearly empty to nearly full, which hold groups of eight
+    /// empty buckets and groups holding a record, and every name resolves to
+    /// its new position once the store is closed up.
+    #[test]
+    fn the_table_built_aside_is_the_table_each_bucket_rewritten_gives() {
+        let (mut empty_groups, mut held_groups) = (0, 0);
+        for (reserved, records, step) in [
+            (1_000usize, 10usize, 3usize),
+            (1_000, 300, 2),
+            (0, 700, 5),
+            (64, 56, 7),
+            (0, 2, 2),
+        ] {
+            let mut store = IdStore::new(reserved);
+            for at in 0..records {
+                store.insert(at, &format!("r{at}")).unwrap();
+            }
+            for at in (1..records).step_by(step) {
+                assert_eq!(store.remove_name(&format!("r{at}")), Some(at));
+            }
+            let old_of_new = store.held_positions();
+            let mut new_of_old = vec![EMPTY; store.extent()];
+            for (k, &old) in old_of_new.iter().enumerate() {
+                new_of_old[old as usize] = k as u32;
+            }
+            for group in store.buckets.chunks_exact(8) {
+                if group.iter().all(|&bucket| bucket == EMPTY) {
+                    empty_groups += 1;
+                } else {
+                    held_groups += 1;
+                }
+            }
+            let each: Vec<u32> = store
+                .buckets
+                .iter()
+                .map(|&bucket| {
+                    if bucket == EMPTY {
+                        EMPTY
+                    } else {
+                        new_of_old[bucket as usize]
+                    }
+                })
+                .collect();
+            let parts = store.closed_up(&old_of_new, &new_of_old, reserved);
+            assert_eq!(parts.buckets, each, "{reserved}, {records}");
+            assert_eq!(parts.buckets.capacity(), store.buckets.capacity());
+            store.close_up(&old_of_new, &new_of_old, reserved);
+            assert_eq!(store.buckets, parts.buckets, "{reserved}, {records}");
+            for (k, &old) in old_of_new.iter().enumerate() {
+                assert_eq!(
+                    store.slot_of(&format!("r{old}")),
+                    Some(k),
+                    "{reserved}, {records}"
+                );
+            }
+        }
+        assert!(
+            empty_groups > 0 && held_groups > 0,
+            "{empty_groups}, {held_groups}"
+        );
+    }
 
     /// What goes in comes back both ways, the empty id included, and a
     /// name the store does not hold resolves to nothing.

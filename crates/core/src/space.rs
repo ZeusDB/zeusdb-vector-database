@@ -137,25 +137,24 @@ impl<'a> PositionWalk<'a> {
 
     /// The position of `id`, which is above every id asked before, or `None`
     /// where the list does not hold it.
+    ///
+    /// The walk steps past the ids below `id` one at a time. It only moves
+    /// forward, so a pass over a list of ids in increasing order steps
+    /// through the list once.
     pub fn position_of(&mut self, id: usize) -> Option<usize> {
-        match self.ids.get(self.next) {
-            Some(&held) if held as usize == id => {}
-            Some(&held) if held as usize > id => return None,
-            Some(_) => {
-                self.next += self.ids[self.next..].partition_point(|&held| (held as usize) < id);
-                if self
-                    .ids
-                    .get(self.next)
-                    .is_none_or(|&held| held as usize != id)
-                {
-                    return None;
-                }
+        while let Some(&held) = self.ids.get(self.next) {
+            let held = held as usize;
+            if held == id {
+                let at = self.next;
+                self.next += 1;
+                return Some(at);
             }
-            None => return None,
+            if held > id {
+                return None;
+            }
+            self.next += 1;
         }
-        let at = self.next;
-        self.next += 1;
-        Some(at)
+        None
     }
 }
 
@@ -743,6 +742,37 @@ pub fn read_artefact(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// A walk answers what a binary search over the whole list answers, for
+    /// ids asked in increasing order, present and absent, in runs of either,
+    /// below the list's first id and past its last.
+    #[test]
+    fn a_walk_answers_what_a_search_of_the_whole_list_answers() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut draw = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..300 {
+            let len = (draw() % 60) as usize;
+            let mut ids: Vec<u32> = Vec::with_capacity(len);
+            let mut id = (draw() % 5) as u32;
+            for _ in 0..len {
+                id += 1 + (draw() % 4) as u32;
+                ids.push(id);
+            }
+            let mut walk = PositionWalk::new(&ids);
+            let top = ids.last().copied().unwrap_or(0) as usize + 3;
+            let mut asked = 0usize;
+            while asked <= top {
+                let found = ids.binary_search(&(asked as u32)).ok();
+                assert_eq!(walk.position_of(asked), found, "round {round}, id {asked}");
+                asked += 1 + (draw() % 3) as usize;
+            }
+        }
+    }
 
     /// The sparse rules refuse each malformed shape by name and admit a
     /// well formed vector, an empty one included.

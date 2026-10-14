@@ -97,15 +97,24 @@ const NONE: u32 = Position::NONE;
 pub(crate) struct IdsByPosition<'a> {
     node_at: &'a [u32],
     origin_ids: &'a [usize],
+    /// Whether every position below the extent holds a record whose
+    /// internal id is one past its position, which a collection holding no
+    /// hole and the ids from one to its record count does.
+    shifted: bool,
 }
 
 impl IdsByPosition<'_> {
     /// The internal id of the record at `at`, where the index holds one.
+    ///
+    /// A hole's node is [`NONE`], which lies past every node the graph holds,
+    /// so the bound of the origin ids answers for it.
     pub(crate) fn get(&self, at: usize) -> Option<usize> {
-        match self.node_at.get(at) {
-            Some(&node) if node != NONE => Some(self.origin_ids[node as usize]),
-            _ => None,
+        if self.shifted {
+            return (at < self.node_at.len()).then_some(at + 1);
         }
+        let node = *self.node_at.get(at)?;
+        debug_assert!(node == NONE || (node as usize) < self.origin_ids.len());
+        self.origin_ids.get(node as usize).copied()
     }
 }
 
@@ -322,6 +331,28 @@ impl DenseIndex {
             .int8_reconstruct_at(self.node_at.get(at).copied().unwrap_or(NONE))
     }
 
+    /// Strand the record at `at`. The position and its node both take the
+    /// empty marker, and the node stays in the graph, since a stranded node
+    /// still routes a traversal. Answers the node the record held, or
+    /// [`NONE`] where the index holds no record at `at`, in which case
+    /// nothing is written.
+    pub(crate) fn strand(&mut self, at: Position) -> u32 {
+        let Some(entry) = self.node_at.get_mut(at.slot()) else {
+            return NONE;
+        };
+        let node = *entry;
+        // A hole's node is the marker, which lies past every node the graph
+        // holds, so the bound of the graph's entries answers for it.
+        let Some(record) = self.graph.records_mut().get_mut(node as usize) else {
+            return NONE;
+        };
+        *record = NONE;
+        *entry = NONE;
+        self.live_count -= 1;
+        self.every_node_live = false;
+        node
+    }
+
     /// The node of the record at `at`, where this index holds one.
     pub(crate) fn node_of(&self, at: Position) -> Option<u32> {
         match self.node_at.get(at.slot()) {
@@ -355,9 +386,25 @@ impl DenseIndex {
     /// The internal id of the record at each position, read as two plain
     /// reads a position, `node_at` and then the graph's origin ids.
     pub(crate) fn ids_by_position(&self) -> IdsByPosition<'_> {
+        let origin_ids = self.graph.origin_ids();
+        // No hole, the first record's id one and the last's the record
+        // count: the ids rise with the positions, so they are one to the
+        // count, each one past its position.
+        let id_at = |at: usize| {
+            self.node_at
+                .get(at)
+                .and_then(|&node| origin_ids.get(node as usize))
+                .copied()
+        };
+        let held = self.live_count;
+        let shifted = held > 0
+            && held == self.node_at.len()
+            && id_at(0) == Some(1)
+            && id_at(held - 1) == Some(held);
         IdsByPosition {
             node_at: &self.node_at,
-            origin_ids: self.graph.origin_ids(),
+            origin_ids,
+            shifted,
         }
     }
 
@@ -781,7 +828,10 @@ impl DenseIndex {
                 PREDICATE_BYTES.with(|bytes| bytes.set((1, 0)));
                 self.graph.search(query, k, ef, None::<&fn(&usize) -> bool>)
             } else {
-                let admits = |at: &usize| *at != NONE as usize;
+                // The marker is a local the closure borrows, so the closure
+                // holds one reference.
+                let none = NONE as usize;
+                let admits = |at: &usize| *at != none;
                 #[cfg(test)]
                 PREDICATE_BYTES.with(|bytes| bytes.set((2, std::mem::size_of_val(&admits))));
                 self.graph.search(query, k, ef, Some(&admits))
@@ -1039,11 +1089,18 @@ impl VectorIndex<Dense> for DenseIndex {
         };
         let node = self.graph.nb_points() as u32;
         self.graph.install(record, id.slot(), at, planned);
+        // A record takes the next position, which `node_at` reaches, but
+        // after a rebuild whose last positions were holes it reaches only the
+        // last record held.
         let slot = at.slot();
-        if slot >= self.node_at.len() {
-            self.node_at.resize(slot + 1, NONE);
+        if slot == self.node_at.len() {
+            self.node_at.push(node);
+        } else {
+            if slot > self.node_at.len() {
+                self.node_at.resize(slot + 1, NONE);
+            }
+            self.node_at[slot] = node;
         }
-        self.node_at[slot] = node;
         self.live_count += 1;
         Ok(())
     }
@@ -1052,13 +1109,9 @@ impl VectorIndex<Dense> for DenseIndex {
     /// routes a traversal, and `compact` rebuilds the graph without it. The
     /// position and the node both take the empty marker.
     fn remove(&mut self, at: Position) -> Result<(), Error> {
-        let Some(node) = self.node_of(at) else {
+        if self.strand(at) == NONE {
             return Err(Error::RecordNotHeld { id: at.0 });
-        };
-        self.node_at[at.slot()] = NONE;
-        self.graph.set_record_of(node, NONE);
-        self.live_count -= 1;
-        self.every_node_live = false;
+        }
         Ok(())
     }
 
@@ -1387,13 +1440,14 @@ mod tests {
     /// record, the same once a node is stranded, a bitmap, and any other set.
     /// `CEILING` is what the four cases captured when each closure carried
     /// the live set by id beside its admit set, and `HERE` is what each
-    /// captures with the marker a constant. A closure's captures are held
-    /// across the whole traversal it is monomorphised into, so none may
-    /// capture more than the ceiling in its case.
+    /// captures, the closure for stranded nodes borrowing the marker and the
+    /// closure for any other set naming it as a constant. A closure's
+    /// captures are held across the whole traversal it is monomorphised
+    /// into, so none may capture more than the ceiling in its case.
     #[test]
     fn each_predicate_captures_no_more_than_its_ceiling() {
         const CEILING: [(u8, usize); 4] = [(1, 0), (2, 8), (3, 16), (4, 24)];
-        const HERE: [(u8, usize); 4] = [(1, 0), (2, 0), (3, 8), (4, 16)];
+        const HERE: [(u8, usize); 4] = [(1, 0), (2, 8), (3, 8), (4, 16)];
         let vectors: Vec<Vec<f32>> = (0..300)
             .map(|i| vec![(i as f32 * 0.37).sin(), (i as f32 * 0.11).cos()])
             .collect();
@@ -1429,8 +1483,8 @@ mod tests {
         }
     }
 
-    /// A held id is refused, an unknown id cannot be removed, and the live
-    /// and stranded counts follow every write.
+    /// A held id is refused, neither an unknown id nor a hole can be
+    /// removed, and the live and stranded counts follow every write.
     #[test]
     fn held_ids_are_refused_and_the_counts_follow_every_write() {
         let mut index = index_of(&[vec![0.0, 0.0], vec![1.0, 0.0], vec![0.0, 1.0]]);
@@ -1452,6 +1506,14 @@ mod tests {
         assert_eq!(index.recover(Position(3)), Some(vec![0.0, 1.0]));
         // The node stays, so the graph still holds three.
         assert_eq!(index.graph().nb_points(), 3);
+        // The hole the removal left is refused as a position never held is,
+        // and the counts stay where they were.
+        assert!(matches!(
+            index.remove(Position(2)),
+            Err(Error::RecordNotHeld { id: 2 })
+        ));
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.stranded(), 1);
     }
 
     /// A small enumerable admit set is scored exactly with the boundary tie
@@ -2213,6 +2275,122 @@ mod tests {
                 }
             }
             assert_eq!(holes, count.div_ceil(7), "gap {gap}");
+        }
+    }
+
+    /// Insert one record at position `at` under internal id `id`.
+    fn put_at(index: &mut DenseIndex, at: u32, id: u32, vector: &[f32]) {
+        let prepared = index.prepare(RecordId(id), vector).unwrap();
+        index
+            .insert(Position(at), RecordId(id), vector, prepared)
+            .unwrap();
+    }
+
+    /// The internal id of the record at each position below `past`, read the
+    /// long way: the node `node_at` names and that node's origin id.
+    fn ids_read_twice(index: &DenseIndex, past: usize) -> Vec<Option<usize>> {
+        (0..past)
+            .map(|at| match index.node_at().get(at) {
+                Some(&node) if node != NONE => Some(index.graph().origin_id_at(node)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The reader of each position's internal id answers what the node and
+    /// its origin id answer, at every position and past the last, and it
+    /// takes the ids as the positions plus one exactly where they are: no
+    /// hole, the first id one and the last the record count.
+    #[test]
+    fn each_position_names_the_internal_id_its_node_was_inserted_under() {
+        let vectors: Vec<Vec<f32>> = (0..40)
+            .map(|i| vec![(i as f32 * 0.37).sin(), (i as f32 * 0.11).cos()])
+            .collect();
+        let graph = || VectorGraph::new_raw("l2", 2, 4, 64, NB_LAYER_MAX as usize, 50);
+        let check = |index: &DenseIndex, shifted: bool, label: &str| {
+            let reader = index.ids_by_position();
+            assert_eq!(reader.shifted, shifted, "{label}");
+            let past = index.node_at().len() + 3;
+            let read: Vec<Option<usize>> = (0..past).map(|at| reader.get(at)).collect();
+            assert_eq!(read, ids_read_twice(index, past), "{label}");
+        };
+        let forty = || {
+            let mut index = DenseIndex::new(graph(), "l2", 2, None, false);
+            for k in 0..40u32 {
+                put_at(&mut index, k, k + 1, &vectors[k as usize]);
+            }
+            index
+        };
+
+        let mut index = DenseIndex::new(graph(), "l2", 2, None, false);
+        check(&index, false, "empty");
+        put_at(&mut index, 0, 1, &vectors[0]);
+        check(&index, true, "one record");
+        let mut index = forty();
+        check(&index, true, "the ids one to forty");
+        index.remove(Position(3)).unwrap();
+        check(&index, false, "a hole");
+        let held: Vec<u32> = (0..40).filter(|&at| at != 3).collect();
+        index.close_up(&held);
+        assert!(index.numbering_agrees());
+        check(&index, false, "closed up past a removed id");
+
+        let mut index = forty();
+        index.remove(Position(0)).unwrap();
+        index.close_up(&(1..40).collect::<Vec<u32>>());
+        assert!(index.numbering_agrees());
+        check(&index, false, "the first id two");
+
+        let mut index = forty();
+        index.remove(Position(39)).unwrap();
+        check(&index, false, "the last position a hole");
+
+        let mut index = DenseIndex::new(graph(), "l2", 2, None, false);
+        for k in 0..39u32 {
+            put_at(&mut index, k, k + 2, &vectors[k as usize]);
+        }
+        check(&index, false, "the ids two to forty");
+    }
+
+    /// An insert files its node at the position it takes, both where
+    /// `node_at` reaches that position and where it stops short of it, as it
+    /// does once the records are handed back with the last positions holes.
+    #[test]
+    fn an_insert_files_its_node_where_node_at_reaches_and_where_it_stops_short() {
+        let vectors: Vec<Vec<f32>> = (0..12)
+            .map(|i| vec![(i as f32 * 0.37).sin(), (i as f32 * 0.11).cos()])
+            .collect();
+        let graph = VectorGraph::new_raw("l2", 2, 4, 64, NB_LAYER_MAX as usize, 50);
+        let mut index = DenseIndex::new(graph, "l2", 2, None, false);
+        for k in 0..6u32 {
+            put_at(&mut index, k, k + 1, &vectors[k as usize]);
+            assert_eq!(index.node_at().len(), k as usize + 1);
+        }
+        index.remove(Position(4)).unwrap();
+        index.remove(Position(5)).unwrap();
+        assert_eq!(index.set_live(0..4usize), 0);
+        assert_eq!(
+            index.node_at().len(),
+            4,
+            "node_at reaches the last record held"
+        );
+
+        put_at(&mut index, 6, 7, &vectors[6]);
+        assert_eq!(index.node_at().len(), 7);
+        assert_eq!(&index.node_at()[4..6], &[NONE, NONE]);
+        put_at(&mut index, 7, 8, &vectors[7]);
+        assert_eq!(index.node_at().len(), 8);
+
+        assert!(index.numbering_agrees());
+        assert_eq!(index.len(), 6);
+        for at in [0usize, 1, 2, 3, 6, 7] {
+            let node = index.node_at()[at];
+            assert_eq!(index.graph().records()[node as usize], at as u32, "{at}");
+            assert_eq!(index.raw_vector(at), Some(vectors[at].as_slice()), "{at}");
+        }
+        for at in [4usize, 5] {
+            assert!(!index.holds(Position(at as u32)), "{at}");
+            assert_eq!(index.raw_vector(at), None, "{at}");
         }
     }
 }

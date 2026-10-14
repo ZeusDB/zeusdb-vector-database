@@ -110,6 +110,15 @@ struct RemovalGuards<'a> {
     columns: WriteGuard<'a, ColumnStore>,
 }
 
+impl RemovalGuards<'_> {
+    /// The records the id store holds and the holes among its positions,
+    /// read as a batch's last step for the close-up's test, which runs once
+    /// the batch has let its guards go.
+    fn held_and_holes(&self) -> (usize, usize) {
+        (self.ids.len(), self.ids.extent() - self.ids.len())
+    }
+}
+
 // How many times the close-up on removal has run on this thread. Read by the
 // tests that hold it to the points it must run at; nothing outside the tests
 // sees it.
@@ -418,17 +427,22 @@ impl Drop for ClosedUp {
 /// with no guard of the collection held. A second writer therefore takes
 /// the guard while the first one's old structures are freed, and a caller
 /// sees the memory given back once its call returns. A helper borrows the
-/// holder from its entry point, as it borrowed the guard.
+/// holder from its entry point, as it borrowed the guard. The list is made
+/// by the first close-up, so a call that closes nothing up drops the guard
+/// and finds no list.
 pub(super) struct MutationGuard<'a> {
     _writers: Locked<'a, ()>,
-    retired: RefCell<Vec<ClosedUp>>,
+    retired: RefCell<Option<Vec<ClosedUp>>>,
 }
 
 impl MutationGuard<'_> {
     /// Keep what a close-up's swap replaced, to drop once the guard is let
     /// go.
     fn retire(&self, parts: ClosedUp) {
-        self.retired.borrow_mut().push(parts);
+        self.retired
+            .borrow_mut()
+            .get_or_insert_with(Vec::new)
+            .push(parts);
     }
 }
 
@@ -790,7 +804,7 @@ impl Collection {
     pub(super) fn hold_writers(&self) -> MutationGuard<'_> {
         MutationGuard {
             _writers: self.writers.lock().unwrap(),
-            retired: RefCell::new(Vec::new()),
+            retired: RefCell::new(None),
         }
     }
 
@@ -1111,6 +1125,11 @@ impl Collection {
     /// its guards go, under the `writers` the caller holds. Returns whether
     /// it ran.
     ///
+    /// `held_and_holes` is what the batch read under its own guards as its
+    /// last step. Nothing writes the id store between the batch and this
+    /// test, since every write holds `writers`, so the figures are the
+    /// store's still.
+    ///
     /// Where the holes exceed both [`HOLE_ALLOWANCE`] and the records held,
     /// every per-record structure is closed up by the routine a compaction
     /// runs, the sparse space dropping the postings of the records it holds
@@ -1123,11 +1142,12 @@ impl Collection {
     ///
     /// A batch is what one removal's record names, so a replay of the
     /// record closes up at the same point as the removal that wrote it.
-    fn close_up_after_removal(&self, writers: &MutationGuard<'_>, expected_size: usize) -> bool {
-        let (held, holes) = {
-            let ids = self.ids.read().unwrap();
-            (ids.len(), ids.extent() - ids.len())
-        };
+    fn close_up_after_removal(
+        &self,
+        writers: &MutationGuard<'_>,
+        (held, holes): (usize, usize),
+        expected_size: usize,
+    ) -> bool {
         if holes <= HOLE_ALLOWANCE.max(held) {
             return false;
         }
@@ -1166,10 +1186,6 @@ impl Collection {
             );
             return false;
         };
-        // The record's node, read before it is stranded. The log below names
-        // the record by the internal id the node was inserted under, which
-        // the node keeps, and reads it only where the record is written.
-        let node = guards.index.node_of(Position::from_slot(slot));
 
         // Track what we're removing for logging.
         //
@@ -1201,18 +1217,18 @@ impl Collection {
         guards.pq_codes.remove(id); // Remove PQ codes (if present)
 
         // The dense index strands the node and drops the record from its
-        // live set, and the sparse index unlinks the record's postings where
-        // the record filled that space. Each is asked whether it holds the
-        // record first, since a record may leave the sparse space empty and
-        // an index refuses to remove a position it does not hold.
+        // live set, and hands back the node, which keeps the internal id the
+        // log below names the record by. The sparse index unlinks the
+        // record's postings where the record filled that space, asked first
+        // whether it holds the record, since a record may leave the sparse
+        // space empty and an index refuses to remove a position it does not
+        // hold.
         let record = Position::from_slot(slot);
+        let node = guards.index.strand(record);
         debug_assert!(
-            guards.index.holds(record),
+            node != Position::NONE,
             "the dense index holds every record the id store holds"
         );
-        if guards.index.holds(record) {
-            let _ = guards.index.remove(record);
-        }
         if let Some(sparse) = guards.sparse.as_mut() {
             if sparse.holds(record) {
                 let _ = sparse.remove(record);
@@ -1264,7 +1280,11 @@ impl Collection {
 
         debug!(target: LOG_TARGET, operation = "remove_point_internal",
             vector_id = %id,
-            internal_id = node.map_or(0, |node| guards.index.graph().origin_id_at(node)),
+            internal_id = if node == Position::NONE {
+                0
+            } else {
+                guards.index.graph().origin_id_at(node)
+            },
             had_raw_vector = had_raw_vector,
             had_pq_codes = had_pq_codes,
             storage_mode = storage_mode,
@@ -1289,11 +1309,12 @@ impl Collection {
         // the declared order puts the graph above every map held below.
         let storage_mode = self.storage_mode();
         let expected_size = self.expected_size();
-        let removed = {
+        let (removed, held_and_holes) = {
             let mut guards = self.removal_guards();
-            self.remove_under_guards(&mut guards, &id, &storage_mode)
+            let removed = self.remove_under_guards(&mut guards, &id, &storage_mode);
+            (removed, guards.held_and_holes())
         };
-        let closed = self.close_up_after_removal(writers, expected_size);
+        let closed = self.close_up_after_removal(writers, held_and_holes, expected_size);
         debug_assert!(
             !closed || self.positions_agree(),
             "the close-up on removal leaves every structure at the positions the records hold"
@@ -1324,7 +1345,7 @@ impl Collection {
     ) -> Vec<String> {
         let storage_mode = self.storage_mode();
         let expected_size = self.expected_size();
-        let missing = {
+        let (missing, held_and_holes) = {
             let mut guards = self.removal_guards();
             let mut handled: HashSet<&str> = HashSet::with_capacity(ids.len());
             let mut missing = Vec::new();
@@ -1336,9 +1357,9 @@ impl Collection {
                     missing.push(id.clone());
                 }
             }
-            missing
+            (missing, guards.held_and_holes())
         };
-        let closed = self.close_up_after_removal(writers, expected_size);
+        let closed = self.close_up_after_removal(writers, held_and_holes, expected_size);
         debug_assert!(
             !closed || self.positions_agree(),
             "the close-up on removal leaves every structure at the positions the records hold"

@@ -109,11 +109,13 @@ impl Collection {
     ) -> R {
         let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
-        let raws = index.raw_vectors();
-        let internal = index.ids_by_position();
+        let node_at = index.node_at();
+        let graph = index.graph();
+        let origin_ids = graph.origin_ids();
         let mut records = ids.slots().filter_map(|at| {
-            let vector = raws.get(at)?;
-            Some((internal.get(at)?, vector))
+            let node = *node_at.get(at)?;
+            let vector = graph.raw_vector_at(node)?;
+            Some((*origin_ids.get(node as usize)?, vector))
         });
         write(&mut records, ids.len())
     }

@@ -244,9 +244,12 @@ pub(crate) fn decode(
             values: &values,
         };
         match walk.position_of(id as usize) {
-            Some(at) => index
-                .insert_record(Position::from_slot(at), RecordId(id), vector)
-                .map_err(|e| corrupt(format!("record {}: {}", id, e)))?,
+            Some(at) => {
+                index
+                    .insert_record(Position::from_slot(at), vector)
+                    .map_err(|e| corrupt(format!("record {}: {}", id, e)))?;
+                index.count_slot(RecordId(id));
+            }
             None => {
                 config
                     .weighting

@@ -1382,7 +1382,10 @@ fn number_nodes(origin_ids: &[usize], positions: Option<&[u32]>) -> Result<Vec<u
         .enumerate()
         .map(|(node, &origin)| (origin, node as u32))
         .collect();
-    order.sort_unstable();
+    // By the origin id alone. A dump that names one id twice is refused
+    // below, and in any other the ids are distinct, so the node never decides
+    // the order.
+    order.sort_unstable_by_key(|&(origin, _)| origin);
     if let Some(pair) = order.windows(2).find(|pair| pair[0].0 == pair[1].0) {
         return Err(format!(
             "the graph dump names origin id {} for more than one node",

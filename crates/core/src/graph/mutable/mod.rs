@@ -954,13 +954,6 @@ where
         self.record_of.capacity()
     }
 
-    /// File the record at `position` under `node`, or strand the node with
-    /// [`Position::NONE`]. The index calls this under its write guard, beside
-    /// its own entry for the position.
-    pub(super) fn set_record_of(&mut self, node: u32, position: u32) {
-        self.record_of[node as usize] = position;
-    }
-
     /// Every node's position, indexed by node, to write, for a pass that
     /// files the records a load holds.
     pub(super) fn records_mut(&mut self) -> &mut [u32] {

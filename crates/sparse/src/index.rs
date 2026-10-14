@@ -838,12 +838,18 @@ impl PostingsIndex {
         ]
     }
 
-    /// Insert one record at its position `at`, with its internal id `id`
-    /// beside it for the slot count, with the check every caller wants.
+    /// Raise the slot count past the internal id `id`, which a caller does
+    /// once the record it inserted under that id is in.
+    pub(crate) fn count_slot(&mut self, id: RecordId) {
+        self.slot_count = self.slot_count.max(id.slot() + 1);
+    }
+
+    /// Insert one record at its position `at`, with the check every caller
+    /// wants. The caller raises the slot count by the record's internal id
+    /// once the record is in, through [`PostingsIndex::count_slot`].
     pub(crate) fn insert_record(
         &mut self,
         at: Position,
-        id: RecordId,
         vector: SparseRef<'_>,
     ) -> Result<(), Error> {
         self.config.weighting.validate_record(vector)?;
@@ -855,7 +861,6 @@ impl PostingsIndex {
         if self.records[slot_index].held() && !self.dead.contains(slot_index) {
             return Err(Error::RecordAlreadyHeld { id: at.0 });
         }
-        self.slot_count = self.slot_count.max(id.slot() + 1);
         if self.dead.contains(slot_index) {
             // A removed position being re-inserted. The engine never does
             // this, since it never reuses a position, but the structure stays
@@ -1004,7 +1009,8 @@ impl VectorIndex<Sparse> for PostingsIndex {
         vector: SparseRef<'_>,
         _prepared: Prepared,
     ) -> Result<(), Error> {
-        self.insert_record(at, id, vector)?;
+        self.insert_record(at, vector)?;
+        self.count_slot(id);
         if self.live.is_power_of_two() && self.live >= crate::calibrate::CALIBRATION_MIN_RECORDS {
             self.calibrate();
         }

@@ -1826,3 +1826,71 @@ fn counts_beside_every_change_see_the_state_before_or_after_it() {
     assert!(over_builds >= 100, "counts overlap the build phases");
     assert!(over_swaps >= 10, "counts overlap the swap phases");
 }
+
+/// The points one thread's close-ups reached, each with the guards the
+/// thread held there.
+type Reached = Rc<RefCell<Vec<(CloseUpPoint, Vec<String>)>>>;
+
+/// A call drops only what its own close-up retired, and only once its
+/// guard is let go. Inserts, removals below the bound and a removal of an id
+/// the collection does not hold reach no point of a close-up. The removal
+/// that passes the bound reaches each point once, in order, and holds no
+/// guard of the collection as its old structures drop.
+#[test]
+fn a_call_drops_only_what_its_close_up_retired_and_after_its_guard() {
+    let collection = collection(Kind::Raw, 100, &["cat"], Unlink::Lazy, Weighting::Dot);
+    add(&collection, 0..6_000);
+    let reached: Reached = Rc::default();
+    {
+        let reached = Rc::clone(&reached);
+        CLOSE_UP_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |point| {
+                reached.borrow_mut().push((point, held_now()));
+            }));
+        });
+    }
+    let quiet = |label: &str| {
+        assert!(
+            reached.borrow().is_empty(),
+            "{label}: {:?}",
+            reached.borrow()
+        );
+    };
+
+    remove(&collection, 0..100);
+    quiet("a removal below the bound");
+    add(&collection, 6_000..6_010);
+    quiet("an insert");
+    assert_eq!(
+        collection.remove_points(&["absent".to_string()]).unwrap(),
+        vec!["absent".to_string()]
+    );
+    quiet("a removal of an id the collection does not hold");
+    remove(&collection, 100..ALLOWANCE);
+    quiet("a removal that reaches the allowance");
+
+    assert!(collection.remove_point(format!("r{ALLOWANCE}")).unwrap());
+    let points: Vec<CloseUpPoint> = reached.borrow().iter().map(|(point, _)| *point).collect();
+    assert_eq!(
+        points,
+        vec![
+            CloseUpPoint::Building,
+            CloseUpPoint::Built,
+            CloseUpPoint::Swapping,
+            CloseUpPoint::Swapped,
+            CloseUpPoint::Dropping,
+            CloseUpPoint::Dropped,
+        ]
+    );
+    for (point, held) in reached.borrow().iter() {
+        if matches!(point, CloseUpPoint::Dropping | CloseUpPoint::Dropped) {
+            assert_eq!(held, &Vec::<String>::new(), "{point:?}");
+        }
+    }
+    assert_eq!(holes(&collection), 0);
+
+    reached.borrow_mut().clear();
+    remove(&collection, ALLOWANCE + 1..ALLOWANCE + 50);
+    quiet("a removal after the close-up");
+    CLOSE_UP_HOOK.with(|hook| *hook.borrow_mut() = None);
+}
