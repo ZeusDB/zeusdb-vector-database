@@ -60,6 +60,9 @@ impl Collection {
     /// ordinary refusal for a value the ordinary path would refuse, and
     /// whatever the body returns for a body that fails.
     pub fn apply(&self, operation: Operation) -> Result<(), Error> {
+        // What a clear traded out, declared before the holder of `writers`
+        // so it drops once the holder has let `writers` go.
+        let mut cleared = None;
         let writers = self.hold_writers();
         if self.sink_attached() {
             return Err(Error::Engine(
@@ -116,7 +119,7 @@ impl Collection {
                 debug_assert!(replaced, "the record was held a moment ago");
                 Ok(())
             }
-            Operation::Clear => self.clear_locked().map(|_| ()),
+            Operation::Clear => self.clear_locked().map(|(_, old)| cleared = Some(old)),
             Operation::Compact => self.compact_locked(&writers).map(|_| ()),
             Operation::Rebuild {
                 m,
@@ -244,6 +247,10 @@ impl Collection {
             let space = self.sparse().ok_or(Error::NoSparseSpace)?;
             space.config().weighting.validate_record(sparse.as_ref())?;
         }
+
+        // The id, held to what the id store can name, as admission holds it.
+        let arena = self.ids.read().unwrap().arena_len();
+        zeusdb_vector_core::refuse_unnamable(&id, arena)?;
 
         // The id the record names, issued only if it is the next, and the
         // level the record names, with nothing drawn.

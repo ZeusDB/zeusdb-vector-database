@@ -320,8 +320,7 @@ fn the_mutable_memory_figure_is_exact() {
     expected += nodes * std::mem::size_of::<u32>();
     expected += nodes * std::mem::size_of::<u32>();
     expected += nodes;
-    // The inverse of the origin ids, one node index per internal id. The
-    // fixture inserts under ids zero upward, so it holds one slot per node.
+    // The position each node holds its record at, one per node.
     expected += nodes * std::mem::size_of::<u32>();
     // No vector. The store is a separate object and its bytes are its own; see
     // `VectorStore::memory_bytes`.

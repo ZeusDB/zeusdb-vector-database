@@ -121,7 +121,9 @@ pub use construct::Declaration;
 pub(crate) use construct::{
     validate_index_parameters, validate_space_supports_quantization, SparseDeclaration,
 };
-pub(crate) use dense::{DenseIndex, DenseOpen, DenseParts};
+pub(crate) use dense::{
+    read_internal_id, shifted_internal_id, DenseIndex, DenseOpen, DenseParts, PositionReader,
+};
 pub use insert::{Added, RebuildPlan};
 pub use page::{FieldRef, HitRef, QueryHits};
 pub use query::{
@@ -1105,14 +1107,15 @@ pub struct Collection {
     ///
     /// **Separate from `id_counter`, and it is not reset by `clear`.** It used
     /// to be the same counter, which meant two things at once. `clear` resets
-    /// `id_counter` deliberately, because the dense index's node for each
-    /// position is one dense slot per internal id issued and an index cleared
-    /// and refilled repeatedly would grow it without bound. That reset handed out `vec_1` a
-    /// second time, so an external reference to the first record now named a
-    /// different one and nothing said so.
+    /// `id_counter` deliberately, because nothing is left for a reissued
+    /// internal id to collide with, and an index cleared and refilled
+    /// repeatedly would otherwise spend its internal ids up to
+    /// `MAX_INTERNAL_ID`. That reset handed out `vec_1` a second time, so an
+    /// external reference to the first record now named a different one and
+    /// nothing said so.
     ///
     /// Splitting them lets each keep the property it needs. `id_counter` still
-    /// resets, so the dense array still shrinks. This one never goes backwards,
+    /// resets, so the internal ids start again. This one never goes backwards,
     /// so a generated id is issued once in the life of an index and survives a
     /// save and load. See `config.json`'s `generated_ids`.
     ///
@@ -1652,6 +1655,24 @@ impl Collection {
         let mut payload = Vec::new();
         operation.encode(&mut payload);
         sink.append(operation.kind(), &payload)
+    }
+
+    /// [`Collection::record`] for a record of `kind` the caller encodes
+    /// from borrowed parts, so nothing is cloned to build an operation. The
+    /// bytes are encoded only where a sink is attached.
+    fn record_encoded(
+        &self,
+        kind: OperationKind,
+        encode: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<(), Error> {
+        let mut slot = self.sink.lock().unwrap();
+        slot.refuse_if_faulted()?;
+        let Some(sink) = slot.attached.as_mut() else {
+            return Ok(());
+        };
+        let mut payload = Vec::new();
+        encode(&mut payload);
+        sink.append(kind, &payload)
     }
 
     /// Hand one record's bytes, already encoded, to the sink, where one is

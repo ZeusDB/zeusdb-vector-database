@@ -282,7 +282,7 @@ pub struct PostingsIndex {
     pub(crate) lengths: Vec<f32>,
     /// One past the largest internal id inserted since the index was made,
     /// restored or cleared, which the artefact records as its slot count and
-    /// a load holds to the collection's largest id.
+    /// a load holds to the last internal id the collection issued.
     pub(crate) slot_count: usize,
     /// Records removed and not yet compacted out.
     pub(crate) dead: Bitmap,

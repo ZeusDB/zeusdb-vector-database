@@ -60,8 +60,9 @@ const EMPTY: u32 = u32::MAX;
 /// keeps `u32::MAX` for the empty bucket, so the last slot is the one below
 /// it, and an internal id is held to the same ceiling so that every number
 /// naming a record fits the same width. `add` issues no id past this one, a
-/// replay installs none and a load refuses one, so the store is never handed
-/// a slot it refuses.
+/// replay installs none, and a load refuses one, whether the mappings name it
+/// or the rebuild fallback would issue it. A record's position is below its
+/// internal id, so the store is never handed a slot it refuses.
 pub const MAX_INTERNAL_ID: usize = EMPTY as usize - 1;
 /// The most entries and the most buckets the store reserves at creation,
 /// whatever the declaration. Eight bytes an entry and five a bucket.
@@ -71,6 +72,50 @@ const RESERVE_CAP: usize = 1 << 20;
 /// declaration, under the cap.
 fn reserved_entries(expected_size: usize) -> usize {
     expected_size.saturating_add(1).min(RESERVE_CAP)
+}
+
+// The longest id and the largest arena this thread's checks hold a record
+// to, which a test lowers to reach the two refusals without gigabytes of
+// text. Nothing outside the tests sees it.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    pub static ID_CEILINGS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((MAX_ID_LEN, MAX_TEXT)) };
+}
+
+/// The longest id and the largest arena a store takes.
+#[cfg(any(test, feature = "test-support"))]
+fn ceilings() -> (u64, u64) {
+    ID_CEILINGS.with(std::cell::Cell::get)
+}
+
+/// The longest id and the largest arena a store takes.
+#[cfg(not(any(test, feature = "test-support")))]
+fn ceilings() -> (u64, u64) {
+    (MAX_ID_LEN, MAX_TEXT)
+}
+
+/// Refuse `id` where a store whose arena holds `arena` bytes could not take
+/// it as its next record: an id longer than an entry can describe, or one
+/// that would take the arena past what an entry can name. The words are
+/// the ones [`IdStore::insert`] gives. A collection runs this where it
+/// admits a record, before anything is issued or recorded for it, with the
+/// text of the records it has admitted and not yet named counted in
+/// `arena`.
+pub fn refuse_unnamable(id: &str, arena: usize) -> Result<(), Error> {
+    let (longest, largest) = ceilings();
+    if id.len() as u64 > longest {
+        return Err(Error::Engine(format!(
+            "an id of {} bytes is longer than the id store can hold",
+            id.len()
+        )));
+    }
+    if arena as u64 + id.len() as u64 > largest {
+        return Err(Error::Engine(
+            "the id store's text arena is full".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Buckets a table holds for `records` entries at seven eighths full, which
@@ -317,26 +362,42 @@ impl IdStore {
     /// Refused where the slot is past [`MAX_INTERNAL_ID`], or where the id
     /// or the arena would pass what an entry can name.
     pub fn insert(&mut self, slot: usize, id: &str) -> Result<(), Error> {
-        let slot32 = u32::try_from(slot)
+        if u32::try_from(slot)
             .ok()
             .filter(|_| slot <= MAX_INTERNAL_ID)
-            .ok_or_else(|| {
-                Error::Engine(format!(
-                    "internal id {} is above what the id store can hold",
-                    slot
-                ))
-            })?;
-        if id.len() as u64 > MAX_ID_LEN {
+            .is_none()
+        {
             return Err(Error::Engine(format!(
-                "an id of {} bytes is longer than the id store can hold",
-                id.len()
+                "internal id {} is above what the id store can hold",
+                slot
             )));
         }
-        if self.text.len() as u64 + id.len() as u64 > MAX_TEXT {
-            return Err(Error::Engine(
-                "the id store's text arena is full".to_string(),
-            ));
-        }
+        refuse_unnamable(id, self.text.len())?;
+        self.insert_admitted(slot, id);
+        Ok(())
+    }
+
+    /// The text arena's length, the text of removed records included, which
+    /// is what [`refuse_unnamable`] holds a record's id against.
+    pub fn arena_len(&self) -> usize {
+        self.text.len()
+    }
+
+    /// [`IdStore::insert`] for a record already held to the three refusals
+    /// it runs, being the slot's ceiling, the id's length and the arena's.
+    /// The collection's insertion path calls this, having run them where a
+    /// record is admitted, where a refusal moves nothing. A debug build
+    /// holds the three as an assertion.
+    pub fn insert_admitted(&mut self, slot: usize, id: &str) {
+        debug_assert!(
+            slot <= MAX_INTERNAL_ID,
+            "slot {slot} is above what the id store can hold"
+        );
+        debug_assert!(
+            refuse_unnamable(id, self.text.len()).is_ok(),
+            "the record was held to the id's and the arena's ceilings"
+        );
+        let slot32 = slot as u32;
         if let Some(at) = self.find(id) {
             let old = self.buckets[at] as usize;
             self.erase_bucket(at);
@@ -355,7 +416,6 @@ impl IdStore {
         Self::place(&mut self.buckets, &mut self.tags, slot32, hash);
         self.live.insert(slot);
         self.held += 1;
-        Ok(())
     }
 
     /// Forget the record named `id`, returning the position it held, which
@@ -396,8 +456,15 @@ impl IdStore {
         }
     }
 
-    /// Forget every record, keeping a reservation for `expected_size`.
+    /// Forget every record, keeping a reservation for `expected_size`. What
+    /// the store held is let go before the reservation is made, so a clear
+    /// never holds both.
     pub fn clear(&mut self, expected_size: usize) {
+        self.text = String::new();
+        self.entries = Vec::new();
+        self.buckets = Vec::new();
+        self.tags = Vec::new();
+        self.live = Bitmap::default();
         *self = IdStore::new(expected_size);
     }
 
@@ -595,6 +662,20 @@ impl IdStore {
         Some(self.text_of(entry))
     }
 
+    /// The external id of `slot`, where it holds a record, for a loader
+    /// naming every record it reads. The text is sliced by a check that
+    /// answers `None` where the range is not one, which no entry's range
+    /// is, rather than one that panics, so the read carries no panic path.
+    /// [`IdStore::name`] is the reader the searches name their hits with.
+    pub fn read_name(&self, slot: usize) -> Option<&str> {
+        let entry = *self.entries.get(slot)?;
+        if entry == ABSENT {
+            return None;
+        }
+        let (offset, len) = unpack(entry);
+        self.text.get(offset..offset + len)
+    }
+
     /// Whether `slot` holds a record. Total over every `usize`.
     #[inline]
     pub fn contains_slot(&self, slot: usize) -> bool {
@@ -723,6 +804,26 @@ impl IdStore {
             + self.buckets.capacity() * std::mem::size_of::<u32>()
             + self.tags.capacity()
             + self.live.heap_bytes()
+    }
+
+    /// Bytes of that request no record has been written into: the arena
+    /// past its text, the entries past the positions assigned and the live
+    /// set's words past them, which [`IdStore::shrink_to_fit`] gives back.
+    /// The table gives nothing, since it is sized from the records it holds.
+    pub fn reserved_bytes(&self) -> usize {
+        (self.text.capacity() - self.text.len())
+            + (self.entries.capacity() - self.entries.len()) * std::mem::size_of::<u64>()
+            + self.live.reserved_past(self.entries.len())
+    }
+
+    /// Give back what [`IdStore::reserved_bytes`] prices, reporting the
+    /// bytes released. No record moves.
+    pub fn shrink_to_fit(&mut self) -> usize {
+        let before = self.heap_bytes();
+        self.text.shrink_to_fit();
+        self.entries.shrink_to_fit();
+        self.live.shrink_past(self.entries.len());
+        before - self.heap_bytes()
     }
 }
 
@@ -1134,5 +1235,85 @@ mod tests {
         store.insert(store.extent(), "next").unwrap();
         assert_eq!(store.slot_of("next"), Some(2));
         assert_eq!(store.slot_of("b"), Some(1));
+    }
+
+    /// What the store reserved and no record has been written into is what
+    /// `reserved_bytes` prices and what `shrink_to_fit` gives back, at the
+    /// declaration, past it and after removals, after which the store prices
+    /// nothing and resolves every record as before. A clear holds a fresh
+    /// store's reservation and nothing else.
+    #[test]
+    fn the_unwritten_reservation_is_what_a_shrink_gives_back() {
+        for (declared, records) in [(1_000usize, 10usize), (100, 3_000), (2_000_000, 500)] {
+            let mut store = IdStore::new(declared);
+            assert_eq!(
+                store.reserved_bytes(),
+                reserved_entries(declared) * 8,
+                "{declared}: nothing is written"
+            );
+            for at in 0..records {
+                store.insert(at, &format!("record-{at}")).unwrap();
+            }
+            for at in (0..records).step_by(3) {
+                assert!(store.remove_slot(at));
+            }
+            let priced = store.reserved_bytes();
+            let before = store.heap_bytes();
+            let released = store.shrink_to_fit();
+            assert_eq!(released, priced, "{declared}");
+            assert_eq!(store.heap_bytes(), before - released, "{declared}");
+            assert_eq!(store.reserved_bytes(), 0, "{declared}");
+            assert_eq!(store.shrink_to_fit(), 0, "{declared}");
+            for at in 0..records {
+                let held = at % 3 != 0;
+                assert_eq!(store.contains_slot(at), held, "{declared}: {at}");
+                assert_eq!(
+                    store.slot_of(&format!("record-{at}")),
+                    held.then_some(at),
+                    "{declared}: {at}"
+                );
+            }
+            assert!(store.table_agrees());
+            store.insert(store.extent(), "next").unwrap();
+            assert_eq!(store.slot_of("next"), Some(records));
+
+            store.clear(declared);
+            let fresh = IdStore::new(declared);
+            assert_eq!(store.heap_bytes(), fresh.heap_bytes(), "{declared}");
+            assert_eq!(store.reserved_bytes(), fresh.reserved_bytes());
+            assert_eq!(store.len(), 0);
+            assert_eq!(store.extent(), 0);
+        }
+    }
+
+    /// The loader's read of a name answers what the searches' read answers
+    /// at every slot, a hole's and the slots past the extent included,
+    /// with ids of one byte a character and of several, and after a
+    /// close-up.
+    #[test]
+    fn a_loaders_read_of_a_name_answers_what_name_answers() {
+        let mut store = IdStore::new(8);
+        let ids: Vec<String> = (0..40)
+            .map(|k| match k % 3 {
+                0 => format!("{k}"),
+                1 => format!("récord-{k}"),
+                _ => "x".repeat(k + 1),
+            })
+            .collect();
+        for (at, id) in ids.iter().enumerate() {
+            store.insert(at, id).unwrap();
+        }
+        for at in (0..40).step_by(4) {
+            assert!(store.remove_slot(at));
+        }
+        let agree = |store: &IdStore| {
+            for slot in 0..store.extent() + 3 {
+                assert_eq!(store.read_name(slot), store.name(slot), "{slot}");
+            }
+        };
+        agree(&store);
+        let (old_of_new, new_of_old) = closing(&store);
+        store.close_up(&old_of_new, &new_of_old, 8);
+        agree(&store);
     }
 }

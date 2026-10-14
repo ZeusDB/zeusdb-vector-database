@@ -190,6 +190,24 @@ impl Bitmap {
         self.words.capacity() * 8
     }
 
+    /// Bytes of the words past those that reach `slots`, whether the words
+    /// hold them or only their capacity does. A store whose set holds no
+    /// position past `slots` reserved them, and no record has been written
+    /// into them.
+    pub(crate) fn reserved_past(&self, slots: usize) -> usize {
+        (self.words.capacity() - self.words.len().min(slots.div_ceil(64))) * 8
+    }
+
+    /// Give back the words [`Bitmap::reserved_past`] prices, reporting the
+    /// bytes released. The set holds no position past `slots`, so it is the
+    /// same set.
+    pub(crate) fn shrink_past(&mut self, slots: usize) -> usize {
+        let before = self.heap_bytes();
+        self.words.truncate(slots.div_ceil(64));
+        self.words.shrink_to_fit();
+        before - self.heap_bytes()
+    }
+
     /// The words and their capacity, for a test that holds two sets to be
     /// the same words. Absent from every build that is not a test.
     #[cfg(any(test, feature = "test-support"))]
@@ -221,10 +239,11 @@ mod tests {
         }
     }
 
-    /// A set is the words it always was: the same growth, the same capacity,
-    /// the same bytes, whatever is inserted or removed.
+    /// A set is its words. An insert grows them as a vector of words grows,
+    /// to the same capacity and the same bytes, and a removal clears its bit
+    /// and keeps them.
     #[test]
-    fn a_flat_set_is_the_words_it_was() {
+    fn a_set_is_the_words_its_inserts_and_removals_write() {
         let mut set = Bitmap::default();
         let mut words: Vec<u64> = Vec::new();
         for slot in (1..50_001usize).filter(|slot| slot % 7 != 3) {
@@ -250,7 +269,7 @@ mod tests {
     /// The model test: inserts and removes over positions drawn across a wide
     /// range, against a sorted set.
     #[test]
-    fn the_set_answers_what_a_sorted_set_answers_through_every_form() {
+    fn the_set_answers_what_a_sorted_set_answers() {
         for seed in 1..=6u64 {
             let mut stream = Stream(seed.wrapping_mul(0x2545_F491_4F6C_DD1D));
             let mut set = Bitmap::default();
@@ -294,7 +313,7 @@ mod tests {
 
     /// The algebra gives what the sorted sets give.
     #[test]
-    fn the_algebra_answers_in_every_form() {
+    fn the_algebra_answers_what_the_sorted_sets_answer() {
         let mut stream = Stream(0x1234_5678);
         let draw = |stream: &mut Stream, n: usize, range: usize| -> Vec<usize> {
             (0..n).map(|_| (stream.next() as usize) % range).collect()
@@ -330,7 +349,7 @@ mod tests {
     /// across word boundaries, past the words' extent and at the empty
     /// marker, which no set holds.
     #[test]
-    fn the_words_of_a_flat_set_answer_what_the_set_answers() {
+    fn the_words_of_a_set_answer_what_the_set_answers() {
         let held = [0usize, 1, 63, 64, 65, 127, 128, 1_000, 4_095];
         let mut set = Bitmap::default();
         for &slot in &held {
@@ -351,8 +370,8 @@ mod tests {
             assert_eq!(set.contains(slot), held.contains(&slot), "at {slot}");
         }
 
-        // A set whose words reach the largest internal id still answers no
-        // for the empty marker, whose bit no insert ever sets.
+        // A set whose words reach the last position a slot can name still
+        // answers no for the empty marker, whose bit no insert ever sets.
         let mut wide = Bitmap::default();
         wide.insert(Position::NONE as usize - 1);
         assert!(wide.contains(Position::NONE as usize - 1));

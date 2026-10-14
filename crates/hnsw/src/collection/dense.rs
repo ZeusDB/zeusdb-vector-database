@@ -103,7 +103,7 @@ pub(crate) struct IdsByPosition<'a> {
     shifted: bool,
 }
 
-impl IdsByPosition<'_> {
+impl<'a> IdsByPosition<'a> {
     /// The internal id of the record at `at`, where the index holds one.
     ///
     /// A hole's node is [`NONE`], which lies past every node the graph holds,
@@ -116,6 +116,51 @@ impl IdsByPosition<'_> {
         debug_assert!(node == NONE || (node as usize) < self.origin_ids.len());
         self.origin_ids.get(node as usize).copied()
     }
+
+    /// The reader, chosen once, for a pass over many positions that matches
+    /// on it and runs a loop compiled for each answer, so neither loop tests
+    /// what the other needs.
+    pub(crate) fn reader(&self) -> PositionReader<'a> {
+        if self.shifted {
+            PositionReader::Shifted {
+                extent: self.node_at.len(),
+            }
+        } else {
+            PositionReader::Read {
+                node_at: self.node_at,
+                origin_ids: self.origin_ids,
+            }
+        }
+    }
+}
+
+/// One of the two ways [`IdsByPosition`] answers, chosen once for a pass.
+#[derive(Clone, Copy)]
+pub(crate) enum PositionReader<'a> {
+    /// Every position below `extent` holds a record whose internal id is
+    /// one past its position.
+    Shifted { extent: usize },
+    /// The node for each position and the graph's origin id for each node.
+    Read {
+        node_at: &'a [u32],
+        origin_ids: &'a [usize],
+    },
+}
+
+/// The internal id of the record at `at` under [`PositionReader::Shifted`].
+pub(crate) fn shifted_internal_id(extent: usize, at: usize) -> Option<usize> {
+    (at < extent).then_some(at + 1)
+}
+
+/// The internal id of the record at `at` under [`PositionReader::Read`],
+/// being the origin id of its node.
+///
+/// A hole's node is [`NONE`], which lies past every node the graph holds,
+/// so the bound of the origin ids answers for it.
+pub(crate) fn read_internal_id(node_at: &[u32], origin_ids: &[usize], at: usize) -> Option<usize> {
+    let node = *node_at.get(at)?;
+    debug_assert!(node == NONE || (node as usize) < origin_ids.len());
+    origin_ids.get(node as usize).copied()
 }
 
 use super::search::FULL_SCAN_THRESHOLD;
@@ -226,6 +271,16 @@ pub(crate) struct DenseIndex {
 #[cfg(test)]
 thread_local! {
     static PREDICATE_BYTES: std::cell::Cell<(u8, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+// Every answer the timing predicate gives on this thread, as the number it
+// was asked about and the answer, kept while a test has set it to a list.
+// Read by the test that holds the timing search to asking about positions;
+// nothing outside the tests sees it.
+#[cfg(test)]
+thread_local! {
+    static TIMING_ANSWERS: std::cell::RefCell<Option<Vec<(usize, bool)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl DenseIndex {
@@ -383,7 +438,8 @@ impl DenseIndex {
         self.ids_by_position().get(at)
     }
 
-    /// The internal id of the record at each position, read as two plain
+    /// The internal id of the record at each position: the position plus
+    /// one where that is what every position holds, and otherwise two plain
     /// reads a position, `node_at` and then the graph's origin ids.
     pub(crate) fn ids_by_position(&self) -> IdsByPosition<'_> {
         let origin_ids = self.graph.origin_ids();
@@ -467,8 +523,11 @@ impl DenseIndex {
     /// written through one borrow of them rather than a call a node.
     ///
     /// The close-up a collection runs is [`DenseIndex::closed_up`] and
-    /// [`DenseIndex::swap_parts`]. This is the same pass made in place,
-    /// kept for the tests that hold the two to the same result.
+    /// [`DenseIndex::swap_parts`]. This makes the same numbering in place,
+    /// kept for the tests that hold the two to the same positions. What
+    /// `node_at` keeps differs, since the close-up a collection runs keeps
+    /// what the declaration reserves for the nodes rather than what the graph
+    /// has reserved.
     #[cfg(test)]
     pub(crate) fn close_up(&mut self, old_of_new: &[u32]) {
         let records = self.graph.records_mut();
@@ -640,9 +699,13 @@ impl DenseIndex {
 
     /// Time the two units on a graph that is not yet installed, so a
     /// replacement is measured with no guard held. The kernel over records
-    /// scattered across the store, and a whole search per unit of `ef`,
-    /// both under a bitmap test admitting every node, which is the
-    /// predicate's cost without its outcome.
+    /// scattered across the store, and a whole search per unit of `ef`, both
+    /// under a bitmap test, which is the predicate's cost without its
+    /// outcome. The bitmap holds every number below the node count. The
+    /// kernel's test is asked about a node, and the search's about the
+    /// position a candidate's node holds its record at, which is below the
+    /// node count for every record the graph holds. So each test admits every
+    /// record, and the search's refuses a stranded node's marker alone.
     pub(crate) fn time_graph(graph: &VectorGraph) -> Option<(f64, f64)> {
         let nodes = graph.nb_points();
         if nodes < CALIBRATION_MIN_NODES {
@@ -652,7 +715,16 @@ impl DenseIndex {
         for node in 0..nodes {
             every.insert(node);
         }
-        let admits = |id: usize| every.contains(id);
+        let admits = |at: usize| {
+            let admitted = every.contains(at);
+            #[cfg(test)]
+            TIMING_ANSWERS.with(|answers| {
+                if let Some(answers) = answers.borrow_mut().as_mut() {
+                    answers.push((at, admitted));
+                }
+            });
+            admitted
+        };
         let distance_ns = graph
             .time_distance_ns(CALIBRATION_EVALUATIONS, CALIBRATION_ROUNDS, &admits)
             .filter(|ns| ns.is_finite() && *ns > 0.0)?;
@@ -811,8 +883,10 @@ impl DenseIndex {
     /// which is the unfiltered search, and no predicate at all while every
     /// node the graph holds holds a record. A bitmap is its bit alone, since
     /// the marker lies past every word. Anything else is the marker's test and
-    /// then the table call. The marker is a constant in each closure, so a
-    /// closure captures the admit set it asks and nothing else.
+    /// then the table call. The bitmap's closure and the table's capture the
+    /// admit set they ask and nothing else, the table's naming the marker as
+    /// a constant, and the closure for stranded nodes borrows the marker from
+    /// a local, so it holds one reference.
     fn traverse(&self, query: &[f32], k: usize, ef: usize, admit: &dyn Admit) -> Hits {
         let quantized = self.graph.is_quantized();
         let operation = if quantized {
@@ -1219,9 +1293,8 @@ fn units_of(
             measured: true,
         },
         None => {
-            // A scalar kernel decodes every value inside the distance and
-            // measured no slower than the raw kernel at every width, so it
-            // takes the raw floor.
+            // A scalar kernel decodes every value inside the distance, and a
+            // scalar graph takes the raw floor.
             let distance_ns = if graph.is_pq() {
                 10.0 + 1.5 * pq.map_or(8, |pq| pq.subvectors()) as f64
             } else {
@@ -1736,6 +1809,56 @@ mod tests {
         assert!(units.measured);
         assert!(units.distance_ns > 0.0 && units.distance_ns.is_finite());
         assert!(units.ef_ns > units.distance_ns);
+    }
+
+    /// The timing search asks its predicate about positions, as every search
+    /// does, so on a graph whose internal ids lie far above its node count it
+    /// admits every record it reaches and refuses a stranded node's marker
+    /// alone. Asked about internal ids, it would refuse every record and time
+    /// a search that admits nothing. The kernel's timing is asked about the
+    /// nodes it scores, every one of which is admitted.
+    #[test]
+    fn the_timing_search_admits_every_record_whatever_its_internal_id() {
+        let (count, dim) = (200usize, 8usize);
+        let vectors = zeusdb_vector_core::test_support::clustered(count, dim, 208);
+        let graph = VectorGraph::new_raw("l2", dim, 8, 64, NB_LAYER_MAX as usize, 50);
+        let mut index = DenseIndex::new(graph, "l2", dim, None, false);
+        for (k, v) in vectors.iter().enumerate() {
+            put_at(&mut index, k as u32, 50_000 + 13 * k as u32, v);
+        }
+        for k in (0..count as u32).step_by(9) {
+            index.remove(Position(k)).unwrap();
+        }
+
+        TIMING_ANSWERS.with(|answers| *answers.borrow_mut() = Some(Vec::new()));
+        let timed = DenseIndex::time_graph(index.graph());
+        let answers = TIMING_ANSWERS
+            .with(|answers| answers.borrow_mut().take())
+            .unwrap();
+        assert!(timed.is_some(), "a graph of {count} nodes is timed");
+
+        let (kernel, search) = answers.split_at(CALIBRATION_EVALUATIONS * CALIBRATION_ROUNDS);
+        assert!(kernel
+            .iter()
+            .all(|&(node, admitted)| node < count && admitted));
+        assert!(!search.is_empty(), "the timing search asked its predicate");
+        for &(at, admitted) in search {
+            if at == NONE as usize {
+                assert!(!admitted, "a stranded node's marker is refused");
+            } else {
+                assert!(at < count, "asked about {at}, which is no position");
+                assert_ne!(index.node_at()[at], NONE, "position {at} holds a record");
+                assert!(admitted, "the record at {at} is admitted");
+            }
+        }
+        assert!(
+            search.iter().any(|&(at, _)| at == NONE as usize),
+            "the timing search reached a stranded node"
+        );
+        assert!(
+            search.iter().filter(|&&(_, admitted)| admitted).count() > 100,
+            "the timing search admitted the records it reached"
+        );
     }
 
     /// An index over `vectors`, the record `k` at the position and internal
@@ -2297,10 +2420,11 @@ mod tests {
             .collect()
     }
 
-    /// The reader of each position's internal id answers what the node and
-    /// its origin id answer, at every position and past the last, and it
-    /// takes the ids as the positions plus one exactly where they are: no
-    /// hole, the first id one and the last the record count.
+    /// The reader of each position's internal id, and the form a pass takes
+    /// of it, answer what the node and its origin id answer, at every
+    /// position and past the last, holes included, and the reader takes the
+    /// ids as the positions plus one exactly where they are: no hole, the
+    /// first id one and the last the record count.
     #[test]
     fn each_position_names_the_internal_id_its_node_was_inserted_under() {
         let vectors: Vec<Vec<f32>> = (0..40)
@@ -2310,9 +2434,26 @@ mod tests {
         let check = |index: &DenseIndex, shifted: bool, label: &str| {
             let reader = index.ids_by_position();
             assert_eq!(reader.shifted, shifted, "{label}");
+            assert_eq!(
+                matches!(reader.reader(), PositionReader::Shifted { .. }),
+                shifted,
+                "{label}"
+            );
             let past = index.node_at().len() + 3;
             let read: Vec<Option<usize>> = (0..past).map(|at| reader.get(at)).collect();
             assert_eq!(read, ids_read_twice(index, past), "{label}");
+            let by_pass: Vec<Option<usize>> = match reader.reader() {
+                PositionReader::Shifted { extent } => (0..past)
+                    .map(|at| shifted_internal_id(extent, at))
+                    .collect(),
+                PositionReader::Read {
+                    node_at,
+                    origin_ids,
+                } => (0..past)
+                    .map(|at| read_internal_id(node_at, origin_ids, at))
+                    .collect(),
+            };
+            assert_eq!(by_pass, read, "{label}, the reader a pass takes");
         };
         let forty = || {
             let mut index = DenseIndex::new(graph(), "l2", 2, None, false);

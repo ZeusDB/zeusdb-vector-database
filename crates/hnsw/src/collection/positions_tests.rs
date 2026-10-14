@@ -1089,8 +1089,6 @@ struct Run {
     temp: TempDir,
     probe: Probe,
     step: usize,
-    /// Saves whose load was refused for the sparse slot count.
-    refusals: usize,
     /// The thread's close-ups on removal when the run began.
     close_ups_before: usize,
     /// The close-ups on removal the recoveries replayed.
@@ -1144,18 +1142,32 @@ impl Run {
         (declaration, quantization)
     }
 
-    /// Whether a load reads the sparse artefact a save would write now. The
-    /// artefact records one past the largest internal id the space took a
-    /// record under since it was made or cleared, and a load refuses a slot
-    /// count past the largest id the mappings hold, plus one.
-    fn loadable(&self) -> bool {
-        let largest = self.model.held.values().map(|held| held.internal).max();
-        self.model.sparse_slots <= largest.unwrap_or(0) + 1
+    /// The slot count a load restores the sparse space to, being one past
+    /// the largest internal id a held record's sparse half is under, since
+    /// the load raises it by each record it files and by nothing else.
+    fn restored_slots(&self) -> usize {
+        self.model
+            .held
+            .values()
+            .filter(|held| held.sparse.is_some())
+            .map(|held| held.internal + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Whether the slot count a save would record now is the one a load of
+    /// it restores, so a collection loaded or recovered from it writes the
+    /// postings the live one does. The artefact records one past the largest
+    /// internal id the space took a record under since it was made or
+    /// cleared, which a removal does not lower.
+    fn slot_count_held(&self) -> bool {
+        self.model.sparse_slots == self.restored_slots()
     }
 
     /// Add one record with a sparse half, which takes the next internal id
-    /// and so makes the next save loadable, where there is room for it.
-    fn make_loadable(&mut self, collection: &Collection) {
+    /// and so makes the slot count one a load restores, where there is room
+    /// for it.
+    fn hold_slot_count(&mut self, collection: &Collection) {
         if self.model.len() == MOST {
             let name = self.held_names(1).pop().unwrap();
             assert!(collection.remove_point(name.clone()).unwrap());
@@ -1170,11 +1182,16 @@ impl Run {
         }));
         let was = collection.is_quantized();
         let added = collection.add_records(vec![record.clone()], vec![], false);
-        assert_eq!(added.total_errors, 0, "{}", self.label("make loadable"));
+        assert_eq!(
+            added.total_errors,
+            0,
+            "{}",
+            self.label("hold the slot count")
+        );
         self.model.insert(&record);
         self.trained_if(was, collection);
-        assert!(self.loadable());
-        self.check(collection, "made loadable");
+        assert!(self.slot_count_held());
+        self.check(collection, "slot count held");
     }
 
     /// Close the model's positions up where the collection trained during
@@ -1493,31 +1510,29 @@ impl Run {
     }
 
     /// Save, check the artefacts, load, check the load and save it again.
+    ///
+    /// A save whose sparse slot count reaches past every record the space
+    /// holds, the newest having gone, loads too. The load restores the slot
+    /// count from the records it files, so the second save records the
+    /// lower count, and its postings differ from the first save's in that
+    /// word and the frame's checksum alone, which its own check reads.
     fn save_and_load(&mut self, collection: Collection) -> Collection {
         let label = self.label("save");
         let dir = self.temp.at(&format!("save-{}", self.step));
-        let loadable = self.loadable();
         collection.save(dir.to_str().unwrap()).unwrap();
         check_artefacts(&dir, &collection, &self.model, self.kind, &label);
-        if !loadable {
-            // The sparse artefact's slot count reaches past the largest id
-            // the mappings hold, which a load refuses before it files a
-            // record, and the collection carries on as it was.
-            let refused = Collection::load(dir.to_str().unwrap()).err();
-            let refused = refused.unwrap_or_else(|| panic!("{label}: the load was refused"));
-            assert!(
-                refused.to_string().contains("record slots"),
-                "{label}: {refused}"
-            );
-            self.refusals += 1;
-            tally("load refused for the slot count");
-            return collection;
+        let restored = self.restored_slots();
+        let moved = restored != self.model.sparse_slots;
+        if moved {
+            tally("load past the newest sparse record");
         }
         let before = pages(&collection, &self.probe);
         let loaded = Collection::load(dir.to_str().unwrap()).unwrap();
         tally("load");
-        // The load files the records at the first positions, with no hole.
+        // The load files the records at the first positions, with no hole,
+        // and counts the sparse slots of the records it files.
         self.model.closed_up();
+        self.model.sparse_slots = restored;
         self.check(&loaded, "loaded");
         check_extents(&loaded, self.model.len(), false, &self.label("loaded"));
         assert_eq!(
@@ -1534,11 +1549,21 @@ impl Run {
             "{label}"
         );
         for (name, bytes) in &first {
+            if moved && name.ends_with("postings.zdbsparse") {
+                continue;
+            }
             assert!(
                 bytes == &second[name],
                 "{label}: {name} differs on the second save"
             );
         }
+        check_artefacts(
+            &again,
+            &loaded,
+            &self.model,
+            self.kind,
+            &self.label("saved again"),
+        );
         loaded
     }
 
@@ -1546,8 +1571,10 @@ impl Run {
     /// checkpoint and the journal into a collection that answers and saves
     /// what the live one does.
     fn journal(&mut self, collection: &Collection) {
-        if !self.loadable() {
-            self.make_loadable(collection);
+        // The checkpoint's slot count is one the recovery restores, so the
+        // recovered collection writes the postings the live one does.
+        if !self.slot_count_held() {
+            self.hold_slot_count(collection);
         }
         let dir = self.temp.at(&format!("journal-{}", self.step));
         collection
@@ -1571,7 +1598,7 @@ impl Run {
             };
             tally(what);
             self.check(collection, what);
-            if k == 0 && self.loadable() && self.rng.chance(30) {
+            if k == 0 && self.slot_count_held() && self.rng.chance(30) {
                 collection.checkpoint().unwrap();
                 self.model.replay = Some(Replayed::default());
             }
@@ -1642,7 +1669,6 @@ fn run(kind: Kind, weighting: Weighting, seed: u64, steps: usize) {
         temp: TempDir::new(),
         probe,
         step: 0,
-        refusals: 0,
         close_ups_before: close_ups(),
         replayed: 0,
         journal_churns: 0,
@@ -1656,8 +1682,11 @@ fn run(kind: Kind, weighting: Weighting, seed: u64, steps: usize) {
         run.step += 1;
         let roll = run.rng.below(100);
         if roll < 7 && run.model.len() > 0 {
-            if !run.loadable() && run.rng.chance(60) {
-                run.make_loadable(&collection);
+            // Now and then the slot count is held first, so the sequence
+            // saves both a collection a load restores whole and one whose
+            // newest sparse record has gone.
+            if !run.slot_count_held() && run.rng.chance(60) {
+                run.hold_slot_count(&collection);
             }
             collection = run.save_and_load(collection);
             saves += 1;

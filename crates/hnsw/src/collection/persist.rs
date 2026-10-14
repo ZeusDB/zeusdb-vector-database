@@ -789,6 +789,9 @@ impl Collection {
         lost.sort_by(|a, b| a.0.cmp(b.0));
         for (id, codes) in lost {
             let internal_id = self.get_next_id();
+            // Held to the ceiling before the id store is touched, as the
+            // mappings' own ids are, so no id past it is cut to 32 bits.
+            crate::persistence::refuse_past_last_id(internal_id).map_err(|e| e.to_string())?;
             let at = {
                 let mut ids = self.ids.write().unwrap();
                 let at = ids.extent();
@@ -1179,6 +1182,9 @@ impl Collection {
         unmapped.sort_by(|a, b| a.0.cmp(&b.0));
         for (id, vector) in unmapped {
             let internal_id = self.get_next_id();
+            // Held to the ceiling before the id store is touched, as the
+            // mappings' own ids are, so no id past it is cut to 32 bits.
+            crate::persistence::refuse_past_last_id(internal_id)?;
             let at = {
                 let mut ids = self.ids.write().unwrap();
                 let at = ids.extent();

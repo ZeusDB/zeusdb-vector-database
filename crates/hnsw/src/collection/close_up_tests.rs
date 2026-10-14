@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -26,6 +26,7 @@ use zeusdb_vector_core::{
 };
 use zeusdb_vector_sparse::{SparseConfig, Unlink, Weighting};
 
+#[cfg(debug_assertions)]
 use crate::locks::held_now;
 
 use super::insert::{CloseUpPoint, Layouts, CLOSE_UP_HOOK};
@@ -33,6 +34,15 @@ use super::{
     Collection, Declaration, DenseIndex, Int8Scale, ParsedRecord, SparseHalf, StorageMode,
     COUNT_HOOK,
 };
+
+/// What this thread holds by the lock registry's count, which a build with
+/// debug assertions keeps. A build without them counts nothing, so this reads
+/// an empty list, and a check that a thread holds a guard runs only where the
+/// registry does.
+#[cfg(not(debug_assertions))]
+fn held_now() -> Vec<String> {
+    Vec::new()
+}
 
 /// Dimension of every vector.
 const DIM: usize = 8;
@@ -661,22 +671,103 @@ fn overlaps(span: Span, phases: &[Span]) -> bool {
 /// The points this thread's close-ups reached, each with when.
 type Marks = Rc<RefCell<Vec<(CloseUpPoint, Instant)>>>;
 
+/// The kinds of answer a thread beside a close-up gives: a search, a count
+/// or a page, and a read of the statistics.
+const SEARCH: usize = 0;
+const READ: usize = 1;
+
+/// How long a hook waits for a thread beside it before it counts the wait
+/// as failed and goes on, which is the tests' own bound on a thread.
+const LIMIT: Duration = Duration::from_secs(20);
+
+/// A handshake between a close-up's hook and the threads that answer beside
+/// it, which holds a phase open until one of them has answered inside it,
+/// rather than for a while. A wait passes its limit only where no thread
+/// answers at all, and that is counted for a check to read, since a hook
+/// that panicked would do so under the guards the close-up holds.
+#[derive(Default)]
+struct Handshake {
+    /// The round the hook opened last.
+    round: AtomicUsize,
+    /// The latest round an answer of each kind read before it finished.
+    finished: [AtomicUsize; 2],
+    /// Searches between their start and their end.
+    searching: AtomicUsize,
+    /// Waits that passed the limit.
+    timed_out: AtomicUsize,
+}
+
+impl Handshake {
+    /// Run `ask` as an answer of `kind`, inside the span the caller times,
+    /// so a search counted between its start and its end is inside that
+    /// span.
+    fn answer<T>(&self, kind: usize, ask: impl FnOnce() -> T) -> T {
+        let round = self.round.load(Ordering::SeqCst);
+        if kind == SEARCH {
+            self.searching.fetch_add(1, Ordering::SeqCst);
+        }
+        let answer = ask();
+        if kind == SEARCH {
+            self.searching.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.finished[kind].fetch_max(round, Ordering::SeqCst);
+        answer
+    }
+
+    /// Open a round and wait until an answer of each of `kinds` read it and
+    /// finished. Each such answer ends after this call began and before it
+    /// returns, so it overlaps the phase the caller holds open.
+    fn finished_after(&self, kinds: &[usize]) {
+        let round = self.round.fetch_add(1, Ordering::SeqCst) + 1;
+        self.until(|| {
+            kinds
+                .iter()
+                .all(|&kind| self.finished[kind].load(Ordering::SeqCst) >= round)
+        });
+    }
+
+    /// Wait until a search is between its start and its end. It began before
+    /// this call returns and ends after it began, so it overlaps the phase
+    /// the caller holds open.
+    fn searching_now(&self) {
+        self.until(|| self.searching.load(Ordering::SeqCst) > 0);
+    }
+
+    fn until(&self, done: impl Fn() -> bool) {
+        let from = Instant::now();
+        while !done() {
+            if from.elapsed() > LIMIT {
+                self.timed_out.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+    }
+
+    fn timed_out(&self) -> usize {
+        self.timed_out.load(Ordering::SeqCst)
+    }
+}
+
 /// The build phases and the swap phases of this thread's close-ups, recorded
-/// by the hook, each held open for a little while so the threads beside it
-/// overlap it.
+/// by the hook. The hook holds each build open until an answer of each of
+/// `kinds` has run inside it, and each swap until a search is waiting on its
+/// guards, so the threads beside every close-up overlap both of its phases.
 struct Phases {
     marks: Marks,
 }
 
 impl Phases {
-    fn record(hold: Duration) -> Self {
+    fn record(shake: Arc<Handshake>, kinds: &'static [usize]) -> Self {
         let marks: Marks = Rc::default();
         let kept = marks.clone();
         CLOSE_UP_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move |point| {
                 kept.borrow_mut().push((point, Instant::now()));
-                if matches!(point, CloseUpPoint::Building | CloseUpPoint::Swapping) {
-                    std::thread::sleep(hold);
+                match point {
+                    CloseUpPoint::Building => shake.finished_after(kinds),
+                    CloseUpPoint::Swapping => shake.searching_now(),
+                    _ => {}
                 }
             }));
         });
@@ -710,9 +801,11 @@ impl Drop for Phases {
 
 /// Run the close-ups of `kind` with three threads searching and one asking
 /// for the statistics beside them, and hold every answer to the states
-/// before and after the change it overlapped. Returns the close-ups run,
-/// the answers that overlapped a build phase, and those that overlapped a
-/// swap phase.
+/// before and after the change it overlapped. Every build phase is held
+/// open until a search and a read of the statistics have run inside it, and
+/// every swap phase until a search waits on its guards, and each phase is
+/// checked to have been overlapped. Returns the close-ups run, the answers
+/// that overlapped a build phase, and those that overlapped a swap phase.
 fn beside(kind: Kind, rounds: usize) -> (usize, usize, usize) {
     let collection = collection(kind, 100, &["cat"], Unlink::Lazy, Weighting::Dot);
     let probes = Probes::new();
@@ -720,7 +813,8 @@ fn beside(kind: Kind, rounds: usize) -> (usize, usize, usize) {
     add(&collection, 0..2_000);
     assert!(narrowed(&collection, &probes.mixed), "{kind:?}");
     let mut states = vec![probes.all(&collection)];
-    let phases = Phases::record(Duration::from_millis(5));
+    let shake = Arc::new(Handshake::default());
+    let phases = Phases::record(Arc::clone(&shake), &[SEARCH, READ]);
     let mut held: Vec<usize> = (0..2_000).collect();
     let mut next = 2_000usize;
     let mut close_ups = 0usize;
@@ -730,13 +824,13 @@ fn beside(kind: Kind, rounds: usize) -> (usize, usize, usize) {
         let stop = epochs.stop_on_drop();
         let searchers: Vec<_> = (0..3)
             .map(|thread| {
-                let (collection, probes, epochs) = (&collection, &probes, &epochs);
+                let (collection, probes, epochs, shake) = (&collection, &probes, &epochs, &shake);
                 scope.spawn(move || {
                     let mut out = Vec::new();
                     let mut probe = thread;
                     while !epochs.stopped() {
                         if let Some((first, last, start, end, answer)) =
-                            epochs.ask(|| probes.ask(collection, probe))
+                            epochs.ask(|| shake.answer(SEARCH, || probes.ask(collection, probe)))
                         {
                             out.push(Asked {
                                 probe,
@@ -755,12 +849,12 @@ fn beside(kind: Kind, rounds: usize) -> (usize, usize, usize) {
         // bound on holes left out, which a removal batch passes between its
         // own guards and its close-up's swap.
         let statistics = {
-            let (collection, epochs) = (&collection, &epochs);
+            let (collection, epochs, shake) = (&collection, &epochs, &shake);
             scope.spawn(move || {
                 let mut read = 0usize;
                 while !epochs.stopped() {
                     if epochs
-                        .ask(|| collection.stats().len().to_string())
+                        .ask(|| shake.answer(READ, || collection.stats().len().to_string()))
                         .is_some()
                     {
                         read += 1;
@@ -827,6 +921,19 @@ fn beside(kind: Kind, rounds: usize) -> (usize, usize, usize) {
         "{kind:?}: a build phase a close-up"
     );
     assert_eq!(swaps.len(), close_ups, "{kind:?}: a swap phase a close-up");
+    assert_eq!(
+        shake.timed_out(),
+        0,
+        "{kind:?}: every phase met a thread beside it"
+    );
+    for (name, spans) in [("build", &builds), ("swap", &swaps)] {
+        for (k, &span) in spans.iter().enumerate() {
+            assert!(
+                asked.iter().any(|asked| overlaps(asked.span, &[span])),
+                "{kind:?}: no search overlapped {name} phase {k}"
+            );
+        }
+    }
     let mut over_builds = 0usize;
     let mut over_swaps = 0usize;
     for asked in &asked {
@@ -859,8 +966,9 @@ fn beside(kind: Kind, rounds: usize) -> (usize, usize, usize) {
 /// answers what the collection answers at rest in the state before the
 /// change it overlapped or the state after it, and never anything else, and
 /// every read of the statistics passes every check but the bound on holes.
-/// The build and the swap of every close-up are held open for a little
-/// while, so thousands of answers overlap a build and hundreds a swap.
+/// The build of every close-up is held open until a search and a read of
+/// the statistics have run inside it, and the swap until a search waits on
+/// its guards, so every build and every swap is overlapped.
 #[test]
 fn searches_beside_every_close_up_see_the_state_before_or_after_it() {
     let mut totals = (0usize, 0usize, 0usize);
@@ -873,8 +981,6 @@ fn searches_beside_every_close_up_see_the_state_before_or_after_it() {
          phase",
         totals.0, totals.1, totals.2
     );
-    assert!(totals.1 >= 2_000, "thousands of answers overlap a build");
-    assert!(totals.2 >= 200, "hundreds of answers overlap a swap");
 }
 
 // ============================================================================
@@ -899,7 +1005,9 @@ fn searches_run_while_the_build_is_held_and_wait_only_for_the_swap() {
         "the allowance reached and not passed"
     );
     let probes = Probes::new();
-    let wait = Duration::from_millis(300);
+    // How long a thread that has begun is watched for an answer it must not
+    // give while the guards it waits for are held.
+    let wait = Duration::from_millis(50);
 
     std::thread::scope(|scope| {
         let (reached_tx, reached) = mpsc::channel::<CloseUpPoint>();
@@ -936,37 +1044,52 @@ fn searches_run_while_the_build_is_held_and_wait_only_for_the_swap() {
         let (during_build, took) = answers
             .recv_timeout(Duration::from_secs(20))
             .expect("searches complete while the build is held open");
+        // A second writer, begun while the build is held: it signals before
+        // it asks for `writers`, and the wait for that signal is what makes
+        // its call one made during the build.
+        let (writer_began_tx, writer_began) = mpsc::channel::<()>();
         let (writer_tx, writer) = mpsc::channel();
         {
             let collection = &collection;
             scope.spawn(move || {
+                writer_began_tx.send(()).unwrap();
                 assert!(collection.detach_sink().is_none());
                 writer_tx.send(Instant::now()).unwrap();
             });
         }
+        writer_began
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the second writer begins");
         assert!(
             writer.recv_timeout(wait).is_err(),
             "a second writer waits while the build is held"
         );
         go.send(()).unwrap();
 
-        // The swap is held open, with every write guard.
+        // The swap is held open, with every write guard. A search begun
+        // while it is held signals before it asks, so it began before the
+        // swap is let go.
         assert_eq!(reached.recv().unwrap(), CloseUpPoint::Swapping);
+        let (began_tx, began) = mpsc::channel::<()>();
         let (waited_tx, waited) = mpsc::channel();
         {
             let (collection, probes) = (&collection, &probes);
             scope.spawn(move || {
                 let started = Instant::now();
+                began_tx.send(()).unwrap();
                 let answer = probes.all(collection);
                 waited_tx.send((answer, started, Instant::now())).unwrap();
             });
         }
+        began
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the search begins while the swap is held");
         assert!(
             waited.recv_timeout(wait).is_err(),
             "a search waits while the swap holds the write guards"
         );
         assert!(
-            writer.recv_timeout(Duration::from_millis(50)).is_err(),
+            writer.recv_timeout(wait).is_err(),
             "a second writer waits while the swap is held"
         );
         let released = Instant::now();
@@ -1038,9 +1161,11 @@ fn own_fields(answer: &[(String, BTreeMap<String, Value>)]) -> bool {
 /// removal takes, by the lock registry's own count. A search begun while the
 /// move is held waits until the swap lets the guards go, and then answers
 /// what the collection answers at rest once the close-up is done. Searches
-/// on three threads run throughout: each answers what the collection
-/// answers at rest before the removal or after it, and each begun once the
-/// move was held waits for the swap and answers the state after it. Every
+/// on three threads run throughout, the first parked between two searches
+/// as the removal begins and let go once the move is held, so a search
+/// begins during the hold. Each answers what the collection answers at rest
+/// before the removal or after it, and each begun once the move was held
+/// waits for the swap and answers the state after it. Every
 /// record those states name carries its own fields, so no search read a
 /// block at a position it was not moved to.
 #[test]
@@ -1073,15 +1198,28 @@ fn searches_wait_for_the_move_pass_and_then_see_the_whole_new_state() {
     );
 
     let collection = make();
-    let wait = Duration::from_millis(300);
+    // How long the search begun during the hold is watched for an answer it
+    // must not give while the guards it waits for are held.
+    let wait = Duration::from_millis(50);
     let limit = Duration::from_secs(20);
     let stop = AtomicBool::new(false);
     let answered = AtomicUsize::new(0);
-    // Until the threads beside the close-up have given `count` answers, or
-    // the limit passes.
-    let until_answered = |count: usize| {
+    // `list`'s answers of the state before the removal and of the state
+    // after it.
+    let lists_before = AtomicUsize::new(0);
+    let lists_after = AtomicUsize::new(0);
+    // The first thread beside the close-up parks between two searches once
+    // `park` is set, and says so, so it is not waiting on a guard when the
+    // move is held. `held_gate` is set once the move is held, and the parked
+    // thread then begins a search, which counts itself as it begins.
+    let park = AtomicBool::new(false);
+    let parked = AtomicBool::new(false);
+    let held_gate = AtomicBool::new(false);
+    let begun_in_hold = AtomicUsize::new(0);
+    // Until `done` holds, or the limit passes.
+    let until = |done: &dyn Fn() -> bool| {
         let from = Instant::now();
-        while answered.load(Ordering::SeqCst) < count && from.elapsed() < limit {
+        while !done() && from.elapsed() < limit {
             std::thread::sleep(Duration::from_millis(1));
         }
     };
@@ -1094,17 +1232,33 @@ fn searches_wait_for_the_move_pass_and_then_see_the_whole_new_state() {
         let searchers: Vec<_> = (0..3)
             .map(|thread| {
                 let (collection, stop, answered) = (&collection, &stop, &answered);
+                let (lists_before, lists_after) = (&lists_before, &lists_after);
+                let (park, parked) = (&park, &parked);
+                let (held_gate, begun_in_hold) = (&held_gate, &begun_in_hold);
                 let (before, after) = (&before, &after);
                 scope.spawn(move || {
                     let mut out: Vec<Beside> = Vec::new();
                     let mut probe = thread;
                     while !stop.load(Ordering::SeqCst) {
+                        let in_hold = held_gate.load(Ordering::SeqCst);
+                        if thread == 0 && park.load(Ordering::SeqCst) && !in_hold {
+                            parked.store(true, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
                         let start = Instant::now();
+                        if in_hold {
+                            begun_in_hold.fetch_add(1, Ordering::SeqCst);
+                        }
                         let answer = fielded(collection, probe);
                         let span = (start, Instant::now());
                         let answer = format!("{answer:?}");
                         let (was_before, was_after) =
                             (answer == before[probe], answer == after[probe]);
+                        if probe == 2 {
+                            lists_before.fetch_add(usize::from(was_before), Ordering::SeqCst);
+                            lists_after.fetch_add(usize::from(was_after), Ordering::SeqCst);
+                        }
                         let kept = (!was_before && !was_after).then_some(answer);
                         out.push((probe, span, was_before, was_after, kept));
                         answered.fetch_add(1, Ordering::SeqCst);
@@ -1114,8 +1268,11 @@ fn searches_wait_for_the_move_pass_and_then_see_the_whole_new_state() {
                 })
             })
             .collect();
-        // Every probe answered at least twice before the removal.
-        until_answered(6);
+        // Answers before the removal, `list`'s among them, and the first
+        // thread parked between two searches.
+        until(&|| answered.load(Ordering::SeqCst) >= 6 && lists_before.load(Ordering::SeqCst) > 0);
+        park.store(true, Ordering::SeqCst);
+        until(&|| parked.load(Ordering::SeqCst));
 
         let (swapping_tx, swapping) = mpsc::channel::<Vec<String>>();
         let (moving_tx, moving) = mpsc::channel::<(Vec<String>, usize, usize)>();
@@ -1163,20 +1320,30 @@ fn searches_wait_for_the_move_pass_and_then_see_the_whole_new_state() {
         let (move_held, k, count) = moving
             .recv_timeout(limit)
             .expect("the swap moves the metadata's blocks");
-        // A search begun while the move is held.
+        // A search begun while the move is held, which signals before it
+        // asks, so it began before the move is let go.
+        let (began_tx, began) = mpsc::channel::<()>();
         let (waited_tx, waited) = mpsc::channel();
         {
             let collection = &collection;
             scope.spawn(move || {
                 let started = Instant::now();
+                let _ = began_tx.send(());
                 let answers: Vec<_> = (0..3).map(|probe| fielded(collection, probe)).collect();
                 let _ = waited_tx.send((answers, started, Instant::now()));
             });
         }
+        began
+            .recv_timeout(limit)
+            .expect("the search begins while the move is held");
         assert!(
             waited.recv_timeout(wait).is_err(),
             "a search waits while the move holds the write guards"
         );
+        // And the parked thread beside the close-up has begun a search since
+        // the hold began.
+        held_gate.store(true, Ordering::SeqCst);
+        until(&|| begun_in_hold.load(Ordering::SeqCst) > 0);
         let released = Instant::now();
         go.send(()).unwrap();
         assert!(remover.join().unwrap());
@@ -1184,9 +1351,12 @@ fn searches_wait_for_the_move_pass_and_then_see_the_whole_new_state() {
             .recv_timeout(limit)
             .expect("the search answers once the swap lets the guards go");
         let points = points.recv_timeout(limit).expect("the close-up's points");
-        // Every probe answered at least twice more once the close-up is
-        // done.
-        until_answered(answered.load(Ordering::SeqCst) + 6);
+        // Answers once the close-up is done, `list`'s among them.
+        let answered_by_now = answered.load(Ordering::SeqCst);
+        until(&|| {
+            answered.load(Ordering::SeqCst) >= answered_by_now + 6
+                && lists_after.load(Ordering::SeqCst) > 0
+        });
         drop(stop_on_drop);
         let asked: Vec<Beside> = searchers
             .into_iter()
@@ -1215,11 +1385,13 @@ fn searches_wait_for_the_move_pass_and_then_see_the_whole_new_state() {
         move_held, swap_held,
         "the move runs under the swap's guards"
     );
-    for name in ["writers", "ids", "vector_metadata", "columns"] {
-        assert!(
-            move_held.iter().any(|held| held == name),
-            "{name} is held through the move: {move_held:?}"
-        );
+    if cfg!(debug_assertions) {
+        for name in ["writers", "ids", "vector_metadata", "columns"] {
+            assert!(
+                move_held.iter().any(|held| held == name),
+                "{name} is held through the move: {move_held:?}"
+            );
+        }
     }
     let place = |name: &str| points.iter().position(|(point, _)| point == name).unwrap();
     assert!(place("Swapping") < place("Moving"));
@@ -1448,7 +1620,10 @@ fn unseeded(collection: &Collection) -> Layouts {
 /// structures begin to drop; a second batch then passes the bound again and
 /// closes up, its own drop included, while the first drop waits. Searches on
 /// three threads run throughout, and each answers what the collection
-/// answers at rest in one of the states its span covers. Once both are done,
+/// answers at rest in one of the states its span covers. The second
+/// close-up's build is held open until a search has answered inside it, so
+/// a search runs while the first drop is held and over the second close-up.
+/// Once both are done,
 /// every structure equals a twin's that ran the same two batches one after
 /// the other with nothing held, part for part and capacity for capacity.
 #[test]
@@ -1474,18 +1649,19 @@ fn a_second_close_up_runs_while_the_first_ones_drop_is_held() {
 
     let collection = make();
     let epochs = Epochs::new();
+    let shake = Arc::new(Handshake::default());
     let mut marks: Vec<(CloseUpPoint, Instant)> = Vec::new();
     let asked: Vec<Asked> = std::thread::scope(|scope| {
         let stop = epochs.stop_on_drop();
         let searchers: Vec<_> = (0..3)
             .map(|thread| {
-                let (collection, probes, epochs) = (&collection, &probes, &epochs);
+                let (collection, probes, epochs, shake) = (&collection, &probes, &epochs, &shake);
                 scope.spawn(move || {
                     let mut out = Vec::new();
                     let mut probe = thread;
                     while !epochs.stopped() {
                         if let Some((first, last, start, end, answer)) =
-                            epochs.ask(|| probes.ask(collection, probe))
+                            epochs.ask(|| shake.answer(SEARCH, || probes.ask(collection, probe)))
                         {
                             out.push(Asked {
                                 probe,
@@ -1538,6 +1714,7 @@ fn a_second_close_up_runs_while_the_first_ones_drop_is_held() {
         let (done_tx, done) = mpsc::channel::<Vec<(CloseUpPoint, Instant)>>();
         {
             let (collection, second) = (&collection, &second);
+            let shake = Arc::clone(&shake);
             scope.spawn(move || {
                 let kept: Marks = Rc::default();
                 {
@@ -1545,8 +1722,11 @@ fn a_second_close_up_runs_while_the_first_ones_drop_is_held() {
                     CLOSE_UP_HOOK.with(|hook| {
                         *hook.borrow_mut() = Some(Box::new(move |point| {
                             kept.borrow_mut().push((point, Instant::now()));
-                            if matches!(point, CloseUpPoint::Building | CloseUpPoint::Swapping) {
-                                std::thread::sleep(Duration::from_millis(10));
+                            // The build holds the read guards a search
+                            // shares, so a search answers inside it, in the
+                            // epoch the second batch runs in.
+                            if point == CloseUpPoint::Building {
+                                shake.finished_after(&[SEARCH]);
                             }
                         }));
                     });
@@ -1606,6 +1786,7 @@ fn a_second_close_up_runs_while_the_first_ones_drop_is_held() {
         during += usize::from(asked.epochs.1 >= 2 && asked.epochs.0 <= 3);
         over_second += usize::from(overlaps(asked.span, &second_phases));
     }
+    assert_eq!(shake.timed_out(), 0, "a search met the second build");
     assert!(during > 0, "searches ran while the first drop was held");
     assert!(over_second > 0, "searches overlapped the second close-up");
     assert_eq!(holes(&collection), 0);
@@ -1709,6 +1890,9 @@ fn a_count_holds_its_bound_while_a_close_up_waits_for_it() {
 /// while the writer runs removal batches that close up, compactions,
 /// rebuilds at another degree and a clear. Every count is the model's count
 /// for the state before the change it overlapped or the state after it.
+/// Every build phase is held open until a count has run inside it, and
+/// every swap phase until a count waits on its guards, so counts overlap
+/// every build and every swap.
 #[test]
 fn counts_beside_every_change_see_the_state_before_or_after_it() {
     let collection = collection(Kind::Raw, 100, &["cat"], Unlink::Lazy, Weighting::Dot);
@@ -1725,17 +1909,18 @@ fn counts_beside_every_change_see_the_state_before_or_after_it() {
     let mut states: Vec<Vec<String>> = vec![vec![model(&held)]];
     let mut changes = 0usize;
     let mut m = collection.m();
-    let phases = Phases::record(Duration::from_millis(2));
+    let shake = Arc::new(Handshake::default());
+    let phases = Phases::record(Arc::clone(&shake), &[SEARCH]);
 
     let asked: Vec<Asked> = std::thread::scope(|scope| {
         let stop = epochs.stop_on_drop();
         let counter = {
-            let (collection, epochs, filter) = (&collection, &epochs, &filter);
+            let (collection, epochs, filter, shake) = (&collection, &epochs, &filter, &shake);
             scope.spawn(move || {
                 let mut out = Vec::new();
                 while !epochs.stopped() {
-                    if let Some((first, last, start, end, answer)) =
-                        epochs.ask(|| collection.count(Some(filter)).to_string())
+                    if let Some((first, last, start, end, answer)) = epochs
+                        .ask(|| shake.answer(SEARCH, || collection.count(Some(filter)).to_string()))
                     {
                         out.push(Asked {
                             probe: 0,
@@ -1823,8 +2008,16 @@ fn counts_beside_every_change_see_the_state_before_or_after_it() {
         builds.len(),
         values.len()
     );
-    assert!(over_builds >= 100, "counts overlap the build phases");
-    assert!(over_swaps >= 10, "counts overlap the swap phases");
+    assert_eq!(shake.timed_out(), 0, "every phase met the count beside it");
+    assert!(!builds.is_empty() && swaps.len() == builds.len());
+    for (name, spans) in [("build", &builds), ("swap", &swaps)] {
+        for (k, &span) in spans.iter().enumerate() {
+            assert!(
+                asked.iter().any(|asked| overlaps(asked.span, &[span])),
+                "no count overlapped {name} phase {k}"
+            );
+        }
+    }
 }
 
 /// The points one thread's close-ups reached, each with the guards the

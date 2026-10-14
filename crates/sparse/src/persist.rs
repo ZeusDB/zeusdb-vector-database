@@ -163,7 +163,7 @@ pub(crate) fn decode(
     let live = u32_of(take(4)?) as usize;
     if slots > bounds.max_records.saturating_add(1) {
         return Err(corrupt(format!(
-            "the payload declares {} record slots and the collection holds ids up to {}",
+            "the payload declares {} record slots and the collection has issued ids up to {}",
             slots, bounds.max_records
         )));
     }
@@ -655,9 +655,10 @@ mod tests {
     /// internal id its position names, writes the bytes a space keyed by the
     /// internal ids themselves writes, and reads them back with each record
     /// at the position the mappings give its id, to the same bytes again.
-    /// The refusals are the ones a space keyed by internal id met: a slot
-    /// count past the largest id the mappings hold, which a save makes once
-    /// the newest record with a sparse half is gone, and a record whose id
+    /// A save made once the newest record with a sparse half is gone records
+    /// a slot count past every id the mappings hold, and reads back under the
+    /// last id the collection issued. The refusals are the ones a space keyed
+    /// by internal id met: a slot count past the bound, and a record whose id
     /// the mappings do not hold, named once the payload is read whole.
     #[test]
     fn a_space_at_dense_positions_writes_and_reads_the_bytes_ids_write() {
@@ -723,21 +724,33 @@ mod tests {
         assert_eq!(encode_with(&restored, &|at| ids[at]), bytes);
 
         // The newest record goes, the slot count stays, and the mappings no
-        // longer reach it.
+        // longer reach it. Held to the last id the collection issued, which
+        // is what a collection passes, the payload loads, with the slot count
+        // of the records it files. Held to an id below its slot count, it is
+        // refused.
         by_id.remove(Position(far(59))).unwrap();
         by_position.remove(Position(59)).unwrap();
         let bytes = encode(&by_id);
         assert_eq!(encode_with(&by_position, &positions_of), bytes);
         let fewer: Vec<u32> = ids.iter().copied().filter(|&id| id != far(59)).collect();
+        let issued = Bounds {
+            max_records: far(59) as usize,
+            ..bounds(&fewer)
+        };
+        let restored = decode(&bytes, &config, &issued, "postings").unwrap();
+        assert_eq!(restored.len(), 57);
+        assert!(restored.keys_agree());
+        assert_eq!(restored.slot_count(), far(58) as usize + 1);
         let refused = decode(&bytes, &config, &bounds(&fewer), "postings")
             .err()
-            .expect("a slot count past the mappings is refused");
+            .expect("a slot count past the last id issued is refused");
         assert_eq!(
             refused.to_string(),
             Error::DecodeFailed {
                 file: "postings".to_string(),
                 error: format!(
-                    "the payload declares {} record slots and the collection holds ids up to {}",
+                    "the payload declares {} record slots and the collection has issued ids up to \
+                     {}",
                     far(59) + 1,
                     far(58)
                 ),

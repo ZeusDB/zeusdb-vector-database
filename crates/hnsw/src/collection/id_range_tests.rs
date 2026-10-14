@@ -14,10 +14,12 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use zeusdb_vector_core::{compile_filter, IdfScope, Operation, SparseVector, DUMP_FILENAME};
+use zeusdb_vector_core::{
+    compile_filter, IdfScope, Operation, SparseVector, DUMP_FILENAME, MAX_INTERNAL_ID,
+};
 use zeusdb_vector_sparse::SparseConfig;
 
-use super::{Collection, Declaration, ParsedRecord, SparseHalf};
+use super::{Collection, Declaration, ParsedRecord, SparseHalf, StorageMode};
 use crate::journal::Durability;
 
 /// A directory under the system's temporary directory, removed on drop
@@ -279,8 +281,8 @@ fn reload(collection: &Collection, temp: &TempDir, name: &str) -> Collection {
 /// that leave half of them, and at its records again after a compaction and
 /// after a save and a load, past its declaration and within it, with a
 /// sparse space and without, and within a declaration far past its records.
-/// The removals keep the newest record, which a sparse space's artefact needs
-/// to load.
+/// The removals take the newest record, so a sparse space's artefact records
+/// a slot count past every id the mappings hold, which the load reads.
 #[test]
 fn a_collection_over_dense_ids_holds_every_structure_at_its_records() {
     let temp = TempDir::new();
@@ -296,7 +298,7 @@ fn a_collection_over_dense_ids_holds_every_structure_at_its_records() {
             reach(records as usize, sparse),
             "as built"
         );
-        remove(&collection, 0..records, |i| i % 2 == 0);
+        remove(&collection, 0..records, |i| i % 2 == 1);
         assert_eq!(
             extents(&collection),
             reach(records as usize, sparse),
@@ -677,4 +679,209 @@ fn a_journal_replays_into_a_collection_whose_ids_are_sparse() {
     // The checkpoint loaded with its records at the first positions, and the
     // replay appended after them with the one hole its removal left.
     assert_eq!(extents(&again), reach(240 + 20, false));
+}
+
+/// A record the mappings lack is handed the next internal id by the load's
+/// rebuild fallback, from records and from codes alike, up to the last id a
+/// collection issues. The id past it is refused in the loader's words before
+/// the id store is touched, so no record is filed under an id cut to 32 bits.
+#[test]
+fn the_rebuild_refuses_an_id_past_the_last_one_for_a_record_the_mappings_lack() {
+    let past = format!(
+        "internal id {} is above what the id store can hold",
+        MAX_INTERNAL_ID + 1
+    );
+    let positions_of = |collection: &Collection| -> Vec<u32> {
+        let mut positions: Vec<u32> = ids_of(collection)
+            .into_iter()
+            .map(|(_, internal)| internal as u32)
+            .collect();
+        positions.sort_unstable();
+        positions
+    };
+
+    // From records, with the counter at the last id and one below it.
+    for (counter, refused) in [(MAX_INTERNAL_ID, true), (MAX_INTERNAL_ID - 1, false)] {
+        let mut collection = Collection::build(declaration(100, false), None);
+        add(&collection, 0..3, false);
+        collection.set_counters(counter, 3);
+        let mut positions = positions_of(&collection);
+        let records = (0..4).map(|i| (format!("r{i}"), vector(i))).collect();
+        let rebuilt = collection.rebuild_from_records(records, &mut positions);
+        if refused {
+            assert_eq!(rebuilt.unwrap_err().to_string(), past);
+            assert_eq!(ids_of(&collection).len(), 3, "the id store was not touched");
+            assert_eq!(positions.len(), 3);
+        } else {
+            assert_eq!(rebuilt.unwrap(), 4);
+            assert_eq!(
+                ids_of(&collection).last(),
+                Some(&("r3".to_string(), MAX_INTERNAL_ID))
+            );
+            assert_eq!(positions.last(), Some(&(MAX_INTERNAL_ID as u32)));
+        }
+    }
+
+    // From codes, on a trained product quantized collection.
+    let vectors = zeusdb_vector_core::test_support::clustered(1_010, 16, 0x0020_8b02);
+    let declaration = Declaration::validate(16, "l2", 8, 40, 100, vec![]).unwrap();
+    let quantization = declaration
+        .quantization(4, 4, 1_000, None, StorageMode::QuantizedWithRaw)
+        .unwrap();
+    let mut collection = Collection::build(declaration, Some(quantization));
+    let records: Vec<ParsedRecord> = (0..vectors.len())
+        .map(|i| ParsedRecord {
+            id: format!("r{i}"),
+            vector: vectors[i].clone(),
+            sparse: None,
+            metadata: HashMap::new(),
+        })
+        .collect();
+    let added = collection.add_records(records, vec![], false);
+    assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    assert!(collection.is_quantized());
+    let mut codes = collection.dense().pq_codes.read().unwrap().clone();
+    let held = codes.len();
+    codes.insert("lost".to_string(), codes["r0"].clone());
+    let count = collection.vector_count();
+    for (counter, refused) in [(MAX_INTERNAL_ID, true), (MAX_INTERNAL_ID - 1, false)] {
+        collection.set_counters(counter, count);
+        let mut positions = positions_of(&collection);
+        let rebuilt = collection.rebuild_graph_from_codes(&codes, &HashMap::new(), &mut positions);
+        if refused {
+            assert_eq!(rebuilt.unwrap_err(), past);
+            assert_eq!(
+                ids_of(&collection).len(),
+                held,
+                "the id store was not touched"
+            );
+            assert_eq!(positions.len(), held);
+        } else {
+            assert_eq!(rebuilt.unwrap(), (held + 1, 0, 1));
+            assert!(ids_of(&collection).contains(&("lost".to_string(), MAX_INTERNAL_ID)));
+            assert_eq!(positions.last(), Some(&(MAX_INTERNAL_ID as u32)));
+        }
+    }
+}
+
+/// A collection with a sparse space whose newest record has gone saves a
+/// directory whose sparse slot count lies past every id its mappings hold,
+/// with a compaction and without, and the load reads it. The loaded
+/// collection holds the records, the pages, the counter and the record
+/// counts the saved one held, and a save of it reads back the same.
+#[test]
+fn a_sparse_space_whose_newest_record_went_saves_a_directory_its_load_reads() {
+    let temp = TempDir::new();
+    let counts = |collection: &Collection| {
+        let stats = collection.stats();
+        (
+            stats["total_vectors"].clone(),
+            stats["sparse_records"].clone(),
+        )
+    };
+    for compacted in [false, true] {
+        let collection = Collection::build(declaration(100, true), None);
+        add(&collection, 0..300, true);
+        remove(&collection, 0..300, |i| i >= 290 || i % 7 == 3);
+        if compacted {
+            collection.compact().unwrap();
+        }
+        let loaded = reload(&collection, &temp, &format!("newest-gone-{compacted}.zdb"));
+        assert_eq!(ids_of(&loaded), ids_of(&collection));
+        assert_eq!(pages(&loaded), pages(&collection));
+        assert_eq!(loaded.id_counter(), collection.id_counter());
+        assert_eq!(counts(&loaded), counts(&collection));
+        let again = reload(
+            &loaded,
+            &temp,
+            &format!("newest-gone-again-{compacted}.zdb"),
+        );
+        assert_eq!(ids_of(&again), ids_of(&collection));
+        assert_eq!(pages(&again), pages(&collection));
+        assert_eq!(counts(&again), counts(&collection));
+    }
+}
+
+/// What `reserved_memory_mb` reports is what `shrink_to_fit` gives back, on
+/// a raw, a product quantized and a scalar quantized collection, with a
+/// declared field and without, declared far past its records and within
+/// them, after removals and again after a clear. The graph's slack, the
+/// vector stores', the numbering's, and the id store's, the metadata
+/// store's and the columns' are counted in both. Each of the stores' parts
+/// is above a hundredth of a mebibyte where the declaration is past the
+/// records, so a part counted in one figure and not the other moves the
+/// figure as reported. Once shrunk the collection reports none, a second
+/// shrink gives back nothing, `total_memory_mb` fell by what was given back
+/// and every page is the page before.
+#[test]
+fn the_reserved_figure_is_what_a_shrink_gives_back_for_every_store() {
+    let mib = |bytes: usize| format!("{:.2}", bytes as f64 / (1024.0 * 1024.0));
+    let figure =
+        |collection: &Collection, key: &str| -> f64 { collection.stats()[key].parse().unwrap() };
+    for (kind, expected, fields) in [
+        ("raw", 200_000usize, true),
+        ("raw", 200_000, false),
+        ("raw", 100, true),
+        ("pq", 200_000, true),
+        ("pq only", 200_000, true),
+        ("int8", 200_000, true),
+    ] {
+        let label = format!("{kind} declared {expected} fields {fields}");
+        let names = if fields {
+            vec!["cat".to_string()]
+        } else {
+            vec![]
+        };
+        let declaration = Declaration::validate(4, "l2", 4, 40, expected, names).unwrap();
+        let quantization = match kind {
+            "pq" => Some(
+                declaration
+                    .quantization(4, 4, 1_000, None, StorageMode::QuantizedWithRaw)
+                    .unwrap(),
+            ),
+            "pq only" => Some(
+                declaration
+                    .quantization(4, 4, 1_000, None, StorageMode::QuantizedOnly)
+                    .unwrap(),
+            ),
+            "int8" => Some(
+                declaration
+                    .scalar_quantization(
+                        super::Int8Scale::PER_DIMENSION,
+                        1_000,
+                        None,
+                        StorageMode::QuantizedOnly,
+                    )
+                    .unwrap(),
+            ),
+            _ => None,
+        };
+        let collection = Collection::build(declaration, quantization);
+        add(&collection, 0..1_200, false);
+        assert_eq!(collection.is_quantized(), kind != "raw", "{label}");
+        remove(&collection, 0..1_200, |i| i % 7 == 3);
+        for phase in ["built", "cleared"] {
+            if phase == "cleared" {
+                collection.clear().unwrap();
+                add(&collection, 0..300, false);
+            }
+            let before = collection.stats();
+            let pages_before = pages(&collection);
+            let freed = collection.shrink_to_fit();
+            assert_eq!(before["reserved_memory_mb"], mib(freed), "{label} {phase}");
+            let after = collection.stats();
+            assert_eq!(after["reserved_memory_mb"], "0.00", "{label} {phase}");
+            assert_eq!(collection.shrink_to_fit(), 0, "{label} {phase}");
+            let fell = before["total_memory_mb"].parse::<f64>().unwrap()
+                - figure(&collection, "total_memory_mb");
+            assert!(
+                (fell - freed as f64 / (1024.0 * 1024.0)).abs() <= 0.011,
+                "{label} {phase}: the total fell {fell} and {freed} bytes were given back"
+            );
+            assert_eq!(pages(&collection), pages_before, "{label} {phase}");
+            if expected > 1_200 {
+                assert!(freed > 1 << 20, "{label} {phase}: {freed}");
+            }
+        }
+    }
 }

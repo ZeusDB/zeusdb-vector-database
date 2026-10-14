@@ -561,9 +561,9 @@ fn a_space_out_of_step_with_the_mappings_is_refused() {
     collection.save(path.to_str().unwrap()).unwrap();
 
     // The postings from a save before a record was removed, over mappings
-    // from after it. The middle record, so the largest live id still
-    // admits the artefact's slot count and the check that fires is the one
-    // on the record itself.
+    // from after it. The slot count is held to the counter, which the
+    // removal does not lower, so the check that fires is the one on the
+    // record itself.
     let stale = dir.path().join("stale.zdb");
     copy_dir(&path, &stale);
     assert!(collection.remove_point("t1".to_string()).unwrap());

@@ -52,9 +52,10 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, Bitmap, ColumnParts, ColumnStore, Error, Filter, IdParts, IdStore, InsertParts,
-    MetadataParts, MetadataStore, Operation, OperationKind, Position, Prepared, RecordId,
-    Selection, SparseVector, VectorGraph, VectorIndex, JOURNAL_MAX_PAYLOAD, MAX_INTERNAL_ID,
+    matches_filter, refuse_unnamable, Bitmap, ColumnParts, ColumnStore, Error, Filter, IdParts,
+    IdStore, InsertParts, MetadataParts, MetadataStore, Operation, OperationKind, Position,
+    Prepared, RecordId, Selection, SparseVector, VectorGraph, VectorIndex, JOURNAL_MAX_PAYLOAD,
+    MAX_INTERNAL_ID,
 };
 use zeusdb_vector_sparse::{PostingsIndex, PostingsParts};
 
@@ -632,9 +633,10 @@ impl Collection {
             let mut columns = self.columns.write().unwrap();
             // The store first, and the position taken back if the graph
             // refuses the node, so a refused record leaves nothing behind.
+            // Admission held the record to the store's refusals.
             let slot = ids.extent();
             let at = Position::from_slot(slot);
-            ids.insert(slot, external_id)?;
+            ids.insert_admitted(slot, external_id);
             if let Err(refused) = index.insert(at, id, vector, prepared) {
                 ids.retract(slot);
                 return Err(refused);
@@ -722,6 +724,148 @@ impl Collection {
         MAX_INTERNAL_ID.saturating_sub(*self.id_counter.lock().unwrap())
     }
 
+    /// Issue the next internal id, refusing where the counter has issued the
+    /// last one the id store holds: the ceiling's check and the issue in one
+    /// acquisition of the counter. Every caller holds `writers`, so nothing
+    /// issues an id between the two.
+    fn issue_id(&self) -> Result<usize, Error> {
+        let mut counter = self.id_counter.lock().unwrap();
+        if *counter >= MAX_INTERNAL_ID {
+            return Err(Error::InternalIdsExhausted {
+                last: MAX_INTERNAL_ID,
+                left: 0,
+                needed: 1,
+            });
+        }
+        *counter += 1;
+        Ok(*counter)
+    }
+
+    /// Refuse a record the id store could not name or the dense space could
+    /// not hold, being an id past the store's ceiling on its length, one
+    /// that would take the arena past its ceiling with `arena` bytes in it
+    /// and the records admitted before it named, or a vector of another
+    /// width. Run where a record is admitted, so a refusal moves nothing.
+    fn refuse_unplaceable(&self, id: &str, vector: &[f32], arena: usize) -> Result<(), Error> {
+        refuse_unnamable(id, arena)?;
+        if vector.len() != self.dense().dim {
+            return Err(Error::VectorDimension {
+                expected: self.dense().dim,
+                got: vector.len(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The refusals of a record's sparse half that depend on the record
+    /// alone and move nothing: a vector held to its rules under the space's
+    /// weighting, or terms with no text layer to count them into, either
+    /// where the collection has no sparse space. What an overwrite runs
+    /// before its removal; `admit` runs the same ones in its own order.
+    fn refuse_sparse_alone(&self, sparse: Option<&SparseHalf>) -> Result<(), Error> {
+        match sparse {
+            None => Ok(()),
+            Some(SparseHalf::Vector(vector)) => self
+                .sparse()
+                .ok_or(Error::NoSparseSpace)
+                .and_then(|space| space.config().weighting.validate_record(vector.as_ref())),
+            Some(SparseHalf::Terms(_)) => self.text_layer().map(|_| ()),
+        }
+    }
+
+    /// Every refusal `admit` would give `record` that depends on the record
+    /// alone, in `admit`'s order, run before an overwrite removes the
+    /// record it replaces: its sparse half's, the sink's ceiling on its
+    /// encoded record where a sink is attached, and the id store's ceilings
+    /// with its vector's width, `arena` being the id store's arena with
+    /// every record before it in the batch named. Nothing moves: no term is
+    /// counted, nothing is issued or drawn, and the sink's ceiling is held
+    /// by a bound on the encoded record, the record being encoded into
+    /// `buffer` only where the bound does not settle it.
+    fn refuse_before_removal(
+        &self,
+        record: &ParsedRecord,
+        arena: usize,
+        attached: bool,
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        self.refuse_sparse_alone(record.sparse.as_ref())?;
+        if attached {
+            let vector = match &record.sparse {
+                Some(SparseHalf::Vector(vector)) => Some(vector.as_ref()),
+                _ => None,
+            };
+            let parts = InsertParts {
+                id: &record.id,
+                vector: &record.vector,
+                metadata: &record.metadata,
+                sparse: vector,
+            };
+            // Terms are not counted here, so they are bounded at two words
+            // a term, which is what a term the record carries once costs.
+            let terms = match &record.sparse {
+                Some(SparseHalf::Terms(terms)) => terms.len().saturating_mul(8),
+                _ => 0,
+            };
+            if Operation::insert_size_bound(&parts).saturating_add(terms) > JOURNAL_MAX_PAYLOAD {
+                Operation::encode_insert(&parts, buffer);
+                // The encoded record holds no terms, so they are added as
+                // they will be counted: each distinct term once, two words
+                // a term, in place of the marker's word.
+                let bytes = match &record.sparse {
+                    Some(SparseHalf::Terms(terms)) => {
+                        let distinct: HashSet<&str> = terms
+                            .iter()
+                            .map(String::as_str)
+                            .filter(|term| !term.is_empty())
+                            .collect();
+                        buffer.len() + distinct.len() * 8
+                    }
+                    _ => buffer.len(),
+                };
+                if bytes > JOURNAL_MAX_PAYLOAD {
+                    return Err(Error::JournalRecordTooLarge {
+                        bytes,
+                        ceiling: JOURNAL_MAX_PAYLOAD,
+                    });
+                }
+            }
+        }
+        self.refuse_unplaceable(&record.id, &record.vector, arena)
+    }
+
+    /// What the records an overwrite replaces hold, as the records with a raw
+    /// vector alone, with codes alone and with both, over every record of the
+    /// batch that names a held record and was not refused before the
+    /// removal. For the line that reports the overwrite, and read only where
+    /// that line is written.
+    fn replaced_storage(
+        &self,
+        records: &[ParsedRecord],
+        refused: &[(usize, Error)],
+    ) -> (usize, usize, usize) {
+        let ids = self.ids.read().unwrap();
+        let index = self.dense().index.read().unwrap();
+        let pq_codes = self.dense().pq_codes.read().unwrap();
+        let raws = index.raw_vectors();
+        let mut refusals = refused.iter().map(|(place, _)| *place).peekable();
+        let (mut has_raw, mut has_pq, mut has_both) = (0, 0, 0);
+        for (place, record) in records.iter().enumerate() {
+            if refusals.next_if_eq(&place).is_some() {
+                continue;
+            }
+            if let Some(slot) = ids.slot_of(&record.id) {
+                match (raws.contains(slot), pq_codes.contains_key(&record.id)) {
+                    (true, true) => has_both += 1,
+                    (true, false) => has_raw += 1,
+                    (false, true) => has_pq += 1,
+                    (false, false) => {} // Shouldn't happen, but handle gracefully
+                }
+            }
+        }
+        (has_raw, has_pq, has_both)
+    }
+
     /// Issue the next internal id only if it is `expected`, which is what a
     /// replay does with the id a record names. The counter does not move
     /// when it is not.
@@ -756,12 +900,15 @@ impl Collection {
     /// Hand a removal's record to the sink and commit it, where a sink is
     /// attached and the removal names anything. Nothing is handed over for
     /// a removal of nothing, so a call naming only absent ids costs the
-    /// sink nothing.
+    /// sink nothing. The record is encoded from the ids as they are held,
+    /// with none of them cloned.
     fn record_removal(&self, held: &[String]) -> Result<(), Error> {
         if held.is_empty() {
             return Ok(());
         }
-        self.record(|| Operation::Remove { ids: held.to_vec() })?;
+        self.record_encoded(OperationKind::Remove, |out| {
+            Operation::encode_remove(held, out)
+        })?;
         self.commit_records()
     }
 
@@ -1959,45 +2106,55 @@ impl Collection {
         let mut inserted_ids: Vec<String> = Vec::with_capacity(parsed_data.len());
         let mut errors: Vec<InsertError> = Vec::new();
 
+        // Whether a sink is attached is read once for the batch. Attaching
+        // one takes the mutation guard, so it cannot change under this call.
+        let attached = self.sink_attached();
+        let mut buffer: Vec<u8> = Vec::new();
+        // The records an overwrite refused before its removal, by their place
+        // in the batch, each with the refusal `admit` gives it, and the places
+        // of those whose sparse vector it held to its rules.
+        let mut refused: Vec<(usize, Error)> = Vec::new();
+        let mut prechecked: Vec<usize> = Vec::new();
+
         // ENHANCED FIX: Handle overwrites properly for ALL paths (Raw, Training, PQ)
         if overwrite {
-            // Phase 1: Batch identify and remove existing documents
-            let (ids_to_remove, storage_analysis) = {
+            // Phase 1: Batch identify and remove existing documents.
+            //
+            // A record that replaces one the collection holds is first held
+            // to every refusal of `admit` that depends on the record alone,
+            // so a record refused for itself keeps the record it would
+            // replace, which stays out of the removal. The arena is counted
+            // with every record before it in the batch named, as `admit`
+            // will count it.
+            let ids_to_remove = {
                 let ids = self.ids.read().unwrap();
-                let index = self.dense().index.read().unwrap();
-                let pq_codes = self.dense().pq_codes.read().unwrap();
-                let raws = index.raw_vectors();
-
+                let mut arena = ids.arena_len();
                 let mut ids_to_remove = Vec::new();
                 let mut doomed: HashSet<&str> = HashSet::new();
-                let mut has_raw = 0;
-                let mut has_pq = 0;
-                let mut has_both = 0;
 
-                for record in &parsed_data {
+                for (place, record) in parsed_data.iter().enumerate() {
                     let id = &record.id;
-                    if let Some(slot) = ids.slot_of(id) {
+                    if ids.slot_of(id).is_some() {
+                        if let Err(err) =
+                            self.refuse_before_removal(record, arena, attached, &mut buffer)
+                        {
+                            refused.push((place, err));
+                            continue;
+                        }
+                        if matches!(record.sparse, Some(SparseHalf::Vector(_))) {
+                            prechecked.push(place);
+                        }
                         // Once per id, so the removal's record names each
                         // id once.
                         if doomed.insert(id.as_str()) {
                             ids_to_remove.push(id.clone());
                         }
-
-                        // Analyze what's being replaced for logging
-                        let has_raw_vector = raws.contains(slot);
-                        let has_pq_codes = pq_codes.contains_key(id);
-
-                        match (has_raw_vector, has_pq_codes) {
-                            (true, true) => has_both += 1,
-                            (true, false) => has_raw += 1,
-                            (false, true) => has_pq += 1,
-                            (false, false) => {} // Shouldn't happen, but handle gracefully
-                        }
                     }
+                    arena = arena.saturating_add(id.len());
                 }
 
-                (ids_to_remove, (has_raw, has_pq, has_both))
-            }; // Release all read locks here
+                ids_to_remove
+            }; // Release the read lock here
 
             if !ids_to_remove.is_empty() {
                 // Every record of the batch takes a fresh internal id, the
@@ -2020,14 +2177,19 @@ impl Collection {
                     return (inserted_ids, errors);
                 }
 
-                info!(target: LOG_TARGET, operation = "overwrite_preparation",
-                    documents_to_remove = ids_to_remove.len(),
-                    storage_analysis = format!(
-                        "raw_only: {}, pq_only: {}, both: {}",
-                        storage_analysis.0, storage_analysis.1, storage_analysis.2
-                    ),
-                    "Removing existing documents for overwrite"
-                );
+                // What the replaced records hold, for this line alone, so it
+                // is read only where the line is written.
+                if tracing::enabled!(target: LOG_TARGET, tracing::Level::INFO) {
+                    let storage_analysis = self.replaced_storage(&parsed_data, &refused);
+                    info!(target: LOG_TARGET, operation = "overwrite_preparation",
+                        documents_to_remove = ids_to_remove.len(),
+                        storage_analysis = format!(
+                            "raw_only: {}, pq_only: {}, both: {}",
+                            storage_analysis.0, storage_analysis.1, storage_analysis.2
+                        ),
+                        "Removing existing documents for overwrite"
+                    );
+                }
 
                 // The removal's record first. A sink that refuses it refuses
                 // the call, since the records would replace what was never
@@ -2050,14 +2212,18 @@ impl Collection {
                     missing.is_empty(),
                     "every id came from the id store under the mutation guard"
                 );
-                let mut removed_count = 0;
-                for id in &ids_to_remove {
-                    if !missing.contains(id) {
-                        removed_count += 1;
-                        trace!(target: LOG_TARGET, operation = "overwrite_removal",
-                            vector_id = %id,
-                            "Removed existing vector/codes for overwrite"
-                        );
+                // Each id the removal named once, and every one it did not
+                // find came from it, so the count is the difference. The
+                // line per id is written only where it is enabled.
+                let removed_count = ids_to_remove.len() - missing.len();
+                if tracing::enabled!(target: LOG_TARGET, tracing::Level::TRACE) {
+                    for id in &ids_to_remove {
+                        if !missing.contains(id) {
+                            trace!(target: LOG_TARGET, operation = "overwrite_removal",
+                                vector_id = %id,
+                                "Removed existing vector/codes for overwrite"
+                            );
+                        }
                     }
                 }
 
@@ -2075,12 +2241,12 @@ impl Collection {
             "Starting insertion phase"
         );
 
-        // Whether a sink is attached is read once for the batch. Attaching
-        // one takes the mutation guard, so it cannot change under this call.
-        let attached = self.sink_attached();
-        let mut buffer: Vec<u8> = Vec::new();
         let mut seen: HashSet<String> = HashSet::with_capacity(parsed_data.len());
         let mut pending = parsed_data.into_iter().peekable();
+        let mut refused = refused.into_iter().peekable();
+        let mut prechecked = prechecked.into_iter().peekable();
+        // The place in the batch of the next record taken from `pending`.
+        let mut place = 0usize;
         // Five of the six points a crash test aborts an `add` at, each named
         // where the step it follows finishes. The sixth is inside the sink,
         // which is what writes half a record. All of them are compiled away
@@ -2091,9 +2257,27 @@ impl Collection {
             let limit = self.segment_limit();
             let mut segment: Vec<Result<Admitted, InsertError>> = Vec::new();
             let mut admitted = 0usize;
+            // The text of the records this segment admits, which the arena
+            // holds once they are installed.
+            let mut named_later = 0usize;
             while let Some(record) = pending.next_if(|_| limit.is_none_or(|limit| admitted < limit))
             {
-                let outcome = self.admit(record, &mut seen, attached, &mut buffer);
+                let outcome = match refused.next_if(|(at, _)| *at == place) {
+                    Some((_, err)) => Err(InsertError::Vector { id: record.id, err }),
+                    None => {
+                        let checked = prechecked.next_if_eq(&place).is_some();
+                        self.admit(
+                            record,
+                            &mut seen,
+                            attached,
+                            &mut buffer,
+                            &mut named_later,
+                            checked,
+                            overwrite,
+                        )
+                    }
+                };
+                place += 1;
                 if outcome.is_ok() {
                     admitted += 1;
                     handed_over += 1;
@@ -2117,23 +2301,23 @@ impl Collection {
                 if let Err(err) = self.commit_records() {
                     let class = err.exception().name();
                     let message = err.to_string();
-                    for outcome in segment.into_iter().chain(pending.map(|record| {
-                        Ok(Admitted {
-                            id: record.id,
-                            vector: record.vector,
-                            sparse: None,
-                            metadata: record.metadata,
-                            internal_id: 0,
-                            level: 0,
-                        })
-                    })) {
+                    let failed = |id: &str| {
+                        InsertError::Counted(format!("Vector {}: {}: {}", id, class, message))
+                    };
+                    for outcome in segment {
                         errors.push(match outcome {
-                            Ok(admitted) => InsertError::Counted(format!(
-                                "Vector {}: {}: {}",
-                                admitted.id, class, message
-                            )),
+                            Ok(admitted) => failed(&admitted.id),
                             Err(e) => e,
                         });
+                    }
+                    // The rest of the batch, each with the refusal the
+                    // overwrite gave it where it gave one.
+                    for record in pending {
+                        errors.push(match refused.next_if(|(at, _)| *at == place) {
+                            Some((_, err)) => InsertError::Vector { id: record.id, err },
+                            None => failed(&record.id),
+                        });
+                        place += 1;
                     }
                     return (inserted_ids, errors);
                 }
@@ -2216,25 +2400,45 @@ impl Collection {
     /// Every check that can refuse the record runs first, being the
     /// duplicate check against the index and against the batch so far, the
     /// id ceiling, the terms counted into ids where the sparse half is
-    /// terms, which hands each new term to the sink as it is issued, and the
-    /// sparse rules under the space's weighting. Where a sink is attached the
-    /// record is then encoded and held to the sink's ceiling while nothing
-    /// has been issued for it, so a record too large to journal is refused
-    /// with the counter and the level stream where they were. Only then is
-    /// the level drawn and the internal id issued, both written into the
-    /// encoded record, and the record handed over. A sink that refuses it
-    /// takes the id back, since nothing else issues one under the mutation
-    /// guard, so the refusal leaves the counter where it was; the draw it
-    /// consumed moves the stream, which the next record's own draw records.
+    /// terms, which hands each new term to the sink as it is issued, the
+    /// sparse rules under the space's weighting, where a sink is attached
+    /// the sink's ceiling on the encoded record, and the id store's
+    /// ceilings on the id and its text with the vector's width. The id is
+    /// issued at the ceiling's check, in the one acquisition of the counter,
+    /// and every refusal after it takes the id back, since nothing else
+    /// issues one under the mutation guard, so a refused record leaves the
+    /// counter where it was. Only once every check has passed is the level
+    /// drawn, written with the id into the encoded record, and the record
+    /// handed over, so a refused record leaves the level stream where it
+    /// was too. A sink that refuses the record takes the id back as well;
+    /// the draw it consumed moves the stream, which the next record's own
+    /// draw records. Nothing the install then does can refuse a record
+    /// admitted here for its id or its width.
+    ///
+    /// `pending` is the text of the records this segment has admitted and
+    /// not yet installed, which the arena will hold before this record's
+    /// id. `prechecked` says an overwrite held the record's sparse vector to
+    /// its rules before it removed what the record replaces, so that check
+    /// is not run twice.
+    ///
+    /// `overwrite` says the batch looked every record's id up before its
+    /// removal and removed each one it found, so the id store holds no id
+    /// this admits that the batch has not admitted already, and the store is
+    /// not asked again. A record refused before the removal never reaches
+    /// this, which is what keeps the record it names held.
     ///
     /// With no sink attached nothing is encoded and the sink's ceiling does
     /// not apply. The id ceiling applies either way.
+    #[allow(clippy::too_many_arguments)]
     fn admit(
         &self,
         record: ParsedRecord,
         seen: &mut HashSet<String>,
         attached: bool,
         buffer: &mut Vec<u8>,
+        pending: &mut usize,
+        prechecked: bool,
+        overwrite: bool,
     ) -> Result<Admitted, InsertError> {
         let ParsedRecord {
             id,
@@ -2243,7 +2447,18 @@ impl Collection {
             metadata,
         } = record;
 
-        let is_new = !seen.contains(&id) && !self.ids.read().unwrap().contains_name(&id);
+        // The duplicate check, and from the same guard the length of the
+        // arena the record's id is held to below.
+        let (is_new, arena) = if seen.contains(&id) {
+            (false, 0)
+        } else {
+            let ids = self.ids.read().unwrap();
+            debug_assert!(
+                !overwrite || !ids.contains_name(&id),
+                "an overwrite removed every held id it admits"
+            );
+            (overwrite || !ids.contains_name(&id), ids.arena_len())
+        };
         if !is_new {
             warn!(target: LOG_TARGET, operation = "add_single_vector",
                 vector_id = %id,
@@ -2256,22 +2471,20 @@ impl Collection {
             });
         }
 
-        // The id ceiling, before anything is counted, encoded, drawn or
-        // issued for the record. Issued, an id past the last one the id store
-        // holds would reach the sink and then be refused at install, and a
-        // replay of that record would refuse the open. Refused here, the
-        // record leaves the counter, the level stream, the dictionary and the
-        // sink where they were, journaled or not.
-        if self.ids_left() == 0 {
-            return Err(InsertError::Vector {
-                err: Error::InternalIdsExhausted {
-                    last: MAX_INTERNAL_ID,
-                    left: 0,
-                    needed: 1,
-                },
-                id,
-            });
-        }
+        // The id ceiling, before anything is counted, encoded or drawn for
+        // the record, and the issue with it. Issued past the last one the id
+        // store holds, an id would reach the sink and then be refused at
+        // install, and a replay of that record would refuse the open.
+        // Refused here, the record leaves the counter, the level stream, the
+        // dictionary and the sink where they were, journaled or not.
+        let internal_id = match self.issue_id() {
+            Ok(issued) => issued,
+            Err(err) => return Err(InsertError::Vector { err, id }),
+        };
+        let refuse = |err: Error, id: String| -> Result<Admitted, InsertError> {
+            self.retract_id(internal_id);
+            Err(InsertError::Vector { id, err })
+        };
 
         // The sparse half. Terms are counted into term ids here, under the
         // mutation guard the caller holds, so the ids a record's postings
@@ -2281,21 +2494,23 @@ impl Collection {
         // the collection having a sparse space, before anything is written,
         // so a record refused for its sparse half leaves nothing behind in
         // the dense one.
-        let sparse = match sparse {
-            None => None,
-            Some(SparseHalf::Vector(vector)) => Some(vector),
+        let (sparse, held_to_rules) = match sparse {
+            None => (None, true),
+            Some(SparseHalf::Vector(vector)) => (Some(vector), prechecked),
             Some(SparseHalf::Terms(terms)) => match self.count_record_terms(&terms) {
-                Ok(vector) => Some(vector),
-                Err(err) => return Err(InsertError::Vector { id, err }),
+                Ok(vector) => (Some(vector), false),
+                Err(err) => return refuse(err, id),
             },
         };
-        if let Some(sparse) = &sparse {
-            let checked = self
-                .sparse()
-                .ok_or(Error::NoSparseSpace)
-                .and_then(|space| space.config().weighting.validate_record(sparse.as_ref()));
-            if let Err(err) = checked {
-                return Err(InsertError::Vector { id, err });
+        if !held_to_rules {
+            if let Some(sparse) = &sparse {
+                let checked = self
+                    .sparse()
+                    .ok_or(Error::NoSparseSpace)
+                    .and_then(|space| space.config().weighting.validate_record(sparse.as_ref()));
+                if let Err(err) = checked {
+                    return refuse(err, id);
+                }
             }
         }
 
@@ -2308,27 +2523,31 @@ impl Collection {
             };
             Operation::encode_insert(&parts, buffer);
             if buffer.len() > JOURNAL_MAX_PAYLOAD {
-                return Err(InsertError::Vector {
-                    id,
-                    err: Error::JournalRecordTooLarge {
-                        bytes: buffer.len(),
-                        ceiling: JOURNAL_MAX_PAYLOAD,
-                    },
-                });
+                let err = Error::JournalRecordTooLarge {
+                    bytes: buffer.len(),
+                    ceiling: JOURNAL_MAX_PAYLOAD,
+                };
+                return refuse(err, id);
             }
         }
 
+        // The id store's refusals and the vector's width, run before the level
+        // is drawn and the record handed to the sink, so the install meets none
+        // of them. A refusal here takes the issued id back.
+        if let Err(err) = self.refuse_unplaceable(&id, &vector, arena.saturating_add(*pending)) {
+            return refuse(err, id);
+        }
+
         let level = self.draw_level();
-        let internal_id = self.get_next_id();
         if attached {
             Operation::stamp_insert(buffer, internal_id as u64, level as u8);
             if let Err(err) = self.append_record(OperationKind::Insert, buffer) {
-                self.retract_id(internal_id);
-                return Err(InsertError::Vector { id, err });
+                return refuse(err, id);
             }
         }
 
         seen.insert(id.clone());
+        *pending += id.len();
         Ok(Admitted {
             id,
             vector,
@@ -2777,13 +2996,19 @@ impl Collection {
         self.compact_locked(&writers)
     }
 
-    /// Return the graph's spare buffer capacity and the dense index's
-    /// numbering's to the allocator, reporting the bytes released. See
-    /// `VectorGraph::shrink_to_fit` and `DenseIndex::shrink_to_fit`.
+    /// Return the graph's spare buffer capacity, the dense index's
+    /// numbering's, and the id store's, the metadata store's and the
+    /// columns' to the allocator, reporting the bytes released, which is what
+    /// `reserved_memory_mb` priced. Each store is shrunk under its own write
+    /// guard, taken alone. See `VectorGraph::shrink_to_fit` and
+    /// `DenseIndex::shrink_to_fit`.
     pub fn shrink_to_fit(&self) -> usize {
         let _writers = self.writers.lock().unwrap();
-        let mut index = self.dense().index.write().unwrap();
-        index.shrink_to_fit()
+        let ids = self.ids.write().unwrap().shrink_to_fit();
+        let dense = self.dense().index.write().unwrap().shrink_to_fit();
+        let metadata = self.vector_metadata.write().unwrap().shrink_to_fit();
+        let columns = self.columns.write().unwrap().shrink_to_fit();
+        ids + dense + metadata + columns
     }
 
     /// Resolve a rebuild request against the configuration the index holds.
@@ -2868,26 +3093,68 @@ impl Collection {
     /// that id, so the next checkpoint must name it too. The next save is
     /// the next generation, so a directory saved before the clear reads as
     /// the earlier one.
+    ///
+    /// **One trade, and the old structures dropped after `writers`.** Every
+    /// structure the clear empties, the sparse space's index and dictionary
+    /// among them, is traded for a fresh one under one acquisition of their
+    /// write guards, so a reader sees the whole state before the clear or
+    /// the whole cleared state. What they held is dropped once `writers` is
+    /// let go, as a close-up's retired parts are, so the next writer does
+    /// not wait for it.
     pub fn clear(&self) -> Result<usize, Error> {
-        let _writers = self.writers.lock().unwrap();
+        let writers = self.writers.lock().unwrap();
         let replacement = self.replacement_for_clear()?;
         self.record(|| Operation::Clear)?;
         self.commit_records()?;
-        Ok(self.clear_with(replacement))
+        let (removed, cleared) = self.clear_with(replacement);
+        drop(writers);
+        drop(cleared);
+        Ok(removed)
     }
 
     /// The body of `clear`, with the mutation guard held by the caller and
-    /// the record already handed over.
-    pub(super) fn clear_locked(&self) -> Result<usize, Error> {
+    /// the record already handed over. What the clear replaced is handed
+    /// back for the caller to drop once it lets `writers` go.
+    pub(super) fn clear_locked(&self) -> Result<(usize, Cleared), Error> {
         let replacement = self.replacement_for_clear()?;
         Ok(self.clear_with(replacement))
     }
 
+    /// The fresh structures a clear installs, and whether the graph it
+    /// replaces scores against codes. Built before any guard is taken, so
+    /// every allocation happens outside the write guards, as `compact`
+    /// arranges it for its graph. The stores reserve for the declared size,
+    /// under their caps, and the code map and the training list hold the
+    /// capacity the old ones hold, which is what emptying them in place kept.
+    fn replacement_for_clear(&self) -> Result<ClearReplacement, Error> {
+        let (quantized, index) = self.fresh_index_for_clear()?;
+        let names = self.columns.read().unwrap().declared().to_vec();
+        let codes = self.dense().pq_codes.read().unwrap().capacity();
+        let training = self.training_ids.read().unwrap().capacity();
+        let sparse = self.sparse().map(|space| {
+            (
+                PostingsIndex::new(space.config().clone()),
+                space
+                    .text
+                    .as_ref()
+                    .map(|_| zeusdb_vector_text::TermDictionary::new()),
+            )
+        });
+        Ok(ClearReplacement {
+            quantized,
+            ids: IdStore::new(self.expected_size()),
+            index,
+            pq_codes: HashMap::with_capacity(codes),
+            sparse,
+            vector_metadata: MetadataStore::new(self.expected_size()),
+            columns: ColumnStore::new(names, self.expected_size()),
+            training_ids: Vec::with_capacity(training),
+        })
+    }
+
     /// The fresh index a clear installs, and whether the graph it replaces
-    /// scores against codes. Built before any guard is taken, so the
-    /// allocation happens outside the write guard exactly as `compact`
-    /// arranges it.
-    fn replacement_for_clear(&self) -> Result<(bool, DenseIndex), Error> {
+    /// scores against codes.
+    fn fresh_index_for_clear(&self) -> Result<(bool, DenseIndex), Error> {
         let quantized = self.is_quantized();
         let pq = self.dense().pq.as_ref().cloned();
         let int8 = self.dense().int8_codec().cloned();
@@ -2954,23 +3221,50 @@ impl Collection {
         Ok((quantized, self.dense().fresh_index(fresh)))
     }
 
-    /// Install the replacement `replacement_for_clear` built and empty every
-    /// map, reporting how many records went.
-    fn clear_with(&self, (quantized, replacement): (bool, DenseIndex)) -> usize {
+    /// Trade every structure a clear empties for the fresh one
+    /// `replacement_for_clear` built, reporting how many records went and
+    /// handing back what the structures held, for the caller to drop once it
+    /// lets `writers` go.
+    fn clear_with(&self, replacement: ClearReplacement) -> (usize, Cleared) {
+        let ClearReplacement {
+            quantized,
+            ids: fresh_ids,
+            index: fresh_index,
+            pq_codes: fresh_codes,
+            sparse: fresh_sparse,
+            vector_metadata: fresh_metadata,
+            columns: fresh_columns,
+            training_ids: fresh_training,
+        } = replacement;
         // The storage guards in the order declared on the struct, which is
-        // the order every other multi-guard path here takes them in.
+        // the order every other multi-guard path here takes them in, the
+        // sparse space's index and its dictionary among them.
         //
         // The dense index is one of them, between the id store and the codes
         // it ranks above and below. Emptying the store here and replacing the
         // index afterwards left the collection's live set empty while the
         // index's still held every record, which is the same disagreement the
         // insertion path carried and which a `get_stats` running beside a
-        // `clear` observed. The two sets are one set, so they empty under one
-        // acquisition.
-        let (removed, old_index) = {
+        // `clear` observed. The sparse space was replaced after the others
+        // under its own guard, so a reader between the two saw the cleared
+        // record set beside the old postings. Every structure is one state,
+        // so they empty under one acquisition. A record's terms are counted
+        // into ids under `writers`, and a query's under the dictionary's read
+        // guard held through its search, so nothing holds an id the old
+        // dictionary issued once the trade is done.
+        let (removed, cleared) = {
             let mut ids = self.ids.write().unwrap();
             let mut index = self.dense().index.write().unwrap();
             let mut pq_codes = self.dense().pq_codes.write().unwrap();
+            let mut sparse = self.sparse().map(|space| {
+                (
+                    space.index.write().unwrap(),
+                    space
+                        .text
+                        .as_ref()
+                        .map(|text| text.dictionary.write().unwrap()),
+                )
+            });
             let mut vector_metadata = self.vector_metadata.write().unwrap();
             let mut columns = self.columns.write().unwrap();
             let mut training_ids = self.training_ids.write().unwrap();
@@ -2978,38 +3272,33 @@ impl Collection {
             let mut vector_count = self.vector_count.lock().unwrap();
 
             let removed = ids.len();
-            ids.clear(self.expected_size());
-            let old_index = std::mem::replace(&mut *index, replacement);
-            pq_codes.clear();
-            vector_metadata.clear(self.expected_size());
-            // Keeps the declaration and drops every record, which is what
-            // `clear` does to the index itself. The reservation comes back
-            // too, since a cleared index is about to be filled again.
-            columns.clear(self.expected_size());
-            training_ids.clear();
+            let sparse = match (sparse.as_mut(), fresh_sparse) {
+                (Some((index, dictionary)), Some((fresh, fresh_dictionary))) => Some((
+                    std::mem::replace(&mut **index, fresh),
+                    dictionary
+                        .as_mut()
+                        .zip(fresh_dictionary)
+                        .map(|(dictionary, fresh)| std::mem::replace(&mut **dictionary, fresh)),
+                )),
+                _ => None,
+            };
+            let cleared = Cleared {
+                _parts: Some(ClearedParts {
+                    _ids: std::mem::replace(&mut *ids, fresh_ids),
+                    _index: std::mem::replace(&mut *index, fresh_index),
+                    _pq_codes: std::mem::replace(&mut *pq_codes, fresh_codes),
+                    _sparse: sparse,
+                    _vector_metadata: std::mem::replace(&mut *vector_metadata, fresh_metadata),
+                    _columns: std::mem::replace(&mut *columns, fresh_columns),
+                    _training_ids: std::mem::replace(&mut *training_ids, fresh_training),
+                }),
+            };
             *id_counter = 0;
             *vector_count = 0;
-            (removed, old_index)
+            (removed, cleared)
         };
-
-        // The graph that was replaced, dropped with every guard released. A
-        // graph's drop forks to rayon, and a rayon fork under a write guard
-        // deadlocks against a batch search holding the pool; see
-        // `DenseSpace::replace_graph`.
-        drop(old_index);
-
-        // The sparse space, where there is one, starts again as well, under
-        // its own guard taken alone. A record's terms are counted into ids
-        // under `writers` as well, in `add_single_vector`, and a query's
-        // under the dictionary's read guard held through its search, so
-        // nothing holds an id this dictionary issued by the time the next
-        // record's terms are counted.
-        if let Some(space) = self.sparse() {
-            *space.index.write().unwrap() = PostingsIndex::new(space.config().clone());
-            if let Some(text) = &space.text {
-                *text.dictionary.write().unwrap() = zeusdb_vector_text::TermDictionary::new();
-            }
-        }
+        #[cfg(test)]
+        reach_clear(ClearPoint::Traded);
 
         // An index still collecting for training starts collecting again,
         // since what it had collected is gone. A trained one is left alone,
@@ -3029,7 +3318,94 @@ impl Collection {
             "Index cleared"
         );
 
-        removed
+        (removed, cleared)
+    }
+}
+
+/// The fresh structures a clear trades in, built by
+/// `Collection::replacement_for_clear` before any guard is taken, and
+/// whether the graph they replace scores against codes.
+struct ClearReplacement {
+    quantized: bool,
+    ids: IdStore,
+    index: DenseIndex,
+    pq_codes: HashMap<String, Vec<u8>>,
+    /// The sparse space's postings and, where it has a text layer, its
+    /// dictionary.
+    sparse: Option<(PostingsIndex, Option<zeusdb_vector_text::TermDictionary>)>,
+    vector_metadata: MetadataStore,
+    columns: ColumnStore,
+    training_ids: Vec<String>,
+}
+
+/// What a clear traded out, held to be dropped once `writers` is let go.
+/// Dropping the graph forks to rayon, and a fork under a write guard
+/// deadlocks against a batch search holding the pool; see
+/// `DenseSpace::replace_graph`.
+pub(super) struct Cleared {
+    _parts: Option<ClearedParts>,
+}
+
+/// The structures a clear traded out.
+struct ClearedParts {
+    _ids: IdStore,
+    _index: DenseIndex,
+    _pq_codes: HashMap<String, Vec<u8>>,
+    _sparse: Option<(PostingsIndex, Option<zeusdb_vector_text::TermDictionary>)>,
+    _vector_metadata: MetadataStore,
+    _columns: ColumnStore,
+    _training_ids: Vec<String>,
+}
+
+/// The points a clear reaches that a test can hold open.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClearPoint {
+    /// Every structure is traded and every guard let go, and `writers` is
+    /// still held.
+    Traded,
+    /// What the clear traded out is about to be dropped.
+    Dropping,
+    /// What the clear traded out is dropped.
+    Dropped,
+}
+
+/// What a test sets for this thread's clears to call at each point.
+#[cfg(test)]
+pub(super) type ClearHook = Box<dyn FnMut(ClearPoint)>;
+
+// What this thread's clears call at each point, where a test set it.
+#[cfg(test)]
+thread_local! {
+    pub(super) static CLEAR_HOOK: std::cell::RefCell<Option<ClearHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Call this thread's clear hook, where a test set one.
+#[cfg(test)]
+fn reach_clear(point: ClearPoint) {
+    CLEAR_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(point);
+        }
+    });
+}
+
+/// What a clear traded out, dropped in the tests alone between two points a
+/// test can hold open or read the guards the dropping thread holds at. A
+/// thread already unwinding drops it past no point, as a close-up's parts
+/// are.
+#[cfg(test)]
+impl Drop for Cleared {
+    fn drop(&mut self) {
+        let observed = !std::thread::panicking();
+        if observed {
+            reach_clear(ClearPoint::Dropping);
+        }
+        drop(self._parts.take());
+        if observed {
+            reach_clear(ClearPoint::Dropped);
+        }
     }
 }
 

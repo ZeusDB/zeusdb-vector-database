@@ -1215,7 +1215,9 @@ impl VectorGraph {
 
     /// Time one whole search on this graph, in nanoseconds, as the median of
     /// `rounds` searches at `k` and `ef` under `admits`, each asked with a
-    /// query built from two of the graph's own points.
+    /// query built from two of the graph's own points. `admits` is asked what
+    /// a search's predicate is asked, being the position each candidate's
+    /// node holds its record at.
     ///
     /// What a traversal costs is not what a distance evaluation costs
     /// multiplied by a count. A traversal's time is the memory it touches,
@@ -1283,7 +1285,7 @@ impl VectorGraph {
                     query.iter_mut().for_each(|v| *v /= norm);
                 }
             }
-            let predicate = |id: &usize| admits(*id);
+            let predicate = |at: &usize| admits(*at);
             let started = std::time::Instant::now();
             let hits = self.search(&query, k, ef, Some(&predicate)).ok()?;
             let elapsed = started.elapsed();

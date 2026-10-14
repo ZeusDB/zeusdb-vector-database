@@ -900,6 +900,466 @@ fn the_last_internal_id_is_refused_before_the_sink_is_reached() {
 }
 
 // ============================================================================
+// A RECORD REFUSED FOR ITSELF
+// ============================================================================
+
+/// The id store's two ceilings, lowered on this thread so the refusals they
+/// give are reached without gigabytes of text, and put back when dropped.
+struct Ceilings((u64, u64));
+
+impl Ceilings {
+    fn lower(longest: u64, arena: u64) -> Self {
+        Ceilings(
+            zeusdb_vector_core::ID_CEILINGS.with(|ceilings| ceilings.replace((longest, arena))),
+        )
+    }
+}
+
+impl Drop for Ceilings {
+    fn drop(&mut self) {
+        zeusdb_vector_core::ID_CEILINGS.with(|ceilings| ceilings.set(self.0));
+    }
+}
+
+/// A raw collection, or a product quantized one trained at 1,000 records,
+/// at width 4 with the field `cat` declared.
+fn refusals_collection(pq: bool) -> Collection {
+    let declaration = Declaration::validate(4, "l2", 4, 50, 100, vec!["cat".to_string()]).unwrap();
+    let quantization = pq.then(|| {
+        declaration
+            .quantization(2, 4, 1_000, None, StorageMode::QuantizedWithRaw)
+            .unwrap()
+    });
+    Collection::build(declaration, quantization)
+}
+
+/// A record the id store would refuse for its id's length or for its arena,
+/// or the graph for its vector's width, is refused at the door, before its
+/// id is issued for good, its level drawn or its record handed to a sink.
+/// The records before and after it in the same call go in under the ids and
+/// levels a collection that never saw it gives them, so the collection is
+/// that collection, artefact for artefact, on a raw and on a product
+/// quantized collection, with a sink and without, and a replay of what the
+/// sink holds reaches it as well. Each of the three was refused at install,
+/// with the id issued, the level drawn and the record committed, and the
+/// width on a raw collection reached the vector store's assertion.
+#[test]
+fn a_record_refused_for_its_id_or_its_width_moves_nothing() {
+    let vectors = clustered(1_100, 4, 0x0208_b001);
+    let queries = Queries {
+        dense: vectors[3].clone(),
+        text: None,
+        sparse: None,
+    };
+    let long = "x".repeat(41);
+    for (case, pq) in [
+        ("long", false),
+        ("arena", false),
+        ("width", false),
+        ("long", true),
+        ("width", true),
+    ] {
+        for journaled in [false, true] {
+            let label = format!("{case}, pq {pq}, journaled {journaled}");
+            let held = if pq { 1_010 } else { 30 };
+            let bad = ParsedRecord {
+                id: if case == "width" {
+                    "wide".to_string()
+                } else {
+                    long.clone()
+                },
+                vector: if case == "width" {
+                    vec![0.5; 5]
+                } else {
+                    vectors[held + 1].clone()
+                },
+                sparse: None,
+                metadata: metadata_for(held + 1),
+            };
+            let words = match case {
+                "long" => "an id of 41 bytes is longer than the id store can hold".to_string(),
+                "arena" => "the id store's text arena is full".to_string(),
+                _ => "Vector dimension mismatch: expected 4, got 5".to_string(),
+            };
+            let batch = |bad: Option<ParsedRecord>| {
+                let mut batch = vec![record(held, &vectors)];
+                batch.extend(bad);
+                batch.push(record(held + 2, &vectors));
+                batch
+            };
+
+            let collection = refusals_collection(pq);
+            add(
+                &collection,
+                (0..held).map(|i| record(i, &vectors)).collect(),
+            );
+            let mut run = journaled.then(|| {
+                let mut run = Run::new(refusals_collection(pq));
+                add(
+                    &run.original,
+                    (0..held).map(|i| record(i, &vectors)).collect(),
+                );
+                run.checkpoint();
+                run
+            });
+            let arena = collection.ids().arena_len() as u64;
+            let ceilings = match case {
+                "long" => Ceilings::lower(40, u64::MAX),
+                "arena" => Ceilings::lower(u64::MAX, arena + format!("r{held}").len() as u64 + 40),
+                _ => Ceilings::lower(u64::MAX, u64::MAX),
+            };
+            for target in std::iter::once(&collection).chain(run.as_ref().map(|run| &run.original))
+            {
+                let added = target.add_records(batch(Some(bad.clone())), vec![], false);
+                assert_eq!(added.total_errors, 1, "{label}: {:?}", added.errors);
+                assert!(
+                    added.errors[0].contains(&words),
+                    "{label}: {:?}",
+                    added.errors
+                );
+                assert_eq!(
+                    added.inserted,
+                    vec![format!("r{held}"), format!("r{}", held + 2)],
+                    "{label}"
+                );
+            }
+            drop(ceilings);
+
+            let twin = refusals_collection(pq);
+            add(&twin, (0..held).map(|i| record(i, &vectors)).collect());
+            add(&twin, batch(None));
+            assert_eq!(collection.is_quantized(), pq, "{label}");
+            let dir = TempDir::new();
+            let ours = Snapshot::take(&collection, &dir.sub("ours.zdb"), &queries);
+            let theirs = Snapshot::take(&twin, &dir.sub("twin.zdb"), &queries);
+            // The training stamp is each collection's own clock reading.
+            let differ = |snapshot: &Snapshot| -> Vec<&'static str> {
+                snapshot
+                    .diff(&theirs)
+                    .into_iter()
+                    .filter(|field| *field != "stamp")
+                    .collect()
+            };
+            assert_eq!(differ(&ours), Vec::<&str>::new(), "{label}");
+            if let Some(run) = run.as_mut() {
+                let journaled = Snapshot::take(&run.original, &dir.sub("journaled.zdb"), &queries);
+                assert_eq!(differ(&journaled), Vec::<&str>::new(), "{label}");
+                assert!(
+                    run.recording
+                        .records()
+                        .iter()
+                        .all(|(_, payload)| !payload.windows(4).any(|w| w == b"wide")
+                            && !payload.windows(41).any(|w| w == long.as_bytes())),
+                    "{label}: the refused record never reached the sink"
+                );
+                run.prove(&queries, None);
+            }
+        }
+    }
+}
+
+/// A collection with a sparse space under BM25, whose values must be whole,
+/// at width 4, or with none where `sparse` is unset.
+fn overwrite_collection(sparse: bool) -> Collection {
+    let declaration = Declaration::validate(4, "l2", 4, 50, 100, vec!["cat".to_string()]).unwrap();
+    let declaration = if sparse {
+        declaration
+            .with_sparse(
+                "terms",
+                SparseConfig {
+                    weighting: Weighting::BM25,
+                    ..SparseConfig::default()
+                },
+            )
+            .unwrap()
+    } else {
+        declaration
+    };
+    Collection::build(declaration, None)
+}
+
+/// An overwrite holds each new record that replaces a held one to every
+/// refusal of the door that depends on the record alone before it removes
+/// anything, so a new record refused for itself keeps the record it would
+/// have replaced, and the others of the batch replace theirs in one removal
+/// and go in under the ids a collection that never saw the refused record
+/// gives them. Covered: a vector of another width, an id past the store's
+/// ceiling, a sparse vector on a collection with no sparse space, a sparse
+/// vector against its weighting's rules, terms on a space with no text
+/// layer, and, with a sink, a record past the journal's ceiling. Each used
+/// to lose the record it replaced, removed and recorded as removed before
+/// the new record was refused.
+#[test]
+fn an_overwrite_keeps_the_record_its_refused_replacement_names() {
+    let vectors = clustered(40, 4, 0x0208_b002);
+    let queries = Queries {
+        dense: vectors[3].clone(),
+        text: None,
+        sparse: None,
+    };
+    let long = "x".repeat(41);
+    for case in ["width", "long", "no space", "rules", "no text", "journal"] {
+        for journaled in [false, true] {
+            if case == "journal" && !journaled {
+                continue;
+            }
+            let label = format!("{case}, journaled {journaled}");
+            let sparse = matches!(case, "rules" | "no text");
+            // The record the batch fails to replace, held under the id
+            // the refused record names.
+            let held_id = if case == "long" {
+                long.clone()
+            } else {
+                "r2".to_string()
+            };
+            let held = |i: usize| ParsedRecord {
+                id: if i == 2 {
+                    held_id.clone()
+                } else {
+                    format!("r{i}")
+                },
+                ..record(i, &vectors)
+            };
+            let replacement = |i: usize| ParsedRecord {
+                id: if i == 2 {
+                    held_id.clone()
+                } else {
+                    format!("r{i}")
+                },
+                metadata: HashMap::from([("cat".to_string(), json!("replaced"))]),
+                ..record(i + 20, &vectors)
+            };
+            let mut bad = replacement(2);
+            let words = match case {
+                "width" => {
+                    bad.vector = vec![0.5; 5];
+                    "Vector dimension mismatch: expected 4, got 5".to_string()
+                }
+                "long" => "an id of 41 bytes is longer than the id store can hold".to_string(),
+                "no space" => {
+                    bad.sparse = Some(SparseHalf::Vector(SparseVector {
+                        dims: vec![1, 2],
+                        values: vec![1.0, 2.0],
+                    }));
+                    Error::NoSparseSpace.to_string()
+                }
+                "rules" => {
+                    bad.sparse = Some(SparseHalf::Vector(SparseVector {
+                        dims: vec![1, 2],
+                        values: vec![1.0, 1.5],
+                    }));
+                    Error::SparseValueNotWhole {
+                        index: 1,
+                        value: 1.5,
+                    }
+                    .to_string()
+                }
+                "no text" => {
+                    bad.sparse = Some(SparseHalf::Terms(vec!["alpha".to_string()]));
+                    Error::NoTextLayer.to_string()
+                }
+                _ => {
+                    bad.metadata.insert(
+                        "note".to_string(),
+                        json!("a".repeat(zeusdb_vector_core::JOURNAL_MAX_PAYLOAD)),
+                    );
+                    format!(
+                        "the journal's record ceiling is {} bytes",
+                        zeusdb_vector_core::JOURNAL_MAX_PAYLOAD
+                    )
+                }
+            };
+            let batch = |bad: Option<ParsedRecord>| {
+                let mut batch = vec![replacement(1)];
+                batch.extend(bad);
+                batch.push(replacement(3));
+                batch.push(ParsedRecord {
+                    id: "r20".to_string(),
+                    ..record(30, &vectors)
+                });
+                batch
+            };
+
+            let mut run = Run::new(overwrite_collection(sparse));
+            if !journaled {
+                assert!(run.original.detach_sink().is_some());
+            }
+            add(&run.original, (0..10).map(held).collect());
+            run.checkpoint();
+            let ceilings = (case == "long").then(|| Ceilings::lower(40, u64::MAX));
+            let added = run.original.add_records(batch(Some(bad)), vec![], true);
+            drop(ceilings);
+            assert_eq!(added.total_errors, 1, "{label}: {:?}", added.errors);
+            assert!(
+                added.errors[0].contains(&words),
+                "{label}: {:?}",
+                added.errors
+            );
+            assert_eq!(
+                added.inserted,
+                vec!["r1".to_string(), "r3".to_string(), "r20".to_string()],
+                "{label}"
+            );
+            let kept = run
+                .original
+                .records(vec![held_id.clone()], true, true)
+                .unwrap();
+            assert_eq!(kept.len(), 1, "{label}: the replaced record is kept");
+            assert_eq!(kept[0].vector.as_ref(), Some(&vectors[2]), "{label}");
+            assert_eq!(kept[0].metadata, metadata_for(2), "{label}");
+
+            let twin = overwrite_collection(sparse);
+            add(&twin, (0..10).map(held).collect());
+            overwrite(&twin, batch(None));
+            let dir = TempDir::new();
+            let ours = Snapshot::take(&run.original, &dir.sub("ours.zdb"), &queries);
+            let theirs = Snapshot::take(&twin, &dir.sub("twin.zdb"), &queries);
+            assert_eq!(ours.diff(&theirs), Vec::<&str>::new(), "{label}");
+            if journaled {
+                run.prove(&queries, None);
+            }
+        }
+    }
+}
+
+/// An add with overwrite off that names an id the collection holds is
+/// refused at the door in the duplicate's words, and the record it names,
+/// the counter and the journal stay as they were for it, while a new record
+/// of the same batch goes in. The same add with overwrite on replaces the
+/// record.
+#[test]
+fn an_add_without_overwrite_refuses_a_held_id_and_keeps_its_record() {
+    let vectors = clustered(30, 4, 0x0208_b003);
+    let mut run = Run::new(overwrite_collection(false));
+    add(
+        &run.original,
+        (0..10).map(|i| record(i, &vectors)).collect(),
+    );
+    let counter = run.original.id_counter();
+    let journaled = run.recording.len();
+    let again = || ParsedRecord {
+        id: "r2".to_string(),
+        ..record(22, &vectors)
+    };
+
+    let added = run
+        .original
+        .add_records(vec![again(), record(20, &vectors)], vec![], false);
+    let words = Error::DuplicateId {
+        id: "r2".to_string(),
+    }
+    .to_string();
+    assert_eq!(added.total_errors, 1, "{:?}", added.errors);
+    assert!(added.errors[0].contains(&words), "{:?}", added.errors);
+    assert_eq!(added.inserted, vec!["r20".to_string()]);
+    let kept = run
+        .original
+        .records(vec!["r2".to_string()], true, true)
+        .unwrap();
+    assert_eq!(kept.len(), 1, "the held record is kept");
+    assert_eq!(kept[0].vector.as_ref(), Some(&vectors[2]));
+    assert_eq!(kept[0].metadata, metadata_for(2));
+    assert_eq!(run.original.len(), 11);
+    assert_eq!(
+        run.original.id_counter(),
+        counter + 1,
+        "only the new record took an id"
+    );
+    assert_eq!(
+        run.recording.len(),
+        journaled + 1,
+        "only the new record was journaled"
+    );
+
+    overwrite(&run.original, vec![again()]);
+    let replaced = run
+        .original
+        .records(vec!["r2".to_string()], true, true)
+        .unwrap();
+    assert_eq!(replaced[0].vector.as_ref(), Some(&vectors[22]));
+    assert_eq!(run.original.len(), 11);
+    run.checkpoint();
+}
+
+/// A recorded insert naming an id the id store could not name is refused
+/// before its id is issued, in the words the store gives, and the collection
+/// is as it was. Admission refuses such a record before it is recorded, so
+/// only a journal written elsewhere can hold one.
+#[test]
+fn apply_refuses_a_recorded_id_the_store_could_not_name() {
+    let collection = Collection::build(
+        Declaration::validate(4, "l2", 4, 50, 100, vec![]).unwrap(),
+        None,
+    );
+    let ceilings = Ceilings::lower(40, u64::MAX);
+    let refused = collection.apply(Operation::Insert {
+        id: "x".repeat(41),
+        internal_id: 1,
+        level: 0,
+        vector: vec![0.0; 4],
+        metadata: serde_json::Map::new(),
+        sparse: None,
+    });
+    drop(ceilings);
+    match refused {
+        Err(Error::Engine(message)) => assert_eq!(
+            message,
+            "an id of 41 bytes is longer than the id store can hold"
+        ),
+        other => panic!("expected the id store's refusal, got {other:?}"),
+    }
+    assert_eq!(collection.len(), 0);
+    assert_eq!(collection.id_counter(), 0);
+}
+
+/// A saved collection whose mappings name an id the id store could not name
+/// is refused at load, in the words the store gives, for the id's length
+/// and for its arena. The ceilings are lowered for the load alone, so the
+/// save writes what the collection holds, and under the store's own
+/// ceilings the same directory loads whole.
+#[test]
+fn a_load_refuses_a_mapped_id_the_store_could_not_name() {
+    let dir = TempDir::new();
+    let collection = Collection::build(
+        Declaration::validate(4, "l2", 4, 50, 100, vec![]).unwrap(),
+        None,
+    );
+    let named = |id: String, axis: usize| {
+        let mut vector = vec![0.0; 4];
+        vector[axis] = 1.0;
+        ParsedRecord {
+            id,
+            vector,
+            sparse: None,
+            metadata: HashMap::new(),
+        }
+    };
+    add(
+        &collection,
+        vec![named("short".to_string(), 0), named("x".repeat(41), 1)],
+    );
+    let path = dir.sub("named.zdb");
+    collection.save(&path).unwrap();
+    for (longest, arena, words) in [
+        (
+            40,
+            u64::MAX,
+            "an id of 41 bytes is longer than the id store can hold",
+        ),
+        (u64::MAX, 45, "the id store's text arena is full"),
+    ] {
+        let ceilings = Ceilings::lower(longest, arena);
+        let refused = Collection::load(&path);
+        drop(ceilings);
+        match refused {
+            Err(err) => assert!(err.to_string().contains(words), "{words}: {err}"),
+            Ok(_) => panic!("{words}: the load was not refused"),
+        }
+    }
+    assert_eq!(Collection::load(&path).unwrap().len(), 2);
+}
+
+// ============================================================================
 // APPLY'S CHECKS
 // ============================================================================
 

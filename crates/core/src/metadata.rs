@@ -199,8 +199,12 @@ impl MetadataStore {
     }
 
     /// Forget every record and every field name, keeping a reservation for
-    /// `expected_size` records.
+    /// `expected_size` records. What the store held is let go before the
+    /// reservation is made, so a clear never holds both.
     pub fn clear(&mut self, expected_size: usize) {
+        self.records = Vec::new();
+        self.names = Vec::new();
+        self.symbols = HashMap::new();
         *self = MetadataStore::new(expected_size);
     }
 
@@ -423,6 +427,24 @@ impl MetadataStore {
         let names = self.names.capacity() * std::mem::size_of::<String>()
             + self.names.iter().map(String::len).sum::<usize>();
         entries + blocks + names
+    }
+
+    /// Bytes of that request no record has been written into: the entries
+    /// past the positions assigned and the name list past its names, which
+    /// [`MetadataStore::shrink_to_fit`] gives back. A block is held at its
+    /// length and gives nothing.
+    pub fn reserved_bytes(&self) -> usize {
+        (self.records.capacity() - self.records.len()) * std::mem::size_of::<Option<Box<[Field]>>>()
+            + (self.names.capacity() - self.names.len()) * std::mem::size_of::<String>()
+    }
+
+    /// Give back what [`MetadataStore::reserved_bytes`] prices, reporting
+    /// the bytes released. No record moves.
+    pub fn shrink_to_fit(&mut self) -> usize {
+        let before = self.heap_bytes();
+        self.records.shrink_to_fit();
+        self.names.shrink_to_fit();
+        before - self.heap_bytes()
     }
 }
 
@@ -787,5 +809,48 @@ mod tests {
         let mut in_place = short();
         in_place.close_up(&[0, 2, 4], 2);
         assert!(store.layout() == in_place.layout());
+    }
+
+    /// What the store reserved and no record has been written into is what
+    /// `reserved_bytes` prices and what `shrink_to_fit` gives back, at the
+    /// declaration and past it, after which the store prices nothing and
+    /// reads every record as before. A clear holds a fresh store's
+    /// reservation and nothing else.
+    #[test]
+    fn the_unwritten_reservation_is_what_a_shrink_gives_back() {
+        let fields =
+            |slot: usize| record(&[("k", json!(slot)), (["a", "b", "c"][slot % 3], json!(true))]);
+        for (declared, records) in [(1_000usize, 10usize), (100, 3_000), (2_000_000, 500)] {
+            let mut store = MetadataStore::new(declared);
+            assert_eq!(
+                store.reserved_bytes(),
+                (declared + 1).min(RESERVE_CAP) * 16,
+                "{declared}: nothing is written"
+            );
+            for slot in 0..records {
+                store.insert(slot, fields(slot));
+            }
+            let priced = store.reserved_bytes();
+            let before = store.heap_bytes();
+            let released = store.shrink_to_fit();
+            assert_eq!(released, priced, "{declared}");
+            assert_eq!(store.heap_bytes(), before - released, "{declared}");
+            assert_eq!(store.reserved_bytes(), 0, "{declared}");
+            assert_eq!(store.shrink_to_fit(), 0, "{declared}");
+            for slot in 0..records {
+                assert_eq!(
+                    store.get(slot).unwrap().to_map(),
+                    fields(slot),
+                    "{declared}: {slot}"
+                );
+            }
+
+            store.clear(declared);
+            let fresh = MetadataStore::new(declared);
+            assert_eq!(store.heap_bytes(), fresh.heap_bytes(), "{declared}");
+            assert_eq!(store.reserved_bytes(), fresh.reserved_bytes());
+            assert_eq!(store.len(), 0);
+            assert!(store.key_table().is_empty());
+        }
     }
 }
