@@ -30,6 +30,7 @@ use crate::distance::{CosineDist, L1Dist, L2Dist};
 use crate::distance::{DistPQ, Int8Dist, Int8Metric, PqMetric};
 use crate::int8::Int8Codec;
 use crate::pq::PQ;
+use crate::space::Position;
 use crate::storage::FsDir;
 use std::sync::Arc;
 
@@ -319,8 +320,7 @@ fn the_mutable_memory_figure_is_exact() {
     expected += nodes * std::mem::size_of::<u32>();
     expected += nodes * std::mem::size_of::<u32>();
     expected += nodes;
-    // The inverse of the origin ids, one node index per internal id. The
-    // fixture inserts under ids zero upward, so it holds one slot per node.
+    // The position each node holds its record at, one per node.
     expected += nodes * std::mem::size_of::<u32>();
     // No vector. The store is a separate object and its bytes are its own; see
     // `VectorStore::memory_bytes`.
@@ -446,10 +446,7 @@ fn a_complete_graph_returns_an_exact_page_on_every_metric() {
         ),
     ] {
         assert_eq!(page.len(), 5, "{name} returned {} hits", page.len());
-        assert_eq!(
-            page[0].internal_id, 0,
-            "{name} did not find the query itself"
-        );
+        assert_eq!(page[0].position, 0, "{name} did not find the query itself");
         assert!(
             page[0].distance.abs() < 1e-5,
             "{name} scored the query against itself at {}",
@@ -462,7 +459,7 @@ fn a_complete_graph_returns_an_exact_page_on_every_metric() {
                 page.iter().map(|hit| hit.distance).collect::<Vec<_>>()
             );
         }
-        let mut ids: Vec<usize> = page.iter().map(|hit| hit.internal_id).collect();
+        let mut ids: Vec<usize> = page.iter().map(|hit| hit.position).collect();
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), page.len(), "{name} returned a record twice");
@@ -665,19 +662,21 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
     // cosine graph, encoded through the graph's own codec.
     let rows: Vec<Vec<i8>> = unit.iter().map(|v| graph.int8_encode(v).unwrap()).collect();
     assert!(rows.iter().all(|row| row.len() == DIM + 4));
-    // Internal ids from one, as the collection issues them.
-    let batch: Vec<(&[i8], usize)> = rows
+    // Internal ids from one, as the collection issues them, each record at
+    // its place among them, counting from zero. The first record is node
+    // zero.
+    let batch: Vec<(&[i8], usize, Position)> = rows
         .iter()
         .enumerate()
-        .map(|(i, c)| (c.as_slice(), i + 1))
+        .map(|(i, c)| (c.as_slice(), i + 1, Position::from_slot(i)))
         .collect();
     graph.insert_batch_int8(&batch).unwrap();
     assert_eq!(graph.nb_points(), N);
-    assert_eq!(graph.int8_codes_of(1), Some(codes[0].as_slice()));
-    assert_eq!(graph.int8_row_of(1), Some(rows[0].as_slice()));
-    assert_eq!(graph.int8_codes_of(N + 1), None);
-    assert!(graph.raw_vector(1).is_none());
-    assert!(graph.codes_of(1).is_none());
+    assert_eq!(graph.int8_codes_at(0), Some(codes[0].as_slice()));
+    assert_eq!(graph.int8_row_at(0), Some(rows[0].as_slice()));
+    assert_eq!(graph.int8_codes_at(N as u32), None);
+    assert!(graph.raw_vector_at(0).is_none());
+    assert!(graph.codes_at(0).is_none());
     assert_eq!(graph.int8_codec().unwrap().dim(), DIM);
     assert!(graph.open_raw_store(DIM, 1).is_err());
     assert!(graph.push_raw_vector(&unit[0]).is_err());
@@ -695,7 +694,7 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
                 .search(q, 10, 100, Some(&admits))
                 .unwrap()
                 .into_iter()
-                .map(|h| (h.internal_id, h.distance.to_bits()))
+                .map(|h| (h.position, h.distance.to_bits()))
                 .collect()
         })
         .collect();
@@ -706,13 +705,17 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
     let norm: f32 = twin.iter().map(|x| x * x).sum::<f32>().sqrt();
     let twin: Vec<f32> = twin.iter().map(|x| x / norm).collect();
     let nearest = graph.search(&twin, 1, 100, Some(&admits)).unwrap();
-    assert_eq!(nearest[0].internal_id, 8);
+    assert_eq!(nearest[0].position, 7);
 
     let dir = tempfile::tempdir().unwrap();
     graph.dump(&FsDir::new(dir.path()), DUMP_FILENAME).unwrap();
+    // The mappings hold every record, so each node comes back at the place
+    // its id holds among them, which is the position it was built at.
+    let held: Vec<u32> = (1..=N as u32).collect();
     let bounds = DumpBounds {
         min_nodes: N,
         max_origin_id: N,
+        positions: Some(&held),
     };
 
     // The raw reader refuses it on the element, and the wrong space on the
@@ -761,7 +764,10 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
     .unwrap();
     assert_eq!(nodes, N);
     assert!(restored.is_int8());
-    assert_eq!(restored.int8_row_of(1), Some(rows[0].as_slice()));
+    let first = (0..N as u32)
+        .find(|&node| restored.origin_id_at(node) == 1)
+        .expect("the first record has a node");
+    assert_eq!(restored.int8_row_at(first), Some(rows[0].as_slice()));
     let after: Vec<Vec<(usize, u32)>> = queries
         .iter()
         .map(|q| {
@@ -769,7 +775,7 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
                 .search(q, 10, 100, Some(&admits))
                 .unwrap()
                 .into_iter()
-                .map(|h| (h.internal_id, h.distance.to_bits()))
+                .map(|h| (h.position, h.distance.to_bits()))
                 .collect()
         })
         .collect();
@@ -1142,7 +1148,7 @@ fn the_reserved_bytes_are_what_a_shrink_releases() {
     let mut graph = VectorGraph::new_raw("l2", DIM, 8, 64, LAYERS, 100);
     for i in 0..2_000usize {
         let v: Vec<f32> = (0..DIM).map(|d| (i * DIM + d) as f32 * 0.001).collect();
-        graph.insert(&v, i);
+        graph.insert(&v, i, Position::from_slot(i));
     }
     let reserved = graph.links_reserved_bytes() + graph.raw_vectors_reserved_bytes();
     assert!(reserved > 0, "a build past its declaration holds no slack");
@@ -1177,7 +1183,7 @@ fn the_seam_reseeds_the_level_stream() {
             graph.set_level_seed(seed);
         }
         for (id, vector) in data.iter().enumerate() {
-            graph.insert(vector, id);
+            graph.insert(vector, id, Position::from_slot(id));
         }
         let dir = tempfile::tempdir().unwrap();
         graph.dump(&FsDir::new(dir.path()), DUMP_FILENAME).unwrap();
@@ -1223,13 +1229,13 @@ fn the_split_insertion_is_the_outright_insertion() {
     let mut split = fresh();
     let mut levels = Vec::with_capacity(data.len());
     for (id, vector) in data.iter().enumerate() {
-        outright.insert(vector, id);
+        outright.insert(vector, id, Position::from_slot(id));
         let level = split.draw_level();
         levels.push(level);
         let planned = split
             .plan_at_level(Record::Raw(vector), level)
             .expect("a raw vector belongs in a raw graph");
-        split.install(Record::Raw(vector), id, planned);
+        split.install(Record::Raw(vector), id, Position::from_slot(id), planned);
     }
     let outright = dump_of(&outright);
     assert_eq!(outright, dump_of(&split));
@@ -1239,7 +1245,7 @@ fn the_split_insertion_is_the_outright_insertion() {
         let planned = replayed
             .plan_at_level(Record::Raw(vector), level)
             .expect("a raw vector belongs in a raw graph");
-        replayed.install(Record::Raw(vector), id, planned);
+        replayed.install(Record::Raw(vector), id, Position::from_slot(id), planned);
     }
     assert_eq!(outright, dump_of(&replayed));
     assert!(
@@ -1297,8 +1303,8 @@ fn a_graph_reserved_after_it_is_built_holds_what_new_reserves() {
             let vector: Vec<f32> = (0..dim)
                 .map(|d| ((id * 31 + d * 7) % 97) as f32 * 0.01)
                 .collect();
-            later.insert(&vector, id + 1);
-            built.insert(&vector, id + 1);
+            later.insert(&vector, id + 1, Position::from_slot(id + 1));
+            built.insert(&vector, id + 1, Position::from_slot(id + 1));
         }
         assert_eq!(
             arrays(&later),

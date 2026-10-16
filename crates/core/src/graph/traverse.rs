@@ -56,9 +56,9 @@ pub(super) trait Topology {
     /// One node's stored vector.
     fn vector(&self, node: u32) -> &[Self::Elem];
 
-    /// The id the node was inserted under, which hits report and a filter is
-    /// asked about.
-    fn origin_id(&self, node: u32) -> usize;
+    /// The position of the record the node holds, which hits report and a
+    /// filter is asked about, and the empty marker for a stranded node.
+    fn position(&self, node: u32) -> usize;
 
     /// One node's neighbour list at one layer, empty where it has none.
     fn neighbours(&self, node: u32, layer: usize) -> &[u32];
@@ -314,10 +314,10 @@ where
     match filter {
         Some(admits) => {
             for point in &neighbours[..last] {
-                let origin_id = graph.origin_id(point.node);
-                if admits(&origin_id) {
+                let position = graph.position(point.node);
+                if admits(&position) {
                     hits.push(GraphHit {
-                        internal_id: origin_id,
+                        position,
                         distance: point.dist_to_ref,
                     });
                 }
@@ -326,7 +326,7 @@ where
         None => {
             for point in &neighbours[..last] {
                 hits.push(GraphHit {
-                    internal_id: graph.origin_id(point.node),
+                    position: graph.position(point.node),
                     distance: point.dist_to_ref,
                 });
             }
@@ -377,7 +377,7 @@ where
     });
     let entry_admitted = match filter {
         None => true,
-        Some(admits) => admits(&graph.origin_id(entry)),
+        Some(admits) => admits(&graph.position(entry)),
     };
     if entry_admitted {
         return_points.push(OrderedNode {
@@ -432,7 +432,7 @@ where
                     });
                     let admitted = match filter {
                         None => true,
-                        Some(admits) => admits(&graph.origin_id(e)),
+                        Some(admits) => admits(&graph.position(e)),
                     };
                     if admitted {
                         return_points.push(OrderedNode {

@@ -41,6 +41,7 @@
 //! | module | what it covers |
 //! |---|---|
 //! | `apply` | a journaled operation applied at the values its record names |
+//! | `close_up_tests` | the close-up built off to the side, against the one made in place and beside searches, counts and writes |
 //! | `construct` | building a collection and validating the declaration |
 //! | `crash_tests` | what a killed process leaves, and what opening it recovers |
 //! | `durability_tests` | the three policies, the interval thread, and what a failed commit leaves |
@@ -72,6 +73,8 @@
 //! attribute in it passes that constant.
 
 mod apply;
+#[cfg(test)]
+mod close_up_tests;
 mod construct;
 #[cfg(test)]
 mod crash_tests;
@@ -80,6 +83,8 @@ mod dense;
 mod durability_tests;
 #[cfg(test)]
 mod features_tests;
+#[cfg(test)]
+mod id_range_tests;
 #[cfg(test)]
 mod identity_tests;
 mod input;
@@ -90,10 +95,14 @@ mod int8_tests;
 mod journal_tests;
 #[cfg(test)]
 mod mutation_tests;
+#[cfg(test)]
+mod numbering_tests;
 mod page;
 mod persist;
 #[cfg(test)]
 mod persist_tests;
+#[cfg(test)]
+mod positions_tests;
 mod query;
 #[cfg(test)]
 mod query_tests;
@@ -112,7 +121,9 @@ pub use construct::Declaration;
 pub(crate) use construct::{
     validate_index_parameters, validate_space_supports_quantization, SparseDeclaration,
 };
-pub(crate) use dense::{DenseIndex, DenseOpen};
+pub(crate) use dense::{
+    read_internal_id, shifted_internal_id, DenseIndex, DenseOpen, DenseParts, PositionReader,
+};
 pub use insert::{Added, RebuildPlan};
 pub use page::{FieldRef, HitRef, QueryHits};
 pub use query::{
@@ -132,7 +143,8 @@ use std::sync::{Arc, OnceLock};
 use tracing::{trace, warn};
 use zeusdb_vector_core::{
     matches_filter, ColumnStore, Error, Filter, IdStore, Int8Codec, MetadataStore, Operation,
-    OperationKind, Persist, Selection, SpaceName, SparseVector, VectorGraph, VectorIndex, PQ,
+    OperationKind, Persist, Position, Selection, SpaceName, SparseVector, VectorGraph, VectorIndex,
+    PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{count_record_with, TermDictionary, Tokenizer, TokenizerConfig};
@@ -431,6 +443,24 @@ struct Lineage {
 /// layer count is refused on load, so this is part of the on-disk contract
 /// rather than a tuning knob.
 const MAX_LAYER: usize = zeusdb_vector_core::NB_LAYER_MAX as usize;
+
+/// The holes a collection keeps between close-ups whatever its size.
+///
+/// A removal leaves a hole at the position of the record it removes, which
+/// costs one entry in each per-record structure until the positions are
+/// closed up. A removal batch that leaves more holes than this and more than
+/// the records held closes them up once it has let its guards go and before
+/// the mutation returns, so after every mutation the holes number at most
+/// this or the records held, whichever is more.
+const HOLE_ALLOWANCE: usize = 4_096;
+
+// What `count` calls on this thread once it has made its selection and
+// before it walks, where a test set it. Nothing outside the tests sees it.
+#[cfg(test)]
+thread_local! {
+    static COUNT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageMode {
@@ -816,27 +846,14 @@ impl DenseSpace {
         }
     }
 
-    /// Install a replacement graph, and drop the old one outside the guard
+    /// Install a graph the loader rebuilt, and drop the old one outside the
+    /// guard, for the reason `Collection::replace_dense_graph` gives.
     ///
-    /// The three paths that replace the whole backend, `compact`, the
-    /// quantization rebuild and the persistence rebuild, all used to write
-    /// `*hnsw_guard = new_hnsw` directly. That assignment drops the old graph
-    /// while the write guard is still held, and dropping a graph is not a quiet
-    /// operation. `PointIndexation::drop` in the vendored crate clears each
-    /// layer with `into_par_iter().for_each(...)`, so the drop forks to rayon.
-    ///
-    /// A rayon fork under the graph's write guard deadlocks whenever the pool is
-    /// occupied by search tasks. `batch_search_parallel` fans a batch of more
-    /// than five queries across the pool and each task takes a read guard, so
-    /// once a writer is queued every worker blocks behind it. The fork then has
-    /// no worker to run on and the writer never reaches the point of releasing.
-    /// The rule is that no path forks to rayon while holding a write guard, and
-    /// this is a fork that rule is easy to miss on, because it is hidden inside
-    /// an assignment rather than written as a call.
-    ///
-    /// Moving the old value out and dropping it after the guard is released
-    /// keeps the swap to a pointer move under the guard. The replacement's
-    /// unit cost is timed before the guard is taken, for the same reason.
+    /// The loader files every record at consecutive positions from the
+    /// mappings before it rebuilds, and the rebuilt graph files each record
+    /// at the position it holds, so there is no hole to close and the index's
+    /// guard alone is taken. The metadata and the columns are restored after
+    /// the graph, so the structures do not agree until the load is done.
     pub(crate) fn replace_graph(&self, new_hnsw: VectorGraph) {
         let timed = DenseIndex::time_graph(&new_hnsw);
         let old = {
@@ -848,7 +865,7 @@ impl DenseSpace {
 
     /// Replace the whole index, which the loader does with the index it
     /// restored from a dump. The old graph is dropped outside the guard, for
-    /// the reason `replace_graph` gives.
+    /// the reason `Collection::replace_dense_graph` gives.
     ///
     /// `clear` swaps the index itself rather than calling this, because it has
     /// to empty the collection's live set and the index's under one
@@ -1036,15 +1053,15 @@ pub struct Collection {
     // Index-level metadata (simple, infrequently accessed)
     metadata: MutexAt<HashMap<String, String>>,
 
-    /// Every record's metadata, indexed by internal id. See
+    /// Every record's metadata, indexed by position. See
     /// [`MetadataStore`] for what a record with and without fields costs.
     vector_metadata: RwLockAt<MetadataStore>,
 
-    /// One column per field declared at `create()`, addressed by internal id.
+    /// One column per field declared at `create()`, addressed by position.
     ///
     /// **This is what a filtered search reads instead of walking every
     /// record.** A filter naming only declared fields compiles to a bitmap over
-    /// internal ids, which both the exact scan and the graph traversal consume,
+    /// positions, which both the exact scan and the graph traversal consume,
     /// and `vector_metadata` is then read only for the records the page
     /// returns. A filter naming an undeclared field cannot be answered here.
     /// Where the declared fields still bound which records could match, the
@@ -1069,15 +1086,16 @@ pub struct Collection {
     /// declaration asked for.
     undeclared_filter_warned: AtomicBool,
 
-    /// Every record's external id, held once, with the internal id it
+    /// Every record's external id, held once, with the position it
     /// resolves to and the live set as bits. The record set: every
     /// insertion path writes it, removal keys on it, and `len`, `contains`,
-    /// `list` and `count` all read it. See [`IdStore`].
+    /// `list` and `count` all read it. Its extent is the position the next
+    /// record takes. See [`IdStore`].
     ///
     /// **The live set is what a filtered search checks its selection
     /// against.** The dense index keeps its own copy, maintained on the same
     /// writes, and the traversal runs under that one; this one is what a
-    /// debug build checks it against, see [`Collection::live_sets_agree`].
+    /// debug build checks it against, see [`Collection::positions_agree`].
     /// It used to be two maps under two guards, one from the id to the
     /// internal id and one back, each holding its own copy of the text.
     ids: RwLockAt<IdStore>,
@@ -1089,14 +1107,15 @@ pub struct Collection {
     ///
     /// **Separate from `id_counter`, and it is not reset by `clear`.** It used
     /// to be the same counter, which meant two things at once. `clear` resets
-    /// `id_counter` deliberately, because the graph's id-to-node array is one
-    /// dense slot per internal id issued and an index cleared and refilled
-    /// repeatedly would grow it without bound. That reset handed out `vec_1` a
-    /// second time, so an external reference to the first record now named a
-    /// different one and nothing said so.
+    /// `id_counter` deliberately, because nothing is left for a reissued
+    /// internal id to collide with, and an index cleared and refilled
+    /// repeatedly would otherwise spend its internal ids up to
+    /// `MAX_INTERNAL_ID`. That reset handed out `vec_1` a second time, so an
+    /// external reference to the first record now named a different one and
+    /// nothing said so.
     ///
     /// Splitting them lets each keep the property it needs. `id_counter` still
-    /// resets, so the dense array still shrinks. This one never goes backwards,
+    /// resets, so the internal ids start again. This one never goes backwards,
     /// so a generated id is issued once in the life of an index and survives a
     /// save and load. See `config.json`'s `generated_ids`.
     ///
@@ -1123,7 +1142,9 @@ pub struct Collection {
     /// mutation of what a save writes is ordered against every other. An
     /// internal caller reaching a mutating helper is already inside the
     /// guard, so the helpers never take it and cannot deadlock against the
-    /// caller that owns it.
+    /// caller that owns it. An operation whose body may close the positions
+    /// up holds it through `insert::MutationGuard`, which drops what the
+    /// close-up replaced once the guard is let go.
     writers: MutexAt<()>,
 
     /// Where every mutation's record goes, once something is attached, and
@@ -1208,15 +1229,127 @@ impl Collection {
         }
     }
 
-    /// Whether the dense index's live set is the collection's, which every
-    /// write keeps true and a debug build checks at the points where the
-    /// two are read together.
+    /// Whether the positions, the records and the nodes agree across every
+    /// per-record structure, which every write keeps true and a debug build
+    /// checks after a close-up, a load and an applied record, and where
+    /// `compact` reads the structures together. `get_stats` checks all of it
+    /// but the bound on holes.
     ///
-    /// Taken in the declared order, the id store then the index.
-    pub(crate) fn live_sets_agree(&self) -> bool {
+    /// One walk over every position and every node. Every record held has
+    /// one position below the extent and none shares one. The id store, the
+    /// dense index's `node_at` and the column store hold one set of positions,
+    /// and the sparse space's live records lie inside it. Each position held
+    /// names a node that names it back, and their internal ids rise with the
+    /// positions. Every other node is stranded, and the flag the unfiltered
+    /// search reads says whether any is. A hole holds no metadata, no node and
+    /// no column entry. `node_at` and the id store reach the extent, every
+    /// other structure reaches no further, and the extent is within the
+    /// graph's nodes. The holes number at most [`HOLE_ALLOWANCE`] or the
+    /// records held, whichever is more. The id store's table names each
+    /// record held once, and the sparse space's keys are positions it holds,
+    /// each list in order.
+    ///
+    /// Taken in the declared order, the id store, the index, the sparse
+    /// index, the metadata, then the columns. The bound on holes holds once
+    /// every mutation is done, so this is the check for a caller holding
+    /// `writers`; a reader holding none asks
+    /// [`Collection::positions_agree_any_holes`].
+    pub(crate) fn positions_agree(&self) -> bool {
+        self.positions_agree_with(true)
+    }
+
+    /// [`Collection::positions_agree`] with the holes left unbounded, for a
+    /// reader that holds no `writers`, which `get_stats` is. A removal batch
+    /// lets its guards go before its close-up builds its copies, so such a
+    /// reader can land between the batch and the swap, where the holes pass
+    /// the bound by design. Every other check still holds there, since the
+    /// copies are made off to the side and swapped in whole.
+    pub(crate) fn positions_agree_any_holes(&self) -> bool {
+        self.positions_agree_with(false)
+    }
+
+    /// The walk both checks make, the bound on holes held where `bounded`.
+    fn positions_agree_with(&self, bounded: bool) -> bool {
         let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
-        ids.agrees_with(index.live_set()) && ids.len() == index.len()
+        let sparse = self.sparse().map(|space| space.index.read().unwrap());
+        let metadata = self.vector_metadata.read().unwrap();
+        let columns = self.columns.read().unwrap();
+        let extent = ids.extent();
+        let node_at = index.node_at();
+        let graph = index.graph();
+        if node_at.len() != extent
+            || metadata.extent() > extent
+            || columns.extent() > extent
+            || sparse
+                .as_ref()
+                .is_some_and(|sparse| sparse.extent() > extent)
+            || extent > graph.nb_points()
+            || extent >= 1 << 31
+        {
+            return false;
+        }
+        let mut held = 0usize;
+        let mut last_id: Option<usize> = None;
+        for (at, &node) in node_at.iter().enumerate() {
+            let named = ids.contains_slot(at);
+            if named != (node != Position::NONE) {
+                return false;
+            }
+            if columns.is_declared() && columns.holds(at) != named {
+                return false;
+            }
+            if !named {
+                if metadata.get(at).is_some() {
+                    return false;
+                }
+                continue;
+            }
+            held += 1;
+            if graph.record_of_at(node) != at as u32 {
+                return false;
+            }
+            let id = graph.origin_id_at(node);
+            if last_id.is_some_and(|last| id <= last) {
+                return false;
+            }
+            last_id = Some(id);
+        }
+        let sparse_within = sparse.as_ref().is_none_or(|sparse| {
+            sparse.keys_agree() && sparse.live_set().count_and(ids.live()) == sparse.len()
+        });
+        held == ids.len()
+            && held == index.len()
+            && (!bounded || extent - held <= HOLE_ALLOWANCE.max(held))
+            && ids.table_agrees()
+            && index.numbering_agrees()
+            && columns.tracks(held)
+            && sparse_within
+    }
+
+    /// Every record's internal id and external id, in increasing internal
+    /// id, which is position order. The internal id is the one the record's
+    /// node was inserted under, so this is what every artefact names the
+    /// record by.
+    #[cfg(test)]
+    pub(crate) fn internal_ids(&self) -> Vec<(usize, String)> {
+        let ids = self.ids.read().unwrap();
+        let index = self.dense().index.read().unwrap();
+        ids.iter()
+            .filter_map(|(at, id)| {
+                index
+                    .internal_id_at(at)
+                    .map(|internal| (internal, id.to_string()))
+            })
+            .collect()
+    }
+
+    /// The internal id the record under `id` holds, where it is held.
+    #[cfg(test)]
+    pub(crate) fn internal_id_of(&self, id: &str) -> Option<usize> {
+        let ids = self.ids.read().unwrap();
+        let index = self.dense().index.read().unwrap();
+        ids.slot_of(id).and_then(|at| index.internal_id_at(at))
     }
 
     /// Bring the dense index's live set into step with the id store, which
@@ -1524,6 +1657,24 @@ impl Collection {
         sink.append(operation.kind(), &payload)
     }
 
+    /// [`Collection::record`] for a record of `kind` the caller encodes
+    /// from borrowed parts, so nothing is cloned to build an operation. The
+    /// bytes are encoded only where a sink is attached.
+    fn record_encoded(
+        &self,
+        kind: OperationKind,
+        encode: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<(), Error> {
+        let mut slot = self.sink.lock().unwrap();
+        slot.refuse_if_faulted()?;
+        let Some(sink) = slot.attached.as_mut() else {
+            return Ok(());
+        };
+        let mut payload = Vec::new();
+        encode(&mut payload);
+        sink.append(kind, &payload)
+    }
+
     /// Hand one record's bytes, already encoded, to the sink, where one is
     /// attached. Refused with the fault while one stands.
     fn append_record(&self, kind: OperationKind, payload: &[u8]) -> Result<(), Error> {
@@ -1712,19 +1863,31 @@ impl Collection {
         // as a population count over the bitmap rather than a walk. Where
         // one field has no column the declared ones bound the candidates
         // and the metadata decides among them, which is the same count over
-        // fewer reads. The columns guard is released before the metadata
-        // guard is taken, since the selection owns its bitmap, and the store
-        // is indexed by the internal ids the bitmap holds, so nothing else
-        // is read. A removed record holds no entry, which is the liveness
-        // check.
-        let selection = {
-            let columns = self.columns.read().unwrap();
-            columns.select(conditions)
-        };
+        // fewer reads. The bound holds positions, and a close-up moves the
+        // records to other positions, so the bound is read in the metadata
+        // under the hold it was selected under: the metadata's guard first
+        // and the columns' second, which is the declared order and the
+        // order a search takes them in, both held from the selection to the
+        // end of the walk. A removed record holds no entry, which is the
+        // liveness check. The two other arms read no position under the
+        // columns' guard, so the exact count lets both guards go and the
+        // walk over every record holds the metadata's alone.
+        let vector_metadata = self.vector_metadata.read().unwrap();
+        let columns = self.columns.read().unwrap();
+        let selection = columns.select(conditions);
+        #[cfg(test)]
+        COUNT_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
         match selection {
-            Selection::Exact(selected) => selected.count(),
+            Selection::Exact(selected) => {
+                drop(columns);
+                drop(vector_metadata);
+                selected.count()
+            }
             Selection::Narrowed(bound, _) => {
-                let vector_metadata = self.vector_metadata.read().unwrap();
                 let mut counted = 0;
                 bound.for_each(|slot| {
                     if vector_metadata
@@ -1737,7 +1900,7 @@ impl Collection {
                 counted
             }
             Selection::Whole(_) => {
-                let vector_metadata = self.vector_metadata.read().unwrap();
+                drop(columns);
                 vector_metadata
                     .iter()
                     .filter(|(_, fields)| matches_filter(fields, conditions))
@@ -1785,9 +1948,7 @@ impl Collection {
         let index = self.dense().index.read().unwrap();
         let pq_codes = self.dense().pq_codes.read().unwrap();
         let vector_metadata = self.vector_metadata.read().unwrap();
-        let raws = crate::RawVectors {
-            graph: index.graph(),
-        };
+        let raws = index.raw_vectors();
 
         for id in ids {
             // The internal id, and whether the record exists in either storage
@@ -1817,7 +1978,7 @@ impl Collection {
                     } else {
                         // Case 3: a scalar row, decoded through the scales,
                         // and nothing where the record holds no vector data
-                        slot.and_then(|slot| index.graph().int8_reconstruct(slot))
+                        slot.and_then(|slot| index.int8_reconstruct(slot))
                     }
                 } else {
                     None

@@ -7,8 +7,9 @@
 //! vectors at the end of that rebuild, which is the single point where the mode
 //! does so.
 
+use super::insert::MutationGuard;
 use super::{Collection, QuantizationConfig, StorageMode, MAX_LAYER};
-use crate::{calibrate_rerank_from_sample, raw_distance_fn, RawVectors, RerankCalibration};
+use crate::{calibrate_rerank_from_sample, raw_distance_fn, RerankCalibration};
 use chrono::Utc;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -16,7 +17,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
-use zeusdb_vector_core::{Error, Int8Codec, Operation, SeededRng, VectorGraph, PQ};
+use zeusdb_vector_core::{Error, Int8Codec, Operation, Position, SeededRng, VectorGraph, PQ};
 
 /// The target every record this file emits carries. See the parent module.
 const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::training";
@@ -43,11 +44,11 @@ const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::training";
 const TRAINING_SAMPLE_SEED: u64 = 0x5A_EE_5D_B0_5E_ED_57_01;
 impl Collection {
     /// TRAINING TRIGGER: Uses threshold flag for race condition safety
-    #[instrument(target = LOG_TARGET, level = "info", skip(self), fields(
+    #[instrument(target = LOG_TARGET, level = "info", skip(self, writers), fields(
         threshold_reached = self.training_threshold_reached.load(Ordering::Acquire),
         has_quantization = self.has_quantization()
     ))]
-    pub(super) fn maybe_trigger_training(&self) -> Result<(), String> {
+    pub(super) fn maybe_trigger_training(&self, writers: &MutationGuard<'_>) -> Result<(), String> {
         // Check atomic flag first (fast path)
         if !self.training_threshold_reached.load(Ordering::Acquire) {
             return Ok(());
@@ -78,9 +79,9 @@ impl Collection {
         .map_err(|e| e.to_string())?;
         self.commit_records().map_err(|e| e.to_string())?;
         if config.is_int8() {
-            self.train_int8_from_ids(completed_at)
+            self.train_int8_from_ids(writers, completed_at)
         } else {
-            self.train_quantization_from_ids(completed_at)
+            self.train_quantization_from_ids(writers, completed_at)
         }
     }
 
@@ -93,11 +94,15 @@ impl Collection {
     /// recorded training hands the stamp that training took. Everything else
     /// training produces is a function of the records that reached the
     /// threshold, since every draw is seeded and every order is fixed.
-    #[instrument(target = LOG_TARGET, level = "info", skip(self, completed_at), fields(
+    #[instrument(target = LOG_TARGET, level = "info", skip(self, writers, completed_at), fields(
         has_pq = self.dense().pq.is_some(),
         has_config = self.dense().quantization_config.is_some()
     ))]
-    pub(super) fn train_quantization_from_ids(&self, completed_at: String) -> Result<(), String> {
+    pub(super) fn train_quantization_from_ids(
+        &self,
+        writers: &MutationGuard<'_>,
+        completed_at: String,
+    ) -> Result<(), String> {
         let start_time = Instant::now();
 
         let pq = self.dense().pq.as_ref().ok_or("PQ not available")?.clone();
@@ -172,7 +177,7 @@ impl Collection {
         );
         let rebuild_start = Instant::now();
         let rebuild_success = self
-            .rebuild_with_quantization_locked()
+            .rebuild_with_quantization_locked(writers)
             .map_err(|e| format!("Failed to rebuild with quantization: {}", e))?;
         let rebuild_duration = rebuild_start.elapsed();
 
@@ -212,9 +217,7 @@ impl Collection {
         let training_vectors = {
             let ids = self.ids.read().unwrap();
             let index = self.dense().index.read().unwrap();
-            let vectors = RawVectors {
-                graph: index.graph(),
-            };
+            let vectors = index.raw_vectors();
             let training_ids = self.training_ids.read().unwrap();
 
             // ADD EARLY CHECK:
@@ -307,8 +310,12 @@ impl Collection {
     /// rebuilt over every stored raw vector's row. There is no rerank
     /// calibration, since a scalar index keeps no raw vector to rerank
     /// against.
-    #[instrument(target = LOG_TARGET, level = "info", skip(self, completed_at))]
-    pub(super) fn train_int8_from_ids(&self, completed_at: String) -> Result<(), String> {
+    #[instrument(target = LOG_TARGET, level = "info", skip(self, writers, completed_at))]
+    pub(super) fn train_int8_from_ids(
+        &self,
+        writers: &MutationGuard<'_>,
+        completed_at: String,
+    ) -> Result<(), String> {
         let start_time = Instant::now();
         let config = self
             .dense()
@@ -366,7 +373,7 @@ impl Collection {
         );
         let rebuild_start = Instant::now();
         let rebuilt = self
-            .rebuild_with_int8_locked()
+            .rebuild_with_int8_locked(writers)
             .map_err(|e| format!("Failed to rebuild with quantization: {}", e))?;
         let rebuild_duration = rebuild_start.elapsed();
 
@@ -394,7 +401,10 @@ impl Collection {
     /// replacement's store and the raw vectors go with the graph that held
     /// them, which is the whole of how `quantized_only` sheds them. The
     /// values the encode clipped are added to the index's count.
-    pub(super) fn rebuild_with_int8_locked(&self) -> Result<bool, String> {
+    pub(super) fn rebuild_with_int8_locked(
+        &self,
+        writers: &MutationGuard<'_>,
+    ) -> Result<bool, String> {
         let start_time = Instant::now();
         let Some(codec) = self.dense().int8_codec().cloned() else {
             warn!(target: LOG_TARGET, operation = "rebuild_quantization",
@@ -413,9 +423,10 @@ impl Collection {
             codec.clone(),
         );
 
-        // Every live record's row, in internal id order so that two rebuilds
-        // of the same records wire the same graph, taken under the storage
-        // guards and released before the graph is built.
+        // Every live record's row, in position order, which is internal id
+        // order, so that two rebuilds of the same records wire the same graph,
+        // each with the internal id its node was inserted under, taken under
+        // the storage guards and released before the graph is built.
         let (rows, encoded, clipped, released) = {
             let ids = self.ids.read().unwrap();
             let old_index = self.dense().index.read().unwrap();
@@ -426,10 +437,13 @@ impl Collection {
             let mut encoded = 0usize;
             let mut clipped = 0u64;
             let mut missing = 0usize;
-            for internal_id in live {
-                if let Some(row) = old_hnsw.int8_row_of(internal_id) {
+            let origin_ids = old_hnsw.origin_ids();
+            for at in live {
+                let node = old_index.node_of(Position::from_slot(at));
+                let internal_id = node.map_or(0, |node| origin_ids[node as usize]);
+                if let Some(row) = node.and_then(|node| old_hnsw.int8_row_at(node)) {
                     rows.push((row.to_vec(), internal_id));
-                } else if let Some(vector) = old_hnsw.raw_vector(internal_id) {
+                } else if let Some(vector) = node.and_then(|node| old_hnsw.raw_vector_at(node)) {
                     let row = new_hnsw.int8_encode(vector)?;
                     clipped += codec.saturated(vector) as u64;
                     rows.push((row, internal_id));
@@ -451,10 +465,16 @@ impl Collection {
             (rows, encoded, clipped, old_hnsw.raw_count())
         };
 
+        // Every record held has a row, so the row at index `k` is the record
+        // at the `k`th position held, which is the position the close-up
+        // installing the graph moves it to.
         if !rows.is_empty() {
-            let batch: Vec<(&[i8], usize)> = rows
+            let batch: Vec<(&[i8], usize, Position)> = rows
                 .iter()
-                .map(|(row, internal_id)| (row.as_slice(), *internal_id))
+                .enumerate()
+                .map(|(k, (row, internal_id))| {
+                    (row.as_slice(), *internal_id, Position::from_slot(k))
+                })
                 .collect();
             new_hnsw.insert_batch_int8(&batch).map_err(|e| {
                 error!(target: LOG_TARGET, operation = "int8_rebuild", error = %e, "Failed to insert scalar rows");
@@ -463,9 +483,9 @@ impl Collection {
         }
 
         // Built in full before it is installed, and the old graph dropped
-        // outside the guard; see `replace_graph`. The clipped count is
+        // outside the guards; see `replace_dense_graph`. The clipped count is
         // added once the index holds the graph the rows are in.
-        self.dense().replace_graph(new_hnsw);
+        self.replace_dense_graph(writers, new_hnsw);
         if clipped > 0 {
             self.dense().index.read().unwrap().add_saturated(clipped);
         }
@@ -512,9 +532,12 @@ impl Collection {
     /// Errors are `String`, which `rebuild_with_quantization` turns into the
     /// `Error::Engine` the binding raises as the `RuntimeError` it always
     /// raised, and the training path formats into its own message.
-    pub(super) fn rebuild_with_quantization_locked(&self) -> Result<bool, String> {
+    pub(super) fn rebuild_with_quantization_locked(
+        &self,
+        writers: &MutationGuard<'_>,
+    ) -> Result<bool, String> {
         if self.dense().declares_int8() {
-            return self.rebuild_with_int8_locked();
+            return self.rebuild_with_int8_locked(writers);
         }
 
         let start_time = Instant::now();
@@ -549,19 +572,16 @@ impl Collection {
         let (vector_count, retained) = {
             let ids = self.ids.read().unwrap();
             let index = self.dense().index.read().unwrap();
-            let hnsw = index.graph();
-            let vectors = RawVectors { graph: hnsw };
+            let vectors = index.raw_vectors();
 
-            // Every live record that still has a raw vector, in internal id
-            // order, which is the order the store walks in. The order is
-            // fixed rather than a hash map's, because the codes are written
-            // back under it and a rebuild has to be a function of the data
-            // alone.
+            // Every live record that still has a raw vector, in position
+            // order, which is internal id order and the order the store walks
+            // in. The order is fixed rather than a hash map's, because the
+            // codes are written back under it and a rebuild has to be a
+            // function of the data alone.
             let with_raw: Vec<(&str, &[f32])> = ids
                 .iter()
-                .filter_map(|(internal_id, id)| {
-                    hnsw.raw_vector(internal_id).map(|vector| (id, vector))
-                })
+                .filter_map(|(at, id)| vectors.get(at).map(|vector| (id, vector)))
                 .collect();
 
             if with_raw.is_empty() {
@@ -619,26 +639,31 @@ impl Collection {
 
         // The codes are copied out so the graph is built with no lock held at
         // all, which keeps the storage guards free while the insertions run.
-        // Copying costs one byte per subvector per record.
-        let batch_data: Vec<(Vec<u8>, usize)> = {
+        // Copying costs one byte per subvector per record. Each carries the
+        // record's position and the internal id its node was inserted under.
+        let batch_data: Vec<(Vec<u8>, usize, usize)> = {
             let ids = self.ids.read().unwrap();
+            let old_index = self.dense().index.read().unwrap();
             let pq_codes = self.dense().pq_codes.read().unwrap();
+            let internal = old_index.ids_by_position();
             pq_codes
                 .iter()
                 .filter_map(|(id, codes)| {
-                    ids.slot_of(id)
-                        .map(|internal_id| (codes.clone(), internal_id))
+                    let at = ids.slot_of(id)?;
+                    let internal_id = internal.get(at)?;
+                    Some((codes.clone(), at, internal_id))
                 })
                 .collect()
         };
 
-        // Internal id order, which is arrival order, rather than the order a
-        // hash map hands its entries out. The level generator is seeded and the
-        // codebook is trained under a seed, so insertion order was the one
-        // remaining draw deciding how this graph is wired. `compact` and the
-        // persistence rebuild already sort for the same reason.
+        // Position order, which is internal id order and arrival order,
+        // rather than the order a hash map hands its entries out. The level
+        // generator is seeded and the codebook is trained under a seed, so
+        // insertion order was the one remaining draw deciding how this graph
+        // is wired. `compact` and the persistence rebuild take the same order
+        // for the same reason.
         let mut batch_data = batch_data;
-        batch_data.sort_unstable_by_key(|&(_, internal_id)| internal_id);
+        batch_data.sort_unstable_by_key(|&(_, at, _)| at);
 
         let mut new_hnsw = VectorGraph::new_pq(
             &self.dense().metric,
@@ -649,16 +674,37 @@ impl Collection {
             pq.clone(),
         );
 
+        // Each record at its place among the records held, counting from
+        // zero, which is the position the close-up installing the graph moves
+        // it to. A held record the codes did not reach is refused below.
         if !batch_data.is_empty() {
-            let batch: Vec<(&Vec<u8>, usize)> = batch_data
+            let batch: Vec<(&Vec<u8>, usize, Position)> = batch_data
                 .iter()
-                .map(|(codes, internal_id)| (codes, *internal_id))
+                .enumerate()
+                .map(|(k, (codes, _, internal_id))| (codes, *internal_id, Position::from_slot(k)))
                 .collect();
             new_hnsw.insert_batch_pq(&batch)
                 .map_err(|e| {
                     error!(target: LOG_TARGET, operation = "quantization_rebuild", error = %e, "Failed to insert quantized vectors");
                     format!("Failed to insert quantized vectors: {}", e)
                 })?;
+        }
+
+        // Every record the index holds takes a node, so a held record the
+        // codes did not reach refuses the rebuild before anything is swapped,
+        // rather than leaving it outside the graph.
+        let held = self.ids.read().unwrap().len();
+        if new_hnsw.nb_points() != held {
+            error!(target: LOG_TARGET, operation = "quantization_rebuild",
+                nodes = new_hnsw.nb_points(),
+                held_records = held,
+                "Refusing the rebuild, some held records have no codes"
+            );
+            return Err(format!(
+                "the quantized rebuild built {} nodes for the {} records the index holds",
+                new_hnsw.nb_points(),
+                held
+            ));
         }
 
         // The raw vectors survive the transition, where the storage mode keeps
@@ -683,8 +729,14 @@ impl Collection {
             let old_hnsw = old_index.graph();
             let held = old_hnsw.raw_count();
             if keeps_raw && old_hnsw.holds_raw() {
+                // Each record's raw vector from the node it held in the graph
+                // being replaced, by the position the replacement files it at.
+                let source: Vec<u32> = batch_data
+                    .iter()
+                    .map(|&(_, at, _)| old_index.node_at()[at])
+                    .collect();
                 new_hnsw
-                    .adopt_raw_from(old_hnsw, self.dense().dim)
+                    .adopt_raw_from(old_hnsw, &source, self.dense().dim)
                     .map_err(|e| format!("Failed to carry the raw vectors over: {}", e))?;
                 // The store that carries them is opened at the number of
                 // records present now, which is the training sample, and the
@@ -708,9 +760,9 @@ impl Collection {
         // partly filled one. It used to see the empty new graph for as long as
         // the insertions took.
         //
-        // The old graph is moved out and dropped after the guard is released.
-        // See `replace_graph`.
-        self.dense().replace_graph(new_hnsw);
+        // The old graph is moved out and dropped after the guards are released.
+        // See `replace_dense_graph`.
+        self.replace_dense_graph(writers, new_hnsw);
         let released = if vector_count > 0 && !keeps_raw {
             released
         } else {
@@ -745,10 +797,10 @@ impl Collection {
     /// turns out to rebuild, since a replay of the record decides that the
     /// same way.
     pub fn rebuild_with_quantization(&self) -> Result<bool, Error> {
-        let _writers = self.writers.lock().unwrap();
+        let writers = self.hold_writers();
         self.record(|| Operation::RebuildQuantized)?;
         self.commit_records()?;
-        self.rebuild_with_quantization_locked()
+        self.rebuild_with_quantization_locked(&writers)
             .map_err(Error::Engine)
     }
 

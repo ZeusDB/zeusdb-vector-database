@@ -746,6 +746,33 @@ impl Error {
             | NotJournaled => Exception::Runtime,
         }
     }
+
+    /// What a replay's refusal says refused the record, as whole sentences
+    /// that end in a full stop. A record that does not belong gives its first
+    /// sentence alone, since the refusal's own last sentence says what was
+    /// applied, and any other error gives its words with a full stop added
+    /// where they end without one.
+    pub fn replay_detail(&self) -> String {
+        match self {
+            Error::JournalReplayMismatch { detail } => mismatch_sentence(detail),
+            other => {
+                let mut words = other.to_string();
+                if !words.ends_with(['.', '!', '?']) {
+                    words.push('.');
+                }
+                words
+            }
+        }
+    }
+}
+
+/// The first sentence of a refusal for a record that does not belong to the
+/// checkpoint it is replayed onto.
+fn mismatch_sentence(detail: &str) -> String {
+    format!(
+        "The journal and the checkpoint do not belong together: {}.",
+        detail
+    )
 }
 
 /// Names quoted and joined as a sentence lists them, being `'a'`, `'a' and
@@ -1293,9 +1320,8 @@ impl fmt::Display for Error {
             ),
             JournalReplayMismatch { detail } => write!(
                 f,
-                "The journal and the checkpoint do not belong together: {}. Nothing from this \
-                 record on was applied.",
-                detail
+                "{} Nothing from this record on was applied.",
+                mismatch_sentence(detail)
             ),
             JournalDirectoryMismatch { journal, target } => write!(
                 f,

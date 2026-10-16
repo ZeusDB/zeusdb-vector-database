@@ -10,7 +10,7 @@
 //! cost 0.3 to 1.2. The walk is 73 to 100 percent of a filtered search, and a
 //! column per field was measured walking 224 times faster.
 //!
-//! A column here is addressed by internal id, so the same bitmap answers both
+//! A column here is addressed by position, so the same bitmap answers both
 //! paths a filtered search can take. The exact scan reads the set bits and
 //! scores those records. The graph traversal tests one bit per node it reaches,
 //! in place of the node, id store, `vector_metadata`, field lookup chain that
@@ -49,6 +49,7 @@
 //! A disjunction with an undeclared branch is the last of those, since that
 //! branch could match anything and a union with the live set is the live set.
 
+use crate::bitmap::Bitmap;
 use crate::error::Error;
 use crate::filter::{field_test_matches, FieldLookup, FieldTest, Filter, Presence};
 use serde_json::Value;
@@ -78,163 +79,22 @@ const ABSENT: u32 = u32::MAX;
 /// column no filter can ever reach.
 const GROUP_KEYS: [&str; 3] = ["$and", "$or", "$not"];
 
-// ============================================================================
-// THE BITMAP
-// ============================================================================
+/// The most slots a column and the live set reserve at creation, whatever
+/// the declaration, which is the cap the id store and the metadata store
+/// put on theirs. Past it a reservation grows with the records written.
+const RESERVE_CAP: usize = 1 << 20;
 
-/// A set of internal ids, one bit each.
-///
-/// Sized to the store's slot count rather than to the record count, because a
-/// slot is an internal id and internal ids are never reused. At 100,000 records
-/// that is 12.5 kilobytes, so a filter of a dozen leaves allocates less than
-/// the page it returns.
-#[derive(Clone, Default)]
-pub struct Bitmap {
-    words: Vec<u64>,
-}
-
-impl Bitmap {
-    fn zeros(slots: usize) -> Self {
-        Bitmap {
-            words: vec![0; slots.div_ceil(64)],
-        }
-    }
-
-    /// An empty set whose words already reach `slots`, so a test of any id
-    /// below that reads a word rather than falling off the end. What a
-    /// measurement of the bit test's cost wants, since the set that admits
-    /// nothing and holds no words answers without a read.
-    pub fn with_slots(slots: usize) -> Self {
-        Self::zeros(slots)
-    }
-
-    #[inline]
-    fn set(&mut self, slot: usize) {
-        self.words[slot >> 6] |= 1u64 << (slot & 63);
-    }
-
-    /// Put an internal id in the set, growing the words to reach it.
-    ///
-    /// The three methods below are what a set maintained beside a map needs,
-    /// being the live record set the collection keeps under its reverse map.
-    /// The columns never call them: every bitmap a column builds is sized to
-    /// the store at once by [`Bitmap::zeros`] and filled by [`Bitmap::set`].
-    pub fn insert(&mut self, slot: usize) {
-        let index = slot >> 6;
-        if index >= self.words.len() {
-            self.words.resize(index + 1, 0);
-        }
-        self.words[index] |= 1u64 << (slot & 63);
-    }
-
-    /// Take an internal id out of the set. An id beyond the words was never in
-    /// it, so there is nothing to clear.
-    pub fn remove(&mut self, slot: usize) {
-        if let Some(word) = self.words.get_mut(slot >> 6) {
-            *word &= !(1u64 << (slot & 63));
-        }
-    }
-
-    /// Empty the set, keeping its allocation for the ids about to refill it.
-    pub fn clear(&mut self) {
-        self.words.iter_mut().for_each(|word| *word = 0);
-    }
-
-    /// Whether an internal id is in the set.
-    ///
-    /// Total over every `usize`, so the traversal predicate can ask it about a
-    /// node the store has never heard of and get `false` rather than a panic.
-    #[inline]
-    pub fn contains(&self, slot: usize) -> bool {
-        self.words
-            .get(slot >> 6)
-            .is_some_and(|word| word >> (slot & 63) & 1 == 1)
-    }
-
-    pub fn count(&self) -> usize {
-        self.words.iter().map(|w| w.count_ones() as usize).sum()
-    }
-
-    /// How many internal ids are in both sets, by a walk over the shorter
-    /// word range. A postings index counts the records a filter admits
-    /// among those it holds with this, rather than by testing each admitted
-    /// id.
-    pub fn count_and(&self, other: &Bitmap) -> usize {
-        self.words
-            .iter()
-            .zip(&other.words)
-            .map(|(mine, theirs)| (mine & theirs).count_ones() as usize)
-            .sum()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.words.iter().all(|word| *word == 0)
-    }
-
-    fn intersect(&mut self, other: &Bitmap) {
-        for (mine, theirs) in self.words.iter_mut().zip(&other.words) {
-            *mine &= *theirs;
-        }
-    }
-
-    fn union(&mut self, other: &Bitmap) {
-        for (mine, theirs) in self.words.iter_mut().zip(&other.words) {
-            *mine |= *theirs;
-        }
-    }
-
-    /// `live` without `self`.
-    ///
-    /// The complement is taken within the live set rather than over the whole
-    /// word range, so a `$not` never selects a slot that holds no record. Every
-    /// other bitmap here is already a subset of the live set, because a slot
-    /// with no record carries [`ABSENT`] in every column and no leaf matches
-    /// that.
-    fn complement_within(&self, live: &Bitmap) -> Bitmap {
-        let mut out = Bitmap {
-            words: vec![0; self.words.len()],
-        };
-        for (index, word) in out.words.iter_mut().enumerate() {
-            *word = live.words.get(index).copied().unwrap_or(0) & !self.words[index];
-        }
-        out
-    }
-
-    /// Every internal id in the set, in increasing order.
-    pub fn for_each<F: FnMut(usize)>(&self, mut visit: F) {
-        self.for_each_while(|slot| {
-            visit(slot);
-            true
-        });
-    }
-
-    /// The same walk, stopping at the first slot the visitor declines.
-    ///
-    /// The bounded scan needs it. That scan gives up once too many records have
-    /// matched, and a bound holding every slot in the store would otherwise be
-    /// walked to the end after the give-up had already been decided.
-    pub fn for_each_while<F: FnMut(usize) -> bool>(&self, mut visit: F) {
-        for (index, mut word) in self.words.iter().copied().enumerate() {
-            while word != 0 {
-                if !visit(index * 64 + word.trailing_zeros() as usize) {
-                    return;
-                }
-                word &= word - 1;
-            }
-        }
-    }
-
-    /// Bytes the words ask the allocator for.
-    pub fn heap_bytes(&self) -> usize {
-        self.words.capacity() * 8
-    }
+/// Slots a column and the live set reserve for `expected_size` records: one
+/// more than the declaration, under the cap.
+fn reserved_slots(expected_size: usize) -> usize {
+    expected_size.min(RESERVE_CAP - 1) + 1
 }
 
 // ============================================================================
 // ONE COLUMN
 // ============================================================================
 
-/// One declared field's values, addressed by internal id.
+/// One declared field's values, addressed by position.
 ///
 /// Two representations, chosen by cardinality and never by declaration. A
 /// column starts as a dictionary and is traded for a plain one the first time
@@ -268,9 +128,11 @@ enum Column {
 }
 
 impl Column {
-    fn new(expected_size: usize) -> Self {
+    /// An empty column reserving `reserved` slots, from
+    /// [`reserved_slots`].
+    fn new(reserved: usize) -> Self {
         Column::Dictionary {
-            codes: Vec::with_capacity(expected_size.saturating_add(1)),
+            codes: Vec::with_capacity(reserved),
             dict: Vec::new(),
             refs: Vec::new(),
             free: Vec::new(),
@@ -364,6 +226,105 @@ impl Column {
         *self = Column::Plain { values };
     }
 
+    /// Move the value of every record held to the front, keeping their order,
+    /// so the slot at `old_of_new[k]` is at `k` and the column reaches no
+    /// further than the records held. A hole holds no value and its code was
+    /// released when the record went, so no count moves. The column then
+    /// gives back what it holds past the records or `reserved` slots,
+    /// whichever is more. Kept for the tests that hold
+    /// [`Column::closed_up`] to it.
+    #[cfg(any(test, feature = "test-support"))]
+    fn close_up(&mut self, old_of_new: &[u32], reserved: usize) {
+        let kept = old_of_new.len().max(reserved);
+        match self {
+            Column::Plain { values } => {
+                for (k, &old) in old_of_new.iter().enumerate() {
+                    let value = values.get_mut(old as usize).and_then(Option::take);
+                    values[k] = value;
+                }
+                values.truncate(old_of_new.len());
+                values.shrink_to(kept);
+            }
+            Column::Dictionary { codes, .. } => {
+                for (k, &old) in old_of_new.iter().enumerate() {
+                    codes[k] = codes[old as usize];
+                }
+                codes.truncate(old_of_new.len());
+                codes.shrink_to(kept);
+            }
+        }
+    }
+
+    /// The codes or the values [`Column::close_up`] leaves, built from this
+    /// column and leaving it as it is: the slot at `old_of_new[k]` copied to
+    /// `k`, in a vector that keeps what the column's holds, or the records
+    /// or `reserved` slots where that is less. A plain column's values are
+    /// copied, so both copies exist until the caller drops the old ones.
+    /// The dictionary, its counts and its lookup do not change at a
+    /// close-up and are not copied.
+    fn closed_up(&self, old_of_new: &[u32], reserved: usize) -> Cells {
+        let kept = old_of_new.len().max(reserved);
+        match self {
+            Column::Plain { values } => {
+                let mut moved = Vec::with_capacity(values.capacity().min(kept));
+                moved.extend(
+                    old_of_new
+                        .iter()
+                        .map(|&old| values.get(old as usize).cloned().flatten()),
+                );
+                Cells::Values(moved)
+            }
+            Column::Dictionary { codes, .. } => {
+                let mut moved = Vec::with_capacity(codes.capacity().min(kept));
+                moved.extend(old_of_new.iter().map(|&old| codes[old as usize]));
+                Cells::Codes(moved)
+            }
+        }
+    }
+
+    /// Trade this column's codes or values for `cells`, which
+    /// [`Column::closed_up`] built from it. A column keeps its form between
+    /// the two, since only a write trades a dictionary for a plain column
+    /// and the writers are kept out from the one to the other.
+    fn swap_cells(&mut self, cells: &mut Cells) {
+        match (self, cells) {
+            (Column::Plain { values }, Cells::Values(moved)) => std::mem::swap(values, moved),
+            (Column::Dictionary { codes, .. }, Cells::Codes(moved)) => std::mem::swap(codes, moved),
+            _ => unreachable!("a column keeps its form from its close-up's copy to the swap"),
+        }
+    }
+
+    /// Every part of the column, each with its capacity, for
+    /// [`ColumnStore::layout`].
+    #[cfg(any(test, feature = "test-support"))]
+    fn layout(&self) -> Vec<(&'static str, usize, String)> {
+        match self {
+            Column::Plain { values } => {
+                let shown: Vec<Option<String>> = values
+                    .iter()
+                    .map(|value| value.as_ref().map(Value::to_string))
+                    .collect();
+                vec![("values", values.capacity(), format!("{shown:?}"))]
+            }
+            Column::Dictionary {
+                codes,
+                dict,
+                refs,
+                free,
+                lookup,
+            } => {
+                let shown: Vec<String> = dict.iter().map(Value::to_string).collect();
+                vec![
+                    ("codes", codes.capacity(), format!("{codes:?}")),
+                    ("dict", dict.capacity(), format!("{shown:?}")),
+                    ("refs", refs.capacity(), format!("{refs:?}")),
+                    ("free", free.capacity(), format!("{free:?}")),
+                    ("lookup", lookup.capacity(), lookup.len().to_string()),
+                ]
+            }
+        }
+    }
+
     /// What this slot holds, for the debug assertion that ties a column to a
     /// record.
     fn read(&self, slot: usize) -> Option<&Value> {
@@ -376,7 +337,7 @@ impl Column {
         }
     }
 
-    /// One leaf of a filter, as the set of internal ids whose value matches.
+    /// One leaf of a filter, as the set of positions whose value matches.
     fn select(&self, test: &FieldTest, slots: usize) -> Bitmap {
         let mut out = Bitmap::zeros(slots);
         match self {
@@ -407,11 +368,11 @@ impl Column {
                 if !any {
                     return out;
                 }
-                for (slot, &code) in codes.iter().enumerate().take(slots) {
-                    if code != ABSENT && matching[code as usize] {
-                        out.set(slot);
-                    }
-                }
+                // A code below the dictionary's length names a value, and
+                // `ABSENT` is past it, so one test serves both.
+                put_by_slots(&codes[..codes.len().min(slots)], &mut out.words, |code| {
+                    matching.get(code as usize) == Some(&true)
+                });
             }
         }
         out
@@ -465,6 +426,79 @@ impl Column {
                     + lookup.capacity() * (std::mem::size_of::<Value>() + 4 + 8)
                     + dict.iter().map(value_payload).sum::<usize>() * 2
             }
+        }
+    }
+
+    /// Bytes of that request no slot or value has been written into, being
+    /// each vector's capacity past its length, which
+    /// [`Column::shrink_to_fit`] gives back. The lookup table gives nothing,
+    /// since it is sized from the values it holds.
+    fn reserved_bytes(&self) -> usize {
+        match self {
+            Column::Plain { values } => {
+                (values.capacity() - values.len()) * std::mem::size_of::<Option<Value>>()
+            }
+            Column::Dictionary {
+                codes,
+                dict,
+                refs,
+                free,
+                ..
+            } => {
+                (codes.capacity() - codes.len()) * 4
+                    + (dict.capacity() - dict.len()) * std::mem::size_of::<Value>()
+                    + (refs.capacity() - refs.len()) * 4
+                    + (free.capacity() - free.len()) * 4
+            }
+        }
+    }
+
+    /// Give back what [`Column::reserved_bytes`] prices. No slot moves.
+    fn shrink_to_fit(&mut self) {
+        match self {
+            Column::Plain { values } => values.shrink_to_fit(),
+            Column::Dictionary {
+                codes,
+                dict,
+                refs,
+                free,
+                ..
+            } => {
+                codes.shrink_to_fit();
+                dict.shrink_to_fit();
+                refs.shrink_to_fit();
+                free.shrink_to_fit();
+            }
+        }
+    }
+}
+
+/// One column's part of a close-up built off to the side, in the form the
+/// column holds.
+enum Cells {
+    Codes(Vec<u32>),
+    Values(Vec<Option<Value>>),
+}
+
+/// What a close-up replaces in a column store, built off to the side by
+/// [`ColumnStore::closed_up`] and swapped in by [`ColumnStore::swap_parts`]:
+/// every column's codes or values, the live set and the extent. The swap
+/// trades the parts with the store's own, so once it has run the value holds
+/// the store's old parts, for the caller to drop with no guard held.
+pub struct ColumnParts {
+    cells: Vec<Cells>,
+    live: Bitmap,
+    slots: usize,
+}
+
+/// Set in `words` the bit of each slot whose code in `codes` `takes`
+/// accepts. `words` holds no bit and reaches every slot of `codes`. `takes`
+/// never accepts [`ABSENT`], the code of a slot no record occupies.
+#[inline(never)]
+fn put_by_slots(codes: &[u32], words: &mut [u64], takes: impl Fn(u32) -> bool) {
+    for (slot, &code) in codes.iter().enumerate() {
+        if takes(code) {
+            words[slot >> 6] |= 1 << (slot & 63);
         }
     }
 }
@@ -661,22 +695,24 @@ pub struct ColumnStore {
     names: Vec<String>,
     columns: Vec<Column>,
     index_of: HashMap<String, usize>,
-    /// One bit per internal id, set while a record occupies the slot.
+    /// One bit per position, set while a record occupies the slot.
     ///
     /// It exists for `$not`, which is the only shape that has to name the
     /// records a filter does not select. Every other bitmap is a subset of this
     /// one by construction.
     live: Bitmap,
-    /// Highest occupied internal id plus one, which is how far any walk goes.
+    /// Highest position written since the last close-up plus one, which is
+    /// how far any walk goes.
     slots: usize,
     records: usize,
 }
 
 impl ColumnStore {
-    /// A store for the declared fields, with each column reserved for the
-    /// declared size.
+    /// A store for the declared fields, with each column and the live set
+    /// reserved for the declared size, under the cap.
     pub fn new(names: Vec<String>, expected_size: usize) -> Self {
-        let columns = names.iter().map(|_| Column::new(expected_size)).collect();
+        let reserved = reserved_slots(expected_size);
+        let columns = names.iter().map(|_| Column::new(reserved)).collect();
         let index_of = names
             .iter()
             .enumerate()
@@ -686,7 +722,7 @@ impl ColumnStore {
             names,
             columns,
             index_of,
-            live: Bitmap::zeros(expected_size.saturating_add(1)),
+            live: Bitmap::zeros(reserved),
             slots: 0,
             records: 0,
         }
@@ -728,7 +764,7 @@ impl ColumnStore {
         }
     }
 
-    /// Forget the record at one internal id.
+    /// Forget the record at one position.
     pub fn erase(&mut self, slot: usize) {
         if self.names.is_empty() || !self.live.contains(slot) {
             return;
@@ -740,10 +776,111 @@ impl ColumnStore {
         self.records -= 1;
     }
 
-    /// Drop every record, keeping the declaration.
+    /// Drop every record, keeping the declaration and the table that finds a
+    /// field's column. Every column and the live set are let go before the
+    /// reservation is made again, so a clear never holds both.
     pub fn clear(&mut self, expected_size: usize) {
-        let names = std::mem::take(&mut self.names);
-        *self = ColumnStore::new(names, expected_size);
+        let reserved = reserved_slots(expected_size);
+        self.columns.clear();
+        self.live = Bitmap::default();
+        self.columns
+            .extend(self.names.iter().map(|_| Column::new(reserved)));
+        self.live = Bitmap::zeros(reserved);
+        self.slots = 0;
+        self.records = 0;
+    }
+
+    /// Move every record held to the front, keeping their order, so the
+    /// record at `old_of_new[k]` is at `k` in every column and the store
+    /// reaches no further than the records it holds. `old_of_new` lists the
+    /// positions held in increasing order. The live set becomes the positions
+    /// below the record count. Each column and the live set give back what
+    /// they hold past the records or the reservation for `expected_size`,
+    /// whichever is more.
+    ///
+    /// The close-up a collection runs is [`ColumnStore::closed_up`] and
+    /// [`ColumnStore::swap_parts`]. This is the same pass made in place,
+    /// kept for the tests that hold the two to the same result.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn close_up(&mut self, old_of_new: &[u32], expected_size: usize) {
+        if self.names.is_empty() {
+            return;
+        }
+        debug_assert_eq!(old_of_new.len(), self.records);
+        let reserved = reserved_slots(expected_size);
+        for column in self.columns.iter_mut() {
+            column.close_up(old_of_new, reserved);
+        }
+        self.live.hold_first(old_of_new.len(), reserved);
+        self.slots = old_of_new.len();
+    }
+
+    /// The parts [`ColumnStore::close_up`] leaves, built from this store
+    /// and leaving it as it is, so a reader goes on reading the store while
+    /// they are made: every column's codes or values with the record at
+    /// `old_of_new[k]` at `k`, the live set as the positions below the
+    /// record count, and the extent at the record count, each part at the
+    /// capacity the pass in place leaves it. `None` on a store with no
+    /// declaration, which a close-up leaves as it is.
+    pub fn closed_up(&self, old_of_new: &[u32], expected_size: usize) -> Option<ColumnParts> {
+        if self.names.is_empty() {
+            return None;
+        }
+        debug_assert_eq!(old_of_new.len(), self.records);
+        let reserved = reserved_slots(expected_size);
+        Some(ColumnParts {
+            cells: self
+                .columns
+                .iter()
+                .map(|column| column.closed_up(old_of_new, reserved))
+                .collect(),
+            live: Bitmap::first(old_of_new.len(), reserved),
+            slots: old_of_new.len(),
+        })
+    }
+
+    /// Trade this store's parts for `parts`, which
+    /// [`ColumnStore::closed_up`] built from it, so the store holds the
+    /// closed-up parts and `parts` the store's old ones. Moves alone.
+    pub fn swap_parts(&mut self, parts: &mut ColumnParts) {
+        for (column, cells) in self.columns.iter_mut().zip(parts.cells.iter_mut()) {
+            column.swap_cells(cells);
+        }
+        std::mem::swap(&mut self.live, &mut parts.live);
+        std::mem::swap(&mut self.slots, &mut parts.slots);
+    }
+
+    /// Every part of the store, each with its capacity, for a test that
+    /// holds two stores to be the same codes and values. Absent from every
+    /// build that is not a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn layout(&self) -> Vec<(&'static str, usize, String)> {
+        let mut out = vec![
+            ("names", self.names.capacity(), format!("{:?}", self.names)),
+            (
+                "live",
+                self.live.words.capacity(),
+                format!("{:?}", self.live.words),
+            ),
+            ("slots", 0, self.slots.to_string()),
+            ("records", 0, self.records.to_string()),
+        ];
+        for column in &self.columns {
+            out.extend(column.layout());
+        }
+        out
+    }
+
+    /// How far any walk goes, being one past the highest position written
+    /// since the last close-up.
+    pub fn extent(&self) -> usize {
+        self.slots
+    }
+
+    /// Whether a record occupies `slot`. False for every slot of a store with
+    /// no declaration, which tracks nothing.
+    pub fn holds(&self, slot: usize) -> bool {
+        self.live.contains(slot)
     }
 
     fn reserve(&mut self, slot: usize) {
@@ -944,7 +1081,7 @@ impl ColumnStore {
     /// **The invariant that ties a column to a record**, asserted by every path
     /// that writes one.
     ///
-    /// A record at internal id `slot` occupies the slot, and every declared
+    /// A record at position `slot` occupies the slot, and every declared
     /// field reads back the value `vector_metadata` holds for that record, with
     /// a field the record does not carry reading absent. Checking it needs both
     /// stores, so the call sites are in the index and this is the half only
@@ -992,6 +1129,29 @@ impl ColumnStore {
                 .iter()
                 .map(|name| name.capacity() * 2 + 48)
                 .sum::<usize>()
+    }
+
+    /// Bytes of that request no record has been written into: each
+    /// column's vectors past their lengths, and the live set's words past
+    /// the last position written, which [`ColumnStore::shrink_to_fit`] gives
+    /// back.
+    pub fn reserved_bytes(&self) -> usize {
+        self.columns
+            .iter()
+            .map(Column::reserved_bytes)
+            .sum::<usize>()
+            + self.live.reserved_past(self.slots)
+    }
+
+    /// Give back what [`ColumnStore::reserved_bytes`] prices, reporting the
+    /// bytes released. No value moves.
+    pub fn shrink_to_fit(&mut self) -> usize {
+        let before = self.heap_bytes();
+        for column in self.columns.iter_mut() {
+            column.shrink_to_fit();
+        }
+        self.live.shrink_past(self.slots);
+        before - self.heap_bytes()
     }
 }
 
@@ -1539,6 +1699,356 @@ mod tests {
         assert_eq!(
             selected(&store, &field("cat", FieldTest::Equals(json!("a")))),
             Vec::<usize>::new()
+        );
+    }
+
+    /// A store over positions with holes, being records at scattered
+    /// positions, some of them erased and some rewritten, selects what the
+    /// walk over the records' metadata selects, through every shape a filter
+    /// takes.
+    #[test]
+    fn a_store_over_scattered_slots_selects_what_the_walk_selects() {
+        let slot = |k: usize| 1 + k * 71;
+        let records: Records = (0..400usize)
+            .map(|k| {
+                let mut fields = vec![
+                    ("cat", json!(["a", "b", "c", "d"][k % 4])),
+                    ("price", json!(k % 50)),
+                ];
+                match k % 3 {
+                    0 => fields.push(("tag", json!(null))),
+                    1 => fields.push(("tag", json!("t"))),
+                    _ => {}
+                }
+                (slot(k), record(&fields))
+            })
+            .collect();
+        let mut store = store_of(&["cat", "tag"], &records);
+
+        let presence = |want: Presence| Filter::Presence {
+            name: "tag".to_string(),
+            want,
+        };
+        let shapes = || {
+            vec![
+                cat("a"),
+                Filter::Not(Box::new(cat("a"))),
+                Filter::Any(vec![cat("a"), cat("c")]),
+                Filter::All(vec![cat("b"), Filter::Not(Box::new(cat("b")))]),
+                presence(Presence::Present),
+                presence(Presence::Absent),
+                presence(Presence::Null),
+                presence(Presence::NotNull),
+                Filter::Not(Box::new(Filter::All(vec![
+                    cat("d"),
+                    presence(Presence::Present),
+                ]))),
+                Filter::All(vec![cat("c"), cheap()]),
+                Filter::Not(Box::new(Filter::Any(vec![cat("a"), cheap()]))),
+            ]
+        };
+        let check = |store: &ColumnStore, records: &Records| {
+            for shape in shapes() {
+                let expected = walked(store, records, &shape);
+                match store.select(&shape) {
+                    Selection::Exact(bitmap) => assert_eq!(bits(&bitmap), expected),
+                    Selection::Narrowed(bitmap, _) => {
+                        let bound = bits(&bitmap);
+                        assert!(expected.iter().all(|slot| bound.contains(slot)));
+                    }
+                    Selection::Whole(_) => {}
+                }
+            }
+        };
+        check(&store, &records);
+
+        for k in (0..400usize).step_by(7) {
+            store.erase(slot(k));
+        }
+        let mut rewritten = records.clone();
+        for (at, (slot, fields)) in rewritten.iter_mut().enumerate() {
+            if at % 11 == 5 && at % 7 != 0 {
+                *fields = record(&[("cat", json!("e"))]);
+                store.write(*slot, fields);
+            }
+        }
+        assert_eq!(store.record_count(), 400 - 400usize.div_ceil(7));
+        check(&store, &rewritten);
+        assert!(store.tracks(400 - 400usize.div_ceil(7)));
+    }
+
+    /// A close-up moves every record's codes and values to the front in its
+    /// order, in a dictionary column and in a plain one, so every filter
+    /// selects at the new positions what the walk over the records selects,
+    /// and the columns and the live set give back what they held past the
+    /// records or the declared reservation.
+    #[test]
+    fn a_close_up_moves_every_column_and_keeps_the_answers() {
+        let total = 6_000usize;
+        let records: Records = (0..total)
+            .map(|k| {
+                let mut fields = vec![
+                    ("cat", json!(["a", "b", "c", "d"][k % 4])),
+                    ("serial", json!(format!("s{k}"))),
+                ];
+                if k % 3 == 0 {
+                    fields.push(("tag", json!("t")));
+                }
+                (k, record(&fields))
+            })
+            .collect();
+        let mut store = ColumnStore::new(
+            ["cat", "serial", "tag"]
+                .iter()
+                .map(|n| n.to_string())
+                .collect(),
+            16,
+        );
+        for (slot, metadata) in &records {
+            store.write(*slot, metadata);
+        }
+        assert!(matches!(store.columns[1], Column::Plain { .. }));
+        assert!(matches!(store.columns[0], Column::Dictionary { .. }));
+        let kept: Vec<usize> = (0..total).filter(|k| k % 25 == 4).collect();
+        for slot in (0..total).filter(|k| k % 25 != 4) {
+            store.erase(slot);
+        }
+        assert_eq!(store.extent(), total, "an erasure leaves a hole");
+
+        let old_of_new: Vec<u32> = kept.iter().map(|&k| k as u32).collect();
+        store.close_up(&old_of_new, 16);
+        assert_eq!(store.extent(), kept.len());
+        assert!(store.tracks(kept.len()));
+        assert_eq!(bits(&store.live), (0..kept.len()).collect::<Vec<_>>());
+        assert_eq!(store.live.heap_bytes(), kept.len().div_ceil(64) * 8);
+        for column in &store.columns {
+            let capacity = match column {
+                Column::Plain { values } => values.capacity(),
+                Column::Dictionary { codes, .. } => codes.capacity(),
+            };
+            assert_eq!(capacity, kept.len());
+        }
+
+        let moved: Records = kept
+            .iter()
+            .enumerate()
+            .map(|(k, &old)| (k, records[old].1.clone()))
+            .collect();
+        for (slot, metadata) in &moved {
+            assert!(store.agrees_with(*slot, metadata), "{slot}");
+        }
+        for filter in [
+            cat("b"),
+            Filter::Not(Box::new(cat("b"))),
+            field("serial", FieldTest::Equals(json!("s104"))),
+            Filter::Presence {
+                name: "tag".to_string(),
+                want: Presence::Present,
+            },
+        ] {
+            assert_eq!(selected(&store, &filter), walked(&store, &moved, &filter));
+        }
+        assert_eq!(
+            selected(&store, &field("serial", FieldTest::Equals(json!("s104")))),
+            vec![4]
+        );
+
+        // The next record takes the position after the last, and the
+        // reservation a declaration makes survives a close-up that leaves
+        // fewer records than it.
+        let next = record(&[("cat", json!("a"))]);
+        store.write(store.extent(), &next);
+        assert!(store.holds(kept.len()));
+        let mut reserved = ColumnStore::new(vec!["cat".to_string()], 1_000);
+        for (slot, metadata) in records.iter().take(3_000) {
+            reserved.write(*slot, metadata);
+        }
+        for slot in 10..3_000 {
+            reserved.erase(slot);
+        }
+        reserved.close_up(&(0..10).collect::<Vec<u32>>(), 1_000);
+        let Column::Dictionary { codes, .. } = &reserved.columns[0] else {
+            panic!("four values keep the dictionary");
+        };
+        assert_eq!(codes.capacity(), 1_001);
+        assert_eq!(reserved.live.heap_bytes(), 1_001usize.div_ceil(64) * 8);
+    }
+
+    /// A dictionary column's selection sets the bits a loop over its codes
+    /// sets, being every slot whose code is held and names a matching value,
+    /// over columns whose records sit at every gap and some of whose slots
+    /// hold no record or no value, and a filter over the column selects what
+    /// the walk over the records' metadata selects.
+    #[test]
+    fn a_dictionary_column_selects_what_a_loop_over_its_codes_selects() {
+        let values = ["a", "b", "c", "d", "e"];
+        let tests = || {
+            [
+                FieldTest::Equals(json!("b")),
+                FieldTest::Operators(vec![(crate::filter::Op::In, json!(["a", "e"]))]),
+                FieldTest::Equals(json!("z")),
+                FieldTest::Equals(Value::Null),
+            ]
+        };
+        for gap in [1usize, 2, 3, 4, 5, 11, 300] {
+            let count = 600;
+            let mut records: Records = (0..count)
+                .map(|k| {
+                    let metadata = if k % 7 == 3 {
+                        record(&[("lang", json!("en"))])
+                    } else if k % 11 == 5 {
+                        record(&[("cat", Value::Null)])
+                    } else {
+                        record(&[("cat", json!(values[k % 5]))])
+                    };
+                    (7 + k * gap, metadata)
+                })
+                .collect();
+            let mut store = ColumnStore::new(vec!["cat".to_string()], 7 + count * gap);
+            for (slot, metadata) in &records {
+                store.write(*slot, metadata);
+            }
+            for (slot, _) in records.iter().step_by(13) {
+                store.erase(*slot);
+            }
+            records.retain(|(slot, _)| store.live.contains(*slot));
+            let Column::Dictionary {
+                codes, dict, refs, ..
+            } = &store.columns[0]
+            else {
+                panic!("a column of five values keeps its dictionary");
+            };
+            for test in tests() {
+                let mut matching = vec![false; dict.len()];
+                for (code, value) in dict.iter().enumerate() {
+                    if refs[code] > 0 && field_test_matches(value, &test) {
+                        matching[code] = true;
+                    }
+                }
+                let mut looped = Bitmap::zeros(store.slots);
+                for (slot, &code) in codes.iter().enumerate().take(store.slots) {
+                    if code != ABSENT && matching[code as usize] {
+                        looped.set(slot);
+                    }
+                }
+                let walked_slots = store.columns[0].select(&test, store.slots);
+                assert_eq!(bits(&walked_slots), bits(&looped), "gap {gap}");
+                let filter = field("cat", test);
+                assert_eq!(
+                    selected(&store, &filter),
+                    walked(&store, &records, &filter),
+                    "gap {gap}"
+                );
+            }
+            for want in [
+                Presence::Present,
+                Presence::Absent,
+                Presence::Null,
+                Presence::NotNull,
+            ] {
+                let filter = Filter::Presence {
+                    name: "cat".to_string(),
+                    want,
+                };
+                assert_eq!(
+                    selected(&store, &filter),
+                    walked(&store, &records, &filter),
+                    "gap {gap}"
+                );
+            }
+        }
+    }
+
+    /// A declaration past the cap reserves the cap in each column and in the
+    /// live set, where one below it reserves a slot more than it declares,
+    /// and a record written past the reservation grows both. What is
+    /// reserved and unwritten is what `reserved_bytes` prices and what
+    /// `shrink_to_fit` gives back, after which the store prices nothing and
+    /// still holds its records.
+    #[test]
+    fn a_declaration_past_the_cap_reserves_the_cap_and_grows_with_its_records() {
+        for (declared, reserved) in [
+            (100usize, 101usize),
+            (RESERVE_CAP - 2, RESERVE_CAP - 1),
+            (RESERVE_CAP - 1, RESERVE_CAP),
+            (RESERVE_CAP, RESERVE_CAP),
+            (10_000_000, RESERVE_CAP),
+        ] {
+            let names = vec!["cat".to_string(), "n".to_string()];
+            let mut store = ColumnStore::new(names, declared);
+            for column in &store.columns {
+                let Column::Dictionary { codes, .. } = column else {
+                    panic!("a new column is a dictionary");
+                };
+                assert_eq!(codes.capacity(), reserved, "{declared}");
+            }
+            assert_eq!(store.live.words.len(), reserved.div_ceil(64), "{declared}");
+            assert_eq!(
+                store.reserved_bytes(),
+                2 * reserved * 4 + reserved.div_ceil(64) * 8,
+                "{declared}: nothing is written"
+            );
+
+            let past = reserved + 10;
+            for slot in [0, 7, past] {
+                store.write(slot, &record(&[("cat", json!("a")), ("n", json!(slot))]));
+            }
+            for column in &store.columns {
+                let Column::Dictionary { codes, .. } = column else {
+                    panic!("three values keep the dictionary");
+                };
+                assert!(codes.capacity() > past, "{declared}");
+            }
+            assert!(store.live.words.len() > past / 64, "{declared}");
+
+            let priced = store.reserved_bytes();
+            let before = store.heap_bytes();
+            let released = store.shrink_to_fit();
+            assert_eq!(released, priced, "{declared}");
+            assert_eq!(store.heap_bytes(), before - released, "{declared}");
+            assert_eq!(store.reserved_bytes(), 0, "{declared}");
+            assert_eq!(store.shrink_to_fit(), 0, "{declared}");
+            for slot in [0, 7, past] {
+                assert!(store.holds(slot), "{declared}: {slot}");
+                assert!(
+                    store.agrees_with(slot, &record(&[("cat", json!("a")), ("n", json!(slot))]))
+                );
+            }
+            assert_eq!(
+                selected(&store, &field("cat", FieldTest::Equals(json!("a")))),
+                vec![0, 7, past]
+            );
+            // The next record grows from the shrunk store.
+            store.write(past + 1, &record(&[("cat", json!("b"))]));
+            assert!(store.holds(past + 1));
+        }
+    }
+
+    /// A clear keeps the declaration and the table that finds a column, and
+    /// holds a fresh store's reservation and nothing else, whatever the store
+    /// grew to and whatever form its columns took.
+    #[test]
+    fn a_clear_holds_the_fresh_reservation_alone() {
+        let names = || vec!["cat".to_string(), "serial".to_string()];
+        let mut store = ColumnStore::new(names(), 1_000);
+        for slot in 0..9_000usize {
+            let metadata = record(&[
+                ("cat", json!(["a", "b", "c"][slot % 3])),
+                ("serial", json!(format!("s{slot}"))),
+            ]);
+            store.write(slot, &metadata);
+        }
+        assert!(matches!(store.columns[1], Column::Plain { .. }));
+        store.clear(1_000);
+        let fresh = ColumnStore::new(names(), 1_000);
+        assert!(store.layout() == fresh.layout());
+        assert_eq!(store.heap_bytes(), fresh.heap_bytes());
+        assert_eq!(store.index_of, fresh.index_of);
+        assert_eq!(store.extent(), 0);
+        store.write(0, &record(&[("cat", json!("b"))]));
+        assert_eq!(
+            selected(&store, &field("cat", FieldTest::Equals(json!("b")))),
+            vec![0]
         );
     }
 }

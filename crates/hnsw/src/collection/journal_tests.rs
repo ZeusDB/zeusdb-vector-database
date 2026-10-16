@@ -87,9 +87,9 @@ fn rewrite_manifest(dir: &std::path::Path, edit: impl FnOnce(&mut Value)) {
 /// Every id the collection holds, in order, with its internal id.
 fn ids(collection: &Collection) -> Vec<(String, usize)> {
     let mut out: Vec<(String, usize)> = collection
-        .ids()
-        .iter()
-        .map(|(internal, id)| (id.to_string(), internal))
+        .internal_ids()
+        .into_iter()
+        .map(|(internal, id)| (id, internal))
         .collect();
     out.sort();
     out
@@ -526,6 +526,48 @@ fn a_record_that_does_not_belong_refuses_the_open_naming_its_sequence() {
         }
         other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
     }
+}
+
+/// A refusal to replay says each sentence once: what refused the record, as
+/// whole sentences each ending in a full stop, and then what was applied. A
+/// record that does not belong gives its first sentence alone, and words that
+/// end without a full stop are given one.
+#[test]
+fn a_refusal_to_replay_says_each_sentence_once() {
+    let temp = TempDir::new();
+    let path = temp.at("sentences.zdb");
+    let collection = journaled(&path);
+    add(&collection, 0..6);
+    drop(collection);
+    rewrite_manifest(&path, |m| m["journal"]["sequence"] = json!(2));
+    let mismatch = match Collection::recover(path.to_str().unwrap(), None, Durability::default()) {
+        Err(error @ Error::JournalReplayFailed { .. }) => error.to_string(),
+        other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+    };
+    let unpunctuated = Error::JournalReplayFailed {
+        file: "col.zdbwal".to_string(),
+        sequence: 4,
+        detail: Error::Engine("PQ not available".to_string()).replay_detail(),
+    }
+    .to_string();
+    let last = " Nothing from that record on was applied and the directory was not opened.";
+    for message in [&mismatch, &unpunctuated] {
+        assert_eq!(message.matches("Nothing from").count(), 1, "{message}");
+        assert!(message.ends_with(last), "{message}");
+        assert!(
+            message[..message.len() - last.len()].ends_with('.'),
+            "{message}"
+        );
+        assert!(!message.contains(".."), "{message}");
+    }
+    assert!(
+        mismatch.contains("do not belong together: the record names internal id 3"),
+        "{mismatch}"
+    );
+    assert!(
+        unpunctuated.contains("could not be applied: PQ not available. Nothing from that"),
+        "{unpunctuated}"
+    );
 }
 
 // ============================================================================

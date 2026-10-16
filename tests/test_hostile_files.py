@@ -387,10 +387,9 @@ def test_a_mappings_file_whose_two_maps_disagree_is_refused(old_raw_index, tmp_p
 
 
 # One record at an internal id above the counter config.json records, with
-# both maps consistent. The id store, the metadata and the columns hold an
-# entry for every id up to the highest a record holds, so the loader reserved
-# and filled one for every id below it before anything refused the file, and
-# at 2^40 asked the allocator for eight tebibytes.
+# both maps consistent. The loader holds every internal id the file names to
+# that counter before it reserves anything, and refuses the file naming the
+# id, however far above the counter it lies.
 @pytest.mark.parametrize("slot", [3, 1 << 24, 1 << 40], ids=["one-above", "2^24", "2^40"])
 def test_a_mappings_id_above_the_counter_is_refused(old_raw_index, tmp_path, slot):
     payload = (varint(2) + wire_str("a") + varint(1) + wire_str("b") + varint(slot)

@@ -486,6 +486,11 @@ def test_compact_shrinks_the_graph_it_rebuilds():
     assert index.compact() == 50
     after = float(index.get_stats()["graph_memory_mb"])
     assert after < before
+    # The compaction shrank the graph it built, so a shrink gives none of it
+    # back. What it does give back is the column store's live set, which an
+    # index with no declared field reserves for expected_size, eleven bits in
+    # one word here, and never writes.
+    assert index.shrink_to_fit() == 8
     assert index.shrink_to_fit() == 0
 
 

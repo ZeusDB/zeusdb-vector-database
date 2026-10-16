@@ -314,7 +314,7 @@ fn leave(rank: u8) {
 
 /// What this thread holds, by name, for a test that wants to assert on it.
 #[cfg(all(test, debug_assertions))]
-fn held_now() -> Vec<String> {
+pub(crate) fn held_now() -> Vec<String> {
     HELD.try_with(|held| held.borrow().iter().map(|&r| name_of(r)).collect())
         .unwrap_or_default()
 }

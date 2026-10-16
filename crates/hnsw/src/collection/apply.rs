@@ -60,7 +60,10 @@ impl Collection {
     /// ordinary refusal for a value the ordinary path would refuse, and
     /// whatever the body returns for a body that fails.
     pub fn apply(&self, operation: Operation) -> Result<(), Error> {
-        let _writers = self.writers.lock().unwrap();
+        // What a clear traded out, declared before the holder of `writers`
+        // so it drops once the holder has let `writers` go.
+        let mut cleared = None;
+        let writers = self.hold_writers();
         if self.sink_attached() {
             return Err(Error::Engine(
                 "A recorded operation cannot be applied while a sink is attached, since a \
@@ -69,7 +72,7 @@ impl Collection {
             ));
         }
         let mismatch = |detail: String| Error::JournalReplayMismatch { detail };
-        match operation {
+        let applied = match operation {
             Operation::Insert {
                 id,
                 internal_id,
@@ -77,14 +80,16 @@ impl Collection {
                 vector,
                 metadata,
                 sparse,
-            } => self.apply_insert(
-                id,
-                internal_id,
-                level,
-                vector,
-                metadata.into_iter().collect(),
-                sparse,
-            ),
+            } => self
+                .apply_insert(
+                    id,
+                    internal_id,
+                    level,
+                    vector,
+                    metadata.into_iter().collect(),
+                    sparse,
+                )
+                .and_then(|()| self.maybe_trigger_training(&writers).map_err(Error::Engine)),
             Operation::Remove { ids } => {
                 let held = self.held_ids(&ids);
                 if held.len() != ids.len() {
@@ -98,7 +103,7 @@ impl Collection {
                         absent
                     )));
                 }
-                let missing = self.remove_points_internal(&ids);
+                let missing = self.remove_points_internal(&writers, &ids);
                 debug_assert!(missing.is_empty(), "every id was held a moment ago");
                 Ok(())
             }
@@ -114,8 +119,8 @@ impl Collection {
                 debug_assert!(replaced, "the record was held a moment ago");
                 Ok(())
             }
-            Operation::Clear => self.clear_locked().map(|_| ()),
-            Operation::Compact => self.compact_locked().map(|_| ()),
+            Operation::Clear => self.clear_locked().map(|(_, old)| cleared = Some(old)),
+            Operation::Compact => self.compact_locked(&writers).map(|_| ()),
             Operation::Rebuild {
                 m,
                 expected_size,
@@ -140,7 +145,7 @@ impl Collection {
                     expected_size,
                     "",
                 )?;
-                self.rebuild_locked(m, expected_size, ef_construction)
+                self.rebuild_locked(&writers, m, expected_size, ef_construction)
                     .map(|_| ())
             }
             Operation::Intern { term_id, term } => {
@@ -179,13 +184,19 @@ impl Collection {
                 Ok(())
             }
             Operation::RebuildQuantized => self
-                .rebuild_with_quantization_locked()
+                .rebuild_with_quantization_locked(&writers)
                 .map(|_| ())
                 .map_err(Error::Engine),
-        }
+        };
+        debug_assert!(
+            self.positions_agree(),
+            "an applied record leaves every structure at the positions the records hold"
+        );
+        applied
     }
 
-    /// The `Insert` arm of `apply`, with the mutation guard held.
+    /// The `Insert` arm of `apply`, with the mutation guard held, up to the
+    /// training trigger, which the arm sets off once this returns.
     fn apply_insert(
         &self,
         id: String,
@@ -237,6 +248,10 @@ impl Collection {
             space.config().weighting.validate_record(sparse.as_ref())?;
         }
 
+        // The id, held to what the id store can name, as admission holds it.
+        let arena = self.ids.read().unwrap().arena_len();
+        zeusdb_vector_core::refuse_unnamable(&id, arena)?;
+
         // The id the record names, issued only if it is the next, and the
         // level the record names, with nothing drawn.
         let issued = self.issue_expected_id(expected)?;
@@ -252,6 +267,6 @@ impl Collection {
             let mut count = self.vector_count.lock().unwrap();
             *count += 1;
         }
-        self.maybe_trigger_training().map_err(Error::Engine)
+        Ok(())
     }
 }

@@ -1172,7 +1172,8 @@ impl HNSWIndex {
         self.inner.indexed_fields()
     }
 
-    /// Return the graph's spare buffer capacity to the allocator.
+    /// Return the graph's spare buffer capacity, and the per-record stores',
+    /// to the allocator.
     ///
     /// A graph built by insertion grows its arenas geometrically, so the last
     /// growth leaves the largest of them holding close to twice what it uses. A
@@ -1183,13 +1184,18 @@ impl HNSWIndex {
     ///
     /// `compact()` does not reclaim it. Compaction rebuilds by inserting, so the
     /// replacement graph regrows exactly the same slack, which is why this is
-    /// its own operation. `compact()` calls it on the graph it built, so a
-    /// caller who runs compaction gets both.
+    /// its own operation. `compact()` shrinks the graph it built in the same
+    /// way, so a caller who runs compaction gets the graph's slack back too.
     ///
     /// **No node, edge or distance is touched.** Fourteen buffers are
     /// reallocated at their current lengths and their contents copied, so the
     /// topology after the call is the topology before it and every search
     /// returns the same page with the same scores.
+    ///
+    /// The id store, the per-record metadata and the declared columns give
+    /// back what they reserved past their records the same way, at their
+    /// lengths, so no record, field or value moves either. What the call
+    /// returns is exactly what `get_stats()["reserved_memory_mb"]` priced.
     ///
     /// **The index stays writable.** Every buffer is a growable vector, so the
     /// next `add()` reallocates the per node arenas once and then proceeds as

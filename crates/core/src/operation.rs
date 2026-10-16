@@ -159,12 +159,7 @@ impl Operation {
                     sparse.as_ref().map(SparseVector::as_ref),
                 );
             }
-            Operation::Remove { ids } => {
-                out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
-                for id in ids {
-                    put_bytes(out, id.as_bytes());
-                }
-            }
+            Operation::Remove { ids } => write_remove(out, ids),
             Operation::UpdateMetadata { id, metadata } => {
                 put_bytes(out, id.as_bytes());
                 put_json(out, metadata);
@@ -210,6 +205,41 @@ impl Operation {
         let sorted: BTreeMap<&String, &Value> = parts.metadata.iter().collect();
         let json = serde_json::to_vec(&sorted).unwrap_or_default();
         write_insert(out, parts.id, 0, 0, parts.vector, &json, parts.sparse);
+    }
+
+    /// An upper bound on the bytes [`Operation::encode_insert`] writes for
+    /// `parts`, found without serialising the metadata: every string at six
+    /// bytes a byte, the longest escape JSON writes for one, every number at
+    /// the longest form it is written in, and a separator after every entry.
+    /// A record whose bound is within the journal's ceiling is within it
+    /// encoded, so a caller holds a record to the ceiling by the bound and
+    /// encodes only where the bound does not settle it.
+    pub fn insert_size_bound(parts: &InsertParts<'_>) -> usize {
+        let metadata = parts.metadata.iter().fold(2usize, |sum, (key, value)| {
+            sum.saturating_add(text_bound(key))
+                .saturating_add(json_bound(value))
+                .saturating_add(2)
+        });
+        let sparse = parts.sparse.map_or(0, |sparse| {
+            (sparse.dims.len().saturating_add(sparse.values.len())).saturating_mul(4)
+        });
+        // The id's length, the internal id, the level, the vector's length,
+        // the metadata's length and the sparse half's count.
+        let fixed: usize = 4 + 8 + 1 + 4 + 4 + 4;
+        fixed
+            .saturating_add(parts.id.len())
+            .saturating_add(parts.vector.len().saturating_mul(4))
+            .saturating_add(metadata)
+            .saturating_add(sparse)
+    }
+
+    /// Encode a removal of `ids`, borrowed, writing the bytes
+    /// [`Operation::encode`] writes for an `Operation::Remove` of the same
+    /// ids, so a caller records a removal without cloning the ids it names.
+    /// `out` is cleared first.
+    pub fn encode_remove(ids: &[String], out: &mut Vec<u8>) {
+        out.clear();
+        write_remove(out, ids);
     }
 
     /// Write the internal id and the level into a payload
@@ -272,6 +302,40 @@ pub struct InsertParts<'a> {
     pub vector: &'a [f32],
     pub metadata: &'a HashMap<String, Value>,
     pub sparse: Option<SparseRef<'a>>,
+}
+
+/// The removal layout, written once for both encoders.
+fn write_remove(out: &mut Vec<u8>, ids: &[String]) {
+    out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    for id in ids {
+        put_bytes(out, id.as_bytes());
+    }
+}
+
+/// An upper bound on the bytes JSON writes for `text` as a string, its
+/// quotes included: six a byte, the longest escape it writes for one.
+fn text_bound(text: &str) -> usize {
+    text.len().saturating_mul(6).saturating_add(2)
+}
+
+/// An upper bound on the bytes JSON writes for `value`: a number at the
+/// longest form an integer or a double takes, and a separator after every
+/// element and every entry.
+fn json_bound(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(_) => 25,
+        Value::String(text) => text_bound(text),
+        Value::Array(items) => items.iter().fold(2usize, |sum, item| {
+            sum.saturating_add(json_bound(item)).saturating_add(1)
+        }),
+        Value::Object(fields) => fields.iter().fold(2usize, |sum, (key, value)| {
+            sum.saturating_add(text_bound(key))
+                .saturating_add(json_bound(value))
+                .saturating_add(2)
+        }),
+    }
 }
 
 /// The insert layout, written once for both encoders. `json` is the
@@ -1128,5 +1192,94 @@ mod tests {
             refused_past_first_field * 4 > cases,
             "only {refused_past_first_field} of {cases} reached past the first field"
         );
+    }
+
+    /// A removal encoded from the ids it names, borrowed, is the bytes the
+    /// operation encodes, for no id, one, and ids of every length the
+    /// journal takes, text that is not ASCII among them.
+    #[test]
+    fn a_removal_encoded_from_borrowed_ids_is_the_removals_encoding() {
+        for ids in [
+            vec![],
+            vec!["a".to_string()],
+            vec![
+                "r1".to_string(),
+                "x".repeat(300),
+                "caf\u{e9}-\u{1f600}".to_string(),
+            ],
+        ] {
+            let mut owned = Vec::new();
+            Operation::Remove { ids: ids.clone() }.encode(&mut owned);
+            let mut borrowed = vec![9u8; 3];
+            Operation::encode_remove(&ids, &mut borrowed);
+            assert_eq!(borrowed, owned, "{ids:?}");
+        }
+    }
+
+    /// The bound on an insert's encoded bytes is at or above what the
+    /// encoder writes, for metadata of every kind a value takes, strings the
+    /// encoder escapes at the most bytes a byte among them, numbers at their
+    /// longest, nested arrays and maps, with and without a sparse half, and
+    /// it is within a few bytes a value of it where nothing is escaped.
+    #[test]
+    fn the_size_bound_holds_every_insert_it_is_asked_about() {
+        let metadatas: Vec<HashMap<String, Value>> = vec![
+            HashMap::new(),
+            HashMap::from([("cat".to_string(), json!("b"))]),
+            HashMap::from([
+                (
+                    "escaped".to_string(),
+                    json!("\u{1}\u{2}\"\\\n\t".repeat(50)),
+                ),
+                ("\u{1}key".to_string(), json!(-9223372036854775808i64)),
+                ("big".to_string(), json!(u64::MAX)),
+                ("float".to_string(), json!(-1.7976931348623157e308f64)),
+                ("tiny".to_string(), json!(5e-324f64)),
+                ("flag".to_string(), json!(false)),
+                ("none".to_string(), Value::Null),
+            ]),
+            HashMap::from([(
+                "nested".to_string(),
+                json!({"a": [1, "two", {"three": [null, true, 3.5]}], "\u{7f}": {}}),
+            )]),
+            HashMap::from([("text".to_string(), json!("caf\u{e9} \u{1f600}".repeat(100)))]),
+        ];
+        let dims = [3u32, 9, 27];
+        let values = [1.0f32, 2.0, 0.5];
+        for metadata in &metadatas {
+            for sparse in [
+                None,
+                Some(SparseRef {
+                    dims: &dims,
+                    values: &values,
+                }),
+            ] {
+                let parts = InsertParts {
+                    id: "r\u{e9}cord-1",
+                    vector: &[0.25; 7],
+                    metadata,
+                    sparse,
+                };
+                let mut out = Vec::new();
+                Operation::encode_insert(&parts, &mut out);
+                let bound = Operation::insert_size_bound(&parts);
+                assert!(
+                    bound >= out.len(),
+                    "{bound} below {} for {metadata:?}",
+                    out.len()
+                );
+            }
+        }
+        let plain = HashMap::from([("cat".to_string(), json!("plain"))]);
+        let parts = InsertParts {
+            id: "r1",
+            vector: &[0.0; 4],
+            metadata: &plain,
+            sparse: None,
+        };
+        let mut out = Vec::new();
+        Operation::encode_insert(&parts, &mut out);
+        let bound = Operation::insert_size_bound(&parts);
+        assert!(bound < out.len() + 64, "{bound} against {}", out.len());
     }
 }

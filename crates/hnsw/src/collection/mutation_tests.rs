@@ -23,8 +23,20 @@ use zeusdb_vector_core::{IdfScope, PQ};
 use zeusdb_vector_sparse::{SparseConfig, Weighting};
 use zeusdb_vector_text::SimpleTokenizer;
 
+#[cfg(debug_assertions)]
+use crate::locks::held_now;
+
+use super::insert::{ClearPoint, CLEAR_HOOK};
 use super::query::AFTER_RESOLVE;
 use super::{Collection, Declaration, ParsedRecord, SparseHalf, StorageMode};
+
+/// What this thread holds by the lock registry's count, which a build with
+/// debug assertions keeps. A build without them counts nothing, so this reads
+/// an empty list.
+#[cfg(not(debug_assertions))]
+fn held_now() -> Vec<String> {
+    Vec::new()
+}
 
 fn text_collection() -> Collection {
     let declaration = Declaration::validate(2, "l2", 4, 50, 100, vec![])
@@ -119,11 +131,15 @@ fn clear_between_a_records_tokenizing_and_its_insert_cannot_reissue_its_terms() 
 
 /// Under clears running on another thread, a search for a term never
 /// returns a record that did not carry it. Every record carries one term of
-/// its own, and after each insert its own term is searched for.
+/// its own, and after each insert its own term is searched for. The clearing
+/// thread signals each clear it finishes on a channel of one place, which
+/// the inserting thread empties after its hundredth insert and waits on
+/// after its two hundredth, so a clear finishes while the inserts run.
 #[test]
 fn a_search_never_returns_a_record_that_never_held_the_term_under_concurrent_clears() {
     let collection = Arc::new(text_collection());
     let stop = Arc::new(AtomicBool::new(false));
+    let (cleared_tx, cleared) = std::sync::mpsc::sync_channel::<()>(1);
     let clearer = {
         let collection = collection.clone();
         let stop = stop.clone();
@@ -132,6 +148,7 @@ fn a_search_never_returns_a_record_that_never_held_the_term_under_concurrent_cle
             while !stop.load(Ordering::Relaxed) {
                 collection.clear().unwrap();
                 clears += 1;
+                let _ = cleared_tx.try_send(());
                 thread::yield_now();
             }
             clears
@@ -140,6 +157,14 @@ fn a_search_never_returns_a_record_that_never_held_the_term_under_concurrent_cle
 
     let mut wrong = Vec::new();
     for i in 0..400 {
+        if i == 100 {
+            while cleared.try_recv().is_ok() {}
+        }
+        if i == 200 {
+            cleared
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("a clear finishes while the inserts run");
+        }
         let own = format!("only{i}");
         let record = text_record(
             &collection,
@@ -343,6 +368,166 @@ fn a_search_never_returns_a_record_that_never_held_the_term_under_concurrent_rei
     assert_eq!(ids_of(&settled), [last.as_str()]);
 }
 
+/// A clear trades every structure it empties under one acquisition of their
+/// guards, the sparse space's postings and its dictionary among them. Held
+/// open once the trade is done and every guard let go, with `writers` still
+/// held, a reader on another thread finds the cleared state in every
+/// structure at once: no record, no posting, no term, and statistics that
+/// count none of them, and never the old postings or the old terms beside
+/// the cleared record set.
+#[test]
+fn a_reader_beside_a_clear_finds_every_structure_cleared_at_once() {
+    let collection = Arc::new(text_collection());
+    let records: Vec<ParsedRecord> = (0..30)
+        .map(|i| {
+            text_record(
+                &collection,
+                &format!("r{i}"),
+                [i as f32, 1.0],
+                &format!("shared only{i}"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        collection.add_records(records, vec![], false).total_errors,
+        0
+    );
+    let read = |collection: &Collection| {
+        let stats = collection.stats();
+        let text = collection
+            .search_text("shared", None, 5, IdfScope::Corpus)
+            .unwrap();
+        let params = collection.search_params(5, None, false, None).unwrap();
+        let dense = collection.search_one(&[1.0, 1.0], None, params).unwrap();
+        (
+            stats["total_vectors"].clone(),
+            stats["sparse_records"].clone(),
+            stats["term_count"].clone(),
+            text.len(),
+            dense.len(),
+        )
+    };
+    assert_eq!(
+        read(&collection),
+        ("30".to_string(), "30".to_string(), "31".to_string(), 5, 5)
+    );
+
+    let (seen_tx, seen) = std::sync::mpsc::channel();
+    {
+        let collection = Arc::clone(&collection);
+        CLEAR_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |point| {
+                if point == ClearPoint::Traded {
+                    let collection = Arc::clone(&collection);
+                    let reader = thread::spawn(move || read(&collection));
+                    let _ = seen_tx.send(reader.join().expect("the reader answers"));
+                }
+            }));
+        });
+    }
+    assert_eq!(collection.clear().unwrap(), 30);
+    CLEAR_HOOK.with(|hook| *hook.borrow_mut() = None);
+    let seen = seen.try_recv().expect("the clear reached its trade");
+    let cleared = ("0".to_string(), "0".to_string(), "0".to_string(), 0, 0);
+    assert_eq!(seen, cleared, "the reader beside the clear");
+    assert_eq!(read(&collection), cleared, "after the clear");
+}
+
+/// What a clear traded out is dropped once `writers` is let go, with no
+/// guard held. While its drop is held open, the dropping thread holds no
+/// guard by the lock registry's own count, a second writer adds a record
+/// and returns, and a search answers it. The clear returns only once the
+/// drop is done.
+#[test]
+fn a_second_writer_goes_while_a_clears_old_structures_drop() {
+    let collection = text_collection();
+    let records: Vec<ParsedRecord> = (0..30)
+        .map(|i| text_record(&collection, &format!("r{i}"), [i as f32, 1.0], "shared"))
+        .collect();
+    assert_eq!(
+        collection.add_records(records, vec![], false).total_errors,
+        0
+    );
+    let wait = Duration::from_secs(20);
+    thread::scope(|scope| {
+        let (dropping_tx, dropping) = std::sync::mpsc::channel::<Vec<String>>();
+        let (dropped_tx, dropped) = std::sync::mpsc::channel::<Vec<String>>();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let (returned_tx, returned) = std::sync::mpsc::channel::<Instant>();
+        let clearer = {
+            let collection = &collection;
+            scope.spawn(move || {
+                CLEAR_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |point| match point {
+                        ClearPoint::Dropping => {
+                            let _ = dropping_tx.send(held_now());
+                            let _ = go_rx.recv();
+                        }
+                        ClearPoint::Dropped => {
+                            let _ = dropped_tx.send(held_now());
+                        }
+                        ClearPoint::Traded => {}
+                    }));
+                });
+                let removed = collection.clear().unwrap();
+                returned_tx.send(Instant::now()).unwrap();
+                CLEAR_HOOK.with(|hook| *hook.borrow_mut() = None);
+                removed
+            })
+        };
+
+        let held = dropping
+            .recv_timeout(wait)
+            .expect("the clear drops what it traded out");
+        assert_eq!(
+            held,
+            Vec::<String>::new(),
+            "no guard is held as the drop begins"
+        );
+        assert_eq!(collection.len(), 0, "the trade ran before the drop");
+
+        // A second writer goes and returns, and a search answers its record.
+        let (wrote_tx, wrote) = std::sync::mpsc::channel::<usize>();
+        {
+            let collection = &collection;
+            scope.spawn(move || {
+                let record = text_record(collection, "later", [1.0, 1.0], "after");
+                let added = collection.add_records(vec![record], vec![], false);
+                wrote_tx.send(added.total_errors).unwrap();
+            });
+        }
+        assert_eq!(
+            wrote
+                .recv_timeout(wait)
+                .expect("a second writer completes a call during the drop"),
+            0
+        );
+        let page = collection
+            .search_text("after", None, 5, IdfScope::Corpus)
+            .unwrap();
+        assert_eq!(ids_of(&page), ["later"]);
+        assert!(
+            returned.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the clear waits for its drop"
+        );
+
+        let released = Instant::now();
+        go.send(()).unwrap();
+        assert_eq!(
+            dropped.recv_timeout(wait).expect("the drop finishes"),
+            Vec::<String>::new(),
+            "no guard is held as the drop ends"
+        );
+        assert_eq!(clearer.join().unwrap(), 30);
+        assert!(
+            returned.recv().unwrap() > released,
+            "the clear returned after the drop"
+        );
+    });
+    assert_eq!(collection.len(), 1);
+    assert!(collection.positions_agree());
+}
+
 /// `add_metadata` takes the mutation guard, as every durable mutation does,
 /// so a caller holding the guard sees it wait, and it merges once the guard
 /// is free.
@@ -427,7 +612,12 @@ fn training_is_stamped_with_the_stamp_it_is_handed() {
     handed.set_pq(Some(Arc::new(PQ::new(8, 4, 4, 1000, None))));
     handed.set_training_ids((0..1000).map(|i| format!("r{i}")).collect());
     let given = "2001-02-03T04:05:06+00:00".to_string();
-    handed.train_quantization_from_ids(given.clone()).unwrap();
+    {
+        let writers = handed.hold_writers();
+        handed
+            .train_quantization_from_ids(&writers, given.clone())
+            .unwrap();
+    }
     assert!(handed.is_quantized());
     assert_eq!(handed.training_completed_at(), Some(given));
     assert_eq!(handed.storage_mode(), "quantized_active");

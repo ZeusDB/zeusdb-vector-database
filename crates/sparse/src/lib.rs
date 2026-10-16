@@ -81,11 +81,20 @@ mod verify;
 
 pub use calibrate::UnitCosts;
 pub use index::{
-    HeapBytes, PostingsIndex, SparseConfig, Unlink, Weighting, DEFAULT_BM25_B, DEFAULT_BM25_K1,
-    DEFAULT_LAZY_THRESHOLD_PERCENT,
+    HeapBytes, PostingsIndex, PostingsParts, SparseConfig, Unlink, Weighting, DEFAULT_BM25_B,
+    DEFAULT_BM25_K1, DEFAULT_LAZY_THRESHOLD_PERCENT,
 };
 pub use search::Mode;
 
 /// The target every record this crate emits carries. See the crate
 /// documentation.
 const LOG_TARGET: &str = "zeusdb_vector_database::sparse";
+
+/// Every internal id from zero to `max`, being the positions of an index
+/// filled on its own, whose positions are its ids, for a test restoring one.
+#[cfg(test)]
+pub(crate) fn identity_positions(max: usize) -> &'static [u32] {
+    static IDS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    let all = IDS.get_or_init(|| (0..=1u32 << 20).collect());
+    &all[..=max.min(1 << 20)]
+}

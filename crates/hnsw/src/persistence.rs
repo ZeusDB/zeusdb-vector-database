@@ -131,8 +131,9 @@
 //! once and writes the new file on the next save. Nothing reads the old format.
 
 use crate::collection::{
-    validate_index_parameters, validate_space_supports_quantization, Collection,
-    QuantizationConfig, QuantizationScheme, SparseDeclaration, StorageMode, DEFAULT_SPACE,
+    read_internal_id, shifted_internal_id, validate_index_parameters,
+    validate_space_supports_quantization, Collection, PositionReader, QuantizationConfig,
+    QuantizationScheme, SparseDeclaration, StorageMode, DEFAULT_SPACE,
 };
 use crate::journal::{JournalPolicy, Recovery};
 use crate::RerankCalibration;
@@ -144,10 +145,11 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, warn};
 use zeusdb_vector_core::{
-    checksum_of, frame, frame_begin, frame_finish, unframe, validate_indexed_fields,
-    ArtefactRecord, Bounds, Dir, Error, FrameEncoding, FrameKind, FsStorage, IdStore, Int8Codec,
-    Inventory, Persist, RecordFields, Restore, SpaceName, Storage, VectorIndex,
-    DUMP_FILENAME as GRAPH_DUMP_FILENAME, FRAME_OVERHEAD_BYTES, LEGACY_DUMP_FILENAMES, PQ,
+    checksum_of, frame, frame_begin, frame_finish, refuse_unnamable, unframe,
+    validate_indexed_fields, ArtefactRecord, Bounds, Dir, Error, FrameEncoding, FrameKind,
+    FsStorage, IdStore, Int8Codec, Inventory, Position, PositionWalk, RecordFields, Restore,
+    SpaceName, Storage, VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME, FRAME_OVERHEAD_BYTES,
+    LEGACY_DUMP_FILENAMES, MAX_INTERNAL_ID, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerConfig};
@@ -1137,20 +1139,12 @@ fn load_config(dir: &dyn Dir, manifest: &IndexManifest) -> Result<IndexConfig, E
         config.expected_size,
         &format!("{}: ", config_path),
     )?;
-    // `id_counter` too, which those five do not cover and which sizes an
-    // allocation rather than a behaviour.
-    //
-    // The internal id a record is inserted under is the index into the graph's
-    // id-to-node array, so that array is `id_counter + 1` slots of four bytes.
-    // A hand edited config declaring 2^40 loaded without complaint, and the
-    // next `add` asked the allocator for 4,398,046,511,112 bytes and **aborted
-    // the process**. An allocation failure does not unwind, so no `catch_unwind`
-    // sees one and a Python caller gets a dead interpreter with no traceback.
-    //
-    // It is the same root cause as the graph dump's origin id, seen from the
-    // other side: one dense array, two unvalidated sources for its index. The
-    // dump's side is checked in `graph::dump::parse_dump` against this same
-    // field, so bounding it here bounds both.
+    // `id_counter` too, which those five do not cover. It is the last internal
+    // id the index issued, and every internal id the load reads is held to it,
+    // the mappings' ids in `load_ids` and the graph dump's origin ids in
+    // `graph::dump::open_dump`, so bounding it here bounds both. No structure
+    // is sized by it, since every per-record structure sits at the positions
+    // the records hold.
     //
     // The ceiling is `u32::MAX` because a node index is a `u32` and both graph
     // constructors refuse a graph holding more points than that. Every id was
@@ -1178,10 +1172,16 @@ fn load_config(dir: &dyn Dir, manifest: &IndexManifest) -> Result<IndexConfig, E
 /// collection declares one.
 ///
 /// Runs after the id mappings are restored and before the graph is, for two
-/// reasons. The largest internal id the mappings hold is what bounds the
-/// space's slot table, and the graph's rebuild fallback replays every record
-/// through `add`, which reads each record's sparse half out of the space and
-/// carries it through; see `Collection::rebuild_from_records`.
+/// reasons. The mappings give the position each record the space holds is
+/// filed at, and the graph's rebuild fallback replays every record through
+/// `add`, which reads each record's sparse half out of the space and carries
+/// it through; see `Collection::rebuild_from_records`.
+///
+/// The space's slot table is bounded by `issued`, the last internal id
+/// `config.json` says the collection issued, as the graph dump's origin ids
+/// are. The space records one past the largest id it ever took a record
+/// under, and a removal does not lower that, so the largest id the mappings
+/// hold would refuse a directory saved after the newest record went.
 ///
 /// Every record the space holds must be one the mappings name. A record may
 /// leave the space empty, so the space may hold fewer, and a space holding
@@ -1192,37 +1192,30 @@ fn restore_spaces(
     index: &Collection,
     dir: &dyn Dir,
     manifest: &IndexManifest,
+    issued: usize,
+    positions: &[u32],
 ) -> Result<(), Error> {
     let Some((name, space)) = index.sparse_named() else {
         return Ok(());
     };
     let prefix = Collection::space_prefix(name);
-    let largest_id = index.ids().highest_slot().unwrap_or(0);
     let bounds = Bounds {
         min_records: 0,
-        max_records: largest_id,
+        max_records: issued,
         max_bytes: u64::MAX,
+        ids_by_position: positions,
     };
-    let restored = PostingsIndex::restore(space.config(), &prefix, dir, manifest, &bounds)?;
-    let unmapped = {
-        let ids = index.ids();
-        let mut unmapped = None;
-        restored.live_set().for_each_while(|slot| {
-            if ids.contains_slot(slot) {
-                true
-            } else {
-                unmapped = Some(slot);
-                false
-            }
-        });
-        unmapped
-    };
-    if let Some(slot) = unmapped {
-        return Err(Error::SparseRecordUnmapped {
-            space: name.as_str().to_string(),
-            id: u32::try_from(slot).unwrap_or(u32::MAX),
-        });
-    }
+    // The space files each record at the position the mappings give its
+    // internal id, and refuses one they do not hold once its payload has
+    // been read whole, which is named here with the space.
+    let restored = PostingsIndex::restore(space.config(), &prefix, dir, manifest, &bounds)
+        .map_err(|error| match error {
+            Error::SparseRecordUnmapped { id, .. } => Error::SparseRecordUnmapped {
+                space: name.as_str().to_string(),
+                id,
+            },
+            other => other,
+        })?;
     if space.text.is_some() {
         let dictionary_name = Collection::dictionary_name(&prefix);
         let bytes = zeusdb_vector_core::read_artefact(
@@ -1254,17 +1247,98 @@ fn restore_spaces(
     Ok(())
 }
 
+/// The records `mappings.bin` holds: the id store, which files them at
+/// consecutive positions from zero in increasing internal id, and the
+/// internal id of the record at each position, which every other artefact
+/// names a record by.
+///
+/// The load keeps the second until it ends, four bytes a record, and finds
+/// each record an artefact names by a step forward through it, since every
+/// framed artefact lists its records in increasing internal id. Positions are
+/// never written, so nothing here outlives the load.
+pub(crate) struct MappedIds {
+    pub(crate) store: IdStore,
+    pub(crate) internal: Vec<u32>,
+}
+
+impl MappedIds {
+    /// The two halves together, as the readers below take them.
+    pub(crate) fn view(&self) -> Mapped<'_> {
+        Mapped {
+            store: &self.store,
+            internal: &self.internal,
+        }
+    }
+
+    /// How many records the mappings hold.
+    pub(crate) fn len(&self) -> usize {
+        self.store.len()
+    }
+
+    /// Every record as its internal id and its external id, in increasing
+    /// internal id.
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &str)> + '_ {
+        self.view().iter()
+    }
+
+    /// The internal id of the record named `id`, where the mappings hold it.
+    #[cfg(test)]
+    pub(crate) fn slot_of(&self, id: &str) -> Option<usize> {
+        self.store.slot_of(id).map(|at| self.internal[at] as usize)
+    }
+}
+
+/// The records the mappings hold, borrowed, which the load reads every other
+/// artefact against: the id store by position and the internal id at each
+/// position. See [`MappedIds`].
+#[derive(Clone, Copy)]
+pub(crate) struct Mapped<'a> {
+    pub(crate) store: &'a IdStore,
+    pub(crate) internal: &'a [u32],
+}
+
+impl<'a> Mapped<'a> {
+    /// How many records the mappings hold.
+    pub(crate) fn len(&self) -> usize {
+        self.store.len()
+    }
+
+    /// A cursor finding each record an artefact names in increasing internal
+    /// id by a step forward.
+    pub(crate) fn walk(&self) -> PositionWalk<'a> {
+        PositionWalk::new(self.internal)
+    }
+
+    /// The external id of the record holding `internal_id`, found by a
+    /// search, for a lookup out of order.
+    pub(crate) fn name(&self, internal_id: usize) -> Option<&'a str> {
+        let id = u32::try_from(internal_id).ok()?;
+        let at = self.internal.binary_search(&id).ok()?;
+        self.store.name(at)
+    }
+
+    /// Every record as its internal id and its external id, in increasing
+    /// internal id.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &'a str)> + 'a {
+        let internal = self.internal;
+        self.store
+            .iter()
+            .map(move |(at, id)| (internal[at] as usize, id))
+    }
+}
+
 /// Build the id store from mappings.bin, and say how the directory holds its
 /// four binary artefacts
 ///
 /// Every internal id the artefact names is held to `id_counter`, the last id
-/// `config.json` says the index issued, before the store is reserved. The
-/// store, the metadata, the columns and a sparse space all hold an entry for
-/// every id up to the highest a record holds, so a file naming one record at
-/// a high id would have the loader reserve and fill an entry for every id
-/// below it. A save holds the mutation guard for its whole run, so every id
-/// the file names was issued by the counter it records. The graph dump's
-/// origin ids are held to the same counter; see `Expected::max_origin_id`.
+/// `config.json` says the index issued, before the store is reserved, and to
+/// the last id a collection issues. A save holds the mutation guard for its
+/// whole run, so every id the file names was issued by the counter it
+/// records. The graph dump's origin ids are held to the same counter; see
+/// `Expected::max_origin_id`. The records take the positions from zero in
+/// increasing internal id, so every per-record structure the load builds is
+/// sized by the records the file holds and not by the ids they carry.
 ///
 /// The store is built before the collection is, because the framed
 /// `vectors.bin` and `pq_codes.bin` name records by internal id and are held
@@ -1274,7 +1348,7 @@ fn load_ids(
     manifest: &IndexManifest,
     major: u32,
     config: &IndexConfig,
-) -> Result<(IdStore, Layout), Error> {
+) -> Result<(MappedIds, Layout), Error> {
     debug!(target: LOG_TARGET, "Loading mappings.bin...");
 
     let mappings_data = read_artefact(dir, "mappings.bin", manifest)?;
@@ -1293,27 +1367,35 @@ fn load_ids(
 ///
 /// One entry a record, in increasing internal id, so an internal id holds one
 /// id, the highest is the last, and the store is reserved once at exactly
-/// what it will hold. An id held under two internal ids is refused.
-fn framed_ids(bytes: &[u8], config: &IndexConfig) -> Result<IdStore, Error> {
+/// what it will hold. The record at entry `k` takes position `k`. An id held
+/// under two internal ids is refused, and so is an internal id past the last
+/// one a collection issues, in the words the store gave it while an entry
+/// was an internal id.
+fn framed_ids(bytes: &[u8], config: &IndexConfig) -> Result<MappedIds, Error> {
     let invalid = |error: String| Error::ArtefactParseFailed {
         name: "mappings.bin",
         error,
     };
     let records = framed::Mappings::read(bytes, "mappings.bin")?;
-    let highest = match records.last() {
-        Some((internal_id, id)) if internal_id > config.id_counter => {
+    if let Some((internal_id, id)) = records.last() {
+        if internal_id > config.id_counter {
             return Err(invalid(format!(
                 "the record '{}' holds internal id {} and config.json counted {}",
                 id, internal_id, config.id_counter
             )));
         }
-        Some((internal_id, _)) => internal_id,
-        None => 0,
-    };
+    }
     let mut store = IdStore::new(config.expected_size);
-    store.reserve(records.len(), highest);
-    for (internal_id, id) in records.iter() {
-        store.insert(internal_id, id)?;
+    store.reserve(records.len(), records.len().saturating_sub(1));
+    let mut internal = Vec::with_capacity(records.len());
+    for (at, (internal_id, id)) in records.iter().enumerate() {
+        refuse_past_last_id(internal_id)?;
+        // `IdStore::insert`'s refusals, being the position's ceiling, the
+        // id's length and the arena's, then the record.
+        refuse_past_last_id(at)?;
+        refuse_unnamable(id, store.arena_len())?;
+        store.insert_admitted(at, id);
+        internal.push(internal_id as u32);
     }
     if store.len() != records.len() {
         return Err(invalid(format!(
@@ -1322,7 +1404,21 @@ fn framed_ids(bytes: &[u8], config: &IndexConfig) -> Result<IdStore, Error> {
             store.len()
         )));
     }
-    Ok(store)
+    Ok(MappedIds { store, internal })
+}
+
+/// Refuse an internal id past the last one a collection issues, which no
+/// save writes, in the words the id store refused it in while an entry was
+/// an internal id. The rebuild fallback holds the ids it hands to records
+/// the mappings lack to the same ceiling.
+pub(crate) fn refuse_past_last_id(internal_id: usize) -> Result<(), Error> {
+    if internal_id > MAX_INTERNAL_ID {
+        return Err(Error::Engine(format!(
+            "internal id {} is above what the id store can hold",
+            internal_id
+        )));
+    }
+    Ok(())
 }
 
 /// The id store bincode's two maps describe, as releases before 4.0.0 wrote
@@ -1331,7 +1427,9 @@ fn framed_ids(bytes: &[u8], config: &IndexConfig) -> Result<IdStore, Error> {
 /// The forward map is what the store is built from, and the reverse map is
 /// held to being its exact inverse, since the two were written from one
 /// structure and a file whose two halves disagree describes two record sets.
-fn bincode_ids(bytes: &[u8], config: &IndexConfig) -> Result<IdStore, Error> {
+/// The forward map is sorted by internal id first, so the records take the
+/// positions from zero in increasing internal id, as a framed file's do.
+fn bincode_ids(bytes: &[u8], config: &IndexConfig) -> Result<MappedIds, Error> {
     let invalid = |error: String| Error::ArtefactParseFailed {
         name: "mappings.bin",
         error,
@@ -1348,19 +1446,40 @@ fn bincode_ids(bytes: &[u8], config: &IndexConfig) -> Result<IdStore, Error> {
             )));
         }
     }
-    let highest = top.map_or(0, |(_, &internal_id)| internal_id);
-    let mut store = IdStore::new(config.expected_size);
-    store.reserve(id_map.len(), highest);
-    for (id, &internal_id) in &id_map {
-        store.insert(internal_id, id)?;
+    let mut pairs: Vec<(usize, &String)> = id_map
+        .iter()
+        .map(|(id, &internal_id)| (internal_id, id))
+        .collect();
+    pairs.sort_unstable();
+    for &(internal_id, _) in &pairs {
+        refuse_past_last_id(internal_id)?;
     }
-    if store.len() != id_map.len() {
+    // Two records under one internal id were one record to the store that
+    // was keyed by it, so the file names fewer records than it lists.
+    let distinct = pairs.len()
+        - pairs
+            .windows(2)
+            .filter(|pair| pair[0].0 == pair[1].0)
+            .count();
+    if distinct != id_map.len() {
         return Err(invalid(format!(
             "the forward map names {} records under {} internal ids",
             id_map.len(),
-            store.len()
+            distinct
         )));
     }
+    let mut store = IdStore::new(config.expected_size);
+    store.reserve(pairs.len(), pairs.len().saturating_sub(1));
+    let mut internal = Vec::with_capacity(pairs.len());
+    for (at, &(internal_id, id)) in pairs.iter().enumerate() {
+        // `IdStore::insert`'s refusals, being the position's ceiling, the
+        // id's length and the arena's, then the record.
+        refuse_past_last_id(at)?;
+        refuse_unnamable(id, store.arena_len())?;
+        store.insert_admitted(at, id);
+        internal.push(internal_id as u32);
+    }
+    let mapped = MappedIds { store, internal };
     if rev_map.len() != id_map.len() {
         return Err(invalid(format!(
             "the forward map holds {} records and the reverse map {}",
@@ -1370,14 +1489,14 @@ fn bincode_ids(bytes: &[u8], config: &IndexConfig) -> Result<IdStore, Error> {
     }
     if let Some((internal_id, id)) = rev_map
         .iter()
-        .find(|(&internal_id, id)| store.name(internal_id) != Some(id.as_str()))
+        .find(|(&internal_id, id)| mapped.view().name(internal_id) != Some(id.as_str()))
     {
         return Err(invalid(format!(
             "the reverse map names internal id {} as '{}' and the forward map does not",
             internal_id, id
         )));
     }
-    Ok(store)
+    Ok(mapped)
 }
 
 /// Load vector metadata from metadata.json
@@ -1411,7 +1530,7 @@ fn load_metadata(
 fn load_vectors(
     dir: &dyn Dir,
     manifest: &IndexManifest,
-    ids: &IdStore,
+    ids: Mapped<'_>,
     layout: Layout,
     dim: usize,
 ) -> Result<HashMap<String, Vec<f32>>, Error> {
@@ -1428,8 +1547,12 @@ fn load_vectors(
         Layout::Framed => {
             let rows = framed_vectors(&vectors_data, ids, dim)?;
             let mut vectors = HashMap::with_capacity(rows.len());
+            let mut walk = ids.walk();
             for (internal_id, row) in rows.iter() {
-                if let Some(id) = ids.name(internal_id) {
+                if let Some(id) = walk
+                    .position_of(internal_id)
+                    .and_then(|at| ids.store.read_name(at))
+                {
                     vectors.insert(id.to_string(), framed::floats(row).collect());
                 }
             }
@@ -1518,7 +1641,7 @@ impl RawVectors {
         &mut self,
         dir: &dyn Dir,
         manifest: &IndexManifest,
-        ids: &IdStore,
+        ids: Mapped<'_>,
         layout: Layout,
         dim: usize,
     ) -> Result<(), Error> {
@@ -1541,7 +1664,7 @@ impl RawVectors {
 fn count_vectors(
     dir: &dyn Dir,
     manifest: &IndexManifest,
-    ids: &IdStore,
+    ids: Mapped<'_>,
     layout: Layout,
     dim: usize,
 ) -> Result<usize, Error> {
@@ -1581,7 +1704,7 @@ fn count_vectors(
 /// `check_vectors_are_finite` names them.
 fn framed_vectors<'a>(
     bytes: &'a [u8],
-    ids: &IdStore,
+    ids: Mapped<'_>,
     dim: usize,
 ) -> Result<framed::Rows<'a>, Error> {
     let rows = framed::Rows::read(
@@ -1601,9 +1724,10 @@ fn framed_vectors<'a>(
         file: "vectors.bin".to_string(),
         error,
     };
+    let mut walk = ids.walk();
     if let Some((internal_id, _)) = rows
         .iter()
-        .find(|&(internal_id, _)| !ids.contains_slot(internal_id))
+        .find(|&(internal_id, _)| walk.position_of(internal_id).is_none())
     {
         return Err(corrupt(format!(
             "names internal id {}, which mappings.bin does not hold",
@@ -1711,7 +1835,7 @@ fn load_pq_centroids(
 fn load_pq_codes(
     dir: &dyn Dir,
     manifest: &IndexManifest,
-    ids: &IdStore,
+    ids: Mapped<'_>,
     layout: Layout,
     subvectors: usize,
 ) -> Result<HashMap<String, Vec<u8>>, Error> {
@@ -1739,8 +1863,12 @@ fn load_pq_codes(
                 },
             )?;
             let mut codes = HashMap::with_capacity(rows.len());
+            let mut walk = ids.walk();
             for (internal_id, code) in rows.iter() {
-                let Some(id) = ids.name(internal_id) else {
+                let Some(id) = walk
+                    .position_of(internal_id)
+                    .and_then(|at| ids.store.read_name(at))
+                else {
                     return Err(Error::DecodeFailed {
                         file: "pq_codes.bin".to_string(),
                         error: format!(
@@ -1804,7 +1932,7 @@ fn load_quantization(
     manifest: &IndexManifest,
     dim: usize,
     space: &str,
-    ids: &IdStore,
+    ids: Mapped<'_>,
     layout: Layout,
 ) -> Result<Option<QuantizationArtefacts>, Error> {
     debug!(target: LOG_TARGET, "Loading quantization components...");
@@ -2148,7 +2276,19 @@ fn save_spaces(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Re
     };
     let prefix = Collection::space_prefix(name);
     debug!(target: LOG_TARGET, "Saving {}postings.zdbsparse...", prefix);
-    space.index.read().unwrap().write(&prefix, dir, ledger)?;
+    // The space keys its records by position and the artefact names them by
+    // internal id, being the one each record's node was inserted under, read
+    // under the dense index's guard, which ranks before the space's.
+    {
+        let dense = index.dense_index();
+        let internal = dense.ids_by_position();
+        let id_of = |at: usize| internal.get(at).map_or(Position::NONE, |id| id as u32);
+        space
+            .index
+            .read()
+            .unwrap()
+            .write_with(&prefix, dir, ledger, &id_of)?;
+    }
     debug!(target: LOG_TARGET, "{}postings.zdbsparse saved", prefix);
     if let Some(text) = &space.text {
         let dictionary_name = Collection::dictionary_name(&prefix);
@@ -2171,7 +2311,7 @@ fn reconstruct_index_simple(
     dir: &dyn Dir,
     manifest: &IndexManifest,
     config: IndexConfig,
-    ids: IdStore,
+    ids: MappedIds,
     layout: Layout,
     metadata: HashMap<String, HashMap<String, Value>>,
     mut vectors: RawVectors,
@@ -2212,19 +2352,26 @@ fn reconstruct_index_simple(
         .map(|q| std::mem::take(&mut q.rows))
         .unwrap_or_default();
 
-    // Step 2: Restore all data fields directly (but not the graph)
-    restore_data_fields(&mut index, ids, &config, quantization)?;
+    // Step 2: Restore all data fields directly (but not the graph). The id
+    // store moves into the collection, and the internal id of the record at
+    // each position stays here until the load is done, since the artefacts
+    // still to be read name records by it.
+    let MappedIds {
+        store,
+        internal: mut positions,
+    } = ids;
+    restore_data_fields(&mut index, store, &config, quantization)?;
 
     // Step 2a: The sparse space, once the mappings are in and before the
     // graph, for the reasons `restore_spaces` gives.
-    restore_spaces(&index, dir, manifest)?;
+    restore_spaces(&index, dir, manifest, config.id_counter, &positions)?;
 
     // The rows of a trained scalar directory, held to the mappings both
     // ways before anything is built from either: every row names a record
     // the mappings hold, and every record the mappings hold has a row. A
     // directory whose rows and mappings disagree describes two indexes.
     if int8_trained {
-        check_int8_rows_against_mappings(&index, &int8_rows)?;
+        check_int8_rows_against_mappings(&index, &int8_rows, &positions)?;
     }
 
     // Step 3: Restore the graph the save wrote. Every save dumps the graph, so
@@ -2232,7 +2379,12 @@ fn reconstruct_index_simple(
     // by a release this build cannot interpret falls back to the rebuild, which
     // is the path that also upgrades a graph carrying a defect the vendored
     // patches have since fixed. See `restore_graph_from_dump`.
-    let graph_rebuilt = match index.restore_graph_from_dump(dir, config.id_counter, dump_bytes) {
+    let graph_rebuilt = match index.restore_graph_from_dump(
+        dir,
+        config.id_counter,
+        dump_bytes,
+        &positions,
+    ) {
         Ok(nodes) => {
             debug!(target: LOG_TARGET, "HNSW graph restored from the saved dump ({} nodes)", nodes);
             false
@@ -2243,22 +2395,26 @@ fn reconstruct_index_simple(
             // whose vectors were counted and not kept reads them now.
             {
                 let ids = index.ids();
-                vectors.hold(dir, manifest, &ids, layout, config.dim)?;
+                let mapped = Mapped {
+                    store: &ids,
+                    internal: &positions,
+                };
+                vectors.hold(dir, manifest, mapped, layout, config.dim)?;
             }
             let empty = HashMap::new();
             let held = vectors.held().unwrap_or(&empty);
             if int8_trained {
                 debug!(target: LOG_TARGET, "Rebuilding scalar quantized HNSW graph from the stored rows...");
                 let inserted = index
-                    .rebuild_graph_from_int8_rows(&int8_rows)
+                    .rebuild_graph_from_int8_rows(&int8_rows, &positions)
                     .map_err(Error::Engine)?;
                 debug!(target: LOG_TARGET, "Scalar quantized graph rebuilt ({} rows inserted)", inserted);
             } else if index.can_use_quantization() {
                 debug!(target: LOG_TARGET, "Rebuilding quantized HNSW graph from stored PQ codes...");
-                rebuild_graph_from_codes(&mut index, &pq_codes, held)?;
+                rebuild_graph_from_codes(&mut index, &pq_codes, held, &mut positions)?;
             } else {
                 debug!(target: LOG_TARGET, "Rebuilding HNSW graph from vectors...");
-                rebuild_graph_from_data(&mut index, held, &pq_codes)?;
+                rebuild_graph_from_data(&mut index, held, &pq_codes, &mut positions)?;
             }
             true
         }
@@ -2342,6 +2498,14 @@ fn reconstruct_index_simple(
     // Step 6: Check the saved count against the index that was actually built
     check_restored_count(&mut index, &config, raw_count, code_count)?;
 
+    // Every structure is now at the positions the mappings gave, and the
+    // internal ids by position are let go.
+    drop(positions);
+    debug_assert!(
+        index.positions_agree(),
+        "a load leaves every structure at the positions the mappings gave"
+    );
+
     debug!(target: LOG_TARGET, "Reconstruction completed!");
     Ok((index, graph_rebuilt))
 }
@@ -2355,13 +2519,22 @@ fn reconstruct_index_simple(
 /// disagreement means a file is missing or truncated and the load fails rather
 /// than producing an index that misreports what it holds.
 /// Hold the rows artefact to the mappings in both directions.
-fn check_int8_rows_against_mappings(index: &Collection, rows: &Int8Rows) -> Result<(), Error> {
+fn check_int8_rows_against_mappings(
+    index: &Collection,
+    rows: &Int8Rows,
+    positions: &[u32],
+) -> Result<(), Error> {
     let invalid = |detail: String| Error::Int8ArtefactInvalid {
         file: INT8_ROWS_FILENAME.to_string(),
         detail,
     };
-    let ids = index.ids();
-    if let Some((id, _)) = rows.iter().find(|&(id, _)| !ids.contains_slot(id)) {
+    let store = index.ids();
+    let ids = Mapped {
+        store: &store,
+        internal: positions,
+    };
+    let mut walk = ids.walk();
+    if let Some((id, _)) = rows.iter().find(|&(id, _)| walk.position_of(id).is_none()) {
         return Err(invalid(format!(
             "names internal id {}, which mappings.bin does not hold",
             id
@@ -2629,9 +2802,10 @@ fn rebuild_graph_from_codes(
     index: &mut Collection,
     pq_codes: &HashMap<String, Vec<u8>>,
     vectors: &HashMap<String, Vec<f32>>,
+    positions: &mut Vec<u32>,
 ) -> Result<(), Error> {
     let (inserted, quantized_from_raw, remapped) = index
-        .rebuild_graph_from_codes(pq_codes, vectors)
+        .rebuild_graph_from_codes(pq_codes, vectors, positions)
         .map_err(Error::Engine)?;
 
     if quantized_from_raw > 0 {
@@ -2668,6 +2842,7 @@ fn rebuild_graph_from_data(
     index: &mut Collection,
     vectors: &HashMap<String, Vec<f32>>,
     pq_codes: &HashMap<String, Vec<u8>>,
+    positions: &mut Vec<u32>,
 ) -> Result<(), Error> {
     if vectors.is_empty() && pq_codes.is_empty() {
         debug!(target: LOG_TARGET, "No records to rebuild (empty index)");
@@ -2721,7 +2896,7 @@ fn rebuild_graph_from_data(
     // ascending internal id, which `rebuild_from_records` orders them into
     // from the restored mappings. This used to build a PyDict holding three
     // PyLists and call add(), which parsed them back into exactly this.
-    let inserted = index.rebuild_from_records(records)?;
+    let inserted = index.rebuild_from_records(records, positions)?;
 
     debug!(target: LOG_TARGET, "Graph rebuild completed: {} records inserted", inserted);
     debug!(target: LOG_TARGET, "Final vector count: {}", index.vector_count());
@@ -2841,13 +3016,32 @@ fn load_from(
     // vectors.bin is read for its count and its check and nothing of it is
     // kept. See `RawVectors`.
     let vectors = if manifest_names(&manifest, "quantization.json") {
-        RawVectors::Held(load_vectors(dir, &manifest, &ids, layout, config.dim)?)
+        RawVectors::Held(load_vectors(
+            dir,
+            &manifest,
+            ids.view(),
+            layout,
+            config.dim,
+        )?)
     } else {
-        RawVectors::Counted(count_vectors(dir, &manifest, &ids, layout, config.dim)?)
+        RawVectors::Counted(count_vectors(
+            dir,
+            &manifest,
+            ids.view(),
+            layout,
+            config.dim,
+        )?)
     };
     debug!(target: LOG_TARGET, "Vectors loaded: {} vectors", vectors.len());
 
-    let quantization = load_quantization(dir, &manifest, config.dim, &config.space, &ids, layout)?;
+    let quantization = load_quantization(
+        dir,
+        &manifest,
+        config.dim,
+        &config.space,
+        ids.view(),
+        layout,
+    )?;
     if let Some(ref quant) = quantization {
         match &quant.config {
             QuantizationFile::Pq(config) => {
@@ -3021,7 +3215,7 @@ fn load_from(
             .map_err(|error| Error::JournalReplayFailed {
                 file: file.clone(),
                 sequence: journal_record.sequence,
-                detail: error.to_string(),
+                detail: error.replay_detail(),
             })?;
         replayed += 1;
     }
@@ -3103,14 +3297,21 @@ fn save_config(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Re
 fn save_mappings(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
     debug!(target: LOG_TARGET, "Saving mappings.bin...");
 
-    // Every record's internal id and id, read out of the id store under its
-    // guard, which ends with this block, in the order the store holds them,
-    // which is increasing internal id. The frame is the one buffer, so the
-    // file is written with nothing held.
+    // Every record's internal id and id, read out of the id store and the
+    // dense index under their guards, which end with this block, in the
+    // order the store holds them, which is position order and increasing
+    // internal id. A record is named by the internal id its node was inserted
+    // under, since a position is never written. The frame is the one buffer,
+    // so the file is written with nothing held.
     let (mappings_data, mapping_count) = {
         let ids = index.ids();
+        let dense = index.dense_index();
+        let internal = dense.ids_by_position();
+        let records = ids
+            .iter()
+            .filter_map(|(at, id)| Some((internal.get(at)?, id)));
         (
-            framed::write_mappings(ids.iter(), ids.len(), ids.text_bytes()),
+            framed::write_mappings(records, ids.len(), ids.text_bytes()),
             ids.len(),
         )
     };
@@ -3122,16 +3323,32 @@ fn save_mappings(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> 
     Ok(())
 }
 
+/// The codes frame over every record `ids` holds that has codes, each named
+/// by the internal id `id_of` gives its position. Compiled once for each
+/// reader, so the loop tests nothing the other reader needs.
+fn codes_of(
+    ids: &IdStore,
+    pq_codes: &HashMap<String, Vec<u8>>,
+    width: usize,
+    id_of: impl Fn(usize) -> Option<usize>,
+) -> Result<(Vec<u8>, usize), Error> {
+    let records = ids.iter().filter_map(|(at, id)| {
+        let code = pq_codes.get(id)?;
+        Some((id_of(at)?, code.as_slice()))
+    });
+    framed::write_codes(width, records, pq_codes.len())
+}
+
 /// Save vector metadata as JSON for external tool compatibility
 fn save_metadata(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
     debug!(target: LOG_TARGET, "Saving metadata.json...");
 
     // Both guards end with the serialize, taken in the documented order,
     // the id store before vector_metadata. The file is keyed by external id
-    // and the store by internal id, so every record is written under the id
-    // the id store holds for it, in increasing internal id order, which is
-    // the order the store walks in. `to_string_pretty` returns an owned
-    // String, so the file is written with nothing held.
+    // and the store by position, so every record is written under the id
+    // the id store holds for it, in position order, which is increasing
+    // internal id and the order the store walks in. `to_string_pretty`
+    // returns an owned String, so the file is written with nothing held.
     let (metadata_json, record_count) = {
         let ids = index.ids();
         let vector_metadata = index.vector_metadata();
@@ -3387,21 +3604,30 @@ fn save_pq_centroids(
 /// Save quantized vector codes, each under its record's internal id
 fn save_pq_codes(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
     let width = index.quantization_code_bytes();
-    // Both guards end with the frame, taken in the documented order, the id
-    // store before the codes, so the file is written with nothing held. The
-    // codes follow increasing internal id, which is the order the store
-    // holds its records in.
+    // The guards end with the frame, taken in the documented order, the id
+    // store, the dense index, then the codes, so the file is written with
+    // nothing held. The codes follow position order, which is increasing
+    // internal id and the order the store holds its records in, each under
+    // the internal id its record's node was inserted under.
     let (codes_data, code_count) = {
         let ids = index.ids();
+        let dense = index.dense_index();
         let pq_codes = index.pq_codes();
         if pq_codes.is_empty() {
             return Ok(());
         }
         debug!(target: LOG_TARGET, "Saving pq_codes.bin...");
-        let records = ids.iter().filter_map(|(internal_id, id)| {
-            pq_codes.get(id).map(|code| (internal_id, code.as_slice()))
-        });
-        framed::write_codes(width, records, pq_codes.len())?
+        match dense.ids_by_position().reader() {
+            PositionReader::Shifted { extent } => {
+                codes_of(&ids, &pq_codes, width, |at| shifted_internal_id(extent, at))?
+            }
+            PositionReader::Read {
+                node_at,
+                origin_ids,
+            } => codes_of(&ids, &pq_codes, width, |at| {
+                read_internal_id(node_at, origin_ids, at)
+            })?,
+        }
     };
 
     write_framed(dir, "pq_codes.bin", &codes_data, ledger)?;

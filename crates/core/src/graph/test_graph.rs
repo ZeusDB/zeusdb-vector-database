@@ -60,7 +60,7 @@ where
         self.graph
             .search(&self.store, query, knbn, ef, None::<&fn(&usize) -> bool>)
             .into_iter()
-            .map(|hit| (hit.internal_id, hit.distance))
+            .map(|hit| (hit.position, hit.distance))
             .collect()
     }
 

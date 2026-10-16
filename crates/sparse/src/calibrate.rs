@@ -128,7 +128,7 @@ impl PostingsIndex {
         let step = (self.records.len() / SAMPLE_RECORDS).max(1);
         let mut at = 0usize;
         while queries.len() < SAMPLE_RECORDS && at < self.records.len() {
-            if let Some(v) = self.slot_of(zeusdb_vector_core::RecordId::from_slot(at)) {
+            if let Some(v) = self.slot_of(zeusdb_vector_core::Position::from_slot(at)) {
                 let v = self.forward(v);
                 let cut = |width: usize| -> SparseVector {
                     let stride = (v.dims.len() / width).max(1);
@@ -331,7 +331,7 @@ pub(crate) fn describe(units: &UnitCosts) -> String {
 mod tests {
     use super::*;
     use crate::index::SparseConfig;
-    use zeusdb_vector_core::{Prepared, RecordId, VectorIndex};
+    use zeusdb_vector_core::{Position, Prepared, RecordId, VectorIndex};
 
     /// A small index keeps the floor, and a large one times itself and
     /// reports figures that are positive and finite.
@@ -344,7 +344,7 @@ mod tests {
                 values: vec![1.0, 1.0, 1.0],
             };
             small
-                .insert(RecordId(id), v.as_ref(), Prepared::none())
+                .insert(Position(id), RecordId(id), v.as_ref(), Prepared::none())
                 .unwrap();
         }
         small.calibrate();
@@ -359,7 +359,7 @@ mod tests {
             let values = vec![1.0; dims.len()];
             let v = SparseVector { dims, values };
             large
-                .insert(RecordId(id), v.as_ref(), Prepared::none())
+                .insert(Position(id), RecordId(id), v.as_ref(), Prepared::none())
                 .unwrap();
         }
         assert!(large.postings_total() >= CALIBRATION_MIN_POSTINGS);

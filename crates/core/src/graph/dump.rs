@@ -96,6 +96,7 @@
 use super::mutable::MutableGraph;
 use super::Distance;
 use crate::checksum::{checksum_of, Checksum};
+use crate::space::Position;
 use crate::storage::Dir;
 use std::io::{BufReader, BufWriter, Read, Write};
 use tracing::{info, warn};
@@ -779,13 +780,11 @@ pub(crate) struct Expected {
     pub min_nodes: usize,
     /// The largest internal id the index has ever issued, from `config.json`.
     ///
-    /// **This is what bounds the loaded graph's memory.** A point's origin id
-    /// is the internal id it was inserted under, and the structure the reader
-    /// builds holds the inverse of that map as an array indexed by the id. The
-    /// origin id region costs eight bytes per point on disk and the array costs
-    /// four bytes per *slot*, so without a ceiling a single point declaring an
-    /// id of 2^59 asks for two exabytes and the process aborts on the
-    /// allocation rather than returning an error.
+    /// A point's origin id is the internal id it was inserted under, so an id
+    /// past this one names no record the directory holds and is refused. No
+    /// structure the reader builds is indexed by the id: each node's position
+    /// comes from the walk of the sorted origin ids beside the mappings, so
+    /// what the ids cost is the nodes that carry them.
     ///
     /// `id_counter` is exact rather than a margin. A save takes the mutation
     /// lock for its whole run, so the counter `config.json` records and the
@@ -822,16 +821,10 @@ pub(super) struct ParsedDump<T> {
     pub level_scale: f64,
 }
 
-/// Read the graph back out of the artefact `name` in `dir`.
-///
-/// Every failure is an error and none is a panic, an exit or an allocation from
-/// a length the file has not earned. [`open_dump`] checks the header against
-/// itself and against the index and reads every region that comes before the
-/// vectors, [`check_adjacency`] checks every list the adjacency region holds,
-/// and only then is the graph built, straight from the region's bytes into the
-/// graph's own arrays. The region's block is released before the vector store
-/// is sized, and the vectors stream into the store in node order. The trailer
-/// and the checksum over everything read come last.
+/// Read the graph back out of the artefact `name` in `dir`, every node taking
+/// the position of the record its origin id names, where every node holds a
+/// record. See [`read_dump_at`].
+#[cfg(test)]
 pub(super) fn read_dump<T, D>(
     dir: &dyn Dir,
     name: &str,
@@ -842,10 +835,43 @@ where
     T: DumpElement,
     D: Distance<T> + Send + Sync,
 {
+    read_dump_at(dir, name, expected, dist, None)
+}
+
+/// Read the graph back out of the artefact `name` in `dir`, filing each node
+/// at the position `positions` gives its origin id.
+///
+/// `positions` is the internal id of the record at each position, in
+/// increasing order, being the records the collection's mappings hold. A
+/// node whose origin id it holds takes that position, a node whose origin id
+/// it does not hold is stranded, and an id it holds that no node carries
+/// refuses the dump. `None` files every node at the rank of its origin id
+/// among the dump's, which is a graph whose every node holds a record.
+///
+/// Every failure is an error and none is a panic, an exit or an allocation from
+/// a length the file has not earned. [`open_dump`] checks the header against
+/// itself and against the index, reads every region that comes before the
+/// vectors and numbers the nodes, [`check_adjacency`] checks every list the
+/// adjacency region holds, and only then is the graph built, straight from the
+/// region's bytes into the graph's own arrays. The region's block is released
+/// before the vector store is sized, and the vectors stream into the store in
+/// node order. The trailer and the checksum over everything read come last.
+pub(super) fn read_dump_at<T, D>(
+    dir: &dyn Dir,
+    name: &str,
+    expected: &Expected,
+    dist: D,
+    positions: Option<&[u32]>,
+) -> Result<(MutableGraph<T, D>, super::store::VectorStore<T>), String>
+where
+    T: DumpElement,
+    D: Distance<T> + Send + Sync,
+{
     let DumpHead {
         mut hashed,
         layer_counts,
         origin_ids,
+        record_of,
         region,
         entry,
         m,
@@ -853,7 +879,7 @@ where
         level_scale,
         nb_point,
         dimension,
-    } = open_dump::<T>(dir, name, expected)?;
+    } = open_dump::<T>(dir, name, expected, positions)?;
     let walk = check_adjacency(&region, nb_point, &layer_counts, m)?;
     let graph = MutableGraph::from_adjacency(
         &layer_counts,
@@ -864,6 +890,7 @@ where
         level_scale,
         dist,
         origin_ids,
+        record_of,
         walk,
     )
     .map_err(|e| format!("the graph dump could not be rebuilt: {}", e))?;
@@ -909,6 +936,7 @@ where
     let mut stream = open_points::<T>(dir, name, expected)?;
     let nb_point = stream.nb_point;
     let layer_counts = stream.layer_counts.clone();
+    let record_of = std::mem::take(&mut stream.record_of);
     let (graph, store) = MutableGraph::from_points(
         &layer_counts,
         stream.dimension,
@@ -917,6 +945,7 @@ where
         stream.ef_construction,
         stream.level_scale,
         dist,
+        record_of,
         || stream.next_point(),
     )
     .map_err(|e| format!("the graph dump could not be rebuilt: {}", e))?;
@@ -983,6 +1012,8 @@ pub(super) struct DumpStream<T> {
     hashed: HashingReader<BufReader<Box<dyn Read>>>,
     layer_counts: Vec<usize>,
     origin_ids: std::vec::IntoIter<usize>,
+    /// Each node's position, as [`open_dump`] numbered the nodes.
+    record_of: Vec<u32>,
     adjacency: std::vec::IntoIter<Vec<Vec<LoadedEdge>>>,
     values_raw: Vec<u8>,
     entry: PointId,
@@ -1029,6 +1060,7 @@ where
         hashed,
         layer_counts,
         origin_ids,
+        record_of,
         region,
         entry,
         m,
@@ -1036,12 +1068,13 @@ where
         level_scale,
         nb_point,
         dimension,
-    } = open_dump::<T>(dir, name, expected)?;
+    } = open_dump::<T>(dir, name, expected, None)?;
     let adjacency = read_adjacency(&region, nb_point, &layer_counts, m)?;
     Ok(DumpStream {
         hashed,
         layer_counts,
         origin_ids: origin_ids.into_iter(),
+        record_of,
         adjacency: adjacency.into_iter(),
         values_raw: vec![0u8; dimension * T::BYTES],
         entry,
@@ -1080,6 +1113,9 @@ struct DumpHead {
     hashed: HashingReader<BufReader<Box<dyn Read>>>,
     layer_counts: Vec<usize>,
     origin_ids: Vec<usize>,
+    /// Each node's position, or [`Position::NONE`] for a stranded node; see
+    /// [`number_nodes`].
+    record_of: Vec<u32>,
     /// The adjacency region, `adjacency_bytes` of it, which the size agreement
     /// ties to the file's real length.
     region: Vec<u8>,
@@ -1091,13 +1127,19 @@ struct DumpHead {
     dimension: usize,
 }
 
-/// Open a dump, check it down to its adjacency and read that region whole,
-/// leaving the vector region and the trailer to the caller.
+/// Open a dump, check it down to its adjacency, number its nodes against
+/// `positions` and read that region whole, leaving the vector region and the
+/// trailer to the caller. See [`read_dump_at`] for `positions`.
 ///
 /// The order is deliberate. The file's real length is established first, the
 /// header is checked against itself second, the header is checked against the
 /// index third, and only then does anything size a buffer from a field.
-fn open_dump<T>(dir: &dyn Dir, name: &str, expected: &Expected) -> Result<DumpHead, String>
+fn open_dump<T>(
+    dir: &dyn Dir,
+    name: &str,
+    expected: &Expected,
+    positions: Option<&[u32]>,
+) -> Result<DumpHead, String>
 where
     T: DumpElement,
 {
@@ -1272,12 +1314,11 @@ where
         let mut word = [0u8; 8];
         word.copy_from_slice(entry);
         let id = u64::from_le_bytes(word);
-        // The ceiling, and the last allocation in the load that a field could
-        // otherwise size without the file having earned it. The graph keys its
-        // id-to-node array by the id, so one point naming 2^59 asks for two
-        // exabytes and aborts the process on the allocation. Everything above
-        // is bounded by the size agreement; this one is bounded by the counter
-        // the same save wrote. See [`Expected::max_origin_id`].
+        // The ceiling. A point's origin id is the internal id its record was
+        // inserted under, so an id past the counter the same save wrote
+        // names no record the directory holds. Everything above is bounded by
+        // the size agreement; this one is bounded by that counter. See
+        // [`Expected::max_origin_id`].
         if id > expected.max_origin_id as u64 {
             return Err(format!(
                 "the graph dump names origin id {} and config.json counted {}",
@@ -1293,20 +1334,11 @@ where
     }
     drop(origin_raw);
 
-    // No two nodes are filed under one origin id. The graph's id-to-node array
-    // is the inverse of the origin ids, which it can only be where each id
-    // names one node, so a repeated id is refused before anything is built.
-    // The check runs over a sorted copy, which takes what the region the ids
-    // were read from took and is released before the adjacency is read.
-    let mut sorted = origin_ids.clone();
-    sorted.sort_unstable();
-    if let Some(pair) = sorted.windows(2).find(|pair| pair[0] == pair[1]) {
-        return Err(format!(
-            "the graph dump names origin id {} for more than one node",
-            pair[0]
-        ));
-    }
-    drop(sorted);
+    // Each node's position, from one sort of pairs of origin id and node,
+    // which also refuses a repeated id before anything is built. The pairs
+    // take twice what the region the ids were read from took and are
+    // released before the adjacency is read.
+    let record_of = number_nodes(&origin_ids, positions)?;
 
     // The adjacency region, read whole. Its length is part of the size
     // agreement, so the block is one the file has the bytes for, and nothing
@@ -1318,6 +1350,7 @@ where
         hashed,
         layer_counts,
         origin_ids,
+        record_of,
         region,
         entry: PointId(header.entry_layer as u8, header.entry_rank as i32),
         m: expected.m,
@@ -1326,6 +1359,69 @@ where
         nb_point,
         dimension,
     })
+}
+
+/// Each node's position, from the origin ids the dump carries, in node order.
+///
+/// Pairs of origin id and node are sorted once, by origin id. Two nodes filed
+/// under one id are refused, since each id names one record and the index's
+/// node for each position is the inverse of the positions here. The sorted
+/// pairs are then walked beside `positions`, which lists the internal ids the
+/// mappings hold
+/// in increasing order. A node whose origin id the mappings hold takes that
+/// id's place in the list as its position. A node whose origin id they do not
+/// hold is stranded, being a record a removal or an overwrite left behind,
+/// and takes [`Position::NONE`]. An id the mappings hold that no node carries
+/// refuses the dump, which sends the load to its rebuild.
+///
+/// `None` files every node at the rank of its origin id, which is the graph
+/// whose every node holds a record.
+fn number_nodes(origin_ids: &[usize], positions: Option<&[u32]>) -> Result<Vec<u32>, String> {
+    let mut order: Vec<(usize, u32)> = origin_ids
+        .iter()
+        .enumerate()
+        .map(|(node, &origin)| (origin, node as u32))
+        .collect();
+    // By the origin id alone. A dump that names one id twice is refused
+    // below, and in any other the ids are distinct, so the node never decides
+    // the order.
+    order.sort_unstable_by_key(|&(origin, _)| origin);
+    if let Some(pair) = order.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(format!(
+            "the graph dump names origin id {} for more than one node",
+            pair[0].0
+        ));
+    }
+    let mut record_of = vec![Position::NONE; origin_ids.len()];
+    let Some(held) = positions else {
+        for (rank, &(_, node)) in order.iter().enumerate() {
+            record_of[node as usize] = rank as u32;
+        }
+        return Ok(record_of);
+    };
+    let unplaced = |id: u32| {
+        format!(
+            "the graph dump names no node for internal id {}, which mappings.bin holds",
+            id
+        )
+    };
+    let mut next = 0usize;
+    for &(origin, node) in &order {
+        let Some(&id) = held.get(next) else {
+            break;
+        };
+        if (id as usize) < origin {
+            return Err(unplaced(id));
+        }
+        if id as usize == origin {
+            record_of[node as usize] = next as u32;
+            next += 1;
+        }
+    }
+    if let Some(&id) = held.get(next) {
+        return Err(unplaced(id));
+    }
+    Ok(record_of)
 }
 
 /// The adjacency entry at `at`, as its target's layer, its target's rank and
@@ -2024,9 +2120,9 @@ mod tests {
     ///
     /// Found by [`super::fuzz`] on its first run, as a splice that dropped 46
     /// bytes of vector data over the origin id region with both checksums
-    /// repaired. The structure keys its id-to-node array by the origin id, so
-    /// one point declaring 2^59 asked for 3.4 exabytes and **the process
-    /// aborted on the allocation**, which no `catch_unwind` can see and which in
+    /// repaired. The structure then keyed an id-to-node array by the origin
+    /// id, so one point declaring 2^59 asked for 3.4 exabytes and **the
+    /// process aborted on the allocation**, which no `catch_unwind` can see and which in
     /// a Python process kills the interpreter with no traceback. That is the
     /// failure mode the vendored reader's `std::process::exit(1)` was replaced
     /// to remove.
@@ -2737,8 +2833,8 @@ mod tests {
 
     /// One origin id named for two nodes is refused before anything is built.
     ///
-    /// The graph's id-to-node array is the inverse of the origin ids, so each
-    /// id names one node. The second point's id is overwritten with the
+    /// The dense index's node for each position is the inverse of the origin
+    /// ids, so each id names one node. The second point's id is overwritten with the
     /// first's and nothing else is altered, so the node count still fits the
     /// counter and the refusal is the repeated id's, not the constructor's.
     /// The same two ids exchanged name one node each, and load.
@@ -2881,8 +2977,6 @@ mod tests {
     struct LoadedShape {
         /// Nodes, each with its per node arrays and its layer zero slots.
         nodes: usize,
-        /// The largest origin id, which the id-to-node array reaches.
-        largest_id: usize,
         /// Upper words, being each node's span, the higher of its level and
         /// the highest layer its lists fill, and the run the in-degree pass
         /// appends whenever an entry names a node above its span.
@@ -2953,11 +3047,6 @@ mod tests {
         }
         LoadedShape {
             nodes: points.len(),
-            largest_id: points
-                .iter()
-                .map(|point| point.origin_id)
-                .max()
-                .unwrap_or(0),
             words,
             wide: wide.len(),
             wide_if_every_owned_list_were: owned.len(),
@@ -2965,16 +3054,15 @@ mod tests {
     }
 
     /// The bytes the graph a load builds from `parsed` asks the allocator
-    /// for. Each node holds its origin id, level, layer zero length and
-    /// counter, first word and span, and `2m + 1` layer zero slots, the
-    /// id-to-node array four bytes an id up to the largest, each upper word
-    /// four bytes, and each wide list a ten byte descriptor and `m + 1` slots.
+    /// for. Each node holds its origin id, its record's position, level,
+    /// layer zero length and counter, first word and span, and `2m + 1` layer
+    /// zero slots, each upper word four bytes, and each wide list a ten byte
+    /// descriptor and `m + 1` slots.
     fn loaded_bytes(parsed: &ParsedDump<f32>) -> usize {
         let shape = loaded_shape(parsed);
         let m = parsed.m;
         std::mem::size_of::<MutableGraph<f32, CosineDist>>()
-            + shape.nodes * (8 * m + 24)
-            + 4 * (shape.largest_id + 1)
+            + shape.nodes * (8 * m + 28)
             + 4 * shape.words
             + (4 * m + 14) * shape.wide
     }
@@ -2996,7 +3084,7 @@ mod tests {
             MutableGraph::new(4, 16, 64, scale, 1, CosineDist {}).unwrap();
         let vector = [0.1f32, 0.2, 0.3, 0.4];
         let planned = built.plan_insertion(&built_store, &vector, top);
-        built.install_insertion(&mut built_store, &vector, 1, planned);
+        built.install_insertion(&mut built_store, &vector, 1, 1, planned);
         assert_eq!(built.level(0) as usize, top);
         assert_eq!(built.nb_wide_lists(), top);
 
@@ -3268,7 +3356,7 @@ mod tests {
                 ] {
                     out.push(
                         page.iter()
-                            .map(|hit| (hit.internal_id, hit.distance.to_bits()))
+                            .map(|hit| (hit.position, hit.distance.to_bits()))
                             .collect(),
                     );
                 }
@@ -3318,7 +3406,7 @@ mod tests {
             let level = (k * 7) % (top + 3);
             for (graph, store) in [(&mut built, &mut built_store), (&mut read, &mut read_store)] {
                 let planned = graph.plan_insertion(store, &vector, level);
-                graph.install_insertion(store, &vector, 300 + k, planned);
+                graph.install_insertion(store, &vector, 300 + k, (300 + k) as u32, planned);
             }
             assert_eq!(
                 dump_of(&built, &built_store),
@@ -3331,7 +3419,7 @@ mod tests {
         let filled = words
             .iter()
             .filter(|&&(id, layer)| {
-                let node = read.node_of(id).expect("every origin id has a node");
+                let node = node_with_origin(&read, id).expect("every origin id has a node");
                 !read.neighbours_at(node, layer).is_empty()
             })
             .count();
@@ -3359,7 +3447,7 @@ mod tests {
             let (mut fresh, mut fresh_store) =
                 MutableGraph::new(4, 2, 64, scale, 1, CosineDist {}).unwrap();
             for id in (0..348usize).filter(live) {
-                let node = graph.node_of(id).expect("every inserted id has a node");
+                let node = node_with_origin(graph, id).expect("every inserted id has a node");
                 fresh.insert(&mut fresh_store, store.get(node), id, &mut levels);
             }
             dump_of(&fresh, &fresh_store)
@@ -3388,5 +3476,146 @@ mod tests {
         assert_eq!(built_again.arrays(), read_again.arrays());
         assert_eq!(pages(&built_again, &built_again_store), built_pages);
         assert_eq!(pages(&read_again, &read_again_store), built_pages);
+    }
+
+    /// The node a graph took for one origin id, found by a pass over the
+    /// nodes, since the graph keeps no map from an id to its node.
+    fn node_with_origin<T, D>(graph: &MutableGraph<T, D>, id: usize) -> Option<u32>
+    where
+        T: Clone + Send + Sync,
+        D: crate::graph::Distance<T> + Send + Sync,
+    {
+        (0..graph.nb_points() as u32).find(|&node| graph.origin_id_of(node) == id)
+    }
+
+    /// A graph over scattered internal ids reads back from its dump with each
+    /// node at the place its origin id holds among the ids the mappings hold,
+    /// counting from zero, whatever the ids. A node whose id the mappings do
+    /// not hold is stranded, an id they hold that no node carries refuses the
+    /// dump, the graph costs what its nodes cost, it reads the same at the
+    /// largest counter, and it writes the same bytes again.
+    #[test]
+    fn a_graph_over_scattered_ids_reads_back_at_the_positions_the_mappings_give() {
+        let (dim, m, nodes) = (6, 8, 600usize);
+        let far = |k: usize| 3 + k * 70_001;
+        let scale = super::super::levels::LevelGenerator::default_scale(m);
+        let mut levels = super::super::levels::LevelGenerator::new(scale, NB_LAYER_MAX as usize);
+        let (mut built, mut built_store) =
+            MutableGraph::new(dim, m, 64, scale, 16, CosineDist {}).unwrap();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for k in 0..nodes {
+            let vector: Vec<f32> = (0..dim)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / 16_777_216.0 - 0.5
+                })
+                .collect();
+            built.insert(&mut built_store, &vector, far(k), &mut levels);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let largest = far(nodes - 1);
+        let mut expected = expected_for(&built, dim, nodes);
+        expected.max_origin_id = largest;
+        let ((read, read_store), (reference, reference_store)) = read_both(dir.path(), &expected);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(store_bytes(&read_store), store_bytes(&reference_store));
+        assert_eq!(topology(&built, &built_store), topology(&read, &read_store));
+
+        // Every id held: each node at its id's place among them, every place
+        // taken once.
+        let every: Vec<u32> = (0..nodes).map(|k| far(k) as u32).collect();
+        let read_at = |held: &[u32]| {
+            read_dump_at::<f32, CosineDist>(
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+                &expected,
+                CosineDist {},
+                Some(held),
+            )
+        };
+        let (numbered, _) = read_at(&every).unwrap();
+        assert_eq!(numbered.arrays(), read.arrays());
+        let mut node_at = vec![Position::NONE; nodes];
+        for node in 0..nodes as u32 {
+            let at = numbered.record_of(node);
+            let k = (numbered.origin_id_of(node) - 3) / 70_001;
+            assert_eq!(at as usize, k, "node {node}");
+            assert_eq!(node_at[k], Position::NONE, "position {k} taken twice");
+            node_at[k] = node;
+        }
+        assert!(node_at.iter().all(|&node| node != Position::NONE));
+
+        // Every third id dropped from the mappings: those nodes are stranded
+        // and the rest take their place among the ids still held.
+        let held: Vec<u32> = (0..nodes)
+            .filter(|k| k % 3 != 1)
+            .map(|k| far(k) as u32)
+            .collect();
+        let (thinned, _) = read_at(&held).unwrap();
+        for node in 0..nodes as u32 {
+            let id = thinned.origin_id_of(node) as u32;
+            let expected = match held.binary_search(&id) {
+                Ok(at) => at as u32,
+                Err(_) => Position::NONE,
+            };
+            assert_eq!(thinned.record_of(node), expected, "node {node}");
+        }
+        assert_eq!(thinned.memory_bytes(), read.memory_bytes());
+
+        // An id the mappings hold that no node carries refuses the dump, at
+        // either end of the list and in its middle.
+        for extra in [1u32, 70_000, largest as u32 + 1] {
+            let mut more = every.clone();
+            more.push(extra);
+            more.sort_unstable();
+            let reason = refused(read_at(&more));
+            assert!(
+                reason.contains(&format!("names no node for internal id {extra}")),
+                "{reason}"
+            );
+        }
+
+        let parsed = parse_dump::<f32>(&FsDir::new(dir.path()), DUMP_FILENAME, &expected).unwrap();
+        assert_eq!(
+            read.memory_bytes(),
+            loaded_bytes(&parsed),
+            "the graph costs its nodes, whatever ids they carry"
+        );
+
+        let at_ceiling = Expected {
+            max_origin_id: u32::MAX as usize,
+            ..expected
+        };
+        let (at_largest, _) = read_dump(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &at_ceiling,
+            CosineDist {},
+        )
+        .unwrap();
+        assert_eq!(at_largest.arrays(), read.arrays());
+
+        let again = tempfile::tempdir().unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(again.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(again.path().join(DUMP_FILENAME)).unwrap()
+        );
     }
 }

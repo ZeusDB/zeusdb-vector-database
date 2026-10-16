@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **Memory follows the records an index holds, not the ids it has issued.** Each record is held at a position, its place among the records in internal id order, and the id store, the per-record metadata, the declared columns, the live sets and the sparse space keep one entry for each position. `load()` sizes nothing from `id_counter` or from the largest id it reads. One record under an id counter of 2^20 reports a `total_memory_mb` of 0.04 where it reported 44.64, and 0.04 under 2^26 and 2^30 as well.
+
+- **A table of 4 bytes a record finds each record's graph node.** `index_bookkeeping_memory_mb` reads 40.4 bytes a record at 100,000 records with short decimal ids where it read 36.6.
+
+- **A removal closes up the positions it leaves empty.** Where the positions left empty since the last close-up outnumber both 4,096 and the records held, a removal or an overwrite moves the records onto the first positions, so the per-record structures hold at most twice the records plus 4,096 entries without a `compact()`. A search waits no longer during a close-up than during any other removal, and a write that arrives during one waits for it to finish. The graph keeps its stranded nodes until `compact()`.
+
+- **`compact()`, `rebuild()`, quantization training and a close-up drop the postings of removed records**, so `sparse_dead_postings` reads 0 after each of them.
+
+- **A declared field reserves at most 2^20 entries when the index is created**, as the id store and the per-record metadata do, and grows with the records written. An empty index declared at 2^22 records with four fields reports a `total_memory_mb` of 181.00 where it reported 227.86.
+
+- **`reserved_memory_mb` and `shrink_to_fit()` cover the id store, the per-record metadata and the declared columns.** Each store prices the entries it reserved and no record has written, and `shrink_to_fit()` returns them with the graph's slack, so `reserved_memory_mb` is still exactly what the call returns.
+
+- **Filtered search is faster.** Of 21 search cases measured against the code before this change, 15 are faster and 6 are within the noise. The largest gains are on filtered search over an index that has removed most of its records. With one record left in a thousand, a filtered exact scan takes 0.1091 of the time it took, and with one left in a hundred, a filtered graph search takes 0.2180.
+
+- **Writes on an index that has removed most of its records are faster, and compaction is slower.** Of 48 write cases, 14 are faster, 31 are within the noise and 3 are slower. Most of the faster ones are inserts, removals, overwrites and loads on an index that keeps one record in ten of those it was given. The 3 slower ones are compactions: two of 1,000 records, by 4.1 and 5.8 percent, and one of 100 records, by 4.9 microseconds a call. Across the four indexes of 1,000 records, compaction takes 3 to 6 percent more time.
+
+- **The README** gives what `shrink_to_fit()` returns from each store, the operations that drop `sparse_dead_postings`, and the bookkeeping cost of a record.
+
+### Fixed
+
+- **`add()` runs every check that can refuse a record before anything is written for it.** A refused record keeps no internal id, so the records after it in the call take the ids they would take without it.
+
+- **An overwrite whose new record is refused keeps the record it would replace.**
+
+- **`load()` opens a directory whose sparse space lost its newest record before the save**, including one that an earlier release saved.
+
+- **`clear()` empties the sparse space at the same time as the rest of the index**, so a search or a `get_stats()` that runs beside it sees the whole index before the clear or the whole index after it.
+
+- **A refused journal replay's message gives each sentence once, and ends each sentence with a full stop.**
+
+- **A directory loaded in two processes reports the same `index_bookkeeping_memory_mb` in both.**
+
+### Unchanged, and verified
+
+The format is unchanged at 4.0.0, and a save writes the same bytes for the same records. Across the change, 43,200 result pages over 24 index configurations are identical, and the crash tests give the same result at all 171 of their points.
+
 ## [0.12.0] - 2026-10-03
 
 ### Added

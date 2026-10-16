@@ -9,12 +9,13 @@
 //! calibration; see `collection::search::rerank_plan` and
 //! `collection::training::calibrate_rerank`.
 
+use crate::collection::DenseIndex;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use zeusdb_vector_core::{CosineDist, Distance, DotDist, L1Dist, L2Dist, VectorGraph, PQ};
+use zeusdb_vector_core::{CosineDist, Distance, DotDist, L1Dist, L2Dist, PQ};
 /// The three terms of the default rerank fetch.
 ///
 /// A rerank fetch has to be deep enough to contain the true neighbours in the
@@ -1301,26 +1302,26 @@ pub fn default_rerank_fetch(
     wanted.min(whole).min(live_records.max(top_k))
 }
 
-/// Where a raw vector is reached, by internal id.
+/// Where a raw vector is reached, by position.
 ///
-/// Two array reads and no hashing: the graph turns the internal id into a
-/// node index and the store is addressed by node. It used to take the
-/// external id and look it up in the forward map first. Every caller now
-/// holds the internal id, because the page carries it and the id store
-/// hands it out, so that lookup is gone from the read path. It is a borrow
-/// of the graph rather than a copy of anything, so a caller holds the read
-/// guard it already held and passes this down.
+/// Two array reads and no hashing: the dense index turns the record's
+/// position into its node through `node_at`, and the store is addressed by
+/// node, both inside one call to the index. Every caller holds the position,
+/// because the page carries it and the id store hands it out. It is a borrow
+/// of the dense index rather than a copy of anything, one reference wide, so
+/// a caller holds the read guard it already held and passes this down.
 #[derive(Clone, Copy)]
 pub struct RawVectors<'a> {
-    /// The graph, which owns the store the vectors live in.
-    pub graph: &'a VectorGraph,
+    /// The dense index, which owns the graph the vectors live in and the
+    /// node of each position.
+    pub(crate) index: &'a DenseIndex,
 }
 
 impl RawVectors<'_> {
     /// One record's raw vector, or `None` where the index keeps none for it.
     #[inline]
     pub fn get(&self, slot: usize) -> Option<&[f32]> {
-        self.graph.raw_vector(slot)
+        self.index.raw_vector(slot)
     }
 
     /// Whether the index keeps a raw vector for this record.
@@ -1330,11 +1331,11 @@ impl RawVectors<'_> {
     }
 }
 
-/// One record on a page: its internal id, and its external id borrowed
-/// from the id store for as long as the store's guard is held.
+/// One record on a page: its position, and its external id borrowed from
+/// the id store for as long as the store's guard is held.
 ///
-/// The internal id is what the metadata, the raw vectors and the scalar
-/// rows are addressed by, and the name is what the code map is keyed by,
+/// The position is what the metadata, the raw vectors and the scalar rows
+/// are addressed by, and the name is what the code map is keyed by,
 /// what a tie is broken on and what the caller receives. A page carries
 /// both so that nothing is looked up twice. The derived order compares the
 /// name first, and a name determines its slot, so two records order by
@@ -1385,7 +1386,23 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use zeusdb_vector_core::{test_support::clustered, CosineDist, PQ};
+    use zeusdb_vector_core::{
+        test_support::clustered, CosineDist, Position, RecordId, VectorGraph, VectorIndex, PQ,
+    };
+
+    /// `RawVectors` is passed by value down every search path into the loop
+    /// over a page's hits and the rerank. It is one reference wide, 8 bytes,
+    /// and this holds it there, since a wider value changes nothing a search
+    /// returns and so shows in no other test.
+    #[test]
+    fn the_raw_vectors_borrow_is_one_reference_wide() {
+        const RECORDED: usize = 8;
+        assert_eq!(std::mem::size_of::<RawVectors>(), RECORDED);
+        assert_eq!(
+            std::mem::size_of::<RawVectors>(),
+            std::mem::size_of::<&DenseIndex>()
+        );
+    }
 
     /// The rescored score has to be the number a raw index would report, not a
     /// second implementation of the same formula that happens to agree today.
@@ -1998,9 +2015,13 @@ mod tests {
             name: "absent",
             slot: 3,
         };
-        let mut graph = VectorGraph::new_raw("cosine", 8, 16, 4, 16, 64);
-        graph.insert(&stored, 1);
-        let vectors = RawVectors { graph: &graph };
+        let graph = VectorGraph::new_raw("cosine", 8, 16, 4, 16, 64);
+        let mut index = DenseIndex::new(graph, "cosine", 8, None, false);
+        let prepared = index.prepare(RecordId(1), &stored).unwrap();
+        index
+            .insert(Position(1), RecordId(1), &stored, prepared)
+            .unwrap();
+        let vectors = index.raw_vectors();
 
         let mut pq_codes: HashMap<String, Vec<u8>> = HashMap::new();
         pq_codes.insert("kept".to_string(), codes.clone());

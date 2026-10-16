@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use zeusdb_vector_core::{
-    Admit, Bitmap, CorpusStats, Error, Hit, Hits, IdfScope, RecordId, ScoreKind, SparseRef,
+    Admit, Bitmap, CorpusStats, Error, Hit, Hits, IdfScope, Position, ScoreKind, SparseRef,
 };
 
 use crate::index::{PostingsIndex, Weighting};
@@ -241,14 +241,14 @@ impl PostingsIndex {
                     continue;
                 };
                 for p in &self.lists[slot as usize].postings {
-                    if !admits(p.id) {
+                    if !admits(p.key) {
                         continue;
                     }
-                    let a = &mut acc[p.id as usize];
-                    let s = scorer.score(p.id, p.weight, qw);
+                    let a = &mut acc[p.key as usize];
+                    let s = scorer.score(p.key, p.weight, qw);
                     if a.is_nan() {
                         *a = s;
-                        touched.push(p.id);
+                        touched.push(p.key);
                     } else {
                         *a += s;
                     }
@@ -279,11 +279,11 @@ impl PostingsIndex {
                     continue;
                 };
                 for p in &self.lists[slot as usize].postings {
-                    let a = &mut acc[p.id as usize];
-                    let s = scorer.score(p.id, p.weight, qw);
+                    let a = &mut acc[p.key as usize];
+                    let s = scorer.score(p.key, p.weight, qw);
                     if a.is_nan() {
                         *a = s;
-                        touched.push(p.id);
+                        touched.push(p.key);
                     } else {
                         *a += s;
                     }
@@ -291,7 +291,7 @@ impl PostingsIndex {
             }
             let dead = &self.dead;
             let page = select(acc, touched, k, boundary_ties, |id| {
-                !dead.contains(id as usize) && admit.admits(RecordId(id))
+                !dead.contains(id as usize) && admit.admits(Position(id))
             });
             scratch.reset(self.slots());
             page
@@ -392,7 +392,7 @@ impl PostingsIndex {
         match mode {
             Mode::Floor => self.scan_per_posting(scorer, query, k, boundary_ties, |_| true),
             Mode::PerPosting => self.scan_per_posting(scorer, query, k, boundary_ties, |id| {
-                !dead.contains(id as usize) && admit.admits(RecordId(id))
+                !dead.contains(id as usize) && admit.admits(Position(id))
             }),
             Mode::BitmapPerPosting => {
                 self.scan_bitmap(scorer, query, k, boundary_ties, admit, has_dead)
@@ -429,10 +429,10 @@ impl PostingsIndex {
                 bitmap.contains(id as usize) && !dead.contains(id as usize)
             }),
             (None, false) => self.scan_per_posting(scorer, query, k, boundary_ties, |id| {
-                admit.admits(RecordId(id))
+                admit.admits(Position(id))
             }),
             (None, true) => self.scan_per_posting(scorer, query, k, boundary_ties, |id| {
-                !dead.contains(id as usize) && admit.admits(RecordId(id))
+                !dead.contains(id as usize) && admit.admits(Position(id))
             }),
         }
     }
@@ -481,7 +481,7 @@ impl PostingsIndex {
             let dead = &self.dead;
             return match (admit.as_bitmap(), has_dead) {
                 (None, false) => self.scan_per_posting(scorer, query, k, boundary_ties, |id| {
-                    admit.admits(RecordId(id))
+                    admit.admits(Position(id))
                 }),
                 _ => self.scan_bitmap(
                     scorer,
@@ -554,12 +554,14 @@ impl PostingsIndex {
                 if has_dead {
                     postings
                         .iter()
-                        .filter(|p| bitmap.contains(p.id as usize) && !dead.contains(p.id as usize))
+                        .filter(|p| {
+                            bitmap.contains(p.key as usize) && !dead.contains(p.key as usize)
+                        })
                         .count()
                 } else {
                     postings
                         .iter()
-                        .filter(|p| bitmap.contains(p.id as usize))
+                        .filter(|p| bitmap.contains(p.key as usize))
                         .count()
                 }
             })
@@ -765,7 +767,7 @@ fn select<P: Fn(u32) -> bool>(
     }
     page.into_iter()
         .map(|c| Hit {
-            id: RecordId(c.id),
+            position: Position(c.id),
             score: c.score,
         })
         .collect()
@@ -786,7 +788,7 @@ fn cut(mut scored: Vec<(f32, u32)>, k: usize, boundary_ties: bool) -> Vec<Hit> {
     scored
         .into_iter()
         .map(|(score, id)| Hit {
-            id: RecordId(id),
+            position: Position(id),
             score,
         })
         .collect()
@@ -796,7 +798,7 @@ fn cut(mut scored: Vec<(f32, u32)>, k: usize, boundary_ties: bool) -> Vec<Hit> {
 mod tests {
     use super::*;
     use crate::index::{SparseConfig, Unlink};
-    use zeusdb_vector_core::{Candidates, Prepared, SparseVector, VectorIndex};
+    use zeusdb_vector_core::{Candidates, Prepared, RecordId, SparseVector, VectorIndex};
 
     const MODES: [Mode; 5] = [
         Mode::Auto,
@@ -822,7 +824,7 @@ mod tests {
                 values: values.to_vec(),
             };
             index
-                .insert(RecordId(id), v.as_ref(), Prepared::none())
+                .insert(Position(id), RecordId(id), v.as_ref(), Prepared::none())
                 .unwrap();
         }
         index
@@ -856,13 +858,13 @@ mod tests {
             let page = index
                 .search_mode(mode, q.as_ref(), 2, &Candidates::All, false)
                 .unwrap();
-            let ids: Vec<u32> = page.items.iter().map(|h| h.id.0).collect();
+            let ids: Vec<u32> = page.items.iter().map(|h| h.position.0).collect();
             assert_eq!(ids, vec![2, 3], "{mode:?}");
 
             let page = index
                 .search_mode(mode, q.as_ref(), 2, &Candidates::All, true)
                 .unwrap();
-            let ids: Vec<u32> = page.items.iter().map(|h| h.id.0).collect();
+            let ids: Vec<u32> = page.items.iter().map(|h| h.position.0).collect();
             assert_eq!(ids, vec![2, 3, 4], "{mode:?} with the boundary group");
 
             let page = index
@@ -885,7 +887,7 @@ mod tests {
             ],
             Unlink::Strand,
         );
-        index.remove(RecordId(2)).unwrap();
+        index.remove(Position(2)).unwrap();
         let q = SparseVector {
             dims: vec![7],
             values: vec![1.0],
@@ -899,7 +901,7 @@ mod tests {
                 let page = index
                     .search_mode(mode, q.as_ref(), 10, admit, false)
                     .unwrap();
-                let ids: Vec<u32> = page.items.iter().map(|h| h.id.0).collect();
+                let ids: Vec<u32> = page.items.iter().map(|h| h.position.0).collect();
                 assert_eq!(ids, vec![1, 3], "{mode:?}");
             }
         }
@@ -944,7 +946,7 @@ mod tests {
             let page = index
                 .search_mode(mode, q.as_ref(), 10, &Candidates::All, true)
                 .unwrap();
-            let ids: Vec<u32> = page.items.iter().map(|h| h.id.0).collect();
+            let ids: Vec<u32> = page.items.iter().map(|h| h.position.0).collect();
             assert_eq!(ids, vec![2, 1, 3], "{mode:?}");
         }
     }
@@ -988,7 +990,7 @@ mod tests {
                 .unwrap();
             assert_eq!(page.items.len(), 3, "{mode:?}");
             for (hit, (id, score)) in page.items.iter().zip(expected) {
-                assert_eq!(hit.id.0, id, "{mode:?}");
+                assert_eq!(hit.position.0, id, "{mode:?}");
                 assert!(
                     ((hit.score as f64 - score) / score).abs() < 1e-5,
                     "{mode:?} record {} scored {} against {}",
@@ -1005,7 +1007,7 @@ mod tests {
             values: vec![1.0, 0.0],
         };
         assert!(matches!(
-            index.insert(RecordId(4), zero.as_ref(), Prepared::none()),
+            index.insert(Position(4), RecordId(4), zero.as_ref(), Prepared::none()),
             Err(Error::SparseValueNotPositive { index: 1, .. })
         ));
         assert_eq!(index.len(), 3);
@@ -1026,7 +1028,7 @@ mod tests {
             ],
             Unlink::Strand,
         );
-        index.remove(RecordId(4)).unwrap();
+        index.remove(Position(4)).unwrap();
         let dims = [1u32, 2, 3, 9];
         assert_eq!(
             index.corpus_stats(&dims, &Candidates::All),
@@ -1050,7 +1052,7 @@ mod tests {
             index.stats_by_walk(&dims, &bitmap),
             expected.clone().unwrap()
         );
-        let sorted = Candidates::Sorted(vec![RecordId(1), RecordId(4), RecordId(5)]);
+        let sorted = Candidates::Sorted(vec![Position(1), Position(4), Position(5)]);
         assert_eq!(index.corpus_stats(&dims, &sorted), expected);
         // Unsorted and repeated dimensions are answered in the order asked.
         assert_eq!(
@@ -1063,7 +1065,7 @@ mod tests {
 
         struct Odd;
         impl Admit for Odd {
-            fn admits(&self, id: RecordId) -> bool {
+            fn admits(&self, id: Position) -> bool {
                 id.0 % 2 == 1
             }
             fn len_hint(&self) -> Option<usize> {
@@ -1095,13 +1097,13 @@ mod tests {
         let before = index
             .search_mode(Mode::Auto, q.as_ref(), 10, &Candidates::All, false)
             .unwrap();
-        let ids: Vec<u32> = before.items.iter().map(|h| h.id.0).collect();
+        let ids: Vec<u32> = before.items.iter().map(|h| h.position.0).collect();
         assert_eq!(ids, vec![2, 1], "the mean is huge, so length barely counts");
-        index.remove(RecordId(3)).unwrap();
+        index.remove(Position(3)).unwrap();
         let after = index
             .search_mode(Mode::Auto, q.as_ref(), 10, &Candidates::All, false)
             .unwrap();
-        let ids: Vec<u32> = after.items.iter().map(|h| h.id.0).collect();
+        let ids: Vec<u32> = after.items.iter().map(|h| h.position.0).collect();
         assert_eq!(
             ids,
             vec![1, 2],
@@ -1148,10 +1150,492 @@ mod tests {
             .unwrap();
         // Record 1 leads under both, but term 1's weight is near nothing
         // inside the filter and large across the index.
-        assert_eq!(corpus.items[0].id, RecordId(1));
-        assert_eq!(global.items[0].id, RecordId(1));
+        assert_eq!(corpus.items[0].position, Position(1));
+        assert_eq!(global.items[0].position, Position(1));
         assert!(corpus.items[1].score < global.items[1].score);
         let ratio = corpus.items[1].score / global.items[1].score;
         assert!(ratio < 0.2, "ratio {ratio}");
+    }
+
+    /// A space whose records sit at scattered positions answers, at every
+    /// admit shape and in every loop, what a space holding the same records
+    /// at consecutive positions answers, position for position, as built,
+    /// after removals and after a compaction.
+    #[test]
+    fn a_space_over_scattered_ids_answers_what_dense_ids_answer() {
+        use crate::index::Weighting;
+        use zeusdb_vector_core::Bitmap;
+        let far = |id: u32| 7 + (id - 1) * 997;
+        let record = |i: u32| -> SparseVector {
+            let mut dims: Vec<u32> = (0..6).map(|j| (i * 7 + j * 11) % 60).collect();
+            dims.sort_unstable();
+            dims.dedup();
+            let values = dims.iter().map(|&d| 1.0 + ((d + i) % 4) as f32).collect();
+            SparseVector { dims, values }
+        };
+        let queries: Vec<SparseVector> = (0..12u32)
+            .map(|q| {
+                let dims = record(q * 13 + 5).dims;
+                SparseVector {
+                    values: vec![1.0; dims.len()],
+                    dims,
+                }
+            })
+            .collect();
+        for weighting in [Weighting::Dot, Weighting::BM25] {
+            for unlink in [Unlink::Strand, Unlink::Lazy, Unlink::Eager] {
+                let config = SparseConfig {
+                    unlink,
+                    weighting,
+                    ..SparseConfig::default()
+                };
+                let mut dense = PostingsIndex::new(config.clone());
+                let mut scattered = PostingsIndex::new(config);
+                for id in 1..=400u32 {
+                    let v = record(id);
+                    dense
+                        .insert(Position(id), RecordId(id), v.as_ref(), Prepared::none())
+                        .unwrap();
+                    scattered
+                        .insert(
+                            Position(far(id)),
+                            RecordId(far(id)),
+                            v.as_ref(),
+                            Prepared::none(),
+                        )
+                        .unwrap();
+                }
+                let check = |dense: &PostingsIndex, scattered: &PostingsIndex, label: &str| {
+                    let held: Vec<u32> = (1..=400u32)
+                        .filter(|&id| dense.holds(Position(id)))
+                        .collect();
+                    let mut third = Bitmap::default();
+                    let mut third_far = Bitmap::default();
+                    for &id in held.iter().filter(|&&id| id % 3 != 1) {
+                        third.insert(id as usize);
+                        third_far.insert(far(id) as usize);
+                    }
+                    let fifty =
+                        Candidates::Sorted(held.iter().take(50).map(|&id| Position(id)).collect());
+                    let fifty_far = Candidates::Sorted(
+                        held.iter().take(50).map(|&id| Position(far(id))).collect(),
+                    );
+                    let admits: [(&dyn Admit, &dyn Admit); 3] = [
+                        (&Candidates::All, &Candidates::All),
+                        (&third, &third_far),
+                        (&fifty, &fifty_far),
+                    ];
+                    for (admit, admit_far) in admits {
+                        for mode in MODES {
+                            for q in &queries {
+                                let want: Vec<(u32, u32)> = dense
+                                    .search_mode(mode, q.as_ref(), 10, admit, true)
+                                    .unwrap()
+                                    .items
+                                    .iter()
+                                    .map(|hit| (far(hit.position.0), hit.score.to_bits()))
+                                    .collect();
+                                let got: Vec<(u32, u32)> = scattered
+                                    .search_mode(mode, q.as_ref(), 10, admit_far, true)
+                                    .unwrap()
+                                    .items
+                                    .iter()
+                                    .map(|hit| (hit.position.0, hit.score.to_bits()))
+                                    .collect();
+                                assert_eq!(got, want, "{label} {weighting:?} {unlink:?} {mode:?}");
+                            }
+                        }
+                    }
+                };
+                check(&dense, &scattered, "as built");
+                for id in (1..=400u32).step_by(7) {
+                    dense.remove(Position(id)).unwrap();
+                    scattered.remove(Position(far(id))).unwrap();
+                }
+                check(&dense, &scattered, "after removals");
+                dense.compact();
+                scattered.compact();
+                check(&dense, &scattered, "after a compaction");
+                assert_eq!(scattered.slots(), far(400) as usize + 1);
+                assert_eq!(scattered.slot_count(), far(400) as usize + 1);
+                assert_eq!(dense.slots(), 401);
+                assert_eq!(dense.slot_count(), 401);
+            }
+        }
+    }
+
+    /// An admit set asked through the table, one position at a time.
+    struct Within(std::collections::BTreeSet<u32>);
+
+    impl Admit for Within {
+        fn admits(&self, at: Position) -> bool {
+            self.0.contains(&at.0)
+        }
+
+        fn len_hint(&self) -> Option<usize> {
+            None
+        }
+    }
+
+    /// A space whose records sit at dense positions, their internal ids
+    /// scattered one in twenty, answers what a space keyed by those internal
+    /// ids answers, each position read as its record's id and the score bits
+    /// equal, in every loop, under both weightings and both corpus scopes,
+    /// with and without the boundary tie group: with no filter, under a
+    /// bitmap that also names positions and ids no live record holds, under a
+    /// sorted list and under a predicate asked through the table. As built,
+    /// with removed records, after a close-up that moves every record and
+    /// drops the removed postings, after a compaction, and after a second
+    /// close-up.
+    #[test]
+    fn a_scan_by_position_answers_what_a_scan_by_id_answers_under_every_admit_form() {
+        use crate::index::Weighting;
+        use std::collections::BTreeSet;
+        use zeusdb_vector_core::{Bitmap, IdfScope};
+        let record = |i: u32| -> SparseVector {
+            let mut dims: Vec<u32> = (0..7).map(|j| (i * 5 + j * 9) % 48).collect();
+            dims.sort_unstable();
+            dims.dedup();
+            let values = dims.iter().map(|&d| 1.0 + ((d + i) % 5) as f32).collect();
+            SparseVector { dims, values }
+        };
+        let mut queries: Vec<SparseVector> = (0..10u32)
+            .map(|q| {
+                let dims = record(q * 11 + 3).dims;
+                SparseVector {
+                    values: dims.iter().map(|&d| 0.5 + (d % 3) as f32).collect(),
+                    dims,
+                }
+            })
+            .collect();
+        // One list, whose postings are too few to build a set of keys for,
+        // and every list, whose postings are enough.
+        queries.push(SparseVector {
+            dims: vec![9],
+            values: vec![1.0],
+        });
+        queries.push(SparseVector {
+            dims: (0..48).collect(),
+            values: vec![1.0; 48],
+        });
+        let id_of = |k: u32| 5 + k * 20;
+        for weighting in [Weighting::Dot, Weighting::Bm25 { k1: 1.2, b: 0.75 }] {
+            let config = SparseConfig {
+                unlink: Unlink::Strand,
+                weighting,
+                ..SparseConfig::default()
+            };
+            let mut by_id = PostingsIndex::new(config.clone());
+            let mut by_position = PostingsIndex::new(config);
+            for k in 0..500u32 {
+                let v = record(k);
+                by_id
+                    .insert(
+                        Position(id_of(k)),
+                        RecordId(id_of(k)),
+                        v.as_ref(),
+                        Prepared::none(),
+                    )
+                    .unwrap();
+                by_position
+                    .insert(
+                        Position(k),
+                        RecordId(id_of(k)),
+                        v.as_ref(),
+                        Prepared::none(),
+                    )
+                    .unwrap();
+            }
+            // The internal id of the record at each position.
+            let mut ids_at: Vec<u32> = (0..500).map(id_of).collect();
+            let check =
+                |by_id: &PostingsIndex, by_position: &PostingsIndex, ids_at: &[u32], step: &str| {
+                    assert!(by_id.keys_agree() && by_position.keys_agree(), "{step}");
+                    let held: Vec<u32> = (0..ids_at.len() as u32)
+                        .filter(|&at| by_position.holds(Position(at)))
+                        .collect();
+                    assert_eq!(
+                        held.iter()
+                            .map(|&at| ids_at[at as usize])
+                            .collect::<Vec<_>>(),
+                        ids_at
+                            .iter()
+                            .copied()
+                            .filter(|&id| by_id.holds(Position(id)))
+                            .collect::<Vec<_>>(),
+                        "{step}: the same records"
+                    );
+                    let picked: Vec<u32> = held
+                        .iter()
+                        .copied()
+                        .filter(|&at| ids_at[at as usize] % 3 != 1)
+                        .collect();
+                    let mut bitmap = Bitmap::default();
+                    let mut bitmap_by_id = Bitmap::default();
+                    for &at in &picked {
+                        bitmap.insert(at as usize);
+                        bitmap_by_id.insert(ids_at[at as usize] as usize);
+                    }
+                    // Positions and ids no live record holds: every position
+                    // and id the arrays reach that is not held, and the id beside
+                    // each record's.
+                    for (at, &id) in ids_at.iter().enumerate() {
+                        if !by_position.holds(Position(at as u32)) {
+                            bitmap.insert(at);
+                            bitmap_by_id.insert(id as usize);
+                        }
+                        bitmap_by_id.insert(id as usize + 1);
+                    }
+                    bitmap.insert(ids_at.len() + 3);
+                    let sorted = Candidates::Sorted(
+                        picked.iter().take(60).map(|&at| Position(at)).collect(),
+                    );
+                    let sorted_by_id = Candidates::Sorted(
+                        picked
+                            .iter()
+                            .take(60)
+                            .map(|&at| Position(ids_at[at as usize]))
+                            .collect(),
+                    );
+                    let within = Within(picked.iter().copied().collect::<BTreeSet<u32>>());
+                    let within_by_id = Within(
+                        picked
+                            .iter()
+                            .map(|&at| ids_at[at as usize])
+                            .collect::<BTreeSet<u32>>(),
+                    );
+                    let admits: [(&dyn Admit, &dyn Admit, &str); 4] = [
+                        (&Candidates::All, &Candidates::All, "everything"),
+                        (&bitmap, &bitmap_by_id, "a bitmap"),
+                        (&sorted, &sorted_by_id, "a sorted list"),
+                        (&within, &within_by_id, "a predicate"),
+                    ];
+                    for (admit, admit_by_id, shape) in admits {
+                        for mode in MODES {
+                            for scope in [IdfScope::Corpus, IdfScope::Global] {
+                                for ties in [true, false] {
+                                    for q in &queries {
+                                        let want: Vec<(u32, u32)> = by_id
+                                            .search_scoped(
+                                                mode,
+                                                q.as_ref(),
+                                                10,
+                                                admit_by_id,
+                                                ties,
+                                                scope,
+                                            )
+                                            .unwrap()
+                                            .items
+                                            .iter()
+                                            .map(|hit| (hit.position.0, hit.score.to_bits()))
+                                            .collect();
+                                        let got: Vec<(u32, u32)> = by_position
+                                            .search_scoped(mode, q.as_ref(), 10, admit, ties, scope)
+                                            .unwrap()
+                                            .items
+                                            .iter()
+                                            .map(|hit| {
+                                                (ids_at[hit.position.slot()], hit.score.to_bits())
+                                            })
+                                            .collect();
+                                        assert_eq!(
+                                        got, want,
+                                        "{weighting:?} {step} {shape} {mode:?} {scope:?} {ties}"
+                                    );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+            let close_up = |by_position: &mut PostingsIndex, ids_at: &mut Vec<u32>| {
+                let old_of_new: Vec<u32> = (0..ids_at.len() as u32)
+                    .filter(|&at| by_position.holds(Position(at)))
+                    .collect();
+                let mut new_of_old = vec![Position::NONE; ids_at.len()];
+                for (k, &old) in old_of_new.iter().enumerate() {
+                    new_of_old[old as usize] = k as u32;
+                }
+                by_position.close_up(&old_of_new, &new_of_old);
+                *ids_at = old_of_new.iter().map(|&old| ids_at[old as usize]).collect();
+            };
+            check(&by_id, &by_position, &ids_at, "as built");
+            for k in (0..500u32).step_by(7) {
+                by_id.remove(Position(id_of(k))).unwrap();
+                by_position.remove(Position(k)).unwrap();
+            }
+            check(&by_id, &by_position, &ids_at, "with removed records");
+            close_up(&mut by_position, &mut ids_at);
+            assert_eq!(by_position.dead_postings(), 0);
+            check(&by_id, &by_position, &ids_at, "closed up");
+            for &id in ids_at.clone().iter().step_by(5) {
+                let at = ids_at.iter().position(|&held| held == id).unwrap();
+                by_id.remove(Position(id)).unwrap();
+                by_position.remove(Position(at as u32)).unwrap();
+            }
+            by_id.compact();
+            by_position.compact();
+            check(&by_id, &by_position, &ids_at, "compacted");
+            close_up(&mut by_position, &mut ids_at);
+            check(&by_id, &by_position, &ids_at, "closed up again");
+        }
+    }
+
+    /// A space whose records sit at dense positions holds its record table,
+    /// its lengths and its sets at the positions it reached, which a removal
+    /// does not shrink, and after a close-up or a restore at the records it
+    /// holds, whatever range the internal ids span. A scan's accumulator, on
+    /// a thread of its own, holds one slot a position and not one an id of
+    /// that range.
+    #[test]
+    fn the_positions_and_the_scan_state_cost_what_the_records_cost() {
+        use zeusdb_vector_core::Bitmap;
+        let far = |k: u32| 7 + k * 100_003;
+        let config = SparseConfig {
+            unlink: Unlink::Strand,
+            ..SparseConfig::default()
+        };
+        let mut index = PostingsIndex::new(config.clone());
+        for k in 0..300u32 {
+            let v = SparseVector {
+                dims: vec![k % 11, 20 + k % 7],
+                values: vec![1.0, 1.0 + k as f32],
+            };
+            index
+                .insert(Position(k), RecordId(far(k)), v.as_ref(), Prepared::none())
+                .unwrap();
+        }
+        let reached = index.extent();
+        assert_eq!(reached, 300);
+        for k in (0..299u32).step_by(10) {
+            index.remove(Position(k)).unwrap();
+        }
+        let heap = index.heap_bytes();
+        assert!(heap.records <= 2 * 8 * reached, "{heap:?}");
+        assert!(heap.lengths <= 2 * 4 * reached, "{heap:?}");
+        assert!(heap.dead <= 2 * 8 * reached.div_ceil(64) * 2, "{heap:?}");
+
+        let old_of_new: Vec<u32> = (0..300u32).filter(|k| k % 10 != 0 || *k == 299).collect();
+        let mut new_of_old = vec![Position::NONE; 300];
+        for (rank, &old) in old_of_new.iter().enumerate() {
+            new_of_old[old as usize] = rank as u32;
+        }
+        index.close_up(&old_of_new, &new_of_old);
+        let live = index.len();
+        assert_eq!(live, old_of_new.len());
+        let heap = index.heap_bytes();
+        assert_eq!(heap.records, 8 * live, "{heap:?}");
+        assert_eq!(heap.lengths, 4 * live, "{heap:?}");
+        assert_eq!(
+            heap.dead,
+            8 * live.div_ceil(64),
+            "the live set alone: {heap:?}"
+        );
+
+        let ids: Vec<u32> = old_of_new.iter().map(|&k| far(k)).collect();
+        let bytes = crate::persist::encode_with(&index, &|at| ids[at]);
+        let bounds = zeusdb_vector_core::Bounds {
+            min_records: 0,
+            max_records: far(299) as usize,
+            max_bytes: 1 << 30,
+            ids_by_position: &ids,
+        };
+        let restored = crate::persist::decode(&bytes, index.config(), &bounds, "postings").unwrap();
+        assert_eq!(restored.len(), live);
+        let heap = restored.heap_bytes();
+        assert_eq!(heap.records, 8 * live, "{heap:?}");
+        assert_eq!(heap.lengths, 4 * live, "{heap:?}");
+        assert!(
+            heap.records + heap.lengths + heap.dead < 8 * 1024,
+            "{heap:?}"
+        );
+
+        let query = SparseVector {
+            dims: vec![3, 21],
+            values: vec![1.0, 1.0],
+        };
+        let mut filter = Bitmap::default();
+        for at in (1..live).step_by(2) {
+            filter.insert(at);
+        }
+        let slots = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    restored
+                        .search_mode(Mode::Auto, query.as_ref(), 10, &Candidates::All, false)
+                        .unwrap();
+                    restored
+                        .search_mode(Mode::Auto, query.as_ref(), 10, &filter, false)
+                        .unwrap();
+                    SCRATCH.with(|scratch| scratch.borrow().acc.len())
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!(slots, live);
+    }
+
+    /// A sum that overflows to a NaN restarts from the next posting, and the
+    /// record is then touched twice and listed twice, the same at scattered
+    /// positions as at consecutive ones, in every loop.
+    #[test]
+    fn a_sum_that_turns_nan_restarts_alike_in_both_accumulators() {
+        let rows: [(&[u32], &[f32]); 3] = [
+            (&[1, 2, 3], &[3.0e38, 3.0e38, 1.0]),
+            (&[1, 3], &[1.0, 2.0]),
+            (&[2, 3], &[1.0, 0.5]),
+        ];
+        let query = SparseVector {
+            dims: vec![1, 2, 3],
+            values: vec![2.0, -2.0, 1.0],
+        };
+        let far = |id: u32| 9 + (id - 1) * 1_009;
+        let mut dense = PostingsIndex::new(SparseConfig::default());
+        let mut scattered = PostingsIndex::new(SparseConfig::default());
+        for (k, (dims, values)) in rows.iter().enumerate() {
+            let v = SparseVector {
+                dims: dims.to_vec(),
+                values: values.to_vec(),
+            };
+            let id = k as u32 + 1;
+            dense
+                .insert(Position(id), RecordId(id), v.as_ref(), Prepared::none())
+                .unwrap();
+            scattered
+                .insert(
+                    Position(far(id)),
+                    RecordId(far(id)),
+                    v.as_ref(),
+                    Prepared::none(),
+                )
+                .unwrap();
+        }
+        for mode in [
+            Mode::Auto,
+            Mode::PerPosting,
+            Mode::PerCandidate,
+            Mode::BitmapPerPosting,
+        ] {
+            let want: Vec<(u32, u32)> = dense
+                .search_mode(mode, query.as_ref(), 10, &Candidates::All, false)
+                .unwrap()
+                .items
+                .iter()
+                .map(|hit| (far(hit.position.0), hit.score.to_bits()))
+                .collect();
+            let got: Vec<(u32, u32)> = scattered
+                .search_mode(mode, query.as_ref(), 10, &Candidates::All, false)
+                .unwrap()
+                .items
+                .iter()
+                .map(|hit| (hit.position.0, hit.score.to_bits()))
+                .collect();
+            assert_eq!(got, want, "{mode:?}");
+            assert_eq!(
+                got.iter().filter(|(at, _)| *at == far(1)).count(),
+                2,
+                "{mode:?}: the record whose sum restarted is listed twice"
+            );
+        }
     }
 }

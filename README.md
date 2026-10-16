@@ -798,7 +798,7 @@ storage_mode_description: raw_only
 | `quantized_codes_memory_mb` | The map holding a second copy of every product quantized code, which grows with the record count. `0.00` on a scalar index, whose rows live in the graph alone |
 | `codebook_memory_mb`, `sdc_table_memory_mb`, `centroid_norm_memory_mb` | The trained product quantization tables, fixed by `dim`, `subvectors` and `bits` |
 | `scale_memory_mb` | The scales of a scalar index, `dim` floats once per index |
-| `index_bookkeeping_memory_mb` | The id store that finds a record, the per-record metadata, the declared columns, the live sets, the index level metadata and, on a product quantized index, the table of the code map |
+| `index_bookkeeping_memory_mb` | The id store that finds a record, the per-record metadata, the declared columns, the live sets, the table that finds each record's graph node, the index level metadata and, on a product quantized index, the table of the code map |
 | `reserved_memory_mb` | The part of `total_memory_mb` no record has been written into. It is committed and not resident, and it is exactly what `shrink_to_fit()` returns |
 | `total_memory_mb` | The sum of the memory figures above, `reserved_memory_mb` being inside that sum rather than beside it, plus `sparse_memory_mb` and `dictionary_memory_mb` where the index declares a sparse space |
 | `quantization_type` | `pq`, `int8`, or `none` on an unquantized index |
@@ -817,7 +817,7 @@ On a quantized index it also carries `quantization_active`, `quantization_traine
 
 **Size infrastructure from the resident figure, and compare two configurations by `total_memory_mb` minus `reserved_memory_mb`**, which is what each has written and is free of where each landed in its doubling cycle. The two rows that hold raw vectors report far above what they hold, because at `dim=1536` the store holding the vectors is reserved under a byte budget well short of the declaration and then grows by doubling, so its last doubling left capacity for far more records than the index holds; `shrink_to_fit()` hands that back once the inserts are done. The `quantized_only` row reports below what it holds, because the map that keys a code by id costs two small heap blocks a record and the allocator charges each block more than the index asked for.
 
-`index_bookkeeping_memory_mb` is proportional to the record count and independent of the dimension. At 100,000 records with short decimal ids and no metadata it reads 36.6 bytes a record, being 20 for the id store and 16 for the per-record metadata entry. A uuid costs 35 more, a record carrying metadata costs 40 bytes a field beside the text of its string values, and a `quantized_only` product quantized index adds the code map's table and its copy of the id at 69 bytes a record. The figure steps with the id store's table rather than climbing smoothly, so it reads 41.9 bytes a record at 115,000 records, where the table has just doubled.
+`index_bookkeeping_memory_mb` is proportional to the record count and independent of the dimension. At 100,000 records with short decimal ids and no metadata it reads 40.4 bytes a record, being 20 for the id store, 16 for the per-record metadata entry and 4 for the table that finds the record's graph node. A uuid costs 35 more, a record carrying metadata costs 40 bytes a field beside the text of its string values, and a `quantized_only` product quantized index adds the code map's table and its copy of the id at 69 bytes a record. The figure steps with the id store's table rather than climbing smoothly, so it reads 45.7 bytes a record at 115,000 records, where the table has just doubled.
 
 **Figures the keys give by arithmetic.** None of these is a key, because each is a division over two that are:
 
@@ -1126,7 +1126,7 @@ Clearing an empty index returns `0` and is not an error. The generated ID counte
 
 #### ♻️ Return the graph's spare capacity
 
-An index built by inserting grows its graph buffers geometrically, so the last growth leaves the largest of them holding close to twice what they use. `shrink_to_fit()` returns that slack to the allocator and reports the bytes it released, and `get_stats()["reserved_memory_mb"]` prices the same slack before the call is made.
+An index built by inserting grows its graph buffers geometrically, so the last growth leaves the largest of them holding close to twice what they use. `shrink_to_fit()` returns that slack to the allocator, with the entries that the id store, the per-record metadata and the declared columns reserved and no record has written, and reports the bytes it released. `get_stats()["reserved_memory_mb"]` prices the same bytes before the call is made.
 
 ```python
 fresh = vdb.create("hnsw", dim=8, expected_size=300)
@@ -1150,7 +1150,7 @@ True
 0
 ```
 
-The index above declared 300 records and was given 500, so its graph grew and left slack behind, and `reserved_memory_mb` named it before the call: the call returns exactly that figure and the key reads `0.00` afterwards. `index`, the index used throughout this section, returns `0` instead, because `compact()` was called on it earlier and compaction already shrinks the graph it rebuilds.
+The index above declared 300 records and was given 500, so its graph and its stores grew and left slack behind, and `reserved_memory_mb` named it before the call: the call returns exactly that figure and the key reads `0.00` afterwards. `index`, the index used throughout this section, returns no graph slack, because `compact()` was called on it earlier and compaction already shrinks the graph it rebuilds. It returns the entries its stores reserved for the 10,000 records its `expected_size` declares, since it holds far fewer.
 
 **No node, edge or distance is touched**, so every search returns the same page with the same scores.
 
@@ -2555,7 +2555,7 @@ sparse_memory_mb 0.00
 | `sparse_weighting` | `dot` or `bm25` |
 | `sparse_records` | Records the space holds, which may be fewer than the index holds |
 | `sparse_postings` | Live entries across every record, one per distinct term per record |
-| `sparse_dead_postings` | Occurrences left by removed records, reclaimed at `compact()` |
+| `sparse_dead_postings` | Occurrences left by removed records. `compact()`, `rebuild()` and quantization training drop them, and so does a removal once the records removed since the last drop outnumber both 4,096 and the records held. A saved directory holds none |
 | `sparse_memory_mb` | What the postings and their index hold |
 | `sparse_tokenizer` | `simple` or `external`, on a text layer alone |
 | `term_count` | Distinct terms the dictionary holds, on a text layer alone |

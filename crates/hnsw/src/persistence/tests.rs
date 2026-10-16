@@ -149,12 +149,16 @@ fn config(id_counter: usize) -> IndexConfig {
     }
 }
 
-fn store(records: &[(usize, &str)]) -> IdStore {
+/// The records a mappings file holds, in increasing internal id, each at its
+/// place among them.
+fn store(records: &[(usize, &str)]) -> MappedIds {
     let mut store = IdStore::new(16);
-    for &(internal_id, id) in records {
-        store.insert(internal_id, id).unwrap();
+    let mut internal = Vec::new();
+    for (at, &(internal_id, id)) in records.iter().enumerate() {
+        store.insert(at, id).unwrap();
+        internal.push(internal_id as u32);
     }
-    store
+    MappedIds { store, internal }
 }
 
 fn bits(values: &[f32]) -> Vec<u32> {
@@ -233,11 +237,7 @@ fn filled(quantization: Option<StorageMode>, n: usize) -> Collection {
 /// Every record, sorted by id, as its internal id, its vector's bits and its
 /// metadata in key order.
 fn everything(collection: &Collection) -> Vec<(String, usize, Vec<u32>, String)> {
-    let names: Vec<(usize, String)> = collection
-        .ids()
-        .iter()
-        .map(|(internal_id, id)| (internal_id, id.to_string()))
-        .collect();
+    let names: Vec<(usize, String)> = collection.internal_ids();
     let views = collection
         .records(names.iter().map(|(_, id)| id.clone()).collect(), true, true)
         .unwrap();
@@ -556,7 +556,7 @@ fn every_refusal_of_a_framed_mappings_is_named() {
 #[test]
 fn every_refusal_of_framed_vectors_is_named() {
     let ids = store(&[(1, "a"), (2, "b")]);
-    let say = |bytes: &[u8]| refused(framed_vectors(bytes, &ids, 2));
+    let say = |bytes: &[u8]| refused(framed_vectors(bytes, ids.view(), 2));
     let row = |id: u32, values: [f32; 2]| -> Vec<u8> {
         let mut out = id.to_le_bytes().to_vec();
         out.extend(values.iter().flat_map(|v| v.to_le_bytes()));
@@ -584,7 +584,7 @@ fn every_refusal_of_framed_vectors_is_named() {
         .ends_with("holds 1 vectors and mappings.bin holds 2 records; record 'b' has no vector"));
     match framed_vectors(
         &file(&[row(1, [f32::NAN, 0.0]), row(2, [0.0; 2])], 2, 2),
-        &ids,
+        ids.view(),
         2,
     ) {
         Err(Error::VectorsNotFinite { offenders, total }) => {
@@ -654,7 +654,7 @@ fn no_mutation_of_a_framed_artefact_panics_its_reader() {
         let _ = framed_ids(&blob, &config(8));
         let blob = frame_fuzz::mutate(&mut rng, &vectors, FrameKind::RawVectors);
         reached[1] += usize::from(unframe(&blob, FrameKind::RawVectors, "v").is_ok());
-        let _ = framed_vectors(&blob, &ids, 2);
+        let _ = framed_vectors(&blob, ids.view(), 2);
         let blob = frame_fuzz::mutate(&mut rng, &codes, FrameKind::PqCodes);
         reached[2] += usize::from(unframe(&blob, FrameKind::PqCodes, "c").is_ok());
         let _ = framed::Rows::read(&blob, FrameKind::PqCodes, "c", 1, 2, |_| String::new())
@@ -1219,6 +1219,63 @@ fn a_directory_written_before_format_4_opens_with_everything_it_held() {
     }
 }
 
+/// A load files every record at its place among the internal ids the
+/// mappings hold, counting from zero, whether `mappings.bin` is framed, and
+/// so lists its records in increasing internal id, or was written before
+/// format 4.0.0, and so lists them in a hash map's order. The ids are
+/// scattered by removals and overwrites, and the names do not follow them.
+#[test]
+fn a_load_files_records_in_internal_id_order_from_either_layout() {
+    let temp = TempDir::new();
+    let collection = filled(None, 600);
+    let gone: Vec<String> = (0..600)
+        .filter(|i| i % 4 != 1)
+        .map(|i| format!("r{i}\u{e9}"))
+        .collect();
+    assert!(collection.remove_points(&gone).unwrap().is_empty());
+    let vectors = clustered(60, 8, 0x0018_2003);
+    let overwrites: Vec<ParsedRecord> = (0..60)
+        .map(|i| record(&format!("r{}\u{e9}", 593 - 8 * i), &vectors[i], "z", -1))
+        .collect();
+    let added = collection.add_records(overwrites, vec![], true);
+    assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    let expected = collection.internal_ids();
+    assert!(expected.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    let names: Vec<String> = expected.iter().map(|(_, name)| name.clone()).collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_ne!(names, sorted, "the names do not follow the ids");
+
+    for version in [None, Some("3.1.0")] {
+        let path = temp.at(&format!("order-{}.zdb", version.unwrap_or("framed")));
+        collection.save(path.to_str().unwrap()).unwrap();
+        if let Some(version) = version {
+            as_old(&path, version);
+        }
+        let loaded = Collection::load(path.to_str().unwrap()).unwrap();
+        {
+            let ids = loaded.ids();
+            let filed: Vec<(usize, String)> =
+                ids.iter().map(|(at, id)| (at, id.to_string())).collect();
+            assert_eq!(
+                filed,
+                names.iter().cloned().enumerate().collect::<Vec<_>>(),
+                "{version:?}: each record at its place in internal id order"
+            );
+        }
+        assert_eq!(loaded.internal_ids(), expected, "{version:?}");
+        assert!(loaded.positions_agree(), "{version:?}");
+        assert_eq!(everything(&loaded), everything(&collection), "{version:?}");
+        for query in &vectors[..8] {
+            assert_eq!(
+                page(&loaded, query),
+                page(&collection, query),
+                "{version:?}"
+            );
+        }
+    }
+}
+
 /// A frame is read wherever it is found, so a directory this build saved
 /// and relabelled to an earlier major opens. Bincode's wire is read only
 /// below 4.x, so an old directory relabelled 4.0.0 is refused by the frame.
@@ -1325,7 +1382,7 @@ fn a_framed_artefact_that_disagrees_with_the_mappings_is_refused() {
     let collection = filled(Some(StorageMode::QuantizedWithRaw), 1050);
     let path = temp.at("spliced.zdb");
     collection.save(path.to_str().unwrap()).unwrap();
-    let highest = collection.ids().highest_slot().unwrap();
+    let highest = collection.internal_ids().last().unwrap().0;
 
     let codes_path = temp.at("codes.zdb");
     collection.save(codes_path.to_str().unwrap()).unwrap();
@@ -1339,9 +1396,12 @@ fn a_framed_artefact_that_disagrees_with_the_mappings_is_refused() {
         )
     );
 
-    let ids = collection.ids();
-    let first: Vec<(usize, Vec<f32>)> =
-        ids.iter().take(3).map(|(i, _)| (i, vec![0.5; 8])).collect();
+    let ids = collection.internal_ids();
+    let first: Vec<(usize, Vec<f32>)> = ids
+        .iter()
+        .take(3)
+        .map(|&(i, _)| (i, vec![0.5; 8]))
+        .collect();
     let (vectors, _) =
         framed::write_vectors(8, first.iter().map(|(i, v)| (*i, v.as_slice())), 3).unwrap();
     drop(ids);

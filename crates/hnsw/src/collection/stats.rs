@@ -93,20 +93,23 @@ impl Collection {
     /// storage mode, the training progress and the vectors still needed are
     /// derived from the captured values by the same rules the helpers apply.
     pub fn stats(&self) -> HashMap<String, String> {
+        // With the holes unbounded, since this takes no `writers` and can
+        // land between a removal batch and its close-up.
         debug_assert!(
-            self.live_sets_agree(),
-            "the dense index's live set is the collection's"
+            self.positions_agree_any_holes(),
+            "every per-record structure agrees with the positions the records hold"
         );
 
         // The record count and, from the same guard, what the id store
-        // occupies: the text of every id once, an entry per internal id, the
+        // occupies: the text of every id once, an entry per position, the
         // forward table's buckets and tags, and the live set's words at one
-        // per sixty-four internal ids. Every `bookkeeping` term below is one
+        // per sixty-four positions. Every `bookkeeping` term below is one
         // structure's own storage, and none of them is the payload the five
-        // memory keys price. See `index_bookkeeping_memory_mb`.
-        let (live, mut bookkeeping) = {
+        // memory keys price. See `index_bookkeeping_memory_mb`. The part of
+        // the id store no record has been written into is read with it.
+        let (live, mut bookkeeping, ids_reserved) = {
             let ids = self.ids.read().unwrap();
-            (ids.len(), ids.heap_bytes())
+            (ids.len(), ids.heap_bytes(), ids.reserved_bytes())
         };
 
         // Nodes the graph holds, which exceeds the live record count by exactly the
@@ -154,7 +157,11 @@ impl Collection {
                 };
             let nodes = hnsw.nb_points();
             let raw = hnsw.raw_vectors_memory_bytes();
-            let reserved = graph_reserved + hnsw.raw_vectors_reserved_bytes();
+            // The numbering's slack is the graph's to return, as the map from
+            // an id to its node gave its slack back with the graph it sat in,
+            // so it is priced here as well as in the bookkeeping it sits in.
+            let reserved =
+                graph_reserved + hnsw.raw_vectors_reserved_bytes() + index.node_at_reserved_bytes();
             let holds_raw = hnsw.holds_raw();
             (
                 nodes,
@@ -163,9 +170,9 @@ impl Collection {
                 holds_raw,
                 raw,
                 reserved,
-                // The second of the two bitmaps, priced from the guard that is
-                // already open on the structure holding it.
-                index.live_heap_bytes(),
+                // The dense index's node for each position, priced from the
+                // guard that is already open on the structure holding it.
+                index.node_at_heap_bytes(),
                 // The scalar row's width and the values the encode has
                 // clipped, from the same guard, for the keys below.
                 hnsw.int8_row_width(),
@@ -185,25 +192,34 @@ impl Collection {
             )
         };
 
-        // The metadata store holds one sixteen byte entry per internal id
-        // issued, priced at the capacity it reserved, one block of forty bytes
+        // The metadata store holds one sixteen byte entry per position,
+        // priced at the capacity it reserved, one block of forty bytes
         // a field behind each record that carries fields, the text of every
         // string value, and the field names once each, in a list and in the
         // table that finds a name's symbol. A record added without metadata
-        // costs its entry alone.
-        bookkeeping += {
+        // costs its entry alone. The part no record has been written into is
+        // read with it.
+        let metadata_reserved = {
             let vector_metadata = self.vector_metadata.read().unwrap();
             let names = vector_metadata.key_table();
-            vector_metadata.heap_bytes() + table_bytes(names) + key_text_bytes(names)
+            bookkeeping +=
+                vector_metadata.heap_bytes() + table_bytes(names) + key_text_bytes(names);
+            vector_metadata.reserved_bytes()
         };
 
         // The declared columns. Four bytes a record per field where the field
         // has few distinct values, and the value itself a second time where
-        // nearly every record holds a different one. Zero on an index created
-        // without `indexed_fields`.
-        bookkeeping += self.columns.read().unwrap().heap_bytes();
+        // nearly every record holds a different one. The live set alone, which
+        // no record writes, on an index created without `indexed_fields`. The
+        // part no record has been written into is read with it.
+        let columns_reserved = {
+            let columns = self.columns.read().unwrap();
+            bookkeeping += columns.heap_bytes();
+            columns.reserved_bytes()
+        };
 
-        // The dense index's live set, captured with the graph above.
+        // The dense index's node for each position, captured with the graph
+        // above.
         bookkeeping += dense_live_bytes;
 
         let training_id_count = {
@@ -689,23 +705,24 @@ impl Collection {
         //
         // The id store, plus the code map on a quantized index, the metadata
         // store, the declared columns, the training buffer, the index level
-        // metadata and the dense index's live bitmap. The id store holds the
-        // text of every id once in one arena, an eight byte entry per internal
-        // id, a forward table of four byte buckets with a tag byte each, and
-        // the live set as bits. The table is a power of two of buckets sized as
-        // the standard map sizes its own, so it is between eight sevenths and
-        // sixteen sevenths of the records it holds and it steps rather than
-        // growing smoothly. `pq_codes` holds the id again as a key, in a
+        // metadata and the dense index's node for each position. The id store
+        // holds the text of every id once in one arena, an eight byte entry
+        // per position, a forward table of four byte buckets with a tag byte
+        // each, and the live set as bits. The table is a power of two of
+        // buckets sized as the standard map sizes its own, so it is between
+        // eight sevenths and sixteen sevenths of the records it holds and it
+        // steps rather than growing smoothly. `pq_codes` holds the id again
+        // as a key, in a
         // 48 byte bucket, and the `Vec` in it contributes only its 24 byte
         // header here, since the bytes it points at are already priced above.
-        // The metadata store is indexed by internal id and holds no copy of the
+        // The metadata store is indexed by position and holds no copy of the
         // id: sixteen bytes an entry, and a forty byte field block behind a
         // record that carries fields.
         //
         // It is proportional to the record count and independent of the
         // dimension. Measured against a counting allocator on 100,000 records
-        // at `m` 16 with five character ids and no metadata, it reads 36.6
-        // bytes a record unquantized and 105.7 under `quantized_only`, where
+        // at `m` 16 with five character ids and no metadata, it reads 40.4
+        // bytes a record unquantized and 109.5 under `quantized_only`, where
         // the difference is the code map and its copy of the id. A record
         // carrying two small metadata fields costs 82.5 bytes a record more,
         // being one block of two forty byte fields and the text of the string
@@ -714,7 +731,7 @@ impl Collection {
         // It steps with the table's powers of two rather than holding still.
         // At 100,000 records the table sits at 76 percent of its buckets, which
         // is near the cheapest point of the cycle; at 115,000 records the same
-        // structures read 41.9 bytes a record, because the table has just
+        // structures read 45.7 bytes a record, because the table has just
         // doubled and sits at 44 percent. A figure quoted at one record count is
         // a point on that sawtooth and not a rate.
         //
@@ -732,8 +749,14 @@ impl Collection {
         // This is a request count and not a commitment. The allocator's own
         // headers, its rounding and its fragmentation sit outside it, the same
         // way they sit outside `graph_memory_mb`; see
-        // `VectorGraph::memory_bytes`. Nothing here is reserved and unwritten,
-        // so none of it appears under `reserved_memory_mb`.
+        // `VectorGraph::memory_bytes`. The parts of it that can be reserved
+        // and unwritten are the dense index's node for each position, the id
+        // store's, the metadata store's and the columns' vectors past their
+        // lengths and the live sets' words past the last position written,
+        // whose slack `shrink_to_fit()` returns with the graph's, so that
+        // slack appears under `reserved_memory_mb`. The training list, the
+        // code map's table and the index level metadata are priced as they
+        // stand and appear there in no part.
         let bookkeeping_mb = bookkeeping as f64 / (1024.0 * 1024.0);
         total_memory_mb += bookkeeping_mb;
         stats.insert(
@@ -834,12 +857,16 @@ impl Collection {
         // block, which no arithmetic here can see.
         //
         // It is exactly the figure `shrink_to_fit()` returns, in bytes, since
-        // both are the same fifteen buffers and the same stores priced at the
-        // gap between their capacity and their length. A caller who reads a
+        // both are the same fifteen buffers, the same vector stores, the
+        // dense index's node for each position, the id store, the metadata
+        // store and the columns, priced at the gap between their capacity and
+        // their length, and the live sets' words past the last position
+        // written. A caller who reads a
         // large figure here and is finished inserting can call that and get it
         // back. The hash tables contribute nothing, because hashbrown sizes a
         // table at a power of two from its length and shrinking recomputes the
-        // same power of two.
+        // same power of two. The sparse space's slack sits outside both.
+        let reserved_bytes = reserved_bytes + ids_reserved + metadata_reserved + columns_reserved;
         let reserved_memory_mb = reserved_bytes as f64 / (1024.0 * 1024.0);
         stats.insert(
             "reserved_memory_mb".to_string(),

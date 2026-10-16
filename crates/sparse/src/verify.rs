@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use zeusdb_vector_core::{
     Admit, ArtefactRecord, Bitmap, Bounds, Budget, Candidates, Hit, Inventory, Ledger, Persist,
-    Prepared, RecordId, Restore, SparseRef, VectorIndex,
+    Position, Prepared, RecordId, Restore, SparseRef, VectorIndex,
 };
 
 use crate::corpus::{self, Corpus, Rng};
@@ -51,7 +51,12 @@ fn build_weighted(corpus: &Corpus, unlink: Unlink, weighting: Weighting) -> Post
     for (i, d) in corpus.docs.iter().enumerate() {
         // Internal ids start at 1, as the collection's counter does.
         index
-            .insert(RecordId(i as u32 + 1), d.as_ref(), Prepared::none())
+            .insert(
+                Position(i as u32 + 1),
+                RecordId(i as u32 + 1),
+                d.as_ref(),
+                Prepared::none(),
+            )
             .unwrap();
     }
     index
@@ -91,7 +96,7 @@ fn brute(
 ) -> Vec<Hit> {
     let mut cands: Vec<(f32, u32)> = Vec::new();
     for (i, d) in corpus.docs.iter().enumerate() {
-        let id = RecordId(i as u32 + 1);
+        let id = Position(i as u32 + 1);
         if dead.contains(id.slot()) || !admit.admits(id) {
             continue;
         }
@@ -105,7 +110,7 @@ fn brute(
     cands
         .into_iter()
         .map(|(s, id)| Hit {
-            id: RecordId(id),
+            position: Position(id),
             score: s,
         })
         .collect()
@@ -115,7 +120,7 @@ fn same(a: &[Hit], b: &[Hit]) -> bool {
     a.len() == b.len()
         && a.iter()
             .zip(b)
-            .all(|(x, y)| x.id == y.id && x.score.to_bits() == y.score.to_bits())
+            .all(|(x, y)| x.position == y.position && x.score.to_bits() == y.score.to_bits())
 }
 
 #[derive(Default)]
@@ -177,7 +182,7 @@ fn check(
     }
     // `vector` answers for live records and not for dead ones.
     for (i, d) in corpus.docs.iter().enumerate() {
-        let id = RecordId(i as u32 + 1);
+        let id = Position(i as u32 + 1);
         match index.vector(id) {
             Some(v) if !dead.contains(id.slot()) => {
                 assert!(
@@ -207,8 +212,8 @@ pub(crate) fn verify(regime: &str, n: usize, nq: usize) -> (usize, usize) {
     let none = Bitmap::default();
     let live = live_bitmap(n, &none);
     let narrow = filter_bitmap(n, 100, 7, &none);
-    let mut sorted_ids: Vec<RecordId> =
-        (0..50).map(|i| RecordId((i * 97 % n + 1) as u32)).collect();
+    let mut sorted_ids: Vec<Position> =
+        (0..50).map(|i| Position((i * 97 % n + 1) as u32)).collect();
     sorted_ids.sort();
     sorted_ids.dedup();
     let chained = Candidates::Sorted(sorted_ids.clone());
@@ -249,7 +254,7 @@ pub(crate) fn verify(regime: &str, n: usize, nq: usize) -> (usize, usize) {
     for id in 1..=n {
         if rng.below(100) < 20 {
             dead.insert(id);
-            doomed.push(RecordId(id as u32));
+            doomed.push(Position(id as u32));
         }
     }
     let mut strand = build(&corpus, Unlink::Strand);
@@ -307,6 +312,7 @@ pub(crate) fn verify(regime: &str, n: usize, nq: usize) -> (usize, usize) {
         min_records: 0,
         max_records: n,
         max_bytes: 1 << 34,
+        ids_by_position: crate::identity_positions(n),
     };
     let restored = PostingsIndex::restore(
         lazy.config(),
@@ -377,7 +383,7 @@ fn brute_bm25(
     mean: f64,
 ) -> Vec<Hit> {
     let admitted = |i: usize| {
-        let id = RecordId(i as u32 + 1);
+        let id = Position(i as u32 + 1);
         !dead.contains(id.slot()) && admit.admits(id)
     };
     let live = |i: usize| !dead.contains(i + 1);
@@ -436,7 +442,7 @@ fn brute_bm25(
     cands
         .into_iter()
         .map(|(s, id)| Hit {
-            id: RecordId(id),
+            position: Position(id),
             score: s,
         })
         .collect()
@@ -522,8 +528,8 @@ pub(crate) fn verify_bm25(regime: &str, n: usize, nq: usize) -> (usize, usize) {
     let none = Bitmap::default();
     let live = live_bitmap(n, &none);
     let narrow = filter_bitmap(n, 100, 7, &none);
-    let mut sorted_ids: Vec<RecordId> =
-        (0..50).map(|i| RecordId((i * 97 % n + 1) as u32)).collect();
+    let mut sorted_ids: Vec<Position> =
+        (0..50).map(|i| Position((i * 97 % n + 1) as u32)).collect();
     sorted_ids.sort();
     sorted_ids.dedup();
     let chained = Candidates::Sorted(sorted_ids.clone());
@@ -573,7 +579,7 @@ pub(crate) fn verify_bm25(regime: &str, n: usize, nq: usize) -> (usize, usize) {
     for id in 1..=n {
         if rng.below(100) < 20 {
             dead.insert(id);
-            doomed.push(RecordId(id as u32));
+            doomed.push(Position(id as u32));
         }
     }
     for id in &doomed {
@@ -629,6 +635,7 @@ pub(crate) fn verify_bm25(regime: &str, n: usize, nq: usize) -> (usize, usize) {
         min_records: 0,
         max_records: n,
         max_bytes: 1 << 34,
+        ids_by_position: crate::identity_positions(n),
     };
     let restored = PostingsIndex::restore(
         lazy.config(),
