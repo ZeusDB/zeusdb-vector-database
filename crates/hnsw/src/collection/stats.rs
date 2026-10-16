@@ -721,8 +721,8 @@ impl Collection {
         //
         // It is proportional to the record count and independent of the
         // dimension. Measured against a counting allocator on 100,000 records
-        // at `m` 16 with five character ids and no metadata, it reads 36.6
-        // bytes a record unquantized and 105.7 under `quantized_only`, where
+        // at `m` 16 with five character ids and no metadata, it reads 40.4
+        // bytes a record unquantized and 109.5 under `quantized_only`, where
         // the difference is the code map and its copy of the id. A record
         // carrying two small metadata fields costs 82.5 bytes a record more,
         // being one block of two forty byte fields and the text of the string
@@ -731,7 +731,7 @@ impl Collection {
         // It steps with the table's powers of two rather than holding still.
         // At 100,000 records the table sits at 76 percent of its buckets, which
         // is near the cheapest point of the cycle; at 115,000 records the same
-        // structures read 41.9 bytes a record, because the table has just
+        // structures read 45.7 bytes a record, because the table has just
         // doubled and sits at 44 percent. A figure quoted at one record count is
         // a point on that sawtooth and not a rate.
         //
