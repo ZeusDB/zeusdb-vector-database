@@ -40,6 +40,11 @@
 # to in the trailing comment. Dependabot raises the pins; see
 # .github/dependabot.yml.
 #
+# Every job names its runner image, such as ubuntu-24.04, windows-2025-vs2026
+# or macos-15, rather than a label such as ubuntu-latest or windows-latest
+# that GitHub moves to a newer image on its own schedule. A change of image is
+# a change to this file.
+#
 # A successful production publish is followed by github-release, which creates
 # the GitHub Release for the tag from the matching CHANGELOG.md section. No
 # other path reaches it, so a dispatch run and a prerelease tag create nothing.
@@ -85,7 +90,7 @@ permissions:
 jobs:
   check-version:
     name: Check the four declared versions agree
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A hung step fails the job here instead of at GitHub's six hour default.
     timeout-minutes: 15
     # Every build job needs this, so a mis-tagged release fails here in well
@@ -363,7 +368,7 @@ jobs:
       fail-fast: true  # A partial wheel set is worse than no release
       matrix:
         platform:
-          - runner: windows-latest
+          - runner: windows-2025-vs2026
             target: x64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -516,7 +521,7 @@ jobs:
 
   sdist:
     needs: check-version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -575,7 +580,7 @@ jobs:
 
   publish-testpypi:
     name: Publish to TestPyPI
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     # Prerelease tags, as check-version parsed them, and dispatch runs with
     # the publish box ticked.
@@ -660,7 +665,7 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     # Stable tags only, as check-version parsed them. A dispatch run never
     # reaches production. The comparison is against the string 'false' rather
@@ -745,7 +750,7 @@ jobs:
 
   github-release:
     name: Create the GitHub Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     # No condition of its own. A job whose needs were skipped is skipped in
     # turn, so this runs exactly when publish-pypi ran and succeeded, which is

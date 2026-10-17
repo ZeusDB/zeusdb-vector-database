@@ -24,6 +24,10 @@
 # What it proves. That no code path any Python test reaches takes the same
 # guard twice on one thread, and that none inverts the declared order. The
 # assertion fires on the acquisition itself, with no writer and no scheduling.
+#
+# Every job names its runner image, ubuntu-24.04, rather than a label such as
+# ubuntu-latest that GitHub moves to a newer image on its own schedule. A
+# change of image is a change to this file.
 name: Lock order
 
 on:
@@ -54,7 +58,7 @@ permissions:
 
 jobs:
   lock-order:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Well above the expected run time so a slow runner does not fail the run,
     # and far enough below the six hour default to be a real bound.
     timeout-minutes: 15

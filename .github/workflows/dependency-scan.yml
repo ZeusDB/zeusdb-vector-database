@@ -15,6 +15,10 @@
 #
 # Separate from ci.yml because its result can change with no change to the
 # repository. ci.yml's paths-ignore must not silence it.
+#
+# Every job names its runner image, ubuntu-24.04, rather than a label such as
+# ubuntu-latest that GitHub moves to a newer image on its own schedule. A
+# change of image is a change to this file.
 name: Dependency scan
 
 on:
@@ -53,7 +57,7 @@ permissions:
 jobs:
   cargo-deny:
     name: cargo-deny
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A hung step fails the job here instead of at GitHub's six hour default.
     timeout-minutes: 15
     permissions:

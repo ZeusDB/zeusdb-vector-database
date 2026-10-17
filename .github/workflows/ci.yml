@@ -37,6 +37,10 @@
 # builds for itself, and the Rust suite compiles its own test binaries with
 # `extension-module` off, which is a different feature set from the one the
 # other two build.
+#
+# Every job names its runner image, ubuntu-24.04, rather than a label such as
+# ubuntu-latest that GitHub moves to a newer image on its own schedule. A
+# change of image is a change to this file.
 name: CI
 
 on:
@@ -61,7 +65,7 @@ permissions:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A hung step fails the job here instead of at GitHub's six hour default.
     timeout-minutes: 15
     steps:
@@ -154,7 +158,7 @@ jobs:
           PY
 
   test-python:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -187,7 +191,7 @@ jobs:
         run: uv run --no-sync pytest tests
 
   test-rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -201,10 +205,11 @@ jobs:
           cache-on-failure: true
       # The Rust tests link an executable, and an executable has to resolve
       # every libpython symbol it references. `cargo test` below turns
-      # `extension-module` off so that PyO3 emits the `-lpython` line, and that
-      # line needs `libpython3.x.so`, which lives in python3-dev. The runner
-      # image ships the interpreter and `libpython3.12.so.1.0` but not the
-      # symlink a linker resolves `-l` against, so this is not a no-op.
+      # `extension-module` off, so PyO3 emits a `-lpython` line and the test
+      # executable links libpython. The linker resolves that line against the
+      # shared-library symlink `libpython3.x.so`, which python3-dev provides.
+      # This step installs python3-dev, so the job does not depend on the
+      # runner image for it.
       #
       # Nothing else in the job needs it. This job neither builds the extension
       # nor installs the project, because the Rust tests read neither.

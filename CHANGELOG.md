@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Internal
+
+- Every workflow job names its runner image. The jobs that ran on `ubuntu-latest` run on `ubuntu-24.04`, and the Windows wheel is built on `windows-2025-vs2026` in place of `windows-latest`. These are the images each job ran on for 0.13.0. A change of runner image is a change to a workflow file.
+
 ## [0.13.0] - 2026-10-17
 
 ### Changed
