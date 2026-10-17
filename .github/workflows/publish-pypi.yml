@@ -529,7 +529,7 @@ jobs:
       # unreachable and the action's README says such a pin will eventually
       # be garbage-collected. master is permanent. On master the channel is a
       # required input, so it is passed here and the meaning is unchanged.
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
           toolchain: stable
       - name: Build sdist
@@ -794,10 +794,9 @@ jobs:
         #
         # --target all covers every platform the wheel matrix builds, so the
         # listing is not the runner's own dependency graph. Dev dependencies
-        # are excluded by construction, so tempfile and the seven crates it
+        # are excluded by construction, so tempfile and the crates only it
         # brings in are absent, because cargo test compiles them and no wheel
-        # ships them. That gives 109 components against the 118 entries in
-        # Cargo.lock, one of which is the crate the SBOM describes.
+        # ships them.
         #
         # cargo is already on the runner image, so only cargo-cyclonedx is
         # installed, and compiling it is the whole cost of this step.
