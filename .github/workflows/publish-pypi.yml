@@ -252,7 +252,7 @@ jobs:
           abi3audit --strict --verbose --assume-minimum-abi3 3.10 dist/*.whl
       - name: Set up QEMU
         if: matrix.platform.docker-platform != 'linux/amd64'
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Install and import the built wheel on two interpreters
         # Runs in a glibc container matching the wheel architecture. A native
         # wheel cannot be handed to another job, so the check runs where the
@@ -270,12 +270,12 @@ jobs:
               sh -c 'python -m pip install --no-index --no-deps --find-links /dist zeusdb-vector-database && python -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__)"'
           done
       - name: Upload wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-linux-${{ matrix.platform.target }}
           path: dist
       - name: Upload the digests
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digests-linux-${{ matrix.platform.target }}
           path: digests
@@ -330,7 +330,7 @@ jobs:
           abi3audit --strict --verbose --assume-minimum-abi3 3.10 dist/*.whl
       - name: Set up QEMU
         if: matrix.platform.docker-platform != 'linux/amd64'
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Install and import the built wheel on two interpreters
         # Runs in a musl container, because a musllinux wheel does not install
         # on the glibc runner that builds it. The floor and the newest release
@@ -343,12 +343,12 @@ jobs:
               sh -c 'python -m pip install --no-index --no-deps --find-links /dist zeusdb-vector-database && python -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__)"'
           done
       - name: Upload wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-musllinux-${{ matrix.platform.target }}
           path: dist
       - name: Upload the digests
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digests-musllinux-${{ matrix.platform.target }}
           path: digests
@@ -430,12 +430,12 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Upload wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-windows-${{ matrix.platform.target }}
           path: dist
       - name: Upload the digests
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digests-windows-${{ matrix.platform.target }}
           path: digests
@@ -504,12 +504,12 @@ jobs:
           check '${{ steps.py310.outputs.python-path }}' 3.10
           check '${{ steps.py314.outputs.python-path }}' 3.14
       - name: Upload wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-macos-${{ matrix.platform.target }}
           path: dist
       - name: Upload the digests
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digests-macos-${{ matrix.platform.target }}
           path: digests
@@ -529,7 +529,7 @@ jobs:
       # unreachable and the action's README says such a pin will eventually
       # be garbage-collected. master is permanent. On master the channel is a
       # required input, so it is passed here and the meaning is unchanged.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
           toolchain: stable
       - name: Build sdist
@@ -563,12 +563,12 @@ jobs:
           "$RUNNER_TEMP/sdist-check/bin/python" -m pip install dist/*.tar.gz
           "$RUNNER_TEMP/sdist-check/bin/python" -c "import zeusdb_vector_database as zvd; print(zvd.__version__)"
       - name: Upload sdist
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-sdist
           path: dist
       - name: Upload the digests
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digests-sdist
           path: digests
@@ -596,14 +596,14 @@ jobs:
       url: https://test.pypi.org/project/zeusdb-vector-database/
     steps:
       - name: Download and merge all build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: wheels-*
           merge-multiple: true
           path: dist
 
       - name: Download the digests recorded at build time
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: digests-*
           merge-multiple: true
@@ -682,14 +682,14 @@ jobs:
       url: https://pypi.org/project/zeusdb-vector-database/
     steps:
       - name: Download and merge all build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: wheels-*
           merge-multiple: true
           path: dist
 
       - name: Download the digests recorded at build time
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: digests-*
           merge-multiple: true
@@ -794,10 +794,9 @@ jobs:
         #
         # --target all covers every platform the wheel matrix builds, so the
         # listing is not the runner's own dependency graph. Dev dependencies
-        # are excluded by construction, so tempfile and the seven crates it
+        # are excluded by construction, so tempfile and the crates only it
         # brings in are absent, because cargo test compiles them and no wheel
-        # ships them. That gives 109 components against the 118 entries in
-        # Cargo.lock, one of which is the crate the SBOM describes.
+        # ships them.
         #
         # cargo is already on the runner image, so only cargo-cyclonedx is
         # installed, and compiling it is the whole cost of this step.

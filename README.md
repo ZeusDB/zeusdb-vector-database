@@ -810,10 +810,10 @@ On a quantized index it also carries `quantization_active`, `quantization_traine
 
 | mode | reported | reserved | written | resident | reported / resident |
 |---|---:|---:|---:|---:|---:|
-| no quantization | 513.40 MiB | 204.36 | 309.04 | 312.68 | 1.64 |
-| `quantized_with_raw` | 543.88 | 219.45 | 324.43 | 348.41 | 1.56 |
-| `quantized_only` | 31.88 | 0.42 | 31.46 | 54.70 | 0.58 |
-| `int8` | 89.93 | 0.42 | 89.51 | 92.48 | 0.97 |
+| no quantization | 513.71 MiB | 204.54 | 309.17 | 311.55 | 1.65 |
+| `quantized_with_raw` | 544.06 | 219.50 | 324.56 | 344.26 | 1.58 |
+| `quantized_only` | 32.07 | 0.47 | 31.60 | 49.84 | 0.64 |
+| `int8` | 90.11 | 0.47 | 89.64 | 92.30 | 0.98 |
 
 **Size infrastructure from the resident figure, and compare two configurations by `total_memory_mb` minus `reserved_memory_mb`**, which is what each has written and is free of where each landed in its doubling cycle. The two rows that hold raw vectors report far above what they hold, because at `dim=1536` the store holding the vectors is reserved under a byte budget well short of the declaration and then grows by doubling, so its last doubling left capacity for far more records than the index holds; `shrink_to_fit()` hands that back once the inserts are done. The `quantized_only` row reports below what it holds, because the map that keys a code by id costs two small heap blocks a record and the allocator charges each block more than the index asked for.
 
@@ -1395,11 +1395,11 @@ Measured resident, one index per interpreter, 50,000 records of real embeddings 
 
 | dataset | dim | unquantized | `quantized_only` | `quantized_with_raw` | `int8` |
 |---|---:|---:|---:|---:|---:|
-| dbpedia-openai | 1,536 | 312.7 MiB | 54.7 MiB, 0.17x | 348.4 MiB, 1.11x | 92.5 MiB, 0.30x |
-| sift-128 | 128 | 42.4 MiB | 29.5 MiB, 0.70x | 55.9 MiB, 1.32x | 24.4 MiB, 0.58x |
-| glove-100 | 100 | 37.0 MiB | 30.1 MiB, 0.81x | 49.4 MiB, 1.33x | 23.4 MiB, 0.63x |
+| dbpedia-openai | 1,536 | 311.6 MiB | 49.8 MiB, 0.16x | 344.3 MiB, 1.10x | 92.3 MiB, 0.30x |
+| sift-128 | 128 | 42.6 MiB | 29.9 MiB, 0.70x | 54.7 MiB, 1.28x | 24.2 MiB, 0.57x |
+| glove-100 | 100 | 37.3 MiB | 29.9 MiB, 0.80x | 50.9 MiB, 1.37x | 23.0 MiB, 0.62x |
 
-**Pick `quantized_only` when memory is the constraint and `quantized_with_raw` when accuracy is, and read [Scalar Quantization](#-scalar-quantization) before either.** What `quantized_only` saves is set by the share of a record that is the vector, and that share falls with the dimension: 19% at `dim=100`, 30% at `dim=128` and 83% at `dim=1,536` on the rows above. `get_stats()` prices your own index on your own records, which is the figure to size against.
+**Pick `quantized_only` when memory is the constraint and `quantized_with_raw` when accuracy is, and read [Scalar Quantization](#-scalar-quantization) before either.** What `quantized_only` saves is set by the share of a record that is the vector, and that share falls with the dimension: 20% at `dim=100`, 30% at `dim=128` and 84% at `dim=1,536` on the rows above. `get_stats()` prices your own index on your own records, which is the figure to size against.
 
 `create()` warns when `quantized_only` cannot repay its fixed tables at the `expected_size` you declared, naming the record count above which it starts saving. Raise `expected_size` if your estimate was low, or drop `quantization_config`. `quantized_with_raw` never repays them, so it gets the warning that names the mode instead.
 
@@ -1558,9 +1558,9 @@ Recall at 10 against exact search on 100,000 records, and resident memory on 50,
 
 | dataset | dim | unquantized | `quantized_only` | `int8` |
 |---|---:|---:|---:|---:|
-| dbpedia-openai | 1,536 | 0.9929, 312.7 MiB | 0.4893, 54.7 MiB | 0.9861, 92.5 MiB |
-| sift-128 | 128 | 0.9988, 42.4 MiB | 0.4038, 29.5 MiB | 0.9827, 24.4 MiB |
-| glove-100 | 100 | 0.8858, 37.0 MiB | 0.2647, 30.1 MiB | 0.8788, 23.4 MiB |
+| dbpedia-openai | 1,536 | 0.9929, 311.6 MiB | 0.4893, 49.8 MiB | 0.9861, 92.3 MiB |
+| sift-128 | 128 | 0.9988, 42.6 MiB | 0.4038, 29.9 MiB | 0.9827, 24.2 MiB |
+| glove-100 | 100 | 0.8858, 37.3 MiB | 0.2647, 29.9 MiB | 0.8788, 23.0 MiB |
 
 A scalar index gives up two hundredths of recall for a third to two thirds of the memory, and searching it is no slower than searching an unquantized one. A trained index writes `int8_scales.zdbint8` and `int8_rows.zdbint8` in place of the two `pq_` files.
 

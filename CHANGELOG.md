@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.13.0] - 2026-10-17
 
 ### Changed
 
@@ -25,7 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Filtered search is faster.** Of 21 search cases measured against the code before this change, 15 are faster and 6 are within the noise. The largest gains are on filtered search over an index that has removed most of its records. With one record left in a thousand, a filtered exact scan takes 0.1091 of the time it took, and with one left in a hundred, a filtered graph search takes 0.2180.
 
-- **Writes on an index that has removed most of its records are faster, and compaction is slower.** Of 48 write cases, 14 are faster, 31 are within the noise and 3 are slower. Most of the faster ones are inserts, removals, overwrites and loads on an index that keeps one record in ten of those it was given. The 3 slower ones are compactions: two of 1,000 records, by 4.1 and 5.8 percent, and one of 100 records, by 4.9 microseconds a call. Across the four indexes of 1,000 records, compaction takes 3 to 6 percent more time.
+- **An unfiltered search runs with no per-node test while every node in the graph holds a record.** That is the case until the first removal or overwrite, and again after `compact()`, `rebuild()` or quantization training builds the graph from the records the index holds. A filtered search keeps its test.
+
+- **Writes on an index that has removed most of its records are faster, and compaction is slower.** Of 48 write cases, 14 are faster, 31 are within the noise and 3 are slower. Most of the faster ones are inserts, removals, overwrites and loads on an index that keeps one record in ten of those it was given. The 3 slower ones are compactions: two of 1,000 records, by 4.1 and 5.8 percent, and one of 100 records, by 4.9 microseconds a call. Across the four indexes of 1,000 records, compaction takes 3 to 6 percent more time. Most of the added work on those indexes is the fixed set of searches that a compaction times for the query planner, which now admits every record the graph holds, as an unfiltered query does, so its share falls as the index grows. The rest, and all of it on the index of 100 records, is the close-up, which builds every per-record structure off to the side so that a search waits only for the swap.
+
+- **`load()` builds the graph straight from the bytes of the graph dump.** It checks every list the dump holds before it builds the graph, allocates no block for each node or list, and releases the dump's adjacency bytes before it sizes the vector store. The empty index a load starts from reserves no memory for `expected_size`.
 
 - **The README** gives what `shrink_to_fit()` returns from each store, the operations that drop `sparse_dead_postings`, and the bookkeeping cost of a record.
 
@@ -37,11 +41,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`load()` opens a directory whose sparse space lost its newest record before the save**, including one that an earlier release saved.
 
+- **`load()` checks the graph dump against its directory before it builds the graph.** The dump must hold no more nodes than the internal ids that `id_counter` in `config.json` counts, no two nodes may carry the same internal id, and no list may be longer than its layer holds, being `2m + 1` at layer zero and `m + 1` above. When a check fails, the load builds the graph again from the directory's records.
+
+- **`load()` sizes the graph's upper layers by the entries the dump holds, not by the levels it declares.** A list that the dump leaves empty takes no neighbour slots until an entry at its layer names its node.
+
 - **`clear()` empties the sparse space at the same time as the rest of the index**, so a search or a `get_stats()` that runs beside it sees the whole index before the clear or the whole index after it.
 
 - **A refused journal replay's message gives each sentence once, and ends each sentence with a full stop.**
 
 - **A directory loaded in two processes reports the same `index_bookkeeping_memory_mb` in both.**
+
+- **The query planner times its graph searches with every record the graph holds admitted, as an unfiltered query does**, so its estimates match the searches it prices.
 
 ### Unchanged, and verified
 
@@ -967,21 +977,3 @@ were actually validating that cosine normalization was properly implemented.
 
 ### Changed
 - CI workflow now explicitly installs and upgrades `pkginfo` alongside `twine` and `wheel` during artifact inspection. This prevents metadata validation errors (such as "Metadata is missing required fields: Name, Version") caused by outdated versions of `pkginfo`.
-
----
-
-## [Unreleased]
-
-### Added
-<!-- Add new features here -->
-
-### Changed
-<!-- Add changed behavior here -->
-
-### Fixed
-<!-- Add bug fixes here -->
-
-### Removed
-<!-- Add removals/deprecations here -->
-
----
