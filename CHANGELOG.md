@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A thread that the interpreter ends during shutdown, while the thread takes the interpreter back after a long call, does not crash the process.** Long calls into the engine, such as a search, a save or a load, release the interpreter while they run and take it back at the end. The binding is built with PyO3 0.29.3, which handles a thread that is ended at that point.
+
 ### Internal
 
 - Every workflow job names its runner image. The jobs that ran on `ubuntu-latest` run on `ubuntu-24.04`, and the Windows wheel is built on `windows-2025-vs2026` in place of `windows-latest`. These are the images each job ran on for 0.13.0. A change of runner image is a change to a workflow file.
