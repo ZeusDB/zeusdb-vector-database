@@ -209,41 +209,29 @@ fn ids(collection: &Collection) -> Vec<String> {
 fn every_save_lists_exactly_the_features_it_holds() {
     let temp = TempDir::new();
     let cases: Vec<(&str, Collection, Value)> = vec![
-        ("dense", dense(40), json!({"identity": "compatible"})),
+        ("dense", dense(40), json!({})),
         (
             "pq-raw",
             pq(StorageMode::QuantizedWithRaw, 1100),
-            json!({"identity": "compatible", "pq": "incompatible"}),
+            json!({"pq": "incompatible"}),
         ),
         (
             "pq-only",
             pq(StorageMode::QuantizedOnly, 1100),
-            json!({"identity": "compatible", "pq": "incompatible"}),
+            json!({"pq": "incompatible"}),
         ),
         (
             "pq-collecting",
             pq(StorageMode::QuantizedOnly, 40),
-            json!({"identity": "compatible", "pq": "incompatible"}),
+            json!({"pq": "incompatible"}),
         ),
-        (
-            "int8",
-            int8(1100),
-            json!({"identity": "compatible", "int8": "incompatible"}),
-        ),
-        (
-            "int8-collecting",
-            int8(40),
-            json!({"identity": "compatible", "int8": "incompatible"}),
-        ),
-        (
-            "sparse",
-            sparse(40),
-            json!({"identity": "compatible", "sparse": "incompatible"}),
-        ),
+        ("int8", int8(1100), json!({"int8": "incompatible"})),
+        ("int8-collecting", int8(40), json!({"int8": "incompatible"})),
+        ("sparse", sparse(40), json!({"sparse": "incompatible"})),
         (
             "text",
             text(40),
-            json!({"identity": "compatible", "sparse": "incompatible", "text": "incompatible"}),
+            json!({"sparse": "incompatible", "text": "incompatible"}),
         ),
     ];
     for (name, collection, expected) in cases {
@@ -266,7 +254,7 @@ fn every_save_lists_exactly_the_features_it_holds() {
         .unwrap();
     assert_eq!(
         manifest(&journaled)["features"],
-        json!({"identity": "compatible", "journal": "incompatible"})
+        json!({"journal": "incompatible"})
     );
     drop(collection);
     assert_eq!(load(&journaled).unwrap().len(), 30);
@@ -279,7 +267,6 @@ fn every_save_lists_exactly_the_features_it_holds() {
     assert_eq!(
         manifest(&both)["features"],
         json!({
-            "identity": "compatible",
             "journal": "incompatible",
             "sparse": "incompatible",
             "text": "incompatible"
@@ -311,7 +298,7 @@ fn the_features_follow_the_collection_and_are_byte_stable() {
     save(&collection, &cleared);
     assert_eq!(
         manifest(&cleared)["features"],
-        json!({"identity": "compatible", "sparse": "incompatible", "text": "incompatible"})
+        json!({"sparse": "incompatible", "text": "incompatible"})
     );
     assert_eq!(load(&cleared).unwrap().len(), 0);
 }
@@ -391,10 +378,7 @@ fn a_compatible_feature_this_build_does_not_know_opens_and_is_not_kept() {
     assert!(opened.is_quantized());
     let again = temp.at("again.zdb");
     save(&opened, &again);
-    assert_eq!(
-        manifest(&again)["features"],
-        json!({"identity": "compatible", "pq": "incompatible"})
-    );
+    assert_eq!(manifest(&again)["features"], json!({"pq": "incompatible"}));
 }
 
 // ============================================================================
@@ -437,31 +421,27 @@ fn the_listed_features_are_the_held_ones() {
 
     let plain = temp.at("plain.zdb");
     save(&dense(20), &plain);
+    // The identity is part of the base at 5.x, so a record listing it
+    // describes no directory a save writes.
+    let path = forged(&temp, &plain, "with-identity.zdb", |m| {
+        m["features"]["identity"] = json!("compatible");
+    });
     assert_eq!(
-        invalid(load(&drop_feature(&plain, "no-identity.zdb", "identity"))),
-        "it lists no feature, and the directory holds identity"
+        invalid(load(&path)),
+        "it lists identity, and the directory holds no feature"
     );
     for (feature, expected) in [
-        (
-            "int8",
-            "it lists identity and int8, and the directory holds identity",
-        ),
+        ("int8", "it lists int8, and the directory holds no feature"),
         (
             "journal",
-            "it lists identity and journal, and the directory holds identity",
+            "it lists journal, and the directory holds no feature",
         ),
-        (
-            "pq",
-            "it lists identity and pq, and the directory holds identity",
-        ),
+        ("pq", "it lists pq, and the directory holds no feature"),
         (
             "sparse",
-            "it lists identity and sparse, and the directory holds identity",
+            "it lists sparse, and the directory holds no feature",
         ),
-        (
-            "text",
-            "it lists identity and text, and the directory holds identity",
-        ),
+        ("text", "it lists text, and the directory holds no feature"),
     ] {
         let path = add_feature(&plain, &format!("with-{feature}.zdb"), feature);
         assert_eq!(invalid(load(&path)), expected, "{feature}");
@@ -471,23 +451,23 @@ fn the_listed_features_are_the_held_ones() {
     save(&pq(StorageMode::QuantizedOnly, 1100), &quantized);
     assert_eq!(
         invalid(load(&drop_feature(&quantized, "no-pq.zdb", "pq"))),
-        "it lists identity, and the directory holds identity and pq"
+        "it lists no feature, and the directory holds pq"
     );
     let scalar = temp.at("int8.zdb");
     save(&int8(1100), &scalar);
     assert_eq!(
         invalid(load(&drop_feature(&scalar, "no-int8.zdb", "int8"))),
-        "it lists identity, and the directory holds identity and int8"
+        "it lists no feature, and the directory holds int8"
     );
     let words = temp.at("text.zdb");
     save(&text(30), &words);
     assert_eq!(
         invalid(load(&drop_feature(&words, "no-text.zdb", "text"))),
-        "it lists identity and sparse, and the directory holds identity, sparse and text"
+        "it lists sparse, and the directory holds sparse and text"
     );
     assert_eq!(
         invalid(load(&drop_feature(&words, "no-sparse.zdb", "sparse"))),
-        "it lists identity and text, and the directory holds identity, sparse and text"
+        "it lists text, and the directory holds sparse and text"
     );
 
     let journaled = temp.at("journaled.zdb");
@@ -499,18 +479,32 @@ fn the_listed_features_are_the_held_ones() {
     let unlisted = drop_feature(&journaled, "no-journal.zdb", "journal");
     assert_eq!(
         invalid(load(&unlisted)),
-        "it lists identity, and the directory holds identity and journal"
+        "it lists no feature, and the directory holds journal"
     );
     // The journal record is the manifest's, so the checkpoint alone is
     // refused too.
     match Collection::load_checkpoint_only(unlisted.to_str().unwrap(), None) {
         Err(Error::FeaturesInvalid { detail, .. }) => assert_eq!(
             detail,
-            "it lists identity, and the directory holds identity and journal"
+            "it lists no feature, and the directory holds journal"
         ),
         Err(other) => panic!("expected the features refused, got {other}"),
         Ok(_) => panic!("expected the features refused, and the checkpoint opened"),
     }
+
+    // At 4.x the identity is listed where it is recorded.
+    let fourth = forged(&temp, &plain, "fourth.zdb", |m| {
+        m["format_version"] = json!("4.0.0");
+    });
+    assert_eq!(
+        invalid(load(&fourth)),
+        "it lists no feature, and the directory holds identity"
+    );
+    let fourth = forged(&temp, &plain, "fourth-listed.zdb", |m| {
+        m["format_version"] = json!("4.0.0");
+        m["features"]["identity"] = json!("compatible");
+    });
+    assert_eq!(load(&fourth).unwrap().len(), 20);
 }
 
 // ============================================================================
@@ -518,7 +512,8 @@ fn the_listed_features_are_the_held_ones() {
 // ============================================================================
 
 /// A 4.0.0 directory saved before the record existed lists no features and
-/// opens as it did, and its next save lists them.
+/// opens as it did, and its next save lists them. At 5.x a manifest that
+/// lists none is refused, which `journal_tests` holds.
 #[test]
 fn a_directory_listing_no_features_opens_and_lists_them_at_its_next_save() {
     let temp = TempDir::new();
@@ -527,6 +522,7 @@ fn a_directory_listing_no_features_opens_and_lists_them_at_its_next_save() {
         save(&collection, &path);
         let expected = manifest(&path)["features"].clone();
         rewrite_manifest(&path, |m| {
+            m["format_version"] = json!("4.0.0");
             m.as_object_mut().unwrap().remove("features");
         });
         let opened = load(&path).unwrap();
@@ -605,8 +601,8 @@ fn the_words_of_both_refusals() {
     assert_eq!(
         message(&listed),
         "manifest.json lists features that do not describe the directory: it lists \
-         identity and journal, and the directory holds identity. A saved directory lists \
-         every feature it holds and no other, and this build marks identity compatible and \
-         int8, journal, pq, sparse and text incompatible."
+         journal, and the directory holds no feature. A saved directory lists every feature \
+         it holds and no other, and this build marks identity compatible and int8, journal, \
+         pq, sparse and text incompatible."
     );
 }

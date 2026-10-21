@@ -836,6 +836,7 @@ impl Collection {
             if let Some(bytes) = journal.bytes {
                 stats.insert("journal_bytes".to_string(), bytes.to_string());
             }
+            stats.insert("journal_segments".to_string(), journal.segments.to_string());
         }
 
         // Of the sum below, the bytes no record has been written into.

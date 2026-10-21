@@ -231,7 +231,7 @@ def test_the_digest_repairer_agrees_with_the_saved_manifest(
             if "checksum" in entry:
                 assert entry["checksum"] == artefact_digest(data), name
                 checked += 1
-            if manifest["format_version"] == "4.0.0" and name in FRAME_KINDS:
+            if manifest["format_version"] in ("4.0.0", "5.0.0") and name in FRAME_KINDS:
                 kind, entries, payload = unframe(data)
                 assert kind == FRAME_KINDS[name], name
                 assert frame(kind, entries, payload) == data, name

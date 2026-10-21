@@ -1,0 +1,64 @@
+{
+  "format_version": "4.0.0",
+  "features": {
+    "identity": "compatible",
+    "journal": "incompatible",
+    "sparse": "incompatible",
+    "text": "incompatible"
+  },
+  "identity": {
+    "collection_id": "d95df5f56a4a67d1c15bb9f01982ea11",
+    "generation": 1,
+    "snapshot": "b814943f31c7d3a6465a39b0656423b4"
+  },
+  "zeusdb_version": "0.13.0",
+  "created_at": "2026-10-20T11:52:58.916346600+00:00",
+  "saved_at": "2026-10-20T11:52:58.963133200+00:00",
+  "total_vectors": 120,
+  "index_type": "HNSW",
+  "has_quantization": false,
+  "quantization_trained": false,
+  "storage_mode": "raw_only",
+  "files_included": [
+    "config.json",
+    "mappings.bin",
+    "metadata.json",
+    "vectors.bin",
+    "spaces/text/postings.zdbsparse",
+    "spaces/text/terms.zdbdict",
+    "hnsw_index.zdbgraph"
+  ],
+  "files_excluded": [],
+  "file_digests": {
+    "spaces/text/terms.zdbdict": {
+      "bytes": 187
+    },
+    "spaces/text/postings.zdbsparse": {
+      "bytes": 3128
+    },
+    "config.json": {
+      "bytes": 495,
+      "checksum": "dd60a3c659c87bc1"
+    },
+    "mappings.bin": {
+      "bytes": 1410
+    },
+    "metadata.json": {
+      "bytes": 5662,
+      "checksum": "597e24a8c80bd5cb"
+    },
+    "vectors.bin": {
+      "bytes": 4404
+    },
+    "hnsw_index.zdbgraph": {
+      "bytes": 23004
+    }
+  },
+  "total_size_mb": 0.03651618957519531,
+  "compression_info": null,
+  "journal": {
+    "file": "journaled.zdb.zdbwal",
+    "sequence": 0,
+    "collection_id": "d95df5f56a4a67d1c15bb9f01982ea11"
+  }
+}

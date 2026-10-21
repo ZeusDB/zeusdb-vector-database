@@ -804,7 +804,7 @@ storage_mode_description: raw_only
 | `quantization_type` | `pq`, `int8`, or `none` on an unquantized index |
 | `raw_vectors_retained` | The storage mode's policy, `none_once_trained` or `all_records`. Quantized indexes only |
 
-On a quantized index it also carries `quantization_active`, `quantization_trained`, `quantization_compression_ratio`, `quantization_training_size`, `training_progress`, `training_threshold_reached` and `training_vectors_needed`. A product quantized index adds the rerank keys below. A scalar index adds `quantization_scale` and `quantization_saturated_values`, which [Scalar Quantization](#-scalar-quantization) describes, and carries no `rerank_` key. A journaled index adds the five `journal_` keys under [Journaling an Index](#-journaling-an-index---journal_to), and an index with a sparse space adds the keys under [Statistics](#-statistics).
+On a quantized index it also carries `quantization_active`, `quantization_trained`, `quantization_compression_ratio`, `quantization_training_size`, `training_progress`, `training_threshold_reached` and `training_vectors_needed`. A product quantized index adds the rerank keys below. A scalar index adds `quantization_scale` and `quantization_saturated_values`, which [Scalar Quantization](#-scalar-quantization) describes, and carries no `rerank_` key. A journaled index adds the `journal_` keys under [Journaling an Index](#-journaling-an-index---journal_to), and an index with a sparse space adds the keys under [Statistics](#-statistics).
 
 **Every memory key prices the capacity its structure asked the allocator for, so `total_memory_mb` is what the index asked for and not what the process holds.** The two differ in both directions. A buffer reserved and not yet written is asked for and not resident, and `reserved_memory_mb` is exactly that part. The allocator's own header on every block it hands out is resident and not asked for, and no figure the index computes can see it. Measured on 50,000 real 1,536-dimensional embeddings at the default `m` of 32, one index per interpreter, against the working set delta across the build:
 
@@ -1712,12 +1712,12 @@ my_index.zdb/
         ├── postings.zdbsparse  # Every live record's term ids and weights
         └── terms.zdbdict       # The term dictionary (text layers only)
 
-my_index.zdb.zdbwal         # The journal, beside the directory (if journaled)
+my_index.zdb.zdbjournal/    # The journal, beside the directory (if journaled)
 ```
 
 `<name>` is the space's `name`, which defaults to `sparse`. `terms.zdbdict` is written only where the space was declared with a tokenizer. The journal is a sibling of the directory rather than a file inside it, and [Journaling an Index](#-journaling-an-index---journal_to) says why.
 
-`manifest.json` lists every file the save wrote under `files_included` and is the last file written, so it is the inventory of what the directory does hold. Beside the list, `file_digests` records each artefact's length and, for each JSON artefact, a digest of its contents, and for a journaled index a `journal` record names the sibling file, the collection id both share and the sequence the checkpoint holds. `features` names what the directory holds, see [What a Directory Holds](#-what-a-directory-holds---features), and `identity` names the index it belongs to, its place among that index's saves and the save it came from, see [Identifying a Directory](#-identifying-a-directory---identity).
+`manifest.json` lists every file the save wrote under `files_included` and is the last file written, so it is the inventory of what the directory does hold. Beside the list, `file_digests` records each artefact's length and, for each JSON artefact, a digest of its contents, and for a journaled index a `journal` record names the sibling journal, the collection id both share and the sequence the checkpoint holds. `features` names what the directory holds, see [What a Directory Holds](#-what-a-directory-holds---features), and `identity` names the index it belongs to, its place among that index's saves and the save it came from, see [Identifying a Directory](#-identifying-a-directory---identity).
 
 A directory saved by 0.6.0 or earlier holds `hnsw_index.hnsw.graph` and `hnsw_index.hnsw.data` in place of `hnsw_index.zdbgraph`. Opening it still works: the graph is rebuilt once from the stored records, and the next `.save()` writes the single file.
 
@@ -1828,16 +1828,16 @@ print("after checkpoint:", index.get_stats()["journal_records"])
 *Output*
 
 ```
-journaled.zdb.zdbwal
+journaled.zdb.zdbjournal
 HNSWIndex(dim=4, space=cosine, m=16, ef_construction=200, expected_size=100, vectors=2, journal=call, quantization=none)
 journal_durability: call
 journal_sequence: 0
 journal_records: 2
-journal_bytes: 165
+journal_bytes: 293
 after checkpoint: 0
 ```
 
-The journal is `<path>.zdbwal`, a sibling of the directory rather than a file inside it. `durability` names what a call promises about its records once it has returned, on `journal_to()` and again on every `load()`:
+The journal is `<path>.zdbjournal`, a sibling of the directory rather than a file inside it. `durability` names what a call promises about its records once it has returned, on `journal_to()` and again on every `load()`:
 
 | `durability` | When the call returns | A process that stops | An OS crash or power loss |
 |---|---|---|---|
@@ -1845,9 +1845,9 @@ The journal is `<path>.zdbwal`, a sibling of the directory rather than a file in
 | `"interval"` | every record is in the kernel, flushed within `interval_ms`, 10 by default | nothing acknowledged is lost | up to one interval of acknowledged calls |
 | `"none"` | every record is in the kernel until the next checkpoint | nothing acknowledged is lost | everything since the last checkpoint |
 
-`get_stats()` reports five `journal_` keys on a journaled index, being the four the example prints and `journal_interval_ms`, which is present under `"interval"` alone.
+`get_stats()` reports the `journal_` keys on a journaled index, being the four the example prints, `journal_segments`, and `journal_interval_ms` under `"interval"`.
 
-**Nothing checkpoints for you.** An index that is never checkpointed opens by replaying every record in its journal, each at the cost of the `add()` that wrote it, so a directory with a million records in the journal takes minutes to open where its checkpoint takes seconds. `journal_records` passing the record count is a reasonable trigger. A checkpoint is a save, so each one moves `identity`'s generation on by one, while the journal's own sequence counts records.
+An index that is never checkpointed opens by replaying every record in its journal, each at the cost of the `add()` that wrote it, so a directory with a million records in the journal takes minutes to open where its checkpoint takes seconds. `journal_records` passing the record count is a reasonable trigger. A checkpoint is a save, so each one moves `identity`'s generation on by one, while the journal's own sequence counts records.
 
 ### 🪪 Identifying a Directory - .identity
 
@@ -1889,7 +1889,7 @@ True
 
 Of two directories of one index, the higher `generation` is the later save. A copy taken before the last save is one generation behind the directory saved after it, and that directory names the copy's `snapshot` as its `parent`. Two directories naming the same `parent` under different snapshots were each saved from the same state, which is what a copy opened and saved in its own place looks like. `clear()` keeps all four, since a cleared index is the same index, and `get_stats()` does not carry them.
 
-A directory saved by 0.11.0 or earlier records no identity and opens as it always did. A journaled one takes the id its journal names, and any other is given one when it is opened. Its next save records that id at generation 1.
+A directory saved by 0.11.0 or earlier records no identity. A journaled one takes the id its journal names, and any other is given one when it is opened. Its next save records that id at generation 1.
 
 ### 📋 What a Directory Holds - features
 
@@ -1915,20 +1915,19 @@ for path in ("plain.zdb", "texts.zdb"):
 *Output*
 
 ```
-plain.zdb 4.0.0 {'identity': 'compatible'}
-texts.zdb 4.0.0 {'identity': 'compatible', 'journal': 'incompatible', 'sparse': 'incompatible', 'text': 'incompatible'}
+plain.zdb 5.0.0 {}
+texts.zdb 5.0.0 {'journal': 'incompatible', 'sparse': 'incompatible', 'text': 'incompatible'}
 ```
 
 | Feature | Listed when the directory holds | Mark |
 |---|---|---|
-| `identity` | its identity, which every save records | compatible |
 | `pq` | product quantization, trained or not | incompatible |
 | `int8` | scalar quantization, trained or not | incompatible |
 | `sparse` | a sparse space | incompatible |
 | `text` | a text layer on that space | incompatible |
 | `journal` | a journal beside the directory | incompatible |
 
-A release that meets a feature it does not know refuses the directory with a message naming the feature, unless the directory marks it `compatible`, in which case the release opens the directory without it and its next save leaves the feature out. A later feature is a new name in this list rather than a new format version, so a directory holding nothing a release does not know keeps opening on that release. A directory saved by 0.11.0 or earlier lists no features and opens as it did.
+A release that meets a feature it does not know refuses the directory with a message naming the feature, unless the directory marks it `compatible`, in which case the release opens the directory without it and its next save leaves the feature out. A later feature is a new name in this list rather than a new format version, so a directory holding nothing a release does not know keeps opening on that release. A directory saved by 0.11.0 or earlier lists no features.
 
 <br />
 
@@ -1944,7 +1943,7 @@ A release that meets a feature it does not know refuses the directory with a mes
 
 - **Same volume.** The staging directory is a sibling of the target, so both are on the target's volume and the move is a rename rather than a copy.
 
-- **Version compatibility.** Every directory this release saves declares format version 4.0.0 and lists its features, see [What a Directory Holds](#-what-a-directory-holds---features). This release reads any 1.x, 2.x, 3.x or 4.x, so a directory an earlier release saved opens here, and saving it again writes 4.0.0. A 4.0.0 directory holds `mappings.bin`, `vectors.bin` and the two `pq_` files inside a frame with checksums of its own, where earlier releases wrote them in the bincode crate's encoding, so 0.5.0 to 0.11.0 refuse it at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
+- **Version compatibility.** Every directory this release saves declares format version 5.0.0 and lists its features, see [What a Directory Holds](#-what-a-directory-holds---features). This release reads any 1.x to 5.x, so a directory an earlier release saved opens here, and saving it again writes 5.0.0. A 5.0.0 directory holds `mappings.bin`, `vectors.bin` and the two `pq_` files inside a frame with checksums of its own, and 0.5.0 to 0.13.0 refuse it at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
 
 - **Integrity checks on load.** Five run, in this order: the format version, then the features against the ones this release knows, then `files_included` against the directory, then each artefact against its recorded length and, for a JSON artefact, its digest, a binary artefact verifying its own checksums as it is read, then the restored record count against the count in `config.json`. Once `config.json` and `quantization.json` are read, the features a 4.0.0 directory lists are held to what it holds. A directory holding a sparse space adds two, being every record the space holds against the id mappings, and every term id the postings carry against the length of the dictionary. A journaled directory adds the journal's own, being the collection id in its header against the manifest's, its first record against the sequence the checkpoint holds, a record in its middle whose bytes changed after it was written, and every replayed record against the index it lands on. A directory recording an identity adds its own, being every id 32 hexadecimal digits and the generation 1 or more, and, where it is journaled, the collection id its journal record names against the identity's. A trained scalar directory adds the bounds of its two artefacts, being one finite positive scale per declared dimension, and one row per record the mappings hold in increasing internal id order. A 4.0.0 directory adds the bounds of its binary artefacts, being every internal id `vectors.bin` and `pq_codes.bin` name one that `mappings.bin` holds, one vector of the declared width for every record `mappings.bin` holds where the directory holds `vectors.bin`, one code of the declared width for each record coded, and a codebook of the shape `quantization.json` describes.
 
@@ -2561,7 +2560,7 @@ sparse_memory_mb 0.00
 | `term_count` | Distinct terms the dictionary holds, on a text layer alone |
 | `dictionary_memory_mb` | What the dictionary holds, on a text layer alone |
 
-**These keys are present on a sparse index and absent otherwise**, and `total_memory_mb` sums them in. A journaled index carries five `journal_` keys the same way; see [Journaling an Index](#-journaling-an-index---journal_to).
+**These keys are present on a sparse index and absent otherwise**, and `total_memory_mb` sums them in. A journaled index carries `journal_` keys the same way; see [Journaling an Index](#-journaling-an-index---journal_to).
 
 <br />
 

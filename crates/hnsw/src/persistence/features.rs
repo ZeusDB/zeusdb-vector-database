@@ -12,17 +12,20 @@
 //!
 //! | Name | Mark | Listed where |
 //! | --- | --- | --- |
-//! | `identity` | compatible | every save, which records `identity` |
+//! | `identity` | compatible | a 4.x save, which records `identity`; part of the base at 5.x and never listed there |
 //! | `int8` | incompatible | `quantization.json` takes the scalar layout, trained or not |
 //! | `journal` | incompatible | the manifest names a journal |
 //! | `pq` | incompatible | `quantization.json` takes the product quantized layout, trained or not |
 //! | `sparse` | incompatible | `config.json` declares a sparse space |
 //! | `text` | incompatible | that space declares a tokenizer |
 //!
-//! The base every 4.x directory shares lists nothing: the manifest,
-//! `config.json`, `metadata.json`, the framed `mappings.bin`, the framed
-//! `vectors.bin` where raw vectors are held, and the graph dump. A field those
-//! files default when it is absent is part of the base too.
+//! The base every 5.x directory shares lists nothing: the manifest with its
+//! identity, `config.json`, `metadata.json`, the framed `mappings.bin`, the
+//! framed `vectors.bin` where raw vectors are held, and the graph dump. A
+//! field those files default when it is absent is part of the base too. A
+//! 5.x manifest carries the record even where it lists nothing, and one
+//! carrying none is refused. The 4.x base is the same without the identity,
+//! which a 4.x save lists.
 //!
 //! **A name and its mark are on disk. Never reuse a name and never change a
 //! mark.** A later feature is a new name, listed only by a directory that
@@ -164,6 +167,12 @@ fn invalid(detail: String) -> Error {
         detail,
         marks: MARKS_LABEL,
     }
+}
+
+/// The refusal a 5.x manifest carrying no features record meets, since
+/// every save at 5.x lists its features, possibly none.
+pub(super) fn missing() -> Error {
+    invalid("it carries no features record, which every manifest at format 5.x carries".to_string())
 }
 
 /// A mark as a refusal spells it: the two this build writes bare, any other

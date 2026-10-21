@@ -46,7 +46,18 @@
 //!
 //! AddMetadata
 //!    u32 count, then count × (u32 key_len, key, u32 value_len, value)
+//!
+//! Commit
+//!    u64 first                  the first sequence of the call it closes
+//!
+//! Abort
+//!    u64 first                  the first sequence of the call it withdraws
+//!    u8  reason                 AbortReason
 //! ```
+//!
+//! `Commit` and `Abort` are framing. The journal's writer appends them and its
+//! reader settles what they say, and neither is ever handed to a collection
+//! as a mutation.
 //!
 //! A payload ends where its last field ends, and trailing bytes fail it.
 //! The encoder writes every length as a `u32`; a field wider than that
@@ -117,6 +128,40 @@ pub enum Operation {
     AddMetadata { pairs: Vec<(String, String)> },
     /// The graph rebuilt over the quantized codes.
     RebuildQuantized,
+    /// The records from `first` to this record's own sequence less one are
+    /// one call's, made durable together.
+    Commit { first: u64 },
+    /// The records from `first` to this record's own sequence less one are
+    /// withdrawn, being a call whose commit failed.
+    Abort { first: u64, reason: AbortReason },
+}
+
+/// Why an [`Operation::Abort`] withdrew a call, at byte 8 of its payload.
+///
+/// **The numbers are on disk for ever. Never reuse one and never change
+/// one.**
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbortReason {
+    /// The sync that was to make the call's records durable failed.
+    SyncFailed = 1,
+    /// A write of the call's commit record failed.
+    WriteFailed = 2,
+}
+
+impl AbortReason {
+    /// The number on disk.
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The reason a number names, or none.
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(AbortReason::SyncFailed),
+            2 => Some(AbortReason::WriteFailed),
+            _ => None,
+        }
+    }
 }
 
 impl Operation {
@@ -133,6 +178,8 @@ impl Operation {
             Operation::Train { .. } => OperationKind::Train,
             Operation::AddMetadata { .. } => OperationKind::AddMetadata,
             Operation::RebuildQuantized => OperationKind::RebuildQuantized,
+            Operation::Commit { .. } => OperationKind::Commit,
+            Operation::Abort { .. } => OperationKind::Abort,
         }
     }
 
@@ -187,6 +234,11 @@ impl Operation {
                     put_bytes(out, key.as_bytes());
                     put_bytes(out, value.as_bytes());
                 }
+            }
+            Operation::Commit { first } => out.extend_from_slice(&first.to_le_bytes()),
+            Operation::Abort { first, reason } => {
+                out.extend_from_slice(&first.to_le_bytes());
+                out.push(reason.code());
             }
         }
     }
@@ -597,6 +649,16 @@ fn decode_fields(c: &mut Cursor<'_>, kind: OperationKind, dim: usize) -> Result<
             }
             Ok(Operation::AddMetadata { pairs })
         }
+        OperationKind::Commit => Ok(Operation::Commit {
+            first: c.u64("first sequence")?,
+        }),
+        OperationKind::Abort => {
+            let first = c.u64("first sequence")?;
+            let code = c.u8("reason")?;
+            let reason = AbortReason::from_code(code)
+                .ok_or_else(|| format!("reason {code} is not one this build knows"))?;
+            Ok(Operation::Abort { first, reason })
+        }
     }
 }
 
@@ -699,7 +761,57 @@ mod tests {
                 pairs: vec![("k".into(), "v".into()), ("".into(), "".into())],
             },
             Operation::RebuildQuantized,
+            Operation::Commit { first: 1 },
+            Operation::Commit { first: u64::MAX },
+            Operation::Abort {
+                first: 9,
+                reason: AbortReason::SyncFailed,
+            },
+            Operation::Abort {
+                first: 9,
+                reason: AbortReason::WriteFailed,
+            },
         ]
+    }
+
+    /// A commit is the first sequence of its call, and an abort is that
+    /// sequence and a reason byte, laid out as the module says. A reason
+    /// this build does not know fails the record.
+    #[test]
+    fn the_framing_records_lay_out_as_documented() {
+        let mut out = Vec::new();
+        Operation::Commit {
+            first: 0x0102_0304_0506_0708,
+        }
+        .encode(&mut out);
+        assert_eq!(out, 0x0102_0304_0506_0708u64.to_le_bytes());
+        Operation::Abort {
+            first: 7,
+            reason: AbortReason::SyncFailed,
+        }
+        .encode(&mut out);
+        let mut expected = 7u64.to_le_bytes().to_vec();
+        expected.push(1);
+        assert_eq!(out, expected);
+        assert_eq!(AbortReason::SyncFailed.code(), 1);
+        assert_eq!(AbortReason::WriteFailed.code(), 2);
+        for code in [1u8, 2] {
+            assert_eq!(
+                AbortReason::from_code(code).map(AbortReason::code),
+                Some(code)
+            );
+        }
+        for code in [0u8, 3, 255] {
+            assert_eq!(AbortReason::from_code(code), None);
+            let mut payload = 7u64.to_le_bytes().to_vec();
+            payload.push(code);
+            assert_eq!(
+                refused(OperationKind::Abort, &payload),
+                format!("reason {code} is not one this build knows")
+            );
+        }
+        assert!(refused(OperationKind::Commit, &[0; 7]).contains("first sequence"));
+        assert!(refused(OperationKind::Abort, &[0; 8]).contains("reason"));
     }
 
     /// Every operation encodes and decodes to itself, under the kind it

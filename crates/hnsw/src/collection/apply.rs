@@ -20,6 +20,12 @@
 //!
 //! `apply` hands nothing to the sink, and refuses to run while one is
 //! attached, so a replay is never recorded as new mutations.
+//!
+//! `apply_withdrawn` takes a record of a call whose commit failed, which the
+//! live collection refused, and does what the live collection kept of it:
+//! an insert's internal id stays issued, since admission issued it before
+//! the commit, and a term stays interned, since the dictionary kept it.
+//! Nothing else of such a call is applied.
 
 use super::insert::Admitted;
 use super::{validate_index_parameters, Collection};
@@ -148,26 +154,7 @@ impl Collection {
                 self.rebuild_locked(&writers, m, expected_size, ef_construction)
                     .map(|_| ())
             }
-            Operation::Intern { term_id, term } => {
-                let layer = self.text_layer()?;
-                let mut dictionary = layer.dictionary.write().unwrap();
-                let next = u32::try_from(dictionary.len()).unwrap_or(u32::MAX);
-                if term_id != next {
-                    return Err(mismatch(format!(
-                        "the record interns '{}' at {} and the dictionary would issue {}",
-                        term, term_id, next
-                    )));
-                }
-                if let Some(held) = dictionary.id_of(&term) {
-                    return Err(mismatch(format!(
-                        "the record interns '{}' at {} and the dictionary holds it at {}",
-                        term, term_id, held
-                    )));
-                }
-                let issued = dictionary.intern(&term)?;
-                debug_assert_eq!(issued, term_id, "the dictionary issued the next id");
-                Ok(())
-            }
+            Operation::Intern { term_id, term } => self.intern_recorded(term_id, &term),
             Operation::Train { completed_at } => {
                 if !self.can_use_quantization() {
                     return Err(mismatch(
@@ -187,12 +174,100 @@ impl Collection {
                 .rebuild_with_quantization_locked(&writers)
                 .map(|_| ())
                 .map_err(Error::Engine),
+            // The reader settles a call by its framing records and hands
+            // none of them on, so one reaching here was built by hand.
+            Operation::Commit { first } => Err(mismatch(format!(
+                "the record is a commit naming sequence {}, which closes a call and is not an \
+                 operation",
+                first
+            ))),
+            Operation::Abort { first, .. } => Err(mismatch(format!(
+                "the record is an abort naming sequence {}, which withdraws a call and is not an \
+                 operation",
+                first
+            ))),
         };
         debug_assert!(
             self.positions_agree(),
             "an applied record leaves every structure at the positions the records hold"
         );
         applied
+    }
+
+    /// Apply one record of a call whose commit failed, as the live
+    /// collection left it.
+    ///
+    /// Under the mutation guard, as `apply` is. An `Insert` issues the
+    /// internal id it names, which must be the one the counter would issue
+    /// next, and installs nothing. An `Intern` interns its term, held as
+    /// `apply` holds it. Every other kind is passed over. A framing record is
+    /// refused, as `apply` refuses one.
+    pub fn apply_withdrawn(&self, operation: Operation) -> Result<(), Error> {
+        let _writers = self.hold_writers();
+        if self.sink_attached() {
+            return Err(Error::Engine(
+                "A recorded operation cannot be applied while a sink is attached, since a \
+                 replay is not a new mutation. Detach the sink, apply, and attach it again."
+                    .to_string(),
+            ));
+        }
+        let mismatch = |detail: String| Error::JournalReplayMismatch { detail };
+        match operation {
+            Operation::Insert {
+                id, internal_id, ..
+            } => {
+                let expected = usize::try_from(internal_id)
+                    .ok()
+                    .filter(|&value| value <= MAX_INTERNAL_ID)
+                    .ok_or_else(|| {
+                        mismatch(format!(
+                            "the withdrawn record names internal id {} for '{}', above the id \
+                             ceiling",
+                            internal_id, id
+                        ))
+                    })?;
+                self.issue_expected_id(expected).map(|_| ())
+            }
+            Operation::Intern { term_id, term } => self.intern_recorded(term_id, &term),
+            Operation::Commit { first } | Operation::Abort { first, .. } => Err(mismatch(format!(
+                "the withdrawn record is a framing record naming sequence {}, which is not an \
+                 operation",
+                first
+            ))),
+            Operation::Remove { .. }
+            | Operation::UpdateMetadata { .. }
+            | Operation::Clear
+            | Operation::Compact
+            | Operation::Rebuild { .. }
+            | Operation::Train { .. }
+            | Operation::AddMetadata { .. }
+            | Operation::RebuildQuantized => Ok(()),
+        }
+    }
+
+    /// The `Intern` arm of `apply` and of `apply_withdrawn`: the term id
+    /// must be the one the dictionary would issue and the term must be new
+    /// to it. Then the interning.
+    fn intern_recorded(&self, term_id: u32, term: &str) -> Result<(), Error> {
+        let mismatch = |detail: String| Error::JournalReplayMismatch { detail };
+        let layer = self.text_layer()?;
+        let mut dictionary = layer.dictionary.write().unwrap();
+        let next = dictionary.next_id().unwrap_or(u32::MAX);
+        if term_id != next {
+            return Err(mismatch(format!(
+                "the record interns '{}' at {} and the dictionary would issue {}",
+                term, term_id, next
+            )));
+        }
+        if let Some(held) = dictionary.id_of(term) {
+            return Err(mismatch(format!(
+                "the record interns '{}' at {} and the dictionary holds it at {}",
+                term, term_id, held
+            )));
+        }
+        let issued = dictionary.intern(term)?;
+        debug_assert_eq!(issued, term_id, "the dictionary issued the next id");
+        Ok(())
     }
 
     /// The `Insert` arm of `apply`, with the mutation guard held, up to the

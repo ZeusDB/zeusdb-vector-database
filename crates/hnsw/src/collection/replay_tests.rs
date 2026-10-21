@@ -699,10 +699,10 @@ fn a_sink_that_refuses_leaves_the_collection_as_it_was() {
         2,
         "the refused records burnt no id"
     );
-    // The first term was interned before its record was refused, and the
-    // refusal stopped the count there, which is the state a replay of the
-    // records before it reaches.
-    assert_eq!(collection.term_count(), Some(1));
+    // A term's record is handed over before the term is interned, so the
+    // refusal of the first stopped the count with nothing interned, which
+    // is the state a replay of the records before it reaches.
+    assert_eq!(collection.term_count(), Some(0));
 
     let refused = |result: Result<(), Error>| {
         let err = result.unwrap_err();

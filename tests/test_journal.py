@@ -6,11 +6,17 @@ index reports. The engine's own tests hold the crash matrix, the interval
 thread's lifetime and what a failed commit leaves; what is here is the
 surface a caller reaches, and the one rule a caller acts on most, being that
 a directory saved without a journal is the directory it always was.
+
+The journal is a directory of segments beside the directory. Every call's
+records are closed by a commit record, which takes a sequence like any
+other, so a call of four records reaches five sequences. A journaled index
+holds the directory's lock for its life, so a test lets go of one before it
+loads the directory again.
 """
 
 import gc
 import json
-import os
+import shutil
 
 import numpy as np
 import pytest
@@ -18,7 +24,7 @@ from helpers import repair_manifest
 from zeusdb_vector_database import VectorDatabase
 
 DIM = 8
-JOURNAL_HEADER_BYTES = 64
+SEGMENT_HEADER_BYTES = 128
 
 
 def build(n=0, **kw):
@@ -49,31 +55,32 @@ def journal_keys(index):
 
 
 def journal_of(path):
-    return path.parent / (path.name + ".zdbwal")
+    return path.parent / (path.name + ".zdbjournal")
 
 
-def drop(index):
-    """Let go of the index so the journal it holds open is closed."""
-    del index
-    gc.collect()
+def segments(path):
+    """Every segment of the journal beside `path`, by name, with its bytes."""
+    return {p.name: p.read_bytes() for p in sorted(journal_of(path).iterdir())}
+
+
+def journal_size(path):
+    return sum(len(b) for b in segments(path).values())
 
 
 # ------------------------------------------------------------
 # The journal is opt-in
 # ------------------------------------------------------------
 def test_a_directory_saved_without_a_journal_is_the_directory_it_always_was(tmp_path):
-    """create() and save() write what they wrote before the journal existed.
-
-    No journal file, no journal record in the manifest, no journal among the
-    features it lists, and nothing about a journal in the stats or the info
-    line.
-    """
+    """create() and save() write no journal, no journal record in the
+    manifest, no journal among the features it lists, and nothing about a
+    journal in the stats or the info line. The lock file a save takes sits
+    beside the directory."""
     index = build(5)
     path = tmp_path / "plain.zdb"
     index.save(str(path))
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["plain.zdb"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["plain.zdb", "plain.zdb.zdblock"]
     m = manifest(path)
-    assert m["features"] == {"identity": "compatible"}
+    assert m["features"] == {}
     assert "journal" not in m
     assert index.journal_path is None
     assert journal_keys(index) == {}
@@ -89,31 +96,36 @@ def test_a_directory_saved_without_a_journal_is_the_directory_it_always_was(tmp_
 def test_journal_to_writes_the_checkpoint_and_the_sibling(tmp_path):
     index = build(3)
     path = tmp_path / "j.zdb"
-    wal = journal_of(path)
+    journal = journal_of(path)
     assert index.journal_to(str(path)) is None
-    assert path.is_dir() and wal.is_file()
-    assert wal.stat().st_size == JOURNAL_HEADER_BYTES
+    assert path.is_dir() and journal.is_dir()
+    assert list(segments(path)) == ["00000000000000000001.zdbseg"]
+    assert journal_size(path) == SEGMENT_HEADER_BYTES
+    assert (tmp_path / "j.zdb.zdblock").is_file()
     m = manifest(path)
-    assert m["features"] == {"identity": "compatible", "journal": "incompatible"}
-    assert m["journal"]["file"] == "j.zdb.zdbwal"
+    assert m["format_version"] == "5.0.0"
+    assert m["features"] == {"journal": "incompatible"}
+    assert m["journal"]["file"] == "j.zdb.zdbjournal"
     assert m["journal"]["sequence"] == 0
+    assert m["identity"]["sequence"] == 0
     assert len(m["journal"]["collection_id"]) == 32
-    assert os.path.normcase(index.journal_path) == os.path.normcase(str(wal))
+    assert index.journal_path == str(journal)
     assert journal_keys(index) == {
         "journal_durability": "call",
         "journal_sequence": "0",
         "journal_records": "0",
-        "journal_bytes": str(JOURNAL_HEADER_BYTES),
+        "journal_bytes": str(SEGMENT_HEADER_BYTES),
+        "journal_segments": "1",
     }
     assert "journal=call" in index.info()
 
-    # Every mutation from now on is a record in the file.
+    # Every mutation from now on is a record in the journal.
     add(index, 3, 7)
     keys = journal_keys(index)
     assert keys["journal_records"] == "4"
     assert keys["journal_sequence"] == "0"
-    assert int(keys["journal_bytes"]) > JOURNAL_HEADER_BYTES
-    assert wal.stat().st_size == int(keys["journal_bytes"])
+    assert int(keys["journal_bytes"]) > SEGMENT_HEADER_BYTES
+    assert journal_size(path) == int(keys["journal_bytes"])
 
     with pytest.raises(RuntimeError, match="journaled once"):
         index.journal_to(str(tmp_path / "second.zdb"))
@@ -122,7 +134,7 @@ def test_journal_to_writes_the_checkpoint_and_the_sibling(tmp_path):
 
 def test_a_journaled_index_reopens_with_what_the_journal_holds(tmp_path):
     """Everything since the checkpoint is replayed by load, and a checkpoint
-    empties the journal."""
+    rolls the journal onto one empty segment."""
     index = build(2)
     path = tmp_path / "replay.zdb"
     index.journal_to(str(path))
@@ -130,7 +142,8 @@ def test_a_journaled_index_reopens_with_what_the_journal_holds(tmp_path):
     assert index.remove_point("r0")
     assert index.update_metadata("r1", {"i": 100, "tag": "moved"})
     expected = index.get_records(["r1"], return_vector=True)
-    drop(index)
+    del index
+    gc.collect()
 
     loaded = VectorDatabase().load(str(path))
     assert len(loaded) == 5
@@ -143,15 +156,36 @@ def test_a_journaled_index_reopens_with_what_the_journal_holds(tmp_path):
 
     assert loaded.checkpoint() is None
     keys = journal_keys(loaded)
-    assert keys["journal_sequence"] == "6"
+    assert keys["journal_sequence"] == "9", "six records and three commits"
     assert keys["journal_records"] == "0"
-    assert keys["journal_bytes"] == str(JOURNAL_HEADER_BYTES)
-    assert manifest(path)["journal"]["sequence"] == 6
-    drop(loaded)
+    assert keys["journal_bytes"] == str(SEGMENT_HEADER_BYTES)
+    assert keys["journal_segments"] == "1"
+    assert manifest(path)["journal"]["sequence"] == 9
+    assert list(segments(path)) == ["00000000000000000010.zdbseg"]
+    del loaded
+    gc.collect()
 
     again = VectorDatabase().load(str(path))
     assert len(again) == 5
     assert journal_keys(again)["journal_records"] == "0"
+
+
+def test_a_journaled_directory_is_held_by_the_index_that_journals_it(tmp_path):
+    """A second index on a directory another one journals is refused, in
+    this process as in another, and opens once the first lets it go."""
+    index = build(2)
+    path = tmp_path / "held.zdb"
+    index.journal_to(str(path))
+    with pytest.raises(RuntimeError, match="is held by"):
+        VectorDatabase().load(str(path))
+    with pytest.raises(RuntimeError, match="is held by"):
+        VectorDatabase().load(str(path), checkpoint_only=True)
+    with pytest.raises(RuntimeError, match="is held by"):
+        build(1).save(str(path))
+    add(index, 2, 3)
+    del index
+    gc.collect()
+    assert len(VectorDatabase().load(str(path))) == 3
 
 
 def test_checkpoint_needs_a_journal_and_save_takes_the_journals_directory(tmp_path):
@@ -167,7 +201,7 @@ def test_checkpoint_needs_a_journal_and_save_takes_the_journals_directory(tmp_pa
     assert not (tmp_path / "elsewhere.zdb").exists()
     add(index, 2, 4)
     index.save(str(path))
-    assert journal_keys(index)["journal_sequence"] == "2"
+    assert journal_keys(index)["journal_sequence"] == "3", "two records and a commit"
 
 
 # ------------------------------------------------------------
@@ -192,7 +226,8 @@ def test_journal_to_takes_one_of_three_durabilities(tmp_path, durability, interv
     assert ("journal_interval_ms" in keys) == (durability == "interval")
     assert f"journal={durability}" in index.info()
     add(index, 2, 12)
-    drop(index)
+    del index
+    gc.collect()
     # Whatever the policy, a process that stops loses nothing a call
     # returned from.
     loaded = VectorDatabase().load(str(path), **kwargs)
@@ -230,17 +265,20 @@ def test_load_takes_a_durability_only_where_there_is_a_journal(tmp_path):
     index = build(3)
     journaled = tmp_path / "journaled.zdb"
     index.journal_to(str(journaled))
-    drop(index)
+    del index
+    gc.collect()
     plain = build(3)
     unjournaled = tmp_path / "plain.zdb"
     plain.save(str(unjournaled))
 
     loaded = VectorDatabase().load(str(journaled), durability="none")
     assert journal_keys(loaded)["journal_durability"] == "none"
-    drop(loaded)
+    del loaded
+    gc.collect()
     loaded = VectorDatabase().load(str(journaled), durability="interval", interval_ms=50)
     assert journal_keys(loaded)["journal_interval_ms"] == "50"
-    drop(loaded)
+    del loaded
+    gc.collect()
 
     with pytest.raises(ValueError, match="has no journal"):
         VectorDatabase().load(str(unjournaled), durability="call")
@@ -259,18 +297,19 @@ def test_load_takes_a_durability_only_where_there_is_a_journal(tmp_path):
 def test_checkpoint_only_opens_the_checkpoint_and_leaves_the_journal_alone(tmp_path):
     index = build(2)
     path = tmp_path / "ckpt.zdb"
-    wal = journal_of(path)
+    journal = journal_of(path)
     index.journal_to(str(path))
     add(index, 2, 5)
-    drop(index)
+    del index
+    gc.collect()
 
     loaded = VectorDatabase().load(str(path), checkpoint_only=True)
     assert len(loaded) == 2, "the three records in the journal were not applied"
     assert loaded.journal_path is None
     assert journal_keys(loaded) == {}
-    # The file was not opened, so it can go while the index is alive, and
-    # the index records nothing until a journal is opened on it.
-    os.remove(wal)
+    # The journal was not opened, so it can go while the index is alive,
+    # and the index records nothing until a journal is opened on it.
+    shutil.rmtree(journal)
     add(loaded, 10, 12)
     assert len(loaded) == 4
     # A directory whose journal is gone refuses to open the ordinary way,
@@ -281,9 +320,10 @@ def test_checkpoint_only_opens_the_checkpoint_and_leaves_the_journal_alone(tmp_p
     # And it can be journaled afresh, which writes a checkpoint of what it
     # now holds.
     loaded.journal_to(str(path))
-    assert wal.is_file()
+    assert journal.is_dir()
     assert manifest(path)["journal"]["sequence"] == 0
-    drop(loaded)
+    del loaded
+    gc.collect()
     assert len(VectorDatabase().load(str(path))) == 4
 
 
@@ -291,13 +331,15 @@ def test_the_journal_closes_when_the_index_is_dropped(tmp_path):
     """load holds the journal open; dropping the index lets it go."""
     index = build(2)
     path = tmp_path / "held.zdb"
-    wal = journal_of(path)
+    journal = journal_of(path)
     index.journal_to(str(path))
-    drop(index)
+    del index
+    gc.collect()
     loaded = VectorDatabase().load(str(path))
-    assert os.path.normcase(loaded.journal_path) == os.path.normcase(str(wal))
-    drop(loaded)
-    os.remove(wal)
+    assert loaded.journal_path == str(journal)
+    del loaded
+    gc.collect()
+    shutil.rmtree(journal)
     with pytest.raises(FileNotFoundError):
         VectorDatabase().load(str(path))
 
@@ -326,7 +368,8 @@ def test_an_external_tokenizer_is_handed_to_load_and_the_replayed_records_are_fo
     assert result.is_success(), result.errors
     before = index.query(arms=[{"text": "GAMMA"}], top_k=5)
     assert [hit["id"] for hit in before] == ["b"]
-    drop(index)
+    del index
+    gc.collect()
 
     with pytest.raises(RuntimeError, match="tokenizer of the caller's own"):
         VectorDatabase().load(str(path))
@@ -384,7 +427,8 @@ def test_an_index_at_its_last_internal_id_refuses_an_add_and_still_opens(tmp_pat
     saved = tmp_path / "saved.zdb"
     index = build(3)
     index.save(str(saved))
-    drop(index)
+    del index
+    gc.collect()
     config = json.loads((saved / "config.json").read_text(encoding="utf-8"))
     config["id_counter"] = LAST_INTERNAL_ID
     (saved / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -395,7 +439,7 @@ def test_an_index_at_its_last_internal_id_refuses_an_add_and_still_opens(tmp_pat
     if journaled:
         path = tmp_path / "journaled.zdb"
         index.journal_to(str(path))
-    journal = journal_of(path).read_bytes() if journaled else None
+    journal = segments(path) if journaled else None
 
     record = {"ids": ["r3"], "embeddings": [[0.5] * DIM], "metadatas": [{"i": 3}]}
     result = index.add(record)
@@ -409,13 +453,14 @@ def test_an_index_at_its_last_internal_id_refuses_an_add_and_still_opens(tmp_pat
     assert result.total_errors == 1 and "last internal id" in result.errors[0]
     assert index.get_records(["r0"], return_vector=False)[0]["metadata"] == {"i": 0}
     if journaled:
-        assert journal_of(path).read_bytes() == journal, "nothing reached the journal"
+        assert segments(path) == journal, "nothing reached the journal"
 
     assert len(index.search([0.5] * DIM, top_k=3)) == 3
     assert index.update_metadata("r2", {"i": 20})
     assert index.remove_point("r1")
     index.save(str(path))
-    drop(index)
+    del index
+    gc.collect()
 
     reopened = VectorDatabase().load(str(path))
     assert sorted(reopened.list(number=10)) == [("r0", {"i": 0}), ("r2", {"i": 20})]
@@ -423,6 +468,7 @@ def test_an_index_at_its_last_internal_id_refuses_an_add_and_still_opens(tmp_pat
     assert reopened.clear() == 2
     add(reopened, 10, 12)
     reopened.save(str(path))
-    drop(reopened)
+    del reopened
+    gc.collect()
     again = VectorDatabase().load(str(path))
     assert sorted(id for id, _ in again.list(number=10)) == ["r10", "r11"]

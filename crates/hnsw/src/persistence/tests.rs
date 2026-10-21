@@ -488,7 +488,7 @@ fn two_saves_of_the_same_records_write_the_same_bytes() {
         assert!(compared >= 4, "{label} compared {compared}");
         assert_eq!(
             read_json(&first.join("manifest.json"))["format_version"],
-            json!("4.0.0")
+            json!("5.0.0")
         );
     }
 }
@@ -1302,7 +1302,7 @@ fn the_layout_follows_mappings_bin_below_4_and_is_the_frame_from_4() {
 }
 
 /// A format version is read only as `MAJOR.MINOR.PATCH`. Every version a
-/// release wrote opens, being 1.0.0 to 3.1.0 and the 4.0.0 this build writes,
+/// release wrote opens, being 1.0.0 to 4.0.0 and the 5.0.0 this build writes,
 /// and so does a later minor or patch under any of those majors. A major this
 /// build does not read is refused by its major, and every other shape is
 /// refused as a version this build cannot interpret.
@@ -1316,19 +1316,23 @@ fn a_format_version_is_read_only_as_major_minor_patch() {
     let load = |version: &str| {
         let mut manifest = saved.clone();
         manifest["format_version"] = json!(version);
+        // A 4.x save lists the identity among its features.
+        if version.starts_with("4.") {
+            manifest["features"]["identity"] = json!("compatible");
+        }
         write_json(&path.join("manifest.json"), &manifest);
         Collection::load(path.to_str().unwrap())
     };
 
     for version in [
         "1.0.0", "1.1.0", "1.2.0", "2.0.0", "2.1.0", "3.0.0", "3.1.0", "4.0.0", "1.9.3", "2.3.0",
-        "2.4.1", "3.2.5", "3.7.2", "4.7.1", "4.9.0",
+        "2.4.1", "3.2.5", "3.7.2", "4.7.1", "4.9.0", "5.0.0", "5.4.2",
     ] {
         let loaded = load(version).unwrap_or_else(|e| panic!("{version}: {e}"));
         assert_eq!(everything(&loaded), everything(&collection), "{version}");
     }
 
-    for (version, newer) in [("5.0.0", true), ("0.9.0", false)] {
+    for (version, newer) in [("6.0.0", true), ("0.9.0", false)] {
         match load(version) {
             Err(Error::FormatVersionUnsupported {
                 format_version,
@@ -1366,7 +1370,7 @@ fn a_format_version_is_read_only_as_major_minor_patch() {
             format!(
                 "manifest.json declares format_version '{version}', which is not a version \
                  this build can interpret. A ZeusDB index directory declares a dotted version \
-                 such as 4.0.0."
+                 such as 5.0.0."
             ),
             "{version:?}"
         );

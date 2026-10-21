@@ -5,7 +5,8 @@ this build does not know refused by its name unless the directory marks it
 compatible, one marked compatible opened and dropped by the next save, a
 record that does not describe its directory refused, and the directories
 that list no features, below 4.0.0 and the 4.0.0 ones saved before the record
-existed, opening as they did.
+existed, opening as they did. At 5.0.0 the identity is part of the base and
+is never listed, and a manifest carrying no features record is refused.
 """
 
 import gc
@@ -60,12 +61,6 @@ def load(path):
     return VectorDatabase().load(str(path))
 
 
-def drop(index):
-    """Let go of the index so a journal it holds open is closed."""
-    del index
-    gc.collect()
-
-
 @pytest.fixture
 def dense_dir(tmp_path):
     path = tmp_path / "dense.zdb"
@@ -74,22 +69,22 @@ def dense_dir(tmp_path):
 
 
 SHAPES = {
-    "dense": (lambda: filled(create(), 30), {"identity": "compatible"}),
+    "dense": (lambda: filled(create(), 30), {}),
     "pq_quantized_with_raw": (
         lambda: filled(create(quantization_config={**PQ, "storage_mode": "quantized_with_raw"}), 1100),
-        {"identity": "compatible", "pq": "incompatible"}),
+        {"pq": "incompatible"}),
     "pq_quantized_only": (
         lambda: filled(create(quantization_config={**PQ, "storage_mode": "quantized_only"}), 1100),
-        {"identity": "compatible", "pq": "incompatible"}),
+        {"pq": "incompatible"}),
     "pq_collecting": (
         lambda: filled(create(quantization_config=dict(PQ)), 30),
-        {"identity": "compatible", "pq": "incompatible"}),
+        {"pq": "incompatible"}),
     "int8": (lambda: filled(create(quantization_config=dict(INT8)), 1100),
-             {"identity": "compatible", "int8": "incompatible"}),
+             {"int8": "incompatible"}),
     "sparse": (lambda: filled(create(sparse={"name": "terms"}), 30, sparse=True),
-               {"identity": "compatible", "sparse": "incompatible"}),
+               {"sparse": "incompatible"}),
     "text": (lambda: filled(create(sparse={"name": "text", "tokenizer": "simple"}), 30, text=True),
-             {"identity": "compatible", "sparse": "incompatible", "text": "incompatible"}),
+             {"sparse": "incompatible", "text": "incompatible"}),
 }
 
 
@@ -105,7 +100,7 @@ def test_every_save_lists_the_features_it_holds(tmp_path, shape):
     m = manifest(path)
     assert m["features"] == expected
     assert list(m)[:3] == ["format_version", "features", "identity"]
-    assert m["format_version"] == "4.0.0"
+    assert m["format_version"] == "5.0.0"
     assert len(load(path)) == len(index)
 
 
@@ -113,9 +108,10 @@ def test_a_journaled_directory_lists_its_journal(tmp_path):
     index = filled(create(sparse={"name": "text", "tokenizer": "simple"}), 20, text=True)
     path = tmp_path / "journaled.zdb"
     index.journal_to(str(path))
-    assert manifest(path)["features"] == {"identity": "compatible", "journal": "incompatible",
+    assert manifest(path)["features"] == {"journal": "incompatible",
                                           "sparse": "incompatible", "text": "incompatible"}
-    drop(index)
+    del index
+    gc.collect()
     assert len(load(path)) == 20
 
 
@@ -149,7 +145,7 @@ def test_a_compatible_feature_this_build_does_not_know_opens_and_is_not_kept(den
     assert len(index) == 30
     again = tmp_path / "again.zdb"
     index.save(str(again))
-    assert manifest(again)["features"] == {"identity": "compatible"}
+    assert manifest(again)["features"] == {}
 
 
 # ------------------------------------------------------------
@@ -160,12 +156,13 @@ INVALID = "manifest.json lists features that do not describe the directory: "
 
 @pytest.mark.parametrize("edit, detail", [
     (lambda f: f.__setitem__("identity", "incompatible"), "it marks identity incompatible"),
-    (lambda f: f.pop("identity"), "it lists no feature, and the directory holds identity"),
+    (lambda f: f.__setitem__("identity", "compatible"),
+     "it lists identity, and the directory holds no feature"),
     (lambda f: f.__setitem__("journal", "incompatible"),
-     "it lists identity and journal, and the directory holds identity"),
+     "it lists journal, and the directory holds no feature"),
     (lambda f: f.__setitem__("pq", "incompatible"),
-     "it lists identity and pq, and the directory holds identity"),
-], ids=["identity_under_another_mark", "identity_unlisted", "journal_not_held", "pq_not_held"])
+     "it lists pq, and the directory holds no feature"),
+], ids=["identity_under_another_mark", "identity_listed", "journal_not_held", "pq_not_held"])
 def test_a_record_that_does_not_describe_its_directory_is_refused(dense_dir, tmp_path, edit, detail):
     path = forged(dense_dir, tmp_path / "forged.zdb", lambda m: edit(m["features"]))
     with pytest.raises(RuntimeError) as refused:
@@ -179,8 +176,8 @@ def test_a_held_feature_left_unlisted_is_refused(tmp_path):
     source = tmp_path / "text.zdb"
     filled(create(sparse={"name": "text", "tokenizer": "simple"}), 20, text=True).save(str(source))
     path = forged(source, tmp_path / "no-text.zdb", lambda m: m["features"].pop("text"))
-    with pytest.raises(RuntimeError, match=INVALID + "it lists identity and sparse, and the "
-                                           "directory holds identity, sparse and text"):
+    with pytest.raises(RuntimeError, match=INVALID + "it lists sparse, and the "
+                                           "directory holds sparse and text"):
         load(path)
 
 
@@ -196,12 +193,17 @@ def test_a_directory_listing_no_features_opens_and_lists_them_at_its_next_save(t
     filled(create(quantization_config={**PQ, "storage_mode": "quantized_only"}), 1100).save(str(path))
     if version != "4.0.0":
         as_old_wire(path, version)
-    rewrite(path, lambda m: m.pop("features"))
+
+    def older(m):
+        m.pop("features")
+        m["format_version"] = version
+
+    rewrite(path, older)
     index = load(path)
     assert len(index) == 1100 and index.is_quantized()
     again = tmp_path / "again.zdb"
     index.save(str(again))
-    assert manifest(again)["features"] == {"identity": "compatible", "pq": "incompatible"}
+    assert manifest(again)["features"] == {"pq": "incompatible"}
 
 
 def test_below_the_fourth_major_the_version_decides(dense_dir, tmp_path):
@@ -220,3 +222,12 @@ def test_below_the_fourth_major_the_version_decides(dense_dir, tmp_path):
                    third(lambda f: f.__setitem__("a_later_feature", "incompatible")))
     with pytest.raises(RuntimeError, match="The directory holds the feature 'a_later_feature'"):
         load(later)
+
+
+def test_a_5x_manifest_carrying_no_features_record_is_refused(dense_dir, tmp_path):
+    """Every save at 5.x lists its features, possibly none, so a manifest
+    carrying no record at all was not written by one."""
+    path = forged(dense_dir, tmp_path / "unlisted.zdb", lambda m: m.pop("features"))
+    with pytest.raises(RuntimeError, match=INVALID + "it carries no features record, which "
+                                           "every manifest at format 5.x carries"):
+        load(path)

@@ -177,7 +177,7 @@ fn a_dense_only_directory_keeps_the_flat_names() {
     let path = dir.path().join("dense.zdb");
     collection.save(path.to_str().unwrap()).unwrap();
     let m = manifest(&path);
-    assert_eq!(m["features"], json!({"identity": "compatible"}));
+    assert_eq!(m["features"], json!({}));
     assert!(!m["files_included"]
         .as_array()
         .unwrap()
@@ -246,10 +246,7 @@ fn a_sparse_space_round_trips_through_the_directory() {
     collection.save(path.to_str().unwrap()).unwrap();
 
     let m = manifest(&path);
-    assert_eq!(
-        m["features"],
-        json!({"identity": "compatible", "sparse": "incompatible"})
-    );
+    assert_eq!(m["features"], json!({"sparse": "incompatible"}));
     let names: Vec<&str> = m["files_included"]
         .as_array()
         .unwrap()
@@ -356,7 +353,7 @@ fn a_text_layer_round_trips_with_its_dictionary() {
     let m = manifest(&path);
     assert_eq!(
         m["features"],
-        json!({"identity": "compatible", "sparse": "incompatible", "text": "incompatible"})
+        json!({"sparse": "incompatible", "text": "incompatible"})
     );
     assert!(path.join("spaces/text/terms.zdbdict").exists());
     let digest = &m["file_digests"]["spaces/text/terms.zdbdict"];
@@ -463,7 +460,7 @@ fn an_external_tokenizer_must_be_handed_back() {
 }
 
 /// The version rule in both directions, as this build sees it. A 1.x
-/// manifest declaring a space is refused, a 5.x manifest is refused naming
+/// manifest declaring a space is refused, a 6.x manifest is refused naming
 /// the majors this build reads, and a 2.x dense-only manifest opens.
 #[test]
 fn the_version_rule_holds_in_both_directions() {
@@ -487,20 +484,20 @@ fn the_version_rule_holds_in_both_directions() {
         other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
     }
 
-    // A later major, refused with the majors this build reads. Four is the
-    // major this build writes and reads, so the refusal starts at five.
+    // A later major, refused with the majors this build reads. Five is the
+    // major this build writes and reads, so the refusal starts at six.
     let future = dir.path().join("future.zdb");
     copy_dir(&path, &future);
-    rewrite_manifest(&future, |m| m["format_version"] = json!("5.0.0"));
+    rewrite_manifest(&future, |m| m["format_version"] = json!("6.0.0"));
     let message = Collection::load(future.to_str().unwrap())
         .err()
         .unwrap()
         .to_string();
     assert!(
-        message.contains("format version 5.0.0 cannot be opened"),
+        message.contains("format version 6.0.0 cannot be opened"),
         "{message}"
     );
-    assert!(message.contains("1.x, 2.x, 3.x and 4.x"), "{message}");
+    assert!(message.contains("1.x, 2.x, 3.x, 4.x and 5.x"), "{message}");
     assert!(message.contains("newer"), "{message}");
 
     // A 2.x label on a dense-only directory opens, since the minor and the
@@ -840,7 +837,7 @@ fn every_mutating_path_keeps_the_saved_shape_correct() {
     let m = manifest(&cleared);
     assert_eq!(
         m["features"],
-        json!({"identity": "compatible", "sparse": "incompatible", "text": "incompatible"})
+        json!({"sparse": "incompatible", "text": "incompatible"})
     );
     assert!(cleared.join("spaces/text/postings.zdbsparse").exists());
     let loaded = Collection::load(cleared.to_str().unwrap()).unwrap();

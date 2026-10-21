@@ -58,9 +58,10 @@ where
 }
 
 /// [`count_record`], with `issued` called for every term this call gives
-/// an id to, at the moment of issue, with the id and the term. A refusal
-/// from `issued` stops the count, after the term was interned. What a
-/// caller recording each interning as it happens counts through.
+/// an id to, with the id it is about to take and the term, before the term
+/// is interned. A refusal from `issued` stops the count with the term not
+/// interned, so the dictionary holds no term whose record was refused. What
+/// a caller recording each interning ahead of it counts through.
 pub fn count_record_with<I, S, F>(
     dictionary: &mut TermDictionary,
     terms: I,
@@ -77,11 +78,16 @@ where
         if term.is_empty() {
             continue;
         }
-        let before = dictionary.len();
-        let id = dictionary.intern(term)?;
-        if dictionary.len() > before {
-            issued(id, term)?;
-        }
+        let id = match dictionary.id_of(term) {
+            Some(id) => id,
+            None => {
+                let id = dictionary.next_id()?;
+                issued(id, term)?;
+                let interned = dictionary.intern(term)?;
+                debug_assert_eq!(interned, id, "a new term takes the id next_id named");
+                interned
+            }
+        };
         ids.push(id);
     }
     Ok(count(ids))
@@ -206,15 +212,14 @@ mod tests {
                 (3, "end".to_string())
             ]
         );
-        let refused = count_record_with(&mut three, ["new"], |_, _| {
+        let refused = count_record_with(&mut three, ["new"], |id, _| {
+            assert_eq!(id, 4, "the id the term would take");
             Err(Error::TokenizerFailed("no".into()))
         });
         assert!(refused.is_err());
-        assert_eq!(
-            three.id_of("new"),
-            Some(4),
-            "the term was interned before the refusal"
-        );
+        assert_eq!(three.id_of("new"), None, "a refused term is not interned");
+        assert_eq!(three.len(), 4);
+        assert_eq!(three.intern("new").unwrap(), 4, "the id is issued afresh");
 
         let query = "dog dog cat THE";
         assert_eq!(

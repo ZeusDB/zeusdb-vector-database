@@ -55,12 +55,18 @@ impl TermDictionary {
         if let Some(&id) = self.ids.get(term) {
             return Ok(id);
         }
-        let id = u32::try_from(self.ids.len()).map_err(|_| Error::TermIdsExhausted)?;
-        if id == u32::MAX {
-            return Err(Error::TermIdsExhausted);
-        }
+        let id = self.next_id()?;
         self.ids.insert(Box::from(term), id);
         Ok(id)
+    }
+
+    /// The id the next new term takes, refused where the ids are exhausted.
+    /// What a caller that records an interning before it happens names.
+    pub fn next_id(&self) -> Result<u32, Error> {
+        match u32::try_from(self.ids.len()) {
+            Ok(id) if id != u32::MAX => Ok(id),
+            _ => Err(Error::TermIdsExhausted),
+        }
     }
 
     /// The id of `term`, where it has one. A query asks this, so a term no
@@ -177,13 +183,17 @@ mod tests {
     use super::*;
 
     /// Ids are issued in arrival order, a repeat gets its id back, a lookup
-    /// issues nothing, and the terms come back in id order.
+    /// issues nothing, the next id is the one the next new term takes, and
+    /// the terms come back in id order.
     #[test]
     fn ids_are_issued_in_arrival_order_and_a_lookup_issues_none() {
         let mut d = TermDictionary::new();
+        assert_eq!(d.next_id().unwrap(), 0);
         assert_eq!(d.intern("fox").unwrap(), 0);
         assert_eq!(d.intern("the").unwrap(), 1);
         assert_eq!(d.intern("fox").unwrap(), 0);
+        assert_eq!(d.next_id().unwrap(), 2, "asking issues nothing");
+        assert_eq!(d.next_id().unwrap(), 2);
         assert_eq!(d.id_of("the"), Some(1));
         assert_eq!(d.id_of("dog"), None);
         assert_eq!(d.len(), 2);

@@ -433,7 +433,8 @@ pub enum Error {
         detail: String,
     },
     /// A commit of the journal failed, so its records were refused and
-    /// nothing more is recorded until a checkpoint reconciles the journal
+    /// withdrawn where the journal allowed, and nothing more is recorded
+    /// until a checkpoint commits
     JournalCommitFailed { sequence: u64, error: String },
     /// A checkpoint was asked of a collection that has no journal
     NotJournaled,
@@ -587,6 +588,27 @@ pub enum Error {
     IndexDirectoryNotFound { path: String },
     /// An artefact did not serialize
     SerializeFailed { what: &'static str, error: String },
+
+    // ------------------------------------------------------------------
+    // The journal of segments and the lock. Appended after every variant
+    // above, and none wider than the widest above, so the type's size and
+    // the tags of the variants above stay as they were.
+    // ------------------------------------------------------------------
+    /// The journal's segments do not form one history: out of order, a gap,
+    /// an overlap, an empty segment that is not the last, or a framing
+    /// record naming the wrong sequence
+    JournalSegmentsInvalid { journal: String, detail: String },
+    /// A segment holding records above the directory's sequence follows
+    /// another checkpoint than the directory's
+    JournalNotThisCheckpoint { file: String, detail: String },
+    /// A mutation in a process forked from the one that opened the journal
+    JournalForked { recorded: u32, current: u32 },
+    /// Another holder has the collection's lock
+    CollectionLocked { path: String, holder: String },
+    /// The filesystem cannot lock the collection
+    LockUnavailable { path: String, error: String },
+    /// A collection read from a directory this process cannot write
+    CollectionReadOnly { directory: String, reason: String },
 }
 
 impl Error {
@@ -743,7 +765,13 @@ impl Error {
             | JournalStartsAfterCheckpoint { .. }
             | JournalReplayFailed { .. }
             | JournalCommitFailed { .. }
-            | NotJournaled => Exception::Runtime,
+            | NotJournaled
+            | JournalSegmentsInvalid { .. }
+            | JournalNotThisCheckpoint { .. }
+            | JournalForked { .. }
+            | CollectionLocked { .. }
+            | LockUnavailable { .. }
+            | CollectionReadOnly { .. } => Exception::Runtime,
         }
     }
 
@@ -1537,10 +1565,10 @@ impl fmt::Display for Error {
             ),
             JournalCommitFailed { sequence, error } => write!(
                 f,
-                "The journal's commit failed at sequence {}: {} The records that commit was \
-                 to make durable were refused and may or may not be on the device, so \
-                 nothing is recorded until a checkpoint reconciles the journal with the \
-                 directory. Call checkpoint().",
+                "The journal's commit failed at sequence {}: {} A failed sync may also have \
+                 lost records of earlier calls that the device had not yet written, so nothing \
+                 more is recorded until a checkpoint writes the collection from memory. Call \
+                 checkpoint().",
                 sequence, error
             ),
             NotJournaled => f.write_str(
@@ -1560,7 +1588,8 @@ impl fmt::Display for Error {
                 "manifest.json records an identity this build cannot read: {}. A saved \
                  directory records the id of its collection, its generation counting from 1, \
                  the id of its snapshot and, where it has one, the id of the snapshot it was \
-                 saved from, every id as 32 hexadecimal digits.",
+                 saved from, every id as 32 hexadecimal digits, and from format 5.0.0 the \
+                 journal sequence its state holds.",
                 detail
             ),
             FeatureUnsupported { features, known } => {
@@ -1769,6 +1798,50 @@ impl fmt::Display for Error {
             SerializeFailed { what, error } => {
                 write!(f, "Failed to serialize {}: {}", what, error)
             }
+            JournalSegmentsInvalid { journal, detail } => write!(
+                f,
+                "The journal {} cannot be read: {}. Nothing in it was replayed.",
+                journal, detail
+            ),
+            JournalNotThisCheckpoint { file, detail } => write!(
+                f,
+                "The journal segment {} {}. A journal holds the mutations made after one \
+                 checkpoint and replays onto that checkpoint alone, so it is not this \
+                 directory's journal and nothing in it was replayed.",
+                file, detail
+            ),
+            JournalForked { recorded, current } => write!(
+                f,
+                "This collection's journal was opened by process {} and this is process {}, a \
+                 child forked from it. The child shares the parent's open journal, so a record \
+                 it appended would land in the parent's file. Nothing was recorded. Change the \
+                 collection in the process that opened it.",
+                recorded, current
+            ),
+            CollectionLocked { path, holder } => write!(
+                f,
+                "The collection at {} is held by {}, so it cannot be opened, saved or journaled \
+                 here. A journaled collection holds its directory for as long as it lives, a \
+                 save for the save and a load while it reads. Let the other collection go, or \
+                 wait for the other process to finish, and try again.",
+                path, holder
+            ),
+            LockUnavailable { path, error } => write!(
+                f,
+                "The lock file {} cannot be locked: {}. This build journals and saves only \
+                 where it can lock the collection against a second writer, so nothing was \
+                 written. The lock file sits beside the directory, so the folder it is in must \
+                 take a new file, on a filesystem that supports file locks.",
+                path, error
+            ),
+            CollectionReadOnly { directory, reason } => write!(
+                f,
+                "The collection was read from {}, which this process cannot write: {}. It holds \
+                 every record the directory and its journal hold and refuses every change, \
+                 since a change it could not journal would be lost. Save it into another \
+                 directory to copy it somewhere writable.",
+                directory, reason
+            ),
         }
     }
 }

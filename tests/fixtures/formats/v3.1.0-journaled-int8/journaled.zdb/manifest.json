@@ -1,0 +1,52 @@
+{
+  "format_version": "3.1.0",
+  "zeusdb_version": "0.11.0",
+  "created_at": "2026-10-20T11:52:58.449493500+00:00",
+  "saved_at": "2026-10-20T11:52:58.525554+00:00",
+  "total_vectors": 998,
+  "index_type": "HNSW",
+  "has_quantization": true,
+  "quantization_trained": false,
+  "storage_mode": "raw_collecting_for_training",
+  "files_included": [
+    "config.json",
+    "mappings.bin",
+    "metadata.json",
+    "quantization.json",
+    "vectors.bin",
+    "hnsw_index.zdbgraph"
+  ],
+  "files_excluded": [],
+  "file_digests": {
+    "hnsw_index.zdbgraph": {
+      "bytes": 204160
+    },
+    "metadata.json": {
+      "bytes": 48684,
+      "checksum": "4e3efd143ae4f674"
+    },
+    "quantization.json": {
+      "bytes": 12151,
+      "checksum": "d7b04241ba6961ab"
+    },
+    "config.json": {
+      "bytes": 201,
+      "checksum": "cd0110bc03334eb3"
+    },
+    "mappings.bin": {
+      "bytes": 14754,
+      "checksum": "9819bac22cf278d2"
+    },
+    "vectors.bin": {
+      "bytes": 37817,
+      "checksum": "72117f29b2c4d811"
+    }
+  },
+  "total_size_mb": 0.30304622650146484,
+  "compression_info": null,
+  "journal": {
+    "file": "journaled.zdb.zdbwal",
+    "sequence": 0,
+    "collection_id": "9c35ce1265598fef73a308569a7ec52d"
+  }
+}

@@ -3,10 +3,14 @@
 //!
 //! Nothing here kills a process; that is `crash_tests`. What is here is the
 //! rest of the contract a caller acts on: that the interval policy's thread
-//! lives exactly as long as the collection and does nothing while the file
-//! is clean, that a failed commit refuses its records and everything after
-//! them until a checkpoint, and that a recovery takes the tokenizer a text
-//! layer was declared with.
+//! lives exactly as long as the collection and does nothing while the
+//! journal is clean, that a failed commit is withdrawn from the journal and
+//! refuses everything after it until a checkpoint, and that a recovery takes
+//! the tokenizer a text layer was declared with.
+//!
+//! A device fault cannot be produced on demand, so a failure is injected
+//! through a journal directory that fails a chosen write, sync or cut; see
+//! `journal_support`.
 
 #![allow(clippy::disallowed_types)]
 
@@ -16,42 +20,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use zeusdb_vector_core::{Error, FsStorage, IdfScope, OperationKind};
+use zeusdb_vector_core::{Error, IdfScope, SEGMENT_HEADER_BYTES};
 use zeusdb_vector_sparse::SparseConfig;
 use zeusdb_vector_text::Tokenizer;
 
-use super::{Added, Collection, Declaration, OperationSink, ParsedRecord, SparseHalf};
-use crate::journal::{journal_path, Durability, JournalSink};
+use super::journal_support::{
+    copy_journaled, expected_of, manifest, sink_over, Faults, FaultyStorage, Segments, TempDir,
+};
+use super::{Added, Collection, Declaration, ParsedRecord, SparseHalf};
+use crate::journal::{journal_path, Durability};
 
 // ============================================================================
 // FIXTURES
 // ============================================================================
-
-struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "zeusdb-durability-tests-{}-{}",
-            std::process::id(),
-            n
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        TempDir(path)
-    }
-
-    fn at(&self, name: &str) -> std::path::PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 fn declaration() -> Declaration {
     Declaration::validate(2, "l2", 4, 50, 100, vec![]).unwrap()
@@ -101,6 +82,25 @@ fn wait_for(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
     condition()
 }
 
+/// A collection journaled at `path` through a journal directory whose
+/// faults the test arms, with the empty checkpoint written, and the faults.
+fn faulty(path: &Path, durability: Durability) -> (Collection, Arc<Faults>) {
+    let collection = Collection::build(declaration(), None);
+    let storage = FaultyStorage::at(path);
+    let faults = storage.faults.clone();
+    let sink = sink_over(&storage, path, collection.collection_id(), durability);
+    collection.attach_sink(Box::new(sink));
+    collection.save(path.to_str().unwrap()).unwrap();
+    (collection, faults)
+}
+
+/// What the journal beside `path` holds, read by hand.
+fn journal_holds(path: &Path) -> (usize, usize, usize) {
+    let segments = Segments::of(path);
+    let contents = segments.read(&expected_of(path)).unwrap();
+    (contents.committed(), contents.withdrawn(), contents.aborts)
+}
+
 // ============================================================================
 // THE INTERVAL THREAD
 // ============================================================================
@@ -111,7 +111,7 @@ fn wait_for(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
 /// have let go and that nothing the thread would still write is in flight.
 #[test]
 fn the_interval_threads_lifetime_is_the_collections() {
-    let temp = TempDir::new();
+    let temp = TempDir::new("durability-tests");
     let path = temp.at("lifetime.zdb");
     let collection = Collection::build(declaration(), None);
     collection
@@ -152,12 +152,12 @@ fn the_interval_threads_lifetime_is_the_collections() {
     assert!(none.flusher_watch().is_none());
 }
 
-/// A clean file costs no sync. The thread sleeps until a commit dirties
-/// the file, syncs once an interval while it is dirty, and goes back to
-/// sleep; a checkpoint that syncs the file itself leaves it nothing to do.
+/// A clean journal costs no sync. The thread sleeps until a commit dirties
+/// it, syncs once an interval while it is dirty, and goes back to sleep; a
+/// checkpoint that syncs the journal itself leaves it nothing to do.
 #[test]
 fn the_interval_thread_syncs_nothing_while_the_file_is_clean() {
-    let temp = TempDir::new();
+    let temp = TempDir::new("durability-tests");
     let path = temp.at("clean.zdb");
     let collection = Collection::build(declaration(), None);
     let interval = Duration::from_millis(200);
@@ -199,7 +199,7 @@ fn the_interval_thread_syncs_nothing_while_the_file_is_clean() {
         "five commits cost {synced} syncs over {spanned} intervals"
     );
 
-    // A checkpoint syncs the file itself, so the thread finds it clean.
+    // A checkpoint syncs the journal itself, so the thread finds it clean.
     // Read the count as the checkpoint returns rather than before the
     // commit, since whether the thread fired between the two is the
     // machine's business and what the checkpoint promises is that nothing
@@ -213,105 +213,36 @@ fn the_interval_thread_syncs_nothing_while_the_file_is_clean() {
         after_checkpoint,
         "the checkpoint left the thread nothing to sync"
     );
-    assert_eq!(collection.journal_sequence(), 7);
+    assert_eq!(
+        collection.journal_sequence(),
+        14,
+        "seven calls of one record, each with its commit"
+    );
 }
 
 // ============================================================================
 // A COMMIT THAT FAILS
 // ============================================================================
 
-/// A journal sink whose commit fails once, at a named call.
-#[derive(Debug)]
-struct FailingCommit {
-    inner: JournalSink,
-    fail_at: usize,
-    commits: usize,
-}
-
-impl OperationSink for FailingCommit {
-    fn append(&mut self, kind: OperationKind, payload: &[u8]) -> Result<(), Error> {
-        self.inner.append(kind, payload)
-    }
-
-    fn commit(&mut self) -> Result<(), Error> {
-        self.commits += 1;
-        if self.commits == self.fail_at {
-            return Err(Error::JournalIoFailed {
-                path: self.inner.path().to_path_buf(),
-                what: "sync",
-                error: "the device refused the flush".to_string(),
-            });
-        }
-        self.inner.commit()
-    }
-
-    fn sync(&mut self) -> Result<(), Error> {
-        self.inner.sync()
-    }
-
-    fn sequence_reached(&self) -> u64 {
-        self.inner.sequence_reached()
-    }
-
-    fn truncate(&mut self) -> Result<(), Error> {
-        self.inner.truncate()
-    }
-
-    fn journal_file(&self) -> Option<&str> {
-        self.inner.journal_file()
-    }
-
-    fn journal_collection_id(&self) -> Option<u128> {
-        self.inner.journal_collection_id()
-    }
-
-    fn journal_path(&self) -> Option<&Path> {
-        self.inner.journal_path()
-    }
-
-    fn durability(&self) -> Option<Durability> {
-        Some(self.inner.durability())
-    }
-}
-
-/// Copy a directory and the journal beside it under another name, so the
-/// copy can be recovered while the original's sink is still open.
-fn copy_journaled(dir: &Path, name: &str) -> std::path::PathBuf {
-    let target = dir.parent().unwrap().join(name);
-    std::fs::create_dir_all(&target).unwrap();
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let entry = entry.unwrap();
-        std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
-    }
-    std::fs::copy(journal_path(dir).unwrap(), journal_path(&target).unwrap()).unwrap();
-    target
-}
-
-/// What a caller sees when a commit fails, what the index then holds, what
-/// a retry does, what a crash before the checkpoint recovers, and what the
-/// checkpoint reconciles.
+/// Withdraw and hold, under the per-call policy. A commit whose sync fails
+/// refuses its call, and the journal holds an abort after the call's
+/// records. Every later mutation is refused naming `checkpoint()` and the
+/// withdrawal. A copy recovers the four records the collection holds and
+/// not the four it refused, at the live id counter, and its load takes a
+/// checkpoint past the abort. `checkpoint()` then clears the fault, and the
+/// segment holding the abort goes with it.
 #[test]
-fn a_commit_that_fails_refuses_its_records_and_everything_after_until_a_checkpoint() {
-    let temp = TempDir::new();
+fn a_commit_whose_sync_fails_is_withdrawn_and_refuses_everything_after_until_a_checkpoint() {
+    let temp = TempDir::new("durability-tests");
     let path = temp.at("fault.zdb");
-    let collection = Collection::build(declaration(), None);
-    let sink = FailingCommit {
-        inner: JournalSink::create(
-            &FsStorage::at(&path).unwrap(),
-            collection.collection_id(),
-            Durability::PerCall,
-        )
-        .unwrap(),
-        fail_at: 2,
-        commits: 0,
-    };
-    collection.attach_sink(Box::new(sink));
-    collection.save(path.to_str().unwrap()).unwrap();
+    let (collection, faults) = faulty(&path, Durability::PerCall);
     add(&collection, 0..4);
     assert_eq!(collection.id_counter(), 4);
 
     // The commit that fails. Every record of the batch is refused with the
-    // sink's own error, none is installed, and the ids stay issued.
+    // sink's own error, saying the call was withdrawn, none is installed,
+    // and the ids stay issued.
+    faults.syncs.arm(0, 1);
     let failed = try_add(&collection, 4..8);
     assert_eq!(failed.inserted.len(), 0);
     assert_eq!(failed.total_errors, 4);
@@ -320,68 +251,73 @@ fn a_commit_that_fails_refuses_its_records_and_everything_after_until_a_checkpoi
             error.starts_with(&format!("Vector r{}: RuntimeError: ", i + 4)),
             "{error}"
         );
-        assert!(error.contains("the device refused the flush"), "{error}");
+        assert!(error.contains("injected: the device refused it"), "{error}");
+        assert!(error.contains("withdrawn by an abort record"), "{error}");
     }
     assert_eq!(collection.len(), 4);
     assert!(!collection.contains("r4"));
+    assert_eq!(collection.id_counter(), 8, "the ids stay issued");
     assert_eq!(
-        collection.id_counter(),
-        8,
-        "the ids stay issued, because the records may be on the device"
+        journal_holds(&path),
+        (4, 4, 1),
+        "four committed, four withdrawn"
     );
 
     // A retry, and every other mutation, is refused naming the sequence,
-    // and issues nothing.
+    // the withdrawal and the checkpoint, and issues nothing. Four inserts
+    // and a commit, then four inserts, a commit and the abort, reach 11.
     let retry = try_add(&collection, 4..5);
     assert_eq!(retry.total_errors, 1);
-    assert!(
-        retry.errors[0].contains("failed at sequence 8"),
-        "{}",
-        retry.errors[0]
-    );
-    assert!(
-        retry.errors[0].contains("checkpoint()"),
-        "{}",
-        retry.errors[0]
-    );
+    for words in [
+        "failed at sequence 11",
+        "withdrawn by an abort record",
+        "checkpoint()",
+    ] {
+        assert!(retry.errors[0].contains(words), "{}", retry.errors[0]);
+    }
     assert_eq!(
         collection.id_counter(),
         8,
         "a refused record takes its id back"
     );
-    let fresh = try_add(&collection, 8..9);
-    assert_eq!(fresh.total_errors, 1);
-    assert_eq!(collection.id_counter(), 8);
     match collection.remove_points(&["r0".to_string()]) {
-        Err(Error::JournalCommitFailed { sequence: 8, .. }) => {}
+        Err(Error::JournalCommitFailed { sequence: 11, .. }) => {}
         other => panic!("expected the fault, got {other:?}"),
     }
     assert!(collection.contains("r0"));
     match collection.update_metadata("r0", HashMap::from([("i".to_string(), json!(99))])) {
-        Err(Error::JournalCommitFailed { sequence: 8, .. }) => {}
+        Err(Error::JournalCommitFailed { sequence: 11, .. }) => {}
         other => panic!("expected the fault, got {other:?}"),
     }
     match collection.clear() {
-        Err(Error::JournalCommitFailed { sequence: 8, .. }) => {}
+        Err(Error::JournalCommitFailed { sequence: 11, .. }) => {}
         other => panic!("expected the fault, got {other:?}"),
     }
     assert_eq!(collection.len(), 4);
 
-    // What a crash here recovers. The refused records reached the journal,
-    // so a replay installs them: that is the "may have reached the device"
-    // half of the contract, and it is why a retry is refused.
+    // What a crash here recovers: the four the collection holds and none
+    // of the four it refused, and the ids the refused records took stay
+    // taken. The load meets the abort and checkpoints past it.
     let copy = copy_journaled(&path, "fault-crashed.zdb");
     let (crashed, report) = recover(&copy, Durability::NoSync);
-    assert_eq!(report.replayed, 8);
-    assert_eq!(crashed.len(), 8);
-    assert!(crashed.contains("r4") && crashed.contains("r7"));
+    assert_eq!(report.replayed, 4);
+    assert_eq!(report.withdrawn, 4);
+    assert!(report.checkpointed, "the load checkpointed past the abort");
+    assert_eq!(crashed.len(), 4);
+    assert!(!crashed.contains("r4") && !crashed.contains("r7"));
+    assert_eq!(crashed.id_counter(), collection.id_counter());
     drop(crashed);
+    let segments = Segments::of(&copy);
+    assert_eq!(segments.numbers.len(), 1);
+    let contents = segments.read(&expected_of(&copy)).unwrap();
+    assert_eq!((contents.records.len(), contents.aborts), (0, 0));
+    assert_eq!(manifest(&copy)["journal"]["sequence"], json!(11));
 
-    // The checkpoint reconciles. Its sync succeeds, the sequence it records
-    // claims the refused records so a replay skips them, the directory
-    // holds what the collection holds, and the journal is emptied.
+    // The checkpoint clears the fault. Its directory holds what the
+    // collection holds, and the segment holding the abort goes.
     collection.checkpoint().unwrap();
-    assert_eq!(collection.journal_sequence(), 8);
+    assert_eq!(collection.journal_sequence(), 11);
+    assert_eq!(Segments::of(&path).numbers, vec![12]);
     assert_eq!(collection.len(), 4);
     add(&collection, 8..10);
     assert_eq!(collection.id_counter(), 10);
@@ -390,7 +326,7 @@ fn a_commit_that_fails_refuses_its_records_and_everything_after_until_a_checkpoi
     drop(collection);
 
     let (recovered, report) = recover(&path, Durability::PerCall);
-    assert_eq!(report.checkpoint_sequence, 8);
+    assert_eq!(report.checkpoint_sequence, 11);
     assert_eq!(report.replayed, 3, "two inserts and a removal");
     assert_eq!(ids(&recovered), before);
     assert!(
@@ -400,11 +336,176 @@ fn a_commit_that_fails_refuses_its_records_and_everything_after_until_a_checkpoi
     assert_eq!(recovered.id_counter(), 10);
 }
 
+/// Withdraw and hold, where the abort itself cannot be written. The segment
+/// is cut back to the boundary, so a copy recovers without the refused
+/// records and the segment holds none of their bytes. The fault stands.
+#[test]
+fn a_commit_whose_abort_cannot_be_written_is_cut_back() {
+    let temp = TempDir::new("durability-tests");
+    let path = temp.at("cut.zdb");
+    let (collection, faults) = faulty(&path, Durability::PerCall);
+    add(&collection, 0..4);
+    let boundary = Segments::of(&path).total_bytes();
+
+    // The four inserts and the commit record go through, the commit's sync
+    // fails, and the abort's write, the call's sixth, fails.
+    faults.writes.arm(5, 1);
+    faults.syncs.arm(0, 1);
+    let failed = try_add(&collection, 4..8);
+    assert_eq!(failed.total_errors, 4);
+    assert!(
+        failed.errors[0].contains("cut from the journal"),
+        "{}",
+        failed.errors[0]
+    );
+    assert_eq!(
+        Segments::of(&path).total_bytes(),
+        boundary,
+        "no byte of the call is left"
+    );
+    assert_eq!(journal_holds(&path), (4, 0, 0));
+    assert!(try_add(&collection, 8..9).errors[0].contains("checkpoint()"));
+
+    let copy = copy_journaled(&path, "cut-crashed.zdb");
+    let (crashed, report) = recover(&copy, Durability::NoSync);
+    assert_eq!(report.replayed, 4);
+    assert_eq!(report.withdrawn, 0);
+    assert!(
+        !report.checkpointed,
+        "nothing in the journal says a commit failed"
+    );
+    assert_eq!(ids(&crashed), ids(&collection));
+
+    collection.checkpoint().unwrap();
+    add(&collection, 8..9);
+}
+
+/// Withdraw and hold, where the sync, the abort and the cut back all fail.
+/// The message says the refused records may come back after a crash until a
+/// checkpoint, and they do: a copy taken then holds them. A copy taken after
+/// `checkpoint()` does not, since the checkpoint writes the collection from
+/// memory and deletes the segment that held them.
+#[test]
+fn a_commit_whose_abort_and_cut_both_fail_says_its_records_may_come_back() {
+    let temp = TempDir::new("durability-tests");
+    let path = temp.at("neither.zdb");
+    let (collection, faults) = faulty(&path, Durability::PerCall);
+    add(&collection, 0..4);
+
+    // The commit's sync fails, the abort's write fails, and both the cut of
+    // the half abort and the cut back to the boundary fail.
+    faults.syncs.arm(0, 1);
+    faults.writes.arm(5, 1);
+    faults.cuts.arm(0, 2);
+    let failed = try_add(&collection, 4..8);
+    assert_eq!(failed.total_errors, 4);
+    assert!(
+        failed.errors[0].contains("may come back after a crash until a checkpoint"),
+        "{}",
+        failed.errors[0]
+    );
+    let early = copy_journaled(&path, "neither-early.zdb");
+    let (crashed, report) = recover(&early, Durability::NoSync);
+    assert_eq!(
+        report.replayed, 8,
+        "the refused records came back, as the message said"
+    );
+    assert_eq!(crashed.len(), 8);
+    drop(crashed);
+
+    collection.checkpoint().unwrap();
+    let late = copy_journaled(&path, "neither-late.zdb");
+    let (recovered, report) = recover(&late, Durability::NoSync);
+    assert_eq!(report.replayed, 0);
+    assert_eq!(ids(&recovered), ids(&collection));
+    assert_eq!(recovered.len(), 4);
+    add(&collection, 8..9);
+}
+
+/// A checkpoint whose sync of the old segment fails still commits, writes
+/// the collection from memory and clears the fault, whether the fault was
+/// there before or the failed sync is the first failure.
+#[test]
+fn a_checkpoint_runs_through_a_failed_sync_and_clears_the_fault() {
+    let temp = TempDir::new("durability-tests");
+    let path = temp.at("through.zdb");
+    let (collection, faults) = faulty(&path, Durability::PerCall);
+    add(&collection, 0..4);
+    faults.syncs.arm(0, 1);
+    assert_eq!(try_add(&collection, 4..6).total_errors, 2);
+
+    // The fault stands and the checkpoint's own sync fails as well.
+    faults.syncs.arm(0, 1);
+    collection.checkpoint().unwrap();
+    add(&collection, 6..8);
+    let before = ids(&collection);
+    drop(collection);
+    let (recovered, report) = recover(&path, Durability::PerCall);
+    assert_eq!(ids(&recovered), before);
+    assert_eq!(report.replayed, 2);
+    drop(recovered);
+
+    // Under the policy that never syncs, the checkpoint's sync is the first
+    // to fail.
+    let path = temp.at("through-none.zdb");
+    let (collection, faults) = faulty(&path, Durability::NoSync);
+    add(&collection, 0..5);
+    faults.syncs.arm(0, 1);
+    collection.checkpoint().unwrap();
+    add(&collection, 5..6);
+    let before = ids(&collection);
+    drop(collection);
+    let (recovered, report) = recover(&path, Durability::PerCall);
+    assert_eq!(ids(&recovered), before);
+    assert_eq!(report.checkpoint_sequence, 6);
+    assert_eq!(report.replayed, 1);
+}
+
+/// Under the interval policy, a sync the thread could not complete refuses
+/// and withdraws the next call, by an abort with no commit before it, and
+/// the fault stands until `checkpoint()`. The call before it was committed
+/// and acknowledged, so a process that stops keeps it.
+#[test]
+fn a_failed_sync_of_the_interval_thread_withdraws_the_next_call() {
+    let temp = TempDir::new("durability-tests");
+    let path = temp.at("interval-fault.zdb");
+    let (collection, faults) = faulty(&path, Durability::PerInterval(Duration::from_millis(5)));
+    add(&collection, 0..2);
+    faults.syncs.arm(0, 1);
+    add(&collection, 2..3);
+    assert!(
+        wait_for(Duration::from_secs(10), || faults.syncs.spent()),
+        "the thread reached its failing sync"
+    );
+    let failed = try_add(&collection, 3..4);
+    assert_eq!(failed.total_errors, 1);
+    assert!(
+        failed.errors[0].contains("withdrawn by an abort record"),
+        "{}",
+        failed.errors[0]
+    );
+    assert!(try_add(&collection, 4..5).errors[0].contains("checkpoint()"));
+    assert_eq!(journal_holds(&path), (3, 1, 1));
+
+    let copy = copy_journaled(&path, "interval-crashed.zdb");
+    let (crashed, report) = recover(&copy, Durability::NoSync);
+    assert_eq!(report.replayed, 3);
+    assert_eq!(report.withdrawn, 1);
+    assert_eq!(crashed.len(), 3);
+    drop(crashed);
+
+    collection.checkpoint().unwrap();
+    add(&collection, 4..6);
+    assert_eq!(collection.len(), 5);
+}
+
 // ============================================================================
 // THE CHECKPOINT AND THE STATUS
 // ============================================================================
 
 /// `checkpoint` is a save into the journal's own directory, and needs one.
+/// The status reports the journal's directory, the operation records a
+/// replay would apply, the bytes of every segment and the segments.
 #[test]
 fn checkpoint_writes_to_the_journals_own_directory_and_needs_one() {
     let plain = Collection::build(declaration(), None);
@@ -414,43 +515,50 @@ fn checkpoint_writes_to_the_journals_own_directory_and_needs_one() {
     }
     assert_eq!(plain.journal_status(), None);
 
-    let temp = TempDir::new();
+    let temp = TempDir::new("durability-tests");
     let path = temp.at("checkpoint.zdb");
     let collection = Collection::build(declaration(), None);
     collection
         .journal_to(path.to_str().unwrap(), Durability::PerCall)
         .unwrap();
-    let wal = journal_path(&path).unwrap();
-    let header = zeusdb_vector_core::JOURNAL_HEADER_BYTES as u64;
+    let journal = journal_path(&path).unwrap();
+    let header = SEGMENT_HEADER_BYTES as u64;
 
     let status = collection.journal_status().unwrap();
-    assert_eq!(status.path, wal);
+    assert_eq!(status.path, journal);
     assert_eq!(status.durability, Durability::PerCall);
     assert_eq!(status.checkpoint_sequence, 0);
     assert_eq!(status.sequence_reached, 0);
     assert_eq!(status.records_since_checkpoint(), 0);
     assert_eq!(status.bytes, Some(header));
+    assert_eq!(status.segments, 1);
 
     add(&collection, 0..6);
     let status = collection.journal_status().unwrap();
     assert_eq!(status.records_since_checkpoint(), 6);
+    assert_eq!(status.sequence_reached, 7, "six records and a commit");
     assert!(status.bytes.unwrap() > header);
+    assert_eq!(status.bytes, Some(Segments::of(&path).total_bytes()));
 
     collection.checkpoint().unwrap();
-    assert_eq!(collection.journal_sequence(), 6);
+    assert_eq!(collection.journal_sequence(), 7);
     let status = collection.journal_status().unwrap();
-    assert_eq!(status.checkpoint_sequence, 6);
-    assert_eq!(status.sequence_reached, 6);
+    assert_eq!(status.checkpoint_sequence, 7);
+    assert_eq!(status.sequence_reached, 7);
     assert_eq!(status.records_since_checkpoint(), 0);
     assert_eq!(
         status.bytes,
         Some(header),
-        "the checkpoint emptied the journal"
+        "the checkpoint rolled onto an empty segment"
     );
-    let manifest: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(path.join("manifest.json")).unwrap())
-            .unwrap();
-    assert_eq!(manifest["journal"]["sequence"], json!(6));
+    assert_eq!(status.segments, 1);
+    let stats = collection.stats();
+    assert_eq!(stats.get("journal_segments").map(String::as_str), Some("1"));
+    assert_eq!(
+        stats.get("journal_bytes").map(String::as_str),
+        Some(header.to_string().as_str())
+    );
+    assert_eq!(manifest(&path)["journal"]["sequence"], json!(7));
 
     let interval = Collection::build(declaration(), None);
     interval
@@ -498,7 +606,7 @@ fn hits(collection: &Collection, text: &str) -> Vec<String> {
 /// records that live in the journal alone are found through it.
 #[test]
 fn a_recovery_takes_the_tokenizer_the_text_layer_was_declared_with() {
-    let temp = TempDir::new();
+    let temp = TempDir::new("durability-tests");
     let path = temp.at("bars.zdb");
     let declaration = declaration()
         .with_text("text", SparseConfig::default(), Arc::new(Bars))
@@ -568,4 +676,55 @@ fn a_recovery_takes_the_tokenizer_the_text_layer_was_declared_with() {
     let mut gamma = hits(&recovered, "GAMMA");
     gamma.sort();
     assert_eq!(gamma, ["b", "c"]);
+}
+
+/// A term whose record the journal refused is not interned, so the next
+/// term takes its id and a replay meets the ids the live dictionary issued.
+#[test]
+fn a_term_whose_record_was_refused_is_not_interned() {
+    let temp = TempDir::new("durability-tests");
+    let path = temp.at("terms.zdb");
+    let declaration = declaration()
+        .with_text("text", SparseConfig::default(), Arc::new(Bars))
+        .unwrap();
+    let collection = Collection::build(declaration, None);
+    let storage = FaultyStorage::at(&path);
+    let faults = storage.faults.clone();
+    collection.attach_sink(Box::new(sink_over(
+        &storage,
+        &path,
+        collection.collection_id(),
+        Durability::PerCall,
+    )));
+    collection.save(path.to_str().unwrap()).unwrap();
+    let text_record = |id: &str, text: &str| ParsedRecord {
+        id: id.to_string(),
+        vector: vec![1.0, 0.0],
+        sparse: Some(SparseHalf::Terms(collection.tokenize(text).unwrap())),
+        metadata: HashMap::new(),
+    };
+
+    // The write of the first term's record fails, and is cut back.
+    faults.writes.arm(0, 1);
+    let refused = collection.add_records(vec![text_record("a", "lost|kept")], vec![], false);
+    assert_eq!(refused.total_errors, 1);
+    assert_eq!(
+        collection.term_count(),
+        Some(0),
+        "no term of the refused record is held"
+    );
+    let added = collection.add_records(vec![text_record("b", "kept|other")], vec![], false);
+    assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    assert_eq!(collection.term_count(), Some(2));
+    drop(collection);
+
+    let (recovered, report) = Collection::recover(
+        path.to_str().unwrap(),
+        Some(Arc::new(Bars)),
+        Durability::PerCall,
+    )
+    .unwrap();
+    assert_eq!(report.replayed, 3, "one insert and two interned terms");
+    assert_eq!(hits(&recovered, "kept"), ["b"]);
+    assert_eq!(recovered.term_count(), Some(2));
 }

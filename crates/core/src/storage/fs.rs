@@ -1,21 +1,26 @@
 //! The storage traits over the local filesystem.
 //!
 //! [`FsStorage`] keeps a collection at a directory path, its target, and
-//! uses three siblings of it on the same volume. `<name>.zdbtmp` is the
+//! uses five siblings of it on the same volume. `<name>.zdbtmp` is the
 //! directory a save writes before it is moved into place, `<name>.zdbold`
-//! holds the directory being replaced while the new one moves in, and
-//! `<name>.zdbwal` is the journal. [`FsDir`] is a directory of artefacts
-//! under one path.
+//! holds the directory being replaced while the new one moves in,
+//! `<name>.zdbjournal` is the journal's directory of segments,
+//! `<name>.zdbwal` is the journal of format version 1 an older release
+//! wrote, and `<name>.zdblock` is the lock file. [`FsDir`] is a directory
+//! of artefacts under one path.
 
-use super::{ArtefactWriter, Dir, JournalFile, Staged, Storage};
+use super::{
+    refuses_writes, ArtefactWriter, Dir, JournalDir, JournalFile, LockFailure, LockGuard, LockMode,
+    Locked, Staged, Storage,
+};
 use crate::error::Error;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
-/// The target the one record this module emits carries, being the module
-/// path the staging code had in the binding. See the crate root.
+/// The target the records this module emits carry, being the module path
+/// the staging code had in the binding. See the crate root.
 const LOG_TARGET: &str = "zeusdb_vector_database::persistence";
 
 /// Suffix of the directory a save builds before it is moved into place.
@@ -24,8 +29,39 @@ const STAGING_SUFFIX: &str = ".zdbtmp";
 /// Suffix the directory being replaced is moved aside under.
 const REPLACED_SUFFIX: &str = ".zdbold";
 
-/// The suffix a collection's journal takes beside its directory.
-pub const JOURNAL_SUFFIX: &str = ".zdbwal";
+/// The suffix a collection's journal, a directory of segments, takes beside
+/// its directory.
+pub const JOURNAL_SUFFIX: &str = ".zdbjournal";
+
+/// The suffix the journal of format version 1, one file, took beside its
+/// directory. Releases from 0.11.0 to 0.13.0 wrote it, and this build reads
+/// it to upgrade the directory.
+pub const LEGACY_JOURNAL_SUFFIX: &str = ".zdbwal";
+
+/// The suffix of the lock file beside a directory.
+pub const LOCK_SUFFIX: &str = ".zdblock";
+
+/// The suffix of a segment inside the journal's directory.
+pub const SEGMENT_SUFFIX: &str = ".zdbseg";
+
+/// The digits of a segment's name, so that the names sort in sequence order.
+const SEGMENT_DIGITS: usize = 20;
+
+/// The file name of the segment whose first record is `number`, being the
+/// number in twenty decimal digits and the suffix.
+pub(crate) fn segment_file_name(number: u64) -> String {
+    format!("{number:0width$}{SEGMENT_SUFFIX}", width = SEGMENT_DIGITS)
+}
+
+/// The number a segment's file name carries, where `name` is a segment's
+/// name and nothing else: twenty decimal digits and the suffix.
+pub(crate) fn segment_number(name: &str) -> Option<u64> {
+    let digits = name.strip_suffix(SEGMENT_SUFFIX)?;
+    if digits.len() != SEGMENT_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
 
 // ============================================================================
 // A DIRECTORY OF ARTEFACTS
@@ -231,11 +267,23 @@ impl ArtefactWriter for FsArtefact {
 ///
 /// # The journal
 ///
-/// `<name>.zdbwal`, a sibling for the same reason. Windows refuses to rename
-/// a directory that holds an open file, and `remove_dir_all` on a directory
-/// holding an open file succeeds, so a journal inside the directory would
-/// either stop the first rename of a commit or be removed with
-/// `<name>.zdbold` after the second.
+/// `<name>.zdbjournal`, a directory of segments and a sibling for the same
+/// reason. Windows refuses to rename a directory that holds an open file,
+/// and `remove_dir_all` on a directory holding an open file succeeds, so a
+/// journal inside the directory would either stop the first rename of a
+/// commit or be removed with `<name>.zdbold` after the second.
+///
+/// A segment open for writing is opened on Windows without delete sharing,
+/// so no other handle can delete or rename it while this one holds it.
+///
+/// # The lock
+///
+/// `<name>.zdblock`, an ordinary file locked whole through `File::try_lock`
+/// and `File::try_lock_shared`, which are `flock` on Linux and macOS and
+/// `LockFileEx` on Windows. The lock lives in a file of its own because on
+/// Windows a lock blocks reads of the locked bytes through every other
+/// handle, so a lock on a segment or an artefact would stop a reader. The
+/// file is created on first use and never removed.
 #[derive(Clone, Debug)]
 pub struct FsStorage {
     target: PathBuf,
@@ -243,6 +291,8 @@ pub struct FsStorage {
     staging: PathBuf,
     replaced: PathBuf,
     journal: PathBuf,
+    legacy_journal: PathBuf,
+    lock: PathBuf,
 }
 
 impl FsStorage {
@@ -253,6 +303,8 @@ impl FsStorage {
             staging: sibling(target, STAGING_SUFFIX)?,
             replaced: sibling(target, REPLACED_SUFFIX)?,
             journal: sibling(target, JOURNAL_SUFFIX)?,
+            legacy_journal: sibling(target, LEGACY_JOURNAL_SUFFIX)?,
+            lock: sibling(target, LOCK_SUFFIX)?,
             dir: FsDir::new(target),
             target: target.to_path_buf(),
         })
@@ -299,6 +351,10 @@ impl Storage for FsStorage {
         self.target.exists()
     }
 
+    fn aside_exists(&self) -> bool {
+        self.replaced.exists()
+    }
+
     fn dir(&self) -> &dyn Dir {
         &self.dir
     }
@@ -335,6 +391,17 @@ impl Storage for FsStorage {
         }))
     }
 
+    /// A staging directory an interrupted save left is removed here, as
+    /// [`Storage::stage`] would remove it, so the probe asks the folder the
+    /// question a checkpoint's first write asks.
+    fn probe_writable(&self) -> io::Result<()> {
+        if self.staging.exists() {
+            fs::remove_dir_all(&self.staging)?;
+        }
+        fs::create_dir(&self.staging)?;
+        fs::remove_dir(&self.staging)
+    }
+
     fn journal_path(&self) -> &Path {
         &self.journal
     }
@@ -350,29 +417,246 @@ impl Storage for FsStorage {
     }
 
     fn journal_exists(&self) -> bool {
-        self.journal.exists()
+        self.journal.is_dir()
     }
 
-    fn read_journal(&self) -> io::Result<Vec<u8>> {
-        fs::read(&self.journal)
+    fn create_journal(&self) -> io::Result<()> {
+        fs::create_dir_all(&self.journal)?;
+        let dir = FsJournalDir {
+            path: self.journal.clone(),
+        };
+        for number in dir.segments()? {
+            dir.remove_segment(number)?;
+        }
+        dir.sync();
+        if let Some(parent) = self.journal.parent() {
+            sync_directory(parent);
+        }
+        Ok(())
     }
 
-    fn create_journal(&self) -> io::Result<Box<dyn JournalFile>> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&self.journal)?;
+    fn journal_dir(&self) -> Box<dyn JournalDir> {
+        Box::new(FsJournalDir {
+            path: self.journal.clone(),
+        })
+    }
+
+    fn legacy_journal_path(&self) -> &Path {
+        &self.legacy_journal
+    }
+
+    fn legacy_journal_exists(&self) -> bool {
+        self.legacy_journal.is_file()
+    }
+
+    fn read_legacy_journal(&self) -> io::Result<Vec<u8>> {
+        fs::read(&self.legacy_journal)
+    }
+
+    fn remove_legacy_journal(&self) -> io::Result<()> {
+        fs::remove_file(&self.legacy_journal)?;
+        if let Some(parent) = self.legacy_journal.parent() {
+            sync_directory(parent);
+        }
+        Ok(())
+    }
+
+    fn lock_path(&self) -> &Path {
+        &self.lock
+    }
+
+    /// The holder's line is written after an exclusive acquisition alone. On
+    /// Windows a shared lock refuses writes to the locked bytes through
+    /// every handle, its own included, so a shared holder writes nothing.
+    fn lock(&self, mode: LockMode, holder: &str) -> Result<Locked, LockFailure> {
+        let open = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&self.lock)
+        };
+        let writable = match open() {
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && mode == LockMode::Exclusive =>
+            {
+                match self
+                    .lock
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    Some(parent) => fs::create_dir_all(parent).and_then(|()| open()),
+                    None => Err(error),
+                }
+            }
+            other => other,
+        };
+        match writable {
+            Ok(file) => {
+                acquire(&file, mode).map_err(|error| self.lock_failure(error))?;
+                if mode == LockMode::Exclusive {
+                    let _ = file
+                        .set_len(0)
+                        .and_then(|()| (&file).write_all(holder.as_bytes()));
+                }
+                Ok(Locked::Writable(Box::new(FsLock { _file: file, mode })))
+            }
+            Err(reason) if refuses_writes(&reason) => match File::open(&self.lock) {
+                Ok(file) => {
+                    acquire(&file, LockMode::Shared).map_err(|error| self.lock_failure(error))?;
+                    Ok(Locked::ReadOnly {
+                        guard: Some(Box::new(FsLock {
+                            _file: file,
+                            mode: LockMode::Shared,
+                        })),
+                        reason,
+                    })
+                }
+                Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(Locked::ReadOnly {
+                    guard: None,
+                    reason,
+                }),
+                Err(other) => Err(LockFailure::Failed(other)),
+            },
+            Err(other) => Err(LockFailure::Failed(other)),
+        }
+    }
+}
+
+impl FsStorage {
+    /// What a lock that was not taken means. A holder that excludes this one
+    /// is named by what its lock file records, its lines joined, where the
+    /// system lets another handle read it, which Windows does not while the
+    /// lock is held exclusive. The record is the last exclusive holder's,
+    /// since a shared holder writes none.
+    fn lock_failure(&self, error: std::fs::TryLockError) -> LockFailure {
+        match error {
+            std::fs::TryLockError::WouldBlock => {
+                let recorded = fs::read_to_string(&self.lock).ok().map(|text| {
+                    text.lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                });
+                let holder = match recorded.filter(|text| !text.is_empty()) {
+                    Some(text) => format!("another holder, its lock file recording {text}"),
+                    None => "another holder, whose record this system does not let a second \
+                             handle read while the lock is held"
+                        .to_string(),
+                };
+                LockFailure::Held { holder }
+            }
+            std::fs::TryLockError::Error(error) => LockFailure::Unavailable(error),
+        }
+    }
+}
+
+/// Take `file`'s lock in `mode` without waiting.
+fn acquire(file: &File, mode: LockMode) -> Result<(), std::fs::TryLockError> {
+    match mode {
+        LockMode::Shared => file.try_lock_shared(),
+        LockMode::Exclusive => file.try_lock(),
+    }
+}
+
+/// A lock held through an open lock file. Dropping it closes the file,
+/// which releases the lock; see [`LockGuard`].
+#[derive(Debug)]
+struct FsLock {
+    _file: File,
+    mode: LockMode,
+}
+
+impl LockGuard for FsLock {
+    fn mode(&self) -> LockMode {
+        self.mode
+    }
+}
+
+// ============================================================================
+// THE JOURNAL'S DIRECTORY
+// ============================================================================
+
+/// The journal's directory of segments.
+#[derive(Clone, Debug)]
+struct FsJournalDir {
+    path: PathBuf,
+}
+
+/// The options a segment is opened with for writing. On Windows the share
+/// mode is read and write without delete, so no other handle can delete or
+/// rename an open segment, which would orphan the journal under a live
+/// collection. The two values are `FILE_SHARE_READ` and `FILE_SHARE_WRITE`.
+fn segment_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0x0000_0001 | 0x0000_0002);
+    }
+    options
+}
+
+impl JournalDir for FsJournalDir {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// An entry whose name is not a segment's is left where it is. One that
+    /// is not the repair's `quarantine` folder is logged, once a listing.
+    fn segments(&self) -> io::Result<Vec<u64>> {
+        let mut numbers = Vec::new();
+        let mut others = Vec::new();
+        for entry in fs::read_dir(&self.path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            match segment_number(&name) {
+                Some(number) if entry.file_type()?.is_file() => numbers.push(number),
+                _ if name == "quarantine" => {}
+                _ => others.push(name.into_owned()),
+            }
+        }
+        if !others.is_empty() {
+            info!(target: LOG_TARGET, operation = "journal_entries",
+                journal = %self.path.display(),
+                entries = ?others,
+                "The journal's directory holds entries that are not segments; they were left where they are"
+            );
+        }
+        numbers.sort_unstable();
+        Ok(numbers)
+    }
+
+    fn read_segment(&self, number: u64) -> io::Result<Vec<u8>> {
+        fs::read(self.segment_path(number))
+    }
+
+    fn create_segment(&self, number: u64) -> io::Result<Box<dyn JournalFile>> {
+        let file = segment_options()
+            .create_new(true)
+            .open(self.segment_path(number))?;
         Ok(Box::new(FsJournalFile { file }))
     }
 
-    fn open_journal(&self) -> io::Result<Box<dyn JournalFile>> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.journal)?;
+    fn open_segment(&self, number: u64) -> io::Result<Box<dyn JournalFile>> {
+        let file = segment_options().open(self.segment_path(number))?;
         Ok(Box::new(FsJournalFile { file }))
+    }
+
+    fn remove_segment(&self, number: u64) -> io::Result<()> {
+        fs::remove_file(self.segment_path(number))
+    }
+
+    fn sync(&self) {
+        sync_directory(&self.path);
+    }
+
+    fn segment_path(&self, number: u64) -> PathBuf {
+        self.path.join(segment_file_name(number))
     }
 }
 
@@ -476,7 +760,7 @@ fn sync_directory(_path: &Path) {}
 // THE JOURNAL
 // ============================================================================
 
-/// The journal's file, shared by its writer and the thread that syncs it.
+/// One segment, shared by its writer and the thread that syncs it.
 #[derive(Debug)]
 struct FsJournalFile {
     file: File,
@@ -485,10 +769,6 @@ struct FsJournalFile {
 impl JournalFile for FsJournalFile {
     fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
         (&self.file).write_all(bytes)
-    }
-
-    fn seek_start(&self) -> io::Result<()> {
-        (&self.file).seek(SeekFrom::Start(0)).map(|_| ())
     }
 
     fn seek_end(&self) -> io::Result<()> {
@@ -640,17 +920,172 @@ mod tests {
         assert_eq!(entries(tmp.path()), vec!["index.zdb"]);
     }
 
-    /// The journal is the target's sibling, a path naming it another way
-    /// names the same journal, and a target with no name has no siblings.
+    /// The journal, the version 1 journal and the lock file are the target's
+    /// siblings, a path naming the journal another way names the same one,
+    /// and a target with no name has no siblings.
     #[test]
-    fn the_journal_is_the_targets_sibling() {
+    fn the_journal_and_the_lock_are_the_targets_siblings() {
         let storage = FsStorage::at(Path::new("a/b/index.zdb")).unwrap();
-        assert_eq!(storage.journal_path(), Path::new("a/b/index.zdb.zdbwal"));
-        assert!(storage.names_journal(Path::new("a/./b/index.zdb.zdbwal")));
-        assert!(!storage.names_journal(Path::new("a/b/other.zdb.zdbwal")));
+        assert_eq!(
+            storage.journal_path(),
+            Path::new("a/b/index.zdb.zdbjournal")
+        );
+        assert_eq!(
+            storage.legacy_journal_path(),
+            Path::new("a/b/index.zdb.zdbwal")
+        );
+        assert_eq!(storage.lock_path(), Path::new("a/b/index.zdb.zdblock"));
+        assert!(storage.names_journal(Path::new("a/./b/index.zdb.zdbjournal")));
+        assert!(!storage.names_journal(Path::new("a/b/other.zdb.zdbjournal")));
+        assert!(!storage.names_journal(Path::new("a/b/index.zdb.zdbwal")));
         assert!(matches!(
             FsStorage::at(Path::new("")),
             Err(Error::TargetHasNoName { .. })
         ));
+    }
+
+    /// A segment is named by its first sequence in twenty digits, so the
+    /// names sort in sequence order, and nothing else reads as a segment.
+    #[test]
+    fn a_segment_is_named_by_its_first_sequence_in_twenty_digits() {
+        assert_eq!(segment_file_name(1), "00000000000000000001.zdbseg");
+        assert_eq!(segment_file_name(u64::MAX), "18446744073709551615.zdbseg");
+        for number in [0u64, 1, 9, 10, 4_294_967_296, u64::MAX] {
+            assert_eq!(segment_number(&segment_file_name(number)), Some(number));
+        }
+        let mut names: Vec<String> = [100u64, 9, 1_000_000, 10]
+            .iter()
+            .map(|n| segment_file_name(*n))
+            .collect();
+        names.sort();
+        let sorted: Vec<u64> = names.iter().map(|n| segment_number(n).unwrap()).collect();
+        assert_eq!(sorted, vec![9, 10, 100, 1_000_000]);
+        for name in [
+            "1.zdbseg",
+            "0000000000000000001.zdbseg",
+            "000000000000000000001.zdbseg",
+            "0000000000000000000a.zdbseg",
+            "99999999999999999999.zdbseg",
+            "00000000000000000001.zdbseg.tmp",
+            "00000000000000000001",
+            "quarantine",
+        ] {
+            assert_eq!(segment_number(name), None, "{name}");
+        }
+    }
+
+    /// The journal's directory lists its segments in order and leaves every
+    /// other entry where it is, a segment is created once, opened, read and
+    /// removed by its number, and creating the journal again empties it of
+    /// segments alone.
+    #[test]
+    fn the_journal_directory_holds_segments_by_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        assert!(!storage.journal_exists());
+        storage.create_journal().unwrap();
+        assert!(storage.journal_exists());
+        let dir = storage.journal_dir();
+        assert_eq!(dir.path(), storage.journal_path());
+        assert!(dir.segments().unwrap().is_empty());
+        for number in [12u64, 1, 7] {
+            let file = dir.create_segment(number).unwrap();
+            file.write_all(&number.to_le_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+        assert!(dir.create_segment(7).is_err(), "a segment is created once");
+        fs::create_dir(storage.journal_path().join("quarantine")).unwrap();
+        fs::write(storage.journal_path().join("notes.txt"), b"left").unwrap();
+        assert_eq!(dir.segments().unwrap(), vec![1, 7, 12]);
+        assert_eq!(dir.read_segment(7).unwrap(), 7u64.to_le_bytes());
+        let open = dir.open_segment(7).unwrap();
+        open.seek_end().unwrap();
+        open.write_all(b"more").unwrap();
+        assert_eq!(open.length().unwrap(), 12);
+        open.set_len(8).unwrap();
+        assert_eq!(dir.read_segment(7).unwrap(), 7u64.to_le_bytes());
+        drop(open);
+        dir.remove_segment(1).unwrap();
+        assert_eq!(dir.segments().unwrap(), vec![7, 12]);
+        assert_eq!(
+            dir.segment_path(7),
+            storage.journal_path().join("00000000000000000007.zdbseg")
+        );
+        storage.create_journal().unwrap();
+        assert!(dir.segments().unwrap().is_empty());
+        assert_eq!(
+            entries(storage.journal_path()),
+            vec!["notes.txt", "quarantine"]
+        );
+    }
+
+    /// The version 1 journal is one file beside the directory, read whole
+    /// and removed.
+    #[test]
+    fn the_version_1_journal_is_read_and_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        assert!(!storage.legacy_journal_exists());
+        fs::write(storage.legacy_journal_path(), b"ZDBJOURN").unwrap();
+        assert!(storage.legacy_journal_exists());
+        assert_eq!(storage.read_legacy_journal().unwrap(), b"ZDBJOURN");
+        storage.remove_legacy_journal().unwrap();
+        assert!(!storage.legacy_journal_exists());
+    }
+
+    /// The probe makes and removes the staging directory, and removes one an
+    /// interrupted save left, so it leaves the folder as it found it.
+    #[test]
+    fn the_write_probe_leaves_the_folder_as_it_found_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        storage.probe_writable().unwrap();
+        assert!(entries(tmp.path()).is_empty());
+        fs::create_dir(tmp.path().join("index.zdb.zdbtmp")).unwrap();
+        fs::write(tmp.path().join("index.zdb.zdbtmp").join("a.bin"), b"left").unwrap();
+        storage.probe_writable().unwrap();
+        assert!(entries(tmp.path()).is_empty());
+    }
+
+    fn holder(storage: &FsStorage, mode: LockMode) -> Result<Box<dyn LockGuard>, LockFailure> {
+        match storage.lock(mode, "pid 1, host test, exclusive, since now\n")? {
+            Locked::Writable(guard) => Ok(guard),
+            Locked::ReadOnly { .. } => panic!("the lock file is writable here"),
+        }
+    }
+
+    /// The lock in one process, as the standard library gives it on this
+    /// system. An exclusive holder refuses a second handle in either mode,
+    /// shared holders sit together and refuse an exclusive one, a dropped
+    /// guard releases, and the lock file is kept.
+    #[test]
+    fn the_lock_refuses_a_second_handle_and_releases_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        let first = holder(&storage, LockMode::Exclusive).unwrap();
+        assert_eq!(first.mode(), LockMode::Exclusive);
+        for mode in [LockMode::Exclusive, LockMode::Shared] {
+            match holder(&storage, mode) {
+                Err(LockFailure::Held { holder }) => {
+                    assert!(!holder.is_empty());
+                    #[cfg(unix)]
+                    assert_eq!(holder, "pid 1, host test, exclusive, since now");
+                }
+                other => panic!("{mode:?}: expected the lock to be held, got {other:?}"),
+            }
+        }
+        drop(first);
+        let shared = holder(&storage, LockMode::Shared).unwrap();
+        let beside = holder(&storage, LockMode::Shared).unwrap();
+        assert_eq!(beside.mode(), LockMode::Shared);
+        assert!(matches!(
+            holder(&storage, LockMode::Exclusive),
+            Err(LockFailure::Held { .. })
+        ));
+        drop(shared);
+        drop(beside);
+        let again = holder(&storage, LockMode::Exclusive).unwrap();
+        drop(again);
+        assert!(storage.lock_path().is_file(), "the lock file is kept");
     }
 }

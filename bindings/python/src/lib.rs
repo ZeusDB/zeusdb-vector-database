@@ -97,8 +97,8 @@ impl From<PyEngineError> for PyErr {
 /// refused, since ignoring it would open the index under a tokenizer the
 /// caller did not ask for.
 ///
-/// A directory whose manifest names a journal is recovered: every record
-/// the journal holds above the checkpoint is replayed, the journal is
+/// A directory whose manifest names a journal is recovered: every committed
+/// record the journal holds above the checkpoint is replayed, the journal is
 /// reopened for append, and the index hands its mutations to it from then
 /// on under `durability`, which takes the three names `journal_to` takes
 /// and defaults to `"call"`. `interval_ms` belongs to `"interval"`. Naming
@@ -108,6 +108,16 @@ impl From<PyEngineError> for PyErr {
 /// attaches none and takes no policy; it is the way in for a directory
 /// copied without its sibling, and for a caller who wants the state as of
 /// the last checkpoint.
+///
+/// A journaled directory saved by a release before 0.14.0 is upgraded by its
+/// first load: its journal is replayed and the directory is written again at
+/// format 5.0.0, after which those releases do not open it. A load holds the
+/// directory's lock, `<path>.zdblock`, while it reads, and a journaled index
+/// keeps it for its life, so a second holder is refused with
+/// `CollectionLocked`. A journaled directory this process cannot write opens
+/// read only, with a `RuntimeWarning` naming the reason: every record is
+/// replayed in memory, nothing on the medium changes, every change raises
+/// `CollectionReadOnly`, and `save` into another directory copies it.
 ///
 /// The whole load runs with the interpreter lock released, the graph rebuild
 /// it may fall back to included. Nothing in the load path touches Python:
@@ -149,6 +159,12 @@ fn load_index(
             path
         ))
         .into());
+    }
+    if let Some(message) = recovery.read_only_warning(path) {
+        let category = py.get_type::<pyo3::exceptions::PyRuntimeWarning>();
+        let message = std::ffi::CString::new(message)
+            .unwrap_or_else(|_| c"The directory was opened read only.".to_owned());
+        PyErr::warn(py, category.as_any(), &message, 1)?;
     }
     Ok(hnsw_index::HNSWIndex::wrap(inner))
 }

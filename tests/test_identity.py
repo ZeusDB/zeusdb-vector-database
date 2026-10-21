@@ -125,7 +125,7 @@ def test_a_save_that_fails_moves_nothing(tmp_path):
     index.save(str(path))
     before = index.identity
     (tmp_path / "afile").write_text("x")
-    with pytest.raises(RuntimeError, match="staging directory"):
+    with pytest.raises(RuntimeError, match="cannot be locked"):
         index.save(str(tmp_path / "afile" / "sub.zdb"))
     assert index.identity == before
     index.save(str(path))
@@ -183,12 +183,13 @@ def test_a_journaled_directory_names_one_id_three_times(tmp_path):
     """The manifest's identity, its journal record and the journal's header."""
     index = build(5)
     path = tmp_path / "j.zdb"
-    wal = path.parent / (path.name + ".zdbwal")
+    journal = path.parent / (path.name + ".zdbjournal")
     index.journal_to(str(path))
 
     def agree():
         m = manifest(path)
-        header = int.from_bytes(wal.read_bytes()[24:40], "little")
+        segment = sorted(journal.iterdir())[-1]
+        header = int.from_bytes(segment.read_bytes()[24:40], "little")
         assert m["identity"]["collection_id"] == m["journal"]["collection_id"]
         assert m["identity"]["collection_id"] == format(header, "032x")
         assert m["identity"]["collection_id"] == index.identity["collection_id"]
@@ -201,7 +202,8 @@ def test_a_journaled_directory_names_one_id_three_times(tmp_path):
     two = recorded(path)
     assert two["generation"] == 2
     add(index, 9, 12)
-    drop(index)
+    del index
+    gc.collect()
 
     reopened = load(path)
     assert reopened.identity == two, "a replay is not a save"
@@ -238,6 +240,8 @@ def test_a_directory_recording_no_identity_is_named_at_its_next_save(tmp_path, v
     if version != "4.0.0":
         as_old_wire(path, version)
     m = manifest(path)
+    if version == "4.0.0":
+        m["format_version"] = "4.0.0"
     del m["identity"]
     m.pop("features", None)
     (path / "manifest.json").write_text(json.dumps(m, indent=2), encoding="utf-8")

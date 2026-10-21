@@ -80,11 +80,20 @@ pub use graph::{
 pub use ids::ID_CEILINGS;
 pub use ids::{refuse_unnamable, IdParts, IdStore, MAX_INTERNAL_ID};
 pub use int8::Int8Codec;
+#[cfg(any(test, feature = "test-support"))]
+pub use journal::encode_legacy_header;
+// The length a writer on the calling thread rolls at, for the tests that
+// reach a roll. Compiled away when `debug_assertions` are off.
+#[cfg(debug_assertions)]
+pub use journal::set_segment_roll_bytes;
 pub use journal::{
-    encode_journal_header, encode_journal_record, read_journal, CommitMode, JournalContents,
-    JournalDamage, JournalHeader, JournalKind, JournalRecord, JournalSyncHandle, JournalWriter,
-    OperationKind, JOURNAL_HEADER_BYTES, JOURNAL_MAGIC, JOURNAL_MAX_PAYLOAD,
-    JOURNAL_RECORD_CHECKSUM_BYTES, JOURNAL_RECORD_HEADER_BYTES, JOURNAL_RECORD_OVERHEAD_BYTES,
+    encode_journal_record, encode_segment_header, read_legacy_journal, read_segment_header,
+    read_segments, CommitMode, Expected, JournalContents, JournalDamage, JournalKind,
+    JournalRecord, JournalSyncHandle, JournalWriter, LegacyContents, LegacyHeader, LiveRecord,
+    OperationKind, RecordState, ResumeFailure, SegmentBase, SegmentBytes, SegmentHeader,
+    SegmentReport, Withdrawal, JOURNAL_MAGIC, JOURNAL_MAX_PAYLOAD, JOURNAL_RECORD_CHECKSUM_BYTES,
+    JOURNAL_RECORD_HEADER_BYTES, JOURNAL_RECORD_OVERHEAD_BYTES, LEGACY_HEADER_BYTES,
+    SEGMENT_HEADER_BYTES, SEGMENT_ROLL_BYTES,
 };
 // The abort hook the crash tests kill a process at. Compiled away when
 // `debug_assertions` are off, which is every profile the wheel is built
@@ -95,7 +104,7 @@ pub use kill::{
 #[cfg(any(test, feature = "test-support"))]
 pub use metadata::{MetadataCopy, MoveHook, METADATA_MOVE_HOOK};
 pub use metadata::{MetadataParts, MetadataStore, RecordFields};
-pub use operation::{InsertParts, Operation};
+pub use operation::{AbortReason, InsertParts, Operation};
 pub use pq::PQ;
 pub use rng::SeededRng;
 pub use space::{
@@ -105,7 +114,9 @@ pub use space::{
     VectorIndex,
 };
 pub use storage::{
-    ArtefactWriter, Dir, FsDir, FsStorage, JournalFile, Staged, Storage, JOURNAL_SUFFIX,
+    refuses_writes, ArtefactWriter, Dir, FsDir, FsStorage, JournalDir, JournalFile, LockFailure,
+    LockGuard, LockMode, Locked, Staged, Storage, JOURNAL_SUFFIX, LEGACY_JOURNAL_SUFFIX,
+    LOCK_SUFFIX, SEGMENT_SUFFIX,
 };
 
 /// What a test in another crate measures against.

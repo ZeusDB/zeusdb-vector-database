@@ -92,7 +92,11 @@ mod insert;
 #[cfg(test)]
 mod int8_tests;
 #[cfg(test)]
+mod journal_support;
+#[cfg(test)]
 mod journal_tests;
+#[cfg(test)]
+mod lock_tests;
 #[cfg(test)]
 mod mutation_tests;
 #[cfg(test)]
@@ -107,12 +111,18 @@ mod query;
 #[cfg(test)]
 mod query_tests;
 #[cfg(test)]
+mod read_only_tests;
+#[cfg(test)]
 mod replay_tests;
 mod search;
+#[cfg(test)]
+mod segment_tests;
 #[cfg(test)]
 mod spaces_tests;
 mod stats;
 mod training;
+#[cfg(test)]
+mod upgrade_tests;
 
 // The declaration rules, so that `persistence::load_config` applies the same
 // ones to `config.json` that `Declaration::validate` applies to a caller's
@@ -143,8 +153,8 @@ use std::sync::{Arc, OnceLock};
 use tracing::{trace, warn};
 use zeusdb_vector_core::{
     matches_filter, ColumnStore, Error, Filter, IdStore, Int8Codec, MetadataStore, Operation,
-    OperationKind, Persist, Position, Selection, SpaceName, SparseVector, VectorGraph, VectorIndex,
-    PQ,
+    OperationKind, Persist, Position, SegmentBase, Selection, SpaceName, SparseVector, VectorGraph,
+    VectorIndex, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{count_record_with, TermDictionary, Tokenizer, TokenizerConfig};
@@ -222,22 +232,27 @@ impl From<(String, Vec<f32>, HashMap<String, Value>)> for ParsedRecord {
 /// through [`Collection::apply`], hands nothing here.
 ///
 /// Beyond the two a mutation uses, the trait carries what a checkpoint asks
-/// of the sink, being the sync, the sequence it has reached, the truncation
-/// once the directory holds those records, and the two values a manifest
-/// records so that a directory and its records are paired by content. They
-/// are on the trait rather than reached by detaching the sink around the
-/// save, because detaching and attaching each take the mutation guard and
-/// release it, and a mutation running in the window between the save and the
-/// reattachment would land in neither the directory nor the records.
+/// of the sink, being the sync, the sequence it has reached, the roll onto a
+/// segment naming the directory once the directory holds those records, and
+/// the two values a manifest records so that a directory and its records
+/// are paired by content. They are on the trait rather than reached by
+/// detaching the sink around the save, because detaching and attaching each
+/// take the mutation guard and release it, and a mutation running in the
+/// window between the save and the reattachment would land in neither the
+/// directory nor the records.
 pub trait OperationSink: Send + std::fmt::Debug {
     /// Take one record's bytes. Called with `writers` held on every
     /// mutation path and with the dictionary's write guard held for an
     /// interning, and with nothing else. A refusal refuses the mutation
-    /// before it runs, with the error carried out to the caller.
+    /// before it runs, with the error carried out to the caller, and leaves
+    /// nothing of the record behind.
     fn append(&mut self, kind: OperationKind, payload: &[u8]) -> Result<(), Error>;
 
-    /// Make everything appended so far durable, after the last record of a
-    /// call and before the call mutates anything a search can see.
+    /// Close what was appended since the last commit and make it durable
+    /// under the sink's policy, after the last record of a call and before
+    /// the call mutates anything a search can see. A commit that fails
+    /// withdraws those records where the sink can, and its error says what
+    /// the withdrawal achieved.
     fn commit(&mut self) -> Result<(), Error>;
 
     /// Make everything appended so far durable whatever the policy, which a
@@ -260,10 +275,12 @@ pub trait OperationSink: Send + std::fmt::Debug {
         0
     }
 
-    /// Drop every record handed over so far, which the checkpoint that just
-    /// ran now holds. Called after the save has committed its directory and
-    /// never before.
-    fn truncate(&mut self) -> Result<(), Error> {
+    /// Go on after the checkpoint `base`, which has just committed its
+    /// directory and holds every record handed over so far, and drop those
+    /// records. Called after the save has committed its directory and never
+    /// before.
+    fn roll(&mut self, base: SegmentBase) -> Result<(), Error> {
+        let _ = base;
         Ok(())
     }
 
@@ -294,9 +311,28 @@ pub trait OperationSink: Send + std::fmt::Debug {
         None
     }
 
-    /// The size of this sink's file, where it is a file, so a caller can
-    /// see what a replay would read.
+    /// The bytes of every segment this sink's journal holds, where it is a
+    /// journal, so a caller can see what a replay would read.
     fn journal_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    /// The segments this sink's journal holds, where it is a journal.
+    fn journal_segments(&self) -> Option<usize> {
+        None
+    }
+
+    /// Operation records committed since the checkpoint the sink follows,
+    /// which is what a replay applies, where the sink counts them.
+    fn committed_operations(&self) -> Option<u64> {
+        None
+    }
+
+    /// The directory this sink's collection was read from and why it cannot
+    /// be written, for a sink that takes no record at all. The collection
+    /// refuses every mutation, a checkpoint, a journal and a save into that
+    /// directory with it.
+    fn read_only(&self) -> Option<(&std::path::Path, &str)> {
         None
     }
 
@@ -311,15 +347,16 @@ pub trait OperationSink: Send + std::fmt::Debug {
 /// The sink a collection hands its records to, and the fault a failed
 /// commit left on it.
 ///
-/// A commit that fails leaves the records it was to make durable in the
-/// sink and out of the collection, since the call refuses them, and they
-/// may or may not be on the device. A replay would install them. So a
-/// mutation recorded after them would replay onto a collection holding
-/// records this one refused, and an insert under the same id, which is what
-/// a retry is, would refuse the whole open as a record the collection
-/// already holds. The fault stops that: every record is refused with it
-/// until a checkpoint syncs the journal, records a sequence at or above the
-/// refused records so a replay skips them, and truncates them.
+/// A commit that fails is withdrawn by the sink where it can be, so a
+/// replay does not install the records the call refused. The fault stands
+/// whatever the withdrawal achieved: a failed sync may also have lost
+/// records of earlier calls that the device had not yet written, and a
+/// mutation recorded after such a gap would replay onto a collection
+/// missing what came before it. So every record is refused with the fault
+/// until a checkpoint commits, which writes the collection from memory into
+/// files the failure never touched and rolls the journal onto a segment
+/// naming them. A checkpoint whose own sync fails leaves a fault the same
+/// way, which its commit then clears.
 #[derive(Debug, Default)]
 pub(crate) struct SinkSlot {
     attached: Option<Box<dyn OperationSink>>,
@@ -349,24 +386,28 @@ impl SinkSlot {
 /// The journal a collection hands its records to, as a caller sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalStatus {
-    /// The file.
+    /// The journal, being its directory of segments.
     pub path: std::path::PathBuf,
     /// The policy every commit keeps.
     pub durability: Durability,
     /// The sequence the checkpoint in the directory holds.
     pub checkpoint_sequence: u64,
-    /// The last sequence handed to the journal.
+    /// The last sequence handed to the journal, a commit's or an abort's
+    /// among them.
     pub sequence_reached: u64,
-    /// The file's length, where the filesystem answered.
+    /// Operation records committed since the checkpoint.
+    pub records: u64,
+    /// The bytes of every segment.
     pub bytes: Option<u64>,
+    /// The segments the journal holds.
+    pub segments: usize,
 }
 
 impl JournalStatus {
-    /// Records a replay of the journal would apply, being every record
-    /// above the checkpoint's sequence.
+    /// Records a replay of the journal would apply, being every operation
+    /// record committed above the checkpoint's sequence.
     pub fn records_since_checkpoint(&self) -> u64 {
-        self.sequence_reached
-            .saturating_sub(self.checkpoint_sequence)
+        self.records
     }
 }
 
@@ -1446,11 +1487,12 @@ impl Collection {
     /// sparse space, or one that takes term ids alone.
     ///
     /// Every term given an id here is handed to the sink as an
-    /// [`Operation::Intern`] at the moment of issue, under the dictionary's
-    /// guard, so the records arrive in id order and each precedes the
-    /// insert whose sparse half carries the id. A sink that refuses the
-    /// record refuses the count, with the term interned, which is the state
-    /// a replay of the records before it reaches.
+    /// [`Operation::Intern`] naming the id it is about to take, under the
+    /// dictionary's guard and before the term is interned, so the records
+    /// arrive in id order and each precedes the insert whose sparse half
+    /// carries the id. A sink that refuses the record refuses the count with
+    /// the term not interned, so the dictionary holds no term a replay of the
+    /// records cannot reach.
     fn count_record_terms(&self, terms: &[String]) -> Result<SparseVector, Error> {
         let layer = self.text_layer()?;
         let mut dictionary = layer.dictionary.write().unwrap();
@@ -1541,7 +1583,7 @@ impl Collection {
     /// The sink's guard is taken alone and released before the checkpoint
     /// sequence is read, so nothing is held across anything.
     pub fn journal_status(&self) -> Option<JournalStatus> {
-        let (path, durability, sequence_reached, bytes) = {
+        let (path, durability, sequence_reached, records, bytes, segments) = {
             let slot = self.sink.lock().unwrap();
             let sink = slot.attached.as_ref()?;
             let path = sink.journal_path()?.to_path_buf();
@@ -1550,7 +1592,9 @@ impl Collection {
                 path,
                 durability,
                 sink.sequence_reached(),
+                sink.committed_operations().unwrap_or(0),
                 sink.journal_bytes(),
+                sink.journal_segments().unwrap_or(0),
             )
         };
         Some(JournalStatus {
@@ -1558,7 +1602,9 @@ impl Collection {
             durability,
             checkpoint_sequence: self.journal_sequence(),
             sequence_reached,
+            records,
             bytes,
+            segments,
         })
     }
 
@@ -1574,34 +1620,79 @@ impl Collection {
     ///
     /// The mutation guard is the caller's, because a checkpoint syncs and
     /// then saves under one hold, so nothing is handed over between the two.
-    /// A fault a failed commit left stands through this: the sync makes the
-    /// refused records durable, and it is the truncation after the save
-    /// that puts them behind the sequence the directory names.
+    ///
+    /// A sync that fails does not stop the checkpoint, since the save writes
+    /// the collection from memory and its commit makes every record durable
+    /// whatever the journal holds. It is logged, and it leaves a fault where
+    /// none stands, so a save that then fails leaves the collection refusing
+    /// mutations, as a failed commit does. A child forked from the process
+    /// that opened the journal is refused, since its save would race the
+    /// parent's.
     pub(crate) fn sync_sink_locked(&self) -> Result<Option<u64>, Error> {
         let mut slot = self.sink.lock().unwrap();
         let Some(sink) = slot.attached.as_mut() else {
             return Ok(None);
         };
-        sink.sync()?;
-        Ok(Some(sink.sequence_reached()))
+        let synced = sink.sync();
+        let reached = sink.sequence_reached();
+        match synced {
+            Ok(()) => {}
+            Err(error @ Error::JournalForked { .. }) => return Err(error),
+            Err(error) => {
+                let message = error.to_string();
+                warn!(target: "zeusdb_vector_database::journal",
+                    operation = "checkpoint_sync_failed",
+                    sequence = reached,
+                    error = %message,
+                    "The journal could not be synced before the checkpoint; the checkpoint writes \
+                     the collection from memory and goes on, and its commit clears the fault"
+                );
+                if slot.fault.is_none() {
+                    slot.fault = Some(SinkFault {
+                        sequence: reached,
+                        error: message,
+                    });
+                }
+            }
+        }
+        Ok(Some(reached))
     }
 
-    /// Drop every record the sink holds, which the checkpoint that has just
-    /// committed its directory now holds itself, and with them the fault a
-    /// failed commit left, since the records it refused are now at or below
-    /// the sequence the directory names and a replay skips them. Does
-    /// nothing where no sink is attached. The mutation guard is the
-    /// caller's.
-    pub(crate) fn truncate_sink_locked(&self) -> Result<(), Error> {
+    /// Roll the sink onto the checkpoint `base`, whose directory has just
+    /// committed and holds every record the sink holds, and clear the fault
+    /// a failed commit left, since that directory holds the collection as
+    /// this process has it. Does nothing where no sink is attached. The
+    /// mutation guard is the caller's. A roll that fails leaves the fault,
+    /// and the sink takes nothing more until a later checkpoint rolls it.
+    pub(crate) fn roll_sink_locked(&self, base: SegmentBase) -> Result<(), Error> {
         let mut slot = self.sink.lock().unwrap();
         match slot.attached.as_mut() {
             Some(sink) => {
-                sink.truncate()?;
+                sink.roll(base)?;
                 slot.fault = None;
                 Ok(())
             }
             None => Ok(()),
         }
+    }
+
+    /// The refusal a collection read from a medium it cannot write meets for
+    /// a mutation, a checkpoint and a journal, where its sink takes nothing.
+    pub(crate) fn sink_refusal(&self) -> Option<Error> {
+        let slot = self.sink.lock().unwrap();
+        let (directory, reason) = slot.attached.as_ref()?.read_only()?;
+        Some(Error::CollectionReadOnly {
+            directory: directory.display().to_string(),
+            reason: reason.to_string(),
+        })
+    }
+
+    /// The directory a collection read from a medium it cannot write was
+    /// read from, where its sink takes nothing.
+    pub(crate) fn sink_read_only_directory(&self) -> Option<std::path::PathBuf> {
+        let slot = self.sink.lock().unwrap();
+        let (directory, _) = slot.attached.as_ref()?.read_only()?;
+        Some(directory.to_path_buf())
     }
 
     /// The file name and the collection id the sink names, for the manifest
@@ -1638,6 +1729,22 @@ impl Collection {
     /// under `writers`, and skips the encode when none is.
     fn sink_attached(&self) -> bool {
         self.sink.lock().unwrap().attached.is_some()
+    }
+
+    /// Whether a sink is attached, and, where it takes nothing, the
+    /// directory and the reason its refusal names, under one hold of the
+    /// sink's guard. The insert path asks once per batch, under `writers`.
+    fn sink_state(&self) -> (bool, Option<(String, String)>) {
+        let slot = self.sink.lock().unwrap();
+        match slot.attached.as_ref() {
+            None => (false, None),
+            Some(sink) => (
+                true,
+                sink.read_only().map(|(directory, reason)| {
+                    (directory.display().to_string(), reason.to_string())
+                }),
+            ),
+        }
     }
 
     /// Hand one operation's record to the sink, where one is attached,
@@ -1690,11 +1797,11 @@ impl Collection {
     /// record of a call and before the call mutates.
     ///
     /// A commit that fails is the one failure the seam holds on to. The
-    /// caller refuses every record the commit was to make durable, so they
-    /// are in the sink and not in the collection, and they may or may not
-    /// be on the device. The failure is written onto the slot with the
-    /// sequence the sink had reached, and every record after it is refused
-    /// with it until a checkpoint reconciles the two; see [`SinkSlot`].
+    /// caller refuses every record the commit was to make durable, and the
+    /// sink has withdrawn them where it could. The failure is written onto
+    /// the slot with the sequence the sink had reached, and every record
+    /// after it is refused with it until a checkpoint commits; see
+    /// [`SinkSlot`].
     fn commit_records(&self) -> Result<(), Error> {
         let mut slot = self.sink.lock().unwrap();
         let Some(sink) = slot.attached.as_mut() else {
@@ -1709,8 +1816,8 @@ impl Collection {
                     operation = "journal_commit_failed",
                     sequence = sequence,
                     error = %message,
-                    "The journal's commit failed; its records are refused and nothing is \
-                     recorded until a checkpoint reconciles the journal with the directory"
+                    "The journal's commit failed; its records are refused and withdrawn where \
+                     the journal allowed, and nothing is recorded until a checkpoint commits"
                 );
                 slot.fault = Some(SinkFault {
                     sequence,

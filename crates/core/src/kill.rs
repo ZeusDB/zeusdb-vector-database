@@ -33,8 +33,10 @@
 
 /// Every point a process can be aborted at.
 ///
-/// The six inside an `add` and the eleven inside a checkpoint, each named for
-/// the step it follows.
+/// Ten inside an `add`, three of them reached only where its commit fails,
+/// two in a roll by size, ten inside a checkpoint, four inside the upgrade
+/// of a journal of format version 1, and one with the lock held, each named
+/// for the step it follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum KillPoint {
@@ -46,10 +48,22 @@ pub enum KillPoint {
     AddAfterSecondAppend,
     /// After every record of a segment is handed over and before the commit.
     AddAfterAppendBeforeCommit,
+    /// After the commit record is written and before it is synced.
+    AddAfterCommitRecord,
     /// After the commit and before the first record is installed.
     AddAfterCommitBeforeApply,
     /// After every record of the call is installed.
     AddAfterApply,
+    /// After a commit's sync failed and before the abort is written.
+    AddAfterFailedCommit,
+    /// With half an abort record's bytes written and no more.
+    AddMidAbort,
+    /// After the abort record is written and before it is synced.
+    AddAfterAbortBeforeSync,
+    /// After a full segment is synced and before the next one is created.
+    RollAfterSeal,
+    /// After the next segment is created and before a record lands in it.
+    RollAfterCreate,
     /// After the journal is synced and the sequence recorded, before the save.
     CheckpointBeforeSave,
     /// After the save has written every artefact but the graph dump.
@@ -63,16 +77,28 @@ pub enum KillPoint {
     SaveBetweenRenames,
     /// After the staged directory is in place.
     SaveAfterCommit,
-    /// After the save and before the journal is truncated.
-    CheckpointAfterSaveBeforeTruncate,
-    /// Before the truncation's first step.
-    TruncateBefore,
-    /// After the body is cut and synced, before the header is restated.
-    TruncateAfterSetLen,
-    /// After the header is restated and synced.
-    TruncateAfterHeader,
-    /// After the whole checkpoint.
-    CheckpointAfterTruncate,
+    /// After the save and before the journal rolls onto a segment naming it.
+    CheckpointAfterSaveBeforeRoll,
+    /// After the segment naming the checkpoint is created and synced, and
+    /// before any segment the checkpoint holds is deleted.
+    CheckpointAfterRoll,
+    /// After the first segment the checkpoint holds is deleted.
+    CheckpointMidDelete,
+    /// After every segment the checkpoint holds is deleted.
+    CheckpointAfterDelete,
+    /// After a journal of format version 1 is replayed and before the
+    /// checkpoint that upgrades its directory.
+    UpgradeAfterReplay,
+    /// After the upgrading checkpoint's directory is in place and before its
+    /// journal's first segment is created.
+    UpgradeAfterCommit,
+    /// After that segment is created and before the version 1 file goes.
+    UpgradeAfterSegment,
+    /// After the version 1 file is removed.
+    UpgradeAfterOldRemoved,
+    /// After `journal_to` takes the collection's lock and before anything is
+    /// written.
+    LockHeld,
 }
 
 impl KillPoint {
@@ -82,19 +108,29 @@ impl KillPoint {
         KillPoint::AddMidAppend,
         KillPoint::AddAfterSecondAppend,
         KillPoint::AddAfterAppendBeforeCommit,
+        KillPoint::AddAfterCommitRecord,
         KillPoint::AddAfterCommitBeforeApply,
         KillPoint::AddAfterApply,
+        KillPoint::AddAfterFailedCommit,
+        KillPoint::AddMidAbort,
+        KillPoint::AddAfterAbortBeforeSync,
+        KillPoint::RollAfterSeal,
+        KillPoint::RollAfterCreate,
         KillPoint::CheckpointBeforeSave,
         KillPoint::SaveAfterArtefacts,
         KillPoint::SaveAfterDump,
         KillPoint::SaveAfterManifest,
         KillPoint::SaveBetweenRenames,
         KillPoint::SaveAfterCommit,
-        KillPoint::CheckpointAfterSaveBeforeTruncate,
-        KillPoint::TruncateBefore,
-        KillPoint::TruncateAfterSetLen,
-        KillPoint::TruncateAfterHeader,
-        KillPoint::CheckpointAfterTruncate,
+        KillPoint::CheckpointAfterSaveBeforeRoll,
+        KillPoint::CheckpointAfterRoll,
+        KillPoint::CheckpointMidDelete,
+        KillPoint::CheckpointAfterDelete,
+        KillPoint::UpgradeAfterReplay,
+        KillPoint::UpgradeAfterCommit,
+        KillPoint::UpgradeAfterSegment,
+        KillPoint::UpgradeAfterOldRemoved,
+        KillPoint::LockHeld,
     ];
 
     /// What a case names the point, which is what a directory and a marker
@@ -105,19 +141,29 @@ impl KillPoint {
             KillPoint::AddMidAppend => "add:mid_append",
             KillPoint::AddAfterSecondAppend => "add:after_second_append",
             KillPoint::AddAfterAppendBeforeCommit => "add:after_append_before_commit",
+            KillPoint::AddAfterCommitRecord => "add:after_commit_record",
             KillPoint::AddAfterCommitBeforeApply => "add:after_commit_before_apply",
             KillPoint::AddAfterApply => "add:after_apply",
+            KillPoint::AddAfterFailedCommit => "add:after_failed_commit",
+            KillPoint::AddMidAbort => "add:mid_abort",
+            KillPoint::AddAfterAbortBeforeSync => "add:after_abort_before_sync",
+            KillPoint::RollAfterSeal => "roll:after_seal",
+            KillPoint::RollAfterCreate => "roll:after_create",
             KillPoint::CheckpointBeforeSave => "checkpoint:before_save",
             KillPoint::SaveAfterArtefacts => "save:after_artefacts",
             KillPoint::SaveAfterDump => "save:after_dump",
             KillPoint::SaveAfterManifest => "save:after_manifest",
             KillPoint::SaveBetweenRenames => "save:between_renames",
             KillPoint::SaveAfterCommit => "save:after_commit",
-            KillPoint::CheckpointAfterSaveBeforeTruncate => "checkpoint:after_save_before_truncate",
-            KillPoint::TruncateBefore => "truncate:before",
-            KillPoint::TruncateAfterSetLen => "truncate:after_setlen",
-            KillPoint::TruncateAfterHeader => "truncate:after_header",
-            KillPoint::CheckpointAfterTruncate => "checkpoint:after_truncate",
+            KillPoint::CheckpointAfterSaveBeforeRoll => "checkpoint:after_save_before_roll",
+            KillPoint::CheckpointAfterRoll => "checkpoint:after_roll",
+            KillPoint::CheckpointMidDelete => "checkpoint:mid_delete",
+            KillPoint::CheckpointAfterDelete => "checkpoint:after_delete",
+            KillPoint::UpgradeAfterReplay => "upgrade:after_replay",
+            KillPoint::UpgradeAfterCommit => "upgrade:after_commit",
+            KillPoint::UpgradeAfterSegment => "upgrade:after_segment",
+            KillPoint::UpgradeAfterOldRemoved => "upgrade:after_old_removed",
+            KillPoint::LockHeld => "lock:held",
         }
     }
 

@@ -888,17 +888,21 @@ impl HNSWIndex {
 
     /// Open a journal beside `path` and record every mutation to it from now on.
     ///
-    /// The journal is a file, `<path>.zdbwal`, beside the directory at `path`.
-    /// It holds every add, removal, metadata change, clear, compaction, rebuild
-    /// and training since the directory was last saved, and `load(path)`
-    /// replays it over the directory, so a process that stops without saving,
-    /// however it stops, loses nothing that a call had returned from.
+    /// The journal is a directory of segments, `<path>.zdbjournal`, beside the
+    /// directory at `path`. It holds every add, removal, metadata change,
+    /// clear, compaction, rebuild and training since the directory was last
+    /// saved, each call closed by a commit record, and `load(path)` replays
+    /// it over the directory, so a process that stops without saving, however
+    /// it stops, loses nothing that a call had returned from.
     ///
-    /// Opening it saves the index into `path` first, as `save(path)` would, so
-    /// the file has a checkpoint to replay onto. From then on `save` on this
-    /// index takes `path` and no other directory, `checkpoint()` is `save`
-    /// with the path taken from the journal, and `journal_path` is the file.
-    /// An index is journaled once.
+    /// Opening it takes the directory's lock, `<path>.zdblock`, which the
+    /// index holds until it is dropped, so a second index in this process or
+    /// another that loads, saves into or journals the directory is refused
+    /// with `CollectionLocked`. It then saves the index into `path`, as
+    /// `save(path)` would, so the journal has a checkpoint to replay onto.
+    /// From then on `save` on this index takes `path` and no other directory,
+    /// `checkpoint()` is `save` with the path taken from the journal, and
+    /// `journal_path` is the journal's directory. An index is journaled once.
     ///
     /// `durability` is what a call promises about its records once it has
     /// returned. A process that stops loses nothing under any of the three;
@@ -919,24 +923,30 @@ impl HNSWIndex {
     ///   that calls `checkpoint()` at the end.
     ///
     /// A call whose flush fails raises, or under `add` reports every record of
-    /// the batch in `AddResult.errors`, installs none of them, and the index
-    /// then refuses every mutation until `checkpoint()` succeeds, because the
-    /// refused records may have reached the file and a replay would install
-    /// them. See `checkpoint`.
+    /// the batch in `AddResult.errors`, and installs none of them. The journal
+    /// withdraws those records, by an abort record or by cutting them off, so
+    /// a replay does not install them, and the message says which, or says
+    /// that neither landed and the records may come back after a crash until
+    /// a checkpoint. The index then refuses every mutation until
+    /// `checkpoint()` succeeds, because a failed flush may also have lost
+    /// records of earlier calls that the device had not written. See
+    /// `checkpoint`.
     ///
     /// A directory saved with a journal lists `journal` among the features its
     /// manifest records, and opens on this release or later. The checkpoint
     /// this writes is a save, so it moves `identity`'s generation on by one,
-    /// and the journal's header names `identity`'s collection id. `load` holds
-    /// the journal open until the index is dropped, and a file deleted or moved
-    /// under a live index is one the directory can no longer replay, so drop
-    /// the index before touching the file. A record whose journal entry would
-    /// exceed 65 MiB is refused on a journaled index and accepted on one
-    /// without a journal.
+    /// and every segment names `identity`'s collection id and the checkpoint
+    /// it follows. The index holds the journal open until it is dropped, and a
+    /// segment deleted or moved under a live index is one the directory can no
+    /// longer replay, so drop the index before touching the journal. A record
+    /// whose journal entry would exceed 65 MiB is refused on a journaled index
+    /// and accepted on one without a journal. In a child process forked from
+    /// the one that opened the journal, every mutation raises `JournalForked`.
     ///
     /// Raises ValueError for a durability that is not one of the three, for
     /// `interval_ms` under any other durability, or for `interval_ms` of 0, and
-    /// RuntimeError for an index that already has a journal.
+    /// RuntimeError for an index that already has a journal, for a directory
+    /// another holder has locked, and for a filesystem that cannot lock.
     #[pyo3(signature = (path, durability = "call", interval_ms = None))]
     #[instrument(level = "info", skip(self, py), fields(
         path = path,
@@ -954,8 +964,8 @@ impl HNSWIndex {
         Ok(py.detach(|| self.inner.journal_to(path, durability))?)
     }
 
-    /// Save the index into the directory its journal sits beside and empty the
-    /// journal.
+    /// Save the index into the directory its journal sits beside and start the
+    /// journal again after it.
     ///
     /// What `save(path)` does on a journaled index, with the path taken from
     /// the journal. Nothing runs it for you. An index that is never
@@ -967,12 +977,17 @@ impl HNSWIndex {
     /// long-running process checkpoints on a schedule of its own, since a
     /// checkpoint holds writes for the length of the save.
     ///
-    /// After a call whose flush failed, this is what lets the index take
-    /// mutations again: the flush is tried once more, the records the failed
-    /// call refused are put behind the sequence the directory names so a
-    /// replay skips them, and the journal is emptied.
+    /// The journal moves onto a new segment naming the directory just written,
+    /// and every segment the directory holds the records of is deleted.
     ///
-    /// Raises RuntimeError on an index with no journal.
+    /// After a call whose flush failed, this is what lets the index take
+    /// mutations again. The flush is tried once more and a failure is logged
+    /// and passed, since the directory is written from memory and holds every
+    /// record the index holds. The segments the failure touched are deleted
+    /// once the directory is in place.
+    ///
+    /// Raises RuntimeError on an index with no journal, and on an index read
+    /// from a directory this process cannot write.
     #[instrument(level = "info", skip(self, py), fields(
         vector_count = self.inner.vector_count()
     ), err)]
@@ -982,9 +997,10 @@ impl HNSWIndex {
 
     /// Python property: `index.journal_path`
     ///
-    /// The file this index records its mutations to, or `None` where it has
-    /// no journal. `journal_to` sets it and `load` of a journaled directory
-    /// finds it.
+    /// The journal this index records its mutations to, being the directory
+    /// of its segments, `<path>.zdbjournal`, or `None` where it has no
+    /// journal. `journal_to` sets it and `load` of a journaled directory finds
+    /// it. An index read from a directory this process cannot write has none.
     #[getter]
     pub fn journal_path(&self) -> Option<String> {
         self.inner

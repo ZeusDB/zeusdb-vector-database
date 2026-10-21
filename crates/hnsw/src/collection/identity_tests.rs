@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use zeusdb_vector_core::{Error, FsStorage};
 
 use super::{Collection, Declaration, Identity, ParsedRecord};
-use crate::journal::{journal_path, Durability, JournalSink};
+use crate::journal::{journal_path, Durability};
 
 // ============================================================================
 // FIXTURES
@@ -116,7 +116,8 @@ fn recorded(dir: &Path) -> Identity {
 
 /// The collection id the journal beside `dir` names in its header.
 fn header_id(dir: &Path) -> u128 {
-    let bytes = std::fs::read(journal_path(dir).unwrap()).unwrap();
+    let segments = super::journal_support::Segments::of(dir);
+    let bytes = segments.bytes.last().expect("the journal holds a segment");
     u128::from_le_bytes(bytes[24..40].try_into().unwrap())
 }
 
@@ -398,7 +399,10 @@ fn a_directory_recording_no_identity_is_named_at_its_next_save() {
     let path = temp.at("older.zdb");
     save(&collection, &path);
     drop(collection);
+    // A 4.0.0 directory saved before the identity was recorded, since
+    // every 5.x manifest records one.
     rewrite_manifest(&path, |m| {
+        m["format_version"] = json!("4.0.0");
         m.as_object_mut().unwrap().remove("identity");
         m.as_object_mut().unwrap().remove("features");
     });
@@ -425,30 +429,25 @@ fn a_directory_recording_no_identity_is_named_at_its_next_save() {
 /// record existed, it lists no features either.
 #[test]
 fn a_journaled_directory_recording_no_identity_takes_its_journal_records_id() {
+    // A 3.0.0 directory 0.11.0 wrote, which records no identity. Its load
+    // upgrades it, and the upgrade's checkpoint is its first save.
     let temp = TempDir::new();
-    let path = temp.at("older-journaled.zdb");
-    let collection = Collection::build(declaration(), None);
-    let id = collection.collection_id();
-    collection
-        .journal_to(path.to_str().unwrap(), Durability::default())
-        .unwrap();
-    add(&collection, 0..6);
-    drop(collection);
-    rewrite_manifest(&path, |m| {
-        m.as_object_mut().unwrap().remove("identity");
-        m.as_object_mut().unwrap().remove("features");
-    });
+    let name = super::journal_support::FIXTURES[0];
+    let path = super::journal_support::copy_fixture(name, &temp.0);
+    let original = manifest(&path);
+    assert!(original.get("identity").is_none());
+    let id =
+        u128::from_str_radix(original["journal"]["collection_id"].as_str().unwrap(), 16).unwrap();
 
     let (recovered, report) =
         Collection::recover(path.to_str().unwrap(), None, Durability::default()).unwrap();
-    assert_eq!(report.replayed, 6);
+    assert_eq!(report.replayed, 72);
     assert_eq!(recovered.collection_id(), id);
-    assert_eq!(recovered.identity().generation, 0);
-    recovered.checkpoint().unwrap();
     let named = recorded(&path);
     assert_eq!(named.collection_id, id);
     assert_eq!(named.generation, 1);
     assert_eq!(named.parent, None);
+    assert_eq!(recovered.identity(), named);
     assert_eq!(header_id(&path), id);
 }
 
@@ -508,7 +507,8 @@ fn an_identity_no_save_writes_is_refused() {
         "manifest.json records an identity this build cannot read: its generation is 0, and \
          a collection's first save records 1. A saved directory records the id of its \
          collection, its generation counting from 1, the id of its snapshot and, where it has \
-         one, the id of the snapshot it was saved from, every id as 32 hexadecimal digits."
+         one, the id of the snapshot it was saved from, every id as 32 hexadecimal digits, and \
+         from format 5.0.0 the journal sequence its state holds."
     );
     let negative = refused("negative.zdb", &|m: &mut Value| {
         m["identity"]["generation"] = json!(-1)
@@ -557,11 +557,10 @@ fn a_journal_record_and_an_identity_naming_two_collections_are_refused() {
 
     let record_apart = temp.at("record-apart.zdb");
     copy_dir(&path, &record_apart);
-    std::fs::copy(
-        journal_path(&path).unwrap(),
-        journal_path(&record_apart).unwrap(),
-    )
-    .unwrap();
+    copy_dir(
+        &journal_path(&path).unwrap(),
+        &journal_path(&record_apart).unwrap(),
+    );
     rewrite_manifest(&record_apart, |m| {
         m["journal"]["collection_id"] = json!(hex(other))
     });
@@ -584,11 +583,10 @@ fn a_journal_record_and_an_identity_naming_two_collections_are_refused() {
 
     let identity_apart = temp.at("identity-apart.zdb");
     copy_dir(&path, &identity_apart);
-    std::fs::copy(
-        journal_path(&path).unwrap(),
-        journal_path(&identity_apart).unwrap(),
-    )
-    .unwrap();
+    copy_dir(
+        &journal_path(&path).unwrap(),
+        &journal_path(&identity_apart).unwrap(),
+    );
     rewrite_manifest(&identity_apart, |m| {
         m["identity"]["collection_id"] = json!(hex(other))
     });
@@ -645,8 +643,12 @@ fn a_save_refuses_a_sink_naming_another_collection() {
     let collection = Collection::build(declaration(), None);
     add(&collection, 0..4);
     let other = collection.collection_id() ^ 1;
-    let sink =
-        JournalSink::create(&FsStorage::at(&path).unwrap(), other, Durability::PerCall).unwrap();
+    let sink = super::journal_support::sink_over(
+        &FsStorage::at(&path).unwrap(),
+        &path,
+        other,
+        Durability::PerCall,
+    );
     collection.attach_sink(Box::new(sink));
 
     match collection.save(path.to_str().unwrap()) {

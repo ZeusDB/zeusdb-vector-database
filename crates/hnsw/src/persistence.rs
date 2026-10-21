@@ -22,26 +22,25 @@
 //!         ├── postings.zdbsparse  # every live record's term ids and weights
 //!         └── terms.zdbdict       # the term dictionary, where the space takes text
 //!
-//! my_index.zdb.zdbwal         # the journal, where the collection held one
+//! my_index.zdb.zdbjournal/    # the journal's segments, where the collection holds one
+//! my_index.zdb.zdblock        # the lock, created by the first lock taken on the directory
 //! ```
 //!
 //! ## The format version and the features
 //!
-//! Every directory this build saves declares `4.0.0` and lists the features
+//! Every directory this build saves declares `5.0.0` and lists the features
 //! it holds under `features`, each with the mark a build that does not know
 //! it reads. See `features` for what a feature is and what each mark means.
 //!
-//! The version is a major for the base every 4.x directory shares and for the
+//! The version is a major for the base every 5.x directory shares and for the
 //! manifest's own shape, `features` included, which a reader must know before
-//! it can read a feature. It is a major because the four binary artefacts,
-//! `mappings.bin`, `vectors.bin`, `pq_codes.bin` and `pq_centroids.bin`, are
-//! written inside the frame `zeusdb_vector_core::frame` describes, where every
-//! earlier release wrote them in bincode's wire and reads nothing else. A
-//! release reading 1.x to 3.x alone refuses such a directory at its version
-//! check, with a message naming the newer release. `framed` holds the four
-//! payloads. A feature does not move the version. A later feature is a name
-//! in `features`, and a build that does not know it refuses the directory by
-//! that name unless the directory marks it compatible.
+//! it can read a feature. 5.0.0 is a major because its journal is a directory
+//! of segments, each naming the checkpoint its records follow, and every
+//! call's records are closed by a commit record, which a release reading 4.x
+//! alone cannot read. A release reading 1.x to 4.x alone refuses such a
+//! directory at its version check, with a message naming the newer release.
+//! A 5.x manifest lists its features and records its identity with the
+//! journal sequence its state holds, and one missing either is refused.
 //!
 //! This build reads every major an earlier release wrote. A directory holding
 //! a dense space alone was written at `1.1.0`, one holding a sparse space at
@@ -52,8 +51,19 @@
 //! word. A dense space declared with scalar quantization moved each to its
 //! next minor, `1.2.0`, `2.1.0` or `3.1.0`, since a reader that knows the
 //! product quantized fields alone refuses such a directory on the first one
-//! its `quantization.json` lacks. No directory below 4.0.0 lists features,
-//! and what one holds is read from its version and its files, as it was.
+//! its `quantization.json` lacks. `4.0.0` framed the four binary artefacts,
+//! `mappings.bin`, `vectors.bin`, `pq_codes.bin` and `pq_centroids.bin`,
+//! inside the frame `zeusdb_vector_core::frame` describes, where every
+//! earlier release wrote them in bincode's wire, and listed features for the
+//! first time. `framed` holds the four payloads. No directory below 4.0.0
+//! lists features, and what one holds is read from its version and its
+//! files, as it was.
+//!
+//! A journaled directory below 5.0.0 has its journal in one file,
+//! `<name>.zdbwal`, at journal format version 1. A load replays it and then
+//! upgrades the directory: a checkpoint at 5.0.0 with a journal of segments,
+//! after which the file goes. Releases before 0.14.0 do not open the
+//! directory afterwards.
 //!
 //! The four binary artefacts of a directory are read in one layout, decided
 //! from `mappings.bin`, which every directory holds. At 4.x it is the frame.
@@ -63,13 +73,14 @@
 //!
 //! ## The journal
 //!
-//! A journaled collection records every mutation to `<name>.zdbwal`, a
-//! sibling of the directory rather than a file inside it, and a save is the
-//! checkpoint that journal replays onto. `manifest.json` names the file, the
-//! collection id both carry and the sequence the checkpoint holds, so the two
-//! are paired by content. A load replays every record above that sequence
-//! before it hands the collection back. See `crate::journal` for where the
-//! file lives and why, and for what is refused.
+//! A journaled collection records every mutation to `<name>.zdbjournal`, a
+//! directory of segments beside the directory rather than inside it, and a
+//! save is the checkpoint that journal replays onto. `manifest.json` names
+//! the journal, the collection id both carry and the sequence the checkpoint
+//! holds, and every segment names the checkpoint it follows, so the two are
+//! paired by content. A load replays every committed record above that
+//! sequence before it hands the collection back. See `crate::journal` for
+//! where the journal lives and why, for the lock, and for what is refused.
 //!
 //! ## Identity
 //!
@@ -135,7 +146,7 @@ use crate::collection::{
     validate_space_supports_quantization, Collection, PositionReader, QuantizationConfig,
     QuantizationScheme, SparseDeclaration, StorageMode, DEFAULT_SPACE,
 };
-use crate::journal::{JournalPolicy, Recovery};
+use crate::journal::{Durability, JournalPolicy, JournalSink, ReadOnlySink, Recovery};
 use crate::RerankCalibration;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -145,11 +156,13 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, warn};
 use zeusdb_vector_core::{
-    checksum_of, frame, frame_begin, frame_finish, refuse_unnamable, unframe,
-    validate_indexed_fields, ArtefactRecord, Bounds, Dir, Error, FrameEncoding, FrameKind,
-    FsStorage, IdStore, Int8Codec, Inventory, Position, PositionWalk, RecordFields, Restore,
-    SpaceName, Storage, VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME, FRAME_OVERHEAD_BYTES,
-    LEGACY_DUMP_FILENAMES, MAX_INTERNAL_ID, PQ,
+    checksum_of, frame, frame_begin, frame_finish, read_legacy_journal, read_segments,
+    refuse_unnamable, refuses_writes, unframe, validate_indexed_fields, ArtefactRecord, Bounds,
+    Dir, Error, Expected, FrameEncoding, FrameKind, FsStorage, IdStore, Int8Codec, Inventory,
+    JournalWriter, LockFailure, LockGuard, LockMode, Locked, Operation, Position, PositionWalk,
+    RecordFields, RecordState, Restore, SegmentBase, SegmentBytes, SpaceName, Storage, VectorIndex,
+    DUMP_FILENAME as GRAPH_DUMP_FILENAME, FRAME_OVERHEAD_BYTES, LEGACY_DUMP_FILENAMES,
+    MAX_INTERNAL_ID, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerConfig};
@@ -169,11 +182,10 @@ const LOG_TARGET: &str = "zeusdb_vector_database::persistence";
 
 /// Version written into manifest.json by every save.
 ///
-/// A major, because the four binary artefacts are framed; see the module
-/// documentation. A sparse space, a journal and scalar quantization each
-/// moved the version an earlier release wrote, and none moves this one,
-/// since a directory lists what it holds under `features`.
-const FORMAT_VERSION: &str = "4.0.0";
+/// A major, because the journal is a directory of segments closed by commit
+/// records; see the module documentation. A feature does not move it, since
+/// a directory lists what it holds under `features`.
+const FORMAT_VERSION: &str = "5.0.0";
 
 /// The first major whose four binary artefacts are framed.
 const FRAMED_FORMAT_MAJOR: u32 = 4;
@@ -181,6 +193,12 @@ const FRAMED_FORMAT_MAJOR: u32 = 4;
 /// The first major whose saves list their features. Below it no release
 /// listed them, and the version decides what a directory holds.
 const FEATURES_FORMAT_MAJOR: u32 = 4;
+
+/// The first major whose journal is a directory of segments, and whose
+/// manifest must list its features and record its identity with the
+/// journal sequence its state holds. Below it a journal is one file at
+/// journal format version 1, which a load replays and upgrades.
+const SEGMENTED_FORMAT_MAJOR: u32 = 5;
 
 /// The two artefacts of a trained scalar quantized index.
 const INT8_SCALES_FILENAME: &str = "int8_scales.zdbint8";
@@ -191,14 +209,14 @@ const INT8_ROWS_CONTENTS: &str = "the scalar row of every record";
 
 /// The majors this build reads.
 ///
-/// A minor bump is additive by construction, so any 1.x, any 2.x, any 3.x
-/// and any 4.x is read. A different major means the layout changed in a way
-/// this build cannot reason about, and guessing at it would be the silent
-/// truncation this format has already suffered once.
-const SUPPORTED_FORMAT_MAJORS: [u32; 4] = [1, 2, 3, 4];
+/// A minor bump is additive by construction, so any 1.x, any 2.x, any 3.x,
+/// any 4.x and any 5.x is read. A different major means the layout changed
+/// in a way this build cannot reason about, and guessing at it would be the
+/// silent truncation this format has already suffered once.
+const SUPPORTED_FORMAT_MAJORS: [u32; 5] = [1, 2, 3, 4, 5];
 
 /// The majors this build reads, as a refusal spells them.
-const SUPPORTED_FORMAT_LABEL: &str = "1.x, 2.x, 3.x and 4.x";
+const SUPPORTED_FORMAT_LABEL: &str = "1.x, 2.x, 3.x, 4.x and 5.x";
 
 /// The first major whose manifest may name a journal.
 const JOURNAL_FORMAT_MAJOR: u32 = 3;
@@ -648,15 +666,17 @@ pub(crate) struct IndexManifest {
 
 /// How `manifest.json` names the journal beside the directory.
 ///
-/// The three values are what pair a directory with a file that is not in it.
-/// `collection_id` is drawn when a collection is built and is in the
-/// journal's own header too, so a journal from another index is refused by
-/// content. `sequence` is what the journal had reached when this checkpoint
-/// was taken, so a recovery replays every record above it and skips every
-/// record at or below it. `file` is the sibling's name as the checkpoint
-/// wrote it, which a refusal quotes; the file a load actually opens is
-/// derived from the directory it was handed, so a directory renamed together
-/// with its journal opens under the new name.
+/// The three values are what pair a directory with a journal that is not in
+/// it, under the names and types every release from 0.11.0 parses before its
+/// version check. `collection_id` is drawn when a collection is built and is
+/// in every segment's header too, so a journal from another index is refused
+/// by content. `sequence` is what the journal had reached when this
+/// checkpoint was taken, so a recovery replays every record above it and
+/// skips every record at or below it, and at 5.x it equals the identity's
+/// sequence. `file` is the journal's name as the checkpoint wrote it, which
+/// a refusal quotes; the journal a load actually opens is derived from the
+/// directory it was handed, so a directory renamed together with its journal
+/// opens under the new name.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct JournalManifest {
     pub(crate) file: String,
@@ -669,7 +689,9 @@ pub(crate) struct JournalManifest {
 /// Every id is 32 hexadecimal digits, the spelling `journal::id_hex`
 /// writes. `generation` is 1 or more, since a collection's first save
 /// writes 1. `parent` is absent from the file where the collection was
-/// saved from no recorded snapshot.
+/// saved from no recorded snapshot. `sequence` is the journal sequence the
+/// directory's state holds, 0 where the collection was never journaled,
+/// which every 5.x manifest records and no earlier one does.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct IdentityManifest {
     pub(crate) collection_id: String,
@@ -677,12 +699,14 @@ pub(crate) struct IdentityManifest {
     pub(crate) snapshot: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sequence: Option<u64>,
 }
 
 impl IdentityManifest {
     /// The record a save writes for `identity`, which carries the snapshot
-    /// the save drew.
-    fn of(identity: &crate::Identity) -> Self {
+    /// the save drew, with the journal sequence the saved state holds.
+    fn of(identity: &crate::Identity, sequence: u64) -> Self {
         IdentityManifest {
             collection_id: crate::journal::id_hex(identity.collection_id),
             generation: identity.generation,
@@ -692,6 +716,7 @@ impl IdentityManifest {
                     .expect("the identity a save records carries the snapshot it drew"),
             ),
             parent: identity.parent.map(crate::journal::id_hex),
+            sequence: Some(sequence),
         }
     }
 
@@ -2924,19 +2949,109 @@ pub(crate) fn load_index(
     load_from(&storage, path, tokenizer, policy)
 }
 
+/// The lock a load holds, and why the load may not write, where it may not.
+struct LoadLock {
+    guard: Option<Box<dyn LockGuard>>,
+    read_only: Option<String>,
+}
+
+impl LoadLock {
+    /// Take the directory's lock in `mode`. A holder that excludes it
+    /// refuses the load. A lock file the medium will not open for writing
+    /// gives a shared lock, or none where the file does not exist, and a
+    /// load that may not write. A filesystem that cannot lock gives no lock
+    /// and the same, since a read corrupts nothing and a journal could not
+    /// be kept safe there. A lock file that will not open for any other
+    /// reason refuses the load.
+    fn take(storage: &dyn Storage, mode: LockMode, path: &str) -> Result<Self, Error> {
+        match storage.lock(mode, &crate::journal::holder_record(mode)) {
+            Ok(Locked::Writable(guard)) => Ok(LoadLock {
+                guard: Some(guard),
+                read_only: None,
+            }),
+            Ok(Locked::ReadOnly { guard, reason }) => Ok(LoadLock {
+                guard,
+                read_only: Some(reason.to_string()),
+            }),
+            Err(LockFailure::Held { holder }) => Err(Error::CollectionLocked {
+                path: path.to_string(),
+                holder,
+            }),
+            Err(LockFailure::Failed(error)) => Err(Error::LockUnavailable {
+                path: storage.lock_path().display().to_string(),
+                error: error.to_string(),
+            }),
+            Err(LockFailure::Unavailable(error)) => {
+                let lock = storage.lock_path().display().to_string();
+                warn!(target: LOG_TARGET, operation = "load_unlocked",
+                    directory = path,
+                    lock = lock.as_str(),
+                    error = %error,
+                    "The lock file cannot be locked, so the load goes on without the lock and \
+                     opens a journaled directory read only"
+                );
+                Ok(LoadLock {
+                    guard: None,
+                    read_only: Some(format!(
+                        "its lock file {} cannot be locked ({})",
+                        lock, error
+                    )),
+                })
+            }
+        }
+    }
+}
+
 /// The load, from the storage the directory `path` names. `path` is the
-/// caller's own words for it, which the refusals and the log quote.
-fn load_from(
+/// caller's own words for it, which the refusals and the log quote. The
+/// tests reach it with a storage of their own, whose medium refuses writes
+/// or whose journal fails on purpose.
+///
+/// The lock comes first, shared, so no save in another process is between
+/// its two renames while this one reads. A load that will replay a journal
+/// holds the lock exclusive and its sink keeps it, so it reads the manifest
+/// under the shared lock, lets that go and takes the exclusive lock before
+/// it reads anything else, and the load proper reads the manifest again.
+pub(crate) fn load_from(
     storage: &dyn Storage,
     path: &str,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     policy: JournalPolicy,
 ) -> Result<(Collection, Recovery), Error> {
+    // Nothing to open, refused before the lock file is created beside a
+    // directory that is not there.
+    if !storage.exists() && !storage.aside_exists() {
+        return Err(Error::IndexDirectoryNotFound {
+            path: path.to_string(),
+        });
+    }
+    let mut lock = LoadLock::take(storage, LockMode::Shared, path)?;
+    let mut restored_from_aside = false;
+    if matches!(policy, JournalPolicy::Replay(_)) && lock.read_only.is_none() {
+        restored_from_aside = storage.recover()?;
+        if storage.exists() && load_manifest(storage.dir())?.journal.is_some() {
+            drop(lock);
+            lock = LoadLock::take(storage, LockMode::Exclusive, path)?;
+        }
+    }
+    load_locked(storage, path, tokenizer, policy, lock, restored_from_aside)
+}
+
+/// The load under `lock`. `restored_before` says whether the look at the
+/// manifest before it put a directory back from `<name>.zdbold`.
+fn load_locked(
+    storage: &dyn Storage,
+    path: &str,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+    policy: JournalPolicy,
+    lock: LoadLock,
+    restored_before: bool,
+) -> Result<(Collection, Recovery), Error> {
     // A save killed between its two renames left the whole index beside the
     // target and nothing at it. Recovery from a killed process is a load, so
     // it is put back here, before the directory is looked for. See
     // `Storage::recover`.
-    let restored_from_aside = storage.recover()?;
+    let restored_from_aside = storage.recover()? || restored_before;
 
     // Validate directory exists
     if !storage.exists() {
@@ -2954,9 +3069,37 @@ fn load_from(
 
     // The features the directory lists, before any artefact is read, so a
     // directory holding one this build does not know is refused by its name
-    // rather than read without it. See `features`.
-    if let Some(record) = manifest.features.as_ref() {
-        features::read(record)?;
+    // rather than read without it. See `features`. Every 5.x manifest lists
+    // them, possibly none, so one listing nothing at all was not written by
+    // a save.
+    match manifest.features.as_ref() {
+        Some(record) => features::read(record)?,
+        None if major >= SEGMENTED_FORMAT_MAJOR => return Err(features::missing()),
+        None => {}
+    }
+
+    // Every 5.x manifest records its identity with the journal sequence its
+    // state holds. Below 5.x the sequence is not read, as no release reading
+    // those formats reads it.
+    match manifest.identity.as_ref() {
+        None if major >= SEGMENTED_FORMAT_MAJOR => {
+            return Err(Error::IdentityInvalid {
+                detail: format!(
+                    "the manifest records none, and every manifest at format {}.x records one",
+                    SEGMENTED_FORMAT_MAJOR
+                ),
+            })
+        }
+        Some(record) if major >= SEGMENTED_FORMAT_MAJOR && record.sequence.is_none() => {
+            return Err(Error::IdentityInvalid {
+                detail: format!(
+                    "it records no sequence, and every identity at format {}.x records the \
+                     journal sequence its state holds",
+                    SEGMENTED_FORMAT_MAJOR
+                ),
+            })
+        }
+        _ => {}
     }
 
     // A manifest below the major that names a journal is a directory
@@ -3070,10 +3213,10 @@ fn load_from(
         }
     }
 
-    // At 4.x the features a manifest lists are the ones the directory holds,
-    // held now that every part they name has been read and before anything
-    // is built from them. Below 4.x no release listed features, and the
-    // version decides what a directory holds.
+    // From 4.x on the features a manifest lists are the ones the directory
+    // holds, held now that every part they name has been read and before
+    // anything is built from them. Below 4.x no release listed features, and
+    // the version decides what a directory holds.
     if let Some(record) = manifest
         .features
         .as_ref()
@@ -3081,7 +3224,8 @@ fn load_from(
     {
         let quantizer = quantization.as_ref().map(|quant| &quant.config);
         let held = features::Held {
-            identity: manifest.identity.is_some(),
+            // Listed at 4.x where recorded, and part of the base at 5.x.
+            identity: manifest.identity.is_some() && major < SEGMENTED_FORMAT_MAJOR,
             int8: matches!(quantizer, Some(QuantizationFile::Int8(_))),
             journal: manifest.journal.is_some(),
             pq: matches!(quantizer, Some(QuantizationFile::Pq(_))),
@@ -3130,8 +3274,28 @@ fn load_from(
     // Phase 3: The journal beside the directory, where the manifest names
     // one. Nothing below runs for a directory saved without one, so such a
     // directory loads exactly as it did.
+    let format_version = manifest.format_version.clone();
+    let identity_sequence = manifest
+        .identity
+        .as_ref()
+        .and_then(|record| record.sequence)
+        .filter(|_| major >= SEGMENTED_FORMAT_MAJOR);
     let Some(record) = manifest.journal else {
-        let recovery = Recovery::unjournaled(restored_from_aside, graph_rebuilt);
+        // The journal sequence the directory's state holds, which a save of
+        // it records again.
+        if let Some(sequence) = identity_sequence {
+            restored_index.set_journal_sequence(sequence);
+        }
+        if major >= SEGMENTED_FORMAT_MAJOR
+            && (storage.journal_exists() || storage.legacy_journal_exists())
+        {
+            warn!(target: LOG_TARGET, operation = "load_journal_left",
+                directory = path,
+                "A journal sits beside a directory whose manifest names none; it was left where \
+                 it is and not read"
+            );
+        }
+        let recovery = Recovery::unjournaled(format_version, restored_from_aside, graph_rebuilt);
         recovery.report(path);
         return Ok((restored_index, recovery));
     };
@@ -3153,6 +3317,17 @@ fn load_from(
             journal_id
         }
     };
+    // No save writes the identity and the journal record apart, so a 5.x
+    // manifest whose two name two sequences was assembled by hand.
+    if major >= SEGMENTED_FORMAT_MAJOR && identity_sequence != Some(record.sequence) {
+        return Err(Error::JournalManifestInvalid {
+            detail: format!(
+                "its sequence is {} and the directory's identity records {}",
+                record.sequence,
+                identity_sequence.map_or_else(|| "none".to_string(), |s| s.to_string())
+            ),
+        });
+    }
     restored_index.set_journal_sequence(record.sequence);
 
     let durability = match policy {
@@ -3164,7 +3339,8 @@ fn load_from(
                 "Opened the checkpoint alone; every mutation after the sequence it holds is in \
                  the journal beside it and was not applied"
             );
-            let mut recovery = Recovery::unjournaled(restored_from_aside, graph_rebuilt);
+            let mut recovery =
+                Recovery::unjournaled(format_version, restored_from_aside, graph_rebuilt);
             recovery.checkpoint_sequence = record.sequence;
             recovery.report(path);
             return Ok((restored_index, recovery));
@@ -3172,81 +3348,335 @@ fn load_from(
         JournalPolicy::Replay(durability) => durability,
     };
 
-    let wal = storage.journal_path();
-    if !storage.journal_exists() {
-        return Err(Error::JournalMissing {
-            directory: path.to_string(),
-            file: wal.display().to_string(),
-            recorded: record.file.clone(),
-            sequence: record.sequence,
-        });
+    let mut recovery = Recovery::unjournaled(format_version, restored_from_aside, graph_rebuilt);
+    recovery.journaled = true;
+    recovery.checkpoint_sequence = record.sequence;
+    let opened = Opened {
+        storage,
+        path,
+        record: &record,
+        journal_id,
+        directory_id,
+        durability,
+        lock,
+    };
+    if major >= SEGMENTED_FORMAT_MAJOR {
+        let identity = identity.expect("a 5.x manifest was held to record an identity");
+        opened.replay_segments(restored_index, &identity, recovery)
+    } else {
+        opened.replay_legacy(restored_index, recovery)
     }
-    let file = wal.display().to_string();
-    let bytes = crate::journal::read_journal_bytes(storage)?;
-    let contents = zeusdb_vector_core::read_journal(&bytes, &file)?;
-    crate::journal::check_contents(&contents, &file, directory_id, record.sequence)?;
-    // No save writes the identity and the journal record apart, so a
-    // manifest whose two name two collections was assembled by hand, and
-    // replaying would be choosing one of them.
-    if journal_id != directory_id {
-        return Err(Error::JournalManifestInvalid {
+}
+
+/// What a load of a journaled directory carries into the replay.
+struct Opened<'a> {
+    storage: &'a dyn Storage,
+    path: &'a str,
+    record: &'a JournalManifest,
+    journal_id: u128,
+    directory_id: u128,
+    durability: Durability,
+    lock: LoadLock,
+}
+
+impl Opened<'_> {
+    /// No save writes the identity and the journal record apart, so a
+    /// manifest whose two name two collections was assembled by hand, and
+    /// replaying would be choosing one of them. Held once the journal itself
+    /// is held to the identity, so a journal of another collection is
+    /// refused as that first.
+    fn journal_record_names_the_directory(&self) -> Result<(), Error> {
+        if self.journal_id == self.directory_id {
+            return Ok(());
+        }
+        Err(Error::JournalManifestInvalid {
             detail: format!(
                 "its collection_id is '{}' and the directory's identity names collection '{}'",
-                record.collection_id,
-                crate::journal::id_hex(directory_id)
+                self.record.collection_id,
+                crate::journal::id_hex(self.directory_id)
             ),
-        });
+        })
     }
 
-    // Every record above the sequence the checkpoint holds, applied at the
-    // values it names. `apply` refuses to run with a sink attached, which is
-    // why the sink goes on after this loop and not before it.
-    let dim = restored_index.dim();
-    let mut replayed = 0usize;
-    let mut skipped = 0usize;
-    for journal_record in &contents.records {
-        if journal_record.sequence <= record.sequence {
-            skipped += 1;
-            continue;
+    /// Replay the journal of segments beside a 5.x directory onto the
+    /// checkpoint `index` holds, then carry the journal on, or hand the
+    /// collection back read only where the medium refuses the first write.
+    ///
+    /// Every segment is read in name order and held to the checkpoint the
+    /// directory is. Each record above it is applied in order: a committed
+    /// one at the values it names, a withdrawn one as the live collection
+    /// left it. Then the writer resumes, its first write deciding whether
+    /// the load may write: it cuts a torn tail and completes a roll a crash
+    /// interrupted. Stale segments and a covered journal of format version 1
+    /// are deleted. A journal that held an abort is checkpointed before it
+    /// takes another record.
+    fn replay_segments(
+        self,
+        index: Collection,
+        identity: &crate::Identity,
+        mut recovery: Recovery,
+    ) -> Result<(Collection, Recovery), Error> {
+        let storage = self.storage;
+        let journal = storage.journal_path();
+        let journal_name = journal.display().to_string();
+        if !storage.journal_exists() {
+            return Err(Error::JournalMissing {
+                directory: self.path.to_string(),
+                file: journal_name,
+                recorded: self.record.file.clone(),
+                sequence: self.record.sequence,
+            });
         }
-        let operation = zeusdb_vector_core::Operation::decode(journal_record, dim, &file)?;
-        restored_index
-            .apply(operation)
-            .map_err(|error| Error::JournalReplayFailed {
-                file: file.clone(),
-                sequence: journal_record.sequence,
+        let base = SegmentBase {
+            snapshot: identity
+                .snapshot
+                .expect("an identity read from a manifest names its snapshot"),
+            sequence: self.record.sequence,
+            generation: identity.generation,
+            parent: identity.parent.unwrap_or(0),
+        };
+        let expected = Expected {
+            collection_id: self.directory_id,
+            base,
+        };
+        let io = |what: &'static str| {
+            let journal = journal.to_path_buf();
+            move |error: std::io::Error| Error::JournalIoFailed {
+                path: journal.clone(),
+                what,
+                error: error.to_string(),
+            }
+        };
+        let dir = storage.journal_dir();
+        let numbers = dir.segments().map_err(io("list"))?;
+        let mut files = Vec::with_capacity(numbers.len());
+        let mut bytes = Vec::with_capacity(numbers.len());
+        for &number in &numbers {
+            files.push(dir.segment_path(number).display().to_string());
+            bytes.push(dir.read_segment(number).map_err(io("read"))?);
+        }
+        let segments: Vec<SegmentBytes<'_>> = numbers
+            .iter()
+            .zip(&files)
+            .zip(&bytes)
+            .map(|((number, file), bytes)| SegmentBytes {
+                number: *number,
+                file,
+                bytes,
+            })
+            .collect();
+        let contents = read_segments(&segments, &expected, &journal_name)?;
+        if let Some(refusal) = contents.refusal() {
+            return Err(refusal);
+        }
+        self.journal_record_names_the_directory()?;
+
+        // `apply` refuses to run with a sink attached, which is why the sink
+        // goes on after this loop and not before it.
+        let dim = index.dim();
+        for live in &contents.records {
+            let file = segment_file(&numbers, &files, live.record.sequence);
+            let operation = Operation::decode(&live.record, dim, file)?;
+            let applied = match live.state {
+                RecordState::Committed => index.apply(operation),
+                RecordState::Withdrawn => index.apply_withdrawn(operation),
+            };
+            applied.map_err(|error| Error::JournalReplayFailed {
+                file: file.to_string(),
+                sequence: live.record.sequence,
                 detail: error.replay_detail(),
             })?;
-        replayed += 1;
+            match live.state {
+                RecordState::Committed => recovery.replayed += 1,
+                RecordState::Withdrawn => recovery.withdrawn += 1,
+            }
+        }
+        recovery.first_sequence = contents
+            .live()
+            .next()
+            .map_or(self.record.sequence.saturating_add(1), |segment| {
+                segment.number
+            });
+        recovery.records_in_journal = contents.records.len();
+        recovery.skipped = contents.skipped;
+        recovery.damage = contents.damage.clone();
+        recovery.good_bytes = contents.good_bytes;
+        recovery.segments = numbers.len();
+        let reached = contents.next_sequence.saturating_sub(1);
+
+        if let Some(reason) = self.lock.read_only {
+            return Ok(read_only(index, self.path, reason, reached, recovery));
+        }
+        let writer = match JournalWriter::resume(dir, self.directory_id, base, &contents) {
+            Ok(writer) => writer,
+            Err(failure) if failure.refuses_writes => {
+                let reason = failure.error.to_string();
+                return Ok(read_only(index, self.path, reason, reached, recovery));
+            }
+            Err(failure) => return Err(failure.error),
+        };
+        let mut sink = JournalSink::from_writer(writer, self.durability, self.lock.guard)?;
+        sink.remove_stale();
+        crate::journal::remove_covered_legacy(storage, self.directory_id, self.record.sequence);
+        index.attach_sink(Box::new(sink));
+        // The fault a failed commit left lived in memory alone, so a process
+        // restarted after one would take writes on top of whatever the
+        // failed sync lost. A checkpoint writes the collection from memory
+        // and rolls past the abort first.
+        if contents.aborts > 0 {
+            index.checkpoint()?;
+            recovery.checkpointed = true;
+        }
+        recovery.report(self.path);
+        Ok((index, recovery))
     }
 
-    // The journal is cut back to its last whole record and reopened for
-    // append after it. Where the body is empty the header is restated at the
-    // checkpoint's sequence plus one, which completes a truncation a crash
-    // left half done.
-    let writer = zeusdb_vector_core::JournalWriter::open_for_append(
-        storage,
-        &contents,
-        record.sequence + 1,
-    )?;
-    restored_index.attach_sink(Box::new(crate::journal::JournalSink::from_writer(
-        writer, durability,
-    )?));
+    /// Replay the journal of format version 1 beside a 3.x or 4.x directory
+    /// onto the checkpoint `index` holds, then upgrade the directory, or
+    /// hand the collection back read only where the medium refuses the
+    /// upgrade's first write.
+    ///
+    /// The upgrade is a checkpoint at 5.0.0 with a journal of segments: the
+    /// journal's directory is created empty, a writer carrying the sequence
+    /// on from the last record replayed is attached, the checkpoint commits
+    /// and rolls the writer onto its first segment, and then the file goes.
+    /// A crash before the commit leaves the old directory and its file, which
+    /// the next load replays and upgrades again. A crash after it leaves a
+    /// 5.0.0 directory holding every record of the file, which the next load
+    /// deletes.
+    fn replay_legacy(
+        self,
+        index: Collection,
+        mut recovery: Recovery,
+    ) -> Result<(Collection, Recovery), Error> {
+        let storage = self.storage;
+        let wal = storage.legacy_journal_path();
+        let file = wal.display().to_string();
+        if !storage.legacy_journal_exists() {
+            return Err(Error::JournalMissing {
+                directory: self.path.to_string(),
+                file,
+                recorded: self.record.file.clone(),
+                sequence: self.record.sequence,
+            });
+        }
+        let bytes = storage
+            .read_legacy_journal()
+            .map_err(|error| Error::JournalIoFailed {
+                path: wal.to_path_buf(),
+                what: "read",
+                error: error.to_string(),
+            })?;
+        let contents = read_legacy_journal(&bytes, &file)?;
+        crate::journal::check_legacy_contents(
+            &contents,
+            &file,
+            self.directory_id,
+            self.record.sequence,
+        )?;
+        self.journal_record_names_the_directory()?;
 
-    let recovery = Recovery {
-        checkpoint_sequence: record.sequence,
-        first_sequence: contents.header.first_sequence,
-        records_in_journal: contents.records.len(),
-        replayed,
-        skipped,
-        damage: contents.damage.clone(),
-        good_bytes: contents.good_bytes,
-        restored_from_aside,
-        graph_rebuilt,
-        journaled: true,
-    };
+        let dim = index.dim();
+        for journal_record in &contents.records {
+            if journal_record.sequence <= self.record.sequence {
+                recovery.skipped += 1;
+                continue;
+            }
+            let operation = Operation::decode(journal_record, dim, &file)?;
+            index
+                .apply(operation)
+                .map_err(|error| Error::JournalReplayFailed {
+                    file: file.clone(),
+                    sequence: journal_record.sequence,
+                    detail: error.replay_detail(),
+                })?;
+            recovery.replayed += 1;
+        }
+        recovery.first_sequence = contents.header.first_sequence;
+        recovery.records_in_journal = contents.records.len();
+        recovery.damage = contents.damage.clone();
+        recovery.good_bytes = contents.good_bytes;
+        let reached = contents
+            .next_sequence()
+            .saturating_sub(1)
+            .max(self.record.sequence);
+
+        if let Some(reason) = self.lock.read_only {
+            return Ok(read_only(index, self.path, reason, reached, recovery));
+        }
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::UpgradeAfterReplay);
+        // The upgrade's first write, before anything has changed.
+        if let Err(error) = storage.probe_writable() {
+            if refuses_writes(&error) {
+                return Ok(read_only(
+                    index,
+                    self.path,
+                    error.to_string(),
+                    reached,
+                    recovery,
+                ));
+            }
+            return Err(Error::JournalIoFailed {
+                path: storage.journal_path().to_path_buf(),
+                what: "upgrade",
+                error: error.to_string(),
+            });
+        }
+        let sink = JournalSink::create_at(
+            storage,
+            self.directory_id,
+            reached,
+            self.durability,
+            self.lock.guard,
+        )?;
+        index.attach_sink(Box::new(sink));
+        index.upgrade_checkpoint(self.path)?;
+        if let Err(error) = storage.remove_legacy_journal() {
+            warn!(target: LOG_TARGET, operation = "upgrade_old_journal_kept",
+                journal = file.as_str(),
+                error = %error,
+                "The directory was upgraded and its journal of format version 1 could not be \
+                 deleted; the directory holds every record in it, and the next load deletes it"
+            );
+        }
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::UpgradeAfterOldRemoved);
+        recovery.upgraded_from = Some(recovery.format_version.clone());
+        recovery.checkpointed = true;
+        recovery.report(self.path);
+        Ok((index, recovery))
+    }
+}
+
+/// The segment's file a record of `sequence` sits in, being the last
+/// segment named at or below it.
+fn segment_file<'a>(numbers: &[u64], files: &'a [String], sequence: u64) -> &'a str {
+    let after = numbers.partition_point(|&number| number <= sequence);
+    after
+        .checked_sub(1)
+        .and_then(|at| files.get(at))
+        .map_or("", String::as_str)
+}
+
+/// The collection a load hands back where the medium refused its first
+/// write: every record replayed, nothing on the medium changed, and a sink
+/// attached that refuses every mutation. `reached` is the last sequence the
+/// replay reached, which a save into another directory records.
+fn read_only(
+    index: Collection,
+    path: &str,
+    reason: String,
+    reached: u64,
+    mut recovery: Recovery,
+) -> (Collection, Recovery) {
+    index.set_journal_sequence(reached);
+    index.attach_sink(Box::new(ReadOnlySink::new(
+        std::path::PathBuf::from(path),
+        reason.clone(),
+        reached,
+    )));
+    recovery.read_only = Some(reason);
     recovery.report(path);
-    Ok((restored_index, recovery))
+    (index, recovery)
 }
 
 // ============================================================================
@@ -3803,12 +4233,12 @@ pub(crate) fn save_manifest(
         });
 
     // What the directory holds, each by the condition the part's own writer
-    // tests: the identity this function records, the journal record above,
-    // quantization.json in the layout its writer chooses, and the space
-    // config.json declares.
+    // tests: the journal record above, quantization.json in the layout its
+    // writer chooses, and the space config.json declares. The identity is
+    // part of the base at 5.x and is not listed.
     let space = index.sparse_named().map(|(_, space)| space);
     let held = features::Held {
-        identity: true,
+        identity: false,
         int8: index.has_quantization() && int8,
         journal: journal.is_some(),
         pq: index.has_quantization() && !int8,
@@ -3819,7 +4249,7 @@ pub(crate) fn save_manifest(
     let manifest = IndexManifest {
         format_version: FORMAT_VERSION.to_string(),
         features: Some(held.record()),
-        identity: Some(IdentityManifest::of(identity)),
+        identity: Some(IdentityManifest::of(identity, index.journal_sequence())),
         zeusdb_version: env!("CARGO_PKG_VERSION").to_string(),
         created_at: index.created_at(),
         saved_at: Utc::now().to_rfc3339(),

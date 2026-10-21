@@ -9,13 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **One index at a time writes a directory.** `<path>.zdblock` beside the directory takes the operating system's file lock. A journaled index holds it for as long as it lives, a save holds it for the save, and a load holds it shared while it reads. A second holder in this process or another raises `RuntimeError`, which names the holder's process and host where the system lets a second handle read the lock file, and the system releases the lock when the holder's process ends, however it ends. Where the lock file cannot be locked, `journal_to()` and `save()` raise `RuntimeError` and write nothing.
+
+- **A journaled directory this process cannot write opens read only.** Where the medium or a missing permission refuses the first write a load needs, `load()` replays the journal in memory, writes nothing, and issues a `RuntimeWarning` naming the directory and the system's refusal. The index raises `RuntimeError` on every mutation, on `checkpoint()`, on `journal_to()` and on a save into the directory it was read from. A save into another directory writes a copy that opens writable.
+
+- **`journal_segments`**, the number of segments the journal holds, in `get_stats()` on a journaled index.
+
+### Changed
+
+- **The journal is a directory of segments.** `journal_to(path)` opens `<path>.zdbjournal`, and `journal_path` names it. Each segment is named for the first sequence it holds, and its header names the collection and the checkpoint it follows. The journal moves to a new segment at the first commit after the active one passes 64 MiB. A checkpoint starts a new segment and deletes the old ones once its save has committed. `journal_bytes` is the length of every segment together.
+
+- **Every call that changes a journaled index ends its records with a commit record.** A recovery replays the records of committed calls, and cuts the records that no commit follows as a torn tail.
+
+- **A commit whose sync fails withdraws its call.** The journal writes an abort record after the call's records, or cuts the segment back to the last commit where the abort cannot be written. `add()` reports every record of the call as an error, and any other mutation raises `RuntimeError`. Every mutation after it is refused the same way, naming `checkpoint()`, until a checkpoint commits, and the checkpoint runs even where the old segment does not sync. Under `"interval"`, a failed sync of the policy's thread withdraws and refuses the next call. A `load()` whose journal holds an abort takes a checkpoint before it records anything.
+
+- **A journaled directory saved by 0.13.0 or earlier is written again at 5.0.0 when it opens.** `load()` replays its journal file, saves the directory with a journal of segments that carries the sequence on, and deletes `<path>.zdbwal`. `checkpoint_only=True` opens the directory as it stood at its last save and changes neither it nor its journal.
+
+- **A child forked from the process that journals an index refuses every mutation of that index** with `RuntimeError`, and leaves the parent's journal and lock as they are.
+
+- **The docstrings of `load()`, `journal_to()`, `checkpoint()` and `journal_path`** describe the journal of segments, the lock and the read-only load.
+
 ### Fixed
+
+- **`load()` refuses a journal whose segments follow another checkpoint of the same index**, with a `RuntimeError` naming both checkpoints, and replays none of it. A segment from another checkpoint that holds nothing past the directory's sequence is passed over, and deleted by a load that can write.
+
+- **The records of a call whose commit failed are not replayed after a crash**, once its abort record or its cut has landed.
+
+- **A second index, in this process or another, cannot open, save or journal a directory that a journaled index holds.**
+
+- **An append that fails part way leaves no bytes in the journal.** The writer cuts the segment back to where the record began, and where the cut fails it records nothing more until a checkpoint. A text index interns a term only after the term's `Intern` record is appended, so a failed append leaves the dictionary as it was.
 
 - **A thread that the interpreter ends during shutdown, while the thread takes the interpreter back after a long call, does not crash the process.** Long calls into the engine, such as a search, a save or a load, release the interpreter while they run and take it back at the end. The binding is built with PyO3 0.29.3, which handles a thread that is ended at that point.
 
 ### Internal
 
 - Every workflow job names its runner image. The jobs that ran on `ubuntu-latest` run on `ubuntu-24.04`, and the Windows wheel is built on `windows-2025-vs2026` in place of `windows-latest`. These are the images each job ran on for 0.13.0. A change of runner image is a change to a workflow file.
+
+### Format
+
+Every directory this release saves declares format version 5.0.0 and lists its features, and a 5.x manifest without its features is refused. A 5.0.0 directory holds its journal as a directory of segments, records as `identity.sequence` the last journal sequence its records include, and lists no `identity` feature, since every 5.0.0 directory holds one. This release reads 1.x, 2.x, 3.x, 4.x and 5.x, so a directory an earlier release saved opens here, and saving it again writes 5.0.0. A journaled directory at 3.0.0, 3.1.0 or 4.0.0 is written again at 5.0.0 when it opens. 0.5.0 to 0.13.0 refuse a 5.0.0 directory at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
 
 ## [0.13.0] - 2026-10-17
 

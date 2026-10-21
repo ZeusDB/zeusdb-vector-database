@@ -597,10 +597,7 @@ fn a_scalar_directory_round_trips_with_its_two_artefacts() {
     let path = Path::new(&path);
 
     let manifest = read_json(&path.join("manifest.json"));
-    assert_eq!(
-        manifest["features"],
-        json!({"identity": "compatible", "int8": "incompatible"})
-    );
+    assert_eq!(manifest["features"], json!({"int8": "incompatible"}));
     let files: Vec<&str> = manifest["files_included"]
         .as_array()
         .unwrap()
@@ -700,10 +697,7 @@ fn a_scalar_directory_round_trips_with_its_two_artefacts() {
     untrained.save(&path).unwrap();
     let path = Path::new(&path);
     let manifest = read_json(&path.join("manifest.json"));
-    assert_eq!(
-        manifest["features"],
-        json!({"identity": "compatible", "int8": "incompatible"})
-    );
+    assert_eq!(manifest["features"], json!({"int8": "incompatible"}));
     let files: Vec<&str> = manifest["files_included"]
         .as_array()
         .unwrap()
@@ -923,7 +917,7 @@ fn the_version_rule_holds_for_a_scalar_directory() {
     dense.save(&dense_path).unwrap();
     assert_eq!(
         read_json(&Path::new(&dense_path).join("manifest.json"))["features"],
-        json!({"identity": "compatible", "int8": "incompatible"})
+        json!({"int8": "incompatible"})
     );
 
     let d = declaration(8, "l2")
@@ -937,7 +931,7 @@ fn the_version_rule_holds_for_a_scalar_directory() {
     spaced.save(&spaced_path).unwrap();
     assert_eq!(
         read_json(&Path::new(&spaced_path).join("manifest.json"))["features"],
-        json!({"identity": "compatible", "int8": "incompatible", "sparse": "incompatible"})
+        json!({"int8": "incompatible", "sparse": "incompatible"})
     );
     assert!(Collection::load(&spaced_path).unwrap().is_quantized());
 
@@ -948,7 +942,7 @@ fn the_version_rule_holds_for_a_scalar_directory() {
         .unwrap();
     assert_eq!(
         read_json(&Path::new(&journaled_path).join("manifest.json"))["features"],
-        json!({"identity": "compatible", "int8": "incompatible", "journal": "incompatible"})
+        json!({"int8": "incompatible", "journal": "incompatible"})
     );
     drop(journaled);
     assert!(Collection::load(&journaled_path).unwrap().is_quantized());
@@ -962,7 +956,7 @@ fn the_version_rule_holds_for_a_scalar_directory() {
     collecting.save(&collecting_path).unwrap();
     assert_eq!(
         read_json(&Path::new(&collecting_path).join("manifest.json"))["features"],
-        json!({"identity": "compatible", "int8": "incompatible"})
+        json!({"int8": "incompatible"})
     );
 
     // This build reads any 1.x and reads a frame wherever it finds one, so
@@ -980,13 +974,13 @@ fn the_version_rule_holds_for_a_scalar_directory() {
     assert!(Collection::load(&relabel("older-minor.zdb", "1.1.0"))
         .unwrap()
         .is_quantized());
-    let message = Collection::load(&relabel("future.zdb", "5.0.0"))
+    let message = Collection::load(&relabel("future.zdb", "6.0.0"))
         .err()
         .unwrap()
         .to_string();
     assert!(
-        message.contains("format version 5.0.0 cannot be opened"),
+        message.contains("format version 6.0.0 cannot be opened"),
         "{message}"
     );
-    assert!(message.contains("1.x, 2.x, 3.x and 4.x"), "{message}");
+    assert!(message.contains("1.x, 2.x, 3.x, 4.x and 5.x"), "{message}");
 }

@@ -430,12 +430,12 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
         assert entry["bytes"] == os.path.getsize(save_dir / name), name
         assert ("checksum" in entry) is name.endswith(".json"), name
 
-    # The one version every save declares. The four binary artefacts are
-    # framed, which a release reading 1.x to 3.x alone refuses at the version.
-    # What the directory holds is in its features, which for a raw dense index
-    # is its identity alone.
-    assert manifest["format_version"] == "4.0.0"
-    assert manifest["features"] == {"identity": "compatible"}
+    # The one version every save declares, which a release reading 1.x to
+    # 4.x alone refuses at the version. What the directory holds beyond the
+    # base is in its features, which for a raw dense index is nothing.
+    assert manifest["format_version"] == "5.0.0"
+    assert manifest["features"] == {}
+    assert manifest["identity"]["sequence"] == 0
     assert manifest["index_type"] == "HNSW"
     assert manifest["total_vectors"] == 3
     assert manifest["has_quantization"] is False
@@ -893,7 +893,7 @@ def test_persistence_reads_previous_format(tmp_path, quantized_only_saved):
     upgraded = tmp_path / "upgraded.zdb"
     loaded.save(str(upgraded))
     assert json.loads((upgraded / "manifest.json").read_text(
-        encoding="utf-8"))["format_version"] == "4.0.0"
+        encoding="utf-8"))["format_version"] == "5.0.0"
     for name in ("mappings.bin", "pq_codes.bin", "pq_centroids.bin"):
         assert (upgraded / name).read_bytes() == (quantized_only_saved["path"] / name).read_bytes(), name
     assert "metadata" in json.loads((upgraded / "config.json").read_text(encoding="utf-8"))
@@ -988,8 +988,8 @@ def test_persistence_drops_raw_vectors_from_an_old_quantized_only_directory(tmp_
 def test_persistence_format_version_gate(tmp_path):
     """A later minor is read, a major this build does not know is refused.
 
-    Minor bumps are additive by construction, so any 1.x, 2.x, 3.x and 4.x is
-    accepted. A different major means the layout changed in a way this build
+    Minor bumps are additive by construction, so any 1.x, 2.x, 3.x, 4.x and
+    5.x is accepted. A different major means the layout changed in a way this build
     cannot reason about, and guessing at it is how a format loses data
     quietly.
     """
@@ -1004,6 +1004,9 @@ def test_persistence_format_version_gate(tmp_path):
         shutil.copytree(source, target)
         manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
         manifest["format_version"] = version
+        # A 4.x save lists the identity among its features.
+        if version.startswith("4."):
+            manifest["features"]["identity"] = "compatible"
         (target / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         return target
 
@@ -1012,7 +1015,7 @@ def test_persistence_format_version_gate(tmp_path):
 
     # A 2.x and a 3.x label are read as well, being what a release before
     # 4.0.0 wrote for a sparse space and for a journal, and the frames under
-    # them are read since a frame is read wherever it is found. A fifth major
+    # them are read since a frame is read wherever it is found. A sixth major
     # is what the loader refuses.
     assert vdb.load(str(with_version("2.0.0", "v200.zdb"))).get_vector_count() == 1
     assert vdb.load(str(with_version("2.4.1", "v241.zdb"))).get_vector_count() == 1
@@ -1020,9 +1023,10 @@ def test_persistence_format_version_gate(tmp_path):
     assert vdb.load(str(with_version("3.2.5", "v325.zdb"))).get_vector_count() == 1
     assert vdb.load(str(with_version("4.0.0", "v400.zdb"))).get_vector_count() == 1
     assert vdb.load(str(with_version("4.7.1", "v471.zdb"))).get_vector_count() == 1
+    assert vdb.load(str(with_version("5.3.0", "v530.zdb"))).get_vector_count() == 1
 
-    with pytest.raises(RuntimeError, match=r"format version 5.0.0 cannot be opened"):
-        vdb.load(str(with_version("5.0.0", "v500.zdb")))
+    with pytest.raises(RuntimeError, match=r"format version 6.0.0 cannot be opened"):
+        vdb.load(str(with_version("6.0.0", "v600.zdb")))
 
     with pytest.raises(RuntimeError, match=r"not a version this build can interpret"):
         vdb.load(str(with_version("banana", "vbanana.zdb")))
@@ -2576,13 +2580,13 @@ def test_a_finished_save_leaves_no_sibling_directory(tmp_path):
 
     A save writes `<name>.zdbtmp` beside the target and renames it into place,
     and replacing an existing directory moves that one to `<name>.zdbold` first.
-    Both are removed by a save that finishes, so the only thing on disk is the
-    index.
+    Both are removed by a save that finishes, so the only things on disk are
+    the index and the lock file the save took beside it.
     """
     path, index, _ = _saved(tmp_path, "clean.zdb")
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["clean.zdb"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["clean.zdb", "clean.zdb.zdblock"]
     index.save(str(path))
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["clean.zdb"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["clean.zdb", "clean.zdb.zdblock"]
 
 
 def test_a_save_never_leaves_a_partial_directory_where_a_reader_looks(tmp_path):
@@ -2644,7 +2648,7 @@ def test_a_leftover_staging_directory_breaks_neither_a_load_nor_a_save(tmp_path)
     assert replacement.add({"ids": ["only"], "embeddings": [[0.5] * 8]}).is_success()
     replacement.save(str(path))
 
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["leftover.zdb"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["leftover.zdb", "leftover.zdb.zdblock"]
     assert VectorDatabase().load(str(path)).get_vector_count() == 1
 
 
@@ -2666,7 +2670,7 @@ def test_an_index_moved_aside_by_a_killed_save_is_put_back(tmp_path):
     assert replacement.add({"ids": ["fresh"], "embeddings": [[0.25] * 8]}).is_success()
     replacement.save(str(path))
 
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["window.zdb"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["window.zdb", "window.zdb.zdblock"]
     assert VectorDatabase().load(str(path)).get_vector_count() == 1
 
 

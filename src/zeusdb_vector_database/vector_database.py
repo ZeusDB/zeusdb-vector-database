@@ -498,7 +498,20 @@ class VectorDatabase:
         A directory saved with a journal beside it is recovered: every
         mutation the journal holds since the directory was last saved is
         replayed, the journal is reopened, and the index keeps recording to
-        it. See HNSWIndex.journal_to for what a journal is.
+        it. See HNSWIndex.journal_to for what a journal is. A journaled
+        directory saved by a release before 0.14.0 is upgraded by its first
+        load to format 5.0.0, which those releases do not open, so keep a
+        copy from before the upgrade where you may need to go back.
+
+        The load holds the directory's lock, a file beside it named
+        <path>.zdblock, while it reads, and a journaled index keeps it until
+        the index is dropped, so a second index on the same directory, in
+        this process or another, raises RuntimeError (CollectionLocked). A
+        journaled directory this process cannot write, such as one on
+        read-only media, opens read only with a RuntimeWarning: every record
+        is replayed in memory, nothing on the medium changes, every change
+        raises RuntimeError (CollectionReadOnly), and save() into another
+        directory copies it somewhere writable.
 
         Args:
             path: Path to the .zdb directory containing the saved index
@@ -530,21 +543,21 @@ class VectorDatabase:
                 10 by default. Refused under any other durability.
             checkpoint_only: Open the directory as it was at its last save
                 and leave the journal beside it alone: nothing is replayed,
-                the file is neither read nor opened, and the index records
-                nothing until journal_to is called on it. This is the way in
-                for a directory copied without its journal, which load
-                otherwise refuses with FileNotFoundError naming the file,
-                and for a caller who wants the state as of the checkpoint.
-                durability and interval_ms do not apply and are refused
-                beside it.
+                the journal is neither read nor opened, and the index
+                records nothing until journal_to is called on it. This is
+                the way in for a directory copied without its journal, which
+                load otherwise refuses with FileNotFoundError naming the
+                journal, and for a caller who wants the state as of the
+                checkpoint. durability and interval_ms do not apply and are
+                refused beside it.
 
         Returns:
             HNSWIndex: The loaded index ready for use
 
-        A loaded journaled index holds its journal file open until the index
-        is dropped, and a file deleted or moved under a live index is one the
+        A loaded journaled index holds its journal open until the index is
+        dropped, and a segment deleted or moved under a live index is one the
         directory can no longer replay, so drop the index before touching the
-        file.
+        journal.
 
         Example:
             >>> vdb = VectorDatabase()

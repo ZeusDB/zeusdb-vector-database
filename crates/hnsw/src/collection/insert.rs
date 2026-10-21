@@ -2108,7 +2108,19 @@ impl Collection {
 
         // Whether a sink is attached is read once for the batch. Attaching
         // one takes the mutation guard, so it cannot change under this call.
-        let attached = self.sink_attached();
+        // A sink that takes nothing refuses every record of the batch, an
+        // overwrite's removal included, before anything is admitted.
+        let (attached, read_only) = self.sink_state();
+        if let Some((directory, reason)) = read_only {
+            for record in parsed_data {
+                let err = Error::CollectionReadOnly {
+                    directory: directory.clone(),
+                    reason: reason.clone(),
+                };
+                errors.push(InsertError::Vector { id: record.id, err });
+            }
+            return (inserted_ids, errors);
+        }
         let mut buffer: Vec<u8> = Vec::new();
         // The records an overwrite refused before its removal, by their place
         // in the batch, each with the refusal `admit` gives it, and the places
