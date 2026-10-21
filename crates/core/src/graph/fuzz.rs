@@ -62,9 +62,10 @@ use super::Distance;
 use crate::distance::{CosineDist, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist};
 use crate::int8::Int8Codec;
 use crate::storage::FsDir;
+use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 // ============================================================================
 // THE BUDGET
@@ -615,28 +616,44 @@ enum Outcome {
     Panicked(String),
 }
 
-/// A silent panic hook for the length of a run, restored on drop.
+/// The panics of a run kept silent on the thread that runs it, for as long as
+/// the guard lives.
 ///
 /// Without it a caught panic still prints its message and its backtrace, and a
 /// run that finds one finding prints it once per case that reproduces it.
-struct Quiet(Option<PanicHook>);
+///
+/// The panic hook is the process's, and tests run on several threads at once,
+/// so the hook is installed once and never put back. It passes every panic to
+/// the hook it replaced unless the panicking thread holds a guard, so a test
+/// that fails on another thread, during a run or after it, prints its message.
+struct Quiet;
 
-/// The hook `std::panic` hands back, named so the field above reads.
-type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+thread_local! {
+    /// How many guards this thread holds.
+    static QUIET: Cell<u32> = const { Cell::new(0) };
+}
+
+/// The one installation of the hook [`Quiet`] reads.
+static QUIET_HOOK: Once = Once::new();
 
 impl Quiet {
     fn new() -> Self {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        Quiet(Some(previous))
+        QUIET_HOOK.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if QUIET.with(Cell::get) == 0 {
+                    previous(info);
+                }
+            }));
+        });
+        QUIET.with(|depth| depth.set(depth.get() + 1));
+        Quiet
     }
 }
 
 impl Drop for Quiet {
     fn drop(&mut self) {
-        if let Some(previous) = self.0.take() {
-            std::panic::set_hook(previous);
-        }
+        QUIET.with(|depth| depth.set(depth.get() - 1));
     }
 }
 

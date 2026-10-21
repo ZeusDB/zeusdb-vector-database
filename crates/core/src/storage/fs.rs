@@ -14,9 +14,12 @@ use super::{
     Locked, Staged, Storage,
 };
 use crate::error::Error;
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{MutexGuard, PoisonError};
 use tracing::info;
 
 /// The target the records this module emits carry, being the module path
@@ -283,7 +286,10 @@ impl ArtefactWriter for FsArtefact {
 /// `LockFileEx` on Windows. The lock lives in a file of its own because on
 /// Windows a lock blocks reads of the locked bytes through every other
 /// handle, so a lock on a segment or an artefact would stop a reader. The
-/// file is created on first use and never removed.
+/// file is created on first use and never removed. A child forked through
+/// Python's `os.fork` closes its copy of every lock file just after the
+/// fork, through [`close_lock_files_in_forked_child`], so a lock stays with
+/// the process that took it.
 #[derive(Clone, Debug)]
 pub struct FsStorage {
     target: PathBuf,
@@ -468,7 +474,23 @@ impl Storage for FsStorage {
     /// The holder's line is written after an exclusive acquisition alone. On
     /// Windows a shared lock refuses writes to the locked bytes through
     /// every handle, its own included, so a shared holder writes nothing.
+    ///
+    /// The process's lock files are held from the open until the file is
+    /// kept among them, so a fork never copies a lock file that its child
+    /// would not know to close.
     fn lock(&self, mode: LockMode, holder: &str) -> Result<Locked, LockFailure> {
+        with_lock_files(|files| self.lock_kept_in(files, mode, holder))
+    }
+}
+
+impl FsStorage {
+    /// [`Storage::lock`], with the lock file it opens kept in `files`.
+    fn lock_kept_in(
+        &self,
+        files: &mut LockFileList,
+        mode: LockMode,
+        holder: &str,
+    ) -> Result<Locked, LockFailure> {
         let open = || {
             OpenOptions::new()
                 .read(true)
@@ -500,16 +522,13 @@ impl Storage for FsStorage {
                         .set_len(0)
                         .and_then(|()| (&file).write_all(holder.as_bytes()));
                 }
-                Ok(Locked::Writable(Box::new(FsLock { _file: file, mode })))
+                Ok(Locked::Writable(Box::new(keep(files, file, mode))))
             }
             Err(reason) if refuses_writes(&reason) => match File::open(&self.lock) {
                 Ok(file) => {
                     acquire(&file, LockMode::Shared).map_err(|error| self.lock_failure(error))?;
                     Ok(Locked::ReadOnly {
-                        guard: Some(Box::new(FsLock {
-                            _file: file,
-                            mode: LockMode::Shared,
-                        })),
+                        guard: Some(Box::new(keep(files, file, LockMode::Shared))),
                         reason,
                     })
                 }
@@ -522,9 +541,7 @@ impl Storage for FsStorage {
             Err(other) => Err(LockFailure::Failed(other)),
         }
     }
-}
 
-impl FsStorage {
     /// What a lock that was not taken means. A holder that excludes this one
     /// is named by what its lock file records, its lines joined, where the
     /// system lets another handle read it, which Windows does not while the
@@ -561,17 +578,155 @@ fn acquire(file: &File, mode: LockMode) -> Result<(), std::fs::TryLockError> {
     }
 }
 
-/// A lock held through an open lock file. Dropping it closes the file,
-/// which releases the lock; see [`LockGuard`].
+/// The lock files a process holds open, each beside the number its guard
+/// carries.
+type LockFileList = Vec<(u64, File)>;
+
+/// [`LockFileList`] behind the lock that every opening, closing and fork of
+/// a lock file takes.
+#[allow(clippy::disallowed_types)]
+type LockFiles = std::sync::Mutex<LockFileList>;
+
+/// This process's lock files.
+///
+/// A file is kept here and not in its guard, so that a child forked from the
+/// process can close its copy of every one, wherever the guard that owns it
+/// lives. A lock on an open file goes only when the file is unlocked or the
+/// last copy of it is closed, so the child's close leaves the parent's lock
+/// held, and the lock then goes with the parent alone.
+static LOCK_FILES: LockFiles = LockFiles::new(Vec::new());
+
+/// The number the next lock file is kept under.
+static NEXT_LOCK_FILE: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// This process's lock files, while the thread that forks holds them
+    /// across the fork.
+    static HELD_FOR_FORK: RefCell<Option<MutexGuard<'static, LockFileList>>> =
+        const { RefCell::new(None) };
+}
+
+/// Hold this process's lock files from just before a fork, so that no other
+/// thread opens or closes one while the process is copied. After the fork the
+/// parent lets them go through [`release_lock_files_after_fork`] and the
+/// child closes its copies through [`close_lock_files_in_forked_child`]. The
+/// binding calls all three from `os.register_at_fork`.
+pub fn hold_lock_files_for_fork() {
+    HELD_FOR_FORK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(LOCK_FILES.lock().unwrap_or_else(PoisonError::into_inner));
+        }
+    });
+}
+
+/// Let this process's lock files go after a fork, in the parent, as they were
+/// before it.
+pub fn release_lock_files_after_fork() {
+    let held = HELD_FOR_FORK.with(|slot| slot.borrow_mut().take());
+    drop(held);
+}
+
+/// Close, in a child just forked, the child's copy of every lock file the
+/// parent held open. The parent keeps every lock, since a lock goes only with
+/// the last copy of its file, and the child holds none, so a lock goes when
+/// the parent lets it go or ends, whether or not the child lives on. A guard
+/// the child drops later closes nothing.
+///
+/// The files are the ones held since [`hold_lock_files_for_fork`]. Where
+/// nothing holds them they are taken here, unless a thread the child does not
+/// have held them at the fork, and then the child keeps its copies.
+pub fn close_lock_files_in_forked_child() {
+    let copies = match HELD_FOR_FORK.with(|slot| slot.borrow_mut().take()) {
+        Some(mut held) => std::mem::take(&mut *held),
+        None => try_with_lock_files(std::mem::take).unwrap_or_default(),
+    };
+    drop(copies);
+}
+
+/// Run `f` through the hold this thread has taken for a fork, where it has
+/// one, so that a lock taken or dropped there before the fork does not wait
+/// on itself, and hand `f` back where it has none.
+fn through_fork_hold<R, F>(f: F) -> Result<R, F>
+where
+    F: FnOnce(&mut LockFileList) -> R,
+{
+    HELD_FOR_FORK.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(held) => Ok(f(held)),
+        None => Err(f),
+    })
+}
+
+/// Run `f` over this process's lock files, waiting for them where another
+/// thread has them.
+fn with_lock_files<R>(f: impl FnOnce(&mut LockFileList) -> R) -> R {
+    through_fork_hold(f)
+        .unwrap_or_else(|f| f(&mut LOCK_FILES.lock().unwrap_or_else(PoisonError::into_inner)))
+}
+
+/// Run `f` over this process's lock files unless another thread has them,
+/// which a child forked from the process cannot wait out, since that thread
+/// is not in the child.
+fn try_with_lock_files<R>(f: impl FnOnce(&mut LockFileList) -> R) -> Option<R> {
+    match through_fork_hold(f) {
+        Ok(result) => Some(result),
+        Err(f) => match LOCK_FILES.try_lock() {
+            Ok(mut held) => Some(f(&mut held)),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(f(&mut poisoned.into_inner())),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        },
+    }
+}
+
+/// Keep `file` among this process's lock files, and give the guard whose drop
+/// closes it.
+fn keep(files: &mut LockFileList, file: File, mode: LockMode) -> FsLock {
+    let id = NEXT_LOCK_FILE.fetch_add(1, Ordering::Relaxed);
+    files.push((id, file));
+    FsLock {
+        id,
+        mode,
+        process: std::process::id(),
+    }
+}
+
+/// A lock held through an open lock file, which this process's lock files
+/// keep under `id`. Dropping it closes the file, which releases the lock; see
+/// [`LockGuard`].
 #[derive(Debug)]
 struct FsLock {
-    _file: File,
+    id: u64,
     mode: LockMode,
+    /// The process that took the lock.
+    process: u32,
 }
 
 impl LockGuard for FsLock {
     fn mode(&self) -> LockMode {
         self.mode
+    }
+}
+
+/// A child forked from the process that took the lock has closed its copy
+/// already where the fork went through `os.register_at_fork`, and then the
+/// drop finds nothing to close. A child does not wait for the lock files,
+/// which a thread it does not have may hold, and keeps its copy where another
+/// thread had them.
+impl Drop for FsLock {
+    fn drop(&mut self) {
+        let id = self.id;
+        let take = move |files: &mut LockFileList| {
+            files
+                .iter()
+                .position(|(kept, _)| *kept == id)
+                .map(|at| files.swap_remove(at).1)
+        };
+        let file = if std::process::id() == self.process {
+            with_lock_files(take)
+        } else {
+            try_with_lock_files(take).flatten()
+        };
+        drop(file);
     }
 }
 
@@ -1047,6 +1202,15 @@ mod tests {
         assert!(entries(tmp.path()).is_empty());
     }
 
+    /// The lock tests run one at a time, since a child's close takes every
+    /// lock file of the process and a hold for a fork stops every other lock.
+    #[allow(clippy::disallowed_types)]
+    static ONE_LOCK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn alone() -> MutexGuard<'static, ()> {
+        ONE_LOCK_TEST.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn holder(storage: &FsStorage, mode: LockMode) -> Result<Box<dyn LockGuard>, LockFailure> {
         match storage.lock(mode, "pid 1, host test, exclusive, since now\n")? {
             Locked::Writable(guard) => Ok(guard),
@@ -1054,22 +1218,35 @@ mod tests {
         }
     }
 
+    /// What a refusal names where the system lets a second handle read the
+    /// lock file, being the record [`holder`] writes.
+    const RECORDED: &str =
+        "another holder, its lock file recording pid 1, host test, exclusive, since now";
+
     /// The lock in one process, as the standard library gives it on this
     /// system. An exclusive holder refuses a second handle in either mode,
     /// shared holders sit together and refuse an exclusive one, a dropped
-    /// guard releases, and the lock file is kept.
+    /// guard releases, and the lock file is kept. A refusal names the record
+    /// wherever the system lets the second handle read the lock file, which
+    /// Windows does beside shared holders alone and Linux and macOS do
+    /// beside any holder.
     #[test]
     fn the_lock_refuses_a_second_handle_and_releases_on_drop() {
+        let _alone = alone();
         let tmp = tempfile::tempdir().unwrap();
         let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
         let first = holder(&storage, LockMode::Exclusive).unwrap();
         assert_eq!(first.mode(), LockMode::Exclusive);
+        let beside_exclusive = if cfg!(windows) {
+            "another holder, whose record this system does not let a second handle read while \
+             the lock is held"
+        } else {
+            RECORDED
+        };
         for mode in [LockMode::Exclusive, LockMode::Shared] {
             match holder(&storage, mode) {
                 Err(LockFailure::Held { holder }) => {
-                    assert!(!holder.is_empty());
-                    #[cfg(unix)]
-                    assert_eq!(holder, "pid 1, host test, exclusive, since now");
+                    assert_eq!(holder, beside_exclusive, "{mode:?}")
                 }
                 other => panic!("{mode:?}: expected the lock to be held, got {other:?}"),
             }
@@ -1078,14 +1255,62 @@ mod tests {
         let shared = holder(&storage, LockMode::Shared).unwrap();
         let beside = holder(&storage, LockMode::Shared).unwrap();
         assert_eq!(beside.mode(), LockMode::Shared);
-        assert!(matches!(
-            holder(&storage, LockMode::Exclusive),
-            Err(LockFailure::Held { .. })
-        ));
+        match holder(&storage, LockMode::Exclusive) {
+            Err(LockFailure::Held { holder }) => assert_eq!(holder, RECORDED),
+            other => panic!("expected the shared holders to refuse, got {other:?}"),
+        }
         drop(shared);
         drop(beside);
         let again = holder(&storage, LockMode::Exclusive).unwrap();
         drop(again);
         assert!(storage.lock_path().is_file(), "the lock file is kept");
+    }
+
+    /// A child forked from a holder closes its copy of every lock file, and a
+    /// guard it drops afterwards closes nothing. Run in one process, the copy
+    /// closed is the holder's own, so the lock is free once it is closed, and
+    /// a holder that takes it then keeps it through the first guard's drop.
+    #[test]
+    fn a_forked_childs_close_leaves_its_guards_nothing_to_close() {
+        let _alone = alone();
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        let first = holder(&storage, LockMode::Exclusive).unwrap();
+        hold_lock_files_for_fork();
+        close_lock_files_in_forked_child();
+        let second = holder(&storage, LockMode::Exclusive).unwrap();
+        drop(first);
+        assert!(
+            matches!(
+                holder(&storage, LockMode::Shared),
+                Err(LockFailure::Held { .. })
+            ),
+            "the first guard's drop closed the second holder's file"
+        );
+        drop(second);
+        holder(&storage, LockMode::Shared).unwrap();
+    }
+
+    /// Held for a fork and let go in the parent, the lock files are as they
+    /// were, and a lock taken and dropped on the thread that holds them goes
+    /// through that hold rather than waiting on it.
+    #[test]
+    fn a_hold_for_a_fork_leaves_every_lock_as_it_was() {
+        let _alone = alone();
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        let other = FsStorage::at(&tmp.path().join("other.zdb")).unwrap();
+        let first = holder(&storage, LockMode::Exclusive).unwrap();
+        hold_lock_files_for_fork();
+        let during = holder(&other, LockMode::Exclusive).unwrap();
+        drop(during);
+        release_lock_files_after_fork();
+        assert!(matches!(
+            holder(&storage, LockMode::Exclusive),
+            Err(LockFailure::Held { .. })
+        ));
+        drop(first);
+        holder(&storage, LockMode::Exclusive).unwrap();
+        holder(&other, LockMode::Exclusive).unwrap();
     }
 }

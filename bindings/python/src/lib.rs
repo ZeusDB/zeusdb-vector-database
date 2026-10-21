@@ -221,5 +221,42 @@ fn engine(py: Python, m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
     let shutdown = m.getattr("shutdown_logging")?;
     py.import("atexit")?.call_method1("register", (shutdown,))?;
 
+    // Close this process's lock files in a child forked from it.
+    //
+    // A lock on an open file is shared by every copy of the file, and a child
+    // forked from this process holds a copy of each lock file the process has
+    // open, so a child that lives on would keep the directories locked after
+    // this process lets them go or ends. The child closes its copies just
+    // after the fork, which leaves every lock with this process. The lock
+    // files are held across the fork, so no other thread opens or closes one
+    // while the process is copied. `os.register_at_fork` exists on POSIX
+    // alone, and the hooks are not attributes of the module.
+    let os = py.import("os")?;
+    if os.hasattr("register_at_fork")? {
+        let hooks = pyo3::types::PyDict::new(py);
+        hooks.set_item(
+            "before",
+            pyo3::types::PyCFunction::new_closure(py, None, None, |_, _| -> PyResult<()> {
+                zeusdb_vector_core::hold_lock_files_for_fork();
+                Ok(())
+            })?,
+        )?;
+        hooks.set_item(
+            "after_in_parent",
+            pyo3::types::PyCFunction::new_closure(py, None, None, |_, _| -> PyResult<()> {
+                zeusdb_vector_core::release_lock_files_after_fork();
+                Ok(())
+            })?,
+        )?;
+        hooks.set_item(
+            "after_in_child",
+            pyo3::types::PyCFunction::new_closure(py, None, None, |_, _| -> PyResult<()> {
+                zeusdb_vector_core::close_lock_files_in_forked_child();
+                Ok(())
+            })?,
+        )?;
+        os.call_method("register_at_fork", (), Some(&hooks))?;
+    }
+
     Ok(())
 }

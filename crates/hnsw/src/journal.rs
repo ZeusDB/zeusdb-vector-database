@@ -77,9 +77,10 @@
 //! [`Error::CollectionLocked`]. A filesystem that cannot lock refuses
 //! journaling and saving with [`Error::LockUnavailable`], and a load there
 //! goes on unlocked and opens a journaled directory read only, since it would
-//! have to journal. A child forked from the process that took the lock
-//! shares it, so the sink refuses every mutation there with
-//! [`Error::JournalForked`].
+//! have to journal. A child forked through Python's `os.fork` closes its copy
+//! of the lock file just after the fork, so the lock stays with the parent.
+//! The child still shares the parent's open journal, so the sink refuses
+//! every mutation there with [`Error::JournalForked`].
 //!
 //! # A medium that cannot be written
 //!
@@ -338,7 +339,7 @@ pub struct JournalSink {
     /// checkpoint writing the manifest does not derive it a second time.
     file: String,
     /// The collection's lock, where one was taken.
-    lock: Option<Box<dyn LockGuard>>,
+    _lock: Option<Box<dyn LockGuard>>,
 }
 
 impl JournalSink {
@@ -410,7 +411,7 @@ impl JournalSink {
             writer,
             durability,
             flusher,
-            lock,
+            _lock: lock,
         })
     }
 
@@ -463,17 +464,16 @@ fn file_name_of(path: &Path) -> String {
 }
 
 /// A child forked from the process that opened the journal shares its open
-/// files and holds no copy of its thread. Dropping the sink there neither
-/// joins a thread the child does not have nor closes the lock, so the
-/// parent's lock and thread are left as they are.
+/// files and holds no copy of its thread. Dropping the sink there does not
+/// join a thread the child does not have. Its lock drops as it would anywhere,
+/// which closes the child's copy of the lock file where the child has not
+/// closed it already, and leaves the parent's lock held, since a lock goes
+/// only with the last copy of its file.
 impl Drop for JournalSink {
     fn drop(&mut self) {
         if !self.writer.in_its_own_process() {
             if let Some(flusher) = self.flusher.take() {
                 std::mem::forget(flusher);
-            }
-            if let Some(lock) = self.lock.take() {
-                std::mem::forget(lock);
             }
         }
     }

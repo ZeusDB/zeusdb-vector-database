@@ -192,7 +192,7 @@ jobs:
 
   test-rust:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # From rust-toolchain.toml, as in the lint job. See the note there.
@@ -221,4 +221,4 @@ jobs:
         # --no-default-features turns off the binding crate's `extension-module`
         # feature, which is on for every other cargo command and for the wheel.
         # See the comment on it in bindings/python/Cargo.toml.
-        run: cargo test --workspace --locked --no-default-features
+        run: cargo test --workspace --locked --no-default-features --no-fail-fast

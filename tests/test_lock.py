@@ -4,13 +4,16 @@
 life, a save for the save, and a load while it reads. A second process is
 refused with a RuntimeError, CollectionLocked, and a process killed holding
 the lock releases it with its exit. A child forked from the process that
-opened a journal refuses every mutation with JournalForked. A journaled
-directory this process cannot write opens read only, with a RuntimeWarning.
+opened a journal refuses every mutation with JournalForked, and closes its
+copy of the lock file just after the fork, so the lock stays with the parent.
+A journaled directory this process cannot write opens read only, with a
+RuntimeWarning.
 """
 
 import gc
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -176,3 +179,101 @@ def test_a_forked_child_refuses_every_mutation_and_leaves_the_parent_whole(tmp_p
     gc.collect()
     reopened = VectorDatabase().load(str(path))
     assert "parent" in reopened and "child" not in reopened and "r0" in reopened
+
+
+# A process that journals the directory named first, adds one record and
+# forks. The child writes its process id to the file named second and lives
+# until the file named fourth exists, then writes the file named fifth and
+# ends. The parent waits for the child's word, drops its index, loads the
+# directory again, writes what the load said to the file named third, and
+# ends while the child lives on.
+FORKING_PARENT = """
+import gc, os, sys, time
+import numpy as np
+from zeusdb_vector_database import VectorDatabase
+path, child_said, parent_said, go, gone = sys.argv[1:6]
+
+def say(name, words):
+    with open(name + ".part", "w") as handle:
+        handle.write(words)
+    os.replace(name + ".part", name)
+
+index = VectorDatabase().create("hnsw", dim=8, expected_size=10)
+index.journal_to(path)
+index.add({"ids": ["parent"], "embeddings": np.full((1, 8), 0.5, dtype=np.float32)})
+pid = os.fork()
+if pid == 0:
+    try:
+        say(child_said, str(os.getpid()))
+        start = time.time()
+        while not os.path.exists(go) and time.time() - start < 120:
+            time.sleep(0.01)
+        say(gone, "gone")
+    finally:
+        os._exit(0)
+start = time.time()
+while not os.path.exists(child_said) and time.time() - start < 60:
+    time.sleep(0.01)
+del index
+gc.collect()
+try:
+    reopened = VectorDatabase().load(path)
+    words = f"reopened {len(reopened)}"
+    del reopened
+    gc.collect()
+except RuntimeError as error:
+    words = f"refused: {error}"
+say(parent_said, words)
+"""
+
+# A new process that loads the directory named first and prints what it holds.
+LOADER = """
+import sys
+from zeusdb_vector_database import VectorDatabase
+try:
+    print(f"opened {len(VectorDatabase().load(sys.argv[1]))}")
+except RuntimeError as error:
+    print(f"refused: {error}")
+"""
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="os.fork exists on POSIX alone")
+def test_a_forked_child_that_lives_on_holds_no_lock(tmp_path):
+    """A child forked while an index is journaled closes its copy of the lock
+    file just after the fork. While it lives, the parent drops its index and
+    loads the directory again, and once the parent has ended a new process
+    loads it as well."""
+    path = tmp_path / "lives-on.zdb"
+    child_said = tmp_path / "child.said"
+    parent_said = tmp_path / "parent.said"
+    go = tmp_path / "go"
+    gone = tmp_path / "gone"
+    parent = subprocess.Popen([sys.executable, "-c", FORKING_PARENT, str(path), str(child_said),
+                               str(parent_said), str(go), str(gone)])
+    child = None
+    try:
+        assert parent.wait(timeout=60) == 0
+        child = int(child_said.read_text())
+        assert parent_said.read_text() == "reopened 1"
+        assert alive(child), "the child lives on after the parent has ended"
+        loaded = subprocess.run([sys.executable, "-c", LOADER, str(path)],
+                                capture_output=True, text=True, timeout=60)
+        assert loaded.returncode == 0, loaded.stderr
+        assert loaded.stdout.strip() == "opened 1"
+        assert alive(child), "the child still lived while the new process loaded the directory"
+    finally:
+        go.write_text("")
+        if child is not None:
+            deadline = time.time() + 60
+            while not gone.exists() and time.time() < deadline:
+                time.sleep(0.01)
+            if not gone.exists() and alive(child):
+                os.kill(child, signal.SIGKILL)

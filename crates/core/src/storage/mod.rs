@@ -48,6 +48,7 @@
 mod fs;
 
 pub use fs::{
+    close_lock_files_in_forked_child, hold_lock_files_for_fork, release_lock_files_after_fork,
     FsDir, FsStorage, JOURNAL_SUFFIX, LEGACY_JOURNAL_SUFFIX, LOCK_SUFFIX, SEGMENT_SUFFIX,
 };
 
@@ -275,7 +276,9 @@ impl LockMode {
 ///
 /// Dropping it closes the lock file, which releases the lock. Nothing
 /// unlocks it explicitly, because a child forked from the holder shares the
-/// open file and an unlock there would release the parent's lock.
+/// open file and an unlock there would release the parent's lock. The child
+/// closes its copy instead, which leaves the lock with the parent; see
+/// [`close_lock_files_in_forked_child`].
 pub trait LockGuard: Send + Sync + std::fmt::Debug {
     /// The mode the lock is held in.
     fn mode(&self) -> LockMode;

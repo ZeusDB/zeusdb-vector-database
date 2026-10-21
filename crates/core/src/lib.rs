@@ -114,9 +114,10 @@ pub use space::{
     VectorIndex,
 };
 pub use storage::{
-    refuses_writes, ArtefactWriter, Dir, FsDir, FsStorage, JournalDir, JournalFile, LockFailure,
-    LockGuard, LockMode, Locked, Staged, Storage, JOURNAL_SUFFIX, LEGACY_JOURNAL_SUFFIX,
-    LOCK_SUFFIX, SEGMENT_SUFFIX,
+    close_lock_files_in_forked_child, hold_lock_files_for_fork, refuses_writes,
+    release_lock_files_after_fork, ArtefactWriter, Dir, FsDir, FsStorage, JournalDir, JournalFile,
+    LockFailure, LockGuard, LockMode, Locked, Staged, Storage, JOURNAL_SUFFIX,
+    LEGACY_JOURNAL_SUFFIX, LOCK_SUFFIX, SEGMENT_SUFFIX,
 };
 
 /// What a test in another crate measures against.
