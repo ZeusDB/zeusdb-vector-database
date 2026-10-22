@@ -12,10 +12,12 @@ defect.
 
 The forged files are written by hand rather than by the library, because the
 library cannot write them. A directory this build saves holds `mappings.bin`,
-`vectors.bin`, `pq_codes.bin` and `pq_centroids.bin` inside a frame, so a forged
-count or width is written into the payload and the frame is built again around
-it, which carries the forgery past both of its checksums to the payload's
-reader. A directory a release before 4.0.0 saved holds the same four in
+`vectors.bin` and `pq_centroids.bin` inside a frame, and one a release from
+4.0.0 to 0.13.0 saved holds `pq_codes.bin` there too, so a forged count or
+width is written into the payload and the frame is built again around it,
+which carries the forgery past both of its checksums to the payload's reader.
+The forgeries of a row store run on a copy of a saved directory rewritten as
+4.0.0, which holds every record's row in its store. A directory a release before 4.0.0 saved holds the same four in
 bincode's wire, where a container length is a varint this file encodes itself,
 and those forgeries run on a copy of a saved directory rewritten in that wire.
 `config.json` and `quantization.json` are JSON and are edited in place.
@@ -30,7 +32,8 @@ import sys
 
 import numpy as np
 import pytest
-from helpers import FRAME_KINDS, artefact_digest, as_old_wire, frame, reframe, repair_manifest, unframe
+from helpers import (FRAME_KINDS, artefact_digest, as_before_five, as_old_wire, frame, reframe,
+                     repair_manifest, unframe)
 from zeusdb_vector_database import VectorDatabase
 
 # A length no file could carry and every unbounded container aborted on.
@@ -97,6 +100,26 @@ def quantized_index(tmp_path_factory):
     index.add({"ids": [f"r{i}" for i in range(1050)], "embeddings": vectors})
     assert index.is_quantized(), "the fixture must train, or the codebook files are absent"
     index.save(str(path))
+    return path
+
+
+@pytest.fixture(scope="module")
+def framed_raw_index(raw_index, tmp_path_factory):
+    """The raw index as a release from 4.0.0 to 0.13.0 wrote it, with
+    `vectors.bin` in its frame."""
+    path = tmp_path_factory.mktemp("framed-raw") / "index"
+    shutil.copytree(raw_index, path)
+    as_before_five(path, "4.0.0")
+    return path
+
+
+@pytest.fixture(scope="module")
+def framed_quantized_index(quantized_index, tmp_path_factory):
+    """The quantized index as a release from 4.0.0 to 0.13.0 wrote it, with
+    `pq_codes.bin` in its frame."""
+    path = tmp_path_factory.mktemp("framed-quantized") / "index"
+    shutil.copytree(quantized_index, path)
+    as_before_five(path, "4.0.0")
     return path
 
 
@@ -211,7 +234,8 @@ def assert_refused(path, tmp_path, *, naming):
 
 
 def test_the_digest_repairer_agrees_with_the_saved_manifest(
-    raw_index, quantized_index, old_raw_index, old_quantized_index
+    raw_index, quantized_index, framed_raw_index, framed_quantized_index, old_raw_index,
+    old_quantized_index
 ):
     """Every digest a real save wrote, recomputed here from the file, and every
     framed artefact it wrote, framed again here from its payload.
@@ -221,7 +245,8 @@ def test_the_digest_repairer_agrees_with_the_saved_manifest(
     is refused rather than that the field validator it names does its job.
     """
     checked = framed = 0
-    for directory in (raw_index, quantized_index, old_raw_index, old_quantized_index):
+    for directory in (raw_index, quantized_index, framed_raw_index, framed_quantized_index,
+                      old_raw_index, old_quantized_index):
         manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
         digests = manifest["file_digests"]
         assert digests, "a save records a length per artefact"
@@ -255,12 +280,12 @@ def test_a_forged_file_whose_digest_is_not_repaired_is_refused(old_raw_index, tm
     assert "vectors.bin" in verdict and "digest" in verdict, verdict
 
 
-def test_a_forged_frame_whose_checksum_is_not_repaired_is_refused(raw_index, tmp_path):
+def test_a_forged_frame_whose_checksum_is_not_repaired_is_refused(framed_raw_index, tmp_path):
     """The frame's payload checksum itself, which every forgery of a framed
     artefact has to get past. The manifest records a framed artefact by its
     length alone, so it is the frame that refuses."""
     target = tmp_path / "unrepaired"
-    shutil.copytree(raw_index, target)
+    shutil.copytree(framed_raw_index, target)
     raw = bytearray((target / "vectors.bin").read_bytes())
     raw[70] ^= 0x40
     (target / "vectors.bin").write_bytes(bytes(raw))
@@ -271,16 +296,18 @@ def test_a_forged_frame_whose_checksum_is_not_repaired_is_refused(raw_index, tmp
     assert "vectors.bin: the frame's payload is corrupt" in verdict, verdict
 
 
-def test_an_untouched_directory_still_loads(raw_index, old_raw_index, tmp_path):
+def test_an_untouched_directory_still_loads(raw_index, framed_raw_index, old_raw_index, tmp_path):
     """Nothing below means anything if the unforged directory does not load."""
-    for directory in (raw_index, old_raw_index):
+    for directory in (raw_index, framed_raw_index, old_raw_index):
         status, verdict, _ = load_in_child(directory, tmp_path)
         assert status == 0
         assert verdict == "LOADED 2", verdict
 
 
-def test_an_untouched_quantized_directory_still_loads(quantized_index, old_quantized_index, tmp_path):
-    for directory in (quantized_index, old_quantized_index):
+def test_an_untouched_quantized_directory_still_loads(
+    quantized_index, framed_quantized_index, old_quantized_index, tmp_path
+):
+    for directory in (quantized_index, framed_quantized_index, old_quantized_index):
         status, verdict, _ = load_in_child(directory, tmp_path)
         assert status == 0
         assert verdict == "LOADED 1050", verdict
@@ -585,12 +612,13 @@ def set_entries(value):
         ("raw", "mappings.bin", set_entries((1 << 64) - 1), "records take at least"),
         ("raw", "mappings.bin", set_u32(8, 0xFFFFFFFF), "the ids' lengths sum to"),
         ("raw", "mappings.bin", set_u32(4, 0), "and the ids are strictly increasing"),
-        ("raw", "vectors.bin", set_entries(HUGE), "rows of"),
-        ("raw", "vectors.bin", set_u32(0, 0xFFFFFFFF), "and config.json declares dim 4"),
-        ("raw", "vectors.bin", set_u32(24, 0xFFFFFFF0), "which mappings.bin does not hold"),
+        ("framed-raw", "vectors.bin", set_entries(HUGE), "rows of"),
+        ("framed-raw", "vectors.bin", set_u32(0, 0xFFFFFFFF), "and config.json declares dim 4"),
+        ("framed-raw", "vectors.bin", set_u32(24, 0xFFFFFFF0), "which mappings.bin does not hold"),
         ("quantized", "vectors.bin", set_entries(HUGE), "rows of"),
-        ("quantized", "pq_codes.bin", set_entries(HUGE), "rows of"),
-        ("quantized", "pq_codes.bin", set_u32(0, 0xFFFFFFFF), "quantization.json declares 4 subvectors"),
+        ("framed-quantized", "pq_codes.bin", set_entries(HUGE), "rows of"),
+        ("framed-quantized", "pq_codes.bin", set_u32(0, 0xFFFFFFFF),
+         "quantization.json declares 4 subvectors"),
         ("quantized", "pq_centroids.bin", set_entries(HUGE), "a codebook of"),
         ("quantized", "pq_centroids.bin", set_u32(0, 0xFFFFFFFF), "a codebook of"),
         ("quantized", "pq_centroids.bin", set_u32(4, 0xFFFFFFFF), "a codebook of"),
@@ -603,9 +631,11 @@ def set_entries(value):
     ],
 )
 def test_a_forged_count_in_a_framed_artefact_is_refused(
-    raw_index, quantized_index, tmp_path, fixture, name, edit, naming
+    raw_index, quantized_index, framed_raw_index, framed_quantized_index, tmp_path, fixture, name,
+    edit, naming
 ):
-    source = raw_index if fixture == "raw" else quantized_index
+    source = {"raw": raw_index, "quantized": quantized_index, "framed-raw": framed_raw_index,
+              "framed-quantized": framed_quantized_index}[fixture]
     path = forged(source, tmp_path, name, edit_payload(edit))
     assert_refused(path, tmp_path, naming=naming)
 

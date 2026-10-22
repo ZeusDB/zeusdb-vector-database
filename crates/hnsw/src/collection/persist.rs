@@ -9,8 +9,8 @@
 //! with the interpreter lock released.
 
 use super::{
-    Collection, DenseIndex, DenseOpen, Identity, IdentityRecord, QuantizationConfig, StorageMode,
-    MAX_LAYER,
+    Collection, DenseIndex, DenseOpen, DenseRestored, Identity, IdentityRecord, QuantizationConfig,
+    StorageMode, MAX_LAYER,
 };
 use crate::journal::{Durability, JournalPolicy, Recovery};
 use crate::locks::ReadGuard;
@@ -23,8 +23,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
-    ArtefactRecord, Bounds, Dir, Error, FsStorage, IdStore, Inventory, KillPoint, MetadataStore,
-    Persist, Position, PositionWalk, Restore, SegmentBase, Storage, VectorGraph, DUMP_FILENAME,
+    ArtefactRecord, Bounds, Dir, DumpRefusal, DumpRegion, DumpRows, Error, FsStorage, IdStore,
+    Inventory, KillPoint, MetadataStore, Persist, Position, PositionWalk, SegmentBase, Storage,
+    VectorGraph, DUMP_FILENAME,
 };
 
 /// What a checkpoint is for, which decides the kill points it passes.
@@ -117,6 +118,24 @@ fn rebuild_requested() -> bool {
     }
 }
 
+/// What restoring the graph from its dump gave.
+pub(crate) enum DumpOutcome {
+    /// The graph the dump holds, installed, with its node count.
+    Read(usize),
+    /// The rows of a version 2 dump, each region verified, which the caller
+    /// rebuilds the graph from: its topology could not be used, or the
+    /// rebuild was asked for, which `asked` says.
+    Rows {
+        rows: DumpRows,
+        reason: String,
+        asked: bool,
+    },
+    /// Below format 5.0.0, why the dump cannot be used, which the caller
+    /// rebuilds the graph from the separate row stores for. Also the
+    /// collection holding no record, at any format, which writes no dump.
+    Rebuild(String),
+}
+
 /// What the manifest recorded about the graph dump, as the inventory the
 /// dense index checks before it reads the dump. A directory written before
 /// the manifest carried lengths records none, and nothing is checked.
@@ -170,10 +189,8 @@ impl Collection {
     /// order, so `write` sees one instant of both. The records are walked in
     /// position order, which is internal id order, and each is named by the
     /// internal id its node was inserted under. The one caller is the save
-    /// of an index that holds a raw vector for every record, which is every
-    /// raw index and a `quantized_with_raw` one; see `holds_raw_vectors` for
-    /// why a raw index writes the file beside the dump that already carries
-    /// its store.
+    /// of a product quantized graph that keeps a raw vector beside every
+    /// code; see `writes_raw_vectors`.
     pub(crate) fn with_raw_vectors<R>(
         &self,
         write: impl FnOnce(&mut dyn Iterator<Item = (usize, &[f32])>, usize) -> R,
@@ -206,22 +223,40 @@ impl Collection {
                 .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw)
     }
 
-    /// Whether the index holds a raw vector for every record it holds.
+    /// Whether a save writes `vectors.bin`, which is where the graph is a
+    /// product quantized one keeping a raw vector beside every code, being a
+    /// trained one under `quantized_with_raw`.
     ///
-    /// True on every raw graph and on a `quantized_with_raw` one, false on a
-    /// trained `quantized_only` one. It is what decides whether a save writes
-    /// `vectors.bin`.
+    /// Every other graph's raw vectors, where it keeps any, are the rows it
+    /// stores, which the graph dump holds, and the dump holds the only copy
+    /// of each.
+    pub(crate) fn writes_raw_vectors(&self) -> bool {
+        let index = self.dense().index.read().unwrap();
+        let graph = index.graph();
+        graph.is_pq() && graph.holds_raw()
+    }
+
+    /// Every live record's codes, read off a product quantized graph's own
+    /// store and keyed by external id, at the capacity of the live count.
+    /// Empty for any other graph.
     ///
-    /// **The saved directory still holds two copies of every raw vector on a
-    /// raw index**, one in `vectors.bin` and one in the graph dump's vector
-    /// region. Removing the map did not remove that, and the reason is the
-    /// rebuild fallback: `vectors.bin` is keyed by external id and a damaged
-    /// graph dump is exactly the case where the node ordering that addresses
-    /// the store is unavailable. Dropping the file would make a raw index with
-    /// a damaged dump unloadable, which is a recovery path the loader
-    /// documents and thirty-three tests hold.
-    pub(crate) fn holds_raw_vectors(&self) -> bool {
-        self.dense().index.read().unwrap().graph().holds_raw()
+    /// The codes map a load restores at format 5.0.0, where the graph dump
+    /// holds the only copy of each record's codes.
+    pub(crate) fn codes_from_graph(&self) -> HashMap<String, Vec<u8>> {
+        let ids = self.ids.read().unwrap();
+        let index = self.dense().index.read().unwrap();
+        let graph = index.graph();
+        if !graph.is_pq() {
+            return HashMap::new();
+        }
+        let mut codes = HashMap::with_capacity(ids.len());
+        for (at, id) in ids.iter() {
+            let node = index.node_of(Position::from_slot(at));
+            if let Some(code) = node.and_then(|node| graph.codes_at(node)) {
+                codes.insert(id.to_string(), code.to_vec());
+            }
+        }
+        codes
     }
 
     /// Rebuild the raw side store of a loaded quantized graph.
@@ -346,6 +381,13 @@ impl Collection {
     /// points of its own besides the save's.
     pub(crate) fn save_locked_as(&self, path: &str, kind: CheckpointKind) -> Result<(), Error> {
         let storage = FsStorage::at(Path::new(path))?;
+        // A collection read only for features its directory holds saves
+        // nowhere, since a directory this build wrote would not hold them.
+        if self.sink_read_only_features() {
+            return Err(self
+                .sink_refusal()
+                .expect("a sink naming read-only features refuses"));
+        }
         // A collection read from a medium it cannot write saves into another
         // directory alone, which copies it somewhere writable.
         if let Some(directory) = self.sink_read_only_directory() {
@@ -518,7 +560,9 @@ impl Collection {
     /// copy's identity.
     ///
     /// Under the mutation guard, so writers wait for it as they wait for a
-    /// checkpoint and searches run throughout. Five targets are refused
+    /// checkpoint and searches run throughout. A collection read only for
+    /// features its directory holds is refused first, with
+    /// [`Error::FeatureReadOnly`]. Five targets are refused
     /// before anything is written: the directory the collection's journal
     /// sits beside or a read-only collection was read from, a directory with
     /// a journal of either version beside it, a path that is not an index
@@ -536,6 +580,13 @@ impl Collection {
     /// checkpoint names the same parent.
     pub fn backup(&self, path: &str) -> Result<IdentityRecord, Error> {
         let _writers = self.writers.lock().unwrap();
+        // A collection read only for features its directory holds writes no
+        // copy, for the reason a save into another directory gives.
+        if self.sink_read_only_features() {
+            return Err(self
+                .sink_refusal()
+                .expect("a sink naming read-only features refuses"));
+        }
         let storage = FsStorage::at(Path::new(path))?;
         let own = self
             .sink_journal_path()
@@ -870,22 +921,34 @@ impl Collection {
     /// installed the id mappings and the product quantizer, because both decide
     /// what the dump is checked against. `positions` is the internal id of the
     /// record at each position, which the mappings gave, and the reader files
-    /// each node at the position of the id it carries.
+    /// each node at the position of the id it carries. `version` is the dump
+    /// version the directory's format requires.
     ///
-    /// Returns the number of graph nodes restored, or the reason the dump
-    /// cannot be used. Every reason is a fallback rather than a failure: the
-    /// caller rebuilds instead, so a directory whose dump is absent, was written
-    /// by a release whose distance types were named differently, or is damaged
-    /// still loads.
+    /// Below format 5.0.0 every reason the dump cannot be used is a fallback
+    /// rather than a failure: the caller rebuilds from the separate row
+    /// stores, so a directory whose dump is absent, was written by a release
+    /// whose distance types were named differently, or is damaged still
+    /// loads. At 5.0.0 the dump holds the only copy of each record's row, so a
+    /// dump refused on its header, its identity or its rows refuses the load
+    /// with [`Error::GraphDumpInvalid`], naming the check, and one whose
+    /// topology cannot be used hands back its rows, which the caller rebuilds
+    /// from. `ZEUSDB_LOAD_REBUILD_GRAPH` asks for the rebuild from the rows
+    /// at 5.0.0, which still reads and verifies them, and for the rebuild from
+    /// the separate stores below it.
     pub(crate) fn restore_graph_from_dump(
         &mut self,
         dir: &dyn Dir,
         max_origin_id: usize,
         recorded_bytes: Option<u64>,
         positions: &[u32],
-    ) -> Result<usize, String> {
-        if rebuild_requested() {
-            return Err(format!("{} asked for the rebuild", REBUILD_ENV));
+        version: u32,
+    ) -> Result<DumpOutcome, Error> {
+        let asked = rebuild_requested();
+        if asked && version < 2 {
+            return Ok(DumpOutcome::Rebuild(format!(
+                "{} asked for the rebuild",
+                REBUILD_ENV
+            )));
         }
 
         // A save skips the graph dump entirely when the index holds nothing, so
@@ -893,8 +956,20 @@ impl Collection {
         // save and describes records this one no longer holds.
         let live = self.ids.read().unwrap().len();
         if live == 0 {
-            return Err("the index holds no records".to_string());
+            return Ok(DumpOutcome::Rebuild(
+                "the index holds no records".to_string(),
+            ));
         }
+        let refused = |refusal: DumpRefusal| {
+            if version >= 2 {
+                Err(Error::GraphDumpInvalid {
+                    name: DUMP_FILENAME.to_string(),
+                    detail: refusal.detail,
+                })
+            } else {
+                Ok(DumpOutcome::Rebuild(refusal.detail))
+            }
+        };
 
         // The dense index restores itself from the dump. The length
         // manifest.json recorded is checked there before the dump is read,
@@ -912,6 +987,8 @@ impl Collection {
             pq: dense.pq.clone(),
             int8: dense.int8_codec().cloned(),
             keeps_raw: dense.keeps_raw(),
+            version,
+            rows_only: asked,
         };
         let bounds = Bounds {
             min_records: live,
@@ -919,8 +996,23 @@ impl Collection {
             max_bytes: u64::MAX,
             ids_by_position: positions,
         };
-        let mut index = DenseIndex::restore(&open, "", dir, &DumpLength(recorded_bytes), &bounds)
-            .map_err(|e| e.to_string())?;
+        let mut index =
+            match DenseIndex::open_dump(&open, "", dir, &DumpLength(recorded_bytes), &bounds) {
+                Ok(DenseRestored::Index(index)) => *index,
+                Ok(DenseRestored::Rows { rows, reason }) => {
+                    let reason = if asked {
+                        format!("{} asked for the rebuild", REBUILD_ENV)
+                    } else {
+                        reason
+                    };
+                    return Ok(DumpOutcome::Rows {
+                        rows,
+                        reason,
+                        asked,
+                    });
+                }
+                Err(refusal) => return refused(refusal),
+            };
         let nodes = index.graph().nb_points();
 
         // Every record the mappings hold has a node in a dump this index
@@ -933,13 +1025,16 @@ impl Collection {
             index.set_live(ids.slots())
         };
         if unplaced > 0 {
-            return Err(format!(
-                "the graph dump names no node for {} of the records mappings.bin holds",
-                unplaced
-            ));
+            return refused(DumpRefusal {
+                region: DumpRegion::Identity,
+                detail: format!(
+                    "the graph dump names no node for {} of the records mappings.bin holds",
+                    unplaced
+                ),
+            });
         }
         dense.replace_index(index);
-        Ok(nodes)
+        Ok(DumpOutcome::Read(nodes))
     }
 
     /// Rebuild the graph from the stored PQ codes (for persistence loading only)
@@ -1129,34 +1224,6 @@ impl Collection {
         self.dense()
             .install_int8_codec(codec)
             .map_err(|_| Error::Engine("the scalar codec was already fitted".to_string()))
-    }
-
-    /// Append every live record's internal id and scalar row to `out`, in
-    /// internal id order, and return how many were written. The payload of
-    /// the rows artefact, written straight into the frame's buffer so the
-    /// rows are copied once. Zero on any graph that is not a scalar one.
-    /// The records are walked in position order, which is internal id order,
-    /// and each is named by the internal id its node was inserted under.
-    pub(crate) fn write_int8_rows(&self, out: &mut Vec<u8>) -> usize {
-        let ids = self.ids.read().unwrap();
-        let index = self.dense().index.read().unwrap();
-        let graph = index.graph();
-        let origin_ids = graph.origin_ids();
-        let mut written = 0usize;
-        for at in ids.slots() {
-            let Some((row, internal_id)) = index
-                .node_of(Position::from_slot(at))
-                .and_then(|node| Some((graph.int8_row_at(node)?, origin_ids[node as usize])))
-            else {
-                continue;
-            };
-            let id =
-                u32::try_from(internal_id).expect("internal ids are issued below the u32 ceiling");
-            out.extend_from_slice(&id.to_le_bytes());
-            out.extend(row.iter().map(|&byte| byte as u8));
-            written += 1;
-        }
-        written
     }
 
     /// Values a scalar graph has clipped since its scales were fitted; see
@@ -1511,12 +1578,13 @@ impl Collection {
         *self.id_counter.lock().unwrap()
     }
 
-    /// Get read access to the PQ codes HashMap (thread-safe)
+    /// Get read access to the PQ codes HashMap (thread-safe), for the tests
     ///
     /// Crate private, as are the four accessors below that also hand out a
     /// guard. They return a [`ReadGuard`], and the binding reaches nothing
     /// through a guard: it takes owned values from the operations and
     /// nothing else.
+    #[cfg(test)]
     pub(crate) fn pq_codes(&self) -> ReadGuard<'_, HashMap<String, Vec<u8>>> {
         self.dense().pq_codes.read().unwrap()
     }
@@ -1548,22 +1616,6 @@ impl Collection {
     /// Get reference to the PQ instance
     pub(crate) fn pq(&self) -> Option<&Arc<zeusdb_vector_core::PQ>> {
         self.dense().pq.as_ref()
-    }
-
-    /// Bytes one record's code occupies: one a subvector under product
-    /// quantization, one a value plus the norm tail under scalar
-    /// quantization, and one where no quantization is declared.
-    pub(crate) fn quantization_code_bytes(&self) -> usize {
-        match self
-            .dense()
-            .quantization_config
-            .as_ref()
-            .map(|config| &config.scheme)
-        {
-            Some(super::QuantizationScheme::Pq { subvectors, .. }) => *subvectors,
-            Some(super::QuantizationScheme::Int8 { .. }) => self.int8_row_bytes(),
-            None => 1,
-        }
     }
 
     /// Get the index creation timestamp

@@ -25,7 +25,9 @@ use super::levels::{LevelGenerator, DEFAULT_LEVEL_SEED};
 use super::mutable::{reserved_records, MutableGraph, RESERVE_BYTES};
 use super::store::VectorStore;
 use super::traverse::LAYERS;
-use super::{restore_graph, restore_int8_graph, Distance, DumpBounds, Record, VectorGraph};
+use super::{
+    restore_graph, restore_int8_graph, Distance, DumpBounds, Record, Restored, VectorGraph,
+};
 use crate::distance::{CosineDist, L1Dist, L2Dist};
 use crate::distance::{DistPQ, Int8Dist, Int8Metric, PqMetric};
 use crate::int8::Int8Codec;
@@ -122,6 +124,7 @@ where
         // Every test graph here inserts under ids 0 to n - 1, so the node count
         // is a ceiling every one of them clears.
         max_origin_id: graph.nb_points(),
+        version: 2,
     };
     parse_dump::<T>(&FsDir::new(dir.path()), DUMP_FILENAME, &expected).unwrap()
 }
@@ -507,26 +510,40 @@ fn a_non_finite_query_traverses_or_panics_at_the_candidate_assertion() {
 // THE DUMP ROUND TRIP
 // ============================================================================
 
-/// Write a graph out, load it into the structure, write it out again, and
-/// compare the two files byte for byte.
+/// The dump of `graph` at `version`, written into `dir`.
+fn write_at<T, D>(
+    graph: &MutableGraph<T, D>,
+    store: &VectorStore<T>,
+    kind: GraphKind,
+    dir: &std::path::Path,
+    version: u32,
+) where
+    T: Clone + Send + Sync + DumpElement,
+    D: Distance<T> + Send + Sync,
+{
+    let view = graph.dump_view(store);
+    match version {
+        1 => super::dump::v1::write_dump(&view, kind, &FsDir::new(dir), DUMP_FILENAME),
+        _ => write_dump(&view, kind, &FsDir::new(dir), DUMP_FILENAME),
+    }
+    .unwrap();
+}
+
+/// Write a graph out at `version`, load it into the structure, write it out
+/// again, and compare the two files byte for byte.
 fn round_trip<T, D>(
     built: &MutableGraph<T, D>,
     built_store: &VectorStore<T>,
     kind: GraphKind,
     dist: impl Fn() -> D,
+    version: u32,
 ) -> (usize, usize)
 where
     T: Clone + Send + Sync + DumpElement,
     D: Distance<T> + Send + Sync,
 {
     let first = tempfile::tempdir().unwrap();
-    write_dump(
-        &built.dump_view(built_store),
-        kind,
-        &FsDir::new(first.path()),
-        DUMP_FILENAME,
-    )
-    .unwrap();
+    write_at(built, built_store, kind, first.path(), version);
     let expected = Expected {
         kind,
         dimension: built.dim(),
@@ -534,6 +551,7 @@ where
         ef_construction: built.ef_construction(),
         min_nodes: 0,
         max_origin_id: built.nb_points(),
+        version,
     };
     let parsed = parse_dump::<T>(&FsDir::new(first.path()), DUMP_FILENAME, &expected).unwrap();
     let (mutable, mutable_store) = MutableGraph::from_loaded(
@@ -546,13 +564,7 @@ where
     )
     .unwrap();
     let second = tempfile::tempdir().unwrap();
-    write_dump(
-        &mutable.dump_view(&mutable_store),
-        kind,
-        &FsDir::new(second.path()),
-        DUMP_FILENAME,
-    )
-    .unwrap();
+    write_at(&mutable, &mutable_store, kind, second.path(), version);
 
     let before = std::fs::read(first.path().join(DUMP_FILENAME)).unwrap();
     let after = std::fs::read(second.path().join(DUMP_FILENAME)).unwrap();
@@ -578,24 +590,36 @@ where
 }
 
 /// A dump loaded into the structure and written back out is the same file, byte
-/// for byte, on every configuration the small tests cover.
+/// for byte, on every configuration the small tests cover, at both versions.
 ///
 /// This is what makes the structure a lossless image of the file rather than a
 /// lossy one, and it is why the descent residue is stored. Without it the
 /// second file would be shorter by exactly the residue edges.
 #[test]
 fn a_dump_round_trips_through_the_mutable_graph() {
+    for version in [1, 2] {
+        round_trips_at(version);
+    }
+}
+
+fn round_trips_at(version: u32) {
     let (cosine, cosine_store) = build(&sample_vectors(1500, 24, 0x78_01), 16, 64, CosineDist {});
-    let (bytes, residue) = round_trip(&cosine, &cosine_store, GraphKind::Cosine, || CosineDist {});
+    let (bytes, residue) = round_trip(
+        &cosine,
+        &cosine_store,
+        GraphKind::Cosine,
+        || CosineDist {},
+        version,
+    );
     println!("round trip cosine bytes {} residue {}", bytes, residue);
     assert!(residue > 0, "the fixture must carry descent residue");
 
     let (l2, l2_store) = build(&sample_vectors(900, 16, 0x78_02), 16, 48, L2Dist {});
-    let (bytes, residue) = round_trip(&l2, &l2_store, GraphKind::L2, || L2Dist {});
+    let (bytes, residue) = round_trip(&l2, &l2_store, GraphKind::L2, || L2Dist {}, version);
     println!("round trip l2 bytes {} residue {}", bytes, residue);
 
     let (l1, l1_store) = build(&sample_vectors(700, 12, 0x78_03), 8, 48, L1Dist {});
-    let (bytes, residue) = round_trip(&l1, &l1_store, GraphKind::L1, || L1Dist {});
+    let (bytes, residue) = round_trip(&l1, &l1_store, GraphKind::L1, || L1Dist {}, version);
     println!("round trip l1 bytes {} residue {}", bytes, residue);
 
     // Ties, where a list holds runs of equal stored distances and only a stable
@@ -603,7 +627,13 @@ fn a_dump_round_trips_through_the_mutable_graph() {
     let distinct = sample_vectors(25, 16, 0x78_04);
     let repeated: Vec<Vec<f32>> = (0..600).map(|i| distinct[i % 25].clone()).collect();
     let (ties, ties_store) = build(&repeated, 16, 48, CosineDist {});
-    let (bytes, residue) = round_trip(&ties, &ties_store, GraphKind::Cosine, || CosineDist {});
+    let (bytes, residue) = round_trip(
+        &ties,
+        &ties_store,
+        GraphKind::Cosine,
+        || CosineDist {},
+        version,
+    );
     println!("round trip ties bytes {} residue {}", bytes, residue);
 
     // The quantized graph, whose elements are `u8` codes.
@@ -621,9 +651,13 @@ fn a_dump_round_trips_through_the_mutable_graph() {
         100,
         DistPQ::new(pq.clone(), PqMetric::SquaredL2),
     );
-    let (bytes, residue) = round_trip(&quantized, &quantized_store, GraphKind::CosinePq, || {
-        DistPQ::new(pq.clone(), PqMetric::SquaredL2)
-    });
+    let (bytes, residue) = round_trip(
+        &quantized,
+        &quantized_store,
+        GraphKind::CosinePq,
+        || DistPQ::new(pq.clone(), PqMetric::SquaredL2),
+        version,
+    );
     println!("round trip quantized bytes {} residue {}", bytes, residue);
 
     // The scalar quantized graph, whose elements are `i8` codes decoded
@@ -633,9 +667,13 @@ fn a_dump_round_trips_through_the_mutable_graph() {
     let dist = Int8Dist::new(codec.clone(), Int8Metric::Cosine);
     let rows: Vec<Vec<i8>> = unit.iter().map(|v| dist.encode(v).unwrap()).collect();
     let (scalar, scalar_store) = build(&rows, 16, 64, dist);
-    let (bytes, residue) = round_trip(&scalar, &scalar_store, GraphKind::CosineInt8, || {
-        Int8Dist::new(codec.clone(), Int8Metric::Cosine)
-    });
+    let (bytes, residue) = round_trip(
+        &scalar,
+        &scalar_store,
+        GraphKind::CosineInt8,
+        || Int8Dist::new(codec.clone(), Int8Metric::Cosine),
+        version,
+    );
     println!("round trip int8 bytes {} residue {}", bytes, residue);
     assert!(residue > 0, "the scalar fixture must carry descent residue");
 }
@@ -716,6 +754,8 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
         min_nodes: N,
         max_origin_id: N,
         positions: Some(&held),
+        version: 2,
+        rows_only: false,
     };
 
     // The raw reader refuses it on the element, and the wrong space on the
@@ -730,8 +770,7 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
         None,
         bounds,
     );
-    assert!(as_raw.is_err());
-    let reason = as_raw.err().unwrap();
+    let reason = as_raw.err().unwrap().detail;
     assert!(
         reason.contains("element type 3") && reason.contains("holds 1"),
         "{reason}"
@@ -745,14 +784,14 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
         codec.clone(),
         bounds,
     );
-    let reason = as_l2.err().unwrap();
+    let reason = as_l2.err().unwrap().detail;
     assert!(
-        reason.contains("written for int8 cosine") && reason.contains("declares int8 l2"),
+        reason.contains("the int8 cosine graph") && reason.contains("declares int8 l2"),
         "{reason}"
     );
 
     // And it comes back as itself.
-    let (restored, nodes) = restore_int8_graph(
+    let restored = match restore_int8_graph(
         &FsDir::new(dir.path()),
         DUMP_FILENAME,
         "cosine",
@@ -761,8 +800,12 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
         codec.clone(),
         bounds,
     )
-    .unwrap();
-    assert_eq!(nodes, N);
+    .unwrap()
+    {
+        Restored::Graph(graph) => *graph,
+        Restored::Rows { reason, .. } => panic!("the dump gave its rows alone: {reason}"),
+    };
+    assert_eq!(restored.nb_points(), N);
     assert!(restored.is_int8());
     let first = (0..N as u32)
         .find(|&node| restored.origin_id_at(node) == 1)

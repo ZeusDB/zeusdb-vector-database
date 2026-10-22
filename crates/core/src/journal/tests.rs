@@ -410,6 +410,70 @@ fn a_legacy_kind_is_held_to_the_ten_operations() {
     }
 }
 
+/// A whole record naming a kind this build does not know is told apart from
+/// a damaged record and from a known one, in a journal of format version 1
+/// and in a segment, where the framing kinds are known.
+#[test]
+fn a_whole_record_of_an_unknown_kind_is_told_from_damage() {
+    let (good, table) = legacy_corpus(6);
+    let at = table[3].0;
+    let mut unknown = good.clone();
+    unknown[at + 12..at + 14].copy_from_slice(&13u16.to_le_bytes());
+    restamp_record(&mut unknown, at, table[3].1);
+    let contents = read_legacy_journal(&unknown, "t").unwrap();
+    match contents.damage {
+        Some(JournalDamage::Corrupt {
+            at: found,
+            sequence,
+            ..
+        }) => assert_eq!((found, sequence), (at as u64, 4)),
+        other => panic!("expected a corrupt middle, got {other:?}"),
+    }
+    assert_eq!(unknown_kind_at(&unknown, at as u64, 4, false), Some(13));
+    assert_eq!(unknown_kind_at(&unknown, at as u64, 5, false), None);
+    assert_eq!(unknown_kind_at(&good, at as u64, 4, false), None);
+    assert_eq!(
+        unknown_kind_at(&unknown, unknown.len() as u64 + 3, 4, false),
+        None
+    );
+    let mut damaged = unknown.clone();
+    damaged[at + 16] ^= 0x01;
+    assert_eq!(unknown_kind_at(&damaged, at as u64, 4, false), None);
+
+    let mut built = build(1, &[(base(LIVE, 0), vec![Call::Committed(3)])]);
+    let victim = built.known[1].clone();
+    {
+        let segment = &mut built.segments[0];
+        segment[victim.at + 12..victim.at + 14].copy_from_slice(&13u16.to_le_bytes());
+        restamp_record(
+            segment,
+            victim.at,
+            victim.len - JOURNAL_RECORD_OVERHEAD_BYTES,
+        );
+    }
+    let files = built.files();
+    let contents = built.read(&files, &expected_at(0)).unwrap();
+    let (found, sequence) = match contents.damage {
+        Some(JournalDamage::Corrupt { at, sequence, .. })
+        | Some(JournalDamage::TornTail { at, sequence }) => (at, sequence),
+        other => panic!("expected damage, got {other:?}"),
+    };
+    assert_eq!((found, sequence), (victim.at as u64, 2));
+    assert_eq!(
+        unknown_kind_at(&built.segments[0], found, sequence, true),
+        Some(13)
+    );
+    let commit = built
+        .known
+        .iter()
+        .find(|known| known.kind == OperationKind::Commit)
+        .unwrap();
+    assert_eq!(
+        unknown_kind_at(&built.segments[0], commit.at as u64, commit.sequence, true),
+        None
+    );
+}
+
 /// A record setting a reserved flag fails, and a record whose checksum
 /// does not hold fails, whether the change is in its header or its payload.
 #[test]

@@ -15,7 +15,7 @@ import shutil
 
 import numpy as np
 import pytest
-from helpers import as_old_wire
+from helpers import as_before_five, as_old_wire
 from zeusdb_vector_database import VectorDatabase
 
 DIM = 8
@@ -131,7 +131,8 @@ def test_a_feature_this_build_does_not_know_is_refused_by_name(dense_dir, tmp_pa
         "package to open it.")
 
     two = forged(dense_dir, tmp_path / "two.zdb", lambda m: m["features"].update(
-        {"zz_later": "incompatible", "a_later_feature": "read_only", "a_later_note": "compatible"}))
+        {"zz_later": "incompatible", "a_later_feature": "incompatible", "a_later_view": "read_only",
+         "a_later_note": "compatible"}))
     with pytest.raises(RuntimeError, match=r"the features 'a_later_feature' and 'zz_later', which "
                                            r"this build does not know\. Its manifest does not mark "
                                            r"them compatible, so a build without them cannot open"):
@@ -191,7 +192,9 @@ def test_a_directory_listing_no_features_opens_and_lists_them_at_its_next_save(t
     lists what it holds."""
     path = tmp_path / "older.zdb"
     filled(create(quantization_config={**PQ, "storage_mode": "quantized_only"}), 1100).save(str(path))
-    if version != "4.0.0":
+    if version == "4.0.0":
+        as_before_five(path, version)
+    else:
         as_old_wire(path, version)
 
     def older(m):
@@ -209,17 +212,15 @@ def test_a_directory_listing_no_features_opens_and_lists_them_at_its_next_save(t
 def test_below_the_fourth_major_the_version_decides(dense_dir, tmp_path):
     """No release before 4.0.0 listed features, so below it a record is read
     for a feature this build does not know and is not held to the directory."""
-    def third(edit):
-        def stamp(m):
-            m["format_version"] = "3.0.0"
-            edit(m["features"])
-        return stamp
+    def third(name, edit):
+        path = tmp_path / name
+        shutil.copytree(dense_dir, path)
+        as_before_five(path, "3.0.0")
+        return rewrite(path, lambda m: edit(m["features"]))
 
-    listed = forged(dense_dir, tmp_path / "listed.zdb",
-                    third(lambda f: f.__setitem__("journal", "incompatible")))
+    listed = third("listed.zdb", lambda f: f.__setitem__("journal", "incompatible"))
     assert len(load(listed)) == 30
-    later = forged(dense_dir, tmp_path / "later.zdb",
-                   third(lambda f: f.__setitem__("a_later_feature", "incompatible")))
+    later = third("later.zdb", lambda f: f.__setitem__("a_later_feature", "incompatible"))
     with pytest.raises(RuntimeError, match="The directory holds the feature 'a_later_feature'"):
         load(later)
 

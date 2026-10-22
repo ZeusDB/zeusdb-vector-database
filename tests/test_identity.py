@@ -13,7 +13,7 @@ import shutil
 
 import numpy as np
 import pytest
-from helpers import as_old_wire
+from helpers import as_before_five, as_old_wire
 from zeusdb_vector_database import VectorDatabase
 
 DIM = 8
@@ -264,11 +264,11 @@ def test_a_directory_recording_no_identity_is_named_at_its_next_save(tmp_path, v
     path = tmp_path / "older.zdb"
     index.save(str(path))
     drop(index)
-    if version != "4.0.0":
+    if version == "4.0.0":
+        as_before_five(path, version)
+    else:
         as_old_wire(path, version)
     m = manifest(path)
-    if version == "4.0.0":
-        m["format_version"] = "4.0.0"
     del m["identity"]
     m.pop("features", None)
     (path / "manifest.json").write_text(json.dumps(m, indent=2), encoding="utf-8")

@@ -1562,7 +1562,7 @@ Recall at 10 against exact search on 100,000 records, and resident memory on 50,
 | sift-128 | 128 | 0.9988, 42.6 MiB | 0.4038, 29.9 MiB | 0.9827, 24.2 MiB |
 | glove-100 | 100 | 0.8858, 37.3 MiB | 0.2647, 29.9 MiB | 0.8788, 23.0 MiB |
 
-A scalar index gives up two hundredths of recall for a third to two thirds of the memory, and searching it is no slower than searching an unquantized one. A trained index writes `int8_scales.zdbint8` and `int8_rows.zdbint8` in place of the two `pq_` files.
+A scalar index gives up two hundredths of recall for a third to two thirds of the memory, and searching it is no slower than searching an unquantized one. A trained index writes `int8_scales.zdbint8` in place of `pq_centroids.bin`.
 
 **A value beyond the range its dimension's sample reached is clipped, not refused.** `quantization_saturated_values` counts every clipped value, and a rate that climbs as records arrive says the sample no longer covers the data.
 
@@ -1612,7 +1612,7 @@ print("saved:", sorted(os.listdir("my_index.zdb")))
 
 *Output*
 ```
-saved: ['config.json', 'hnsw_index.zdbgraph', 'manifest.json', 'mappings.bin', 'metadata.json', 'vectors.bin']
+saved: ['config.json', 'hnsw_index.zdbgraph', 'manifest.json', 'mappings.bin', 'metadata.json']
 ```
 
 <br />
@@ -1641,7 +1641,7 @@ top hit: doc_0
 
 **Loading reads the saved graph back rather than rebuilding it**, so a reloaded index returns the same result pages as the index that was saved, with the same IDs and the same scores. Load time is proportional to the size of the directory rather than to the cost of building the index: 50,000 records at 1,536 dimensions load in 1.1 seconds against a 156 second build. A journaled directory adds the replay of every record in its journal, each at the cost of the `add()` that wrote it; see [Journaling an Index](#-journaling-an-index---journal_to).
 
-The graph is rebuilt by re-inserting every record only when the saved graph cannot be used, which covers a directory whose graph files were lost or damaged and one written by a release too old for this build to interpret. Set `ZEUSDB_LOAD_REBUILD_GRAPH=1` to ask for that rebuild on a directory whose graph is perfectly readable, which is how an index built by an earlier release picks up graph improvements made since.
+The graph is rebuilt by re-inserting every record only when the saved graph cannot be used, which covers a directory whose graph links were damaged and one written by a release too old for this build to interpret. Set `ZEUSDB_LOAD_REBUILD_GRAPH=1` to ask for that rebuild on a directory whose graph is perfectly readable, which is how an index built by an earlier release picks up graph improvements made since.
 
 **A directory whose sparse space was declared with your own tokenizer needs it handed back**, as `vdb.load(path, tokenizer=tokenize)`. See [Text Search](#-text-search).
 
@@ -1684,10 +1684,10 @@ print("saved:", sorted(os.listdir("quantized_index.zdb")))
 quantization active: True
 quantization active after load: True
 storage mode after load: quantized_active
-saved: ['config.json', 'hnsw_index.zdbgraph', 'manifest.json', 'mappings.bin', 'metadata.json', 'pq_centroids.bin', 'pq_codes.bin', 'quantization.json', 'vectors.bin']
+saved: ['config.json', 'hnsw_index.zdbgraph', 'manifest.json', 'mappings.bin', 'metadata.json', 'pq_centroids.bin', 'quantization.json', 'vectors.bin']
 ```
 
-A scalar index writes `int8_scales.zdbint8` and `int8_rows.zdbint8` in place of the two `pq_` files and holds no `vectors.bin`; [Scalar Quantization](#-scalar-quantization) shows the listing.
+A scalar index writes `int8_scales.zdbint8` in place of `pq_centroids.bin` and holds no `vectors.bin`; [Scalar Quantization](#-scalar-quantization) shows the listing.
 
 <br/>
 
@@ -1700,12 +1700,10 @@ my_index.zdb/
 ├── config.json             # HNSW configuration and index level metadata
 ├── mappings.bin            # Every record's id and internal id (framed binary)
 ├── metadata.json           # Per-record metadata (JSON format)
-├── vectors.bin             # Raw vectors (whenever the index holds any)
+├── vectors.bin             # Raw vectors beside trained PQ codes
 ├── quantization.json       # Quantization configuration and training state (if enabled)
 ├── pq_centroids.bin        # Trained centroids (if PQ trained)
-├── pq_codes.bin            # Quantized codes (if PQ active)
 ├── int8_scales.zdbint8     # One scale per dimension (if scalar quantization trained)
-├── int8_rows.zdbint8       # Every record's scalar row (if scalar quantization trained)
 ├── hnsw_index.zdbgraph     # HNSW graph structure and payload
 └── spaces/                 # One directory per sparse space (if declared)
     └── <name>/
@@ -1721,9 +1719,9 @@ my_index.zdb.zdbjournal/    # The journal, beside the directory (if journaled)
 
 A directory saved by 0.6.0 or earlier holds `hnsw_index.hnsw.graph` and `hnsw_index.hnsw.data` in place of `hnsw_index.zdbgraph`. Opening it still works: the graph is rebuilt once from the stored records, and the next `.save()` writes the single file.
 
-**`load()` refuses a directory that does not hold what its manifest names.** It checks `files_included` before it reads anything, and the graph dump is the one exempt artefact, because every record carries what the graph is built from. A directory missing any other file will not open, and the refusal names the file and says what it held. Restore it from a copy; the missing file cannot be rebuilt from the ones that remain. A file the manifest does not name is neither read nor complained about.
+**`load()` refuses a directory that does not hold what its manifest names.** It checks `files_included` before it reads anything, and below format 5.0.0 the graph dump is exempt. A directory missing any other file will not open, and the refusal names the file and says what it held. Restore it from a copy; the missing file cannot be rebuilt from the ones that remain. A file the manifest does not name is neither read nor complained about.
 
-**It also refuses a file that is present and has changed.** Each artefact is checked against the length `file_digests` records for it, and each JSON artefact against its digest, before anything parses it, so a file edited in place is refused with its name in the message, and a JSON artefact's refusal names both digests. Every binary artefact, being `mappings.bin`, `vectors.bin`, the two `pq_` files, the two scalar artefacts, a sparse space's two files and the graph dump, carries its own header and payload checksums, so the manifest records only its length. A dump that disagrees is rebuilt rather than refused, and any of the others is refused by its own frame.
+**It also refuses a file that is present and has changed.** Each artefact is checked against the length `file_digests` records for it, and each JSON artefact against its digest, before anything parses it, so a file edited in place is refused with its name in the message, and a JSON artefact's refusal names both digests. Every binary artefact, being `mappings.bin`, `vectors.bin`, `pq_centroids.bin`, `int8_scales.zdbint8`, a sparse space's two files and the graph dump, carries its own header and payload checksums, so the manifest records only its length. At format 5.0.0 a dump that disagrees is refused, and any of the others is refused by its own frame.
 
 A directory saved before 0.8.0 carries no digests, so nothing is verified and it loads exactly as it did.
 
@@ -1927,7 +1925,7 @@ texts.zdb 5.0.0 {'journal': 'incompatible', 'sparse': 'incompatible', 'text': 'i
 | `text` | a text layer on that space | incompatible |
 | `journal` | a journal beside the directory | incompatible |
 
-A release that meets a feature it does not know refuses the directory with a message naming the feature, unless the directory marks it `compatible`, in which case the release opens the directory without it and its next save leaves the feature out. A later feature is a new name in this list rather than a new format version, so a directory holding nothing a release does not know keeps opening on that release. A directory saved by 0.11.0 or earlier lists no features.
+A release that meets a feature it does not know refuses the directory with a message naming the feature if it is marked `incompatible`, and opens the directory without it if it is marked `compatible`, and its next save leaves the feature out. A later feature is a new name in this list rather than a new format version, so a directory holding nothing a release does not know keeps opening on that release. A directory saved by 0.11.0 or earlier lists no features.
 
 <br />
 
@@ -1943,9 +1941,9 @@ A release that meets a feature it does not know refuses the directory with a mes
 
 - **Same volume.** The staging directory is a sibling of the target, so both are on the target's volume and the move is a rename rather than a copy.
 
-- **Version compatibility.** Every directory this release saves declares format version 5.0.0 and lists its features, see [What a Directory Holds](#-what-a-directory-holds---features). This release reads any 1.x to 5.x, so a directory an earlier release saved opens here, and saving it again writes 5.0.0. A 5.0.0 directory holds `mappings.bin`, `vectors.bin` and the two `pq_` files inside a frame with checksums of its own, and 0.5.0 to 0.13.0 refuse it at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
+- **Version compatibility.** Every directory this release saves declares format version 5.0.0 and lists its features, see [What a Directory Holds](#-what-a-directory-holds---features). This release reads any 1.x to 5.x, so a directory an earlier release saved opens here, and saving it again writes 5.0.0. A 5.0.0 directory holds `mappings.bin`, `vectors.bin` and `pq_centroids.bin` inside a frame with checksums of its own, and 0.5.0 to 0.13.0 refuse it at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
 
-- **Integrity checks on load.** Five run, in this order: the format version, then the features against the ones this release knows, then `files_included` against the directory, then each artefact against its recorded length and, for a JSON artefact, its digest, a binary artefact verifying its own checksums as it is read, then the restored record count against the count in `config.json`. Once `config.json` and `quantization.json` are read, the features a 4.0.0 directory lists are held to what it holds. A directory holding a sparse space adds two, being every record the space holds against the id mappings, and every term id the postings carry against the length of the dictionary. A journaled directory adds the journal's own, being the collection id in its header against the manifest's, its first record against the sequence the checkpoint holds, a record in its middle whose bytes changed after it was written, and every replayed record against the index it lands on. A directory recording an identity adds its own, being every id 32 hexadecimal digits and the generation 1 or more, and, where it is journaled, the collection id its journal record names against the identity's. A trained scalar directory adds the bounds of its two artefacts, being one finite positive scale per declared dimension, and one row per record the mappings hold in increasing internal id order. A 4.0.0 directory adds the bounds of its binary artefacts, being every internal id `vectors.bin` and `pq_codes.bin` name one that `mappings.bin` holds, one vector of the declared width for every record `mappings.bin` holds where the directory holds `vectors.bin`, one code of the declared width for each record coded, and a codebook of the shape `quantization.json` describes.
+- **Integrity checks on load.** Five run, in this order: the format version, then the features against the ones this release knows, then `files_included` against the directory, then each artefact against its recorded length and, for a JSON artefact, its digest, a binary artefact verifying its own checksums as it is read, then the restored record count against the count in `config.json`. Once `config.json` and `quantization.json` are read, the features a 4.0.0 directory lists are held to what it holds. A directory holding a sparse space adds two, being every record the space holds against the id mappings, and every term id the postings carry against the length of the dictionary. A journaled directory adds the journal's own, being the collection id in its header against the manifest's, its first record against the sequence the checkpoint holds, a record in its middle whose bytes changed after it was written, and every replayed record against the index it lands on. A directory recording an identity adds its own, being every id 32 hexadecimal digits and the generation 1 or more, and, where it is journaled, the collection id its journal record names against the identity's. A trained scalar directory adds the bounds of its scales, being one finite positive scale per declared dimension. A 4.0.0 directory adds the bounds of its binary artefacts, being every internal id `vectors.bin` and `pq_codes.bin` name one that `mappings.bin` holds, one vector of the declared width for every record `mappings.bin` holds where the directory holds `vectors.bin`, one code of the declared width for each record coded, and a codebook of the shape `quantization.json` describes.
 
 - **`save()` and `load()` are silent.** Every step they used to print to stdout is a `debug` log line instead, so a library caller sees nothing on stdout. Set `ZEUSDB_LOG_LEVEL=debug` to see the steps.
 

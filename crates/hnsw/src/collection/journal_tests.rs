@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::json;
 use zeusdb_vector_core::{
     CommitMode, Error, FsStorage, JournalWriter, Operation, SparseVector, Storage, DUMP_FILENAME,
     MAX_INTERNAL_ID, SEGMENT_HEADER_BYTES,
@@ -800,31 +800,31 @@ fn a_manifest_below_the_third_major_that_names_a_journal_is_refused() {
 }
 
 /// Every major this build reads opens a directory it wrote, and a sixth is
-/// refused with the majors this build reads. A 4.x label lists the identity
-/// among its features, as a 4.x save does.
+/// refused with the majors this build reads. A label below 5.x is read from
+/// a directory written again as one before format 5.0.0, and a 4.x label
+/// lists the identity among its features, as a 4.x save does.
 #[test]
 fn every_major_up_to_the_fifth_is_read_and_a_sixth_is_not() {
     let temp = TempDir::new("journal-tests");
     let path = temp.at("majors.zdb");
+    let older = temp.at("majors-before-five.zdb");
     let collection = Collection::build(declaration(), None);
     add(&collection, 0..8);
     collection.save(path.to_str().unwrap()).unwrap();
+    collection.save(older.to_str().unwrap()).unwrap();
+    crate::persistence::older::rewrite_before_five(&older, "3.0.0");
 
     // A 3.x label on a directory with no journal opens, since its four
     // binary artefacts are read in the frame wherever one is found.
-    rewrite_manifest(&path, |m| m["format_version"] = json!("3.0.0"));
-    assert_eq!(Collection::load(path.to_str().unwrap()).unwrap().len(), 8);
-    rewrite_manifest(&path, |m| m["format_version"] = json!("3.7.2"));
-    assert!(Collection::load(path.to_str().unwrap()).is_ok());
-    rewrite_manifest(&path, |m| {
+    assert_eq!(Collection::load(older.to_str().unwrap()).unwrap().len(), 8);
+    rewrite_manifest(&older, |m| m["format_version"] = json!("3.7.2"));
+    assert!(Collection::load(older.to_str().unwrap()).is_ok());
+    rewrite_manifest(&older, |m| {
         m["format_version"] = json!("4.9.0");
         m["features"]["identity"] = json!("compatible");
     });
-    assert!(Collection::load(path.to_str().unwrap()).is_ok());
-    rewrite_manifest(&path, |m| {
-        m["format_version"] = json!("5.3.1");
-        m["features"].as_object_mut().unwrap().remove("identity");
-    });
+    assert!(Collection::load(older.to_str().unwrap()).is_ok());
+    rewrite_manifest(&path, |m| m["format_version"] = json!("5.3.1"));
     assert!(Collection::load(path.to_str().unwrap()).is_ok());
 
     rewrite_manifest(&path, |m| m["format_version"] = json!("6.0.0"));
@@ -954,23 +954,10 @@ fn a_checkpoint_whose_dump_was_refused_reports_the_rebuild() {
     let before = ids(&collection);
     drop(collection);
 
-    std::fs::remove_file(path.join(DUMP_FILENAME)).unwrap();
-    rewrite_manifest(&path, |m| {
-        m["files_included"] = json!(m["files_included"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|f| f.as_str() != Some(DUMP_FILENAME))
-            .cloned()
-            .collect::<Vec<Value>>());
-        m["file_digests"]
-            .as_object_mut()
-            .unwrap()
-            .remove(DUMP_FILENAME);
-    });
+    super::journal_support::break_topology(&path);
 
     let (recovered, report) = recover(&path).unwrap();
-    assert!(report.graph_rebuilt, "the dump was not read");
+    assert!(report.graph_rebuilt, "the dump's topology was not read");
     assert_eq!(report.replayed, 5);
     // The rebuild keeps the ids the mappings hold, so the records and the
     // ids are the checkpoint's; the graph's topology is not.

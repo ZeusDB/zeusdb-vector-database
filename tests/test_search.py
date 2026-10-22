@@ -6,6 +6,7 @@ import pytest
 import struct
 
 import numpy as np
+from helpers import artefact_digest
 from zeusdb_vector_database import VectorDatabase
 
 # ------------------------------------------------------------
@@ -1009,22 +1010,33 @@ def test_dot_cannot_be_quantized():
         )
 
 
+def _claim_quantization(path):
+    """Write a product quantized quantization.json into the saved directory at
+    `path`, and record it in the manifest as a save holding one records it."""
+    data = json.dumps({
+        "type": "pq", "subvectors": 4, "bits": 8, "training_size": 1000,
+        "max_training_vectors": None, "storage_mode": "quantized_only",
+        "is_trained": False, "training_completed_at": None, "memory_stats": None,
+        "pq_config": {"dim": 16, "sub_dim": 4, "num_centroids": 256},
+    }).encode("utf-8")
+    (path / "quantization.json").write_bytes(data)
+    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    manifest["files_included"].append("quantization.json")
+    manifest["file_digests"]["quantization.json"] = {"bytes": len(data),
+                                                     "checksum": artefact_digest(data)}
+    manifest["has_quantization"] = True
+    manifest["total_size_mb"] = sum(
+        entry["bytes"] for entry in manifest["file_digests"].values()) / (1024 * 1024)
+    (path / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
 def test_a_hand_assembled_dot_directory_claiming_quantization_is_refused(tmp_path):
     """The same rule at load, because a config.json is not a caller."""
     corpus = _dot_corpus(n=60)
     index = _dot_index(corpus)
     path = tmp_path / "forged.zdb"
     index.save(str(path))
-
-    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    manifest["files_included"].append("quantization.json")
-    (path / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    (path / "quantization.json").write_text(json.dumps({
-        "type": "pq", "subvectors": 4, "bits": 8, "training_size": 1000,
-        "max_training_vectors": None, "storage_mode": "quantized_only",
-        "is_trained": False, "training_completed_at": None, "memory_stats": None,
-        "pq_config": {"dim": 16, "sub_dim": 4, "num_centroids": 256},
-    }), encoding="utf-8")
+    _claim_quantization(path)
 
     with pytest.raises(ValueError, match=r"space='dot' cannot be product quantized"):
         VectorDatabase().load(str(path))
@@ -1065,16 +1077,7 @@ def test_a_hand_assembled_l1_directory_claiming_quantization_is_refused(tmp_path
                "vectors": corpus.tolist()})
     path = tmp_path / "forged.zdb"
     index.save(str(path))
-
-    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    manifest["files_included"].append("quantization.json")
-    (path / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    (path / "quantization.json").write_text(json.dumps({
-        "type": "pq", "subvectors": 4, "bits": 8, "training_size": 1000,
-        "max_training_vectors": None, "storage_mode": "quantized_only",
-        "is_trained": False, "training_completed_at": None, "memory_stats": None,
-        "pq_config": {"dim": 16, "sub_dim": 4, "num_centroids": 256},
-    }), encoding="utf-8")
+    _claim_quantization(path)
 
     with pytest.raises(ValueError, match=r"space='l1' cannot be product quantized"):
         VectorDatabase().load(str(path))

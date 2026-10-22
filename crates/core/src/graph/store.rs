@@ -111,6 +111,11 @@ impl<T> VectorStore<T> {
         &self.data
     }
 
+    /// Every stored value, node by node, taken out of the store.
+    pub(crate) fn into_values(self) -> Vec<T> {
+        self.data
+    }
+
     /// Bytes the block has asked the allocator for, the header included.
     pub(crate) fn memory_bytes(&self) -> usize {
         std::mem::size_of::<Self>() + self.data.capacity() * std::mem::size_of::<T>()

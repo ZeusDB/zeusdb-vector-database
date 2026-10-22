@@ -2052,12 +2052,9 @@ impl Collection {
         // A sink that takes nothing refuses every record of the batch, an
         // overwrite's removal included, before anything is admitted.
         let (attached, read_only) = self.sink_state();
-        if let Some((directory, reason)) = read_only {
+        if let Some(refusing) = read_only {
             for record in parsed_data {
-                let err = Error::CollectionReadOnly {
-                    directory: directory.clone(),
-                    reason: reason.clone(),
-                };
+                let err = refusing.error();
                 errors.push(InsertError::Vector { id: record.id, err });
             }
             return (inserted_ids, errors);

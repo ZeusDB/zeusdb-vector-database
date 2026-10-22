@@ -20,7 +20,7 @@ import threading
 
 import numpy as np
 import pytest
-from helpers import repair_manifest
+from helpers import break_topology, repair_manifest
 from zeusdb_vector_database import VectorDatabase, _engine
 
 DIM = 4
@@ -1285,8 +1285,9 @@ def test_the_graph_rebuild_fallback_carries_the_sparse_space(tmp_path):
     before = pages_of(index, records)
     path = tmp_path / "rebuild.zdb"
     index.save(str(path))
-    (path / "hnsw_index.zdbgraph").unlink()
+    break_topology(path / "hnsw_index.zdbgraph")
     loaded = VectorDatabase().load(str(path))
+    assert loaded.recovery["graph_rebuilt"] is True
     assert len(loaded) == 60
     after = pages_of(loaded, records)
     # The sparse pages are exact and identical; the dense page is the rebuilt

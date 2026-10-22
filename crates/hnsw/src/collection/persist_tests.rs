@@ -500,12 +500,12 @@ fn the_version_rule_holds_in_both_directions() {
     assert!(message.contains("1.x, 2.x, 3.x, 4.x and 5.x"), "{message}");
     assert!(message.contains("newer"), "{message}");
 
-    // A 2.x label on a dense-only directory opens, since the minor and the
-    // major are both read.
+    // A 2.x label on a dense-only directory written as one before format
+    // 5.0.0 opens, since the minor and the major are both read.
     let plain = Collection::build(base(), None);
     let plain_path = dir.path().join("plain.zdb");
     plain.save(plain_path.to_str().unwrap()).unwrap();
-    rewrite_manifest(&plain_path, |m| m["format_version"] = json!("2.3.0"));
+    crate::persistence::older::rewrite_before_five(&plain_path, "2.3.0");
     assert!(Collection::load(plain_path.to_str().unwrap()).is_ok());
 
     // A space declared under a name the collection refuses.
@@ -513,21 +513,15 @@ fn the_version_rule_holds_in_both_directions() {
     copy_dir(&path, &renamed);
     let mut c = config(&renamed);
     c["spaces"][0]["name"] = json!("default");
-    std::fs::write(
-        renamed.join("config.json"),
-        serde_json::to_string_pretty(&c).unwrap(),
-    )
-    .unwrap();
-    let mut m = manifest(&renamed);
-    m["file_digests"]
-        .as_object_mut()
-        .unwrap()
-        .remove("config.json");
-    std::fs::write(
-        renamed.join("manifest.json"),
-        serde_json::to_string_pretty(&m).unwrap(),
-    )
-    .unwrap();
+    let text = serde_json::to_string_pretty(&c).unwrap();
+    std::fs::write(renamed.join("config.json"), &text).unwrap();
+    rewrite_manifest(&renamed, |m| {
+        m["file_digests"]["config.json"] = json!({
+            "bytes": text.len(),
+            "checksum": format!("{:016x}", zeusdb_vector_core::checksum_of(text.as_bytes())),
+        });
+        super::journal_support::resized(m);
+    });
     assert!(matches!(
         Collection::load(renamed.to_str().unwrap()),
         Err(Error::SpaceRecordInvalid { .. })
@@ -575,6 +569,7 @@ fn a_space_out_of_step_with_the_mappings_is_refused() {
     rewrite_manifest(&shrunk, |m| {
         m["file_digests"]["spaces/text/postings.zdbsparse"] =
             stale_manifest["file_digests"]["spaces/text/postings.zdbsparse"].clone();
+        super::journal_support::resized(m);
     });
     match Collection::load(shrunk.to_str().unwrap()) {
         Err(Error::SparseRecordUnmapped { space, id }) => {
@@ -610,6 +605,7 @@ fn a_space_out_of_step_with_the_mappings_is_refused() {
     rewrite_manifest(&short, |m| {
         m["file_digests"]["spaces/text/terms.zdbdict"] =
             fewer_manifest["file_digests"]["spaces/text/terms.zdbdict"].clone();
+        super::journal_support::resized(m);
     });
     match Collection::load(short.to_str().unwrap()) {
         Err(Error::TermIdBeyondDictionary { term, terms, .. }) => {
@@ -632,10 +628,11 @@ fn a_space_out_of_step_with_the_mappings_is_refused() {
     }
 }
 
-/// The graph's rebuild fallback keeps every internal id the mappings name,
-/// so the sparse space, restored under those ids before the graph, needs
-/// nothing carried through it: the loaded collection answers the same sparse
-/// page and holds the ids and the counter a load from the dump holds.
+/// The graph's rebuild from the dump's rows keeps every internal id the
+/// mappings name, so the sparse space, restored under those ids before the
+/// graph, needs nothing carried through it: the loaded collection answers the
+/// same sparse page and holds the ids and the counter a load from the dump
+/// holds.
 #[test]
 fn the_graph_rebuild_fallback_carries_the_sparse_space() {
     let declaration = base()
@@ -647,8 +644,9 @@ fn the_graph_rebuild_fallback_carries_the_sparse_space() {
     let dir = TempDir::new();
     let path = dir.path().join("both.zdb");
     collection.save(path.to_str().unwrap()).unwrap();
-    // Without its dump the loader rebuilds the graph from the records.
-    std::fs::remove_file(path.join("hnsw_index.zdbgraph")).unwrap();
+    // With its dump's topology damaged the loader rebuilds the graph from
+    // the rows the dump holds.
+    super::journal_support::break_topology(&path);
     let loaded = Collection::load(path.to_str().unwrap()).unwrap();
     assert_eq!(loaded.len(), 60);
     let after = pages(&loaded);
@@ -660,11 +658,10 @@ fn the_graph_rebuild_fallback_carries_the_sparse_space() {
     assert_eq!(loaded.id_counter(), collection.id_counter());
 }
 
-/// The raw rebuild fallback keeps every internal id the mappings name and
-/// the counter `config.json` records, so a directory loaded through it is
-/// the directory its own artefacts describe. It used to route every record
-/// through `add` with overwrite, which reissued every id above the saved
-/// counter and left the counter doubled.
+/// The raw rebuild from the dump's rows keeps every internal id the mappings
+/// name and the counter `config.json` records, so a directory loaded through
+/// it is the directory its own artefacts describe, and a stranded node's row
+/// is dropped.
 #[test]
 fn the_raw_rebuild_fallback_keeps_every_internal_id_and_the_counter() {
     let collection = Collection::build(base(), None);
@@ -703,7 +700,7 @@ fn the_raw_rebuild_fallback_keeps_every_internal_id_and_the_counter() {
     assert_eq!(config(&path)["id_counter"], 301);
     let fallback = dir.path().join("fallback.zdb");
     copy_dir(&path, &fallback);
-    std::fs::remove_file(fallback.join("hnsw_index.zdbgraph")).unwrap();
+    super::journal_support::break_topology(&fallback);
 
     let from_dump = Collection::load(path.to_str().unwrap()).unwrap();
     let rebuilt = Collection::load(fallback.to_str().unwrap()).unwrap();
@@ -1096,21 +1093,22 @@ fn a_directory_at_the_largest_m_and_the_smallest_dimension_reads_its_dump_and_wr
     );
 }
 
-/// Lists at or below their owners' levels that a graph dump leaves empty, the
-/// trailing ones the writer trims included, read off the file.
+/// Lists at or below their owners' levels that a version 2 graph dump
+/// leaves empty, the trailing ones the writer trims included, read off the
+/// file.
 fn empty_lists_at_or_below_levels(dump: &[u8]) -> usize {
-    let word = |at: usize| u64::from_le_bytes(dump[at..at + 8].try_into().unwrap()) as usize;
+    let length = |at: usize| u64::from_le_bytes(dump[at..at + 8].try_into().unwrap()) as usize;
     let count = |at: usize| u32::from_le_bytes(dump[at..at + 4].try_into().unwrap()) as usize;
     let layers = NB_LAYER_MAX as usize;
-    let mut at = 96 + 4 * layers + 8 * word(40);
+    let mut at = 128 + length(48) + length(56);
     let mut empty = 0;
     for level in 0..layers {
-        for _ in 0..count(96 + 4 * level) {
+        for _ in 0..count(128 + 4 * level) {
             let lists = dump[at] as usize;
             at += 1;
             for layer in 0..lists {
-                let entries = count(at);
-                at += 4 + 9 * entries;
+                let entries = u16::from_le_bytes([dump[at], dump[at + 1]]) as usize;
+                at += 2 + 4 * entries;
                 if (1..=level).contains(&layer) && entries == 0 {
                     empty += 1;
                 }
@@ -1121,14 +1119,14 @@ fn empty_lists_at_or_below_levels(dump: &[u8]) -> usize {
     empty
 }
 
-/// The largest origin id a graph dump names, read off the file.
+/// The largest origin id a version 2 graph dump names, read off the file.
 fn largest_origin_id(dump: &[u8]) -> u64 {
-    let nodes = u64::from_le_bytes(dump[40..48].try_into().unwrap()) as usize;
-    let first = 96 + 4 * NB_LAYER_MAX as usize;
+    let nodes = u32::from_le_bytes(dump[32..36].try_into().unwrap()) as usize;
+    let first = 128 + 4 * NB_LAYER_MAX as usize;
     (0..nodes)
         .map(|node| {
-            let at = first + 8 * node;
-            u64::from_le_bytes(dump[at..at + 8].try_into().unwrap())
+            let at = first + 4 * node;
+            u32::from_le_bytes(dump[at..at + 4].try_into().unwrap()) as u64
         })
         .max()
         .unwrap_or(0)

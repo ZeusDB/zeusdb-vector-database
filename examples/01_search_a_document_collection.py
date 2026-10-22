@@ -151,7 +151,7 @@ filtered to garden, top_k=12 (the same two, because top_k is the page size)
   1.0000  doc_09  Pruning fruit trees
   1.0000  doc_10  Composting at home
 
-saved files: ['config.json', 'hnsw_index.zdbgraph', 'manifest.json', 'mappings.bin', 'metadata.json', 'vectors.bin']
+saved files: ['config.json', 'hnsw_index.zdbgraph', 'manifest.json', 'mappings.bin', 'metadata.json']
 
 reopened: 12 documents
 collection: demo_library

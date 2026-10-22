@@ -47,6 +47,17 @@
 //! every point at every step under every arm, the upgrade over every fixture
 //! and the repair of every class.
 //!
+//! # The quantized collections
+//!
+//! The full matrix runs the script over two more collections as well, at
+//! every checkpoint and backup point under the three durability arms: a
+//! trained scalar one and a trained product quantized one under
+//! `quantized_only`. Each takes 1,000 records before the script, which train
+//! it, so every save point runs over a quantized directory at format 5.0.0,
+//! whose rows the graph dump alone holds. A record's vector there is the
+//! decoding of its codes, which the parent takes through the recovered
+//! collection's own codec or codebook.
+//!
 //! # The four arms
 //!
 //! Three are the durability policies, each by name. `sync` is
@@ -98,7 +109,7 @@ use super::journal_support::{
     copy_fixture, damaged_journal, holds_fixture, manifest, quarantine_of, sink_over,
     FaultyStorage, DAMAGED_CALL_RECORDS, REPAIR_CLASSES,
 };
-use super::{Collection, Declaration, ParsedRecord};
+use super::{Collection, Declaration, Int8Scale, ParsedRecord, QuantizationConfig, StorageMode};
 
 // ============================================================================
 // THE SCRIPT
@@ -149,6 +160,99 @@ const SCRIPT: &[Step] = &[
 
 /// The highest record index the script ever adds.
 const HIGHEST_RECORD: usize = 27;
+
+/// The records a quantized collection takes before the script, which train
+/// it, by index from `HIGHEST_RECORD + 1`.
+const BASE_RECORDS: usize = 1000;
+
+/// The collection the script runs over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    /// The raw collection the script was written for.
+    Raw,
+    /// A scalar quantized one, trained by the records it takes before the
+    /// script.
+    Int8,
+    /// A product quantized one under `quantized_only`, trained the same way.
+    Pq,
+}
+
+impl Shape {
+    fn name(self) -> &'static str {
+        match self {
+            Shape::Raw => "raw",
+            Shape::Int8 => "int8",
+            Shape::Pq => "pq",
+        }
+    }
+
+    fn from_name(name: &str) -> Self {
+        match name {
+            "int8" => Shape::Int8,
+            "pq" => Shape::Pq,
+            _ => Shape::Raw,
+        }
+    }
+
+    /// The records it takes before the script.
+    fn base(self) -> usize {
+        match self {
+            Shape::Raw => 0,
+            Shape::Int8 | Shape::Pq => BASE_RECORDS,
+        }
+    }
+
+    /// The highest record index it ever holds.
+    fn highest(self) -> usize {
+        HIGHEST_RECORD + self.base()
+    }
+
+    /// The quantization it declares.
+    fn quantization(self, declaration: &Declaration) -> Option<QuantizationConfig> {
+        match self {
+            Shape::Raw => None,
+            Shape::Int8 => Some(
+                declaration
+                    .scalar_quantization(
+                        Int8Scale::PER_DIMENSION,
+                        BASE_RECORDS,
+                        None,
+                        StorageMode::QuantizedOnly,
+                    )
+                    .unwrap(),
+            ),
+            Shape::Pq => Some(
+                declaration
+                    .quantization(4, 4, BASE_RECORDS, None, StorageMode::QuantizedOnly)
+                    .unwrap(),
+            ),
+        }
+    }
+
+    /// The vector `collection` gives back for a record given `vector`: the
+    /// vector on a raw collection, and the decoding of its codes through the
+    /// collection's own codec or codebook on a quantized one.
+    fn stored(self, collection: &Collection, vector: Vec<f32>) -> Vec<f32> {
+        match self {
+            Shape::Raw => vector,
+            Shape::Int8 => {
+                let codec = collection
+                    .int8_codec()
+                    .expect("a trained scalar collection holds its codec");
+                codec
+                    .reconstruct(&codec.quantize(&vector).unwrap())
+                    .unwrap()
+            }
+            Shape::Pq => {
+                let pq = collection
+                    .pq()
+                    .expect("a trained product quantized collection holds its codebook")
+                    .clone();
+                pq.reconstruct(&pq.quantize(&vector).unwrap()).unwrap()
+            }
+        }
+    }
+}
 
 /// The steps whose commit the failing arm fails, being an `add` and the
 /// first overwrite.
@@ -233,12 +337,12 @@ const REPAIR_POINTS: &[KillPoint] = &[
 /// The corpus, drawn the same way in every process, so the parent knows what
 /// vector each record was given.
 fn corpus() -> Vec<Vec<f32>> {
-    let mut vectors = Vec::with_capacity(HIGHEST_RECORD + 1);
+    let mut vectors = Vec::with_capacity(HIGHEST_RECORD + 1 + BASE_RECORDS);
     // A generator of its own rather than the engine's, because the parent
     // and the child have to agree on the bytes and nothing else depends on
     // them. One multiplicative step per value.
     let mut state: u64 = 0x5eed_0148;
-    for _ in 0..=HIGHEST_RECORD {
+    for _ in 0..=HIGHEST_RECORD + BASE_RECORDS {
         let mut vector = Vec::with_capacity(DIM);
         for _ in 0..DIM {
             state = state
@@ -366,6 +470,7 @@ const ENV_RESUME: &str = "ZEUSDB_KILL_RESUME";
 const ENV_MATRIX: &str = "ZEUSDB_KILL_MATRIX";
 const ENV_UPGRADE: &str = "ZEUSDB_KILL_UPGRADE";
 const ENV_REPAIR: &str = "ZEUSDB_KILL_REPAIR";
+const ENV_SHAPE: &str = "ZEUSDB_KILL_SHAPE";
 
 /// The name of the child test, as `--exact` spells it.
 const CHILD_TEST: &str = "collection::crash_tests::the_kill_matrixs_child";
@@ -419,6 +524,12 @@ fn acknowledged(path: &Path) -> Acknowledged {
     for line in text.lines() {
         if line == "done" {
             out.finished = true;
+            continue;
+        }
+        if let Some(ids) = line.strip_prefix("base add ") {
+            for id in ids.split(',') {
+                out.present.insert(id.to_string(), Form::Original);
+            }
             continue;
         }
         let parts: Vec<&str> = line.split(' ').collect();
@@ -476,12 +587,13 @@ fn holds(
     expected: &Acknowledged,
     vectors: &[Vec<f32>],
     in_flight: Option<&Step>,
+    shape: Shape,
 ) -> Result<usize, String> {
     let replacing: BTreeSet<String> = match in_flight {
         Some(Step::Overwrite(records)) => records.iter().map(|i| format!("r{i}")).collect(),
         _ => BTreeSet::new(),
     };
-    holds_present(collection, &expected.present, vectors, &replacing)?;
+    holds_present(collection, &expected.present, vectors, &replacing, shape)?;
     let live: BTreeSet<String> = collection
         .ids()
         .iter()
@@ -498,7 +610,7 @@ fn holds(
         let i: usize = id[1..]
             .parse()
             .map_err(|_| format!("record {id} was never in the script"))?;
-        if i > HIGHEST_RECORD {
+        if i > shape.highest() {
             return Err(format!("record {id} was never in the script"));
         }
     }
@@ -506,12 +618,14 @@ fn holds(
 }
 
 /// Every record of `present` held in its form, or in its overwritten form
-/// where `replacing` names it, and never absent.
+/// where `replacing` names it, and never absent, its vector the one `shape`
+/// gives back.
 fn holds_present(
     collection: &Collection,
     present: &BTreeMap<String, Form>,
     vectors: &[Vec<f32>],
     replacing: &BTreeSet<String>,
+    shape: Shape,
 ) -> Result<(), String> {
     for (id, form) in present {
         if !collection.contains(id) {
@@ -526,6 +640,7 @@ fn holds_present(
         let i: usize = id[1..].parse().unwrap();
         let matches = |form: Form| {
             let (vector, metadata) = form_of(i, form, vectors);
+            let vector = shape.stored(collection, vector);
             view.vector.as_deref() == Some(&vector[..])
                 && metadata.len() == view.metadata.len()
                 && metadata
@@ -548,8 +663,9 @@ fn holds_exactly(
     collection: &Collection,
     present: &BTreeMap<String, Form>,
     vectors: &[Vec<f32>],
+    shape: Shape,
 ) -> Result<(), String> {
-    holds_present(collection, present, vectors, &BTreeSet::new())?;
+    holds_present(collection, present, vectors, &BTreeSet::new(), shape)?;
     if collection.len() != present.len() {
         return Err(format!(
             "{} records are held and {} were expected",
@@ -569,6 +685,7 @@ fn backup_holds(
     expected: &Acknowledged,
     vectors: &[Vec<f32>],
     in_flight: Option<&Step>,
+    shape: Shape,
 ) -> Result<&'static str, String> {
     let target = backup_target(dir);
     let aside = target.with_extension("zdb.zdbold");
@@ -590,7 +707,7 @@ fn backup_holds(
         .unwrap_or_default();
     if let Some((acknowledged, present)) = expected.backups.last() {
         if *acknowledged == snapshot {
-            holds_exactly(&copy, present, vectors)?;
+            holds_exactly(&copy, present, vectors, shape)?;
             return Ok("as it was");
         }
     }
@@ -600,7 +717,7 @@ fn backup_holds(
              backup was in flight"
         ));
     }
-    holds_exactly(&copy, &expected.present, vectors)?;
+    holds_exactly(&copy, &expected.present, vectors, shape)?;
     Ok("complete")
 }
 
@@ -629,6 +746,7 @@ fn the_kill_matrixs_child() {
         None => (None, String::new()),
     };
     let point = KillPoint::from_name(&target_point);
+    let shape = Shape::from_name(&std::env::var(ENV_SHAPE).unwrap_or_default());
     let vectors = corpus();
     let durability = durability(&arm);
     zeusdb_vector_core::set_segment_roll_bytes(roll_length(&vectors));
@@ -666,7 +784,7 @@ fn the_kill_matrixs_child() {
             .unwrap_or(0);
         (collection, done)
     } else {
-        let collection = Collection::build(declaration(), None);
+        let collection = Collection::build(declaration(), shape.quantization(&declaration()));
         let _ = std::fs::remove_file(&acknowledgements);
         if point == Some(KillPoint::LockHeld) {
             zeusdb_vector_core::kill_arm(KillPoint::LockHeld, &marker);
@@ -683,6 +801,20 @@ fn the_kill_matrixs_child() {
             collection
                 .journal_to(&dir.to_string_lossy(), durability)
                 .expect("the journal opens beside the directory");
+        }
+        // The records a quantized collection takes before the script, which
+        // train it.
+        if shape.base() > 0 {
+            let base: Vec<usize> = (HIGHEST_RECORD + 1..=shape.highest()).collect();
+            let added = collection.add_records(
+                base.iter().map(|&i| parsed(i, &vectors)).collect(),
+                vec![],
+                false,
+            );
+            assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+            assert!(collection.is_quantized(), "the base trains the collection");
+            let ids: Vec<String> = base.iter().map(|i| format!("r{i}")).collect();
+            acknowledge(&acknowledgements, &format!("base add {}", ids.join(",")));
         }
         (collection, 0)
     };
@@ -798,6 +930,18 @@ struct Case {
     point: KillPoint,
     fixture: Option<&'static str>,
     repair: Option<&'static str>,
+    shape: Shape,
+}
+
+/// What a case is called in the matrix's lines and its folders.
+fn case_name(case: &Case) -> String {
+    let point = case.point.name().replace(':', "_");
+    match (case.fixture, case.repair) {
+        (Some(fixture), _) => format!("upgrade-{fixture}-{point}"),
+        (None, Some(class)) => format!("repair-{class}-{point}"),
+        (None, None) if case.shape == Shape::Raw => format!("{}-{}-{point}", case.arm, case.step),
+        (None, None) => format!("{}-{}-{}-{point}", case.shape.name(), case.arm, case.step),
+    }
 }
 
 /// The points a step of the script reaches, with the roll's at the step
@@ -826,6 +970,7 @@ fn cases(full: bool) -> Vec<Case> {
         point,
         fixture: None,
         repair: None,
+        shape: Shape::Raw,
     };
     let arms: &[&'static str] = if full {
         &["sync", "none", "interval"]
@@ -893,15 +1038,35 @@ fn cases(full: bool) -> Vec<Case> {
             });
         }
     }
+    // The quantized collections: every checkpoint and backup point at each
+    // step that saves, under the three durability arms.
+    if full {
+        for shape in [Shape::Int8, Shape::Pq] {
+            for &arm in arms {
+                for (step, kind) in SCRIPT.iter().enumerate() {
+                    if !matches!(kind, Step::Checkpoint | Step::Backup) {
+                        continue;
+                    }
+                    for point in points_of(step) {
+                        cases.push(Case {
+                            shape,
+                            ..case(arm, step, point)
+                        });
+                    }
+                }
+            }
+        }
+    }
     cases
 }
 
-fn child_command(dir: &Path, arm: &str) -> std::process::Command {
+fn child_command(dir: &Path, arm: &str, shape: Shape) -> std::process::Command {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
         .env(ENV_DIR, dir)
         .env(ENV_MODE, arm)
+        .env(ENV_SHAPE, shape.name())
         .env_remove(ENV_MATRIX)
         .env_remove(ENV_UPGRADE)
         .env_remove(ENV_REPAIR);
@@ -941,7 +1106,7 @@ fn upgrade_case(work: &Path, case: &Case, name: &str) -> Option<String> {
     let fixture = case.fixture.unwrap();
     let dir = copy_fixture(fixture, &work.join(name));
     let marker = work.join(format!("{name}.marker"));
-    let status = child_command(&dir, "upgrade")
+    let status = child_command(&dir, "upgrade", Shape::Raw)
         .env(ENV_UPGRADE, "1")
         .env(ENV_TARGET, format!("0:{}", case.point.name()))
         .env(ENV_MARKER, &marker)
@@ -984,7 +1149,7 @@ fn repair_case(work: &Path, case: &Case, name: &str, vectors: &[Vec<f32>]) -> Op
     let (calls, aside) = damaged_journal(&dir, class, declaration(), |i| parsed(i, vectors));
     let kept = kept_records(calls);
     let marker = work.join(format!("{name}.marker"));
-    let status = child_command(&dir, "repair")
+    let status = child_command(&dir, "repair", Shape::Raw)
         .env(ENV_REPAIR, "1")
         .env(ENV_TARGET, format!("0:{}", case.point.name()))
         .env(ENV_MARKER, &marker)
@@ -1005,7 +1170,7 @@ fn repair_case(work: &Path, case: &Case, name: &str, vectors: &[Vec<f32>]) -> Op
                 KillPoint::RepairAfterQuarantine,
                 "{name}: a plain load opened a journal still damaged"
             );
-            holds_exactly(&plain, &kept, vectors)
+            holds_exactly(&plain, &kept, vectors, Shape::Raw)
                 .unwrap_or_else(|e| panic!("{name}, the plain load: {e}"));
         }
         Err(error) => assert_eq!(
@@ -1022,7 +1187,7 @@ fn repair_case(work: &Path, case: &Case, name: &str, vectors: &[Vec<f32>]) -> Op
         JournalPolicy::Repair(Durability::NoSync),
     )
     .unwrap_or_else(|e| panic!("{name}: the second repair refused: {e}"));
-    holds_exactly(&repaired, &kept, vectors)
+    holds_exactly(&repaired, &kept, vectors, Shape::Raw)
         .unwrap_or_else(|e| panic!("{name}, the second repair: {e}"));
     drop(repaired);
     let (files, folders, unsealed) = quarantine_of(&dir);
@@ -1039,7 +1204,8 @@ fn repair_case(work: &Path, case: &Case, name: &str, vectors: &[Vec<f32>]) -> Op
     // And the directory opens plainly from then on.
     let (again, _) = Collection::recover(&dir.to_string_lossy(), None, Durability::NoSync)
         .unwrap_or_else(|e| panic!("{name}: reopening after the repair refused: {e}"));
-    holds_exactly(&again, &kept, vectors).unwrap_or_else(|e| panic!("{name}, reopened: {e}"));
+    holds_exactly(&again, &kept, vectors, Shape::Raw)
+        .unwrap_or_else(|e| panic!("{name}, reopened: {e}"));
     Some(format!(
         "{name}: kept {} calls, second repair cut {} checkpoint {:?}",
         calls,
@@ -1054,7 +1220,7 @@ fn repair_case(work: &Path, case: &Case, name: &str, vectors: &[Vec<f32>]) -> Op
 fn lock_case(work: &Path, name: &str, vectors: &[Vec<f32>]) -> Option<String> {
     let dir = work.join(format!("{name}.zdb"));
     let marker = work.join(format!("{name}.marker"));
-    let status = child_command(&dir, "sync")
+    let status = child_command(&dir, "sync", Shape::Raw)
         .env(ENV_TARGET, format!("0:{}", KillPoint::LockHeld.name()))
         .env(ENV_MARKER, &marker)
         .env_remove(ENV_RESUME)
@@ -1079,7 +1245,7 @@ fn lock_case(work: &Path, name: &str, vectors: &[Vec<f32>]) -> Option<String> {
             other => panic!("{name}: the killed holder's lock was not released: {other:?}"),
         }
     }
-    let status = child_command(&dir, "sync")
+    let status = child_command(&dir, "sync", Shape::Raw)
         .env(ENV_TARGET, "")
         .env_remove(ENV_RESUME)
         .env_remove(ENV_MARKER)
@@ -1094,7 +1260,8 @@ fn lock_case(work: &Path, name: &str, vectors: &[Vec<f32>]) -> Option<String> {
     assert!(expected.finished, "{name}");
     let (recovered, _) = Collection::recover(&dir.to_string_lossy(), None, Durability::NoSync)
         .unwrap_or_else(|e| panic!("reopening {name} refused: {e}"));
-    holds(&recovered, &expected, vectors, None).unwrap_or_else(|e| panic!("after {name}: {e}"));
+    holds(&recovered, &expected, vectors, None, Shape::Raw)
+        .unwrap_or_else(|e| panic!("after {name}: {e}"));
     Some(format!("{name}: the lock was released with the process"))
 }
 
@@ -1118,20 +1285,7 @@ fn the_kill_matrix_holds_at_every_point() {
     let mut lines: Vec<String> = Vec::new();
 
     for case in &cases {
-        let name = match (case.fixture, case.repair) {
-            (Some(fixture), _) => {
-                format!("upgrade-{fixture}-{}", case.point.name().replace(':', "_"))
-            }
-            (None, Some(class)) => {
-                format!("repair-{class}-{}", case.point.name().replace(':', "_"))
-            }
-            (None, None) => format!(
-                "{}-{}-{}",
-                case.arm,
-                case.step,
-                case.point.name().replace(':', "_")
-            ),
-        };
+        let name = case_name(case);
         if case.fixture.is_some() {
             lines.extend(upgrade_case(&work.0, case, &name));
             reached += 1;
@@ -1152,7 +1306,7 @@ fn the_kill_matrix_holds_at_every_point() {
         let in_flight = Some(&SCRIPT[case.step]);
 
         // The child, armed at this point.
-        let status = child_command(&dir, case.arm)
+        let status = child_command(&dir, case.arm, case.shape)
             .env(ENV_TARGET, format!("{}:{}", case.step, case.point.name()))
             .env(ENV_MARKER, &marker)
             .env_remove(ENV_RESUME)
@@ -1180,7 +1334,7 @@ fn the_kill_matrix_holds_at_every_point() {
         let (recovered, report) =
             Collection::recover(&dir.to_string_lossy(), None, Durability::NoSync)
                 .unwrap_or_else(|e| panic!("recovering {name} refused: {e}"));
-        let unacknowledged = holds(&recovered, &expected, &vectors, in_flight)
+        let unacknowledged = holds(&recovered, &expected, &vectors, in_flight, case.shape)
             .unwrap_or_else(|e| panic!("after {name}: {e}"));
         assert!(
             report
@@ -1198,7 +1352,7 @@ fn the_kill_matrix_holds_at_every_point() {
             case.point == KillPoint::SaveBetweenRenames,
             "{name} put the index back from beside the target"
         );
-        let backup = backup_holds(&dir, &expected, &vectors, in_flight)
+        let backup = backup_holds(&dir, &expected, &vectors, in_flight, case.shape)
             .unwrap_or_else(|e| panic!("the backup after {name}: {e}"));
         lines.push(format!(
             "{name}: {} acknowledged, {} refused, {unacknowledged} unacknowledged present, \
@@ -1219,7 +1373,7 @@ fn the_kill_matrix_holds_at_every_point() {
         drop(recovered);
 
         // The script resumed from the recovered state, to the end.
-        let status = child_command(&dir, case.arm)
+        let status = child_command(&dir, case.arm, case.shape)
             .env(ENV_TARGET, "")
             .env(ENV_RESUME, "1")
             .env_remove(ENV_MARKER)
@@ -1234,15 +1388,15 @@ fn the_kill_matrix_holds_at_every_point() {
         assert!(expected.finished, "resuming {name} did not reach the end");
         assert_eq!(
             expected.present.len(),
-            HIGHEST_RECORD - expected.refused.len(),
+            HIGHEST_RECORD - expected.refused.len() + case.shape.base(),
             "the finished script holds every record but the one it removes and those refused"
         );
         let (recovered, _) = Collection::recover(&dir.to_string_lossy(), None, Durability::NoSync)
             .unwrap_or_else(|e| panic!("reopening {name} after the resume refused: {e}"));
-        holds(&recovered, &expected, &vectors, None)
+        holds(&recovered, &expected, &vectors, None, case.shape)
             .unwrap_or_else(|e| panic!("after resuming {name}: {e}"));
         drop(recovered);
-        let finished = backup_holds(&dir, &expected, &vectors, None)
+        let finished = backup_holds(&dir, &expected, &vectors, None, case.shape)
             .unwrap_or_else(|e| panic!("the backup after resuming {name}: {e}"));
         assert_eq!(finished, "as it was", "{name}: the last backup stands");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1275,13 +1429,9 @@ fn the_kill_matrix_holds_at_every_point() {
     let reached_points: BTreeSet<&str> = cases
         .iter()
         .filter(|case| {
-            let name = format!(
-                "{}-{}-{}",
-                case.arm,
-                case.step,
-                case.point.name().replace(':', "_")
-            );
-            case.fixture.is_some() || case.repair.is_some() || !unreachable.contains(&name)
+            case.fixture.is_some()
+                || case.repair.is_some()
+                || !unreachable.contains(&case_name(case))
         })
         .map(|case| case.point.name())
         .collect();

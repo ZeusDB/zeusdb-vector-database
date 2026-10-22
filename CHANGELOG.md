@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`identity` holds `saved_at` and `sequence`**, the time the manifest of the directory `snapshot` names records for its save, and the journal sequence that directory holds.
 
+- **A directory holding a feature this release does not know, which its manifest marks `read_only`, opens read only.** `load()` reads every record, issues a `RuntimeWarning` naming the feature, and sets `recovery["read_only"]`, with a `read_only_reason` that names the feature. The index raises `RuntimeError` naming the feature on every mutation, on `save()` into any directory, and on `checkpoint()`, `journal_to()` and `backup()`. Where such a directory's journal holds a record of a kind this release does not know, `load()` raises `RuntimeError` naming the feature, the kind and the sequence, and `checkpoint_only=True` opens the directory as its last save left it.
+
 ### Changed
 
 - **The journal is a directory of segments.** `journal_to(path)` opens `<path>.zdbjournal`, and `journal_path` names it. Each segment is named for the first sequence it holds, and its header names the collection and the checkpoint it follows. The journal moves to a new segment at the first commit after the active one passes 64 MiB. A checkpoint starts a new segment and deletes the old ones once its save has committed. `journal_bytes` is the length of every segment together.
@@ -50,6 +52,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The refusal of a corrupt journal names `repair=True`**, the record and the byte where the repair cuts, and the records that it sets aside.
 
 - **The docstrings of `load()` and `identity`** describe `repair`, `recovery` and the two new keys.
+
+- **A save writes each record's stored vector, code or scalar row once, in the graph dump.** The dump is version 2, with a 128 byte header, an identity region, a rows region and a topology region that each carry a checksum of their own, and a trailer. `vectors.bin` holds the raw vectors that a trained product quantized index keeps beside its codes under `quantized_with_raw`.
+
+- **`load()` reads a 5.0.0 directory's rows from its graph dump.** It raises `RuntimeError` naming the dump and the check where the dump's length, header, identity region or rows region fails a check, or where a raw graph's row holds a NaN or an infinity, and `FileNotFoundError` where the directory lacks the dump. Where the topology region alone fails, it rebuilds the graph from the rows the dump holds and sets `recovery["graph_rebuilt"]`.
+
+- **`ZEUSDB_LOAD_REBUILD_GRAPH=1` rebuilds the graph from the rows the dump holds**, which the load verifies first.
+
+- **`metadata.json` is compact JSON that names each record holding a field, in increasing internal id.** A load gives every other record an empty entry, and raises `RuntimeError` for a file that names a record outside `mappings.bin`, or names one record twice.
+
+- **`quantization.json` holds the declaration and the training state.** A load ignores `memory_stats` and `pq_config` where a file holds them.
+
+- **`manifest.json` holds the twelve fields that 0.5.0 to 0.13.0 read, `features`, `identity`, `file_digests` and, for a journaled index, `journal`.** `total_size_mb` is the lengths that `file_digests` records, added.
+
+- **`load()` holds each field of a 5.x `manifest.json` to the directory**, being the release and the two times it records, the index type, the storage mode, `has_quantization`, `quantization_trained`, the three file lists, `total_vectors` against the `vector_count` of `config.json`, and `total_size_mb` against the lengths `file_digests` records. A field that disagrees with the directory raises `RuntimeError` naming the field and both values.
+
+- **`load()` raises `ValueError` for a product quantized `quantization.json` whose `training_size` is below 1000 or whose `max_training_vectors` is below its `training_size`**, as `create()` does, at every format version.
+
+- **The docstrings of `load()` and `recovery`** describe the read-only load of a directory holding a feature marked `read_only`, and the docstring of `save()` names the writers a save runs.
 
 ### Fixed
 
@@ -79,7 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Format
 
-Every directory this release saves declares format version 5.0.0 and lists its features, and a 5.x manifest without its features is refused. A 5.0.0 directory holds its journal as a directory of segments, records as `identity.sequence` the last journal sequence its records include, and lists no `identity` feature, since every 5.0.0 directory holds one. This release reads 1.x, 2.x, 3.x, 4.x and 5.x, so a directory an earlier release saved opens here, and saving it again writes 5.0.0. A journaled directory at 3.0.0, 3.1.0 or 4.0.0 is written again at 5.0.0 when it opens. 0.5.0 to 0.13.0 refuse a 5.0.0 directory at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
+Every directory this release saves declares format version 5.0.0 and lists its features, and a 5.x manifest without its features is refused. A 5.0.0 directory holds its journal as a directory of segments, records as `identity.sequence` the last journal sequence its records include, and lists no `identity` feature, since every 5.0.0 directory holds one. This release reads 1.x, 2.x, 3.x, 4.x and 5.x, so a directory an earlier release saved opens here, and saving it again writes 5.0.0. A journaled directory at 3.0.0, 3.1.0 or 4.0.0 is written again at 5.0.0 when it opens. 0.5.0 to 0.13.0 refuse a 5.0.0 directory at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`. A 5.0.0 directory holds its graph dump at version 2, which holds each record's stored vector, code or scalar row, and its `metadata.json` names the records that hold a field. A directory at 1.x to 4.x opens with its version 1 dump read, and saving it again writes 5.0.0.
 
 ## [0.13.0] - 2026-10-17
 

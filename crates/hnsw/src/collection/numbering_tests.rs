@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use zeusdb_vector_core::{compile_filter, IdfScope, SparseVector, DUMP_FILENAME};
+use zeusdb_vector_core::{compile_filter, IdfScope, SparseVector};
 use zeusdb_vector_sparse::SparseConfig;
 
 use super::{
@@ -186,7 +186,7 @@ fn the_live_nodes_follow_every_path_that_changes_the_graph_or_the_live_set() {
 
         let rebuilt_path = temp.at(&format!("numbering-{kind}-rebuilt.zdb"));
         loaded.save(rebuilt_path.to_str().unwrap()).unwrap();
-        std::fs::remove_file(rebuilt_path.join(DUMP_FILENAME)).unwrap();
+        super::journal_support::break_topology(&rebuilt_path);
         let rebuilt = Collection::load(rebuilt_path.to_str().unwrap()).unwrap();
         agree(&rebuilt, "loaded through a rebuild");
         remove(&rebuilt, 1_500..1_600, |i| i % 2 == 0);
@@ -350,7 +350,7 @@ fn the_sparse_keys_follow_every_path_that_changes_the_sparse_space() {
 
             let rebuilt_path = temp.at(&format!("sparse-keys-{kind}-{spread}-rebuilt.zdb"));
             loaded.save(rebuilt_path.to_str().unwrap()).unwrap();
-            std::fs::remove_file(rebuilt_path.join(DUMP_FILENAME)).unwrap();
+            super::journal_support::break_topology(&rebuilt_path);
             let rebuilt = Collection::load(rebuilt_path.to_str().unwrap()).unwrap();
             step(&rebuilt, "loaded through a rebuild");
             remove(&rebuilt, 1_500..1_599, |i| i % 2 == 0);

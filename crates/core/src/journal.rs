@@ -495,6 +495,9 @@ enum Parsed<'a> {
     Incomplete,
     /// The record is whole and wrong, with how.
     Failed(String),
+    /// The record is whole, carries the expected sequence and passes its
+    /// checksum, and names a kind this build does not know.
+    UnknownKind(u16),
 }
 
 /// Parse one record at `at`, expecting `expected` as its sequence. The
@@ -533,7 +536,7 @@ fn parse_record(bytes: &[u8], at: usize, expected: u64, framing: bool) -> Parsed
         return Parsed::Failed(format!("sequence {sequence} where {expected} was expected"));
     }
     let Some(kind) = OperationKind::from_code(kind).filter(|k| framing || !k.is_framing()) else {
-        return Parsed::Failed(format!("kind {kind} is not one this build knows"));
+        return Parsed::UnknownKind(kind);
     };
     if flags != 0 {
         return Parsed::Failed("the record sets a reserved flag".into());
@@ -544,6 +547,21 @@ fn parse_record(bytes: &[u8], at: usize, expected: u64, framing: bool) -> Parsed
         offset: at as u64,
         payload: &bytes[at + JOURNAL_RECORD_HEADER_BYTES..end],
     })
+}
+
+/// The kind the record at `at` names, where the record is whole, carries
+/// `expected` as its sequence, passes its checksum and names a kind this
+/// build does not know. `None` for any other record, damaged or whole.
+/// `framing` says the bytes are a segment rather than a journal of format
+/// version 1.
+///
+/// A directory holding a `read_only` feature this build does not know reads
+/// such a record as the feature's own rather than as damage.
+pub fn unknown_kind_at(bytes: &[u8], at: u64, expected: u64, framing: bool) -> Option<u16> {
+    match parse_record(bytes, usize::try_from(at).ok()?, expected, framing) {
+        Parsed::UnknownKind(kind) => Some(kind),
+        _ => None,
+    }
 }
 
 /// The bytes a record occupies from its first.
@@ -641,6 +659,7 @@ fn scan(
             }
             Parsed::Incomplete => "the record runs past the end of the file".to_string(),
             Parsed::Failed(detail) => detail,
+            Parsed::UnknownKind(kind) => format!("kind {kind} is not one this build knows"),
         };
         return (
             records,

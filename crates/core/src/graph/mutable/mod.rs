@@ -37,10 +37,10 @@
 //! zero slab of `2 * m + 1` slots used to spend half its bytes on. What the
 //! builder reads is bounded: a reverse link is placed into a list that is
 //! already ordered, so [`MutableGraph::place_last`] evaluates the distance to
-//! the entries a binary search touches and to nothing else. The dump writer
-//! recomputes every edge's distance at save time, so the file carries what it
-//! carried when the distances were stored. The traversal reads no stored
-//! distance, since it scores every neighbour against the query.
+//! the entries a binary search touches and to nothing else. A dump records each
+//! list in the order the graph holds it, with no distance, and a load installs
+//! it in that order. The traversal reads no stored distance, since it scores
+//! every neighbour against the query.
 //!
 //! ## The capacity is one slot above the vendored threshold
 //!
@@ -124,10 +124,11 @@
 //! which carries a recorded read-then-act race on the parallel insertion path.
 //! These are plain integers because the mutator is serialised.
 
+#[cfg(any(test, feature = "test-support"))]
 use super::dump::EachNeighbourhood;
 #[cfg(test)]
 use super::dump::LoadedPoint;
-use super::dump::{AdjacencyWalk, LoadedEdge, PointId};
+use super::dump::{EachLists, ListWalk, LoadedEdge, PointId};
 use super::store::VectorStore;
 use super::traverse::{self, Topology, LAYERS};
 use super::{Distance, GraphHit};
@@ -410,9 +411,10 @@ where
     /// caps a list at what the guarded pop needs. A refusal reaches the loader's
     /// rebuild path, which is what every other refusal reaches too.
     ///
-    /// The file's distances order each list and are then dropped, since the
-    /// structure holds targets alone. Every one of them is checked finite
-    /// first, which is the rule the vendored constructor applied to them.
+    /// Each list is ordered by its entries' distances and the distances are
+    /// then dropped, since the structure holds targets alone. Every one is
+    /// checked finite first. A parse of a version 2 dump gives every entry a
+    /// distance of zero, so its lists keep the order they were written in.
     ///
     /// Nodes are numbered in the order the dump streams them, which is layer
     /// major, so a loaded graph's node indices match the dump's exactly. Each
@@ -506,8 +508,8 @@ where
         );
 
         let mut store = VectorStore::with_capacity(dim, nb_point);
-        let mut lists: Vec<Vec<(f32, u32)>> = Vec::new();
-        let mut targets: Vec<u32> = Vec::new();
+        let mut lists: Vec<Vec<u32>> = Vec::new();
+        let mut ordered: Vec<(f32, u32)> = Vec::new();
         for (layer, &count) in layer_counts_in.iter().enumerate() {
             for rank in 0..count {
                 let point = next()?;
@@ -537,32 +539,30 @@ where
 
                 lists.clear();
                 for list in point.neighbours.into_iter() {
-                    let mut edges: Vec<(f32, u32)> = Vec::with_capacity(list.len());
-                    ordered_list(&list, &layer_offsets, &mut edges)?;
-                    lists.push(edges);
+                    let mut targets: Vec<u32> = Vec::with_capacity(list.len());
+                    ordered_targets(&list, &layer_offsets, &mut ordered, &mut targets)?;
+                    lists.push(targets);
                 }
-                graph.install_point(node, layer, rank, &lists, &mut targets)?;
+                graph.install_point(node, layer, rank, &lists)?;
             }
         }
         graph.finish_loading(entry_point, &layer_offsets)?;
         Ok((graph, store))
     }
 
-    /// Build the graph a dump's adjacency describes, walked point by point in
-    /// (layer, rank) order, `layer_counts[l]` points at layer `l`, the points
-    /// taking `origin_ids` in the same order and the positions `record_of`
-    /// gives them, which the reader numbered against the mappings.
+    /// Build the graph a dump's lists describe, walked node by node in layer
+    /// then rank order, `layer_counts[l]` nodes at layer `l`, the nodes taking
+    /// `origin_ids` in the same order and the positions `record_of` gives
+    /// them, which the reader numbered against the mappings.
     ///
-    /// Every list goes from the region's bytes into the slab its node owns,
-    /// ordered by the file's distances, through buffers kept from one point to
-    /// the next, so the walk allocates nothing a list. The rules are the ones
-    /// the tests' `from_points` applies, in the same order and in the same words,
-    /// and a refusal reaches the loader's rebuild path as every other refusal
-    /// does.
+    /// Every list goes from the walk into the slab its node owns, in the order
+    /// the walk hands it, through buffers kept from one node to the next, so
+    /// the build allocates nothing a list. The rules are the ones the tests'
+    /// `from_points` applies, in the same order and in the same words. A
+    /// refusal hands `origin_ids` and `record_of` back, so a reader whose
+    /// topology will not build still holds what its rows are filed by.
     ///
-    /// The vectors are not part of it. The reader streams them into the store
-    /// once the region's block is gone, so the region and the store are never
-    /// held together.
+    /// The rows are not part of it. The reader streams them into the store.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_adjacency(
         layer_counts_in: &[usize],
@@ -574,16 +574,29 @@ where
         dist_f: D,
         origin_ids: Vec<usize>,
         record_of: Vec<u32>,
-        mut walk: AdjacencyWalk<'_>,
-    ) -> Result<Self, String> {
+        mut walk: impl ListWalk,
+    ) -> Result<Self, NotBuilt> {
         let (layer_counts, layer_offsets, nb_point) =
-            loading_layout(layer_counts_in, m, level_scale)?;
+            match loading_layout(layer_counts_in, m, level_scale) {
+                Ok(layout) => layout,
+                Err(reason) => {
+                    return Err(NotBuilt {
+                        reason,
+                        origin_ids,
+                        record_of,
+                    })
+                }
+            };
         if origin_ids.len() != nb_point {
-            return Err(format!(
-                "the graph holds {} points and {} origin ids",
-                nb_point,
-                origin_ids.len()
-            ));
+            return Err(NotBuilt {
+                reason: format!(
+                    "the graph holds {} points and {} origin ids",
+                    nb_point,
+                    origin_ids.len()
+                ),
+                origin_ids,
+                record_of,
+            });
         }
         debug_assert_eq!(
             record_of.len(),
@@ -602,33 +615,40 @@ where
             record_of,
         );
 
-        let mut carried: Vec<Vec<LoadedEdge>> = Vec::new();
-        let mut lists: Vec<Vec<(f32, u32)>> = Vec::new();
-        let mut targets: Vec<u32> = Vec::new();
+        let mut lists: Vec<Vec<u32>> = Vec::new();
         for (layer, &count) in layer_counts_in.iter().enumerate() {
             for rank in 0..count {
                 let node = layer_offsets[layer] + rank as u32;
-                let list_count = walk.next_point(&mut carried);
+                let list_count = match walk.next_lists(&layer_offsets, &mut lists) {
+                    Ok(list_count) => list_count,
+                    Err(reason) => return Err(graph.not_built(reason)),
+                };
                 if list_count > LAYERS {
-                    return Err(format!(
+                    return Err(graph.not_built(format!(
                         "the point at layer {} rank {} carries adjacency for {} layers and \
                          a point carries at most {}",
                         layer, rank, list_count, LAYERS
-                    ));
+                    )));
                 }
                 graph.levels.push(layer as u8);
-
-                while lists.len() < list_count {
-                    lists.push(Vec::new());
+                if let Err(reason) = graph.install_point(node, layer, rank, &lists[..list_count]) {
+                    return Err(graph.not_built(reason));
                 }
-                for (list, edges) in carried.iter().zip(lists.iter_mut()).take(list_count) {
-                    ordered_list(list, &layer_offsets, edges)?;
-                }
-                graph.install_point(node, layer, rank, &lists[..list_count], &mut targets)?;
             }
         }
-        graph.finish_loading(entry_point, &layer_offsets)?;
+        if let Err(reason) = graph.finish_loading(entry_point, &layer_offsets) {
+            return Err(graph.not_built(reason));
+        }
         Ok(graph)
+    }
+
+    /// A refusal of the loading constructor, carrying back what it took.
+    fn not_built(self, reason: String) -> NotBuilt {
+        NotBuilt {
+            reason,
+            origin_ids: self.origin_ids,
+            record_of: self.record_of,
+        }
     }
 
     /// The graph a loading constructor fills: the per node arrays sized for
@@ -694,8 +714,7 @@ where
         node: u32,
         layer: usize,
         rank: usize,
-        lists: &[Vec<(f32, u32)>],
-        targets: &mut Vec<u32>,
+        lists: &[Vec<u32>],
     ) -> Result<(), String> {
         let mut span = layer;
         for (list_layer, list) in lists.iter().enumerate() {
@@ -727,9 +746,7 @@ where
                     cap
                 ));
             }
-            targets.clear();
-            targets.extend(list.iter().map(|&(_, target)| target));
-            self.install_loaded_list(node, list_layer, targets);
+            self.install_loaded_list(node, list_layer, list);
         }
         Ok(())
     }
@@ -1593,8 +1610,9 @@ where
     ///
     /// Every list is ordered by the distance from its owner to each target
     /// whenever no push is in flight: install site 2 writes a list phase one
-    /// sorted, the descent writes one entry, the loader sorts by the file's
-    /// distances, and an eviction shifts entries without reordering them. So
+    /// sorted, the descent writes one entry, the loader installs a version 2
+    /// list as written and orders a version 1 list by its stored distances,
+    /// and an eviction shifts entries without reordering them. So
     /// the entries before the last are in order and the last is the one whose
     /// place is not known. A binary search over the ordered entries finds it,
     /// evaluating the distance to each entry it probes and to nothing else,
@@ -1952,13 +1970,37 @@ where
         Bound { graph: self, store }
     }
 
-    /// One node's adjacency as a dump records it, being every list from layer
-    /// zero up to the highest layer the node carries anything at, each edge
-    /// carrying the distance from the node to its target, recomputed.
+    /// One node's lists as a version 2 dump records them, being every list
+    /// from layer zero up to the highest layer the node owns one at, each
+    /// target as its index in the dump's node order, in the order the list
+    /// holds it.
     ///
     /// Empty lists in the middle are kept, because a node can carry residue at
     /// a layer above one it carries nothing at, and the file records lists by
-    /// position. Trailing empty lists are the writer's business to trim.
+    /// position. Trailing empty lists are the writer's to leave out.
+    fn lists_into(&self, node: u32, order: &DumpOrder, out: &mut Vec<Vec<u32>>) {
+        for list in out.iter_mut() {
+            list.clear();
+        }
+        while out.len() < LAYERS {
+            out.push(Vec::new());
+        }
+        let lists = self.span(node) + 1;
+        for (layer, list) in out.iter_mut().enumerate().take(lists) {
+            list.extend(
+                self.neighbours_at(node, layer)
+                    .iter()
+                    .map(|&target| order.node_index(self, target)),
+            );
+        }
+    }
+
+    /// One node's adjacency as a version 1 dump records it, being every list
+    /// from layer zero up to the highest layer the node carries anything at,
+    /// each edge carrying the distance from the node to its target,
+    /// recomputed. Empty lists in the middle are kept and trailing empty lists
+    /// are the writer's to leave out.
+    #[cfg(any(test, feature = "test-support"))]
     fn neighbourhood_into(
         &self,
         node: u32,
@@ -2101,13 +2143,23 @@ impl DumpOrder {
         }
     }
 
-    /// Where one node sits, as the dump names it.
+    /// Where one node sits, as its layer and its rank within that layer.
     fn point_id<T, D>(&self, graph: &MutableGraph<T, D>, node: u32) -> PointId
     where
         T: Clone + Send + Sync,
         D: Distance<T> + Send + Sync,
     {
         PointId(graph.levels[node as usize], self.rank[node as usize] as i32)
+    }
+
+    /// One node's index in the dump's layer then rank order, which is how a
+    /// version 2 dump names it.
+    fn node_index<T, D>(&self, graph: &MutableGraph<T, D>, node: u32) -> u32
+    where
+        T: Clone + Send + Sync,
+        D: Distance<T> + Send + Sync,
+    {
+        self.offsets[graph.levels[node as usize] as usize] + self.rank[node as usize]
     }
 
     /// The nodes of one layer, in rank order.
@@ -2191,6 +2243,16 @@ where
         Ok(())
     }
 
+    fn each_lists(&self, layer: usize, f: EachLists<'_>) -> Result<(), String> {
+        let mut scratch: Vec<Vec<u32>> = Vec::new();
+        for &node in self.order.layer(layer) {
+            self.graph.lists_into(node, &self.order, &mut scratch);
+            f(&scratch)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     fn each_neighbourhood(&self, layer: usize, f: EachNeighbourhood<'_>) -> Result<(), String> {
         let mut scratch: Vec<Vec<LoadedEdge>> = Vec::new();
         for &node in self.order.layer(layer) {
@@ -2237,6 +2299,15 @@ fn edge_target(edge: &LoadedEdge, layer_offsets: &[u32; LAYERS + 1]) -> Result<u
         ));
     }
     Ok(layer_offsets[target_layer] + edge.target.1 as u32)
+}
+
+/// A refusal of [`MutableGraph::from_adjacency`], with the origin ids and the
+/// positions it was handed, so a reader still holds what its rows are filed
+/// by.
+pub(super) struct NotBuilt {
+    pub(super) reason: String,
+    pub(super) origin_ids: Vec<usize>,
+    pub(super) record_of: Vec<u32>,
 }
 
 /// The rules both loading constructors apply before anything is sized, and
@@ -2324,6 +2395,21 @@ fn ordered_list(
         a.0.partial_cmp(&b.0)
             .expect("every distance was checked finite by edge_target")
     });
+    Ok(())
+}
+
+/// One version 1 list as the node indices it installs as, in the order of its
+/// stored distances, stable on ties, written into `targets`. `scratch` holds
+/// the list's entries with their distances while it is ordered.
+pub(in crate::graph) fn ordered_targets(
+    list: &[LoadedEdge],
+    layer_offsets: &[u32; LAYERS + 1],
+    scratch: &mut Vec<(f32, u32)>,
+    targets: &mut Vec<u32>,
+) -> Result<(), String> {
+    ordered_list(list, layer_offsets, scratch)?;
+    targets.clear();
+    targets.extend(scratch.iter().map(|&(_, target)| target));
     Ok(())
 }
 

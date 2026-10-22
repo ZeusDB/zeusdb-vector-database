@@ -74,7 +74,8 @@ pub use frame::{
 pub use fusion::{fuse, Contribution, FusedHit, Fusion, DEFAULT_RRF_K};
 pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES, NB_LAYER_MAX};
 pub use graph::{
-    restore_graph, restore_int8_graph, Distance, DumpBounds, GraphHit, Planned, Record, VectorGraph,
+    restore_graph, restore_int8_graph, Distance, DumpBounds, DumpRefusal, DumpRegion, DumpRows,
+    GraphHit, Planned, Record, Restored, RowValues, VectorGraph,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use ids::ID_CEILINGS;
@@ -88,12 +89,13 @@ pub use journal::encode_legacy_header;
 pub use journal::set_segment_roll_bytes;
 pub use journal::{
     encode_journal_record, encode_segment_header, read_legacy_journal, read_segment_header,
-    read_segments, read_segments_for_repair, whole_records_from, CommitMode, Cut, Expected,
-    JournalContents, JournalDamage, JournalKind, JournalRecord, JournalSyncHandle, JournalWriter,
-    LegacyContents, LegacyHeader, LiveRecord, OperationKind, RecordState, ResumeFailure,
-    SegmentBase, SegmentBytes, SegmentHeader, SegmentReport, StaleSegment, Withdrawal,
-    JOURNAL_MAGIC, JOURNAL_MAX_PAYLOAD, JOURNAL_RECORD_CHECKSUM_BYTES, JOURNAL_RECORD_HEADER_BYTES,
-    JOURNAL_RECORD_OVERHEAD_BYTES, LEGACY_HEADER_BYTES, SEGMENT_HEADER_BYTES, SEGMENT_ROLL_BYTES,
+    read_segments, read_segments_for_repair, unknown_kind_at, whole_records_from, CommitMode, Cut,
+    Expected, JournalContents, JournalDamage, JournalKind, JournalRecord, JournalSyncHandle,
+    JournalWriter, LegacyContents, LegacyHeader, LiveRecord, OperationKind, RecordState,
+    ResumeFailure, SegmentBase, SegmentBytes, SegmentHeader, SegmentReport, StaleSegment,
+    Withdrawal, JOURNAL_MAGIC, JOURNAL_MAX_PAYLOAD, JOURNAL_RECORD_CHECKSUM_BYTES,
+    JOURNAL_RECORD_HEADER_BYTES, JOURNAL_RECORD_OVERHEAD_BYTES, LEGACY_HEADER_BYTES,
+    SEGMENT_HEADER_BYTES, SEGMENT_ROLL_BYTES,
 };
 // The abort hook the crash tests kill a process at. Compiled away when
 // `debug_assertions` are off, which is every profile the wheel is built

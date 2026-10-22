@@ -1,0 +1,48 @@
+{
+  "format_version": "4.0.0",
+  "features": {
+    "identity": "compatible"
+  },
+  "identity": {
+    "collection_id": "156b66cc40cabada0a56aaab4c142e76",
+    "generation": 1,
+    "snapshot": "4b4885bc62c5231c595462fc050b4a6b"
+  },
+  "zeusdb_version": "0.13.0",
+  "created_at": "2026-10-22T08:44:29.832137700+00:00",
+  "saved_at": "2026-10-22T08:44:29.857369400+00:00",
+  "total_vectors": 119,
+  "index_type": "HNSW",
+  "has_quantization": false,
+  "quantization_trained": false,
+  "storage_mode": "raw_only",
+  "files_included": [
+    "config.json",
+    "mappings.bin",
+    "metadata.json",
+    "vectors.bin",
+    "hnsw_index.zdbgraph"
+  ],
+  "files_excluded": [],
+  "file_digests": {
+    "config.json": {
+      "bytes": 200,
+      "checksum": "0763f89a2d9042fb"
+    },
+    "mappings.bin": {
+      "bytes": 1400
+    },
+    "metadata.json": {
+      "bytes": 1741,
+      "checksum": "520d82fe013099e7"
+    },
+    "vectors.bin": {
+      "bytes": 4368
+    },
+    "hnsw_index.zdbgraph": {
+      "bytes": 17551
+    }
+  },
+  "total_size_mb": 0.024089813232421875,
+  "compression_info": null
+}

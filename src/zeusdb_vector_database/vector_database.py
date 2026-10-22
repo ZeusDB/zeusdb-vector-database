@@ -512,7 +512,11 @@ class VectorDatabase:
         read-only media, opens read only with a RuntimeWarning: every record
         is replayed in memory, nothing on the medium changes, every change
         raises RuntimeError (CollectionReadOnly), and save() into another
-        directory copies it somewhere writable.
+        directory copies it somewhere writable. A directory holding a feature
+        this build does not know, which its manifest marks read_only, opens
+        read only the same way whatever the medium, and there every change,
+        every save, checkpoint(), journal_to() and backup() raises
+        RuntimeError (FeatureReadOnly).
 
         Args:
             path: Path to the .zdb directory containing the saved index

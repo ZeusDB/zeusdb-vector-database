@@ -82,9 +82,9 @@ use std::sync::Arc;
 use tracing::error;
 use zeusdb_vector_core::{
     restore_graph, restore_int8_graph, Admit, ArtefactRecord, Bitmap, Bounds, Budget, Cost, Dense,
-    Dir, DumpBounds, Error, Hit, Hits, Int8Codec, Inventory, Ledger, Persist, Planned, Position,
-    Prepared, Record, RecordId, Restore, ScoreKind, Selectivity, VectorGraph, VectorIndex,
-    DUMP_FILENAME, PQ,
+    Dir, DumpBounds, DumpRefusal, DumpRegion, DumpRows, Error, Hit, Hits, Int8Codec, Inventory,
+    Ledger, Persist, Planned, Position, Prepared, Record, RecordId, Restore, Restored, ScoreKind,
+    Selectivity, VectorGraph, VectorIndex, DUMP_FILENAME, PQ,
 };
 
 /// The empty marker, being a position that holds no record or a node that
@@ -116,51 +116,6 @@ impl<'a> IdsByPosition<'a> {
         debug_assert!(node == NONE || (node as usize) < self.origin_ids.len());
         self.origin_ids.get(node as usize).copied()
     }
-
-    /// The reader, chosen once, for a pass over many positions that matches
-    /// on it and runs a loop compiled for each answer, so neither loop tests
-    /// what the other needs.
-    pub(crate) fn reader(&self) -> PositionReader<'a> {
-        if self.shifted {
-            PositionReader::Shifted {
-                extent: self.node_at.len(),
-            }
-        } else {
-            PositionReader::Read {
-                node_at: self.node_at,
-                origin_ids: self.origin_ids,
-            }
-        }
-    }
-}
-
-/// One of the two ways [`IdsByPosition`] answers, chosen once for a pass.
-#[derive(Clone, Copy)]
-pub(crate) enum PositionReader<'a> {
-    /// Every position below `extent` holds a record whose internal id is
-    /// one past its position.
-    Shifted { extent: usize },
-    /// The node for each position and the graph's origin id for each node.
-    Read {
-        node_at: &'a [u32],
-        origin_ids: &'a [usize],
-    },
-}
-
-/// The internal id of the record at `at` under [`PositionReader::Shifted`].
-pub(crate) fn shifted_internal_id(extent: usize, at: usize) -> Option<usize> {
-    (at < extent).then_some(at + 1)
-}
-
-/// The internal id of the record at `at` under [`PositionReader::Read`],
-/// being the origin id of its node.
-///
-/// A hole's node is [`NONE`], which lies past every node the graph holds,
-/// so the bound of the origin ids answers for it.
-pub(crate) fn read_internal_id(node_at: &[u32], origin_ids: &[usize], at: usize) -> Option<usize> {
-    let node = *node_at.get(at)?;
-    debug_assert!(node == NONE || (node as usize) < origin_ids.len());
-    origin_ids.get(node as usize).copied()
 }
 
 use super::search::FULL_SCAN_THRESHOLD;
@@ -1413,45 +1368,64 @@ pub(crate) struct DenseOpen {
     /// The fitted scalar codec, where the saved graph was a scalar one.
     pub(crate) int8: Option<Arc<Int8Codec>>,
     pub(crate) keeps_raw: bool,
+    /// The dump version the directory's format requires.
+    pub(crate) version: u32,
+    /// At version 2, read and verify the rows and hand them back without
+    /// building a graph, for a rebuild the caller asked for.
+    pub(crate) rows_only: bool,
 }
 
-impl Restore for DenseIndex {
-    type Config = DenseOpen;
+/// What opening a dense index from its dump gave.
+pub(crate) enum DenseRestored {
+    /// The index over the graph the dump holds, boxed so the open moves a
+    /// pointer to it.
+    Index(Box<DenseIndex>),
+    /// The verified rows of a version 2 dump, where no graph was built from
+    /// it, with why.
+    Rows { rows: DumpRows, reason: String },
+}
 
-    /// Restore the graph the save wrote.
+impl DenseIndex {
+    /// Open the graph the save wrote, or the rows its dump holds.
     ///
     /// The inventory's recorded length is checked before the dump is read,
     /// because a self-consistent dump from a different save of an index of
-    /// the same shape would otherwise pass the dump's own checksums. Every
-    /// error is a reason to rebuild rather than to fail, which the caller
-    /// decides. The reader numbers the nodes against the mappings the bounds
-    /// carry, so each node names its record's position or is stranded, and a
-    /// dump naming no node for a record the mappings hold is refused. The
-    /// index comes back holding no record and the caller files the records at
-    /// those positions; see [`DenseIndex::set_live`].
-    fn restore(
+    /// the same shape would otherwise pass the dump's own checksums. A
+    /// refusal names the region it falls in, and the caller decides whether
+    /// it refuses the load or rebuilds. The reader numbers the nodes against
+    /// the mappings the bounds carry, so each node names its record's
+    /// position or is stranded, and a dump naming no node for a record the
+    /// mappings hold is refused. The index comes back holding no record and
+    /// the caller files the records at those positions; see
+    /// [`DenseIndex::set_live`].
+    pub(crate) fn open_dump(
         config: &DenseOpen,
         prefix: &str,
         dir: &dyn Dir,
         inventory: &dyn Inventory,
         bounds: &Bounds<'_>,
-    ) -> Result<Self, Error> {
+    ) -> Result<DenseRestored, DumpRefusal> {
         let name = dump_name(prefix);
         if let Some(recorded) = inventory.recorded(&name) {
             let found = dir.length(&name).unwrap_or(0);
             if found != recorded.bytes {
-                return Err(Error::Engine(format!(
-                    "the graph dump is {} bytes and manifest.json records it as {}",
-                    found, recorded.bytes
-                )));
+                return Err(DumpRefusal {
+                    region: DumpRegion::Header,
+                    detail: format!(
+                        "the file is {} bytes and manifest.json records {}",
+                        found, recorded.bytes
+                    ),
+                });
             }
         }
         let dump_bounds = DumpBounds {
             min_nodes: bounds.min_records,
             max_origin_id: bounds.max_records,
             positions: Some(bounds.ids_by_position),
+            version: config.version,
+            rows_only: config.rows_only,
         };
-        let (graph, _nodes) = match &config.int8 {
+        let restored = match &config.int8 {
             Some(codec) => restore_int8_graph(
                 dir,
                 &name,
@@ -1474,15 +1448,38 @@ impl Restore for DenseIndex {
                     dump_bounds,
                 )
             }
+        }?;
+        Ok(match restored {
+            Restored::Graph(graph) => DenseRestored::Index(Box::new(DenseIndex::new(
+                *graph,
+                &config.metric,
+                config.dim,
+                config.pq.clone(),
+                config.keeps_raw,
+            ))),
+            Restored::Rows { rows, reason } => DenseRestored::Rows { rows, reason },
+        })
+    }
+}
+
+impl Restore for DenseIndex {
+    type Config = DenseOpen;
+
+    /// Restore the graph the save wrote, through
+    /// [`DenseIndex::open_dump`], a refusal and rows handed back both refused
+    /// in the words of the check that failed.
+    fn restore(
+        config: &DenseOpen,
+        prefix: &str,
+        dir: &dyn Dir,
+        inventory: &dyn Inventory,
+        bounds: &Bounds<'_>,
+    ) -> Result<Self, Error> {
+        match DenseIndex::open_dump(config, prefix, dir, inventory, bounds) {
+            Ok(DenseRestored::Index(index)) => Ok(*index),
+            Ok(DenseRestored::Rows { reason, .. }) => Err(Error::Engine(reason)),
+            Err(refusal) => Err(Error::Engine(refusal.detail)),
         }
-        .map_err(Error::Engine)?;
-        Ok(DenseIndex::new(
-            graph,
-            &config.metric,
-            config.dim,
-            config.pq.clone(),
-            config.keeps_raw,
-        ))
     }
 }
 
@@ -2420,11 +2417,10 @@ mod tests {
             .collect()
     }
 
-    /// The reader of each position's internal id, and the form a pass takes
-    /// of it, answer what the node and its origin id answer, at every
-    /// position and past the last, holes included, and the reader takes the
-    /// ids as the positions plus one exactly where they are: no hole, the
-    /// first id one and the last the record count.
+    /// The reader of each position's internal id answers what the node and
+    /// its origin id answer, at every position and past the last, holes
+    /// included, and takes the ids as the positions plus one exactly where
+    /// they are: no hole, the first id one and the last the record count.
     #[test]
     fn each_position_names_the_internal_id_its_node_was_inserted_under() {
         let vectors: Vec<Vec<f32>> = (0..40)
@@ -2434,26 +2430,9 @@ mod tests {
         let check = |index: &DenseIndex, shifted: bool, label: &str| {
             let reader = index.ids_by_position();
             assert_eq!(reader.shifted, shifted, "{label}");
-            assert_eq!(
-                matches!(reader.reader(), PositionReader::Shifted { .. }),
-                shifted,
-                "{label}"
-            );
             let past = index.node_at().len() + 3;
             let read: Vec<Option<usize>> = (0..past).map(|at| reader.get(at)).collect();
             assert_eq!(read, ids_read_twice(index, past), "{label}");
-            let by_pass: Vec<Option<usize>> = match reader.reader() {
-                PositionReader::Shifted { extent } => (0..past)
-                    .map(|at| shifted_internal_id(extent, at))
-                    .collect(),
-                PositionReader::Read {
-                    node_at,
-                    origin_ids,
-                } => (0..past)
-                    .map(|at| read_internal_id(node_at, origin_ids, at))
-                    .collect(),
-            };
-            assert_eq!(by_pass, read, "{label}, the reader a pass takes");
         };
         let forty = || {
             let mut index = DenseIndex::new(graph(), "l2", 2, None, false);

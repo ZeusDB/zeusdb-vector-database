@@ -8,7 +8,8 @@ import warnings
 
 import numpy as np
 import pytest
-from helpers import artefact_digest, as_old_wire, frame, reframe, repair_manifest, unframe
+from helpers import (artefact_digest, as_before_five, as_old_wire, frame, reframe,
+                     repair_manifest, reseal_dump, unframe)
 from zeusdb_vector_database import VectorDatabase
 
 # ------------------------------------------------------------
@@ -168,7 +169,7 @@ def test_persistence_vector_equality_by_space(tmp_path, space):
     than assumed. add() runs process_vector_for_space, which normalizes on the
     cosine path and returns the vector untouched on l1 and l2. What the load
     path returns is the stored vector as it was written, bit for bit, in every
-    space, because vectors.bin is restored verbatim.
+    space, because the graph dump's rows are restored verbatim.
     """
     vdb = VectorDatabase()
     index = vdb.create("hnsw", dim=8, space=space, expected_size=50)
@@ -212,8 +213,8 @@ def test_persistence_vector_equality_by_space(tmp_path, space):
             # Stored form is the normalized input, not the input itself.
             assert np.allclose(stored_before, _normalize(vectors[i]), atol=1e-6)
             assert not np.array_equal(stored_before, vectors[i].astype(np.float64))
-            # And the stored form comes back exactly, because vectors.bin is
-            # restored as written and nothing normalizes it a second time.
+            # And the stored form comes back exactly, because the dump's rows
+            # are restored as written and nothing normalizes them a second time.
             assert np.array_equal(stored_before, stored_after)
         else:
             # l1 and l2 do not normalize, so the stored vector is the input and
@@ -401,19 +402,19 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
     on_disk = sorted(p.name for p in save_dir.glob("*"))
     # One graph file rather than the two the vendored writer used to leave. The
     # split existed so the points could be memory mapped, which this build never
-    # asks for, and it meant the topology and the points could disagree.
+    # asks for, and it meant the topology and the points could disagree. The
+    # graph file holds each record's vector, so no vectors.bin is written.
     assert on_disk == [
         "config.json",
         "hnsw_index.zdbgraph",
         "manifest.json",
         "mappings.bin",
         "metadata.json",
-        "vectors.bin",
     ]
 
     manifest = json.loads((save_dir / "manifest.json").read_text(encoding="utf-8"))
     assert sorted(manifest) == [
-        "compression_info", "created_at", "features", "file_digests", "files_excluded",
+        "created_at", "features", "file_digests", "files_excluded",
         "files_included", "format_version", "has_quantization", "identity",
         "index_type", "quantization_trained", "saved_at", "storage_mode",
         "total_size_mb", "total_vectors", "zeusdb_version",
@@ -441,19 +442,18 @@ def test_persistence_manifest_and_file_inventory(tmp_path):
     assert manifest["has_quantization"] is False
     assert manifest["quantization_trained"] is False
     assert manifest["storage_mode"] == "raw_only"
-    assert manifest["compression_info"] is None
     assert manifest["total_size_mb"] > 0
 
     # files_included is the inventory the loader reads back, and it is a strict
     # subset of what is on disk. The graph file is in it, because the loader
     # restores the saved graph and cannot do that without the points.
+    # files_excluded names what the save did not write.
     assert manifest["files_included"] == [
-        "config.json", "mappings.bin", "metadata.json", "vectors.bin",
-        "hnsw_index.zdbgraph",
+        "config.json", "mappings.bin", "metadata.json", "hnsw_index.zdbgraph",
     ]
-    assert manifest["files_excluded"] == []
+    assert manifest["files_excluded"] == ["vectors.bin"]
     assert set(manifest["files_included"]).issubset(on_disk)
-    assert set(manifest["files_excluded"]).issubset(on_disk)
+    assert not set(manifest["files_excluded"]) & set(on_disk)
 
     config = json.loads((save_dir / "config.json").read_text(encoding="utf-8"))
     assert config["dim"] == 8
@@ -501,21 +501,21 @@ def test_persistence_quantized_with_raw_round_trip(tmp_path):
     save_dir = tmp_path / "qwr.zdb"
     index.save(str(save_dir))
 
+    # The codes are the graph's rows and go into the graph file alone, and
+    # this mode keeps the raw vectors beside them in vectors.bin.
     on_disk = sorted(p.name for p in save_dir.glob("*"))
-    for expected in ("quantization.json", "pq_centroids.bin", "pq_codes.bin", "vectors.bin"):
+    for expected in ("quantization.json", "pq_centroids.bin", "vectors.bin"):
         assert expected in on_disk
+    assert "pq_codes.bin" not in on_disk
 
     manifest = json.loads((save_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["has_quantization"] is True
     assert manifest["quantization_trained"] is True
     assert manifest["storage_mode"] == "quantized_active"
     # dim 8 at 4 subvectors, so a code is 4 bytes against 32 for the vector.
-    # This mode keeps a raw vector for every coded record, so the manifest read
-    # 8.0 before the numerator was changed to count the coded records too, and
-    # it reads 8.0 after. Under quantized_only it did not; see test 105.
-    assert manifest["compression_info"]["compression_ratio"] == 8.0
-    assert manifest["compression_info"]["original_size_mb"] == pytest.approx(
-        count * 8 * 4 / (1024 * 1024))
+    # The index reports the ratio, and the manifest records none.
+    assert "compression_info" not in manifest
+    assert index.get_quantization_info()["compression_ratio"] == 8.0
 
     loaded = vdb.load(str(save_dir))
 
@@ -598,7 +598,7 @@ def test_persistence_untrained_pq_index(tmp_path):
     assert manifest["has_quantization"] is True
     assert manifest["quantization_trained"] is False
     assert manifest["storage_mode"] == "raw_collecting_for_training"
-    assert manifest["compression_info"] is None
+    assert "compression_info" not in manifest
 
     # The saved file does carry the whole training set.
     quantization = json.loads((save_dir / "quantization.json").read_text(encoding="utf-8"))
@@ -660,19 +660,19 @@ def test_persistence_untrained_pq_index(tmp_path):
 def test_persistence_quantized_only_round_trip(quantized_only_saved):
     """Every record comes back, including the ones stored as codes alone.
 
-    A trained quantized_only index holds no raw vectors, so its directory has
-    pq_codes.bin and no vectors.bin at all. The loader restores the PQ graph the
-    save dumped, so every record is covered, nothing is reconstructed to full
-    width on the way, and the loaded index is quantized exactly as the saved one
-    was. The stored codes are put back as written rather than recomputed, and no
-    record is promoted to raw storage,
-    so the mode keeps the memory saving that is its whole purpose.
+    A trained quantized_only index holds no raw vectors, so its directory holds
+    each record's code in the graph dump and no vectors.bin at all. The loader
+    restores the PQ graph the save dumped, so every record is covered, nothing
+    is reconstructed to full width on the way, and the loaded index is quantized
+    exactly as the saved one was. The stored codes are put back as written
+    rather than recomputed, and no record is promoted to raw storage, so the
+    mode keeps the memory saving that is its whole purpose.
     """
     vdb = VectorDatabase()
     ids = quantized_only_saved["ids"]
     save_dir = quantized_only_saved["path"]
     on_disk = {p.name for p in save_dir.glob("*")}
-    assert "pq_codes.bin" in on_disk
+    assert "pq_codes.bin" not in on_disk
     assert "vectors.bin" not in on_disk
 
     loaded = vdb.load(str(save_dir))
@@ -753,29 +753,22 @@ def test_persistence_vector_count_matches_reality(tmp_path, quantized_only_saved
     assert vdb.load(str(plain_dir)).get_vector_count() == 6
 
     # A file the manifest names and the directory lacks is refused before any
-    # artefact is read, so losing vectors.bin from a plain index is caught by
-    # the completeness check rather than by the count. Both files below are
-    # named under files_included, which is what makes the earlier check the one
-    # that fires.
-    broken = tmp_path / "broken.zdb"
-    shutil.copytree(plain_dir, broken)
-    (broken / "vectors.bin").unlink()
-    with pytest.raises(FileNotFoundError,
-                       match=r"manifest.json names vectors.bin under files_included"):
-        vdb.load(str(broken))
-
-    # Losing pq_codes.bin from a quantized_only index loses every record,
-    # because the codes are the only copy the mode keeps. The directory carries
-    # no vectors.bin to fall back on: a trained index in this mode saved none,
-    # having released the training records' raw vectors when training
-    # completed.
+    # artefact is read, so losing the graph dump, which holds every record's
+    # vector or code, is caught by the completeness check rather than by the
+    # count. The dump is named under files_included, which is what makes the
+    # earlier check the one that fires. Under quantized_only the codes are the
+    # only copy the mode keeps, and the directory carries no vectors.bin to
+    # fall back on: a trained index in this mode saved none, having released
+    # the training records' raw vectors when training completed.
     assert not (quantized_only_saved["path"] / "vectors.bin").exists()
-    no_codes = tmp_path / "no_codes.zdb"
-    shutil.copytree(quantized_only_saved["path"], no_codes)
-    (no_codes / "pq_codes.bin").unlink()
-    with pytest.raises(FileNotFoundError,
-                       match=r"manifest.json names pq_codes.bin under files_included"):
-        vdb.load(str(no_codes))
+    for source, name in ((plain_dir, "broken.zdb"),
+                         (quantized_only_saved["path"], "no_codes.zdb")):
+        broken = tmp_path / name
+        shutil.copytree(source, broken)
+        (broken / "hnsw_index.zdbgraph").unlink()
+        with pytest.raises(FileNotFoundError,
+                           match=r"manifest.json names hnsw_index.zdbgraph under files_included"):
+            vdb.load(str(broken))
 
     # The count check itself still stands behind that one. A directory whose
     # files are all present and all parse, but whose config.json reports a
@@ -788,8 +781,13 @@ def test_persistence_vector_count_matches_reality(tmp_path, quantized_only_saved
                                             encoding="utf-8")
     # The manifest records a digest per artefact, so an edit that is not
     # recorded stops at the digest and never reaches the count check this case
-    # is about. See helpers.repair_manifest.
+    # is about. See helpers.repair_manifest. A 5.x manifest records the count
+    # as total_vectors, held to config.json, so the edit records it there too.
     repair_manifest(miscounted, "config.json")
+    manifest = json.loads((miscounted / "manifest.json").read_text(encoding="utf-8"))
+    manifest["total_vectors"] = 9
+    (miscounted / "manifest.json").write_text(json.dumps(manifest, indent=2),
+                                              encoding="utf-8")
     with pytest.raises(RuntimeError, match=r"yields 6 records while config.json reports 9"):
         vdb.load(str(miscounted))
 
@@ -848,12 +846,13 @@ def test_persistence_rejects_unusable_codebook(tmp_path, quantized_only_saved):
 def test_persistence_reads_previous_format(tmp_path, quantized_only_saved):
     """Format 1.0.0, written by 0.3.0 through 0.4.1, still opens.
 
-    The fixture is built by saving with this build and then reversing three of
-    the save side changes since, being the four binary artefacts in bincode's
-    wire rather than the frame, the index level metadata field in config.json,
-    and the format version in manifest.json. The fourth difference is that
-    those releases also wrote the training records to vectors.bin for a
-    trained quantized_only index; that file's handling is covered by
+    The fixture is built by saving with this build and then reversing the save
+    side changes since: each code goes into pq_codes.bin and the graph dump is
+    written at version 1, the binary artefacts go into bincode's wire rather
+    than the frame, the index level metadata field leaves config.json, and the
+    manifest declares the format version. Those releases also wrote the
+    training records to vectors.bin for a trained quantized_only index; that
+    file's handling is covered by
     test_persistence_drops_raw_vectors_from_an_old_quantized_only_directory,
     which loads a directory that carries one.
     """
@@ -888,14 +887,16 @@ def test_persistence_reads_previous_format(tmp_path, quantized_only_saved):
     # because it was never written. An empty map is the honest answer.
     assert loaded.get_all_metadata() == {}
 
-    # Saving it again upgrades the directory, its four binary artefacts framed
-    # and every one of them what a save of the original index wrote.
+    # Saving it again upgrades the directory, its binary artefacts framed, each
+    # code held in the graph dump alone, and every one of them what a save of
+    # the original index wrote.
     upgraded = tmp_path / "upgraded.zdb"
     loaded.save(str(upgraded))
     assert json.loads((upgraded / "manifest.json").read_text(
         encoding="utf-8"))["format_version"] == "5.0.0"
-    for name in ("mappings.bin", "pq_codes.bin", "pq_centroids.bin"):
+    for name in ("mappings.bin", "pq_centroids.bin", "hnsw_index.zdbgraph"):
         assert (upgraded / name).read_bytes() == (quantized_only_saved["path"] / name).read_bytes(), name
+    assert not (upgraded / "pq_codes.bin").exists()
     assert "metadata" in json.loads((upgraded / "config.json").read_text(encoding="utf-8"))
     assert vdb.load(str(upgraded)).get_vector_count() == QO_COUNT
 
@@ -914,10 +915,11 @@ def test_persistence_drops_raw_vectors_from_an_old_quantized_only_directory(tmp_
     record, and the count check still passes because the union of raws and
     codes is unchanged.
 
-    The fixture is a quantized_with_raw save, whose vectors.bin holds a raw
-    vector for every record alongside full codes, relabelled quantized_only in
-    quantization.json. That is a superset of what 0.4.1 wrote for
-    quantized_only, where vectors.bin held the training records alone.
+    The fixture is a quantized_with_raw save written as a 4.0.0 directory,
+    whose vectors.bin holds a raw vector for every record alongside full
+    codes, relabelled quantized_only in quantization.json. That is a superset
+    of what 0.4.1 wrote for quantized_only, where vectors.bin held the
+    training records alone.
     """
     vdb = VectorDatabase()
     count = 1100
@@ -938,6 +940,7 @@ def test_persistence_drops_raw_vectors_from_an_old_quantized_only_directory(tmp_
 
     old_style = tmp_path / "old_quantized_only.zdb"
     index.save(str(old_style))
+    as_before_five(old_style, "4.0.0")
     assert (old_style / "vectors.bin").exists()
 
     quantization = json.loads(
@@ -1002,11 +1005,14 @@ def test_persistence_format_version_gate(tmp_path):
     def with_version(version, name):
         target = tmp_path / name
         shutil.copytree(source, target)
+        if version.split(".")[0] in ("1", "2", "3", "4"):
+            # A save before 5.0.0 holds each row in vectors.bin as well and
+            # the graph dump at version 1, and a 4.x save lists the identity
+            # among its features.
+            as_before_five(target, version)
+            return target
         manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
         manifest["format_version"] = version
-        # A 4.x save lists the identity among its features.
-        if version.startswith("4."):
-            manifest["features"]["identity"] = "compatible"
         (target / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         return target
 
@@ -1132,9 +1138,9 @@ def test_load_validates_the_declaration_in_config_json(tmp_path):
         4, "l2", 8, 64, 100)
     assert reopened.get_vector_count() == 5
 
-    def corrupted(name, field, value):
+    def corrupted(name, field, value, source=good):
         target = tmp_path / name
-        shutil.copytree(good, target)
+        shutil.copytree(source, target)
         config = json.loads((target / "config.json").read_text(encoding="utf-8"))
         config[field] = value
         (target / "config.json").write_text(json.dumps(config, indent=2),
@@ -1188,10 +1194,19 @@ def test_load_validates_the_declaration_in_config_json(tmp_path):
     assert grown.get_vector_count() == 6
 
     # A valid value that merely differs still opens, so the check refuses bad
-    # declarations rather than unfamiliar ones.
-    reopened = vdb.load(corrupted("l1.zdb", "space", "l1"))
+    # declarations rather than unfamiliar ones. A directory before 5.0.0
+    # rebuilds its graph in the space config.json declares. At 5.0.0 the graph
+    # dump holds the only copy of each row and its header names the space the
+    # graph was built in, so a dump of another space refuses the load.
+    older = tmp_path / "older.zdb"
+    shutil.copytree(good, older)
+    as_before_five(older, "4.0.0")
+    reopened = vdb.load(corrupted("l1-older.zdb", "space", "l1", source=older))
     assert reopened.get_stats()["space"] == "l1"
     assert reopened.get_vector_count() == 5
+    with pytest.raises(RuntimeError,
+                       match=r"its header names the l2 graph and config\.json declares l1"):
+        vdb.load(corrupted("l1.zdb", "space", "l1"))
 
 # ------------------------------------------------------------
 # Test 100: a saved directory holding a non-finite value fails loudly
@@ -1202,12 +1217,13 @@ def test_load_refuses_a_saved_index_holding_a_non_finite_value(tmp_path):
     The guard is in the loader rather than in the graph rebuild. The rebuild
     used to catch this by replaying every record through add(), which refuses a
     non-finite value, but the loader now restores the saved graph and the
-    rebuild does not run. vectors.bin is checked as it is read, so the refusal
-    holds whichever graph path the directory takes.
+    rebuild does not run. Each stored vector is checked as it is read, the
+    graph dump's rows at 5.0.0 and vectors.bin before it, so the refusal holds
+    whichever graph path the directory takes.
 
-    The directory is poisoned by patching the float in vectors.bin and
-    framing the payload again, because add() no longer accepts one, which is
-    the point of the other half of this change.
+    The directory is poisoned by patching the float in the file and sealing
+    it again, because add() no longer accepts one, which is the point of the
+    other half of this change.
     """
     marker_value = 123456.75  # exactly representable in f32 and unique here
     vdb = VectorDatabase()
@@ -1217,23 +1233,38 @@ def test_load_refuses_a_saved_index_holding_a_non_finite_value(tmp_path):
 
     save_dir = tmp_path / "poisoned.zdb"
     index.save(str(save_dir))
-
-    vectors_bin = save_dir / "vectors.bin"
-    _, _, payload = unframe(vectors_bin.read_bytes())
+    older = tmp_path / "poisoned-older.zdb"
+    shutil.copytree(save_dir, older)
+    as_before_five(older, "4.0.0")
     marker = struct.pack("<f", marker_value)
+
+    dump = save_dir / "hnsw_index.zdbgraph"
+    blob = dump.read_bytes()
+    assert blob.count(marker) == 1
+    dump.write_bytes(blob.replace(marker, struct.pack("<f", float("nan"))))
+    reseal_dump(dump)
+
+    vectors_bin = older / "vectors.bin"
+    _, _, payload = unframe(vectors_bin.read_bytes())
     assert payload.count(marker) == 1
     reframe(vectors_bin, payload.replace(marker, struct.pack("<f", float("nan"))))
-    repair_manifest(save_dir, "vectors.bin")
+    repair_manifest(older, "vectors.bin")
 
-    with pytest.raises(RuntimeError, match="holds a NaN or an infinity"):
-        vdb.load(str(save_dir))
+    refusals = (
+        (save_dir, r"its rows region holds NaN in the row of node \d+, internal id \d+"),
+        (older, "holds a NaN or an infinity"),
+    )
+    for directory, refusal in refusals:
+        with pytest.raises(RuntimeError, match=refusal):
+            vdb.load(str(directory))
 
     # The same refusal when the graph is rebuilt rather than restored, so the
     # guard does not depend on which path the load takes.
     os.environ["ZEUSDB_LOAD_REBUILD_GRAPH"] = "1"
     try:
-        with pytest.raises(RuntimeError, match="holds a NaN or an infinity"):
-            vdb.load(str(save_dir))
+        for directory, refusal in refusals:
+            with pytest.raises(RuntimeError, match=refusal):
+                vdb.load(str(directory))
     finally:
         del os.environ["ZEUSDB_LOAD_REBUILD_GRAPH"]
 
@@ -1486,9 +1517,9 @@ def test_reload_preserves_m_against_a_changed_default(tmp_path):
     assert len(hits) == 5
 
 # ------------------------------------------------------------
-# Test 105: the manifest compression ratio is the compression ratio
+# Test 105: the reported compression ratio is the compression ratio
 # ------------------------------------------------------------
-def test_manifest_compression_ratio_is_mode_independent(quantized_reload):
+def test_the_reported_compression_ratio_is_mode_independent(quantized_reload):
     """Both sizes are taken over the coded records, so the ratio is dim * 4 / subvectors.
 
     The fixture is parametrised over both storage modes, so this runs twice and
@@ -1497,23 +1528,15 @@ def test_manifest_compression_ratio_is_mode_independent(quantized_reload):
     The numerator used to count the raw vectors the index still holds. Under
     quantized_with_raw that is every coded record and the ratio came out right.
     Under quantized_only it is only the training records, so with 1,000 of the
-    1,500 collected before training the manifest read 5.3x where the codes are
-    8x smaller than the vectors. The figure now matches the ratio the index
-    reports live, in both modes.
+    1,500 collected before training the figure read 5.3x where the codes are
+    8x smaller than the vectors. The index reports the ratio in both modes,
+    and the manifest records none.
     """
     expected = RELOAD_DIM * 4 / RELOAD_SUBVECTORS
     manifest = json.loads(
         (quantized_reload["path"] / "manifest.json").read_text(encoding="utf-8"))
-    info = manifest["compression_info"]
+    assert "compression_info" not in manifest
 
-    assert info["compression_ratio"] == pytest.approx(expected)
-    assert info["original_size_mb"] == pytest.approx(
-        RELOAD_TOTAL * RELOAD_DIM * 4 / (1024 * 1024))
-    assert info["compressed_size_mb"] == pytest.approx(
-        RELOAD_TOTAL * RELOAD_SUBVECTORS / (1024 * 1024))
-
-    # And it agrees with what the live index reports, which is the point of
-    # having it in the manifest at all.
     loaded = VectorDatabase().load(str(quantized_reload["path"]))
     assert loaded.get_quantization_info()["compression_ratio"] == pytest.approx(expected)
 
@@ -1659,7 +1682,7 @@ def test_restored_graph_accepts_inserts_removals_and_compaction(tmp_path):
 # ------------------------------------------------------------
 # Test 109: the rebuild is still there when the dump cannot be used
 # ------------------------------------------------------------
-@pytest.mark.parametrize("damage", [
+DUMP_DAMAGE = [
     "absent",
     "empty",
     "header_only",
@@ -1676,37 +1699,22 @@ def test_restored_graph_accepts_inserts_removals_and_compaction(tmp_path):
     "corrupt_trailer_magic",
     "wrong_m",
     "vendored_dump",
-])
-def test_load_falls_back_to_the_rebuild_when_the_dump_is_unusable(tmp_path, damage):
-    """Every record comes back whatever state the dump is in.
+]
 
-    None of these may panic, exit the process, or size a buffer from a length
-    the file has not earned. That is the class of failure the vendored reader
-    had: it panicked on a malformed header and reached std::process::exit(1) on
-    a short data file, which is why the loader used to measure the data file
-    beforehand and wrap the reload in two catch_unwind calls.
 
-    A dump written by 0.6.0 or earlier is one of these cases rather than a
-    special one. There is deliberately no reader for the vendored format, so
-    such a directory reaches the rebuild, comes back whole, and writes the new
-    format on its next save.
-    """
-    vectors = _clustered_unit_vectors(400, 16, 31415)
-    ids = [f"v_{i}" for i in range(len(vectors))]
-    index = VectorDatabase().create("hnsw", dim=16, expected_size=400)
-    assert index.add({"ids": ids, "embeddings": vectors}).is_success()
-
-    save_dir = tmp_path / "damaged.zdb"
-    index.save(str(save_dir))
+def _damage_the_dump(save_dir, damage):
+    """Damage the graph dump `save_dir` holds as `damage` names, at the
+    offsets of the dump's version."""
     dump = save_dir / "hnsw_index.zdbgraph"
     blob = dump.read_bytes()
+    version = struct.unpack_from("<I", blob, 8)[0]
 
     if damage == "absent":
         dump.unlink()
     elif damage == "empty":
         dump.write_bytes(b"")
     elif damage == "header_only":
-        dump.write_bytes(blob[:96])
+        dump.write_bytes(blob[:96 if version == 1 else 128])
     elif damage == "truncated_early":
         dump.write_bytes(blob[:200])
     elif damage == "truncated_half":
@@ -1730,10 +1738,14 @@ def test_load_falls_back_to_the_rebuild_when_the_dump_is_unusable(tmp_path, dama
         # the header checksum, so this case is caught there. The case where the
         # checksum agrees and the count is still absurd is a Rust unit test,
         # since only the writer can produce a consistent header.
-        dump.write_bytes(blob[:40] + struct.pack("<Q", 1_000_000_000) + blob[48:])
+        if version == 1:
+            dump.write_bytes(blob[:40] + struct.pack("<Q", 1_000_000_000) + blob[48:])
+        else:
+            dump.write_bytes(blob[:32] + struct.pack("<I", 1_000_000_000) + blob[36:])
     elif damage == "corrupt_body":
-        # A flipped bit in the vector region, which only the payload checksum
-        # can see: every length in the file still agrees.
+        # A flipped bit 64 bytes from the end, which only a region checksum
+        # can see: every length in the file still agrees. In a version 1 dump
+        # it lies in the vectors, and in a version 2 dump in the topology.
         at = len(blob) - 64
         dump.write_bytes(blob[:at] + bytes([blob[at] ^ 0x08]) + blob[at + 1:])
     elif damage == "corrupt_trailer_magic":
@@ -1755,6 +1767,33 @@ def test_load_falls_back_to_the_rebuild_when_the_dump_is_unusable(tmp_path, dama
         (save_dir / "hnsw_index.hnsw.data").write_bytes(
             struct.pack("<I", 0xA67F0000) + blob[8:4096])
 
+
+@pytest.mark.parametrize("damage", DUMP_DAMAGE)
+def test_load_falls_back_to_the_rebuild_when_the_dump_is_unusable(tmp_path, damage):
+    """Every record of a directory before 5.0.0 comes back whatever state the
+    dump is in, since each row is in its own store as well.
+
+    None of these may panic, exit the process, or size a buffer from a length
+    the file has not earned. That is the class of failure the vendored reader
+    had: it panicked on a malformed header and reached std::process::exit(1) on
+    a short data file, which is why the loader used to measure the data file
+    beforehand and wrap the reload in two catch_unwind calls.
+
+    A dump written by 0.6.0 or earlier is one of these cases rather than a
+    special one. There is deliberately no reader for the vendored format, so
+    such a directory reaches the rebuild, comes back whole, and writes the new
+    format on its next save.
+    """
+    vectors = _clustered_unit_vectors(400, 16, 31415)
+    ids = [f"v_{i}" for i in range(len(vectors))]
+    index = VectorDatabase().create("hnsw", dim=16, expected_size=400)
+    assert index.add({"ids": ids, "embeddings": vectors}).is_success()
+
+    save_dir = tmp_path / "damaged.zdb"
+    index.save(str(save_dir))
+    as_before_five(save_dir, "4.0.0")
+    _damage_the_dump(save_dir, damage)
+
     loaded = VectorDatabase().load(str(save_dir))
     assert loaded.get_vector_count() == 400
     assert all(loaded.contains(i) for i in ids)
@@ -1768,6 +1807,60 @@ def test_load_falls_back_to_the_rebuild_when_the_dump_is_unusable(tmp_path, dama
     assert not (again / "hnsw_index.hnsw.graph").exists()
     assert _pages(VectorDatabase().load(str(again)), vectors[3:6]) == \
            _pages(loaded, vectors[3:6])
+
+
+# What a load at 5.0.0 makes of each damage. The dump holds the only copy of
+# each row, so damage to its header, its length or its trailer refuses the
+# load, naming the dump and the check, and so does a dump the directory lost.
+# A flipped bit in the topology is rebuilt from the rows the dump holds.
+_LENGTH = r"cannot be used, since the file is \d+ bytes and manifest\.json records \d+"
+_LOST = r"manifest\.json names hnsw_index\.zdbgraph under files_included"
+AT_FIVE = {
+    "absent": (FileNotFoundError, _LOST),
+    "empty": (RuntimeError, _LENGTH),
+    "header_only": (RuntimeError, _LENGTH),
+    "truncated_early": (RuntimeError, _LENGTH),
+    "truncated_half": (RuntimeError, _LENGTH),
+    "truncated_by_one": (RuntimeError, _LENGTH),
+    "truncated_trailer": (RuntimeError, _LENGTH),
+    "extra_bytes": (RuntimeError, _LENGTH),
+    "wrong_magic": (RuntimeError, r"since its header does not open with the dump's magic"),
+    "wrong_version": (RuntimeError, r"since its header names format version 99, where a "
+                                    r"directory at format 5\.0\.0 holds version 2"),
+    "corrupt_header": (RuntimeError, r"since its header fails its checksum"),
+    "huge_nb_point": (RuntimeError, r"since its header fails its checksum"),
+    "corrupt_body": None,
+    "corrupt_trailer_magic": (RuntimeError,
+                              r"since its trailer does not close the file its header names"),
+    "wrong_m": (RuntimeError, r"since its header names m 16 and config\.json declares 17"),
+    "vendored_dump": (FileNotFoundError, _LOST),
+}
+
+
+@pytest.mark.parametrize("damage", DUMP_DAMAGE)
+def test_a_dump_that_cannot_be_used_refuses_a_load_at_5_0_0(tmp_path, damage):
+    """At 5.0.0 a dump whose header, length or trailer is damaged, or which
+    the directory lost, refuses the load, naming the dump and the check, and
+    one whose topology alone is damaged is rebuilt from the rows it holds."""
+    vectors = _clustered_unit_vectors(400, 16, 31415)
+    ids = [f"v_{i}" for i in range(len(vectors))]
+    index = VectorDatabase().create("hnsw", dim=16, expected_size=400)
+    assert index.add({"ids": ids, "embeddings": vectors}).is_success()
+
+    save_dir = tmp_path / "damaged.zdb"
+    index.save(str(save_dir))
+    _damage_the_dump(save_dir, damage)
+
+    outcome = AT_FIVE[damage]
+    if outcome is None:
+        loaded = VectorDatabase().load(str(save_dir))
+        assert loaded.recovery["graph_rebuilt"] is True
+        assert loaded.get_vector_count() == 400
+        assert all(loaded.contains(i) for i in ids)
+        return
+    error, refusal = outcome
+    with pytest.raises(error, match=refusal):
+        VectorDatabase().load(str(save_dir))
 
 # ------------------------------------------------------------
 # Test 110: the rebuild can be asked for on an intact directory
@@ -1817,7 +1910,7 @@ def test_an_index_at_the_top_of_the_m_range_restores(tmp_path, m):
     The vendored header stored max_nb_connection as a u8 while the graph admits
     256, so a dump written at 256 declared 0, the loader compared 0 against the
     256 in config.json, and the directory fell back to the rebuild every single
-    time it was opened. m is a u64 in ZeusDB's header.
+    time it was opened. m is a u32 in ZeusDB's header.
 
     The evidence that the dump was read rather than rebuilt is the score bits.
     A rebuild wires a different graph over the same records and would not
@@ -1832,8 +1925,8 @@ def test_an_index_at_the_top_of_the_m_range_restores(tmp_path, m):
     index.save(str(save_dir))
 
     with open(save_dir / "hnsw_index.zdbgraph", "rb") as handle:
-        header = handle.read(96)
-    assert struct.unpack_from("<Q", header, 24)[0] == m
+        header = handle.read(128)
+    assert struct.unpack_from("<I", header, 24)[0] == m
 
     queries = _clustered_unit_vectors(40, 16, 8192)
     loaded = VectorDatabase().load(str(save_dir))
@@ -2010,22 +2103,18 @@ def damage(directory, name, kind):
 
 
 # Every artefact whose loss or truncation must be reported rather than absorbed,
-# per storage mode. The graph dump is deliberately absent from these lists: it is
-# derived data and the loader rebuilds it, which is covered separately below.
-#
-# These are now every file each mode's directory holds bar the graph. Three
-# entries in the quantized_with_raw row used to be missing, being vectors.bin,
-# quantization.json and pq_codes.bin, because deleting any of the three loaded
-# rather than raised. The loader now checks files_included against the
-# directory, so they are here.
+# per storage mode, being every file each mode's directory holds. The graph
+# dump holds every record's vector or code at 5.0.0, so it is among them. A
+# directory before 5.0.0 holds each row in its own store as well and the
+# loader rebuilds its graph, which is covered separately below.
 MUST_RAISE = {
-    "raw": ["config.json", "mappings.bin", "metadata.json", "vectors.bin",
+    "raw": ["config.json", "mappings.bin", "metadata.json", "hnsw_index.zdbgraph",
             "manifest.json"],
     "quantized_with_raw": ["config.json", "mappings.bin", "metadata.json",
                            "quantization.json", "pq_centroids.bin",
-                           "pq_codes.bin", "vectors.bin", "manifest.json"],
+                           "vectors.bin", "hnsw_index.zdbgraph", "manifest.json"],
     "quantized_only": ["config.json", "mappings.bin", "metadata.json",
-                       "pq_centroids.bin", "pq_codes.bin", "quantization.json",
+                       "pq_centroids.bin", "quantization.json", "hnsw_index.zdbgraph",
                        "manifest.json"],
 }
 
@@ -2073,17 +2162,19 @@ def test_load_refuses_a_half_written_directory(tmp_path, mode, kind):
 @pytest.mark.parametrize("mode", ["raw", "quantized_with_raw", "quantized_only"])
 @pytest.mark.parametrize("kind", ["truncate", "half", "delete"])
 def test_load_rebuilds_a_damaged_graph_dump_rather_than_refusing(tmp_path, mode, kind):
-    """The graph is derived data, so a damaged dump is recoverable and recovered.
+    """A directory before 5.0.0 holds each row in its own store as well, so
+    its graph is derived data and a damaged dump is recoverable and recovered.
 
-    This is the one artefact whose loss is not an error. The records carry
-    everything the graph is built from, so the loader rebuilds rather than
-    refusing, and it says on stdout which of the three conditions it detected.
-    The page has to be the page the intact directory answers, since the records
-    are the same records.
+    This is the one artefact whose loss is not an error there. The records
+    carry everything the graph is built from, so the loader rebuilds rather
+    than refusing, and it says on stdout which of the three conditions it
+    detected. The page has to be the page the intact directory answers, since
+    the records are the same records.
     """
     index, vectors = half_written_source(mode)
     pristine = tmp_path / f"graph-{mode}.zdb"
     index.save(str(pristine))
+    as_before_five(pristine, "4.0.0")
 
     control = VectorDatabase().load(str(pristine))
     want = [hit["id"] for hit in control.search(vectors[0], top_k=5)]
@@ -2112,15 +2203,15 @@ def test_load_refuses_a_missing_vectors_bin_under_quantized_with_raw(tmp_path):
 
     That is what the refusal prevents. The same check covers the second face,
     a missing quantization.json under the same mode, which used to load as an
-    unquantized index, and a missing pq_codes.bin, which used to load as an
-    index reporting itself quantized while storing no codes.
+    unquantized index, and a missing graph dump, which holds every record's
+    code.
     """
     index, vectors = half_written_source("quantized_with_raw")
     pristine = tmp_path / "qraw-refusal.zdb"
     index.save(str(pristine))
 
     manifest = json.loads((pristine / "manifest.json").read_text(encoding="utf-8"))
-    for name in ("vectors.bin", "quantization.json", "pq_codes.bin"):
+    for name in ("vectors.bin", "quantization.json", "hnsw_index.zdbgraph"):
         assert name in manifest["files_included"], name
 
     # The intact directory is the control, and it returns what was supplied
@@ -2142,7 +2233,8 @@ def test_load_refuses_a_missing_vectors_bin_under_quantized_with_raw(tmp_path):
         "vectors.bin": "vectors.bin holds the raw vector of every record",
         "quantization.json": ("quantization.json holds the quantization "
                               "configuration of either scheme"),
-        "pq_codes.bin": "pq_codes.bin holds the quantized code of every record",
+        "hnsw_index.zdbgraph": ("hnsw_index.zdbgraph holds the graph and the stored vector "
+                                "or code of every record"),
     }
     for name, phrase in expected.items():
         work = tmp_path / f"qraw-refusal-{name}.zdb"
@@ -2178,9 +2270,9 @@ def test_load_refuses_a_missing_vectors_bin_under_quantized_with_raw(tmp_path):
 def test_load_exempts_every_graph_name_an_older_manifest_can_carry(tmp_path):
     """A directory written by 0.6.0 or earlier names two graph files, not one.
 
-    The completeness check exempts the graph, and the exemption has to cover the
-    names every release wrote or a 0.5.0 and 0.6.0 directory would start
-    refusing to open. Those two releases listed hnsw_index.hnsw.graph and
+    The completeness check exempts the graph of a directory before 5.0.0, and
+    the exemption has to cover the names every release wrote or a 0.5.0 and
+    0.6.0 directory would start refusing to open. Those two releases listed hnsw_index.hnsw.graph and
     hnsw_index.hnsw.data under files_included; 0.3.0 through 0.4.1 listed the
     first and excluded the second. Neither pair is readable by this build, which
     rebuilds from the records instead, so neither is required.
@@ -2194,6 +2286,7 @@ def test_load_exempts_every_graph_name_an_older_manifest_can_carry(tmp_path):
 
     work = tmp_path / "legacy-graph-work.zdb"
     shutil.copytree(pristine, work)
+    as_before_five(work, "4.0.0")
     manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
     manifest["files_included"] = [
         name for name in manifest["files_included"] if name != "hnsw_index.zdbgraph"
@@ -2213,23 +2306,32 @@ def test_load_exempts_every_graph_name_an_older_manifest_can_carry(tmp_path):
 def test_load_treats_a_never_written_file_as_one_removed_afterwards(tmp_path):
     """A manifest naming a file that was never written is the same state.
 
-    A save writes manifest.json after every artefact it names except the graph
-    dump, so an interrupted save cannot leave a manifest naming a load bearing
-    file it never wrote. The only way to reach that state is to write the
-    manifest by hand, and the check cannot tell it from a file removed after a
-    completed save, because on disk the two are the same thing. This asserts
-    that equivalence rather than assuming it.
+    A save writes manifest.json after every artefact it names, so an
+    interrupted save cannot leave a manifest naming a load bearing file it
+    never wrote. The only way to reach that state is to write the manifest by
+    hand, and the check cannot tell it from a file removed after a completed
+    save, because on disk the two are the same thing. This asserts that
+    equivalence rather than assuming it.
     """
     index, _ = half_written_source("raw")
     pristine = tmp_path / "never-written.zdb"
     index.save(str(pristine))
 
-    # A name the save never wrote, added to the inventory by hand.
+    # A name the save never wrote, added to the inventory by hand. A 5.x
+    # manifest records a length for every file it names, and one naming a
+    # file with no length is refused before the files are looked for, so the
+    # hand records one.
     invented = tmp_path / "invented.zdb"
     shutil.copytree(pristine, invented)
     manifest = json.loads((invented / "manifest.json").read_text(encoding="utf-8"))
     assert "sidecar.bin" not in manifest["files_included"]
     manifest["files_included"].append("sidecar.bin")
+    (invented / "manifest.json").write_text(json.dumps(manifest, indent=2),
+                                            encoding="utf-8")
+    with pytest.raises(RuntimeError, match=r"names sidecar\.bin under files_included, and "
+                                           r"file_digests records no length for it"):
+        VectorDatabase().load(str(invented))
+    manifest["file_digests"]["sidecar.bin"] = {"bytes": 0}
     (invented / "manifest.json").write_text(json.dumps(manifest, indent=2),
                                             encoding="utf-8")
     with pytest.raises(FileNotFoundError) as excinfo:
@@ -2243,10 +2345,10 @@ def test_load_treats_a_never_written_file_as_one_removed_afterwards(tmp_path):
     # message, differing only in what the file holds.
     removed = tmp_path / "removed.zdb"
     shutil.copytree(pristine, removed)
-    os.remove(removed / "vectors.bin")
+    os.remove(removed / "mappings.bin")
     with pytest.raises(FileNotFoundError) as excinfo:
         VectorDatabase().load(str(removed))
-    assert "manifest.json names vectors.bin under files_included" in str(excinfo.value)
+    assert "manifest.json names mappings.bin under files_included" in str(excinfo.value)
 
 
 def test_a_save_over_a_quantized_directory_leaves_none_of_it(tmp_path):
@@ -2266,7 +2368,7 @@ def test_a_save_over_a_quantized_directory_leaves_none_of_it(tmp_path):
     quantized, _ = half_written_source("quantized_with_raw")
     shared = tmp_path / "shared.zdb"
     quantized.save(str(shared))
-    assert (shared / "pq_codes.bin").exists()
+    assert (shared / "pq_centroids.bin").exists()
     stray = json.loads((shared / "quantization.json").read_text(encoding="utf-8"))
 
     plain = VectorDatabase().create("hnsw", dim=HALF_WRITTEN_DIM, expected_size=5000)
@@ -2281,12 +2383,12 @@ def test_a_save_over_a_quantized_directory_leaves_none_of_it(tmp_path):
 
     # Not merely unread. Not there.
     manifest = json.loads((shared / "manifest.json").read_text(encoding="utf-8"))
-    for name in ("quantization.json", "pq_centroids.bin", "pq_codes.bin"):
+    for name in ("quantization.json", "pq_centroids.bin", "vectors.bin"):
         assert not (shared / name).exists(), name
         assert name not in manifest["files_included"], name
     assert sorted(p.name for p in shared.glob("*")) == [
         "config.json", "hnsw_index.zdbgraph", "manifest.json",
-        "mappings.bin", "metadata.json", "vectors.bin",
+        "mappings.bin", "metadata.json",
     ]
 
     # And a file the manifest does not name is still not read, which is now the
@@ -2374,7 +2476,6 @@ def test_total_size_mb_counts_the_graph_dump(tmp_path):
         "manifest.json",
         "mappings.bin",
         "metadata.json",
-        "vectors.bin",
     ]
 
     # And the directory still opens.
@@ -2730,7 +2831,7 @@ def repair_digest_matches(directory, name):
 
 
 @pytest.mark.parametrize("name", [
-    "config.json", "metadata.json", "mappings.bin", "vectors.bin",
+    "config.json", "metadata.json", "mappings.bin", "hnsw_index.zdbgraph",
 ])
 def test_an_artefact_edited_to_the_same_length_is_refused(tmp_path, name):
     """The case files_included cannot catch, being present and wrong.
@@ -2738,19 +2839,25 @@ def test_an_artefact_edited_to_the_same_length_is_refused(tmp_path, name):
     A one byte edit that keeps the length loaded in silence before the digest
     existed: an edit inside metadata.json came back as that record's metadata
     and a flipped byte inside vectors.bin came back as that record's vector.
-    A JSON artefact is refused by its digest and a framed one by the checksum
-    over its payload.
+    A JSON artefact is refused by its digest, a framed one by the checksum
+    over its payload, and the graph dump by the checksum over the region the
+    edit is in.
     """
     path, _, _ = _saved(tmp_path, "edited.zdb")
     target = path / name
     raw = bytearray(target.read_bytes())
-    framed = not name.endswith(".json")
-    at = 66 if framed else len(raw) - 6
+    if name.endswith(".json"):
+        at, refusal = len(raw) - 6, r".*digest recorded beside it"
+    elif name == "hnsw_index.zdbgraph":
+        # A byte of the first row, past the header and the identity region.
+        at = 128 + struct.unpack_from("<Q", raw, 48)[0] + 2
+        refusal = r" cannot be used, since its rows region fails its checksum"
+    else:
+        at, refusal = 66, r": the frame's payload is corrupt"
     raw[at] ^= 0x40
     assert len(raw) == os.path.getsize(target)
     target.write_bytes(bytes(raw))
 
-    refusal = r": the frame's payload is corrupt" if framed else r".*digest recorded beside it"
     with pytest.raises(RuntimeError, match=rf"{name}{refusal}"):
         VectorDatabase().load(str(path))
 
@@ -2770,9 +2877,12 @@ def test_a_directory_with_no_digests_still_opens(tmp_path):
     """Backward compatibility, which is what the defaulted field buys.
 
     Every directory written before this field existed carries no digests at all,
-    so nothing is verified and the load is what it always was.
+    so nothing is verified and the load is what it always was. The fixture is
+    a directory written as 4.0.0, since a 5.x manifest records a length for
+    every file it names.
     """
     path, _, _ = _saved(tmp_path, "predigest.zdb")
+    as_before_five(path, "4.0.0")
     manifest = _read_manifest(path)
     assert manifest.pop("file_digests")
     (path / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -2789,13 +2899,16 @@ def test_a_directory_with_no_digests_still_opens(tmp_path):
 
 
 def test_a_graph_dump_of_the_wrong_length_falls_back_to_the_rebuild(tmp_path):
-    """The dump's manifest entry is its length, and a mismatch is not fatal.
+    """The dump's manifest entry is its length, and below 5.0.0 a mismatch is
+    not fatal.
 
-    The dump is the one artefact the loader can produce again, so a length that
+    A directory before 5.0.0 holds each row in its own store as well, so its
+    dump is the one artefact the loader can produce again, and a length that
     disagrees takes the rebuild rather than refusing, which is what an absent
-    dump has always done.
+    dump has always done there.
     """
     path, _, vectors = _saved(tmp_path, "dumped.zdb")
+    as_before_five(path, "4.0.0")
     dump = path / "hnsw_index.zdbgraph"
     dump.write_bytes(dump.read_bytes() + b"\x00" * 16)
 

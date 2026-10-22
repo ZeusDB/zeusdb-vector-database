@@ -1,0 +1,43 @@
+{
+  "type": "pq",
+  "subvectors": 4,
+  "bits": 4,
+  "training_size": 1000,
+  "max_training_vectors": null,
+  "storage_mode": "quantized_with_raw",
+  "is_trained": true,
+  "training_completed_at": "2026-10-22T08:44:30.610678+00:00",
+  "memory_stats": {
+    "centroid_storage_mb": 0.00048828125,
+    "compression_ratio": 8.0,
+    "centroids_per_subvector": 16,
+    "total_centroids": 64
+  },
+  "pq_config": {
+    "dim": 8,
+    "sub_dim": 2,
+    "num_centroids": 16
+  },
+  "training_ids": [],
+  "training_threshold_reached": true,
+  "rerank_calibration": {
+    "fetch": 70,
+    "fit_fetches": [
+      46,
+      54,
+      60,
+      70
+    ],
+    "exponent": 0.4386976659463294,
+    "page_fetches": [
+      20,
+      70,
+      264
+    ],
+    "page_exponent": 0.5602869656029248,
+    "sample_records": 1000,
+    "queries": 512,
+    "target": 0.99,
+    "millis": 5
+  }
+}

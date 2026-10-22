@@ -94,6 +94,13 @@
 //! into another directory alone. Any other failure, and any failure after
 //! the load changed something, refuses the load.
 //!
+//! A directory holding a feature this build does not know, which its
+//! manifest marks `read_only`, opens the same way whatever the medium, journaled
+//! or not and under `checkpoint_only=True` too. Its collection refuses every
+//! change, every save, a checkpoint, a journal and a backup with
+//! [`Error::FeatureReadOnly`], since a directory this build wrote would not
+//! hold the feature.
+//!
 //! # The three policies
 //!
 //! [`Durability`] is what a journaled collection promises about a record
@@ -584,33 +591,90 @@ impl OperationSink for JournalSink {
 // THE SINK OF A COLLECTION READ ONLY
 // ============================================================================
 
-/// The sink a collection read from a medium it cannot write carries.
+/// Why a collection takes no record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadOnlyCause {
+    /// The medium refused the load's first write, for the reason the system
+    /// gave.
+    Medium(String),
+    /// The directory holds these features, which this build does not know
+    /// and its manifest marks `read_only`, in name order.
+    Features(Vec<String>),
+}
+
+impl ReadOnlyCause {
+    /// The reason the load's report and a medium's refusal name.
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            ReadOnlyCause::Medium(reason) => reason.clone(),
+            ReadOnlyCause::Features(features) => format!(
+                "it holds the {} {}, which this build does not know and its manifest marks \
+                 read_only",
+                if features.len() == 1 {
+                    "feature"
+                } else {
+                    "features"
+                },
+                quoted(features)
+            ),
+        }
+    }
+}
+
+/// Names quoted and joined as a sentence lists them.
+fn quoted(names: &[String]) -> String {
+    let quoted: Vec<String> = names.iter().map(|name| format!("'{}'", name)).collect();
+    match quoted.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {}", rest.join(", "), last),
+        Some((last, _)) => last.clone(),
+        None => String::new(),
+    }
+}
+
+/// The sink a collection read only carries, read from a medium it cannot
+/// write or from a directory holding features this build does not know,
+/// marked `read_only`.
 ///
-/// It takes no record, so every mutation is refused before it runs with
-/// [`Error::CollectionReadOnly`], naming the directory and the system's
-/// refusal. It names no journal, so the collection reports none, and the
-/// sequence it reports is the last one the load replayed, which a save into
-/// another directory records as the sequence its state holds.
+/// It takes no record, so every mutation is refused before it runs: with
+/// [`Error::CollectionReadOnly`] for a medium, naming the directory and the
+/// system's refusal, and with [`Error::FeatureReadOnly`] for features,
+/// naming the directory and the features. It names no journal, so the
+/// collection reports none, and the sequence it reports is the last one the
+/// load replayed, which a save into another directory records as the
+/// sequence its state holds.
 #[derive(Debug)]
 pub(crate) struct ReadOnlySink {
     directory: PathBuf,
     reason: String,
+    features: Option<Vec<String>>,
     sequence: u64,
 }
 
 impl ReadOnlySink {
-    pub(crate) fn new(directory: PathBuf, reason: String, sequence: u64) -> Self {
+    pub(crate) fn new(directory: PathBuf, cause: ReadOnlyCause, sequence: u64) -> Self {
+        let reason = cause.reason();
+        let features = match cause {
+            ReadOnlyCause::Medium(_) => None,
+            ReadOnlyCause::Features(features) => Some(features),
+        };
         ReadOnlySink {
             directory,
             reason,
+            features,
             sequence,
         }
     }
 
     fn refusal(&self) -> Error {
-        Error::CollectionReadOnly {
-            directory: self.directory.display().to_string(),
-            reason: self.reason.clone(),
+        match &self.features {
+            Some(features) => Error::FeatureReadOnly {
+                path: self.directory.display().to_string(),
+                features: features.clone(),
+            },
+            None => Error::CollectionReadOnly {
+                directory: self.directory.display().to_string(),
+                reason: self.reason.clone(),
+            },
         }
     }
 }
@@ -635,6 +699,10 @@ impl OperationSink for ReadOnlySink {
 
     fn read_only(&self) -> Option<(&Path, &str)> {
         Some((&self.directory, &self.reason))
+    }
+
+    fn read_only_features(&self) -> Option<&[String]> {
+        self.features.as_deref()
     }
 }
 
@@ -781,8 +849,12 @@ pub struct Recovery {
     /// Why the load took a checkpoint, where it took one.
     pub checkpoint_taken: Option<CheckpointTaken>,
     /// Why the collection is read only, where the medium refused the load's
-    /// first write.
+    /// first write or the directory holds features this build does not know
+    /// and its manifest marks `read_only`.
     pub read_only: Option<String>,
+    /// The features that make the collection read only, in name order, and
+    /// none where the medium did.
+    pub read_only_features: Vec<String>,
     /// What a repair set aside, where the load was asked to repair and the
     /// journal was damaged.
     pub repair: Option<Repair>,
@@ -813,6 +885,7 @@ impl Recovery {
             upgraded_from: None,
             checkpoint_taken: None,
             read_only: None,
+            read_only_features: Vec::new(),
             repair: None,
         }
     }
@@ -826,6 +899,7 @@ impl Recovery {
             );
         }
         if !self.journaled {
+            self.report_read_only(directory);
             return;
         }
         if let Some(damage) = self.damage.as_ref().filter(|d| d.kind == "torn_tail") {
@@ -906,17 +980,7 @@ impl Recovery {
                  checkpoint before journaling again"
             );
         }
-        if let Some(reason) = &self.read_only {
-            warn!(target: LOG_TARGET, operation = "load_read_only",
-                directory = directory,
-                reason = reason.as_str(),
-                format_version = self.format_version.as_str(),
-                replayed = self.replayed,
-                "The directory was opened read only, since this process cannot write it; its \
-                 journal was replayed in memory, nothing on the medium changed, and every \
-                 change to the collection is refused"
-            );
-        }
+        self.report_read_only(directory);
         info!(target: LOG_TARGET, operation = "recover_complete",
             directory = directory,
             checkpoint_sequence = self.checkpoint_sequence,
@@ -929,6 +993,35 @@ impl Recovery {
         );
     }
 
+    /// The record a load opened read only writes, at `warn`.
+    fn report_read_only(&self, directory: &str) {
+        let Some(reason) = &self.read_only else {
+            return;
+        };
+        if self.read_only_features.is_empty() {
+            warn!(target: LOG_TARGET, operation = "load_read_only",
+                directory = directory,
+                reason = reason.as_str(),
+                format_version = self.format_version.as_str(),
+                replayed = self.replayed,
+                "The directory was opened read only, since this process cannot write it; its \
+                 journal was replayed in memory, nothing on the medium changed, and every \
+                 change to the collection is refused"
+            );
+        } else {
+            warn!(target: LOG_TARGET, operation = "load_read_only",
+                directory = directory,
+                reason = reason.as_str(),
+                features = self.read_only_features.join(", ").as_str(),
+                format_version = self.format_version.as_str(),
+                replayed = self.replayed,
+                "The directory was opened read only, since it holds features this build does \
+                 not know and its manifest marks read_only; nothing on the medium changed, and \
+                 every change, save, checkpoint, journal and backup is refused"
+            );
+        }
+    }
+
     /// What a caller who loaded the directory is told where the collection
     /// came back read only, being the warning the binding raises. A repair
     /// says it in [`Recovery::repair_warning`] instead.
@@ -937,6 +1030,22 @@ impl Recovery {
             return None;
         }
         let reason = self.read_only.as_ref()?;
+        if !self.read_only_features.is_empty() {
+            let replayed = if self.journaled {
+                format!(
+                    ", and {} records of its journal were replayed in memory",
+                    self.replayed
+                )
+            } else {
+                String::new()
+            };
+            return Some(format!(
+                "The directory {} was opened read only, since {}. It stays at format {}{}. \
+                 Every change, save, checkpoint, journal and backup is refused. Upgrade the \
+                 package to change it.",
+                directory, reason, self.format_version, replayed
+            ));
+        }
         Some(format!(
             "The directory {} was opened read only, since this process cannot write it: {}. It \
              stays at format {}, and {} records of its journal were replayed in memory. Every \
@@ -989,6 +1098,12 @@ impl Recovery {
             (Some(folder), _) => format!(
                 "{found} {kept} {verb} set aside in {}. {done}",
                 folder.display()
+            ),
+            (None, Some(reason)) if !self.read_only_features.is_empty() => format!(
+                "{found} {kept} {verb} left out of the replay. The directory was opened read \
+                 only, since {}. Nothing on the medium changed, and every change, save, \
+                 checkpoint, journal and backup is refused.",
+                reason
             ),
             (None, reason) => format!(
                 "{found} {kept} {verb} left out of the replay. The directory was opened read \

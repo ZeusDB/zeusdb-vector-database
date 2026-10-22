@@ -9,14 +9,12 @@
 //! ├── manifest.json           # Index metadata and file list
 //! ├── config.json             # Index configuration
 //! ├── mappings.bin            # ID mappings (binary)
-//! ├── metadata.json           # Vector metadata (JSON)
-//! ├── vectors.bin             # Raw vectors (storage mode dependent)
+//! ├── metadata.json           # the fields of every record that holds one (JSON)
+//! ├── vectors.bin             # raw vectors beside a trained PQ graph under quantized_with_raw
 //! ├── quantization.json       # quantization configuration and training state (if enabled)
-//! ├── pq_codes.bin            # Quantized codes (if PQ enabled)
 //! ├── pq_centroids.bin        # PQ centroids (if trained)
 //! ├── int8_scales.zdbint8     # the scales of a scalar quantized index, one a dimension (if trained)
-//! ├── int8_rows.zdbint8       # every record's scalar row (if trained and not empty)
-//! ├── hnsw_index.zdbgraph     # HNSW graph topology and the point each node holds
+//! ├── hnsw_index.zdbgraph     # the graph and the stored vector or code of every record
 //! └── spaces/                 # one directory per sparse space, where one is declared
 //!     └── <name>/
 //!         ├── postings.zdbsparse  # every live record's term ids and weights
@@ -37,8 +35,14 @@
 //! it can read a feature. 5.0.0 is a major because its journal is a directory
 //! of segments, each naming the checkpoint its records follow, and every
 //! call's records are closed by a commit record, which a release reading 4.x
-//! alone cannot read. A release reading 1.x to 4.x alone refuses such a
-//! directory at its version check, with a message naming the newer release.
+//! alone cannot read, and because its graph dump is version 2 and holds the
+//! only copy of each record's row. A 5.x directory holds no `pq_codes.bin`
+//! and no `int8_rows.zdbint8`, and holds `vectors.bin` only beside a trained
+//! product quantized graph under `quantized_with_raw`. A release reading 1.x
+//! to 4.x alone refuses such a directory at its version check, with a
+//! message naming the newer release. Every field of a 5.x manifest is held
+//! to what a save writes, and `metadata.json` names only the records that
+//! hold a field, in increasing internal id.
 //! A 5.x manifest lists its features and records its identity with the
 //! journal sequence its state holds, and one missing either is refused.
 //!
@@ -127,7 +131,12 @@
 //!
 //! The graph file is ZeusDB's own format, written and read by `graph::dump`,
 //! and the loader restores the graph from it rather than rebuilding it by
-//! re-inserting every record. See `Collection::restore_graph_from_dump`.
+//! re-inserting every record. See `Collection::restore_graph_from_dump`. At
+//! 5.x the dump is version 2. A failure of its header, its identity region
+//! or its rows region refuses the load with `Error::GraphDumpInvalid`, and a
+//! failure of its topology rebuilds the graph from the rows it holds. Below
+//! 5.x it is version 1, beside the separate row stores, and any failure
+//! rebuilds the graph from those.
 //!
 //! This module and `collection::persist` call each other: `save` and `load`
 //! on the collection reach `save_index`, `save_manifest` and `load_index`
@@ -142,12 +151,13 @@
 //! once and writes the new file on the next save. Nothing reads the old format.
 
 use crate::collection::{
-    read_internal_id, shifted_internal_id, validate_index_parameters,
-    validate_space_supports_quantization, Collection, IdentityRecord, PositionReader,
-    QuantizationConfig, QuantizationScheme, SparseDeclaration, StorageMode, DEFAULT_SPACE,
+    validate_index_parameters, validate_space_supports_quantization, Collection, DumpOutcome,
+    IdentityRecord, QuantizationConfig, QuantizationScheme, SparseDeclaration, StorageMode,
+    DEFAULT_SPACE,
 };
 use crate::journal::{
-    CheckpointTaken, Damage, Durability, JournalPolicy, JournalSink, ReadOnlySink, Recovery,
+    CheckpointTaken, Damage, Durability, JournalPolicy, JournalSink, ReadOnlyCause, ReadOnlySink,
+    Recovery,
 };
 use crate::RerankCalibration;
 use serde::{Deserialize, Serialize};
@@ -157,13 +167,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, warn};
 use zeusdb_vector_core::{
-    checksum_of, frame, frame_begin, frame_finish, read_legacy_journal, read_segments,
-    read_segments_for_repair, refuse_unnamable, refuses_writes, unframe, validate_indexed_fields,
-    ArtefactRecord, Bounds, Cut, Dir, Error, Expected, FrameEncoding, FrameKind, FsStorage,
-    IdStore, Int8Codec, Inventory, JournalDamage, JournalRecord, JournalWriter, LiveRecord,
-    LockFailure, LockGuard, LockMode, Locked, Operation, Position, PositionWalk, RecordFields,
-    RecordState, Restore, SegmentBase, SegmentBytes, SpaceName, Storage, VectorIndex,
-    DUMP_FILENAME as GRAPH_DUMP_FILENAME, FRAME_OVERHEAD_BYTES, LEGACY_DUMP_FILENAMES,
+    checksum_of, frame, read_legacy_journal, read_segments, read_segments_for_repair,
+    refuse_unnamable, refuses_writes, unframe, unknown_kind_at, validate_indexed_fields,
+    ArtefactRecord, Bounds, Cut, Dir, DumpRows, Error, Expected, FrameEncoding, FrameKind,
+    FsStorage, IdStore, Int8Codec, Inventory, JournalDamage, JournalRecord, JournalWriter,
+    LiveRecord, LockFailure, LockGuard, LockMode, Locked, Operation, Position, PositionWalk,
+    RecordFields, RecordState, Restore, RowValues, SegmentBase, SegmentBytes, SpaceName, Storage,
+    VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME, FRAME_OVERHEAD_BYTES, LEGACY_DUMP_FILENAMES,
     MAX_INTERNAL_ID, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
@@ -172,6 +182,8 @@ use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerCo
 mod features;
 mod framed;
 mod legacy;
+#[cfg(test)]
+pub(crate) mod older;
 mod repair;
 
 /// The target every record this file emits carries. It is the module path
@@ -186,8 +198,9 @@ const LOG_TARGET: &str = "zeusdb_vector_database::persistence";
 /// Version written into manifest.json by every save.
 ///
 /// A major, because the journal is a directory of segments closed by commit
-/// records; see the module documentation. A feature does not move it, since
-/// a directory lists what it holds under `features`.
+/// records and the graph dump holds the only copy of each record's row; see
+/// the module documentation. A feature does not move it, since a directory
+/// lists what it holds under `features`.
 const FORMAT_VERSION: &str = "5.0.0";
 
 /// The first major whose four binary artefacts are framed.
@@ -202,6 +215,24 @@ const FEATURES_FORMAT_MAJOR: u32 = 4;
 /// journal sequence its state holds. Below it a journal is one file at
 /// journal format version 1, which a load replays and upgrades.
 const SEGMENTED_FORMAT_MAJOR: u32 = 5;
+
+/// The first major whose graph dump is version 2 and holds the only copy of
+/// each record's row, whose manifest's fields are each held to what a save
+/// writes, and whose `metadata.json` is compact.
+const DUMP_V2_FORMAT_MAJOR: u32 = 5;
+
+/// Bytes in a mebibyte, which `total_size_mb` counts in.
+const MEBIBYTE: f64 = 1024.0 * 1024.0;
+
+/// The storage modes a manifest records, being every value
+/// `Collection::storage_mode` gives.
+const STORAGE_MODES: [&str; 5] = [
+    "raw_only",
+    "raw_collecting_for_training",
+    "raw_ready_for_training",
+    "quantized_active",
+    "raw_trained_not_rebuilt",
+];
 
 /// The two artefacts of a trained scalar quantized index.
 const INT8_SCALES_FILENAME: &str = "int8_scales.zdbint8";
@@ -292,11 +323,11 @@ fn write_framed(
 /// dump is written by `graph::dump::write_dump`, which streams it and then
 /// seeks back to fill the header in, so there is no single buffer to hash and
 /// a digest would mean reading the largest artefact in the directory back off
-/// the disk. It carries a checksum over its own header and another over its
-/// own payload, both verified by `parse_dump` on every load, and a frame
-/// carries the same two, verified by `unframe` on every load, so a manifest
-/// digest would duplicate a check the loader already makes. Their lengths are
-/// recorded and checked.
+/// the disk. It carries a checksum over its own header and one over each of
+/// its regions, verified on every load, and a frame carries one over its
+/// header and one over its payload, verified by `unframe` on every load, so a
+/// manifest digest would duplicate a check the loader already makes. Their
+/// lengths are recorded and checked.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ArtefactDigest {
     pub(crate) bytes: u64,
@@ -420,9 +451,9 @@ fn read_artefact_string(
 
 /// The length manifest.json records for the graph dump, where it records one
 ///
-/// The dump is read by `graph::dump::parse_dump` rather than through
-/// `read_artefact`, because it is streamed rather than held whole in memory.
-/// This is the part of the digest check that still applies to it.
+/// The dump is read by `graph::dump` as a stream rather than through
+/// `read_artefact`, because it is not held whole in memory. This is the part
+/// of the digest check that still applies to it.
 pub(crate) fn recorded_dump_length(manifest: &IndexManifest, name: &str) -> Option<u64> {
     manifest.file_digests.get(name).map(|entry| entry.bytes)
 }
@@ -471,23 +502,22 @@ fn is_version_part(part: &str) -> bool {
 // DIRECTORY COMPLETENESS
 // ============================================================================
 
-/// Whether an artefact is one the loader can produce again rather than read
+/// Whether an artefact is one the loader can produce again rather than read,
+/// in a directory declaring `major`
 ///
-/// The graph is the only one. Every record carries what the graph is built
-/// from, so a directory that lost its dump is rebuilt rather than refused, and
-/// that has always been the behaviour. The list holds the name this build
+/// Below 5.x the graph is the only one. Every record carries what the graph
+/// is built from in the separate row stores, so a directory that lost its
+/// dump is rebuilt rather than refused. The list holds the name this build
 /// writes and the pair 0.6.0 and earlier wrote, because a directory saved by
 /// one of those names both of them under `files_included` and neither is
-/// needed to reopen it.
+/// needed to reopen it, and a directory saved before the manifest was
+/// written last can name a dump that was never written.
 ///
-/// A save now writes the dump before the manifest and moves the whole
-/// directory into place afterwards, so a directory this build wrote and a
-/// reader can see always holds the dump its manifest names. The exemption
-/// stays for the directories that came before it, where the manifest was
-/// written first and a save interrupted between the two left a manifest naming
-/// a dump that was never written.
-fn is_derived_artefact(name: &str) -> bool {
-    name == GRAPH_DUMP_FILENAME || LEGACY_DUMP_FILENAMES.contains(&name)
+/// At 5.x nothing is: the dump holds the only copy of each record's row, so
+/// a directory that lost it lost its records.
+fn is_derived_artefact(name: &str, major: u32) -> bool {
+    major < DUMP_V2_FORMAT_MAJOR
+        && (name == GRAPH_DUMP_FILENAME || LEGACY_DUMP_FILENAMES.contains(&name))
 }
 
 /// What an artefact holds, for the message its absence produces
@@ -509,6 +539,7 @@ fn artefact_contents(name: &str) -> &'static str {
         "pq_codes.bin" => "the quantized code of every record",
         INT8_SCALES_FILENAME => INT8_SCALES_CONTENTS,
         INT8_ROWS_FILENAME => INT8_ROWS_CONTENTS,
+        GRAPH_DUMP_FILENAME => "the graph and the stored vector or code of every record",
         _ if name.ends_with("/postings.zdbsparse") => {
             "the postings of a sparse space, being every record's term ids and weights"
         }
@@ -546,12 +577,12 @@ const DICTIONARY_CONTENTS: &str =
 /// opened as a complete index built entirely from PQ reconstructions, and one
 /// that lost `quantization.json` opened as an unquantized index. Both were
 /// silent.
-fn check_files_present(dir: &dyn Dir, manifest: &IndexManifest) -> Result<(), Error> {
+fn check_files_present(dir: &dyn Dir, manifest: &IndexManifest, major: u32) -> Result<(), Error> {
     let missing: Vec<&str> = manifest
         .files_included
         .iter()
         .map(String::as_str)
-        .filter(|name| !is_derived_artefact(name))
+        .filter(|name| !is_derived_artefact(name, major))
         .filter(|name| !dir.exists(name))
         .collect();
 
@@ -579,9 +610,9 @@ fn check_files_present(dir: &dyn Dir, manifest: &IndexManifest) -> Result<(), Er
 /// exclude. It stays because a directory written by an earlier release can
 /// still hold those files.
 ///
-/// The graph dump is not gated this way. It is derived, it carries its own
-/// checks on node count, distance kind and `m`, and it already falls back to
-/// the rebuild when any of them disagree.
+/// The graph dump is not gated this way. It is read wherever the collection
+/// holds a record, and its own checks hold it to `config.json` and the
+/// mappings.
 fn manifest_names(manifest: &IndexManifest, name: &str) -> bool {
     manifest.files_included.iter().any(|entry| entry == name)
 }
@@ -644,15 +675,10 @@ pub(crate) struct IndexManifest {
     #[serde(default)]
     pub(crate) file_digests: HashMap<String, ArtefactDigest>,
 
-    /// Every byte the directory holds except `manifest.json` itself
-    ///
-    /// The manifest is now the last file a save writes, so it does not exist
-    /// when the figure is taken and cannot count itself. It used to be written
-    /// before the graph dump and then rewritten through a temporary file to
-    /// record a total it had missed the largest artefact of, which is a second
-    /// write this ordering removes.
+    /// The lengths `file_digests` records, added and divided by a mebibyte,
+    /// being every artefact the save wrote. `manifest.json` itself is the
+    /// last file a save writes and counts in none.
     pub(crate) total_size_mb: f64,
-    pub(crate) compression_info: Option<CompressionInfo>,
 
     /// The journal beside the directory, where the collection that saved it
     /// held one.
@@ -772,14 +798,6 @@ impl Inventory for IndexManifest {
                 .and_then(|hex| u64::from_str_radix(hex, 16).ok()),
         })
     }
-}
-
-/// Compression statistics for quantized indexes
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct CompressionInfo {
-    pub(crate) original_size_mb: f64,
-    pub(crate) compressed_size_mb: f64,
-    pub(crate) compression_ratio: f64,
 }
 
 /// Index configuration for reconstruction
@@ -942,8 +960,6 @@ pub(crate) struct QuantizationPersistence {
     pub(crate) storage_mode: String,
     pub(crate) is_trained: bool,
     pub(crate) training_completed_at: Option<String>,
-    pub(crate) memory_stats: Option<MemoryStats>,
-    pub(crate) pq_config: PQConfig,
     #[serde(default)]
     pub(crate) training_ids: Vec<String>,
     #[serde(default)]
@@ -955,23 +971,6 @@ pub(crate) struct QuantizationPersistence {
     /// they were built against. See `RerankCalibration`.
     #[serde(default)]
     pub(crate) rerank_calibration: Option<RerankCalibration>,
-}
-
-/// Memory usage statistics for quantization
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct MemoryStats {
-    pub(crate) centroid_storage_mb: f64,
-    pub(crate) compression_ratio: f64,
-    pub(crate) centroids_per_subvector: usize,
-    pub(crate) total_centroids: usize,
-}
-
-/// Product Quantization configuration details
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct PQConfig {
-    pub(crate) dim: usize,
-    pub(crate) sub_dim: usize,
-    pub(crate) num_centroids: usize,
 }
 
 /// quantization.json under `type: int8`: the scalar declaration and the
@@ -1050,6 +1049,11 @@ impl Int8Rows {
     fn push(&mut self, id: u32, row: &[u8]) {
         self.ids.push(id);
         self.data.extend(row.iter().map(|&b| b as i8));
+    }
+
+    fn push_row(&mut self, id: u32, row: &[i8]) {
+        self.ids.push(id);
+        self.data.extend_from_slice(row);
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -1527,23 +1531,93 @@ fn bincode_ids(bytes: &[u8], config: &IndexConfig) -> Result<MappedIds, Error> {
     Ok(mapped)
 }
 
-/// Load vector metadata from metadata.json
+/// Load vector metadata from metadata.json, keyed by external id
+///
+/// At 5.x the file names only the records that hold a field, and each
+/// record it names must be one the mappings hold, named once. A record it
+/// leaves out takes an empty entry, as a record with no field holds in
+/// memory, since a filter judges an empty entry and never an absent one.
+/// Below 5.x the file is read as it was, an entry for an id the mappings do
+/// not hold dropped when the entries are placed.
 fn load_metadata(
     dir: &dyn Dir,
     manifest: &IndexManifest,
+    major: u32,
+    ids: Mapped<'_>,
 ) -> Result<HashMap<String, HashMap<String, Value>>, Error> {
     debug!(target: LOG_TARGET, "Loading metadata.json...");
 
     let metadata_data = read_artefact_string(dir, "metadata.json", manifest)?;
+    let parse_failed = |e: serde_json::Error| Error::ArtefactParseFailed {
+        name: "metadata.json",
+        error: e.to_string(),
+    };
 
-    let metadata: HashMap<String, HashMap<String, Value>> = serde_json::from_str(&metadata_data)
-        .map_err(|e| Error::ArtefactParseFailed {
-            name: "metadata.json",
-            error: e.to_string(),
-        })?;
+    if major < DUMP_V2_FORMAT_MAJOR {
+        let metadata: HashMap<String, HashMap<String, Value>> =
+            serde_json::from_str(&metadata_data).map_err(parse_failed)?;
+        debug!(target: LOG_TARGET, "metadata.json loaded");
+        return Ok(metadata);
+    }
 
-    debug!(target: LOG_TARGET, "metadata.json loaded");
+    let CompactMetadata(entries) = serde_json::from_str(&metadata_data).map_err(parse_failed)?;
+    let corrupt = |error: String| Error::DecodeFailed {
+        file: "metadata.json".to_string(),
+        error,
+    };
+    let mut named = vec![false; ids.len()];
+    let mut metadata: HashMap<String, HashMap<String, Value>> = HashMap::with_capacity(ids.len());
+    for (id, fields) in entries {
+        let Some(at) = ids.store.slot_of(&id) else {
+            return Err(corrupt(format!(
+                "names record '{}', which mappings.bin does not hold",
+                id
+            )));
+        };
+        if std::mem::replace(&mut named[at], true) {
+            return Err(corrupt(format!("names record '{}' twice", id)));
+        }
+        metadata.insert(id, fields);
+    }
+    for (_, id) in ids.iter() {
+        if !metadata.contains_key(id) {
+            metadata.insert(id.to_string(), HashMap::new());
+        }
+    }
+    debug!(target: LOG_TARGET, "metadata.json loaded (compact)");
     Ok(metadata)
+}
+
+/// The records a compact `metadata.json` names, each with its fields, in the
+/// order the file holds them, a record named twice kept twice so the load
+/// can refuse it.
+struct CompactMetadata(Vec<(String, HashMap<String, Value>)>);
+
+impl<'de> Deserialize<'de> for CompactMetadata {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Entries;
+
+        impl<'de> serde::de::Visitor<'de> for Entries {
+            type Value = CompactMetadata;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an object of records")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<CompactMetadata, A::Error> {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(entry) = map.next_entry::<String, HashMap<String, Value>>()? {
+                    entries.push(entry);
+                }
+                Ok(CompactMetadata(entries))
+            }
+        }
+
+        deserializer.deserialize_map(Entries)
+    }
 }
 
 /// Load raw vectors from vectors.bin, keyed by external id
@@ -1927,7 +2001,9 @@ fn load_pq_codes(
 /// the configurations `create()` refuses and no more. `bits` is 1 to 8 because
 /// a code is one byte a subvector. `subvectors` must be positive, must divide
 /// `dim` and must not exceed it, because `sub_dim` is `dim / subvectors` and a
-/// subvector of no values encodes nothing.
+/// subvector of no values encodes nothing. `training_size` is at least 1,000
+/// and `max_training_vectors`, where given, at or above it, at every format
+/// version.
 fn validate_quantization_fields(
     file: &str,
     config: &QuantizationPersistence,
@@ -1950,6 +2026,25 @@ fn validate_quantization_fields(
             subvectors: config.subvectors,
             dim,
         });
+    }
+    let invalid = |detail: String| Error::QuantizationFieldInvalidInFile {
+        file: file.to_string(),
+        detail,
+    };
+    if config.training_size < 1000 {
+        return Err(invalid(format!(
+            "training_size is {}, and create() requires at least 1000",
+            config.training_size
+        )));
+    }
+    if let Some(max_training) = config.max_training_vectors {
+        if max_training < config.training_size {
+            return Err(invalid(format!(
+                "max_training_vectors is {} and training_size is {}, and create() requires the \
+                 first to be at or above the second",
+                max_training, config.training_size
+            )));
+        }
     }
     Ok(())
 }
@@ -2265,22 +2360,21 @@ pub(crate) fn save_index(index: &Collection, dir: &dyn Dir) -> Result<SaveLedger
     save_mappings(index, dir, &mut ledger)?;
     save_metadata(index, dir, &mut ledger)?;
 
-    // Save quantization components if enabled
+    // Save quantization components if enabled. Every record's code or row
+    // is in the graph dump, which holds the only copy of each.
     if index.has_quantization() {
         save_quantization_config(index, dir, &mut ledger)?;
 
         if index.can_use_quantization() {
             if index.declares_int8() {
                 save_int8_scales(index, dir, &mut ledger)?;
-                save_int8_rows(index, dir, &mut ledger)?;
             } else {
                 save_pq_centroids(index, dir, &mut ledger)?;
-                save_pq_codes(index, dir, &mut ledger)?;
             }
         }
     }
 
-    // Save vectors based on storage mode
+    // The raw vectors a product quantized graph keeps beside its codes.
     save_vectors(index, dir, &mut ledger)?;
 
     // The sparse space, where one is declared, under `spaces/<name>/`.
@@ -2338,6 +2432,7 @@ fn save_spaces(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Re
 fn reconstruct_index_simple(
     dir: &dyn Dir,
     manifest: &IndexManifest,
+    major: u32,
     config: IndexConfig,
     ids: MappedIds,
     layout: Layout,
@@ -2364,8 +2459,9 @@ fn reconstruct_index_simple(
 
     // The codes are needed twice, once to rebuild the graph for records that
     // have no raw vector and once to restore the stored codes afterwards.
+    // At 5.x they come from the graph once it is back, below.
     let mut quantization = quantization;
-    let pq_codes = quantization
+    let mut pq_codes = quantization
         .as_ref()
         .map(|q| q.codes.clone())
         .unwrap_or_default();
@@ -2394,30 +2490,59 @@ fn reconstruct_index_simple(
     // graph, for the reasons `restore_spaces` gives.
     restore_spaces(&index, dir, manifest, config.id_counter, &positions)?;
 
-    // The rows of a trained scalar directory, held to the mappings both
-    // ways before anything is built from either: every row names a record
-    // the mappings hold, and every record the mappings hold has a row. A
-    // directory whose rows and mappings disagree describes two indexes.
-    if int8_trained {
+    // The rows of a trained scalar directory below 5.x, held to the mappings
+    // both ways before anything is built from either: every row names a
+    // record the mappings hold, and every record the mappings hold has a
+    // row. A directory whose rows and mappings disagree describes two
+    // indexes. At 5.x the rows are in the graph dump, whose identity region
+    // is held to the mappings.
+    if int8_trained && major < DUMP_V2_FORMAT_MAJOR {
         check_int8_rows_against_mappings(&index, &int8_rows, &positions)?;
     }
 
     // Step 3: Restore the graph the save wrote. Every save dumps the graph, so
-    // the ordinary path is a read. A dump that is absent, damaged, or written
-    // by a release this build cannot interpret falls back to the rebuild, which
-    // is the path that also upgrades a graph carrying a defect the vendored
-    // patches have since fixed. See `restore_graph_from_dump`.
+    // the ordinary path is a read. At 5.x the dump holds the only copy of each
+    // record's row: a dump refused on its header, its identity or its rows
+    // refuses the load, and one whose topology fails gives its rows back to
+    // rebuild from. Below 5.x a dump that is absent, damaged, or written by a
+    // release this build cannot interpret falls back to the rebuild from the
+    // separate stores, which is the path that also upgrades a graph carrying
+    // a defect the vendored patches have since fixed. See
+    // `restore_graph_from_dump`.
+    let version = if major >= DUMP_V2_FORMAT_MAJOR { 2 } else { 1 };
     let graph_rebuilt = match index.restore_graph_from_dump(
         dir,
         config.id_counter,
         dump_bytes,
         &positions,
-    ) {
-        Ok(nodes) => {
+        version,
+    )? {
+        DumpOutcome::Read(nodes) => {
             debug!(target: LOG_TARGET, "HNSW graph restored from the saved dump ({} nodes)", nodes);
             false
         }
-        Err(reason) => {
+        DumpOutcome::Rows {
+            rows,
+            reason,
+            asked,
+        } => {
+            if asked {
+                debug!(target: LOG_TARGET, "Rebuilding the HNSW graph from the dump's rows, because {}", reason);
+            } else {
+                warn!(target: LOG_TARGET, operation = "load_graph_rebuilt",
+                    directory = %dir.locate(""),
+                    dump = GRAPH_DUMP_FILENAME,
+                    reason = reason.as_str(),
+                    "The graph dump's topology could not be used, so the graph was rebuilt from \
+                     the rows the dump holds, each region of which was verified; every record \
+                     and every internal id is the saved one, and the graph's topology is not"
+                );
+            }
+            let inserted = rebuild_graph_from_rows(&mut index, rows, &mut positions)?;
+            debug!(target: LOG_TARGET, "Graph rebuilt from the dump's rows ({} records inserted)", inserted);
+            true
+        }
+        DumpOutcome::Rebuild(reason) => {
             debug!(target: LOG_TARGET, "Rebuilding the HNSW graph, because {}", reason);
             // Both rebuilds below replay the raw vectors, so a directory
             // whose vectors were counted and not kept reads them now.
@@ -2451,6 +2576,13 @@ fn reconstruct_index_simple(
     // index writes none, so the rebuild that runs over no records is the
     // ordinary path rather than a graph that could not be read.
     let graph_rebuilt = graph_rebuilt && index.vector_count() > 0;
+
+    // At 5.x the codes map of a product quantized graph is every live
+    // record's codes, read off the graph's own store, which the dump's rows
+    // filled. It holds nothing for any other graph.
+    if major >= DUMP_V2_FORMAT_MAJOR {
+        pq_codes = index.codes_from_graph();
+    }
 
     // Step 4: The stored record data, exactly as it was written, once the
     // graph is back. Neither rebuild touches the storage maps, and the
@@ -2817,6 +2949,83 @@ fn restore_int8_state(
     Ok(())
 }
 
+/// Rebuild the graph from the rows a version 2 dump holds, each region of it
+/// verified, where its topology could not be used or the rebuild was asked
+/// for
+///
+/// Every live record's row is re-inserted in increasing internal id, filed
+/// at the position the mappings give its origin id, which is the order every
+/// other rebuild takes, and a stranded node's row is dropped. A raw graph
+/// rebuilds from the vectors through the path a raw rebuild always took, a
+/// product quantized one from the codes and a scalar one from the rows,
+/// under the quantizer or the codec the loader installed. The raw vectors a
+/// `quantized_with_raw` graph keeps go beside the codes afterwards, as on
+/// every load.
+fn rebuild_graph_from_rows(
+    index: &mut Collection,
+    rows: DumpRows,
+    positions: &mut Vec<u32>,
+) -> Result<usize, Error> {
+    let DumpRows {
+        positions: record_of,
+        width,
+        values,
+        ..
+    } = rows;
+    // Each live node, by the position its record holds, in increasing
+    // position, which is increasing internal id.
+    let mut live: Vec<(usize, usize)> = record_of
+        .iter()
+        .enumerate()
+        .filter(|&(_, &at)| at != Position::NONE)
+        .map(|(node, &at)| (at as usize, node))
+        .collect();
+    live.sort_unstable();
+    let row = |node: usize| node * width..(node + 1) * width;
+    let named = |at: usize, store: &IdStore| -> Result<String, Error> {
+        store.name(at).map(str::to_string).ok_or_else(|| {
+            Error::Engine(format!(
+                "the dump files a node at position {}, which mappings.bin does not hold",
+                at
+            ))
+        })
+    };
+    match values {
+        RowValues::Raw(values) => {
+            let records = {
+                let ids = index.ids();
+                live.iter()
+                    .map(|&(at, node)| Ok((named(at, &ids)?, values[row(node)].to_vec())))
+                    .collect::<Result<Vec<_>, Error>>()?
+            };
+            index.rebuild_from_records(records, positions)
+        }
+        RowValues::Codes(values) => {
+            let codes = {
+                let ids = index.ids();
+                let mut codes = HashMap::with_capacity(live.len());
+                for &(at, node) in &live {
+                    codes.insert(named(at, &ids)?, values[row(node)].to_vec());
+                }
+                codes
+            };
+            let (inserted, _, _) = index
+                .rebuild_graph_from_codes(&codes, &HashMap::new(), positions)
+                .map_err(Error::Engine)?;
+            Ok(inserted)
+        }
+        RowValues::Int8(values) => {
+            let mut held = Int8Rows::with_capacity(live.len(), width);
+            for &(at, node) in &live {
+                held.push_row(positions[at], &values[row(node)]);
+            }
+            index
+                .rebuild_graph_from_int8_rows(&held, positions)
+                .map_err(Error::Engine)
+        }
+    }
+}
+
 /// Rebuild the graph for a trained quantized index from its stored codes
 ///
 /// The saved graph was a PQ graph over the codes, so the rebuild inserts those
@@ -3035,9 +3244,19 @@ pub(crate) fn load_from(
         && lock.read_only.is_none()
     {
         restored_from_aside = storage.recover()?;
-        if storage.exists() && load_manifest(storage.dir())?.journal.is_some() {
-            drop(lock);
-            lock = LoadLock::take(storage, LockMode::Exclusive, path)?;
+        // A directory holding a feature this build does not know, marked
+        // read_only, is read under the shared lock, since its load writes
+        // nothing.
+        if storage.exists() {
+            let manifest = load_manifest(storage.dir())?;
+            let read_only = manifest
+                .features
+                .as_ref()
+                .is_some_and(features::lists_read_only);
+            if manifest.journal.is_some() && !read_only {
+                drop(lock);
+                lock = LoadLock::take(storage, LockMode::Exclusive, path)?;
+            }
         }
     }
     load_locked(storage, path, tokenizer, policy, lock, restored_from_aside)
@@ -3072,6 +3291,7 @@ fn load_locked(
         major,
         identity,
         graph_rebuilt,
+        read_only_features,
     } = read_checkpoint(storage, tokenizer.clone())?;
 
     // Phase 3: The journal beside the directory, where the manifest names
@@ -3099,6 +3319,11 @@ fn load_locked(
             );
         }
         let recovery = Recovery::unjournaled(format_version, restored_from_aside, graph_rebuilt);
+        if !read_only_features.is_empty() {
+            let reached = identity_sequence.unwrap_or(0);
+            let cause = ReadOnlyCause::Features(read_only_features);
+            return Ok(read_only(restored_index, path, cause, reached, recovery));
+        }
         recovery.report(path);
         return Ok((restored_index, recovery));
     };
@@ -3145,6 +3370,16 @@ fn load_locked(
             let mut recovery =
                 Recovery::unjournaled(format_version, restored_from_aside, graph_rebuilt);
             recovery.checkpoint_sequence = record.sequence;
+            if !read_only_features.is_empty() {
+                let cause = ReadOnlyCause::Features(read_only_features);
+                return Ok(read_only(
+                    restored_index,
+                    path,
+                    cause,
+                    record.sequence,
+                    recovery,
+                ));
+            }
             recovery.report(path);
             return Ok((restored_index, recovery));
         }
@@ -3166,6 +3401,7 @@ fn load_locked(
         durability,
         repairing,
         lock,
+        read_only_features,
     };
     if major >= SEGMENTED_FORMAT_MAJOR {
         let identity = identity.expect("a 5.x manifest was held to record an identity");
@@ -3183,6 +3419,10 @@ struct Checkpoint {
     major: u32,
     identity: Option<crate::Identity>,
     graph_rebuilt: bool,
+    /// The features the directory holds that this build does not know and
+    /// its manifest marks `read_only`, in name order, which make the load
+    /// read only.
+    read_only_features: Vec<String>,
 }
 
 /// Phases 1 and 2 of a load: every artefact of the directory `storage`
@@ -3203,14 +3443,14 @@ fn read_checkpoint(
 
     // The features the directory lists, before any artefact is read, so a
     // directory holding one this build does not know is refused by its name
-    // rather than read without it. See `features`. Every 5.x manifest lists
-    // them, possibly none, so one listing nothing at all was not written by
-    // a save.
-    match manifest.features.as_ref() {
-        Some(record) => features::read(record)?,
+    // rather than read without it, or read only where its manifest marks it
+    // so. See `features`. Every 5.x manifest lists them, possibly none, so
+    // one listing nothing at all was not written by a save.
+    let reading = match manifest.features.as_ref() {
+        Some(record) => features::read(record, &features::THIS_BUILD)?,
         None if major >= SEGMENTED_FORMAT_MAJOR => return Err(features::missing()),
-        None => {}
-    }
+        None => features::Reading::default(),
+    };
 
     // Every 5.x manifest records its identity with the journal sequence its
     // state holds. Below 5.x the sequence is not read, as no release reading
@@ -3253,15 +3493,29 @@ fn read_checkpoint(
         .map(IdentityManifest::read)
         .transpose()?;
 
+    // Every field of a 5.x manifest a save writes from the directory, held to
+    // it before any artefact is read.
+    if major >= DUMP_V2_FORMAT_MAJOR {
+        check_manifest_fields(dir, &manifest)?;
+    }
+
     // Before any artefact is read, so a directory missing two files names the
     // first rather than failing on whichever one a partial load reaches.
-    check_files_present(dir, &manifest)?;
+    check_files_present(dir, &manifest, major)?;
     debug!(target: LOG_TARGET, "Manifest loaded: {} vectors, format v{}",
         manifest.total_vectors, manifest.format_version
     );
 
     let config = load_config(dir, &manifest)?;
     debug!(target: LOG_TARGET, "Config loaded: dim={}, space={}", config.dim, config.space);
+    if major >= DUMP_V2_FORMAT_MAJOR && manifest.total_vectors != config.vector_count {
+        return Err(Error::ManifestFieldInvalid {
+            detail: format!(
+                "records total_vectors as {}, and config.json records vector_count {}",
+                manifest.total_vectors, config.vector_count
+            ),
+        });
+    }
 
     // A 1.x directory declares no space, since no release writing 1.x held
     // one, and a 1.x manifest over a config that declares one is a
@@ -3286,7 +3540,7 @@ fn read_checkpoint(
     let (ids, layout) = load_ids(dir, &manifest, major, &config)?;
     debug!(target: LOG_TARGET, "Mappings loaded: {} ID mappings", ids.len());
 
-    let metadata = load_metadata(dir, &manifest)?;
+    let metadata = load_metadata(dir, &manifest, major, ids.view())?;
     debug!(target: LOG_TARGET, "Metadata loaded: {} records", metadata.len());
 
     // A raw index takes its vectors back from the graph dump, so its
@@ -3347,6 +3601,10 @@ fn read_checkpoint(
         }
     }
 
+    if major >= DUMP_V2_FORMAT_MAJOR {
+        check_quantization_fields(&manifest, quantization.as_ref())?;
+    }
+
     // From 4.x on the features a manifest lists are the ones the directory
     // holds, held now that every part they name has been read and before
     // anything is built from them. Below 4.x no release listed features, and
@@ -3377,6 +3635,7 @@ fn read_checkpoint(
     let (mut restored_index, graph_rebuilt) = reconstruct_index_simple(
         dir,
         &manifest,
+        major,
         config,
         ids,
         layout,
@@ -3420,7 +3679,158 @@ fn read_checkpoint(
         major,
         identity,
         graph_rebuilt,
+        read_only_features: reading.read_only,
     })
+}
+
+/// Hold a 5.x manifest's fields to what a save writes, before any artefact
+/// is read
+///
+/// `zeusdb_version` is not empty, `created_at` and `saved_at` are RFC 3339
+/// times, `index_type` is `HNSW`, and `storage_mode` is one a save records.
+/// `has_quantization` says whether `files_included` names
+/// `quantization.json`. `files_included` and `file_digests` name the same
+/// files, none of them one no 5.0.0 save writes. `files_excluded` names
+/// nothing `files_included` names and nothing the directory holds. And
+/// `total_size_mb`, in whole bytes, is the lengths `file_digests` records,
+/// added.
+fn check_manifest_fields(dir: &dyn Dir, manifest: &IndexManifest) -> Result<(), Error> {
+    let invalid = |detail: String| Err(Error::ManifestFieldInvalid { detail });
+    if manifest.zeusdb_version.is_empty() {
+        return invalid(
+            "records zeusdb_version as an empty string, and a save records the release that \
+             wrote it"
+                .to_string(),
+        );
+    }
+    for (field, value) in [
+        ("created_at", &manifest.created_at),
+        ("saved_at", &manifest.saved_at),
+    ] {
+        if chrono::DateTime::parse_from_rfc3339(value).is_err() {
+            return invalid(format!(
+                "records {} as '{}', which is not an RFC 3339 time",
+                field, value
+            ));
+        }
+    }
+    if manifest.index_type != "HNSW" {
+        return invalid(format!(
+            "records index_type as '{}', and a save records HNSW",
+            manifest.index_type
+        ));
+    }
+    if !STORAGE_MODES.contains(&manifest.storage_mode.as_str()) {
+        return invalid(format!(
+            "records storage_mode as '{}', which is not one a save records",
+            manifest.storage_mode
+        ));
+    }
+    let names_quantization = manifest_names(manifest, "quantization.json");
+    if manifest.has_quantization != names_quantization {
+        return invalid(format!(
+            "records has_quantization as {}, and files_included {} quantization.json",
+            manifest.has_quantization,
+            if names_quantization {
+                "names"
+            } else {
+                "does not name"
+            }
+        ));
+    }
+    for name in &manifest.files_included {
+        if !manifest.file_digests.contains_key(name) {
+            return invalid(format!(
+                "names {} under files_included, and file_digests records no length for it",
+                name
+            ));
+        }
+        if name == "pq_codes.bin"
+            || name == INT8_ROWS_FILENAME
+            || LEGACY_DUMP_FILENAMES.contains(&name.as_str())
+        {
+            return invalid(format!(
+                "names {} under files_included, which no save at format 5.0.0 writes",
+                name
+            ));
+        }
+    }
+    let mut recorded: Vec<&String> = manifest.file_digests.keys().collect();
+    recorded.sort_unstable();
+    if let Some(name) = recorded.iter().find(|name| !manifest_names(manifest, name)) {
+        return invalid(format!(
+            "records a length for {} under file_digests, and files_included does not name it",
+            name
+        ));
+    }
+    for name in &manifest.files_excluded {
+        if manifest_names(manifest, name) {
+            return invalid(format!(
+                "names {} under both files_included and files_excluded",
+                name
+            ));
+        }
+        if dir.exists(name) {
+            return invalid(format!(
+                "names {} under files_excluded, and the directory holds it",
+                name
+            ));
+        }
+    }
+    // A length in bytes divided by a power of two is exact, and a JSON
+    // reader may take the decimal it reads back one unit in the last place
+    // away, so the field is held to the lengths in whole bytes.
+    let total = manifest
+        .file_digests
+        .values()
+        .fold(0u64, |total, digest| total.saturating_add(digest.bytes));
+    if (manifest.total_size_mb * MEBIBYTE).round() != total as f64 {
+        return invalid(format!(
+            "records total_size_mb as {}, and the lengths file_digests records add up to {} MiB",
+            manifest.total_size_mb,
+            total as f64 / MEBIBYTE
+        ));
+    }
+    Ok(())
+}
+
+/// Hold a 5.x manifest's two quantization fields to `quantization.json`, once
+/// it has been read: `quantization_trained` is its `is_trained`, false where
+/// there is none, and `files_included` names `vectors.bin` only beside a
+/// trained product quantized graph under `quantized_with_raw`, which is the
+/// one graph whose raw vectors are not its rows.
+fn check_quantization_fields(
+    manifest: &IndexManifest,
+    quantization: Option<&QuantizationArtefacts>,
+) -> Result<(), Error> {
+    let (trained, keeps_raw) = match quantization.map(|quant| &quant.config) {
+        Some(QuantizationFile::Pq(config)) => (
+            config.is_trained,
+            config.is_trained && config.storage_mode == StorageMode::QuantizedWithRaw.to_string(),
+        ),
+        Some(QuantizationFile::Int8(config)) => (config.is_trained, false),
+        None => (false, false),
+    };
+    if manifest.quantization_trained != trained {
+        return Err(Error::ManifestFieldInvalid {
+            detail: format!(
+                "records quantization_trained as {}, and {}",
+                manifest.quantization_trained,
+                match quantization {
+                    Some(_) => format!("quantization.json records is_trained {}", trained),
+                    None => "files_included names no quantization.json".to_string(),
+                }
+            ),
+        });
+    }
+    if manifest_names(manifest, "vectors.bin") && !keeps_raw {
+        return Err(Error::ManifestFieldInvalid {
+            detail: "names vectors.bin under files_included, and the graph keeps no raw vectors \
+                     beside its rows"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// What a load of a journaled directory carries into the replay.
@@ -3440,6 +3850,10 @@ struct Opened<'a> {
     /// The load was asked to repair a damaged journal.
     repairing: bool,
     lock: LoadLock,
+    /// The features the directory holds that this build does not know and
+    /// its manifest marks `read_only`, which make the load read only
+    /// whatever the medium.
+    read_only_features: Vec<String>,
 }
 
 impl Opened<'_> {
@@ -3452,6 +3866,44 @@ impl Opened<'_> {
         index.set_journal_sequence(self.record.sequence);
         Ok(index)
     }
+
+    /// Refuse a journal whose damage is a whole record of a kind this build
+    /// does not know, in a directory holding features this build does not
+    /// know and its manifest marks `read_only`, since the record is the
+    /// feature's and not damage. `file`, `at` and `sequence` name the
+    /// record, and `bytes` is the file it is in. Nothing is refused where
+    /// the directory holds no such feature.
+    fn refuse_feature_record(
+        &self,
+        bytes: &[u8],
+        at: u64,
+        sequence: u64,
+        framing: bool,
+    ) -> Result<(), Error> {
+        if self.read_only_features.is_empty() {
+            return Ok(());
+        }
+        match unknown_kind_at(bytes, at, sequence, framing) {
+            Some(kind) => Err(Error::FeatureJournalUnreadable {
+                path: self.path.to_string(),
+                features: self.read_only_features.clone(),
+                kind,
+                sequence,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// The cause of a load read only, where it is: features the directory
+    /// holds before the medium, and the medium where the lock found it
+    /// cannot be written.
+    fn read_only_cause(&self) -> Option<ReadOnlyCause> {
+        if !self.read_only_features.is_empty() {
+            return Some(ReadOnlyCause::Features(self.read_only_features.clone()));
+        }
+        self.lock.read_only.clone().map(ReadOnlyCause::Medium)
+    }
+
     /// No save writes the identity and the journal record apart, so a
     /// manifest whose two name two collections was assembled by hand, and
     /// replaying would be choosing one of them. Held once the journal itself
@@ -3537,12 +3989,31 @@ impl Opened<'_> {
         let contents = if self.repairing {
             read_segments_for_repair(&segments, &expected, &journal_name)?
         } else {
-            let contents = read_segments(&segments, &expected, &journal_name)?;
+            read_segments(&segments, &expected, &journal_name)?
+        };
+        // A record of a read-only feature is the feature's, so it is named
+        // as that before it is taken for damage.
+        let damage = match (&contents.damage, &contents.cut) {
+            (Some(JournalDamage::Corrupt { at, sequence, .. }), _)
+            | (Some(JournalDamage::TornTail { at, sequence }), _) => contents
+                .damage_file
+                .as_deref()
+                .and_then(|file| segments.iter().find(|segment| segment.file == file))
+                .map(|segment| (segment.bytes, *at, *sequence)),
+            (None, Some(cut)) => segments
+                .iter()
+                .find(|segment| segment.number == cut.damage_segment)
+                .map(|segment| (segment.bytes, cut.damage_at, cut.damage_sequence)),
+            (None, None) => None,
+        };
+        if let Some((bytes, at, sequence)) = damage {
+            self.refuse_feature_record(bytes, at, sequence, true)?;
+        }
+        if !self.repairing {
             if let Some(refusal) = contents.refusal() {
                 return Err(refusal);
             }
-            contents
-        };
+        }
         self.journal_record_names_the_directory()?;
 
         // `apply` refuses to run with a sink attached, which is why the sink
@@ -3612,9 +4083,9 @@ impl Opened<'_> {
             Vec::new()
         };
 
-        if let Some(reason) = self.lock.read_only {
+        if let Some(cause) = self.read_only_cause() {
             recovery.repair = plan.as_ref().map(|plan| plan.report(None));
-            return Ok(read_only(index, self.path, reason, reached, recovery));
+            return Ok(read_only(index, self.path, cause, reached, recovery));
         }
         let mut sealed: Vec<String> = Vec::new();
         let writer = match &plan {
@@ -3624,8 +4095,8 @@ impl Opened<'_> {
                     Ok(folder) => folder,
                     Err(repair::SetAside::Create(error)) if refuses_writes(&error) => {
                         recovery.repair = Some(plan.report(None));
-                        let reason = error.to_string();
-                        return Ok(read_only(index, self.path, reason, reached, recovery));
+                        let cause = ReadOnlyCause::Medium(error.to_string());
+                        return Ok(read_only(index, self.path, cause, reached, recovery));
                     }
                     Err(repair::SetAside::Create(error)) => return Err(io("set aside")(error)),
                     Err(repair::SetAside::Write(error)) => return Err(error),
@@ -3654,8 +4125,8 @@ impl Opened<'_> {
         let writer = match writer {
             Ok(writer) => writer,
             Err(failure) if failure.refuses_writes => {
-                let reason = failure.error.to_string();
-                return Ok(read_only(index, self.path, reason, reached, recovery));
+                let cause = ReadOnlyCause::Medium(failure.error.to_string());
+                return Ok(read_only(index, self.path, cause, reached, recovery));
             }
             Err(failure) => return Err(failure.error),
         };
@@ -3744,6 +4215,12 @@ impl Opened<'_> {
                 error: error.to_string(),
             })?;
         let contents = read_legacy_journal(&bytes, &file)?;
+        if let Some(
+            JournalDamage::Corrupt { at, sequence, .. } | JournalDamage::TornTail { at, sequence },
+        ) = &contents.damage
+        {
+            self.refuse_feature_record(&bytes, *at, *sequence, false)?;
+        }
         crate::journal::check_legacy_contents(
             &contents,
             &file,
@@ -3829,9 +4306,9 @@ impl Opened<'_> {
             Vec::new()
         };
 
-        if let Some(reason) = self.lock.read_only {
+        if let Some(cause) = self.read_only_cause() {
             recovery.repair = plan.as_ref().map(|plan| plan.report(None));
-            return Ok(read_only(index, self.path, reason, reached, recovery));
+            return Ok(read_only(index, self.path, cause, reached, recovery));
         }
         zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::UpgradeAfterReplay);
         let mut sealed: Vec<String> = Vec::new();
@@ -3841,8 +4318,8 @@ impl Opened<'_> {
                 Ok(folder) => folder,
                 Err(repair::SetAside::Create(error)) if refuses_writes(&error) => {
                     recovery.repair = Some(plan.report(None));
-                    let reason = error.to_string();
-                    return Ok(read_only(index, self.path, reason, reached, recovery));
+                    let cause = ReadOnlyCause::Medium(error.to_string());
+                    return Ok(read_only(index, self.path, cause, reached, recovery));
                 }
                 Err(repair::SetAside::Create(error)) => {
                     return Err(Error::JournalIoFailed {
@@ -3875,7 +4352,7 @@ impl Opened<'_> {
                 return Ok(read_only(
                     index,
                     self.path,
-                    error.to_string(),
+                    ReadOnlyCause::Medium(error.to_string()),
                     reached,
                     recovery,
                 ));
@@ -4102,24 +4579,29 @@ fn segment_file<'a>(numbers: &[u64], files: &'a [String], sequence: u64) -> &'a 
         .map_or("", String::as_str)
 }
 
-/// The collection a load hands back where the medium refused its first
-/// write: every record replayed, nothing on the medium changed, and a sink
-/// attached that refuses every mutation. `reached` is the last sequence the
-/// replay reached, which a save into another directory records.
+/// The collection a load hands back read only, where the medium refused its
+/// first write or the directory holds features this build does not know and
+/// its manifest marks `read_only`: every record replayed, nothing on the
+/// medium changed, and a sink attached that refuses every mutation.
+/// `reached` is the last sequence the replay reached, which a save into
+/// another directory records.
 fn read_only(
     index: Collection,
     path: &str,
-    reason: String,
+    cause: ReadOnlyCause,
     reached: u64,
     mut recovery: Recovery,
 ) -> (Collection, Recovery) {
     index.set_journal_sequence(reached);
+    recovery.read_only = Some(cause.reason());
+    if let ReadOnlyCause::Features(features) = &cause {
+        recovery.read_only_features = features.clone();
+    }
     index.attach_sink(Box::new(ReadOnlySink::new(
         std::path::PathBuf::from(path),
-        reason.clone(),
+        cause,
         reached,
     )));
-    recovery.read_only = Some(reason);
     recovery.report(path);
     (index, recovery)
 }
@@ -4198,23 +4680,10 @@ fn save_mappings(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> 
     Ok(())
 }
 
-/// The codes frame over every record `ids` holds that has codes, each named
-/// by the internal id `id_of` gives its position. Compiled once for each
-/// reader, so the loop tests nothing the other reader needs.
-fn codes_of(
-    ids: &IdStore,
-    pq_codes: &HashMap<String, Vec<u8>>,
-    width: usize,
-    id_of: impl Fn(usize) -> Option<usize>,
-) -> Result<(Vec<u8>, usize), Error> {
-    let records = ids.iter().filter_map(|(at, id)| {
-        let code = pq_codes.get(id)?;
-        Some((id_of(at)?, code.as_slice()))
-    });
-    framed::write_codes(width, records, pq_codes.len())
-}
-
 /// Save vector metadata as JSON for external tool compatibility
+///
+/// Compact, and naming only the records that hold a field, since a load
+/// gives every record the file leaves out an empty entry.
 fn save_metadata(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
     debug!(target: LOG_TARGET, "Saving metadata.json...");
 
@@ -4222,18 +4691,23 @@ fn save_metadata(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> 
     // the id store before vector_metadata. The file is keyed by external id
     // and the store by position, so every record is written under the id
     // the id store holds for it, in position order, which is increasing
-    // internal id and the order the store walks in. `to_string_pretty`
-    // returns an owned String, so the file is written with nothing held.
+    // internal id and the order the store walks in. `to_string` returns an
+    // owned String, so the file is written with nothing held.
     let (metadata_json, record_count) = {
         let ids = index.ids();
         let vector_metadata = index.vector_metadata();
         let file = MetadataFile {
             records: ids
                 .iter()
-                .filter_map(|(slot, id)| vector_metadata.get(slot).map(|fields| (id, fields)))
+                .filter_map(|(slot, id)| {
+                    vector_metadata
+                        .get(slot)
+                        .filter(|fields| !fields.is_empty())
+                        .map(|fields| (id, fields))
+                })
                 .collect(),
         };
-        let json = serde_json::to_string_pretty(&file);
+        let json = serde_json::to_string(&file);
         (json, file.records.len())
     };
     let metadata_json = metadata_json.map_err(|e| Error::SerializeFailed {
@@ -4247,9 +4721,9 @@ fn save_metadata(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> 
     Ok(())
 }
 
-/// `metadata.json` as it is written: one object per record under its
-/// external id, holding the record's fields. The same shape the file has
-/// always had, which `load_metadata` reads back into a map of maps.
+/// `metadata.json` as it is written: one object per record holding a field,
+/// under its external id, holding the record's fields, which `load_metadata`
+/// reads back into a map of maps.
 struct MetadataFile<'a> {
     records: Vec<(&'a str, RecordFields<'a>)>,
 }
@@ -4302,32 +4776,6 @@ fn save_quantization_config(
         let training_ids = index.training_ids().clone();
         let training_threshold_reached = index.training_threshold_reached();
 
-        let (memory_stats, pq_config) = if let Some(pq) = index.pq() {
-            let (memory_mb, total_centroids) = pq.get_memory_stats();
-
-            let memory_stats = MemoryStats {
-                centroid_storage_mb: memory_mb,
-                compression_ratio: (pq.dim() * 4) as f64 / pq.subvectors() as f64,
-                centroids_per_subvector: pq.num_centroids(),
-                total_centroids,
-            };
-
-            let pq_config = PQConfig {
-                dim: pq.dim(),
-                sub_dim: pq.sub_dim(),
-                num_centroids: pq.num_centroids(),
-            };
-
-            (Some(memory_stats), pq_config)
-        } else {
-            let pq_config = PQConfig {
-                dim: index.dim(),
-                sub_dim: index.dim() / subvectors,
-                num_centroids: 1 << bits,
-            };
-            (None, pq_config)
-        };
-
         let quant_persistence = QuantizationPersistence {
             r#type: "pq".to_string(),
             subvectors,
@@ -4337,8 +4785,6 @@ fn save_quantization_config(
             storage_mode: config.storage_mode.to_string().to_string(),
             is_trained: index.can_use_quantization(),
             training_completed_at,
-            memory_stats,
-            pq_config,
             training_ids,
             training_threshold_reached,
             rerank_calibration: index.rerank_calibration(),
@@ -4430,28 +4876,6 @@ fn save_int8_scales(
     Ok(())
 }
 
-/// The rows artefact: every live record's internal id and row, ascending,
-/// written straight into the frame's buffer. Nothing is written for an index
-/// holding no record, and the manifest then names no rows artefact.
-fn save_int8_rows(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
-    let stride = 4 + index.quantization_code_bytes();
-    let mut out = frame_begin(
-        FrameKind::Int8Rows,
-        FrameEncoding::Engine,
-        index.len().saturating_mul(stride),
-    );
-    let entries = index.write_int8_rows(&mut out);
-    if entries == 0 {
-        return Ok(());
-    }
-    debug!(target: LOG_TARGET, "Saving {}...", INT8_ROWS_FILENAME);
-    let bytes = frame_finish(out, entries as u64);
-    zeusdb_vector_core::write_artefact(dir, INT8_ROWS_FILENAME, &bytes)?;
-    ledger.record_digest(INT8_ROWS_FILENAME, bytes.len() as u64, None);
-    debug!(target: LOG_TARGET, "{} saved ({} rows)", INT8_ROWS_FILENAME, entries);
-    Ok(())
-}
-
 /// Save PQ centroids for vector reconstruction
 fn save_pq_centroids(
     index: &Collection,
@@ -4476,50 +4900,16 @@ fn save_pq_centroids(
     Ok(())
 }
 
-/// Save quantized vector codes, each under its record's internal id
-fn save_pq_codes(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
-    let width = index.quantization_code_bytes();
-    // The guards end with the frame, taken in the documented order, the id
-    // store, the dense index, then the codes, so the file is written with
-    // nothing held. The codes follow position order, which is increasing
-    // internal id and the order the store holds its records in, each under
-    // the internal id its record's node was inserted under.
-    let (codes_data, code_count) = {
-        let ids = index.ids();
-        let dense = index.dense_index();
-        let pq_codes = index.pq_codes();
-        if pq_codes.is_empty() {
-            return Ok(());
-        }
-        debug!(target: LOG_TARGET, "Saving pq_codes.bin...");
-        match dense.ids_by_position().reader() {
-            PositionReader::Shifted { extent } => {
-                codes_of(&ids, &pq_codes, width, |at| shifted_internal_id(extent, at))?
-            }
-            PositionReader::Read {
-                node_at,
-                origin_ids,
-            } => codes_of(&ids, &pq_codes, width, |at| {
-                read_internal_id(node_at, origin_ids, at)
-            })?,
-        }
-    };
-
-    write_framed(dir, "pq_codes.bin", &codes_data, ledger)?;
-
-    debug!(target: LOG_TARGET, "pq_codes.bin saved ({} vectors)", code_count);
-    Ok(())
-}
-
-/// Save raw vectors based on storage mode configuration
+/// Save the raw vectors a product quantized graph keeps beside its codes
 ///
 /// Every record's internal id and raw vector, read out of the store the graph
 /// is addressed against, in increasing internal id, straight into the frame.
 ///
-/// A trained `quantized_only` index writes none, as before, because it holds
-/// none.
+/// Written only by a trained product quantized graph under
+/// `quantized_with_raw`. Every other graph's rows are what it stores, which
+/// the graph dump holds.
 fn save_vectors(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
-    if !index.holds_raw_vectors() {
+    if !index.writes_raw_vectors() {
         return Ok(());
     }
     let dim = index.dim();
@@ -4554,10 +4944,10 @@ pub(crate) struct ManifestRecord<'a> {
 /// Write manifest.json, which is the last file a save writes
 ///
 /// It names every other artefact, records the length and digest of each, and
-/// records the directory size. All three are facts about files that are already
-/// on disk, which is why it is written last and why there is no second pass to
-/// correct any of them. It records what `record` holds too, which the save
-/// settled.
+/// records the directory size, being those lengths added. All three are facts
+/// about files that are already on disk, which is why it is written last and
+/// why there is no second pass to correct any of them. It records what
+/// `record` holds too, which the save settled.
 pub(crate) fn save_manifest(
     index: &Collection,
     dir: &dyn Dir,
@@ -4565,19 +4955,6 @@ pub(crate) fn save_manifest(
     record: &ManifestRecord<'_>,
 ) -> Result<(), Error> {
     debug!(target: LOG_TARGET, "Saving manifest.json...");
-
-    // The manifest needs two facts about the stores rather than the stores
-    // themselves, so it takes those two facts and releases both guards here.
-    //
-    // This used to hold the `vectors` and `pq_codes` read guards for the whole
-    // function, and `get_storage_mode` below takes the graph's read guard. The
-    // documented order is `hnsw < vectors < pq_codes`, so that acquired the
-    // three in exactly the wrong order. It could not deadlock, because a save
-    // holds the mutation lock and every path that takes the graph's write guard
-    // holds it too, so no counterparty could be in flight. That is the same
-    // reasoning that failed the three inversions found before this one.
-    let has_raw_vectors = index.holds_raw_vectors() && index.vector_count() > 0;
-    let code_count = index.pq_codes().len();
 
     // Determine what files are included based on what we actually saved
     let mut files_included = vec![
@@ -4596,20 +4973,14 @@ pub(crate) fn save_manifest(
         if index.can_use_quantization() {
             if int8 {
                 files_included.push(INT8_SCALES_FILENAME.to_string());
-                if index.vector_count() > 0 {
-                    files_included.push(INT8_ROWS_FILENAME.to_string());
-                }
             } else {
                 files_included.push("pq_centroids.bin".to_string());
-                if code_count > 0 {
-                    files_included.push("pq_codes.bin".to_string());
-                }
             }
         }
     }
 
     // Add vectors.bin if it was saved
-    if has_raw_vectors {
+    if ledger.recorded_bytes("vectors.bin").is_some() {
         files_included.push("vectors.bin".to_string());
     } else {
         files_excluded.push("vectors.bin".to_string());
@@ -4637,48 +5008,15 @@ pub(crate) fn save_manifest(
         debug!(target: LOG_TARGET, "No graph file (empty index)");
     }
 
-    // Calculate compression info for quantized indexes
-    //
-    // Both sizes are taken over the coded records, so the ratio is the size of
-    // a code against the size of the vector it stands for. `original_size_mb`
-    // used to count the raw vectors the index still holds, which under
-    // quantized_only is only the training records. That put a record count in
-    // the numerator and a different one in the denominator, and the ratio came
-    // out as the compression ratio scaled by the share of records collected
-    // before training. At 1,000 training records in 3,000 it read 10.7x where
-    // the codes are 32x smaller than the vectors. Under quantized_with_raw the
-    // two counts were already equal, so this changes nothing there.
-    // A scalar index holds one row a live record, so the coded count is the
-    // live count once it is trained.
-    let code_count = if int8 && index.can_use_quantization() {
-        vector_count
-    } else {
-        code_count
-    };
-    let compression_info =
-        if index.has_quantization() && index.can_use_quantization() && code_count > 0 {
-            let raw_size_mb = (code_count * index.dim() * 4) as f64 / (1024.0 * 1024.0);
-            let compressed_size_mb =
-                (code_count * index.quantization_code_bytes()) as f64 / (1024.0 * 1024.0);
-            let compression_ratio = if compressed_size_mb > 0.0 {
-                raw_size_mb / compressed_size_mb
-            } else {
-                1.0
-            };
-
-            Some(CompressionInfo {
-                original_size_mb: raw_size_mb,
-                compressed_size_mb,
-                compression_ratio,
-            })
-        } else {
-            None
-        };
-
-    // Every artefact, the graph dump included, because they are all on disk by
-    // the time this runs. manifest.json itself is not, so the figure counts the
-    // directory without it, which the field's own comment states.
-    let total_size_mb = calculate_directory_size(dir).unwrap_or(0.0);
+    // Every artefact the ledger recorded, the graph dump included, because
+    // they are all on disk by the time this runs. manifest.json itself is
+    // not, so the figure counts the directory without it.
+    let total_size_mb = ledger
+        .digests
+        .values()
+        .fold(0u64, |total, digest| total.saturating_add(digest.bytes))
+        as f64
+        / MEBIBYTE;
 
     // The journal, where the collection holds one and the directory is its
     // own. Its two names come from the sink itself and the sequence from the
@@ -4724,7 +5062,6 @@ pub(crate) fn save_manifest(
         files_excluded,
         file_digests: ledger.digests,
         total_size_mb,
-        compression_info,
         journal,
     };
 
@@ -4742,16 +5079,6 @@ pub(crate) fn save_manifest(
 
     debug!(target: LOG_TARGET, "manifest.json saved");
     Ok(())
-}
-
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
-/// Calculate the total size of a directory in MB, the artefacts under
-/// `spaces/` included.
-fn calculate_directory_size(dir: &dyn Dir) -> Result<f64, std::io::Error> {
-    Ok(dir.total_bytes()? as f64 / (1024.0 * 1024.0))
 }
 
 // ============================================================================

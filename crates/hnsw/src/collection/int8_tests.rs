@@ -583,12 +583,13 @@ fn every_mutation_keeps_the_codec_and_the_rows() {
 // THE ARTEFACTS
 // ============================================================================
 
-/// A trained scalar directory carries the scales and the rows beside the
-/// dump, and comes back page for page; a second save of the loaded index
-/// writes the same bytes. An untrained one carries the
-/// declaration and the raw vectors, and trains after it is loaded.
+/// A trained scalar directory carries the scales beside the dump, which
+/// holds every row, and comes back page for page; a second save of the
+/// loaded index writes the same bytes. An untrained one carries the
+/// declaration, its raw graph's dump holding the raw vectors, and trains
+/// after it is loaded.
 #[test]
-fn a_scalar_directory_round_trips_with_its_two_artefacts() {
+fn a_scalar_directory_round_trips_with_its_scales() {
     let vectors = clustered(1300, 16, 0x0157_0007);
     let c = build("cosine", &vectors, 1000);
     let dir = TempDir::new();
@@ -605,13 +606,10 @@ fn a_scalar_directory_round_trips_with_its_two_artefacts() {
         .map(|v| v.as_str().unwrap())
         .collect();
     assert!(files.contains(&"int8_scales.zdbint8"), "{files:?}");
-    assert!(files.contains(&"int8_rows.zdbint8"), "{files:?}");
+    assert!(!files.contains(&"int8_rows.zdbint8"), "{files:?}");
     assert!(!files.contains(&"pq_centroids.bin"), "{files:?}");
     assert!(!files.contains(&"vectors.bin"), "{files:?}");
-    assert_eq!(
-        manifest["compression_info"]["compression_ratio"],
-        64.0 / 20.0
-    );
+    assert!(manifest.get("compression_info").is_none());
     assert_eq!(manifest["quantization_trained"], true);
     assert_eq!(manifest["storage_mode"], "quantized_active");
 
@@ -676,11 +674,7 @@ fn a_scalar_directory_round_trips_with_its_two_artefacts() {
     let again = dir.sub("again.zdb");
     loaded.save(&again).unwrap();
     let again = Path::new(&again);
-    for name in [
-        "hnsw_index.zdbgraph",
-        "int8_scales.zdbint8",
-        "int8_rows.zdbint8",
-    ] {
+    for name in ["hnsw_index.zdbgraph", "int8_scales.zdbint8"] {
         assert_eq!(
             std::fs::read(path.join(name)).unwrap(),
             std::fs::read(again.join(name)).unwrap(),
@@ -704,7 +698,7 @@ fn a_scalar_directory_round_trips_with_its_two_artefacts() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert!(files.contains(&"vectors.bin"), "{files:?}");
+    assert!(!files.contains(&"vectors.bin"), "{files:?}");
     assert!(!files.contains(&"int8_scales.zdbint8"), "{files:?}");
     let quantization = read_json(&path.join("quantization.json"));
     assert_eq!(quantization["is_trained"], false);
@@ -720,26 +714,41 @@ fn a_scalar_directory_round_trips_with_its_two_artefacts() {
     );
 }
 
-/// A dump the loader refuses is rebuilt from the rows, and the rebuilt
-/// index holds every record, searches, and writes the rows back byte for
-/// byte.
+/// A dump whose topology the loader refuses is rebuilt from the rows it
+/// holds, and the rebuilt index holds every record, searches, and decodes
+/// every row as the saved one did. A dump one byte short of the length the
+/// manifest records is refused, since its rows are the only copy.
 #[test]
-fn the_rows_rebuild_the_graph_when_the_dump_is_refused() {
+fn the_rows_rebuild_the_graph_when_the_topology_is_refused() {
     let vectors = clustered(1300, 16, 0x0157_0008);
     let c = build("l2", &vectors, 1000);
     let dir = TempDir::new();
     let path = dir.sub("scalar.zdb");
     c.save(&path).unwrap();
     let path = Path::new(&path);
-    let rows_written = std::fs::read(path.join("int8_rows.zdbint8")).unwrap();
 
-    // A dump one byte short of the length the manifest records.
-    let dump = path.join("hnsw_index.zdbgraph");
+    let short = PathBuf::from(dir.sub("short.zdb"));
+    copy_dir(path, &short);
+    let dump = short.join("hnsw_index.zdbgraph");
     let mut bytes = std::fs::read(&dump).unwrap();
     bytes.pop();
     std::fs::write(&dump, bytes).unwrap();
+    match Collection::load(short.to_str().unwrap()) {
+        Err(Error::GraphDumpInvalid { name, detail }) => {
+            assert_eq!(name, "hnsw_index.zdbgraph");
+            assert!(detail.contains("manifest.json records"), "{detail}");
+        }
+        other => panic!("expected the dump refused, got {:?}", other.map(|_| ())),
+    }
 
-    let loaded = Collection::load(path.to_str().unwrap()).unwrap();
+    super::journal_support::break_topology(path);
+    let (loaded, recovery) = Collection::recover_with(
+        path.to_str().unwrap(),
+        None,
+        crate::journal::JournalPolicy::Replay(Durability::default()),
+    )
+    .unwrap();
+    assert!(recovery.graph_rebuilt);
     assert!(loaded.is_quantized());
     assert_eq!(loaded.len(), 1300);
     assert_eq!(loaded.stats()["graph_nodes"], "1300");
@@ -755,17 +764,20 @@ fn the_rows_rebuild_the_graph_when_the_dump_is_refused() {
     let again = dir.sub("rebuilt.zdb");
     loaded.save(&again).unwrap();
     assert_eq!(
-        std::fs::read(Path::new(&again).join("int8_rows.zdbint8")).unwrap(),
-        rows_written
-    );
-    assert_eq!(
         std::fs::read(Path::new(&again).join("int8_scales.zdbint8")).unwrap(),
         std::fs::read(path.join("int8_scales.zdbint8")).unwrap()
     );
+    let reloaded = Collection::load(&again).unwrap();
+    for id in ["r0", "r999", "r1299"] {
+        assert_eq!(decoded(&c, id), decoded(&reloaded, id));
+    }
 }
 
 /// Every bound the two artefacts and the scalar fields of quantization.json
-/// are held to refuses by name, before anything is built from the file.
+/// are held to refuses by name, before anything is built from the file. The
+/// rows artefact is read from a directory written as one before format
+/// 5.0.0, which holds it, and the others from a 5.0.0 directory, whose
+/// manifest records each edit as a hand would.
 #[test]
 fn every_scales_and_rows_bound_is_refused_by_name() {
     let vectors = clustered(1200, 16, 0x0157_0009);
@@ -774,17 +786,32 @@ fn every_scales_and_rows_bound_is_refused_by_name() {
     let source = dir.sub("scalar.zdb");
     c.save(&source).unwrap();
     let source = PathBuf::from(source);
+    let older = PathBuf::from(dir.sub("scalar-before-five.zdb"));
+    c.save(older.to_str().unwrap()).unwrap();
+    crate::persistence::older::rewrite_before_five(&older, "4.0.0");
     let counter = std::cell::Cell::new(0usize);
 
-    let refused = |mutate: &dyn Fn(&Path)| -> String {
+    let refused_from = |from: &Path, mutate: &dyn Fn(&Path)| -> String {
         counter.set(counter.get() + 1);
         let target = PathBuf::from(dir.sub(&format!("damaged-{}.zdb", counter.get())));
-        copy_dir(&source, &target);
+        copy_dir(from, &target);
         mutate(&target);
         match Collection::load(target.to_str().unwrap()) {
             Ok(_) => panic!("the damaged directory opened"),
             Err(e) => e.to_string(),
         }
+    };
+    let refused = |mutate: &dyn Fn(&Path)| refused_from(&source, mutate);
+    let refused_before_five = |mutate: &dyn Fn(&Path)| refused_from(&older, mutate);
+    // The directory size a manifest records, from the lengths it records.
+    let resized = |manifest: &mut Value| {
+        let total: u64 = manifest["file_digests"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|digest| digest["bytes"].as_u64().unwrap())
+            .sum();
+        manifest["total_size_mb"] = json!(total as f64 / (1024.0 * 1024.0));
     };
     let edit = |target: &Path, name: &str, f: &dyn Fn(&mut Vec<u8>)| {
         let file = target.join(name);
@@ -802,19 +829,22 @@ fn every_scales_and_rows_bound_is_refused_by_name() {
             .as_object_mut()
             .unwrap()
             .remove(name);
+        resized(&mut manifest);
         write_json(&manifest_path, &manifest);
     };
     let edit_quantization = |target: &Path, f: &dyn Fn(&mut Value)| {
         let file = target.join("quantization.json");
         let mut value = read_json(&file);
         f(&mut value);
-        std::fs::write(&file, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+        let text = serde_json::to_string_pretty(&value).unwrap();
+        std::fs::write(&file, &text).unwrap();
         let manifest_path = target.join("manifest.json");
         let mut manifest = read_json(&manifest_path);
-        manifest["file_digests"]
-            .as_object_mut()
-            .unwrap()
-            .remove("quantization.json");
+        manifest["file_digests"]["quantization.json"] = json!({
+            "bytes": text.len(),
+            "checksum": format!("{:016x}", zeusdb_vector_core::checksum_of(text.as_bytes())),
+        });
+        resized(&mut manifest);
         write_json(&manifest_path, &manifest);
     };
     let scales = "int8_scales.zdbint8";
@@ -856,7 +886,7 @@ fn every_scales_and_rows_bound_is_refused_by_name() {
     // The rows: ids out of order, an id the mappings do not hold, a count
     // the payload does not match, and no rows at all.
     let stride = 4 + 16;
-    let m = refused(&|t| {
+    let m = refused_before_five(&|t| {
         edit(t, rows, &|b| {
             let mut first = [0u8; 4];
             first.copy_from_slice(&b[payload..payload + 4]);
@@ -868,7 +898,7 @@ fn every_scales_and_rows_bound_is_refused_by_name() {
         })
     });
     assert!(m.contains(rows) && m.contains("strictly increasing"), "{m}");
-    let m = refused(&|t| {
+    let m = refused_before_five(&|t| {
         edit(t, rows, &|b| {
             b[payload..payload + 4].copy_from_slice(&0u32.to_le_bytes());
             frame_fuzz::repair_trailer(b);
@@ -878,9 +908,9 @@ fn every_scales_and_rows_bound_is_refused_by_name() {
         m.contains(rows) && m.contains("internal id 0") && m.contains("mappings.bin"),
         "{m}"
     );
-    let m = refused(&|t| edit(t, rows, &|b| frame_fuzz::set_entries(b, 1199)));
+    let m = refused_before_five(&|t| edit(t, rows, &|b| frame_fuzz::set_entries(b, 1199)));
     assert!(m.contains(rows) && m.contains("1199 rows"), "{m}");
-    let m = refused(&|t| drop_artefact(t, rows));
+    let m = refused_before_five(&|t| drop_artefact(t, rows));
     assert!(m.contains(rows) && m.contains("holds 0 rows"), "{m}");
 
     // The fields of quantization.json under `int8`.
@@ -899,8 +929,9 @@ fn every_scales_and_rows_bound_is_refused_by_name() {
     let m = refused(&|t| edit_quantization(t, &|v| v["type"] = json!("opq")));
     assert!(m.contains("quantization.json"), "{m}");
 
-    // And the untouched directory still opens.
+    // And the untouched directories still open.
     assert!(Collection::load(source.to_str().unwrap()).is_ok());
+    assert!(Collection::load(older.to_str().unwrap()).is_ok());
 }
 
 /// A scalar directory lists `int8` among its features whatever else it
@@ -965,6 +996,9 @@ fn the_version_rule_holds_for_a_scalar_directory() {
     let relabel = |name: &str, version: &str| -> String {
         let target = PathBuf::from(dir.sub(name));
         copy_dir(Path::new(&dense_path), &target);
+        if version.starts_with(|first: char| ('1'..='4').contains(&first)) {
+            crate::persistence::older::rewrite_before_five(&target, version);
+        }
         let manifest_path = target.join("manifest.json");
         let mut manifest = read_json(&manifest_path);
         manifest["format_version"] = json!(version);

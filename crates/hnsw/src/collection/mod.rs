@@ -82,6 +82,8 @@ mod construct;
 mod crash_tests;
 mod dense;
 #[cfg(test)]
+mod directory_tests;
+#[cfg(test)]
 mod durability_tests;
 #[cfg(test)]
 mod features_tests;
@@ -105,6 +107,7 @@ mod mutation_tests;
 mod numbering_tests;
 mod page;
 mod persist;
+pub(crate) use persist::DumpOutcome;
 #[cfg(test)]
 mod persist_tests;
 #[cfg(test)]
@@ -135,9 +138,7 @@ pub use construct::Declaration;
 pub(crate) use construct::{
     validate_index_parameters, validate_space_supports_quantization, SparseDeclaration,
 };
-pub(crate) use dense::{
-    read_internal_id, shifted_internal_id, DenseIndex, DenseOpen, DenseParts, PositionReader,
-};
+pub(crate) use dense::{DenseIndex, DenseOpen, DenseParts, DenseRestored};
 pub use insert::{Added, RebuildPlan};
 pub use page::{FieldRef, HitRef, QueryHits};
 pub use query::{
@@ -347,11 +348,56 @@ pub trait OperationSink: Send + std::fmt::Debug {
         None
     }
 
+    /// The features that make this sink's collection read only, where the
+    /// directory it was read from holds features this build does not know
+    /// and its manifest marks `read_only`, in name order. The collection then
+    /// refuses a save into any directory and a backup as well, with
+    /// [`Error::FeatureReadOnly`].
+    fn read_only_features(&self) -> Option<&[String]> {
+        None
+    }
+
     /// The interval policy's thread, for the tests that hold it to its
     /// lifetime and its cost. Compiled away outside them.
     #[cfg(test)]
     fn flusher_watch(&self) -> Option<crate::flusher::Watch> {
         None
+    }
+}
+
+/// What the refusal of a sink that takes nothing names: the directory the
+/// collection was read from, why it cannot be written, and the features
+/// that make it read only where those do.
+pub(crate) struct Refusing {
+    directory: String,
+    reason: String,
+    features: Option<Vec<String>>,
+}
+
+impl Refusing {
+    /// What `sink` refuses with, where it takes nothing.
+    fn of(sink: &dyn OperationSink) -> Option<Self> {
+        let (directory, reason) = sink.read_only()?;
+        Some(Refusing {
+            directory: directory.display().to_string(),
+            reason: reason.to_string(),
+            features: sink.read_only_features().map(<[String]>::to_vec),
+        })
+    }
+
+    /// The refusal: [`Error::FeatureReadOnly`] for features and
+    /// [`Error::CollectionReadOnly`] for a medium.
+    pub(crate) fn error(&self) -> Error {
+        match &self.features {
+            Some(features) => Error::FeatureReadOnly {
+                path: self.directory.clone(),
+                features: features.clone(),
+            },
+            None => Error::CollectionReadOnly {
+                directory: self.directory.clone(),
+                reason: self.reason.clone(),
+            },
+        }
     }
 }
 
@@ -1746,15 +1792,20 @@ impl Collection {
         }
     }
 
-    /// The refusal a collection read from a medium it cannot write meets for
-    /// a mutation, a checkpoint and a journal, where its sink takes nothing.
+    /// The refusal a collection read only meets for a mutation, a checkpoint
+    /// and a journal, where its sink takes nothing.
     pub(crate) fn sink_refusal(&self) -> Option<Error> {
         let slot = self.sink.lock().unwrap();
-        let (directory, reason) = slot.attached.as_ref()?.read_only()?;
-        Some(Error::CollectionReadOnly {
-            directory: directory.display().to_string(),
-            reason: reason.to_string(),
-        })
+        Refusing::of(slot.attached.as_deref()?).map(|refusing| refusing.error())
+    }
+
+    /// Whether the collection is read only for features its directory
+    /// holds, which refuses a save into any directory and a backup.
+    pub(crate) fn sink_read_only_features(&self) -> bool {
+        let slot = self.sink.lock().unwrap();
+        slot.attached
+            .as_ref()
+            .is_some_and(|sink| sink.read_only_features().is_some())
     }
 
     /// The directory a collection read from a medium it cannot write was
@@ -1801,19 +1852,14 @@ impl Collection {
         self.sink.lock().unwrap().attached.is_some()
     }
 
-    /// Whether a sink is attached, and, where it takes nothing, the
-    /// directory and the reason its refusal names, under one hold of the
-    /// sink's guard. The insert path asks once per batch, under `writers`.
-    fn sink_state(&self) -> (bool, Option<(String, String)>) {
+    /// Whether a sink is attached, and, where it takes nothing, what its
+    /// refusal names, under one hold of the sink's guard. The insert path
+    /// asks once per batch, under `writers`.
+    fn sink_state(&self) -> (bool, Option<Refusing>) {
         let slot = self.sink.lock().unwrap();
-        match slot.attached.as_ref() {
+        match slot.attached.as_deref() {
             None => (false, None),
-            Some(sink) => (
-                true,
-                sink.read_only().map(|(directory, reason)| {
-                    (directory.display().to_string(), reason.to_string())
-                }),
-            ),
+            Some(sink) => (true, Refusing::of(sink)),
         }
     }
 
@@ -1921,6 +1967,7 @@ impl Collection {
             Error::JournalCommitFailed { .. }
                 | Error::JournalForked { .. }
                 | Error::CollectionReadOnly { .. }
+                | Error::FeatureReadOnly { .. }
         ) {
             return error;
         }

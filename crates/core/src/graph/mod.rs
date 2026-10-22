@@ -81,8 +81,8 @@ mod mutable;
 mod structure;
 #[cfg(test)]
 pub(crate) mod test_graph;
-// A seeded mutator over a valid dump, driving the reader with generated input
-// rather than with the enumerated damage cases written by hand.
+// A seeded mutator over valid dumps of both versions, driving the readers with
+// generated input rather than with the damage cases written by hand.
 #[cfg(test)]
 mod fuzz;
 // The graph and ADC guards, which build a graph directly rather than through
@@ -93,6 +93,7 @@ mod guard_tests;
 #[cfg_attr(not(test), allow(dead_code))]
 mod traverse;
 
+pub use dump::{DumpRefusal, DumpRegion};
 use dump::{Expected, GraphKind};
 use levels::LevelGenerator;
 use mutable::MutableGraph;
@@ -1808,8 +1809,41 @@ impl VectorGraph {
         }
     }
 
-    /// Write the graph in ZeusDB's own format as the artefact `name` in
-    /// `dir`, replacing any artefact of that name.
+    /// Write the graph as a version 1 dump, which a directory saved before
+    /// format 5.0.0 holds, for a test that makes such a directory.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn dump_version_1(&self, dir: &dyn Dir, name: &str) -> Result<(), String> {
+        let kind = self.kind();
+        match self {
+            VectorGraph::Cosine(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::L2(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::L1(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::Dot(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::CosinePQ(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::L2PQ(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::L1PQ(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::Int8(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+        }
+    }
+
+    /// Write the graph in ZeusDB's own format, at version 2, as the artefact
+    /// `name` in `dir`, replacing any artefact of that name.
     pub fn dump(&self, dir: &dyn Dir, name: &str) -> Result<(), String> {
         let kind = self.kind();
         trace!(
@@ -1839,13 +1873,12 @@ impl VectorGraph {
 // RESTORING THE SAVED GRAPH
 // ============================================================================
 
-/// What the directory says the dump has to sit within, and the records its
-/// nodes are filed for.
+/// What the directory says the dump has to sit within, the records its nodes
+/// are filed for, and how it is to be read.
 ///
-/// Two numbers, both read from the directory rather than from the dump, and
-/// both checked before the reader allocates from anything the file declares.
-/// They travel together because they are the same kind of claim. Beside them
-/// is the list of records the mappings hold, which numbers the nodes.
+/// The two bounds are read from the directory rather than from the dump, and
+/// both are checked before the reader allocates from anything the file
+/// declares.
 #[derive(Clone, Copy)]
 pub struct DumpBounds<'a> {
     /// The live record count. The graph holds at least this many nodes and
@@ -1864,48 +1897,108 @@ pub struct DumpBounds<'a> {
     /// at the rank of its origin id, which is the graph whose every node
     /// holds a record.
     pub positions: Option<&'a [u32]>,
+    /// The dump version the directory's format requires: 1 below format
+    /// 5.0.0 and 2 from it.
+    pub version: u32,
+    /// At version 2, read and verify the identity and the rows and hand the
+    /// rows back without building a graph, for a rebuild the caller asked
+    /// for. Version 1 reads the whole dump whatever this says.
+    pub rows_only: bool,
 }
 
-/// Restore the saved graph for one index configuration
+/// What restoring a graph from its dump gave.
+#[allow(private_interfaces)]
+pub enum Restored {
+    /// The graph the dump holds, boxed so the restore moves a pointer to it.
+    Graph(Box<VectorGraph>),
+    /// The rows of a version 2 dump, each region verified, where no graph was
+    /// built from it: its topology fails, which `reason` names, or the caller
+    /// asked for the rows alone.
+    Rows { rows: DumpRows, reason: String },
+}
+
+/// The rows of a version 2 dump, in the dump's node order, with what each
+/// node is filed by.
+pub struct DumpRows {
+    /// Each node's origin id, being the internal id it was inserted under.
+    pub origin_ids: Vec<usize>,
+    /// Each node's position among the records the mappings hold, or
+    /// `Position::NONE` for a stranded node.
+    pub positions: Vec<u32>,
+    /// Values in one row.
+    pub width: usize,
+    /// Every node's row, end to end.
+    pub values: RowValues,
+}
+
+/// The values of every row a dump holds, in the element type its graph
+/// stores.
+pub enum RowValues {
+    /// A raw graph's vectors.
+    Raw(Vec<f32>),
+    /// A product quantized graph's codes, one byte a subvector.
+    Codes(Vec<u8>),
+    /// A scalar quantized graph's rows, one signed byte a value.
+    Int8(Vec<i8>),
+}
+
+/// The rows of `read` as the type a caller rebuilds from.
+fn erased_rows<T: dump::DumpElement>(read: dump::ReadRows<T>) -> DumpRows {
+    let width = read.store.dim();
+    DumpRows {
+        origin_ids: read.origin_ids,
+        positions: read.record_of,
+        width,
+        values: T::into_row_values(read.store.into_values()),
+    }
+}
+
+/// Read a dump of element type `T` and hand back what it gave, the graph
+/// wrapped by `wrap` where it gave one.
+fn restore_with<T, D>(
+    dir: &dyn Dir,
+    name: &str,
+    expected: &Expected,
+    dist: D,
+    bounds: &DumpBounds<'_>,
+    wrap: impl FnOnce(Backend<T, D>) -> VectorGraph,
+) -> Result<Restored, DumpRefusal>
+where
+    T: dump::DumpElement,
+    D: Distance<T> + Send + Sync,
+{
+    match dump::read_dump_at::<T, D>(
+        dir,
+        name,
+        expected,
+        dist,
+        bounds.positions,
+        bounds.rows_only,
+    )? {
+        dump::DumpRead::Graph(graph, store) => Ok(Restored::Graph(Box::new(wrap(
+            Backend::restored((*graph, store)),
+        )))),
+        dump::DumpRead::Rows { rows, reason } => Ok(Restored::Rows {
+            rows: erased_rows(rows),
+            reason,
+        }),
+    }
+}
+
+/// Restore the saved graph for one index configuration.
 ///
-/// `pq` present means the saved graph was a quantized one, which is exactly the
-/// condition the loader branches on, since training is what replaces the raw
-/// graph with a PQ graph. A directory whose dump disagrees is caught by the
-/// element type and the distance discriminant in the header and falls back.
+/// `pq` present means the saved graph was a product quantized one, which is
+/// the condition the loader branches on, since training is what replaces the
+/// raw graph with a quantized one. A dump whose element type or kind
+/// disagrees with that is refused on its header.
 ///
-/// Every reason this returns an error is a reason to rebuild rather than a
-/// reason to fail, and the caller treats it that way. A dump written by 0.6.0
-/// or earlier is one of them: it carries the vendored magic, this reader does
-/// not recognise it, and the index rebuilds its graph once and writes the new
-/// format on the next save. There is deliberately no reader for the old format.
+/// A refusal names its region. Below format 5.0.0 the caller rebuilds the
+/// graph from the directory's separate row stores on any refusal. At 5.0.0 a
+/// refusal refuses the load, and the rows handed back where the topology
+/// fails are what the caller rebuilds from.
 ///
-/// # What this no longer does
-///
-/// It used to inspect the dump's header, compare the data file's length against
-/// what the point count implied, and only then enter the vendored reload inside
-/// a `catch_unwind`, because that reload panics on a malformed header and calls
-/// `std::process::exit(1)` on a short data file. It also leaked the vendored
-/// loader, because the returned graph borrowed it. [`dump::read_dump`] returns
-/// an error on every malformed input and owns nothing borrowed, so all four are
-/// gone.
-///
-/// It also used to reset `extend_candidates`, which the vendored reload set
-/// true where `Hnsw::new` sets it false. Neither construction path here has such
-/// a flag, since the branches those two parameters guarded are absent rather
-/// than present behind a setter nothing calls.
-///
-/// # The bounds
-///
-/// [`DumpBounds`] carries the two numbers the directory declares that the dump
-/// has to sit within. Both are checked before anything is built.
-///
-/// # The level scale comes from the dump
-///
-/// A restored graph keeps drawing levels if the index goes on inserting, and it
-/// draws at the scale the dump recorded rather than at the default for its
-/// degree. That is what the vendored reload did through
-/// `new_with_absolute_scale`, so it is a match rather than a change. See
-/// [`Backend::restored`].
+/// A restored graph draws levels at the scale the dump recorded, if the index
+/// goes on inserting. See [`Backend::restored`].
 ///
 /// The dump is the artefact `name` in `dir`.
 #[allow(clippy::too_many_arguments)]
@@ -1918,13 +2011,14 @@ pub fn restore_graph(
     dim: usize,
     pq: Option<Arc<PQ>>,
     bounds: DumpBounds<'_>,
-) -> Result<(VectorGraph, usize), String> {
+) -> Result<Restored, DumpRefusal> {
     let DumpBounds {
         min_nodes,
         max_origin_id,
-        positions,
+        version,
+        ..
     } = bounds;
-    let graph = match pq {
+    match pq {
         Some(pq) => {
             let kind = match space {
                 "l2" => GraphKind::L2Pq,
@@ -1940,6 +2034,7 @@ pub fn restore_graph(
                 ef_construction,
                 min_nodes,
                 max_origin_id,
+                version,
             };
             // The metric follows the discriminant the dump carries, so a
             // directory scores the way the graph inside it was wired.
@@ -1947,18 +2042,18 @@ pub fn restore_graph(
                 GraphKind::CosinePq => PqMetric::Cosine,
                 _ => PqMetric::SquaredL2,
             };
-            let restored = Backend::restored(dump::read_dump_at::<u8, DistPQ>(
+            restore_with::<u8, DistPQ>(
                 dir,
                 name,
                 &expected,
                 DistPQ::new(pq, metric),
-                positions,
-            )?);
-            match kind {
-                GraphKind::L2Pq => VectorGraph::L2PQ(restored),
-                GraphKind::L1Pq => VectorGraph::L1PQ(restored),
-                _ => VectorGraph::CosinePQ(restored),
-            }
+                &bounds,
+                |restored| match kind {
+                    GraphKind::L2Pq => VectorGraph::L2PQ(restored),
+                    GraphKind::L1Pq => VectorGraph::L1PQ(restored),
+                    _ => VectorGraph::CosinePQ(restored),
+                },
+            )
         }
         None => {
             // The raw graphs differ only in their distance type, so each arm
@@ -1973,10 +2068,16 @@ pub fn restore_graph(
                         ef_construction,
                         min_nodes,
                         max_origin_id,
+                        version,
                     };
-                    VectorGraph::$variant(Backend::restored(dump::read_dump_at::<f32, $dist>(
-                        dir, name, &expected, $value, positions,
-                    )?))
+                    restore_with::<f32, $dist>(
+                        dir,
+                        name,
+                        &expected,
+                        $value,
+                        &bounds,
+                        VectorGraph::$variant,
+                    )
                 }};
             }
             match space {
@@ -1988,10 +2089,7 @@ pub fn restore_graph(
                 _ => raw!(GraphKind::Cosine, CosineDist, CosineDist {}, Cosine),
             }
         }
-    };
-
-    let nodes = graph.nb_points();
-    Ok((graph, nodes))
+    }
 }
 
 /// The scalar quantized kind a space name maps to, which is the kind a dump
@@ -2009,12 +2107,10 @@ fn int8_kind(space: &str) -> GraphKind {
 ///
 /// The counterpart of [`restore_graph`] for a graph holding one `i8` a
 /// value. The codec and the space together decide the row width the dump
-/// must carry, being the codec's width plus the norm tail on a cosine
-/// graph, and the space decides the kind the header must carry. A dump of
-/// any other element type or kind is refused on its header, and every
-/// refusal is a reason to rebuild rather than to fail, exactly as it is for
-/// the other graphs. The bounds are checked the same way, before anything
-/// is allocated from a field. The dump is the artefact `name` in `dir`.
+/// must carry, being the codec's width plus the norm tail on a cosine graph,
+/// and the space decides the kind the header must carry. A refusal and the
+/// rows handed back mean what they mean for [`restore_graph`]. The dump is
+/// the artefact `name` in `dir`.
 pub fn restore_int8_graph(
     dir: &dyn Dir,
     name: &str,
@@ -2023,7 +2119,7 @@ pub fn restore_int8_graph(
     ef_construction: usize,
     codec: Arc<Int8Codec>,
     bounds: DumpBounds<'_>,
-) -> Result<(VectorGraph, usize), String> {
+) -> Result<Restored, DumpRefusal> {
     let kind = int8_kind(space);
     let dist = Int8Dist::new(codec, Int8Metric::from_space(space));
     let expected = Expected {
@@ -2033,15 +2129,7 @@ pub fn restore_int8_graph(
         ef_construction,
         min_nodes: bounds.min_nodes,
         max_origin_id: bounds.max_origin_id,
+        version: bounds.version,
     };
-    let restored = Backend::restored(dump::read_dump_at::<i8, Int8Dist>(
-        dir,
-        name,
-        &expected,
-        dist,
-        bounds.positions,
-    )?);
-    let graph = VectorGraph::Int8(restored);
-    let nodes = graph.nb_points();
-    Ok((graph, nodes))
+    restore_with::<i8, Int8Dist>(dir, name, &expected, dist, &bounds, VectorGraph::Int8)
 }

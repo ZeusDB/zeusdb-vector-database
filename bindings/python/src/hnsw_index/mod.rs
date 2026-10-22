@@ -957,13 +957,13 @@ impl HNSWIndex {
     ///
     /// The whole save runs with the interpreter lock released. `save` reaches
     /// `save_config`, `save_mappings`, `save_metadata`,
-    /// `save_quantization_config`, `save_pq_centroids`, `save_pq_codes`,
-    /// `save_int8_scales`, `save_int8_rows` and `save_vectors`, and every one
-    /// of them speaks only to `serde_json`, the engine's frame and the storage
-    /// seam. `save_hnsw_graph` reaches `graph::dump::write_dump`,
-    /// which names PyO3 nowhere, and `save_manifest` and `Staged::commit`
-    /// after it speak only to `serde_json` and the storage seam. Nothing in
-    /// the index crate names Python at all.
+    /// `save_quantization_config`, `save_pq_centroids`, `save_int8_scales`
+    /// and `save_vectors`, and every one of them speaks only to `serde_json`,
+    /// the engine's frame and the storage seam. `save_hnsw_graph` reaches
+    /// `graph::dump::write_dump`, which names PyO3 nowhere, and
+    /// `save_manifest` and `Staged::commit` after it speak only to
+    /// `serde_json` and the storage seam. Nothing in the index crate names
+    /// Python at all.
     #[instrument(level = "info", skip(self, py), fields(
         vector_count = self.inner.vector_count(),
         has_quantization = self.inner.has_quantization(),
@@ -1157,7 +1157,9 @@ impl HNSWIndex {
     /// - `checkpoint_taken`: why the load took a checkpoint, `"upgrade"`,
     ///   `"abort"` or `"repair"`, or `None`.
     /// - `read_only`, `read_only_reason`: whether the index was opened read
-    ///   only, and the system's refusal where it was.
+    ///   only, and why: the system's refusal, or the features the directory
+    ///   holds that this build does not know and its manifest marks
+    ///   `read_only`.
     /// - `repair`: where a load with `repair=True` cut the journal or set a
     ///   stale segment aside, a dict of `kept_through`, `discarded_from`,
     ///   `records_discarded`, `bytes_discarded` and `quarantine`, being the

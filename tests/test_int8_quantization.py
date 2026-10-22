@@ -3,8 +3,9 @@
 The declaration and every refusal a caller can reach, training on the
 `add()` that fills the sample, what `get_stats()`, `get_quantization_info()`
 and `info()` report, the page against a raw index under every space, the
-directory a save writes and its version, the two artefacts held to their
-bounds, the journal, and the mutations that keep the scales.
+directory a save writes and its version, the scales held to their bounds and
+the rows of a directory before 5.0.0 held to theirs, the journal, and the
+mutations that keep the scales.
 """
 import json
 import shutil
@@ -13,7 +14,7 @@ import warnings
 
 import numpy as np
 import pytest
-from helpers import artefact_digest
+from helpers import artefact_digest, as_before_five, break_topology, dump_rows
 
 from zeusdb_vector_database import VectorDatabase, _engine
 
@@ -316,20 +317,21 @@ def test_every_mutation_keeps_the_scales():
 # The directory
 # ------------------------------------------------------------------
 
-def test_a_scalar_directory_carries_its_two_artefacts(tmp_path):
+def test_a_scalar_directory_round_trips_with_its_scales(tmp_path):
     index, data = _trained("cosine")
     path = tmp_path / "scalar.zdb"
     index.save(str(path))
     names = sorted(p.name for p in path.iterdir())
-    assert names == ["config.json", "hnsw_index.zdbgraph", "int8_rows.zdbint8", "int8_scales.zdbint8",
+    assert names == ["config.json", "hnsw_index.zdbgraph", "int8_scales.zdbint8",
                      "manifest.json", "mappings.bin", "metadata.json", "quantization.json"]
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["features"] == {"int8": "incompatible"}
     assert manifest["quantization_trained"] is True
     assert "int8_scales.zdbint8" in manifest["files_included"]
-    assert "int8_rows.zdbint8" in manifest["files_included"]
+    assert "int8_rows.zdbint8" not in manifest["files_included"]
     assert "int8_scales.zdbint8" in manifest["file_digests"]
-    assert manifest["compression_info"]["compression_ratio"] == pytest.approx(DIM * 4 / (DIM + 4))
+    assert "compression_info" not in manifest
+    assert index.get_quantization_info()["compression_ratio"] == pytest.approx(DIM * 4 / (DIM + 4))
     quantization = json.loads((path / "quantization.json").read_text(encoding="utf-8"))
     assert quantization["type"] == "int8"
     assert quantization["scale"] == "per_dimension"
@@ -339,8 +341,9 @@ def test_a_scalar_directory_carries_its_two_artefacts(tmp_path):
         assert key not in quantization
     # The scales artefact is dim floats under an 80 byte frame.
     assert (path / "int8_scales.zdbint8").stat().st_size == 80 + DIM * 4
-    # The rows artefact is one u32 id and one row of dim + 4 bytes a record.
-    assert (path / "int8_rows.zdbint8").stat().st_size == 80 + N * (4 + DIM + 4)
+    # The dump's rows region is one row of dim + 4 bytes a record.
+    blob = (path / "hnsw_index.zdbgraph").read_bytes()
+    assert struct.unpack_from("<Q", blob, 56)[0] == N * (DIM + 4)
 
     loaded = VectorDatabase().load(str(path))
     assert loaded.is_quantized()
@@ -362,7 +365,7 @@ def test_a_scalar_directory_carries_its_two_artefacts(tmp_path):
 
     again = tmp_path / "again.zdb"
     loaded.save(str(again))
-    for name in ("hnsw_index.zdbgraph", "int8_scales.zdbint8", "int8_rows.zdbint8"):
+    for name in ("hnsw_index.zdbgraph", "int8_scales.zdbint8"):
         assert (again / name).read_bytes() == (path / name).read_bytes(), name
 
 
@@ -374,7 +377,7 @@ def test_a_collecting_scalar_directory_trains_after_it_is_loaded(tmp_path):
     index.save(str(path))
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["features"] == {"int8": "incompatible"}
-    assert "vectors.bin" in manifest["files_included"]
+    assert "vectors.bin" not in manifest["files_included"]
     assert "int8_scales.zdbint8" not in manifest["files_included"]
     loaded = VectorDatabase().load(str(path))
     assert loaded.get_storage_mode() == "raw_collecting_for_training"
@@ -385,14 +388,14 @@ def test_a_collecting_scalar_directory_trains_after_it_is_loaded(tmp_path):
         _trained("l2")[0].get_records(["r5"], return_vector=True)[0]["vector"]
 
 
-def test_the_rows_rebuild_the_graph_when_the_dump_is_refused(tmp_path):
+def test_the_rows_rebuild_the_graph_when_the_topology_is_refused(tmp_path):
     index, data = _trained("l2")
     path = tmp_path / "scalar.zdb"
     index.save(str(path))
-    rows = (path / "int8_rows.zdbint8").read_bytes()
-    dump = path / "hnsw_index.zdbgraph"
-    dump.write_bytes(dump.read_bytes()[:-1])
+    rows = dump_rows((path / "hnsw_index.zdbgraph").read_bytes())
+    break_topology(path / "hnsw_index.zdbgraph")
     loaded = VectorDatabase().load(str(path))
+    assert loaded.recovery["graph_rebuilt"] is True
     assert loaded.is_quantized()
     assert loaded.get_vector_count() == N
     assert loaded.get_stats()["graph_nodes"] == str(N)
@@ -400,7 +403,7 @@ def test_the_rows_rebuild_the_graph_when_the_dump_is_refused(tmp_path):
         assert loaded.search(data[i], top_k=1)[0]["id"] == f"r{i}"
     again = tmp_path / "rebuilt.zdb"
     loaded.save(str(again))
-    assert (again / "int8_rows.zdbint8").read_bytes() == rows
+    assert dump_rows((again / "hnsw_index.zdbgraph").read_bytes()) == rows
 
 
 def _relabel(path, version):
@@ -429,11 +432,12 @@ def test_a_scalar_directory_lists_its_features(tmp_path):
     assert manifest["features"] == {"int8": "incompatible", "journal": "incompatible"}
 
     # This build reads any 1.x and reads a frame wherever it finds one, so an
-    # earlier label over a scalar directory opens here; the older reader's
-    # refusal is held outside the suite.
+    # earlier label over a scalar directory written as a release before 5.0.0
+    # wrote it opens here; the older reader's refusal is held outside the
+    # suite.
     plain, _ = _trained("l2")
     plain.save(str(tmp_path / "plain.zdb"))
-    _relabel(tmp_path / "plain.zdb", "1.1.0")
+    as_before_five(tmp_path / "plain.zdb", "1.1.0")
     assert vdb.load(str(tmp_path / "plain.zdb")).is_quantized()
     _relabel(tmp_path / "plain.zdb", "6.0.0")
     with pytest.raises(RuntimeError, match="format version 6.0.0 cannot be opened"):
@@ -450,6 +454,9 @@ def test_a_scalar_artefact_outside_its_bounds_is_refused_by_name(tmp_path, name,
     index, _ = _trained("l2")
     path = tmp_path / "scalar.zdb"
     index.save(str(path))
+    if name == "int8_rows.zdbint8":
+        # A directory before 5.0.0 holds the rows in an artefact of their own.
+        as_before_five(path, "4.0.0")
     file = path / name
     damaged = bytearray(mutate(file.read_bytes()))
     # The frame's header and trailer checksums cover what was changed, so
@@ -483,6 +490,7 @@ def test_a_scalar_directory_without_its_scales_is_refused(tmp_path):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["files_included"].remove("int8_scales.zdbint8")
     del manifest["file_digests"]["int8_scales.zdbint8"]
+    manifest["total_size_mb"] = sum(e["bytes"] for e in manifest["file_digests"].values()) / (1024 * 1024)
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     # The same class the missing codebook raises: the file is what is absent.
     with pytest.raises(FileNotFoundError, match="int8_scales.zdbint8 is missing"):

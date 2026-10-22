@@ -401,8 +401,8 @@ fn a_directory_recording_no_identity_is_named_at_its_next_save() {
     drop(collection);
     // A 4.0.0 directory saved before the identity was recorded, since
     // every 5.x manifest records one.
+    crate::persistence::older::rewrite_before_five(&path, "4.0.0");
     rewrite_manifest(&path, |m| {
-        m["format_version"] = json!("4.0.0");
         m.as_object_mut().unwrap().remove("identity");
         m.as_object_mut().unwrap().remove("features");
     });

@@ -150,30 +150,6 @@ impl Dir for FsDir {
         Ok(Box::new(File::open(self.at(name))?))
     }
 
-    /// Every file under the path, the directories under it included, and
-    /// nothing where the path is not a directory.
-    fn total_bytes(&self) -> io::Result<u64> {
-        fn bytes_under(path: &Path) -> io::Result<u64> {
-            let mut total = 0u64;
-            for entry in fs::read_dir(path)? {
-                let entry = entry?;
-                let metadata = entry.metadata()?;
-                if metadata.is_file() {
-                    total += metadata.len();
-                } else if metadata.is_dir() {
-                    total += bytes_under(&entry.path())?;
-                }
-            }
-            Ok(total)
-        }
-
-        if self.root.is_dir() {
-            bytes_under(&self.root)
-        } else {
-            Ok(0)
-        }
-    }
-
     fn locate(&self, name: &str) -> String {
         if name.is_empty() {
             self.root.display().to_string()
@@ -1037,8 +1013,8 @@ mod tests {
     }
 
     /// An artefact under a prefix lands in the directory the prefix names,
-    /// reads back whole, and is counted, measured, located and removed by
-    /// the name it was written under.
+    /// reads back whole, and is measured, located and removed by the name it
+    /// was written under.
     #[test]
     fn an_artefact_lands_under_its_prefix_and_reads_back() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1054,7 +1030,6 @@ mod tests {
         assert!(dir.exists("config.json"));
         assert!(!dir.exists("absent.bin"));
         assert_eq!(dir.length("spaces/s/postings.zdbsparse").unwrap(), 300);
-        assert_eq!(dir.total_bytes().unwrap(), 302);
         assert_eq!(dir.locate(""), tmp.path().display().to_string());
         assert_eq!(
             dir.locate("config.json"),
@@ -1066,13 +1041,6 @@ mod tests {
         ));
         dir.remove("config.json").unwrap();
         assert!(!dir.exists("config.json"));
-        assert_eq!(dir.total_bytes().unwrap(), 300);
-        assert_eq!(
-            FsDir::new(tmp.path().join("nowhere"))
-                .total_bytes()
-                .unwrap(),
-            0
-        );
     }
 
     /// A streamed artefact has its head written over the bytes it reserved,

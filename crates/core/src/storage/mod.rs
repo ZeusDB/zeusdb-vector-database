@@ -84,9 +84,6 @@ pub trait Dir {
     /// Open the artefact `name` to be read as a stream.
     fn open(&self, name: &str) -> io::Result<Box<dyn Read>>;
 
-    /// Every byte the directory holds, under every prefix.
-    fn total_bytes(&self) -> io::Result<u64>;
-
     /// Where the artefact `name` is, as a message names it, or the directory
     /// itself where `name` is empty.
     fn locate(&self, name: &str) -> String;

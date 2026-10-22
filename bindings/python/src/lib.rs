@@ -117,7 +117,11 @@ impl From<PyEngineError> for PyErr {
 /// `CollectionLocked`. A journaled directory this process cannot write opens
 /// read only, with a `RuntimeWarning` naming the reason: every record is
 /// replayed in memory, nothing on the medium changes, every change raises
-/// `CollectionReadOnly`, and `save` into another directory copies it.
+/// `CollectionReadOnly`, and `save` into another directory copies it. A
+/// directory holding a feature this build does not know, which its manifest
+/// marks `read_only`, opens read only the same way whatever the medium, and
+/// every change, every save, `checkpoint`, `journal_to` and `backup` raises
+/// `FeatureReadOnly`.
 ///
 /// `repair=True` loads a journal whose own history is broken: a corrupt
 /// record with records after it, damage in a segment that is not the last,

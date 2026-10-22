@@ -1,6 +1,7 @@
 //! What the journal's tests share: a temporary folder, a journal read back
-//! by hand, a journal damaged for a repair, faults armed on a journal's
-//! directory, and a storage on a medium that refuses every write.
+//! by hand, a journal damaged for a repair, a graph dump whose topology is
+//! damaged, faults armed on a journal's directory, and a storage on a medium
+//! that refuses every write.
 //!
 //! A device fault cannot be produced on demand, so a failure is injected
 //! through a journal directory that fails a chosen write, sync, cut or
@@ -25,6 +26,35 @@ use zeusdb_vector_core::{
 
 use super::{Collection, Declaration, ParsedRecord};
 use crate::journal::{Durability, JournalSink};
+
+// ============================================================================
+// A GRAPH DUMP DAMAGED
+// ============================================================================
+
+/// The directory size a 5.x manifest records, written from the lengths it
+/// records, after an edit to one of them.
+pub(super) fn resized(manifest: &mut Value) {
+    let total: u64 = manifest["file_digests"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|digest| digest["bytes"].as_u64().unwrap())
+        .sum();
+    manifest["total_size_mb"] = serde_json::json!(total as f64 / (1024.0 * 1024.0));
+}
+
+/// Damage the topology region of the version 2 graph dump in `directory`,
+/// leaving its length and every other region as they were, so a load
+/// refuses the topology alone and rebuilds the graph from the rows the dump
+/// holds.
+pub(super) fn break_topology(directory: &Path) {
+    let path = directory.join(zeusdb_vector_core::DUMP_FILENAME);
+    let mut blob = std::fs::read(&path).unwrap();
+    let length = |at: usize| u64::from_le_bytes(blob[at..at + 8].try_into().unwrap()) as usize;
+    let topology = 128 + length(48) + length(56);
+    blob[topology] ^= 0x01;
+    std::fs::write(&path, &blob).unwrap();
+}
 
 // ============================================================================
 // A TEMPORARY FOLDER

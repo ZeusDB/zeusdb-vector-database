@@ -627,6 +627,33 @@ pub enum Error {
     /// A save was asked of a path holding a file, or a folder of entries and
     /// no `manifest.json`
     TargetNotAnIndex { path: String, holds: String },
+
+    // ------------------------------------------------------------------
+    // The directory at format 5.0.0. Appended after every variant above,
+    // and none wider than the widest above.
+    // ------------------------------------------------------------------
+    /// The graph dump of a directory at format 5.x fails a check of its
+    /// header, its identity region or its rows region, which hold the only
+    /// copy of each record's stored row. `detail` reads after "since"
+    GraphDumpInvalid { name: String, detail: String },
+    /// A field of `manifest.json` at format 5.x does not describe the
+    /// directory. `detail` reads after "manifest.json"
+    ManifestFieldInvalid { detail: String },
+    /// A product quantized field of quantization.json outside the rule
+    /// create() applies. `detail` names the fields and the rule
+    QuantizationFieldInvalidInFile { file: String, detail: String },
+    /// The directory holds features this build does not know, marked
+    /// `read_only`, in name order. The collection refuses every change, every
+    /// save, a checkpoint, a journal and a backup
+    FeatureReadOnly { path: String, features: Vec<String> },
+    /// A directory holding features this build does not know, marked
+    /// `read_only`, holds a journal record of a kind this build cannot replay
+    FeatureJournalUnreadable {
+        path: String,
+        features: Vec<String>,
+        kind: u16,
+        sequence: u64,
+    },
 }
 
 impl Error {
@@ -689,6 +716,7 @@ impl Error {
             | BitsOutOfRangeInFile { .. }
             | SubvectorsZeroInFile { .. }
             | SubvectorsInvalidInFile { .. }
+            | QuantizationFieldInvalidInFile { .. }
             | SpaceNameEmpty
             | SpaceDeclaredTwice { .. }
             | SpacesTooMany { .. }
@@ -792,7 +820,11 @@ impl Error {
             | CollectionReadOnly { .. }
             | BackupIntoOwnDirectory { .. }
             | BackupTargetJournaled { .. }
-            | TargetNotAnIndex { .. } => Exception::Runtime,
+            | TargetNotAnIndex { .. }
+            | GraphDumpInvalid { .. }
+            | ManifestFieldInvalid { .. }
+            | FeatureReadOnly { .. }
+            | FeatureJournalUnreadable { .. } => Exception::Runtime,
         }
     }
 
@@ -1694,8 +1726,8 @@ impl fmt::Display for Error {
                     f,
                     "manifest.json names {} under files_included and the index directory does \
                      not hold it. {} holds {}. manifest.json is written after every file it \
-                     names except the graph dump, so a directory in this state lost the file \
-                     after the save that wrote it finished, or was copied without it. \
+                     names, so a directory in this state lost the file after the save that \
+                     wrote it finished, or was copied without it. \
                      Refusing to load an index assembled from the files that survived, \
                      because it would not hold what was saved. Restore the directory from a \
                      copy.{}",
@@ -1888,6 +1920,67 @@ impl fmt::Display for Error {
                  written. Save into a new or empty path, or into a directory an earlier save \
                  wrote.",
                 path, holds
+            ),
+            GraphDumpInvalid { name, detail } => write!(
+                f,
+                "The graph dump {} cannot be used, since {}. At format 5.0.0 the dump holds the \
+                 only copy of each record's stored vector or code, so the directory cannot open \
+                 without it. Restore the directory from a copy, such as one backup() wrote.",
+                name, detail
+            ),
+            ManifestFieldInvalid { detail } => write!(
+                f,
+                "manifest.json {}. A save writes every field of manifest.json from the \
+                 directory it describes, so this manifest does not describe the directory. \
+                 Restore the directory from a copy.",
+                detail
+            ),
+            QuantizationFieldInvalidInFile { file, detail } => write!(
+                f,
+                "{}: {}, so this file does not describe an index this build can rebuild.",
+                file, detail
+            ),
+            FeatureReadOnly { path, features } => {
+                let (noun, object) = if features.len() == 1 {
+                    ("feature", "the feature")
+                } else {
+                    ("features", "them")
+                };
+                write!(
+                    f,
+                    "The directory {} holds the {} {}, which this build does not know. Its \
+                     manifest marks {} read_only, so this build reads every record the \
+                     directory holds and refuses every change, every save, a checkpoint, a \
+                     journal and a backup, since a directory this build wrote would not hold \
+                     the {}. Upgrade the package to change the collection.",
+                    path,
+                    noun,
+                    quoted_list(features),
+                    object,
+                    noun
+                )
+            }
+            FeatureJournalUnreadable {
+                path,
+                features,
+                kind,
+                sequence,
+            } => write!(
+                f,
+                "The directory {} holds the {} {}, which this build does not know and its \
+                 manifest marks read_only, and its journal holds a record of kind {} at \
+                 sequence {}, which this build cannot replay. Load it with \
+                 checkpoint_only=True to read the directory as its last save left it, or \
+                 upgrade the package.",
+                path,
+                if features.len() == 1 {
+                    "feature"
+                } else {
+                    "features"
+                },
+                quoted_list(features),
+                kind,
+                sequence
             ),
         }
     }

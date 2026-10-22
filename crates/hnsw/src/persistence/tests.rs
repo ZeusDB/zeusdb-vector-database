@@ -11,6 +11,7 @@
 //! The format version a directory declares, held to the form every release
 //! has written it in.
 
+use super::older::rewrite_before_five;
 use super::*;
 use crate::collection::{Declaration, ParsedRecord};
 use serde_json::json;
@@ -278,10 +279,12 @@ fn write_json(path: &Path, value: &Value) {
 }
 
 /// Rewrite a directory this build saved as a release before 4.0.0 would have
-/// written it: the four binary artefacts in the old wire, in the order a hash
-/// map would hand them out, and the manifest declaring `version` with a
-/// length and a digest for each.
+/// written it: every record's row in its separate store and the graph dump
+/// at version 1, through `older`, then the four binary artefacts in the old
+/// wire, in the order a hash map would hand them out, and the manifest
+/// declaring `version` with a length and a digest for each.
 fn as_old(path: &Path, version: &str) {
+    super::older::rewrite_before_five(path, version);
     let config = read_json(&path.join("config.json"));
     let dim = config["dim"].as_u64().unwrap() as usize;
     let quantization = path
@@ -361,11 +364,19 @@ fn as_old(path: &Path, version: &str) {
     write_json(&path.join("manifest.json"), &manifest);
 }
 
-/// Replace one artefact and record its new length, as a hand would.
+/// Replace one artefact and record its new length, as a hand would, and
+/// the directory size those lengths add up to.
 fn replace(path: &Path, name: &str, bytes: &[u8]) {
     std::fs::write(path.join(name), bytes).unwrap();
     let mut manifest = read_json(&path.join("manifest.json"));
     manifest["file_digests"][name] = json!({ "bytes": bytes.len() });
+    let total: u64 = manifest["file_digests"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|digest| digest["bytes"].as_u64().unwrap())
+        .sum();
+    manifest["total_size_mb"] = json!(total as f64 / (1024.0 * 1024.0));
     write_json(&path.join("manifest.json"), &manifest);
 }
 
@@ -444,8 +455,9 @@ fn every_framed_artefact_reads_back_what_was_written() {
 }
 
 /// Two saves of the same records write the same bytes, the second after a
-/// load has rebuilt every hash map under a seed of its own: the four framed
-/// artefacts, `metadata.json` and `config.json` with index level metadata.
+/// load has rebuilt every hash map under a seed of its own: the framed
+/// artefacts, the graph dump, `metadata.json` and `config.json` with index
+/// level metadata.
 #[test]
 fn two_saves_of_the_same_records_write_the_same_bytes() {
     let temp = TempDir::new();
@@ -476,6 +488,7 @@ fn two_saves_of_the_same_records_write_the_same_bytes() {
             "pq_centroids.bin",
             "metadata.json",
             "config.json",
+            "hnsw_index.zdbgraph",
         ] {
             let a = std::fs::read(first.join(name)).ok();
             let b = std::fs::read(second.join(name)).ok();
@@ -1174,8 +1187,8 @@ fn an_old_mappings_whose_two_maps_disagree_is_refused() {
 
 /// A directory a release before 4.0.0 wrote opens with every record, every
 /// internal id, every vector's bits, every field and every page it held, in
-/// each storage mode, and saving it again writes the framed artefacts the
-/// original save wrote, byte for byte.
+/// each storage mode, and saving it again writes the framed artefacts and
+/// the graph dump the original save wrote, byte for byte.
 #[test]
 fn a_directory_written_before_format_4_opens_with_everything_it_held() {
     let temp = TempDir::new();
@@ -1209,6 +1222,7 @@ fn a_directory_written_before_format_4_opens_with_everything_it_held() {
             "vectors.bin",
             "pq_codes.bin",
             "pq_centroids.bin",
+            "hnsw_index.zdbgraph",
         ] {
             assert_eq!(
                 std::fs::read(framed_dir.join(name)).ok(),
@@ -1276,15 +1290,17 @@ fn a_load_files_records_in_internal_id_order_from_either_layout() {
     }
 }
 
-/// A frame is read wherever it is found, so a directory this build saved
-/// and relabelled to an earlier major opens. Bincode's wire is read only
-/// below 4.x, so an old directory relabelled 4.0.0 is refused by the frame.
+/// A frame is read wherever it is found, so a directory this build saved,
+/// written again as one before format 5.0.0 and relabelled to an earlier
+/// major, opens. Bincode's wire is read only below 4.x, so an old directory
+/// relabelled 4.0.0 is refused by the frame.
 #[test]
 fn the_layout_follows_mappings_bin_below_4_and_is_the_frame_from_4() {
     let temp = TempDir::new();
     let collection = filled(None, 60);
     let path = temp.at("relabelled.zdb");
     collection.save(path.to_str().unwrap()).unwrap();
+    super::older::rewrite_before_five(&path, "1.1.0");
     for version in ["1.1.0", "2.0.0", "3.0.0"] {
         let mut manifest = read_json(&path.join("manifest.json"));
         manifest["format_version"] = json!(version);
@@ -1305,16 +1321,30 @@ fn the_layout_follows_mappings_bin_below_4_and_is_the_frame_from_4() {
 /// release wrote opens, being 1.0.0 to 4.0.0 and the 5.0.0 this build writes,
 /// and so does a later minor or patch under any of those majors. A major this
 /// build does not read is refused by its major, and every other shape is
-/// refused as a version this build cannot interpret.
+/// refused as a version this build cannot interpret. A version below 5.0.0
+/// is read from a directory written again as one before format 5.0.0.
 #[test]
 fn a_format_version_is_read_only_as_major_minor_patch() {
     let temp = TempDir::new();
     let collection = filled(None, 60);
     let path = temp.at("versioned.zdb");
     collection.save(path.to_str().unwrap()).unwrap();
+    let before_five = temp.at("versioned-before-five.zdb");
+    collection.save(before_five.to_str().unwrap()).unwrap();
+    super::older::rewrite_before_five(&before_five, "4.0.0");
     let saved = read_json(&path.join("manifest.json"));
+    let saved_before_five = read_json(&before_five.join("manifest.json"));
     let load = |version: &str| {
-        let mut manifest = saved.clone();
+        let below_five = version
+            .split('.')
+            .next()
+            .and_then(|major| major.parse::<u32>().ok())
+            .is_some_and(|major| (1..5).contains(&major));
+        let (path, mut manifest) = if below_five {
+            (&before_five, saved_before_five.clone())
+        } else {
+            (&path, saved.clone())
+        };
         manifest["format_version"] = json!(version);
         // A 4.x save lists the identity among its features.
         if version.starts_with("4.") {
@@ -1378,8 +1408,9 @@ fn a_format_version_is_read_only_as_major_minor_patch() {
 }
 
 /// A framed artefact a hand assembled from another directory is refused by
-/// name: codes under an internal id the mappings do not hold, and vectors
-/// short of a record.
+/// name: codes under an internal id the mappings do not hold, in a directory
+/// before format 5.0.0, which holds `pq_codes.bin`, and vectors short of a
+/// record.
 #[test]
 fn a_framed_artefact_that_disagrees_with_the_mappings_is_refused() {
     let temp = TempDir::new();
@@ -1390,6 +1421,7 @@ fn a_framed_artefact_that_disagrees_with_the_mappings_is_refused() {
 
     let codes_path = temp.at("codes.zdb");
     collection.save(codes_path.to_str().unwrap()).unwrap();
+    super::older::rewrite_before_five(&codes_path, "4.0.0");
     let (codes, _) = framed::write_codes(4, [(highest + 7, &[1u8, 2, 3, 4][..])], 1).unwrap();
     replace(&codes_path, "pq_codes.bin", &codes);
     assert_eq!(
@@ -1415,4 +1447,455 @@ fn a_framed_artefact_that_disagrees_with_the_mappings_is_refused() {
         message.starts_with("Failed to deserialize vectors.bin: holds 3 vectors and mappings.bin holds 1050 records; record '"),
         "{message}"
     );
+}
+
+// ============================================================================
+// THE MANIFEST AT 5.x
+// ============================================================================
+
+/// Write `text` as the JSON artefact `name` and record its length and digest
+/// in `manifest`, with the directory size, as a save records them.
+fn record_json(path: &Path, name: &str, text: &str, manifest: &mut Value) {
+    std::fs::write(path.join(name), text).unwrap();
+    manifest["file_digests"][name] = json!({
+        "bytes": text.len(),
+        "checksum": format!("{:016x}", checksum_of(text.as_bytes())),
+    });
+    resize(manifest);
+}
+
+/// The directory size a manifest records, from the lengths it records.
+fn resize(manifest: &mut Value) {
+    let total: u64 = manifest["file_digests"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|digest| digest["bytes"].as_u64().unwrap())
+        .sum();
+    manifest["total_size_mb"] = json!(total as f64 / (1024.0 * 1024.0));
+}
+
+/// A copy of `source` beside it whose manifest `edit` changes, and what a
+/// load of it gives.
+fn load_edited(
+    source: &Path,
+    name: &str,
+    edit: impl FnOnce(&Path, &mut Value),
+) -> Result<Collection, Error> {
+    let target = source.with_file_name(name);
+    let _ = std::fs::remove_dir_all(&target);
+    std::fs::create_dir_all(&target).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+    }
+    let mut manifest = read_json(&target.join("manifest.json"));
+    edit(&target, &mut manifest);
+    write_json(&target.join("manifest.json"), &manifest);
+    Collection::load(target.to_str().unwrap())
+}
+
+/// The detail of a `ManifestFieldInvalid`.
+fn field_invalid(result: Result<Collection, Error>, label: &str) -> String {
+    match result {
+        Err(Error::ManifestFieldInvalid { detail }) => detail,
+        Err(other) => panic!("{label}: expected the manifest refused, got {other}"),
+        Ok(_) => panic!("{label}: expected the manifest refused, and the directory opened"),
+    }
+}
+
+/// An edit of a manifest's JSON.
+type ManifestEdit = Box<dyn Fn(&mut Value)>;
+
+/// Each field of a 5.x manifest a save writes from the directory is held to
+/// it, one refusal a check, and the same edits on a directory before format
+/// 5.0.0 load as they did.
+#[test]
+fn every_field_of_a_5_x_manifest_is_held_to_the_directory() {
+    let temp = TempDir::new();
+    let raw = temp.at("raw.zdb");
+    let raw_collection = filled(None, 60);
+    raw_collection.save(raw.to_str().unwrap()).unwrap();
+    // A whole vectors.bin over the raw collection's records, as a release
+    // before 5.0.0 wrote it.
+    let (raw_vectors, _) = {
+        let ids = raw_collection.internal_ids();
+        let views = raw_collection
+            .records(ids.iter().map(|(_, id)| id.clone()).collect(), true, true)
+            .unwrap();
+        let rows: Vec<(usize, Vec<f32>)> = ids
+            .iter()
+            .zip(views)
+            .map(|((internal_id, _), view)| (*internal_id, view.vector.unwrap()))
+            .collect();
+        framed::write_vectors(8, rows.iter().map(|(i, v)| (*i, v.as_slice())), rows.len()).unwrap()
+    };
+    let quantized = temp.at("quantized.zdb");
+    filled(Some(StorageMode::QuantizedOnly), 1050)
+        .save(quantized.to_str().unwrap())
+        .unwrap();
+    let total = |manifest: &Value| {
+        manifest["file_digests"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|digest| digest["bytes"].as_u64().unwrap())
+            .sum::<u64>()
+    };
+
+    // The fields read before any artefact.
+    let cases: Vec<(&str, ManifestEdit, String)> = vec![
+        (
+            "version",
+            Box::new(|m: &mut Value| m["zeusdb_version"] = json!("")),
+            "records zeusdb_version as an empty string, and a save records the release that \
+             wrote it"
+                .to_string(),
+        ),
+        (
+            "created",
+            Box::new(|m: &mut Value| m["created_at"] = json!("yesterday")),
+            "records created_at as 'yesterday', which is not an RFC 3339 time".to_string(),
+        ),
+        (
+            "saved",
+            Box::new(|m: &mut Value| m["saved_at"] = json!("2026-13-01T00:00:00Z")),
+            "records saved_at as '2026-13-01T00:00:00Z', which is not an RFC 3339 time".to_string(),
+        ),
+        (
+            "type",
+            Box::new(|m: &mut Value| m["index_type"] = json!("IVF")),
+            "records index_type as 'IVF', and a save records HNSW".to_string(),
+        ),
+        (
+            "mode",
+            Box::new(|m: &mut Value| m["storage_mode"] = json!("compressed")),
+            "records storage_mode as 'compressed', which is not one a save records".to_string(),
+        ),
+        (
+            "has",
+            Box::new(|m: &mut Value| m["has_quantization"] = json!(true)),
+            "records has_quantization as true, and files_included does not name \
+             quantization.json"
+                .to_string(),
+        ),
+        (
+            "excluded",
+            Box::new(|m: &mut Value| m["files_excluded"] = json!(["config.json"])),
+            "names config.json under both files_included and files_excluded".to_string(),
+        ),
+        (
+            "size",
+            Box::new(|m: &mut Value| m["total_size_mb"] = json!(1.25)),
+            String::new(),
+        ),
+        (
+            "vectors",
+            Box::new(|m: &mut Value| m["total_vectors"] = json!(59)),
+            "records total_vectors as 59, and config.json records vector_count 60".to_string(),
+        ),
+        (
+            "trained",
+            Box::new(|m: &mut Value| m["quantization_trained"] = json!(true)),
+            "records quantization_trained as true, and files_included names no \
+             quantization.json"
+                .to_string(),
+        ),
+    ];
+    let older = temp.at("raw-before-five.zdb");
+    filled(None, 60).save(older.to_str().unwrap()).unwrap();
+    rewrite_before_five(&older, "4.0.0");
+    for (label, edit, expected) in &cases {
+        let detail = field_invalid(
+            load_edited(&raw, &format!("raw-{label}.zdb"), |_, m| edit(m)),
+            label,
+        );
+        if *label == "size" {
+            let recorded = total(&read_json(&raw.join("manifest.json")));
+            assert_eq!(
+                detail,
+                format!(
+                    "records total_size_mb as 1.25, and the lengths file_digests records add up \
+                     to {} MiB",
+                    recorded as f64 / (1024.0 * 1024.0)
+                ),
+                "{label}"
+            );
+        } else {
+            assert_eq!(&detail, expected, "{label}");
+        }
+        // The same edit before format 5.0.0 is not read.
+        assert!(
+            load_edited(&older, &format!("older-{label}.zdb"), |_, m| edit(m)).is_ok(),
+            "{label}: a 4.0.0 directory refused"
+        );
+    }
+
+    // The words of the refusal, whole.
+    let message = load_edited(&raw, "raw-words.zdb", |_, m| m["total_vectors"] = json!(12))
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        message,
+        "manifest.json records total_vectors as 12, and config.json records vector_count 60. A \
+         save writes every field of manifest.json from the directory it describes, so this \
+         manifest does not describe the directory. Restore the directory from a copy."
+    );
+
+    // files_included and file_digests name the same files, and none of them
+    // one no 5.0.0 save writes.
+    let detail = field_invalid(
+        load_edited(&raw, "raw-undigested.zdb", |_, m| {
+            m["files_included"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("extra.bin"))
+        }),
+        "undigested",
+    );
+    assert_eq!(
+        detail,
+        "names extra.bin under files_included, and file_digests records no length for it"
+    );
+    let detail = field_invalid(
+        load_edited(&raw, "raw-unlisted.zdb", |_, m| {
+            m["file_digests"]["extra.bin"] = json!({ "bytes": 0 });
+        }),
+        "unlisted",
+    );
+    assert_eq!(
+        detail,
+        "records a length for extra.bin under file_digests, and files_included does not name it"
+    );
+    for name in [
+        "pq_codes.bin",
+        "int8_rows.zdbint8",
+        "hnsw_index.hnsw.graph",
+        "hnsw_index.hnsw.data",
+    ] {
+        let detail = field_invalid(
+            load_edited(&raw, &format!("raw-{name}"), |target, m| {
+                std::fs::write(target.join(name), [0u8; 8]).unwrap();
+                m["files_included"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(name));
+                m["file_digests"][name] = json!({ "bytes": 8 });
+                resize(m);
+            }),
+            name,
+        );
+        assert_eq!(
+            detail,
+            format!("names {name} under files_included, which no save at format 5.0.0 writes")
+        );
+    }
+    let detail = field_invalid(
+        load_edited(&raw, "raw-held.zdb", |target, m| {
+            std::fs::write(target.join("vectors.bin"), [0u8; 8]).unwrap();
+            m["files_excluded"] = json!(["vectors.bin"]);
+        }),
+        "held",
+    );
+    assert_eq!(
+        detail,
+        "names vectors.bin under files_excluded, and the directory holds it"
+    );
+    let detail = field_invalid(
+        load_edited(&raw, "raw-vectors.zdb", |target, m| {
+            std::fs::write(target.join("vectors.bin"), &raw_vectors).unwrap();
+            m["files_included"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("vectors.bin"));
+            m["files_excluded"] = json!([]);
+            m["file_digests"]["vectors.bin"] = json!({ "bytes": raw_vectors.len() });
+            resize(m);
+        }),
+        "vectors",
+    );
+    assert_eq!(
+        detail,
+        "names vectors.bin under files_included, and the graph keeps no raw vectors beside its \
+         rows"
+    );
+
+    // A trained quantizer, recorded as untrained.
+    let detail = field_invalid(
+        load_edited(&quantized, "quantized-trained.zdb", |_, m| {
+            m["quantization_trained"] = json!(false)
+        }),
+        "untrained",
+    );
+    assert_eq!(
+        detail,
+        "records quantization_trained as false, and quantization.json records is_trained true"
+    );
+
+    // The untouched directories open.
+    assert!(Collection::load(raw.to_str().unwrap()).is_ok());
+    assert!(Collection::load(quantized.to_str().unwrap()).is_ok());
+}
+
+// ============================================================================
+// THE PRODUCT QUANTIZED FIELDS OF QUANTIZATION.JSON
+// ============================================================================
+
+/// `training_size` below 1,000 and `max_training_vectors` below it are
+/// refused as `create()` refuses them, at 5.0.0 and before it, and a file
+/// still holding `memory_stats` and `pq_config` is read with the two
+/// ignored.
+#[test]
+fn the_product_quantized_training_fields_are_held_to_create() {
+    let temp = TempDir::new();
+    let collection = filled(Some(StorageMode::QuantizedOnly), 1050);
+    let current = temp.at("current.zdb");
+    collection.save(current.to_str().unwrap()).unwrap();
+    let older = temp.at("older.zdb");
+    collection.save(older.to_str().unwrap()).unwrap();
+    rewrite_before_five(&older, "4.0.0");
+
+    for (label, source) in [("current", &current), ("older", &older)] {
+        let edited = |name: &str, edit: &dyn Fn(&mut Value)| {
+            load_edited(source, &format!("{label}-{name}.zdb"), |target, m| {
+                let mut quantization = read_json(&target.join("quantization.json"));
+                edit(&mut quantization);
+                let text = serde_json::to_string_pretty(&quantization).unwrap();
+                record_json(target, "quantization.json", &text, m);
+            })
+        };
+        match edited("small", &|q| q["training_size"] = json!(999)) {
+            Err(Error::QuantizationFieldInvalidInFile { file, detail }) => {
+                assert!(file.ends_with("quantization.json"), "{label}: {file}");
+                assert_eq!(
+                    detail, "training_size is 999, and create() requires at least 1000",
+                    "{label}"
+                );
+            }
+            other => panic!("{label}: expected a refusal, got {:?}", other.map(|_| ())),
+        }
+        let message = edited("short", &|q| {
+            q["training_size"] = json!(1000);
+            q["max_training_vectors"] = json!(900);
+        })
+        .err()
+        .unwrap();
+        assert!(matches!(
+            message.exception(),
+            zeusdb_vector_core::Exception::Value
+        ));
+        let text = message.to_string();
+        assert!(
+            text.ends_with(
+                "quantization.json: max_training_vectors is 900 and training_size is 1000, \
+                 and create() requires the first to be at or above the second, so this file \
+                 does not describe an index this build can rebuild."
+            ),
+            "{label}: {text}"
+        );
+        let loaded = edited("stats", &|q| {
+            q["memory_stats"] = json!({
+                "centroid_storage_mb": 0.0,
+                "compression_ratio": 8.0,
+                "centroids_per_subvector": 16,
+                "total_centroids": 64,
+            });
+            q["pq_config"] = json!({ "dim": 8, "sub_dim": 2, "num_centroids": 16 });
+        })
+        .unwrap();
+        assert_eq!(everything(&loaded), everything(&collection), "{label}");
+    }
+    let written = read_json(&current.join("quantization.json"));
+    assert!(written.get("memory_stats").is_none());
+    assert!(written.get("pq_config").is_none());
+    let manifest = read_json(&current.join("manifest.json"));
+    assert!(manifest.get("compression_info").is_none());
+}
+
+// ============================================================================
+// COMPACT METADATA.JSON
+// ============================================================================
+
+/// `metadata.json` at 5.0.0 is compact and names only the records that hold
+/// a field, in increasing internal id. A load gives every record it leaves
+/// out an empty entry, so the collection holds what the saved one held.
+#[test]
+fn compact_metadata_names_only_the_records_holding_a_field() {
+    let temp = TempDir::new();
+    let collection = filled(None, 30);
+    let bare: Vec<ParsedRecord> = (0..5)
+        .map(|i| ParsedRecord {
+            id: format!("bare{i}"),
+            vector: vec![0.1 * i as f32; 8],
+            sparse: None,
+            metadata: HashMap::new(),
+        })
+        .collect();
+    assert_eq!(collection.add_records(bare, vec![], false).total_errors, 0);
+    let path = temp.at("compact.zdb");
+    collection.save(path.to_str().unwrap()).unwrap();
+    let text = std::fs::read_to_string(path.join("metadata.json")).unwrap();
+    assert!(!text.contains('\n'), "{text}");
+    let parsed: serde_json::Map<String, Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed.len(), 30);
+    assert!(parsed.keys().all(|id| id.starts_with('r')));
+    let positions: Vec<usize> = (0..30)
+        .map(|i| text.find(&format!("\"r{i}\u{e9}\":")).unwrap())
+        .collect();
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+
+    let loaded = Collection::load(path.to_str().unwrap()).unwrap();
+    assert_eq!(everything(&loaded), everything(&collection));
+    assert_eq!(loaded.vector_metadata().len(), 35);
+}
+
+/// A compact `metadata.json` naming a record the mappings do not hold, or
+/// one record twice, is refused naming the record. Before format 5.0.0 an
+/// entry the mappings do not hold is dropped, as it was.
+#[test]
+fn compact_metadata_naming_a_record_not_held_or_held_twice_is_refused() {
+    let temp = TempDir::new();
+    let collection = filled(None, 20);
+    let path = temp.at("named.zdb");
+    collection.save(path.to_str().unwrap()).unwrap();
+    let text = std::fs::read_to_string(path.join("metadata.json")).unwrap();
+
+    let ghost = format!("{{\"ghost\":{{\"x\":1}},{}", &text[1..]);
+    let result = load_edited(&path, "ghost.zdb", |target, m| {
+        record_json(target, "metadata.json", &ghost, m)
+    });
+    match result {
+        Err(Error::DecodeFailed { file, error }) => {
+            assert_eq!(file, "metadata.json");
+            assert_eq!(
+                error,
+                "names record 'ghost', which mappings.bin does not hold"
+            );
+        }
+        other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+    }
+
+    let twice = format!("{{\"r0\u{e9}\":{{\"x\":1}},{}", &text[1..]);
+    let result = load_edited(&path, "twice.zdb", |target, m| {
+        record_json(target, "metadata.json", &twice, m)
+    });
+    match result {
+        Err(Error::DecodeFailed { file, error }) => {
+            assert_eq!(file, "metadata.json");
+            assert_eq!(error, "names record 'r0\u{e9}' twice");
+        }
+        other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+    }
+
+    let older = temp.at("older.zdb");
+    collection.save(older.to_str().unwrap()).unwrap();
+    rewrite_before_five(&older, "4.0.0");
+    let old_text = std::fs::read_to_string(older.join("metadata.json")).unwrap();
+    let ghost = format!("{{\"ghost\":{{\"x\":1}},{}", &old_text[1..]);
+    let loaded = load_edited(&older, "older-ghost.zdb", |target, m| {
+        record_json(target, "metadata.json", &ghost, m)
+    })
+    .unwrap();
+    assert_eq!(everything(&loaded), everything(&collection));
 }

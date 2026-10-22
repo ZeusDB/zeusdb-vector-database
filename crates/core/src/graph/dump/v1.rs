@@ -1,0 +1,3081 @@
+//! Version 1 of the graph dump, which every directory saved before format
+//! 5.0.0 holds.
+//!
+//! This build reads it and writes it only under the `test-support` feature,
+//! for the tests and for the fuzzer's corpora. A directory at format 5.x holds
+//! version 2, which the parent module writes and reads.
+//!
+//! # Layout
+//!
+//! ```text
+//! Header, 96 bytes
+//!    0   8  magic             u64   b"ZDBGRAPH"
+//!    8   4  format_version    u32   1
+//!   12   4  flags             u32   reserved, zero
+//!   16   1  distance          u8    GraphKind
+//!   17   1  element           u8    1 f32, 2 u8, 3 i8
+//!   18   1  nb_layer          u8
+//!   19   1  reserved0         u8    zero
+//!   20   4  dimension         u32
+//!   24   8  m                 u64
+//!   32   8  ef_construction   u64
+//!   40   8  nb_point          u64
+//!   48   8  level_scale       f64
+//!   56   4  entry_layer       u32
+//!   60   4  entry_rank        u32
+//!   64   8  adjacency_bytes   u64
+//!   72   8  file_bytes        u64   the whole file, trailer included
+//!   80   8  reserved1         u64   zero
+//!   88   8  header_checksum   u64   over bytes 0 to 88
+//!
+//! Layer table      nb_layer * u32, points per layer
+//! Origin ids       nb_point * u64, in (layer, rank) order
+//! Adjacency        adjacency_bytes, per point in (layer, rank) order
+//!                    u8  list_count, trailing empty layers trimmed
+//!                    per list: u32 edge_count, then edge_count entries of
+//!                      u8 target_layer, u32 target_rank, f32 distance
+//! Vectors          nb_point * dimension * element width, (layer, rank) order
+//!
+//! Trailer, 16 bytes
+//!    0   8  payload_checksum  u64   over everything from 96 to here
+//!    8   8  end_magic         u64
+//! ```
+//!
+//! A list is installed in the order of its stored distances, entries at an
+//! equal distance keeping the order the file holds them in.
+//!
+//! # How truncation is caught
+//!
+//! `file_bytes` sits in the header and is compared against the file's own
+//! length before anything is allocated, so a header claiming a billion points
+//! is refused on a file that cannot hold a billion points. `header_checksum`
+//! covers every field that comparison depends on. `payload_checksum` and
+//! `end_magic` catch damage inside the body and are checked as the body
+//! streams past. A refusal of any kind sends a load to the rebuild from the
+//! directory's separate row stores.
+
+#[cfg(test)]
+use super::LoadedPoint;
+#[cfg(test)]
+use super::ParsedDump;
+use super::{
+    number_nodes, take4, take8, DumpElement, Expected, GraphKind, HashingReader, ListWalk,
+    LoadedEdge, Numbering, PointId, IO_BUFFER_BYTES, MAGIC, NB_LAYER_MAX,
+};
+#[cfg(any(test, feature = "test-support"))]
+use super::{remove_legacy_dumps, DumpSource, HashingWriter};
+#[cfg(test)]
+use super::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES};
+use crate::checksum::checksum_of;
+use crate::graph::mutable::{ordered_targets, MutableGraph};
+use crate::graph::store::VectorStore;
+use crate::graph::traverse::LAYERS;
+use crate::graph::Distance;
+use crate::storage::Dir;
+use std::io::{BufReader, Read};
+#[cfg(any(test, feature = "test-support"))]
+use std::io::{BufWriter, Write};
+
+/// The version this module reads.
+const FORMAT_VERSION: u32 = 1;
+
+/// Bytes the header occupies, header checksum included.
+const HEADER_BYTES: usize = 96;
+
+/// Bytes the header checksum is taken over, being everything before it.
+const HEADER_CHECKSUM_BYTES: usize = 88;
+
+/// Bytes the trailer occupies, being the payload checksum and the end magic.
+const TRAILER_BYTES: usize = 16;
+
+/// Bytes one adjacency entry occupies, being a layer, a rank and a distance.
+const EDGE_BYTES: usize = 9;
+
+/// Bytes one point's origin id occupies.
+const ORIGIN_ID_BYTES: usize = 8;
+
+/// Bytes one entry of the layer table occupies.
+const LAYER_TABLE_ENTRY_BYTES: usize = 4;
+
+// ============================================================================
+// THE HEADER
+// ============================================================================
+
+/// The header, as fields rather than as bytes.
+struct Header {
+    kind: GraphKind,
+    element: u8,
+    nb_layer: u8,
+    dimension: u32,
+    m: u64,
+    ef_construction: u64,
+    nb_point: u64,
+    level_scale: f64,
+    entry_layer: u32,
+    entry_rank: u32,
+    adjacency_bytes: u64,
+    file_bytes: u64,
+}
+
+impl Header {
+    /// The header as the 96 bytes that go on disk, checksum included.
+    #[cfg(any(test, feature = "test-support"))]
+    fn encode(&self) -> [u8; HEADER_BYTES] {
+        let mut out = [0u8; HEADER_BYTES];
+        out[0..8].copy_from_slice(&MAGIC.to_le_bytes());
+        out[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        // 12..16 flags, 19 reserved0 and 80..88 reserved1 stay zero.
+        out[16] = self.kind.code();
+        out[17] = self.element;
+        out[18] = self.nb_layer;
+        out[20..24].copy_from_slice(&self.dimension.to_le_bytes());
+        out[24..32].copy_from_slice(&self.m.to_le_bytes());
+        out[32..40].copy_from_slice(&self.ef_construction.to_le_bytes());
+        out[40..48].copy_from_slice(&self.nb_point.to_le_bytes());
+        out[48..56].copy_from_slice(&self.level_scale.to_le_bytes());
+        out[56..60].copy_from_slice(&self.entry_layer.to_le_bytes());
+        out[60..64].copy_from_slice(&self.entry_rank.to_le_bytes());
+        out[64..72].copy_from_slice(&self.adjacency_bytes.to_le_bytes());
+        out[72..80].copy_from_slice(&self.file_bytes.to_le_bytes());
+        let sum = checksum_of(&out[..HEADER_CHECKSUM_BYTES]);
+        out[88..96].copy_from_slice(&sum.to_le_bytes());
+        out
+    }
+
+    /// Read the header back, rejecting anything this build cannot interpret.
+    ///
+    /// Nothing here allocates from a field, so a header claiming a billion
+    /// points costs the 96 bytes it was read from and nothing else. The size
+    /// agreement in `read_dump` is what makes the later allocations safe.
+    fn decode(raw: &[u8; HEADER_BYTES]) -> Result<Self, String> {
+        let magic = u64::from_le_bytes(take8(raw, 0));
+        if magic != MAGIC {
+            return Err("the file is not a ZeusDB graph dump".to_string());
+        }
+        let version = u32::from_le_bytes(take4(raw, 8));
+        if version != FORMAT_VERSION {
+            return Err(format!(
+                "the graph dump is format version {} where a directory saved before format \
+                 5.0.0 holds version {}",
+                version, FORMAT_VERSION
+            ));
+        }
+        let stored = u64::from_le_bytes(take8(raw, 88));
+        let computed = checksum_of(&raw[..HEADER_CHECKSUM_BYTES]);
+        if stored != computed {
+            return Err("the graph dump's header is corrupt".to_string());
+        }
+        let flags = u32::from_le_bytes(take4(raw, 12));
+        let reserved1 = u64::from_le_bytes(take8(raw, 80));
+        if flags != 0 || raw[19] != 0 || reserved1 != 0 {
+            return Err(
+                "the graph dump sets a reserved field this build does not know".to_string(),
+            );
+        }
+        let kind = GraphKind::from_code(raw[16]).ok_or_else(|| {
+            format!(
+                "the graph dump names distance {}, which is not one this build writes",
+                raw[16]
+            )
+        })?;
+        Ok(Header {
+            kind,
+            element: raw[17],
+            nb_layer: raw[18],
+            dimension: u32::from_le_bytes(take4(raw, 20)),
+            m: u64::from_le_bytes(take8(raw, 24)),
+            ef_construction: u64::from_le_bytes(take8(raw, 32)),
+            nb_point: u64::from_le_bytes(take8(raw, 40)),
+            level_scale: f64::from_le_bytes(take8(raw, 48)),
+            entry_layer: u32::from_le_bytes(take4(raw, 56)),
+            entry_rank: u32::from_le_bytes(take4(raw, 60)),
+            adjacency_bytes: u64::from_le_bytes(take8(raw, 64)),
+            file_bytes: u64::from_le_bytes(take8(raw, 72)),
+        })
+    }
+}
+
+// ============================================================================
+// WRITING
+// ============================================================================
+
+/// Write the graph as the artefact `name` in `dir`, at version 1.
+///
+/// Three passes over the layers, one a region, each point's lists carrying the
+/// distance from the point to each target, recomputed by the source. The
+/// header is written as zeros first and again at the end with
+/// `adjacency_bytes`, `file_bytes` and the magic, and then the file is synced.
+#[cfg(any(test, feature = "test-support"))]
+pub(in crate::graph) fn write_dump<T, S>(
+    source: &S,
+    kind: GraphKind,
+    dir: &dyn Dir,
+    name: &str,
+) -> Result<(), String>
+where
+    T: DumpElement,
+    S: DumpSource<T> + ?Sized,
+{
+    let nb_point = source.nb_point();
+    if nb_point == 0 {
+        return Err("the graph holds no points".to_string());
+    }
+    let entry = source
+        .entry()
+        .ok_or_else(|| "the graph holds points and no entry point".to_string())?;
+
+    let nb_layer = NB_LAYER_MAX as usize;
+    let layer_counts: Vec<usize> = (0..nb_layer)
+        .map(|layer| source.layer_nb_point(layer))
+        .collect();
+    let counted: usize = layer_counts.iter().sum();
+    if counted != nb_point {
+        return Err(format!(
+            "the graph reports {} points and its layers hold {}",
+            nb_point, counted
+        ));
+    }
+
+    let dimension = source.dimension();
+    if dimension == 0 {
+        return Err("the graph holds points of no width".to_string());
+    }
+
+    let file = dir
+        .create(name)
+        .map_err(|e| format!("the graph dump could not be created: {}", e))?;
+    let mut out = HashingWriter::new(BufWriter::with_capacity(IO_BUFFER_BYTES, file));
+
+    // The header's own bytes are not part of the payload checksum, so they are
+    // written straight through rather than through the hashing writer.
+    out.inner
+        .write_all(&[0u8; HEADER_BYTES])
+        .map_err(|e| format!("the graph dump could not be written: {}", e))?;
+
+    for count in &layer_counts {
+        let count = u32::try_from(*count)
+            .map_err(|_| format!("a layer holds {} points and the table is a u32", count))?;
+        out.put_u32(count)?;
+    }
+
+    for layer in 0..nb_layer {
+        source.each_origin_id(layer, &mut |origin_id| out.put_u64(origin_id as u64))?;
+    }
+
+    let adjacency_start = out.written;
+    for layer in 0..nb_layer {
+        source.each_neighbourhood(layer, &mut |neighbourhood| {
+            // Trailing empty lists are left out, so a node's list count is
+            // one more than the highest layer it holds an entry at. That
+            // layer can sit above the node's own level, where the descent
+            // that inserted it left an entry at each layer it passed through.
+            let list_count = neighbourhood
+                .iter()
+                .rposition(|list| !list.is_empty())
+                .map_or(0, |last| last + 1);
+            out.put_u8(
+                u8::try_from(list_count)
+                    .map_err(|_| format!("a point carries adjacency for {} layers", list_count))?,
+            )?;
+            for list in &neighbourhood[..list_count] {
+                out.put_u32(u32::try_from(list.len()).map_err(|_| {
+                    format!("a point carries {} neighbours at one layer", list.len())
+                })?)?;
+                for edge in list {
+                    if edge.target.1 < 0 {
+                        return Err(format!(
+                            "a neighbour sits at rank {} of layer {}",
+                            edge.target.1, edge.target.0
+                        ));
+                    }
+                    out.put_u8(edge.target.0)?;
+                    out.put_u32(edge.target.1 as u32)?;
+                    out.put(&edge.distance.to_le_bytes())?;
+                }
+            }
+            Ok(())
+        })?;
+    }
+    let adjacency_bytes = out.written - adjacency_start;
+
+    let mut buffer: Vec<u8> = Vec::with_capacity(dimension * T::BYTES);
+    for layer in 0..nb_layer {
+        source.each_vector(layer, &mut |values| {
+            if values.len() != dimension {
+                return Err(format!(
+                    "a point holds {} values where the graph holds {}",
+                    values.len(),
+                    dimension
+                ));
+            }
+            buffer.clear();
+            T::encode(values, &mut buffer);
+            out.put(&buffer)
+        })?;
+    }
+
+    let payload_checksum = out.sum.finish();
+    let mut inner = out.inner;
+    inner
+        .write_all(&payload_checksum.to_le_bytes())
+        .and_then(|()| inner.write_all(&MAGIC.to_le_bytes()))
+        .map_err(|e| format!("the graph dump's trailer could not be written: {}", e))?;
+
+    let file_bytes = HEADER_BYTES as u64 + out.written + TRAILER_BYTES as u64;
+    let header = Header {
+        kind,
+        element: T::KIND,
+        nb_layer: NB_LAYER_MAX,
+        dimension: u32::try_from(dimension)
+            .map_err(|_| format!("the graph holds points of {} values", dimension))?,
+        m: source.max_nb_connection() as u64,
+        ef_construction: source.ef_construction() as u64,
+        nb_point: nb_point as u64,
+        level_scale: source.level_scale(),
+        entry_layer: entry.0 as u32,
+        entry_rank: u32::try_from(entry.1)
+            .map_err(|_| format!("the entry point sits at rank {}", entry.1))?,
+        adjacency_bytes,
+        file_bytes,
+    };
+
+    // The body is written before the header names it, and the magic arrives
+    // with the header. A save interrupted before this point leaves zeros at
+    // offset zero, which reads as no dump at all rather than as a short one.
+    //
+    // The dump is made durable once the header is in place, as every whole
+    // artefact is by `Dir::write` and for the same reason. The rename that
+    // moves the staging directory into place can otherwise be recorded while
+    // these bytes are still in the page cache, and a power loss then leaves a
+    // directory whose manifest is complete and whose graph dump is short.
+    let mut file = inner
+        .into_inner()
+        .map_err(|e| format!("the graph dump could not be flushed: {}", e))?;
+    file.write_head(&header.encode())
+        .and_then(|()| file.finish())
+        .map_err(|e| format!("the graph dump's header could not be written: {}", e))?;
+
+    remove_legacy_dumps(dir, name);
+
+    Ok(())
+}
+
+/// Read the graph back out of the artefact `name` in `dir`, every node taking
+/// the position of the record its origin id names, where every node holds a
+/// record. See [`read_dump_at`].
+#[cfg(test)]
+pub(super) fn read_dump<T, D>(
+    dir: &dyn Dir,
+    name: &str,
+    expected: &Expected,
+    dist: D,
+) -> Result<(MutableGraph<T, D>, VectorStore<T>), String>
+where
+    T: DumpElement,
+    D: Distance<T> + Send + Sync,
+{
+    read_dump_at(dir, name, expected, dist, None)
+}
+
+/// Read the graph back out of the artefact `name` in `dir`, filing each node
+/// at the position `positions` gives its origin id.
+///
+/// `positions` is the internal id of the record at each position, in
+/// increasing order, being the records the collection's mappings hold. A
+/// node whose origin id it holds takes that position, a node whose origin id
+/// it does not hold is stranded, and an id it holds that no node carries
+/// refuses the dump. `None` files every node at the rank of its origin id
+/// among the dump's, which is a graph whose every node holds a record.
+///
+/// Every failure is an error and none is a panic, an exit or an allocation from
+/// a length the file has not earned. [`open_dump`] checks the header against
+/// itself and against the index, reads every region that comes before the
+/// vectors and numbers the nodes, [`check_adjacency`] checks every list the
+/// adjacency region holds, and only then is the graph built, straight from the
+/// region's bytes into the graph's own arrays. The region's block is released
+/// before the vector store is sized, and the vectors stream into the store in
+/// node order. The trailer and the checksum over everything read come last.
+pub(super) fn read_dump_at<T, D>(
+    dir: &dyn Dir,
+    name: &str,
+    expected: &Expected,
+    dist: D,
+    positions: Option<&[u32]>,
+) -> Result<(MutableGraph<T, D>, VectorStore<T>), String>
+where
+    T: DumpElement,
+    D: Distance<T> + Send + Sync,
+{
+    let DumpHead {
+        mut hashed,
+        layer_counts,
+        origin_ids,
+        record_of,
+        region,
+        entry,
+        m,
+        ef_construction,
+        level_scale,
+        nb_point,
+        dimension,
+    } = open_dump::<T>(dir, name, expected, positions)?;
+    let walk = check_adjacency(&region, nb_point, &layer_counts, m)?;
+    let graph = MutableGraph::from_adjacency(
+        &layer_counts,
+        dimension,
+        entry,
+        m,
+        ef_construction,
+        level_scale,
+        dist,
+        origin_ids,
+        record_of,
+        walk,
+    )
+    .map_err(|e| format!("the graph dump could not be rebuilt: {}", e.reason))?;
+    // Every list the region holds is in the graph's own arrays now, so its
+    // block goes before the store, the largest allocation of the read, is
+    // sized.
+    drop(region);
+
+    let mut store = VectorStore::with_capacity(dimension, nb_point);
+    let mut values_raw = vec![0u8; dimension * T::BYTES];
+    for _ in 0..nb_point {
+        hashed.read_exact_hashed(&mut values_raw)?;
+        store.append(T::decode(&values_raw));
+    }
+    read_trailer(hashed)?;
+
+    let restored = graph.nb_points();
+    if restored != nb_point {
+        return Err(format!(
+            "the graph dump declares {} nodes and yielded {}",
+            nb_point, restored
+        ));
+    }
+    Ok((graph, store))
+}
+
+/// The graph [`MutableGraph::from_points`] builds from the points
+/// [`open_points`] hands out, every list decoded into a block of its own, with
+/// every refusal [`read_dump`] makes, in the same order and in the same words.
+///
+/// The tests hold [`read_dump`] to it graph for graph and refusal for refusal.
+#[cfg(test)]
+pub(super) fn read_dump_reference<T, D>(
+    dir: &dyn Dir,
+    name: &str,
+    expected: &Expected,
+    dist: D,
+) -> Result<(MutableGraph<T, D>, VectorStore<T>), String>
+where
+    T: DumpElement,
+    D: Distance<T> + Send + Sync,
+{
+    let mut stream = open_points::<T>(dir, name, expected)?;
+    let nb_point = stream.nb_point;
+    let layer_counts = stream.layer_counts.clone();
+    let record_of = std::mem::take(&mut stream.record_of);
+    let (graph, store) = MutableGraph::from_points(
+        &layer_counts,
+        stream.dimension,
+        stream.entry,
+        stream.m,
+        stream.ef_construction,
+        stream.level_scale,
+        dist,
+        record_of,
+        || stream.next_point(),
+    )
+    .map_err(|e| format!("the graph dump could not be rebuilt: {}", e))?;
+    stream.finish()?;
+
+    let restored = graph.nb_points();
+    if restored != nb_point {
+        return Err(format!(
+            "the graph dump declares {} nodes and yielded {}",
+            nb_point, restored
+        ));
+    }
+    Ok((graph, store))
+}
+
+/// Parse a dump into the topology and parameters it carries, building nothing.
+///
+/// [`open_points`] does the checking and hands the points out one at a time;
+/// this collects them, which is the shape the tests hand to more than one
+/// constructor call.
+#[cfg(test)]
+pub(super) fn parse_dump<T>(
+    dir: &dyn Dir,
+    name: &str,
+    expected: &Expected,
+) -> Result<ParsedDump<T>, String>
+where
+    T: DumpElement,
+{
+    let mut stream = open_points::<T>(dir, name, expected)?;
+    let mut points_by_layer: Vec<Vec<LoadedPoint<T>>> =
+        Vec::with_capacity(stream.layer_counts.len());
+    for count in stream.layer_counts.clone() {
+        let mut layer = Vec::with_capacity(count);
+        for _ in 0..count {
+            layer.push(stream.next_point()?);
+        }
+        points_by_layer.push(layer);
+    }
+    let (entry, m, ef_construction, level_scale) = (
+        stream.entry,
+        stream.m,
+        stream.ef_construction,
+        stream.level_scale,
+    );
+    stream.finish()?;
+    Ok(ParsedDump {
+        points_by_layer,
+        entry,
+        m,
+        ef_construction,
+        level_scale,
+    })
+}
+
+/// A dump opened through [`open_dump`] with every list of its adjacency
+/// decoded into a block of its own, handing out its points one at a time as
+/// their vectors are read.
+///
+/// [`DumpStream::finish`] reads the trailer and checks the checksum over
+/// everything read.
+#[cfg(test)]
+pub(super) struct DumpStream<T> {
+    hashed: HashingReader<BufReader<Box<dyn Read>>>,
+    layer_counts: Vec<usize>,
+    origin_ids: std::vec::IntoIter<usize>,
+    /// Each node's position, as [`open_dump`] numbered the nodes.
+    record_of: Vec<u32>,
+    adjacency: std::vec::IntoIter<Vec<Vec<LoadedEdge>>>,
+    values_raw: Vec<u8>,
+    entry: PointId,
+    m: usize,
+    ef_construction: usize,
+    level_scale: f64,
+    nb_point: usize,
+    dimension: usize,
+    _elem: std::marker::PhantomData<T>,
+}
+
+#[cfg(test)]
+impl<T: DumpElement> DumpStream<T> {
+    /// The next point in (layer, rank) order, its vector read from the file.
+    fn next_point(&mut self) -> Result<LoadedPoint<T>, String> {
+        self.hashed.read_exact_hashed(&mut self.values_raw)?;
+        Ok(LoadedPoint {
+            origin_id: self
+                .origin_ids
+                .next()
+                .ok_or_else(|| "the graph dump ran out of origin ids".to_string())?,
+            data: T::decode(&self.values_raw),
+            neighbours: self
+                .adjacency
+                .next()
+                .ok_or_else(|| "the graph dump ran out of adjacency".to_string())?,
+        })
+    }
+
+    /// The trailer, once every point is out.
+    fn finish(self) -> Result<(), String> {
+        read_trailer(self.hashed)
+    }
+}
+
+/// [`open_dump`], with every list of the adjacency region decoded into a block
+/// of its own by [`read_adjacency`].
+#[cfg(test)]
+fn open_points<T>(dir: &dyn Dir, name: &str, expected: &Expected) -> Result<DumpStream<T>, String>
+where
+    T: DumpElement,
+{
+    let DumpHead {
+        hashed,
+        layer_counts,
+        origin_ids,
+        record_of,
+        region,
+        entry,
+        m,
+        ef_construction,
+        level_scale,
+        nb_point,
+        dimension,
+    } = open_dump::<T>(dir, name, expected, None)?;
+    let adjacency = read_adjacency(&region, nb_point, &layer_counts, m)?;
+    Ok(DumpStream {
+        hashed,
+        layer_counts,
+        origin_ids: origin_ids.into_iter(),
+        record_of,
+        adjacency: adjacency.into_iter(),
+        values_raw: vec![0u8; dimension * T::BYTES],
+        entry,
+        m,
+        ef_construction,
+        level_scale,
+        nb_point,
+        dimension,
+        _elem: std::marker::PhantomData,
+    })
+}
+
+/// The trailer, once every vector is read: the end marker and the checksum
+/// over everything read since the header.
+fn read_trailer<R: Read>(hashed: HashingReader<R>) -> Result<(), String> {
+    let HashingReader { mut inner, sum } = hashed;
+    let mut trailer = [0u8; TRAILER_BYTES];
+    inner
+        .read_exact(&mut trailer)
+        .map_err(|e| format!("the graph dump's trailer could not be read: {}", e))?;
+    let stored = u64::from_le_bytes(take8(&trailer, 0));
+    let end_magic = u64::from_le_bytes(take8(&trailer, 8));
+    if end_magic != MAGIC {
+        return Err("the graph dump does not end where it says it does".to_string());
+    }
+    let computed = sum.finish();
+    if stored != computed {
+        return Err("the graph dump's contents are corrupt".to_string());
+    }
+    Ok(())
+}
+
+/// A dump opened and checked down to its adjacency, with that region read
+/// whole and unchecked, and the reader standing at the first vector.
+struct DumpHead {
+    hashed: HashingReader<BufReader<Box<dyn Read>>>,
+    layer_counts: Vec<usize>,
+    origin_ids: Vec<usize>,
+    /// Each node's position, or [`Position::NONE`] for a stranded node; see
+    /// [`number_nodes`].
+    record_of: Vec<u32>,
+    /// The adjacency region, `adjacency_bytes` of it, which the size agreement
+    /// ties to the file's real length.
+    region: Vec<u8>,
+    entry: PointId,
+    m: usize,
+    ef_construction: usize,
+    level_scale: f64,
+    nb_point: usize,
+    dimension: usize,
+}
+
+/// Open a dump, check it down to its adjacency, number its nodes against
+/// `positions` and read that region whole, leaving the vector region and the
+/// trailer to the caller. See [`read_dump_at`] for `positions`.
+///
+/// The order is deliberate. The file's real length is established first, the
+/// header is checked against itself second, the header is checked against the
+/// index third, and only then does anything size a buffer from a field.
+fn open_dump<T>(
+    dir: &dyn Dir,
+    name: &str,
+    expected: &Expected,
+    positions: Option<&[u32]>,
+) -> Result<DumpHead, String>
+where
+    T: DumpElement,
+{
+    let actual_bytes = match dir.length(name) {
+        Ok(bytes) => bytes,
+        Err(_) => return Err("the directory holds no ZeusDB graph dump".to_string()),
+    };
+    if actual_bytes < (HEADER_BYTES + TRAILER_BYTES) as u64 {
+        return Err(format!(
+            "the graph dump is {} bytes and the smallest one is {}",
+            actual_bytes,
+            HEADER_BYTES + TRAILER_BYTES
+        ));
+    }
+
+    let file = dir
+        .open(name)
+        .map_err(|e| format!("the graph dump could not be opened: {}", e))?;
+    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, file);
+
+    let mut raw = [0u8; HEADER_BYTES];
+    reader
+        .read_exact(&mut raw)
+        .map_err(|e| format!("the graph dump's header could not be read: {}", e))?;
+    let header = Header::decode(&raw)?;
+
+    // The header now describes itself consistently. Everything below decides
+    // whether it describes *this* index, and the size agreement is what makes
+    // the allocations after it safe.
+    if header.nb_layer != NB_LAYER_MAX {
+        return Err(format!(
+            "the graph dump carries {} layers where this build uses {}",
+            header.nb_layer, NB_LAYER_MAX
+        ));
+    }
+    if header.element != T::KIND {
+        return Err(format!(
+            "the graph dump stores element type {} where this index holds {}",
+            header.element,
+            T::KIND
+        ));
+    }
+    if header.kind != expected.kind {
+        return Err(format!(
+            "the graph dump was written for {} and config.json declares {}",
+            header.kind.label(),
+            expected.kind.label()
+        ));
+    }
+    if header.dimension as usize != expected.dimension {
+        return Err(format!(
+            "the graph dump stores {} values per point where this index expects {}",
+            header.dimension, expected.dimension
+        ));
+    }
+    if header.m != expected.m as u64 {
+        return Err(format!(
+            "the graph dump was written at m {} and config.json declares {}",
+            header.m, expected.m
+        ));
+    }
+    if header.ef_construction != expected.ef_construction as u64 {
+        return Err(format!(
+            "the graph dump was written at ef_construction {} and config.json declares {}",
+            header.ef_construction, expected.ef_construction
+        ));
+    }
+    if header.nb_point < expected.min_nodes as u64 {
+        return Err(format!(
+            "the graph dump holds {} nodes and the index holds {} records",
+            header.nb_point, expected.min_nodes
+        ));
+    }
+    if header.nb_point == 0 {
+        return Err("the graph dump holds no nodes".to_string());
+    }
+    if !header.level_scale.is_finite() || header.level_scale <= 0. {
+        return Err(format!(
+            "the graph dump declares a level scale of {}",
+            header.level_scale
+        ));
+    }
+
+    let nb_point = usize::try_from(header.nb_point)
+        .map_err(|_| format!("the graph dump declares {} nodes", header.nb_point))?;
+    let dimension = header.dimension as usize;
+    let nb_layer = header.nb_layer as usize;
+    let adjacency_bytes = usize::try_from(header.adjacency_bytes)
+        .map_err(|_| "the graph dump declares an adjacency region too large to read".to_string())?;
+
+    // The length the header's own fields imply, against the length the file
+    // actually has. This is the check that makes a header claiming a billion
+    // points harmless: the arithmetic below either overflows or names a size
+    // the file does not have, and either way nothing is allocated.
+    let implied = (|| {
+        let vectors = nb_point.checked_mul(dimension)?.checked_mul(T::BYTES)?;
+        HEADER_BYTES
+            .checked_add(nb_layer.checked_mul(LAYER_TABLE_ENTRY_BYTES)?)?
+            .checked_add(nb_point.checked_mul(ORIGIN_ID_BYTES)?)?
+            .checked_add(adjacency_bytes)?
+            .checked_add(vectors)?
+            .checked_add(TRAILER_BYTES)
+    })()
+    .ok_or_else(|| {
+        format!(
+            "the graph dump declares {} nodes of {} values, which no file could hold",
+            nb_point, dimension
+        )
+    })?;
+    if header.file_bytes != implied as u64 {
+        return Err(format!(
+            "the graph dump's header declares {} bytes and its own fields need {}",
+            header.file_bytes, implied
+        ));
+    }
+    if header.file_bytes != actual_bytes {
+        return Err(format!(
+            "the graph dump declares {} bytes and the file holds {}",
+            header.file_bytes, actual_bytes
+        ));
+    }
+
+    // The node count against the ids the directory has issued. Every node is
+    // filed under an id at or below the counter, and no two under the same
+    // one, which the origin ids are held to below, so the dump holds at most
+    // one node for each id from zero to the counter. The per node arrays and
+    // the layer zero slab are sized by the node count, so it is held to the
+    // counter before anything past the header is read. A counter at the top
+    // of the range allows any count, so the sum is checked rather than
+    // wrapped.
+    let nodes_the_ids_allow = (expected.max_origin_id as u64).checked_add(1);
+    if nodes_the_ids_allow.is_some_and(|allowed| header.nb_point > allowed) {
+        return Err(format!(
+            "the graph dump holds {} nodes and config.json counted {}",
+            header.nb_point, expected.max_origin_id
+        ));
+    }
+
+    // Every allocation from here on is bounded by a file that really is this
+    // long, so the header can no longer ask for memory it has not accounted for.
+    let mut hashed = HashingReader::new(reader);
+
+    let mut layer_counts = Vec::with_capacity(nb_layer);
+    let mut table = vec![0u8; nb_layer * LAYER_TABLE_ENTRY_BYTES];
+    hashed.read_exact_hashed(&mut table)?;
+    let mut counted = 0usize;
+    for entry in table.chunks_exact(LAYER_TABLE_ENTRY_BYTES) {
+        let count = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) as usize;
+        counted = counted
+            .checked_add(count)
+            .ok_or_else(|| "the graph dump's layer table does not add up".to_string())?;
+        layer_counts.push(count);
+    }
+    if counted != nb_point {
+        return Err(format!(
+            "the graph dump declares {} nodes and its layers hold {}",
+            nb_point, counted
+        ));
+    }
+    let entry_layer = header.entry_layer as usize;
+    if entry_layer >= nb_layer || header.entry_rank as usize >= layer_counts[entry_layer] {
+        return Err(format!(
+            "the graph dump's entry point sits at layer {} rank {} and no node is there",
+            header.entry_layer, header.entry_rank
+        ));
+    }
+
+    let mut origin_raw = vec![0u8; nb_point * ORIGIN_ID_BYTES];
+    hashed.read_exact_hashed(&mut origin_raw)?;
+    let mut origin_ids = Vec::with_capacity(nb_point);
+    for entry in origin_raw.chunks_exact(ORIGIN_ID_BYTES) {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(entry);
+        let id = u64::from_le_bytes(word);
+        // The ceiling. A point's origin id is the internal id its record was
+        // inserted under, so an id past the counter the same save wrote
+        // names no record the directory holds. Everything above is bounded by
+        // the size agreement; this one is bounded by that counter. See
+        // [`Expected::max_origin_id`].
+        if id > expected.max_origin_id as u64 {
+            return Err(format!(
+                "the graph dump names origin id {} and config.json counted {}",
+                id, expected.max_origin_id
+            ));
+        }
+        origin_ids.push(usize::try_from(id).map_err(|_| {
+            format!(
+                "the graph dump names origin id {}, which this target cannot hold",
+                id
+            )
+        })?);
+    }
+    drop(origin_raw);
+
+    // Each node's position, from one sort of pairs of origin id and node,
+    // which also refuses a repeated id before anything is built. The pairs
+    // take twice what the region the ids were read from took and are
+    // released before the adjacency is read.
+    let record_of = number_nodes(&origin_ids, positions).map_err(|failure| match failure {
+        Numbering::Repeated(id) => {
+            format!(
+                "the graph dump names origin id {} for more than one node",
+                id
+            )
+        }
+        Numbering::Unplaced(id) => format!(
+            "the graph dump names no node for internal id {}, which mappings.bin holds",
+            id
+        ),
+    })?;
+
+    // The adjacency region, read whole. Its length is part of the size
+    // agreement, so the block is one the file has the bytes for, and nothing
+    // is built from it until `check_adjacency` has accepted all of it.
+    let mut region = vec![0u8; adjacency_bytes];
+    hashed.read_exact_hashed(&mut region)?;
+
+    Ok(DumpHead {
+        hashed,
+        layer_counts,
+        origin_ids,
+        record_of,
+        region,
+        entry: PointId(header.entry_layer as u8, header.entry_rank as i32),
+        m: expected.m,
+        ef_construction: header.ef_construction as usize,
+        level_scale: header.level_scale,
+        nb_point,
+        dimension,
+    })
+}
+
+/// The adjacency entry at `at`, as its target's layer, its target's rank and
+/// its distance. The caller has checked that nine bytes are there.
+fn entry_at(region: &[u8], at: usize) -> (usize, usize, f32) {
+    let target_layer = region[at] as usize;
+    let target_rank = u32::from_le_bytes([
+        region[at + 1],
+        region[at + 2],
+        region[at + 3],
+        region[at + 4],
+    ]) as usize;
+    let distance = f32::from_le_bytes([
+        region[at + 5],
+        region[at + 6],
+        region[at + 7],
+        region[at + 8],
+    ]);
+    (target_layer, target_rank, distance)
+}
+
+/// Check the adjacency region whole, building nothing, and hand back the walk
+/// the graph's constructor takes over it.
+///
+/// Every count is checked against the bytes the region has left before
+/// anything reads past it, so a list count of four billion is refused on
+/// arithmetic, and no count, nor any sum of them, sizes anything here or in
+/// the constructor that walks the region afterwards. Every count is held to
+/// the slots a list at its layer has in the graph, being `2m + 1` at layer zero
+/// and `m + 1` above, so a list the graph cannot hold is refused here rather
+/// than once the graph's arrays are allocated. Every target is checked
+/// against the layer table, so an edge naming a node that is not there is
+/// caught here rather than inside the constructor, every distance is checked
+/// finite, and the region must end where its last point does.
+fn check_adjacency<'a>(
+    region: &'a [u8],
+    nb_point: usize,
+    layer_counts: &[usize],
+    m: usize,
+) -> Result<AdjacencyWalk<'a>, String> {
+    // Saturating, since `m` is held to its range by the constructor, which
+    // runs after this, and an `m` it refuses must not overflow here first.
+    let base_cap = m.saturating_mul(2).saturating_add(1);
+    let upper_cap = m.saturating_add(1);
+    let mut at = 0usize;
+    for point in 0..nb_point {
+        if at >= region.len() {
+            return Err(format!(
+                "the graph dump's adjacency ends at node {} of {}",
+                point, nb_point
+            ));
+        }
+        let list_count = region[at] as usize;
+        at += 1;
+        if list_count > NB_LAYER_MAX as usize {
+            return Err(format!(
+                "node {} carries adjacency for {} layers and a node carries at most {}",
+                point, list_count, NB_LAYER_MAX
+            ));
+        }
+        for layer in 0..list_count {
+            if region.len() - at < 4 {
+                return Err(format!(
+                    "the graph dump's adjacency ends inside node {} at layer {}",
+                    point, layer
+                ));
+            }
+            let edge_count =
+                u32::from_le_bytes([region[at], region[at + 1], region[at + 2], region[at + 3]])
+                    as usize;
+            at += 4;
+            let needed = edge_count.checked_mul(EDGE_BYTES).ok_or_else(|| {
+                format!(
+                    "node {} declares {} neighbours at layer {}",
+                    point, edge_count, layer
+                )
+            })?;
+            if needed > region.len() - at {
+                return Err(format!(
+                    "node {} declares {} neighbours at layer {} and the dump has room for {}",
+                    point,
+                    edge_count,
+                    layer,
+                    (region.len() - at) / EDGE_BYTES
+                ));
+            }
+            let cap = if layer == 0 { base_cap } else { upper_cap };
+            if edge_count > cap {
+                return Err(format!(
+                    "node {} declares {} neighbours at layer {} and a list there holds {}",
+                    point, edge_count, layer, cap
+                ));
+            }
+            for _ in 0..edge_count {
+                let (target_layer, target_rank, distance) = entry_at(region, at);
+                at += EDGE_BYTES;
+                if target_layer >= layer_counts.len() || target_rank >= layer_counts[target_layer] {
+                    return Err(format!(
+                        "node {} names layer {} rank {} and no node is there",
+                        point, target_layer, target_rank
+                    ));
+                }
+                if !distance.is_finite() {
+                    return Err(format!(
+                        "node {} carries a distance of {} at layer {}",
+                        point, distance, layer
+                    ));
+                }
+                if target_rank > i32::MAX as usize {
+                    return Err(format!(
+                        "node {} names rank {}, which is not an i32",
+                        point, target_rank
+                    ));
+                }
+            }
+        }
+    }
+    if at != region.len() {
+        return Err(format!(
+            "the graph dump's adjacency holds {} bytes beyond its {} nodes",
+            region.len() - at,
+            nb_point
+        ));
+    }
+    Ok(AdjacencyWalk {
+        region,
+        at: 0,
+        carried: Vec::new(),
+        ordered: Vec::new(),
+    })
+}
+
+/// A walk over an adjacency region [`check_adjacency`] accepted, point by
+/// point in (layer, rank) order, which is the order the graph's constructor
+/// numbers its nodes in.
+///
+/// Only [`check_adjacency`] makes one, so the walk reads bytes that were read
+/// and accepted in the same order, and it meets nothing the check did not.
+pub(super) struct AdjacencyWalk<'a> {
+    region: &'a [u8],
+    at: usize,
+    /// The entries of the point the walk is at, kept from one point to the
+    /// next.
+    carried: Vec<Vec<LoadedEdge>>,
+    /// One list's entries with their distances, while it is ordered.
+    ordered: Vec<(f32, u32)>,
+}
+
+impl AdjacencyWalk<'_> {
+    /// The next point's lists, written into the first entries of `lists`,
+    /// each cleared first, and how many lists the point carries.
+    ///
+    /// `lists` is the caller's and keeps its buffers from one point to the
+    /// next, so it grows to the longest list the region holds and allocates
+    /// nothing after that. An entry names its target by layer and rank, as
+    /// the file does.
+    pub(super) fn next_point(&mut self, lists: &mut Vec<Vec<LoadedEdge>>) -> usize {
+        let list_count = self.region[self.at] as usize;
+        self.at += 1;
+        while lists.len() < list_count {
+            lists.push(Vec::new());
+        }
+        for list in lists.iter_mut().take(list_count) {
+            list.clear();
+            let edge_count = u32::from_le_bytes([
+                self.region[self.at],
+                self.region[self.at + 1],
+                self.region[self.at + 2],
+                self.region[self.at + 3],
+            ]) as usize;
+            self.at += 4;
+            for _ in 0..edge_count {
+                let (target_layer, target_rank, distance) = entry_at(self.region, self.at);
+                self.at += EDGE_BYTES;
+                list.push(LoadedEdge {
+                    target: PointId(target_layer as u8, target_rank as i32),
+                    distance,
+                });
+            }
+        }
+        list_count
+    }
+}
+
+/// Decode the adjacency region into one entry per point, in (layer, rank)
+/// order, every list a block of its own.
+///
+/// The checks [`check_adjacency`] makes, made as the lists are built. The
+/// tests read through it to hold [`read_dump`] to a decoder that builds every
+/// list on its own.
+#[cfg(test)]
+fn read_adjacency(
+    region: &[u8],
+    nb_point: usize,
+    layer_counts: &[usize],
+    m: usize,
+) -> Result<Vec<Vec<Vec<LoadedEdge>>>, String> {
+    let base_cap = m.saturating_mul(2).saturating_add(1);
+    let upper_cap = m.saturating_add(1);
+    let mut at = 0usize;
+    let mut out: Vec<Vec<Vec<LoadedEdge>>> = Vec::with_capacity(nb_point);
+    for point in 0..nb_point {
+        if at >= region.len() {
+            return Err(format!(
+                "the graph dump's adjacency ends at node {} of {}",
+                point, nb_point
+            ));
+        }
+        let list_count = region[at] as usize;
+        at += 1;
+        if list_count > NB_LAYER_MAX as usize {
+            return Err(format!(
+                "node {} carries adjacency for {} layers and a node carries at most {}",
+                point, list_count, NB_LAYER_MAX
+            ));
+        }
+        let mut lists = Vec::with_capacity(list_count);
+        for layer in 0..list_count {
+            if region.len() - at < 4 {
+                return Err(format!(
+                    "the graph dump's adjacency ends inside node {} at layer {}",
+                    point, layer
+                ));
+            }
+            let edge_count =
+                u32::from_le_bytes([region[at], region[at + 1], region[at + 2], region[at + 3]])
+                    as usize;
+            at += 4;
+            let needed = edge_count.checked_mul(EDGE_BYTES).ok_or_else(|| {
+                format!(
+                    "node {} declares {} neighbours at layer {}",
+                    point, edge_count, layer
+                )
+            })?;
+            if needed > region.len() - at {
+                return Err(format!(
+                    "node {} declares {} neighbours at layer {} and the dump has room for {}",
+                    point,
+                    edge_count,
+                    layer,
+                    (region.len() - at) / EDGE_BYTES
+                ));
+            }
+            let cap = if layer == 0 { base_cap } else { upper_cap };
+            if edge_count > cap {
+                return Err(format!(
+                    "node {} declares {} neighbours at layer {} and a list there holds {}",
+                    point, edge_count, layer, cap
+                ));
+            }
+            let mut edges = Vec::with_capacity(edge_count);
+            for _ in 0..edge_count {
+                let target_layer = region[at] as usize;
+                let target_rank = u32::from_le_bytes([
+                    region[at + 1],
+                    region[at + 2],
+                    region[at + 3],
+                    region[at + 4],
+                ]) as usize;
+                let distance = f32::from_le_bytes([
+                    region[at + 5],
+                    region[at + 6],
+                    region[at + 7],
+                    region[at + 8],
+                ]);
+                at += EDGE_BYTES;
+                if target_layer >= layer_counts.len() || target_rank >= layer_counts[target_layer] {
+                    return Err(format!(
+                        "node {} names layer {} rank {} and no node is there",
+                        point, target_layer, target_rank
+                    ));
+                }
+                if !distance.is_finite() {
+                    return Err(format!(
+                        "node {} carries a distance of {} at layer {}",
+                        point, distance, layer
+                    ));
+                }
+                if target_rank > i32::MAX as usize {
+                    return Err(format!(
+                        "node {} names rank {}, which is not an i32",
+                        point, target_rank
+                    ));
+                }
+                edges.push(LoadedEdge {
+                    target: PointId(target_layer as u8, target_rank as i32),
+                    distance,
+                });
+            }
+            lists.push(edges);
+        }
+        out.push(lists);
+    }
+    if at != region.len() {
+        return Err(format!(
+            "the graph dump's adjacency holds {} bytes beyond its {} nodes",
+            region.len() - at,
+            nb_point
+        ));
+    }
+    Ok(out)
+}
+
+/// The version 1 walk the graph's constructor takes: each target resolved
+/// from its layer and rank to its node index, and each list put in the order
+/// of its stored distances, stable on ties.
+impl ListWalk for AdjacencyWalk<'_> {
+    fn next_lists(
+        &mut self,
+        layer_offsets: &[u32; LAYERS + 1],
+        lists: &mut Vec<Vec<u32>>,
+    ) -> Result<usize, String> {
+        let mut carried = std::mem::take(&mut self.carried);
+        let list_count = self.next_point(&mut carried);
+        while lists.len() < list_count {
+            lists.push(Vec::new());
+        }
+        let mut result = Ok(list_count);
+        for (list, targets) in carried.iter().zip(lists.iter_mut()).take(list_count) {
+            if let Err(reason) = ordered_targets(list, layer_offsets, &mut self.ordered, targets) {
+                result = Err(reason);
+                break;
+            }
+        }
+        self.carried = carried;
+        result
+    }
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checksum::Checksum;
+    use crate::distance::CosineDist;
+    use crate::space::Position;
+    use crate::storage::FsDir;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Build a small graph the tests can round trip.
+    fn sample_graph(
+        records: usize,
+        dim: usize,
+        m: usize,
+    ) -> (
+        MutableGraph<f32, CosineDist>,
+        crate::graph::store::VectorStore<f32>,
+    ) {
+        let scale = crate::graph::levels::LevelGenerator::default_scale(m);
+        let mut levels = crate::graph::levels::LevelGenerator::new(scale, NB_LAYER_MAX as usize);
+        let (mut graph, mut store) =
+            MutableGraph::new(dim, m, 64, scale, records.max(1), CosineDist {}).unwrap();
+        // A cheap deterministic spread. The graph's shape does not matter here,
+        // only that it has one and that the same call makes the same one.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for id in 0..records {
+            let vector: Vec<f32> = (0..dim)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / 16_777_216.0 - 0.5
+                })
+                .collect();
+            graph.insert(&mut store, &vector, id, &mut levels);
+        }
+        (graph, store)
+    }
+
+    /// The whole graph as plain values, for comparing one against another.
+    ///
+    /// Keyed by origin id rather than by position, because two graphs that hold
+    /// the same points in the same layers still have to agree on which point is
+    /// where, and a position keyed comparison would pass that by. The
+    /// neighbours are the targets' origin ids and the distance's exact bits, in
+    /// list order.
+    #[allow(clippy::type_complexity)]
+    fn topology<D: Distance<f32> + Send + Sync>(
+        graph: &MutableGraph<f32, D>,
+        store: &crate::graph::store::VectorStore<f32>,
+    ) -> BTreeMap<usize, (u8, i32, Vec<u32>, Vec<Vec<(usize, u32)>>)> {
+        let point_ids = graph.point_ids();
+        let mut out = BTreeMap::new();
+        for node in 0..graph.nb_points() as u32 {
+            let p_id = point_ids[node as usize];
+            let values = store.get(node).iter().map(|v| v.to_bits()).collect();
+            let adjacency = graph
+                .neighbourhood_ids(store, node)
+                .iter()
+                .map(|list| {
+                    list.iter()
+                        .map(|&(id, distance)| (id, distance.to_bits()))
+                        .collect()
+                })
+                .collect();
+            out.insert(
+                graph.origin_id_of(node),
+                (p_id.0, p_id.1, values, adjacency),
+            );
+        }
+        out
+    }
+
+    /// The reason a read was refused. Neither graph is `Debug`, so `unwrap_err`
+    /// and `expect_err` are both out of reach.
+    fn refused<T, D>(
+        result: Result<(MutableGraph<T, D>, crate::graph::store::VectorStore<T>), String>,
+    ) -> String
+    where
+        T: DumpElement,
+        D: Distance<T> + Send + Sync,
+    {
+        match result {
+            Ok(_) => panic!("a dump that should have been refused was accepted"),
+            Err(reason) => reason,
+        }
+    }
+
+    fn expected_for(graph: &MutableGraph<f32, CosineDist>, dim: usize, nodes: usize) -> Expected {
+        Expected {
+            kind: GraphKind::Cosine,
+            dimension: dim,
+            m: graph.m(),
+            ef_construction: graph.ef_construction(),
+            min_nodes: nodes,
+            // `sample_graph` inserts under ids 0 to records - 1, so the largest
+            // one it ever issues is the last.
+            max_origin_id: nodes.saturating_sub(1),
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn a_round_trip_reproduces_every_node_and_every_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let (built, built_store) = sample_graph(600, 12, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let expected = expected_for(&built, 12, 600);
+        let (read, _read_store): (MutableGraph<f32, CosineDist>, _) = read_dump(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &expected,
+            CosineDist {},
+        )
+        .unwrap();
+
+        assert_eq!(read.nb_points(), built.nb_points());
+        assert_eq!(read.m(), 16);
+        assert_eq!(read.ef_construction(), built.ef_construction());
+        assert_eq!(read.level_scale(), built.level_scale());
+        assert_eq!(read.entry_point_id(), built.entry_point_id());
+
+        let before = topology(&built, &built_store);
+        let after = topology(&read, &_read_store);
+        assert_eq!(before.len(), after.len());
+        let mut differing_nodes = 0;
+        let mut differing_edges = 0;
+        for (id, left) in &before {
+            let right = after.get(id).expect("a node went missing");
+            if left.0 != right.0 || left.1 != right.1 || left.2 != right.2 {
+                differing_nodes += 1;
+            }
+            for (l, list) in left.3.iter().enumerate() {
+                if list != &right.3[l] {
+                    differing_edges += 1;
+                }
+            }
+        }
+        assert_eq!(differing_nodes, 0);
+        assert_eq!(differing_edges, 0);
+    }
+
+    #[test]
+    fn writing_the_same_graph_twice_gives_the_same_bytes() {
+        let one = tempfile::tempdir().unwrap();
+        let two = tempfile::tempdir().unwrap();
+        let (built, built_store) = sample_graph(300, 8, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(one.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let expected = expected_for(&built, 8, 300);
+        let (read, read_store): (MutableGraph<f32, CosineDist>, _) = read_dump(
+            &FsDir::new(one.path()),
+            DUMP_FILENAME,
+            &expected,
+            CosineDist {},
+        )
+        .unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(two.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(one.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(two.path().join(DUMP_FILENAME)).unwrap()
+        );
+    }
+
+    #[test]
+    fn m_at_the_top_of_the_range_survives() {
+        // 256 is what the index admits and what the vendored header, a u8,
+        // recorded as 0.
+        for m in [2usize, 16, 255, 256] {
+            let dir = tempfile::tempdir().unwrap();
+            let (built, built_store) = sample_graph(120, 6, m);
+            assert_eq!(built.m(), m);
+            write_dump(
+                &built.dump_view(&built_store),
+                GraphKind::Cosine,
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+            )
+            .unwrap();
+            let expected = expected_for(&built, 6, 120);
+            let (read, read_store): (MutableGraph<f32, CosineDist>, _) = read_dump(
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+                &expected,
+                CosineDist {},
+            )
+            .unwrap();
+            assert_eq!(read.m(), m);
+            assert_eq!(topology(&built, &built_store), topology(&read, &read_store));
+        }
+    }
+
+    /// Round trip one damaged file and report what the reader said.
+    fn damaged(mutate: impl FnOnce(Vec<u8>) -> Vec<u8>) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let (built, built_store) = sample_graph(200, 6, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let path = dir.path().join(DUMP_FILENAME);
+        let blob = std::fs::read(&path).unwrap();
+        std::fs::write(&path, mutate(blob)).unwrap();
+        let expected = expected_for(&built, 6, 200);
+        refused(read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &expected,
+            CosineDist {},
+        ))
+    }
+
+    #[test]
+    fn every_damaged_input_is_an_error() {
+        assert!(damaged(|_| Vec::new()).contains("smallest"));
+        assert!(damaged(|b| b[..96].to_vec()).contains("smallest"));
+        // Long enough to clear the floor, so the header parses and the size it
+        // implies is what refuses it.
+        assert!(damaged(|b| b[..112].to_vec()).contains("the file holds"));
+        assert!(damaged(|b| b[..b.len() / 2].to_vec()).contains("the file holds"));
+        assert!(damaged(|b| b[..b.len() - 1].to_vec()).contains("the file holds"));
+        assert!(damaged(|mut b| {
+            b.extend_from_slice(&[0u8; 16]);
+            b
+        })
+        .contains("the file holds"));
+        assert!(damaged(|mut b| {
+            b[0] ^= 0xff;
+            b
+        })
+        .contains("not a ZeusDB graph dump"));
+        assert!(damaged(|mut b| {
+            b[8..12].copy_from_slice(&99u32.to_le_bytes());
+            b
+        })
+        .contains("format version"));
+        assert!(damaged(|mut b| {
+            b[40] ^= 0x01;
+            b
+        })
+        .contains("header is corrupt"));
+        // A flipped bit in the vector region, where every length still agrees.
+        assert!(damaged(|mut b| {
+            let at = b.len() - 32;
+            b[at] ^= 0x10;
+            b
+        })
+        .contains("contents are corrupt"));
+        assert!(damaged(|mut b| {
+            let at = b.len() - 8;
+            b[at..].copy_from_slice(&0u64.to_le_bytes());
+            b
+        })
+        .contains("does not end where it says"));
+    }
+
+    #[test]
+    fn an_absent_file_is_an_error_rather_than_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let (built, _built_store) = sample_graph(50, 4, 16);
+        let expected = expected_for(&built, 4, 50);
+        let reason = refused(read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &expected,
+            CosineDist {},
+        ));
+        assert!(reason.contains("holds no ZeusDB graph dump"), "{}", reason);
+    }
+
+    #[test]
+    fn a_save_clears_the_files_an_earlier_release_left() {
+        let dir = tempfile::tempdir().unwrap();
+        for legacy in LEGACY_DUMP_FILENAMES {
+            std::fs::write(dir.path().join(legacy), vec![7u8; 4096]).unwrap();
+        }
+        let (built, built_store) = sample_graph(100, 5, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec![DUMP_FILENAME.to_string()], "{:?}", left);
+
+        // And a save into a directory that never held them is unbothered.
+        let clean = tempfile::tempdir().unwrap();
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(clean.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        assert!(clean.path().join(DUMP_FILENAME).exists());
+    }
+
+    #[test]
+    fn a_dump_in_the_vendored_format_is_not_recognised() {
+        // MAGICDESCR_4, which is what a 0.6.0 dump opens with. There is no
+        // reader for it and there is deliberately not going to be one, so the
+        // only thing that has to hold is that it is rejected cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let (built, _built_store) = sample_graph(50, 4, 16);
+        let mut blob = 0x002a_6779u32.to_le_bytes().to_vec();
+        blob.extend_from_slice(&[0u8; 4096]);
+        std::fs::write(dir.path().join(DUMP_FILENAME), &blob).unwrap();
+        let expected = expected_for(&built, 4, 50);
+        let reason = refused(read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &expected,
+            CosineDist {},
+        ));
+        assert!(reason.contains("not a ZeusDB graph dump"), "{}", reason);
+    }
+
+    /// A header this build wrote, carrying a node count nothing could hold.
+    ///
+    /// The Python damage tests cannot reach this, because rewriting the field
+    /// breaks the header checksum and the reader stops there. Only the writer
+    /// can produce a header that is internally consistent, so the check that
+    /// the reader refuses to allocate from it is made here.
+    #[test]
+    fn a_header_claiming_a_billion_points_allocates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (built, built_store) = sample_graph(80, 4, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let path = dir.path().join(DUMP_FILENAME);
+        let blob = std::fs::read(&path).unwrap();
+
+        let mut header = Header::decode(&{
+            let mut raw = [0u8; HEADER_BYTES];
+            raw.copy_from_slice(&blob[..HEADER_BYTES]);
+            raw
+        })
+        .unwrap();
+        header.nb_point = 1_000_000_000;
+        let mut damaged = header.encode().to_vec();
+        damaged.extend_from_slice(&blob[HEADER_BYTES..]);
+        std::fs::write(&path, &damaged).unwrap();
+
+        let expected = expected_for(&built, 4, 80);
+        let reason = refused(read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &expected,
+            CosineDist {},
+        ));
+        // Rejected on the size the fields imply, before the layer table is even
+        // read, so no allocation is ever sized from the count.
+        assert!(reason.contains("its own fields need"), "{}", reason);
+
+        // And the same again with a count large enough that the arithmetic
+        // itself overflows rather than merely disagreeing.
+        header.nb_point = u64::MAX / 2;
+        let mut damaged = header.encode().to_vec();
+        damaged.extend_from_slice(&blob[HEADER_BYTES..]);
+        std::fs::write(&path, &damaged).unwrap();
+        let reason = refused(read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &expected,
+            CosineDist {},
+        ));
+        assert!(reason.contains("no file could hold"), "{}", reason);
+    }
+
+    /// An origin id above what `config.json` counted is refused.
+    ///
+    /// Found by [`super::fuzz`] on its first run, as a splice that dropped 46
+    /// bytes of vector data over the origin id region with both checksums
+    /// repaired. The structure then keyed an id-to-node array by the origin
+    /// id, so one point declaring 2^59 asked for 3.4 exabytes and **the
+    /// process aborted on the allocation**, which no `catch_unwind` can see and which in
+    /// a Python process kills the interpreter with no traceback. That is the
+    /// failure mode the vendored reader's `std::process::exit(1)` was replaced
+    /// to remove.
+    ///
+    /// The ceiling is `config.json`'s `id_counter`, which is exact: a save holds
+    /// the mutation lock for its whole run, so the counter and the graph come
+    /// from one instant and every id in the dump was issued before the counter
+    /// was read.
+    #[test]
+    fn an_origin_id_above_what_config_counted_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (built, built_store) = sample_graph(80, 4, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let path = dir.path().join(DUMP_FILENAME);
+        let blob = std::fs::read(&path).unwrap();
+
+        // The origin id region opens straight after the header and the layer
+        // table, so this rewrites the first point's id and leaves every length
+        // in the file unchanged.
+        let at = HEADER_BYTES + NB_LAYER_MAX as usize * LAYER_TABLE_ENTRY_BYTES;
+        let repaired = |id: u64| {
+            let mut damaged = blob.clone();
+            damaged[at..at + ORIGIN_ID_BYTES].copy_from_slice(&id.to_le_bytes());
+            // The payload checksum, recomputed, which is what a random
+            // corruption cannot do and what makes this a reader question rather
+            // than a checksum question.
+            let end = damaged.len() - TRAILER_BYTES;
+            let sum = checksum_of(&damaged[HEADER_BYTES..end]);
+            damaged[end..end + 8].copy_from_slice(&sum.to_le_bytes());
+            std::fs::write(&path, &damaged).unwrap();
+            let expected = expected_for(&built, 4, 80);
+            refused(read_dump::<f32, CosineDist>(
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+                &expected,
+                CosineDist {},
+            ))
+        };
+
+        assert!(
+            repaired(1 << 59).contains("names origin id 576460752303423488"),
+            "{}",
+            repaired(1 << 59)
+        );
+        assert!(repaired(u64::MAX).contains("names origin id"));
+        // One past the ceiling is refused as well, so the bound is the counter
+        // rather than a margin around it.
+        assert!(repaired(80).contains("config.json counted 79"));
+
+        // And the largest id the index really issued is accepted, so the check
+        // refuses nothing a save wrote.
+        std::fs::write(&path, &blob).unwrap();
+        let expected = expected_for(&built, 4, 80);
+        assert!(read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &expected,
+            CosineDist {}
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_dump_written_for_another_configuration_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (built, built_store) = sample_graph(120, 6, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+
+        let refuse = |expected: &Expected| {
+            refused(read_dump::<f32, CosineDist>(
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+                expected,
+                CosineDist {},
+            ))
+        };
+
+        let base = expected_for(&built, 6, 120);
+        assert!(refuse(&Expected {
+            kind: GraphKind::L2,
+            ..base
+        })
+        .contains("was written for cosine"));
+        assert!(refuse(&Expected {
+            dimension: 7,
+            ..base
+        })
+        .contains("values per point"));
+        assert!(refuse(&Expected { m: 17, ..base }).contains("written at m 16"));
+        assert!(refuse(&Expected {
+            ef_construction: 65,
+            ..base
+        })
+        .contains("ef_construction"));
+        // More live records than the dump holds nodes, which is the shape of a
+        // directory whose graph belongs to an earlier, smaller save.
+        assert!(refuse(&Expected {
+            min_nodes: 121,
+            ..base
+        })
+        .contains("and the index holds"));
+
+        // The element type is checked as well, so a raw dump handed to the
+        // quantized reader is refused rather than read at a quarter the width.
+        assert!(refused(read_dump::<u8, ByteDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &base,
+            ByteDist {}
+        ))
+        .contains("element type"));
+    }
+
+    /// A `u8` distance, only so the element type check has something to refuse.
+    struct ByteDist;
+
+    impl Distance<u8> for ByteDist {
+        fn eval(&self, _va: &[u8], _vb: &[u8]) -> f32 {
+            0.0
+        }
+    }
+
+    #[test]
+    fn the_checksum_does_not_depend_on_how_the_bytes_were_split() {
+        let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let whole = checksum_of(&payload);
+        for split in [1usize, 3, 7, 8, 9, 64, 511] {
+            let mut sum = Checksum::new();
+            for chunk in payload.chunks(split) {
+                sum.write(chunk);
+            }
+            assert_eq!(sum.finish(), whole, "split {}", split);
+        }
+        // Appended zeros change the answer, which a length blind fold would not
+        // catch, and a single flipped bit changes it too.
+        let mut longer = payload.clone();
+        longer.push(0);
+        assert_ne!(checksum_of(&longer), whole);
+        let mut flipped = payload.clone();
+        flipped[500] ^= 0x01;
+        assert_ne!(checksum_of(&flipped), whole);
+    }
+
+    #[test]
+    fn the_header_is_ninety_six_bytes_and_checksums_itself() {
+        let header = Header {
+            kind: GraphKind::L1Pq,
+            element: 2,
+            nb_layer: NB_LAYER_MAX,
+            dimension: 96,
+            m: 256,
+            ef_construction: 200,
+            nb_point: 12345,
+            level_scale: 0.25,
+            entry_layer: 3,
+            entry_rank: 7,
+            adjacency_bytes: 999,
+            file_bytes: 4242,
+        };
+        let raw = header.encode();
+        assert_eq!(raw.len(), HEADER_BYTES);
+        let back = Header::decode(&raw).unwrap();
+        assert_eq!(back.kind, GraphKind::L1Pq);
+        assert_eq!(back.m, 256);
+        assert_eq!(back.nb_point, 12345);
+        assert_eq!(back.level_scale, 0.25);
+        assert_eq!(back.entry_rank, 7);
+        assert_eq!(back.adjacency_bytes, 999);
+        assert_eq!(back.file_bytes, 4242);
+
+        // Every byte the checksum covers is actually covered by it.
+        for at in 0..HEADER_CHECKSUM_BYTES {
+            let mut broken = raw;
+            broken[at] ^= 0x01;
+            assert!(
+                Header::decode(&broken).is_err(),
+                "byte {} passed unchecked",
+                at
+            );
+        }
+    }
+
+    type ReadGraph = (
+        MutableGraph<f32, CosineDist>,
+        crate::graph::store::VectorStore<f32>,
+    );
+
+    /// The dump in `dir` read by the reader and by the reference, which
+    /// decodes every list into a block of its own and builds a point at a
+    /// time.
+    fn read_both(dir: &std::path::Path, expected: &Expected) -> (ReadGraph, ReadGraph) {
+        let read = read_dump(&FsDir::new(dir), DUMP_FILENAME, expected, CosineDist {})
+            .unwrap_or_else(|e| panic!("the reader refused: {}", e));
+        let reference =
+            read_dump_reference(&FsDir::new(dir), DUMP_FILENAME, expected, CosineDist {})
+                .unwrap_or_else(|e| panic!("the reference refused: {}", e));
+        (read, reference)
+    }
+
+    /// A store as its request and its values' bytes.
+    fn store_bytes(store: &crate::graph::store::VectorStore<f32>) -> (usize, Vec<u8>) {
+        let mut bytes = Vec::new();
+        f32::encode(store.values(), &mut bytes);
+        (store.memory_bytes(), bytes)
+    }
+
+    /// Lists that declare more entries than the region's bytes carry are
+    /// refused on the region's length, before anything is sized.
+    ///
+    /// Two forgeries, each with the payload checksum repaired, so nothing but
+    /// the region check can refuse them. In the first every list the dump
+    /// records declares 2^32 - 1 entries, several hundred lists of them, a
+    /// declared total past 2^40 entries that no allocation from the counts
+    /// could have been asked for and survived, and the first list is refused
+    /// on the region's length. In the second the first list declares exactly
+    /// as many entries as the rest of the region could hold, a count the
+    /// region's length admits and the slots a list has in the graph do not,
+    /// so it is refused on those. Both are refused by the region check, which
+    /// runs before the graph's constructor sizes anything, and the reference
+    /// refuses both in the same words.
+    #[test]
+    fn a_dump_declaring_more_neighbours_than_its_bytes_carry_is_refused_before_anything_is_sized() {
+        let dir = tempfile::tempdir().unwrap();
+        let (built, built_store) = sample_graph(200, 6, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let path = dir.path().join(DUMP_FILENAME);
+        let blob = std::fs::read(&path).unwrap();
+        let expected = expected_for(&built, 6, 200);
+
+        let mut raw = [0u8; HEADER_BYTES];
+        raw.copy_from_slice(&blob[..HEADER_BYTES]);
+        let region_bytes = Header::decode(&raw).unwrap().adjacency_bytes as usize;
+        let region_at =
+            HEADER_BYTES + NB_LAYER_MAX as usize * LAYER_TABLE_ENTRY_BYTES + 200 * ORIGIN_ID_BYTES;
+
+        // Where every list's count sits, read off the region as written.
+        let mut counts: Vec<usize> = Vec::new();
+        let mut at = region_at;
+        for _ in 0..200 {
+            let lists = blob[at] as usize;
+            at += 1;
+            for _ in 0..lists {
+                counts.push(at);
+                let entries =
+                    u32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]]);
+                at += 4 + entries as usize * EDGE_BYTES;
+            }
+        }
+        assert_eq!(at, region_at + region_bytes);
+        assert!(counts.len() > 256, "{} lists", counts.len());
+
+        let refusal = |edit: &dyn Fn(&mut [u8])| {
+            let mut forged = blob.clone();
+            edit(&mut forged);
+            let end = forged.len() - TRAILER_BYTES;
+            let sum = checksum_of(&forged[HEADER_BYTES..end]);
+            forged[end..end + 8].copy_from_slice(&sum.to_le_bytes());
+            std::fs::write(&path, &forged).unwrap();
+            let reason = refused(read_dump::<f32, CosineDist>(
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+                &expected,
+                CosineDist {},
+            ));
+            let reference = refused(read_dump_reference::<f32, CosineDist>(
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+                &expected,
+                CosineDist {},
+            ));
+            assert_eq!(reason, reference);
+            // Refused by the region check rather than by the constructor.
+            assert!(!reason.contains("could not be rebuilt"), "{}", reason);
+            reason
+        };
+
+        let every = refusal(&|forged| {
+            for &count in &counts {
+                forged[count..count + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            }
+        });
+        assert!(
+            every.contains(
+                "node 0 declares 4294967295 neighbours at layer 0 and the dump has room for"
+            ),
+            "{}",
+            every
+        );
+
+        let first = counts[0];
+        let room = ((region_at + region_bytes - (first + 4)) / EDGE_BYTES) as u32;
+        let past = refusal(&|forged| {
+            forged[first..first + 4].copy_from_slice(&room.to_le_bytes());
+        });
+        assert!(
+            past.starts_with("node 0 ") || past.starts_with("the graph dump's adjacency"),
+            "{}",
+            past
+        );
+    }
+
+    /// One point, which carries no list, reads back to the graph the
+    /// reference builds and writes back to the same bytes.
+    #[test]
+    fn a_dump_of_one_point_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let (built, built_store) = sample_graph(1, 5, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let expected = expected_for(&built, 5, 1);
+        let ((read, read_store), (reference, reference_store)) = read_both(dir.path(), &expected);
+        assert_eq!(read.nb_points(), 1);
+        assert_eq!(read.nb_edges(), 0);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(store_bytes(&read_store), store_bytes(&reference_store));
+        assert_eq!(topology(&built, &built_store), topology(&read, &read_store));
+
+        let again = tempfile::tempdir().unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(again.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(again.path().join(DUMP_FILENAME)).unwrap()
+        );
+    }
+
+    /// A point recording an empty list at every one of the sixteen layers is
+    /// accepted and builds the graph the reference builds.
+    ///
+    /// The writer trims trailing empty lists, so no save writes one, and the
+    /// dump here is forged from a one point dump with every length and both
+    /// checksums made to agree. The point sits alone at the top layer, so it
+    /// opens a list at every layer up to its level and fills none. The read
+    /// graph writes a dump that records no list for it, and that dump reads
+    /// back to the same graph.
+    #[test]
+    fn a_point_with_an_empty_list_at_every_layer_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let (built, built_store) = sample_graph(1, 4, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let blob = std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap();
+        let mut raw = [0u8; HEADER_BYTES];
+        raw.copy_from_slice(&blob[..HEADER_BYTES]);
+        let mut header = Header::decode(&raw).unwrap();
+        assert_eq!(header.adjacency_bytes, 1, "the point records no list");
+
+        let top = NB_LAYER_MAX as usize - 1;
+        let origin_at = HEADER_BYTES + NB_LAYER_MAX as usize * LAYER_TABLE_ENTRY_BYTES;
+        let region_at = origin_at + ORIGIN_ID_BYTES;
+        let mut body: Vec<u8> = Vec::new();
+        for layer in 0..NB_LAYER_MAX as usize {
+            let count: u32 = if layer == top { 1 } else { 0 };
+            body.extend_from_slice(&count.to_le_bytes());
+        }
+        body.extend_from_slice(&blob[origin_at..region_at]);
+        body.push(NB_LAYER_MAX);
+        for _ in 0..NB_LAYER_MAX {
+            body.extend_from_slice(&0u32.to_le_bytes());
+        }
+        body.extend_from_slice(&blob[region_at + 1..blob.len() - TRAILER_BYTES]);
+        header.adjacency_bytes = 1 + 4 * NB_LAYER_MAX as u64;
+        header.entry_layer = top as u32;
+        header.entry_rank = 0;
+        header.file_bytes = (HEADER_BYTES + body.len() + TRAILER_BYTES) as u64;
+        let mut forged = header.encode().to_vec();
+        forged.extend_from_slice(&body);
+        forged.extend_from_slice(&checksum_of(&body).to_le_bytes());
+        forged.extend_from_slice(&MAGIC.to_le_bytes());
+        std::fs::write(dir.path().join(DUMP_FILENAME), &forged).unwrap();
+
+        let expected = expected_for(&built, 4, 1);
+        let ((read, read_store), (reference, reference_store)) = read_both(dir.path(), &expected);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(store_bytes(&read_store), store_bytes(&reference_store));
+        assert_eq!(read.level(0), top as u8);
+        assert_eq!(read.entry_level(), top as u8);
+        assert_eq!(read.nb_edges(), 0);
+        assert_eq!(read.nb_upper_lists(), top);
+
+        let again = tempfile::tempdir().unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(again.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let ((reread, reread_store), _) = read_both(again.path(), &expected);
+        assert_eq!(reread.arrays(), read.arrays());
+        assert_eq!(store_bytes(&reread_store), store_bytes(&read_store));
+    }
+
+    /// The reader builds the graph the points build, buffer for buffer.
+    ///
+    /// The reference decodes every list into a block of its own and builds
+    /// through `from_points` a vector at a time. The reader walks the region's
+    /// bytes into the graph's arrays and fills the store afterwards. Over
+    /// graphs of three layers and more, the deepest of them more than six,
+    /// carrying lists above their owners' levels, every buffer, every
+    /// capacity and every scalar agree, the stores agree, and both hold every
+    /// node and every edge the written graph held.
+    #[test]
+    fn the_reader_builds_the_graph_the_points_build() {
+        let mut deepest = 0;
+        for (records, dim, m) in [(1_500usize, 6usize, 2usize), (2_000, 8, 4), (1_200, 12, 16)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (built, built_store) = sample_graph(records, dim, m);
+            write_dump(
+                &built.dump_view(&built_store),
+                GraphKind::Cosine,
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+            )
+            .unwrap();
+            let expected = expected_for(&built, dim, records);
+            let ((read, read_store), (reference, reference_store)) =
+                read_both(dir.path(), &expected);
+
+            let layers = (0..NB_LAYER_MAX as usize)
+                .filter(|&layer| read.layer_len(layer) > 0)
+                .count();
+            assert!(layers >= 3, "m {} holds {} layers", m, layers);
+            deepest = deepest.max(layers);
+            assert!(read.above_level_edges() > 0, "m {}", m);
+
+            assert_eq!(read.arrays(), reference.arrays(), "m {}", m);
+            assert_eq!(
+                store_bytes(&read_store),
+                store_bytes(&reference_store),
+                "m {}",
+                m
+            );
+            assert_eq!(read.memory_bytes(), reference.memory_bytes(), "m {}", m);
+            assert_eq!(
+                topology(&built, &built_store),
+                topology(&read, &read_store),
+                "m {}",
+                m
+            );
+        }
+        assert!(deepest > 6, "the deepest graph holds {} layers", deepest);
+    }
+
+    /// `parsed` written into a directory of its own.
+    fn written(parsed: &ParsedDump<f32>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        write_dump::<f32, _>(
+            parsed,
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        dir
+    }
+
+    /// The dump `graph` writes, parsed back under `expected`.
+    ///
+    /// Written back unaltered, the parse is the file it came from, byte for
+    /// byte, so a forgery made from it differs from a save in what a test
+    /// alters and in nothing else.
+    fn parse_written(
+        graph: &MutableGraph<f32, CosineDist>,
+        store: &crate::graph::store::VectorStore<f32>,
+        expected: &Expected,
+    ) -> ParsedDump<f32> {
+        let dir = tempfile::tempdir().unwrap();
+        write_dump(
+            &graph.dump_view(store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let parsed = parse_dump::<f32>(&FsDir::new(dir.path()), DUMP_FILENAME, expected).unwrap();
+        let again = written(&parsed);
+        assert_eq!(
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(again.path().join(DUMP_FILENAME)).unwrap(),
+            "a parse written back is not the file it was parsed from"
+        );
+        parsed
+    }
+
+    /// The reader's refusal of the dump in `dir`, which the reference gives
+    /// in the same words.
+    fn refused_by_both(dir: &std::path::Path, expected: &Expected) -> String {
+        let reason = refused(read_dump::<f32, CosineDist>(
+            &FsDir::new(dir),
+            DUMP_FILENAME,
+            expected,
+            CosineDist {},
+        ));
+        let reference = refused(read_dump_reference::<f32, CosineDist>(
+            &FsDir::new(dir),
+            DUMP_FILENAME,
+            expected,
+            CosineDist {},
+        ));
+        assert_eq!(reason, reference);
+        reason
+    }
+
+    /// `graph` written, read back at the counter its own ids reach to the
+    /// reference's graph and to the written graph's topology, and written
+    /// again to the same bytes.
+    fn round_trips_at_its_counter(
+        graph: &MutableGraph<f32, CosineDist>,
+        store: &crate::graph::store::VectorStore<f32>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        write_dump(
+            &graph.dump_view(store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let expected = expected_for(graph, graph.dim(), graph.nb_points());
+        let ((read, read_store), (reference, reference_store)) = read_both(dir.path(), &expected);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(store_bytes(&read_store), store_bytes(&reference_store));
+        assert_eq!(topology(graph, store), topology(&read, &read_store));
+
+        let again = tempfile::tempdir().unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(again.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(again.path().join(DUMP_FILENAME)).unwrap()
+        );
+    }
+
+    /// A dump holding more nodes than the ids its directory issued is refused
+    /// on its header, before its layers or its ids are read.
+    ///
+    /// No two nodes are filed under one id and none above the counter, so a
+    /// dump holds at most one node for each id from zero to the counter. Read
+    /// at the counter its own ids reach, the dump loads. Read one below, it is
+    /// refused in the node count's words rather than in those of the id above
+    /// the counter, which only reading the ids would find. One point under
+    /// the only id the counter issued, with two more filed under it at the
+    /// top layer, is refused the same way, and a counter too large to add one
+    /// to bounds nothing rather than wrapping.
+    #[test]
+    fn a_dump_holding_more_nodes_than_its_counter_allows_is_refused_on_its_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let (built, built_store) = sample_graph(40, 4, 16);
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let at_the_counter = expected_for(&built, 4, 40);
+        assert_eq!(at_the_counter.max_origin_id, 39);
+        assert!(read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &at_the_counter,
+            CosineDist {}
+        )
+        .is_ok());
+        let below = Expected {
+            max_origin_id: 38,
+            ..at_the_counter
+        };
+        assert_eq!(
+            refused_by_both(dir.path(), &below),
+            "the graph dump holds 40 nodes and config.json counted 38"
+        );
+        let unbounded = Expected {
+            max_origin_id: usize::MAX,
+            ..at_the_counter
+        };
+        assert!(read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &unbounded,
+            CosineDist {}
+        )
+        .is_ok());
+
+        let (one, one_store) = sample_graph(1, 4, 16);
+        let only = expected_for(&one, 4, 1);
+        let mut forged = parse_written(&one, &one_store, &only);
+        let point = forged
+            .points_by_layer
+            .iter()
+            .flatten()
+            .next()
+            .unwrap()
+            .clone();
+        let top = NB_LAYER_MAX as usize - 1;
+        forged.points_by_layer[top].push(point.clone());
+        forged.points_by_layer[top].push(point);
+        assert_eq!(
+            refused_by_both(written(&forged).path(), &only),
+            "the graph dump holds 3 nodes and config.json counted 0"
+        );
+    }
+
+    /// One origin id named for two nodes is refused before anything is built.
+    ///
+    /// The dense index's node for each position is the inverse of the origin
+    /// ids, so each id names one node. The second point's id is overwritten with the
+    /// first's and nothing else is altered, so the node count still fits the
+    /// counter and the refusal is the repeated id's, not the constructor's.
+    /// The same two ids exchanged name one node each, and load.
+    #[test]
+    fn a_dump_naming_one_origin_id_for_two_nodes_is_refused_before_the_graph_is_built() {
+        let (built, built_store) = sample_graph(40, 4, 16);
+        let expected = expected_for(&built, 4, 40);
+        let parsed = parse_written(&built, &built_store, &expected);
+        let first = parsed.points_by_layer[0][0].origin_id;
+        let second = parsed.points_by_layer[0][1].origin_id;
+
+        let mut repeated = parsed.clone();
+        repeated.points_by_layer[0][1].origin_id = first;
+        assert_eq!(
+            refused_by_both(written(&repeated).path(), &expected),
+            format!(
+                "the graph dump names origin id {} for more than one node",
+                first
+            )
+        );
+
+        let mut exchanged = parsed.clone();
+        exchanged.points_by_layer[0][0].origin_id = second;
+        exchanged.points_by_layer[0][1].origin_id = first;
+        let dir = written(&exchanged);
+        let ((read, read_store), (reference, reference_store)) = read_both(dir.path(), &expected);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(store_bytes(&read_store), store_bytes(&reference_store));
+        assert_eq!(read.origin_id_of(0), second);
+        assert_eq!(read.origin_id_of(1), first);
+    }
+
+    /// A list longer than the slots its layer has in the graph is refused
+    /// before the graph is built, at layer zero and above.
+    ///
+    /// At `m` 2 a list holds 5 at layer zero and 3 above, the overflow slot
+    /// included. One list at each is given exactly that many entries and
+    /// loads, and one more and is refused in the region check's words, which
+    /// the reference gives too, rather than by the constructor. An `m` too
+    /// large to double is refused by the constructor's own range rule, the
+    /// slots saturating on the way rather than wrapping.
+    #[test]
+    fn a_list_longer_than_its_layer_holds_is_refused_before_the_graph_is_built() {
+        let (built, built_store) = sample_graph(300, 4, 2);
+        let expected = expected_for(&built, 4, 300);
+        let parsed = parse_written(&built, &built_store, &expected);
+        let layer_zero = parsed.points_by_layer[0].len();
+        assert!(parsed.points_by_layer[1].len() > 4);
+
+        // The first point of `layer` given a list of `count` entries there,
+        // each naming another point of the same layer.
+        let with_list = |layer: usize, count: usize| {
+            let mut forged = parsed.clone();
+            let point = &mut forged.points_by_layer[layer][0];
+            let lists = point.neighbours.len().max(layer + 1);
+            point.neighbours.resize(lists, Vec::new());
+            point.neighbours[layer] = (1..=count)
+                .map(|rank| LoadedEdge {
+                    target: PointId(layer as u8, rank as i32),
+                    distance: 0.5,
+                })
+                .collect();
+            written(&forged)
+        };
+
+        for (layer, node, slots) in [(0usize, 0usize, 5usize), (1, layer_zero, 3)] {
+            let full = with_list(layer, slots);
+            let ((read, _), (reference, _)) = read_both(full.path(), &expected);
+            assert_eq!(read.arrays(), reference.arrays(), "layer {}", layer);
+            assert_eq!(read.neighbours_at(node as u32, layer).len(), slots);
+
+            let past = with_list(layer, slots + 1);
+            assert_eq!(
+                refused_by_both(past.path(), &expected),
+                format!(
+                    "node {} declares {} neighbours at layer {} and a list there holds {}",
+                    node,
+                    slots + 1,
+                    layer,
+                    slots
+                )
+            );
+        }
+
+        let mut wide = parsed.clone();
+        wide.m = usize::MAX;
+        let reason = refused_by_both(
+            written(&wide).path(),
+            &Expected {
+                m: usize::MAX,
+                ..expected
+            },
+        );
+        assert!(
+            reason.starts_with(
+                "the graph dump could not be rebuilt: max_nb_connection is between 1 and 256"
+            ),
+            "{}",
+            reason
+        );
+    }
+
+    /// A graph holding an empty list at or below its owner's level reads back
+    /// to the reference's graph and writes the same bytes.
+    ///
+    /// A node's list at a layer is filled from a search at that layer when the
+    /// node arrives, and a layer at which no node yet has its top level yields
+    /// nothing, so a node can keep an empty list at a layer at or below its own
+    /// level. The deep graph a small `m` builds holds such lists. The rules
+    /// hold a list to its slots and an empty one to nothing, and the read is at
+    /// the counter the graph's own ids reach, the tightest the node count
+    /// allows.
+    #[test]
+    fn a_graph_holding_empty_upper_lists_reads_back_and_writes_the_same_bytes() {
+        let (built, built_store) = sample_graph(300, 4, 2);
+        let empty = (0..built.nb_points() as u32)
+            .filter(|&node| {
+                (1..=built.level(node) as usize)
+                    .any(|layer| built.neighbours_at(node, layer).is_empty())
+            })
+            .count();
+        assert!(
+            empty > 0,
+            "no node holds an empty list at or below its level"
+        );
+        round_trips_at_its_counter(&built, &built_store);
+    }
+
+    /// The largest `m` at the smallest dimension reads back to the
+    /// reference's graph and writes the same bytes.
+    #[test]
+    fn the_largest_m_at_the_smallest_dimension_reads_back_and_writes_the_same_bytes() {
+        let (built, built_store) = sample_graph(300, 1, 256);
+        assert_eq!((built.m(), built.dim()), (256, 1));
+        round_trips_at_its_counter(&built, &built_store);
+    }
+
+    /// What the graph a load builds from `parsed` holds, from the dump's
+    /// content alone.
+    struct LoadedShape {
+        /// Nodes, each with its per node arrays and its layer zero slots.
+        nodes: usize,
+        /// Upper words, being each node's span, the higher of its level and
+        /// the highest layer its lists fill, and the run the in-degree pass
+        /// appends whenever an entry names a node above its span.
+        words: usize,
+        /// Wide lists, being every list above layer zero that the dump fills
+        /// at or below its owner's level or fills with two or more entries
+        /// above it, and every node an entry names above layer zero, each node
+        /// and layer once.
+        wide: usize,
+        /// The wide lists the graph would hold were every list at or below
+        /// its owner's level opened wide whatever it holds.
+        wide_if_every_owned_list_were: usize,
+    }
+
+    fn loaded_shape(parsed: &ParsedDump<f32>) -> LoadedShape {
+        let mut first = Vec::with_capacity(parsed.points_by_layer.len());
+        let mut points: Vec<&LoadedPoint<f32>> = Vec::new();
+        let mut levels: Vec<usize> = Vec::new();
+        for (layer, layer_points) in parsed.points_by_layer.iter().enumerate() {
+            first.push(points.len());
+            for point in layer_points {
+                points.push(point);
+                levels.push(layer);
+            }
+        }
+        let node = |target: PointId| first[target.0 as usize] + target.1 as usize;
+        let mut spans: Vec<usize> = points
+            .iter()
+            .zip(&levels)
+            .map(|(point, &level)| {
+                point
+                    .neighbours
+                    .iter()
+                    .rposition(|list| !list.is_empty())
+                    .map_or(level, |highest| highest.max(level))
+            })
+            .collect();
+        let mut words: usize = spans.iter().sum();
+        let mut wide = BTreeSet::new();
+        for (owner, point) in points.iter().enumerate() {
+            for (layer, list) in point.neighbours.iter().enumerate().skip(1) {
+                if !list.is_empty() && (layer <= levels[owner] || list.len() >= 2) {
+                    wide.insert((owner, layer));
+                }
+            }
+        }
+        // The in-degree pass, in its order: every entry of every list up to
+        // the span its owner holds when the pass reaches it.
+        for owner in 0..points.len() {
+            for layer in 0..=spans[owner] {
+                for edge in points[owner].neighbours.get(layer).into_iter().flatten() {
+                    let target = node(edge.target);
+                    if layer > spans[target] {
+                        spans[target] = layer;
+                        words += layer;
+                    }
+                    if layer > 0 {
+                        wide.insert((target, layer));
+                    }
+                }
+            }
+        }
+        let mut owned = wide.clone();
+        for (owner, &level) in levels.iter().enumerate() {
+            for layer in 1..=level {
+                owned.insert((owner, layer));
+            }
+        }
+        LoadedShape {
+            nodes: points.len(),
+            words,
+            wide: wide.len(),
+            wide_if_every_owned_list_were: owned.len(),
+        }
+    }
+
+    /// The bytes the graph a load builds from `parsed` asks the allocator
+    /// for. Each node holds its origin id, its record's position, level,
+    /// layer zero length and counter, first word and span, and `2m + 1` layer
+    /// zero slots, each upper word four bytes, and each wide list a ten byte
+    /// descriptor and `m + 1` slots.
+    fn loaded_bytes(parsed: &ParsedDump<f32>) -> usize {
+        let shape = loaded_shape(parsed);
+        let m = parsed.m;
+        std::mem::size_of::<MutableGraph<f32, CosineDist>>()
+            + shape.nodes * (8 * m + 28)
+            + 4 * shape.words
+            + (4 * m + 14) * shape.wide
+    }
+
+    /// One node inserted alone at the top layer loads to the graph its save
+    /// wrote, holding a word a layer and no wide list.
+    ///
+    /// Insertion opens the node's lists at every layer up to its level wide,
+    /// because install site 2 fills them wholesale, and with no other node
+    /// nothing fills them, so the save records no list for it. A load opens
+    /// each as an empty word. The graph holds the built one's lists, its
+    /// storage is what the dump's content gives, it is the same graph read at
+    /// the largest counter, and it writes the same bytes again.
+    #[test]
+    fn a_node_alone_at_the_top_layer_loads_to_the_graph_its_save_wrote() {
+        let top = NB_LAYER_MAX as usize - 1;
+        let scale = crate::graph::levels::LevelGenerator::default_scale(16);
+        let (mut built, mut built_store) =
+            MutableGraph::new(4, 16, 64, scale, 1, CosineDist {}).unwrap();
+        let vector = [0.1f32, 0.2, 0.3, 0.4];
+        let planned = built.plan_insertion(&built_store, &vector, top);
+        built.install_insertion(&mut built_store, &vector, 1, 1, planned);
+        assert_eq!(built.level(0) as usize, top);
+        assert_eq!(built.nb_wide_lists(), top);
+
+        let dir = tempfile::tempdir().unwrap();
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let expected = Expected {
+            max_origin_id: 1,
+            ..expected_for(&built, 4, 1)
+        };
+        let ((read, read_store), (reference, reference_store)) = read_both(dir.path(), &expected);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(store_bytes(&read_store), store_bytes(&reference_store));
+        assert_eq!(topology(&built, &built_store), topology(&read, &read_store));
+        assert_eq!(read.entry_level() as usize, top);
+        assert_eq!((read.nb_upper_lists(), read.nb_wide_lists()), (top, 0));
+        let parsed = parse_dump::<f32>(&FsDir::new(dir.path()), DUMP_FILENAME, &expected).unwrap();
+        assert_eq!(loaded_shape(&parsed).wide_if_every_owned_list_were, top);
+        assert_eq!(read.memory_bytes(), loaded_bytes(&parsed));
+
+        let largest = Expected {
+            max_origin_id: u32::MAX as usize,
+            ..expected
+        };
+        let (at_largest, _) = read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &largest,
+            CosineDist {},
+        )
+        .unwrap();
+        assert_eq!(at_largest.arrays(), read.arrays());
+
+        let again = tempfile::tempdir().unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(again.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(again.path().join(DUMP_FILENAME)).unwrap()
+        );
+    }
+
+    /// Lists at or below their owners' levels that the dump leaves empty load
+    /// as words, and as wide lists where an entry names their owner.
+    ///
+    /// The deep graph a small `m` builds holds such lists, at layers no node
+    /// had reached when their owner arrived. Insertion opened them wide. A
+    /// load opens each as an empty word and the in-degree pass promotes the
+    /// ones an entry names, since the counter lives on the wide descriptor,
+    /// so the load holds one wide list fewer for each empty list nothing
+    /// names. Its storage is what the dump's content gives, it holds the
+    /// written graph's topology, and it writes the same bytes again.
+    #[test]
+    fn empty_lists_at_or_below_a_level_load_as_words_unless_an_entry_names_them() {
+        let (built, built_store) = sample_graph(300, 4, 2);
+        let (mut named, mut unnamed) = (0usize, 0usize);
+        for layer in 1..NB_LAYER_MAX as usize {
+            let counted = built.counted_in_degree(layer);
+            for node in 0..built.nb_points() as u32 {
+                if layer <= built.level(node) as usize
+                    && built.neighbours_at(node, layer).is_empty()
+                {
+                    if counted[node as usize] > 0 {
+                        named += 1;
+                    } else {
+                        unnamed += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            named > 0 && unnamed > 0,
+            "{} empty lists an entry names and {} nothing names",
+            named,
+            unnamed
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let expected = expected_for(&built, 4, 300);
+        let ((read, read_store), (reference, _)) = read_both(dir.path(), &expected);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(topology(&built, &built_store), topology(&read, &read_store));
+        let parsed = parse_dump::<f32>(&FsDir::new(dir.path()), DUMP_FILENAME, &expected).unwrap();
+        let shape = loaded_shape(&parsed);
+        assert_eq!(read.nb_wide_lists(), shape.wide);
+        assert_eq!(shape.wide_if_every_owned_list_were - shape.wide, unnamed);
+        assert_eq!(read.nb_upper_lists(), shape.words);
+        assert_eq!(read.memory_bytes(), loaded_bytes(&parsed));
+
+        let again = tempfile::tempdir().unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(again.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(again.path().join(DUMP_FILENAME)).unwrap()
+        );
+    }
+
+    /// A node the dump files at the top layer with no entry above layer zero
+    /// costs a word a layer and no wide list, at the largest `m` and the
+    /// smallest dimension, whatever counter the dump is read at.
+    ///
+    /// Three nodes are added at the top layer of a dump a save wrote, under
+    /// fresh ids, each a copy of a point's vector carrying one layer zero
+    /// entry at the distance a save records. Their lists above layer zero are
+    /// empty and nothing names them there, so the load gives them fifteen
+    /// words each and no wide list, where opening every list at or below a
+    /// level wide gives them fifteen wide lists each. The graph's storage is
+    /// what the dump's content gives, the same at the tightest counter and at
+    /// the largest, and a save of it writes the forged file again.
+    #[test]
+    fn a_node_filed_high_with_no_upper_entry_costs_a_word_a_layer() {
+        let top = NB_LAYER_MAX as usize - 1;
+        let (built, built_store) = sample_graph(300, 1, 256);
+        assert_eq!((built.m(), built.dim()), (256, 1));
+        let expected = expected_for(&built, 1, 300);
+        let parsed = parse_written(&built, &built_store, &expected);
+        let plain = written(&parsed);
+        let (base, _) = read_dump::<f32, CosineDist>(
+            &FsDir::new(plain.path()),
+            DUMP_FILENAME,
+            &expected,
+            CosineDist {},
+        )
+        .unwrap();
+
+        let mut forged = parsed.clone();
+        let donor = forged.points_by_layer[0][0].clone();
+        for k in 0..3usize {
+            let target = &forged.points_by_layer[0][k + 1];
+            let mut point = donor.clone();
+            point.origin_id = 300 + k;
+            point.neighbours = vec![vec![LoadedEdge {
+                target: PointId(0, k as i32 + 1),
+                distance: CosineDist {}.eval(&donor.data, &target.data),
+            }]];
+            forged.points_by_layer[top].push(point);
+        }
+        let dir = written(&forged);
+        let tight = Expected {
+            max_origin_id: 302,
+            ..expected
+        };
+        let ((read, read_store), (reference, _)) = read_both(dir.path(), &tight);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(read.nb_points(), 303);
+        assert_eq!(read.nb_wide_lists(), base.nb_wide_lists());
+        assert_eq!(read.nb_upper_lists(), base.nb_upper_lists() + 3 * top);
+        let reparsed = parse_dump::<f32>(&FsDir::new(dir.path()), DUMP_FILENAME, &tight).unwrap();
+        let shape = loaded_shape(&reparsed);
+        assert_eq!(shape.wide_if_every_owned_list_were - shape.wide, 3 * top);
+        assert_eq!(read.memory_bytes(), loaded_bytes(&reparsed));
+
+        let largest = Expected {
+            max_origin_id: u32::MAX as usize,
+            ..tight
+        };
+        let (at_largest, _) = read_dump::<f32, CosineDist>(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &largest,
+            CosineDist {},
+        )
+        .unwrap();
+        assert_eq!(at_largest.arrays(), read.arrays());
+
+        let again = tempfile::tempdir().unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(again.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(again.path().join(DUMP_FILENAME)).unwrap()
+        );
+    }
+
+    /// A loaded graph holding empty lists at or below its levels, changed by
+    /// insertion, gives the dumps and the pages the graph that wrote it gives
+    /// after the same insertions.
+    ///
+    /// Insertion does not depend on the form a list takes, and a load builds
+    /// the lists and the inbound counts of the graph that wrote the dump, so
+    /// the graph that never left memory is what the loaded one has to match.
+    /// Both take the same insertions at chosen levels, since a loaded graph
+    /// draws from a fresh stream, reaching every layer the graph holds and two
+    /// above it, so the lists the load held as words are counted into and
+    /// filled. Before the insertions and after them, every inbound counter of
+    /// each graph is the count of the lists naming its node, and the two hold
+    /// the same counts. After each insertion the two dumps are the same bytes.
+    /// Then the two answer the same pages, unfiltered and with ids filtered out
+    /// as a removal does, they evicted the same entries, a graph rebuilt from
+    /// the live points of each is the same graph, and each written and read
+    /// back is the same graph answering the same pages.
+    #[test]
+    fn a_loaded_graph_changed_after_the_load_matches_the_graph_that_wrote_it() {
+        type Graph = MutableGraph<f32, CosineDist>;
+        type Store = crate::graph::store::VectorStore<f32>;
+        fn dump_of(graph: &Graph, store: &Store) -> Vec<u8> {
+            let dir = tempfile::tempdir().unwrap();
+            write_dump(
+                &graph.dump_view(store),
+                GraphKind::Cosine,
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+            )
+            .unwrap();
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap()
+        }
+        fn spread(state: &mut u64) -> Vec<f32> {
+            (0..4)
+                .map(|_| {
+                    *state ^= *state << 13;
+                    *state ^= *state >> 7;
+                    *state ^= *state << 17;
+                    (*state >> 40) as f32 / 16_777_216.0 - 0.5
+                })
+                .collect()
+        }
+        // The lists naming each node at each layer, by origin id and layer,
+        // counted from the lists themselves.
+        fn counted(graph: &Graph) -> BTreeMap<(usize, usize), u32> {
+            let mut out = BTreeMap::new();
+            for layer in 0..NB_LAYER_MAX as usize {
+                for (node, &count) in graph.counted_in_degree(layer).iter().enumerate() {
+                    if count > 0 {
+                        out.insert((graph.origin_id_of(node as u32), layer), count);
+                    }
+                }
+            }
+            out
+        }
+        // Every id that is not three more than a multiple of seven, as a
+        // removal leaves the live set.
+        let live = |id: &usize| id % 7 != 3;
+        let pages = |graph: &Graph, store: &Store| -> Vec<Vec<(usize, u32)>> {
+            let mut state = 0xbb67_ae85_84ca_a73bu64;
+            let mut out = Vec::new();
+            for _ in 0..24 {
+                let query = spread(&mut state);
+                for page in [
+                    graph.search(store, &query, 10, 32, None::<&fn(&usize) -> bool>),
+                    graph.search(store, &query, 10, 32, Some(&live)),
+                ] {
+                    out.push(
+                        page.iter()
+                            .map(|hit| (hit.position, hit.distance.to_bits()))
+                            .collect(),
+                    );
+                }
+            }
+            out
+        };
+
+        let (mut built, mut built_store) = sample_graph(300, 4, 2);
+        let dir = tempfile::tempdir().unwrap();
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let (mut read, mut read_store): (Graph, Store) = read_dump(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &expected_for(&built, 4, 300),
+            CosineDist {},
+        )
+        .unwrap();
+        // The lists the load holds as words at or below their owners'
+        // levels, by origin id and layer.
+        let mut words: Vec<(usize, usize)> = Vec::new();
+        for layer in 1..NB_LAYER_MAX as usize {
+            let counted = read.counted_in_degree(layer);
+            for node in 0..read.nb_points() as u32 {
+                if layer <= read.level(node) as usize
+                    && read.neighbours_at(node, layer).is_empty()
+                    && counted[node as usize] == 0
+                {
+                    words.push((read.origin_id_of(node), layer));
+                }
+            }
+        }
+        assert!(!words.is_empty(), "the load holds no list as a word");
+        assert_eq!(read.in_degrees(), counted(&read));
+        assert_eq!(read.in_degrees(), built.in_degrees());
+        let (built_guard, read_guard) = (built.guard_stats(), read.guard_stats());
+
+        let top = built.entry_level() as usize;
+        let mut state = 0x6a09_e667_f3bc_c909u64;
+        for k in 0..48usize {
+            let vector = spread(&mut state);
+            let level = (k * 7) % (top + 3);
+            for (graph, store) in [(&mut built, &mut built_store), (&mut read, &mut read_store)] {
+                let planned = graph.plan_insertion(store, &vector, level);
+                graph.install_insertion(store, &vector, 300 + k, (300 + k) as u32, planned);
+            }
+            assert_eq!(
+                dump_of(&built, &built_store),
+                dump_of(&read, &read_store),
+                "after insertion {} at level {}",
+                k,
+                level
+            );
+        }
+        let filled = words
+            .iter()
+            .filter(|&&(id, layer)| {
+                let node = node_with_origin(&read, id).expect("every origin id has a node");
+                !read.neighbours_at(node, layer).is_empty()
+            })
+            .count();
+        assert!(
+            filled > 0,
+            "no insertion reached a list the load held as a word"
+        );
+        assert_eq!(built.in_degrees(), counted(&built));
+        assert_eq!(read.in_degrees(), counted(&read));
+        assert_eq!(read.in_degrees(), built.in_degrees());
+
+        let evicted = |now: (u64, u64, u64), then: (u64, u64, u64)| {
+            (now.0 - then.0, now.1 - then.1, now.2 - then.2)
+        };
+        let built_evictions = evicted(built.guard_stats(), built_guard);
+        assert_eq!(built_evictions, evicted(read.guard_stats(), read_guard));
+        assert!(built_evictions.0 > 0, "no insertion overflowed a list");
+        let built_pages = pages(&built, &built_store);
+        assert_eq!(built_pages, pages(&read, &read_store));
+
+        let rebuilt = |graph: &Graph, store: &Store| {
+            let scale = crate::graph::levels::LevelGenerator::default_scale(2);
+            let mut levels =
+                crate::graph::levels::LevelGenerator::new(scale, NB_LAYER_MAX as usize);
+            let (mut fresh, mut fresh_store) =
+                MutableGraph::new(4, 2, 64, scale, 1, CosineDist {}).unwrap();
+            for id in (0..348usize).filter(live) {
+                let node = node_with_origin(graph, id).expect("every inserted id has a node");
+                fresh.insert(&mut fresh_store, store.get(node), id, &mut levels);
+            }
+            dump_of(&fresh, &fresh_store)
+        };
+        assert_eq!(rebuilt(&built, &built_store), rebuilt(&read, &read_store));
+
+        let reread = |graph: &Graph, store: &Store| {
+            let dir = tempfile::tempdir().unwrap();
+            write_dump(
+                &graph.dump_view(store),
+                GraphKind::Cosine,
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+            )
+            .unwrap();
+            read_dump::<f32, CosineDist>(
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+                &expected_for(graph, 4, 348),
+                CosineDist {},
+            )
+            .unwrap()
+        };
+        let (built_again, built_again_store) = reread(&built, &built_store);
+        let (read_again, read_again_store) = reread(&read, &read_store);
+        assert_eq!(built_again.arrays(), read_again.arrays());
+        assert_eq!(pages(&built_again, &built_again_store), built_pages);
+        assert_eq!(pages(&read_again, &read_again_store), built_pages);
+    }
+
+    /// The node a graph took for one origin id, found by a pass over the
+    /// nodes, since the graph keeps no map from an id to its node.
+    fn node_with_origin<T, D>(graph: &MutableGraph<T, D>, id: usize) -> Option<u32>
+    where
+        T: Clone + Send + Sync,
+        D: crate::graph::Distance<T> + Send + Sync,
+    {
+        (0..graph.nb_points() as u32).find(|&node| graph.origin_id_of(node) == id)
+    }
+
+    /// A graph over scattered internal ids reads back from its dump with each
+    /// node at the place its origin id holds among the ids the mappings hold,
+    /// counting from zero, whatever the ids. A node whose id the mappings do
+    /// not hold is stranded, an id they hold that no node carries refuses the
+    /// dump, the graph costs what its nodes cost, it reads the same at the
+    /// largest counter, and it writes the same bytes again.
+    #[test]
+    fn a_graph_over_scattered_ids_reads_back_at_the_positions_the_mappings_give() {
+        let (dim, m, nodes) = (6, 8, 600usize);
+        let far = |k: usize| 3 + k * 70_001;
+        let scale = crate::graph::levels::LevelGenerator::default_scale(m);
+        let mut levels = crate::graph::levels::LevelGenerator::new(scale, NB_LAYER_MAX as usize);
+        let (mut built, mut built_store) =
+            MutableGraph::new(dim, m, 64, scale, 16, CosineDist {}).unwrap();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for k in 0..nodes {
+            let vector: Vec<f32> = (0..dim)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / 16_777_216.0 - 0.5
+                })
+                .collect();
+            built.insert(&mut built_store, &vector, far(k), &mut levels);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write_dump(
+            &built.dump_view(&built_store),
+            GraphKind::Cosine,
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        let largest = far(nodes - 1);
+        let mut expected = expected_for(&built, dim, nodes);
+        expected.max_origin_id = largest;
+        let ((read, read_store), (reference, reference_store)) = read_both(dir.path(), &expected);
+        assert_eq!(read.arrays(), reference.arrays());
+        assert_eq!(store_bytes(&read_store), store_bytes(&reference_store));
+        assert_eq!(topology(&built, &built_store), topology(&read, &read_store));
+
+        // Every id held: each node at its id's place among them, every place
+        // taken once.
+        let every: Vec<u32> = (0..nodes).map(|k| far(k) as u32).collect();
+        let read_at = |held: &[u32]| {
+            read_dump_at::<f32, CosineDist>(
+                &FsDir::new(dir.path()),
+                DUMP_FILENAME,
+                &expected,
+                CosineDist {},
+                Some(held),
+            )
+        };
+        let (numbered, _) = read_at(&every).unwrap();
+        assert_eq!(numbered.arrays(), read.arrays());
+        let mut node_at = vec![Position::NONE; nodes];
+        for node in 0..nodes as u32 {
+            let at = numbered.record_of(node);
+            let k = (numbered.origin_id_of(node) - 3) / 70_001;
+            assert_eq!(at as usize, k, "node {node}");
+            assert_eq!(node_at[k], Position::NONE, "position {k} taken twice");
+            node_at[k] = node;
+        }
+        assert!(node_at.iter().all(|&node| node != Position::NONE));
+
+        // Every third id dropped from the mappings: those nodes are stranded
+        // and the rest take their place among the ids still held.
+        let held: Vec<u32> = (0..nodes)
+            .filter(|k| k % 3 != 1)
+            .map(|k| far(k) as u32)
+            .collect();
+        let (thinned, _) = read_at(&held).unwrap();
+        for node in 0..nodes as u32 {
+            let id = thinned.origin_id_of(node) as u32;
+            let expected = match held.binary_search(&id) {
+                Ok(at) => at as u32,
+                Err(_) => Position::NONE,
+            };
+            assert_eq!(thinned.record_of(node), expected, "node {node}");
+        }
+        assert_eq!(thinned.memory_bytes(), read.memory_bytes());
+
+        // An id the mappings hold that no node carries refuses the dump, at
+        // either end of the list and in its middle.
+        for extra in [1u32, 70_000, largest as u32 + 1] {
+            let mut more = every.clone();
+            more.push(extra);
+            more.sort_unstable();
+            let reason = refused(read_at(&more));
+            assert!(
+                reason.contains(&format!("names no node for internal id {extra}")),
+                "{reason}"
+            );
+        }
+
+        let parsed = parse_dump::<f32>(&FsDir::new(dir.path()), DUMP_FILENAME, &expected).unwrap();
+        assert_eq!(
+            read.memory_bytes(),
+            loaded_bytes(&parsed),
+            "the graph costs its nodes, whatever ids they carry"
+        );
+
+        let at_ceiling = Expected {
+            max_origin_id: u32::MAX as usize,
+            ..expected
+        };
+        let (at_largest, _) = read_dump(
+            &FsDir::new(dir.path()),
+            DUMP_FILENAME,
+            &at_ceiling,
+            CosineDist {},
+        )
+        .unwrap();
+        assert_eq!(at_largest.arrays(), read.arrays());
+
+        let again = tempfile::tempdir().unwrap();
+        write_dump(
+            &read.dump_view(&read_store),
+            GraphKind::Cosine,
+            &FsDir::new(again.path()),
+            DUMP_FILENAME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(DUMP_FILENAME)).unwrap(),
+            std::fs::read(again.path().join(DUMP_FILENAME)).unwrap()
+        );
+    }
+}

@@ -153,7 +153,9 @@ pub(super) fn write_vectors<'a>(
 
 /// `pq_codes.bin` from every coded record's internal id and code, in
 /// increasing internal id order, each code `width` bytes. Returns the frame
-/// and the records it holds.
+/// and the records it holds. No save writes the file, which a directory
+/// below format 5.0.0 holds, so this is for the tests that make one.
+#[cfg(test)]
 pub(super) fn write_codes<'a>(
     width: usize,
     records: impl IntoIterator<Item = (usize, &'a [u8])>,

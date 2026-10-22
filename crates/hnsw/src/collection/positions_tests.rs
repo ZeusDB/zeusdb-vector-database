@@ -22,12 +22,12 @@
 //! over the model, and every traversal returns the page the same graph
 //! returns under a test by internal id that the model answers, read through
 //! the nodes' origin ids. After every save the artefacts list the model's
-//! records in increasing internal id, a load answers the same, and a second
-//! save writes the same bytes. After a recovery from a checkpoint and a
-//! journal, the recovered collection holds the holes the model replays and
-//! answers and saves what the live one does. After every compaction, rebuild
-//! and load, every per-record structure reaches the records held and no
-//! further.
+//! records in increasing internal id, the graph dump holds each record's row
+//! once, a load answers the same, and a second save writes the same bytes.
+//! After a recovery from a checkpoint and a journal, the recovered collection
+//! holds the holes the model replays and answers and saves what the live one
+//! does. After every compaction, rebuild and load, every per-record structure
+//! reaches the records held and no further.
 
 #![allow(clippy::disallowed_types)]
 
@@ -864,6 +864,24 @@ fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
 }
 
+/// Every node of a version 2 graph dump as its origin id and its row's
+/// bytes, read by the layout its header names.
+fn dump_rows(blob: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    let long = |at: usize| u64::from_le_bytes(blob[at..at + 8].try_into().unwrap()) as usize;
+    assert_eq!(word(blob, 8), 2, "a version 2 dump");
+    let nodes = word(blob, 32) as usize;
+    let (identity, rows) = (long(48), long(56));
+    let width = rows / nodes;
+    let ids_at = 128 + 64;
+    let rows_at = 128 + identity;
+    (0..nodes)
+        .map(|node| {
+            let row = &blob[rows_at + node * width..rows_at + (node + 1) * width];
+            (word(blob, ids_at + 4 * node), row.to_vec())
+        })
+        .collect()
+}
+
 /// The artefacts list the model's records in increasing internal id, each
 /// with the model's content.
 fn check_artefacts(dir: &Path, collection: &Collection, model: &Model, kind: Kind, step: &str) {
@@ -892,9 +910,9 @@ fn check_artefacts(dir: &Path, collection: &Collection, model: &Model, kind: Kin
         text += len;
     }
 
-    // vectors.bin, where the collection holds raw vectors.
+    // vectors.bin, where a product quantized graph keeps raw vectors.
     let path = dir.join("vectors.bin");
-    if collection.holds_raw_vectors() && !ordered.is_empty() {
+    if collection.writes_raw_vectors() && !ordered.is_empty() {
         let bytes = std::fs::read(&path).unwrap();
         let framed = unframe(&bytes, FrameKind::RawVectors, "vectors.bin").unwrap();
         let payload = framed.payload;
@@ -913,61 +931,61 @@ fn check_artefacts(dir: &Path, collection: &Collection, model: &Model, kind: Kin
             assert_eq!(values, want, "{step}: vector {i}");
         }
     } else {
-        assert!(!path.exists(), "{step}: no raw vectors, so no vectors.bin");
+        assert!(
+            !path.exists(),
+            "{step}: no raw vectors beside codes, so no vectors.bin"
+        );
     }
 
-    // pq_codes.bin, where the collection holds codes.
-    let path = dir.join("pq_codes.bin");
-    if collection.is_quantized()
-        && matches!(kind, Kind::PqWithRaw | Kind::PqOnly)
-        && !ordered.is_empty()
-    {
-        let pq = collection.pq().unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        let framed = unframe(&bytes, FrameKind::PqCodes, "pq_codes.bin").unwrap();
-        let payload = framed.payload;
-        let width = word(payload, 0) as usize;
-        assert_eq!(framed.entries as usize, ordered.len(), "{step}: codes");
-        for (i, (_, held)) in ordered.iter().enumerate() {
-            let row = &payload[4 + i * (4 + width)..4 + (i + 1) * (4 + width)];
-            assert_eq!(
-                word(row, 0) as usize,
-                held.internal,
-                "{step}: code {i}'s id"
-            );
-            assert_eq!(
-                &row[4..],
-                pq.quantize(&held.vector).unwrap().as_slice(),
-                "{step}: code {i}"
-            );
-        }
+    // No separate row store: the graph dump holds every record's row.
+    for name in ["pq_codes.bin", "int8_rows.zdbint8"] {
+        assert!(!dir.join(name).exists(), "{step}: no {name}");
+    }
+
+    // The graph dump's rows: each record the model holds once, its row the
+    // vector it holds, its codes or its scalar row, by the graph's kind, and
+    // any other node stranded.
+    let path = dir.join("hnsw_index.zdbgraph");
+    if ordered.is_empty() {
+        assert!(!path.exists(), "{step}: no record, so no graph dump");
     } else {
-        assert!(!path.exists(), "{step}: no codes, so no pq_codes.bin");
-    }
-
-    // The scalar rows, where the collection holds them.
-    let path = dir.join("int8_rows.zdbint8");
-    if collection.is_quantized() && kind == Kind::Int8 && !ordered.is_empty() {
-        let bytes = std::fs::read(&path).unwrap();
-        let framed = unframe(&bytes, FrameKind::Int8Rows, "int8_rows.zdbint8").unwrap();
-        let payload = framed.payload;
-        assert_eq!(framed.entries as usize, ordered.len(), "{step}: rows");
+        let quantized = collection.is_quantized();
         let index = collection.dense().index.read().unwrap();
-        let stride = payload.len() / ordered.len();
-        for (i, (_, held)) in ordered.iter().enumerate() {
-            let row = &payload[i * stride..(i + 1) * stride];
-            assert_eq!(word(row, 0) as usize, held.internal, "{step}: row {i}'s id");
-            let want: Vec<u8> = index
-                .graph()
-                .int8_encode(&held.vector)
-                .unwrap()
-                .iter()
-                .map(|&b| b as u8)
-                .collect();
-            assert_eq!(&row[4..4 + want.len()], want.as_slice(), "{step}: row {i}");
+        let expected_row = |vector: &[f32]| -> Vec<u8> {
+            match kind {
+                Kind::PqWithRaw | Kind::PqOnly if quantized => {
+                    collection.pq().unwrap().quantize(vector).unwrap()
+                }
+                Kind::Int8 if quantized => index
+                    .graph()
+                    .int8_encode(vector)
+                    .unwrap()
+                    .iter()
+                    .map(|&b| b as u8)
+                    .collect(),
+                _ => vector.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            }
+        };
+        let by_internal: HashMap<usize, &Held> = ordered
+            .iter()
+            .map(|(_, held)| (held.internal, *held))
+            .collect();
+        let mut found = 0usize;
+        for (origin, row) in dump_rows(&std::fs::read(&path).unwrap()) {
+            if let Some(held) = by_internal.get(&(origin as usize)) {
+                assert_eq!(
+                    row,
+                    expected_row(&held.vector),
+                    "{step}: the row of {origin}"
+                );
+                found += 1;
+            }
         }
-    } else {
-        assert!(!path.exists(), "{step}: no rows, so no row artefact");
+        assert_eq!(
+            found,
+            ordered.len(),
+            "{step}: every record has its row once"
+        );
     }
 
     // The sparse postings: the slot count, the live count, then every live
@@ -1018,26 +1036,28 @@ fn check_artefacts(dir: &Path, collection: &Collection, model: &Model, kind: Kin
         );
     }
 
-    // metadata.json, keyed by external id, in increasing internal id.
+    // metadata.json, compact, keyed by external id, in increasing internal
+    // id, naming every held record that holds a field and no other.
     let text = std::fs::read_to_string(dir.join("metadata.json")).unwrap();
     let parsed: HashMap<String, HashMap<String, Value>> = serde_json::from_str(&text).unwrap();
     let with_fields: Vec<&(&str, &Held)> = ordered
         .iter()
-        .filter(|(name, _)| parsed.contains_key(*name))
+        .filter(|(_, held)| !held.fields.is_empty())
         .collect();
     assert_eq!(
         with_fields.len(),
         parsed.len(),
-        "{step}: metadata names held records"
+        "{step}: metadata names the held records that hold a field"
     );
     let mut last = 0usize;
     for (name, held) in with_fields {
         assert_eq!(
-            &parsed[*name], &held.fields,
+            parsed.get(*name),
+            Some(&held.fields),
             "{step}: {name}'s saved fields"
         );
         let found = text
-            .find(&format!("\n  \"{name}\": "))
+            .find(&format!("\"{name}\":"))
             .unwrap_or_else(|| panic!("{step}: {name} in metadata.json"));
         assert!(
             found >= last,
@@ -2105,9 +2125,42 @@ fn each_rebuild_refuses_a_record_without_source_data() {
     );
     assert!(collection.positions_agree());
 
+    // A directory before format 5.0.0 holds each record's codes in
+    // pq_codes.bin beside the dump, and its rebuild from that file meets the
+    // record the file lacks. At 5.0.0 the dump holds every node's codes.
     let temp = TempDir::new();
     let path = temp.at("codes-short.zdb");
     collection.save(path.to_str().unwrap()).unwrap();
+    crate::persistence::older::rewrite_before_five(&path, "4.0.0");
+    let lacking = before
+        .iter()
+        .find(|(_, name)| name == "r40")
+        .map(|(internal, _)| *internal as u32)
+        .unwrap();
+    let codes = std::fs::read(path.join("pq_codes.bin")).unwrap();
+    let framed = zeusdb_vector_core::unframe(&codes, FrameKind::PqCodes, "pq_codes.bin").unwrap();
+    let width = u32::from_le_bytes(framed.payload[..4].try_into().unwrap()) as usize;
+    let mut payload = framed.payload[..4].to_vec();
+    for row in framed.payload[4..].chunks_exact(4 + width) {
+        if u32::from_le_bytes(row[..4].try_into().unwrap()) != lacking {
+            payload.extend_from_slice(row);
+        }
+    }
+    let codes = zeusdb_vector_core::frame(
+        FrameKind::PqCodes,
+        zeusdb_vector_core::FrameEncoding::Engine,
+        framed.entries - 1,
+        &payload,
+    );
+    std::fs::write(path.join("pq_codes.bin"), &codes).unwrap();
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(path.join("manifest.json")).unwrap()).unwrap();
+    manifest["file_digests"]["pq_codes.bin"] = json!({ "bytes": codes.len() });
+    std::fs::write(
+        path.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
     std::fs::remove_file(path.join(zeusdb_vector_core::DUMP_FILENAME)).unwrap();
     let refused = Collection::load(path.to_str().unwrap()).err().unwrap();
     assert!(
