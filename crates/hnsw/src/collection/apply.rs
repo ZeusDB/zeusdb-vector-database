@@ -26,11 +26,22 @@
 //! an insert's internal id stays issued, since admission issued it before
 //! the commit, and a term stays interned, since the dictionary kept it.
 //! Nothing else of such a call is applied.
+//!
+//! `apply` is for a record of a journal of format version 2, and
+//! `apply_legacy` for one of version 1, which releases from 0.11.0 to 0.13.0
+//! wrote. The two differ in training alone. A version 2 `Train` record
+//! carries what the training fitted and `apply` installs it, so no insert
+//! trains. A version 1 `Train` record carries the stamp alone, so under
+//! `apply_legacy` the insert that fills the training set trains, as those
+//! releases did, and the record restamps the training.
 
-use super::insert::Admitted;
-use super::{validate_index_parameters, Collection};
+use super::insert::{Admitted, MutationGuard};
+use super::training::Trained;
+use super::{validate_index_parameters, Collection, StorageMode};
+use crate::RerankCalibration;
 use std::collections::HashMap;
-use zeusdb_vector_core::{Error, Operation, SparseVector, MAX_INTERNAL_ID};
+use std::sync::atomic::Ordering;
+use zeusdb_vector_core::{Error, Fitted, Int8Codec, Operation, SparseVector, MAX_INTERNAL_ID};
 
 impl Collection {
     /// Apply one recorded operation to the collection.
@@ -45,9 +56,7 @@ impl Collection {
     ///   to the space's rules under its weighting, as admission holds it.
     ///   The id is then issued, no level is drawn, and the record is
     ///   installed at the level it names through the path `add` installs
-    ///   through, training trigger included. A training that fires here
-    ///   stamps itself from the clock, and the `Train` record that follows
-    ///   it in the journal restamps it.
+    ///   through. Nothing trains, since the training's own record follows.
     /// - `Remove`. Every id must be held, since the record named what was
     ///   held. Then the removal.
     /// - `UpdateMetadata`. The id must be held. Then the replacement.
@@ -55,10 +64,13 @@ impl Collection {
     ///   and the term must be new to it. Then the interning.
     /// - `Rebuild`. The three values are held to the rules `create()`
     ///   applies, through the same function. Then the rebuild.
-    /// - `Train`. The codebook must be fitted, since the record was written
-    ///   as a training began. The stamp is installed and nothing else runs,
-    ///   because the training itself fired as the insert that filled the
-    ///   set was applied.
+    /// - `Train`. The collection declares the quantizer the record carries,
+    ///   holds it unfitted and has filled its training set. A codebook's
+    ///   subvector count is the declared one and its centroid count is two
+    ///   to the declared bits, every value finite, and a calibration comes
+    ///   under `quantized_with_raw` alone and parses. Scales are finite and
+    ///   positive. Then the install the live training runs, with the stamp
+    ///   the record carries, and no fit.
     /// - `Clear`, `Compact`, `RebuildQuantized` and `AddMetadata` run their
     ///   bodies.
     ///
@@ -66,6 +78,22 @@ impl Collection {
     /// ordinary refusal for a value the ordinary path would refuse, and
     /// whatever the body returns for a body that fails.
     pub fn apply(&self, operation: Operation) -> Result<(), Error> {
+        self.apply_at(operation, false)
+    }
+
+    /// [`Collection::apply`] for a record of a journal of format version 1.
+    ///
+    /// Every kind applies as `apply` applies it but two. An `Insert` sets
+    /// off the training trigger once it is installed, so the insert that
+    /// fills the set trains, stamping the training from the clock. A
+    /// `Train` record carries the stamp alone: the quantizer must be fitted,
+    /// since the record was written as a training began, and the stamp is
+    /// installed.
+    pub fn apply_legacy(&self, operation: Operation) -> Result<(), Error> {
+        self.apply_at(operation, true)
+    }
+
+    fn apply_at(&self, operation: Operation, legacy: bool) -> Result<(), Error> {
         // What a clear traded out, declared before the holder of `writers`
         // so it drops once the holder has let `writers` go.
         let mut cleared = None;
@@ -95,7 +123,13 @@ impl Collection {
                     metadata.into_iter().collect(),
                     sparse,
                 )
-                .and_then(|()| self.maybe_trigger_training(&writers).map_err(Error::Engine)),
+                .and_then(|()| {
+                    if legacy {
+                        self.maybe_trigger_training(&writers).map_err(Error::Engine)
+                    } else {
+                        Ok(())
+                    }
+                }),
             Operation::Remove { ids } => {
                 let held = self.held_ids(&ids);
                 if held.len() != ids.len() {
@@ -155,7 +189,7 @@ impl Collection {
                     .map(|_| ())
             }
             Operation::Intern { term_id, term } => self.intern_recorded(term_id, &term),
-            Operation::Train { completed_at } => {
+            Operation::Train { completed_at, .. } if legacy => {
                 if !self.can_use_quantization() {
                     return Err(mismatch(
                         "the record names a training and the collection's codebook is not \
@@ -166,6 +200,15 @@ impl Collection {
                 *self.dense().training_completed_at.write().unwrap() = Some(completed_at);
                 Ok(())
             }
+            Operation::Train {
+                completed_at,
+                fitted: Some(fitted),
+            } => self.apply_train(&writers, completed_at, fitted),
+            Operation::Train { fitted: None, .. } => Err(mismatch(
+                "the record names a training and carries nothing it fitted, which every training \
+                 record of journal format version 2 carries"
+                    .to_string(),
+            )),
             Operation::AddMetadata { pairs } => {
                 self.add_metadata_locked(pairs.into_iter().collect());
                 Ok(())
@@ -243,6 +286,122 @@ impl Collection {
             | Operation::AddMetadata { .. }
             | Operation::RebuildQuantized => Ok(()),
         }
+    }
+
+    /// The version 2 `Train` arm of `apply`: `fitted` held to the quantizer
+    /// the collection declares and to the state it is in, every check before
+    /// anything is installed, then the install the live training runs. See
+    /// `apply` for the checks.
+    fn apply_train(
+        &self,
+        writers: &MutationGuard<'_>,
+        completed_at: String,
+        fitted: Fitted,
+    ) -> Result<(), Error> {
+        let mismatch = |detail: String| Error::JournalReplayMismatch { detail };
+        let Some(config) = self.dense().quantization_config.as_ref() else {
+            return Err(mismatch(
+                "the record names a training and the collection declares no quantization"
+                    .to_string(),
+            ));
+        };
+        if self.can_use_quantization() {
+            return Err(mismatch(
+                "the record names a training and the collection's quantizer is already fitted"
+                    .to_string(),
+            ));
+        }
+        if !self.training_threshold_reached.load(Ordering::Acquire) {
+            return Err(mismatch(
+                "the record names a training and the collection has not filled its training set"
+                    .to_string(),
+            ));
+        }
+        let trained = match fitted {
+            Fitted::Codebook {
+                subvectors,
+                centroids,
+                width,
+                values,
+                calibration,
+            } => {
+                let Some((declared, bits)) = config.scheme.pq_shape() else {
+                    return Err(mismatch(
+                        "the record carries a codebook and the collection declares scalar \
+                         quantization"
+                            .to_string(),
+                    ));
+                };
+                if subvectors as usize != declared {
+                    return Err(mismatch(format!(
+                        "the record's codebook has {} subvectors and the collection declares {}",
+                        subvectors, declared
+                    )));
+                }
+                let declared_centroids = 1usize << bits;
+                if centroids as usize != declared_centroids {
+                    return Err(mismatch(format!(
+                        "the record's codebook has {} centroids a subvector and the collection's \
+                         {} bits make {}",
+                        centroids, bits, declared_centroids
+                    )));
+                }
+                if let Some((at, value)) = values
+                    .iter()
+                    .enumerate()
+                    .find(|(_, value)| !value.is_finite())
+                {
+                    return Err(mismatch(format!(
+                        "value {} of the record's codebook is {}, and every value is finite",
+                        at, value
+                    )));
+                }
+                if let Some(json) = &calibration {
+                    if config.storage_mode != StorageMode::QuantizedWithRaw {
+                        return Err(mismatch(
+                            "the record carries a rerank calibration and the collection keeps no \
+                             raw vector to rerank against"
+                                .to_string(),
+                        ));
+                    }
+                    if let Err(error) = serde_json::from_str::<RerankCalibration>(json) {
+                        return Err(mismatch(format!(
+                            "the record's rerank calibration does not parse: {}",
+                            error
+                        )));
+                    }
+                }
+                let block = centroids as usize * width as usize;
+                let centroids = values
+                    .chunks_exact(block)
+                    .map(|subvector| {
+                        subvector
+                            .chunks_exact(width as usize)
+                            .map(<[f32]>::to_vec)
+                            .collect()
+                    })
+                    .collect();
+                Trained::Codebook {
+                    centroids,
+                    calibration,
+                }
+            }
+            Fitted::Scales { values } => {
+                if !config.is_int8() {
+                    return Err(mismatch(
+                        "the record carries scales and the collection declares product \
+                         quantization"
+                            .to_string(),
+                    ));
+                }
+                let codec = Int8Codec::from_scales(values).map_err(|error| {
+                    mismatch(format!("the record's scales are refused: {}", error))
+                })?;
+                Trained::Scales(codec)
+            }
+        };
+        self.install_training(writers, trained, completed_at)
+            .map_err(Error::Engine)
     }
 
     /// The `Intern` arm of `apply` and of `apply_withdrawn`: the term id

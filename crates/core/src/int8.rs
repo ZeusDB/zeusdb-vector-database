@@ -20,7 +20,11 @@
 //! A dimension whose sample holds only zeros gets a scale of one, so that
 //! it decodes to zero and a later non-zero value in it rounds to zero as
 //! well rather than saturating. That dimension carries nothing the sample
-//! could see, and a scale of one is the least surprising value for it.
+//! could see, and a scale of one is the least surprising value for it. A
+//! dimension whose largest magnitude is so small that dividing it by 127
+//! rounds to zero in single precision takes a scale of one for the same
+//! reason, so every scale a fit produces is positive and a codec built from
+//! the scales again is the codec fitted.
 //!
 //! # What is exact
 //!
@@ -52,6 +56,8 @@ impl Int8Codec {
     /// Refuses an empty sample, a zero width, and a row of the wrong width
     /// or holding a value that is not finite, naming the row.
     pub fn fit(dim: usize, sample: &[Vec<f32>]) -> Result<Self, String> {
+        #[cfg(any(test, feature = "test-support"))]
+        crate::pq::count_fit();
         if dim == 0 {
             return Err("a scalar codec quantizes vectors of at least one value".to_string());
         }
@@ -84,8 +90,9 @@ impl Int8Codec {
         let scales = largest
             .into_iter()
             .map(|magnitude| {
-                if magnitude > 0.0 {
-                    magnitude / QMAX
+                let scale = magnitude / QMAX;
+                if scale > 0.0 {
+                    scale
                 } else {
                     1.0
                 }
@@ -251,6 +258,27 @@ mod tests {
             codec.quantize(&[-1.0, -3.5, 0.0, -12.7]).unwrap(),
             vec![-127, -127, 0, -127]
         );
+    }
+
+    /// A dimension whose largest magnitude divided by 127 rounds to zero in
+    /// single precision takes a scale of one, as a dimension of zeros does,
+    /// so every scale is positive and the codec built from the scales again
+    /// is the codec fitted. Above that magnitude the scale is the quotient.
+    #[test]
+    fn a_tiny_largest_magnitude_takes_a_scale_of_one() {
+        let tiny = 1e-44f32;
+        assert_eq!(tiny / QMAX, 0.0, "the quotient rounds to zero");
+        let least = 9e-44f32;
+        assert!(least / QMAX > 0.0, "the quotient is the least subnormal");
+        let codec = Int8Codec::fit(3, &[vec![tiny, -least, 0.5], vec![-tiny, 0.0, -0.25]]).unwrap();
+        assert_eq!(codec.scales()[0], 1.0);
+        assert_eq!(codec.scales()[1], least / QMAX);
+        assert_eq!(codec.scales()[2], 0.5 / QMAX);
+        let rebuilt = Int8Codec::from_scales(codec.scales().to_vec()).unwrap();
+        assert_eq!(rebuilt, codec);
+        let codes = codec.quantize(&[tiny, -least, 0.5]).unwrap();
+        assert_eq!((codes[0], codes[2]), (0, 127));
+        assert!((-127..0).contains(&codes[1]), "{codes:?}");
     }
 
     /// A value beyond the fitted range saturates at the edge rather than

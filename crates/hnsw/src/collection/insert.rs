@@ -757,103 +757,17 @@ impl Collection {
         Ok(())
     }
 
-    /// The refusals of a record's sparse half that depend on the record
-    /// alone and move nothing: a vector held to its rules under the space's
-    /// weighting, or terms with no text layer to count them into, either
-    /// where the collection has no sparse space. What an overwrite runs
-    /// before its removal; `admit` runs the same ones in its own order.
-    fn refuse_sparse_alone(&self, sparse: Option<&SparseHalf>) -> Result<(), Error> {
-        match sparse {
-            None => Ok(()),
-            Some(SparseHalf::Vector(vector)) => self
-                .sparse()
-                .ok_or(Error::NoSparseSpace)
-                .and_then(|space| space.config().weighting.validate_record(vector.as_ref())),
-            Some(SparseHalf::Terms(_)) => self.text_layer().map(|_| ()),
-        }
-    }
-
-    /// Every refusal `admit` would give `record` that depends on the record
-    /// alone, in `admit`'s order, run before an overwrite removes the
-    /// record it replaces: its sparse half's, the sink's ceiling on its
-    /// encoded record where a sink is attached, and the id store's ceilings
-    /// with its vector's width, `arena` being the id store's arena with
-    /// every record before it in the batch named. Nothing moves: no term is
-    /// counted, nothing is issued or drawn, and the sink's ceiling is held
-    /// by a bound on the encoded record, the record being encoded into
-    /// `buffer` only where the bound does not settle it.
-    fn refuse_before_removal(
-        &self,
-        record: &ParsedRecord,
-        arena: usize,
-        attached: bool,
-        buffer: &mut Vec<u8>,
-    ) -> Result<(), Error> {
-        self.refuse_sparse_alone(record.sparse.as_ref())?;
-        if attached {
-            let vector = match &record.sparse {
-                Some(SparseHalf::Vector(vector)) => Some(vector.as_ref()),
-                _ => None,
-            };
-            let parts = InsertParts {
-                id: &record.id,
-                vector: &record.vector,
-                metadata: &record.metadata,
-                sparse: vector,
-            };
-            // Terms are not counted here, so they are bounded at two words
-            // a term, which is what a term the record carries once costs.
-            let terms = match &record.sparse {
-                Some(SparseHalf::Terms(terms)) => terms.len().saturating_mul(8),
-                _ => 0,
-            };
-            if Operation::insert_size_bound(&parts).saturating_add(terms) > JOURNAL_MAX_PAYLOAD {
-                Operation::encode_insert(&parts, buffer);
-                // The encoded record holds no terms, so they are added as
-                // they will be counted: each distinct term once, two words
-                // a term, in place of the marker's word.
-                let bytes = match &record.sparse {
-                    Some(SparseHalf::Terms(terms)) => {
-                        let distinct: HashSet<&str> = terms
-                            .iter()
-                            .map(String::as_str)
-                            .filter(|term| !term.is_empty())
-                            .collect();
-                        buffer.len() + distinct.len() * 8
-                    }
-                    _ => buffer.len(),
-                };
-                if bytes > JOURNAL_MAX_PAYLOAD {
-                    return Err(Error::JournalRecordTooLarge {
-                        bytes,
-                        ceiling: JOURNAL_MAX_PAYLOAD,
-                    });
-                }
-            }
-        }
-        self.refuse_unplaceable(&record.id, &record.vector, arena)
-    }
-
     /// What the records an overwrite replaces hold, as the records with a raw
     /// vector alone, with codes alone and with both, over every record of the
-    /// batch that names a held record and was not refused before the
-    /// removal. For the line that reports the overwrite, and read only where
-    /// that line is written.
-    fn replaced_storage(
-        &self,
-        records: &[ParsedRecord],
-        refused: &[(usize, Error)],
-    ) -> (usize, usize, usize) {
+    /// batch that names a held record. For the line that reports the
+    /// overwrite, and read only where that line is written.
+    fn replaced_storage(&self, records: &[ParsedRecord]) -> (usize, usize, usize) {
         let ids = self.ids.read().unwrap();
         let index = self.dense().index.read().unwrap();
         let pq_codes = self.dense().pq_codes.read().unwrap();
         let raws = index.raw_vectors();
-        let mut refusals = refused.iter().map(|(place, _)| *place).peekable();
         let (mut has_raw, mut has_pq, mut has_both) = (0, 0, 0);
-        for (place, record) in records.iter().enumerate() {
-            if refusals.next_if_eq(&place).is_some() {
-                continue;
-            }
+        for record in records {
             if let Some(slot) = ids.slot_of(&record.id) {
                 match (raws.contains(slot), pq_codes.contains_key(&record.id)) {
                     (true, true) => has_both += 1,
@@ -2057,6 +1971,30 @@ impl Collection {
     /// build without a sink draws, record for record, and the graph is the
     /// same graph.
     ///
+    /// The fault a failed commit left is read at the start of each segment,
+    /// and while it stands the rest of the batch is refused with its words,
+    /// issuing no id and drawing no level.
+    ///
+    /// # Replacing a held record
+    ///
+    /// A batch with `overwrite` that names a record the collection holds
+    /// takes each of its segments through admission whole before anything
+    /// but its interned terms is handed over. A held id a record names
+    /// counts as free there, so a record refused at admission keeps the
+    /// record it names. The segment is then handed over as one call: the
+    /// removal record naming, once each, the held ids its admitted records
+    /// replace, then their inserts, then the commit. The terms come first
+    /// because a term is handed over as the dictionary takes it, and a
+    /// removal never touches the dictionary, so a replay that applies them
+    /// first reaches the same state. Only after the commit are the replaced
+    /// records removed, as one batch, and the new ones installed, so a
+    /// failed commit or a crash before it leaves every replaced record
+    /// held. An append that fails after admission withdraws the segment and
+    /// leaves the fault, as a failed commit does, since the ids and levels
+    /// admission issued stay issued. The order is the same with no sink, so
+    /// a journaled and an unjournaled collection build the same graph. Every
+    /// other batch hands each record over as admission passes it.
+    ///
     /// The complete set of functions reachable from here, verified by reading
     /// each one rather than by inference:
     ///
@@ -2066,13 +2004,16 @@ impl Collection {
     /// - `admit`, and through it `count_record_terms`, the text layer's
     ///   dictionary, `Operation::encode_insert`, `get_next_id`,
     ///   `draw_level` and the sink's `append`
+    /// - `append_segment`, and through it the sink's `append` and
+    ///   `withdraw`
     /// - `install`, and the three paths below it, `add_raw_vector`,
     ///   `add_with_id_collection` and `add_quantized_vector`
     /// - `is_quantized`, `segment_limit`, `ids_left`
-    /// - `maybe_trigger_training`, `train_quantization_from_ids` and
-    ///   `rebuild_with_quantization_locked`
-    /// - `PQ::is_trained`, `quantize`, `quantize_batch` and `train`, plus the
-    ///   k-means below `train`
+    /// - `maybe_trigger_training`, `fit_training`, `record_training`,
+    ///   `install_training`, `rebuild_with_quantization_locked` and
+    ///   `rebuild_with_int8_locked`
+    /// - `PQ::is_trained`, `quantize`, `quantize_batch`, `fit` and `install`,
+    ///   plus the k-means below `fit`, and `Int8Codec::fit`
     /// - `VectorGraph::draw_level`, `plan_at_level`, `install`, `insert`,
     ///   `insert_batch_pq`, `new_pq` and `nb_points`, and the graph structure
     ///   in `graph::mutable` below them
@@ -2122,132 +2063,58 @@ impl Collection {
             return (inserted_ids, errors);
         }
         let mut buffer: Vec<u8> = Vec::new();
-        // The records an overwrite refused before its removal, by their place
-        // in the batch, each with the refusal `admit` gives it, and the places
-        // of those whose sparse vector it held to its rules.
-        let mut refused: Vec<(usize, Error)> = Vec::new();
-        let mut prechecked: Vec<usize> = Vec::new();
 
-        // ENHANCED FIX: Handle overwrites properly for ALL paths (Raw, Training, PQ)
-        if overwrite {
-            // Phase 1: Batch identify and remove existing documents.
-            //
-            // A record that replaces one the collection holds is first held
-            // to every refusal of `admit` that depends on the record alone,
-            // so a record refused for itself keeps the record it would
-            // replace, which stays out of the removal. The arena is counted
-            // with every record before it in the batch named, as `admit`
-            // will count it.
-            let ids_to_remove = {
-                let ids = self.ids.read().unwrap();
-                let mut arena = ids.arena_len();
-                let mut ids_to_remove = Vec::new();
-                let mut doomed: HashSet<&str> = HashSet::new();
-
-                for (place, record) in parsed_data.iter().enumerate() {
-                    let id = &record.id;
-                    if ids.slot_of(id).is_some() {
-                        if let Err(err) =
-                            self.refuse_before_removal(record, arena, attached, &mut buffer)
-                        {
-                            refused.push((place, err));
-                            continue;
-                        }
-                        if matches!(record.sparse, Some(SparseHalf::Vector(_))) {
-                            prechecked.push(place);
-                        }
-                        // Once per id, so the removal's record names each
-                        // id once.
-                        if doomed.insert(id.as_str()) {
-                            ids_to_remove.push(id.clone());
-                        }
-                    }
-                    arena = arena.saturating_add(id.len());
+        // Whether the batch replaces a record the collection holds, and how
+        // many distinct held records it names. Such a batch goes in segment
+        // by segment, each admitted whole before anything but its interned
+        // terms is recorded; see `# Replacing a held record`.
+        let held_named = if overwrite {
+            let ids = self.ids.read().unwrap();
+            let mut named: HashSet<&str> = HashSet::new();
+            parsed_data
+                .iter()
+                .filter(|record| ids.contains_name(&record.id) && named.insert(&record.id))
+                .count()
+        } else {
+            0
+        };
+        let replaces = held_named > 0;
+        if replaces {
+            // Every record of the batch takes a fresh internal id, the ones
+            // replacing a held record included, so a batch needing more ids
+            // than the collection has left is refused before anything is
+            // admitted. Admitted as far as the ids went, it would remove
+            // records it could not put back.
+            let left = self.ids_left();
+            if parsed_data.len() > left {
+                for record in &parsed_data {
+                    errors.push(InsertError::Vector {
+                        id: record.id.clone(),
+                        err: Error::InternalIdsExhausted {
+                            last: MAX_INTERNAL_ID,
+                            left,
+                            needed: parsed_data.len(),
+                        },
+                    });
                 }
+                return (inserted_ids, errors);
+            }
 
-                ids_to_remove
-            }; // Release the read lock here
-
-            if !ids_to_remove.is_empty() {
-                // Every record of the batch takes a fresh internal id, the
-                // ones replacing a held record included, so a batch needing
-                // more ids than the collection has left is refused before
-                // anything is removed. Admitted as far as the ids went, it
-                // would remove records it could not put back.
-                let left = self.ids_left();
-                if parsed_data.len() > left {
-                    for record in &parsed_data {
-                        errors.push(InsertError::Vector {
-                            id: record.id.clone(),
-                            err: Error::InternalIdsExhausted {
-                                last: MAX_INTERNAL_ID,
-                                left,
-                                needed: parsed_data.len(),
-                            },
-                        });
-                    }
-                    return (inserted_ids, errors);
-                }
-
-                // What the replaced records hold, for this line alone, so it
-                // is read only where the line is written.
-                if tracing::enabled!(target: LOG_TARGET, tracing::Level::INFO) {
-                    let storage_analysis = self.replaced_storage(&parsed_data, &refused);
-                    info!(target: LOG_TARGET, operation = "overwrite_preparation",
-                        documents_to_remove = ids_to_remove.len(),
-                        storage_analysis = format!(
-                            "raw_only: {}, pq_only: {}, both: {}",
-                            storage_analysis.0, storage_analysis.1, storage_analysis.2
-                        ),
-                        "Removing existing documents for overwrite"
-                    );
-                }
-
-                // The removal's record first. A sink that refuses it refuses
-                // the call, since the records would replace what was never
-                // removed.
-                if let Err(err) = self.record_removal(&ids_to_remove) {
-                    errors.push(InsertError::Counted(format!(
-                        "Failed to record the removal for overwrite: {}",
-                        err
-                    )));
-                    return (inserted_ids, errors);
-                }
-
-                // Batch remove existing documents (handles both raw and PQ data)
-                //
-                // One batch under one set of guards, which is how a replay
-                // applies the removal's record, so the close-up on removal
-                // runs at the same point in both.
-                let missing = self.remove_points_internal(writers, &ids_to_remove);
-                debug_assert!(
-                    missing.is_empty(),
-                    "every id came from the id store under the mutation guard"
-                );
-                // Each id the removal named once, and every one it did not
-                // find came from it, so the count is the difference. The
-                // line per id is written only where it is enabled.
-                let removed_count = ids_to_remove.len() - missing.len();
-                if tracing::enabled!(target: LOG_TARGET, tracing::Level::TRACE) {
-                    for id in &ids_to_remove {
-                        if !missing.contains(id) {
-                            trace!(target: LOG_TARGET, operation = "overwrite_removal",
-                                vector_id = %id,
-                                "Removed existing vector/codes for overwrite"
-                            );
-                        }
-                    }
-                }
-
-                info!(target: LOG_TARGET, operation = "overwrite_removal_complete",
-                    removed_count = removed_count,
-                    removal_errors = 0,
-                    "Completed removal phase for overwrite"
+            // What the replaced records hold, for this line alone, so it is
+            // read only where the line is written.
+            if tracing::enabled!(target: LOG_TARGET, tracing::Level::INFO) {
+                let storage_analysis = self.replaced_storage(&parsed_data);
+                info!(target: LOG_TARGET, operation = "overwrite_preparation",
+                    documents_to_remove = held_named,
+                    storage_analysis = format!(
+                        "raw_only: {}, pq_only: {}, both: {}",
+                        storage_analysis.0, storage_analysis.1, storage_analysis.2
+                    ),
+                    "Removing existing documents for overwrite"
                 );
             }
         }
 
-        // Phase 2: Add new vectors using the correct path based on current PQ state
         debug!(target: LOG_TARGET, operation = "add_vectors_insertion_phase",
             current_state = self.storage_mode(),
             "Starting insertion phase"
@@ -2255,53 +2122,80 @@ impl Collection {
 
         let mut seen: HashSet<String> = HashSet::with_capacity(parsed_data.len());
         let mut pending = parsed_data.into_iter().peekable();
-        let mut refused = refused.into_iter().peekable();
-        let mut prechecked = prechecked.into_iter().peekable();
-        // The place in the batch of the next record taken from `pending`.
-        let mut place = 0usize;
-        // Five of the six points a crash test aborts an `add` at, each named
-        // where the step it follows finishes. The sixth is inside the sink,
+        // Five of the points a crash test aborts an `add` at, each named
+        // where the step it follows finishes, and a sixth where a replacing
+        // segment's removal record is appended. The last is inside the sink,
         // which is what writes half a record. All of them are compiled away
         // when `debug_assertions` are off; see `zeusdb_vector_core::kill_at`.
         let mut handed_over = 0usize;
         zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::AddBeforeFirstAppend);
         while pending.peek().is_some() {
+            // A call made while the fault a failed commit left stands is
+            // refused whole, with the fault's words for every record, and
+            // issues no id and draws no level.
+            if let Some(fault) = self.sink_fault() {
+                for record in pending {
+                    errors.push(InsertError::Vector {
+                        id: record.id,
+                        err: fault.refusal(),
+                    });
+                }
+                return (inserted_ids, errors);
+            }
             let limit = self.segment_limit();
             let mut segment: Vec<Result<Admitted, InsertError>> = Vec::new();
             let mut admitted = 0usize;
             // The text of the records this segment admits, which the arena
             // holds once they are installed.
             let mut named_later = 0usize;
+            // The held ids this segment's admitted records replace, each once,
+            // since a batch admits an id once.
+            let mut replaced: Vec<String> = Vec::new();
             while let Some(record) = pending.next_if(|_| limit.is_none_or(|limit| admitted < limit))
             {
-                let outcome = match refused.next_if(|(at, _)| *at == place) {
-                    Some((_, err)) => Err(InsertError::Vector { id: record.id, err }),
-                    None => {
-                        let checked = prechecked.next_if_eq(&place).is_some();
-                        self.admit(
-                            record,
-                            &mut seen,
-                            attached,
-                            &mut buffer,
-                            &mut named_later,
-                            checked,
-                            overwrite,
-                        )
-                    }
-                };
-                place += 1;
+                let outcome = self
+                    .admit(
+                        record,
+                        &mut seen,
+                        attached,
+                        &mut buffer,
+                        &mut named_later,
+                        overwrite,
+                        replaces,
+                    )
+                    .map(|(admitted, held)| {
+                        if held {
+                            replaced.push(admitted.id.clone());
+                        }
+                        admitted
+                    });
                 if outcome.is_ok() {
                     admitted += 1;
-                    handed_over += 1;
-                    if handed_over == 2 {
-                        zeusdb_vector_core::kill_at(
-                            zeusdb_vector_core::KillPoint::AddAfterSecondAppend,
-                        );
+                    if !replaces {
+                        handed_over += 1;
+                        if handed_over == 2 {
+                            zeusdb_vector_core::kill_at(
+                                zeusdb_vector_core::KillPoint::AddAfterSecondAppend,
+                            );
+                        }
                     }
                 }
                 segment.push(outcome);
             }
-            zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::AddAfterAppendBeforeCommit);
+
+            // A replacing segment is recorded once its admission is over. An
+            // append that fails withdraws the segment and leaves the fault,
+            // and the segment and the rest of the batch are refused with it.
+            let recorded = if replaces && admitted > 0 && attached {
+                self.append_segment(&replaced, &segment, &mut buffer, &mut handed_over)
+            } else {
+                Ok(())
+            };
+            if recorded.is_ok() {
+                zeusdb_vector_core::kill_at(
+                    zeusdb_vector_core::KillPoint::AddAfterAppendBeforeCommit,
+                );
+            }
 
             // One commit for the segment, before any of it is installed. A
             // commit that fails refuses every record it was to make durable
@@ -2309,32 +2203,56 @@ impl Collection {
             // the call's contract is that what it returns is on the device.
             // The ids issued stay issued, because the records may have
             // reached the sink.
-            if admitted > 0 {
-                if let Err(err) = self.commit_records() {
-                    let class = err.exception().name();
-                    let message = err.to_string();
-                    let failed = |id: &str| {
-                        InsertError::Counted(format!("Vector {}: {}: {}", id, class, message))
-                    };
-                    for outcome in segment {
-                        errors.push(match outcome {
-                            Ok(admitted) => failed(&admitted.id),
-                            Err(e) => e,
-                        });
-                    }
-                    // The rest of the batch, each with the refusal the
-                    // overwrite gave it where it gave one.
-                    for record in pending {
-                        errors.push(match refused.next_if(|(at, _)| *at == place) {
-                            Some((_, err)) => InsertError::Vector { id: record.id, err },
-                            None => failed(&record.id),
-                        });
-                        place += 1;
-                    }
-                    return (inserted_ids, errors);
+            let committed = recorded.and_then(|()| {
+                if admitted > 0 {
+                    self.commit_records()
+                } else {
+                    Ok(())
                 }
+            });
+            if let Err(err) = committed {
+                let class = err.exception().name();
+                let message = err.to_string();
+                let failed = |id: &str| {
+                    InsertError::Counted(format!("Vector {}: {}: {}", id, class, message))
+                };
+                for outcome in segment {
+                    errors.push(match outcome {
+                        Ok(admitted) => failed(&admitted.id),
+                        Err(e) => e,
+                    });
+                }
+                for record in pending {
+                    errors.push(failed(&record.id));
+                }
+                return (inserted_ids, errors);
             }
             zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::AddAfterCommitBeforeApply);
+
+            // The records a replacing segment replaces go once its records
+            // are durable, as one batch under one set of guards, which is how
+            // a replay applies the removal's record, so the close-up on
+            // removal runs at the same point in both.
+            if !replaced.is_empty() {
+                let missing = self.remove_points_internal(writers, &replaced);
+                debug_assert!(
+                    missing.is_empty(),
+                    "every replaced id was held at its admission, under the mutation guard"
+                );
+                if tracing::enabled!(target: LOG_TARGET, tracing::Level::TRACE) {
+                    for id in &replaced {
+                        trace!(target: LOG_TARGET, operation = "overwrite_removal",
+                            vector_id = %id,
+                            "Removed existing vector/codes for overwrite"
+                        );
+                    }
+                }
+                info!(target: LOG_TARGET, operation = "overwrite_removal_complete",
+                    removed_count = replaced.len() - missing.len(),
+                    removal_errors = 0,
+                    "Completed removal phase for overwrite"
+                );
+            }
 
             for outcome in segment {
                 let admitted = match outcome {
@@ -2407,6 +2325,51 @@ impl Collection {
         Some(config.training_size.saturating_sub(collected).max(1))
     }
 
+    /// Record one segment of a batch that replaces a held record, once its
+    /// admission is over: the removal record naming the held ids `replaced`,
+    /// then each admitted record's insert, encoded from what admission holds
+    /// at the id and the level it issued. The terms admission interned are
+    /// already in the sink ahead of these. An append that fails withdraws
+    /// what the segment appended, those terms among it, and leaves the fault;
+    /// see `withdraw_records`.
+    fn append_segment(
+        &self,
+        replaced: &[String],
+        segment: &[Result<Admitted, InsertError>],
+        buffer: &mut Vec<u8>,
+        handed_over: &mut usize,
+    ) -> Result<(), Error> {
+        let mut append = || -> Result<(), Error> {
+            if !replaced.is_empty() {
+                self.record_encoded(OperationKind::Remove, |out| {
+                    Operation::encode_remove(replaced, out)
+                })?;
+                zeusdb_vector_core::kill_at(
+                    zeusdb_vector_core::KillPoint::OverwriteAfterRemovalAppend,
+                );
+            }
+            for admitted in segment.iter().flatten() {
+                let parts = InsertParts {
+                    id: &admitted.id,
+                    vector: &admitted.vector,
+                    metadata: &admitted.metadata,
+                    sparse: admitted.sparse.as_ref().map(SparseVector::as_ref),
+                };
+                Operation::encode_insert(&parts, buffer);
+                Operation::stamp_insert(buffer, admitted.internal_id as u64, admitted.level as u8);
+                self.append_record(OperationKind::Insert, buffer)?;
+                *handed_over += 1;
+                if *handed_over == 2 {
+                    zeusdb_vector_core::kill_at(
+                        zeusdb_vector_core::KillPoint::AddAfterSecondAppend,
+                    );
+                }
+            }
+            Ok(())
+        };
+        append().map_err(|error| self.withdraw_records(error))
+    }
+
     /// One record through the door.
     ///
     /// Every check that can refuse the record runs first, being the
@@ -2429,15 +2392,15 @@ impl Collection {
     ///
     /// `pending` is the text of the records this segment has admitted and
     /// not yet installed, which the arena will hold before this record's
-    /// id. `prechecked` says an overwrite held the record's sparse vector to
-    /// its rules before it removed what the record replaces, so that check
-    /// is not run twice.
+    /// id. The arena is the id store's as it stands, before any record the
+    /// batch replaces goes.
     ///
-    /// `overwrite` says the batch looked every record's id up before its
-    /// removal and removed each one it found, so the id store holds no id
-    /// this admits that the batch has not admitted already, and the store is
-    /// not asked again. A record refused before the removal never reaches
-    /// this, which is what keeps the record it names held.
+    /// `overwrite` says a held id the record names counts as free, and the
+    /// second value returned says the record replaces a held one. `defer`
+    /// says the batch replaces a held record, so the record is held to the
+    /// sink's ceiling and handed over later, with its segment; see
+    /// `append_segment`. A record refused here keeps the record it names
+    /// held, since the removal names the ids of admitted records alone.
     ///
     /// With no sink attached nothing is encoded and the sink's ceiling does
     /// not apply. The id ceiling applies either way.
@@ -2449,9 +2412,9 @@ impl Collection {
         attached: bool,
         buffer: &mut Vec<u8>,
         pending: &mut usize,
-        prechecked: bool,
         overwrite: bool,
-    ) -> Result<Admitted, InsertError> {
+        defer: bool,
+    ) -> Result<(Admitted, bool), InsertError> {
         let ParsedRecord {
             id,
             vector,
@@ -2459,17 +2422,15 @@ impl Collection {
             metadata,
         } = record;
 
-        // The duplicate check, and from the same guard the length of the
-        // arena the record's id is held to below.
-        let (is_new, arena) = if seen.contains(&id) {
-            (false, 0)
+        // The duplicate check, whether the record replaces a held one, and
+        // from the same guard the length of the arena the record's id is held
+        // to below.
+        let (is_new, arena, held) = if seen.contains(&id) {
+            (false, 0, false)
         } else {
             let ids = self.ids.read().unwrap();
-            debug_assert!(
-                !overwrite || !ids.contains_name(&id),
-                "an overwrite removed every held id it admits"
-            );
-            (overwrite || !ids.contains_name(&id), ids.arena_len())
+            let held = ids.contains_name(&id);
+            (overwrite || !held, ids.arena_len(), held)
         };
         if !is_new {
             warn!(target: LOG_TARGET, operation = "add_single_vector",
@@ -2493,7 +2454,7 @@ impl Collection {
             Ok(issued) => issued,
             Err(err) => return Err(InsertError::Vector { err, id }),
         };
-        let refuse = |err: Error, id: String| -> Result<Admitted, InsertError> {
+        let refuse = |err: Error, id: String| -> Result<(Admitted, bool), InsertError> {
             self.retract_id(internal_id);
             Err(InsertError::Vector { id, err })
         };
@@ -2506,26 +2467,26 @@ impl Collection {
         // the collection having a sparse space, before anything is written,
         // so a record refused for its sparse half leaves nothing behind in
         // the dense one.
-        let (sparse, held_to_rules) = match sparse {
-            None => (None, true),
-            Some(SparseHalf::Vector(vector)) => (Some(vector), prechecked),
+        let sparse = match sparse {
+            None => None,
+            Some(SparseHalf::Vector(vector)) => Some(vector),
             Some(SparseHalf::Terms(terms)) => match self.count_record_terms(&terms) {
-                Ok(vector) => (Some(vector), false),
+                Ok(vector) => Some(vector),
                 Err(err) => return refuse(err, id),
             },
         };
-        if !held_to_rules {
-            if let Some(sparse) = &sparse {
-                let checked = self
-                    .sparse()
-                    .ok_or(Error::NoSparseSpace)
-                    .and_then(|space| space.config().weighting.validate_record(sparse.as_ref()));
-                if let Err(err) = checked {
-                    return refuse(err, id);
-                }
+        if let Some(sparse) = &sparse {
+            let checked = self
+                .sparse()
+                .ok_or(Error::NoSparseSpace)
+                .and_then(|space| space.config().weighting.validate_record(sparse.as_ref()));
+            if let Err(err) = checked {
+                return refuse(err, id);
             }
         }
 
+        // The sink's ceiling. A record handed over later is encoded here
+        // only where the bound does not settle it.
         if attached {
             let parts = InsertParts {
                 id: &id,
@@ -2533,13 +2494,15 @@ impl Collection {
                 metadata: &metadata,
                 sparse: sparse.as_ref().map(SparseVector::as_ref),
             };
-            Operation::encode_insert(&parts, buffer);
-            if buffer.len() > JOURNAL_MAX_PAYLOAD {
-                let err = Error::JournalRecordTooLarge {
-                    bytes: buffer.len(),
-                    ceiling: JOURNAL_MAX_PAYLOAD,
-                };
-                return refuse(err, id);
+            if !defer || Operation::insert_size_bound(&parts) > JOURNAL_MAX_PAYLOAD {
+                Operation::encode_insert(&parts, buffer);
+                if buffer.len() > JOURNAL_MAX_PAYLOAD {
+                    let err = Error::JournalRecordTooLarge {
+                        bytes: buffer.len(),
+                        ceiling: JOURNAL_MAX_PAYLOAD,
+                    };
+                    return refuse(err, id);
+                }
             }
         }
 
@@ -2551,7 +2514,7 @@ impl Collection {
         }
 
         let level = self.draw_level();
-        if attached {
+        if attached && !defer {
             Operation::stamp_insert(buffer, internal_id as u64, level as u8);
             if let Err(err) = self.append_record(OperationKind::Insert, buffer) {
                 return refuse(err, id);
@@ -2560,14 +2523,17 @@ impl Collection {
 
         seen.insert(id.clone());
         *pending += id.len();
-        Ok(Admitted {
-            id,
-            vector,
-            sparse,
-            metadata,
-            internal_id,
-            level,
-        })
+        Ok((
+            Admitted {
+                id,
+                vector,
+                sparse,
+                metadata,
+                internal_id,
+                level,
+            },
+            held,
+        ))
     }
 
     /// The second pass over one admitted record: the vector put into the
@@ -2694,8 +2660,8 @@ impl Collection {
         // distribution is.
         //
         // What is drawn randomly is the order the sample is held in, which is
-        // what every subset of it is taken by. `train_quantization_from_ids`
-        // shuffles it under a fixed seed; see `TRAINING_SAMPLE_SEED`.
+        // what every subset of it is taken by. `training_sample` shuffles it
+        // under a fixed seed; see `TRAINING_SAMPLE_SEED`.
         if let Some(config) = &self.dense().quantization_config {
             if !self.training_threshold_reached.load(Ordering::Acquire) {
                 let mut training_ids = self.training_ids.write().unwrap();

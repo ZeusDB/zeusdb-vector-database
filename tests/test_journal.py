@@ -1,8 +1,8 @@
 """The journal beside a directory, from Python.
 
 `journal_to`, `checkpoint`, the `journal_path` property, the three
-durabilities, the three arguments `load` gained, and the keys a journaled
-index reports. The engine's own tests hold the crash matrix, the interval
+durabilities, the arguments `load` gained, the `recovery` property, and the
+keys a journaled index reports. The engine's own tests hold the crash matrix, the interval
 thread's lifetime and what a failed commit leaves; what is here is the
 surface a caller reaches, and the one rule a caller acts on most, being that
 a directory saved without a journal is the directory it always was.
@@ -325,6 +325,65 @@ def test_checkpoint_only_opens_the_checkpoint_and_leaves_the_journal_alone(tmp_p
     del loaded
     gc.collect()
     assert len(VectorDatabase().load(str(path))) == 4
+
+
+RECOVERY_KEYS = [
+    "checkpoint_sequence", "checkpoint_taken", "damage", "first_sequence", "format_version",
+    "graph_rebuilt", "journaled", "read_only", "read_only_reason", "records_in_journal",
+    "repair", "replayed", "restored_from_aside", "segments", "skipped", "upgraded_from",
+    "withdrawn",
+]
+
+
+def test_recovery_is_none_on_an_index_created_here():
+    assert build(3).recovery is None
+
+
+def test_recovery_says_what_a_load_did(tmp_path):
+    """A directory with no journal, a journaled one replayed, and one opened
+    as the checkpoint alone, each reported as the load found it."""
+    plain = tmp_path / "plain.zdb"
+    build(3).save(str(plain))
+    recovery = VectorDatabase().load(str(plain)).recovery
+    assert sorted(recovery) == RECOVERY_KEYS
+    assert recovery["format_version"] == "5.0.0"
+    assert recovery["journaled"] is False
+    assert recovery["replayed"] == 0
+    assert recovery["first_sequence"] == 0
+    assert recovery["damage"] is None
+    assert recovery["read_only"] is False
+    assert recovery["read_only_reason"] is None
+    assert recovery["checkpoint_taken"] is None
+    assert recovery["repair"] is None
+
+    index = build(2)
+    path = tmp_path / "j.zdb"
+    index.journal_to(str(path))
+    add(index, 2, 6)
+    add(index, 6, 8)
+    del index
+    gc.collect()
+    loaded = VectorDatabase().load(str(path))
+    recovery = loaded.recovery
+    assert recovery["journaled"] is True
+    assert recovery["checkpoint_sequence"] == 0
+    assert recovery["first_sequence"] == 1
+    assert recovery["records_in_journal"] == 6
+    assert recovery["replayed"] == 6
+    assert recovery["withdrawn"] == 0
+    assert recovery["skipped"] == 0
+    assert recovery["segments"] == 1
+    assert recovery["restored_from_aside"] is False
+    assert recovery["graph_rebuilt"] is False
+    assert recovery["upgraded_from"] is None
+    assert loaded.recovery == recovery, "the report stays with the index"
+    del loaded
+    gc.collect()
+
+    alone = VectorDatabase().load(str(path), checkpoint_only=True).recovery
+    assert alone["journaled"] is False
+    assert alone["checkpoint_sequence"] == 0
+    assert alone["replayed"] == 0
 
 
 def test_the_journal_closes_when_the_index_is_dropped(tmp_path):

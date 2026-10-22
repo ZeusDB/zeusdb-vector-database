@@ -74,6 +74,8 @@
 
 mod apply;
 #[cfg(test)]
+mod backup_tests;
+#[cfg(test)]
 mod close_up_tests;
 mod construct;
 #[cfg(test)]
@@ -112,6 +114,8 @@ mod query;
 mod query_tests;
 #[cfg(test)]
 mod read_only_tests;
+#[cfg(test)]
+mod repair_tests;
 #[cfg(test)]
 mod replay_tests;
 mod search;
@@ -154,7 +158,7 @@ use tracing::{trace, warn};
 use zeusdb_vector_core::{
     matches_filter, ColumnStore, Error, Filter, IdStore, Int8Codec, MetadataStore, Operation,
     OperationKind, Persist, Position, SegmentBase, Selection, SpaceName, SparseVector, VectorGraph,
-    VectorIndex, PQ,
+    VectorIndex, Withdrawal, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{count_record_with, TermDictionary, Tokenizer, TokenizerConfig};
@@ -254,6 +258,13 @@ pub trait OperationSink: Send + std::fmt::Debug {
     /// withdraws those records where the sink can, and its error says what
     /// the withdrawal achieved.
     fn commit(&mut self) -> Result<(), Error>;
+
+    /// Withdraw what was appended since the last commit, after an append of
+    /// the call failed once its admission was over, and say what the
+    /// withdrawal achieved. The default holds nothing to withdraw.
+    fn withdraw(&mut self) -> Withdrawal {
+        Withdrawal::Nothing
+    }
 
     /// Make everything appended so far durable whatever the policy, which a
     /// checkpoint does before it records the sequence it is about to hold.
@@ -370,14 +381,21 @@ struct SinkFault {
     error: String,
 }
 
+impl SinkFault {
+    /// The refusal every record meets while the fault stands.
+    fn refusal(&self) -> Error {
+        Error::JournalCommitFailed {
+            sequence: self.sequence,
+            error: self.error.clone(),
+        }
+    }
+}
+
 impl SinkSlot {
     /// The refusal every record meets while the fault stands.
     fn refuse_if_faulted(&self) -> Result<(), Error> {
         match &self.fault {
-            Some(fault) => Err(Error::JournalCommitFailed {
-                sequence: fault.sequence,
-                error: fault.error.clone(),
-            }),
+            Some(fault) => Err(fault.refusal()),
             None => Ok(()),
         }
     }
@@ -468,13 +486,33 @@ impl Identity {
     }
 }
 
-/// The part of [`Identity`] a save moves, behind one guard; see the field
-/// on [`Collection`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// What a caller reads of a collection's identity, and what a backup
+/// returns of the copy it wrote: the four values of [`Identity`], the time
+/// the manifest of the directory `snapshot` names records as its save, and
+/// the journal sequence that directory's state holds.
+///
+/// `saved_at` is `None` where `snapshot` is. `sequence` is 0 where the
+/// directory records none, which is every directory below format 5.0.0 and
+/// every collection never saved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityRecord {
+    pub identity: Identity,
+    /// The manifest's `saved_at`, an RFC 3339 time.
+    pub saved_at: Option<String>,
+    /// The identity's `sequence` in that manifest.
+    pub sequence: u64,
+}
+
+/// The part of [`Identity`] a save moves, with the time and the sequence the
+/// directory it names records, behind one guard; see the field on
+/// [`Collection`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Lineage {
     generation: u64,
     snapshot: Option<u128>,
     parent: Option<u128>,
+    saved_at: Option<String>,
+    sequence: u64,
 }
 
 /// Layers every graph this crate builds is created with.
@@ -1543,7 +1581,7 @@ impl Collection {
     /// What this collection is: its id, and the generation, snapshot and
     /// parent of the directory it last committed or read. See [`Identity`].
     pub fn identity(&self) -> Identity {
-        let lineage = *self.lineage.lock().unwrap();
+        let lineage = self.lineage.lock().unwrap();
         Identity {
             collection_id: self.collection_id,
             generation: lineage.generation,
@@ -1552,16 +1590,34 @@ impl Collection {
         }
     }
 
-    /// Record `identity` as the directory this collection last committed or
+    /// [`Collection::identity`], with the time and the journal sequence the
+    /// directory `snapshot` names records. See [`IdentityRecord`].
+    pub fn identity_record(&self) -> IdentityRecord {
+        let lineage = self.lineage.lock().unwrap();
+        IdentityRecord {
+            identity: Identity {
+                collection_id: self.collection_id,
+                generation: lineage.generation,
+                snapshot: lineage.snapshot,
+                parent: lineage.parent,
+            },
+            saved_at: lineage.saved_at.clone(),
+            sequence: lineage.sequence,
+        }
+    }
+
+    /// Record `record` as the directory this collection last committed or
     /// read, which a save does once its directory is committed and a load
     /// does from the manifest it read. The id is the field's and is set
     /// apart from this.
-    pub(crate) fn set_lineage(&self, identity: &Identity) {
-        debug_assert_eq!(identity.collection_id, self.collection_id);
+    pub(crate) fn set_lineage(&self, record: &IdentityRecord) {
+        debug_assert_eq!(record.identity.collection_id, self.collection_id);
         *self.lineage.lock().unwrap() = Lineage {
-            generation: identity.generation,
-            snapshot: identity.snapshot,
-            parent: identity.parent,
+            generation: record.identity.generation,
+            snapshot: record.identity.snapshot,
+            parent: record.identity.parent,
+            saved_at: record.saved_at.clone(),
+            sequence: record.sequence,
         };
     }
 
@@ -1627,8 +1683,10 @@ impl Collection {
     /// none stands, so a save that then fails leaves the collection refusing
     /// mutations, as a failed commit does. A child forked from the process
     /// that opened the journal is refused, since its save would race the
-    /// parent's.
-    pub(crate) fn sync_sink_locked(&self) -> Result<Option<u64>, Error> {
+    /// parent's. `backup` says the sync is a backup's, whose commit leaves
+    /// the fault, since a backup does not write the collection's own
+    /// directory.
+    pub(crate) fn sync_sink_locked(&self, backup: bool) -> Result<Option<u64>, Error> {
         let mut slot = self.sink.lock().unwrap();
         let Some(sink) = slot.attached.as_mut() else {
             return Ok(None);
@@ -1640,13 +1698,25 @@ impl Collection {
             Err(error @ Error::JournalForked { .. }) => return Err(error),
             Err(error) => {
                 let message = error.to_string();
-                warn!(target: "zeusdb_vector_database::journal",
-                    operation = "checkpoint_sync_failed",
-                    sequence = reached,
-                    error = %message,
-                    "The journal could not be synced before the checkpoint; the checkpoint writes \
-                     the collection from memory and goes on, and its commit clears the fault"
-                );
+                if backup {
+                    warn!(target: "zeusdb_vector_database::journal",
+                        operation = "backup_sync_failed",
+                        sequence = reached,
+                        error = %message,
+                        "The journal could not be synced before the backup; the backup writes the \
+                         collection from memory and goes on, and the fault stands until a \
+                         checkpoint commits"
+                    );
+                } else {
+                    warn!(target: "zeusdb_vector_database::journal",
+                        operation = "checkpoint_sync_failed",
+                        sequence = reached,
+                        error = %message,
+                        "The journal could not be synced before the checkpoint; the checkpoint \
+                         writes the collection from memory and goes on, and its commit clears the \
+                         fault"
+                    );
+                }
                 if slot.fault.is_none() {
                     slot.fault = Some(SinkFault {
                         sequence: reached,
@@ -1826,6 +1896,77 @@ impl Collection {
                 Err(error)
             }
         }
+    }
+
+    /// The fault a failed commit left, where it stands, which a batch reads
+    /// at the start of each segment.
+    fn sink_fault(&self) -> Option<SinkFault> {
+        self.sink.lock().unwrap().fault.clone()
+    }
+
+    /// Withdraw what the sink holds since the last commit, after `error`
+    /// failed an append once a call's admission was over, and leave the
+    /// fault, as a failed commit leaves it. Returns `error` with what the
+    /// withdrawal achieved said after it.
+    ///
+    /// The ids and the levels admission issued for the call stay issued
+    /// while a replay of the withdrawn records may not consume them, so the
+    /// collection takes nothing more until a checkpoint writes it from
+    /// memory. A refusal the sink gives before it writes anything is
+    /// returned as it is: the fault's own, a forked child's, and a sink that
+    /// takes no record.
+    fn withdraw_records(&self, error: Error) -> Error {
+        if matches!(
+            error,
+            Error::JournalCommitFailed { .. }
+                | Error::JournalForked { .. }
+                | Error::CollectionReadOnly { .. }
+        ) {
+            return error;
+        }
+        let mut slot = self.sink.lock().unwrap();
+        let Some(sink) = slot.attached.as_mut() else {
+            return error;
+        };
+        let error = sink.withdraw().attach_to(error);
+        let sequence = sink.sequence_reached();
+        let message = error.to_string();
+        tracing::error!(target: "zeusdb_vector_database::journal",
+            operation = "journal_append_failed",
+            sequence = sequence,
+            error = %message,
+            "An append failed once the call's admission was over; the call's records are \
+             refused and withdrawn where the journal allowed, and nothing is recorded until a \
+             checkpoint commits"
+        );
+        slot.fault = Some(SinkFault {
+            sequence,
+            error: message,
+        });
+        error
+    }
+
+    /// Leave the fault on the sink after `error`, a failure that no valid
+    /// record reaches once its record has committed, so the collection
+    /// takes nothing more until a checkpoint writes it from memory. Does
+    /// nothing where no sink is attached.
+    fn fault_sink(&self, error: &str) {
+        let mut slot = self.sink.lock().unwrap();
+        let Some(sink) = slot.attached.as_ref() else {
+            return;
+        };
+        let sequence = sink.sequence_reached();
+        tracing::error!(target: "zeusdb_vector_database::journal",
+            operation = "journal_install_failed",
+            sequence = sequence,
+            error = %error,
+            "A committed record could not be installed; nothing is recorded until a checkpoint \
+             commits"
+        );
+        slot.fault = Some(SinkFault {
+            sequence,
+            error: error.to_string(),
+        });
     }
 
     /// Distinct terms the sparse space's dictionary holds, where it has

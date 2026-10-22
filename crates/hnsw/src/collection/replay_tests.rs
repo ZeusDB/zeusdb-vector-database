@@ -18,13 +18,14 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use zeusdb_vector_core::{
-    compile_filter, test_support::clustered, Error, IdfScope, JournalRecord, Operation,
+    compile_filter, test_support::clustered, Error, Fitted, IdfScope, JournalRecord, Operation,
     OperationKind, SparseVector, DUMP_FILENAME, MAX_INTERNAL_ID,
 };
 use zeusdb_vector_sparse::{SparseConfig, Weighting};
 use zeusdb_vector_text::{SimpleTokenizer, Tokenizer};
 
 use super::{Collection, Declaration, OperationSink, ParsedRecord, SparseHalf, StorageMode};
+use crate::RerankCalibration;
 
 // ============================================================================
 // FIXTURES
@@ -258,7 +259,10 @@ struct Snapshot {
     training_ids: Vec<String>,
     threshold_reached: bool,
     stamp: Option<String>,
-    rerank_fetch: Option<usize>,
+    /// The rerank calibration as JSON, every field but its measured time.
+    calibration: Option<String>,
+    /// The calibration's measured time, a clock reading like the stamp.
+    calibration_millis: Option<u64>,
     /// Values a scalar graph has clipped, which every replay must reach.
     saturated: u64,
     terms: Option<Vec<String>>,
@@ -345,7 +349,10 @@ impl Snapshot {
             training_ids,
             threshold_reached: collection.training_threshold_reached(),
             stamp: collection.training_completed_at(),
-            rerank_fetch: collection.rerank_calibration().map(|c| c.fetch),
+            calibration: collection
+                .rerank_calibration()
+                .map(|c| serde_json::to_string(&RerankCalibration { millis: 0, ..c }).unwrap()),
+            calibration_millis: collection.rerank_calibration().map(|c| c.millis),
             saturated: collection.int8_saturated(),
             terms,
             index_metadata: collection.all_metadata().into_iter().collect(),
@@ -389,7 +396,8 @@ impl Snapshot {
         cmp!(training_ids);
         cmp!(threshold_reached);
         cmp!(stamp);
-        cmp!(rerank_fetch);
+        cmp!(calibration);
+        cmp!(calibration_millis);
         cmp!(saturated);
         cmp!(terms);
         cmp!(index_metadata);
@@ -437,8 +445,10 @@ impl Run {
     }
 
     /// Load the checkpoint, apply every record past it, and hold the result
-    /// to the original under rule R2. A second replay from the same
-    /// checkpoint is held to the first. Returns the kinds replayed.
+    /// to the original under rule R2, every saved artefact among it. A
+    /// second replay from the same checkpoint is held to the first, and
+    /// neither fits a quantizer, since a training's record carries what it
+    /// fitted. Returns the kinds replayed.
     fn prove(
         &self,
         queries: &Queries,
@@ -466,10 +476,16 @@ impl Run {
         for (kind, _) in records.iter().skip(from) {
             kinds.insert(*kind);
         }
+        let fits = zeusdb_vector_core::test_support::quantizer_fits();
         let first = replay("replayed");
         assert_eq!(original.diff(&first), Vec::<&str>::new());
         let second = replay("replayed-again");
         assert_eq!(first.diff(&second), Vec::<&str>::new());
+        assert_eq!(
+            zeusdb_vector_core::test_support::quantizer_fits(),
+            fits,
+            "a replay fits no quantizer"
+        );
         assert!(!first.records.is_empty() || first.id_counter == 0);
         kinds
     }
@@ -481,11 +497,11 @@ impl Run {
 
 /// The records arrive in the order the seam is built to keep: a term's record at
 /// the moment its id is issued and ahead of the insert that carries it, a
-/// removal ahead of the inserts that replace what it removed, every insert
-/// of a call handed over and committed before any is installed, and the
-/// training's record between the insert that filled the set and the one
-/// after it, so that the levels the records carry are the ones the graph
-/// installed at.
+/// removal ahead of the inserts that replace what it removed and in the same
+/// call, every insert of a call handed over and committed before any is
+/// installed, and the training's record between the insert that filled the
+/// set and the one after it, so that the levels the records carry are the
+/// ones the graph installed at.
 #[test]
 fn the_seam_hands_records_over_in_the_order_the_mutations_ran() {
     let vectors = clustered(20, 4, 0x0014_7b01);
@@ -552,18 +568,15 @@ fn the_seam_hands_records_over_in_the_order_the_mutations_ran() {
         }
     }
 
-    // An overwrite removes first, and the record of the removal comes
-    // before the replacement's interning and insert.
+    // An overwrite of a held record admits the replacement first, which
+    // hands its new term over as it is counted, then hands over the removal
+    // and the replacement's insert, and commits them as one call.
     overwrite(
         &collection,
         vec![text_record(&collection, 12, &vectors).with_id("r0")],
     );
-    assert_eq!(recording.kinds()[8..], [Remove, Intern, Insert]);
-    assert_eq!(
-        recording.commits(),
-        3,
-        "the removal and the segment each commit"
-    );
+    assert_eq!(recording.kinds()[8..], [Intern, Remove, Insert]);
+    assert_eq!(recording.commits(), 2, "the overwrite commits once");
 
     // A removal names only the ids the index holds, once each, and a
     // removal of nothing is not recorded.
@@ -621,7 +634,7 @@ fn the_seam_hands_records_over_in_the_order_the_mutations_ran() {
         } => assert_eq!((m, expected_size, ef_construction), (6, 100, 50)),
         other => panic!("{other:?}"),
     }
-    assert_eq!(recording.commits(), 9);
+    assert_eq!(recording.commits(), 8);
 
     // Training inside a batch: the insert that fills the set ends its
     // segment, the training's record follows it, and the rest of the batch
@@ -644,8 +657,24 @@ fn the_seam_hands_records_over_in_the_order_the_mutations_ran() {
     assert_eq!(recording.commits(), 3);
     let records = recording.records();
     match decode(1000, records[1000].0, &records[1000].1, 8) {
-        Operation::Train { completed_at } => {
-            assert_eq!(Some(completed_at), quantized.training_completed_at())
+        Operation::Train {
+            completed_at,
+            fitted,
+        } => {
+            assert_eq!(Some(completed_at), quantized.training_completed_at());
+            assert!(
+                matches!(
+                    fitted,
+                    Some(Fitted::Codebook {
+                        subvectors: 2,
+                        centroids: 4,
+                        width: 4,
+                        calibration: Some(_),
+                        ..
+                    })
+                ),
+                "the record carries the codebook and its calibration"
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -664,10 +693,12 @@ impl WithId for ParsedRecord {
     }
 }
 
-/// A sink that refuses leaves the counter, the index and every map as they
-/// were, and every entry point carries the refusal out, so a caller learns
-/// that nothing was recorded rather than finding a mutation the journal
-/// never saw.
+/// A sink that refuses leaves the index and every map as they were, and
+/// every entry point carries the refusal out, so a caller learns that
+/// nothing was recorded rather than finding a mutation the journal never
+/// saw. A record refused at admission leaves the counter where it was. An
+/// overwrite refused once its admission is over leaves the ids admission
+/// issued issued, as a withdrawn call does, and the fault with them.
 #[test]
 fn a_sink_that_refuses_leaves_the_collection_as_it_was() {
     let vectors = clustered(6, 4, 0x0014_7b03);
@@ -729,10 +760,22 @@ fn a_sink_that_refuses_leaves_the_collection_as_it_was() {
     );
     refused(collection.clear().map(|_| ()));
     refused(collection.rebuild_with_quantization().map(|_| ()));
-    // An overwrite of a held record is refused at the removal's record.
+    // An overwrite of a held record is refused at the removal's record,
+    // once the replacement is admitted, and leaves the fault.
     let added = collection.add_records(vec![record(0, &vectors)], vec![], true);
     assert_eq!(added.total_errors, 1);
-    assert!(added.errors[0].contains("Failed to record the removal"));
+    assert!(
+        added.errors[0].contains("the sink refuses everything"),
+        "{:?}",
+        added.errors
+    );
+    let next = collection.add_records(vec![record(5, &vectors)], vec![], false);
+    assert!(
+        next.errors[0].contains("The journal's commit failed"),
+        "{:?}",
+        next.errors
+    );
+    assert_eq!(collection.id_counter(), 3, "the admitted id stays issued");
 
     assert_eq!(collection.len(), 2);
     assert_eq!(collection.m(), 4);
@@ -746,11 +789,12 @@ fn a_sink_that_refuses_leaves_the_collection_as_it_was() {
         Some(&json!(0))
     );
 
-    // Detached, everything runs again and the next ids follow the counter.
+    // Detached, the fault goes with the sink, everything runs again and the
+    // next ids follow the counter.
     assert!(collection.detach_sink().is_some());
     add(&collection, vec![record(2, &vectors), record(3, &vectors)]);
-    assert_eq!(collection.internal_id_of("r2"), Some(3));
-    assert_eq!(collection.internal_id_of("r3"), Some(4));
+    assert_eq!(collection.internal_id_of("r2"), Some(4));
+    assert_eq!(collection.internal_id_of("r3"), Some(5));
 }
 
 /// A record whose journal payload would be above the ceiling is refused at
@@ -1032,12 +1076,13 @@ fn a_record_refused_for_its_id_or_its_width_moves_nothing() {
             let dir = TempDir::new();
             let ours = Snapshot::take(&collection, &dir.sub("ours.zdb"), &queries);
             let theirs = Snapshot::take(&twin, &dir.sub("twin.zdb"), &queries);
-            // The training stamp is each collection's own clock reading.
+            // The training stamp and the calibration's measured time are each
+            // collection's own clock readings.
             let differ = |snapshot: &Snapshot| -> Vec<&'static str> {
                 snapshot
                     .diff(&theirs)
                     .into_iter()
-                    .filter(|field| *field != "stamp")
+                    .filter(|field| *field != "stamp" && *field != "calibration_millis")
                     .collect()
             };
             assert_eq!(differ(&ours), Vec::<&str>::new(), "{label}");
@@ -1500,12 +1545,23 @@ fn apply_refuses_a_record_that_does_not_belong_to_the_collection() {
     ));
     assert_eq!(collection.m(), 4);
 
-    // A training the collection has not run.
+    // A training that carries nothing it fitted, and one before the
+    // collection has filled its training set.
     mismatch(
         Operation::Train {
             completed_at: "2001-02-03T04:05:06+00:00".into(),
+            fitted: None,
         },
-        "codebook is not fitted",
+        "carries nothing it fitted",
+    );
+    mismatch(
+        Operation::Train {
+            completed_at: "2001-02-03T04:05:06+00:00".into(),
+            fitted: Some(Fitted::Scales {
+                values: vec![1.0; 4],
+            }),
+        },
+        "has not filled its training set",
     );
 
     // Nothing is applied while a sink is attached.
@@ -1625,10 +1681,10 @@ fn replay_reproduces_a_raw_collection_kind_for_kind() {
 }
 
 /// Training fires inside a batch after the checkpoint, in both storage
-/// modes, and the replay retrains from the same records to the same
-/// codebook, the same codes, the same calibration and the same graph, with
-/// the stamp taken from the training's record. The quantized rebuild, a
-/// compaction over codes and an overwrite into the quantized graph follow.
+/// modes, and the replay installs the codebook, the calibration and the
+/// stamp the training's record carries, fitting nothing, to the same codes
+/// and the same graph. The quantized rebuild, a compaction over codes and an
+/// overwrite into the quantized graph follow.
 #[test]
 fn replay_reproduces_training_inside_a_batch() {
     for (mode, seed) in [
@@ -1689,9 +1745,8 @@ fn replay_reproduces_training_inside_a_batch() {
 /// The scalar counterpart of the test above: a checkpoint before the set
 /// fills, training inside a batch, and the mutations after it, replayed
 /// under rule R2 with the scales, the rows and the clipped count among what
-/// is compared. Two builds of the same records reach one codec because the
-/// fit draws nothing, and the rows are a function of the codec and the
-/// records.
+/// is compared. The replay installs the scales the training's record
+/// carries, and the rows are a function of the codec and the records.
 #[test]
 fn replay_reproduces_scalar_training_inside_a_batch() {
     let vectors = clustered(1400, 16, 0x0015_7b20);
@@ -1758,6 +1813,125 @@ fn replay_reproduces_scalar_training_inside_a_batch() {
     }
     assert!(run.original.training_completed_at().is_some());
     assert!(run.original.int8_codec().is_some());
+}
+
+/// A training's record is held to the collection before anything is
+/// installed: the quantizer it carries is the one the collection declares,
+/// at the declared shape, with every value finite and a calibration only
+/// where the collection reranks, and the collection holds its quantizer
+/// unfitted with its set full. Each refusal leaves the collection
+/// untrained, and the record as written installs once.
+#[test]
+fn a_training_record_is_held_to_the_collection() {
+    let vectors = clustered(1000, 8, 0x0219_b002);
+    let declaration = Declaration::validate(8, "l2", 8, 60, 2000, vec![]).unwrap();
+    let quantization = declaration
+        .quantization(2, 4, 1000, None, StorageMode::QuantizedOnly)
+        .unwrap();
+    let mut run = Run::new(Collection::build(declaration, Some(quantization)));
+    run.checkpoint();
+    add(
+        &run.original,
+        (0..1000).map(|i| record(i, &vectors)).collect(),
+    );
+    assert!(run.original.is_quantized());
+    let records = run.recording.records();
+    let train_at = records
+        .iter()
+        .position(|(kind, _)| *kind == OperationKind::Train)
+        .unwrap();
+    let (checkpoint, _) = run.checkpoint.clone().unwrap();
+    let replayed = Collection::load_with(&checkpoint, None).unwrap();
+    for (i, (kind, payload)) in records.iter().enumerate().take(train_at) {
+        replayed.apply(decode(i, *kind, payload, 8)).unwrap();
+    }
+    assert!(!replayed.is_quantized() && replayed.is_training_ready());
+    let (completed_at, fitted) =
+        match decode(train_at, records[train_at].0, &records[train_at].1, 8) {
+            Operation::Train {
+                completed_at,
+                fitted: Some(fitted),
+            } => (completed_at, fitted),
+            other => panic!("{other:?}"),
+        };
+    let Fitted::Codebook {
+        subvectors,
+        centroids,
+        width,
+        values,
+        ..
+    } = fitted.clone()
+    else {
+        panic!("{fitted:?}")
+    };
+    let refused = |fitted: Fitted, expected: &str| match replayed.apply(Operation::Train {
+        completed_at: completed_at.clone(),
+        fitted: Some(fitted),
+    }) {
+        Err(Error::JournalReplayMismatch { detail }) => {
+            assert!(detail.contains(expected), "{detail}")
+        }
+        other => panic!("{other:?}"),
+    };
+    refused(
+        Fitted::Codebook {
+            subvectors: 4,
+            centroids,
+            width: 2,
+            values: values.clone(),
+            calibration: None,
+        },
+        "4 subvectors",
+    );
+    refused(
+        Fitted::Codebook {
+            subvectors,
+            centroids: 8,
+            width,
+            values: values[..2 * 8 * 4].to_vec(),
+            calibration: None,
+        },
+        "8 centroids",
+    );
+    let mut not_finite = values.clone();
+    not_finite[3] = f32::NAN;
+    refused(
+        Fitted::Codebook {
+            subvectors,
+            centroids,
+            width,
+            values: not_finite,
+            calibration: None,
+        },
+        "value 3",
+    );
+    refused(
+        Fitted::Codebook {
+            subvectors,
+            centroids,
+            width,
+            values: values.clone(),
+            calibration: Some("{}".into()),
+        },
+        "keeps no raw vector",
+    );
+    refused(
+        Fitted::Scales {
+            values: vec![1.0; 8],
+        },
+        "declares product quantization",
+    );
+    assert!(!replayed.is_quantized(), "every refusal installed nothing");
+
+    replayed
+        .apply(Operation::Train {
+            completed_at: completed_at.clone(),
+            fitted: Some(fitted.clone()),
+        })
+        .unwrap();
+    assert!(replayed.is_quantized());
+    assert_eq!(replayed.training_completed_at(), Some(completed_at.clone()));
+    refused(fitted, "already fitted");
 }
 
 /// A checkpoint taken after training, on the mode that sheds its raw

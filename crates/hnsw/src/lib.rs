@@ -51,15 +51,16 @@ mod rerank;
 
 pub use collection::{
     Added, AdmitShape, Arm, ArmPlan, Collection, Declaration, DenseConfig, FieldRef, HitRef,
-    Identity, Int8Scale, JournalStatus, Listing, OperationSink, Page, ParsedRecord, ParsedRecords,
-    Plan, QuantizationConfig, QuantizationReport, QuantizationScheme, QuantizerReport, Query,
-    QueryHit, QueryHits, RebuildPlan, RecordView, SpaceConfig, SparseHalf, SparseHits, StorageMode,
-    TextConfig, DEFAULT_FETCH_PER_K, DEFAULT_SPACE, MAX_ARMS,
+    Identity, IdentityRecord, Int8Scale, JournalStatus, Listing, OperationSink, Page, ParsedRecord,
+    ParsedRecords, Plan, QuantizationConfig, QuantizationReport, QuantizationScheme,
+    QuantizerReport, Query, QueryHit, QueryHits, RebuildPlan, RecordView, SpaceConfig, SparseHalf,
+    SparseHits, StorageMode, TextConfig, DEFAULT_FETCH_PER_K, DEFAULT_SPACE, MAX_ARMS,
 };
 #[cfg(test)]
 pub use flusher::Watch;
 pub use journal::{
-    directory_of, journal_path, Durability, JournalPolicy, JournalSink, Recovery, JOURNAL_SUFFIX,
+    directory_of, journal_path, CheckpointTaken, Damage, Durability, JournalPolicy, JournalSink,
+    Recovery, Repair, JOURNAL_SUFFIX,
 };
 pub use rerank::{
     calibrate_rerank_from_sample, default_rerank_fetch, prepare_reconstruction, raw_distance_fn,

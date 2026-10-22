@@ -152,6 +152,22 @@
 //!    Records after the last boundary belong to the torn tail. A torn tail is
 //!    cut at its first byte.
 //!
+//! # A reading for a repair
+//!
+//! [`read_segments_for_repair`] reads the same way, and refuses a journal
+//! that is not the directory's as [`read_segments`] does. Every other break
+//! of rules 1 to 7, and a corrupt middle, stops the reading and names a
+//! [`Cut`] at the first record of the call the break touches. The records of
+//! every call before the cut are handed over, and the journal cut there
+//! reads under the seven rules with no damage.
+//!
+//! A segment named at or below the directory's sequence holds no record
+//! above it, so its name makes it stale whatever its header holds. Where its
+//! header does not read or names another sequence than its file, a reading
+//! that is not for a repair refuses the journal and names the repair, and a
+//! reading for a repair sets the segment aside whole, lists it in
+//! [`JournalContents::stale_set_aside`] and reads every other segment.
+//!
 //! # The writer
 //!
 //! Appends one record in one write, and cuts the segment back where a write
@@ -215,17 +231,18 @@ const WIDEST_VECTOR: usize = 65_536;
 
 /// The most centroids a codebook holds per subvector, being `bits` at its
 /// ceiling of eight.
-const MOST_CENTROIDS: usize = 256;
+pub(crate) const MOST_CENTROIDS: usize = 256;
 
 /// The widest payload a record may carry, and the ceiling every
 /// `payload_len` is held to before the payload is touched.
 ///
 /// Derived rather than chosen. A vector at the widest declaration is
-/// 262,144 bytes. A codebook at that width and the most centroids, should a
-/// later build record one, is the width times the centroids times four
-/// bytes a value, 64 MiB, whatever the subvector count. A mebibyte of
-/// metadata sits beside either with margin. It bounds a hostile length that
-/// the remaining-bytes check alone would admit on a large file.
+/// 262,144 bytes. A codebook at that width and the most centroids, which a
+/// `Train` record carries, is the width times the centroids times four bytes
+/// a value, 64 MiB, whatever the subvector count. A mebibyte of metadata, or
+/// of a training record's stamp, counts and calibration, sits beside either
+/// with margin. It bounds a hostile length that the remaining-bytes check
+/// alone would admit on a large file.
 pub const JOURNAL_MAX_PAYLOAD: usize = WIDEST_VECTOR * MOST_CENTROIDS * 4 + (1 << 20);
 
 /// The length past which the active segment is sealed at a commit and the
@@ -553,6 +570,48 @@ fn a_later_record_parses(bytes: &[u8], from: usize, expected: u64, framing: bool
     false
 }
 
+/// The whole operation records in `bytes` from `from` on, the first of them
+/// expected at `first`, counted as the reader's scans count them: the run of
+/// whole records from `from`, then, past each record that fails, the run
+/// from the next whole record at a later sequence. What a repair reports it
+/// set aside. Framing records are not counted. `framing` says the bytes are
+/// a journal of segments, whose framing kinds parse, rather than a journal
+/// of format version 1, where they do not.
+pub fn whole_records_from(bytes: &[u8], from: usize, first: u64, framing: bool) -> usize {
+    let mut count = 0usize;
+    let mut at = from;
+    let mut expected = first;
+    loop {
+        let (records, failure) = scan(bytes, at, expected, framing);
+        count += records.iter().filter(|r| !r.kind.is_framing()).count();
+        let Some(failure) = failure else {
+            return count;
+        };
+        let mut probe = failure.at + 1;
+        let mut next = None;
+        while probe + JOURNAL_RECORD_OVERHEAD_BYTES <= bytes.len() {
+            let sequence = u64::from_le_bytes(take8(bytes, probe));
+            if sequence > failure.expected
+                && matches!(
+                    parse_record(bytes, probe, sequence, framing),
+                    Parsed::Whole(_)
+                )
+            {
+                next = Some((probe, sequence));
+                break;
+            }
+            probe += 1;
+        }
+        match next {
+            Some((resume, sequence)) => {
+                at = resume;
+                expected = sequence;
+            }
+            None => return count,
+        }
+    }
+}
+
 /// Where a run of records stopped.
 #[derive(Clone, Debug)]
 struct Failure {
@@ -635,25 +694,38 @@ impl LegacyContents<'_> {
     }
 
     /// The refusal a corrupt middle earns, naming the file, the sequence
-    /// and the byte. None for a torn tail or an undamaged file.
+    /// and the byte. A journal of format version 1 frames no call, so a
+    /// repair cuts at the damaged record itself. None for a torn tail or an
+    /// undamaged file.
     pub fn refusal(&self, file: &str) -> Option<Error> {
-        corrupt_refusal(self.damage.as_ref(), file)
+        corrupt_refusal(self.damage.as_ref(), file, None)
     }
 }
 
 /// The refusal a corrupt middle earns, and nothing for any other damage.
-fn corrupt_refusal(damage: Option<&JournalDamage>, file: &str) -> Option<Error> {
+/// `cut` is the sequence and the byte a repair cuts at, and the damaged
+/// record's own where none is given.
+fn corrupt_refusal(
+    damage: Option<&JournalDamage>,
+    file: &str,
+    cut: Option<(u64, u64)>,
+) -> Option<Error> {
     match damage {
         Some(JournalDamage::Corrupt {
             at,
             sequence,
             detail,
-        }) => Some(Error::JournalCorrupt {
-            file: file.to_string(),
-            sequence: *sequence,
-            at: *at,
-            detail: detail.clone(),
-        }),
+        }) => {
+            let (cut_sequence, cut_at) = cut.unwrap_or((*sequence, *at));
+            Some(Error::JournalCorrupt {
+                file: file.to_string(),
+                sequence: *sequence,
+                at: *at,
+                detail: detail.clone(),
+                cut_sequence,
+                cut_at,
+            })
+        }
         _ => None,
     }
 }
@@ -943,6 +1015,9 @@ pub struct JournalContents<'a> {
     /// in sequence order, with whether it replays. Framing records are not
     /// listed.
     pub records: Vec<LiveRecord<'a>>,
+    /// The place in `records` of each call's first record, in order, so a
+    /// record's call begins at the last place at or below its own.
+    pub calls: Vec<usize>,
     /// Operation records in stale segments, which the checkpoint holds.
     pub skipped: usize,
     /// Abort records read in the segments naming the checkpoint.
@@ -962,6 +1037,62 @@ pub struct JournalContents<'a> {
     /// where one exists and a crash did not interrupt the creation of the
     /// one after it.
     pub active: Option<u64>,
+    /// Where a repair cuts, where the journal holds a corrupt middle or, read
+    /// for a repair, breaks its own history in any other way. `records` then
+    /// holds only the records before the cut.
+    pub cut: Option<Cut>,
+    /// The segments named at or below the directory's sequence whose header
+    /// does not read or names another sequence than its file, which a
+    /// reading for a repair sets aside whole. A reading that is not for a
+    /// repair refuses the first of them instead, so it lists none.
+    pub stale_set_aside: Vec<StaleSegment>,
+}
+
+/// A segment named at or below the directory's sequence whose header the
+/// reader cannot use. Every record it could hold is at or below the
+/// checkpoint, so a repair sets it aside whole and cuts nothing for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaleSegment {
+    /// The number its file is named for.
+    pub number: u64,
+    /// Its file, as a message names it.
+    pub file: String,
+    /// Why its header cannot be used.
+    pub detail: String,
+}
+
+/// Where a repair cuts a journal of segments, and the damage that puts the
+/// cut there.
+///
+/// The cut is at the first record of the call the damage touches, since a
+/// call applies whole or not at all, and a call's records never span two
+/// segments. Every byte from the cut on, and every segment after the one it
+/// is in, is set aside.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cut {
+    /// The segment the cut is in, by the number its file is named for.
+    pub segment: u64,
+    /// The byte of that segment the cut is at. Zero where the whole segment
+    /// goes, being one whose header does not read or which breaks the run of
+    /// segments. The header's length where its header stays and every record
+    /// goes.
+    pub at: u64,
+    /// The sequence of the first record set aside.
+    pub sequence: u64,
+    /// What broke, being `corrupt` for a record that fails with a whole
+    /// record after it or in a sealed segment, `header` for a segment whose
+    /// header does not read or names another sequence than its file, and
+    /// `structure` for segments or framing records that do not form one run
+    /// of calls.
+    pub kind: &'static str,
+    /// The segment the damage is in, by number.
+    pub damage_segment: u64,
+    /// The byte of that segment the damage is at.
+    pub damage_at: u64,
+    /// The sequence the record at the damage was expected to carry.
+    pub damage_sequence: u64,
+    /// How the damage fails.
+    pub detail: String,
 }
 
 impl JournalContents<'_> {
@@ -987,11 +1118,14 @@ impl JournalContents<'_> {
     }
 
     /// The refusal a corrupt middle earns, naming the segment, the sequence
-    /// and the byte. None for a torn tail or an undamaged journal.
+    /// and the byte, and the record and byte a repair cuts at. None for a
+    /// torn tail or an undamaged journal.
     pub fn refusal(&self) -> Option<Error> {
+        let cut = self.cut.as_ref().map(|cut| (cut.sequence, cut.at));
         corrupt_refusal(
             self.damage.as_ref(),
             self.damage_file.as_deref().unwrap_or_default(),
+            cut,
         )
     }
 }
@@ -1030,6 +1164,8 @@ struct Withdrawing {
 /// The records of the segments naming the checkpoint, settled one at a time.
 struct Settle<'a> {
     records: Vec<LiveRecord<'a>>,
+    /// The place in `records` of each call's first record.
+    calls: Vec<usize>,
     /// Operation records after the last boundary and not under a commit.
     pending: Vec<usize>,
     /// Where the first of them sits, being its segment's place among the
@@ -1046,6 +1182,7 @@ impl<'a> Settle<'a> {
     fn new(checkpoint: u64) -> Self {
         Settle {
             records: Vec::new(),
+            calls: Vec::new(),
             pending: Vec::new(),
             pending_start: None,
             tentative: None,
@@ -1104,6 +1241,7 @@ impl<'a> Settle<'a> {
             _ => {
                 if self.pending_start.is_none() {
                     self.pending_start = Some((segment, record.offset, record.sequence));
+                    self.calls.push(self.records.len());
                 }
                 self.records.push(LiveRecord {
                     record,
@@ -1166,6 +1304,9 @@ impl<'a> Settle<'a> {
         let pending = std::mem::take(&mut self.pending);
         self.withdraw(&pending);
         self.pending_start = None;
+        // The records found between the damage and the abort belong to the
+        // call open at the damage, and begin one where none was open.
+        let mut open = !pending.is_empty();
         let mut next = failure.expected.max(abort.first);
         let mut at = failure.at;
         while at < abort.at && at + JOURNAL_RECORD_OVERHEAD_BYTES <= abort.at {
@@ -1173,6 +1314,10 @@ impl<'a> Settle<'a> {
             if sequence >= next && sequence < abort.sequence {
                 if let Parsed::Whole(record) = parse_record(bytes, at, sequence, true) {
                     if !record.kind.is_framing() {
+                        if !open {
+                            self.calls.push(self.records.len());
+                            open = true;
+                        }
                         self.records.push(LiveRecord {
                             record,
                             state: RecordState::Withdrawn,
@@ -1201,9 +1346,16 @@ impl<'a> Settle<'a> {
             return None;
         }
         let first = self.pending[0];
-        self.records.truncate(first);
+        self.truncate(first);
         self.pending.clear();
         self.pending_start.take()
+    }
+
+    /// Keep the records before `place` and the calls they begin.
+    fn truncate(&mut self, place: usize) {
+        self.records.truncate(place);
+        let calls = self.calls.partition_point(|&start| start < place);
+        self.calls.truncate(calls);
     }
 }
 
@@ -1214,21 +1366,116 @@ impl<'a> Settle<'a> {
 /// A header that does not read, a segment from another collection or another
 /// history, a gap, an overlap or a framing record naming the wrong sequence
 /// is refused outright. Damage inside a segment is reported in the contents
-/// and the caller decides.
+/// and the caller decides. A corrupt middle carries the cut a repair makes.
 pub fn read_segments<'a>(
     segments: &[SegmentBytes<'a>],
     expected: &Expected,
     journal: &str,
+) -> Result<JournalContents<'a>, Error> {
+    read_journal(segments, expected, journal, false)
+}
+
+/// [`read_segments`] for a repair.
+///
+/// A segment from another collection, a stale segment holding a record
+/// above the directory's sequence or following a live one, and a first live
+/// segment past the one after the checkpoint are refused as
+/// [`read_segments`] refuses them, since such a journal is not the
+/// directory's. Every other way the journal breaks its own history stops the
+/// reading there and puts a [`Cut`] in the contents: a header that does not
+/// read or names another sequence than its file, an empty live segment that
+/// is not the last, a gap or an overlap, a framing record naming the wrong
+/// sequence, records after the last commit in a sealed segment, a torn
+/// creation of the wrong number, and a corrupt middle. `records` then holds
+/// the records of the calls before the cut and none after it, and
+/// `next_sequence` is the cut's sequence. A segment named at or below the
+/// directory's sequence whose header does not read or names another
+/// sequence than its file is stale by its name, so it is listed in
+/// `stale_set_aside` instead and the reading goes on without it.
+pub fn read_segments_for_repair<'a>(
+    segments: &[SegmentBytes<'a>],
+    expected: &Expected,
+    journal: &str,
+) -> Result<JournalContents<'a>, Error> {
+    read_journal(segments, expected, journal, true)
+}
+
+/// The first break of the journal's own history a reading for a repair met:
+/// the segment, its file and the byte the break is at, the sequence the
+/// record there was expected to carry, what broke and how.
+struct Break {
+    segment: u64,
+    file: String,
+    at: u64,
+    sequence: u64,
+    kind: &'static str,
+    detail: String,
+}
+
+impl Break {
+    /// A break that takes the whole segment, being one whose header does not
+    /// read or which breaks the run of segments.
+    fn whole(segment: &SegmentBytes<'_>, kind: &'static str, detail: String) -> Self {
+        Break {
+            segment: segment.number,
+            file: segment.file.to_string(),
+            at: 0,
+            sequence: segment.number,
+            kind,
+            detail,
+        }
+    }
+}
+
+/// The cut a repair makes for `found`: the first record of the call open at
+/// the break where one is open, and the break itself where none is.
+fn cut_for(
+    settle: &Settle<'_>,
+    read: &[(SegmentBytes<'_>, SegmentHeader)],
+    live: &[usize],
+    found: Break,
+) -> Cut {
+    let (segment, at, sequence) = match settle.pending_start {
+        Some((place, offset, first)) => (read[live[place]].0.number, offset, first),
+        None => (found.segment, found.at, found.sequence),
+    };
+    Cut {
+        segment,
+        at,
+        sequence,
+        kind: found.kind,
+        damage_segment: found.segment,
+        damage_at: found.at,
+        damage_sequence: found.sequence,
+        detail: found.detail,
+    }
+}
+
+/// The reader both [`read_segments`] and [`read_segments_for_repair`] run.
+/// Where `repairing` is false, every break of the journal's history is the
+/// refusal [`read_segments`] documents.
+fn read_journal<'a>(
+    segments: &[SegmentBytes<'a>],
+    expected: &Expected,
+    journal: &str,
+    repairing: bool,
 ) -> Result<JournalContents<'a>, Error> {
     let invalid = |detail: String| Error::JournalSegmentsInvalid {
         journal: journal.to_string(),
         detail,
     };
     let checkpoint = expected.base.sequence;
+    // The first break a reading for a repair met. A reading that is not for
+    // a repair refuses at each one instead.
+    let mut broken: Option<Break> = None;
 
-    // Rule 1: every header, and a torn creation as the last alone.
+    // Rule 1: every header, and a torn creation as the last alone. A segment
+    // named at or below the checkpoint's sequence is stale by its name, so
+    // one whose header cannot be used is set aside whole for a repair, and
+    // the reading goes on.
     let mut read: Vec<(SegmentBytes<'a>, SegmentHeader)> = Vec::new();
     let mut torn_creation = None;
+    let mut stale_set_aside = Vec::new();
     for (i, segment) in segments.iter().enumerate() {
         if i > 0 && segment.number <= segments[i - 1].number {
             return Err(invalid(format!(
@@ -1236,19 +1483,39 @@ pub fn read_segments<'a>(
                 segment.file
             )));
         }
+        let stale_by_name = segment.number <= checkpoint;
         let header = match read_segment_header(segment.bytes, segment.file) {
             Ok(header) => header,
+            Err(error) if stale_by_name => {
+                let detail = header_detail(error);
+                stale_set_aside.push(stale_header(segment, checkpoint, detail, repairing)?);
+                continue;
+            }
             Err(_) if i + 1 == segments.len() && segment.bytes.len() <= SEGMENT_HEADER_BYTES => {
                 torn_creation = Some(segment.number);
                 continue;
             }
+            Err(error) if repairing => {
+                broken = Some(Break::whole(segment, "header", error.to_string()));
+                break;
+            }
             Err(error) => return Err(error),
         };
         if header.first_sequence != segment.number {
-            return Err(invalid(format!(
+            let detail = format!(
                 "the segment {} is named for sequence {} and its header names {}",
                 segment.file, segment.number, header.first_sequence
-            )));
+            );
+            if stale_by_name {
+                stale_set_aside.push(stale_header(segment, checkpoint, detail, repairing)?);
+                continue;
+            }
+            let error = invalid(detail);
+            if repairing {
+                broken = Some(Break::whole(segment, "header", error.to_string()));
+                break;
+            }
+            return Err(error);
         }
         if header.collection_id != expected.collection_id {
             return Err(Error::JournalNotThisCollection {
@@ -1318,39 +1585,66 @@ pub fn read_segments<'a>(
         }
     }
 
-    // Rules 4 to 7, over the live segments in order.
+    // Rules 4 to 7, over the live segments in order. A segment that breaks
+    // the run of segments is never the last, so where a reading for a repair
+    // broke at a header, the damage in every segment read before it is a
+    // corrupt middle.
     let mut settle = Settle::new(checkpoint);
     let mut damage = None;
     let mut damage_file = None;
     let mut good_bytes = 0u64;
-    let last_live = if torn_creation.is_some() {
+    let last_live = if torn_creation.is_some() || broken.is_some() {
         None
     } else {
         live.last().copied()
     };
-    for (place, &i) in live.iter().enumerate() {
+    'segments: for (place, &i) in live.iter().enumerate() {
         let (segment, header) = &read[i];
         let (records, failure) = &scans[i];
         if place > 0 {
+            let (previous, _) = &read[live[place - 1]];
             let before = &scans[live[place - 1]].0;
             let end = before
                 .last()
                 .map_or(read[live[place - 1]].1.first_sequence - 1, |r| r.sequence);
             if before.is_empty() {
-                return Err(invalid(format!(
+                let error = invalid(format!(
                     "the segment {} holds no record and is not the last",
-                    read[live[place - 1]].0.file
-                )));
+                    previous.file
+                ));
+                if repairing {
+                    broken = Some(Break::whole(previous, "structure", error.to_string()));
+                    break;
+                }
+                return Err(error);
             }
             if header.first_sequence != end + 1 {
-                return Err(invalid(format!(
+                let error = invalid(format!(
                     "the segment {} begins at sequence {} and the segment before it ends at {}",
                     segment.file, header.first_sequence, end
-                )));
+                ));
+                if repairing {
+                    broken = Some(Break::whole(segment, "structure", error.to_string()));
+                    break;
+                }
+                return Err(error);
             }
         }
         for record in records {
-            settle.feed(*record, place).map_err(&invalid)?;
+            if let Err(detail) = settle.feed(*record, place) {
+                if repairing {
+                    broken = Some(Break {
+                        segment: segment.number,
+                        file: segment.file.to_string(),
+                        at: record.offset,
+                        sequence: record.sequence,
+                        kind: "structure",
+                        detail: invalid(detail).to_string(),
+                    });
+                    break 'segments;
+                }
+                return Err(invalid(detail));
+            }
         }
         good_bytes = segment.bytes.len() as u64;
         let Some(failure) = failure.clone() else {
@@ -1372,7 +1666,20 @@ pub fn read_segments<'a>(
                 settle.withdraw_region(segment.bytes, &failure, &abort);
                 let (rest, after) = scan(segment.bytes, abort.end, abort.sequence + 1, true);
                 for record in rest {
-                    settle.feed(record, place).map_err(&invalid)?;
+                    if let Err(detail) = settle.feed(record, place) {
+                        if repairing {
+                            broken = Some(Break {
+                                segment: segment.number,
+                                file: segment.file.to_string(),
+                                at: record.offset,
+                                sequence: record.sequence,
+                                kind: "structure",
+                                detail: invalid(detail).to_string(),
+                            });
+                            break 'segments;
+                        }
+                        return Err(invalid(detail));
+                    }
                 }
                 stopped = after;
                 continue;
@@ -1403,22 +1710,52 @@ pub fn read_segments<'a>(
         Some(JournalDamage::TornTail { sequence, .. }) => *sequence,
         _ => settle.last.saturating_add(1),
     };
-    if !corrupt {
-        if let Some((place, at, sequence)) = settle.finish() {
-            if Some(live[place]) != last_live {
-                return Err(invalid(format!(
+    if !corrupt && broken.is_none() {
+        if let Some(open) = settle.pending_start {
+            if Some(live[open.0]) != last_live {
+                let (segment, _) = &read[live[open.0]];
+                let error = invalid(format!(
                     "records after the last commit sit in the segment {}, which is not the last",
-                    read[live[place]].0.file
-                )));
+                    segment.file
+                ));
+                if !repairing {
+                    return Err(error);
+                }
+                // The open call is the cut, so the break names its first
+                // record.
+                broken = Some(Break {
+                    segment: segment.number,
+                    file: segment.file.to_string(),
+                    at: open.1,
+                    sequence: open.2,
+                    kind: "structure",
+                    detail: error.to_string(),
+                });
             }
+        }
+    }
+    if !corrupt && broken.is_none() {
+        if let Some((place, at, sequence)) = settle.finish() {
             damage = Some(JournalDamage::TornTail { at, sequence });
             damage_file = Some(read[live[place]].0.file.to_string());
             good_bytes = at;
             next_sequence = sequence;
         }
     }
-    if let Some(number) = torn_creation {
-        if number != next_sequence {
+    if let (Some(number), None) = (torn_creation, broken.as_ref()) {
+        if !corrupt && number != next_sequence {
+            let error = invalid(format!(
+                "the last segment, numbered {number}, has no whole header and is not the \
+                 segment the journal would begin next, numbered {next_sequence}"
+            ));
+            if !repairing {
+                return Err(error);
+            }
+            let segment = segments
+                .last()
+                .expect("a torn creation is the last segment listed");
+            broken = Some(Break::whole(segment, "structure", error.to_string()));
+        } else if corrupt && number != next_sequence && !repairing {
             return Err(invalid(format!(
                 "the last segment, numbered {number}, has no whole header and is not the \
                  segment the journal would begin next, numbered {next_sequence}"
@@ -1428,17 +1765,116 @@ pub fn read_segments<'a>(
     if live.is_empty() {
         good_bytes = 0;
     }
+
+    // The cut, for a corrupt middle at any reading and for every other break
+    // at a reading for a repair. A repair keeps the records before it alone,
+    // and the call open at the break, a tentative commit aside, goes. A
+    // corrupt middle lies in a segment read before any header that broke the
+    // reading, so where both were met the corrupt middle is the first break.
+    let found = match (&damage, broken) {
+        (
+            Some(JournalDamage::Corrupt {
+                at,
+                sequence,
+                detail,
+            }),
+            _,
+        ) => {
+            let file = damage_file.clone().unwrap_or_default();
+            let number = read
+                .iter()
+                .find(|(segment, _)| segment.file == file)
+                .map_or(0, |(segment, _)| segment.number);
+            Some(Break {
+                segment: number,
+                file,
+                at: *at,
+                sequence: *sequence,
+                kind: "corrupt",
+                detail: detail.clone(),
+            })
+        }
+        (_, broken) => broken,
+    };
+    let mut active = last_live.map(|i| read[i].0.number);
+    let mut cut = None;
+    if let Some(found) = found {
+        let file = found.file.clone();
+        let made = cut_for(&settle, &read, &live, found);
+        if repairing {
+            if let Some(&first) = settle.pending.first() {
+                settle.truncate(first);
+            }
+            if !corrupt {
+                damage = Some(JournalDamage::Corrupt {
+                    at: made.damage_at,
+                    sequence: made.damage_sequence,
+                    detail: made.detail.clone(),
+                });
+                damage_file = Some(file);
+            }
+            next_sequence = made.sequence;
+            good_bytes = made.at;
+            active = None;
+        }
+        cut = Some(made);
+    }
+    let torn_creation = if repairing && cut.is_some() {
+        None
+    } else {
+        torn_creation
+    };
     Ok(JournalContents {
         segments: reports,
         torn_creation,
         records: settle.records,
+        calls: settle.calls,
         skipped,
         aborts: settle.aborts,
         damage,
         damage_file,
         good_bytes,
         next_sequence,
-        active: last_live.map(|i| read[i].0.number),
+        active,
+        cut,
+        stale_set_aside,
+    })
+}
+
+/// What a header refusal says is wrong, without the file it names.
+fn header_detail(error: Error) -> String {
+    match error {
+        Error::JournalHeaderInvalid { detail, .. } => detail,
+        other => other.to_string(),
+    }
+}
+
+/// A segment named at or below the directory's sequence `checkpoint` whose
+/// header cannot be used, for the reason `detail`. A reading for a repair
+/// sets it aside whole, and any other reading refuses the journal, naming
+/// the repair.
+fn stale_header(
+    segment: &SegmentBytes<'_>,
+    checkpoint: u64,
+    detail: String,
+    repairing: bool,
+) -> Result<StaleSegment, Error> {
+    if repairing {
+        return Ok(StaleSegment {
+            number: segment.number,
+            file: segment.file.to_string(),
+            detail,
+        });
+    }
+    Err(Error::JournalHeaderInvalid {
+        file: segment.file.to_string(),
+        detail: format!(
+            "{detail}. The segment is named for sequence {}, at or below the directory's \
+             sequence {checkpoint}, so it holds no record the directory needs, and a load with \
+             repair=True sets it aside whole in the journal's quarantine folder and keeps every \
+             other segment",
+            segment.number
+        ),
     })
 }
 

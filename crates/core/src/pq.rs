@@ -29,6 +29,27 @@ use std::sync::RwLock;
 /// rather than taken from `StdRng`, so a `rand` release cannot move a codebook.
 const PQ_TRAINING_SEED: u64 = 0x5A_EE_5D_B0_5E_ED_57_02;
 
+// The quantizer fits made on this thread, by `PQ::fit` and `Int8Codec::fit`,
+// for the tests that hold a replay to making none. Absent outside the tests.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static FITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The quantizer fits made on the calling thread, k-means codebooks and
+/// scalar scales together. Present under the `test-support` feature and in
+/// this crate's own tests alone.
+#[cfg(any(test, feature = "test-support"))]
+pub fn quantizer_fits() -> usize {
+    FITS.with(std::cell::Cell::get)
+}
+
+/// Count one fit on the calling thread.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn count_fit() {
+    FITS.with(|fits| fits.set(fits.get() + 1));
+}
+
 /// The tables a codebook implies, rebuilt whenever the codebook is installed
 ///
 /// Both are derived from the same centroids and both are read by
@@ -467,8 +488,29 @@ impl PQ {
         self.derived.read().unwrap().norms.len() * std::mem::size_of::<f32>()
     }
 
-    /// Train the PQ codebook using k-means clustering
+    /// Train the PQ codebook using k-means clustering, and install it.
     pub fn train(&self, vectors: &[Vec<f32>]) -> Result<(), String> {
+        let centroids = self.fit(vectors)?;
+        self.install(centroids)
+    }
+
+    /// Install a codebook a fit produced or a record carried, with the
+    /// tables it implies, and mark the quantizer trained. Nothing reads the
+    /// tables before the flag is set, so the graph never sees a half-built
+    /// one. Refused, leaving the quantizer as it was, for a codebook of
+    /// another shape.
+    pub fn install(&self, centroids: Vec<Vec<Vec<f32>>>) -> Result<(), String> {
+        self.set_centroids(centroids)?;
+        self.set_trained(true);
+        Ok(())
+    }
+
+    /// Fit a codebook to `vectors` by k-means, one subvector at a time on
+    /// streams of their own, and return it without installing it. The
+    /// codebook is a function of the vectors alone, see `PQ_TRAINING_SEED`.
+    pub fn fit(&self, vectors: &[Vec<f32>]) -> Result<Vec<Vec<Vec<f32>>>, String> {
+        #[cfg(any(test, feature = "test-support"))]
+        count_fit();
         if vectors.is_empty() {
             return Err("Cannot train on empty vector set".to_string());
         }
@@ -506,7 +548,7 @@ impl PQ {
         };
 
         // Train each subvector independently using parallel processing
-        let new_centroids: Result<Vec<_>, String> = (0..self.subvectors)
+        (0..self.subvectors)
             .into_par_iter()
             .map(|s| {
                 let start_idx = s * self.sub_dim;
@@ -528,25 +570,7 @@ impl PQ {
                 let mut rng = SeededRng::seed_from_u64(PQ_TRAINING_SEED ^ (s as u64 + 1));
                 self.kmeans(&subvectors, self.num_centroids, max_iter, &mut rng)
             })
-            .collect();
-
-        match new_centroids {
-            Ok(centroids_vec) => {
-                // Install the codebook and the symmetric distance table derived
-                // from it, then mark trained. Nothing reads the table before
-                // the flag is set, so the graph never sees a half-built one.
-                self.set_centroids(centroids_vec)?;
-
-                // Mark as trained
-                {
-                    let mut trained = self.is_trained.write().unwrap();
-                    *trained = true;
-                }
-
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+            .collect()
     }
 
     /// Quantize a vector into PQ codes

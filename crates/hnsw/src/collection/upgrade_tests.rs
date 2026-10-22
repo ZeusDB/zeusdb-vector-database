@@ -20,7 +20,7 @@ use super::journal_support::{
     TempDir, FIXTURES,
 };
 use super::{Collection, ParsedRecord};
-use crate::journal::{journal_path, Durability};
+use crate::journal::{journal_path, CheckpointTaken, Durability};
 
 fn recover(path: &Path) -> Result<(Collection, crate::Recovery), Error> {
     Collection::recover(path.to_str().unwrap(), None, Durability::PerCall)
@@ -63,17 +63,22 @@ fn every_fixture_upgrades_to_5_0_0_with_every_record_it_recorded() {
             Some(format.as_str()),
             "{name}"
         );
-        assert!(report.checkpointed, "{name}");
+        assert_eq!(
+            report.checkpoint_taken,
+            Some(CheckpointTaken::Upgrade),
+            "{name}"
+        );
         assert_eq!(report.format_version, format, "{name}");
         assert_eq!(
             report.replayed as u64,
             expected["records_in_journal"].as_u64().unwrap(),
             "{name}: every whole record above the checkpoint"
         );
-        assert!(matches!(
-            report.damage,
-            Some(zeusdb_vector_core::JournalDamage::TornTail { .. })
-        ));
+        assert_eq!(
+            report.damage.as_ref().map(|damage| damage.kind),
+            Some("torn_tail"),
+            "{name}"
+        );
         assert_eq!(report.read_only, None);
 
         let m = manifest(&path);

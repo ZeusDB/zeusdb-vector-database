@@ -511,11 +511,15 @@ fn a_legacy_corrupt_middle_is_told_from_a_torn_tail() {
             sequence,
             at,
             detail,
+            cut_sequence,
+            cut_at,
         }) => {
             assert_eq!(file, "journal.zdbwal");
             assert_eq!(sequence, 3);
             assert_eq!(at, third.0 as u64);
             assert_eq!(detail, "checksum mismatch");
+            // Version 1 frames no call, so the cut is the damaged record.
+            assert_eq!((cut_sequence, cut_at), (3, third.0 as u64));
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
@@ -849,6 +853,7 @@ fn whole_calls_across_segments_read_back() {
     want.extend(committed_seqs(10..12));
     want.extend(committed_seqs(13..14));
     assert_eq!(states(&contents), want);
+    assert_eq!(contents.calls, vec![0, 3, 5]);
     assert_eq!(contents.committed(), 6);
     assert_eq!(contents.withdrawn(), 0);
     assert_eq!(contents.aborts, 0);
@@ -859,6 +864,35 @@ fn whole_calls_across_segments_read_back() {
     assert_eq!(contents.torn_creation, None);
     assert_eq!(contents.live().count(), 2);
     assert!(contents.refusal().is_none());
+}
+
+/// Every call is marked at its first record, a withdrawn call's included,
+/// and the call a torn tail cut goes with its records.
+#[test]
+fn each_call_is_marked_where_it_begins() {
+    let built = build(
+        1,
+        &[(
+            base(LIVE, 0),
+            vec![
+                Call::Committed(2),
+                Call::AbortedWithoutCommit(1),
+                Call::Committed(1),
+                Call::Open(2),
+            ],
+        )],
+    );
+    let files = built.files();
+    let contents = built.read(&files, &expected_at(0)).unwrap();
+    let mut want = committed_seqs(1..3);
+    want.extend(withdrawn_seqs(4..5));
+    want.extend(committed_seqs(6..7));
+    assert_eq!(states(&contents), want);
+    assert_eq!(contents.calls, vec![0, 2, 3]);
+    assert!(matches!(
+        contents.damage,
+        Some(JournalDamage::TornTail { sequence: 8, .. })
+    ));
 }
 
 /// Rule 1. A segment from another collection is refused by content, and a
@@ -1463,6 +1497,18 @@ impl JournalDir for FaultyDir {
     }
     fn segment_path(&self, number: u64) -> PathBuf {
         self.inner.segment_path(number)
+    }
+    fn create_quarantine(&self, folder: &str) -> std::io::Result<()> {
+        self.inner.create_quarantine(folder)
+    }
+    fn quarantine(&self) -> Box<dyn crate::storage::Dir> {
+        self.inner.quarantine()
+    }
+    fn quarantine_folders(&self) -> std::io::Result<Vec<String>> {
+        self.inner.quarantine_folders()
+    }
+    fn sync_quarantine(&self, folder: &str) {
+        self.inner.sync_quarantine(folder)
     }
 }
 
@@ -2079,6 +2125,508 @@ fn no_record_carries_the_last_sequence() {
     let contents = read_legacy_journal(&file, "t").unwrap();
     assert!(contents.records.is_empty());
     assert_eq!(contents.next_sequence(), u64::MAX);
+}
+
+// ============================================================================
+// THE READER FOR A REPAIR
+// ============================================================================
+
+/// The journal a repair keeps: every segment but the stale ones it sets
+/// aside, and where it cuts, every segment numbered below the cut's and the
+/// cut's own up to the cut where it keeps any of it.
+fn kept_by(built: &Built, cut: Option<&Cut>, stale: &[StaleSegment]) -> Built {
+    let mut kept = Built {
+        numbers: Vec::new(),
+        segments: Vec::new(),
+        known: Vec::new(),
+    };
+    for (number, bytes) in built.numbers.iter().zip(&built.segments) {
+        if stale.iter().any(|segment| segment.number == *number) {
+            continue;
+        }
+        match cut {
+            Some(cut) if *number > cut.segment || (*number == cut.segment && cut.at == 0) => {}
+            Some(cut) if *number == cut.segment => {
+                kept.numbers.push(*number);
+                kept.segments.push(bytes[..cut.at as usize].to_vec());
+            }
+            _ => {
+                kept.numbers.push(*number);
+                kept.segments.push(bytes.clone());
+            }
+        }
+    }
+    kept
+}
+
+/// `built` read for a repair.
+fn read_for_repair<'a>(
+    built: &'a Built,
+    files: &'a [String],
+    expected: &Expected,
+) -> Result<JournalContents<'a>, Error> {
+    let segments: Vec<SegmentBytes<'a>> = built
+        .numbers
+        .iter()
+        .zip(&built.segments)
+        .zip(files)
+        .map(|((number, bytes), file)| SegmentBytes {
+            number: *number,
+            file,
+            bytes,
+        })
+        .collect();
+    read_segments_for_repair(&segments, expected, "j.zdbjournal")
+}
+
+/// Hold a reading of `built` for a repair to its rule: where it cuts or sets
+/// a stale segment aside, the journal the repair keeps reads as an ordinary
+/// load reads it and holds exactly the records the reading kept in the same
+/// states. Where it cuts, that journal has no damage at all. Where it only
+/// sets stale segments aside, it has the damage the reading met in the live
+/// segments, which a load cuts as it would.
+fn holds_its_cut(built: &Built, expected: &Expected, contents: &JournalContents<'_>) {
+    let cut = contents.cut.as_ref();
+    if cut.is_none() && contents.stale_set_aside.is_empty() {
+        return;
+    }
+    let stale = &contents.stale_set_aside;
+    let kept = kept_by(built, cut, stale);
+    let kept_files = kept.files();
+    let again = kept.read(&kept_files, expected).unwrap_or_else(|e| {
+        panic!("the kept journal does not read at {cut:?} with {stale:?} set aside: {e}")
+    });
+    assert_eq!(again.cut, None);
+    assert!(again.stale_set_aside.is_empty());
+    assert_eq!(
+        states(&again),
+        states(contents),
+        "the kept journal holds the kept records at {cut:?} with {stale:?} set aside"
+    );
+    match cut {
+        Some(cut) => {
+            assert_eq!(contents.next_sequence, cut.sequence);
+            assert!(contents.damage.is_some());
+            assert_eq!(
+                again.damage, None,
+                "the kept journal reads clean at {cut:?}"
+            );
+        }
+        None => {
+            assert_eq!(again.damage, contents.damage, "with {stale:?} set aside");
+            assert_eq!(again.next_sequence, contents.next_sequence);
+        }
+    }
+}
+
+/// Read `built` for a repair and hold the reading to its rule. Returns the
+/// reading's cut and its records.
+fn repaired(built: &Built, expected: &Expected) -> (Option<Cut>, Vec<(u64, RecordState)>) {
+    let files = built.files();
+    let contents = read_for_repair(built, &files, expected).unwrap();
+    holds_its_cut(built, expected, &contents);
+    (contents.cut.clone(), states(&contents))
+}
+
+/// A segment named at or below the directory's sequence is stale by its
+/// name, whatever its header holds. Where its header does not read, or names
+/// another sequence than its file, a load refuses the journal and names the
+/// repair, and a reading for a repair sets the segment aside whole, cuts
+/// nothing for it, and keeps every record of the live segments. A corrupt
+/// middle in a live segment is still cut where it falls.
+#[test]
+fn a_stale_segment_whose_header_cannot_be_used_is_set_aside_for_a_repair() {
+    let clean = build(
+        1,
+        &[
+            (base(STALE, 0), vec![Call::Committed(2), Call::Committed(1)]),
+            (base(LIVE, 5), vec![Call::Committed(3)]),
+            (base(LIVE, 5), vec![Call::Committed(2), Call::Committed(1)]),
+        ],
+    );
+    let expected = expected_at(5);
+    let files = clean.files();
+    let loaded = clean.read(&files, &expected).unwrap();
+    for how in ["corrupt", "renumbered"] {
+        let mut built = clean.clone();
+        if how == "corrupt" {
+            built.segments[0][40] ^= 0x40;
+        } else {
+            built.segments[0][88..96].copy_from_slice(&3u64.to_le_bytes());
+            restamp_segment_header(&mut built.segments[0]);
+        }
+        let refused = built.read(&files, &expected).unwrap_err();
+        let message = refused.to_string();
+        assert!(
+            matches!(refused, Error::JournalHeaderInvalid { .. }),
+            "{how}: {message}"
+        );
+        assert!(
+            message.contains("at or below the directory's sequence 5")
+                && message.contains("repair=True"),
+            "{how}: {message}"
+        );
+        let contents = read_for_repair(&built, &files, &expected).unwrap();
+        assert_eq!(contents.cut, None, "{how}");
+        assert_eq!(
+            contents
+                .stale_set_aside
+                .iter()
+                .map(|segment| segment.number)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "{how}"
+        );
+        assert_eq!(states(&contents), states(&loaded), "{how}");
+        assert_eq!(contents.next_sequence, loaded.next_sequence, "{how}");
+        assert_eq!(contents.damage, None, "{how}");
+        holds_its_cut(&built, &expected, &contents);
+    }
+
+    let mut both = clean.clone();
+    both.segments[0][40] ^= 0x40;
+    let seventh = both.known.iter().find(|k| k.sequence == 7).unwrap().clone();
+    both.segments[seventh.segment][seventh.at + 17] ^= 0x40;
+    let contents = read_for_repair(&both, &files, &expected).unwrap();
+    assert_eq!(contents.stale_set_aside.len(), 1);
+    let cut = contents.cut.clone().expect("the corrupt middle is cut");
+    assert_eq!((cut.segment, cut.sequence, cut.kind), (6, 6, "corrupt"));
+    holds_its_cut(&both, &expected, &contents);
+}
+
+/// A journal with no damage reads the same for a repair as for a load, and
+/// nothing is cut.
+#[test]
+fn an_undamaged_journal_reads_the_same_for_a_repair() {
+    let built = build(
+        1,
+        &[
+            (base(LIVE, 0), vec![Call::Committed(3)]),
+            (
+                base(LIVE, 0),
+                vec![Call::AbortedAfterCommit(2), Call::Committed(1)],
+            ),
+        ],
+    );
+    let files = built.files();
+    let loaded = built.read(&files, &expected_at(0)).unwrap();
+    let (cut, kept) = repaired(&built, &expected_at(0));
+    assert_eq!(cut, None);
+    assert_eq!(kept, states(&loaded));
+    assert_eq!(loaded.cut, None);
+}
+
+/// A corrupt middle is cut at the first record of the call the damage is
+/// in, and every record from there on is set aside. A load names the same
+/// cut in its refusal.
+#[test]
+fn a_corrupt_middle_is_cut_at_the_first_record_of_its_call() {
+    // Records 1 and 2 committed at 3, then 4, 5 and 6 committed at 7.
+    let mut built = build(
+        1,
+        &[(base(LIVE, 0), vec![Call::Committed(2), Call::Committed(3)])],
+    );
+    let fourth = built
+        .known
+        .iter()
+        .find(|k| k.sequence == 4)
+        .unwrap()
+        .clone();
+    let fifth = built
+        .known
+        .iter()
+        .find(|k| k.sequence == 5)
+        .unwrap()
+        .clone();
+    built.segments[0][fifth.at + 17] ^= 0x40;
+    let files = built.files();
+    let loaded = built.read(&files, &expected_at(0)).unwrap();
+    match loaded.refusal() {
+        Some(Error::JournalCorrupt {
+            sequence,
+            at,
+            cut_sequence,
+            cut_at,
+            ..
+        }) => {
+            assert_eq!((sequence, at), (5, fifth.at as u64));
+            assert_eq!((cut_sequence, cut_at), (4, fourth.at as u64));
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let message = loaded.refusal().unwrap().to_string();
+    assert!(message.contains("repair=True"), "{message}");
+    assert!(
+        message.contains(&format!("byte {}", fourth.at)),
+        "{message}"
+    );
+    assert!(message.contains("record 4"), "{message}");
+    let (cut, kept) = repaired(&built, &expected_at(0));
+    let cut = cut.unwrap();
+    assert_eq!(
+        (cut.segment, cut.at, cut.sequence, cut.kind),
+        (1, fourth.at as u64, 4, "corrupt")
+    );
+    assert_eq!(
+        (cut.damage_segment, cut.damage_at, cut.damage_sequence),
+        (1, fifth.at as u64, 5)
+    );
+    assert_eq!(kept, committed_seqs(1..3));
+}
+
+/// Damage in a sealed segment sets aside the rest of that segment from the
+/// first record of its call, and every segment after it.
+#[test]
+fn damage_in_a_sealed_segment_sets_aside_every_later_segment() {
+    // Segment 1 holds 1, 2 and 3 committed at 4. Segment 5 holds 5 and 6
+    // committed at 7.
+    let mut built = build(
+        1,
+        &[
+            (base(LIVE, 0), vec![Call::Committed(3)]),
+            (base(LIVE, 0), vec![Call::Committed(2)]),
+        ],
+    );
+    let second = built
+        .known
+        .iter()
+        .find(|k| k.sequence == 2)
+        .unwrap()
+        .clone();
+    built.segments[0][second.at + 17] ^= 0x40;
+    let (cut, kept) = repaired(&built, &expected_at(0));
+    let cut = cut.unwrap();
+    assert_eq!(
+        (cut.segment, cut.at, cut.sequence),
+        (1, SEGMENT_HEADER_BYTES as u64, 1),
+        "the call began at the segment's first record"
+    );
+    assert!(kept.is_empty());
+}
+
+/// A header that does not read takes its whole segment, and every segment
+/// after it, while a load refuses it.
+#[test]
+fn a_header_that_does_not_read_cuts_its_whole_segment() {
+    let mut built = build(
+        1,
+        &[
+            (base(LIVE, 0), vec![Call::Committed(2)]),
+            (base(LIVE, 0), vec![Call::Committed(2)]),
+            (base(LIVE, 0), vec![Call::Committed(1)]),
+        ],
+    );
+    built.segments[1][9] ^= 1;
+    let files = built.files();
+    assert!(matches!(
+        built.read(&files, &expected_at(0)),
+        Err(Error::JournalHeaderInvalid { .. })
+    ));
+    let (cut, kept) = repaired(&built, &expected_at(0));
+    let cut = cut.unwrap();
+    assert_eq!(
+        (cut.segment, cut.at, cut.sequence, cut.kind),
+        (built.numbers[1], 0, built.numbers[1], "header")
+    );
+    assert_eq!(kept, committed_seqs(1..3));
+}
+
+/// A segment missing from the run cuts the segment after the gap whole.
+#[test]
+fn a_gap_cuts_the_segment_after_it() {
+    let mut built = build(
+        1,
+        &[
+            (base(LIVE, 0), vec![Call::Committed(2)]),
+            (base(LIVE, 0), vec![Call::Committed(2)]),
+            (base(LIVE, 0), vec![Call::Committed(1)]),
+        ],
+    );
+    built.numbers.remove(1);
+    built.segments.remove(1);
+    let files = built.files();
+    assert!(matches!(
+        built.read(&files, &expected_at(0)),
+        Err(Error::JournalSegmentsInvalid { .. })
+    ));
+    let (cut, kept) = repaired(&built, &expected_at(0));
+    let cut = cut.unwrap();
+    assert_eq!(
+        (cut.segment, cut.at, cut.kind),
+        (built.numbers[1], 0, "structure")
+    );
+    assert_eq!(kept, committed_seqs(1..3));
+}
+
+/// A framing record naming the wrong first sequence is cut at the first
+/// record of the call it would close.
+#[test]
+fn a_framing_record_naming_the_wrong_sequence_is_cut_at_its_call() {
+    // Records 1 and 2 committed at 3, then 4 and 5 committed at 6.
+    let mut built = build(
+        1,
+        &[(base(LIVE, 0), vec![Call::Committed(2), Call::Committed(2)])],
+    );
+    let commit = built
+        .known
+        .iter()
+        .find(|k| k.sequence == 6)
+        .unwrap()
+        .clone();
+    let fourth = built
+        .known
+        .iter()
+        .find(|k| k.sequence == 4)
+        .unwrap()
+        .clone();
+    let at = commit.at + JOURNAL_RECORD_HEADER_BYTES;
+    built.segments[0][at..at + 8].copy_from_slice(&5u64.to_le_bytes());
+    restamp_record(&mut built.segments[0], commit.at, 8);
+    let files = built.files();
+    assert!(matches!(
+        built.read(&files, &expected_at(0)),
+        Err(Error::JournalSegmentsInvalid { .. })
+    ));
+    let (cut, kept) = repaired(&built, &expected_at(0));
+    let cut = cut.unwrap();
+    assert_eq!(
+        (cut.segment, cut.at, cut.sequence, cut.kind),
+        (1, fourth.at as u64, 4, "structure")
+    );
+    assert_eq!((cut.damage_at, cut.damage_sequence), (commit.at as u64, 6));
+    assert_eq!(kept, committed_seqs(1..3));
+}
+
+/// A call left open at the end of a sealed segment is cut at its first
+/// record, and the segment after it goes.
+#[test]
+fn an_open_call_in_a_sealed_segment_is_cut_at_its_first_record() {
+    // Segment 1 holds 1 committed at 2, then 3 and 4 with no commit.
+    // Segment 5 holds 5 committed at 6.
+    let built = build(
+        1,
+        &[
+            (base(LIVE, 0), vec![Call::Committed(1), Call::Open(2)]),
+            (base(LIVE, 0), vec![Call::Committed(1)]),
+        ],
+    );
+    let third = built
+        .known
+        .iter()
+        .find(|k| k.sequence == 3)
+        .unwrap()
+        .clone();
+    let files = built.files();
+    assert!(matches!(
+        built.read(&files, &expected_at(0)),
+        Err(Error::JournalSegmentsInvalid { .. })
+    ));
+    let (cut, kept) = repaired(&built, &expected_at(0));
+    let cut = cut.unwrap();
+    assert_eq!(
+        (cut.segment, cut.at, cut.sequence, cut.kind),
+        (1, third.at as u64, 3, "structure")
+    );
+    assert_eq!(kept, committed_seqs(1..2));
+    // The same open call as the last segment's is a torn tail, which a
+    // load cuts and a repair leaves to it.
+    let built = build(
+        1,
+        &[(base(LIVE, 0), vec![Call::Committed(1), Call::Open(2)])],
+    );
+    let (cut, kept) = repaired(&built, &expected_at(0));
+    assert_eq!(cut, None);
+    assert_eq!(kept, committed_seqs(1..2));
+}
+
+/// A journal of another collection, a stale segment holding a record above
+/// the directory's sequence, and a first live segment past the one after
+/// the checkpoint are refused under repair as without it.
+#[test]
+fn a_journal_not_the_directorys_is_refused_under_repair() {
+    let built = build(1, &[(base(LIVE, 0), vec![Call::Committed(2)])]);
+    let files = built.files();
+    let segments: Vec<SegmentBytes<'_>> = built
+        .numbers
+        .iter()
+        .zip(&built.segments)
+        .zip(&files)
+        .map(|((number, bytes), file)| SegmentBytes {
+            number: *number,
+            file,
+            bytes,
+        })
+        .collect();
+    let other = Expected {
+        collection_id: COLLECTION ^ 1,
+        base: base(LIVE, 0),
+    };
+    assert!(matches!(
+        read_segments_for_repair(&segments, &other, "j"),
+        Err(Error::JournalNotThisCollection { .. })
+    ));
+    let elsewhere = Expected {
+        collection_id: COLLECTION,
+        base: base(STALE, 0),
+    };
+    assert!(matches!(
+        read_segments_for_repair(&segments, &elsewhere, "j"),
+        Err(Error::JournalNotThisCheckpoint { .. })
+    ));
+    let later = build(5, &[(base(LIVE, 2), vec![Call::Committed(1)])]);
+    let later_files = later.files();
+    let segments: Vec<SegmentBytes<'_>> = later
+        .numbers
+        .iter()
+        .zip(&later.segments)
+        .zip(&later_files)
+        .map(|((number, bytes), file)| SegmentBytes {
+            number: *number,
+            file,
+            bytes,
+        })
+        .collect();
+    assert!(matches!(
+        read_segments_for_repair(&segments, &expected_at(2), "j"),
+        Err(Error::JournalStartsAfterCheckpoint { .. })
+    ));
+}
+
+/// The whole records past a cut are counted by the reader's own scans, the
+/// run before a damaged record and the run after it, framing aside.
+#[test]
+fn the_records_set_aside_are_counted_past_the_damage() {
+    // Records 1 and 2 committed at 3, then 4, 5 and 6 committed at 7.
+    let mut built = build(
+        1,
+        &[(base(LIVE, 0), vec![Call::Committed(2), Call::Committed(3)])],
+    );
+    let fourth = built
+        .known
+        .iter()
+        .find(|k| k.sequence == 4)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        whole_records_from(&built.segments[0], fourth.at, 4, true),
+        3
+    );
+    let fifth = built
+        .known
+        .iter()
+        .find(|k| k.sequence == 5)
+        .unwrap()
+        .clone();
+    built.segments[0][fifth.at + 17] ^= 0x40;
+    assert_eq!(
+        whole_records_from(&built.segments[0], fourth.at, 4, true),
+        2,
+        "the damaged record is not counted and the ones either side of it are"
+    );
+    assert_eq!(
+        whole_records_from(&built.segments[0], SEGMENT_HEADER_BYTES, 1, true),
+        4
+    );
 }
 
 // ============================================================================
@@ -2843,17 +3391,31 @@ fn read_mutated<'a>(
     read_segments(&segments, expected, "j.zdbjournal")
 }
 
+/// The calls a reading marks begin at its first record, rise, and lie
+/// within its records.
+fn calls_hold(contents: &JournalContents<'_>) {
+    let calls = &contents.calls;
+    if contents.records.is_empty() {
+        assert!(calls.is_empty(), "{calls:?}");
+        return;
+    }
+    assert_eq!(calls.first(), Some(&0), "{calls:?}");
+    assert!(calls.windows(2).all(|pair| pair[0] < pair[1]), "{calls:?}");
+    assert!(calls.iter().all(|&start| start < contents.records.len()));
+}
+
 /// **The property, at format version 2.** Every mutation of any segment of a
 /// valid journal, its header included, reads or is refused with the reader's
 /// own error, none panics, and what reads holds together: every record above
-/// the checkpoint and in order, the next sequence above the checkpoint, and
-/// the good bytes within the last segment where the journal is not corrupt.
+/// the checkpoint and in order, its calls marked where they begin, the next
+/// sequence above the checkpoint, and the good bytes within the last segment
+/// where the journal is not corrupt.
 #[test]
 fn no_mutation_of_a_journal_of_segments_panics_the_reader() {
     let (built, expected) = segment_corpus();
     let mut rng = Rng(0x5eed_219a_e000_0002);
     let cases = budget(4_000);
-    let (mut read, mut refused) = (0usize, 0usize);
+    let (mut read, mut refused, mut cuts) = (0usize, 0usize, 0usize);
     for _ in 0..cases {
         let mut mutated = built.clone();
         for _ in 0..1 + rng.below(3) {
@@ -2930,6 +3492,7 @@ fn no_mutation_of_a_journal_of_segments_panics_the_reader() {
                     contents.committed() + contents.withdrawn(),
                     contents.records.len()
                 );
+                calls_hold(&contents);
                 let corrupt = matches!(contents.damage, Some(JournalDamage::Corrupt { .. }));
                 if let (Some(active), false) = (contents.active, corrupt) {
                     let i = mutated.numbers.iter().position(|n| *n == active).unwrap();
@@ -2952,9 +3515,30 @@ fn no_mutation_of_a_journal_of_segments_panics_the_reader() {
             ) => refused += 1,
             Err(other) => panic!("unexpected error {other:?}"),
         }
+        // The same journal read for a repair is refused only as not the
+        // directory's, and where it cuts, the journal it keeps reads clean
+        // with the records it kept.
+        match read_for_repair(&mutated, &files, &expected) {
+            Ok(contents) => {
+                calls_hold(&contents);
+                holds_its_cut(&mutated, &expected, &contents);
+                cuts += usize::from(contents.cut.is_some());
+            }
+            Err(
+                Error::JournalSegmentsInvalid { .. }
+                | Error::JournalNotThisCollection { .. }
+                | Error::JournalNotThisCheckpoint { .. }
+                | Error::JournalStartsAfterCheckpoint { .. },
+            ) => {}
+            Err(other) => panic!("a reading for a repair gave {other:?}"),
+        }
     }
     assert!(read * 4 > cases, "only {read} of {cases} read");
     assert!(refused > 0, "no case was refused");
+    assert!(
+        cuts * 10 > cases,
+        "only {cuts} of {cases} were cut for a repair"
+    );
 }
 
 /// **The classification, at format version 2.** Every mutation of the last
@@ -3043,4 +3627,183 @@ fn the_segment_classification_matches_an_oracle_under_mutation() {
         torn * 20 > cases && corrupt * 50 > cases && whole > 0 && regions > 0,
         "{torn} torn, {corrupt} corrupt, {whole} whole, {regions} with a region, of {cases}"
     );
+}
+
+/// A journal of one segment whose calls each carry one real operation at
+/// width 4 and are committed, a version 2 training record of each scheme
+/// among them, with the place and length of every record.
+fn operation_corpus() -> Built {
+    use crate::operation::Fitted;
+    let operations = vec![
+        Operation::Insert {
+            id: "a".into(),
+            internal_id: 1,
+            level: 0,
+            vector: vec![1.0, 0.0, -1.0, 0.5],
+            metadata: serde_json::Map::new(),
+            sparse: None,
+        },
+        Operation::Train {
+            completed_at: "2026-10-21T00:00:00+00:00".into(),
+            fitted: Some(Fitted::Codebook {
+                subvectors: 2,
+                centroids: 4,
+                width: 2,
+                values: (0..16).map(|v| v as f32 * 0.25).collect(),
+                calibration: Some(r#"{"fetch":12}"#.into()),
+            }),
+        },
+        Operation::Intern {
+            term_id: 0,
+            term: "fox".into(),
+        },
+        Operation::Train {
+            completed_at: "t".into(),
+            fitted: Some(Fitted::Scales {
+                values: vec![0.5, 1.0, 0.25, 2.0],
+            }),
+        },
+        Operation::Remove {
+            ids: vec!["a".into()],
+        },
+        Operation::AddMetadata {
+            pairs: vec![("k".into(), "v".into())],
+        },
+    ];
+    let mut built = Built {
+        numbers: vec![1],
+        segments: Vec::new(),
+        known: Vec::new(),
+    };
+    let mut bytes = encode_segment_header(&segment_header(base(LIVE, 0), 1)).to_vec();
+    let mut sequence = 1u64;
+    let (mut payload, mut record) = (Vec::new(), Vec::new());
+    for operation in &operations {
+        operation.encode(&mut payload);
+        encode_journal_record(sequence, operation.kind(), &payload, &mut record);
+        built.known.push(Known {
+            segment: 0,
+            at: bytes.len(),
+            len: record.len(),
+            sequence,
+            kind: operation.kind(),
+            first: None,
+        });
+        bytes.extend_from_slice(&record);
+        let first = sequence;
+        sequence += 1;
+        Operation::Commit { first }.encode(&mut payload);
+        encode_journal_record(sequence, OperationKind::Commit, &payload, &mut record);
+        built.known.push(Known {
+            segment: 0,
+            at: bytes.len(),
+            len: record.len(),
+            sequence,
+            kind: OperationKind::Commit,
+            first: Some(first),
+        });
+        bytes.extend_from_slice(&record);
+        sequence += 1;
+    }
+    built.segments.push(bytes);
+    built
+}
+
+/// **The decoder under the reader, at format version 2.** Every mutation of
+/// a journal whose records carry real operations, a version 2 training
+/// record of each scheme among them, reads or is refused with the reader's
+/// own error, for a load and for a repair, and every record either reading
+/// hands over decodes or is refused with the decoder's own error, its counts
+/// held to its payload before anything is sized.
+#[test]
+fn no_mutation_of_a_journal_of_operations_panics_the_decoder() {
+    use crate::operation::Fitted;
+    let built = operation_corpus();
+    let expected = expected_at(0);
+    let mut rng = Rng(0x5eed_219b_d000_0002);
+    let cases = budget(4_000);
+    let (mut decoded, mut trained, mut refused) = (0usize, 0usize, 0usize);
+    for _ in 0..cases {
+        let mut mutated = built.clone();
+        for _ in 0..1 + rng.below(3) {
+            let segment = &mut mutated.segments[0];
+            let len = segment.len();
+            match rng.below(6) {
+                0..=2 => {
+                    // A value written inside a record's payload, the record
+                    // restamped, so the reader hands the payload over.
+                    let k = &built.known[rng.below(built.known.len())];
+                    let payload = k.len - JOURNAL_RECORD_OVERHEAD_BYTES;
+                    if payload > 0 && k.at + k.len <= segment.len() {
+                        let start = k.at + JOURNAL_RECORD_HEADER_BYTES;
+                        let at = start + rng.below(payload);
+                        let value = HOSTILE[rng.below(HOSTILE.len())].to_le_bytes();
+                        let end = (at + [1usize, 2, 4, 8][rng.below(4)]).min(start + payload);
+                        segment[at..end].copy_from_slice(&value[..end - at]);
+                        restamp_record(segment, k.at, payload);
+                    }
+                }
+                3 => {
+                    if len > 0 {
+                        let at = rng.below(len);
+                        segment[at] = rng.byte();
+                    }
+                }
+                4 => segment.truncate(rng.below(len + 1)),
+                _ => {
+                    let extra = 1 + rng.below(40);
+                    segment.extend(std::iter::repeat_n(rng.byte(), extra));
+                }
+            }
+        }
+        let files = mutated.files();
+        for reading in [
+            mutated.read(&files, &expected),
+            read_for_repair(&mutated, &files, &expected),
+        ] {
+            let contents = match reading {
+                Ok(contents) => contents,
+                Err(
+                    Error::JournalHeaderInvalid { .. }
+                    | Error::JournalSegmentsInvalid { .. }
+                    | Error::JournalNotThisCollection { .. }
+                    | Error::JournalNotThisCheckpoint { .. }
+                    | Error::JournalStartsAfterCheckpoint { .. },
+                ) => {
+                    refused += 1;
+                    continue;
+                }
+                Err(other) => panic!("unexpected error {other:?}"),
+            };
+            for live in &contents.records {
+                match Operation::decode(&live.record, 4, "f") {
+                    Ok(Operation::Train {
+                        fitted: Some(fitted),
+                        ..
+                    }) => {
+                        decoded += 1;
+                        trained += 1;
+                        let values = match &fitted {
+                            Fitted::Codebook { values, .. } | Fitted::Scales { values } => {
+                                values.len()
+                            }
+                        };
+                        assert!(values * 4 <= live.record.payload.len());
+                    }
+                    Ok(_) => decoded += 1,
+                    Err(Error::JournalRecordInvalid { .. }) => {}
+                    Err(other) => panic!("unexpected decode error {other:?}"),
+                }
+            }
+        }
+    }
+    assert!(
+        decoded > cases,
+        "only {decoded} records decoded over {cases} cases"
+    );
+    assert!(
+        trained * 4 > cases,
+        "only {trained} training records decoded over {cases} cases"
+    );
+    assert!(refused > 0, "no case was refused");
 }

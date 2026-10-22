@@ -23,7 +23,8 @@
 //! [`Staged`] is the directory a save writes before the commit puts it in
 //! place. Dropped without a commit, it is removed.
 //!
-//! [`JournalDir`] is the journal, being a directory of segments, and
+//! [`JournalDir`] is the journal, being a directory of segments with the
+//! `quarantine` folder a repair copies what it sets aside into, and
 //! [`JournalFile`] is one segment, open to read and write.
 //!
 //! [`LockGuard`] is a lock on the collection, held until it is dropped.
@@ -127,6 +128,17 @@ pub trait Storage {
     /// for this save to write into.
     fn stage(&self) -> Result<Box<dyn Staged>, Error>;
 
+    /// What stands at the target that a save must not replace, being a
+    /// file, a folder holding entries and no `manifest.json`, or a folder
+    /// this process cannot list, as a phrase a refusal quotes. `None` where
+    /// nothing stands there, where an empty folder does, and where a folder
+    /// holding a manifest does, which is an index directory an earlier save
+    /// wrote. A save replaces the directory at its target whole, so it asks
+    /// this before anything is written. A target the system will not
+    /// describe at all is `None`, and the save's own first write meets the
+    /// same refusal.
+    fn foreign_target(&self) -> Option<String>;
+
     /// Whether the folder the directory sits in takes a new entry, found by
     /// creating the staging directory and removing it again. A load runs
     /// this before the first write a checkpoint makes, and reads the I/O
@@ -164,6 +176,11 @@ pub trait Storage {
     /// its checkpoint holds every record the file held.
     fn remove_legacy_journal(&self) -> io::Result<()>;
 
+    /// Cut the journal of format version 1 to its first `len` bytes and make
+    /// the cut durable, which a repair does once its quarantine holds every
+    /// byte past `len`.
+    fn cut_legacy_journal(&self, len: u64) -> io::Result<()>;
+
     /// Where the lock file is.
     fn lock_path(&self) -> &Path;
 
@@ -187,8 +204,10 @@ pub trait Staged {
     fn dir(&self) -> &dyn Dir;
 
     /// Put the directory in place of the one there, whole, so a reader sees
-    /// the one or the other and never a mixture.
-    fn commit(self: Box<Self>) -> Result<(), Error>;
+    /// the one or the other and never a mixture. `between` is the point a
+    /// crash test aborts at between the two renames, being the save's or a
+    /// backup's.
+    fn commit(self: Box<Self>, between: crate::KillPoint) -> Result<(), Error>;
 }
 
 /// The journal, being a directory of segments, each a file named by the
@@ -224,6 +243,26 @@ pub trait JournalDir: Send + Sync + std::fmt::Debug {
 
     /// Where the segment `number` is, which a message names.
     fn segment_path(&self, number: u64) -> std::path::PathBuf;
+
+    /// Create the folder `folder` under the journal's `quarantine` folder,
+    /// and the `quarantine` folder where it is missing. The first write a
+    /// repair makes, so the error is the system's, for the caller to tell a
+    /// medium that refuses writes from any other failure.
+    fn create_quarantine(&self, folder: &str) -> io::Result<()>;
+
+    /// The journal's `quarantine` folder as a directory of artefacts, each
+    /// named `<folder>/<file>`. A file written there is durable before the
+    /// write returns.
+    fn quarantine(&self) -> Box<dyn Dir>;
+
+    /// Every folder under the journal's `quarantine` folder, by name, in
+    /// name order, and none where it does not exist.
+    fn quarantine_folders(&self) -> io::Result<Vec<String>>;
+
+    /// Make the entries of the folder `folder` under `quarantine`, of
+    /// `quarantine` and of the journal's directory durable, where the
+    /// system has a call for it. Best effort.
+    fn sync_quarantine(&self, folder: &str);
 }
 
 /// One segment of the journal, open to read and write.
@@ -274,10 +313,11 @@ impl LockMode {
 
 /// A lock on a collection, held until it is dropped.
 ///
-/// Dropping it closes the lock file, which releases the lock. Nothing
-/// unlocks it explicitly, because a child forked from the holder shares the
-/// open file and an unlock there would release the parent's lock. The child
-/// closes its copy instead, which leaves the lock with the parent; see
+/// Dropping it in the process that took the lock unlocks the lock file and
+/// then closes it, so the lock goes even while a child process still holds a
+/// copy of the file. A child forked from the holder shares the open file, and
+/// an unlock there would release the parent's lock, so the child closes its
+/// copy without unlocking it, which leaves the lock with the parent; see
 /// [`close_lock_files_in_forked_child`].
 pub trait LockGuard: Send + Sync + std::fmt::Debug {
     /// The mode the lock is held in.

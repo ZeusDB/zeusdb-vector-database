@@ -131,6 +131,7 @@ use tracing::{info, warn};
 use zeusdb_vector_core::{
     read_legacy_journal, AbortReason, CommitMode, Error, FsStorage, JournalDamage, JournalWriter,
     LegacyContents, LockFailure, LockGuard, LockMode, Locked, OperationKind, SegmentBase, Storage,
+    Withdrawal,
 };
 
 use crate::collection::OperationSink;
@@ -465,10 +466,10 @@ fn file_name_of(path: &Path) -> String {
 
 /// A child forked from the process that opened the journal shares its open
 /// files and holds no copy of its thread. Dropping the sink there does not
-/// join a thread the child does not have. Its lock drops as it would anywhere,
-/// which closes the child's copy of the lock file where the child has not
-/// closed it already, and leaves the parent's lock held, since a lock goes
-/// only with the last copy of its file.
+/// join a thread the child does not have. Its lock drops as a lock does in a
+/// child, which closes the child's copy of the lock file without unlocking it
+/// where the child has not closed it already, and leaves the parent's lock
+/// held, since a close lets a lock go only with the last copy of its file.
 impl Drop for JournalSink {
     fn drop(&mut self) {
         if !self.writer.in_its_own_process() {
@@ -517,6 +518,12 @@ impl OperationSink for JournalSink {
                 Ok(())
             }
         }
+    }
+
+    /// An abort record naming the call's first sequence, synced, or the
+    /// segment cut back to the last boundary, as a failed commit withdraws.
+    fn withdraw(&mut self) -> Withdrawal {
+        self.writer.withdraw(AbortReason::WriteFailed)
     }
 
     fn sync(&mut self) -> Result<(), Error> {
@@ -635,6 +642,94 @@ impl OperationSink for ReadOnlySink {
 // WHAT A RECOVERY DID
 // ============================================================================
 
+/// What stopped the reader or broke the journal's history, as a caller reads
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Damage {
+    /// `torn_tail`, `corrupt`, `header`, `structure`, `decode` or `apply`.
+    /// See [`Cut`](zeusdb_vector_core::Cut) for the middle four, and
+    /// `decode` and `apply` are a record whose checksum holds and which
+    /// would not decode or apply.
+    pub kind: &'static str,
+    /// The file the damage is in, by name.
+    pub segment: String,
+    /// The byte of that file the damage is at.
+    pub at: u64,
+    /// The sequence the record there carries or was expected to carry.
+    pub sequence: u64,
+    /// How it fails. `None` for a torn tail.
+    pub detail: Option<String>,
+}
+
+impl Damage {
+    /// A torn tail or a corrupt middle the reader reported, in `file`.
+    pub(crate) fn of(damage: &JournalDamage, file: &str) -> Self {
+        let segment = file_name_of(Path::new(file));
+        match damage {
+            JournalDamage::TornTail { at, sequence } => Damage {
+                kind: "torn_tail",
+                segment,
+                at: *at,
+                sequence: *sequence,
+                detail: None,
+            },
+            JournalDamage::Corrupt {
+                at,
+                sequence,
+                detail,
+            } => Damage {
+                kind: "corrupt",
+                segment,
+                at: *at,
+                sequence: *sequence,
+                detail: Some(detail.clone()),
+            },
+        }
+    }
+}
+
+/// What a repair set aside.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Repair {
+    /// The last sequence kept.
+    pub kept_through: u64,
+    /// The first sequence set aside past the checkpoint, where the repair
+    /// cut the journal, and `None` where it set aside only stale segments,
+    /// which hold no record past the checkpoint.
+    pub discarded_from: Option<u64>,
+    /// The whole operation records the bytes set aside hold, counted by the
+    /// reader's own scan.
+    pub records_discarded: u64,
+    /// The bytes set aside, every later segment's included.
+    pub bytes_discarded: u64,
+    /// The folder the bytes were copied into, or `None` where the medium
+    /// refused the write and nothing was set aside.
+    pub quarantine: Option<PathBuf>,
+}
+
+/// Why a load took a checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointTaken {
+    /// The directory was written again at 5.0.0 with a journal of segments.
+    Upgrade,
+    /// The journal held a call withdrawn after a failed commit.
+    Abort,
+    /// A repair cut the journal, or found one a killed repair left
+    /// unfinished. One checkpoint serves an abort the repair also met.
+    Repair,
+}
+
+impl CheckpointTaken {
+    /// The name a caller reads.
+    pub fn name(self) -> &'static str {
+        match self {
+            CheckpointTaken::Upgrade => "upgrade",
+            CheckpointTaken::Abort => "abort",
+            CheckpointTaken::Repair => "repair",
+        }
+    }
+}
+
 /// What a recovery did, for a caller that wants to know rather than for the
 /// engine, which needs none of it once the collection is built.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -661,12 +756,14 @@ pub struct Recovery {
     /// Records at or below the checkpoint's sequence, which it already
     /// holds.
     pub skipped: usize,
-    /// What stopped the reader, where anything did.
-    pub damage: Option<JournalDamage>,
+    /// What stopped the reader, or what a repair cut the journal for, where
+    /// anything did.
+    pub damage: Option<Damage>,
     /// The byte the good records end at in the last segment, which the
     /// journal was cut to.
     pub good_bytes: u64,
-    /// The segments the journal held when it was read.
+    /// The segments the journal held when it was read, and 0 for a journal
+    /// held in one file.
     pub segments: usize,
     /// The directory was put back from `<name>.zdbold`, so the save that
     /// wrote it had been killed between its two renames.
@@ -681,12 +778,14 @@ pub struct Recovery {
     /// The format the directory was upgraded from, where the load replayed a
     /// journal held in one file and wrote the directory again at 5.0.0.
     pub upgraded_from: Option<String>,
-    /// The load took a checkpoint, which an upgrade does and a load that
-    /// replays an abort does.
-    pub checkpointed: bool,
+    /// Why the load took a checkpoint, where it took one.
+    pub checkpoint_taken: Option<CheckpointTaken>,
     /// Why the collection is read only, where the medium refused the load's
     /// first write.
     pub read_only: Option<String>,
+    /// What a repair set aside, where the load was asked to repair and the
+    /// journal was damaged.
+    pub repair: Option<Repair>,
 }
 
 impl Recovery {
@@ -712,8 +811,9 @@ impl Recovery {
             graph_rebuilt,
             journaled: false,
             upgraded_from: None,
-            checkpointed: false,
+            checkpoint_taken: None,
             read_only: None,
+            repair: None,
         }
     }
 
@@ -728,14 +828,51 @@ impl Recovery {
         if !self.journaled {
             return;
         }
-        if let Some(JournalDamage::TornTail { at, sequence }) = &self.damage {
+        if let Some(damage) = self.damage.as_ref().filter(|d| d.kind == "torn_tail") {
             info!(target: LOG_TARGET, operation = "recover_torn_tail",
                 directory = directory,
-                at = at,
-                sequence = sequence,
+                at = damage.at,
+                sequence = damage.sequence,
                 "The journal ended inside a record or after records no commit closed; it was cut \
                  back to the last whole call"
             );
+        }
+        if let (Some(repair), Some(damage)) = (&self.repair, &self.damage) {
+            let quarantine = repair
+                .quarantine
+                .as_ref()
+                .map_or_else(|| "none".to_string(), |path| path.display().to_string());
+            if repair.discarded_from.is_some() {
+                warn!(target: LOG_TARGET, operation = "load_repair",
+                    directory = directory,
+                    kind = damage.kind,
+                    segment = damage.segment.as_str(),
+                    at = damage.at,
+                    sequence = damage.sequence,
+                    detail = damage.detail.as_deref().unwrap_or(""),
+                    kept_through = repair.kept_through,
+                    discarded_from = repair.discarded_from,
+                    records_discarded = repair.records_discarded,
+                    bytes_discarded = repair.bytes_discarded,
+                    quarantine = %quarantine,
+                    "The journal was damaged and was repaired: every record before the damaged \
+                     call was kept, and that call and every record after it were set aside in the \
+                     quarantine folder"
+                );
+            } else {
+                warn!(target: LOG_TARGET, operation = "load_repair",
+                    directory = directory,
+                    kind = damage.kind,
+                    segment = damage.segment.as_str(),
+                    detail = damage.detail.as_deref().unwrap_or(""),
+                    kept_through = repair.kept_through,
+                    bytes_discarded = repair.bytes_discarded,
+                    quarantine = %quarantine,
+                    "A stale segment of the journal, named at or below the checkpoint's sequence, \
+                     could not be read and was repaired: it was set aside whole in the quarantine \
+                     folder, and every record of the journal was kept"
+                );
+            }
         }
         if self.withdrawn > 0 {
             info!(target: LOG_TARGET, operation = "recover_withdrawn",
@@ -762,7 +899,7 @@ impl Recovery {
                  its journal of format version 1 was replayed into it; releases before 0.14.0 do \
                  not open it now"
             );
-        } else if self.checkpointed {
+        } else if self.checkpoint_taken == Some(CheckpointTaken::Abort) {
             info!(target: LOG_TARGET, operation = "recover_checkpoint",
                 directory = directory,
                 "The journal held a call withdrawn after a failed commit, so the load took a \
@@ -793,8 +930,12 @@ impl Recovery {
     }
 
     /// What a caller who loaded the directory is told where the collection
-    /// came back read only, being the warning the binding raises.
+    /// came back read only, being the warning the binding raises. A repair
+    /// says it in [`Recovery::repair_warning`] instead.
     pub fn read_only_warning(&self, directory: &str) -> Option<String> {
+        if self.repair.is_some() {
+            return None;
+        }
         let reason = self.read_only.as_ref()?;
         Some(format!(
             "The directory {} was opened read only, since this process cannot write it: {}. It \
@@ -803,6 +944,60 @@ impl Recovery {
              somewhere writable.",
             directory, reason, self.format_version, self.replayed
         ))
+    }
+
+    /// What a caller who loaded the directory with a repair is told where
+    /// the repair cut the journal, being the warning the binding raises.
+    /// Where the medium refused the repair's first write, it names that
+    /// refusal as well, and nothing was set aside.
+    pub fn repair_warning(&self, directory: &str) -> Option<String> {
+        let repair = self.repair.as_ref()?;
+        let damage = self.damage.as_ref()?;
+        let found = format!(
+            "The journal of the directory {} was damaged at byte {} of {} ({}, at record {}{}).",
+            directory,
+            damage.at,
+            damage.segment,
+            damage.kind.replace('_', " "),
+            damage.sequence,
+            damage
+                .detail
+                .as_deref()
+                .map_or_else(String::new, |detail| format!(": {detail}"))
+        );
+        let (kept, verb, done) = match repair.discarded_from {
+            Some(from) => (
+                format!(
+                    "Every record through {} was kept, and record {} and the {} records from it \
+                     on, {} bytes,",
+                    repair.kept_through, from, repair.records_discarded, repair.bytes_discarded
+                ),
+                "were",
+                "The journal was cut there and a checkpoint written.",
+            ),
+            None => (
+                format!(
+                    "Every record through {} was kept, and the segment {}, {} bytes, which is \
+                     named at or below the checkpoint's sequence and so holds no record past it,",
+                    repair.kept_through, damage.segment, repair.bytes_discarded
+                ),
+                "was",
+                "The segment was removed from the journal and a checkpoint written.",
+            ),
+        };
+        Some(match (&repair.quarantine, &self.read_only) {
+            (Some(folder), _) => format!(
+                "{found} {kept} {verb} set aside in {}. {done}",
+                folder.display()
+            ),
+            (None, reason) => format!(
+                "{found} {kept} {verb} left out of the replay. The directory was opened read \
+                 only, since this process cannot write it: {}. Nothing on the medium changed, \
+                 every change to the collection is refused, and a save into another directory \
+                 copies what was kept.",
+                reason.as_deref().unwrap_or("the medium refused the write")
+            ),
+        })
     }
 }
 
@@ -814,6 +1009,13 @@ pub enum JournalPolicy {
     /// policy and attach a sink over it. This is recovery, and it is what
     /// [`crate::Collection::load`] does under the default policy.
     Replay(Durability),
+    /// [`JournalPolicy::Replay`], under the exclusive lock, where damage to
+    /// the journal's history is cut away rather than refused: every whole
+    /// call before the damage is replayed, the damaged call and everything
+    /// after it are copied into the journal's `quarantine` folder, the
+    /// journal is cut and a checkpoint seals it. Where nothing is damaged
+    /// and no repair is unfinished it is a replay and writes nothing more.
+    Repair(Durability),
     /// Open the checkpoint alone. The journal is neither read nor reopened,
     /// no sink is attached, and the mutations it holds are not applied.
     ///
@@ -832,12 +1034,14 @@ pub enum JournalPolicy {
 /// content. The first sequence must not sit above the one after the
 /// checkpoint's, because the records between the two would be in neither.
 /// And a corrupt middle is refused, since a record after it proves it landed
-/// and skipping it would recover a state nothing acknowledged.
+/// and skipping it would recover a state nothing acknowledged, unless the
+/// load is `repairing` and cuts it away.
 pub(crate) fn check_legacy_contents(
     contents: &LegacyContents<'_>,
     file: &str,
     directory_id: u128,
     checkpoint_sequence: u64,
+    repairing: bool,
 ) -> Result<(), Error> {
     if contents.header.collection_id != directory_id {
         return Err(Error::JournalNotThisCollection {
@@ -853,7 +1057,7 @@ pub(crate) fn check_legacy_contents(
             checkpoint: checkpoint_sequence,
         });
     }
-    if let Some(refusal) = contents.refusal(file) {
+    if let Some(refusal) = contents.refusal(file).filter(|_| !repairing) {
         return Err(refusal);
     }
     Ok(())

@@ -12,32 +12,40 @@
 //! A child process runs a scripted sequence of mutations against a journaled
 //! collection, acknowledging each step by writing the ids it took to a file
 //! it fsyncs, and aborts at one named point. The parent then opens the
-//! directory the child left, and holds it to three rules.
+//! directory the child left, and holds it to four rules.
 //!
 //! Every record an acknowledged step added is present, with the vector and
 //! the metadata it was given. Nothing the script never added is present. No
-//! record of a call that returned refused is present. An unacknowledged
-//! record may be present or absent, since a batch the child died inside
-//! leaves whatever prefix of itself had reached the journal, and either is
-//! correct.
+//! record of a call that returned refused is present. A record the step
+//! the child died inside replaces is present in its old form or its new
+//! one, and never absent. An unacknowledged record may be present or
+//! absent, since a batch the child died inside leaves whatever prefix of
+//! itself had reached the journal, and either is correct.
+//!
+//! The backup the script writes is held to its own rule: its directory is
+//! absent where no backup was acknowledged, holds the last acknowledged
+//! backup as it was, or holds the backup the child died inside complete.
 //!
 //! The parent then resumes the script in a second child from the recovered
 //! state, runs it to the end, and holds the finished collection to the same
-//! rules. That is what proves the journal is usable after a recovery and not
-//! merely readable.
+//! rules, and the backup to the state its last step backed up. That is what
+//! proves the journal is usable after a recovery and not merely readable.
 //!
 //! # The matrix
 //!
-//! Twenty-seven points: ten inside an `add`, three of them reached only
-//! where its commit fails, two in a roll by size, ten inside a checkpoint,
-//! four inside the upgrade of a journal of format version 1, and one with
-//! the lock held. The script's segments roll at a length set so its last
-//! step passes it and no earlier step does. The ordinary gate runs a
-//! reduced matrix, being every point once: the add, roll and checkpoint
-//! points under the per-call arm, the three failing points under the
-//! failing arm, the lock, and the upgrade over one fixture.
-//! `ZEUSDB_KILL_MATRIX=full` runs every point at every step under every arm
-//! and the upgrade over every fixture.
+//! Thirty-six points: eleven inside an `add`, three of them reached only
+//! where its commit fails and one only where it replaces a held record, two
+//! in a roll by size, ten inside a checkpoint, five inside a backup, four
+//! inside the upgrade of a journal of format version 1, three inside a
+//! repair, and one with the lock held. The script's segments roll at a
+//! length set so its last step passes it and no earlier step does. The
+//! ordinary gate runs a reduced matrix, being every point once: the add,
+//! overwrite, roll, checkpoint and backup points under the per-call arm, the
+//! backup points at the second backup, the three failing points under the
+//! failing arm at each step it fails, the lock, the upgrade over one fixture
+//! and the repair of one class of damage. `ZEUSDB_KILL_MATRIX=full` runs
+//! every point at every step under every arm, the upgrade over every fixture
+//! and the repair of every class.
 //!
 //! # The four arms
 //!
@@ -48,9 +56,21 @@
 //! what these tests kill with. `interval` is [`Durability::PerInterval`] at
 //! ten milliseconds, so the engine's own thread syncs the journal, and an
 //! abort lands wherever that thread happens to be. The fourth, `fail`, runs
-//! the per-call policy through a journal directory whose sync fails at one
-//! step's commit, so that step returns its records refused, and the child
-//! then takes the checkpoint the fault requires before it goes on.
+//! the per-call policy through a journal directory whose sync fails at the
+//! commit of two steps, an `add` and the first overwrite, so each returns
+//! its records refused and the child then takes the checkpoint the fault
+//! requires before it goes on.
+//!
+//! # The repair cases
+//!
+//! Each builds a journal of six calls in two segments and damages it one
+//! way: a corrupt middle in the last segment, damage in the segment that is
+//! not the last, a header that will not read, or a record whose checksum
+//! holds and which will not decode. A child loads it with a repair armed at
+//! one of the repair's points. A plain load then refuses the damage where
+//! the child died before its cut and holds the kept calls otherwise, and a
+//! second repair finishes, holding the kept calls, one quarantine folder
+//! with no marker, and the bytes set aside equal to the bytes the cut took.
 //!
 //! # How the child is run
 //!
@@ -68,13 +88,16 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use zeusdb_vector_core::{
-    InsertParts, JournalDamage, KillPoint, LockFailure, LockMode, Locked, Operation, Storage,
+    InsertParts, KillPoint, LockFailure, LockMode, Locked, Operation, Storage,
     JOURNAL_RECORD_OVERHEAD_BYTES, SEGMENT_HEADER_BYTES,
 };
 
-use crate::journal::Durability;
+use crate::journal::{Durability, JournalPolicy};
 
-use super::journal_support::{copy_fixture, holds_fixture, manifest, sink_over, FaultyStorage};
+use super::journal_support::{
+    copy_fixture, damaged_journal, holds_fixture, manifest, quarantine_of, sink_over,
+    FaultyStorage, DAMAGED_CALL_RECORDS, REPAIR_CLASSES,
+};
 use super::{Collection, Declaration, ParsedRecord};
 
 // ============================================================================
@@ -89,17 +112,23 @@ const DIM: usize = 8;
 enum Step {
     /// Insert these records, by index into the corpus.
     Add(&'static [usize]),
+    /// Insert these records in their overwritten form with `overwrite`, the
+    /// first of them replacing records the collection holds and the last
+    /// new.
+    Overwrite(&'static [usize]),
     /// Remove these records.
     Remove(&'static [usize]),
     /// Replace this record's metadata.
     Update(usize),
     /// Save, which on a journaled collection is a checkpoint.
     Checkpoint,
+    /// Write a backup into the script's one backup directory.
+    Backup,
 }
 
-/// Every step, in order. Every record index is added exactly once, so a
-/// record present that no acknowledged step added is a defect rather than a
-/// duplicate.
+/// Every step, in order. Every record index is added exactly once, and
+/// replaced at most once by an overwrite, so a record present that no
+/// acknowledged step added is a defect rather than a duplicate.
 const SCRIPT: &[Step] = &[
     Step::Add(&[0, 1, 2]),
     Step::Add(&[3, 4, 5, 6]),
@@ -109,25 +138,43 @@ const SCRIPT: &[Step] = &[
     Step::Add(&[8, 9, 10, 11, 12]),
     Step::Update(2),
     Step::Checkpoint,
+    Step::Backup,
     Step::Add(&[13, 14]),
+    Step::Overwrite(&[3, 4, 26]),
     Step::Add(&[15, 16, 17]),
+    Step::Overwrite(&[5, 6, 27]),
+    Step::Backup,
     Step::Add(&[18, 19, 20, 21, 22, 23, 24, 25]),
 ];
 
 /// The highest record index the script ever adds.
-const HIGHEST_RECORD: usize = 25;
+const HIGHEST_RECORD: usize = 27;
 
-/// The step whose commit the failing arm fails.
-const FAILING_STEP: usize = 5;
+/// The steps whose commit the failing arm fails, being an `add` and the
+/// first overwrite.
+const FAILING_STEPS: [usize; 2] = [5, 10];
 
 /// The step that passes the segment's roll length.
-const ROLL_STEP: usize = 10;
+const ROLL_STEP: usize = 14;
 
 /// The points inside an `add` whose commit holds, in the order the call
 /// reaches them.
 const ADD_POINTS: &[KillPoint] = &[
     KillPoint::AddBeforeFirstAppend,
     KillPoint::AddMidAppend,
+    KillPoint::AddAfterSecondAppend,
+    KillPoint::AddAfterAppendBeforeCommit,
+    KillPoint::AddAfterCommitRecord,
+    KillPoint::AddAfterCommitBeforeApply,
+    KillPoint::AddAfterApply,
+];
+
+/// The points inside an `add` that replaces held records, in the order the
+/// call reaches them.
+const OVERWRITE_POINTS: &[KillPoint] = &[
+    KillPoint::AddBeforeFirstAppend,
+    KillPoint::AddMidAppend,
+    KillPoint::OverwriteAfterRemovalAppend,
     KillPoint::AddAfterSecondAppend,
     KillPoint::AddAfterAppendBeforeCommit,
     KillPoint::AddAfterCommitRecord,
@@ -159,12 +206,28 @@ const CHECKPOINT_POINTS: &[KillPoint] = &[
     KillPoint::CheckpointAfterDelete,
 ];
 
+/// The points inside a backup, in the order the call reaches them.
+const BACKUP_POINTS: &[KillPoint] = &[
+    KillPoint::BackupAfterSync,
+    KillPoint::BackupAfterArtefacts,
+    KillPoint::BackupAfterManifest,
+    KillPoint::BackupBetweenRenames,
+    KillPoint::BackupAfterCommit,
+];
+
 /// The points inside the upgrade of a journal of format version 1.
 const UPGRADE_POINTS: &[KillPoint] = &[
     KillPoint::UpgradeAfterReplay,
     KillPoint::UpgradeAfterCommit,
     KillPoint::UpgradeAfterSegment,
     KillPoint::UpgradeAfterOldRemoved,
+];
+
+/// The points inside a repair, in the order the load reaches them.
+const REPAIR_POINTS: &[KillPoint] = &[
+    KillPoint::RepairAfterQuarantine,
+    KillPoint::RepairAfterCut,
+    KillPoint::RepairAfterCheckpoint,
 ];
 
 /// The corpus, drawn the same way in every process, so the parent knows what
@@ -188,6 +251,15 @@ fn corpus() -> Vec<Vec<f32>> {
     vectors
 }
 
+/// The form a record takes: as the script first adds it, with its metadata
+/// replaced, or as an overwrite inserts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Form {
+    Original,
+    Updated,
+    Overwritten,
+}
+
 fn metadata_for(i: usize) -> BTreeMap<String, Value> {
     BTreeMap::from([
         ("i".to_string(), json!(i)),
@@ -202,6 +274,28 @@ fn updated_metadata(i: usize) -> BTreeMap<String, Value> {
     ])
 }
 
+fn overwritten_metadata(i: usize) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("i".to_string(), json!(i)),
+        ("overwritten".to_string(), json!(true)),
+    ])
+}
+
+/// The vector an overwrite gives record `i`, which is not the one the
+/// script first gave it.
+fn overwritten_vector(i: usize, vectors: &[Vec<f32>]) -> Vec<f32> {
+    vectors[i].iter().map(|value| 0.25 - value).collect()
+}
+
+/// The vector and the metadata record `i` holds in `form`.
+fn form_of(i: usize, form: Form, vectors: &[Vec<f32>]) -> (Vec<f32>, BTreeMap<String, Value>) {
+    match form {
+        Form::Original => (vectors[i].clone(), metadata_for(i)),
+        Form::Updated => (vectors[i].clone(), updated_metadata(i)),
+        Form::Overwritten => (overwritten_vector(i, vectors), overwritten_metadata(i)),
+    }
+}
+
 fn parsed(i: usize, vectors: &[Vec<f32>]) -> ParsedRecord {
     ParsedRecord {
         id: format!("r{i}"),
@@ -211,16 +305,21 @@ fn parsed(i: usize, vectors: &[Vec<f32>]) -> ParsedRecord {
     }
 }
 
+fn overwritten(i: usize, vectors: &[Vec<f32>]) -> ParsedRecord {
+    ParsedRecord {
+        id: format!("r{i}"),
+        vector: overwritten_vector(i, vectors),
+        sparse: None,
+        metadata: overwritten_metadata(i).into_iter().collect(),
+    }
+}
+
 fn declaration() -> Declaration {
     Declaration::validate(DIM, "l2", 8, 50, 200, vec![]).unwrap()
 }
 
-/// The length the child's segments roll at: ten of the script's inserts and
-/// two commits past a segment's header. The first segment takes seven
-/// inserts and the second six with a removal and a replacement, both short
-/// of it, and the third takes thirteen by the end of the last step, so the
-/// last step's commit rolls and no earlier commit does.
-fn roll_length(vectors: &[Vec<f32>]) -> u64 {
+/// The bytes one insert record of the script and one commit record take.
+fn record_lengths(vectors: &[Vec<f32>]) -> (u64, u64) {
     let metadata: HashMap<String, Value> = metadata_for(10).into_iter().collect();
     let mut payload = Vec::new();
     Operation::encode_insert(
@@ -234,7 +333,25 @@ fn roll_length(vectors: &[Vec<f32>]) -> u64 {
     );
     let insert = (payload.len() + JOURNAL_RECORD_OVERHEAD_BYTES) as u64;
     let commit = (8 + JOURNAL_RECORD_OVERHEAD_BYTES) as u64;
-    SEGMENT_HEADER_BYTES as u64 + 10 * insert + 2 * commit
+    (insert, commit)
+}
+
+/// The length the child's segments roll at: thirteen of the script's
+/// inserts and four commits past a segment's header. The segment after the
+/// second checkpoint takes eleven inserts, two removals and four commits by
+/// the second backup, short of it, and passes it at the last step, as the
+/// failing arm's segment after its last checkpoint does with eight inserts,
+/// one removal and two commits before the last step. Every earlier segment
+/// holds less, so the last step's commit rolls and no earlier commit does.
+fn roll_length(vectors: &[Vec<f32>]) -> u64 {
+    let (insert, commit) = record_lengths(vectors);
+    SEGMENT_HEADER_BYTES as u64 + 13 * insert + 4 * commit
+}
+
+/// The one directory every backup of the script writes into, beside the
+/// collection's.
+fn backup_target(dir: &Path) -> PathBuf {
+    dir.with_extension("backup.zdb")
 }
 
 // ============================================================================
@@ -248,6 +365,7 @@ const ENV_MARKER: &str = "ZEUSDB_KILL_MARKER";
 const ENV_RESUME: &str = "ZEUSDB_KILL_RESUME";
 const ENV_MATRIX: &str = "ZEUSDB_KILL_MATRIX";
 const ENV_UPGRADE: &str = "ZEUSDB_KILL_UPGRADE";
+const ENV_REPAIR: &str = "ZEUSDB_KILL_REPAIR";
 
 /// The name of the child test, as `--exact` spells it.
 const CHILD_TEST: &str = "collection::crash_tests::the_kill_matrixs_child";
@@ -277,14 +395,18 @@ fn acknowledge(path: &Path, line: &str) {
     file.sync_all().expect("the acknowledgement is synced");
 }
 
-/// What the acknowledgements say the collection must hold.
+/// What the acknowledgements say the collection and its backup must hold.
 #[derive(Debug, Default)]
 struct Acknowledged {
     /// Every record an acknowledged step added and no acknowledged step
-    /// removed, against whether its metadata was replaced.
-    present: BTreeMap<String, bool>,
-    /// Every record of a call that returned refused.
+    /// removed, against the form it was acknowledged in.
+    present: BTreeMap<String, Form>,
+    /// Every record of a call that returned refused that no acknowledged
+    /// step holds.
     refused: BTreeSet<String>,
+    /// Every acknowledged backup: the snapshot the copy records, and what
+    /// the collection held when it was taken.
+    backups: Vec<(String, BTreeMap<String, Form>)>,
     steps: usize,
     finished: bool,
 }
@@ -307,12 +429,19 @@ fn acknowledged(path: &Path) -> Acknowledged {
         match parts[2] {
             "add" => {
                 for id in parts[3].split(',') {
-                    out.present.insert(id.to_string(), false);
+                    out.present.insert(id.to_string(), Form::Original);
+                }
+            }
+            "overwrite" => {
+                for id in parts[3].split(',') {
+                    out.present.insert(id.to_string(), Form::Overwritten);
                 }
             }
             "refused" => {
                 for id in parts[3].split(',') {
-                    out.refused.insert(id.to_string());
+                    if !out.present.contains_key(id) {
+                        out.refused.insert(id.to_string());
+                    }
                 }
             }
             "remove" => {
@@ -321,7 +450,11 @@ fn acknowledged(path: &Path) -> Acknowledged {
                 }
             }
             "update" => {
-                out.present.insert(parts[3].to_string(), true);
+                out.present.insert(parts[3].to_string(), Form::Updated);
+            }
+            "backup" => {
+                out.backups
+                    .push((parts[3].to_string(), out.present.clone()));
             }
             _ => {}
         }
@@ -329,50 +462,31 @@ fn acknowledged(path: &Path) -> Acknowledged {
     out
 }
 
-/// Hold a recovered collection to the acknowledgements.
+/// Hold a recovered collection to the acknowledgements, with `in_flight`
+/// the step the child died inside, where it died inside one.
 ///
-/// Every acknowledged record present with the vector and the metadata it was
-/// given, nothing present that the script never added, and no record of a
-/// call that returned refused present. What is not held is the presence of
-/// an unacknowledged record, which is correct either way.
+/// Every acknowledged record present with the vector and the metadata of
+/// the form it was acknowledged in, or of its overwritten form where the
+/// step in flight replaces it, nothing present that the script never added,
+/// and no record of a call that returned refused present. What is not held
+/// is the presence of an unacknowledged record, which is correct either
+/// way. Returns the records present that no acknowledgement names.
 fn holds(
     collection: &Collection,
     expected: &Acknowledged,
     vectors: &[Vec<f32>],
+    in_flight: Option<&Step>,
 ) -> Result<usize, String> {
+    let replacing: BTreeSet<String> = match in_flight {
+        Some(Step::Overwrite(records)) => records.iter().map(|i| format!("r{i}")).collect(),
+        _ => BTreeSet::new(),
+    };
+    holds_present(collection, &expected.present, vectors, &replacing)?;
     let live: BTreeSet<String> = collection
         .ids()
         .iter()
         .map(|(_, id)| id.to_string())
         .collect();
-    for (id, updated) in &expected.present {
-        if !live.contains(id) {
-            return Err(format!("acknowledged record {id} is missing"));
-        }
-        let view = collection
-            .records(vec![id.clone()], true, true)
-            .map_err(|e| e.to_string())?;
-        let view = view
-            .first()
-            .ok_or_else(|| format!("{id} came back empty"))?;
-        let i: usize = id[1..].parse().unwrap();
-        if view.vector.as_deref() != Some(&vectors[i][..]) {
-            return Err(format!("record {id} came back with a different vector"));
-        }
-        let wanted = if *updated {
-            updated_metadata(i)
-        } else {
-            metadata_for(i)
-        };
-        for (key, value) in &wanted {
-            if view.metadata.get(key) != Some(value) {
-                return Err(format!(
-                    "record {id} has {key} of {:?} where {value:?} was acknowledged",
-                    view.metadata.get(key)
-                ));
-            }
-        }
-    }
     for id in &expected.refused {
         if live.contains(id) {
             return Err(format!(
@@ -389,6 +503,105 @@ fn holds(
         }
     }
     Ok(live.len() - expected.present.len())
+}
+
+/// Every record of `present` held in its form, or in its overwritten form
+/// where `replacing` names it, and never absent.
+fn holds_present(
+    collection: &Collection,
+    present: &BTreeMap<String, Form>,
+    vectors: &[Vec<f32>],
+    replacing: &BTreeSet<String>,
+) -> Result<(), String> {
+    for (id, form) in present {
+        if !collection.contains(id) {
+            return Err(format!("acknowledged record {id} is missing"));
+        }
+        let view = collection
+            .records(vec![id.clone()], true, true)
+            .map_err(|e| e.to_string())?;
+        let view = view
+            .first()
+            .ok_or_else(|| format!("{id} came back empty"))?;
+        let i: usize = id[1..].parse().unwrap();
+        let matches = |form: Form| {
+            let (vector, metadata) = form_of(i, form, vectors);
+            view.vector.as_deref() == Some(&vector[..])
+                && metadata.len() == view.metadata.len()
+                && metadata
+                    .iter()
+                    .all(|(key, value)| view.metadata.get(key) == Some(value))
+        };
+        if !(matches(*form) || replacing.contains(id) && matches(Form::Overwritten)) {
+            return Err(format!(
+                "record {id} came back as {:?} {:?}, which is neither its acknowledged form \
+                 {form:?} nor a form the step in flight gives it",
+                view.vector, view.metadata
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Hold `collection` to holding exactly `present`, each in its form.
+fn holds_exactly(
+    collection: &Collection,
+    present: &BTreeMap<String, Form>,
+    vectors: &[Vec<f32>],
+) -> Result<(), String> {
+    holds_present(collection, present, vectors, &BTreeSet::new())?;
+    if collection.len() != present.len() {
+        return Err(format!(
+            "{} records are held and {} were expected",
+            collection.len(),
+            present.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Hold the backup directory beside `dir` to the acknowledgements, with
+/// `in_flight` the step the child died inside: absent where no backup was
+/// acknowledged, the last acknowledged backup as it was, or, where the
+/// child died inside a backup, that backup complete.
+fn backup_holds(
+    dir: &Path,
+    expected: &Acknowledged,
+    vectors: &[Vec<f32>],
+    in_flight: Option<&Step>,
+) -> Result<&'static str, String> {
+    let target = backup_target(dir);
+    let aside = target.with_extension("zdb.zdbold");
+    if !target.exists() && !aside.exists() {
+        return match expected.backups.last() {
+            None => Ok("absent"),
+            Some((snapshot, _)) => Err(format!("the acknowledged backup {snapshot} is gone")),
+        };
+    }
+    let (copy, report) = Collection::recover(&target.to_string_lossy(), None, Durability::NoSync)
+        .map_err(|e| format!("the backup does not open: {e}"))?;
+    if report.journaled {
+        return Err("the backup names a journal".to_string());
+    }
+    let snapshot = copy
+        .identity()
+        .snapshot
+        .map(|snapshot| format!("{snapshot:032x}"))
+        .unwrap_or_default();
+    if let Some((acknowledged, present)) = expected.backups.last() {
+        if *acknowledged == snapshot {
+            holds_exactly(&copy, present, vectors)?;
+            return Ok("as it was");
+        }
+    }
+    if in_flight != Some(&Step::Backup) {
+        return Err(format!(
+            "the backup records snapshot {snapshot}, which no acknowledged backup names, and no \
+             backup was in flight"
+        ));
+    }
+    holds_exactly(&copy, &expected.present, vectors)?;
+    Ok("complete")
 }
 
 // ============================================================================
@@ -420,14 +633,22 @@ fn the_kill_matrixs_child() {
     let durability = durability(&arm);
     zeusdb_vector_core::set_segment_roll_bytes(roll_length(&vectors));
 
-    // An upgrade case loads a copy of a fixture, armed inside its upgrade.
-    if std::env::var(ENV_UPGRADE).is_ok() {
+    // An upgrade case loads a copy of a fixture, and a repair case a
+    // damaged journal with a repair, each armed inside the load.
+    let policy = if std::env::var(ENV_UPGRADE).is_ok() {
+        Some(JournalPolicy::Replay(Durability::PerCall))
+    } else if std::env::var(ENV_REPAIR).is_ok() {
+        Some(JournalPolicy::Repair(Durability::PerCall))
+    } else {
+        None
+    };
+    if let Some(policy) = policy {
         if let Some(point) = point {
             zeusdb_vector_core::kill_arm(point, &marker);
         }
-        let opened = Collection::recover(&dir.to_string_lossy(), None, Durability::PerCall);
+        let opened = Collection::recover_with(&dir.to_string_lossy(), None, policy);
         zeusdb_vector_core::kill_disarm();
-        opened.expect("the fixture opens");
+        opened.expect("the directory opens");
         return;
     }
 
@@ -472,16 +693,24 @@ fn the_kill_matrixs_child() {
             None => zeusdb_vector_core::kill_disarm(),
         }
         match step {
-            Step::Add(records) => {
+            Step::Add(records) | Step::Overwrite(records) => {
+                let replaces = matches!(step, Step::Overwrite(_));
                 let ids: Vec<String> = records.iter().map(|i| format!("r{i}")).collect();
-                // The failing arm's step: the commit's sync fails, the call
+                let build = |i: usize| {
+                    if replaces {
+                        overwritten(i, &vectors)
+                    } else {
+                        parsed(i, &vectors)
+                    }
+                };
+                // The failing arm's steps: the commit's sync fails, the call
                 // returns every record refused, and the fault it leaves is
-                // cleared by the checkpoint the caller then takes.
-                if let (Some(faults), FAILING_STEP) = (&faults, index) {
+                // cleared by the checkpoint the caller then takes. A refused
+                // overwrite leaves every record it replaces as it was.
+                if let (Some(faults), true) = (&faults, FAILING_STEPS.contains(&index)) {
                     faults.syncs.arm(0, 1);
-                    let batch: Vec<ParsedRecord> =
-                        records.iter().map(|&i| parsed(i, &vectors)).collect();
-                    let added = collection.add_records(batch, vec![], false);
+                    let batch: Vec<ParsedRecord> = records.iter().map(|&i| build(i)).collect();
+                    let added = collection.add_records(batch, vec![], replaces);
                     assert_eq!(added.total_errors, records.len(), "{:?}", added.errors);
                     acknowledge(
                         &acknowledgements,
@@ -497,21 +726,23 @@ fn the_kill_matrixs_child() {
                     continue;
                 }
                 // A step re-run after a recovery may find some of its
-                // records already durable and replayed, which the engine
-                // refuses as duplicates exactly as it would any retry, so a
-                // caller resuming skips what is present.
+                // records already durable and replayed. An add refuses them
+                // as duplicates exactly as it would any retry, so a caller
+                // resuming skips what is present, and an overwrite replaces
+                // them again with the same records.
                 let batch: Vec<ParsedRecord> = records
                     .iter()
-                    .filter(|&&i| !collection.contains(&format!("r{i}")))
-                    .map(|&i| parsed(i, &vectors))
+                    .filter(|&&i| replaces || !collection.contains(&format!("r{i}")))
+                    .map(|&i| build(i))
                     .collect();
                 if !batch.is_empty() {
-                    let added = collection.add_records(batch, vec![], false);
+                    let added = collection.add_records(batch, vec![], replaces);
                     assert_eq!(added.total_errors, 0, "{:?}", added.errors);
                 }
+                let verb = if replaces { "overwrite" } else { "add" };
                 acknowledge(
                     &acknowledgements,
-                    &format!("step {index} add {}", ids.join(",")),
+                    &format!("step {index} {verb} {}", ids.join(",")),
                 );
             }
             Step::Remove(records) => {
@@ -537,6 +768,16 @@ fn the_kill_matrixs_child() {
                     &format!("step {index} checkpoint {}", collection.journal_sequence()),
                 );
             }
+            Step::Backup => {
+                let copy = collection
+                    .backup(&backup_target(&dir).to_string_lossy())
+                    .expect("the backup runs");
+                let snapshot = copy.identity.snapshot.expect("a backup draws a snapshot");
+                acknowledge(
+                    &acknowledgements,
+                    &format!("step {index} backup {snapshot:032x}"),
+                );
+            }
         }
     }
     zeusdb_vector_core::kill_disarm();
@@ -548,83 +789,84 @@ fn the_kill_matrixs_child() {
 // ============================================================================
 
 /// One case of the matrix, being an arm, a step of the script and a point
-/// inside it, or a fixture and a point inside its upgrade.
+/// inside it, a fixture and a point inside its upgrade, or a class of
+/// damage and a point inside its repair.
 #[derive(Clone, Debug)]
 struct Case {
     arm: &'static str,
     step: usize,
     point: KillPoint,
     fixture: Option<&'static str>,
+    repair: Option<&'static str>,
+}
+
+/// The points a step of the script reaches, with the roll's at the step
+/// that rolls.
+fn points_of(step: usize) -> Vec<KillPoint> {
+    let mut points: Vec<KillPoint> = match &SCRIPT[step] {
+        Step::Add(_) => ADD_POINTS.to_vec(),
+        Step::Overwrite(_) => OVERWRITE_POINTS.to_vec(),
+        Step::Checkpoint => CHECKPOINT_POINTS.to_vec(),
+        Step::Backup => BACKUP_POINTS.to_vec(),
+        Step::Remove(_) | Step::Update(_) => Vec::new(),
+    };
+    if step == ROLL_STEP {
+        points.extend_from_slice(ROLL_POINTS);
+    }
+    points
 }
 
 /// Every case the script can reach, or the reduced set the ordinary gate
 /// runs, being every point once.
 fn cases(full: bool) -> Vec<Case> {
     let mut cases = Vec::new();
+    let case = |arm: &'static str, step: usize, point: KillPoint| Case {
+        arm,
+        step,
+        point,
+        fixture: None,
+        repair: None,
+    };
     let arms: &[&'static str] = if full {
         &["sync", "none", "interval"]
     } else {
         &["sync"]
     };
+    // The first backup writes into a path with nothing at it, so its commit
+    // is one rename and the point between the two is reached at the second
+    // alone, which is where the reduced matrix takes every backup point.
+    let last_backup = SCRIPT
+        .iter()
+        .rposition(|step| *step == Step::Backup)
+        .expect("the script backs up");
     for &arm in arms {
         let mut seen: BTreeSet<&'static str> = BTreeSet::new();
         for (step, kind) in SCRIPT.iter().enumerate() {
-            let mut points: Vec<KillPoint> = match kind {
-                Step::Add(_) => ADD_POINTS.to_vec(),
-                Step::Checkpoint => CHECKPOINT_POINTS.to_vec(),
-                _ => continue,
-            };
-            if step == ROLL_STEP {
-                points.extend_from_slice(ROLL_POINTS);
+            if !full && *kind == Step::Backup && step != last_backup {
+                continue;
             }
-            for point in points {
+            for point in points_of(step) {
                 if full || seen.insert(point.name()) {
-                    cases.push(Case {
-                        arm,
-                        step,
-                        point,
-                        fixture: None,
-                    });
+                    cases.push(case(arm, step, point));
                 }
             }
         }
     }
-    // The failing arm: the three failing points at the failing step, and
-    // in the full matrix every point of every step after it.
-    for point in FAILING_POINTS {
-        cases.push(Case {
-            arm: "fail",
-            step: FAILING_STEP,
-            point: *point,
-            fixture: None,
-        });
+    // The failing arm: the three failing points at each step it fails, and
+    // in the full matrix every point of every step after the first.
+    for step in FAILING_STEPS {
+        for point in FAILING_POINTS {
+            cases.push(case("fail", step, *point));
+        }
     }
     if full {
-        for (step, kind) in SCRIPT.iter().enumerate().skip(FAILING_STEP + 1) {
-            let mut points: Vec<KillPoint> = match kind {
-                Step::Add(_) => ADD_POINTS.to_vec(),
-                Step::Checkpoint => CHECKPOINT_POINTS.to_vec(),
-                _ => continue,
-            };
-            if step == ROLL_STEP {
-                points.extend_from_slice(ROLL_POINTS);
-            }
-            for point in points {
-                cases.push(Case {
-                    arm: "fail",
-                    step,
-                    point,
-                    fixture: None,
-                });
+        for step in FAILING_STEPS[0] + 1..SCRIPT.len() {
+            for point in points_of(step) {
+                cases.push(case("fail", step, point));
             }
         }
     }
-    cases.push(Case {
-        arm: "sync",
-        step: 0,
-        point: KillPoint::LockHeld,
-        fixture: None,
-    });
+    cases.push(case("sync", 0, KillPoint::LockHeld));
     let fixtures: &[&'static str] = if full {
         &super::journal_support::FIXTURES
     } else {
@@ -633,10 +875,21 @@ fn cases(full: bool) -> Vec<Case> {
     for fixture in fixtures {
         for point in UPGRADE_POINTS {
             cases.push(Case {
-                arm: "upgrade",
-                step: 0,
-                point: *point,
                 fixture: Some(fixture),
+                ..case("upgrade", 0, *point)
+            });
+        }
+    }
+    let classes: &[&'static str] = if full {
+        &REPAIR_CLASSES
+    } else {
+        &REPAIR_CLASSES[..1]
+    };
+    for class in classes {
+        for point in REPAIR_POINTS {
+            cases.push(Case {
+                repair: Some(class),
+                ..case("repair", 0, *point)
             });
         }
     }
@@ -650,7 +903,8 @@ fn child_command(dir: &Path, arm: &str) -> std::process::Command {
         .env(ENV_DIR, dir)
         .env(ENV_MODE, arm)
         .env_remove(ENV_MATRIX)
-        .env_remove(ENV_UPGRADE);
+        .env_remove(ENV_UPGRADE)
+        .env_remove(ENV_REPAIR);
     command
 }
 
@@ -675,8 +929,7 @@ impl Drop for Work {
 /// The damage a report found, as a line says it.
 fn damage_of(report: &crate::Recovery) -> String {
     match &report.damage {
-        Some(JournalDamage::TornTail { sequence, .. }) => format!("torn tail at {sequence}"),
-        Some(JournalDamage::Corrupt { sequence, .. }) => format!("corrupt at {sequence}"),
+        Some(damage) => format!("{} at {}", damage.kind.replace('_', " "), damage.sequence),
         None => "none".to_string(),
     }
 }
@@ -712,6 +965,86 @@ fn upgrade_case(work: &Path, case: &Case, name: &str) -> Option<String> {
         report.upgraded_from,
         report.replayed,
         damage_of(&report)
+    ))
+}
+
+/// The records the first `calls` calls of a repair case's journal add.
+fn kept_records(calls: usize) -> BTreeMap<String, Form> {
+    (0..DAMAGED_CALL_RECORDS * calls)
+        .map(|i| (format!("r{i}"), Form::Original))
+        .collect()
+}
+
+/// A repair case: a damaged journal, a child loading it with a repair armed
+/// at the point, then a plain load, a second repair and a plain load again,
+/// each held to the calls the repair keeps.
+fn repair_case(work: &Path, case: &Case, name: &str, vectors: &[Vec<f32>]) -> Option<String> {
+    let class = case.repair.unwrap();
+    let dir = work.join(format!("{name}.zdb"));
+    let (calls, aside) = damaged_journal(&dir, class, declaration(), |i| parsed(i, vectors));
+    let kept = kept_records(calls);
+    let marker = work.join(format!("{name}.marker"));
+    let status = child_command(&dir, "repair")
+        .env(ENV_REPAIR, "1")
+        .env(ENV_TARGET, format!("0:{}", case.point.name()))
+        .env(ENV_MARKER, &marker)
+        .output()
+        .expect("the child runs");
+    assert!(
+        marker.exists(),
+        "{name}: the repair never reached its point"
+    );
+    assert!(!status.status.success(), "{name}: the child did not abort");
+
+    // A plain load meets the damage where the child died before its cut,
+    // and the journal the cut left otherwise.
+    match Collection::recover(&dir.to_string_lossy(), None, Durability::NoSync) {
+        Ok((plain, _)) => {
+            assert_ne!(
+                case.point,
+                KillPoint::RepairAfterQuarantine,
+                "{name}: a plain load opened a journal still damaged"
+            );
+            holds_exactly(&plain, &kept, vectors)
+                .unwrap_or_else(|e| panic!("{name}, the plain load: {e}"));
+        }
+        Err(error) => assert_eq!(
+            case.point,
+            KillPoint::RepairAfterQuarantine,
+            "{name}: a plain load refused the journal the cut left: {error}"
+        ),
+    }
+
+    // A second repair finishes what the first began.
+    let (repaired, report) = Collection::recover_with(
+        &dir.to_string_lossy(),
+        None,
+        JournalPolicy::Repair(Durability::NoSync),
+    )
+    .unwrap_or_else(|e| panic!("{name}: the second repair refused: {e}"));
+    holds_exactly(&repaired, &kept, vectors)
+        .unwrap_or_else(|e| panic!("{name}, the second repair: {e}"));
+    drop(repaired);
+    let (files, folders, unsealed) = quarantine_of(&dir);
+    assert_eq!(folders.len(), 1, "{name}: one quarantine folder");
+    assert!(!unsealed, "{name}: the repair's marker is gone");
+    let held: Vec<u8> = files.into_iter().flat_map(|(_, bytes)| bytes).collect();
+    assert!(
+        held == aside,
+        "{name}: the quarantine holds {} bytes where the cut took {}",
+        held.len(),
+        aside.len()
+    );
+
+    // And the directory opens plainly from then on.
+    let (again, _) = Collection::recover(&dir.to_string_lossy(), None, Durability::NoSync)
+        .unwrap_or_else(|e| panic!("{name}: reopening after the repair refused: {e}"));
+    holds_exactly(&again, &kept, vectors).unwrap_or_else(|e| panic!("{name}, reopened: {e}"));
+    Some(format!(
+        "{name}: kept {} calls, second repair cut {} checkpoint {:?}",
+        calls,
+        report.repair.is_some(),
+        report.checkpoint_taken
     ))
 }
 
@@ -761,16 +1094,19 @@ fn lock_case(work: &Path, name: &str, vectors: &[Vec<f32>]) -> Option<String> {
     assert!(expected.finished, "{name}");
     let (recovered, _) = Collection::recover(&dir.to_string_lossy(), None, Durability::NoSync)
         .unwrap_or_else(|e| panic!("reopening {name} refused: {e}"));
-    holds(&recovered, &expected, vectors).unwrap_or_else(|e| panic!("after {name}: {e}"));
+    holds(&recovered, &expected, vectors, None).unwrap_or_else(|e| panic!("after {name}: {e}"));
     Some(format!("{name}: the lock was released with the process"))
 }
 
 /// The matrix.
 ///
 /// The count this asserts is the count of points the script actually
-/// reaches. One point is unreachable by construction, being the second
-/// append of an `add` of one record, and the parent says so rather than
-/// failing on it.
+/// reaches. Some points are unreachable by construction, being the second
+/// append of an `add` of one record, the point between a backup's two
+/// renames where its directory does not exist yet, the half record of a
+/// step the failing arm fails, whose sync is the sync that arm fails, and
+/// the points after the commit of such a step, and the parent says so
+/// rather than failing on them.
 #[test]
 fn the_kill_matrix_holds_at_every_point() {
     let full = std::env::var(ENV_MATRIX).as_deref() == Ok("full");
@@ -782,9 +1118,14 @@ fn the_kill_matrix_holds_at_every_point() {
     let mut lines: Vec<String> = Vec::new();
 
     for case in &cases {
-        let name = match case.fixture {
-            Some(fixture) => format!("upgrade-{fixture}-{}", case.point.name().replace(':', "_")),
-            None => format!(
+        let name = match (case.fixture, case.repair) {
+            (Some(fixture), _) => {
+                format!("upgrade-{fixture}-{}", case.point.name().replace(':', "_"))
+            }
+            (None, Some(class)) => {
+                format!("repair-{class}-{}", case.point.name().replace(':', "_"))
+            }
+            (None, None) => format!(
                 "{}-{}-{}",
                 case.arm,
                 case.step,
@@ -796,6 +1137,11 @@ fn the_kill_matrix_holds_at_every_point() {
             reached += 1;
             continue;
         }
+        if case.repair.is_some() {
+            lines.extend(repair_case(&work.0, case, &name, &vectors));
+            reached += 1;
+            continue;
+        }
         if case.point == KillPoint::LockHeld {
             lines.extend(lock_case(&work.0, &name, &vectors));
             reached += 1;
@@ -803,6 +1149,7 @@ fn the_kill_matrix_holds_at_every_point() {
         }
         let dir = work.0.join(format!("{name}.zdb"));
         let marker = work.0.join(format!("{name}.marker"));
+        let in_flight = Some(&SCRIPT[case.step]);
 
         // The child, armed at this point.
         let status = child_command(&dir, case.arm)
@@ -812,8 +1159,7 @@ fn the_kill_matrix_holds_at_every_point() {
             .output()
             .expect("the child runs");
         if !marker.exists() {
-            // The point is not on the path this step takes, which the
-            // one-record `add` makes true of the second append.
+            // The point is not on the path this step takes.
             assert!(
                 status.status.success(),
                 "the child failed at {name} without reaching the point:\n{}",
@@ -834,11 +1180,14 @@ fn the_kill_matrix_holds_at_every_point() {
         let (recovered, report) =
             Collection::recover(&dir.to_string_lossy(), None, Durability::NoSync)
                 .unwrap_or_else(|e| panic!("recovering {name} refused: {e}"));
-        let unacknowledged =
-            holds(&recovered, &expected, &vectors).unwrap_or_else(|e| panic!("after {name}: {e}"));
+        let unacknowledged = holds(&recovered, &expected, &vectors, in_flight)
+            .unwrap_or_else(|e| panic!("after {name}: {e}"));
         assert!(
-            !matches!(report.damage, Some(JournalDamage::Corrupt { .. })),
-            "recovering {name} found a corrupt middle, which no crash produces: {:?}",
+            report
+                .damage
+                .as_ref()
+                .is_none_or(|damage| damage.kind == "torn_tail"),
+            "recovering {name} found damage no crash produces: {:?}",
             report.damage
         );
         // A save killed between its two renames left the whole index
@@ -849,9 +1198,12 @@ fn the_kill_matrix_holds_at_every_point() {
             case.point == KillPoint::SaveBetweenRenames,
             "{name} put the index back from beside the target"
         );
+        let backup = backup_holds(&dir, &expected, &vectors, in_flight)
+            .unwrap_or_else(|e| panic!("the backup after {name}: {e}"));
         lines.push(format!(
             "{name}: {} acknowledged, {} refused, {unacknowledged} unacknowledged present, \
-             replayed {} withdrawn {} skipped {} segments {} aside {} checkpointed {} damage {}",
+             replayed {} withdrawn {} skipped {} segments {} aside {} checkpoint {:?} damage {} \
+             backup {backup}",
             expected.present.len(),
             expected.refused.len(),
             report.replayed,
@@ -859,7 +1211,7 @@ fn the_kill_matrix_holds_at_every_point() {
             report.skipped,
             report.segments,
             report.restored_from_aside,
-            report.checkpointed,
+            report.checkpoint_taken,
             damage_of(&report)
         ));
         // The journal is open for append on this collection, and the
@@ -887,10 +1239,14 @@ fn the_kill_matrix_holds_at_every_point() {
         );
         let (recovered, _) = Collection::recover(&dir.to_string_lossy(), None, Durability::NoSync)
             .unwrap_or_else(|e| panic!("reopening {name} after the resume refused: {e}"));
-        holds(&recovered, &expected, &vectors)
+        holds(&recovered, &expected, &vectors, None)
             .unwrap_or_else(|e| panic!("after resuming {name}: {e}"));
         drop(recovered);
+        let finished = backup_holds(&dir, &expected, &vectors, None)
+            .unwrap_or_else(|e| panic!("the backup after resuming {name}: {e}"));
+        assert_eq!(finished, "as it was", "{name}: the last backup stands");
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(backup_target(&dir));
         let _ = std::fs::remove_file(dir.with_extension("ack"));
         let _ = std::fs::remove_dir_all(crate::journal::journal_path(&dir).unwrap());
     }
@@ -915,5 +1271,23 @@ fn the_kill_matrix_holds_at_every_point() {
         named.len(),
         KillPoint::ALL.len(),
         "every point the engine declares has a case"
+    );
+    let reached_points: BTreeSet<&str> = cases
+        .iter()
+        .filter(|case| {
+            let name = format!(
+                "{}-{}-{}",
+                case.arm,
+                case.step,
+                case.point.name().replace(':', "_")
+            );
+            case.fixture.is_some() || case.repair.is_some() || !unreachable.contains(&name)
+        })
+        .map(|case| case.point.name())
+        .collect();
+    assert_eq!(
+        reached_points.len(),
+        KillPoint::ALL.len(),
+        "every point the engine declares is reached at least once"
     );
 }

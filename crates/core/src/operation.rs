@@ -41,7 +41,22 @@
 //! Intern
 //!    u32 term_id, then the term, UTF-8, at least one byte, to the end
 //!
-//! Train
+//! Train, in a journal of format version 2
+//!    u32 stamp_len, stamp       UTF-8, 1 to STAMP_CEILING bytes
+//!    u8  scheme                 1 a codebook, 2 scales
+//!    a codebook
+//!      u32 subvectors, u32 centroids, u32 width
+//!                               subvectors × width is the index's dim, and
+//!                               centroids is 1 to MOST_CENTROIDS
+//!      f32 × subvectors × centroids × width
+//!                               subvector, then centroid, then value
+//!    scales
+//!      u32 width                the index's dim
+//!      f32 × width
+//!    u32 calibration_len, bytes the rerank calibration as JSON, 0 for none,
+//!                               and 0 beside scales
+//!
+//! Train, in a journal of format version 1
 //!    the completion stamp, UTF-8, at least one byte, to the end
 //!
 //! AddMetadata
@@ -58,6 +73,14 @@
 //! `Commit` and `Abort` are framing. The journal's writer appends them and its
 //! reader settles what they say, and neither is ever handed to a collection
 //! as a mutation.
+//!
+//! Every kind but `Train` lays out the same at both journal versions.
+//! [`Operation::decode`] reads a record of a journal of segments, at format
+//! version 2, and [`Operation::decode_legacy`] one of a journal held in one
+//! file, at format version 1. A version 2 `Train` record carries what the
+//! training fitted, which a replay installs. A version 1 one carries the
+//! stamp alone, and its replay trains where the insert that filled the set
+//! is applied.
 //!
 //! A payload ends where its last field ends, and trailing bytes fail it.
 //! The encoder writes every length as a `u32`; a field wider than that
@@ -76,13 +99,23 @@
 
 use crate::error::Error;
 use crate::graph::dump::NB_LAYER_MAX;
-use crate::journal::{JournalRecord, OperationKind};
+use crate::journal::{JournalRecord, OperationKind, MOST_CENTROIDS};
 use crate::space::{SparseRef, SparseVector};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
 
 /// The value `nnz` carries for a record with no sparse vector.
 const NO_SPARSE: u32 = u32::MAX;
+
+/// The longest stamp a version 2 `Train` record carries. An RFC 3339 time
+/// with nanoseconds and an offset is 35 bytes.
+pub const STAMP_CEILING: usize = 64;
+
+/// The scheme byte of a version 2 `Train` record that carries a codebook.
+const SCHEME_CODEBOOK: u8 = 1;
+
+/// The scheme byte of a version 2 `Train` record that carries scales.
+const SCHEME_SCALES: u8 = 2;
 
 /// One mutation, as the journal records it.
 #[derive(Clone, Debug, PartialEq)]
@@ -123,7 +156,14 @@ pub enum Operation {
     Intern { term_id: u32, term: String },
     /// The quantizer trained, with the stamp it took, injected on replay
     /// rather than read from the clock.
-    Train { completed_at: String },
+    Train {
+        completed_at: String,
+        /// What the training fitted, which a replay installs. Present in
+        /// every record of a journal of format version 2, and absent from a
+        /// record of format version 1, whose replay trains at the insert
+        /// that fills the set.
+        fitted: Option<Fitted>,
+    },
     /// Pairs added to the index's own metadata.
     AddMetadata { pairs: Vec<(String, String)> },
     /// The graph rebuilt over the quantized codes.
@@ -160,6 +200,86 @@ impl AbortReason {
             1 => Some(AbortReason::SyncFailed),
             2 => Some(AbortReason::WriteFailed),
             _ => None,
+        }
+    }
+}
+
+/// What a training fitted, as a `Train` record of journal format version 2
+/// carries it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Fitted {
+    /// A product quantizer's codebook, `subvectors × centroids × width`
+    /// values, subvector, then centroid, then value, with the rerank
+    /// calibration measured on it as JSON, where one was measured.
+    Codebook {
+        subvectors: u32,
+        centroids: u32,
+        width: u32,
+        values: Vec<f32>,
+        calibration: Option<String>,
+    },
+    /// A scalar quantizer's scales, one a dimension.
+    Scales { values: Vec<f32> },
+}
+
+impl Fitted {
+    /// The state borrowed, which is what the encoder writes from.
+    pub fn as_ref(&self) -> FittedRef<'_> {
+        match self {
+            Fitted::Codebook {
+                subvectors,
+                centroids,
+                width,
+                values,
+                calibration,
+            } => FittedRef::Codebook {
+                subvectors: *subvectors,
+                centroids: *centroids,
+                width: *width,
+                values: Values::Flat(values),
+                calibration: calibration.as_deref(),
+            },
+            Fitted::Scales { values } => FittedRef::Scales(values),
+        }
+    }
+}
+
+/// A training's fitted state borrowed from where the training holds it, so
+/// the record is encoded with no copy of the codebook made for it.
+#[derive(Clone, Copy, Debug)]
+pub enum FittedRef<'a> {
+    Codebook {
+        subvectors: u32,
+        centroids: u32,
+        width: u32,
+        values: Values<'a>,
+        calibration: Option<&'a str>,
+    },
+    Scales(&'a [f32]),
+}
+
+/// A codebook's values, flat as a record carries them or nested as the
+/// quantizer holds them, being one list a subvector of one list a centroid.
+#[derive(Clone, Copy, Debug)]
+pub enum Values<'a> {
+    Flat(&'a [f32]),
+    Nested(&'a [Vec<Vec<f32>>]),
+}
+
+impl Values<'_> {
+    /// Every value, subvector, then centroid, then value.
+    fn for_each(self, mut write: impl FnMut(f32)) {
+        match self {
+            Values::Flat(values) => values.iter().copied().for_each(write),
+            Values::Nested(subvectors) => {
+                for centroids in subvectors {
+                    for centroid in centroids {
+                        for &value in centroid {
+                            write(value);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -225,9 +345,14 @@ impl Operation {
                 out.extend_from_slice(&term_id.to_le_bytes());
                 out.extend_from_slice(term.as_bytes());
             }
-            Operation::Train { completed_at } => {
-                out.extend_from_slice(completed_at.as_bytes());
-            }
+            Operation::Train {
+                completed_at,
+                fitted: Some(fitted),
+            } => write_train(out, completed_at, fitted.as_ref()),
+            Operation::Train {
+                completed_at,
+                fitted: None,
+            } => out.extend_from_slice(completed_at.as_bytes()),
             Operation::AddMetadata { pairs } => {
                 out.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
                 for (key, value) in pairs {
@@ -294,6 +419,15 @@ impl Operation {
         write_remove(out, ids);
     }
 
+    /// Encode a training's record at journal format version 2 from the
+    /// stamp and the fitted state, borrowed, writing the bytes
+    /// [`Operation::encode`] writes for the same `Train`. `out` is cleared
+    /// first.
+    pub fn encode_train(completed_at: &str, fitted: FittedRef<'_>, out: &mut Vec<u8>) {
+        out.clear();
+        write_train(out, completed_at, fitted);
+    }
+
     /// Write the internal id and the level into a payload
     /// [`Operation::encode_insert`] built, at the place the layout puts
     /// them, being after the id's length and its bytes.
@@ -304,15 +438,36 @@ impl Operation {
         payload[at + 8] = level;
     }
 
-    /// Decode a record's payload, holding every length to what remains of
-    /// it before anything is sized. `dim` is the index's vector width, and
-    /// `file` names the journal in a message.
+    /// Decode a record of a journal of format version 2, holding every
+    /// length to what remains of the payload before anything is sized.
+    /// `dim` is the index's vector width, and `file` names the journal in a
+    /// message.
     pub fn decode(record: &JournalRecord<'_>, dim: usize, file: &str) -> Result<Operation, Error> {
+        Self::decode_at(record, dim, file, false)
+    }
+
+    /// Decode a record of a journal of format version 1, which releases
+    /// from 0.11.0 to 0.13.0 wrote. Every kind reads as at version 2 but
+    /// `Train`, which carries the stamp alone.
+    pub fn decode_legacy(
+        record: &JournalRecord<'_>,
+        dim: usize,
+        file: &str,
+    ) -> Result<Operation, Error> {
+        Self::decode_at(record, dim, file, true)
+    }
+
+    fn decode_at(
+        record: &JournalRecord<'_>,
+        dim: usize,
+        file: &str,
+        legacy: bool,
+    ) -> Result<Operation, Error> {
         let mut cursor = Cursor {
             bytes: record.payload,
             at: 0,
         };
-        let decoded = decode_fields(&mut cursor, record.kind, dim);
+        let decoded = decode_fields(&mut cursor, record.kind, dim, legacy);
         let decoded = decoded.and_then(|op| {
             if cursor.remaining() == 0 {
                 Ok(op)
@@ -423,6 +578,45 @@ fn write_insert(
     }
 }
 
+/// The version 2 `Train` layout, written once for both encoders. The caller
+/// holds the stamp to [`STAMP_CEILING`] and the state to its shape, which
+/// the training it comes from guarantees.
+fn write_train(out: &mut Vec<u8>, completed_at: &str, fitted: FittedRef<'_>) {
+    debug_assert!(!completed_at.is_empty() && completed_at.len() <= STAMP_CEILING);
+    put_bytes(out, completed_at.as_bytes());
+    let calibration = match fitted {
+        FittedRef::Codebook {
+            subvectors,
+            centroids,
+            width,
+            values,
+            calibration,
+        } => {
+            out.push(SCHEME_CODEBOOK);
+            out.extend_from_slice(&subvectors.to_le_bytes());
+            out.extend_from_slice(&centroids.to_le_bytes());
+            out.extend_from_slice(&width.to_le_bytes());
+            let start = out.len();
+            values.for_each(|value| out.extend_from_slice(&value.to_le_bytes()));
+            debug_assert_eq!(
+                out.len() - start,
+                subvectors as usize * centroids as usize * width as usize * 4,
+                "the codebook holds the values its counts name"
+            );
+            calibration
+        }
+        FittedRef::Scales(scales) => {
+            out.push(SCHEME_SCALES);
+            out.extend_from_slice(&(scales.len() as u32).to_le_bytes());
+            for value in scales {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            None
+        }
+    };
+    put_bytes(out, calibration.map_or(&[][..], str::as_bytes));
+}
+
 /// A position in a payload. Every read checks what remains first.
 struct Cursor<'a> {
     bytes: &'a [u8],
@@ -523,8 +717,15 @@ fn u32_at(raw: &[u8]) -> u32 {
     u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])
 }
 
-/// Read the fields of one kind. Trailing bytes are the caller's check.
-fn decode_fields(c: &mut Cursor<'_>, kind: OperationKind, dim: usize) -> Result<Operation, String> {
+/// Read the fields of one kind, at journal format version 1 where `legacy`
+/// says so and at version 2 otherwise. Trailing bytes are the caller's
+/// check.
+fn decode_fields(
+    c: &mut Cursor<'_>,
+    kind: OperationKind,
+    dim: usize,
+    legacy: bool,
+) -> Result<Operation, String> {
     match kind {
         OperationKind::Insert => {
             let id = c.string("id")?;
@@ -618,7 +819,7 @@ fn decode_fields(c: &mut Cursor<'_>, kind: OperationKind, dim: usize) -> Result<
                 .to_string();
             Ok(Operation::Intern { term_id, term })
         }
-        OperationKind::Train => {
+        OperationKind::Train if legacy => {
             let raw = c.take(c.remaining(), "stamp")?;
             if raw.is_empty() {
                 return Err("the stamp is empty".into());
@@ -626,8 +827,12 @@ fn decode_fields(c: &mut Cursor<'_>, kind: OperationKind, dim: usize) -> Result<
             let completed_at = std::str::from_utf8(raw)
                 .map_err(|e| format!("the stamp is not UTF-8: {e}"))?
                 .to_string();
-            Ok(Operation::Train { completed_at })
+            Ok(Operation::Train {
+                completed_at,
+                fitted: None,
+            })
         }
+        OperationKind::Train => decode_train(c, dim),
         OperationKind::AddMetadata => {
             let count = c.u32("pair count")? as usize;
             // Eight bytes a pair at least, being two lengths, held before
@@ -662,6 +867,95 @@ fn decode_fields(c: &mut Cursor<'_>, kind: OperationKind, dim: usize) -> Result<
     }
 }
 
+/// The version 2 `Train` payload. Every count is held to `dim` and to what
+/// remains of the payload before anything is sized from it. Holding the
+/// counts to the quantizer the collection declares is the replay's check.
+fn decode_train(c: &mut Cursor<'_>, dim: usize) -> Result<Operation, String> {
+    let len = c.u32("stamp length")? as usize;
+    if len == 0 {
+        return Err("the stamp is empty".into());
+    }
+    if len > STAMP_CEILING {
+        return Err(format!(
+            "the stamp is {len} bytes and a stamp is at most {STAMP_CEILING}"
+        ));
+    }
+    let completed_at = std::str::from_utf8(c.take(len, "stamp")?)
+        .map_err(|e| format!("the stamp is not UTF-8: {e}"))?
+        .to_string();
+    let fitted = match c.u8("scheme")? {
+        SCHEME_CODEBOOK => {
+            let subvectors = c.u32("subvector count")?;
+            let centroids = c.u32("centroid count")?;
+            let width = c.u32("centroid width")?;
+            if subvectors == 0 || width == 0 {
+                return Err(format!(
+                    "the codebook has {subvectors} subvectors of width {width}, and both are at \
+                     least 1"
+                ));
+            }
+            if (subvectors as usize).checked_mul(width as usize) != Some(dim) {
+                return Err(format!(
+                    "the codebook has {subvectors} subvectors of width {width}, which do not \
+                     make the index's width of {dim}"
+                ));
+            }
+            if centroids == 0 || centroids as usize > MOST_CENTROIDS {
+                return Err(format!(
+                    "the codebook has {centroids} centroids a subvector, and a codebook has 1 \
+                     to {MOST_CENTROIDS}"
+                ));
+            }
+            let count = dim
+                .checked_mul(centroids as usize)
+                .ok_or_else(|| format!("the codebook of {centroids} centroids overflows"))?;
+            let values = c.values(count, 4, "codebook", f32_at)?;
+            let calibration = read_calibration(c)?;
+            Fitted::Codebook {
+                subvectors,
+                centroids,
+                width,
+                values,
+                calibration,
+            }
+        }
+        SCHEME_SCALES => {
+            let width = c.u32("scale count")? as usize;
+            if width != dim {
+                return Err(format!(
+                    "the record carries {width} scales and the index is {dim} wide"
+                ));
+            }
+            let values = c.values(width, 4, "scales", f32_at)?;
+            if read_calibration(c)?.is_some() {
+                return Err(
+                    "the record carries a rerank calibration beside scales, and a scalar index \
+                     measures none"
+                        .into(),
+                );
+            }
+            Fitted::Scales { values }
+        }
+        other => return Err(format!("scheme {other} is not one this build knows")),
+    };
+    Ok(Operation::Train {
+        completed_at,
+        fitted: Some(fitted),
+    })
+}
+
+/// A `Train` record's rerank calibration, being its JSON as UTF-8 or none
+/// where its length is zero.
+fn read_calibration(c: &mut Cursor<'_>) -> Result<Option<String>, String> {
+    let len = c.u32("calibration length")? as usize;
+    if len == 0 {
+        return Ok(None);
+    }
+    std::str::from_utf8(c.take(len, "calibration")?)
+        .map(|text| Some(text.to_string()))
+        .map_err(|e| format!("the calibration is not UTF-8: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,8 +978,20 @@ mod tests {
         Operation::decode(&record(kind, payload), DIM, "t.zdbwal")
     }
 
+    fn decode_legacy(kind: OperationKind, payload: &[u8]) -> Result<Operation, Error> {
+        Operation::decode_legacy(&record(kind, payload), DIM, "t.zdbwal")
+    }
+
     fn refused(kind: OperationKind, payload: &[u8]) -> String {
-        match decode(kind, payload) {
+        refused_by(decode(kind, payload))
+    }
+
+    fn refused_legacy(kind: OperationKind, payload: &[u8]) -> String {
+        refused_by(decode_legacy(kind, payload))
+    }
+
+    fn refused_by(decoded: Result<Operation, Error>) -> String {
+        match decoded {
             Err(Error::JournalRecordInvalid {
                 file,
                 sequence,
@@ -755,6 +1061,29 @@ mod tests {
             },
             Operation::Train {
                 completed_at: "2026-01-02T03:04:05.678Z".into(),
+                fitted: Some(Fitted::Codebook {
+                    subvectors: 2,
+                    centroids: 3,
+                    width: 2,
+                    values: (0..12).map(|v| v as f32 * 0.5 - 2.0).collect(),
+                    calibration: Some(r#"{"fetch":40,"exponent":0.25}"#.into()),
+                }),
+            },
+            Operation::Train {
+                completed_at: "2026-01-02T03:04:05+00:00".into(),
+                fitted: Some(Fitted::Codebook {
+                    subvectors: 1,
+                    centroids: 2,
+                    width: 4,
+                    values: vec![1.0, -1.0, 0.5, 0.0, 2.0, 3.0, -4.0, 1e-7],
+                    calibration: None,
+                }),
+            },
+            Operation::Train {
+                completed_at: "x".into(),
+                fitted: Some(Fitted::Scales {
+                    values: vec![0.01, 1.0, 0.5, 3.25],
+                }),
             },
             Operation::AddMetadata { pairs: vec![] },
             Operation::AddMetadata {
@@ -1164,11 +1493,234 @@ mod tests {
         );
     }
 
-    /// A train's stamp is the whole payload, non-empty UTF-8.
+    /// At journal format version 1 a train's stamp is the whole payload,
+    /// non-empty UTF-8, and the record carries nothing fitted. The version
+    /// 2 reader refuses such a payload, since its first four bytes are read
+    /// as the stamp's length.
     #[test]
-    fn a_train_stamp_is_non_empty_utf8() {
-        assert_eq!(refused(OperationKind::Train, &[]), "the stamp is empty");
-        assert!(refused(OperationKind::Train, &[0xFF]).contains("not UTF-8"));
+    fn a_version_1_train_is_the_stamp_alone() {
+        assert_eq!(
+            refused_legacy(OperationKind::Train, &[]),
+            "the stamp is empty"
+        );
+        assert!(refused_legacy(OperationKind::Train, &[0xFF]).contains("not UTF-8"));
+        let legacy = Operation::Train {
+            completed_at: "2025-11-30T23:59:59.999999+00:00".into(),
+            fitted: None,
+        };
+        let mut out = Vec::new();
+        legacy.encode(&mut out);
+        assert_eq!(out, b"2025-11-30T23:59:59.999999+00:00");
+        assert_eq!(decode_legacy(OperationKind::Train, &out).unwrap(), legacy);
+        assert!(decode(OperationKind::Train, &out).is_err());
+        // Every other kind reads the same at both versions.
+        for op in every_operation() {
+            if op.kind() == OperationKind::Train || op.kind().is_framing() {
+                continue;
+            }
+            op.encode(&mut out);
+            assert_eq!(decode_legacy(op.kind(), &out).unwrap(), op);
+        }
+    }
+
+    /// A version 2 train lays out as the module says: the stamp with its
+    /// length, the scheme, the counts and every value, then the
+    /// calibration with its length.
+    #[test]
+    fn a_version_2_train_lays_out_as_documented() {
+        let mut out = Vec::new();
+        Operation::Train {
+            completed_at: "ab".into(),
+            fitted: Some(Fitted::Codebook {
+                subvectors: 2,
+                centroids: 1,
+                width: 2,
+                values: vec![1.0, 2.0, 3.0, 4.0],
+                calibration: Some("{}".into()),
+            }),
+        }
+        .encode(&mut out);
+        let mut want = Vec::new();
+        want.extend_from_slice(&2u32.to_le_bytes());
+        want.extend_from_slice(b"ab");
+        want.push(1);
+        for count in [2u32, 1, 2] {
+            want.extend_from_slice(&count.to_le_bytes());
+        }
+        for v in [1.0f32, 2.0, 3.0, 4.0] {
+            want.extend_from_slice(&v.to_le_bytes());
+        }
+        want.extend_from_slice(&2u32.to_le_bytes());
+        want.extend_from_slice(b"{}");
+        assert_eq!(out, want);
+
+        Operation::Train {
+            completed_at: "c".into(),
+            fitted: Some(Fitted::Scales {
+                values: vec![0.5; 4],
+            }),
+        }
+        .encode(&mut out);
+        let mut want = Vec::new();
+        want.extend_from_slice(&1u32.to_le_bytes());
+        want.push(b'c');
+        want.push(2);
+        want.extend_from_slice(&4u32.to_le_bytes());
+        for _ in 0..4 {
+            want.extend_from_slice(&0.5f32.to_le_bytes());
+        }
+        want.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(out, want);
+    }
+
+    /// Every count of a version 2 train is held to the index's width and to
+    /// what remains before anything is sized from it, and each refusal says
+    /// which.
+    #[test]
+    fn a_version_2_train_is_held_before_anything_is_sized() {
+        let stamp = |out: &mut Vec<u8>, text: &[u8]| {
+            out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            out.extend_from_slice(text);
+        };
+        let codebook = |subvectors: u32, centroids: u32, width: u32| {
+            let mut out = Vec::new();
+            stamp(&mut out, b"t");
+            out.push(1);
+            for count in [subvectors, centroids, width] {
+                out.extend_from_slice(&count.to_le_bytes());
+            }
+            out
+        };
+        assert_eq!(
+            refused(OperationKind::Train, &[]),
+            "the stamp length needs 4 bytes and 0 remain"
+        );
+        assert_eq!(
+            refused(OperationKind::Train, &0u32.to_le_bytes()),
+            "the stamp is empty"
+        );
+        let mut long = Vec::new();
+        stamp(&mut long, &[b'x'; STAMP_CEILING + 1]);
+        assert_eq!(
+            refused(OperationKind::Train, &long),
+            format!(
+                "the stamp is {} bytes and a stamp is at most {STAMP_CEILING}",
+                STAMP_CEILING + 1
+            )
+        );
+        let mut bad = Vec::new();
+        stamp(&mut bad, &[0xFF]);
+        assert!(refused(OperationKind::Train, &bad).contains("not UTF-8"));
+        let mut unknown = Vec::new();
+        stamp(&mut unknown, b"t");
+        unknown.push(3);
+        assert_eq!(
+            refused(OperationKind::Train, &unknown),
+            "scheme 3 is not one this build knows"
+        );
+        assert!(refused(OperationKind::Train, &codebook(0, 2, 4)).contains("at least 1"));
+        assert!(refused(OperationKind::Train, &codebook(2, 2, 0)).contains("at least 1"));
+        assert_eq!(
+            refused(OperationKind::Train, &codebook(3, 2, 2)),
+            "the codebook has 3 subvectors of width 2, which do not make the index's width of 4"
+        );
+        assert_eq!(
+            refused(OperationKind::Train, &codebook(u32::MAX, 2, u32::MAX)),
+            format!(
+                "the codebook has {} subvectors of width {}, which do not make the index's \
+                 width of 4",
+                u32::MAX,
+                u32::MAX
+            )
+        );
+        assert!(refused(OperationKind::Train, &codebook(2, 0, 2)).contains("1 to 256"));
+        assert!(refused(OperationKind::Train, &codebook(2, 257, 2)).contains("1 to 256"));
+        // The values' bytes are held to what remains before the list is
+        // sized, at the most centroids a codebook takes.
+        assert_eq!(
+            refused(OperationKind::Train, &codebook(2, 256, 2)),
+            "the codebook needs 4096 bytes and 0 remain"
+        );
+        let mut scales = Vec::new();
+        stamp(&mut scales, b"t");
+        scales.push(2);
+        scales.extend_from_slice(&5u32.to_le_bytes());
+        assert_eq!(
+            refused(OperationKind::Train, &scales),
+            "the record carries 5 scales and the index is 4 wide"
+        );
+        let mut scales = Vec::new();
+        stamp(&mut scales, b"t");
+        scales.push(2);
+        scales.extend_from_slice(&4u32.to_le_bytes());
+        scales.extend_from_slice(&[0; 16]);
+        let mut beside = scales.clone();
+        beside.extend_from_slice(&2u32.to_le_bytes());
+        beside.extend_from_slice(b"{}");
+        assert!(refused(OperationKind::Train, &beside).contains("beside scales"));
+        let mut not_utf8 = codebook(1, 1, 4);
+        not_utf8.extend_from_slice(&[0; 16]);
+        not_utf8.extend_from_slice(&1u32.to_le_bytes());
+        not_utf8.push(0xFF);
+        assert!(refused(OperationKind::Train, &not_utf8).contains("calibration is not UTF-8"));
+        let mut huge = codebook(1, 1, 4);
+        huge.extend_from_slice(&[0; 16]);
+        huge.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            refused(OperationKind::Train, &huge),
+            "the calibration needs 4294967295 bytes and 0 remain"
+        );
+        scales.extend_from_slice(&0u32.to_le_bytes());
+        assert!(decode(OperationKind::Train, &scales).is_ok());
+        scales.push(0);
+        assert_eq!(
+            refused(OperationKind::Train, &scales),
+            "1 bytes follow the last field of the train payload"
+        );
+    }
+
+    /// The borrowed encoder writes what `encode` writes for the same
+    /// training, from a codebook held nested as the quantizer holds it, and
+    /// from scales.
+    #[test]
+    fn the_borrowed_train_encoder_matches_encode() {
+        for op in every_operation() {
+            let Operation::Train {
+                completed_at,
+                fitted: Some(fitted),
+            } = &op
+            else {
+                continue;
+            };
+            let mut whole = Vec::new();
+            op.encode(&mut whole);
+            let mut borrowed = vec![7u8; 3];
+            let nested: Vec<Vec<Vec<f32>>>;
+            let parts = match fitted {
+                Fitted::Codebook {
+                    subvectors,
+                    centroids,
+                    width,
+                    values,
+                    calibration,
+                } => {
+                    nested = values
+                        .chunks(*centroids as usize * *width as usize)
+                        .map(|sub| sub.chunks(*width as usize).map(<[f32]>::to_vec).collect())
+                        .collect();
+                    FittedRef::Codebook {
+                        subvectors: *subvectors,
+                        centroids: *centroids,
+                        width: *width,
+                        values: Values::Nested(&nested),
+                        calibration: calibration.as_deref(),
+                    }
+                }
+                Fitted::Scales { values } => FittedRef::Scales(values),
+            };
+            Operation::encode_train(completed_at, parts, &mut borrowed);
+            assert_eq!(borrowed, whole);
+        }
     }
 
     /// A rebuild is exactly three `u64`s.
@@ -1217,7 +1769,7 @@ mod tests {
         let mut out = Vec::new();
         for op in every_operation() {
             let kind = op.kind();
-            if matches!(kind, OperationKind::Intern | OperationKind::Train) {
+            if kind == OperationKind::Intern {
                 // The last field runs to the end, so nothing can trail it.
                 continue;
             }
@@ -1289,10 +1841,32 @@ mod tests {
                 }
             }
             assert!(blob.len() <= JOURNAL_MAX_PAYLOAD);
+            // The version 1 reader takes the same bytes, and differs from
+            // the version 2 one on a train alone.
+            match decode_legacy(*kind, &blob) {
+                Ok(_) | Err(Error::JournalRecordInvalid { .. }) => {}
+                Err(other) => panic!("unexpected error at version 1 {other:?}"),
+            }
             match decode(*kind, &blob) {
+                Ok(Operation::Train {
+                    fitted: Some(fitted),
+                    ..
+                }) => {
+                    accepted += 1;
+                    let values = match &fitted {
+                        Fitted::Codebook { values, .. } | Fitted::Scales { values } => values,
+                    };
+                    assert!(
+                        values.len() * 4 < blob.len(),
+                        "the values came from the payload"
+                    );
+                }
                 Ok(_) => accepted += 1,
                 Err(Error::JournalRecordInvalid { detail, .. }) => {
-                    if !detail.contains("id length") && !detail.contains("id count") {
+                    if !detail.contains("id length")
+                        && !detail.contains("id count")
+                        && !detail.contains("stamp length")
+                    {
                         refused_past_first_field += 1;
                     }
                 }

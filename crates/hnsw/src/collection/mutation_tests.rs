@@ -581,9 +581,9 @@ fn training_records() -> Vec<ParsedRecord> {
         .collect()
 }
 
-/// The stamp training records is a parameter. Through the trigger it is the
-/// clock, read as training starts; handed a stamp, training records that
-/// stamp and nothing else about the training changes.
+/// The stamp training records is a parameter of the install. Through the
+/// trigger it is the clock, read as training starts; handed a stamp, the
+/// install records that stamp and nothing else about the training changes.
 #[test]
 fn training_is_stamped_with_the_stamp_it_is_handed() {
     let declare = || Declaration::validate(8, "l2", 8, 50, 2000, vec![]).unwrap();
@@ -608,14 +608,15 @@ fn training_is_stamped_with_the_stamp_it_is_handed() {
     let added = handed.add_records(training_records(), vec![], false);
     assert_eq!(added.total_errors, 0, "{:?}", added.errors);
     assert!(!handed.has_quantization());
-    handed.set_quantization_config(Some(config));
+    handed.set_quantization_config(Some(config.clone()));
     handed.set_pq(Some(Arc::new(PQ::new(8, 4, 4, 1000, None))));
     handed.set_training_ids((0..1000).map(|i| format!("r{i}")).collect());
     let given = "2001-02-03T04:05:06+00:00".to_string();
     {
         let writers = handed.hold_writers();
+        let trained = handed.fit_training(&config).unwrap();
         handed
-            .train_quantization_from_ids(&writers, given.clone())
+            .install_training(&writers, trained, given.clone())
             .unwrap();
     }
     assert!(handed.is_quantized());

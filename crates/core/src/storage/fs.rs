@@ -289,7 +289,9 @@ impl ArtefactWriter for FsArtefact {
 /// file is created on first use and never removed. A child forked through
 /// Python's `os.fork` closes its copy of every lock file just after the
 /// fork, through [`close_lock_files_in_forked_child`], so a lock stays with
-/// the process that took it.
+/// the process that took it. That process unlocks the file before it closes
+/// it, so the lock goes when it lets the lock go, even while a child it
+/// started still holds a copy of the file.
 #[derive(Clone, Debug)]
 pub struct FsStorage {
     target: PathBuf,
@@ -397,6 +399,26 @@ impl Storage for FsStorage {
         }))
     }
 
+    /// The target is read through its link where it is one, so a link to an
+    /// index directory is an index directory.
+    fn foreign_target(&self) -> Option<String> {
+        let metadata = fs::metadata(&self.target).ok()?;
+        if !metadata.is_dir() {
+            return Some("a file".to_string());
+        }
+        if self.target.join("manifest.json").is_file() {
+            return None;
+        }
+        match fs::read_dir(&self.target).map(Iterator::count) {
+            Ok(0) => None,
+            Ok(1) => Some("a folder holding 1 entry and no manifest.json".to_string()),
+            Ok(n) => Some(format!("a folder holding {n} entries and no manifest.json")),
+            Err(error) => Some(format!(
+                "a folder this process cannot list ({error}) and no manifest.json"
+            )),
+        }
+    }
+
     /// A staging directory an interrupted save left is removed here, as
     /// [`Storage::stage`] would remove it, so the probe asks the folder the
     /// question a checkpoint's first write asks.
@@ -465,6 +487,12 @@ impl Storage for FsStorage {
             sync_directory(parent);
         }
         Ok(())
+    }
+
+    fn cut_legacy_journal(&self, len: u64) -> io::Result<()> {
+        let file = OpenOptions::new().write(true).open(&self.legacy_journal)?;
+        file.set_len(len)?;
+        file.sync_all()
     }
 
     fn lock_path(&self) -> &Path {
@@ -628,10 +656,10 @@ pub fn release_lock_files_after_fork() {
 }
 
 /// Close, in a child just forked, the child's copy of every lock file the
-/// parent held open. The parent keeps every lock, since a lock goes only with
-/// the last copy of its file, and the child holds none, so a lock goes when
-/// the parent lets it go or ends, whether or not the child lives on. A guard
-/// the child drops later closes nothing.
+/// parent held open. The parent keeps every lock, since a close releases a
+/// lock only with the last copy of its file, and the child holds none, so a
+/// lock goes when the parent lets it go or ends, whether or not the child
+/// lives on. A guard the child drops later closes nothing.
 ///
 /// The files are the ones held since [`hold_lock_files_for_fork`]. Where
 /// nothing holds them they are taken here, unless a thread the child does not
@@ -691,8 +719,8 @@ fn keep(files: &mut LockFileList, file: File, mode: LockMode) -> FsLock {
 }
 
 /// A lock held through an open lock file, which this process's lock files
-/// keep under `id`. Dropping it closes the file, which releases the lock; see
-/// [`LockGuard`].
+/// keep under `id`. Dropping it in the process that took it unlocks the file
+/// and closes it; see [`LockGuard`].
 #[derive(Debug)]
 struct FsLock {
     id: u64,
@@ -707,11 +735,15 @@ impl LockGuard for FsLock {
     }
 }
 
-/// A child forked from the process that took the lock has closed its copy
-/// already where the fork went through `os.register_at_fork`, and then the
-/// drop finds nothing to close. A child does not wait for the lock files,
-/// which a thread it does not have may hold, and keeps its copy where another
-/// thread had them.
+/// In the process that took the lock, the drop unlocks the file before it
+/// closes it, so the lock goes even while a child process holds a copy of
+/// the file, as a child does from its fork to its exec. A child never
+/// unlocks, since the open file it shares with the parent carries the
+/// parent's lock. A child forked from the process that took the lock has
+/// closed its copy already where the fork went through `os.register_at_fork`,
+/// and then the drop finds nothing to close. A child does not wait for the
+/// lock files, which a thread it does not have may hold, and keeps its copy
+/// where another thread had them.
 impl Drop for FsLock {
     fn drop(&mut self) {
         let id = self.id;
@@ -722,7 +754,15 @@ impl Drop for FsLock {
                 .map(|at| files.swap_remove(at).1)
         };
         let file = if std::process::id() == self.process {
-            with_lock_files(take)
+            with_lock_files(|files| {
+                let file = take(files);
+                if let Some(file) = &file {
+                    // Where the unlock fails, the close still releases the
+                    // lock once no child holds a copy.
+                    let _ = file.unlock();
+                }
+                file
+            })
         } else {
             try_with_lock_files(take).flatten()
         };
@@ -771,7 +811,7 @@ impl JournalDir for FsJournalDir {
             let name = name.to_string_lossy();
             match segment_number(&name) {
                 Some(number) if entry.file_type()?.is_file() => numbers.push(number),
-                _ if name == "quarantine" => {}
+                _ if name == QUARANTINE => {}
                 _ => others.push(name.into_owned()),
             }
         }
@@ -813,7 +853,42 @@ impl JournalDir for FsJournalDir {
     fn segment_path(&self, number: u64) -> PathBuf {
         self.path.join(segment_file_name(number))
     }
+
+    fn create_quarantine(&self, folder: &str) -> io::Result<()> {
+        fs::create_dir_all(self.path.join(QUARANTINE).join(folder))
+    }
+
+    fn quarantine(&self) -> Box<dyn Dir> {
+        Box::new(FsDir::new(self.path.join(QUARANTINE)))
+    }
+
+    fn quarantine_folders(&self) -> io::Result<Vec<String>> {
+        let root = self.path.join(QUARANTINE);
+        if !root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut folders = Vec::new();
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                folders.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        folders.sort_unstable();
+        Ok(folders)
+    }
+
+    fn sync_quarantine(&self, folder: &str) {
+        let root = self.path.join(QUARANTINE);
+        sync_directory(&root.join(folder));
+        sync_directory(&root);
+        sync_directory(&self.path);
+    }
 }
+
+/// The folder under the journal's directory a repair copies what it sets
+/// aside into, one folder a repair.
+const QUARANTINE: &str = "quarantine";
 
 /// The staging directory, and the move that puts it in place. See
 /// [`FsStorage`] for what the move is on each platform.
@@ -830,7 +905,7 @@ impl Staged for FsStaged {
         &self.dir
     }
 
-    fn commit(mut self: Box<Self>) -> Result<(), Error> {
+    fn commit(mut self: Box<Self>, between: crate::KillPoint) -> Result<(), Error> {
         sync_directory(&self.staging);
 
         if self.target.exists() {
@@ -839,7 +914,7 @@ impl Staged for FsStaged {
                 error: e.to_string(),
             })?;
 
-            crate::kill_at(crate::KillPoint::SaveBetweenRenames);
+            crate::kill_at(between);
 
             if let Err(e) = fs::rename(&self.staging, &self.target) {
                 // The target is empty at this point, so putting the previous
@@ -1034,13 +1109,13 @@ mod tests {
 
         let staged = storage.stage().unwrap();
         staged.dir().write("a.bin", b"first").unwrap();
-        staged.commit().unwrap();
+        staged.commit(crate::KillPoint::SaveBetweenRenames).unwrap();
         assert!(storage.exists());
         assert_eq!(storage.dir().read("a.bin").unwrap(), b"first");
 
         let staged = storage.stage().unwrap();
         staged.dir().write("b.bin", b"second").unwrap();
-        staged.commit().unwrap();
+        staged.commit(crate::KillPoint::SaveBetweenRenames).unwrap();
         assert_eq!(entries(&tmp.path().join("index.zdb")), vec!["b.bin"]);
         assert_eq!(entries(tmp.path()), vec!["index.zdb"]);
 
@@ -1186,6 +1261,83 @@ mod tests {
         assert_eq!(storage.read_legacy_journal().unwrap(), b"ZDBJOURN");
         storage.remove_legacy_journal().unwrap();
         assert!(!storage.legacy_journal_exists());
+    }
+
+    /// A cut keeps the first bytes of the journal of format version 1 and
+    /// drops the rest.
+    #[test]
+    fn the_version_1_journal_is_cut_to_a_length() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        fs::write(storage.legacy_journal_path(), b"ZDBJOURN-and-a-tail").unwrap();
+        storage.cut_legacy_journal(8).unwrap();
+        assert_eq!(storage.read_legacy_journal().unwrap(), b"ZDBJOURN");
+    }
+
+    /// Nothing at the target, an empty folder and a folder holding a manifest
+    /// are each a target a save may replace. A file and a folder of other
+    /// entries are not, and each is named as what it is.
+    #[test]
+    fn a_target_that_is_not_an_index_directory_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("index.zdb");
+        let storage = FsStorage::at(&target).unwrap();
+        assert_eq!(storage.foreign_target(), None);
+        fs::create_dir(&target).unwrap();
+        assert_eq!(storage.foreign_target(), None);
+        fs::write(target.join("notes.txt"), b"mine").unwrap();
+        assert_eq!(
+            storage.foreign_target().as_deref(),
+            Some("a folder holding 1 entry and no manifest.json")
+        );
+        fs::create_dir(target.join("more")).unwrap();
+        assert_eq!(
+            storage.foreign_target().as_deref(),
+            Some("a folder holding 2 entries and no manifest.json")
+        );
+        fs::write(target.join("manifest.json"), b"{}").unwrap();
+        assert_eq!(storage.foreign_target(), None);
+        let file = tmp.path().join("file.zdb");
+        fs::write(&file, b"a file").unwrap();
+        assert_eq!(
+            FsStorage::at(&file).unwrap().foreign_target().as_deref(),
+            Some("a file")
+        );
+    }
+
+    /// The quarantine is folders under the journal's directory, each holding
+    /// files written durably, and the listing of segments passes over it.
+    #[test]
+    fn the_quarantine_sits_beside_the_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        storage.create_journal().unwrap();
+        let journal = storage.journal_dir();
+        assert!(journal.quarantine_folders().unwrap().is_empty());
+        journal.create_segment(5).unwrap();
+        journal.create_quarantine("b-9").unwrap();
+        journal.create_quarantine("a-3").unwrap();
+        journal
+            .quarantine()
+            .write("a-3/00000000000000000003.zdbseg", b"bytes")
+            .unwrap();
+        journal.sync_quarantine("a-3");
+        assert_eq!(journal.quarantine_folders().unwrap(), ["a-3", "b-9"]);
+        assert_eq!(
+            journal
+                .quarantine()
+                .read("a-3/00000000000000000003.zdbseg")
+                .unwrap(),
+            b"bytes"
+        );
+        assert_eq!(journal.segments().unwrap(), [5]);
+        storage.create_journal().unwrap();
+        assert!(journal.segments().unwrap().is_empty());
+        assert_eq!(
+            journal.quarantine_folders().unwrap(),
+            ["a-3", "b-9"],
+            "emptying the journal of segments leaves the quarantine"
+        );
     }
 
     /// The probe makes and removes the staging directory, and removes one an

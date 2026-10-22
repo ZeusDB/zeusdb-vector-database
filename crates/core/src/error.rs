@@ -375,12 +375,17 @@ pub enum Error {
     /// A journal's file header cannot be read
     JournalHeaderInvalid { file: String, detail: String },
     /// A record fails and records follow it, so its bytes changed after it
-    /// was written
+    /// was written. `cut_sequence` and `cut_at` are the record and the byte
+    /// in the same file a repair cuts at, being the first record of the call
+    /// the damage is in, or the damaged record itself in a journal of format
+    /// version 1, which frames no call.
     JournalCorrupt {
         file: String,
         sequence: u64,
         at: u64,
         detail: String,
+        cut_sequence: u64,
+        cut_at: u64,
     },
     /// A record's payload does not decode
     JournalRecordInvalid {
@@ -609,6 +614,19 @@ pub enum Error {
     LockUnavailable { path: String, error: String },
     /// A collection read from a directory this process cannot write
     CollectionReadOnly { directory: String, reason: String },
+
+    // ------------------------------------------------------------------
+    // The backup and the target of a save. Appended after every variant
+    // above, and none wider than the widest above.
+    // ------------------------------------------------------------------
+    /// A backup was asked of the directory the collection's journal sits
+    /// beside
+    BackupIntoOwnDirectory { path: String },
+    /// A backup was asked of a directory with a journal beside it
+    BackupTargetJournaled { path: String, journal: String },
+    /// A save was asked of a path holding a file, or a folder of entries and
+    /// no `manifest.json`
+    TargetNotAnIndex { path: String, holds: String },
 }
 
 impl Error {
@@ -771,7 +789,10 @@ impl Error {
             | JournalForked { .. }
             | CollectionLocked { .. }
             | LockUnavailable { .. }
-            | CollectionReadOnly { .. } => Exception::Runtime,
+            | CollectionReadOnly { .. }
+            | BackupIntoOwnDirectory { .. }
+            | BackupTargetJournaled { .. }
+            | TargetNotAnIndex { .. } => Exception::Runtime,
         }
     }
 
@@ -1313,14 +1334,18 @@ impl fmt::Display for Error {
                 sequence,
                 at,
                 detail,
+                cut_sequence,
+                cut_at,
             } => write!(
                 f,
                 "Record {} at byte {} of the journal {} is corrupt ({}) and records \
                  follow it, so it was written whole and its bytes changed afterwards. \
                  Refusing to open, because skipping it would recover a state nothing \
-                 acknowledged. Restore the journal from a copy, or repair it by name \
-                 to cut it at byte {} and lose record {} and everything after it.",
-                sequence, at, file, detail, at, sequence
+                 acknowledged. Restore the journal from a copy, or load the directory \
+                 with repair=True, which keeps every record before record {}, cuts the \
+                 journal at byte {} of the file holding that record, and sets aside \
+                 record {} and every record after it in the journal's quarantine folder.",
+                sequence, at, file, detail, cut_sequence, cut_at, cut_sequence
             ),
             JournalRecordInvalid {
                 file,
@@ -1841,6 +1866,28 @@ impl fmt::Display for Error {
                  since a change it could not journal would be lost. Save it into another \
                  directory to copy it somewhere writable.",
                 directory, reason
+            ),
+            BackupIntoOwnDirectory { path } => write!(
+                f,
+                "This collection's journal sits beside {}, so that directory is the \
+                 collection's own, and checkpoint() is what writes it. A backup writes a copy \
+                 into another directory.",
+                path
+            ),
+            BackupTargetJournaled { path, journal } => write!(
+                f,
+                "A journal sits beside {} at {}. A backup replaces the directory at its path \
+                 whole, which would leave that journal's records with no directory to replay \
+                 onto, so nothing was written. Back up into another path.",
+                path, journal
+            ),
+            TargetNotAnIndex { path, holds } => write!(
+                f,
+                "{} holds {}, so it is not an index directory, and a save replaces the \
+                 directory at its path whole, which would delete what it holds. Nothing was \
+                 written. Save into a new or empty path, or into a directory an earlier save \
+                 wrote.",
+                path, holds
             ),
         }
     }

@@ -145,6 +145,55 @@ fn a_load_lets_the_lock_go_when_it_returns() {
     assert!(temp.at("released.zdb.zdblock").is_file(), "the file stays");
 }
 
+/// A child process holds a copy of every file its parent has open from its
+/// fork to its exec, the lock file among them, and a lock goes only when its
+/// file is unlocked or the last copy of the file closes. The index the
+/// parent lets go releases its lock first, so the directory opens again at
+/// once while the child still holds its copy. The child here waits before
+/// its exec until the reopen is done, so the case does not rest on timing.
+#[cfg(unix)]
+#[test]
+fn a_child_holding_a_copy_of_the_lock_file_keeps_no_lock() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+
+    let temp = TempDir::new("lock-tests");
+    let path = temp.at("copied.zdb");
+    let dir = path.to_str().unwrap();
+    let first = Collection::build(declaration(), None);
+    first.journal_to(dir, Durability::PerCall).unwrap();
+    add(&first, "a");
+
+    // The child says it has forked, then waits before its exec until the
+    // parent says go, holding a copy of each of the parent's files.
+    let (forked, forked_in_child) = UnixStream::pair().unwrap();
+    let (go, go_in_child) = UnixStream::pair().unwrap();
+    let spawner = std::thread::spawn(move || {
+        let mut command = std::process::Command::new("true");
+        // SAFETY: the closure runs in the child between its fork and its
+        // exec, and calls only `write` and `read` on two sockets it owns.
+        unsafe {
+            command.pre_exec(move || {
+                (&forked_in_child).write_all(b"f")?;
+                let mut byte = [0u8; 1];
+                (&go_in_child).read_exact(&mut byte)
+            });
+        }
+        command.status()
+    });
+    let mut byte = [0u8; 1];
+    (&forked).read_exact(&mut byte).unwrap();
+
+    drop(first);
+    let reopened = Collection::recover(dir, None, Durability::PerCall);
+    (&go).write_all(b"g").unwrap();
+    let status = spawner.join().unwrap().unwrap();
+    assert!(status.success(), "{status:?}");
+    let (reopened, _) = reopened.expect("the directory opens while the child holds its copy");
+    assert!(reopened.contains("a"));
+}
+
 // ============================================================================
 // ACROSS PROCESSES
 // ============================================================================

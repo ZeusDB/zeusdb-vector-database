@@ -53,7 +53,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{debug, error, instrument, trace};
 use zeusdb_vector_core::{compile_filter, Error};
-use zeusdb_vector_hnsw::{Added, Collection, ParsedRecord, QuantizationScheme, SparseHalf};
+use zeusdb_vector_hnsw::{
+    Added, Collection, IdentityRecord, ParsedRecord, QuantizationScheme, Recovery, SparseHalf,
+};
 
 /// `skip_from_py_object` because nothing extracts an `AddResult`. It is the
 /// return type of `add` and appears in no argument position, in this crate or
@@ -157,9 +159,13 @@ impl AddResult {
 /// searches are never serialised against writes by PyO3's borrow flag. The
 /// lock acquisition order, the registry that checks it and the reasoning
 /// behind both are documented on `Collection`.
+///
+/// `recovery` is what the load that built the index did, and `None` on an
+/// index created in this process.
 #[pyclass]
 pub struct HNSWIndex {
     inner: Collection,
+    recovery: Option<Recovery>,
 }
 /// Build an `HNSWIndex`
 ///
@@ -195,9 +201,90 @@ pub fn create_hnsw_index(
     )
 }
 impl HNSWIndex {
-    /// Wrap a collection the index crate built or loaded.
+    /// Wrap a collection the index crate built.
     pub(crate) fn wrap(inner: Collection) -> Self {
-        HNSWIndex { inner }
+        HNSWIndex {
+            inner,
+            recovery: None,
+        }
+    }
+
+    /// Wrap a collection a load built, with what the load did.
+    pub(crate) fn wrap_loaded(inner: Collection, recovery: Recovery) -> Self {
+        HNSWIndex {
+            inner,
+            recovery: Some(recovery),
+        }
+    }
+
+    /// An identity as `identity` and `backup` return it.
+    fn identity_dict(py: Python<'_>, record: &IdentityRecord) -> PyResult<Py<PyAny>> {
+        let hex = |id: u128| format!("{:032x}", id);
+        let identity = &record.identity;
+        let dict = PyDict::new(py);
+        dict.set_item("collection_id", hex(identity.collection_id))?;
+        dict.set_item("generation", identity.generation)?;
+        dict.set_item("snapshot", identity.snapshot.map(hex))?;
+        dict.set_item("parent", identity.parent.map(hex))?;
+        dict.set_item("saved_at", record.saved_at.as_deref())?;
+        dict.set_item("sequence", record.sequence)?;
+        Ok(dict.into())
+    }
+
+    /// What a load did, as `recovery` returns it.
+    fn recovery_dict(py: Python<'_>, recovery: &Recovery) -> PyResult<Py<PyAny>> {
+        let dict = PyDict::new(py);
+        dict.set_item("format_version", &recovery.format_version)?;
+        dict.set_item("journaled", recovery.journaled)?;
+        dict.set_item("checkpoint_sequence", recovery.checkpoint_sequence)?;
+        dict.set_item("first_sequence", recovery.first_sequence)?;
+        dict.set_item("records_in_journal", recovery.records_in_journal)?;
+        dict.set_item("replayed", recovery.replayed)?;
+        dict.set_item("withdrawn", recovery.withdrawn)?;
+        dict.set_item("skipped", recovery.skipped)?;
+        dict.set_item("segments", recovery.segments)?;
+        let damage = match &recovery.damage {
+            Some(damage) => {
+                let entry = PyDict::new(py);
+                entry.set_item("kind", damage.kind)?;
+                entry.set_item("segment", &damage.segment)?;
+                entry.set_item("at", damage.at)?;
+                entry.set_item("sequence", damage.sequence)?;
+                entry.set_item("detail", damage.detail.as_deref())?;
+                Some(entry)
+            }
+            None => None,
+        };
+        dict.set_item("damage", damage)?;
+        dict.set_item("restored_from_aside", recovery.restored_from_aside)?;
+        dict.set_item("graph_rebuilt", recovery.graph_rebuilt)?;
+        dict.set_item("upgraded_from", recovery.upgraded_from.as_deref())?;
+        dict.set_item(
+            "checkpoint_taken",
+            recovery.checkpoint_taken.map(|taken| taken.name()),
+        )?;
+        dict.set_item("read_only", recovery.read_only.is_some())?;
+        dict.set_item("read_only_reason", recovery.read_only.as_deref())?;
+        let repair = match &recovery.repair {
+            Some(repair) => {
+                let entry = PyDict::new(py);
+                entry.set_item("kept_through", repair.kept_through)?;
+                entry.set_item("discarded_from", repair.discarded_from)?;
+                entry.set_item("records_discarded", repair.records_discarded)?;
+                entry.set_item("bytes_discarded", repair.bytes_discarded)?;
+                entry.set_item(
+                    "quarantine",
+                    repair
+                        .quarantine
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                )?;
+                Some(entry)
+            }
+            None => None,
+        };
+        dict.set_item("repair", repair)?;
+        Ok(dict.into())
     }
 
     /// The shape rule for a 2-D query array
@@ -1011,7 +1098,7 @@ impl HNSWIndex {
     /// Python property: `index.identity`
     ///
     /// What this index is, as every directory it saves records it under
-    /// `identity` in `manifest.json`. A dict of four keys.
+    /// `identity` in `manifest.json`. A dict of six keys.
     ///
     /// - `collection_id`: the index's id, 32 hexadecimal digits, drawn when
     ///   the index is created and kept through every save and load. The
@@ -1022,21 +1109,101 @@ impl HNSWIndex {
     /// - `snapshot`: the id of the directory the index last saved or read,
     ///   drawn at that save, or `None`.
     /// - `parent`: the snapshot that directory was saved from, or `None`.
+    /// - `saved_at`: the time, in RFC 3339, that directory's manifest
+    ///   records as its save, or `None` where `snapshot` is `None`.
+    /// - `sequence`: the journal sequence that directory's state holds, or 0
+    ///   where it records none.
     ///
     /// Of two directories of one index the higher generation is the later
     /// save, and a directory whose `parent` is another's `snapshot` was saved
     /// from that one. Two directories naming one parent under two snapshots
-    /// were saved from one state twice. `clear()` keeps all four.
+    /// were saved from one state twice, and a backup is one of them.
+    /// `clear()` keeps all six.
     #[getter]
     pub fn identity(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let identity = self.inner.identity();
-        let hex = |id: u128| format!("{:032x}", id);
-        let dict = PyDict::new(py);
-        dict.set_item("collection_id", hex(identity.collection_id))?;
-        dict.set_item("generation", identity.generation)?;
-        dict.set_item("snapshot", identity.snapshot.map(hex))?;
-        dict.set_item("parent", identity.parent.map(hex))?;
-        Ok(dict.into())
+        Self::identity_dict(py, &self.inner.identity_record())
+    }
+
+    /// Python property: `index.recovery`
+    ///
+    /// What the load that built this index did, as a dict, or `None` on an
+    /// index created in this process.
+    ///
+    /// - `format_version`: the format the directory declared when it was
+    ///   read.
+    /// - `journaled`: whether a journal was read.
+    /// - `checkpoint_sequence`: the sequence the directory's checkpoint
+    ///   holds.
+    /// - `first_sequence`: the first sequence above the checkpoint the
+    ///   journal holds, or 0 where none was read.
+    /// - `records_in_journal`: the operation records above the checkpoint
+    ///   the load kept.
+    /// - `replayed`, `withdrawn`, `skipped`: the records applied, the records
+    ///   of calls withdrawn after a failed commit, and the records the
+    ///   checkpoint already held.
+    /// - `segments`: the segments the journal held, or 0 for a journal of
+    ///   format version 1, which is one file.
+    /// - `damage`: what stopped the reader or what a repair cut the journal
+    ///   for, as a dict of `kind`, `segment`, `at`, `sequence` and `detail`,
+    ///   or `None`. `kind` is one of `"torn_tail"`, `"corrupt"`, `"header"`,
+    ///   `"structure"`, `"decode"` and `"apply"`, `segment` the file's name,
+    ///   and `detail` `None` for a torn tail.
+    /// - `restored_from_aside`: whether the directory was put back from
+    ///   `<path>.zdbold`.
+    /// - `graph_rebuilt`: whether the graph was rebuilt rather than read from
+    ///   its dump.
+    /// - `upgraded_from`: the format an upgraded directory was read at, or
+    ///   `None`.
+    /// - `checkpoint_taken`: why the load took a checkpoint, `"upgrade"`,
+    ///   `"abort"` or `"repair"`, or `None`.
+    /// - `read_only`, `read_only_reason`: whether the index was opened read
+    ///   only, and the system's refusal where it was.
+    /// - `repair`: where a load with `repair=True` cut the journal or set a
+    ///   stale segment aside, a dict of `kept_through`, `discarded_from`,
+    ///   `records_discarded`, `bytes_discarded` and `quarantine`, being the
+    ///   last sequence kept, the first set aside past the checkpoint or
+    ///   `None` where only a stale segment was set aside, the whole records
+    ///   and the bytes set aside, and the folder they were copied into, or
+    ///   `None` where the medium refused the write. `None` where no repair set
+    ///   anything aside.
+    #[getter]
+    pub fn recovery(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.recovery
+            .as_ref()
+            .map(|recovery| Self::recovery_dict(py, recovery))
+            .transpose()
+    }
+
+    /// Write a copy of the index into the directory `path` and return the
+    /// copy's identity, a dict of the six keys `identity` returns.
+    ///
+    /// The copy is a directory of its own at format 5.0.0 that names no
+    /// journal and opens with `load()` like any saved index. It holds every
+    /// record the index holds, its generation is the next, its `snapshot` is
+    /// its own, its `parent` is this index's `snapshot`, and its `sequence`
+    /// is the sequence the journal has reached, or the index's own where it
+    /// has none. Neither this index's identity nor its journal moves, so its
+    /// next checkpoint names the same parent.
+    ///
+    /// Writes wait for it as they wait for a checkpoint, and searches run
+    /// throughout. On a journaled index the journal is synced first, and a
+    /// sync that fails is logged and leaves the index refusing changes until
+    /// a checkpoint, while the copy is still written. It works on an index
+    /// with no journal and on one opened read only.
+    ///
+    /// Raises RuntimeError before anything is written for the directory the
+    /// index's journal sits beside or a read-only index was read from
+    /// (BackupIntoOwnDirectory), for a directory with a journal beside it
+    /// (BackupTargetJournaled), for a path holding a file or a folder of
+    /// other files (TargetNotAnIndex), and for a directory another holder
+    /// locks (CollectionLocked). A directory an earlier save or backup wrote
+    /// at that path, of any format, is replaced whole.
+    #[instrument(level = "info", skip(self, py), fields(
+        vector_count = self.inner.vector_count()
+    ), err)]
+    pub fn backup(&self, py: Python<'_>, path: &str) -> Result<Py<PyAny>, PyEngineError> {
+        let record = py.detach(|| self.inner.backup(path))?;
+        Ok(Self::identity_dict(py, &record)?)
     }
 
     /// Python property: `index.dim`

@@ -491,7 +491,8 @@ class VectorDatabase:
 
 
     def load(self, path: str, tokenizer: Any = None, durability: Optional[str] = None,
-             interval_ms: Optional[int] = None, checkpoint_only: bool = False) -> Any:
+             interval_ms: Optional[int] = None, checkpoint_only: bool = False,
+             repair: bool = False) -> Any:
         """
         Load a previously saved ZeusDB index from disk.
 
@@ -550,9 +551,23 @@ class VectorDatabase:
                 journal, and for a caller who wants the state as of the
                 checkpoint. durability and interval_ms do not apply and are
                 refused beside it.
+            repair: Load a directory whose journal is damaged, which load
+                otherwise refuses naming repair=True. Every whole call
+                before the first call the damage touches is replayed, that
+                call and everything after it in the journal are copied into
+                <path>.zdbjournal/quarantine/ beside a repair.json that
+                describes them, the journal is cut there, and the directory
+                is saved. A RuntimeWarning names the damage, the records set
+                aside and the folder, and index.recovery reports the same. A
+                directory with nothing damaged loads as it would without
+                repair. On a medium this process cannot write, nothing is
+                set aside or changed and the index opens read only. Refused
+                beside checkpoint_only with ValueError.
 
         Returns:
-            HNSWIndex: The loaded index ready for use
+            HNSWIndex: The loaded index ready for use. index.recovery says
+            what the load did, such as the records it replayed and any
+            damage it found.
 
         A loaded journaled index holds its journal open until the index is
         dropped, and a segment deleted or moved under a live index is one the
@@ -566,7 +581,7 @@ class VectorDatabase:
         """
         from ._engine import _load_index  # Direct function import
         return _load_index(path, tokenizer, durability=durability, interval_ms=interval_ms,
-                           checkpoint_only=checkpoint_only)
+                           checkpoint_only=checkpoint_only, repair=repair)
 
 
     def _validate_quantization_config(self, config: Dict[str, Any], dim: int,

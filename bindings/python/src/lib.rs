@@ -14,7 +14,7 @@ mod tokenizer;
 
 use pyo3::prelude::*;
 use zeusdb_vector_core::{Error, Exception};
-use zeusdb_vector_hnsw::Collection;
+use zeusdb_vector_hnsw::{Collection, JournalPolicy};
 
 /// An engine failure on its way to Python.
 ///
@@ -119,13 +119,28 @@ impl From<PyEngineError> for PyErr {
 /// replayed in memory, nothing on the medium changes, every change raises
 /// `CollectionReadOnly`, and `save` into another directory copies it.
 ///
+/// `repair=True` loads a journal whose own history is broken: a corrupt
+/// record with records after it, damage in a segment that is not the last,
+/// a header that will not read, a record that will not decode or apply,
+/// and segments that do not form one run of calls. Every whole call before
+/// the first call the damage touches is replayed, that call and every byte
+/// after it are copied into `<path>.zdbjournal/quarantine/<UTC stamp>-<first
+/// sequence set aside>/` with a `repair.json` describing them, the journal
+/// is cut there, and a checkpoint is written. A `RuntimeWarning` names the
+/// damage, the records set aside and the folder, and `index.recovery`
+/// reports the same. A load that finds nothing damaged and no repair
+/// unfinished is a plain load. A journal that belongs to another collection
+/// or another checkpoint is refused as without it. On a medium this process
+/// cannot write, the kept calls are replayed in memory, nothing is set
+/// aside or changed, and the index opens read only.
+///
 /// The whole load runs with the interpreter lock released, the graph rebuild
 /// it may fall back to included. Nothing in the load path touches Python:
 /// the directory is read, the collection is built and restored, and the
 /// result is wrapped here with the lock back. A tokenizer handed in is
 /// stored and never run by the load.
 #[pyfunction]
-#[pyo3(name = "_load_index", signature = (path, tokenizer = None, durability = None, interval_ms = None, checkpoint_only = false))]
+#[pyo3(name = "_load_index", signature = (path, tokenizer = None, durability = None, interval_ms = None, checkpoint_only = false, repair = false))]
 fn load_index(
     py: Python<'_>,
     path: &str,
@@ -133,12 +148,20 @@ fn load_index(
     durability: Option<&str>,
     interval_ms: Option<u64>,
     checkpoint_only: bool,
+    repair: bool,
 ) -> Result<hnsw_index::HNSWIndex, PyEngineError> {
     let tokenizer = tokenizer
         .map(|argument| tokenizer::tokenizer_from_python(argument, "tokenizer"))
         .transpose()?;
     let named = durability.is_some() || interval_ms.is_some();
-    if checkpoint_only {
+    let policy = if checkpoint_only {
+        if repair {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "repair=True reads the journal to repair it, and checkpoint_only=True reads no \
+                 journal, so the two do not go together",
+            )
+            .into());
+        }
         if named {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "checkpoint_only=True opens the checkpoint alone and attaches no journal, so \
@@ -146,11 +169,16 @@ fn load_index(
             )
             .into());
         }
-        let inner = py.detach(|| Collection::load_checkpoint_only(path, tokenizer))?;
-        return Ok(hnsw_index::HNSWIndex::wrap(inner));
-    }
-    let durability = durability::parse_durability(durability.unwrap_or("call"), interval_ms)?;
-    let (inner, recovery) = py.detach(|| Collection::recover(path, tokenizer, durability))?;
+        JournalPolicy::CheckpointOnly
+    } else {
+        let durability = durability::parse_durability(durability.unwrap_or("call"), interval_ms)?;
+        if repair {
+            JournalPolicy::Repair(durability)
+        } else {
+            JournalPolicy::Replay(durability)
+        }
+    };
+    let (inner, recovery) = py.detach(|| Collection::recover_with(path, tokenizer, policy))?;
     if named && !recovery.journaled {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "load names a durability and the directory at '{}' has no journal. A durability \
@@ -160,13 +188,16 @@ fn load_index(
         ))
         .into());
     }
-    if let Some(message) = recovery.read_only_warning(path) {
+    let warning = recovery
+        .repair_warning(path)
+        .or_else(|| recovery.read_only_warning(path));
+    if let Some(message) = warning {
         let category = py.get_type::<pyo3::exceptions::PyRuntimeWarning>();
         let message = std::ffi::CString::new(message)
-            .unwrap_or_else(|_| c"The directory was opened read only.".to_owned());
+            .unwrap_or_else(|_| c"The directory was loaded with a warning.".to_owned());
         PyErr::warn(py, category.as_any(), &message, 1)?;
     }
-    Ok(hnsw_index::HNSWIndex::wrap(inner))
+    Ok(hnsw_index::HNSWIndex::wrap_loaded(inner, recovery))
 }
 
 /// ZeusDB Vector Database Python Module

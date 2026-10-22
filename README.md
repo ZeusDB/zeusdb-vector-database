@@ -1851,7 +1851,7 @@ An index that is never checkpointed opens by replaying every record in its journ
 
 ### 🪪 Identifying a Directory - .identity
 
-Every save records what the directory is, under `identity` in `manifest.json`, and an index reports the same four values as its `identity` property.
+Every save records what the directory is, under `identity` in `manifest.json`, and an index reports the same values as its `identity` property.
 
 | Key | What it is |
 |---|---|
@@ -1887,7 +1887,7 @@ True
 True
 ```
 
-Of two directories of one index, the higher `generation` is the later save. A copy taken before the last save is one generation behind the directory saved after it, and that directory names the copy's `snapshot` as its `parent`. Two directories naming the same `parent` under different snapshots were each saved from the same state, which is what a copy opened and saved in its own place looks like. `clear()` keeps all four, since a cleared index is the same index, and `get_stats()` does not carry them.
+Of two directories of one index, the higher `generation` is the later save. A copy taken before the last save is one generation behind the directory saved after it, and that directory names the copy's `snapshot` as its `parent`. Two directories naming the same `parent` under different snapshots were each saved from the same state, which is what a copy opened and saved in its own place looks like. `clear()` keeps them all, since a cleared index is the same index, and `get_stats()` does not carry them.
 
 A directory saved by 0.11.0 or earlier records no identity. A journaled one takes the id its journal names, and any other is given one when it is opened. Its next save records that id at generation 1.
 

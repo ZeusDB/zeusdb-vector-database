@@ -984,3 +984,40 @@ fn the_version_rule_holds_for_a_scalar_directory() {
     );
     assert!(message.contains("1.x, 2.x, 3.x, 4.x and 5.x"), "{message}");
 }
+
+/// A dimension whose largest magnitude over the sample is above
+/// zero and so small that it divided by 127 rounds to zero takes a scale of
+/// 1.0, as a dimension of zeros does, so the directory a save writes loads,
+/// and a replay of the training's record, which carries the scales, opens.
+#[test]
+fn a_dimension_of_tiny_values_trains_to_a_directory_that_loads() {
+    let dir = TempDir::new();
+    let mut vectors = clustered(1000, 8, 0x0219_b003);
+    for vector in &mut vectors {
+        vector[0] = f32::from_bits(1);
+    }
+    let path = dir.sub("tiny.zdb");
+    let declaration = declaration(8, "l2");
+    let collection = Collection::build(declaration.clone(), Some(scalar(&declaration, 1000)));
+    collection.journal_to(&path, Durability::PerCall).unwrap();
+    add(&collection, records(&collection, &vectors, 0..1000));
+    assert!(collection.is_quantized());
+    let scales = collection.int8_codec().unwrap().scales().to_vec();
+    assert_eq!(scales[0], 1.0, "the tiny dimension takes 1.0");
+    assert!(scales[1..]
+        .iter()
+        .all(|scale| *scale > 0.0 && *scale != 1.0));
+
+    let copy = super::journal_support::copy_journaled(Path::new(&path), "tiny-copy.zdb");
+    let (replayed, report) =
+        Collection::recover(copy.to_str().unwrap(), None, Durability::PerCall).unwrap();
+    assert!(report.replayed >= 1000);
+    assert_eq!(replayed.int8_codec().unwrap().scales(), &scales[..]);
+    drop(replayed);
+
+    collection.save(&path).unwrap();
+    drop(collection);
+    let loaded = Collection::load(&path).unwrap();
+    assert_eq!(loaded.int8_codec().unwrap().scales(), &scales[..]);
+    assert_eq!(loaded.len(), 1000);
+}

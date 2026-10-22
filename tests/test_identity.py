@@ -44,12 +44,15 @@ def manifest(path):
 
 def recorded(path):
     """The identity a directory's manifest records, as the property spells it."""
-    identity = manifest(path)["identity"]
+    m = manifest(path)
+    identity = m["identity"]
     return {
         "collection_id": identity["collection_id"],
         "generation": identity["generation"],
         "snapshot": identity["snapshot"],
         "parent": identity.get("parent"),
+        "saved_at": m["saved_at"],
+        "sequence": identity["sequence"],
     }
 
 
@@ -73,11 +76,15 @@ def drop(index):
 def test_a_new_index_has_an_id_and_no_snapshot():
     index = build()
     identity = index.identity
-    assert sorted(identity) == ["collection_id", "generation", "parent", "snapshot"]
+    assert sorted(identity) == [
+        "collection_id", "generation", "parent", "saved_at", "sequence", "snapshot",
+    ]
     assert is_id(identity["collection_id"])
     assert identity["generation"] == 0
     assert identity["snapshot"] is None
     assert identity["parent"] is None
+    assert identity["saved_at"] is None
+    assert identity["sequence"] == 0
     assert index.identity == identity, "the same index reports the same identity"
     assert build().identity["collection_id"] != identity["collection_id"]
 
@@ -210,6 +217,26 @@ def test_a_journaled_directory_names_one_id_three_times(tmp_path):
     assert len(reopened) == 12
 
 
+def test_the_identity_names_the_time_and_the_sequence_its_directory_records(tmp_path):
+    """saved_at is the time the manifest of the directory snapshot names
+    records as its save, and sequence the journal sequence that directory's
+    state holds, which moves at a checkpoint and not as records are added."""
+    index = build(4)
+    path = tmp_path / "j.zdb"
+    index.journal_to(str(path))
+    first = index.identity
+    assert first == recorded(path)
+    assert first["sequence"] == 0
+    assert isinstance(first["saved_at"], str) and "T" in first["saved_at"]
+    add(index, 4, 8)
+    assert index.identity == first, "records in the journal are not a save"
+    index.checkpoint()
+    second = index.identity
+    assert second == recorded(path)
+    assert second["sequence"] == 5, "four inserts and their commit"
+    assert second["saved_at"] >= first["saved_at"]
+
+
 def test_clear_keeps_the_identity(tmp_path):
     index = build(10)
     path = tmp_path / "cleared.zdb"
@@ -251,6 +278,9 @@ def test_a_directory_recording_no_identity_is_named_at_its_next_save(tmp_path, v
     assert first.identity["generation"] == 0
     assert first.identity["snapshot"] is None
     assert len(first) == 10
+
+    assert first.identity["saved_at"] is None
+    assert first.identity["sequence"] == 0
 
     first.save(str(path))
     named = recorded(path)

@@ -1,6 +1,6 @@
 //! What the journal's tests share: a temporary folder, a journal read back
-//! by hand, faults armed on a journal's directory, and a storage on a medium
-//! that refuses every write.
+//! by hand, a journal damaged for a repair, faults armed on a journal's
+//! directory, and a storage on a medium that refuses every write.
 //!
 //! A device fault cannot be produced on demand, so a failure is injected
 //! through a journal directory that fails a chosen write, sync, cut or
@@ -17,10 +17,13 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use zeusdb_vector_core::{
-    Dir, Error, Expected, FsStorage, JournalContents, JournalDir, JournalFile, LockFailure,
-    LockGuard, LockMode, Locked, SegmentBase, SegmentBytes, Staged, Storage,
+    encode_journal_record, Dir, Error, Expected, FsStorage, InsertParts, JournalContents,
+    JournalDir, JournalFile, LockFailure, LockGuard, LockMode, Locked, Operation, SegmentBase,
+    SegmentBytes, Staged, Storage, JOURNAL_RECORD_HEADER_BYTES, JOURNAL_RECORD_OVERHEAD_BYTES,
+    SEGMENT_HEADER_BYTES, SEGMENT_ROLL_BYTES,
 };
 
+use super::{Collection, Declaration, ParsedRecord};
 use crate::journal::{Durability, JournalSink};
 
 // ============================================================================
@@ -214,6 +217,196 @@ pub(super) fn sink_over(
 }
 
 // ============================================================================
+// A JOURNAL DAMAGED FOR A REPAIR
+// ============================================================================
+
+/// The classes of damage a repair is held to: a corrupt middle in the last
+/// segment, damage in the segment that is not the last, a header that will
+/// not read, a record whose checksum holds and which will not decode, and a
+/// stale segment whose header will not read beside a live one. A repair cuts
+/// at the first four, and sets the stale segment aside whole.
+pub(super) const REPAIR_CLASSES: [&str; 5] = ["corrupt", "sealed", "header", "decode", "stale"];
+
+/// The calls a damaged journal holds, and the records each call adds.
+pub(super) const DAMAGED_CALLS: usize = 6;
+pub(super) const DAMAGED_CALL_RECORDS: usize = 3;
+
+/// A journaled directory at `dir`, declared by `declaration`, holding
+/// [`DAMAGED_CALLS`] calls of [`DAMAGED_CALL_RECORDS`] records each, every
+/// record built by `record` from its index, the first four calls in one
+/// segment and the last two in the next, damaged as `class` names.
+///
+/// Returns the calls a repair keeps, being every call before the one the
+/// damage touches, and the bytes the repair sets aside, being that call's
+/// first byte and every byte after it, segment by segment. Each call is
+/// four records, three inserts and the commit, from sequence one.
+///
+/// For `stale` a checkpoint follows the first four calls, so the second
+/// segment holds the last two calls and the first is deleted, and a copy of
+/// the first is put back with its header damaged, as a crash inside that
+/// deletion and damage to the copy leave it. A repair keeps every call and
+/// sets that copy aside whole, which is the bytes returned.
+pub(super) fn damaged_journal(
+    dir: &Path,
+    class: &str,
+    declaration: Declaration,
+    record: impl Fn(usize) -> ParsedRecord,
+) -> (usize, Vec<u8>) {
+    let probe = record(10);
+    let mut payload = Vec::new();
+    Operation::encode_insert(
+        &InsertParts {
+            id: &probe.id,
+            vector: &probe.vector,
+            metadata: &probe.metadata,
+            sparse: None,
+        },
+        &mut payload,
+    );
+    let insert = (payload.len() + JOURNAL_RECORD_OVERHEAD_BYTES) as u64;
+    let commit = (8 + JOURNAL_RECORD_OVERHEAD_BYTES) as u64;
+    let first_segment = crate::journal::journal_path(dir)
+        .unwrap()
+        .join(format!("{:020}.zdbseg", 1));
+    let mut stale_copy = None;
+    {
+        // Ten inserts and four commits past the header: the fourth call's
+        // commit passes it and the sixth's does not. A writer takes the
+        // length when it is made.
+        zeusdb_vector_core::set_segment_roll_bytes(
+            SEGMENT_HEADER_BYTES as u64 + 10 * insert + 4 * commit,
+        );
+        let collection = Collection::build(declaration, None);
+        collection
+            .journal_to(dir.to_str().unwrap(), Durability::PerCall)
+            .unwrap();
+        for call in 0..DAMAGED_CALLS {
+            let first = DAMAGED_CALL_RECORDS * call;
+            let batch = (first..first + DAMAGED_CALL_RECORDS).map(&record).collect();
+            let added = collection.add_records(batch, vec![], false);
+            assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+            if class == "stale" && call == 3 {
+                stale_copy = Some(std::fs::read(&first_segment).unwrap());
+                collection.checkpoint().unwrap();
+            }
+        }
+        zeusdb_vector_core::set_segment_roll_bytes(SEGMENT_ROLL_BYTES);
+    }
+    if let Some(copy) = &stale_copy {
+        assert!(
+            !first_segment.exists(),
+            "the checkpoint deleted the first segment"
+        );
+        std::fs::write(&first_segment, copy).unwrap();
+    }
+    let segments = Segments::of(dir);
+    assert_eq!(segments.numbers, vec![1, 17], "the calls fill two segments");
+    let contents = segments.read(&expected_of(dir)).unwrap();
+    let place_of = |sequence: u64| -> (usize, usize) {
+        let live = contents
+            .records
+            .iter()
+            .find(|live| live.record.sequence == sequence)
+            .unwrap();
+        (usize::from(sequence >= 17), live.record.offset as usize)
+    };
+    let first_of_call = |call: u64| 1 + 4 * call;
+    let mut bytes = segments.bytes.clone();
+    let (kept, cut_segment, cut_at) = match class {
+        // The fifth call's second record in the last segment, with the
+        // sixth call whole after it.
+        "corrupt" => {
+            let (segment, at) = place_of(first_of_call(4) + 1);
+            bytes[segment][at + JOURNAL_RECORD_HEADER_BYTES + 1] ^= 0x40;
+            (4, 1, SEGMENT_HEADER_BYTES)
+        }
+        // The second call's second record in the first segment, which is
+        // not the last.
+        "sealed" => {
+            let (segment, at) = place_of(first_of_call(1) + 1);
+            bytes[segment][at + JOURNAL_RECORD_HEADER_BYTES + 1] ^= 0x40;
+            (1, 0, place_of(first_of_call(1)).1)
+        }
+        // The last segment's header, which then does not read.
+        "header" => {
+            bytes[1][40] ^= 0x40;
+            (4, 1, 0)
+        }
+        // The third call's second record, its payload replaced by bytes
+        // that do not decode under a checksum that holds.
+        "decode" => {
+            let sequence = first_of_call(2) + 1;
+            let (segment, at) = place_of(sequence);
+            let damaged = contents
+                .records
+                .iter()
+                .find(|live| live.record.sequence == sequence)
+                .unwrap()
+                .record;
+            let mut out = Vec::new();
+            encode_journal_record(
+                sequence,
+                damaged.kind,
+                &vec![0xFF; damaged.payload.len()],
+                &mut out,
+            );
+            bytes[segment][at..at + out.len()].copy_from_slice(&out);
+            (2, 0, place_of(first_of_call(2)).1)
+        }
+        // The stale first segment's header, which then does not read.
+        "stale" => {
+            bytes[0][40] ^= 0x40;
+            (DAMAGED_CALLS, 0, 0)
+        }
+        other => panic!("no repair class {other}"),
+    };
+    let journal = crate::journal::journal_path(dir).unwrap();
+    for (number, segment) in segments.numbers.iter().zip(&bytes) {
+        std::fs::write(journal.join(format!("{number:020}.zdbseg")), segment).unwrap();
+    }
+    if class == "stale" {
+        return (kept, bytes[0].clone());
+    }
+    let mut aside = bytes[cut_segment][cut_at..].to_vec();
+    for later in &bytes[cut_segment + 1..] {
+        aside.extend_from_slice(later);
+    }
+    (kept, aside)
+}
+
+/// What a quarantine holds: every file but the reports, by name in name
+/// order with its bytes, the folders in name order, and whether any folder
+/// holds the marker of an unfinished repair.
+pub(super) type Quarantine = (Vec<(String, Vec<u8>)>, Vec<String>, bool);
+
+/// What the quarantine of the journal beside `directory` holds.
+pub(super) fn quarantine_of(directory: &Path) -> Quarantine {
+    let root = crate::journal::journal_path(directory)
+        .unwrap()
+        .join("quarantine");
+    let mut folders: Vec<String> = std::fs::read_dir(&root)
+        .map(|entries| {
+            entries
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    folders.sort();
+    let mut files = Vec::new();
+    let mut unsealed = false;
+    for (path, bytes) in files_under(&[&root]) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        match name.as_str() {
+            "repair.json" => {}
+            "UNSEALED" => unsealed = true,
+            _ => files.push((name, bytes)),
+        }
+    }
+    files.sort();
+    (files, folders, unsealed)
+}
+
+// ============================================================================
 // THE FIXTURES OLDER RELEASES WROTE
 // ============================================================================
 
@@ -369,12 +562,17 @@ impl Arm {
 
 /// Failures a test arms on a journal's directory. A failing write lands half
 /// its bytes first, which is what a device that fills part way leaves.
+/// `quarantines` fails the creation of a repair's quarantine folder, and
+/// `quarantines_denied` fails it with the system's refusal of a missing
+/// permission.
 #[derive(Debug, Default)]
 pub(super) struct Faults {
     pub(super) writes: Arm,
     pub(super) syncs: Arm,
     pub(super) cuts: Arm,
     pub(super) creates: Arm,
+    pub(super) quarantines: Arm,
+    pub(super) quarantines_denied: Arm,
 }
 
 fn injected() -> io::Error {
@@ -426,6 +624,27 @@ impl JournalDir for FaultyDir {
     }
     fn segment_path(&self, number: u64) -> PathBuf {
         self.inner.segment_path(number)
+    }
+    fn create_quarantine(&self, folder: &str) -> io::Result<()> {
+        if self.faults.quarantines_denied.trips() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected: the folder may not be written",
+            ));
+        }
+        if self.faults.quarantines.trips() {
+            return Err(injected());
+        }
+        self.inner.create_quarantine(folder)
+    }
+    fn quarantine(&self) -> Box<dyn Dir> {
+        self.inner.quarantine()
+    }
+    fn quarantine_folders(&self) -> io::Result<Vec<String>> {
+        self.inner.quarantine_folders()
+    }
+    fn sync_quarantine(&self, folder: &str) {
+        self.inner.sync_quarantine(folder)
     }
 }
 
@@ -493,6 +712,9 @@ impl Storage for FaultyStorage {
     fn stage(&self) -> Result<Box<dyn Staged>, Error> {
         self.inner.stage()
     }
+    fn foreign_target(&self) -> Option<String> {
+        self.inner.foreign_target()
+    }
     fn probe_writable(&self) -> io::Result<()> {
         self.inner.probe_writable()
     }
@@ -525,6 +747,9 @@ impl Storage for FaultyStorage {
     }
     fn remove_legacy_journal(&self) -> io::Result<()> {
         self.inner.remove_legacy_journal()
+    }
+    fn cut_legacy_journal(&self, len: u64) -> io::Result<()> {
+        self.inner.cut_legacy_journal(len)
     }
     fn lock_path(&self) -> &Path {
         self.inner.lock_path()
@@ -602,6 +827,16 @@ impl JournalDir for RefusingDir {
     fn segment_path(&self, number: u64) -> PathBuf {
         self.inner.segment_path(number)
     }
+    fn create_quarantine(&self, _folder: &str) -> io::Result<()> {
+        Err(io::Error::new(self.kind, "the medium refuses writes"))
+    }
+    fn quarantine(&self) -> Box<dyn Dir> {
+        self.inner.quarantine()
+    }
+    fn quarantine_folders(&self) -> io::Result<Vec<String>> {
+        self.inner.quarantine_folders()
+    }
+    fn sync_quarantine(&self, _folder: &str) {}
 }
 
 impl Storage for RefusingStorage {
@@ -629,6 +864,9 @@ impl Storage for RefusingStorage {
             staging: PathBuf::from(format!("{}.zdbtmp", self.inner.dir().locate(""))),
             error: self.refusal().to_string(),
         })
+    }
+    fn foreign_target(&self) -> Option<String> {
+        self.inner.foreign_target()
     }
     fn probe_writable(&self) -> io::Result<()> {
         Err(self.refusal())
@@ -661,6 +899,9 @@ impl Storage for RefusingStorage {
         self.inner.read_legacy_journal()
     }
     fn remove_legacy_journal(&self) -> io::Result<()> {
+        Err(self.refusal())
+    }
+    fn cut_legacy_journal(&self, _len: u64) -> io::Result<()> {
         Err(self.refusal())
     }
     fn lock_path(&self) -> &Path {

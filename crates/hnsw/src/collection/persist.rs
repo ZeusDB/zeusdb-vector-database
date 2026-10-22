@@ -9,11 +9,13 @@
 //! with the interpreter lock released.
 
 use super::{
-    Collection, DenseIndex, DenseOpen, Identity, QuantizationConfig, StorageMode, MAX_LAYER,
+    Collection, DenseIndex, DenseOpen, Identity, IdentityRecord, QuantizationConfig, StorageMode,
+    MAX_LAYER,
 };
 use crate::journal::{Durability, JournalPolicy, Recovery};
 use crate::locks::ReadGuard;
 use crate::RerankCalibration;
+use chrono::Utc;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
@@ -21,8 +23,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
-    ArtefactRecord, Bounds, Dir, Error, FsStorage, IdStore, Inventory, MetadataStore, Persist,
-    Position, PositionWalk, Restore, SegmentBase, Storage, VectorGraph, DUMP_FILENAME,
+    ArtefactRecord, Bounds, Dir, Error, FsStorage, IdStore, Inventory, KillPoint, MetadataStore,
+    Persist, Position, PositionWalk, Restore, SegmentBase, Storage, VectorGraph, DUMP_FILENAME,
 };
 
 /// What a checkpoint is for, which decides the kill points it passes.
@@ -33,6 +35,65 @@ pub(crate) enum CheckpointKind {
     /// The checkpoint that writes a directory read at an older format again
     /// at this build's, with a journal of segments.
     Upgrade,
+}
+
+/// Whose directory a save writes, which decides the manifest's journal
+/// record, the sequence its identity records, the kill points the save
+/// passes, and whether the lineage moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Written {
+    /// The collection's own: the manifest names the journal where the
+    /// collection holds one and records the sequence its checkpoint holds,
+    /// and the lineage moves to the directory once it commits.
+    Own,
+    /// A backup's copy: the manifest names no journal and records
+    /// `sequence`, and the lineage stays where it was.
+    Copy { sequence: u64 },
+}
+
+/// The points a crash test aborts a save at: after the artefacts, where the
+/// save has one, then after the graph dump, after the manifest, between the
+/// two renames and after the commit.
+struct SavePoints {
+    artefacts: Option<KillPoint>,
+    dump: KillPoint,
+    manifest: KillPoint,
+    between: KillPoint,
+    commit: KillPoint,
+}
+
+impl Written {
+    fn points(self) -> SavePoints {
+        match self {
+            Written::Own => SavePoints {
+                artefacts: Some(KillPoint::SaveAfterArtefacts),
+                dump: KillPoint::SaveAfterDump,
+                manifest: KillPoint::SaveAfterManifest,
+                between: KillPoint::SaveBetweenRenames,
+                commit: KillPoint::SaveAfterCommit,
+            },
+            Written::Copy { .. } => SavePoints {
+                artefacts: None,
+                dump: KillPoint::BackupAfterArtefacts,
+                manifest: KillPoint::BackupAfterManifest,
+                between: KillPoint::BackupBetweenRenames,
+                commit: KillPoint::BackupAfterCommit,
+            },
+        }
+    }
+}
+
+/// Refuse a target that is a file, or a folder holding entries and no
+/// `manifest.json`, which a save would replace whole. Asked before anything
+/// is written, the lock file included.
+fn refuse_foreign_target(storage: &dyn Storage, path: &str) -> Result<(), Error> {
+    match storage.foreign_target() {
+        Some(holds) => Err(Error::TargetNotAnIndex {
+            path: path.to_string(),
+            holds,
+        }),
+        None => Ok(()),
+    }
 }
 use zeusdb_vector_sparse::PostingsIndex;
 use zeusdb_vector_text::{TermDictionary, Tokenizer};
@@ -320,6 +381,7 @@ impl Collection {
                 });
             }
         }
+        refuse_foreign_target(&storage, path)?;
         // The directory's lock. A journal holds it for the collection's life,
         // and any other save takes it for the save, so a second writer in
         // this process or another is refused before anything is written.
@@ -329,7 +391,7 @@ impl Collection {
         };
         // Every record handed over is synced before the directory that will
         // claim them is written, where the device allows.
-        if let Some(reached) = self.sync_sink_locked()? {
+        if let Some(reached) = self.sync_sink_locked(false)? {
             self.set_journal_sequence(reached);
             debug!(target: LOG_TARGET, operation = "checkpoint_sync",
                 sequence = reached,
@@ -375,7 +437,7 @@ impl Collection {
         let start_time = Instant::now();
         info!(target: LOG_TARGET, operation = "save_start", path = path, "Starting index save");
 
-        self.save_to(storage)?;
+        self.save_to(storage, Written::Own)?;
 
         let duration_ms = start_time.elapsed().as_millis();
         info!(target: LOG_TARGET, operation = "save_complete",
@@ -386,11 +448,17 @@ impl Collection {
         Ok(())
     }
 
-    /// The four phases, into the directory `storage` keeps.
-    fn save_to(&self, storage: &dyn Storage) -> Result<(), Error> {
+    /// The four phases, into the directory `storage` keeps, returning what
+    /// the manifest records of the directory's identity.
+    fn save_to(&self, storage: &dyn Storage, written: Written) -> Result<IdentityRecord, Error> {
+        let points = written.points();
         // What the directory will be, settled before anything is written, so
         // a collection whose generation cannot move writes nothing.
         let identity = self.next_identity()?;
+        let (sequence, names_journal) = match written {
+            Written::Own => (self.journal_sequence(), true),
+            Written::Copy { sequence } => (sequence, false),
+        };
 
         // Every artefact goes into a directory of its own that is moved into
         // place at the end, so a reader sees the previous index or this one and
@@ -401,31 +469,113 @@ impl Collection {
         // Phase 1: Save all ZeusDB components (already tested to work)
         debug!(target: LOG_TARGET, operation = "save_phase1", "Saving ZeusDB components");
         let mut ledger = crate::persistence::save_index(self, staging.dir())?;
-        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterArtefacts);
+        if let Some(point) = points.artefacts {
+            zeusdb_vector_core::kill_at(point);
+        }
 
         // Phase 2: Save the HNSW graph in ZeusDB's own format
         debug!(target: LOG_TARGET, operation = "save_phase2", "Saving HNSW graph");
         self.save_hnsw_graph(staging.dir(), &mut ledger)?;
-        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterDump);
+        zeusdb_vector_core::kill_at(points.dump);
 
         // Phase 3: The manifest, last, because it records a length and a digest
         // for every artefact above and the directory size all of them add up
         // to.
         debug!(target: LOG_TARGET, operation = "save_phase3", "Writing the manifest");
-        crate::persistence::save_manifest(self, staging.dir(), ledger, &identity)?;
-        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterManifest);
+        let saved_at = Utc::now().to_rfc3339();
+        let record = crate::persistence::ManifestRecord {
+            identity: &identity,
+            sequence,
+            saved_at: &saved_at,
+            names_journal,
+        };
+        crate::persistence::save_manifest(self, staging.dir(), ledger, &record)?;
+        zeusdb_vector_core::kill_at(points.manifest);
 
         // Phase 4: Two renames, or one where nothing is there yet.
         debug!(target: LOG_TARGET, operation = "save_phase4",
             "Moving the saved index into place"
         );
-        staging.commit()?;
+        staging.commit(points.between)?;
+        let record = IdentityRecord {
+            identity,
+            saved_at: Some(saved_at),
+            sequence,
+        };
         // The directory is in place, so it is the one this collection last
         // committed. A save that failed before here left the lineage where
-        // it was, and the next one records the same generation again.
-        self.set_lineage(&identity);
-        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterCommit);
-        Ok(())
+        // it was, and the next one records the same generation again. A
+        // backup's copy is not the collection's directory.
+        if written == Written::Own {
+            self.set_lineage(&record);
+        }
+        zeusdb_vector_core::kill_at(points.commit);
+        Ok(record)
+    }
+
+    /// Write a copy of this collection into the directory `path`, at format
+    /// 5.0.0 and standalone, and return what its manifest records of the
+    /// copy's identity.
+    ///
+    /// Under the mutation guard, so writers wait for it as they wait for a
+    /// checkpoint and searches run throughout. Five targets are refused
+    /// before anything is written: the directory the collection's journal
+    /// sits beside or a read-only collection was read from, a directory with
+    /// a journal of either version beside it, a path that is not an index
+    /// directory, and a directory another holder locks. The journal is
+    /// synced as a checkpoint syncs it, and a sync that fails is logged and
+    /// leaves the fault, since the copy is written from memory and holds
+    /// every record the collection holds whatever the journal lost. Then
+    /// the save's four phases under the target's lock.
+    ///
+    /// The copy's manifest names no journal. Its identity is the next
+    /// generation under a snapshot of its own, with the collection's
+    /// snapshot as its parent and, as its sequence, the sequence the
+    /// journal has reached, or the collection's own where it has no
+    /// journal. Neither the lineage nor the journal moves, so the next
+    /// checkpoint names the same parent.
+    pub fn backup(&self, path: &str) -> Result<IdentityRecord, Error> {
+        let _writers = self.writers.lock().unwrap();
+        let storage = FsStorage::at(Path::new(path))?;
+        let own = self
+            .sink_journal_path()
+            .and_then(|journal| crate::journal::directory_of(&journal))
+            .or_else(|| self.sink_read_only_directory());
+        if own.is_some_and(|own| crate::journal::same_directory(&own, Path::new(path))) {
+            return Err(Error::BackupIntoOwnDirectory {
+                path: path.to_string(),
+            });
+        }
+        let journal = if storage.journal_exists() {
+            Some(storage.journal_path())
+        } else if storage.legacy_journal_exists() {
+            Some(storage.legacy_journal_path())
+        } else {
+            None
+        };
+        if let Some(journal) = journal {
+            return Err(Error::BackupTargetJournaled {
+                path: path.to_string(),
+                journal: journal.display().to_string(),
+            });
+        }
+        refuse_foreign_target(&storage, path)?;
+        let _lock = crate::journal::lock_for_save(&storage, path)?;
+        let sequence = match self.sync_sink_locked(true)? {
+            Some(reached) => reached,
+            None => self.journal_sequence(),
+        };
+        zeusdb_vector_core::kill_at(KillPoint::BackupAfterSync);
+        let start_time = Instant::now();
+        info!(target: LOG_TARGET, operation = "backup_start", path = path, "Starting backup");
+        let record = self.save_to(&storage, Written::Copy { sequence })?;
+        info!(target: LOG_TARGET, operation = "backup_complete",
+            path = path,
+            sequence = sequence,
+            duration_ms = start_time.elapsed().as_millis(),
+            "Backup completed successfully"
+        );
+        Ok(record)
     }
 
     /// What the next save records: this collection's id, one generation on
@@ -560,7 +710,18 @@ impl Collection {
         tokenizer: Option<Arc<dyn Tokenizer>>,
         durability: Durability,
     ) -> Result<(Self, Recovery), Error> {
-        crate::persistence::load_index(path, tokenizer, JournalPolicy::Replay(durability))
+        Self::recover_with(path, tokenizer, JournalPolicy::Replay(durability))
+    }
+
+    /// [`Collection::recover`] under any of the three policies, being a
+    /// replay, a repair or the checkpoint alone, with the report of what the
+    /// load did. See [`JournalPolicy`].
+    pub fn recover_with(
+        path: &str,
+        tokenizer: Option<Arc<dyn Tokenizer>>,
+        policy: JournalPolicy,
+    ) -> Result<(Self, Recovery), Error> {
+        crate::persistence::load_index(path, tokenizer, policy)
     }
 
     /// Open a directory's checkpoint and leave the journal beside it alone.
@@ -644,6 +805,7 @@ impl Collection {
             ));
         }
         let storage = FsStorage::at(Path::new(dir))?;
+        refuse_foreign_target(&storage, dir)?;
         let lock = crate::journal::lock_for_journal(&storage, dir)?;
         zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::LockHeld);
         info!(target: LOG_TARGET, operation = "journal_open",

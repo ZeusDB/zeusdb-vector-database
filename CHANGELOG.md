@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`journal_segments`**, the number of segments the journal holds, in `get_stats()` on a journaled index.
 
+- **`backup(path)`** writes a copy of the index into the directory at `path` and returns the copy's identity, a dict of the six keys `identity` holds. The copy is a directory at format 5.0.0 that names no journal. Its generation is the next, its `snapshot` is its own, its `parent` is the index's `snapshot`, and its `sequence` is the sequence the index's journal has reached, or the index's own where it has none. The index's identity and journal do not change. Writes wait for the backup and searches run during it. It raises `RuntimeError` and writes nothing for the directory the index's journal sits beside or a read-only index was read from, for a directory with a journal beside it, for a path that holds a file or a folder of other files, and for a directory another holder locks.
+
+- **`load(path, repair=True)`** loads a directory whose journal is damaged. It replays every whole call before the first call the damage touches, copies that call and every byte after it in the journal into `<path>.zdbjournal/quarantine/<UTC time>-<first sequence set aside>/` with a `repair.json` that describes them, cuts the journal there, and saves the directory. A `RuntimeWarning` names the damage, the records set aside and the folder. The next `load(path, repair=True)` completes a repair that stopped part way. A directory with no damage loads as it does without `repair`. On a medium that this process cannot write, the load replays the kept calls in memory, sets nothing aside and opens the index read only. `repair=True` with `checkpoint_only=True` raises `ValueError`.
+
+- **`recovery`**, a dict that describes what the load that built the index did, being the format it read, the records it replayed, withdrew and skipped, the damage it found, the checkpoint it took and why, whether it opened the index read only and why, and what a repair set aside. It is `None` on an index made in the process.
+
+- **`identity` holds `saved_at` and `sequence`**, the time the manifest of the directory `snapshot` names records for its save, and the journal sequence that directory holds.
+
 ### Changed
 
 - **The journal is a directory of segments.** `journal_to(path)` opens `<path>.zdbjournal`, and `journal_path` names it. Each segment is named for the first sequence it holds, and its header names the collection and the checkpoint it follows. The journal moves to a new segment at the first commit after the active one passes 64 MiB. A checkpoint starts a new segment and deletes the old ones once its save has committed. `journal_bytes` is the length of every segment together.
@@ -31,6 +39,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The docstrings of `load()`, `journal_to()`, `checkpoint()` and `journal_path`** describe the journal of segments, the lock and the read-only load.
 
+- **An `add()` with `overwrite=True` that replaces a record the index holds records its removal and its records as one call.** The call admits each record first, then appends the removal record, the records and one commit, and removes the replaced records only after the commit. A record that admission refuses keeps the record it names.
+
+- **The journal record of a training holds the codebook or the scales and the rerank calibration that the training fitted**, and commits before the index installs them. A recovery installs what the record holds. A journal that 0.11.0 to 0.13.0 wrote replays as those releases replayed it.
+
+- **A call made while a failed commit's refusal stands is refused before it takes an internal id or draws a level.**
+
+- **`save()`, `journal_to()` and `backup()` refuse a path that holds a file, or a folder that holds entries and no `manifest.json`**, with `RuntimeError`, before they write anything. An empty folder and a directory that an earlier save wrote are taken as before.
+
+- **The refusal of a corrupt journal names `repair=True`**, the record and the byte where the repair cuts, and the records that it sets aside.
+
+- **The docstrings of `load()` and `identity`** describe `repair`, `recovery` and the two new keys.
+
 ### Fixed
 
 - **`load()` refuses a journal whose segments follow another checkpoint of the same index**, with a `RuntimeError` naming both checkpoints, and replays none of it. A segment from another checkpoint that holds nothing past the directory's sequence is passed over, and deleted by a load that can write.
@@ -42,6 +62,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An append that fails part way leaves no bytes in the journal.** The writer cuts the segment back to where the record began, and where the cut fails it records nothing more until a checkpoint. A text index interns a term only after the term's `Intern` record is appended, so a failed append leaves the dictionary as it was.
 
 - **A thread that the interpreter ends during shutdown, while the thread takes the interpreter back after a long call, does not crash the process.** Long calls into the engine, such as a search, a save or a load, release the interpreter while they run and take it back at the end. The binding is built with PyO3 0.29.3, which handles a thread that is ended at that point.
+
+- **An overwrite keeps every record that it replaces when its commit fails**, live and after a crash, and when the process stops between its removal record and its records.
+
+- **A training whose journal record fails to commit trains nothing, live or after a crash.** The first call after the checkpoint trains.
+
+- **A recovery installs the codebook or the scales that each training's journal record holds.**
+
+- **A scalar quantizer fitted to a dimension whose largest magnitude divided by 127 rounds to zero gives that dimension a scale of 1.0**, so the directory that a save writes loads.
+
+- **A save into a folder of other files leaves the files where they are**, and so do `journal_to()` and `backup()`.
 
 ### Internal
 

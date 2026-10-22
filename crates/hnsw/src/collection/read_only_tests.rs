@@ -325,6 +325,18 @@ impl JournalDir for OpenFails {
     fn segment_path(&self, number: u64) -> PathBuf {
         self.inner.segment_path(number)
     }
+    fn create_quarantine(&self, folder: &str) -> io::Result<()> {
+        self.inner.create_quarantine(folder)
+    }
+    fn quarantine(&self) -> Box<dyn Dir> {
+        self.inner.quarantine()
+    }
+    fn quarantine_folders(&self) -> io::Result<Vec<String>> {
+        self.inner.quarantine_folders()
+    }
+    fn sync_quarantine(&self, folder: &str) {
+        self.inner.sync_quarantine(folder)
+    }
 }
 
 impl Storage for Fails {
@@ -342,6 +354,9 @@ impl Storage for Fails {
     }
     fn stage(&self) -> Result<Box<dyn Staged>, Error> {
         self.inner.stage()
+    }
+    fn foreign_target(&self) -> Option<String> {
+        self.inner.foreign_target()
     }
     fn probe_writable(&self) -> io::Result<()> {
         match self.at {
@@ -387,6 +402,9 @@ impl Storage for Fails {
             FailAt::RemoveLegacy(kind) => Err(failure(kind)),
             _ => self.inner.remove_legacy_journal(),
         }
+    }
+    fn cut_legacy_journal(&self, len: u64) -> io::Result<()> {
+        self.inner.cut_legacy_journal(len)
     }
     fn lock_path(&self) -> &Path {
         self.inner.lock_path()

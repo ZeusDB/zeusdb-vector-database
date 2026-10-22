@@ -28,7 +28,7 @@ use super::journal_support::{
     copy_journaled, expected_of, manifest, sink_over, Faults, FaultyStorage, Segments, TempDir,
 };
 use super::{Added, Collection, Declaration, ParsedRecord, SparseHalf};
-use crate::journal::{journal_path, Durability};
+use crate::journal::{journal_path, CheckpointTaken, Durability};
 
 // ============================================================================
 // FIXTURES
@@ -302,7 +302,11 @@ fn a_commit_whose_sync_fails_is_withdrawn_and_refuses_everything_after_until_a_c
     let (crashed, report) = recover(&copy, Durability::NoSync);
     assert_eq!(report.replayed, 4);
     assert_eq!(report.withdrawn, 4);
-    assert!(report.checkpointed, "the load checkpointed past the abort");
+    assert_eq!(
+        report.checkpoint_taken,
+        Some(CheckpointTaken::Abort),
+        "the load checkpointed past the abort"
+    );
     assert_eq!(crashed.len(), 4);
     assert!(!crashed.contains("r4") && !crashed.contains("r7"));
     assert_eq!(crashed.id_counter(), collection.id_counter());
@@ -370,8 +374,8 @@ fn a_commit_whose_abort_cannot_be_written_is_cut_back() {
     let (crashed, report) = recover(&copy, Durability::NoSync);
     assert_eq!(report.replayed, 4);
     assert_eq!(report.withdrawn, 0);
-    assert!(
-        !report.checkpointed,
+    assert_eq!(
+        report.checkpoint_taken, None,
         "nothing in the journal says a commit failed"
     );
     assert_eq!(ids(&crashed), ids(&collection));
@@ -727,4 +731,298 @@ fn a_term_whose_record_was_refused_is_not_interned() {
     assert_eq!(report.replayed, 3, "one insert and two interned terms");
     assert_eq!(hits(&recovered, "kept"), ["b"]);
     assert_eq!(recovered.term_count(), Some(2));
+}
+
+// ============================================================================
+// AN OVERWRITE AND A TRAINING WHOSE COMMIT FAILS
+// ============================================================================
+
+/// A journal sink that fails the sync of the first commit to follow a record
+/// of `kind` once it is armed, by arming the storage's fault just before
+/// that commit, so the writer withdraws the call as it withdraws any whose
+/// sync fails.
+#[derive(Debug)]
+struct FailsAfter {
+    inner: crate::JournalSink,
+    faults: Arc<Faults>,
+    kind: zeusdb_vector_core::OperationKind,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    pending: bool,
+}
+
+impl crate::OperationSink for FailsAfter {
+    fn append(
+        &mut self,
+        kind: zeusdb_vector_core::OperationKind,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        self.pending |= kind == self.kind;
+        self.inner.append(kind, payload)
+    }
+    fn commit(&mut self) -> Result<(), Error> {
+        let pending = std::mem::take(&mut self.pending);
+        if pending && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.faults.syncs.arm(0, 1);
+        }
+        self.inner.commit()
+    }
+    fn sync(&mut self) -> Result<(), Error> {
+        self.inner.sync()
+    }
+    fn sequence_reached(&self) -> u64 {
+        self.inner.sequence_reached()
+    }
+    fn roll(&mut self, base: zeusdb_vector_core::SegmentBase) -> Result<(), Error> {
+        self.inner.roll(base)
+    }
+    fn journal_file(&self) -> Option<&str> {
+        self.inner.journal_file()
+    }
+    fn journal_collection_id(&self) -> Option<u128> {
+        self.inner.journal_collection_id()
+    }
+    fn journal_path(&self) -> Option<&Path> {
+        crate::OperationSink::journal_path(&self.inner)
+    }
+    fn durability(&self) -> Option<Durability> {
+        crate::OperationSink::durability(&self.inner)
+    }
+}
+
+/// A collection declared by `declaration`, journaled at `path` through a
+/// sink that fails the first commit after a record of `kind` once the flag
+/// it returns is set, with the empty checkpoint written.
+fn failing_after(
+    path: &Path,
+    declaration: Declaration,
+    quantization: Option<super::QuantizationConfig>,
+    kind: zeusdb_vector_core::OperationKind,
+) -> (Collection, Arc<std::sync::atomic::AtomicBool>) {
+    let collection = Collection::build(declaration, quantization);
+    let storage = FaultyStorage::at(path);
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sink = FailsAfter {
+        inner: sink_over(
+            &storage,
+            path,
+            collection.collection_id(),
+            Durability::PerCall,
+        ),
+        faults: storage.faults.clone(),
+        kind,
+        armed: armed.clone(),
+        pending: false,
+    };
+    collection.attach_sink(Box::new(sink));
+    collection.save(path.to_str().unwrap()).unwrap();
+    (collection, armed)
+}
+
+/// The record `i` as an overwrite replaces it, with another vector.
+fn replacement(i: usize) -> ParsedRecord {
+    ParsedRecord {
+        vector: vec![-1.0 - i as f32, 7.0],
+        ..record(i)
+    }
+}
+
+fn vector_of(collection: &Collection, id: &str) -> Vec<f32> {
+    collection
+        .records(vec![id.to_string()], true, false)
+        .unwrap()[0]
+        .vector
+        .clone()
+        .unwrap()
+}
+
+/// An overwrite whose commit fails keeps every record it would
+/// replace, live and after a crash, since its removal and its inserts are
+/// one call and the removal runs only once that call commits.
+#[test]
+fn an_overwrite_whose_commit_fails_keeps_what_it_replaces() {
+    let tmp = TempDir::new("overwrite-fault");
+    let path = tmp.at("index.zdb");
+    let (collection, armed) = failing_after(
+        &path,
+        declaration(),
+        None,
+        zeusdb_vector_core::OperationKind::Insert,
+    );
+    add(&collection, 0..4);
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let replaced = collection.add_records(vec![replacement(0), replacement(1)], vec![], true);
+    assert_eq!(replaced.total_errors, 2, "{:?}", replaced.errors);
+    assert_eq!(ids(&collection), ["r0", "r1", "r2", "r3"]);
+    assert_eq!(vector_of(&collection, "r0"), record(0).vector);
+    assert_eq!(vector_of(&collection, "r1"), record(1).vector);
+
+    let crashed = copy_journaled(&path, "overwrite-fault-crashed.zdb");
+    let (recovered, _) = recover(&crashed, Durability::PerCall);
+    assert_eq!(ids(&recovered), ["r0", "r1", "r2", "r3"]);
+    assert_eq!(vector_of(&recovered, "r0"), record(0).vector);
+    assert_eq!(vector_of(&recovered, "r1"), record(1).vector);
+}
+
+/// A journal sink that copies the directory and the journal aside at the
+/// first insert handed over once it is armed, which is the state a process
+/// killed at that moment leaves.
+#[derive(Debug)]
+struct CopiesAtTheInsert {
+    inner: crate::JournalSink,
+    directory: std::path::PathBuf,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::OperationSink for CopiesAtTheInsert {
+    fn append(
+        &mut self,
+        kind: zeusdb_vector_core::OperationKind,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        if kind == zeusdb_vector_core::OperationKind::Insert
+            && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            copy_journaled(&self.directory, "overwrite-crash-copy.zdb");
+        }
+        self.inner.append(kind, payload)
+    }
+    fn commit(&mut self) -> Result<(), Error> {
+        self.inner.commit()
+    }
+    fn sync(&mut self) -> Result<(), Error> {
+        self.inner.sync()
+    }
+    fn sequence_reached(&self) -> u64 {
+        self.inner.sequence_reached()
+    }
+    fn roll(&mut self, base: zeusdb_vector_core::SegmentBase) -> Result<(), Error> {
+        self.inner.roll(base)
+    }
+    fn journal_file(&self) -> Option<&str> {
+        self.inner.journal_file()
+    }
+    fn journal_collection_id(&self) -> Option<u128> {
+        self.inner.journal_collection_id()
+    }
+    fn journal_path(&self) -> Option<&Path> {
+        crate::OperationSink::journal_path(&self.inner)
+    }
+    fn durability(&self) -> Option<Durability> {
+        crate::OperationSink::durability(&self.inner)
+    }
+}
+
+/// A crash inside an overwrite, once its removal has reached the
+/// journal and before its inserts have, recovers every record it would
+/// replace, since nothing of the call is committed until its inserts are.
+#[test]
+fn a_crash_inside_an_overwrite_keeps_what_it_replaces() {
+    let tmp = TempDir::new("overwrite-crash");
+    let path = tmp.at("index.zdb");
+    let collection = Collection::build(declaration(), None);
+    let storage = FaultyStorage::at(&path);
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sink = CopiesAtTheInsert {
+        inner: sink_over(
+            &storage,
+            &path,
+            collection.collection_id(),
+            Durability::PerCall,
+        ),
+        directory: path.clone(),
+        armed: armed.clone(),
+    };
+    collection.attach_sink(Box::new(sink));
+    collection.save(path.to_str().unwrap()).unwrap();
+    add(&collection, 0..4);
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let replaced = collection.add_records(vec![replacement(0), replacement(1)], vec![], true);
+    assert_eq!(replaced.total_errors, 0, "{:?}", replaced.errors);
+    drop(collection);
+
+    let copy = tmp.at("overwrite-crash-copy.zdb");
+    let (recovered, _) = recover(&copy, Durability::PerCall);
+    assert_eq!(ids(&recovered), ["r0", "r1", "r2", "r3"]);
+    assert_eq!(vector_of(&recovered, "r0"), record(0).vector);
+    assert_eq!(vector_of(&recovered, "r1"), record(1).vector);
+}
+
+/// A declaration with product quantization that trains at 1,000 records,
+/// the least a declaration takes.
+fn trained_declaration() -> (Declaration, super::QuantizationConfig) {
+    let declaration = Declaration::validate(2, "l2", 4, 50, 2000, vec![]).unwrap();
+    let quantization = declaration
+        .quantization(1, 2, 1000, None, super::StorageMode::QuantizedWithRaw)
+        .unwrap();
+    (declaration, quantization)
+}
+
+/// The codebook a trained collection holds, as the bits of every value.
+fn codebook_of(collection: &Collection) -> Vec<u32> {
+    collection
+        .dense()
+        .pq
+        .as_ref()
+        .unwrap()
+        .with_centroids(|centroids| {
+            centroids
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect()
+        })
+}
+
+/// A training whose record fails to commit trains nothing, live
+/// or after a crash: what was fitted is dropped and the live collection
+/// stays untrained with its set full, and a replay of the records trains
+/// nothing at the insert that filled the set and passes over the withdrawn
+/// record. The first call after the checkpoint trains, and a replay of its
+/// record installs the codebook it fitted.
+#[test]
+fn a_training_whose_record_fails_trains_nothing_live_or_replayed() {
+    let tmp = TempDir::new("training-fault");
+    let path = tmp.at("index.zdb");
+    let (declaration, quantization) = trained_declaration();
+    let (collection, armed) = failing_after(
+        &path,
+        declaration,
+        Some(quantization),
+        zeusdb_vector_core::OperationKind::Train,
+    );
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let added = try_add(&collection, 0..1000);
+    assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    assert!(
+        added.errors.iter().any(|e| e.contains("Training failed")),
+        "{:?}",
+        added.errors
+    );
+    assert_eq!(collection.len(), 1000);
+    assert!(!collection.can_use_quantization(), "nothing trained live");
+    assert!(collection.is_training_ready());
+
+    let crashed = copy_journaled(&path, "training-fault-crashed.zdb");
+    let (recovered, _) = recover(&crashed, Durability::PerCall);
+    assert_eq!(recovered.len(), 1000);
+    assert!(
+        !recovered.can_use_quantization(),
+        "nothing trained on the replay either"
+    );
+    assert!(recovered.is_training_ready());
+    drop(recovered);
+
+    collection.checkpoint().unwrap();
+    add(&collection, 1000..1001);
+    assert!(collection.can_use_quantization(), "the next call trains");
+    let crashed = copy_journaled(&path, "training-crashed.zdb");
+    let (recovered, _) = recover(&crashed, Durability::PerCall);
+    assert!(recovered.can_use_quantization());
+    assert_eq!(codebook_of(&recovered), codebook_of(&collection));
+    assert_eq!(
+        recovered.training_completed_at(),
+        collection.training_completed_at()
+    );
+    assert_eq!(ids(&recovered), ids(&collection));
 }

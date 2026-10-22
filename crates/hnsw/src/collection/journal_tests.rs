@@ -279,7 +279,7 @@ fn a_recovered_collection_is_the_collection_the_script_built() {
     assert_eq!(report.damage, None);
     assert_eq!(report.segments, 1);
     assert!(!report.graph_rebuilt);
-    assert!(!report.checkpointed);
+    assert_eq!(report.checkpoint_taken, None);
     assert_eq!(report.format_version, "5.0.0");
     assert_eq!(ids(&recovered), before);
     assert_eq!(page(&recovered), before_pages);

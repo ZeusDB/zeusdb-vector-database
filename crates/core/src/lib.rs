@@ -88,12 +88,12 @@ pub use journal::encode_legacy_header;
 pub use journal::set_segment_roll_bytes;
 pub use journal::{
     encode_journal_record, encode_segment_header, read_legacy_journal, read_segment_header,
-    read_segments, CommitMode, Expected, JournalContents, JournalDamage, JournalKind,
-    JournalRecord, JournalSyncHandle, JournalWriter, LegacyContents, LegacyHeader, LiveRecord,
-    OperationKind, RecordState, ResumeFailure, SegmentBase, SegmentBytes, SegmentHeader,
-    SegmentReport, Withdrawal, JOURNAL_MAGIC, JOURNAL_MAX_PAYLOAD, JOURNAL_RECORD_CHECKSUM_BYTES,
-    JOURNAL_RECORD_HEADER_BYTES, JOURNAL_RECORD_OVERHEAD_BYTES, LEGACY_HEADER_BYTES,
-    SEGMENT_HEADER_BYTES, SEGMENT_ROLL_BYTES,
+    read_segments, read_segments_for_repair, whole_records_from, CommitMode, Cut, Expected,
+    JournalContents, JournalDamage, JournalKind, JournalRecord, JournalSyncHandle, JournalWriter,
+    LegacyContents, LegacyHeader, LiveRecord, OperationKind, RecordState, ResumeFailure,
+    SegmentBase, SegmentBytes, SegmentHeader, SegmentReport, StaleSegment, Withdrawal,
+    JOURNAL_MAGIC, JOURNAL_MAX_PAYLOAD, JOURNAL_RECORD_CHECKSUM_BYTES, JOURNAL_RECORD_HEADER_BYTES,
+    JOURNAL_RECORD_OVERHEAD_BYTES, LEGACY_HEADER_BYTES, SEGMENT_HEADER_BYTES, SEGMENT_ROLL_BYTES,
 };
 // The abort hook the crash tests kill a process at. Compiled away when
 // `debug_assertions` are off, which is every profile the wheel is built
@@ -104,7 +104,9 @@ pub use kill::{
 #[cfg(any(test, feature = "test-support"))]
 pub use metadata::{MetadataCopy, MoveHook, METADATA_MOVE_HOOK};
 pub use metadata::{MetadataParts, MetadataStore, RecordFields};
-pub use operation::{AbortReason, InsertParts, Operation};
+pub use operation::{
+    AbortReason, Fitted, FittedRef, InsertParts, Operation, Values, STAMP_CEILING,
+};
 pub use pq::PQ;
 pub use rng::SeededRng;
 pub use space::{
@@ -126,5 +128,6 @@ pub use storage::{
 /// and absent from every other build.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
+    pub use crate::pq::quantizer_fits;
     pub use crate::test_vectors::clustered;
 }
