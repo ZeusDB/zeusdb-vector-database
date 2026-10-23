@@ -14,7 +14,7 @@
 # job it would cover the second pass as well.
 #
 # Separate from ci.yml because its result can change with no change to the
-# repository. ci.yml's paths-ignore must not silence it.
+# repository. ci.yml's documentation rule must not silence it.
 #
 # Every job names its runner image, ubuntu-24.04, rather than a label such as
 # ubuntu-latest that GitHub moves to a newer image on its own schedule. A

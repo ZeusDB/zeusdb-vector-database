@@ -3,38 +3,59 @@
 #
 # Triggers:
 #   - push of a tag matching v*, which builds and publishes
-#   - workflow_dispatch, which builds everything and only publishes when the
-#     publish input is ticked
+#   - workflow_dispatch, which builds and checks everything and publishes
+#     nothing
 #
 # Tag routing, decided by the check-version job:
+#   - a tag whose version is a PEP 440 release publishes to production PyPI
 #   - a tag whose version is a PEP 440 prerelease, meaning an a, b, rc or dev
-#     segment, publishes to TestPyPI
-#   - any other v* tag publishes to production PyPI
+#     segment, builds and checks everything and publishes nothing
 #   Tags must be the letter v followed by a PEP 440 version in its canonical
 #   spelling, and the version must be the one pyproject.toml, the root
 #   Cargo.toml's [workspace.package] and src/zeusdb_vector_database/__version__
 #   declare.
 #   check-version parses all four with the packaging library and fails the
 #   run, before a single wheel is built, naming whichever disagreed or did not
-#   parse. The publish jobs read its prerelease output and nothing else, so a
-#   tag is never routed by searching its text for letters.
+#   parse. For a tag it also fails there when CHANGELOG.md holds no section for
+#   the version, the section github-release reads for the release's notes. The
+#   publish job reads its prerelease output and nothing else, so a tag is never
+#   routed by searching its text for letters.
 #
-# A workflow_dispatch run can only ever reach TestPyPI. Production publishing
-# requires a stable tag.
+# Every tool a job installs is pinned to an exact version and checked against
+# a published hash:
+#   - uv, by its version and the SHA-256 GitHub publishes for its archive on
+#     each runner, both in env below, which setup-uv checks
+#   - CPython, by the exact build uv installs, which uv checks against the
+#     SHA-256 in its own list of builds
+#   - every Python package, by a file under .github/requirements/, installed
+#     with --require-hashes, wheels only and no dependency resolution
+#   - every container image, by its digest, with its tag in a comment beside it
+#   - Rust, by rust-toolchain.toml, with each component checked by rustup
+#   - cargo-cyclonedx, by its version, which cargo checks against the index
+#   .github/requirements/maturin.txt names the maturin uv.lock names, and the
+#   lint job in ci.yml fails when the two disagree. Dependabot raises the
+#   action pins alone. The other pins move by hand, each proven by a dispatch
+#   run. No job here builds through a compiler cache or restores anything from
+#   the Actions cache, and no checkout keeps a credential.
 #
 # Every build job records a SHA-256 for each artefact as the first step after
-# the build, before the audit, the container install and the upload, and ships
-# the digests as their own artifact. The publish jobs verify every file in dist
-# against those digests before attestation and before upload, and fail if one
-# disagrees or is missing. That catches a later step or the artifact store
-# altering a wheel.
+# the build and uploads the artefacts and their digests straight after that,
+# so the install checks and the audit run once the files have left the job.
+# The publish job verifies every file in dist against those digests before
+# attestation and before upload. It requires the six wheels and the sdist and
+# no other file, and fails if one disagrees or is missing. That catches the
+# artifact store altering a file and a file added after the builds.
 #
-# Both publish jobs upload through pypa/gh-action-pypi-publish, which
-# exchanges the job's OIDC token for an index credential and mints a PEP 740
-# attestation for every file from that same identity, so PyPI verifies each
-# file against this workflow and shows the provenance on the file's page. The
-# GitHub artifact attestation generated the step before is a separate record
-# in this repository's attestation store, and both are kept.
+# The audit job checks all six wheels against the stable ABI. The publish job
+# needs it and a dispatch runs it, so a wheel that reaches outside the limited
+# API fails every run.
+#
+# The publish job uploads through pypa/gh-action-pypi-publish, which exchanges
+# the job's OIDC token for an index credential and mints a PEP 740 attestation
+# for every file from that same identity, so PyPI verifies each file against
+# this workflow and shows the provenance on the file's page. The GitHub
+# artifact attestation generated the step before is a separate record in this
+# repository's attestation store, and both are kept.
 #
 # Every action is pinned to a full commit SHA, with the release it corresponds
 # to in the trailing comment. Dependabot raises the pins; see
@@ -46,15 +67,17 @@
 # a change to this file.
 #
 # A successful production publish is followed by github-release, which creates
-# the GitHub Release for the tag from the matching CHANGELOG.md section. No
-# other path reaches it, so a dispatch run and a prerelease tag create nothing.
+# the GitHub Release for the tag from the matching CHANGELOG.md section, and
+# fails when the tag has no such section. No other path reaches it, so a
+# dispatch run and a prerelease tag create nothing.
 #
-# This filename is registered in the PyPI and TestPyPI Trusted Publisher
-# records. Renaming this file breaks publishing until both records are updated.
+# This filename is registered in the PyPI Trusted Publisher record. Renaming
+# this file breaks publishing until the record is updated.
 #
 # Every wheel build passes --locked to maturin, which forwards it to cargo, so
 # a release fails when Cargo.lock is out of date instead of resolving
-# fresh. The sdist command takes no such flag.
+# fresh. The sdist check passes it through maturin's build backend. The sdist
+# command takes no such flag.
 #
 # One wheel per platform, six in total. The workspace's Cargo.toml enables
 # pyo3/abi3-py310 on the pyo3 dependency, so a
@@ -77,15 +100,27 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
-    inputs:
-      publish:
-        description: 'Publish to TestPyPI'
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
+
+env:
+  # uv, and the SHA-256 GitHub publishes for its archive on each runner.
+  PINNED_UV_VERSION: "0.13.5"
+  PINNED_UV_SHA256_LINUX: f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
+  PINNED_UV_SHA256_WINDOWS: a38b8d1902b7cfbc76b423ba1bb456f623f42064cdc72628b6075b89afd1019a
+  PINNED_UV_SHA256_MACOS: 743f85035a1996ecb350659e01cd9faea9709829be09b1b4b03c73eaf3c9cd73
+  # The CPython builds uv installs, as uv names them. The floor is the oldest
+  # version the package supports and the abi3 target, and the newest is the
+  # newest CPython release.
+  FLOOR_CPYTHON_LINUX: cpython-3.10.22-linux-x86_64-gnu
+  NEWEST_CPYTHON_LINUX: cpython-3.15.1-linux-x86_64-gnu
+  FLOOR_CPYTHON_WINDOWS: cpython-3.10.22-windows-x86_64-none
+  NEWEST_CPYTHON_WINDOWS: cpython-3.15.1-windows-x86_64-none
+  FLOOR_CPYTHON_MACOS: cpython-3.10.22-macos-aarch64-none
+  NEWEST_CPYTHON_MACOS: cpython-3.15.1-macos-aarch64-none
+  # uv takes no interpreter from the runner image.
+  UV_PYTHON_PREFERENCE: only-managed
 
 jobs:
   check-version:
@@ -95,17 +130,26 @@ jobs:
     timeout-minutes: 15
     # Every build job needs this, so a mis-tagged release fails here in well
     # under a minute instead of after the wheel matrix has run. Its outputs are
-    # what route the publish jobs.
+    # what route the publish job.
     outputs:
       version: ${{ steps.gate.outputs.version }}
       prerelease: ${{ steps.gate.outputs.prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          # tomllib, for the two TOML files. The floor of the package is 3.10,
-          # but nothing here builds the package, so the interpreter is free.
-          python-version: '3.12'
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_LINUX }}
+          enable-cache: false
+      - name: Install packaging
+        # tomllib reads the two TOML files, and it needs Python 3.11 or later,
+        # so this job runs on the newest build. Nothing here builds the
+        # package.
+        run: |
+          uv venv "$RUNNER_TEMP/gate" --python "$NEWEST_CPYTHON_LINUX"
+          uv pip install --python "$RUNNER_TEMP/gate" --require-hashes --only-binary :all: --no-deps -r .github/requirements/check-version.txt
       - name: Compare the tag, pyproject.toml, Cargo.toml and __version__
         id: gate
         env:
@@ -118,10 +162,10 @@ jobs:
         # CHANGELOG.md section by the tag's text and maturin writes the
         # canonical spelling into the wheel, so `v0.8.0-rc1` is refused where
         # `v0.8.0rc1` is accepted. packaging is the reference implementation of
-        # PEP 440 and is pinned so the run is reproducible.
+        # PEP 440, and .github/requirements/check-version.txt pins it by hash so
+        # the run is reproducible.
         run: |
-          python -m pip install --disable-pip-version-check packaging==26.3
-          python - <<'PY'
+          "$RUNNER_TEMP/gate/bin/python" - <<'PY'
           import os, pathlib, re, sys, tomllib
           from packaging.version import InvalidVersion, Version
 
@@ -191,6 +235,27 @@ jobs:
           version = parsed["pyproject.toml"]
           prerelease = "true" if version.is_prerelease else "false"
           print(f"version {version}, prerelease {prerelease}")
+
+          # A tag must have its CHANGELOG.md section, the one github-release
+          # reads for the release's notes, so a tag without notes fails here
+          # before a single wheel is built. The match is that job's: a line
+          # that starts with the heading, then at least one line other than a
+          # blank or a rule before the next section's heading.
+          if ref_type == "tag":
+              heading = f"## [{version}]"
+              lines = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8-sig").splitlines()
+              start = next((i for i, line in enumerate(lines) if line.startswith(heading)), None)
+              if start is None:
+                  fail(f"CHANGELOG.md holds no '{heading}' section for tag {ref_name}")
+              section = []
+              for line in lines[start + 1:]:
+                  if line.startswith("## ["):
+                      break
+                  section.append(line)
+              if not any(line.strip() and not re.fullmatch(r"-{3,}\s*", line) for line in section):
+                  fail(f"the '{heading}' section of CHANGELOG.md holds nothing for tag {ref_name}")
+              print(f"CHANGELOG.md holds the '{heading}' section")
+
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"version={version}\nprerelease={prerelease}\n")
           PY
@@ -207,26 +272,60 @@ jobs:
         platform:
           - runner: ubuntu-24.04
             target: x86_64
+            rust-target: x86_64-unknown-linux-gnu
             docker-platform: linux/amd64
+            # quay.io/pypa/manylinux2014_x86_64, tag latest
+            image: quay.io/pypa/manylinux2014_x86_64@sha256:2bd80fa8fca6b775a913b7e42fa410c5f2246fb6f7f8f3280b5d562e5ca5d63f
           - runner: ubuntu-24.04
             target: aarch64
+            rust-target: aarch64-unknown-linux-gnu
             docker-platform: linux/arm64
+            # ghcr.io/rust-cross/manylinux2014-cross, tag aarch64
+            image: ghcr.io/rust-cross/manylinux2014-cross@sha256:32c92568ebee8db53e0598c21bcd06a6dd1649d45d507646a8a49313c50325f8
+    env:
+      # The install check's two images. Each digest names a multi-platform
+      # index, so the aarch64 leg runs the same images under QEMU.
+      # python, tag 3.10-slim
+      FLOOR_IMAGE: python@sha256:6ff506466f8b1e981719b468cc0023b8ef000b983cdec0eafe119d01f379e31d
+      # python, tag 3.15-slim
+      NEWEST_IMAGE: python@sha256:044d5bd747976e21f8bc4d746c3479b19a84bb8ae6261b802acdd26b29036c93
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: '3.10'  # Match the minimum required version in pyproject.toml
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_LINUX }}
+          enable-cache: false
+      - name: Install maturin
+        # Into an environment of its own on the floor build, from the
+        # hash-locked file. The wheel holds a static binary, which the build
+        # image runs from a read-only mount.
+        run: |
+          uv venv "$RUNNER_TEMP/maturin" --python "$FLOOR_CPYTHON_LINUX"
+          uv pip install --python "$RUNNER_TEMP/maturin" --require-hashes --only-binary :all: --no-deps -r .github/requirements/maturin.txt
       - name: Build wheels
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
-        with:
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist --locked
-          sccache: true  # Always use sccache for manual Dispatch
-          manylinux: auto
+        # In the pinned build image, through .github/scripts/build-linux-wheel.sh,
+        # which installs the toolchain rust-toolchain.toml names and nothing
+        # else. No token and no other credential enters the container.
+        env:
+          IMAGE: ${{ matrix.platform.image }}
+          RUST_TARGET: ${{ matrix.platform.rust-target }}
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/io" \
+            --volume "$RUNNER_TEMP/maturin/bin/maturin:/usr/local/bin/maturin:ro" \
+            --workdir /io \
+            --env CARGO_INCREMENTAL=0 \
+            --env CARGO_TERM_COLOR=always \
+            "$IMAGE" \
+            bash .github/scripts/build-linux-wheel.sh "$RUST_TARGET" auto
+          sudo chown -R "$(id -u):$(id -g)" dist
       - name: Record the digest of every artefact before anything else touches it
-        # The first step after the build, before the ABI audit, before the
-        # container install and before the upload, so the digest is of the
-        # wheel as maturin wrote it. The publish job verifies every artefact
+        # The first step after the build, so the digest is of the wheel as
+        # maturin wrote it, and the two uploads follow at once, before the
+        # install check and the audit. The publish job verifies every artefact
         # against these digests before it attests or uploads anything. bash on
         # every runner, because the step is the same text on all five.
         # sha256sum on Linux and on the Git Bash of the Windows runner,
@@ -245,35 +344,6 @@ jobs:
             shasum -a 256 -- * > "../digests/SHA256SUMS-${DIGEST_NAME}"
           fi
           cat "../digests/SHA256SUMS-${DIGEST_NAME}"
-      - name: Audit the wheel against the stable ABI
-        # Runs before the wheel is uploaded, so a wheel that reaches outside
-        # the limited API never becomes an artifact the publish job can
-        # collect. It runs here rather than in the publish job because the
-        # publish jobs are conditional on the tag, and a dispatch run with the
-        # box unticked would skip the gate entirely. --strict makes any
-        # violation or version mismatch a failure rather than a note.
-        run: |
-          python -m pip install --disable-pip-version-check abi3audit
-          abi3audit --strict --verbose --assume-minimum-abi3 3.10 dist/*.whl
-      - name: Set up QEMU
-        if: matrix.platform.docker-platform != 'linux/amd64'
-        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-      - name: Install and import the built wheel on two interpreters
-        # Runs in a glibc container matching the wheel architecture. A native
-        # wheel cannot be handed to another job, so the check runs where the
-        # wheel is built.
-        #
-        # Two interpreters rather than one, because an abi3 wheel claims to
-        # load on every CPython from 3.10 up and one install proves only the
-        # version it was installed on. The floor and the newest release
-        # bracket the claim.
-        run: |
-          for tag in 3.10-slim 3.14-slim; do
-            docker run --rm --platform ${{ matrix.platform.docker-platform }} \
-              --volume "${{ github.workspace }}/dist:/dist:ro" \
-              "python:$tag" \
-              sh -c 'python -m pip install --no-index --no-deps --find-links /dist zeusdb-vector-database && python -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__)"'
-          done
       - name: Upload wheels
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -284,6 +354,29 @@ jobs:
         with:
           name: digests-linux-${{ matrix.platform.target }}
           path: digests
+      - name: Set up QEMU
+        if: matrix.platform.docker-platform != 'linux/amd64'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          # docker.io/tonistiigi/binfmt, tag latest
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          cache-image: false
+      - name: Install and import the built wheel on two interpreters
+        # Runs in a glibc container matching the wheel architecture. A native
+        # wheel cannot be handed to another job, so the check runs where the
+        # wheel is built.
+        #
+        # Two interpreters rather than one, because an abi3 wheel claims to
+        # load on every CPython from 3.10 up and one install proves only the
+        # version it was installed on. The floor and the newest release
+        # bracket the claim.
+        run: |
+          for image in "$FLOOR_IMAGE" "$NEWEST_IMAGE"; do
+            docker run --rm --platform ${{ matrix.platform.docker-platform }} \
+              --volume "${{ github.workspace }}/dist:/dist:ro" \
+              "$image" \
+              sh -c 'python -m pip install --no-index --no-deps --find-links /dist zeusdb-vector-database && python -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__)"'
+          done
 
   musllinux:
     needs: check-version
@@ -297,22 +390,52 @@ jobs:
         platform:
           - runner: ubuntu-24.04
             target: x86_64
+            rust-target: x86_64-unknown-linux-musl
             docker-platform: linux/amd64
+            # ghcr.io/rust-cross/rust-musl-cross, tag x86_64-musl
+            image: ghcr.io/rust-cross/rust-musl-cross@sha256:ce75e9174325d4fbb3de85c309e2d7ca29f7500169bc4b5d2c611ff7e86d549a
           - runner: ubuntu-24.04
             target: aarch64
+            rust-target: aarch64-unknown-linux-musl
             docker-platform: linux/arm64
+            # ghcr.io/rust-cross/rust-musl-cross, tag aarch64-musl
+            image: ghcr.io/rust-cross/rust-musl-cross@sha256:ecae5dd62d1c938c14f8071d36c16fa699860aace03bfb5284fb1216474d2643
+    env:
+      # The install check's two images, multi-platform as in the linux job.
+      # python, tag 3.10-alpine
+      FLOOR_IMAGE: python@sha256:8ca9f9d0f4df2af674092e7e9d79ce7985e783cecfe070f8ea850801b6520bf7
+      # python, tag 3.15-alpine
+      NEWEST_IMAGE: python@sha256:d44b1254cb92329418d164b22b20d86bbd3869d48e80e09e476531a409a728bb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: '3.10'  # Match the minimum required version in pyproject.toml
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_LINUX }}
+          enable-cache: false
+      - name: Install maturin
+        # See the linux job.
+        run: |
+          uv venv "$RUNNER_TEMP/maturin" --python "$FLOOR_CPYTHON_LINUX"
+          uv pip install --python "$RUNNER_TEMP/maturin" --require-hashes --only-binary :all: --no-deps -r .github/requirements/maturin.txt
       - name: Build wheels
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
-        with:
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist --locked
-          sccache: true  # Always use sccache for manual Dispatch
-          manylinux: musllinux_1_2
+        # See the linux job. musllinux_1_2 is the tag every musllinux wheel
+        # has carried.
+        env:
+          IMAGE: ${{ matrix.platform.image }}
+          RUST_TARGET: ${{ matrix.platform.rust-target }}
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/io" \
+            --volume "$RUNNER_TEMP/maturin/bin/maturin:/usr/local/bin/maturin:ro" \
+            --workdir /io \
+            --env CARGO_INCREMENTAL=0 \
+            --env CARGO_TERM_COLOR=always \
+            "$IMAGE" \
+            bash .github/scripts/build-linux-wheel.sh "$RUST_TARGET" musllinux_1_2
+          sudo chown -R "$(id -u):$(id -g)" dist
       - name: Record the digest of every artefact before anything else touches it
         # See the linux job for why this sits here.
         shell: bash
@@ -328,25 +451,6 @@ jobs:
             shasum -a 256 -- * > "../digests/SHA256SUMS-${DIGEST_NAME}"
           fi
           cat "../digests/SHA256SUMS-${DIGEST_NAME}"
-      - name: Audit the wheel against the stable ABI
-        # See the linux job for why the gate sits here.
-        run: |
-          python -m pip install --disable-pip-version-check abi3audit
-          abi3audit --strict --verbose --assume-minimum-abi3 3.10 dist/*.whl
-      - name: Set up QEMU
-        if: matrix.platform.docker-platform != 'linux/amd64'
-        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-      - name: Install and import the built wheel on two interpreters
-        # Runs in a musl container, because a musllinux wheel does not install
-        # on the glibc runner that builds it. The floor and the newest release
-        # bracket the abi3 claim.
-        run: |
-          for tag in 3.10-alpine 3.14-alpine; do
-            docker run --rm --platform ${{ matrix.platform.docker-platform }} \
-              --volume "${{ github.workspace }}/dist:/dist:ro" \
-              "python:$tag" \
-              sh -c 'python -m pip install --no-index --no-deps --find-links /dist zeusdb-vector-database && python -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__)"'
-          done
       - name: Upload wheels
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -357,6 +461,24 @@ jobs:
         with:
           name: digests-musllinux-${{ matrix.platform.target }}
           path: digests
+      - name: Set up QEMU
+        if: matrix.platform.docker-platform != 'linux/amd64'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          # docker.io/tonistiigi/binfmt, tag latest
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          cache-image: false
+      - name: Install and import the built wheel on two interpreters
+        # Runs in a musl container, because a musllinux wheel does not install
+        # on the glibc runner that builds it. The floor and the newest release
+        # bracket the abi3 claim.
+        run: |
+          for image in "$FLOOR_IMAGE" "$NEWEST_IMAGE"; do
+            docker run --rm --platform ${{ matrix.platform.docker-platform }} \
+              --volume "${{ github.workspace }}/dist:/dist:ro" \
+              "$image" \
+              sh -c 'python -m pip install --no-index --no-deps --find-links /dist zeusdb-vector-database && python -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__)"'
+          done
 
   windows:
     needs: check-version
@@ -370,27 +492,37 @@ jobs:
         platform:
           - runner: windows-2025-vs2026
             target: x64
+            rust-target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Two interpreters, the abi3 floor and the newest release, so the wheel
-      # can be installed on both below. 3.10 is set up last so that it is the
-      # one on PATH when maturin runs.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        id: py314
         with:
-          python-version: '3.14'
-          architecture: ${{ matrix.platform.target }}
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        id: py310
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
-          python-version: '3.10'  # Match the minimum required version in pyproject.toml
-          architecture: ${{ matrix.platform.target }}
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_WINDOWS }}
+          enable-cache: false
+      # From rust-toolchain.toml, as in ci.yml.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: Install maturin
+        # Into an environment of its own on the floor build, from the
+        # hash-locked file.
+        shell: pwsh
+        run: |
+          uv venv "$env:RUNNER_TEMP\maturin" --python $env:FLOOR_CPYTHON_WINDOWS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv pip install --python "$env:RUNNER_TEMP\maturin" --require-hashes --only-binary :all: --no-deps -r .github/requirements/maturin.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build wheels
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
-        with:
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist --locked
-          sccache: true  # Always use sccache for manual Dispatch
+        # The floor build's environment is first on PATH. maturin generates
+        # the stable ABI's import library itself, so the wheel needs no
+        # interpreter to link.
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:RUNNER_TEMP\maturin\Scripts;$env:PATH"
+          maturin build --release --locked --out dist --target ${{ matrix.platform.rust-target }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Record the digest of every artefact before anything else touches it
         # See the linux job for why this sits here.
         shell: bash
@@ -406,34 +538,6 @@ jobs:
             shasum -a 256 -- * > "../digests/SHA256SUMS-${DIGEST_NAME}"
           fi
           cat "../digests/SHA256SUMS-${DIGEST_NAME}"
-      - name: Audit the wheel against the stable ABI
-        # See the linux job for why the gate sits here.
-        shell: pwsh
-        run: |
-          python -m pip install --disable-pip-version-check abi3audit
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $wheel = (Get-ChildItem dist/*.whl).FullName
-          abi3audit --strict --verbose --assume-minimum-abi3 3.10 $wheel
-      - name: Install and import the built wheel on two interpreters
-        # One install proves only the version it ran on, so the floor and the
-        # newest release are both exercised. Each native call is checked,
-        # because the runner only inspects the exit code of the last one.
-        shell: pwsh
-        run: |
-          $interpreters = [ordered]@{
-            '3.10' = '${{ steps.py310.outputs.python-path }}'
-            '3.14' = '${{ steps.py314.outputs.python-path }}'
-          }
-          foreach ($entry in $interpreters.GetEnumerator()) {
-            $venv = Join-Path $env:RUNNER_TEMP "wheel-check-$($entry.Key)"
-            & $entry.Value -m venv $venv
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            $py = Join-Path $venv 'Scripts\python.exe'
-            & $py -m pip install --no-index --no-deps --find-links dist zeusdb-vector-database
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            & $py -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__)"
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
       - name: Upload wheels
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -444,6 +548,26 @@ jobs:
         with:
           name: digests-windows-${{ matrix.platform.target }}
           path: digests
+      - name: Install and import the built wheel on two interpreters
+        # One install proves only the version it ran on, so the floor and the
+        # newest release are both exercised. Each native call is checked,
+        # because the runner only inspects the exit code of the last one.
+        shell: pwsh
+        run: |
+          $interpreters = [ordered]@{
+            'floor' = $env:FLOOR_CPYTHON_WINDOWS
+            'newest' = $env:NEWEST_CPYTHON_WINDOWS
+          }
+          foreach ($entry in $interpreters.GetEnumerator()) {
+            $venv = Join-Path $env:RUNNER_TEMP "wheel-check-$($entry.Key)"
+            uv venv $venv --python $entry.Value
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            uv pip install --python $venv --no-index --no-deps --find-links dist zeusdb-vector-database
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $py = Join-Path $venv 'Scripts\python.exe'
+            & $py -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__)"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
   macos:
     needs: check-version
@@ -457,25 +581,31 @@ jobs:
         platform:
           - runner: macos-15
             target: aarch64
+            rust-target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Two interpreters, the abi3 floor and the newest release, so the wheel
-      # can be installed on both below. 3.10 is set up last so that it is the
-      # one on PATH when maturin runs.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        id: py314
         with:
-          python-version: '3.14'
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        id: py310
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
-          python-version: '3.10'  # Match the minimum required version in pyproject.toml
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_MACOS }}
+          enable-cache: false
+      # From rust-toolchain.toml, as in ci.yml.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: Install maturin
+        # Into an environment of its own on the floor build, from the
+        # hash-locked file.
+        run: |
+          uv venv "$RUNNER_TEMP/maturin" --python "$FLOOR_CPYTHON_MACOS"
+          uv pip install --python "$RUNNER_TEMP/maturin" --require-hashes --only-binary :all: --no-deps -r .github/requirements/maturin.txt
       - name: Build wheels
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
-        with:
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist --locked
-          sccache: true
+        # The floor build's environment is first on PATH, so the interpreter
+        # maturin finds there is the floor.
+        run: |
+          export PATH="$RUNNER_TEMP/maturin/bin:$PATH"
+          maturin build --release --locked --out dist --target ${{ matrix.platform.rust-target }}
       - name: Record the digest of every artefact before anything else touches it
         # See the linux job for why this sits here.
         shell: bash
@@ -491,23 +621,6 @@ jobs:
             shasum -a 256 -- * > "../digests/SHA256SUMS-${DIGEST_NAME}"
           fi
           cat "../digests/SHA256SUMS-${DIGEST_NAME}"
-      - name: Audit the wheel against the stable ABI
-        # See the linux job for why the gate sits here.
-        run: |
-          python -m pip install --disable-pip-version-check abi3audit
-          abi3audit --strict --verbose --assume-minimum-abi3 3.10 dist/*.whl
-      - name: Install and import the built wheel on two interpreters
-        # One install proves only the version it ran on, so the floor and the
-        # newest release are both exercised.
-        run: |
-          check() {
-            venv="$RUNNER_TEMP/wheel-check-$2"
-            "$1" -m venv "$venv"
-            "$venv/bin/python" -m pip install --no-index --no-deps --find-links dist zeusdb-vector-database
-            "$venv/bin/python" -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__)"
-          }
-          check '${{ steps.py310.outputs.python-path }}' 3.10
-          check '${{ steps.py314.outputs.python-path }}' 3.14
       - name: Upload wheels
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -518,6 +631,18 @@ jobs:
         with:
           name: digests-macos-${{ matrix.platform.target }}
           path: digests
+      - name: Install and import the built wheel on two interpreters
+        # One install proves only the version it ran on, so the floor and the
+        # newest release are both exercised.
+        run: |
+          check() {
+            venv="$RUNNER_TEMP/wheel-check-$2"
+            uv venv "$venv" --python "$1"
+            uv pip install --python "$venv" --no-index --no-deps --find-links dist zeusdb-vector-database
+            "$venv/bin/python" -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__)"
+          }
+          check "$FLOOR_CPYTHON_MACOS" floor
+          check "$NEWEST_CPYTHON_MACOS" newest
 
   sdist:
     needs: check-version
@@ -525,23 +650,25 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: '3.10'  # Match the minimum required version in pyproject.toml
-      # Pinned to a commit on master rather than to the tip of the `stable`
-      # branch. That branch is master plus one commit that sets the default
-      # channel, regenerated on every master change, so its tip SHA goes
-      # unreachable and the action's README says such a pin will eventually
-      # be garbage-collected. master is permanent. On master the channel is a
-      # required input, so it is passed here and the meaning is unchanged.
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
-          toolchain: stable
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_LINUX }}
+          enable-cache: false
+      # From rust-toolchain.toml, as in ci.yml. maturin sdist reads the
+      # workspace through cargo, and the check below compiles the archive.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: Install maturin
+        # Into an environment of its own on the floor build, from the
+        # hash-locked file.
+        run: |
+          uv venv "$RUNNER_TEMP/maturin" --python "$FLOOR_CPYTHON_LINUX"
+          uv pip install --python "$RUNNER_TEMP/maturin" --require-hashes --only-binary :all: --no-deps -r .github/requirements/maturin.txt
       - name: Build sdist
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
-        with:
-          command: sdist
-          args: --out dist
+        run: '"$RUNNER_TEMP/maturin/bin/maturin" sdist --out dist'
       - name: Record the digest of every artefact before anything else touches it
         # See the linux job for why this sits here.
         shell: bash
@@ -557,16 +684,6 @@ jobs:
             shasum -a 256 -- * > "../digests/SHA256SUMS-${DIGEST_NAME}"
           fi
           cat "../digests/SHA256SUMS-${DIGEST_NAME}"
-      - name: Build the extension from the unpacked sdist
-        # The sdist layout differs from the working tree, so a manifest-path or
-        # a python-source that resolves in the tree can still fail in the
-        # archive. Installing the archive is the only check that catches it.
-        run: |
-          tar -tzf dist/*.tar.gz
-          python -m venv "$RUNNER_TEMP/sdist-check"
-          "$RUNNER_TEMP/sdist-check/bin/python" -m pip install --upgrade pip
-          "$RUNNER_TEMP/sdist-check/bin/python" -m pip install dist/*.tar.gz
-          "$RUNNER_TEMP/sdist-check/bin/python" -c "import zeusdb_vector_database as zvd; print(zvd.__version__)"
       - name: Upload sdist
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -577,91 +694,66 @@ jobs:
         with:
           name: digests-sdist
           path: digests
+      - name: Build the extension from the unpacked sdist
+        # The sdist layout differs from the working tree, so a manifest-path or
+        # a python-source that resolves in the tree can still fail in the
+        # archive. Installing the archive is the only check that catches it.
+        #
+        # It runs on the floor build, with the hash-locked maturin as the build
+        # backend and the hash-locked numpy as the one runtime dependency, and
+        # fetches no other package. The archive carries no
+        # rust-toolchain.toml, so RUSTUP_TOOLCHAIN names the toolchain that
+        # file names, and MATURIN_PEP517_ARGS passes --locked to cargo.
+        env:
+          MATURIN_PEP517_ARGS: --locked
+        run: |
+          set -euo pipefail
+          tar -tzf dist/*.tar.gz
+          uv venv "$RUNNER_TEMP/sdist-check" --python "$FLOOR_CPYTHON_LINUX"
+          uv pip install --python "$RUNNER_TEMP/sdist-check" --require-hashes --only-binary :all: --no-deps \
+            -r .github/requirements/maturin.txt -r .github/requirements/sdist-check.txt
+          RUSTUP_TOOLCHAIN=$(sed -n 's/^channel *= *"\([^"]*\)".*$/\1/p' rust-toolchain.toml)
+          export RUSTUP_TOOLCHAIN
+          uv pip install --python "$RUNNER_TEMP/sdist-check" --no-build-isolation --no-deps --no-index dist/*.tar.gz
+          "$RUNNER_TEMP/sdist-check/bin/python" -c "import zeusdb_vector_database as zvd; print(zvd.__version__)"
 
-  publish-testpypi:
-    name: Publish to TestPyPI
+  audit:
+    name: Audit the wheels against the stable ABI
+    needs: [linux, musllinux, windows, macos]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # Prerelease tags, as check-version parsed them, and dispatch runs with
-    # the publish box ticked.
-    if: >-
-      ${{ (github.event_name == 'push'
-      && needs.check-version.outputs.prerelease == 'true')
-      || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
-    needs: [check-version, linux, musllinux, windows, macos, sdist]
-    permissions:
-      # Use to sign the release artifacts
-      id-token: write
-      # Used to upload release artifacts
-      contents: write
-      # Used to generate artifact attestation
-      attestations: write
-    environment:
-      name: testpypi
-      url: https://test.pypi.org/project/zeusdb-vector-database/
     steps:
-      - name: Download and merge all build artifacts
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_LINUX }}
+          enable-cache: false
+      - name: Download the six wheels
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: wheels-*
           merge-multiple: true
           path: dist
-
-      - name: Download the digests recorded at build time
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: digests-*
-          merge-multiple: true
-          path: digests
-
-      - name: Verify every artefact against the digest recorded when it was built
-        # Before attestation and before upload, so nothing is signed or
-        # published that is not byte for byte what its build job produced.
-        # Two checks: every file in dist has a recorded digest, and every
-        # recorded digest matches. --strict makes a malformed line a failure
-        # rather than a warning. A job that fails here has caught a wheel
-        # changed between its build and this point, by a later step in the
-        # build job or in the artifact store, and the run stops with nothing
-        # uploaded.
+      - name: Audit every wheel against the stable ABI
+        # Before any wheel can be published, and in a dispatch run as well,
+        # since this job is not conditional on the tag. abi3audit reads ELF, PE
+        # and Mach-O alike, so one Linux job audits every platform's wheel.
+        # --strict makes any violation or version mismatch a failure rather
+        # than a note.
         run: |
           set -euo pipefail
-          ls -l digests
-          expected=$(cat digests/SHA256SUMS-* | wc -l)
-          actual=$(ls -1 dist | wc -l)
-          if [ "$expected" -ne "$actual" ]; then
-            echo "::error::dist holds $actual file(s) but $expected digest line(s) were recorded at build time."
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -ne 6 ]; then
+            echo "::error::expected six wheels and found ${#wheels[@]}"
             exit 1
           fi
-          cd dist
-          for sums in ../digests/SHA256SUMS-*; do
-            sha256sum --check --strict "$sums"
-          done
-
-      - name: Inspect build artifacts
-        run: |
-          echo "Contents of dist/ directory:"
-          ls -lh dist/
-          echo ""
-          echo "File types of artifacts:"
-          file dist/* || true
-
-      - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: 'dist/*'
-      - name: Publish to TestPyPI
-        # Trusted Publishing against TestPyPI, which is what repository-url
-        # selects. The action exchanges the job's OIDC token for a TestPyPI
-        # credential, runs twine check over dist, mints a PEP 740 attestation
-        # for every file from that same identity and uploads the files with
-        # their attestations. skip-existing keeps the behaviour of the
-        # previous upload step, so a rerun does not fail on a file an earlier
-        # run already uploaded.
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
-        with:
-          repository-url: https://test.pypi.org/legacy/
-          attestations: true
-          skip-existing: true
+          uv venv "$RUNNER_TEMP/abi3audit" --python "$NEWEST_CPYTHON_LINUX"
+          uv pip install --python "$RUNNER_TEMP/abi3audit" --require-hashes --only-binary :all: --no-deps -r .github/requirements/abi3audit.txt
+          "$RUNNER_TEMP/abi3audit/bin/abi3audit" --strict --verbose --assume-minimum-abi3 3.10 "${wheels[@]}"
 
   publish-pypi:
     name: Publish to PyPI
@@ -674,7 +766,7 @@ jobs:
     if: >-
       ${{ github.event_name == 'push'
       && needs.check-version.outputs.prerelease == 'false' }}
-    needs: [check-version, linux, musllinux, windows, macos, sdist]
+    needs: [check-version, linux, musllinux, windows, macos, sdist, audit]
     permissions:
       # Use to sign the release artifacts
       id-token: write
@@ -703,17 +795,23 @@ jobs:
       - name: Verify every artefact against the digest recorded when it was built
         # Before attestation and before upload, so nothing is signed or
         # published that is not byte for byte what its build job produced.
-        # Two checks: every file in dist has a recorded digest, and every
-        # recorded digest matches. --strict makes a malformed line a failure
-        # rather than a warning. A job that fails here has caught a wheel
-        # changed between its build and this point, by a later step in the
-        # build job or in the artifact store, and the run stops with nothing
-        # uploaded.
+        # Three checks: dist holds the six wheels and the sdist and no other
+        # file, every file in dist has a recorded digest, and every recorded
+        # digest matches. --strict makes a malformed line a failure rather
+        # than a warning. A job that fails here has caught a file changed or
+        # added between its build and this point, in the artifact store or by
+        # any step that could upload, and the run stops with nothing uploaded.
         run: |
           set -euo pipefail
           ls -l digests
+          wheels=$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)
+          archives=$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)
+          actual=$(find dist -mindepth 1 -maxdepth 1 | wc -l)
+          if [ "$wheels" -ne 6 ] || [ "$archives" -ne 1 ] || [ "$actual" -ne 7 ]; then
+            echo "::error::dist must hold six wheels and one sdist and nothing else, and holds $actual file(s), $wheels of them wheels and $archives of them sdists."
+            exit 1
+          fi
           expected=$(cat digests/SHA256SUMS-* | wc -l)
-          actual=$(ls -1 dist | wc -l)
           if [ "$expected" -ne "$actual" ]; then
             echo "::error::dist holds $actual file(s) but $expected digest line(s) were recorded at build time."
             exit 1
@@ -755,9 +853,9 @@ jobs:
     # No condition of its own. A job whose needs were skipped is skipped in
     # turn, so this runs exactly when publish-pypi ran and succeeded, which is
     # a stable tag push that reached production PyPI. A dispatch run skips
-    # publish-pypi and therefore skips this, whether or not the publish box was
-    # ticked, and a prerelease tag does the same. A failed publish leaves it
-    # unrun, because needs defaults to requiring success.
+    # publish-pypi and therefore skips this, and a prerelease tag does the
+    # same. A failed publish leaves it unrun, because needs defaults to
+    # requiring success.
     needs: [publish-pypi]
     permissions:
       # Creating a release writes to the repository. Nothing else is needed
@@ -767,6 +865,8 @@ jobs:
       # Checks out the tag, so CHANGELOG.md is the file the release was cut
       # from rather than whatever main holds now.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # A re-run of the workflow on the same tag must not go red because the
       # release is already there, and it must not overwrite a body that was
@@ -804,12 +904,15 @@ jobs:
         # ships them.
         #
         # cargo is already on the runner image, so only cargo-cyclonedx is
-        # installed, and compiling it is the whole cost of this step.
+        # installed, and compiling it is the whole cost of this step. Its
+        # version is named, cargo checks the crate against the crates.io index,
+        # and --locked builds it with the dependencies its own lock file
+        # records.
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          cargo install --locked cargo-cyclonedx
+          cargo install --locked --version 0.5.9 cargo-cyclonedx
           cargo cyclonedx \
             --manifest-path bindings/python/Cargo.toml \
             --format json \
@@ -850,17 +953,13 @@ jobs:
             }
           ' CHANGELOG.md > "$notes"
 
-          # The package is already on PyPI by this point, so a missing section
-          # is not worth failing the run over. The release is created with a
-          # pointer instead of notes, and the warning annotation records that
-          # the body needs writing by hand.
+          # check-version refuses a tag whose section is missing before any
+          # build, and this check stays as a second guard. A run that reaches
+          # it with no notes fails and creates no release, so a release is
+          # never published without its notes.
           if [ ! -s "$notes" ]; then
-            echo "::warning::CHANGELOG.md holds no '## [${version}]' section. Creating the release with a pointer in place of notes."
-            cat > "$notes" <<EOF
-          No changelog section was found for ${version} when this release was created.
-
-          See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${TAG}/CHANGELOG.md) and the [package on PyPI](https://pypi.org/project/zeusdb-vector-database/${version}/).
-          EOF
+            echo "::error::CHANGELOG.md holds no '## [${version}]' section, so no release was created."
+            exit 1
           fi
 
           # --latest is deliberately absent. Its default is automatic, by date

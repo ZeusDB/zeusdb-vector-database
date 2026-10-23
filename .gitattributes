@@ -14,6 +14,7 @@ Cargo.lock      text eol=lf
 # GitHub Actions workflows
 *.yml           text eol=lf
 *.yaml          text eol=lf
+*.sh            text eol=lf
 
 # Python
 *.py            text eol=lf

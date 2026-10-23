@@ -1,0 +1,77 @@
+# The sparse index's checks against brute force at scale.
+#
+# crates/sparse/src/verify.rs holds three tests that compare every result page
+# the sparse index returns with a brute-force ranking, over 50,000 records of
+# text, 50,000 records of text under BM25 and 20,000 records of splade. They
+# are `#[ignore]`d, so the gate in ci.yml runs their smaller versions and stays
+# fast, and this workflow is where they run. --ignored runs the ignored tests
+# alone, and in this crate those are these three.
+#
+# They build with the `checked` profile in the root Cargo.toml, which is the
+# release profile with debug assertions on, so the engine's own assertions run
+# at optimised speed. The sparse crate links no Python library, so the job
+# needs no interpreter.
+#
+# It runs on a pull request that touches the sparse crate, the core crate it is
+# built on, the workspace manifest, the lock file, the toolchain or this file,
+# on a weekly schedule, and by hand from the Actions tab. The weekly run stays
+# because a path trigger fires only on a commit here, and the runner image or a
+# dependency can move without one.
+#
+# The workspace manifest is at the repository root, so cargo runs from there,
+# and rust-cache's key holds the runner image's name and version, as in
+# ci.yml. Cargo passes --locked, as every cargo step in this project does.
+#
+# Every job names its runner image, ubuntu-24.04, rather than a label such as
+# ubuntu-latest that GitHub moves to a newer image on its own schedule. A
+# change of image is a change to this file.
+name: Sparse scale
+
+on:
+  pull_request:
+    branches: [main, development]
+    paths:
+      - 'crates/sparse/**'
+      - 'crates/core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/sparse-scale.yml'
+  schedule:
+    # 05.17 UTC on Mondays, an hour after lock-order.yml and off the hour
+    # because the scheduler queues runs filed on the hour.
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sparse-scale:
+    runs-on: ubuntu-24.04
+    # Well above the expected run time so a slow runner does not fail the run,
+    # and far enough below the six hour default to be a real bound.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # From rust-toolchain.toml, as in ci.yml. See the note there.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ". -> target"
+          # Its own key. Only this job builds the sparse crate's tests with the
+          # checked profile, so sharing a key with any job in ci.yml or
+          # lock-order.yml would evict that cache on every run of this one.
+          shared-key: sparse-checked
+          # The runner image's name and version, as in ci.yml.
+          env-vars: ImageOS ImageVersion
+          cache-on-failure: true
+      - name: Run the checks at scale
+        # --lib, because the three live in the library's test module, and
+        # --nocapture shows the page count each check prints.
+        run: cargo test -p zeusdb-vector-sparse --lib --locked --profile checked -- --ignored --nocapture

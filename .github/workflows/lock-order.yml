@@ -25,6 +25,11 @@
 # guard twice on one thread, and that none inverts the declared order. The
 # assertion fires on the acquisition itself, with no writer and no scheduling.
 #
+# The suite runs on the newest CPython release, the exact build test-python in
+# ci.yml runs, which uv installs and checks against the SHA-256 in its own
+# list. uv itself is pinned by version and by the SHA-256 of its archive.
+# rust-cache's key holds the runner image's name and version, as in ci.yml.
+#
 # Every job names its runner image, ubuntu-24.04, rather than a label such as
 # ubuntu-latest that GitHub moves to a newer image on its own schedule. A
 # change of image is a change to this file.
@@ -56,6 +61,14 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # uv, and the SHA-256 GitHub publishes for uv-x86_64-unknown-linux-gnu.tar.gz
+  # at that version.
+  PINNED_UV_VERSION: "0.13.5"
+  PINNED_UV_SHA256_LINUX: f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
+  # uv takes no interpreter from the runner image.
+  UV_PYTHON_PREFERENCE: only-managed
+
 jobs:
   lock-order:
     runs-on: ubuntu-24.04
@@ -75,9 +88,16 @@ jobs:
           # its test-python job keeps, so sharing either key would evict that
           # cache on every run of this one.
           shared-key: workspace-checked
+          # The runner image's name and version, as in ci.yml.
+          env-vars: ImageOS ImageVersion
           cache-on-failure: true
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_LINUX }}
+          # The newest CPython release, as uv names its build, the same as
+          # test-python in ci.yml.
+          python-version: cpython-3.15.1-linux-x86_64-gnu
           enable-cache: true
           cache-dependency-glob: uv.lock
       - name: Install the project without building the extension

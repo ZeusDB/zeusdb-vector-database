@@ -3,56 +3,62 @@
 # Linux only and cached, so the gate stays fast. The cross-platform build is
 # covered by the wheel matrix in publish-pypi.yml.
 #
-# ON A PULL REQUEST THERE IS NO PATH FILTER, AND ONE MUST NOT BE ADDED.
+# NEITHER TRIGGER HAS A PATH FILTER, AND ONE MUST NOT BE ADDED.
 #
 # `lint`, `test-python` and `test-rust` are the three required status checks on
 # main. A workflow that a path filter skips does not report its checks as
 # skipped, it never reports them at all, and a required check that never reports
 # leaves the pull request waiting for a status that cannot arrive. A pull request
 # touching only CHANGELOG.md would therefore be unmergeable rather than cheap.
-# The push trigger below keeps its ignore list, because no branch rule reads a
-# push.
 #
-# README.md and examples/ are deliberately NOT in the push ignore list either,
-# and must not be added to it. tests/test_readme_examples.py executes every
-# fenced python block in README.md and compares the captured stdout against the
-# output the document claims, and tests/test_examples.py runs every file under
-# examples/ the same way. A commit touching only README.md therefore can and
-# does break this gate, which is the whole reason both modules exist. The
-# ignore list holds the files no test reads.
-#
-# A push matching every entry in the list runs nothing. A push touching one
-# ignored file and one other file runs everything, because paths-ignore skips a
-# run only when every changed path matches.
+# A change to documentation alone passes quickly instead. Every job runs, and
+# its first step after the checkout, .github/scripts/documentation_only.py,
+# compares the change with its base. Every later step runs only when that
+# answers that the change touches more than documentation, so each check
+# reports on every change. The documentation is the six files the script
+# names, which no test reads and no job here builds from. README.md and
+# examples/ are deliberately NOT among them, and must not be added.
+# tests/test_readme_examples.py executes every fenced python block in README.md
+# and compares the captured stdout against the output the document claims, and
+# tests/test_examples.py runs every file under examples/ the same way. A commit
+# touching only README.md therefore can and does break this gate, which is the
+# whole reason both modules exist. A change the script cannot compare with its
+# base, such as a push that creates a branch, runs everything.
 #
 # The workspace manifest is at the repository root, so every cargo step runs
-# from there, and rust-cache's workspaces input names that root.
+# from there, and rust-cache's workspaces input names that root. Its key also
+# holds the runner image's name and version, through its env-vars input, so a
+# newer image starts entries of its own and nothing an earlier image compiled
+# is restored onto it.
 #
 # Cargo steps pass --locked, which fails the run when Cargo.lock is out of
 # date instead of silently updating it. Keep the flag on every cargo step
 # that accepts it.
 #
-# The three jobs declare no needs, so they start together. Nothing one of them
-# produces is read by another. The Python suite runs on the extension that job
+# The Python suite runs twice, on the newest CPython release in test-python and
+# on the oldest version the package supports in test-python-floor, each an
+# exact build that uv installs and checks against the SHA-256 in its own list.
+# uv itself is pinned by version and by the SHA-256 of its archive. Both jobs
+# build the extension with the maturin uv.lock names, and lint checks that
+# .github/requirements/maturin.txt names the same one for the release.
+# test-rust links its test executables against the libpython of the newest
+# build, which uv installs the same way.
+#
+# The jobs declare no needs, so they start together. Nothing one of them
+# produces is read by another. Each Python suite runs on the extension its job
 # builds for itself, and the Rust suite compiles its own test binaries with
 # `extension-module` off, which is a different feature set from the one the
-# other two build.
+# other jobs build.
 #
 # Every job names its runner image, ubuntu-24.04, rather than a label such as
 # ubuntu-latest that GitHub moves to a newer image on its own schedule. A
-# change of image is a change to this file.
+# change of image is a change to this file. lint uses the image's own python3
+# for two checks, so the label fixes that version too.
 name: CI
 
 on:
   push:
     branches: [main, development]
-    paths-ignore:
-      - 'CHANGELOG.md'
-      - 'LICENSE'
-      - 'NOTICE'
-      - 'ATTRIBUTION.md'
-      - '.gitignore'
-      - '.gitattributes'
   pull_request:
     branches: [main, development]
 
@@ -63,6 +69,19 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # uv for both Python jobs, and the SHA-256 GitHub publishes for
+  # uv-x86_64-unknown-linux-gnu.tar.gz at that version.
+  PINNED_UV_VERSION: "0.13.5"
+  PINNED_UV_SHA256_LINUX: f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
+  # The CPython builds uv installs, as uv names them. The floor is the oldest
+  # version the package supports, which is the floor requires-python declares
+  # and the abi3 target, and the newest is the newest CPython release.
+  FLOOR_CPYTHON_LINUX: cpython-3.10.22-linux-x86_64-gnu
+  NEWEST_CPYTHON_LINUX: cpython-3.15.1-linux-x86_64-gnu
+  # uv takes no interpreter from the runner image.
+  UV_PYTHON_PREFERENCE: only-managed
+
 jobs:
   lint:
     runs-on: ubuntu-24.04
@@ -70,13 +89,27 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The whole history, so the next step can compare the change with its
+          # base.
+          fetch-depth: 0
+      - name: Decide whether the change is documentation alone
+        id: scope
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/documentation_only.py
       # The toolchain comes from rust-toolchain.toml and from nowhere else.
       # `rustup toolchain install` with no argument reads the channel and the
       # components out of the file, so the version installed is the version
       # that runs. Raising the pin there is the whole of a toolchain bump.
       - name: Install the pinned toolchain
+        if: steps.scope.outputs.documentation-only != 'true'
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.scope.outputs.documentation-only != 'true'
         with:
           # One workspace root per line, as `root -> target`. The action
           # hashes every member manifest it finds through cargo metadata
@@ -88,11 +121,16 @@ jobs:
           # build has nothing in common with a debug one and the two would take
           # turns evicting each other under one key.
           shared-key: workspace
+          # The runner image's name and version, which the runner sets in
+          # these two variables.
+          env-vars: ImageOS ImageVersion
           # Save the cache on a failed run too, so a red gate still warms it.
           cache-on-failure: true
       - name: Check Rust formatting
+        if: steps.scope.outputs.documentation-only != 'true'
         run: cargo fmt --all -- --check
       - name: Run clippy
+        if: steps.scope.outputs.documentation-only != 'true'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # The three steps below hold the workspace's shape, and each guards
       # against something a member manifest could undo without a warning.
@@ -104,6 +142,7 @@ jobs:
       # that spells its own version is invisible to the release gate in
       # publish-pypi.yml, which reads [workspace.package].
       - name: Check that clippy.toml and deny.toml exist once each, at the root
+        if: steps.scope.outputs.documentation-only != 'true'
         run: |
           set -euo pipefail
           for name in clippy.toml deny.toml; do
@@ -115,6 +154,7 @@ jobs:
             echo "$name is present once, at the root"
           done
       - name: Check that no crate but the binding depends on Python or an async runtime
+        if: steps.scope.outputs.documentation-only != 'true'
         # Every workspace member other than the binding is listed, and the
         # normal and build dependency tree of each must hold none of the
         # crates deny.toml bans. With no such member there is nothing to list
@@ -140,6 +180,7 @@ jobs:
           done
           exit "$status"
       - name: Check that every member takes its version from the workspace
+        if: steps.scope.outputs.documentation-only != 'true'
         run: |
           set -euo pipefail
           cargo metadata --no-deps --locked --format-version 1 > "$RUNNER_TEMP/metadata.json"
@@ -156,38 +197,138 @@ jobs:
               print("::error::a member declares a version of its own rather than version.workspace = true: " + ", ".join(own))
               sys.exit(1)
           PY
+      # The release builds every wheel with the maturin
+      # .github/requirements/maturin.txt pins, and this workflow builds the
+      # extension with the one uv.lock pins. They must be the same release.
+      - name: Check that maturin.txt and uv.lock name the same maturin
+        if: steps.scope.outputs.documentation-only != 'true'
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys, tomllib
+          lock = tomllib.loads(pathlib.Path("uv.lock").read_text(encoding="utf-8"))
+          locked = sorted({p["version"] for p in lock["package"] if p["name"] == "maturin"})
+          text = pathlib.Path(".github/requirements/maturin.txt").read_text(encoding="utf-8")
+          pinned = sorted(set(re.findall(r"^maturin==([^\s;\\]+)", text, re.MULTILINE)))
+          print(f"uv.lock names maturin {', '.join(locked) or 'nowhere'}")
+          print(f".github/requirements/maturin.txt pins maturin {', '.join(pinned) or 'nowhere'}")
+          if len(locked) != 1 or pinned != locked:
+              print("::error::.github/requirements/maturin.txt and uv.lock must name one and the same maturin version")
+              sys.exit(1)
+          PY
 
   test-python:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # See the lint job.
+          fetch-depth: 0
+      - name: Decide whether the change is documentation alone
+        id: scope
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/documentation_only.py
       # From rust-toolchain.toml, as in the lint job. See the note there.
-      # uv sync builds the extension with cargo, so this job needs a toolchain
+      # maturin builds the extension with cargo, so this job needs a toolchain
       # even though it runs no cargo command of its own.
       - name: Install the pinned toolchain
+        if: steps.scope.outputs.documentation-only != 'true'
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.scope.outputs.documentation-only != 'true'
         with:
           workspaces: ". -> target"
-          # Its own key. This is the only job that builds the release profile,
-          # which is what the wheel is and what maturin produces through the
-          # build backend. Under the shared key it restored the lint job's debug
-          # artefacts, which a release build cannot use, and then declined to
-          # save its own because the key was already taken.
+          # Its own key. This and test-python-floor are the only jobs that
+          # build the release profile, which is what the wheel is. Under the
+          # shared key it restored the lint job's debug artefacts, which a
+          # release build cannot use, and then declined to save its own because
+          # the key was already taken.
           shared-key: workspace-release
+          # See the lint job.
+          env-vars: ImageOS ImageVersion
           cache-on-failure: true
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        if: steps.scope.outputs.documentation-only != 'true'
         with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_LINUX }}
+          # The newest build. The action sets UV_PYTHON to it for every later
+          # step.
+          python-version: ${{ env.NEWEST_CPYTHON_LINUX }}
           enable-cache: true
           cache-dependency-glob: uv.lock
+      - name: Install the locked environment without the project
+        if: steps.scope.outputs.documentation-only != 'true'
+        # --no-install-project installs the dependencies and skips the package
+        # itself, so the build below is the only one.
+        run: uv sync --locked --extra dev --no-install-project
       - name: Build the extension and install the project
-        # uv sync installs the project through the maturin backend, which is
-        # how the extension is built for development.
-        run: uv sync --locked --extra dev
+        if: steps.scope.outputs.documentation-only != 'true'
+        # The release profile, which is what the wheel is, built by the maturin
+        # uv.lock names. It builds on every run, so no cached build can stand in
+        # for the source the job checked out.
+        run: uv run --no-sync maturin develop --release
       - name: Run the Python test suite
+        if: steps.scope.outputs.documentation-only != 'true'
         # Scoped to the tests directory, as testpaths in pyproject.toml is, and
         # spread over four workers, as addopts there is.
+        run: uv run --no-sync pytest tests
+
+  test-python-floor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # See the lint job.
+          fetch-depth: 0
+      - name: Decide whether the change is documentation alone
+        id: scope
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/documentation_only.py
+      # From rust-toolchain.toml, as in the lint job. See test-python.
+      - name: Install the pinned toolchain
+        if: steps.scope.outputs.documentation-only != 'true'
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.scope.outputs.documentation-only != 'true'
+        with:
+          workspaces: ". -> target"
+          # Its own key, apart from test-python's, because the extension is
+          # built against a different interpreter and the two jobs would take
+          # turns over one entry.
+          shared-key: workspace-release-floor
+          # See the lint job.
+          env-vars: ImageOS ImageVersion
+          cache-on-failure: true
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        if: steps.scope.outputs.documentation-only != 'true'
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_LINUX }}
+          # The floor build. The action sets UV_PYTHON to it for every later
+          # step.
+          python-version: ${{ env.FLOOR_CPYTHON_LINUX }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install the locked environment without the project
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv sync --locked --extra dev --no-install-project
+      - name: Build the extension and install the project
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv run --no-sync maturin develop --release
+      - name: Run the Python test suite
+        if: steps.scope.outputs.documentation-only != 'true'
         run: uv run --no-sync pytest tests
 
   test-rust:
@@ -195,29 +336,70 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # See the lint job.
+          fetch-depth: 0
+      - name: Decide whether the change is documentation alone
+        id: scope
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/documentation_only.py
       # From rust-toolchain.toml, as in the lint job. See the note there.
       - name: Install the pinned toolchain
+        if: steps.scope.outputs.documentation-only != 'true'
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.scope.outputs.documentation-only != 'true'
         with:
           workspaces: ". -> target"
           shared-key: workspace
+          # See the lint job.
+          env-vars: ImageOS ImageVersion
           cache-on-failure: true
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        if: steps.scope.outputs.documentation-only != 'true'
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_LINUX }}
+          # uv installs one interpreter here and resolves no package, so its
+          # cache would hold nothing.
+          enable-cache: false
       # The Rust tests link an executable, and an executable has to resolve
       # every libpython symbol it references. `cargo test` below turns
-      # `extension-module` off, so PyO3 emits a `-lpython` line and the test
-      # executable links libpython. The linker resolves that line against the
-      # shared-library symlink `libpython3.x.so`, which python3-dev provides.
-      # This step installs python3-dev, so the job does not depend on the
-      # runner image for it.
+      # `extension-module` off, so PyO3 emits a `-lpython3.x` line and the test
+      # executable links libpython. uv installs the newest build, the one
+      # test-python runs, and PYO3_PYTHON names it, so PyO3 links the
+      # libpython3.x.so in the LIBDIR that build's sysconfig reports.
+      # LD_LIBRARY_PATH lets the test executables load that library when they
+      # run, since cargo adds no search path outside the target directory. No
+      # Rust test starts an interpreter.
       #
       # Nothing else in the job needs it. This job neither builds the extension
       # nor installs the project, because the Rust tests read neither.
-      - name: Install libpython so the Rust tests can link
+      - name: Install the CPython whose libpython the Rust tests link
+        id: libpython
+        if: steps.scope.outputs.documentation-only != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends python3-dev
+          set -euo pipefail
+          uv python install "$NEWEST_CPYTHON_LINUX"
+          python=$(uv python find "$NEWEST_CPYTHON_LINUX")
+          libdir=$("$python" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')
+          library="libpython$("$python" -c 'import sysconfig; print(sysconfig.get_config_var("LDVERSION"))').so"
+          if [ ! -e "$libdir/$library" ]; then
+            echo "::error::$library, the library PyO3 links, is not in $libdir"
+            exit 1
+          fi
+          ls -l "$libdir"/libpython3*
+          echo "python=$python" >> "$GITHUB_OUTPUT"
+          echo "libdir=$libdir" >> "$GITHUB_OUTPUT"
       - name: Run the Rust test suite
+        if: steps.scope.outputs.documentation-only != 'true'
+        env:
+          PYO3_PYTHON: ${{ steps.libpython.outputs.python }}
+          LD_LIBRARY_PATH: ${{ steps.libpython.outputs.libdir }}
         # --no-default-features turns off the binding crate's `extension-module`
         # feature, which is on for every other cargo command and for the wheel.
         # See the comment on it in bindings/python/Cargo.toml.

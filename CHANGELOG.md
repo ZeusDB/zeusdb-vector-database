@@ -97,6 +97,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Every workflow job names its runner image. The jobs that ran on `ubuntu-latest` run on `ubuntu-24.04`, and the Windows wheel is built on `windows-2025-vs2026` in place of `windows-latest`. These are the images each job ran on for 0.13.0. A change of runner image is a change to a workflow file.
 
+- Every tool the release workflow installs has an exact version and is checked against a published hash. Python tools install from files under `.github/requirements/` with `--require-hashes`, uv has a fixed version and archive checksum, each CPython is an exact build that uv installs, and each container image is pinned by digest.
+
+- The release workflow builds the wheels and the source distribution with maturin 1.15.0 from a clean build, and `.github/scripts/build-linux-wheel.sh` builds each Linux wheel inside its pinned image. `uv.lock` names maturin 1.15.0, and the CI lint job fails when it and `.github/requirements/maturin.txt` name different versions.
+
+- Each wheel job uploads its wheels and their digests as soon as it records the digests. One audit job checks all six wheels against the stable ABI, and the publish job refuses any file other than six wheels and one source distribution.
+
+- The release workflow publishes to PyPI from a stable version tag. A dispatch run or a prerelease tag builds and checks every file and stops before the publish job. The `check-version` job and the GitHub Release job fail when `CHANGELOG.md` holds no section for the tag.
+
+- CI runs the Python suite on CPython 3.15.1 in `test-python` and on CPython 3.10.22 in `test-python-floor`. The release workflow installs and imports each wheel on CPython 3.10 and 3.15.
+
+- `test-rust` links the Rust tests against the libpython of CPython 3.15.1, which uv installs.
+
+- A change to the documentation files that `.github/scripts/documentation_only.py` lists passes every CI job and skips the build and test steps. The Rust build cache is keyed by the runner image as well.
+
+- `sparse-scale.yml` runs the sparse index's three checks against brute force at scale, on a pull request that touches the sparse or core crate, weekly and by hand.
+
+- `.gitattributes` holds every `*.sh` file to LF line endings.
+
 ### Format
 
 Every directory this release saves declares format version 5.0.0 and lists its features, and a 5.x manifest without its features is refused. A 5.0.0 directory holds its journal as a directory of segments, records as `identity.sequence` the last journal sequence its records include, and lists no `identity` feature, since every 5.0.0 directory holds one. This release reads 1.x, 2.x, 3.x, 4.x and 5.x, so a directory an earlier release saved opens here, and saving it again writes 5.0.0. A journaled directory at 3.0.0, 3.1.0 or 4.0.0 is written again at 5.0.0 when it opens. 0.5.0 to 0.13.0 refuse a 5.0.0 directory at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`. A 5.0.0 directory holds its graph dump at version 2, which holds each record's stored vector, code or scalar row, and its `metadata.json` names the records that hold a field. A directory at 1.x to 4.x opens with its version 1 dump read, and saving it again writes 5.0.0.
