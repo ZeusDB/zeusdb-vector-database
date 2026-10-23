@@ -46,9 +46,11 @@
 # no other file, and fails if one disagrees or is missing. That catches the
 # artifact store altering a file and a file added after the builds.
 #
-# The audit job checks all six wheels against the stable ABI. The publish job
+# The audit job checks all six wheels against the stable ABI. It also lists
+# the libraries each wheel bundles, and fails a musllinux wheel that does not
+# carry the libraries its extension needs beyond musl's libc. The publish job
 # needs it and a dispatch runs it, so a wheel that reaches outside the limited
-# API fails every run.
+# API, or a musllinux wheel without its libraries, fails every run.
 #
 # The publish job uploads through pypa/gh-action-pypi-publish, which exchanges
 # the job's OIDC token for an index credential and mints a PEP 740 attestation
@@ -298,13 +300,14 @@ jobs:
           version: ${{ env.PINNED_UV_VERSION }}
           checksum: ${{ env.PINNED_UV_SHA256_LINUX }}
           enable-cache: false
-      - name: Install maturin
+      - name: Install maturin and patchelf
         # Into an environment of its own on the floor build, from the
-        # hash-locked file. The wheel holds a static binary, which the build
-        # image runs from a read-only mount.
+        # hash-locked files. The maturin and patchelf wheels each hold a
+        # static binary, which the build image runs from a read-only mount.
+        # maturin runs patchelf when it copies a library into a wheel.
         run: |
           uv venv "$RUNNER_TEMP/maturin" --python "$FLOOR_CPYTHON_LINUX"
-          uv pip install --python "$RUNNER_TEMP/maturin" --require-hashes --only-binary :all: --no-deps -r .github/requirements/maturin.txt
+          uv pip install --python "$RUNNER_TEMP/maturin" --require-hashes --only-binary :all: --no-deps -r .github/requirements/maturin.txt -r .github/requirements/patchelf.txt
       - name: Build wheels
         # In the pinned build image, through .github/scripts/build-linux-wheel.sh,
         # which installs the toolchain rust-toolchain.toml names and nothing
@@ -316,6 +319,7 @@ jobs:
           docker run --rm \
             --volume "$GITHUB_WORKSPACE:/io" \
             --volume "$RUNNER_TEMP/maturin/bin/maturin:/usr/local/bin/maturin:ro" \
+            --volume "$RUNNER_TEMP/maturin/bin/patchelf:/opt/patchelf/bin/patchelf:ro" \
             --workdir /io \
             --env CARGO_INCREMENTAL=0 \
             --env CARGO_TERM_COLOR=always \
@@ -415,11 +419,11 @@ jobs:
           version: ${{ env.PINNED_UV_VERSION }}
           checksum: ${{ env.PINNED_UV_SHA256_LINUX }}
           enable-cache: false
-      - name: Install maturin
+      - name: Install maturin and patchelf
         # See the linux job.
         run: |
           uv venv "$RUNNER_TEMP/maturin" --python "$FLOOR_CPYTHON_LINUX"
-          uv pip install --python "$RUNNER_TEMP/maturin" --require-hashes --only-binary :all: --no-deps -r .github/requirements/maturin.txt
+          uv pip install --python "$RUNNER_TEMP/maturin" --require-hashes --only-binary :all: --no-deps -r .github/requirements/maturin.txt -r .github/requirements/patchelf.txt
       - name: Build wheels
         # See the linux job. musllinux_1_2 is the tag every musllinux wheel
         # has carried.
@@ -430,6 +434,7 @@ jobs:
           docker run --rm \
             --volume "$GITHUB_WORKSPACE:/io" \
             --volume "$RUNNER_TEMP/maturin/bin/maturin:/usr/local/bin/maturin:ro" \
+            --volume "$RUNNER_TEMP/maturin/bin/patchelf:/opt/patchelf/bin/patchelf:ro" \
             --workdir /io \
             --env CARGO_INCREMENTAL=0 \
             --env CARGO_TERM_COLOR=always \
@@ -737,6 +742,18 @@ jobs:
           pattern: wheels-*
           merge-multiple: true
           path: dist
+      - name: Install abi3audit
+        # From the hash-locked file, on the newest build. The next step reads
+        # the Linux wheels with the pyelftools it brings.
+        run: |
+          uv venv "$RUNNER_TEMP/abi3audit" --python "$NEWEST_CPYTHON_LINUX"
+          uv pip install --python "$RUNNER_TEMP/abi3audit" --require-hashes --only-binary :all: --no-deps -r .github/requirements/abi3audit.txt
+      - name: List the libraries each wheel bundles
+        # .github/scripts/wheel_libraries.py prints each wheel's bundled
+        # libraries and the needed libraries and run path of each ELF file. It
+        # fails a musllinux wheel that bundles no library, or that needs a
+        # library other than musl's libc.so which the wheel does not carry.
+        run: '"$RUNNER_TEMP/abi3audit/bin/python" .github/scripts/wheel_libraries.py dist/*.whl'
       - name: Audit every wheel against the stable ABI
         # Before any wheel can be published, and in a dispatch run as well,
         # since this job is not conditional on the tag. abi3audit reads ELF, PE
@@ -751,8 +768,6 @@ jobs:
             echo "::error::expected six wheels and found ${#wheels[@]}"
             exit 1
           fi
-          uv venv "$RUNNER_TEMP/abi3audit" --python "$NEWEST_CPYTHON_LINUX"
-          uv pip install --python "$RUNNER_TEMP/abi3audit" --require-hashes --only-binary :all: --no-deps -r .github/requirements/abi3audit.txt
           "$RUNNER_TEMP/abi3audit/bin/abi3audit" --strict --verbose --assume-minimum-abi3 3.10 "${wheels[@]}"
 
   publish-pypi:

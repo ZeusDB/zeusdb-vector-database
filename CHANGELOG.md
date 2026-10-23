@@ -101,7 +101,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The release workflow builds the wheels and the source distribution with maturin 1.15.0 from a clean build, and `.github/scripts/build-linux-wheel.sh` builds each Linux wheel inside its pinned image. `uv.lock` names maturin 1.15.0, and the CI lint job fails when it and `.github/requirements/maturin.txt` name different versions.
 
+- Each Linux wheel build installs patchelf 0.19.1.0 from `.github/requirements/patchelf.txt` with maturin and mounts it into the pinned image, where maturin uses it to copy the libraries a musllinux wheel needs into the wheel. `.github/scripts/build-linux-wheel.sh` keeps rustup at the version it installs or the image carries.
+
 - Each wheel job uploads its wheels and their digests as soon as it records the digests. One audit job checks all six wheels against the stable ABI, and the publish job refuses any file other than six wheels and one source distribution.
+
+- The audit job lists the libraries each wheel bundles and the libraries each ELF file in a wheel needs, with `.github/scripts/wheel_libraries.py`. It fails a musllinux wheel that bundles no library, or that needs a library other than musl's `libc.so` that it does not carry.
 
 - The release workflow publishes to PyPI from a stable version tag. A dispatch run or a prerelease tag builds and checks every file and stops before the publish job. The `check-version` job and the GitHub Release job fail when `CHANGELOG.md` holds no section for the tag.
 

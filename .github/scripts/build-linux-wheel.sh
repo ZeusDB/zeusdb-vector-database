@@ -4,7 +4,10 @@
 # The linux and musllinux jobs run it through `docker run`, with the
 # repository at /io as the working directory and the maturin binary installed
 # from .github/requirements/maturin.txt mounted read only at
-# /usr/local/bin/maturin. That binary is static, so it runs in every image.
+# /usr/local/bin/maturin. The patchelf binary installed from
+# .github/requirements/patchelf.txt is mounted read only at
+# /opt/patchelf/bin/patchelf. Both binaries are static, so they run in every
+# image.
 #
 # The first argument is the Rust target triple. The second is the wheel's
 # compatibility, either a value for maturin's --compatibility or "auto", which
@@ -15,8 +18,8 @@ set -euo pipefail
 target="$1"
 compatibility="$2"
 
-# The pypa manylinux image carries no rustup, and the rust-cross images carry
-# their own. Where it is missing, this is the rustup the runner images carry,
+# The manylinux images carry no rustup, and the musl images carry their own.
+# Where it is missing, this is the rustup the runner images carry,
 # fetched by version and checked against the SHA-256 the Rust project
 # publishes beside it.
 rustup_version="1.29.1"
@@ -33,18 +36,29 @@ if ! command -v rustup >/dev/null 2>&1; then
 fi
 
 # The toolchain rust-toolchain.toml names, with the one target this wheel
-# needs. rustup checks every component against the release's manifest.
+# needs. rustup checks every component against the release's manifest, and
+# --no-self-update keeps rustup at the version above or the image's own.
 channel=$(sed -n 's/^channel *= *"\([^"]*\)".*$/\1/p' rust-toolchain.toml)
 if [ -z "$channel" ]; then
   echo "::error::rust-toolchain.toml names no channel"
   exit 1
 fi
-rustup toolchain install "$channel" --profile minimal --target "$target"
+rustup toolchain install "$channel" --profile minimal --target "$target" --no-self-update
 # Named for every later command, ahead of rust-toolchain.toml, so cargo runs
 # the toolchain just installed and rustup fetches nothing else that file lists.
 export RUSTUP_TOOLCHAIN="$channel"
 rustup --version
 rustc --version
+
+# maturin runs patchelf by name when it copies a library into the wheel, so
+# the mounted binary goes first on PATH, ahead of any patchelf the image
+# carries.
+export PATH="/opt/patchelf/bin:$PATH"
+if [ "$(command -v patchelf)" != /opt/patchelf/bin/patchelf ]; then
+  echo "::error::the patchelf on PATH is not the one mounted at /opt/patchelf/bin"
+  exit 1
+fi
+patchelf --version
 
 # By its full path, so the mounted binary builds the wheel whatever else the
 # image carries.
