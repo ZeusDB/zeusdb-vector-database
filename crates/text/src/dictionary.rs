@@ -39,6 +39,45 @@ use zeusdb_vector_core::{frame_begin, frame_finish, unframe, Error, FrameEncodin
 /// Bytes a term costs at least, being its length and one byte of text.
 const TERM_MIN_BYTES: usize = 5;
 
+/// The longest term a dictionary holds, in bytes, being what the length
+/// written before each term can name.
+pub const MAX_TERM_BYTES: usize = u32::MAX as usize;
+
+// The longest term this thread's dictionaries take, which a test lowers to
+// reach the refusal without a term of four gibibytes. Nothing outside the
+// tests sees it.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    pub static TERM_CEILING: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(MAX_TERM_BYTES) };
+}
+
+/// The longest term a dictionary takes.
+#[cfg(any(test, feature = "test-support"))]
+fn term_ceiling() -> usize {
+    TERM_CEILING.with(std::cell::Cell::get)
+}
+
+/// The longest term a dictionary takes.
+#[cfg(not(any(test, feature = "test-support")))]
+fn term_ceiling() -> usize {
+    MAX_TERM_BYTES
+}
+
+/// Refuse a term longer than a dictionary holds, which is what interning it
+/// would refuse. A caller that records an interning before it happens runs
+/// this first.
+pub fn refuse_term(term: &str) -> Result<(), Error> {
+    let ceiling = term_ceiling();
+    if term.len() > ceiling {
+        return Err(Error::TermTooLong {
+            bytes: term.len(),
+            ceiling,
+        });
+    }
+    Ok(())
+}
+
 /// Every distinct term a space has seen, by id.
 #[derive(Clone, Debug, Default)]
 pub struct TermDictionary {
@@ -50,11 +89,13 @@ impl TermDictionary {
         Self::default()
     }
 
-    /// The id of `term`, issued now if the term is new.
+    /// The id of `term`, issued now if the term is new, refused where a new
+    /// term is longer than the dictionary holds.
     pub fn intern(&mut self, term: &str) -> Result<u32, Error> {
         if let Some(&id) = self.ids.get(term) {
             return Ok(id);
         }
+        refuse_term(term)?;
         let id = self.next_id()?;
         self.ids.insert(Box::from(term), id);
         Ok(id)
@@ -111,7 +152,9 @@ impl TermDictionary {
         );
         payload.extend((terms.len() as u32).to_le_bytes());
         for term in &terms {
-            payload.extend((term.len() as u32).to_le_bytes());
+            let len = u32::try_from(term.len())
+                .expect("a term is interned within the dictionary's ceiling, which a u32 names");
+            payload.extend(len.to_le_bytes());
             payload.extend_from_slice(term.as_bytes());
         }
         frame_finish(payload, terms.len() as u64)
@@ -179,7 +222,7 @@ impl TermDictionary {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Ids are issued in arrival order, a repeat gets its id back, a lookup
@@ -272,6 +315,48 @@ mod tests {
             TermDictionary::decode(&TermDictionary::new().encode(), "terms")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// The term ceiling, lowered on this thread for the length of a test and
+    /// put back when dropped.
+    pub(crate) struct Lowered(usize);
+
+    impl Lowered {
+        pub(crate) fn to(ceiling: usize) -> Self {
+            Lowered(TERM_CEILING.with(|held| held.replace(ceiling)))
+        }
+    }
+
+    impl Drop for Lowered {
+        fn drop(&mut self) {
+            TERM_CEILING.with(|held| held.set(self.0));
+        }
+    }
+
+    /// A term as long as the ceiling is interned, and one byte longer is
+    /// refused, naming its length and the ceiling, with no id issued, and
+    /// the next term takes the id the refused one would have taken. A term
+    /// already held is found whatever the ceiling.
+    #[test]
+    fn a_term_past_the_ceiling_is_refused_and_takes_no_id() {
+        let mut d = TermDictionary::new();
+        d.intern("abcdefgh").unwrap();
+        let _lowered = Lowered::to(5);
+        assert_eq!(d.intern("fives").unwrap(), 1);
+        assert!(matches!(
+            d.intern("sixsix"),
+            Err(Error::TermTooLong {
+                bytes: 6,
+                ceiling: 5
+            })
+        ));
+        assert_eq!(d.id_of("sixsix"), None);
+        assert_eq!(d.next_id().unwrap(), 2);
+        assert_eq!(d.intern("abcdefgh").unwrap(), 0, "a held term is found");
+        assert_eq!(
+            refuse_term("sixsix").unwrap_err().to_string(),
+            "A term of 6 bytes is longer than the 5 bytes a text space stores for one term."
         );
     }
 

@@ -162,6 +162,7 @@ use crate::journal::{
 use crate::RerankCalibration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -171,10 +172,10 @@ use zeusdb_vector_core::{
     refuse_unnamable, refuses_writes, unframe, unknown_kind_at, validate_indexed_fields,
     ArtefactRecord, Bounds, Cut, Dir, DumpRows, Error, Expected, FrameEncoding, FrameKind,
     FsStorage, IdStore, Int8Codec, Inventory, JournalDamage, JournalRecord, JournalWriter,
-    LiveRecord, LockFailure, LockGuard, LockMode, Locked, Operation, Position, PositionWalk,
-    RecordFields, RecordState, Restore, RowValues, SegmentBase, SegmentBytes, SpaceName, Storage,
-    VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME, FRAME_OVERHEAD_BYTES, LEGACY_DUMP_FILENAMES,
-    MAX_INTERNAL_ID, PQ,
+    LiveRecord, LockFailure, LockGuard, LockMode, Locked, MetadataStore, Operation, Position,
+    PositionWalk, RecordFields, RecordState, Restore, RowValues, SegmentBase, SegmentBytes,
+    SpaceName, Storage, VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME, FRAME_OVERHEAD_BYTES,
+    LEGACY_DUMP_FILENAMES, MAX_INTERNAL_ID, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerConfig};
@@ -254,6 +255,12 @@ const SUPPORTED_FORMAT_LABEL: &str = "1.x, 2.x, 3.x, 4.x and 5.x";
 
 /// The first major whose manifest may name a journal.
 const JOURNAL_FORMAT_MAJOR: u32 = 3;
+
+/// The first major whose releases refuse an internal id before they issue
+/// it. Below it a release issued an id first, so one whose id store was full
+/// issued ids past the store's last slot, refused each at install, and moved
+/// its counter on with each.
+const ID_CEILING_FORMAT_MAJOR: u32 = 4;
 
 // ============================================================================
 // THE FOUR BINARY ARTEFACTS
@@ -1136,14 +1143,15 @@ impl TrainingState {
 // INDIVIDUAL COMPONENT LOADERS
 // ============================================================================
 
-/// Load index configuration from config.json
-fn load_config(dir: &dyn Dir, manifest: &IndexManifest) -> Result<IndexConfig, Error> {
+/// Load index configuration from config.json, written at the format whose
+/// major is `major`
+fn load_config(dir: &dyn Dir, manifest: &IndexManifest, major: u32) -> Result<IndexConfig, Error> {
     debug!(target: LOG_TARGET, "Loading config.json...");
 
     let config_path = dir.locate("config.json");
     let config_data = read_artefact_string(dir, "config.json", manifest)?;
 
-    let config: IndexConfig =
+    let mut config: IndexConfig =
         serde_json::from_str(&config_data).map_err(|e| Error::ArtefactParseFailed {
             name: "config.json",
             error: e.to_string(),
@@ -1178,11 +1186,23 @@ fn load_config(dir: &dyn Dir, manifest: &IndexManifest) -> Result<IndexConfig, E
     // is sized by it, since every per-record structure sits at the positions
     // the records hold.
     //
-    // The ceiling is `u32::MAX` because a node index is a `u32` and both graph
-    // constructors refuse a graph holding more points than that. Every id was
-    // issued to a record the graph then held a node for, so an index that
-    // issued more ids than a node index can name has a graph it could not have
-    // built. The check refuses nothing that can exist.
+    // A release before 0.12.0, which wrote a format below 4.0.0, issued an id
+    // before its id store refused it, so one whose store was full issued
+    // `u32::MAX` and larger ids, refused each at install and moved the counter
+    // on with each. Below that format a counter past the last id a collection
+    // issues is one such a release left, and it is held to that id. The ids
+    // the mappings name are refused past it as they are read, as every
+    // directory's are, and the collection refuses every add, as one at its
+    // last id does.
+    //
+    // From that format a release refuses an id before issuing it, so a
+    // counter past `u32::MAX` was written by no release, and it is refused.
+    if major < ID_CEILING_FORMAT_MAJOR && config.id_counter > MAX_INTERNAL_ID {
+        debug!(target: LOG_TARGET, "config.json records id_counter {}, past the last internal id a collection issues, which a release before 0.12.0 left; held to {}",
+            config.id_counter, MAX_INTERNAL_ID
+        );
+        config.id_counter = MAX_INTERNAL_ID;
+    }
     if config.id_counter > u32::MAX as usize {
         return Err(Error::IdCounterTooLarge {
             file: config_path.clone(),
@@ -1239,15 +1259,10 @@ fn restore_spaces(
     };
     // The space files each record at the position the mappings give its
     // internal id, and refuses one they do not hold once its payload has
-    // been read whole, which is named here with the space.
+    // been read whole, or one its forward arena cannot take, each named here
+    // with the space.
     let restored = PostingsIndex::restore(space.config(), &prefix, dir, manifest, &bounds)
-        .map_err(|error| match error {
-            Error::SparseRecordUnmapped { id, .. } => Error::SparseRecordUnmapped {
-                space: name.as_str().to_string(),
-                id,
-            },
-            other => other,
-        })?;
+        .map_err(|error| index.sparse_refusal_named(error))?;
     if space.text.is_some() {
         let dictionary_name = Collection::dictionary_name(&prefix);
         let bytes = zeusdb_vector_core::read_artefact(
@@ -1441,8 +1456,7 @@ fn framed_ids(bytes: &[u8], config: &IndexConfig) -> Result<MappedIds, Error> {
 
 /// Refuse an internal id past the last one a collection issues, which no
 /// save writes, in the words the id store refused it in while an entry was
-/// an internal id. The rebuild fallback holds the ids it hands to records
-/// the mappings lack to the same ceiling.
+/// an internal id.
 pub(crate) fn refuse_past_last_id(internal_id: usize) -> Result<(), Error> {
     if internal_id > MAX_INTERNAL_ID {
         return Err(Error::Engine(format!(
@@ -1531,92 +1545,240 @@ fn bincode_ids(bytes: &[u8], config: &IndexConfig) -> Result<MappedIds, Error> {
     Ok(mapped)
 }
 
-/// Load vector metadata from metadata.json, keyed by external id
+/// Load vector metadata from metadata.json straight into the store the
+/// collection takes, each record's fields at the position the mappings give
+/// its id
 ///
 /// At 5.x the file names only the records that hold a field, and each
 /// record it names must be one the mappings hold, named once. A record it
 /// leaves out takes an empty entry, as a record with no field holds in
 /// memory, since a filter judges an empty entry and never an absent one.
-/// Below 5.x the file is read as it was, an entry for an id the mappings do
-/// not hold dropped when the entries are placed.
+/// Below 5.x the file names every record, an entry for an id the mappings do
+/// not hold is dropped and counted, and a record named twice keeps its last
+/// entry.
+///
+/// The file is read once, with nothing between its text and the store. Each
+/// id is resolved through the mappings as its key is read, borrowed from the
+/// text, each field name is interned with no copy where the store holds it
+/// already, and each record's fields take one block. The entry vector is
+/// sized once, to the records the mappings hold or the reservation for
+/// `expected_size`, whichever is more, whatever order the file names them
+/// in. Text that is not the shape a metadata file takes is refused before
+/// any record the file names.
 fn load_metadata(
     dir: &dyn Dir,
     manifest: &IndexManifest,
     major: u32,
     ids: Mapped<'_>,
-) -> Result<HashMap<String, HashMap<String, Value>>, Error> {
+    expected_size: usize,
+) -> Result<MetadataStore, Error> {
     debug!(target: LOG_TARGET, "Loading metadata.json...");
 
     let metadata_data = read_artefact_string(dir, "metadata.json", manifest)?;
-    let parse_failed = |e: serde_json::Error| Error::ArtefactParseFailed {
-        name: "metadata.json",
-        error: e.to_string(),
+    let compact = major >= DUMP_V2_FORMAT_MAJOR;
+    let extent = ids.store.extent();
+    let mut reader = MetadataReader {
+        store: MetadataStore::with_records(extent, expected_size),
+        ids,
+        compact,
+        named: if compact {
+            vec![false; extent]
+        } else {
+            Vec::new()
+        },
+        refused: None,
+        unmapped: 0,
     };
-
-    if major < DUMP_V2_FORMAT_MAJOR {
-        let metadata: HashMap<String, HashMap<String, Value>> =
-            serde_json::from_str(&metadata_data).map_err(parse_failed)?;
+    let mut deserializer = serde_json::Deserializer::from_str(&metadata_data);
+    serde::de::DeserializeSeed::deserialize(&mut reader, &mut deserializer)
+        .and_then(|()| deserializer.end())
+        .map_err(|e| Error::ArtefactParseFailed {
+            name: "metadata.json",
+            error: e.to_string(),
+        })?;
+    let MetadataReader {
+        mut store,
+        refused,
+        unmapped,
+        ..
+    } = reader;
+    if let Some(refused) = refused {
+        return Err(Error::DecodeFailed {
+            file: "metadata.json".to_string(),
+            error: match refused {
+                MetadataRefused::Unmapped(id) => {
+                    format!("names record '{}', which mappings.bin does not hold", id)
+                }
+                MetadataRefused::Twice(id) => format!("names record '{}' twice", id),
+            },
+        });
+    }
+    if compact {
+        store.fill_empty(ids.store.slots());
+        debug!(target: LOG_TARGET, "metadata.json loaded (compact)");
+    } else {
+        if unmapped > 0 {
+            debug!(target: LOG_TARGET, operation = "restore_metadata",
+                unmapped = unmapped,
+                "metadata.json names records the mappings do not hold, and their entries were dropped"
+            );
+        }
         debug!(target: LOG_TARGET, "metadata.json loaded");
-        return Ok(metadata);
     }
-
-    let CompactMetadata(entries) = serde_json::from_str(&metadata_data).map_err(parse_failed)?;
-    let corrupt = |error: String| Error::DecodeFailed {
-        file: "metadata.json".to_string(),
-        error,
-    };
-    let mut named = vec![false; ids.len()];
-    let mut metadata: HashMap<String, HashMap<String, Value>> = HashMap::with_capacity(ids.len());
-    for (id, fields) in entries {
-        let Some(at) = ids.store.slot_of(&id) else {
-            return Err(corrupt(format!(
-                "names record '{}', which mappings.bin does not hold",
-                id
-            )));
-        };
-        if std::mem::replace(&mut named[at], true) {
-            return Err(corrupt(format!("names record '{}' twice", id)));
-        }
-        metadata.insert(id, fields);
-    }
-    for (_, id) in ids.iter() {
-        if !metadata.contains_key(id) {
-            metadata.insert(id.to_string(), HashMap::new());
-        }
-    }
-    debug!(target: LOG_TARGET, "metadata.json loaded (compact)");
-    Ok(metadata)
+    Ok(store)
 }
 
-/// The records a compact `metadata.json` names, each with its fields, in the
-/// order the file holds them, a record named twice kept twice so the load
-/// can refuse it.
-struct CompactMetadata(Vec<(String, HashMap<String, Value>)>);
+/// Why a metadata.json whose text parses is refused: the first record it
+/// names that the load cannot place, in the order the file names them.
+enum MetadataRefused {
+    /// A record the mappings do not hold.
+    Unmapped(String),
+    /// A record the file names a second time.
+    Twice(String),
+}
 
-impl<'de> Deserialize<'de> for CompactMetadata {
+/// The reader [`load_metadata`] runs over the file's text, filling `store`.
+///
+/// A record the load refuses is noted rather than raised, and the rest of
+/// the file is still read, keeping nothing, so that text which does not
+/// parse is refused before any record the file names.
+struct MetadataReader<'m> {
+    store: MetadataStore,
+    ids: Mapped<'m>,
+    /// Whether the file is the compact one of 5.x.
+    compact: bool,
+    /// At 5.x, which positions the file has named.
+    named: Vec<bool>,
+    /// The first record the load refuses.
+    refused: Option<MetadataRefused>,
+    /// Below 5.x, the entries naming an id the mappings do not hold.
+    unmapped: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for &mut MetadataReader<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for &mut MetadataReader<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The words the parse each layout was read with gave.
+        f.write_str(if self.compact {
+            "an object of records"
+        } else {
+            "a map"
+        })
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        // One record's fields as they are read, kept from one record to the
+        // next, so the record's block is the only thing allocated for it.
+        let mut pairs: Vec<(Cow<'de, str>, Value)> = Vec::new();
+        while let Some(JsonKey(id)) = map.next_key::<JsonKey<'de>>()? {
+            let at = self.ids.store.slot_of(&id);
+            let placed = match at {
+                None if self.compact => {
+                    self.refused
+                        .get_or_insert(MetadataRefused::Unmapped(id.into_owned()));
+                    false
+                }
+                None => {
+                    self.unmapped += 1;
+                    false
+                }
+                Some(at) if self.compact && std::mem::replace(&mut self.named[at], true) => {
+                    self.refused
+                        .get_or_insert(MetadataRefused::Twice(id.into_owned()));
+                    false
+                }
+                Some(_) => true,
+            };
+            let keep = placed && self.refused.is_none();
+            map.next_value_seed(RecordFieldsSeed {
+                pairs: &mut pairs,
+                keep,
+            })?;
+            if let (true, Some(at)) = (keep, at) {
+                self.store.insert_pairs(at, pairs.drain(..));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One record's fields, read into `pairs` where `keep` is set and read and
+/// let go otherwise.
+struct RecordFieldsSeed<'p, 'de> {
+    pairs: &'p mut Vec<(Cow<'de, str>, Value)>,
+    keep: bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for RecordFieldsSeed<'_, 'de> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for RecordFieldsSeed<'_, 'de> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The words the parse of a record's fields as a map gave.
+        f.write_str("a map")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(JsonKey(name)) = map.next_key::<JsonKey<'de>>()? {
+            if self.keep {
+                let value: Value = map.next_value()?;
+                self.pairs.push((name, value));
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A key of a JSON object, borrowed from the text wherever it holds no
+/// escape, which is every id and field name a save writes.
+struct JsonKey<'de>(Cow<'de, str>);
+
+impl<'de> Deserialize<'de> for JsonKey<'de> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Entries;
+        struct Key;
 
-        impl<'de> serde::de::Visitor<'de> for Entries {
-            type Value = CompactMetadata;
+        impl<'de> serde::de::Visitor<'de> for Key {
+            type Value = JsonKey<'de>;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("an object of records")
+                f.write_str("a string")
             }
 
-            fn visit_map<A: serde::de::MapAccess<'de>>(
+            fn visit_borrowed_str<E: serde::de::Error>(
                 self,
-                mut map: A,
-            ) -> Result<CompactMetadata, A::Error> {
-                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
-                while let Some(entry) = map.next_entry::<String, HashMap<String, Value>>()? {
-                    entries.push(entry);
-                }
-                Ok(CompactMetadata(entries))
+                key: &'de str,
+            ) -> Result<JsonKey<'de>, E> {
+                Ok(JsonKey(Cow::Borrowed(key)))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, key: &str) -> Result<JsonKey<'de>, E> {
+                Ok(JsonKey(Cow::Owned(key.to_string())))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, key: String) -> Result<JsonKey<'de>, E> {
+                Ok(JsonKey(Cow::Owned(key)))
             }
         }
 
-        deserializer.deserialize_map(Entries)
+        deserializer.deserialize_str(Key)
     }
 }
 
@@ -1662,6 +1824,11 @@ fn load_vectors(
         }
         Layout::Bincode => {
             let vectors = legacy::read_vectors(&vectors_data, "vectors.bin", ids.len())?;
+            let mut hold = LegacyHold::new(dim);
+            for (id, vector) in &vectors {
+                hold.see(id, vector.len(), ids);
+            }
+            hold.refusal("vectors.bin", |width| vectors_mismatch(width, dim))?;
             check_vectors_are_finite(&vectors)?;
             vectors
         }
@@ -1782,7 +1949,12 @@ fn count_vectors(
     let count = match layout {
         Layout::Framed => framed_vectors(&vectors_data, ids, dim)?.len(),
         Layout::Bincode => {
-            let (count, offenders) = legacy::walk_vectors(&vectors_data, "vectors.bin", ids.len())?;
+            let mut hold = LegacyHold::new(dim);
+            let (count, offenders) =
+                legacy::walk_vectors(&vectors_data, "vectors.bin", ids.len(), &mut |id, width| {
+                    hold.see(id, width, ids)
+                })?;
+            hold.refusal("vectors.bin", |width| vectors_mismatch(width, dim))?;
             if !offenders.is_empty() {
                 return Err(Error::VectorsNotFinite {
                     offenders,
@@ -1795,6 +1967,145 @@ fn count_vectors(
 
     debug!(target: LOG_TARGET, "vectors.bin walked ({} vectors, none kept)", count);
     Ok(count)
+}
+
+/// The refusal of a record a store names by its id and mappings.bin does not
+/// hold, in the words a framed store's reader refuses one it names by
+/// internal id in.
+pub(crate) fn unmapped_record(file: &str, id: &str) -> Error {
+    Error::DecodeFailed {
+        file: file.to_string(),
+        error: format!("names record '{}', which mappings.bin does not hold", id),
+    }
+}
+
+/// What vectors.bin holds where its vectors are `width` values wide and
+/// config.json declares `dim`.
+fn vectors_mismatch(width: usize, dim: usize) -> String {
+    format!(
+        "holds vectors of {} values and config.json declares dim {}",
+        width, dim
+    )
+}
+
+/// What pq_codes.bin holds where its codes are `width` bytes wide and
+/// quantization.json declares `subvectors`.
+fn codes_mismatch(width: usize, subvectors: usize) -> String {
+    format!(
+        "holds codes of {} bytes and quantization.json declares {} subvectors",
+        width, subvectors
+    )
+}
+
+/// A store of bincode's wire, which names each record by its id, held to the
+/// mappings and to its width entry by entry, with the rules a framed store's
+/// reader holds a framed one to: every entry is `width` wide and names a
+/// record the mappings hold. An id the store holds twice is judged by its
+/// last copy, which is the copy its map keeps.
+struct LegacyHold<'s> {
+    width: usize,
+    /// The ids whose last copy is not `width` wide, with that copy's width.
+    wrong: BTreeMap<&'s str, usize>,
+    /// The least id the mappings do not hold.
+    foreign: Option<&'s str>,
+}
+
+impl<'s> LegacyHold<'s> {
+    fn new(width: usize) -> Self {
+        LegacyHold {
+            width,
+            wrong: BTreeMap::new(),
+            foreign: None,
+        }
+    }
+
+    /// One entry of the store, holding `held` values.
+    fn see(&mut self, id: &'s str, held: usize, ids: Mapped<'_>) {
+        if held == self.width {
+            self.wrong.remove(id);
+        } else {
+            self.wrong.insert(id, held);
+        }
+        if ids.store.slot_of(id).is_none() && self.foreign.is_none_or(|least| id < least) {
+            self.foreign = Some(id);
+        }
+    }
+
+    /// The refusal a framed reader gives the store, in its order: a width
+    /// that is not the declared one, in `mismatch`'s words for the least id
+    /// holding one, and then the least id the mappings do not hold.
+    fn refusal(self, file: &str, mismatch: impl FnOnce(usize) -> String) -> Result<(), Error> {
+        if let Some(&held) = self.wrong.values().next() {
+            return Err(Error::DecodeFailed {
+                file: file.to_string(),
+                error: mismatch(held),
+            });
+        }
+        if let Some(id) = self.foreign {
+            return Err(unmapped_record(file, id));
+        }
+        Ok(())
+    }
+}
+
+/// Whether a directory keeps every record's raw vector in vectors.bin, being
+/// one with no quantization, one not yet trained, or a trained one under
+/// `quantized_with_raw`.
+fn keeps_every_raw(quantization: Option<&QuantizationArtefacts>) -> bool {
+    match quantization.map(|quant| &quant.config) {
+        None => true,
+        Some(QuantizationFile::Pq(config)) => {
+            !config.is_trained || config.storage_mode == StorageMode::QuantizedWithRaw.to_string()
+        }
+        Some(QuantizationFile::Int8(config)) => !config.is_trained,
+    }
+}
+
+/// Refuse a vectors.bin of bincode's wire that holds no vector for a record
+/// the mappings hold, in the words a framed one is refused in, naming the
+/// least such id.
+///
+/// `vectors` is what the load kept of the file, which was held to the
+/// mappings as it was read, so it holds every record where it holds as many
+/// as the mappings do. Where the load kept the count alone, the file is read
+/// again for its ids, which only a directory short of a vector reaches.
+fn refuse_missing_vectors(
+    dir: &dyn Dir,
+    manifest: &IndexManifest,
+    ids: Mapped<'_>,
+    vectors: &RawVectors,
+) -> Result<(), Error> {
+    if vectors.len() == ids.len() {
+        return Ok(());
+    }
+    let least_without = |held: &dyn Fn(&str) -> bool| {
+        ids.iter()
+            .map(|(_, id)| id)
+            .filter(|id| !held(id))
+            .min()
+            .unwrap_or("")
+            .to_string()
+    };
+    let without = match vectors {
+        RawVectors::Held(map) => least_without(&|id| map.contains_key(id)),
+        RawVectors::Counted(_) => {
+            let bytes = read_artefact(dir, "vectors.bin", manifest)?;
+            let mut held: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            legacy::walk_vectors(&bytes, "vectors.bin", ids.len(), &mut |id, _| {
+                held.insert(id);
+            })?;
+            least_without(&|id| held.contains(id))
+        }
+    };
+    Err(Error::DecodeFailed {
+        file: "vectors.bin".to_string(),
+        error: format!(
+            "holds {} vectors and mappings.bin holds {} records; record '{}' has no vector",
+            vectors.len(),
+            ids.len(),
+            without
+        ),
+    })
 }
 
 /// A framed vectors.bin, held to the mappings
@@ -1815,12 +2126,7 @@ fn framed_vectors<'a>(
         "vectors.bin",
         4,
         dim,
-        |width| {
-            format!(
-                "holds vectors of {} values and config.json declares dim {}",
-                width, dim
-            )
-        },
+        |width| vectors_mismatch(width, dim),
     )?;
     let corrupt = |error: String| Error::DecodeFailed {
         file: "vectors.bin".to_string(),
@@ -1957,12 +2263,7 @@ fn load_pq_codes(
                 "pq_codes.bin",
                 1,
                 subvectors,
-                |width| {
-                    format!(
-                        "holds codes of {} bytes and quantization.json declares {} subvectors",
-                        width, subvectors
-                    )
-                },
+                |width| codes_mismatch(width, subvectors),
             )?;
             let mut codes = HashMap::with_capacity(rows.len());
             let mut walk = ids.walk();
@@ -1983,7 +2284,15 @@ fn load_pq_codes(
             }
             codes
         }
-        Layout::Bincode => legacy::read_codes(&codes_data, "pq_codes.bin", ids.len())?,
+        Layout::Bincode => {
+            let codes = legacy::read_codes(&codes_data, "pq_codes.bin", ids.len())?;
+            let mut hold = LegacyHold::new(subvectors);
+            for (id, code) in &codes {
+                hold.see(id, code.len(), ids);
+            }
+            hold.refusal("pq_codes.bin", |width| codes_mismatch(width, subvectors))?;
+            codes
+        }
     };
 
     debug!(target: LOG_TARGET, "pq_codes.bin loaded ({} records)", codes.len());
@@ -2124,6 +2433,13 @@ fn load_quantization(
     };
     let centroids = load_pq_centroids(dir, manifest, layout, shape)?;
     let codes = load_pq_codes(dir, manifest, ids, layout, quant_config.subvectors)?;
+
+    // A code is what a trained codebook encodes a record as, so a directory
+    // whose quantization.json records no training holds no code, and one
+    // that does holds codes nothing it carries can decode.
+    if !quant_config.is_trained && !codes.is_empty() {
+        return Err(Error::CodesWithoutCodebook { count: codes.len() });
+    }
 
     Ok(Some(QuantizationArtefacts {
         config: QuantizationFile::Pq(quant_config),
@@ -2436,7 +2752,7 @@ fn reconstruct_index_simple(
     config: IndexConfig,
     ids: MappedIds,
     layout: Layout,
-    metadata: HashMap<String, HashMap<String, Value>>,
+    metadata: MetadataStore,
     mut vectors: RawVectors,
     quantization: Option<QuantizationArtefacts>,
     sparse: Option<SparseDeclaration>,
@@ -2482,7 +2798,7 @@ fn reconstruct_index_simple(
     // still to be read name records by it.
     let MappedIds {
         store,
-        internal: mut positions,
+        internal: positions,
     } = ids;
     restore_data_fields(&mut index, store, &config, quantization)?;
 
@@ -2509,8 +2825,11 @@ fn reconstruct_index_simple(
     // separate stores, which is the path that also upgrades a graph carrying
     // a defect the vendored patches have since fixed. See
     // `restore_graph_from_dump`.
+    //
+    // Each arm also says where the records came from, which the count check
+    // of step 6 names if the count is not the one config.json records.
     let version = if major >= DUMP_V2_FORMAT_MAJOR { 2 } else { 1 };
-    let graph_rebuilt = match index.restore_graph_from_dump(
+    let (graph_rebuilt, source) = match index.restore_graph_from_dump(
         dir,
         config.id_counter,
         dump_bytes,
@@ -2519,7 +2838,7 @@ fn reconstruct_index_simple(
     )? {
         DumpOutcome::Read(nodes) => {
             debug!(target: LOG_TARGET, "HNSW graph restored from the saved dump ({} nodes)", nodes);
-            false
+            (false, "Every record came from the graph dump.".to_string())
         }
         DumpOutcome::Rows {
             rows,
@@ -2538,9 +2857,13 @@ fn reconstruct_index_simple(
                      and every internal id is the saved one, and the graph's topology is not"
                 );
             }
-            let inserted = rebuild_graph_from_rows(&mut index, rows, &mut positions)?;
+            let inserted = rebuild_graph_from_rows(&mut index, rows, &positions)?;
             debug!(target: LOG_TARGET, "Graph rebuilt from the dump's rows ({} records inserted)", inserted);
-            true
+            let source = format!(
+                "The graph was rebuilt from the {} rows the graph dump holds, because {}.",
+                inserted, reason
+            );
+            (true, source)
         }
         DumpOutcome::Rebuild(reason) => {
             debug!(target: LOG_TARGET, "Rebuilding the HNSW graph, because {}", reason);
@@ -2556,20 +2879,48 @@ fn reconstruct_index_simple(
             }
             let empty = HashMap::new();
             let held = vectors.held().unwrap_or(&empty);
+            // The stores the rebuild below reads, each with what it holds.
+            let mut stores: Vec<String> = Vec::new();
             if int8_trained {
                 debug!(target: LOG_TARGET, "Rebuilding scalar quantized HNSW graph from the stored rows...");
-                let inserted = index
-                    .rebuild_graph_from_int8_rows(&int8_rows, &positions)
-                    .map_err(Error::Engine)?;
+                let inserted = index.rebuild_graph_from_int8_rows(&int8_rows, &positions)?;
                 debug!(target: LOG_TARGET, "Scalar quantized graph rebuilt ({} rows inserted)", inserted);
-            } else if index.can_use_quantization() {
-                debug!(target: LOG_TARGET, "Rebuilding quantized HNSW graph from stored PQ codes...");
-                rebuild_graph_from_codes(&mut index, &pq_codes, held, &mut positions)?;
+                if int8_rows.len() > 0 {
+                    stores.push(format!(
+                        "the {} rows {} holds",
+                        int8_rows.len(),
+                        INT8_ROWS_FILENAME
+                    ));
+                }
             } else {
-                debug!(target: LOG_TARGET, "Rebuilding HNSW graph from vectors...");
-                rebuild_graph_from_data(&mut index, held, &pq_codes, &mut positions)?;
+                if index.can_use_quantization() {
+                    debug!(target: LOG_TARGET, "Rebuilding quantized HNSW graph from stored PQ codes...");
+                    rebuild_graph_from_codes(&mut index, &pq_codes, held, &positions)?;
+                } else {
+                    debug!(target: LOG_TARGET, "Rebuilding HNSW graph from vectors...");
+                    rebuild_graph_from_data(&mut index, held, &pq_codes, &positions)?;
+                }
+                if !pq_codes.is_empty() {
+                    stores.push(format!("the {} codes pq_codes.bin holds", pq_codes.len()));
+                }
+                if !held.is_empty() {
+                    stores.push(format!("the {} vectors vectors.bin holds", held.len()));
+                }
             }
-            true
+            let source = if stores.is_empty() {
+                format!(
+                    "The graph dump was not read, because {}, and the directory holds no vector, \
+                     code or row to rebuild the graph from.",
+                    reason
+                )
+            } else {
+                format!(
+                    "The graph dump was not read, because {}, and the graph was rebuilt from {}.",
+                    reason,
+                    stores.join(" and ")
+                )
+            };
+            (true, source)
         }
     };
     // An empty directory holds no dump to read, since a save of an empty
@@ -2586,10 +2937,8 @@ fn reconstruct_index_simple(
 
     // Step 4: The stored record data, exactly as it was written, once the
     // graph is back. Neither rebuild touches the storage maps, and the
-    // columns are built over the id store, which either rebuild may have added
-    // an id to for a record the mappings did not name.
-    let raw_count = vectors.len();
-    let code_count = pq_codes.len();
+    // columns are built over the id store, which holds the records the
+    // mappings name and no other.
 
     // A trained quantized_only index holds no raw vectors, but a directory
     // written before that was true carries its training records in
@@ -2656,7 +3005,7 @@ fn reconstruct_index_simple(
     }
 
     // Step 6: Check the saved count against the index that was actually built
-    check_restored_count(&mut index, &config, raw_count, code_count)?;
+    check_restored_count(&mut index, &config, source)?;
 
     // Every structure is now at the positions the mappings gave, and the
     // internal ids by position are let go.
@@ -2670,14 +3019,6 @@ fn reconstruct_index_simple(
     Ok((index, graph_rebuilt))
 }
 
-/// Reconcile the stored vector count with the records that were restored
-///
-/// `vector_count` is written to config.json and was previously restored
-/// verbatim, so it could report records the directory no longer contains. The
-/// count is derived here from the restored data and asserted against the saved
-/// value. They agree for every directory whose files are intact, so a
-/// disagreement means a file is missing or truncated and the load fails rather
-/// than producing an index that misreports what it holds.
 /// Hold the rows artefact to the mappings in both directions.
 fn check_int8_rows_against_mappings(
     index: &Collection,
@@ -2719,11 +3060,19 @@ fn check_int8_rows_against_mappings(
     Ok(())
 }
 
+/// Reconcile the stored vector count with the records that were restored
+///
+/// `vector_count` is written to config.json, and a load holds it to the
+/// records it restored, so the index never reports a record the directory
+/// does not hold. The count is derived here from the restored data and
+/// asserted against the saved value. They agree for every directory whose
+/// files are intact, so where they disagree the load fails, naming in
+/// `source` where the records it counted came from, rather than producing
+/// an index that misreports what it holds.
 fn check_restored_count(
     index: &mut Collection,
     config: &IndexConfig,
-    raw_count: usize,
-    code_count: usize,
+    source: String,
 ) -> Result<(), Error> {
     let restored = index.count_stored_records();
 
@@ -2731,8 +3080,7 @@ fn check_restored_count(
         return Err(Error::RestoredCountMismatch {
             restored,
             expected: config.vector_count,
-            raw_count,
-            code_count,
+            source,
         });
     }
 
@@ -2964,7 +3312,7 @@ fn restore_int8_state(
 fn rebuild_graph_from_rows(
     index: &mut Collection,
     rows: DumpRows,
-    positions: &mut Vec<u32>,
+    positions: &[u32],
 ) -> Result<usize, Error> {
     let DumpRows {
         positions: record_of,
@@ -3009,9 +3357,8 @@ fn rebuild_graph_from_rows(
                 }
                 codes
             };
-            let (inserted, _, _) = index
-                .rebuild_graph_from_codes(&codes, &HashMap::new(), positions)
-                .map_err(Error::Engine)?;
+            let (inserted, _) =
+                index.rebuild_graph_from_codes(&codes, &HashMap::new(), positions)?;
             Ok(inserted)
         }
         RowValues::Int8(values) => {
@@ -3019,9 +3366,7 @@ fn rebuild_graph_from_rows(
             for &(at, node) in &live {
                 held.push_row(positions[at], &values[row(node)]);
             }
-            index
-                .rebuild_graph_from_int8_rows(&held, positions)
-                .map_err(Error::Engine)
+            index.rebuild_graph_from_int8_rows(&held, positions)
         }
     }
 }
@@ -3039,22 +3384,15 @@ fn rebuild_graph_from_codes(
     index: &mut Collection,
     pq_codes: &HashMap<String, Vec<u8>>,
     vectors: &HashMap<String, Vec<f32>>,
-    positions: &mut Vec<u32>,
+    positions: &[u32],
 ) -> Result<(), Error> {
-    let (inserted, quantized_from_raw, remapped) = index
-        .rebuild_graph_from_codes(pq_codes, vectors, positions)
-        .map_err(Error::Engine)?;
+    let (inserted, quantized_from_raw) =
+        index.rebuild_graph_from_codes(pq_codes, vectors, positions)?;
 
     if quantized_from_raw > 0 {
         debug!(target: LOG_TARGET, "{} records had a raw vector and no stored PQ codes and were quantized \
              through the loaded codebook",
             quantized_from_raw
-        );
-    }
-    if remapped > 0 {
-        debug!(target: LOG_TARGET, "{} records were missing from mappings.bin and were assigned fresh \
-             internal ids",
-            remapped
         );
     }
     debug!(target: LOG_TARGET, "Quantized graph rebuilt ({} records inserted from stored PQ codes)",
@@ -3069,19 +3407,25 @@ fn rebuild_graph_from_codes(
 /// This is the path for an index that is not trained, meaning one saved with no
 /// quantization at all or one saved while still collecting training vectors.
 /// A record that has a raw vector is replayed from it. A record that has only
-/// PQ codes is reconstructed through the codebook, which is what `get_records`
-/// already does for the same record while the index is live, so the graph is
-/// built at the fidelity the storage mode already delivers rather than losing
-/// the record. The codes themselves are restored as stored and are never
-/// recomputed from a reconstruction. The metadata is not carried here; step 4
-/// of the reconstruction writes it back from the file under the same ids.
+/// PQ codes is refused, since no trained codebook can decode them here, which
+/// the read of pq_codes.bin refuses first. The metadata is not carried here;
+/// step 4 of the reconstruction writes it back from the file under the same
+/// ids.
 fn rebuild_graph_from_data(
     index: &mut Collection,
     vectors: &HashMap<String, Vec<f32>>,
     pq_codes: &HashMap<String, Vec<u8>>,
-    positions: &mut Vec<u32>,
+    positions: &[u32],
 ) -> Result<(), Error> {
-    if vectors.is_empty() && pq_codes.is_empty() {
+    let code_only = pq_codes
+        .keys()
+        .filter(|id| !vectors.contains_key(*id))
+        .count();
+    if code_only > 0 {
+        return Err(Error::CodesWithoutCodebook { count: code_only });
+    }
+
+    if vectors.is_empty() {
         debug!(target: LOG_TARGET, "No records to rebuild (empty index)");
         // The collection keeps the graph it was built with, which reserves
         // nothing until it is given the declared reservation here.
@@ -3089,43 +3433,14 @@ fn rebuild_graph_from_data(
         return Ok(());
     }
 
-    let mut records: Vec<(String, Vec<f32>)> = Vec::with_capacity(vectors.len() + pq_codes.len());
-    let mut reconstructed = 0usize;
-
     // Every record with a raw vector, replayed from it
-    for (ext_id, vector) in vectors.iter() {
-        records.push((ext_id.clone(), vector.clone()));
-    }
-
-    // Every record that has codes and no raw vector, reconstructed
-    let code_only: Vec<&String> = pq_codes
-        .keys()
-        .filter(|id| !vectors.contains_key(*id))
+    let records: Vec<(String, Vec<f32>)> = vectors
+        .iter()
+        .map(|(ext_id, vector)| (ext_id.clone(), vector.clone()))
         .collect();
 
-    if !code_only.is_empty() {
-        let pq = index.pq().cloned().ok_or(Error::CodesWithoutCodebook {
-            count: code_only.len(),
-        })?;
-
-        for ext_id in code_only {
-            let codes = &pq_codes[ext_id];
-            let vector = pq
-                .reconstruct(codes)
-                .map_err(|e| Error::ReconstructFailed {
-                    id: ext_id.clone(),
-                    codes: codes.len(),
-                    error: e,
-                })?;
-            records.push((ext_id.clone(), vector));
-            reconstructed += 1;
-        }
-    }
-
-    debug!(target: LOG_TARGET, "Prepared {} records for the graph rebuild ({} replayed from raw vectors, {} reconstructed from PQ codes)",
-        records.len(),
-        records.len() - reconstructed,
-        reconstructed
+    debug!(target: LOG_TARGET, "Prepared {} records for the graph rebuild, each replayed from its raw vector",
+        records.len()
     );
     debug!(target: LOG_TARGET, "Rebuilding the graph from the restored records...");
 
@@ -3506,7 +3821,7 @@ fn read_checkpoint(
         manifest.total_vectors, manifest.format_version
     );
 
-    let config = load_config(dir, &manifest)?;
+    let config = load_config(dir, &manifest, major)?;
     debug!(target: LOG_TARGET, "Config loaded: dim={}, space={}", config.dim, config.space);
     if major >= DUMP_V2_FORMAT_MAJOR && manifest.total_vectors != config.vector_count {
         return Err(Error::ManifestFieldInvalid {
@@ -3540,7 +3855,7 @@ fn read_checkpoint(
     let (ids, layout) = load_ids(dir, &manifest, major, &config)?;
     debug!(target: LOG_TARGET, "Mappings loaded: {} ID mappings", ids.len());
 
-    let metadata = load_metadata(dir, &manifest, major, ids.view())?;
+    let metadata = load_metadata(dir, &manifest, major, ids.view(), config.expected_size)?;
     debug!(target: LOG_TARGET, "Metadata loaded: {} records", metadata.len());
 
     // A raw index takes its vectors back from the graph dump, so its
@@ -3599,6 +3914,19 @@ fn read_checkpoint(
                 );
             }
         }
+    }
+
+    // Below 4.0.0 vectors.bin was held to the mappings and to its width as it
+    // was read. Where the directory keeps every record's raw vector, it holds
+    // one for every record the mappings hold as well, as a framed vectors.bin
+    // is held to at 4.0.0. A trained `quantized_only` index keeps no raw
+    // vector but the training records' some releases left there, so its file
+    // is not held to the mappings that way.
+    if matches!(layout, Layout::Bincode)
+        && manifest_names(&manifest, "vectors.bin")
+        && keeps_every_raw(quantization.as_ref())
+    {
+        refuse_missing_vectors(dir, &manifest, ids.view(), &vectors)?;
     }
 
     if major >= DUMP_V2_FORMAT_MAJOR {

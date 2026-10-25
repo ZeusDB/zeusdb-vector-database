@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A directory holding a feature this release does not know, which its manifest marks `read_only`, opens read only.** `load()` reads every record, issues a `RuntimeWarning` naming the feature, and sets `recovery["read_only"]`, with a `read_only_reason` that names the feature. The index raises `RuntimeError` naming the feature on every mutation, on `save()` into any directory, and on `checkpoint()`, `journal_to()` and `backup()`. Where such a directory's journal holds a record of a kind this release does not know, `load()` raises `RuntimeError` naming the feature, the kind and the sequence, and `checkpoint_only=True` opens the directory as its last save left it.
 
+- **`add()` refuses a record the graph has no room for**, with `RuntimeError`, before the record takes an internal id or reaches the journal. The graph addresses 2,147,483,648 nodes and as many wide upper lists, and 4,294,967,295 upper list words and as many upper list slots. A record is admitted where the most its insertion can add to each, at the level drawn for it, fits beside what the records the call admitted before it can add. Where the record fits on its own, the message says that the call is too large to place at once and that the records go in across smaller calls. Where it does not, the message says that the graph is full and names `compact()`. A recovery holds each insert record to the same room.
+
+- **A sparse space holds at most 4,294,967,294 nonzeros in its forward store**, a removed record's among them until `compact()`. `add()` refuses a record that would take the store past them with `RuntimeError` naming the space, before the record takes an internal id, and `load()` refuses a sparse space whose records hold more.
+
+- **A text space stores a term of at most 4,294,967,295 bytes.** `add()` refuses a record that carries a longer term with `RuntimeError`, before the term takes an id.
+
 ### Changed
 
 - **The journal is a directory of segments.** `journal_to(path)` opens `<path>.zdbjournal`, and `journal_path` names it. Each segment is named for the first sequence it holds, and its header names the collection and the checkpoint it follows. The journal moves to a new segment at the first commit after the active one passes 64 MiB. A checkpoint starts a new segment and deletes the old ones once its save has committed. `journal_bytes` is the length of every segment together.
@@ -71,6 +77,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The docstrings of `load()` and `recovery`** describe the read-only load of a directory holding a feature marked `read_only`, and the docstring of `save()` names the writers a save runs.
 
+- **`compact()`, `rebuild()` and `rebuild_with_quantization()` raise `RuntimeError` where the replacement graph has no room for the records the index holds**, and keep the graph, the configuration it was built with and every record. The message says that the rebuilt graph is full. A recovery passes over the journal record of such a call. A training whose rebuild has no room fails with the graph's message after the words `Failed to rebuild with quantization:`.
+
+- **`load()` reads `metadata.json` straight into the index's per-record metadata**, one allocation for a record's fields and one for each string value, and sizes it once, to the larger of the records the directory holds and the reservation its declared size makes when an index is created.
+
+- **The refusal of a directory whose restored record count differs from `config.json` says where the load took the records from**, being the graph dump, the rows the graph dump holds, or the stores it rebuilt the graph from with the count each holds, or that the directory holds none to rebuild from.
+
+- **`load()` raises `RuntimeError` for a directory whose `quantization.json` records no trained codebook and whose `pq_codes.bin` holds codes**, naming how many records are coded.
+
+- **`load()` holds the `vectors.bin` and `pq_codes.bin` of a directory below format 4.0.0 to `mappings.bin`**, as it holds those of 4.0.0. It raises `RuntimeError` for an entry that names a record `mappings.bin` does not hold or has a width other than the declared one, and for a record with no vector where the directory keeps every record's raw vector.
+
+- **Where `load()` rebuilds the graph from a directory's stores, it raises `RuntimeError` for a record that `mappings.bin` does not hold.**
+
+- **`load()` opens a directory below format 4.0.0 whose `id_counter` passes 4,294,967,294 with the counter at 4,294,967,294**, and `add()` then refuses every record as it does on an index whose internal ids are exhausted. A recovery passes over a version 1 journal's insert record past that id. A directory at 4.0.0 or later whose `id_counter` passes it raises `ValueError`.
+
 ### Fixed
 
 - **`load()` refuses a journal whose segments follow another checkpoint of the same index**, with a `RuntimeError` naming both checkpoints, and replays none of it. A segment from another checkpoint that holds nothing past the directory's sequence is passed over, and deleted by a load that can write.
@@ -92,6 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A scalar quantizer fitted to a dimension whose largest magnitude divided by 127 rounds to zero gives that dimension a scale of 1.0**, so the directory that a save writes loads.
 
 - **A save into a folder of other files leaves the files where they are**, and so do `journal_to()` and `backup()`.
+
+- **`load()` raises `RuntimeError` naming the arena for a directory whose graph does not fit the graph's ceilings.**
+
+- **`compact()` rewrites every posting list of a sparse space**, whatever the number of distinct dimensions it holds.
 
 ### Internal
 
@@ -118,6 +142,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sparse-scale.yml` runs the sparse index's three checks against brute force at scale, on a pull request that touches the sparse or core crate, weekly and by hand.
 
 - `.gitattributes` holds every `*.sh` file to LF line endings.
+
+- Every offset into the graph's upper list arenas, a sparse space's forward store and a text space's dictionary is converted with `try_from`, and a value past its width stops the call.
 
 ### Format
 

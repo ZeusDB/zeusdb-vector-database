@@ -41,7 +41,9 @@ mod dictionary;
 mod tokenizer;
 mod vectorize;
 
-pub use dictionary::TermDictionary;
+#[cfg(any(test, feature = "test-support"))]
+pub use dictionary::TERM_CEILING;
+pub use dictionary::{refuse_term, TermDictionary, MAX_TERM_BYTES};
 pub use tokenizer::{SimpleTokenizer, Tokenizer, TokenizerConfig};
 pub use vectorize::{
     count_query, count_record, count_record_with, tokenize, vectorize_query, vectorize_record,

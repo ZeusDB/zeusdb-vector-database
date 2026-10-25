@@ -118,6 +118,17 @@ pub enum Planned {
     Descended(Insertion),
 }
 
+impl Planned {
+    /// The level the insertion was planned at, which the room it is held to
+    /// is reckoned from.
+    pub fn level(&self) -> usize {
+        match self {
+            Planned::First { level } => *level,
+            Planned::Descended(insertion) => insertion.level,
+        }
+    }
+}
+
 /// The graph as the vendored insert sees it partway through its own insertion.
 ///
 /// One difference from the graph itself and no more: the layer the new point

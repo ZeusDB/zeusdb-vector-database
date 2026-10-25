@@ -237,6 +237,53 @@ impl Slot {
     }
 }
 
+/// The most nonzeros the forward arena holds, removed records' included until
+/// a compaction. A span names its start and its length as `u32`s and a length
+/// of `u32::MAX` marks a slot never held, so a span that ends within this
+/// ceiling has a start, a length and an end a `u32` holds, and a length below
+/// the marker.
+pub const MAX_FORWARD: usize = u32::MAX as usize - 1;
+
+// The forward arena's ceiling this thread's indexes hold a record to, which a
+// test lowers to reach the refusal without gigabytes of postings. Nothing
+// outside the tests sees it.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    pub static FORWARD_CEILING: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(MAX_FORWARD) };
+}
+
+/// The forward arena's ceiling.
+#[cfg(any(test, feature = "test-support"))]
+fn forward_ceiling() -> usize {
+    FORWARD_CEILING.with(std::cell::Cell::get)
+}
+
+/// The forward arena's ceiling.
+#[cfg(not(any(test, feature = "test-support")))]
+fn forward_ceiling() -> usize {
+    MAX_FORWARD
+}
+
+/// Refuse a record of `nnz` nonzeros where a forward arena holding `held`,
+/// and `admitted` more for the records a caller has admitted and not yet
+/// inserted, cannot take it. A collection runs this where it admits a
+/// record, before anything is recorded for it, and an index runs it as it
+/// inserts one. The refusal leaves the space for the caller to name.
+pub fn refuse_forward(held: usize, admitted: usize, nnz: usize) -> Result<(), Error> {
+    let ceiling = forward_ceiling();
+    if held.saturating_add(admitted).saturating_add(nnz) > ceiling {
+        return Err(Error::SparseForwardFull {
+            space: String::new(),
+            held,
+            admitted,
+            nnz,
+            ceiling,
+        });
+    }
+    Ok(())
+}
+
 /// Heap bytes the structure holds, by capacity, split by part. The
 /// allocator's own overhead sits outside it.
 #[derive(Clone, Copy, Debug, Default)]
@@ -543,10 +590,16 @@ impl PostingsIndex {
         }
     }
 
+    /// Nonzeros the forward arena holds, removed records' spans included
+    /// until a compaction, which is what [`MAX_FORWARD`] bounds.
+    pub fn forward_len(&self) -> usize {
+        self.fwd_dims.len()
+    }
+
     /// Rewrite one list without its dead postings.
-    fn compact_list(&mut self, slot: u32) {
+    fn compact_list(&mut self, slot: usize) {
         let dead = &self.dead;
-        let list = &mut self.lists[slot as usize];
+        let list = &mut self.lists[slot];
         let before = list.postings.len();
         list.postings.retain(|p| !dead.contains(p.key as usize));
         let removed = before - list.postings.len();
@@ -574,11 +627,11 @@ impl PostingsIndex {
     pub fn compact(&mut self) {
         let postings_before = self.postings_total;
         let dead_before = self.dead_records;
-        for slot in 0..self.lists.len() as u32 {
-            if self.lists[slot as usize].dead > 0 {
+        for slot in 0..self.lists.len() {
+            if self.lists[slot].dead > 0 {
                 self.compact_list(slot);
             }
-            self.lists[slot as usize].postings.shrink_to_fit();
+            self.lists[slot].postings.shrink_to_fit();
         }
         // The forward arena, rebuilt in position order, and the length total
         // summed again from the records that survive.
@@ -595,7 +648,10 @@ impl PostingsIndex {
                 continue;
             }
             let (s, e) = (slot.start as usize, (slot.start + slot.len) as usize);
-            let start = dims.len() as u32;
+            let start = u32::try_from(dims.len()).expect(
+                "the rebuilt arena holds the live records' nonzeros, which the forward arena's \
+                 ceiling held within a u32",
+            );
             dims.extend_from_slice(&self.fwd_dims[s..e]);
             values.extend_from_slice(&self.fwd_values[s..e]);
             slot.start = start;
@@ -645,8 +701,8 @@ impl PostingsIndex {
     #[cfg(any(test, feature = "test-support"))]
     pub fn close_up(&mut self, old_of_new: &[u32], new_of_old: &[u32]) {
         if self.dead_records > 0 {
-            for slot in 0..self.lists.len() as u32 {
-                if self.lists[slot as usize].dead > 0 {
+            for slot in 0..self.lists.len() {
+                if self.lists[slot].dead > 0 {
                     self.compact_list(slot);
                 }
             }
@@ -845,7 +901,8 @@ impl PostingsIndex {
     }
 
     /// Insert one record at its position `at`, with the check every caller
-    /// wants. The caller raises the slot count by the record's internal id
+    /// wants and the forward arena's ceiling, both before anything is
+    /// written. The caller raises the slot count by the record's internal id
     /// once the record is in, through [`PostingsIndex::count_slot`].
     pub(crate) fn insert_record(
         &mut self,
@@ -853,6 +910,8 @@ impl PostingsIndex {
         vector: SparseRef<'_>,
     ) -> Result<(), Error> {
         self.config.weighting.validate_record(vector)?;
+        let nnz = vector.dims.len();
+        refuse_forward(self.fwd_dims.len(), 0, nnz)?;
         let slot_index = at.slot();
         if slot_index >= self.records.len() {
             self.records.resize(slot_index + 1, NEVER_HELD);
@@ -869,14 +928,13 @@ impl PostingsIndex {
             self.dead.remove(slot_index);
             self.dead_records -= 1;
         }
-        let nnz = vector.dims.len();
-        let start = self.fwd_dims.len() as u32;
+        let start = u32::try_from(self.fwd_dims.len())
+            .expect("the forward arena is held within its ceiling, which no u32 offset passes");
+        let len = u32::try_from(nnz)
+            .expect("a record's nonzeros are held within the forward arena's ceiling");
         self.fwd_dims.extend_from_slice(vector.dims);
         self.fwd_values.extend_from_slice(vector.values);
-        self.records[slot_index] = Slot {
-            start,
-            len: nnz as u32,
-        };
+        self.records[slot_index] = Slot { start, len };
         let length = vector.values.iter().map(|&v| v as f64).sum::<f64>() as f32;
         self.lengths[slot_index] = length;
         self.live_length += length as f64;
@@ -953,11 +1011,11 @@ impl PostingsIndex {
             Unlink::Lazy => {
                 self.dead_postings += slot.len as usize;
                 let threshold = self.config.lazy_threshold_percent as usize;
-                let mut to_compact: Vec<u32> = Vec::new();
+                let mut to_compact: Vec<usize> = Vec::new();
                 for i in s..e {
                     let d = self.fwd_dims[i];
-                    let list_slot = self.slots_by_dim[&d];
-                    let list = &mut self.lists[list_slot as usize];
+                    let list_slot = self.slots_by_dim[&d] as usize;
+                    let list = &mut self.lists[list_slot];
                     list.dead += 1;
                     if list.dead as usize * 100 > list.postings.len() * threshold {
                         to_compact.push(list_slot);
@@ -1144,7 +1202,7 @@ impl Restore for PostingsIndex {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use zeusdb_vector_core::Candidates;
 
@@ -1278,6 +1336,103 @@ mod tests {
         assert!(hits.exact);
         assert_eq!(hits.items[0].position, Position(3));
         assert_eq!(hits.items[0].score, 4.0);
+    }
+
+    /// The forward arena's ceiling, lowered on this thread for the length of
+    /// a test and put back when dropped.
+    pub(crate) struct Lowered(usize);
+
+    impl Lowered {
+        pub(crate) fn to(ceiling: usize) -> Self {
+            Lowered(FORWARD_CEILING.with(|held| held.replace(ceiling)))
+        }
+    }
+
+    impl Drop for Lowered {
+        fn drop(&mut self) {
+            FORWARD_CEILING.with(|held| held.set(self.0));
+        }
+    }
+
+    /// A record that takes the forward arena exactly to its ceiling goes in,
+    /// and one that would pass it by a nonzero is refused, naming what the
+    /// arena holds, what the record carries and the ceiling, with nothing
+    /// written. A removed record's span is counted until a compaction gives
+    /// it back, and then the record that was refused goes in. A caller's
+    /// admitted nonzeros count toward the ceiling as the arena's do.
+    #[test]
+    fn the_forward_arena_takes_a_record_to_its_ceiling_and_refuses_one_past_it() {
+        let _lowered = Lowered::to(12);
+        let mut index = PostingsIndex::new(SparseConfig::default());
+        let four = |base: u32| sparse(&[base, base + 1, base + 2, base + 3], &[1.0; 4]);
+        for id in 1..=3u32 {
+            index
+                .insert(
+                    Position(id),
+                    RecordId(id),
+                    four(id * 10).as_ref(),
+                    Prepared::none(),
+                )
+                .unwrap();
+        }
+        assert_eq!(index.forward_len(), 12, "the arena is at its ceiling");
+        let refused = index
+            .insert(
+                Position(4),
+                RecordId(4),
+                sparse(&[90], &[1.0]).as_ref(),
+                Prepared::none(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                Error::SparseForwardFull { ref space, held: 12, admitted: 0, nnz: 1, ceiling: 12 }
+                    if space.is_empty()
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(index.len(), 3);
+        assert_eq!(index.forward_len(), 12);
+        assert!(!index.holds(Position(4)));
+
+        index.remove(Position(2)).unwrap();
+        assert_eq!(
+            index.forward_len(),
+            12,
+            "a removed record's span stays until a compaction"
+        );
+        assert!(index
+            .insert(
+                Position(4),
+                RecordId(4),
+                sparse(&[90], &[1.0]).as_ref(),
+                Prepared::none()
+            )
+            .is_err());
+        index.compact();
+        assert_eq!(index.forward_len(), 8);
+        index
+            .insert(
+                Position(4),
+                RecordId(4),
+                four(90).as_ref(),
+                Prepared::none(),
+            )
+            .unwrap();
+        assert_eq!(index.forward_len(), 12);
+
+        assert!(refuse_forward(8, 4, 0).is_ok());
+        assert!(matches!(
+            refuse_forward(8, 3, 2),
+            Err(Error::SparseForwardFull {
+                held: 8,
+                admitted: 3,
+                nnz: 2,
+                ceiling: 12,
+                ..
+            })
+        ));
     }
 
     /// The list stays sorted when an id arrives out of order, which the

@@ -14,6 +14,7 @@ use super::{
 };
 use crate::journal::{Durability, JournalPolicy, Recovery};
 use crate::locks::ReadGuard;
+use crate::persistence::unmapped_record;
 use crate::RerankCalibration;
 use chrono::Utc;
 use serde_json::Value;
@@ -1048,25 +1049,28 @@ impl Collection {
     /// A record that has a raw vector but no stored codes is quantized through
     /// the loaded codebook rather than dropped. An intact directory saved by a
     /// trained index holds codes for every record, so that path only runs on a
-    /// directory that lost pq_codes.bin while keeping its raw vectors. A record
-    /// missing from mappings.bin is assigned a fresh internal id for the same
-    /// reason: every record must come back. It takes the next position, and
-    /// its id joins `positions`, the internal id of the record at each
-    /// position.
+    /// directory that lost pq_codes.bin while keeping its raw vectors. Every
+    /// record is filed at the position mappings.bin gives it, `positions`
+    /// being the internal id of the record at each position, and a record
+    /// mappings.bin does not hold is refused, in the words the readers of the
+    /// two files refuse one in, since its internal id is not known. The
+    /// readers refuse such a record first, so none reaches here from a load.
+    /// A replacement with no room for a record is refused with the graph's
+    /// own words. Either refusal installs nothing.
     ///
-    /// Returns (records inserted, quantized from raw, remapped).
+    /// Returns (records inserted, quantized from raw).
     pub(crate) fn rebuild_graph_from_codes(
         &mut self,
         pq_codes: &HashMap<String, Vec<u8>>,
         vectors: &HashMap<String, Vec<f32>>,
-        positions: &mut Vec<u32>,
-    ) -> Result<(usize, usize, usize), String> {
+        positions: &[u32],
+    ) -> Result<(usize, usize), Error> {
         let pq = match &self.dense().pq {
             Some(pq) if pq.is_trained() => pq.clone(),
             _ => {
-                return Err(
+                return Err(Error::Engine(
                     "the quantized graph rebuild requires a trained product quantizer".to_string(),
-                )
+                ))
             }
         };
 
@@ -1074,11 +1078,11 @@ impl Collection {
         for (id, vector) in vectors {
             if !pq_codes.contains_key(id) {
                 let codes = pq.quantize(vector).map_err(|e| {
-                    format!(
+                    Error::Engine(format!(
                         "record '{}' has a raw vector but no stored PQ codes, and quantizing \
                          it through the loaded codebook failed: {}",
                         id, e
-                    )
+                    ))
                 })?;
                 extra.push((id.clone(), codes));
             }
@@ -1098,36 +1102,31 @@ impl Collection {
 
         let mut batch: Vec<(&Vec<u8>, usize, Position)> =
             Vec::with_capacity(pq_codes.len() + extra.len());
-        let mut lost: Vec<(&String, &Vec<u8>)> = Vec::new();
+        // The least id of a record mappings.bin does not hold, with the file
+        // that named it, so the refusal names the same record in every
+        // process whatever order the maps hand their entries in.
+        let mut unmapped: Option<(&str, &str)> = None;
         {
             let ids = self.ids.read().unwrap();
-            for (id, codes) in pq_codes
+            let named = pq_codes
                 .iter()
-                .chain(extra.iter().map(|(id, codes)| (id, codes)))
-            {
+                .map(|(id, codes)| (id, codes, "pq_codes.bin"))
+                .chain(extra.iter().map(|(id, codes)| (id, codes, "vectors.bin")));
+            for (id, codes, file) in named {
                 match ids.slot_of(id) {
                     Some(at) => {
                         batch.push((codes, positions[at] as usize, Position::from_slot(at)))
                     }
-                    None => lost.push((id, codes)),
+                    None => {
+                        if unmapped.is_none_or(|(least, _)| id.as_str() < least) {
+                            unmapped = Some((id, file));
+                        }
+                    }
                 }
             }
         }
-        let remapped = lost.len();
-        lost.sort_by(|a, b| a.0.cmp(b.0));
-        for (id, codes) in lost {
-            let internal_id = self.get_next_id();
-            // Held to the ceiling before the id store is touched, as the
-            // mappings' own ids are, so no id past it is cut to 32 bits.
-            crate::persistence::refuse_past_last_id(internal_id).map_err(|e| e.to_string())?;
-            let at = {
-                let mut ids = self.ids.write().unwrap();
-                let at = ids.extent();
-                ids.insert(at, id).map_err(|e| e.to_string())?;
-                at
-            };
-            positions.push(internal_id as u32);
-            batch.push((codes, internal_id, Position::from_slot(at)));
+        if let Some((id, file)) = unmapped {
+            return Err(unmapped_record(file, id));
         }
 
         // Insert in internal id order, which is arrival order, rather than in
@@ -1138,23 +1137,25 @@ impl Collection {
         // Filled before it is installed, and installed under one write guard, so
         // the graph the index holds is never a partly rebuilt one.
         if !batch.is_empty() {
-            new_hnsw.insert_batch_pq(&batch)?;
+            new_hnsw
+                .insert_batch_pq(&batch)
+                .map_err(Error::in_rebuild)?;
         }
         // Every record the index holds takes a node, so a record the codes
         // did not reach refuses the rebuild before anything is swapped, rather
         // than leaving a held record outside the graph.
         let held = self.ids.read().unwrap().len();
         if new_hnsw.nb_points() != held {
-            return Err(format!(
+            return Err(Error::Engine(format!(
                 "the rebuild from codes built {} nodes for the {} records the index holds",
                 new_hnsw.nb_points(),
                 held
-            ));
+            )));
         }
         self.dense().replace_graph(new_hnsw);
         self.sync_dense_live();
 
-        Ok((batch.len(), extra.len(), remapped))
+        Ok((batch.len(), extra.len()))
     }
 
     /// Rebuild the graph of a trained scalar index from the rows artefact,
@@ -1170,12 +1171,10 @@ impl Collection {
         &mut self,
         rows: &crate::persistence::Int8Rows,
         positions: &[u32],
-    ) -> Result<usize, String> {
-        let codec = self
-            .dense()
-            .int8_codec()
-            .cloned()
-            .ok_or_else(|| "the scalar graph rebuild requires fitted scales".to_string())?;
+    ) -> Result<usize, Error> {
+        let codec = self.dense().int8_codec().cloned().ok_or_else(|| {
+            Error::Engine("the scalar graph rebuild requires fitted scales".to_string())
+        })?;
         let mut new_hnsw = VectorGraph::new_int8(
             &self.dense().metric,
             self.dense().m(),
@@ -1189,16 +1188,18 @@ impl Collection {
             .iter()
             .map(|(internal_id, row)| {
                 let at = walk.position_of(internal_id).ok_or_else(|| {
-                    format!(
+                    Error::Engine(format!(
                         "the row of internal id {} names a record mappings.bin does not hold",
                         internal_id
-                    )
+                    ))
                 })?;
                 Ok((row, internal_id, Position::from_slot(at)))
             })
-            .collect::<Result<_, String>>()?;
+            .collect::<Result<_, Error>>()?;
         if !batch.is_empty() {
-            new_hnsw.insert_batch_int8(&batch)?;
+            new_hnsw
+                .insert_batch_int8(&batch)
+                .map_err(Error::in_rebuild)?;
         }
         self.dense().replace_graph(new_hnsw);
         self.sync_dense_live();
@@ -1260,61 +1261,31 @@ impl Collection {
 
     /// Set the vector count alone (for persistence loading only)
     ///
-    /// Separate from `set_counters` because the id counter must keep whatever
-    /// a graph rebuild advanced it to for a record the mappings did not name.
-    /// Rewinding it would hand out an internal id such a record already holds.
+    /// Separate from `set_counters` because the count is set from the records
+    /// the load restored, once they are counted, and the id counter is the one
+    /// config.json records, which nothing after it moves.
     pub(crate) fn set_vector_count(&mut self, vector_count: usize) {
         *self.vector_count.lock().unwrap() = vector_count;
     }
 
     /// Replace the stored record data with what was read from disk
     ///
-    /// For persistence loading only, and only after the graph is back, because
-    /// the columns are built over the id store and either rebuild fallback may add
-    /// an id for a record the mappings did not name. Writing the two maps back
-    /// and building the columns from them leaves the loaded index holding
-    /// exactly what was saved.
+    /// For persistence loading only, once the graph is back. The metadata
+    /// store comes whole, read straight from `metadata.json` with every
+    /// record at the position the mappings give it, which no rebuild moves,
+    /// since a rebuild refuses a record the mappings do not name. An entry
+    /// naming an id the mappings do not hold had no position to go in and
+    /// was dropped by the read. Writing the codes back, taking the store and
+    /// building the columns from it leaves the loaded index holding exactly
+    /// what was saved.
     pub(crate) fn restore_storage_maps(
         &mut self,
         pq_codes: HashMap<String, Vec<u8>>,
-        vector_metadata: HashMap<String, HashMap<String, Value>>,
+        vector_metadata: MetadataStore,
     ) {
         *self.dense().pq_codes.write().unwrap() = pq_codes;
-        self.restore_metadata(vector_metadata);
+        *self.vector_metadata.write().unwrap() = vector_metadata;
         self.rebuild_columns();
-    }
-
-    /// Place every record's metadata at the position the id store holds for
-    /// it.
-    ///
-    /// `metadata.json` is keyed by external id and the store is indexed by
-    /// position, so each entry is resolved through the id store, which the
-    /// mappings and either graph rebuild have filled by now. An entry naming
-    /// an id the mappings do not hold has no slot to go in and is dropped,
-    /// counted in the log. No reader could reach such an entry by id, since
-    /// every one resolved a record through the id store first; a filtered
-    /// `count` on an undeclared field used to count it, and counts it no
-    /// longer.
-    ///
-    /// The guards are taken in the declared order, the id store then
-    /// `vector_metadata`.
-    fn restore_metadata(&mut self, metadata: HashMap<String, HashMap<String, Value>>) {
-        let ids = self.ids.read().unwrap();
-        let mut store = self.vector_metadata.write().unwrap();
-        store.clear(self.expected_size());
-        let mut unmapped = 0usize;
-        for (ext_id, fields) in metadata {
-            match ids.slot_of(&ext_id) {
-                Some(at) => store.insert(at, fields),
-                None => unmapped += 1,
-            }
-        }
-        if unmapped > 0 {
-            debug!(target: LOG_TARGET, operation = "restore_metadata",
-                unmapped = unmapped,
-                "metadata.json names records the mappings do not hold, and their entries were dropped"
-            );
-        }
     }
 
     /// Build every declared column from the restored metadata.
@@ -1421,12 +1392,13 @@ impl Collection {
     /// own mappings, with the quantized fallback, and with anything outside
     /// the directory keyed on internal ids.
     ///
-    /// A record the mappings do not name is given a fresh id, as the
-    /// quantized fallback gives one, taken in external id order so the ids
-    /// are handed out the same way in every process, and the next position,
-    /// its id joining `positions`. Ascending internal id is arrival order and
-    /// position order, so the rebuild is as close to the original build as a
-    /// rebuild can get, and two rebuilds of one directory are one graph.
+    /// A record the mappings do not name is refused, as the quantized
+    /// fallback refuses one, since its internal id is not known; the least
+    /// such id is named, so every process names the same one. The reader of
+    /// vectors.bin refuses such a record first, so none reaches here from a
+    /// load. Ascending internal id is arrival order and position order, so
+    /// the rebuild is as close to the original build as a rebuild can get,
+    /// and two rebuilds of one directory are one graph.
     ///
     /// What is reproduced exactly from the path this replaced is
     /// `extract_single_vector`'s validation and its call to
@@ -1436,14 +1408,16 @@ impl Collection {
     /// on this path means giving a user's index different answers. A refused
     /// record fails the whole rebuild rather than being dropped, since a
     /// graph short of a record the storage maps still report is an index
-    /// every query silently misses on.
+    /// every query silently misses on. So is a record the replacement has no
+    /// room for, with the room's refusal as a rebuild gives it, and the
+    /// replacement is dropped.
     pub(crate) fn rebuild_from_records(
         &self,
         records: Vec<(String, Vec<f32>)>,
-        positions: &mut Vec<u32>,
+        positions: &[u32],
     ) -> Result<usize, Error> {
         let mut mapped: Vec<(usize, usize, Vec<f32>)> = Vec::with_capacity(records.len());
-        let mut unmapped: Vec<(String, Vec<f32>)> = Vec::new();
+        let mut unmapped: Option<String> = None;
         {
             let ids = self.ids.read().unwrap();
             for (id, vector) in records {
@@ -1468,32 +1442,23 @@ impl Collection {
                 let vector = self.process_vector_for_space(vector);
                 match ids.slot_of(&id) {
                     Some(at) => mapped.push((at, positions[at] as usize, vector)),
-                    None => unmapped.push((id, vector)),
+                    None => {
+                        if unmapped.as_ref().is_none_or(|least| id < *least) {
+                            unmapped = Some(id);
+                        }
+                    }
                 }
             }
+        }
+        if let Some(id) = unmapped {
+            return Err(unmapped_record("vectors.bin", &id));
         }
 
         // The binding releases the interpreter lock around the whole load,
         // so the rebuild runs without it. The mutation guard is held for the
-        // ids handed to unmapped records and for the swap, which is the
-        // discipline every other mutation keeps, though nothing else can
-        // reach a collection the loader still holds.
+        // swap, which is the discipline every other mutation keeps, though
+        // nothing else can reach a collection the loader still holds.
         let _writers = self.writers.lock().unwrap();
-        unmapped.sort_by(|a, b| a.0.cmp(&b.0));
-        for (id, vector) in unmapped {
-            let internal_id = self.get_next_id();
-            // Held to the ceiling before the id store is touched, as the
-            // mappings' own ids are, so no id past it is cut to 32 bits.
-            crate::persistence::refuse_past_last_id(internal_id)?;
-            let at = {
-                let mut ids = self.ids.write().unwrap();
-                let at = ids.extent();
-                ids.insert(at, &id)?;
-                at
-            };
-            positions.push(internal_id as u32);
-            mapped.push((at, internal_id, vector));
-        }
         mapped.sort_by_key(|&(_, internal_id, _)| internal_id);
 
         let dense = self.dense();
@@ -1506,7 +1471,9 @@ impl Collection {
             dense.ef_construction(),
         );
         for (at, internal_id, vector) in &mapped {
-            new_hnsw.insert(vector, *internal_id, Position::from_slot(*at));
+            new_hnsw
+                .try_insert(vector, *internal_id, Position::from_slot(*at))
+                .map_err(Error::in_rebuild)?;
         }
 
         // Filled before it is installed, and installed under one write guard,

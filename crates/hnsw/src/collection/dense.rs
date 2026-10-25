@@ -1084,7 +1084,9 @@ impl VectorIndex<Dense> for DenseIndex {
     /// the graph's, is a refusal: nothing is installed and the record is not
     /// held, so every record the index holds has a node. The graph logs the
     /// cause. No caller reaches it, since the plan takes the record's form
-    /// from the graph.
+    /// from the graph. So is a record the graph has no room for at the level
+    /// it was planned at, which the collection's door and a replay refuse
+    /// before they reach here.
     fn insert(
         &mut self,
         at: Position,
@@ -1108,6 +1110,7 @@ impl VectorIndex<Dense> for DenseIndex {
                 id.0
             )));
         };
+        self.graph.room().take(planned.level())?;
         let record = match (&plan.codes, &plan.row) {
             (Some(codes), _) => Record::Codes {
                 codes,

@@ -153,6 +153,21 @@ impl MetadataStore {
         }
     }
 
+    /// An empty store whose entry vector holds `records` entries, or the
+    /// reservation for `expected_size` where that is more, so a load that
+    /// fills `records` positions sizes it once, whatever order it fills them
+    /// in.
+    pub fn with_records(records: usize, expected_size: usize) -> Self {
+        MetadataStore {
+            names: Vec::new(),
+            symbols: HashMap::new(),
+            records: Vec::with_capacity(
+                records.max(expected_size.saturating_add(1).min(RESERVE_CAP)),
+            ),
+            held: 0,
+        }
+    }
+
     /// The symbol for a field name, interning it on first sight.
     fn symbol(&mut self, name: String) -> u32 {
         if let Some(&symbol) = self.symbols.get(&name) {
@@ -162,6 +177,60 @@ impl MetadataStore {
         self.names.push(name.clone());
         self.symbols.insert(name, symbol);
         symbol
+    }
+
+    /// The symbol for a field name, interning it on first sight, with no
+    /// copy of the name where the store already holds it.
+    fn symbol_of(&mut self, name: &str) -> u32 {
+        match self.symbols.get(name) {
+            Some(&symbol) => symbol,
+            None => self.symbol(name.to_string()),
+        }
+    }
+
+    /// Set the record at `slot` to the fields `pairs` yields, as name and
+    /// value, replacing whatever it held, as [`MetadataStore::insert`] does.
+    /// A name given twice keeps its last value, as a mapping would.
+    ///
+    /// The record's fields take one block, sized from `pairs` before it is
+    /// filled, and a name the store already holds is interned without a
+    /// copy, so a load reading names out of a file allocates the block and
+    /// nothing else for a record whose names it has seen.
+    pub fn insert_pairs<S: AsRef<str>>(
+        &mut self,
+        slot: usize,
+        pairs: impl ExactSizeIterator<Item = (S, Value)>,
+    ) {
+        let mut fields: Vec<Field> = Vec::with_capacity(pairs.len());
+        for (name, value) in pairs {
+            let key = self.symbol_of(name.as_ref());
+            match fields.iter_mut().find(|field| field.key == key) {
+                Some(field) => field.value = value,
+                None => fields.push(Field { key, value }),
+            }
+        }
+        fields.sort_unstable_by_key(|field| field.key);
+        if slot >= self.records.len() {
+            self.records.resize_with(slot + 1, || None);
+        }
+        if self.records[slot].is_none() {
+            self.held += 1;
+        }
+        self.records[slot] = Some(fields.into_boxed_slice());
+    }
+
+    /// Give every one of `slots` that holds no entry an empty one, as a
+    /// record inserted with no fields holds.
+    pub fn fill_empty(&mut self, slots: impl Iterator<Item = usize>) {
+        for slot in slots {
+            if slot >= self.records.len() {
+                self.records.resize_with(slot + 1, || None);
+            }
+            if self.records[slot].is_none() {
+                self.records[slot] = Some(Box::default());
+                self.held += 1;
+            }
+        }
     }
 
     /// Set the record at `slot` to exactly `metadata`, replacing whatever it

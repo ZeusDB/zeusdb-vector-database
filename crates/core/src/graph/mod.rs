@@ -52,6 +52,7 @@
 use crate::distance::{
     CosineDist, DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric,
 };
+use crate::error::Error;
 use crate::int8::Int8Codec;
 use crate::pq::PQ;
 use crate::space::Position;
@@ -100,6 +101,12 @@ use mutable::MutableGraph;
 /// What phase one of an insertion hands to phase two. Opaque outside the
 /// graph, and nameable so a caller can carry it between the two guards.
 pub use mutable::Planned;
+#[cfg(any(test, feature = "test-support"))]
+pub use mutable::GRAPH_CEILINGS;
+/// The room a graph has for insertions, which a caller admitting records
+/// holds each to before anything is recorded for it, and the ceilings it is
+/// reckoned against.
+pub use mutable::{GraphCeilings, GraphRoom};
 use store::VectorStore;
 use traverse::LAYERS;
 
@@ -380,11 +387,15 @@ where
         );
     }
 
-    /// The draw and both phases, for a caller holding the graph outright.
-    fn insert(&mut self, data: &[T], origin_id: usize, position: u32) {
+    /// The draw and both phases, for a caller holding the graph outright,
+    /// refused with nothing installed where the drawn level leaves the graph
+    /// no room for the record.
+    fn try_insert(&mut self, data: &[T], origin_id: usize, position: u32) -> Result<(), Error> {
         let level = self.draw_level();
+        self.graph.room().take(level)?;
         let planned = self.plan_at_level(data, level);
         self.install(data, origin_id, position, planned);
+        Ok(())
     }
 }
 
@@ -1727,26 +1738,59 @@ impl VectorGraph {
         }
     }
 
+    /// The room this graph has for insertions, with nothing admitted yet.
+    ///
+    /// A caller admitting records takes each one's level from the room before
+    /// anything is recorded for it, so a record the graph cannot be sure to
+    /// place is refused at the door. See [`GraphRoom`].
+    pub fn room(&self) -> GraphRoom {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.room(),
+            VectorGraph::L2(b) => b.graph.room(),
+            VectorGraph::L1(b) => b.graph.room(),
+            VectorGraph::Dot(b) => b.graph.room(),
+            VectorGraph::CosinePQ(b) => b.graph.room(),
+            VectorGraph::L2PQ(b) => b.graph.room(),
+            VectorGraph::L1PQ(b) => b.graph.room(),
+            VectorGraph::Int8(b) => b.graph.room(),
+        }
+    }
+
     /// Insert one raw vector under internal id `id` at position `at`, the
-    /// draw and both phases, for a caller holding the graph outright.
+    /// draw and both phases, for a caller holding the graph outright, or
+    /// refuse it with nothing installed where the drawn level leaves the
+    /// graph no room for it.
     ///
     /// The three rebuild paths, being `compact`, the quantization rebuild and
     /// the persistence rebuild, each build a fresh graph off to the side and
     /// swap it in under one write guard, so the graph they insert into is a
-    /// local nobody else can reach. They need no phase split and no lock.
-    pub fn insert(&mut self, vector: &[f32], id: usize, at: Position) {
+    /// local nobody else can reach. They need no phase split and no lock, and
+    /// a rebuild refused for room drops the graph it was building.
+    pub fn try_insert(&mut self, vector: &[f32], id: usize, at: Position) -> Result<(), Error> {
         let level = self.draw_level();
+        self.room().take(level)?;
         if let Some(planned) = self.plan_at_level(Record::Raw(vector), level) {
             self.install(Record::Raw(vector), id, at, planned);
         }
+        Ok(())
+    }
+
+    /// [`VectorGraph::try_insert`] for a test building a graph well inside
+    /// the ceilings.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert(&mut self, vector: &[f32], id: usize, at: Position) {
+        self.try_insert(vector, id, at)
+            .expect("a test graph is built well inside the ceilings");
     }
 
     /// Insertion is sequential whatever the batch size. Every caller is a
     /// one-time structural rebuild, at training completion, in `compact` or in
     /// the persistence loader, and each of them sorts its batch by internal id
     /// so that two rebuilds of the same records wire the same graph. Each entry
-    /// is the codes, the internal id and the record's position.
-    pub fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize, Position)]) -> Result<(), String> {
+    /// is the codes, the internal id and the record's position. A record the
+    /// graph has no room for refuses the batch, with the records before it
+    /// installed.
+    pub fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize, Position)]) -> Result<(), Error> {
         debug!(
             target: LOG_TARGET,
             operation = "batch_insert_pq",
@@ -1757,12 +1801,14 @@ impl VectorGraph {
         match self {
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 for (codes, id, at) in data {
-                    b.insert(codes.as_slice(), *id, at.0);
+                    b.try_insert(codes.as_slice(), *id, at.0)?;
                 }
 
                 Ok(())
             }
-            _ => Err("Cannot insert PQ codes into raw HNSW index".to_string()),
+            _ => Err(Error::Engine(
+                "Cannot insert PQ codes into raw HNSW index".to_string(),
+            )),
         }
     }
 
@@ -1771,8 +1817,9 @@ impl VectorGraph {
     /// build a fresh graph off to the side. Every caller sorts its batch by
     /// internal id so that two rebuilds of the same records wire the same
     /// graph, as [`VectorGraph::insert_batch_pq`] requires of its callers.
-    /// Each entry is the row, the internal id and the record's position.
-    pub fn insert_batch_int8(&mut self, data: &[(&[i8], usize, Position)]) -> Result<(), String> {
+    /// Each entry is the row, the internal id and the record's position. A
+    /// record the graph has no room for refuses the batch, as there.
+    pub fn insert_batch_int8(&mut self, data: &[(&[i8], usize, Position)]) -> Result<(), Error> {
         debug!(
             target: LOG_TARGET,
             operation = "batch_insert_int8",
@@ -1782,11 +1829,13 @@ impl VectorGraph {
         match self {
             VectorGraph::Int8(b) => {
                 for (codes, id, at) in data {
-                    b.insert(codes, *id, at.0);
+                    b.try_insert(codes, *id, at.0)?;
                 }
                 Ok(())
             }
-            _ => Err("Cannot insert scalar codes into a graph that does not hold them".to_string()),
+            _ => Err(Error::Engine(
+                "Cannot insert scalar codes into a graph that does not hold them".to_string(),
+            )),
         }
     }
 

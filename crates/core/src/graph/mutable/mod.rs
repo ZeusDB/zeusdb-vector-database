@@ -132,12 +132,16 @@ use super::dump::{EachLists, ListWalk, LoadedEdge, PointId};
 use super::store::VectorStore;
 use super::traverse::{self, Topology, LAYERS};
 use super::{Distance, GraphHit};
+use crate::error::Error;
 use crate::space::Position;
 
 mod insert;
 // The layout of the struct the traversal borrows, held to recorded figures.
 #[cfg(test)]
 mod layout_tests;
+// The ceilings and the room an insertion is admitted under.
+#[cfg(test)]
+mod room_tests;
 
 /// What phase one hands phase two, re-exported so the seam can name it without
 /// the arena's own module being visible outside `mutable`.
@@ -153,10 +157,212 @@ const WORD_EMPTY: u32 = u32::MAX;
 /// rather than a target.
 ///
 /// A target is a node index, so a node index has to stay below this bit and
-/// away from [`WORD_EMPTY`]. [`MutableGraph::append_node`] refuses the node
-/// that would reach it, which is the 2,147,483,648th; at the smallest layer
-/// zero slab a graph of that many nodes holds twenty gigabytes of targets.
+/// away from [`WORD_EMPTY`], and so does a wide descriptor's index. Both are
+/// held there by their ceilings, [`MAX_NODES`] and [`MAX_WIDE_LISTS`]; at the
+/// smallest layer zero slab a graph of that many nodes holds twenty gigabytes
+/// of targets.
 const WORD_WIDE: u32 = 1 << 31;
+
+/// The most nodes a graph holds, so that every node index is below
+/// [`WORD_WIDE`].
+const MAX_NODES: usize = WORD_WIDE as usize;
+
+/// The most upper list words a graph holds. A node names its first word by a
+/// `u32` offset and [`NO_UPPER`] names none, so a run that ends within this
+/// ceiling starts below the marker.
+const MAX_WORDS: usize = NO_UPPER as usize;
+
+/// The most wide upper lists a graph holds, so that every wide descriptor's
+/// index is below [`WORD_WIDE`].
+const MAX_WIDE_LISTS: usize = WORD_WIDE as usize;
+
+/// The most upper list slots a graph holds. A wide list names its first slot
+/// by a `u32` offset, so a list that ends within this ceiling starts within
+/// one.
+const MAX_SLOTS: usize = u32::MAX as usize;
+
+/// What each of a graph's four growing arenas can address.
+///
+/// The room an insertion is admitted under holds a graph to these, and so do
+/// the loading constructors. A test lowers them through
+/// [`GRAPH_CEILINGS`] to reach the refusals without gigabytes of graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphCeilings {
+    /// Nodes.
+    pub nodes: usize,
+    /// Upper list words.
+    pub words: usize,
+    /// Wide upper lists.
+    pub wide_lists: usize,
+    /// Upper list slots.
+    pub slots: usize,
+}
+
+impl GraphCeilings {
+    /// The ceilings the layout sets.
+    pub const LAYOUT: GraphCeilings = GraphCeilings {
+        nodes: MAX_NODES,
+        words: MAX_WORDS,
+        wide_lists: MAX_WIDE_LISTS,
+        slots: MAX_SLOTS,
+    };
+
+    /// The ceilings in the order [`ARENAS`] names the arenas.
+    fn each(&self) -> [usize; 4] {
+        [self.nodes, self.words, self.wide_lists, self.slots]
+    }
+}
+
+// The ceilings this thread's graphs are held to, which a test lowers to reach
+// the refusals without gigabytes of graph. Nothing outside the tests sees it.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    pub static GRAPH_CEILINGS: std::cell::Cell<GraphCeilings> =
+        const { std::cell::Cell::new(GraphCeilings::LAYOUT) };
+}
+
+/// The ceilings a graph is held to.
+#[cfg(any(test, feature = "test-support"))]
+fn ceilings() -> GraphCeilings {
+    GRAPH_CEILINGS.with(std::cell::Cell::get)
+}
+
+/// The ceilings a graph is held to.
+#[cfg(not(any(test, feature = "test-support")))]
+fn ceilings() -> GraphCeilings {
+    GraphCeilings::LAYOUT
+}
+
+/// The four arenas a refusal names, in the order the room counts them.
+const ARENAS: [&str; 4] = [
+    "nodes",
+    "upper list words",
+    "wide upper lists",
+    "upper list slots",
+];
+
+/// Where the nodes, the words, the wide lists and the slots sit in [`ARENAS`].
+const NODES: usize = 0;
+const WORDS: usize = 1;
+const WIDE_LISTS: usize = 2;
+const SLOTS: usize = 3;
+
+/// What an insertion growing an arena past its ceiling breaks, which the room
+/// the insertion was admitted under rules out.
+const ADMITTED: &str = "an insertion is admitted under the room its level leaves, which holds \
+                        every arena it grows within its ceiling";
+
+/// Refuse `more` entries where an arena holding `held` cannot take them under
+/// `ceiling`, in the words a loading constructor refuses a dump in.
+fn within(arena: usize, held: usize, more: usize, ceiling: usize) -> Result<(), String> {
+    let total = held.saturating_add(more);
+    if total > ceiling {
+        return Err(format!(
+            "the graph's {} would number {} and the graph can address {}",
+            ARENAS[arena], total, ceiling
+        ));
+    }
+    Ok(())
+}
+
+/// The room a graph has for insertions, and what the insertions a caller has
+/// admitted and not yet installed may take of it.
+///
+/// One insertion at level `L`, meeting an entry level `E`, grows each arena by
+/// at most what [`GraphRoom::bound`] gives, whatever the records around it
+/// do. It appends one node. Its own run of words is the higher of `L` and the
+/// highest layer its descent files an edge at, which is at most `E`, and
+/// where `L` is above `E` the old entry point is named at layer `L` and its
+/// run is regrown to `L` words. It opens a wide list at every layer up to
+/// `L`, and its search promotes at most one list a layer it visits, being the
+/// list of the node a layer's search starts from, since a node any list
+/// names at a layer already holds a wide list there. Each wide list takes
+/// `m + 1` slots.
+///
+/// The admitted insertions install in the order they were admitted, so each
+/// meets the higher of the graph's entry level and the levels admitted before
+/// it, which is the entry level the room carries forward.
+pub struct GraphRoom {
+    /// `max_nb_connection`, which sets a wide list's slots.
+    m: usize,
+    /// The graph's own entry level, which an insertion admitted alone meets,
+    /// and `None` where the graph holds no node.
+    entry: Option<usize>,
+    /// The entry level the next admitted insertion meets, and `None` where
+    /// neither the graph nor an admitted insertion holds a node.
+    top: Option<usize>,
+    /// What each arena holds, in the order of [`ARENAS`].
+    held: [usize; 4],
+    /// What the admitted insertions may add to each.
+    admitted: [usize; 4],
+    /// What each arena can address.
+    ceilings: [usize; 4],
+}
+
+impl GraphRoom {
+    /// The most one insertion at `level` can add to each arena, meeting the
+    /// entry level `top`. The first node of an empty graph searches nothing,
+    /// so it adds its own run and its own lists alone.
+    fn bound(&self, level: usize, top: Option<usize>) -> [usize; 4] {
+        let (words, wide) = match top {
+            None => (level, level),
+            Some(top) => {
+                let reach = top.max(level);
+                let regrown = if level > top { level } else { 0 };
+                (reach + regrown, level + reach)
+            }
+        };
+        [1, words, wide, wide.saturating_mul(self.m + 1)]
+    }
+
+    /// What each arena holds, as nodes, upper list words, wide upper lists
+    /// and upper list slots, for a test that sets a ceiling against them.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn held(&self) -> [usize; 4] {
+        self.held
+    }
+
+    /// Admit one insertion at `level`, or refuse it with the arena it could
+    /// take past its ceiling.
+    ///
+    /// The refusal says whether the insertion would have fit with nothing
+    /// admitted before it. Where it would, the graph has room for it and the
+    /// call admitting it is what is too large to place at once, and where it
+    /// would not, the graph is full for an insertion at that level. A refused
+    /// insertion adds nothing to what the room has admitted.
+    pub fn take(&mut self, level: usize) -> Result<(), Error> {
+        let needed = self.bound(level, self.top);
+        let passes = |admitted: &[usize; 4], needed: &[usize; 4]| {
+            (0..ARENAS.len()).find(|&arena| {
+                self.held[arena]
+                    .saturating_add(admitted[arena])
+                    .saturating_add(needed[arena])
+                    > self.ceilings[arena]
+            })
+        };
+        let Some(arena) = passes(&self.admitted, &needed) else {
+            for (admitted, needed) in self.admitted.iter_mut().zip(needed) {
+                *admitted = admitted.saturating_add(needed);
+            }
+            self.top = Some(self.top.map_or(level, |top| top.max(level)));
+            return Ok(());
+        };
+        let alone = self.bound(level, self.entry);
+        let (arena, needed, call) = match passes(&[0; 4], &alone) {
+            None => (arena, needed[arena], true),
+            Some(full) => (full, alone[full], false),
+        };
+        Err(Error::GraphFull {
+            arena: ARENAS[arena],
+            held: self.held[arena],
+            admitted: self.admitted[arena],
+            needed,
+            ceiling: self.ceilings[arena],
+            call,
+            rebuild: false,
+        })
+    }
+}
 
 /// Bytes the creation-time reservation may ask the allocator for.
 ///
@@ -722,9 +928,9 @@ where
                 span = span.max(list_layer);
             }
         }
-        self.open_node(span, |list_layer| {
+        self.try_open_node(span, |list_layer| {
             list_layer <= layer && lists.get(list_layer).is_some_and(|list| !list.is_empty())
-        });
+        })?;
 
         for (list_layer, list) in lists.iter().enumerate() {
             if list.is_empty() {
@@ -746,7 +952,7 @@ where
                     cap
                 ));
             }
-            self.install_loaded_list(node, list_layer, list);
+            self.install_loaded_list(node, list_layer, list)?;
         }
         Ok(())
     }
@@ -771,12 +977,15 @@ where
         // span grown on the way is a node's, and the list it opens is empty,
         // so what the pass reads is the edges the walk installed and nothing
         // else, in the order it would have collected them.
+        //
+        // A span grown or a list promoted here takes words, wide lists and
+        // slots the walk did not, so each is held to its ceiling as it grows.
         for node in 0..self.origin_ids.len() as u32 {
             for layer in 0..=self.span(node) {
                 for slot in 0..self.list_len(node, layer) {
                     let target = self.target_at(node, layer, slot);
-                    self.grow_span(target, layer);
-                    self.bump_in_degree(target, layer, 1);
+                    self.try_grow_span(target, layer)?;
+                    self.try_bump_in_degree(target, layer, 1)?;
                 }
             }
         }
@@ -1123,6 +1332,24 @@ where
         self.upper_targets.len()
     }
 
+    /// The room this graph has for insertions, with nothing admitted yet.
+    pub(super) fn room(&self) -> GraphRoom {
+        let entry = (!self.origin_ids.is_empty()).then_some(self.entry_level as usize);
+        GraphRoom {
+            m: self.m,
+            entry,
+            top: entry,
+            held: [
+                self.origin_ids.len(),
+                self.upper_word.len(),
+                self.wide_at.len(),
+                self.upper_targets.len(),
+            ],
+            admitted: [0; 4],
+            ceilings: ceilings().each(),
+        }
+    }
+
     /// Upper list words by what they hold, as (empty, one entry, wide), for
     /// the memory test. A word `grow_span` left behind is counted as well.
     #[cfg(test)]
@@ -1322,42 +1549,59 @@ where
     /// because install site 2 fills it wholesale. A load opens wide only the
     /// ones the dump fills, since nothing fills the rest wholesale afterwards
     /// and a word is promoted the first time its owner is named.
-    fn open_node(&mut self, span: usize, wide: impl Fn(usize) -> bool) {
+    ///
+    /// Refused where the run or a wide list it opens would take an arena past
+    /// its ceiling, which a load reports as a topology it cannot build. An
+    /// insertion opens a node through [`Self::open_node`].
+    fn try_open_node(&mut self, span: usize, wide: impl Fn(usize) -> bool) -> Result<(), String> {
         if span == 0 {
             self.upper_first.push(NO_UPPER);
             self.upper_span.push(0);
-            return;
+            return Ok(());
         }
-        self.upper_first.push(self.upper_word.len() as u32);
+        within(WORDS, self.upper_word.len(), span, ceilings().words)?;
+        let first = u32::try_from(self.upper_word.len())
+            .expect("the word arena is held within its ceiling, which no u32 offset passes");
+        self.upper_first.push(first);
         self.upper_span.push(span as u8);
         for layer in 1..=span {
             let word = if wide(layer) {
-                WORD_WIDE | self.open_wide()
+                WORD_WIDE | self.try_open_wide()?
             } else {
                 WORD_EMPTY
             };
             self.upper_word.push(word);
         }
+        Ok(())
+    }
+
+    /// [`Self::try_open_node`] for an insertion, which the room it was
+    /// admitted under holds within every ceiling.
+    fn open_node(&mut self, span: usize, wide: impl Fn(usize) -> bool) {
+        self.try_open_node(span, wide).expect(ADMITTED);
     }
 
     /// Append one wide descriptor with its `m + 1` slots, and hand back its
-    /// index.
-    fn open_wide(&mut self) -> u32 {
+    /// index, or refuse where the lists or the slots would pass their
+    /// ceilings.
+    fn try_open_wide(&mut self) -> Result<u32, String> {
+        let ceilings = ceilings();
+        let cap = self.upper_cap_full();
+        within(WIDE_LISTS, self.wide_at.len(), 1, ceilings.wide_lists)?;
+        within(SLOTS, self.upper_targets.len(), cap, ceilings.slots)?;
         let wide = u32::try_from(self.wide_at.len())
-            .expect("a wide list index is a u32 and the arena is checked on every open");
-        assert!(
-            wide < WORD_WIDE,
-            "the graph holds as many wide upper lists as a word names"
-        );
-        self.wide_at.push(self.upper_targets.len() as u32);
+            .expect("the wide lists are held below their ceiling, which is WORD_WIDE");
+        let at = u32::try_from(self.upper_targets.len())
+            .expect("the slot arena is held within its ceiling, which no u32 offset passes");
+        self.wide_at.push(at);
         self.wide_len.push(0);
         self.wide_in_degree.push(0);
-        let cap = self.upper_cap_full();
         self.upper_targets.resize(self.upper_targets.len() + cap, 0);
-        wide
+        Ok(wide)
     }
 
-    /// Raise one node's span so that it owns a list at `layer`.
+    /// Raise one node's span so that it owns a list at `layer`, or refuse
+    /// where its new run would take the words past their ceiling.
     ///
     /// A node's words are consecutive, so extending the run means moving it to
     /// the end of the word arena and leaving the old one behind. A wide list's
@@ -1365,10 +1609,14 @@ where
     /// node is named at a layer above its own level, which happens to the point
     /// that was the entry point when a higher one arrived, so it is on the order
     /// of the entry level per graph rather than per node.
-    fn grow_span(&mut self, node: u32, layer: usize) {
+    ///
+    /// Every node opens a span at least its level, and a span only grows, so
+    /// every layer the run grows to is above the node's level and takes an
+    /// empty word.
+    fn try_grow_span(&mut self, node: u32, layer: usize) -> Result<(), String> {
         let old_span = self.span(node);
         if layer <= old_span {
-            return;
+            return Ok(());
         }
         assert!(
             layer < LAYERS,
@@ -1377,46 +1625,65 @@ where
             LAYERS
         );
         let level = self.levels[node as usize] as usize;
+        assert!(
+            old_span >= level,
+            "node {} spans {} layers and its level is {}, and every node opens a span at least \
+             its level",
+            node,
+            old_span,
+            level
+        );
+        within(WORDS, self.upper_word.len(), layer, ceilings().words)?;
         let old_first = self.upper_first[node as usize] as usize;
-        let new_first = self.upper_word.len() as u32;
+        let new_first = u32::try_from(self.upper_word.len())
+            .expect("the word arena is held within its ceiling, which no u32 offset passes");
         for slot in 0..old_span {
             let word = self.upper_word[old_first + slot];
             self.upper_word.push(word);
         }
-        for new_layer in (old_span + 1)..=layer {
-            let word = if new_layer <= level {
-                WORD_WIDE | self.open_wide()
-            } else {
-                WORD_EMPTY
-            };
-            self.upper_word.push(word);
+        for _ in (old_span + 1)..=layer {
+            self.upper_word.push(WORD_EMPTY);
         }
         self.upper_first[node as usize] = new_first;
         self.upper_span[node as usize] = layer as u8;
+        Ok(())
+    }
+
+    /// [`Self::try_grow_span`] for an insertion, which the room it was
+    /// admitted under holds within every ceiling.
+    fn grow_span(&mut self, node: u32, layer: usize) {
+        self.try_grow_span(node, layer).expect(ADMITTED);
     }
 
     /// Promote one list held as a word to a wide list, carrying its entry if it
-    /// holds one, and hand back the wide descriptor's index.
+    /// holds one, and hand back the wide descriptor's index, or refuse where
+    /// the list would take the lists or the slots past their ceilings.
     ///
     /// This is what a second entry needs and what an inbound counter needs,
     /// since both live on the wide descriptor. It fires for the old entry
     /// points' lists above their level and for nothing else on a build, and
     /// on a load also for an empty list at or below its owner's level that an
     /// entry names.
-    fn promote(&mut self, list: usize) -> usize {
+    fn try_promote(&mut self, list: usize) -> Result<usize, String> {
         let word = self.upper_word[list];
         assert!(
             word & WORD_WIDE == 0 || word == WORD_EMPTY,
             "a list is promoted once"
         );
-        let wide = self.open_wide();
+        let wide = self.try_open_wide()?;
         if word != WORD_EMPTY {
             let at = self.wide_at[wide as usize] as usize;
             self.upper_targets[at] = word;
             self.wide_len[wide as usize] = 1;
         }
         self.upper_word[list] = WORD_WIDE | wide;
-        wide as usize
+        Ok(wide as usize)
+    }
+
+    /// [`Self::try_promote`] for an insertion, which the room it was admitted
+    /// under holds within every ceiling.
+    fn promote(&mut self, list: usize) -> usize {
+        self.try_promote(list).expect(ADMITTED)
     }
 
     /// One entry of one list.
@@ -1457,13 +1724,14 @@ where
     /// there rather than assuming one, and promotes a list held as one word,
     /// since the counter lives on the wide descriptor. The vendored counterpart
     /// never has to, since it carries sixteen counters on every point whatever
-    /// its level.
+    /// its level. Refused where the span or the promotion would take an arena
+    /// past its ceiling.
     #[inline]
-    fn bump_in_degree(&mut self, node: u32, layer: usize, delta: i32) {
+    fn try_bump_in_degree(&mut self, node: u32, layer: usize, delta: i32) -> Result<(), String> {
         let slot = if layer == 0 {
             &mut self.base_in_degree[node as usize]
         } else {
-            self.grow_span(node, layer);
+            self.try_grow_span(node, layer)?;
             let list = self
                 .upper_list(node, layer)
                 .expect("the span was just grown to cover this layer");
@@ -1474,7 +1742,7 @@ where
                         delta > 0,
                         "an inbound counter is lowered only on a list that was raised"
                     );
-                    self.promote(list)
+                    self.try_promote(list)?
                 }
             };
             &mut self.wide_in_degree[wide]
@@ -1482,6 +1750,14 @@ where
         *slot = slot
             .checked_add_signed(delta)
             .expect("an inbound counter is moved once per edge installed or evicted");
+        Ok(())
+    }
+
+    /// [`Self::try_bump_in_degree`] for an insertion, which the room it was
+    /// admitted under holds within every ceiling.
+    #[inline]
+    fn bump_in_degree(&mut self, node: u32, layer: usize, delta: i32) {
+        self.try_bump_in_degree(node, layer, delta).expect(ADMITTED);
     }
 
     /// Whether one list already names a node, which the reverse update asks
@@ -1534,8 +1810,14 @@ where
     /// The caller has checked the length against the cap of the layer. A list
     /// above the owner's level holding one entry is the word itself, and one
     /// holding more is promoted first, which is the state a built graph holds
-    /// an old entry point's list in.
-    fn install_loaded_list(&mut self, node: u32, layer: usize, targets: &[u32]) {
+    /// an old entry point's list in. Refused where the promotion would take
+    /// the lists or the slots past their ceilings.
+    fn install_loaded_list(
+        &mut self,
+        node: u32,
+        layer: usize,
+        targets: &[u32],
+    ) -> Result<(), String> {
         if layer > 0 {
             let list = self
                 .upper_list(node, layer)
@@ -1543,12 +1825,13 @@ where
             if self.wide_of(list).is_none() {
                 if targets.len() == 1 {
                     self.upper_word[list] = targets[0];
-                    return;
+                    return Ok(());
                 }
-                self.promote(list);
+                self.try_promote(list)?;
             }
         }
         self.write_list(node, layer, targets);
+        Ok(())
     }
 
     /// Append one edge to one list, which is what the reverse update and the
@@ -1726,12 +2009,9 @@ where
             level,
             LAYERS
         );
+        within(NODES, self.origin_ids.len(), 1, ceilings().nodes).expect(ADMITTED);
         let node = u32::try_from(self.origin_ids.len())
-            .expect("a node index is a u32 and the arena is checked on every append");
-        assert!(
-            node < WORD_WIDE,
-            "the graph holds as many nodes as an upper list word names"
-        );
+            .expect("the nodes are held below their ceiling, which is WORD_WIDE");
 
         debug_assert_eq!(
             store.len(),
@@ -2314,9 +2594,9 @@ pub(super) struct NotBuilt {
 /// what they give: each layer's node count, where each layer's run starts in
 /// node order with a sentinel after the last, and the node count.
 ///
-/// A rank is an `i32` in a dump and a node index a `u32`, and an upper list
-/// word names a node below [`WORD_WIDE`], so a layer table past any of those
-/// is refused here rather than wrapped later.
+/// A rank is an `i32` in a dump, and a graph holds no more nodes than its
+/// ceiling, which keeps every node index below [`WORD_WIDE`], so a layer table
+/// past either is refused here rather than wrapped later.
 fn loading_layout(
     layer_counts_in: &[usize],
     m: usize,
@@ -2357,18 +2637,7 @@ fn loading_layout(
     if nb_point == 0 {
         return Err("a graph holding no points has no entry point".to_string());
     }
-    if nb_point > u32::MAX as usize {
-        return Err(format!(
-            "the graph holds {} points and a node index is a u32",
-            nb_point
-        ));
-    }
-    if nb_point >= WORD_WIDE as usize {
-        return Err(format!(
-            "the graph holds {} points and an upper list word names a node below {}",
-            nb_point, WORD_WIDE
-        ));
-    }
+    within(NODES, 0, nb_point, ceilings().nodes)?;
     for layer in 0..LAYERS {
         let count = layer_counts_in.get(layer).copied().unwrap_or(0) as u32;
         layer_counts[layer] = count;

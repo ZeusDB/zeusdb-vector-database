@@ -52,12 +52,12 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
 use zeusdb_vector_core::{
-    matches_filter, refuse_unnamable, Bitmap, ColumnParts, ColumnStore, Error, Filter, IdParts,
-    IdStore, InsertParts, MetadataParts, MetadataStore, Operation, OperationKind, Position,
-    Prepared, RecordId, Selection, SparseVector, VectorGraph, VectorIndex, JOURNAL_MAX_PAYLOAD,
-    MAX_INTERNAL_ID,
+    matches_filter, refuse_unnamable, Bitmap, ColumnParts, ColumnStore, Error, Filter, GraphRoom,
+    IdParts, IdStore, InsertParts, MetadataParts, MetadataStore, Operation, OperationKind,
+    Position, Prepared, RecordId, Selection, SparseVector, VectorGraph, VectorIndex,
+    JOURNAL_MAX_PAYLOAD, MAX_INTERNAL_ID,
 };
-use zeusdb_vector_sparse::{PostingsIndex, PostingsParts};
+use zeusdb_vector_sparse::{refuse_forward, PostingsIndex, PostingsParts};
 
 #[cfg(test)]
 use zeusdb_vector_core::MetadataCopy;
@@ -463,6 +463,36 @@ pub(super) struct Admitted {
     pub(super) level: usize,
 }
 
+/// What the records a segment has admitted and not yet installed will take
+/// once they are, which the door holds each next record of the segment to.
+/// Nothing installs while a segment is admitted, so what the stores hold is
+/// read once, as the segment begins.
+struct Taken {
+    /// The text of their ids, which the id store's arena holds once they are
+    /// installed.
+    text: usize,
+    /// The nonzeros the sparse space's forward arena held as the segment
+    /// began, being zero where the collection declares no sparse space.
+    forward: usize,
+    /// Their sparse nonzeros, which the forward arena holds once they are
+    /// installed.
+    nonzeros: usize,
+    /// The room they may take in the graph.
+    room: GraphRoom,
+}
+
+/// A rebuild's insertion refused, logged as `what`: a refusal for the graph's
+/// room as a rebuild gives it, since it names what is full, and any other as
+/// the failure of the re-insertion.
+fn reinsert_refused(error: Error, what: &str) -> Error {
+    let error = error.in_rebuild();
+    error!(target: LOG_TARGET, operation = "rebuild_graph", error = %error, "{}", what);
+    match error {
+        Error::GraphFull { .. } => error,
+        other => Error::ReinsertCodesFailed(other.to_string()),
+    }
+}
+
 impl Collection {
     /// Warn once when the index holds materially more records than it declared
     ///
@@ -685,26 +715,17 @@ impl Collection {
     ) -> Result<(), Error> {
         let space = self.sparse().ok_or(Error::NoSparseSpace)?;
         let mut index = space.index.write().unwrap();
-        index.insert(
-            at,
-            RecordId::from_slot(internal_id),
-            vector.as_ref(),
-            Prepared::none(),
-        )
+        index
+            .insert(
+                at,
+                RecordId::from_slot(internal_id),
+                vector.as_ref(),
+                Prepared::none(),
+            )
+            .map_err(|err| self.sparse_refusal_named(err))
     }
 
-    /// Get next available internal ID
-    ///
-    /// Not exposed to Python. Every call takes the counter mutex and
-    /// increments it, so a call from outside the insertion path burns an
-    /// internal id that no record will ever hold.
-    pub(super) fn get_next_id(&self) -> usize {
-        let mut counter = self.id_counter.lock().unwrap();
-        *counter += 1;
-        *counter
-    }
-
-    /// Take back the id `get_next_id` just issued, because the record it
+    /// Take back the id `issue_id` just issued, because the record it
     /// was issued for was refused by the sink. Sound under `writers`, since
     /// nothing else issues an id while it is held, which the assertion
     /// states.
@@ -1566,6 +1587,11 @@ impl Collection {
 
     /// The body of `compact`, with the mutation guard held by the caller and
     /// the record already handed over.
+    ///
+    /// A replacement graph with no room for a record held is refused with
+    /// the room's refusal as a rebuild gives it and installs nothing, so the
+    /// graph and every record stay as they were. The sparse space's compaction, which runs
+    /// first and is held to no room of the graph's, has run by then.
     pub(super) fn compact_locked(&self, writers: &MutationGuard<'_>) -> Result<usize, Error> {
         let start_time = Instant::now();
 
@@ -1655,8 +1681,9 @@ impl Collection {
     /// to raise it has to be able to.
     ///
     /// **The three are written after the rebuild has succeeded**, so an index
-    /// whose records could not be rebuilt from still reports the configuration
-    /// its graph actually has.
+    /// whose records could not be rebuilt from, or whose replacement has no
+    /// room for them at the new degree, still reports the configuration its
+    /// graph actually has.
     ///
     /// Returns the live record count the replacement holds. The mutation
     /// guard is held by the caller and the record already handed over.
@@ -1743,8 +1770,10 @@ impl Collection {
     /// The replacement `rebuild_graph` installs: every record held
     /// re-inserted at one degree, in position order, under the internal id
     /// it holds, with the slack of its arenas given back. Refused, with
-    /// nothing built, where a record held has no source data. The caller
-    /// holds `writers`, so nothing it reads can change before the install.
+    /// nothing built, where a record held has no source data, and with what
+    /// was built dropped where the replacement has no room for a record at
+    /// the level drawn for it. The caller holds `writers`, so nothing it
+    /// reads can change before the install.
     pub(super) fn replacement_graph(
         &self,
         m: usize,
@@ -1842,10 +1871,9 @@ impl Collection {
                 }
 
                 if missing.is_empty() && !batch.is_empty() {
-                    new_hnsw.insert_batch_int8(&batch).map_err(|e| {
-                        error!(target: LOG_TARGET, operation = "rebuild_graph", error = %e, "Failed to re-insert scalar rows");
-                        Error::ReinsertCodesFailed(e)
-                    })?;
+                    new_hnsw
+                        .insert_batch_int8(&batch)
+                        .map_err(|e| reinsert_refused(e, "Failed to re-insert scalar rows"))?;
                 }
 
                 missing
@@ -1865,10 +1893,9 @@ impl Collection {
                 }
 
                 if missing.is_empty() && !batch.is_empty() {
-                    new_hnsw.insert_batch_pq(&batch).map_err(|e| {
-                        error!(target: LOG_TARGET, operation = "rebuild_graph", error = %e, "Failed to re-insert quantized codes");
-                        Error::ReinsertCodesFailed(e)
-                    })?;
+                    new_hnsw
+                        .insert_batch_pq(&batch)
+                        .map_err(|e| reinsert_refused(e, "Failed to re-insert quantized codes"))?;
                 }
 
                 // The raw vectors a `quantized_with_raw` index keeps beside its
@@ -1899,9 +1926,9 @@ impl Collection {
                             .raw_vector_at(node)
                             .map(|vector| (vector, origin_ids[node as usize]))
                     }) {
-                        Some((vector, internal_id)) => {
-                            new_hnsw.insert(vector, internal_id, Position::from_slot(k))
-                        }
+                        Some((vector, internal_id)) => new_hnsw
+                            .try_insert(vector, internal_id, Position::from_slot(k))
+                            .map_err(|e| reinsert_refused(e, "Failed to re-insert a vector"))?,
                         None => missing.push(ext_id.to_string()),
                     }
                 }
@@ -2002,7 +2029,7 @@ impl Collection {
     ///   `has_quantization`, `can_use_quantization` and the close-up on
     ///   removal
     /// - `admit`, and through it `count_record_terms`, the text layer's
-    ///   dictionary, `Operation::encode_insert`, `get_next_id`,
+    ///   dictionary, `Operation::encode_insert`, `issue_id`,
     ///   `draw_level` and the sink's `append`
     /// - `append_segment`, and through it the sink's `append` and
     ///   `withdraw`
@@ -2142,9 +2169,10 @@ impl Collection {
             let limit = self.segment_limit();
             let mut segment: Vec<Result<Admitted, InsertError>> = Vec::new();
             let mut admitted = 0usize;
-            // The text of the records this segment admits, which the arena
-            // holds once they are installed.
-            let mut named_later = 0usize;
+            // What the records this segment admits take once they are
+            // installed, being their ids' text, their nonzeros and their room
+            // in the graph, which each next record is held to.
+            let mut taken = self.taken_by_segment();
             // The held ids this segment's admitted records replace, each once,
             // since a batch admits an id once.
             let mut replaced: Vec<String> = Vec::new();
@@ -2156,7 +2184,7 @@ impl Collection {
                         &mut seen,
                         attached,
                         &mut buffer,
-                        &mut named_later,
+                        &mut taken,
                         overwrite,
                         replaces,
                     )
@@ -2322,6 +2350,21 @@ impl Collection {
         Some(config.training_size.saturating_sub(collected).max(1))
     }
 
+    /// What a segment's records take before any is admitted: nothing, against
+    /// the graph's room and the sparse space's forward arena as they stand.
+    fn taken_by_segment(&self) -> Taken {
+        let room = self.dense().index.read().unwrap().graph().room();
+        let forward = self
+            .sparse()
+            .map_or(0, |space| space.index.read().unwrap().forward_len());
+        Taken {
+            text: 0,
+            forward,
+            nonzeros: 0,
+            room,
+        }
+    }
+
     /// Record one segment of a batch that replaces a held record, once its
     /// admission is over: the removal record naming the held ids `replaced`,
     /// then each admitted record's insert, encoded from what admission holds
@@ -2373,24 +2416,28 @@ impl Collection {
     /// duplicate check against the index and against the batch so far, the
     /// id ceiling, the terms counted into ids where the sparse half is
     /// terms, which hands each new term to the sink as it is issued, the
-    /// sparse rules under the space's weighting, where a sink is attached
-    /// the sink's ceiling on the encoded record, and the id store's
-    /// ceilings on the id and its text with the vector's width. The id is
-    /// issued at the ceiling's check, in the one acquisition of the counter,
-    /// and every refusal after it takes the id back, since nothing else
-    /// issues one under the mutation guard, so a refused record leaves the
-    /// counter where it was. Only once every check has passed is the level
-    /// drawn, written with the id into the encoded record, and the record
-    /// handed over, so a refused record leaves the level stream where it
-    /// was too. A sink that refuses the record takes the id back as well;
-    /// the draw it consumed moves the stream, which the next record's own
-    /// draw records. Nothing the install then does can refuse a record
-    /// admitted here for its id or its width.
+    /// sparse rules under the space's weighting with the forward arena's
+    /// ceiling, where a sink is attached the sink's ceiling on the encoded
+    /// record, and the id store's ceilings on the id and its text with the
+    /// vector's width. The id is issued at the ceiling's check, in the one
+    /// acquisition of the counter, and every refusal after it takes the id
+    /// back, since nothing else issues one under the mutation guard, so a
+    /// refused record leaves the counter where it was. Only once every check
+    /// has passed is the level drawn, so a record those refuse leaves the
+    /// level stream where it was too. The graph's room is then taken at that
+    /// level, since what a record can add to the graph's arenas follows from
+    /// its level, and only then is the level written with the id into the
+    /// encoded record and the record handed over. A record the graph's room
+    /// or the sink refuses takes the id back as well; the draw it consumed
+    /// moves the stream, which the next record's own draw records. Nothing
+    /// the install then does can refuse a record admitted here for its id,
+    /// its width or the room it takes.
     ///
-    /// `pending` is the text of the records this segment has admitted and
-    /// not yet installed, which the arena will hold before this record's
-    /// id. The arena is the id store's as it stands, before any record the
-    /// batch replaces goes.
+    /// `taken` is what the records this segment has admitted and not yet
+    /// installed take once they are: the text the id store's arena will hold
+    /// before this record's id, the nonzeros the forward arena will hold
+    /// before its own, and their room in the graph. Each store is the one
+    /// that stands, before any record the batch replaces goes.
     ///
     /// `overwrite` says a held id the record names counts as free, and the
     /// second value returned says the record replaces a held one. `defer`
@@ -2408,7 +2455,7 @@ impl Collection {
         seen: &mut HashSet<String>,
         attached: bool,
         buffer: &mut Vec<u8>,
-        pending: &mut usize,
+        taken: &mut Taken,
         overwrite: bool,
         defer: bool,
     ) -> Result<(Admitted, bool), InsertError> {
@@ -2476,7 +2523,11 @@ impl Collection {
             let checked = self
                 .sparse()
                 .ok_or(Error::NoSparseSpace)
-                .and_then(|space| space.config().weighting.validate_record(sparse.as_ref()));
+                .and_then(|space| space.config().weighting.validate_record(sparse.as_ref()))
+                .and_then(|()| {
+                    refuse_forward(taken.forward, taken.nonzeros, sparse.dims.len())
+                        .map_err(|err| self.sparse_refusal_named(err))
+                });
             if let Err(err) = checked {
                 return refuse(err, id);
             }
@@ -2506,11 +2557,16 @@ impl Collection {
         // The id store's refusals and the vector's width, run before the level
         // is drawn and the record handed to the sink, so the install meets none
         // of them. A refusal here takes the issued id back.
-        if let Err(err) = self.refuse_unplaceable(&id, &vector, arena.saturating_add(*pending)) {
+        if let Err(err) = self.refuse_unplaceable(&id, &vector, arena.saturating_add(taken.text)) {
             return refuse(err, id);
         }
 
+        // The graph's room at the level just drawn, counting what the records
+        // this segment admitted may take, before the record is recorded.
         let level = self.draw_level();
+        if let Err(err) = taken.room.take(level) {
+            return refuse(err, id);
+        }
         if attached && !defer {
             Operation::stamp_insert(buffer, internal_id as u64, level as u8);
             if let Err(err) = self.append_record(OperationKind::Insert, buffer) {
@@ -2519,7 +2575,8 @@ impl Collection {
         }
 
         seen.insert(id.clone());
-        *pending += id.len();
+        taken.text += id.len();
+        taken.nonzeros += sparse.as_ref().map_or(0, |sparse| sparse.dims.len());
         Ok((
             Admitted {
                 id,

@@ -558,12 +558,12 @@ pub enum Error {
     },
     /// The raw store of a `quantized_with_raw` index could not be restored
     RestoreRawFailed(String),
-    /// The restored record count is not the one config.json records
+    /// The restored record count is not the one config.json records.
+    /// `source` is a sentence naming where the restored records came from
     RestoredCountMismatch {
         restored: usize,
         expected: usize,
-        raw_count: usize,
-        code_count: usize,
+        source: String,
     },
     /// The codebook's shape is not the one quantization.json describes
     CodebookShapeMismatch {
@@ -581,14 +581,9 @@ pub enum Error {
     /// A scalar quantization artefact, or a field of quantization.json
     /// under `int8`, outside the bounds the loader holds it to
     Int8ArtefactInvalid { file: String, detail: String },
-    /// Records held as codes with no codebook to reconstruct them
+    /// Records held as codes in a directory whose quantization.json records
+    /// no trained codebook
     CodesWithoutCodebook { count: usize },
-    /// A record's codes did not reconstruct
-    ReconstructFailed {
-        id: String,
-        codes: usize,
-        error: String,
-    },
     /// The directory to load is not there
     IndexDirectoryNotFound { path: String },
     /// An artefact did not serialize
@@ -654,6 +649,40 @@ pub enum Error {
         kind: u16,
         sequence: u64,
     },
+
+    // ------------------------------------------------------------------
+    // The ceilings of the graph's arenas, the sparse forward store and a
+    // term. Appended after every variant above, and none wider than the
+    // widest above.
+    // ------------------------------------------------------------------
+    /// A record the graph cannot be sure to place. `held` is what the
+    /// `arena` holds, `admitted` what the records the call admitted before
+    /// this one may add to it, `needed` what this record may add, and
+    /// `ceiling` what the arena can address. `call` is set where the record
+    /// would fit were it the only record the call admitted, and `rebuild`
+    /// where the graph is the replacement a rebuild or a load builds; see
+    /// [`Error::in_rebuild`]
+    GraphFull {
+        arena: &'static str,
+        held: usize,
+        admitted: usize,
+        needed: usize,
+        ceiling: usize,
+        call: bool,
+        rebuild: bool,
+    },
+    /// A sparse record whose nonzeros would take its space's forward store
+    /// past the offsets the store can address. `admitted` is the nonzeros
+    /// of the records the call admitted before this one
+    SparseForwardFull {
+        space: String,
+        held: usize,
+        admitted: usize,
+        nnz: usize,
+        ceiling: usize,
+    },
+    /// A term longer than a text space stores for one term
+    TermTooLong { bytes: usize, ceiling: usize },
 }
 
 impl Error {
@@ -798,7 +827,6 @@ impl Error {
             | Int8ArtefactInvalid { .. }
             | CodebookAllZero
             | CodesWithoutCodebook { .. }
-            | ReconstructFailed { .. }
             | SerializeFailed { .. }
             | JournalHeaderInvalid { .. }
             | JournalCorrupt { .. }
@@ -824,7 +852,36 @@ impl Error {
             | GraphDumpInvalid { .. }
             | ManifestFieldInvalid { .. }
             | FeatureReadOnly { .. }
-            | FeatureJournalUnreadable { .. } => Exception::Runtime,
+            | FeatureJournalUnreadable { .. }
+            | GraphFull { .. }
+            | SparseForwardFull { .. }
+            | TermTooLong { .. } => Exception::Runtime,
+        }
+    }
+
+    /// The graph's refusal of a record as a rebuild gives it, and any other
+    /// error as it is. A rebuild or a load inserts every record into a
+    /// replacement graph, so the refusal names that graph and no remedy:
+    /// no smaller call or compaction places the records the index holds.
+    pub fn in_rebuild(self) -> Self {
+        match self {
+            Error::GraphFull {
+                arena,
+                held,
+                admitted,
+                needed,
+                ceiling,
+                ..
+            } => Error::GraphFull {
+                arena,
+                held,
+                admitted,
+                needed,
+                ceiling,
+                call: false,
+                rebuild: true,
+            },
+            other => other,
         }
     }
 
@@ -1793,16 +1850,13 @@ impl fmt::Display for Error {
             RestoredCountMismatch {
                 restored,
                 expected,
-                raw_count,
-                code_count,
+                source,
             } => write!(
                 f,
                 "Restored record count does not match config.json: the directory yields {} \
-                 records while config.json reports {}. vectors.bin holds {} records and \
-                 pq_codes.bin holds {}, so a data file is missing or truncated. Refusing to \
-                 load an index that would report a count it cannot produce; restore the \
-                 directory from a copy.",
-                restored, expected, raw_count, code_count
+                 records while config.json reports {}. {} Refusing to load an index that would \
+                 report a count it cannot produce; restore the directory from a copy.",
+                restored, expected, source
             ),
             CodebookShapeMismatch {
                 actual,
@@ -1837,17 +1891,12 @@ impl fmt::Display for Error {
             Int8ArtefactInvalid { file, detail } => write!(f, "{}: {}", file, detail),
             CodesWithoutCodebook { count } => write!(
                 f,
-                "{} records are stored as PQ codes with no raw vector, but the index has \
-                 no codebook to reconstruct them with. pq_codes.bin and quantization.json \
-                 disagree about whether this index was trained, so the directory cannot \
-                 be loaded without dropping those records.",
-                count
-            ),
-            ReconstructFailed { id, codes, error } => write!(
-                f,
-                "Failed to reconstruct record '{}' from its {} PQ codes: {}. The \
-                 codebook in pq_centroids.bin does not fit the codes in pq_codes.bin.",
-                id, codes, error
+                "pq_codes.bin holds codes for {} record{}, and quantization.json records no \
+                 trained codebook to decode them with. The two files disagree about whether \
+                 this index was trained, so the directory cannot be loaded without dropping \
+                 those codes.",
+                count,
+                if *count == 1 { "" } else { "s" }
             ),
             IndexDirectoryNotFound { path } => {
                 write!(f, "Index directory not found: {}", path)
@@ -1981,6 +2030,77 @@ impl fmt::Display for Error {
                 quoted_list(features),
                 kind,
                 sequence
+            ),
+            GraphFull {
+                arena,
+                held,
+                needed,
+                ceiling,
+                rebuild: true,
+                ..
+            } => write!(
+                f,
+                "The rebuilt graph is full: its {} number {} of the {} it can address, and the \
+                 next record to go in can add up to {}.",
+                arena, held, ceiling, needed
+            ),
+            GraphFull {
+                arena,
+                held,
+                admitted,
+                needed,
+                ceiling,
+                call: true,
+                rebuild: false,
+            } => write!(
+                f,
+                "This call is too large to place at once: the graph's {} number {}, the \
+                 records the call admitted before this one can add up to {} more and this one \
+                 up to {}, and the graph can address {}. The graph has room for the record on \
+                 its own, so add the records across smaller calls.",
+                arena, held, admitted, needed, ceiling
+            ),
+            GraphFull {
+                arena,
+                held,
+                needed,
+                ceiling,
+                call: false,
+                rebuild: false,
+                ..
+            } => write!(
+                f,
+                "The graph is full: its {} number {} of the {} it can address, and one more \
+                 record can add up to {}. compact() rebuilds the graph without the nodes that \
+                 removed and replaced records leave in it.",
+                arena, held, ceiling, needed
+            ),
+            SparseForwardFull {
+                space,
+                held,
+                admitted,
+                nnz,
+                ceiling,
+            } => write!(
+                f,
+                "The sparse space '{}' cannot take the record: its forward store holds {} \
+                 nonzeros{}, the record carries {}, and the store can address {}. compact() \
+                 reclaims the nonzeros of removed records.",
+                space,
+                held,
+                if *admitted > 0 {
+                    format!(", the records this call admitted before it carry {} more", admitted)
+                } else {
+                    String::new()
+                },
+                nnz,
+                ceiling
+            ),
+            TermTooLong { bytes, ceiling } => write!(
+                f,
+                "A term of {} bytes is longer than the {} bytes a text space stores for one \
+                 term.",
+                bytes, ceiling
             ),
         }
     }

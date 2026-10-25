@@ -2915,3 +2915,55 @@ def test_a_graph_dump_of_the_wrong_length_falls_back_to_the_rebuild(tmp_path):
     loaded = VectorDatabase().load(str(path))
     assert loaded.get_vector_count() == 40
     assert len(loaded.search(vectors[0].tolist(), top_k=5)) == 5
+
+
+def test_a_counter_an_old_release_left_past_the_last_id_opens_at_it(tmp_path):
+    """Below format 4.0.0 a counter past 2**32 in config.json is one a
+    release whose id store was full left, and the directory opens with every
+    record, the index refusing the next record as one at its last internal
+    id does. From format 4.0.0 the load refuses such a counter, naming it."""
+    past = (1 << 32) + 5
+    for version in ("1.1.0", "4.0.0"):
+        path, _, vectors = _saved(tmp_path, f"past-{version}.zdb")
+        if version == "1.1.0":
+            as_old_wire(path, version)
+        else:
+            as_before_five(path, version)
+        config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+        config["id_counter"] = past
+        (path / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+        repair_manifest(path, "config.json")
+        if version == "4.0.0":
+            with pytest.raises(ValueError, match=rf"config\.json: id_counter is {past}"):
+                VectorDatabase().load(str(path))
+            continue
+        loaded = VectorDatabase().load(str(path))
+        assert loaded.get_vector_count() == 40
+        assert loaded.get_records("v3")[0]["metadata"] == {"tag": "t3"}
+        result = loaded.add({"ids": ["next"], "embeddings": [vectors[0].tolist()]})
+        assert result.total_inserted == 0 and result.total_errors == 1
+        assert result.errors[0].startswith(
+            "Vector next: RuntimeError: This collection has issued its last internal id, "
+            "4294967294."), result.errors
+
+
+def test_a_restored_count_config_json_disagrees_with_says_where_the_records_came_from(tmp_path):
+    """A directory whose config.json and manifest count a record more than it
+    holds is refused with the count the load restored and where it came from,
+    which at 5.0.0 is the graph dump, and names no file a directory at 5.0.0
+    does not hold."""
+    path, _, _ = _saved(tmp_path, "counted.zdb")
+    config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    config["vector_count"] = 41
+    (path / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    repair_manifest(path, "config.json")
+    manifest = _read_manifest(path)
+    manifest["total_vectors"] = 41
+    (path / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    with pytest.raises(RuntimeError) as refused:
+        VectorDatabase().load(str(path))
+    assert str(refused.value) == (
+        "Restored record count does not match config.json: the directory yields 40 records "
+        "while config.json reports 41. Every record came from the graph dump. Refusing to "
+        "load an index that would report a count it cannot produce; restore the directory "
+        "from a copy.")

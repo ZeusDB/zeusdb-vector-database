@@ -1868,8 +1868,8 @@ impl HNSWIndex {
     /// given id resolves to is the same before and after.
     ///
     /// The replacement graph is built in full before the old one is dropped, so peak
-    /// memory holds both for the duration and a failure part way through leaves the
-    /// index exactly as it was.
+    /// memory holds both for the duration and a failure part way through leaves
+    /// every record, page and saved file as it was.
     ///
     /// This is never automatic. Calling it is a decision a deployment can schedule.
     ///

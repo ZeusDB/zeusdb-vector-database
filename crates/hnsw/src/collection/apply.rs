@@ -42,6 +42,7 @@ use crate::RerankCalibration;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use zeusdb_vector_core::{Error, Fitted, Int8Codec, Operation, SparseVector, MAX_INTERNAL_ID};
+use zeusdb_vector_sparse::refuse_forward;
 
 impl Collection {
     /// Apply one recorded operation to the collection.
@@ -52,11 +53,13 @@ impl Collection {
     /// - `Insert`. The internal id is held under the id ceiling and equal to
     ///   the one the counter would issue next, the record's id must not be
     ///   held already, the vector is the declared width and finite, which
-    ///   is the refusal `add` makes at its door, and a sparse half is held
-    ///   to the space's rules under its weighting, as admission holds it.
-    ///   The id is then issued, no level is drawn, and the record is
-    ///   installed at the level it names through the path `add` installs
-    ///   through. Nothing trains, since the training's own record follows.
+    ///   is the refusal `add` makes at its door, a sparse half is held to the
+    ///   space's rules under its weighting and to the forward arena's
+    ///   ceiling, and the graph's room is taken at the level the record
+    ///   names, as admission holds them. The id is then issued, no level is
+    ///   drawn, and the record is installed at the level it names through
+    ///   the path `add` installs through. Nothing trains, since the
+    ///   training's own record follows.
     /// - `Remove`. Every id must be held, since the record named what was
     ///   held. Then the removal.
     /// - `UpdateMetadata`. The id must be held. Then the replacement.
@@ -74,6 +77,12 @@ impl Collection {
     /// - `Clear`, `Compact`, `RebuildQuantized` and `AddMetadata` run their
     ///   bodies.
     ///
+    /// A `Compact`, `Rebuild` or `RebuildQuantized` the graph's room refuses
+    /// is passed over. Its record is committed before the rebuild runs, and
+    /// the rebuild builds its graph off to the side from the records alone,
+    /// so the live collection was refused at the same record and kept the
+    /// graph it had.
+    ///
     /// Returns [`Error::JournalReplayMismatch`] for a check that fails, the
     /// ordinary refusal for a value the ordinary path would refuse, and
     /// whatever the body returns for a body that fails.
@@ -85,10 +94,13 @@ impl Collection {
     ///
     /// Every kind applies as `apply` applies it but two. An `Insert` sets
     /// off the training trigger once it is installed, so the insert that
-    /// fills the set trains, stamping the training from the clock. A
-    /// `Train` record carries the stamp alone: the quantizer must be fitted,
-    /// since the record was written as a training began, and the stamp is
-    /// installed.
+    /// fills the set trains, stamping the training from the clock. An
+    /// `Insert` naming an internal id past the last one a collection issues
+    /// is passed over where the counter stands at that id, since a release
+    /// before 0.12.0 issued such an id, refused it at its id store and never
+    /// held the record. A `Train` record carries the stamp alone: the
+    /// quantizer must be fitted, since the record was written as a training
+    /// began, and the stamp is installed.
     pub fn apply_legacy(&self, operation: Operation) -> Result<(), Error> {
         self.apply_at(operation, true)
     }
@@ -107,6 +119,17 @@ impl Collection {
         }
         let mismatch = |detail: String| Error::JournalReplayMismatch { detail };
         let applied = match operation {
+            // An insert of a version 1 journal past the last id, which a
+            // release before 0.12.0 issued and its id store then refused, so
+            // its index never held the record. Passed over where the counter
+            // stands at the last id, as that release's stood past it.
+            Operation::Insert { internal_id, .. }
+                if legacy
+                    && internal_id > MAX_INTERNAL_ID as u64
+                    && *self.id_counter.lock().unwrap() == MAX_INTERNAL_ID =>
+            {
+                Ok(())
+            }
             Operation::Insert {
                 id,
                 internal_id,
@@ -160,7 +183,7 @@ impl Collection {
                 Ok(())
             }
             Operation::Clear => self.clear_locked().map(|(_, old)| cleared = Some(old)),
-            Operation::Compact => self.compact_locked(&writers).map(|_| ()),
+            Operation::Compact => passed_over_if_full(self.compact_locked(&writers).map(|_| ())),
             Operation::Rebuild {
                 m,
                 expected_size,
@@ -185,8 +208,10 @@ impl Collection {
                     expected_size,
                     "",
                 )?;
-                self.rebuild_locked(&writers, m, expected_size, ef_construction)
-                    .map(|_| ())
+                passed_over_if_full(
+                    self.rebuild_locked(&writers, m, expected_size, ef_construction)
+                        .map(|_| ()),
+                )
             }
             Operation::Intern { term_id, term } => self.intern_recorded(term_id, &term),
             Operation::Train { completed_at, .. } if legacy => {
@@ -213,10 +238,9 @@ impl Collection {
                 self.add_metadata_locked(pairs.into_iter().collect());
                 Ok(())
             }
-            Operation::RebuildQuantized => self
-                .rebuild_with_quantization_locked(&writers)
-                .map(|_| ())
-                .map_err(Error::Engine),
+            Operation::RebuildQuantized => {
+                passed_over_if_full(self.rebuild_with_quantization_locked(&writers).map(|_| ()))
+            }
             // The reader settles a call by its framing records and hands
             // none of them on, so one reaching here was built by hand.
             Operation::Commit { first } => Err(mismatch(format!(
@@ -476,15 +500,30 @@ impl Collection {
             return Err(Error::VectorNotFinite { index, value });
         }
 
-        // The sparse half, as admission holds it.
+        // The sparse half, as admission holds it, the forward arena's ceiling
+        // with it.
         if let Some(sparse) = &sparse {
             let space = self.sparse().ok_or(Error::NoSparseSpace)?;
             space.config().weighting.validate_record(sparse.as_ref())?;
+            let held = space.index.read().unwrap().forward_len();
+            refuse_forward(held, 0, sparse.dims.len())
+                .map_err(|err| self.sparse_refusal_named(err))?;
         }
 
         // The id, held to what the id store can name, as admission holds it.
         let arena = self.ids.read().unwrap().arena_len();
         zeusdb_vector_core::refuse_unnamable(&id, arena)?;
+
+        // The graph's room at the level the record names, as admission holds
+        // it. A replay installs each record before it applies the next, so
+        // nothing is admitted ahead of it.
+        self.dense()
+            .index
+            .read()
+            .unwrap()
+            .graph()
+            .room()
+            .take(level as usize)?;
 
         // The id the record names, issued only if it is the next, and the
         // level the record names, with nothing drawn.
@@ -502,5 +541,14 @@ impl Collection {
             *count += 1;
         }
         Ok(())
+    }
+}
+
+/// A rebuild the graph's room refused, taken as passed over, and every other
+/// outcome as it is. See `apply`.
+fn passed_over_if_full(applied: Result<(), Error>) -> Result<(), Error> {
+    match applied {
+        Err(Error::GraphFull { .. }) => Ok(()),
+        other => other,
     }
 }

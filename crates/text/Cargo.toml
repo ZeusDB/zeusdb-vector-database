@@ -14,6 +14,14 @@ license.workspace = true
 # artefact.
 publish = false
 
+[features]
+# The term ceiling, for a test in another crate that lowers it to reach the
+# refusal of a term too long for the dictionary. Off in every build that is
+# not a test, so the wheel carries none of it. The collection's crate turns
+# it on through its dev-dependency on this crate, which cargo applies to that
+# crate's test targets and to nothing else.
+test-support = []
+
 # Every version is the workspace's, declared once in the root Cargo.toml with
 # the reason for each pin.
 [dependencies]

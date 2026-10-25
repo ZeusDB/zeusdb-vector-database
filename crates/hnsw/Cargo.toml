@@ -32,11 +32,15 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 # The engine again, with its test data turned on, for the tests in
-# src/rerank.rs and src/collection/training.rs that measure against it.
-# cargo applies a dev-dependency's features to this crate's test targets and
-# to nothing else, so the wheel is built without them.
+# src/rerank.rs and src/collection/training.rs that measure against it, and
+# with the graph's ceilings a test lowers. cargo applies a dev-dependency's
+# features to this crate's test targets and to nothing else, so the wheel is
+# built without them.
 zeusdb-vector-core = { workspace = true, features = ["test-support"] }
 # The sparse index again, with its test support turned on, for the tests in
 # src/collection that hold the close-up built off to the side to the one
-# made in place.
+# made in place, and for the forward arena's ceiling a test lowers.
 zeusdb-vector-sparse = { workspace = true, features = ["test-support"] }
+# The text layer again, with its test support turned on, for the term
+# ceiling a test lowers.
+zeusdb-vector-text = { workspace = true, features = ["test-support"] }

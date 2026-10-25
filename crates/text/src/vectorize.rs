@@ -10,7 +10,7 @@
 
 use zeusdb_vector_core::{Error, SparseVector};
 
-use crate::dictionary::TermDictionary;
+use crate::dictionary::{refuse_term, TermDictionary};
 use crate::tokenizer::Tokenizer;
 
 /// The ids sorted and run-length counted into a vector whose dimensions are
@@ -59,9 +59,11 @@ where
 
 /// [`count_record`], with `issued` called for every term this call gives
 /// an id to, with the id it is about to take and the term, before the term
-/// is interned. A refusal from `issued` stops the count with the term not
-/// interned, so the dictionary holds no term whose record was refused. What
-/// a caller recording each interning ahead of it counts through.
+/// is interned. A term too long for the dictionary is refused before
+/// `issued` is called for it. A refusal from either stops the count with
+/// the term not interned, so the dictionary holds no term whose record was
+/// refused. What a caller recording each interning ahead of it counts
+/// through.
 pub fn count_record_with<I, S, F>(
     dictionary: &mut TermDictionary,
     terms: I,
@@ -81,6 +83,7 @@ where
         let id = match dictionary.id_of(term) {
             Some(id) => id,
             None => {
+                refuse_term(term)?;
                 let id = dictionary.next_id()?;
                 issued(id, term)?;
                 let interned = dictionary.intern(term)?;
@@ -220,6 +223,29 @@ mod tests {
         assert_eq!(three.id_of("new"), None, "a refused term is not interned");
         assert_eq!(three.len(), 4);
         assert_eq!(three.intern("new").unwrap(), 4, "the id is issued afresh");
+
+        // A term past the ceiling stops the count before `issued` is called
+        // for it, so nothing records an interning that does not happen, and
+        // the dictionary holds the terms before it and not it.
+        {
+            let _lowered = crate::dictionary::tests::Lowered::to(4);
+            let mut issued = Vec::new();
+            let refused = count_record_with(&mut three, ["cat", "toolong", "eel"], |id, term| {
+                issued.push((id, term.to_string()));
+                Ok(())
+            });
+            assert!(matches!(
+                refused,
+                Err(Error::TermTooLong {
+                    bytes: 7,
+                    ceiling: 4
+                })
+            ));
+            assert_eq!(issued, vec![(5, "cat".to_string())]);
+            assert_eq!(three.id_of("toolong"), None);
+            assert_eq!(three.id_of("eel"), None);
+            assert_eq!(three.len(), 6);
+        }
 
         let query = "dog dog cat THE";
         assert_eq!(

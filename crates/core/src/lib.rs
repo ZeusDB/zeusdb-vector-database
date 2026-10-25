@@ -73,9 +73,11 @@ pub use frame::{
 };
 pub use fusion::{fuse, Contribution, FusedHit, Fusion, DEFAULT_RRF_K};
 pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES, NB_LAYER_MAX};
+#[cfg(any(test, feature = "test-support"))]
+pub use graph::GRAPH_CEILINGS;
 pub use graph::{
     restore_graph, restore_int8_graph, Distance, DumpBounds, DumpRefusal, DumpRegion, DumpRows,
-    GraphHit, Planned, Record, Restored, RowValues, VectorGraph,
+    GraphCeilings, GraphHit, GraphRoom, Planned, Record, Restored, RowValues, VectorGraph,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use ids::ID_CEILINGS;

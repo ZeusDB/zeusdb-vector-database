@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use zeusdb_vector_core::{
-    compile_filter, test_support::clustered, Error, Fitted, IdfScope, JournalRecord, Operation,
-    OperationKind, SparseVector, DUMP_FILENAME, MAX_INTERNAL_ID,
+    compile_filter, test_support::clustered, Error, Fitted, GraphCeilings, IdfScope, JournalRecord,
+    Operation, OperationKind, SparseVector, DUMP_FILENAME, GRAPH_CEILINGS, MAX_INTERNAL_ID,
 };
 use zeusdb_vector_sparse::{SparseConfig, Weighting};
 use zeusdb_vector_text::{SimpleTokenizer, Tokenizer};
@@ -1101,6 +1101,507 @@ fn a_record_refused_for_its_id_or_its_width_moves_nothing() {
             }
         }
     }
+}
+
+// ============================================================================
+// THE GRAPH'S ROOM, THE FORWARD ARENA AND THE LONGEST TERM
+// ============================================================================
+
+/// The graph's ceilings, lowered on this thread so the refusals they give
+/// are reached without gigabytes of graph, and put back when dropped.
+struct GraphLowered(GraphCeilings);
+
+impl GraphLowered {
+    fn to(ceilings: GraphCeilings) -> Self {
+        GraphLowered(GRAPH_CEILINGS.with(|held| held.replace(ceilings)))
+    }
+}
+
+impl Drop for GraphLowered {
+    fn drop(&mut self) {
+        GRAPH_CEILINGS.with(|held| held.set(self.0));
+    }
+}
+
+/// What the dense graph's arenas hold, as nodes, upper list words, wide
+/// upper lists and upper list slots.
+fn graph_held(collection: &Collection) -> [usize; 4] {
+    collection.dense_index().graph().room().held()
+}
+
+/// The words the graph gives a record a graph that is full of `arena` cannot
+/// take, holding `held` of the `held` it can address.
+fn full(arena: &str, held: usize, needed: usize) -> String {
+    format!(
+        "The graph is full: its {arena} number {held} of the {held} it can address, and one \
+         more record can add up to {needed}. compact() rebuilds the graph without the nodes \
+         that removed and replaced records leave in it."
+    )
+}
+
+/// The words a rebuild gives where the graph it builds is full of `arena`,
+/// holding `held` of the `held` it can address.
+fn rebuilt_full(arena: &str, held: usize, needed: usize) -> String {
+    format!(
+        "The rebuilt graph is full: its {arena} number {held} of the {held} it can address, \
+         and the next record to go in can add up to {needed}."
+    )
+}
+
+/// A call whose records together may take the graph past a ceiling, though
+/// the graph has room for each of them alone, has each record the room
+/// cannot be sure of, after the records the call admitted before it, refused
+/// in the words that say the call is too large to place at once, with the
+/// graph far from full. The records the call admits go in, and nothing of a
+/// refused record reaches the sink. The refused records then go in one call each,
+/// and every record of the call is held. A replay of what the sink holds
+/// reaches the collection, artefact for artefact, under the same ceiling.
+#[test]
+fn a_call_too_large_to_place_at_once_goes_in_across_smaller_calls() {
+    let vectors = clustered(300, 4, 0x0221_d001);
+    let queries = Queries {
+        dense: vectors[7].clone(),
+        text: None,
+        sparse: None,
+    };
+    let mut run = Run::new(refusals_collection(false));
+    add(
+        &run.original,
+        (0..200).map(|i| record(i, &vectors)).collect(),
+    );
+    run.checkpoint();
+    let held = graph_held(&run.original);
+    let ceiling = held[2] + 150;
+    let _lowered = GraphLowered::to(GraphCeilings {
+        wide_lists: ceiling,
+        ..GraphCeilings::LAYOUT
+    });
+
+    let added = run.original.add_records(
+        (200..300).map(|i| record(i, &vectors)).collect(),
+        vec![],
+        false,
+    );
+    assert!(added.total_errors > 0, "the call is too large for the room");
+    assert!(
+        added.errors.iter().all(|error| error.contains(
+            "This call is too large to place at once: the graph's wide upper lists number "
+        ) && error.contains(
+            "The graph has room for the record on its own, so add the records across smaller \
+             calls."
+        )),
+        "{:?}",
+        added.errors
+    );
+    let refused: Vec<usize> = (200..300)
+        .filter(|i| !added.inserted.contains(&format!("r{i}")))
+        .collect();
+    assert_eq!(refused.len(), added.total_errors);
+    assert!(
+        graph_held(&run.original)[2] < ceiling,
+        "the graph has room left"
+    );
+
+    for i in refused {
+        add(&run.original, vec![record(i, &vectors)]);
+    }
+    assert!((0..300).all(|i| run.original.contains(&format!("r{i}"))));
+    assert_eq!(run.original.vector_count(), 300);
+    let inserts = run
+        .recording
+        .kinds()
+        .iter()
+        .filter(|kind| **kind == OperationKind::Insert)
+        .count();
+    assert_eq!(inserts, 300, "no refused record reached the sink");
+    run.prove(&queries, None);
+}
+
+/// A record the graph has no room for even alone is refused in the words
+/// that say the graph is full, before its id is issued for good or anything
+/// reaches the sink. The nodes removed records leave in the graph take room
+/// until a compaction rebuilds it without them, as the words say, and the
+/// record then goes in.
+#[test]
+fn a_record_a_full_graph_has_no_room_for_moves_nothing_until_a_compaction() {
+    let vectors = clustered(40, 4, 0x0221_d002);
+    let run = Run::new(refusals_collection(false));
+    add(
+        &run.original,
+        (0..30).map(|i| record(i, &vectors)).collect(),
+    );
+    let gone: Vec<String> = (0..5).map(|i| format!("r{i}")).collect();
+    assert!(run.original.remove_points(&gone).unwrap().is_empty());
+    assert_eq!(graph_held(&run.original)[0], 30);
+    let counter = run.original.id_counter();
+    let handed = run.recording.len();
+    let _lowered = GraphLowered::to(GraphCeilings {
+        nodes: 30,
+        ..GraphCeilings::LAYOUT
+    });
+
+    let added = run
+        .original
+        .add_records(vec![record(30, &vectors)], vec![], false);
+    assert_eq!(added.total_errors, 1);
+    assert!(
+        added.errors[0].contains(&full("nodes", 30, 1)),
+        "{:?}",
+        added.errors
+    );
+    assert!(!run.original.contains("r30"));
+    assert_eq!(run.original.id_counter(), counter);
+    assert_eq!(run.recording.len(), handed, "nothing reached the sink");
+
+    assert_eq!(run.original.compact().unwrap(), 5);
+    add(&run.original, vec![record(30, &vectors)]);
+    assert!(run.original.contains("r30"));
+}
+
+/// A compaction whose replacement graph has no room for the records held is
+/// refused in the words a rebuild gives and installs nothing, so the graph, every
+/// record and every page stay as they were, on a raw collection and on a
+/// product quantized one. A replay of a compaction's record passes it over
+/// where the room refuses it, as the live collection, which committed the
+/// record before the compaction ran, was refused at the same record.
+#[test]
+fn a_compaction_the_room_refuses_changes_nothing() {
+    let vectors = clustered(1_100, 4, 0x0221_d003);
+    let queries = Queries {
+        dense: vectors[33].clone(),
+        text: None,
+        sparse: None,
+    };
+    for pq in [false, true] {
+        let label = format!("pq {pq}");
+        let held = if pq { 1_010 } else { 60 };
+        let collection = refusals_collection(pq);
+        add(
+            &collection,
+            (0..held).map(|i| record(i, &vectors)).collect(),
+        );
+        assert_eq!(collection.is_quantized(), pq, "{label}");
+        let gone: Vec<String> = (0..10).map(|i| format!("r{i}")).collect();
+        assert!(collection.remove_points(&gone).unwrap().is_empty());
+        let live = held - 10;
+        let dir = TempDir::new();
+        let before = Snapshot::take(&collection, &dir.sub("before.zdb"), &queries);
+
+        let lowered = GraphLowered::to(GraphCeilings {
+            nodes: live - 1,
+            ..GraphCeilings::LAYOUT
+        });
+        assert_eq!(
+            collection.compact().unwrap_err().to_string(),
+            rebuilt_full("nodes", live - 1, 1),
+            "{label}"
+        );
+        collection.apply(Operation::Compact).unwrap();
+        drop(lowered);
+        let after = Snapshot::take(&collection, &dir.sub("after.zdb"), &queries);
+        assert_eq!(before.diff(&after), Vec::<&str>::new(), "{label}");
+        assert_eq!(collection.compact().unwrap(), 10, "{label}");
+    }
+}
+
+/// A rebuild whose replacement graph has no room for the records at its new
+/// degree is refused in the words a rebuild gives, and the graph and the
+/// configuration it was built with stay. A replay of the rebuild's record
+/// passes it over, so the collection a replay reaches is the collection. A
+/// graph at `m` 2 spans about four times the layers one at `m` 16 does, so
+/// the rebuild needs more upper list words than the graph it replaces held,
+/// and the ceiling is set at what that graph holds.
+#[test]
+fn a_rebuild_the_room_refuses_keeps_the_graph_and_its_configuration() {
+    let vectors = clustered(300, 4, 0x0221_d004);
+    let queries = Queries {
+        dense: vectors[5].clone(),
+        text: None,
+        sparse: None,
+    };
+    let declaration = Declaration::validate(4, "l2", 16, 50, 400, vec!["cat".to_string()]).unwrap();
+    let mut run = Run::new(Collection::build(declaration, None));
+    add(
+        &run.original,
+        (0..300).map(|i| record(i, &vectors)).collect(),
+    );
+    run.checkpoint();
+    let words = graph_held(&run.original)[1];
+    let _lowered = GraphLowered::to(GraphCeilings {
+        words,
+        ..GraphCeilings::LAYOUT
+    });
+
+    let plan = run.original.plan_rebuild(Some(2), None, None).unwrap();
+    let refused = run.original.rebuild(plan).unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            Error::GraphFull {
+                arena: "upper list words",
+                call: false,
+                rebuild: true,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .starts_with("The rebuilt graph is full: its upper list words number "),
+        "{refused}"
+    );
+    assert_eq!(run.original.m(), 16);
+    assert_eq!(graph_held(&run.original)[1], words);
+    assert_eq!(
+        run.recording.kinds().last(),
+        Some(&OperationKind::Rebuild),
+        "the rebuild's record was handed over before it ran"
+    );
+    run.prove(&queries, None);
+}
+
+/// A quantized rebuild whose replacement graph has no room for the records
+/// held is refused in the words a rebuild gives and installs nothing, so the
+/// graph, every record, every code and every page stay as they were, on a
+/// product quantized and on a scalar collection, and the same rebuild goes
+/// in at the ceilings the layout sets.
+#[test]
+fn a_quantized_rebuild_the_room_refuses_changes_nothing() {
+    let vectors = clustered(1_100, 4, 0x0221_d005);
+    let queries = Queries {
+        dense: vectors[44].clone(),
+        text: None,
+        sparse: None,
+    };
+    for scalar in [false, true] {
+        let label = format!("scalar {scalar}");
+        let declaration =
+            Declaration::validate(4, "l2", 4, 50, 2_000, vec!["cat".to_string()]).unwrap();
+        let quantization = if scalar {
+            declaration
+                .scalar_quantization("per_dimension", 1_000, None, StorageMode::QuantizedOnly)
+                .unwrap()
+        } else {
+            declaration
+                .quantization(2, 4, 1_000, None, StorageMode::QuantizedWithRaw)
+                .unwrap()
+        };
+        let collection = Collection::build(declaration, Some(quantization));
+        add(
+            &collection,
+            (0..1_010).map(|i| record(i, &vectors)).collect(),
+        );
+        assert!(collection.is_quantized(), "{label}");
+        let dir = TempDir::new();
+        let before = Snapshot::take(&collection, &dir.sub("before.zdb"), &queries);
+
+        let lowered = GraphLowered::to(GraphCeilings {
+            nodes: 1_009,
+            ..GraphCeilings::LAYOUT
+        });
+        assert_eq!(
+            collection
+                .rebuild_with_quantization()
+                .unwrap_err()
+                .to_string(),
+            rebuilt_full("nodes", 1_009, 1),
+            "{label}"
+        );
+        drop(lowered);
+        let after = Snapshot::take(&collection, &dir.sub("after.zdb"), &queries);
+        assert_eq!(before.diff(&after), Vec::<&str>::new(), "{label}");
+        assert!(collection.rebuild_with_quantization().unwrap(), "{label}");
+    }
+}
+
+/// A recorded insert the graph has no room for at the level it names is
+/// refused as admission refuses it, before its id is issued, and the
+/// collection is as it was.
+#[test]
+fn a_replayed_insert_is_held_to_the_room() {
+    let vectors = clustered(40, 4, 0x0221_d005);
+    let mut run = Run::new(refusals_collection(false));
+    add(
+        &run.original,
+        (0..30).map(|i| record(i, &vectors)).collect(),
+    );
+    run.checkpoint();
+    add(&run.original, vec![record(30, &vectors)]);
+    let (checkpoint, from) = run.checkpoint.clone().unwrap();
+    let records = run.recording.records();
+    let (at, (kind, payload)) = records
+        .iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, (kind, _))| *kind == OperationKind::Insert)
+        .unwrap();
+    let operation = decode(at, *kind, payload, 4);
+    let replayed = Collection::load(&checkpoint).unwrap();
+    let counter = replayed.id_counter();
+    let _lowered = GraphLowered::to(GraphCeilings {
+        nodes: 30,
+        ..GraphCeilings::LAYOUT
+    });
+    assert_eq!(
+        replayed.apply(operation).unwrap_err().to_string(),
+        full("nodes", 30, 1)
+    );
+    assert_eq!(replayed.id_counter(), counter);
+    assert!(!replayed.contains("r30"));
+}
+
+/// The sparse forward arena's ceiling, lowered on this thread for the length
+/// of a test and put back when dropped.
+struct ForwardLowered(usize);
+
+impl ForwardLowered {
+    fn to(ceiling: usize) -> Self {
+        ForwardLowered(zeusdb_vector_sparse::FORWARD_CEILING.with(|held| held.replace(ceiling)))
+    }
+}
+
+impl Drop for ForwardLowered {
+    fn drop(&mut self) {
+        zeusdb_vector_sparse::FORWARD_CEILING.with(|held| held.set(self.0));
+    }
+}
+
+/// A record whose sparse half would take the space's forward arena past its
+/// ceiling, counting the nonzeros of the records the call admitted before
+/// it, is refused naming the space, before anything of it reaches the sink,
+/// and the records before it go in. A replayed insert is held to the same
+/// ceiling, before its id is issued.
+#[test]
+fn a_sparse_half_past_the_forward_ceiling_is_refused_naming_the_space() {
+    let vectors = clustered(40, 4, 0x0221_d006);
+    let sparse = |i: usize| {
+        let dims: Vec<u32> = (0..4).map(|j| (i * 4 + j) as u32).collect();
+        SparseHalf::Vector(SparseVector {
+            dims,
+            values: vec![1.0; 4],
+        })
+    };
+    let with_sparse = |i: usize| ParsedRecord {
+        sparse: Some(sparse(i)),
+        ..record(i, &vectors)
+    };
+    let mut run = Run::new(overwrite_collection(true));
+    add(&run.original, (0..10).map(with_sparse).collect());
+    run.checkpoint();
+    let held = run
+        .original
+        .sparse()
+        .unwrap()
+        .index
+        .read()
+        .unwrap()
+        .forward_len();
+    assert_eq!(held, 40);
+    let handed = run.recording.len();
+    let lowered = ForwardLowered::to(held + 10);
+    let added = run
+        .original
+        .add_records((10..13).map(with_sparse).collect(), vec![], false);
+    assert_eq!(added.inserted, vec!["r10".to_string(), "r11".to_string()]);
+    assert_eq!(added.total_errors, 1);
+    assert!(
+        added.errors[0].contains(
+            "The sparse space 'terms' cannot take the record: its forward store holds 40 \
+             nonzeros, the records this call admitted before it carry 8 more, the record \
+             carries 4, and the store can address 50. compact() reclaims the nonzeros of \
+             removed records."
+        ),
+        "{:?}",
+        added.errors
+    );
+    assert_eq!(run.recording.len(), handed + 2, "the two records went in");
+    drop(lowered);
+
+    let records = run.recording.records();
+    let (at, (kind, payload)) = records
+        .iter()
+        .enumerate()
+        .skip(handed)
+        .find(|(_, (kind, _))| *kind == OperationKind::Insert)
+        .unwrap();
+    let operation = decode(at, *kind, payload, 4);
+    let (checkpoint, _) = run.checkpoint.clone().unwrap();
+    let replayed = Collection::load(&checkpoint).unwrap();
+    let counter = replayed.id_counter();
+    let _lowered = ForwardLowered::to(held + 3);
+    assert_eq!(
+        replayed.apply(operation).unwrap_err().to_string(),
+        "The sparse space 'terms' cannot take the record: its forward store holds 40 nonzeros, \
+         the record carries 4, and the store can address 43. compact() reclaims the nonzeros \
+         of removed records."
+    );
+    assert_eq!(replayed.id_counter(), counter);
+}
+
+/// A record carrying a term longer than a text space stores is refused,
+/// before its id is issued for good, with the term neither interned nor
+/// handed to the sink, and the records around it go in.
+#[test]
+fn a_term_past_the_ceiling_is_refused_before_it_is_interned() {
+    let vectors = clustered(10, 8, 0x0221_d007);
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(SimpleTokenizer);
+    let declaration = Declaration::validate(8, "l2", 8, 60, 50, vec!["cat".to_string()])
+        .unwrap()
+        .with_text("text", SparseConfig::default(), tokenizer)
+        .unwrap();
+    let run = Run::new(Collection::build(declaration, None));
+    let c = &run.original;
+    let with_text = |i: usize, text: &str| ParsedRecord {
+        sparse: Some(SparseHalf::Terms(c.tokenize(text).unwrap())),
+        ..record(i, &vectors)
+    };
+    add(c, vec![with_text(0, "alpha beta")]);
+    let counter = c.id_counter();
+    let lowered = zeusdb_vector_text::TERM_CEILING.with(|held| held.replace(6));
+    let added = c.add_records(
+        vec![
+            with_text(1, "alpha gamma"),
+            with_text(2, "alpha overlong"),
+            with_text(3, "beta delta"),
+        ],
+        vec![],
+        false,
+    );
+    zeusdb_vector_text::TERM_CEILING.with(|held| held.set(lowered));
+    assert_eq!(added.inserted, vec!["r1".to_string(), "r3".to_string()]);
+    assert_eq!(added.total_errors, 1);
+    assert!(
+        added.errors[0].contains(
+            "A term of 8 bytes is longer than the 6 bytes a text space stores for one term."
+        ),
+        "{:?}",
+        added.errors
+    );
+    assert!(!c.contains("r2"));
+    assert_eq!(c.id_counter(), counter + 2);
+    let dictionary = c
+        .sparse()
+        .unwrap()
+        .text
+        .as_ref()
+        .unwrap()
+        .dictionary
+        .read()
+        .unwrap()
+        .terms()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<String>>();
+    assert_eq!(dictionary, ["alpha", "beta", "gamma", "delta"]);
+    assert!(
+        run.recording
+            .records()
+            .iter()
+            .all(|(_, payload)| !payload.windows(8).any(|w| w == b"overlong")),
+        "the term never reached the sink"
+    );
 }
 
 /// A collection with a sparse space under BM25, whose values must be whole,

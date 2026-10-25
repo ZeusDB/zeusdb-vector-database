@@ -80,9 +80,11 @@ mod search;
 mod verify;
 
 pub use calibrate::UnitCosts;
+#[cfg(any(test, feature = "test-support"))]
+pub use index::FORWARD_CEILING;
 pub use index::{
-    HeapBytes, PostingsIndex, PostingsParts, SparseConfig, Unlink, Weighting, DEFAULT_BM25_B,
-    DEFAULT_BM25_K1, DEFAULT_LAZY_THRESHOLD_PERCENT,
+    refuse_forward, HeapBytes, PostingsIndex, PostingsParts, SparseConfig, Unlink, Weighting,
+    DEFAULT_BM25_B, DEFAULT_BM25_K1, DEFAULT_LAZY_THRESHOLD_PERCENT, MAX_FORWARD,
 };
 pub use search::Mode;
 

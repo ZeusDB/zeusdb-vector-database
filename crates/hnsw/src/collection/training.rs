@@ -433,11 +433,13 @@ impl Collection {
     /// rebuild does. Nothing is held twice: the rows live in the
     /// replacement's store and the raw vectors go with the graph that held
     /// them, which is the whole of how `quantized_only` sheds them. The
-    /// values the encode clipped are added to the index's count.
+    /// values the encode clipped are added to the index's count. A
+    /// replacement with no room for a row is refused with the room's refusal
+    /// as a rebuild gives it and installs nothing.
     pub(super) fn rebuild_with_int8_locked(
         &self,
         writers: &MutationGuard<'_>,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, Error> {
         let start_time = Instant::now();
         let Some(codec) = self.dense().int8_codec().cloned() else {
             warn!(target: LOG_TARGET, operation = "rebuild_quantization",
@@ -477,7 +479,7 @@ impl Collection {
                 if let Some(row) = node.and_then(|node| old_hnsw.int8_row_at(node)) {
                     rows.push((row.to_vec(), internal_id));
                 } else if let Some(vector) = node.and_then(|node| old_hnsw.raw_vector_at(node)) {
-                    let row = new_hnsw.int8_encode(vector)?;
+                    let row = new_hnsw.int8_encode(vector).map_err(Error::Engine)?;
                     clipped += codec.saturated(vector) as u64;
                     rows.push((row, internal_id));
                     encoded += 1;
@@ -490,10 +492,10 @@ impl Collection {
                     missing_records = missing,
                     "Refusing to rebuild, some live records hold neither a raw vector nor a scalar row"
                 );
-                return Err(format!(
+                return Err(Error::Engine(format!(
                     "{} live records hold neither a raw vector nor a scalar row to rebuild from",
                     missing
-                ));
+                )));
             }
             (rows, encoded, clipped, old_hnsw.raw_count())
         };
@@ -511,7 +513,10 @@ impl Collection {
                 .collect();
             new_hnsw.insert_batch_int8(&batch).map_err(|e| {
                 error!(target: LOG_TARGET, operation = "int8_rebuild", error = %e, "Failed to insert scalar rows");
-                format!("Failed to insert scalar rows: {}", e)
+                match e {
+                    Error::GraphFull { .. } => e.in_rebuild(),
+                    e => Error::Engine(format!("Failed to insert scalar rows: {}", e)),
+                }
             })?;
         }
 
@@ -580,13 +585,14 @@ impl Collection {
     /// call, so the two entry points are separate rather than one taking the guard
     /// twice and deadlocking on itself.
     ///
-    /// Errors are `String`, which `rebuild_with_quantization` turns into the
-    /// `Error::Engine` the binding raises as the `RuntimeError` it always
-    /// raised, and the training path formats into its own message.
+    /// Errors are `Error::Engine`, which the binding raises as `RuntimeError`
+    /// and the training path formats into its own message, except a
+    /// replacement with no room for a record, which is refused with the
+    /// room's refusal as a rebuild gives it and installs nothing.
     pub(super) fn rebuild_with_quantization_locked(
         &self,
         writers: &MutationGuard<'_>,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, Error> {
         if self.dense().declares_int8() {
             return self.rebuild_with_int8_locked(writers);
         }
@@ -659,7 +665,7 @@ impl Collection {
                 let vector_refs: Vec<&[f32]> = with_raw.iter().map(|&(_, vector)| vector).collect();
                 let quantized_codes = pq.quantize_batch(&vector_refs).map_err(|e| {
                     error!(target: LOG_TARGET, operation = "quantization_rebuild", error = %e, "Failed to quantize vectors");
-                    format!("Failed to quantize vectors: {}", e)
+                    Error::Engine(format!("Failed to quantize vectors: {}", e))
                 })?;
 
                 // Store quantized codes. Codes for records that have no raw vector
@@ -737,7 +743,10 @@ impl Collection {
             new_hnsw.insert_batch_pq(&batch)
                 .map_err(|e| {
                     error!(target: LOG_TARGET, operation = "quantization_rebuild", error = %e, "Failed to insert quantized vectors");
-                    format!("Failed to insert quantized vectors: {}", e)
+                    match e {
+                        Error::GraphFull { .. } => e.in_rebuild(),
+                        e => Error::Engine(format!("Failed to insert quantized vectors: {}", e)),
+                    }
                 })?;
         }
 
@@ -751,11 +760,11 @@ impl Collection {
                 held_records = held,
                 "Refusing the rebuild, some held records have no codes"
             );
-            return Err(format!(
+            return Err(Error::Engine(format!(
                 "the quantized rebuild built {} nodes for the {} records the index holds",
                 new_hnsw.nb_points(),
                 held
-            ));
+            )));
         }
 
         // The raw vectors survive the transition, where the storage mode keeps
@@ -788,7 +797,9 @@ impl Collection {
                     .collect();
                 new_hnsw
                     .adopt_raw_from(old_hnsw, &source, self.dense().dim)
-                    .map_err(|e| format!("Failed to carry the raw vectors over: {}", e))?;
+                    .map_err(|e| {
+                        Error::Engine(format!("Failed to carry the raw vectors over: {}", e))
+                    })?;
                 // The store that carries them is opened at the number of
                 // records present now, which is the training sample, and the
                 // rest of the corpus is still coming. Every record after this
@@ -852,7 +863,6 @@ impl Collection {
         self.record(|| Operation::RebuildQuantized)?;
         self.commit_records()?;
         self.rebuild_with_quantization_locked(&writers)
-            .map_err(Error::Engine)
     }
 
     /// How far the training collection has come, as a percentage, and 100 on

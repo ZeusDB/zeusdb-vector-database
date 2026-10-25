@@ -309,16 +309,23 @@ fn vectors(bytes: &[u8], records: usize) -> Result<HashMap<String, Vec<f32>>, St
 /// set sized by `records`, the count the mappings hold, and a set as large as
 /// the file's count proves every id distinct. A smaller set holds a duplicate
 /// or a collision, and the ids are counted again by name, which no file a
-/// save wrote reaches.
-pub(super) fn walk_vectors(
-    bytes: &[u8],
+/// save wrote reaches. `each` is handed every entry's id and the number of
+/// values its vector holds, in the order the file holds them, and what it
+/// gathers stands only where the walk returns the count.
+pub(super) fn walk_vectors<'a>(
+    bytes: &'a [u8],
     file: &str,
     records: usize,
+    each: &mut dyn FnMut(&'a str, usize),
 ) -> Result<(usize, Vec<String>), Error> {
-    walk(bytes, records).map_err(|stop| stop.refusal(file, bytes.len()))
+    walk(bytes, records, each).map_err(|stop| stop.refusal(file, bytes.len()))
 }
 
-fn walk(bytes: &[u8], records: usize) -> Result<(usize, Vec<String>), Stop> {
+fn walk<'a>(
+    bytes: &'a [u8],
+    records: usize,
+    each: &mut dyn FnMut(&'a str, usize),
+) -> Result<(usize, Vec<String>), Stop> {
     let hasher = RandomState::new();
     let mut wire = Wire::new(bytes);
     let entries = wire.len(2)?;
@@ -326,11 +333,13 @@ fn walk(bytes: &[u8], records: usize) -> Result<(usize, Vec<String>), Stop> {
     let mut offenders: BTreeSet<&str> = BTreeSet::new();
     for _ in 0..entries {
         let id = wire.str()?;
-        if all_finite(wire.floats()?) {
+        let values = wire.floats()?;
+        if all_finite(values) {
             offenders.remove(id);
         } else {
             offenders.insert(id);
         }
+        each(id, values.len() / 4);
         hashes.insert(hasher.hash_one(id));
     }
     wire.end()?;

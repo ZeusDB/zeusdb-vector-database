@@ -1503,6 +1503,34 @@ impl Collection {
         })
     }
 
+    /// `error` with the sparse space named in it, where it is a refusal the
+    /// sparse index gave with the space left for its caller to name.
+    pub(crate) fn sparse_refusal_named(&self, error: Error) -> Error {
+        let name = || {
+            self.sparse_named()
+                .map_or_else(String::new, |(name, _)| name.as_str().to_string())
+        };
+        match error {
+            Error::SparseForwardFull {
+                held,
+                admitted,
+                nnz,
+                ceiling,
+                ..
+            } => Error::SparseForwardFull {
+                space: name(),
+                held,
+                admitted,
+                nnz,
+                ceiling,
+            },
+            Error::SparseRecordUnmapped { id, .. } => {
+                Error::SparseRecordUnmapped { space: name(), id }
+            }
+            other => other,
+        }
+    }
+
     /// The prefix a sparse space's artefacts are written under, being
     /// `spaces/<name>/`.
     pub(crate) fn space_prefix(name: &SpaceName) -> String {
