@@ -1174,7 +1174,7 @@ def test_load_validates_the_declaration_in_config_json(tmp_path):
 
     # A space this build does not know. new_raw fell back to cosine and logged
     # it, so an l2 index came back answering cosine distances.
-    with pytest.raises(RuntimeError,
+    with pytest.raises(ValueError,
                        match=r"config\.json: Unsupported space: 'euclidean'"):
         vdb.load(corrupted("space.zdb", "space", "euclidean"))
 

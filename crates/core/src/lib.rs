@@ -8,8 +8,9 @@
 //! in `space` and `admit`, the fusion that combines several indexes'
 //! pages into one, the write-ahead journal's format with its reader and
 //! the operations it records, the storage a saved collection is kept in
-//! with its one implementation over the filesystem, and the abort hook a
-//! crash test kills a process at. The binding takes this crate as a path
+//! with its one implementation over the filesystem, the abort hook a crash
+//! test kills a process at, and the hook a test panics at inside a mutation.
+//! The binding takes this crate as a path
 //! dependency and reaches it through the re-exports below, so the crate's
 //! surface is this file's `pub use` list and nothing else.
 //! Every module is private. An item a module marks `pub` that this file does
@@ -51,6 +52,7 @@ mod journal;
 mod kill;
 mod metadata;
 mod operation;
+mod panic_point;
 mod pq;
 mod rng;
 mod space;
@@ -111,6 +113,11 @@ pub use metadata::{MetadataParts, MetadataStore, RecordFields};
 pub use operation::{
     AbortReason, Fitted, FittedRef, InsertParts, Operation, Values, STAMP_CEILING,
 };
+// The hook a test panics at inside a mutation. An empty function in every
+// build without the `test-support` feature; see `panic_point`.
+#[cfg(any(test, feature = "test-support"))]
+pub use panic_point::{arm as panic_arm, disarm as panic_disarm};
+pub use panic_point::{at as panic_at, PanicPoint};
 pub use pq::PQ;
 pub use rng::SeededRng;
 pub use space::{

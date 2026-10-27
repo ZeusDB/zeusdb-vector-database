@@ -15,8 +15,28 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use zeusdb_vector_core::Error;
 use zeusdb_vector_hnsw::{FieldRef, QueryHits};
+
+/// A count or a size a call takes, read from a Python integer, with a
+/// negative one refused naming the argument. The signatures take `i64`,
+/// which is the index-sized integer Python itself reads, so PyO3 refuses an
+/// integer past what it holds with `OverflowError` before this runs.
+pub(crate) fn count(value: i64, name: &'static str) -> Result<usize, Error> {
+    if value < 0 {
+        return Err(Error::ArgumentNegative { name, value });
+    }
+    Ok(usize::try_from(value).unwrap_or(usize::MAX))
+}
+
+/// [`count`] for an argument that may be left out.
+pub(crate) fn count_if_given(
+    value: Option<i64>,
+    name: &'static str,
+) -> Result<Option<usize>, Error> {
+    value.map(|value| count(value, name)).transpose()
+}
 
 /// How deeply a Python object may nest on the way in.
 ///
@@ -107,9 +127,10 @@ fn convert_value(py_obj: &Bound<PyAny>, depth: usize) -> PyResult<Value> {
     }
 }
 
-/// A metadata map as a Python dict.
+/// A metadata map as a Python dict, its keys in the map's order, which is
+/// code point order.
 pub(crate) fn value_map_to_python(
-    value_map: &HashMap<String, Value>,
+    value_map: &BTreeMap<String, Value>,
     py: Python<'_>,
 ) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
@@ -172,17 +193,35 @@ pub(crate) fn value_to_python_object(value: &Value, py: Python<'_>) -> PyResult<
 /// Python strings for its id and its string values alone. A value that is not
 /// a string goes through `value_to_python_object`, which is what
 /// `value_map_to_python` applies to the same value.
+///
+/// Each hit's metadata keys go in in code point order, as every other call
+/// hands metadata over. The page's names are ranked once, and each hit's
+/// fields are put in rank order before its dict is built.
 pub(crate) fn hits_to_python(hits: QueryHits, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
     let id_key = intern!(py, "id");
     let score_key = intern!(py, "score");
     let metadata_key = intern!(py, "metadata");
     let vector_key = intern!(py, "vector");
-    let names: Vec<Bound<'_, PyString>> =
-        hits.names().map(|name| PyString::new(py, name)).collect();
+    let page_names: Vec<&str> = hits.names().collect();
+    let names: Vec<Bound<'_, PyString>> = page_names
+        .iter()
+        .map(|name| PyString::new(py, name))
+        .collect();
+    // Each name's place in code point order, by the page's number for it.
+    let mut by_name: Vec<usize> = (0..page_names.len()).collect();
+    by_name.sort_unstable_by_key(|&number| page_names[number]);
+    let mut rank = vec![0usize; page_names.len()];
+    for (place, &number) in by_name.iter().enumerate() {
+        rank[number] = place;
+    }
+    let mut fields: Vec<(usize, FieldRef<'_>)> = Vec::new();
     let mut output = Vec::with_capacity(hits.len());
     for hit in hits.iter() {
+        fields.clear();
+        fields.extend(hit.fields());
+        fields.sort_unstable_by_key(|&(name, _)| rank[name]);
         let metadata = PyDict::new(py);
-        for (name, value) in hit.fields() {
+        for &(name, value) in &fields {
             match value {
                 FieldRef::Text(text) => metadata.set_item(&names[name], PyString::new(py, text))?,
                 FieldRef::Other(value) => {

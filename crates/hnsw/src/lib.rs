@@ -56,6 +56,9 @@ pub use collection::{
     QuantizerReport, Query, QueryHit, QueryHits, RebuildPlan, RecordView, SpaceConfig, SparseHalf,
     SparseHits, StorageMode, TextConfig, DEFAULT_FETCH_PER_K, DEFAULT_SPACE, MAX_ARMS,
 };
+// The rule a panic inside a call keeps. A call on an index goes through
+// `Collection::run`, and a call with no index to stop through this.
+pub use collection::run_without_index;
 #[cfg(test)]
 pub use flusher::Watch;
 pub use journal::{

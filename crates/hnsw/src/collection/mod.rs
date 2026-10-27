@@ -51,6 +51,8 @@
 //! | `journal_tests` | a directory and the journal beside it |
 //! | `query` | a query over one or more arms, its plan and its fused page |
 //! | `search` | the four paths that reach the graph, and the page they build |
+//! | `stop` | the rule a panic inside a call keeps, which stops the index |
+//! | `stop_tests` | a panic inside a call, and what every later call sees |
 //! | `training` | fitting the codebook and rebuilding over the codes |
 //! | `stats` | what the index reports about itself |
 //! | `persist` | the accessors and setters `persistence.rs` speaks to |
@@ -127,6 +129,9 @@ mod segment_tests;
 #[cfg(test)]
 mod spaces_tests;
 mod stats;
+mod stop;
+#[cfg(test)]
+mod stop_tests;
 mod training;
 #[cfg(test)]
 mod upgrade_tests;
@@ -146,13 +151,14 @@ pub use query::{
 };
 pub use search::SparseHits;
 pub use stats::{QuantizationReport, QuantizerReport};
+pub use stop::run_without_index;
 
 use crate::journal::Durability;
 use crate::locks::{MutexAt, RwLockAt};
 use crate::RerankCalibration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::{trace, warn};
@@ -713,8 +719,9 @@ impl QuantizationConfig {
     }
 }
 
-/// One page of `list`, as (id, metadata) in ascending internal id.
-pub type Listing = Vec<(String, HashMap<String, Value>)>;
+/// One page of `list`, as (id, metadata) in ascending internal id, each
+/// record's names in code point order.
+pub type Listing = Vec<(String, BTreeMap<String, Value>)>;
 
 /// The name of the dense space the binding declares.
 ///
@@ -722,12 +729,13 @@ pub type Listing = Vec<(String, HashMap<String, Value>)>;
 /// through `Declaration` always holds a dense space under it, first.
 pub const DEFAULT_SPACE: &str = "default";
 
-/// One record as `get_records` returns it: its id, its metadata, and its
-/// vector where one was asked for and the index could supply one.
+/// One record as `get_records` returns it: its id, its metadata with its
+/// names in code point order, and its vector where one was asked for and the
+/// index could supply one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordView {
     pub id: String,
-    pub metadata: HashMap<String, Value>,
+    pub metadata: BTreeMap<String, Value>,
     pub vector: Option<Vec<f32>>,
 }
 
@@ -921,6 +929,17 @@ impl DenseSpace {
         self.pq.as_ref().is_some_and(|pq| pq.is_trained()) || self.int8.get().is_some()
     }
 
+    /// [`DenseSpace::can_use_quantization`] without waiting for the
+    /// quantizer's lock, and `None` where a writer holds it or a panic
+    /// poisoned it.
+    pub(crate) fn try_can_use_quantization(&self) -> Option<bool> {
+        let fitted = match &self.pq {
+            Some(pq) => pq.try_is_trained()?,
+            None => false,
+        };
+        Some(fitted || self.int8.get().is_some())
+    }
+
     /// Whether the space was declared with scalar quantization, fitted or
     /// not.
     pub(crate) fn declares_int8(&self) -> bool {
@@ -951,6 +970,16 @@ impl DenseSpace {
             return index.graph().is_quantized();
         }
         false
+    }
+
+    /// [`DenseSpace::is_quantized`] without waiting for the quantizer's lock
+    /// or the index's read guard, and `None` where a writer holds one or a
+    /// panic poisoned one.
+    pub(crate) fn try_is_quantized(&self) -> Option<bool> {
+        if self.try_can_use_quantization()? {
+            return Some(self.index.try_read()?.graph().is_quantized());
+        }
+        Some(false)
     }
 
     /// Whether the storage mode keeps a raw vector beside every code.
@@ -1331,6 +1360,11 @@ pub struct Collection {
     /// `expected_size` declared, so the warning fires once rather than on every
     /// subsequent `add`.
     overgrowth_warned: AtomicBool,
+
+    /// What stopped the index, set once by the first call that panicked
+    /// inside it, after which every call made through [`Collection::run`] is
+    /// refused. See the `stop` module.
+    stopped: OnceLock<stop::Stop>,
 }
 
 impl Collection {
@@ -2118,18 +2152,25 @@ impl Collection {
     /// asked under a storage guard; `remove_point_internal` reads it before it
     /// takes any.
     pub fn storage_mode(&self) -> String {
+        self.storage_mode_name(self.can_use_quantization(), self.is_quantized())
+            .to_string()
+    }
+
+    /// The storage mode's name, from whether the quantizer is fitted and
+    /// whether the graph scores against codes.
+    fn storage_mode_name(&self, fitted: bool, active: bool) -> &'static str {
         if !self.has_quantization() {
-            "raw_only".to_string()
-        } else if !self.can_use_quantization() {
+            "raw_only"
+        } else if !fitted {
             if self.training_threshold_reached.load(Ordering::Acquire) {
-                "raw_ready_for_training".to_string()
+                "raw_ready_for_training"
             } else {
-                "raw_collecting_for_training".to_string()
+                "raw_collecting_for_training"
             }
-        } else if self.is_quantized() {
-            "quantized_active".to_string()
+        } else if active {
+            "quantized_active"
         } else {
-            "raw_trained_not_rebuilt".to_string()
+            "raw_trained_not_rebuilt"
         }
     }
 
@@ -2158,6 +2199,100 @@ impl Collection {
     /// `remove_point` removed.
     pub fn contains(&self, id: &str) -> bool {
         self.ids.read().unwrap().contains_name(id)
+    }
+
+    // ------------------------------------------------------------------
+    // The reads a caller holding the interpreter makes without waiting.
+    // Each is the accessor of its name without the `try_` prefix, taking
+    // every guard it takes without waiting, and gives `None` where a writer
+    // holds one of them or a panic poisoned one. The binding asks one of
+    // these with the interpreter held, and asks the waiting accessor with
+    // the interpreter released only where it gives `None`, so a cheap call
+    // pays no hand-off of the interpreter and never waits with it held.
+    // ------------------------------------------------------------------
+
+    /// [`Collection::len`] without waiting.
+    pub fn try_len(&self) -> Option<usize> {
+        Some(self.ids.try_read()?.len())
+    }
+
+    /// [`Collection::contains`] without waiting.
+    pub fn try_contains(&self, id: &str) -> Option<bool> {
+        Some(self.ids.try_read()?.contains_name(id))
+    }
+
+    /// [`Collection::vector_count`] without waiting.
+    pub fn try_vector_count(&self) -> Option<usize> {
+        Some(*self.vector_count.try_lock()?)
+    }
+
+    /// [`Collection::can_use_quantization`] without waiting.
+    pub fn try_can_use_quantization(&self) -> Option<bool> {
+        self.dense().try_can_use_quantization()
+    }
+
+    /// [`Collection::is_quantized`] without waiting.
+    pub fn try_is_quantized(&self) -> Option<bool> {
+        self.dense().try_is_quantized()
+    }
+
+    /// [`Collection::storage_mode`] without waiting.
+    pub fn try_storage_mode(&self) -> Option<String> {
+        let fitted = self.dense().try_can_use_quantization()?;
+        let active = self.dense().try_is_quantized()?;
+        Some(self.storage_mode_name(fitted, active).to_string())
+    }
+
+    /// [`Collection::indexed_fields`] without waiting.
+    pub fn try_indexed_fields(&self) -> Option<Vec<String>> {
+        Some(self.columns.try_read()?.declared().to_vec())
+    }
+
+    /// [`Collection::metadata`] without waiting.
+    pub fn try_metadata(&self, key: &str) -> Option<Option<String>> {
+        Some(self.metadata.try_lock()?.get(key).cloned())
+    }
+
+    /// [`Collection::all_metadata`] without waiting.
+    pub fn try_all_metadata(&self) -> Option<BTreeMap<String, String>> {
+        let meta_lock = self.metadata.try_lock()?;
+        Some(
+            meta_lock
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )
+    }
+
+    /// The `path` [`Collection::journal_status`] reports, read under the
+    /// sink's guard alone and without waiting.
+    pub fn try_journal_path(&self) -> Option<Option<std::path::PathBuf>> {
+        let slot = self.sink.try_lock()?;
+        Some(slot.attached.as_ref().and_then(|sink| {
+            sink.durability()?;
+            sink.journal_path().map(std::path::Path::to_path_buf)
+        }))
+    }
+
+    /// [`Collection::identity_record`] without waiting.
+    pub fn try_identity_record(&self) -> Option<IdentityRecord> {
+        let lineage = self.lineage.try_lock()?;
+        Some(IdentityRecord {
+            identity: Identity {
+                collection_id: self.collection_id,
+                generation: lineage.generation,
+                snapshot: lineage.snapshot,
+                parent: lineage.parent,
+            },
+            saved_at: lineage.saved_at.clone(),
+            sequence: lineage.sequence,
+        })
+    }
+
+    /// Whether the sparse space has a text layer, read without a guard,
+    /// since the layer is declared at creation and never changes.
+    pub fn takes_text(&self) -> bool {
+        self.sparse().is_some_and(|space| space.text.is_some())
     }
 
     /// Live records matching a filter, or every live record when none is given.
@@ -2432,10 +2567,13 @@ impl Collection {
         meta_lock.get(key).cloned()
     }
 
-    /// Get all index-level metadata
-    pub fn all_metadata(&self) -> HashMap<String, String> {
+    /// Get all index-level metadata, the keys in code point order
+    pub fn all_metadata(&self) -> BTreeMap<String, String> {
         let meta_lock = self.metadata.lock().unwrap();
-        meta_lock.clone()
+        meta_lock
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     }
 
     /// Generate a unique ID for a vector
@@ -2452,7 +2590,15 @@ impl Collection {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_types)]
+
     use super::construct::MAX_DIM;
+    use super::journal_support::TempDir;
+    use super::{Collection, Declaration, ParsedRecord, StorageMode};
+    use crate::journal::Durability;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::sync::mpsc::{channel, Receiver, Sender};
     use zeusdb_vector_core::JOURNAL_MAX_PAYLOAD;
 
     /// The journal's payload ceiling is derived from this crate's ceilings,
@@ -2466,5 +2612,224 @@ mod tests {
             JOURNAL_MAX_PAYLOAD,
             MAX_DIM * most_centroids * 4 + (1 << 20)
         );
+    }
+
+    /// `hold` takes a guard on a thread of its own and holds it, sending on
+    /// its first channel once it holds it and letting it go once the second
+    /// receives, and `check` runs on this thread while it is held.
+    fn while_held(hold: impl FnOnce(Sender<()>, Receiver<()>) + Send, check: impl FnOnce()) {
+        std::thread::scope(|scope| {
+            let (held_tx, held_rx) = channel();
+            let (done_tx, done_rx) = channel();
+            scope.spawn(move || hold(held_tx, done_rx));
+            held_rx.recv().unwrap();
+            check();
+            done_tx.send(()).unwrap();
+        });
+    }
+
+    /// A collection of `n` records of width two, each with the field `cat`
+    /// declared and filled, quantized by a codebook that fits at 1,000.
+    fn quantized(n: usize) -> Collection {
+        let declaration =
+            Declaration::validate(2, "l2", 4, 50, 2000, vec!["cat".to_string()]).unwrap();
+        let quantization = declaration
+            .quantization(1, 2, 1000, None, StorageMode::QuantizedWithRaw)
+            .unwrap();
+        let collection = Collection::build(declaration, Some(quantization));
+        let records: Vec<ParsedRecord> = (0..n)
+            .map(|i| {
+                let metadata: HashMap<String, Value> =
+                    HashMap::from([("cat".to_string(), json!(i % 3))]);
+                let x = (i % 97) as f32 / 97.0;
+                let y = (i % 89) as f32 / 89.0;
+                ParsedRecord::from((format!("r{i}"), vec![x, y], metadata))
+            })
+            .collect();
+        let added = collection.add_records(records, vec![], false);
+        assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+        collection
+            .add_metadata(HashMap::from([("owner".to_string(), "test".to_string())]))
+            .unwrap();
+        collection
+    }
+
+    /// Each read a caller holding the interpreter makes without waiting
+    /// gives what the waiting read gives where every guard it takes is free,
+    /// and `None` while another thread holds one of them, or once a panic
+    /// has poisoned one.
+    #[test]
+    fn every_read_without_waiting_gives_none_while_its_guard_is_held() {
+        let dir = TempDir::new("try-reads");
+        let trained = quantized(1000);
+        trained
+            .journal_to(
+                dir.at("trained.zdb").to_str().unwrap(),
+                Durability::default(),
+            )
+            .unwrap();
+        let collecting = quantized(10);
+        assert!(trained.is_quantized() && !collecting.can_use_quantization());
+
+        for collection in [&trained, &collecting] {
+            assert_eq!(collection.try_len(), Some(collection.len()));
+            assert_eq!(collection.try_contains("r1"), Some(true));
+            assert_eq!(collection.try_contains("absent"), Some(false));
+            assert_eq!(
+                collection.try_vector_count(),
+                Some(collection.vector_count())
+            );
+            assert_eq!(
+                collection.try_can_use_quantization(),
+                Some(collection.can_use_quantization())
+            );
+            assert_eq!(
+                collection.try_is_quantized(),
+                Some(collection.is_quantized())
+            );
+            assert_eq!(
+                collection.try_storage_mode(),
+                Some(collection.storage_mode())
+            );
+            assert_eq!(
+                collection.try_indexed_fields(),
+                Some(collection.indexed_fields())
+            );
+            assert_eq!(
+                collection.try_metadata("owner"),
+                Some(collection.metadata("owner"))
+            );
+            assert_eq!(
+                collection.try_all_metadata(),
+                Some(collection.all_metadata())
+            );
+            assert_eq!(
+                collection.try_journal_path(),
+                Some(collection.journal_status().map(|status| status.path))
+            );
+            assert_eq!(
+                collection.try_identity_record(),
+                Some(collection.identity_record())
+            );
+            assert_eq!(collection.try_info(), Some(collection.info()));
+            assert_eq!(
+                collection.try_quantization_report(),
+                Some(collection.quantization_report())
+            );
+            assert_eq!(
+                collection.try_training_progress(),
+                Some(collection.training_progress())
+            );
+            assert_eq!(
+                collection.try_training_vectors_needed(),
+                Some(collection.training_vectors_needed())
+            );
+        }
+
+        let held = |held: Sender<()>, done: Receiver<()>| {
+            held.send(()).unwrap();
+            done.recv().unwrap();
+        };
+        let trained = &trained;
+        let collecting = &collecting;
+        while_held(
+            |tx, rx| {
+                let _ids = trained.ids.write().unwrap();
+                held(tx, rx);
+            },
+            || {
+                assert_eq!(trained.try_len(), None);
+                assert_eq!(trained.try_contains("r1"), None);
+                assert_eq!(trained.try_info(), None);
+            },
+        );
+        while_held(
+            |tx, rx| {
+                let _index = trained.dense().index.write().unwrap();
+                held(tx, rx);
+            },
+            || {
+                assert_eq!(trained.try_is_quantized(), None);
+                assert_eq!(trained.try_storage_mode(), None);
+                assert_eq!(trained.try_info(), None);
+            },
+        );
+        while_held(
+            |tx, rx| {
+                let _trained = trained
+                    .dense()
+                    .pq
+                    .as_ref()
+                    .unwrap()
+                    .is_trained
+                    .write()
+                    .unwrap();
+                held(tx, rx);
+            },
+            || {
+                assert_eq!(trained.try_can_use_quantization(), None);
+                assert_eq!(trained.try_quantization_report(), None);
+                assert_eq!(trained.try_training_progress(), None);
+            },
+        );
+        while_held(
+            |tx, rx| {
+                let _count = trained.vector_count.lock().unwrap();
+                held(tx, rx);
+            },
+            || assert_eq!(trained.try_vector_count(), None),
+        );
+        while_held(
+            |tx, rx| {
+                let _columns = trained.columns.write().unwrap();
+                held(tx, rx);
+            },
+            || assert_eq!(trained.try_indexed_fields(), None),
+        );
+        while_held(
+            |tx, rx| {
+                let _metadata = trained.metadata.lock().unwrap();
+                held(tx, rx);
+            },
+            || {
+                assert_eq!(trained.try_metadata("owner"), None);
+                assert_eq!(trained.try_all_metadata(), None);
+            },
+        );
+        while_held(
+            |tx, rx| {
+                let _sink = trained.sink.lock().unwrap();
+                held(tx, rx);
+            },
+            || {
+                assert_eq!(trained.try_journal_path(), None);
+                assert_eq!(trained.try_info(), None);
+            },
+        );
+        while_held(
+            |tx, rx| {
+                let _lineage = trained.lineage.lock().unwrap();
+                held(tx, rx);
+            },
+            || assert_eq!(trained.try_identity_record(), None),
+        );
+        while_held(
+            |tx, rx| {
+                let _training = collecting.training_ids.write().unwrap();
+                held(tx, rx);
+            },
+            || {
+                assert_eq!(collecting.try_training_progress(), None);
+                assert_eq!(collecting.try_training_vectors_needed(), None);
+            },
+        );
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ids = collecting.ids.write().unwrap();
+            panic!("a panic under the id store's guard");
+        }));
+        assert!(poisoned.is_err());
+        assert_eq!(collecting.try_len(), None);
+        assert_eq!(collecting.try_contains("r1"), None);
     }
 }

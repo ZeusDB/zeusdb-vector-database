@@ -4,8 +4,9 @@
 // parsing, the result construction, the logging control, and the conversion
 // below of an engine failure into an exception. The index itself is
 // zeusdb-vector-hnsw, over the engine's floor in zeusdb-vector-core, and
-// every method here parses, releases the interpreter lock, calls one
-// operation on the collection and converts what comes back.
+// every method here parses, calls one operation on the collection through the
+// rule a panic keeps, and converts what comes back, releasing the interpreter
+// lock around any call that may wait for an engine guard.
 mod conversion;
 mod durability;
 mod hnsw_index;
@@ -14,7 +15,7 @@ mod tokenizer;
 
 use pyo3::prelude::*;
 use zeusdb_vector_core::{Error, Exception};
-use zeusdb_vector_hnsw::{Collection, JournalPolicy};
+use zeusdb_vector_hnsw::{run_without_index, Collection, JournalPolicy};
 
 /// An engine failure on its way to Python.
 ///
@@ -84,8 +85,8 @@ impl From<PyEngineError> for PyErr {
 
 /// Load an index from a directory. See `Collection::load_with`.
 ///
-/// Registered as `_load_index`. `VectorDatabase.load(path, tokenizer=None)`
-/// is the documented route and is a one line pass through to this.
+/// Registered as `_load_index`. `VectorDatabase.load()` is the documented
+/// route and is a one line pass through to this.
 ///
 /// `tokenizer` is the tokenizer the directory's text layer was declared
 /// with, where it has one: `"simple"` for the built-in tokenizer, which a
@@ -142,7 +143,9 @@ impl From<PyEngineError> for PyErr {
 /// it may fall back to included. Nothing in the load path touches Python:
 /// the directory is read, the collection is built and restored, and the
 /// result is wrapped here with the lock back. A tokenizer handed in is
-/// stored and never run by the load.
+/// stored and never run by the load. `interval_ms` is a Python integer, and a
+/// negative one raises `ValueError` naming it. A panic inside the engine
+/// raises `RuntimeError`; see `run_without_index`.
 #[pyfunction]
 #[pyo3(name = "_load_index", signature = (path, tokenizer = None, durability = None, interval_ms = None, checkpoint_only = false, repair = false))]
 fn load_index(
@@ -150,10 +153,34 @@ fn load_index(
     path: &str,
     tokenizer: Option<&Bound<PyAny>>,
     durability: Option<&str>,
-    interval_ms: Option<u64>,
+    interval_ms: Option<i64>,
     checkpoint_only: bool,
     repair: bool,
 ) -> Result<hnsw_index::HNSWIndex, PyEngineError> {
+    run_without_index("load()", || {
+        load_index_body(
+            py,
+            path,
+            tokenizer,
+            durability,
+            interval_ms,
+            checkpoint_only,
+            repair,
+        )
+    })
+}
+
+/// The body of `load_index`, run through the rule a panic keeps by it.
+fn load_index_body(
+    py: Python<'_>,
+    path: &str,
+    tokenizer: Option<&Bound<PyAny>>,
+    durability: Option<&str>,
+    interval_ms: Option<i64>,
+    checkpoint_only: bool,
+    repair: bool,
+) -> Result<hnsw_index::HNSWIndex, PyEngineError> {
+    let interval_ms = conversion::count_if_given(interval_ms, "interval_ms")?.map(|ms| ms as u64);
     let tokenizer = tokenizer
         .map(|argument| tokenizer::tokenizer_from_python(argument, "tokenizer"))
         .transpose()?;

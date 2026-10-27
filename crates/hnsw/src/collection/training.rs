@@ -252,6 +252,7 @@ impl Collection {
                     *self.dense().rerank_calibration.write().unwrap() = Some(calibration);
                 }
                 self.release_training_ids();
+                zeusdb_vector_core::panic_at(zeusdb_vector_core::PanicPoint::TrainingBeforeRebuild);
 
                 debug!(target: LOG_TARGET, operation = "pq_rebuild_start",
                     "Rebuilding index with quantization"
@@ -881,6 +882,19 @@ impl Collection {
         }
     }
 
+    /// [`Collection::training_progress`] without waiting; see
+    /// [`Collection::try_len`].
+    pub fn try_training_progress(&self) -> Option<f32> {
+        let Some(config) = &self.dense().quantization_config else {
+            return Some(0.0);
+        };
+        if self.dense().try_can_use_quantization()? {
+            return Some(100.0);
+        }
+        let training_ids = self.training_ids.try_read()?;
+        Some((training_ids.len() as f32 / config.training_size as f32 * 100.0).min(100.0))
+    }
+
     /// Get number of training vectors still needed
     pub fn training_vectors_needed(&self) -> usize {
         if let Some(config) = &self.dense().quantization_config {
@@ -893,6 +907,19 @@ impl Collection {
         } else {
             0
         }
+    }
+
+    /// [`Collection::training_vectors_needed`] without waiting; see
+    /// [`Collection::try_len`].
+    pub fn try_training_vectors_needed(&self) -> Option<usize> {
+        let Some(config) = &self.dense().quantization_config else {
+            return Some(0);
+        };
+        if self.training_threshold_reached.load(Ordering::Acquire) {
+            return Some(0);
+        }
+        let training_ids = self.training_ids.try_read()?;
+        Some(config.training_size.saturating_sub(training_ids.len()))
     }
 
     /// Check if training is ready to be triggered

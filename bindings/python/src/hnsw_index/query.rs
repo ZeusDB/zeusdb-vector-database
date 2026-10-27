@@ -10,7 +10,7 @@
 
 use super::input::extract_sparse_vector;
 use super::HNSWIndex;
-use crate::conversion::{python_dict_to_value_map, value_map_to_python};
+use crate::conversion::{count_if_given, python_dict_to_value_map, value_map_to_python};
 use crate::PyEngineError;
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
@@ -222,12 +222,18 @@ impl HNSWIndex {
         match kind {
             "vector" => Ok(ParsedArm::Dense {
                 vector: dense_vector(&value, position)?,
-                ef: present(dict, "ef_search")?
-                    .map(|ef| ef.extract::<usize>())
-                    .transpose()?,
-                rerank: present(dict, "rerank")?
-                    .map(|rerank| rerank.extract::<usize>())
-                    .transpose()?,
+                ef: count_if_given(
+                    present(dict, "ef_search")?
+                        .map(|ef| ef.extract::<i64>())
+                        .transpose()?,
+                    "ef_search",
+                )?,
+                rerank: count_if_given(
+                    present(dict, "rerank")?
+                        .map(|rerank| rerank.extract::<i64>())
+                        .transpose()?,
+                    "rerank",
+                )?,
             }),
             "sparse" => {
                 let vector = extract_sparse_vector(&value)
@@ -237,9 +243,9 @@ impl HNSWIndex {
                 // term ids are the dictionary's to issue. The arm's own
                 // rules come first, the vector's as the engine applies
                 // them, so a malformed arm reads the same message on
-                // either kind of space, and then the space's, through an
-                // accessor that takes no guard where there is no layer.
-                if self.inner.term_count().is_some() {
+                // either kind of space, and then the space's, which is
+                // read with no guard taken.
+                if self.inner.takes_text() {
                     vector.as_ref().validate()?;
                     return Err(Error::SparseVectorOnTextSpace.into());
                 }

@@ -317,7 +317,9 @@ pub fn init_logging() {
 ///
 /// Returns true if initialization occurred, false if already initialized.
 /// Forces JSON to stdout regardless of ZEUSDB_LOG_TARGET; use env vars for other formats.
+/// `level` left out or `None` is `info`, under a `RUST_LOG` that takes precedence.
 #[pyfunction(name = "init_logging")]
+#[pyo3(signature = (level = None))]
 pub fn py_init_logging(level: Option<String>) -> PyResult<bool> {
     let mut took_init = false;
     INIT.call_once(|| {
@@ -350,7 +352,10 @@ pub fn py_init_logging(level: Option<String>) -> PyResult<bool> {
 /// Python-exposed file logging initialization (JSON to rotating files)
 ///
 /// Returns true if initialization occurred, false if already initialized.
+/// `level` left out or `None` is `info`, under a `RUST_LOG` that takes
+/// precedence, and `file_prefix` left out or `None` is `zeusdb`.
 #[pyfunction(name = "init_file_logging")]
+#[pyo3(signature = (log_dir, level = None, file_prefix = None))]
 pub fn py_init_file_logging(
     log_dir: String,
     level: Option<String>,
@@ -417,21 +422,24 @@ pub fn py_init_file_logging(
 /// Check if logging has been initialized
 ///
 /// Returns true if logging initialization has occurred (either auto or manual).
-/// Useful for determining whether to set ZEUSDB_DISABLE_AUTOLOG or not.
+/// Useful for determining whether to set ZEUSDB_DISABLE_AUTO_LOGGING or not.
 #[pyfunction]
 pub fn is_logging_initialized() -> bool {
     INIT.is_completed()
 }
 
+/// The dependencies whose records the default filter holds at `warn`,
+/// whatever level the engine's own records run at. Each is a package in the
+/// workspace's lock file; see `every_quieted_crate_is_in_the_lock_file`.
+const QUIETED_CRATES: [&str; 3] = ["rayon", "pyo3", "serde_json"];
+
 /// Create environment filter with intelligent defaults for dependencies
 fn create_env_filter(log_level: &str) -> EnvFilter {
-    let base = format!(
-        "zeusdb_vector_database={level},\
-         rayon=warn,pyo3=warn,bincode=warn,serde_json=warn,\
-         mio=warn,tokio=warn",
-        level = canonical_level(log_level)
-    );
-    EnvFilter::new(base)
+    let mut directives = format!("zeusdb_vector_database={}", canonical_level(log_level));
+    for name in QUIETED_CRATES {
+        directives.push_str(&format!(",{}=warn", name));
+    }
+    EnvFilter::new(directives)
 }
 
 /// The one place a level name becomes a level, for both layers
@@ -807,6 +815,21 @@ mod tests {
                 tracing::Level::WARN
             ));
         });
+    }
+
+    /// Every crate the default filter quiets is a package the workspace's
+    /// lock file holds, so no directive names a crate the engine does not
+    /// depend on.
+    #[test]
+    fn every_quieted_crate_is_in_the_lock_file() {
+        let lock = include_str!("../../../Cargo.lock");
+        for name in QUIETED_CRATES {
+            let entry = format!("name = \"{}\"", name);
+            assert!(
+                lock.lines().any(|line| line == entry),
+                "{name} is not a package in Cargo.lock"
+            );
+        }
     }
 
     #[test]

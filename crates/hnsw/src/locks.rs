@@ -378,6 +378,29 @@ impl<T> RwLockAt<T> {
             })),
         }
     }
+
+    /// The read guard where the lock is free to read now, taken without
+    /// waiting, and `None` where a writer holds it or a panic poisoned it.
+    ///
+    /// Held to the order and to the rule against a second acquisition as
+    /// `read` is, since the guard it returns is held the same way, and a
+    /// refusal leaves the held set as it found it.
+    pub fn try_read(&self) -> Option<ReadGuard<'_, T>> {
+        #[cfg(debug_assertions)]
+        enter(self.rank);
+        match self.inner.try_read() {
+            Ok(guard) => Some(ReadGuard {
+                inner: guard,
+                #[cfg(debug_assertions)]
+                rank: self.rank,
+            }),
+            Err(_) => {
+                #[cfg(debug_assertions)]
+                leave(self.rank);
+                None
+            }
+        }
+    }
 }
 
 /// A `Mutex` that knows its place in the declared order.
@@ -413,6 +436,27 @@ impl<T> MutexAt<T> {
                 #[cfg(debug_assertions)]
                 rank: self.rank,
             })),
+        }
+    }
+
+    /// The guard where the lock is free now, taken without waiting, and
+    /// `None` where another thread holds it or a panic poisoned it. Held to
+    /// the order as `lock` is, and a refusal leaves the held set as it found
+    /// it.
+    pub fn try_lock(&self) -> Option<Locked<'_, T>> {
+        #[cfg(debug_assertions)]
+        enter(self.rank);
+        match self.inner.try_lock() {
+            Ok(guard) => Some(Locked {
+                inner: guard,
+                #[cfg(debug_assertions)]
+                rank: self.rank,
+            }),
+            Err(_) => {
+                #[cfg(debug_assertions)]
+                leave(self.rank);
+                None
+            }
         }
     }
 }
@@ -515,6 +559,46 @@ mod tests {
         } else {
             assert_eq!(extras, [0, 0, 0, 0]);
         }
+    }
+
+    /// A try takes a free lock as a wait would, and gives `None` without
+    /// waiting where another thread holds the lock or a panic poisoned it,
+    /// leaving this thread's held set as it found it.
+    #[test]
+    fn a_try_takes_a_free_lock_and_refuses_a_held_or_poisoned_one() {
+        let lock: RwLockAt<u32> = RwLockAt::new(order::COLUMNS, 5);
+        let mutex: MutexAt<u32> = MutexAt::new(order::VECTOR_COUNT, 6);
+        assert_eq!(lock.try_read().map(|guard| *guard), Some(5));
+        assert_eq!(mutex.try_lock().map(|guard| *guard), Some(6));
+
+        let (lock_ref, mutex_ref) = (&lock, &mutex);
+        std::thread::scope(|scope| {
+            let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            scope.spawn(move || {
+                let _write = lock_ref.write().unwrap();
+                let _locked = mutex_ref.lock().unwrap();
+                held_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+            });
+            held_rx.recv().unwrap();
+            assert!(lock.try_read().is_none(), "a writer holds the lock");
+            assert!(mutex.try_lock().is_none(), "another thread holds the mutex");
+            #[cfg(debug_assertions)]
+            assert!(held_now().is_empty());
+            done_tx.send(()).unwrap();
+        });
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _write = lock.write().unwrap();
+            let _locked = mutex.lock().unwrap();
+            panic!("a panic under both guards");
+        }));
+        assert!(poisoned.is_err());
+        assert!(lock.try_read().is_none(), "a panic poisoned the lock");
+        assert!(mutex.try_lock().is_none(), "a panic poisoned the mutex");
+        #[cfg(debug_assertions)]
+        assert!(held_now().is_empty());
     }
 
     /// A second read on one thread is refused, which is the whole point.

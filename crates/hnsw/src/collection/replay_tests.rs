@@ -1752,7 +1752,11 @@ fn an_overwrite_keeps_the_record_its_refused_replacement_names() {
                 .unwrap();
             assert_eq!(kept.len(), 1, "{label}: the replaced record is kept");
             assert_eq!(kept[0].vector.as_ref(), Some(&vectors[2]), "{label}");
-            assert_eq!(kept[0].metadata, metadata_for(2), "{label}");
+            assert_eq!(
+                kept[0].metadata,
+                metadata_for(2).into_iter().collect::<BTreeMap<_, _>>(),
+                "{label}"
+            );
 
             let twin = overwrite_collection(sparse);
             add(&twin, (0..10).map(held).collect());
@@ -1804,7 +1808,10 @@ fn an_add_without_overwrite_refuses_a_held_id_and_keeps_its_record() {
         .unwrap();
     assert_eq!(kept.len(), 1, "the held record is kept");
     assert_eq!(kept[0].vector.as_ref(), Some(&vectors[2]));
-    assert_eq!(kept[0].metadata, metadata_for(2));
+    assert_eq!(
+        kept[0].metadata,
+        metadata_for(2).into_iter().collect::<BTreeMap<_, _>>()
+    );
     assert_eq!(run.original.len(), 11);
     assert_eq!(
         run.original.id_counter(),

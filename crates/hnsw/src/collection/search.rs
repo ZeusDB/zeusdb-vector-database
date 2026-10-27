@@ -715,24 +715,12 @@ impl Collection {
         }
     }
 
-    /// Resolve the search arguments into the parameters every path reads.
+    /// The two bounds a search's arguments are held to, checked with no guard
+    /// taken, for a caller that refuses them before it reads anything else.
     ///
     /// Both bounds size the candidate heaps the traversal allocates before it
     /// visits a node, and neither allocation is fallible; see `MAX_TOP_K`.
-    /// Checked first, so a bad argument is a ValueError and not a dead
-    /// interpreter, and before `ef` is derived so the derivation cannot
-    /// overflow on a value the check would have refused.
-    ///
-    /// The rerank plan is resolved once here rather than per query, because it
-    /// locks the graph to read whether the index is quantized and the search
-    /// paths take that lock themselves.
-    pub fn search_params(
-        &self,
-        top_k: usize,
-        ef_search: Option<usize>,
-        return_vector: bool,
-        rerank: Option<usize>,
-    ) -> Result<SearchParams, Error> {
+    pub fn check_search_bounds(top_k: usize, ef_search: Option<usize>) -> Result<(), Error> {
         if top_k > MAX_TOP_K {
             return Err(Error::TopKTooLarge {
                 max: MAX_TOP_K,
@@ -747,6 +735,28 @@ impl Collection {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Resolve the search arguments into the parameters every path reads.
+    ///
+    /// The bounds of [`Collection::check_search_bounds`] are checked first,
+    /// so a bad argument is a ValueError and not a dead interpreter, and
+    /// before `ef` is derived so the derivation cannot overflow on a value
+    /// the check would have refused.
+    ///
+    /// The rerank plan is resolved once here rather than per query, because it
+    /// locks the graph to read whether the index is quantized and the search
+    /// paths take that lock themselves. So a caller holding the interpreter
+    /// asks this with the interpreter released.
+    pub fn search_params(
+        &self,
+        top_k: usize,
+        ef_search: Option<usize>,
+        return_vector: bool,
+        rerank: Option<usize>,
+    ) -> Result<SearchParams, Error> {
+        Self::check_search_bounds(top_k, ef_search)?;
 
         let ef = ef_search.unwrap_or_else(|| match self.dense().metric.to_lowercase().as_str() {
             "l1" | "l2" => std::cmp::max(2 * top_k, 150),

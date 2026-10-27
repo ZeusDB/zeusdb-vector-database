@@ -91,6 +91,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`load()` opens a directory below format 4.0.0 whose `id_counter` passes 4,294,967,294 with the counter at 4,294,967,294**, and `add()` then refuses every record as it does on an index whose internal ids are exhausted. A recovery passes over a version 1 journal's insert record past that id. A directory at 4.0.0 or later whose `id_counter` passes it raises `ValueError`.
 
+- **A panic inside the engine stops the index.** The call that panics raises `RuntimeError` naming the call and what the panic said, and every later call on the index, `recovery`, `len()` and the properties among them, raises the same error, since the call that panicked may have left a change part made. No call reads or writes what the panic left. The journal stays as it is, and `load()` opens the directory with every call whose commit landed. A panic inside `create()` or `load()` raises `RuntimeError`.
+
+- **A record's metadata holds its keys in code point order** in every call that returns it, being `search()`, `query()`, `get_records()`, `list()`, `get_metadata()` and `get_all_metadata()`, and so do the dicts that `get_all_metadata()`, `get_stats()`, `get_performance_info()` and `benchmark_concurrent_reads()` return. The order is the same in every process and across a save and a load.
+
+- **`create()` raises the error the engine raises, `ValueError` or `TypeError`, in the engine's words.** An unsupported `space` raises `ValueError` from `create()` and from `load()`.
+
+- **A negative count or size raises `ValueError` naming the argument**, in the words `<name> cannot be negative, got <value>`. This holds for `dim`, `m`, `ef_construction` and `expected_size` at `create()`, `top_k`, `ef_search` and `rerank` at `search()`, `top_k` and `fetch` at `query()` and `explain()` and an arm's `ef_search` and `rerank`, `number` and `offset` at `list()`, `interval_ms` at `journal_to()` and `load()`, the three values of `rebuild()`, and `query_count` and `max_threads` at `benchmark_concurrent_reads()`.
+
+- **`add()` raises before it inserts anything for an input it cannot read.** It raises `TypeError` for an input that is none of its formats and for a list holding an item that is neither a record dict nor a vector. It raises `ValueError` for a dict with no `vectors`, `embeddings` or `values` key, for `values` that is not a list, and for a two dimensional array whose rows are not the index's dimension. It raises `TypeError` naming the key for a batch whose metadata is not a list, a tuple among them, as it does for `ids`, `sparse` and `texts`, and for a batch whose vectors are neither a list nor a two dimensional array.
+
+- **Every shape of `add()` reads a record's metadata entry the same way.** A mapping is the record's metadata, a string is kept under `text`, any other value is kept under `value`, and `None` is no metadata.
+
+- **`AddResult`'s repr prints its shape as Python writes it**, `shape=(2, 2)` or `shape=None`.
+
+- **The docstrings of `add()`, `search()`, `count()`, `list()`, `get_quantization_info()`, `shrink_to_fit()`, `compact()`, `backup()`, `query()`, `add_metadata()`, `save()`, `create()` and `is_logging_initialized()`, and of `AddResult.ids`, describe what each does**, among them each space's default `ef_search` and the fetch of `search()`, the cost of `count()`, how `add()` reads metadata, and the calls that release the interpreter.
+
 ### Fixed
 
 - **`load()` refuses a journal whose segments follow another checkpoint of the same index**, with a `RuntimeError` naming both checkpoints, and replays none of it. A segment from another checkpoint that holds nothing past the directory's sequence is passed over, and deleted by a load that can write.
@@ -116,6 +132,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`load()` raises `RuntimeError` naming the arena for a directory whose graph does not fit the graph's ceilings.**
 
 - **`compact()` rewrites every posting list of a sparse space**, whatever the number of distinct dimensions it holds.
+
+- **A refused record of a batch of parallel lists leaves the other records to go in.** `errors` names it as `Vector <id>: <cause>`, by its id, or by `item_<position>` where the batch gives no id.
+
+- **A record whose metadata does not convert is refused and named in `errors`, in every shape**, after the words `Metadata error`, where a key is not a string or a value nests more than 128 levels deep. It takes no generated id, and the records around it go in.
+
+- **`add()` reads a `float64` two dimensional array**, narrowing each value to `float32` as `search()` does.
+
+- **`AddResult.vector_shape` is the number of records the input holds and the index's dimension.**
+
+- **`search()` raises `ValueError` with `Search vector cannot be empty` for an empty list, tuple or one dimensional array**, and `Batch cannot be empty` for a two dimensional array with no rows.
+
+- **`get_quantization_info()` raises the error it meets while it builds its dict.**
+
+- **`init_logging()` takes no argument and `init_file_logging()` takes the folder alone**, with `None` as the default of each other argument.
+
+- **An unrecognised `ZEUSDB_LOG_LEVEL` runs the Python and Rust layers at the same default level.**
+
+- **A call that waits for a writer lets other Python threads run.** `get_stats()` and every call that does more than a constant amount of work release the interpreter while they run, and `len()`, `contains()` and the property getters release it only to wait for a writer.
 
 ### Internal
 
@@ -144,6 +178,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.gitattributes` holds every `*.sh` file to LF line endings.
 
 - Every offset into the graph's upper list arenas, a sparse space's forward store and a text space's dictionary is converted with `try_from`, and a value past its width stops the call.
+
+- Each call into the engine runs inside one function that catches a panic and stops the index. Four points of an insert and a training can inject a panic under the `test-support` feature, which the wheel does not enable.
+
+- The lock wrappers take a lock without waiting, for the reads made with the interpreter held.
+
+- The sparse index refuses a record at a position it holds as removed, before it writes anything, and its consistency check holds each posting list's count of removed postings to the postings on it whose record is removed.
+
+- The default Rust log filter quiets `rayon`, `pyo3` and `serde_json`, and a test holds each name to `Cargo.lock`.
 
 ### Format
 

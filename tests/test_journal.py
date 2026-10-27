@@ -249,7 +249,7 @@ def test_journal_to_refuses_what_is_not_a_durability(tmp_path):
         index.journal_to(path, durability="none", interval_ms=5)
     with pytest.raises(ValueError, match="at least 1"):
         index.journal_to(path, durability="interval", interval_ms=0)
-    with pytest.raises(OverflowError):
+    with pytest.raises(ValueError, match="^interval_ms cannot be negative, got -1$"):
         index.journal_to(path, durability="interval", interval_ms=-1)
     with pytest.raises(TypeError):
         index.journal_to(path, durability="interval", interval_ms=2.5)

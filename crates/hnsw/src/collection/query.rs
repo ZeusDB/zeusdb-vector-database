@@ -54,7 +54,7 @@ use super::Collection;
 use crate::{Named, SearchParams};
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use zeusdb_vector_core::{
     fuse, Budget, Contribution, Cost, Error, Filter, Fusion, IdfScope, Selectivity, SpaceKind,
     SpaceName, SparseRef, SparseVector, VectorIndex,
@@ -172,7 +172,8 @@ pub struct QueryHit {
     /// The record's rank and score on every arm's page it appeared on, in
     /// arm order, which is what the fused score was made from.
     pub contributions: Vec<Contribution>,
-    pub metadata: HashMap<String, Value>,
+    /// The record's metadata, its names in code point order.
+    pub metadata: BTreeMap<String, Value>,
 }
 
 /// The page, with the plan that produced it.

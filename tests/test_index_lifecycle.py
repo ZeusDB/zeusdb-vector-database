@@ -57,23 +57,23 @@ def test_index_creation_validation():
     vdb = VectorDatabase()
     
     # Test invalid dimension
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         vdb.create("hnsw", dim=0)
     
     # Test invalid ef_construction
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         vdb.create("hnsw", dim=4, ef_construction=0)
     
     # Test invalid expected_size
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         vdb.create("hnsw", dim=4, expected_size=0)
     
     # Test invalid m
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         vdb.create("hnsw", dim=4, m=300)  # > 256
     
     # Test invalid space
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         vdb.create("hnsw", dim=4, space="invalid")
 
 # ------------------------------------------------------------
@@ -382,10 +382,10 @@ def test_m_lower_bound():
     vdb = VectorDatabase()
 
     for bad in (0, 1):
-        with pytest.raises(RuntimeError, match="m must be at least 2"):
+        with pytest.raises(ValueError, match="m must be at least 2"):
             vdb.create("hnsw", dim=4, m=bad)
 
-    with pytest.raises(RuntimeError, match="scale of 1 / ln"):
+    with pytest.raises(ValueError, match="scale of 1 / ln"):
         vdb.create("hnsw", dim=4, m=1)
 
     # Two is the smallest value that is accepted, and it works.
@@ -541,9 +541,9 @@ def test_explicit_m_overrides_the_scaled_default():
 
     # The ladder never produces a value outside the bounds for any
     # expected_size the Rust layer accepts.
-    with pytest.raises(RuntimeError, match="m must be at least 2"):
+    with pytest.raises(ValueError, match="m must be at least 2"):
         vdb.create("hnsw", dim=4, m=0, expected_size=30_000)
-    with pytest.raises(RuntimeError, match="less than or equal to 256"):
+    with pytest.raises(ValueError, match="less than or equal to 256"):
         vdb.create("hnsw", dim=4, m=257, expected_size=10)
 
     # An index created with no expected_size keeps the historical m 16, so the
@@ -554,7 +554,7 @@ def test_explicit_m_overrides_the_scaled_default():
     # than failing inside the ladder with a worse message.
     assert VectorDatabase._default_m("large") == 16
     assert VectorDatabase._default_m(True) == 16
-    with pytest.raises(RuntimeError):
+    with pytest.raises(TypeError):
         vdb.create("hnsw", dim=4, expected_size="large")
 
 
@@ -623,11 +623,11 @@ def test_neighbour_selection_heuristic_warning():
 
     # A pair the Rust layer rejects gets its real error and no warning.
     with _no_user_warning():
-        with pytest.raises(RuntimeError, match="ef_construction must be positive"):
+        with pytest.raises(ValueError, match="ef_construction must be positive"):
             vdb.create("hnsw", dim=4, ef_construction=0)
-        with pytest.raises(RuntimeError, match="less than or equal to 256"):
+        with pytest.raises(ValueError, match="less than or equal to 256"):
             vdb.create("hnsw", dim=4, m=257)
-        with pytest.raises(RuntimeError, match="m must be at least 2"):
+        with pytest.raises(ValueError, match="m must be at least 2"):
             vdb.create("hnsw", dim=4, m=1)
 
     # The warning points at the caller's create() rather than inside the
@@ -651,11 +651,70 @@ def test_ef_construction_has_a_ceiling_and_the_ceiling_is_inclusive():
     than dying, and the raises below fail in-process.
     """
     vdb = VectorDatabase()
-    with pytest.raises(RuntimeError, match="ef_construction must be at most 4096, got 4097"):
+    with pytest.raises(ValueError, match="ef_construction must be at most 4096, got 4097"):
         vdb.create("hnsw", dim=4, ef_construction=4097)
-    with pytest.raises(RuntimeError, match="ef_construction must be at most 4096, got 1099511627776"):
+    with pytest.raises(ValueError, match="ef_construction must be at most 4096, got 1099511627776"):
         vdb.create("hnsw", dim=4, ef_construction=1 << 40)
     index = vdb.create("hnsw", dim=4, ef_construction=4096, expected_size=4)
     assert index.ef_construction == 4096
     index.add({"ids": ["a"], "embeddings": [[1.0, 0.0, 0.0, 0.0]]})
     assert len(index) == 1
+
+
+# ------------------------------------------------------------
+# create() raises what the factory raises
+# ------------------------------------------------------------
+@pytest.mark.parametrize("kwargs,klass,words", [
+    ({"dim": 4, "m": 1}, ValueError, "m must be at least 2, got 1."),
+    ({"dim": 4, "space": "hamming"}, ValueError,
+     "Unsupported space: 'hamming'. Supported spaces: 'cosine', 'l2', 'l1', 'dot'"),
+    ({"dim": 0}, ValueError, "dim must be positive, got 0"),
+    ({"dim": "four"}, TypeError, "'str' object cannot be interpreted as an integer"),
+    ({"dim": 4, "ef_construction": 0}, ValueError, "ef_construction must be positive, got 0"),
+    ({"dim": 4, "expected_size": 10**9}, ValueError,
+     "expected_size must be at most 100000000, got 1000000000."),
+    ({"dim": 4, "indexed_fields": ["$and"]}, ValueError, 'indexed_fields names "$and"'),
+    ({"dim": 4, "sparse": {"unlink": "sometimes"}}, ValueError,
+     "unknown variant `sometimes`, expected one of `strand`, `lazy`, `eager`"),
+    ({"dim": 8, "space": "dot", "quantization_config": {"type": "pq", "subvectors": 2}},
+     ValueError, "space='dot' cannot be product quantized."),
+    ({"dim": 4, "colour": "red"}, TypeError, "unexpected keyword argument 'colour'"),
+])
+def test_create_raises_what_the_factory_raises(kwargs, klass, words):
+    """Every refusal reaches the caller in the factory's class and words, with
+    no prefix naming the factory and no exception beneath it, and an unknown
+    space is a ValueError as every other rule of the declaration is."""
+    with pytest.raises(klass) as raised:
+        VectorDatabase().create("hnsw", **kwargs)
+    assert type(raised.value) is klass
+    assert words in str(raised.value)
+    assert not str(raised.value).startswith("Failed to create")
+    assert raised.value.__cause__ is None
+
+
+@pytest.mark.parametrize("name", ["dim", "m", "ef_construction", "expected_size"])
+def test_create_refuses_a_negative_count_by_name(name):
+    """A negative count is a value outside the range, refused with ValueError
+    naming it."""
+    kwargs = {"dim": 4, name: -3}
+    with pytest.raises(ValueError) as raised:
+        VectorDatabase().create("hnsw", **kwargs)
+    assert str(raised.value) == f"{name} cannot be negative, got -3"
+    with pytest.raises(ValueError) as raised:
+        _create_hnsw_index(**{"dim": 4, "space": "l2", "m": 8, "ef_construction": 50,
+                              "expected_size": 10, name: -3})
+    assert str(raised.value) == f"{name} cannot be negative, got -3"
+
+
+def test_the_factory_docstrings_say_what_it_raises():
+    """`create()` names the classes it raises, and the field list check names
+    the rules it checks rather than every rule."""
+    create_doc = VectorDatabase.create.__doc__
+    assert "TypeError: If dim is missing" in create_doc
+    assert "RuntimeError: If index creation fails due to backend validation" not in create_doc
+    fields_doc = VectorDatabase._validate_indexed_fields.__doc__
+    assert "Every rule a declared field list has to satisfy" not in fields_doc
+    assert "held to their rules by the Rust constructor" in fields_doc
+    from zeusdb_vector_database import _engine
+    assert "load(path, tokenizer=None)" not in _engine._load_index.__doc__
+    assert "ZEUSDB_DISABLE_AUTO_LOGGING" in _engine.is_logging_initialized.__doc__

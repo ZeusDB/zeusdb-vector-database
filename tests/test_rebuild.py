@@ -335,13 +335,13 @@ def test_an_invalid_m_raises_the_message_create_raises(m, fragment):
 
     with pytest.raises(ValueError) as rebuilt:
         index.rebuild(m=m)
-    with pytest.raises(RuntimeError) as created:
+    with pytest.raises(ValueError) as created:
         VectorDatabase().create("hnsw", dim=DIM, m=m)
 
     assert fragment in str(rebuilt.value)
-    # `create()` wraps the same ValueError in a RuntimeError naming the factory,
-    # so the rebuild's message is the tail of the creation's.
-    assert str(created.value).endswith(str(rebuilt.value))
+    # `create()` raises the factory's ValueError as it is, so the two messages
+    # are one.
+    assert str(created.value) == str(rebuilt.value)
     # And the index is untouched.
     assert index.m == 8
     assert len(index) == 50
@@ -505,10 +505,10 @@ def test_an_invalid_ef_construction_raises_the_message_create_raises():
     index, _, _, _ = build(m=8, size=50)
     with pytest.raises(ValueError) as rebuilt:
         index.rebuild(ef_construction=0)
-    with pytest.raises(RuntimeError) as created:
+    with pytest.raises(ValueError) as created:
         VectorDatabase().create("hnsw", dim=DIM, ef_construction=0)
     assert "ef_construction must be positive" in str(rebuilt.value)
-    assert str(created.value).endswith(str(rebuilt.value))
+    assert str(created.value) == str(rebuilt.value)
     assert index.ef_construction == 200
 
 
@@ -543,8 +543,8 @@ def test_an_ef_construction_above_the_ceiling_raises_the_message_create_raises()
     index, _, _, _ = build(m=8, size=50)
     with pytest.raises(ValueError) as rebuilt:
         index.rebuild(ef_construction=4097)
-    with pytest.raises(RuntimeError) as created:
+    with pytest.raises(ValueError) as created:
         VectorDatabase().create("hnsw", dim=DIM, ef_construction=4097)
     assert "ef_construction must be at most 4096, got 4097" in str(rebuilt.value)
-    assert str(created.value).endswith(str(rebuilt.value))
+    assert str(created.value) == str(rebuilt.value)
     assert index.ef_construction == 200

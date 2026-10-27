@@ -318,10 +318,10 @@ print(add_result)
 
 *Output*
 ```
-AddResult(inserted=2, errors=0, shape=Some((2, 2)))
+AddResult(inserted=2, errors=0, shape=(2, 2))
 ```
 
-The `Some(...)` wrapper appears only in the printed form. `add_result.vector_shape` is the plain tuple `(2, 2)`.
+`add_result.vector_shape` is the plain tuple `(2, 2)`.
 
 #### ✅ Format 4 – Using NumPy Arrays
 
@@ -362,7 +362,7 @@ print(add_result)
 
 *Output*
 ```
-AddResult(inserted=2, errors=0, shape=Some((2, 2)))
+AddResult(inserted=2, errors=0, shape=(2, 2))
 ```
 
 #### ✅ Format 6 – Sparse and text beside the vector
@@ -392,9 +392,9 @@ print(index.get_stats()["sparse_records"], len(index))
 
 *Output*
 ```
-AddResult(inserted=1, errors=0, shape=Some((1, 2)))
-AddResult(inserted=2, errors=0, shape=Some((2, 2)))
-AddResult(inserted=1, errors=0, shape=Some((1, 2)))
+AddResult(inserted=1, errors=0, shape=(1, 2))
+AddResult(inserted=2, errors=0, shape=(2, 2))
+AddResult(inserted=1, errors=0, shape=(1, 2))
 3 4
 ```
 
@@ -705,7 +705,7 @@ environment: production
 version: 0.1
 ```
 
-`get_all_metadata()` returns a `dict` whose iteration order is not stable, which is why the example sorts it.
+`get_all_metadata()` returns a `dict` whose keys are in code point order.
 
 <br/>
 
@@ -1016,7 +1016,7 @@ False
 0
 ```
 
-The example sorts the second result because a record's metadata comes back as a `dict` whose key order is not stable between processes. Read metadata by key rather than by position.
+A record's metadata comes back as a `dict` whose keys are in code point order. Read metadata by key rather than by position.
 
 **The replacement is wholesale, not a merge.** Any key you leave out is gone, which is what `add(overwrite=True)` already does. It returns `False` for an ID the index does not hold, and writes nothing in that case.
 

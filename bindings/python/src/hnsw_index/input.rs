@@ -24,18 +24,30 @@
 //! tokenized with the interpreter lock held; see the crate's `tokenizer`
 //! module. Every shape without either key parses as it always did.
 //!
-//! Two validators that look alike are deliberately not one.
-//! `extract_single_vector` raises a `PyErr` and `extract_single_vector_safe`
-//! returns a `String` that `add` reports against the record it belongs to, and
-//! their messages differ.
+//! A record's vector is read by `extract_single_vector_safe`, which returns
+//! the words `add` reports against the record it belongs to, so a bad vector
+//! in any shape is that record's error and the records around it go in.
+//!
+//! # A record's metadata
+//!
+//! Every shape reads a record's metadata entry by one rule, `metadata_entry`.
+//! A mapping is converted key by key, a string is kept under `text`, any
+//! other value is kept under `value`, and `None` or an absent entry is no
+//! metadata. A record whose entry does not convert, through a key that is not
+//! a string or a value nested past `conversion::MAX_VALUE_DEPTH` levels, is
+//! that record's error, named `Metadata error` with the conversion's own
+//! words, and is found before the record takes a generated id.
 
 use super::HNSWIndex;
 use crate::conversion::{python_dict_to_value_map, python_object_to_value};
 use crate::PyEngineError;
-use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
+use numpy::{
+    PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArray, PyUntypedArrayMethods,
+};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList, PySequence, PyString};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use tracing::{error, trace};
 use zeusdb_vector_core::{Error, SparseVector};
@@ -187,15 +199,150 @@ fn parallel_list<'py>(dict: &Bound<'py, PyDict>, key: &str) -> Option<Bound<'py,
         .and_then(|item| item.cast::<PyList>().ok().cloned())
 }
 
+/// A two dimensional array of `f32` or of `f64`, as `add` reads one. An
+/// `f64` array is narrowed to `f32` in one pass, as `search` narrows one, and
+/// the narrowing is the rounding `extract::<f32>` applies to each element.
+enum Rows<'py> {
+    F32(PyReadonlyArray2<'py, f32>),
+    F64(PyReadonlyArray2<'py, f64>),
+}
+
+impl<'py> Rows<'py> {
+    /// The array `value` is, where it is a two dimensional array of either.
+    fn of(value: &Bound<'py, PyAny>) -> Option<Rows<'py>> {
+        if let Ok(array) = value.cast::<PyArray2<f32>>() {
+            return Some(Rows::F32(array.readonly()));
+        }
+        if let Ok(array) = value.cast::<PyArray2<f64>>() {
+            return Some(Rows::F64(array.readonly()));
+        }
+        None
+    }
+
+    fn shape(&self) -> &[usize] {
+        match self {
+            Rows::F32(array) => array.shape(),
+            Rows::F64(array) => array.shape(),
+        }
+    }
+
+    /// Every value, row after row, refusing an array whose rows are not
+    /// `dim` wide with `BatchArrayShape`, and one not contiguous in memory
+    /// with the `TypeError` `search` raises for it.
+    fn flat(&self, dim: usize) -> Result<Cow<'_, [f32]>, PyEngineError> {
+        let shape = self.shape();
+        if shape.len() != 2 || shape[1] != dim {
+            error!(
+                operation = "parse_numpy",
+                error = "shape_mismatch",
+                expected_shape = format!("(N, {})", dim),
+                actual_shape = format!("{:?}", shape),
+                "NumPy array shape validation failed"
+            );
+            return Err(Error::BatchArrayShape {
+                dim,
+                shape: shape.to_vec(),
+            }
+            .into());
+        }
+        Ok(match self {
+            Rows::F32(array) => Cow::Borrowed(array.as_slice()?),
+            Rows::F64(array) => Cow::Owned(
+                array
+                    .as_slice()?
+                    .iter()
+                    .map(|&value| value as f32)
+                    .collect(),
+            ),
+        })
+    }
+}
+
+/// Whether `value` is shaped as one vector: a sequence other than a string,
+/// or a NumPy array. What `add` reads as a vector, so a value of this shape
+/// that is not one is that record's error, and a value of any other shape is
+/// not a record at all.
+fn shaped_as_a_vector(value: &Bound<PyAny>) -> bool {
+    if value.is_instance_of::<PyString>() || value.is_instance_of::<PyBytes>() {
+        return false;
+    }
+    value.cast::<PySequence>().is_ok() || value.cast::<PyUntypedArray>().is_ok()
+}
+
+/// The name of `value`'s type, for a refusal.
+fn type_name(value: &Bound<PyAny>) -> String {
+    value
+        .get_type()
+        .name()
+        .map(|name| name.to_string())
+        .unwrap_or_default()
+}
+
+/// The words `errors` names a record's metadata with where it does not
+/// convert, after the record's label.
+fn metadata_error(e: PyErr) -> String {
+    format!("Metadata error: {}", e)
+}
+
+/// A record's metadata entry, read by the one rule every shape keeps: a
+/// mapping converted key by key, a string kept under `text`, any other value
+/// kept under `value`, and `None` as no metadata. An entry that does not
+/// convert, through a key that is not a string or a value nested past
+/// `conversion::MAX_VALUE_DEPTH` levels, is the record's error.
+fn metadata_entry(entry: &Bound<PyAny>) -> Result<HashMap<String, Value>, String> {
+    if entry.is_none() {
+        return Ok(HashMap::new());
+    }
+    let converted = match entry.cast::<PyDict>() {
+        Ok(mapping) => python_dict_to_value_map(mapping),
+        Err(_) => python_object_to_value(entry).map(|value| {
+            let key = if value.is_string() { "text" } else { "value" };
+            HashMap::from([(key.to_string(), value)])
+        }),
+    };
+    converted.map_err(metadata_error)
+}
+
+/// The metadata a record dict carries under `metadata`, read by
+/// `metadata_entry`, and none where the key is absent.
+fn record_dict_metadata(dict: &Bound<PyDict>) -> Result<HashMap<String, Value>, String> {
+    match dict.get_item("metadata") {
+        Ok(Some(entry)) => metadata_entry(&entry),
+        _ => Ok(HashMap::new()),
+    }
+}
+
+/// What a batch dict carries its vectors under, and as what.
+enum BatchVectors<'py> {
+    List(Bound<'py, PyList>),
+    Rows(Rows<'py>),
+}
+
+impl BatchVectors<'_> {
+    /// How many records the batch holds.
+    fn count(&self) -> usize {
+        match self {
+            BatchVectors::List(list) => list.len(),
+            BatchVectors::Rows(rows) => rows.shape().first().copied().unwrap_or(0),
+        }
+    }
+}
+
 impl HNSWIndex {
     /// Parse input data into records with error collection
     ///
     /// Two error channels, and which one a mistake takes is the distinction
     /// this function exists to draw. A bad record is collected into `errors`
-    /// and reported through `AddResult`, because the other records in the batch
-    /// are still what the caller asked for. A malformed call raises, because
-    /// there is no record set to report against. The only mistakes in the
-    /// second class are the ones `check_batch_lengths` names.
+    /// and reported through `AddResult`, because the other records in the
+    /// batch are still what the caller asked for. Each refused record is
+    /// named once, so the records parsed and the errors collected number the
+    /// records the input holds, which is the count `vector_shape` reports. A
+    /// malformed call raises before anything is inserted, because there is no
+    /// record set to report against: an input that is none of the formats, a
+    /// list holding an item that is neither a record dict nor a vector, a
+    /// batch dict with no vector field or with one of the wrong type, a
+    /// parallel array that is not a list or not the vectors' length, and a
+    /// two dimensional array whose rows are not the index's width.
     pub(super) fn parse_input_data(
         &self,
         data: &Bound<PyAny>,
@@ -206,13 +353,10 @@ impl HNSWIndex {
         if let Ok(dict) = data.cast::<PyDict>() {
             self.parse_dict_input_safe(dict, &mut parsed_vectors, &mut errors)?;
         } else if let Ok(list) = data.cast::<PyList>() {
-            self.parse_list_input_safe(list, &mut parsed_vectors, &mut errors);
-        } else if let Ok(np_array) = data.cast::<PyArray2<f32>>() {
-            if let Err(e) = self.parse_numpy_input_safe(np_array, &mut parsed_vectors, &mut errors)
-            {
-                errors.push(format!("NumPy parsing error: {}", e));
-            }
-        } else {
+            self.parse_list_input_safe(list, &mut parsed_vectors, &mut errors)?;
+        } else if let Some(rows) = Rows::of(data) {
+            self.parse_numpy_input_safe(&rows, &mut parsed_vectors, &mut errors)?;
+        } else if shaped_as_a_vector(data) {
             // Single vector
             match self.extract_single_vector_safe(data) {
                 Ok(vector) => {
@@ -223,6 +367,18 @@ impl HNSWIndex {
                     errors.push(format!("Single vector error: {}", e));
                 }
             }
+        } else {
+            error!(
+                operation = "add_vectors",
+                error = "unrecognised_input",
+                input_type = %type_name(data),
+                "Input is none of the formats add takes"
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                "add() takes a record dict, a list of records, a dict of parallel arrays, a \
+                 two dimensional array or one vector, and got {}",
+                type_name(data)
+            )));
         }
 
         Ok((parsed_vectors, errors))
@@ -230,8 +386,9 @@ impl HNSWIndex {
 
     /// Safe dictionary parsing that collects errors
     ///
-    /// Returns `Err` only for the length and type rule on the parallel arrays.
-    /// Every other failure is collected.
+    /// Returns `Err` for the rules a batch dict is held to as a whole, being
+    /// its vector field and its parallel arrays. Every failure of one record
+    /// is collected.
     fn parse_dict_input_safe(
         &self,
         dict: &Bound<PyDict>,
@@ -254,23 +411,24 @@ impl HNSWIndex {
 
             match vector_result {
                 Ok(vector) => {
-                    let id = match dict.get_item("id") {
-                        Ok(Some(id_item)) => id_item
-                            .extract::<String>()
-                            .unwrap_or_else(|_| self.inner.generate_id()),
-                        _ => self.inner.generate_id(),
+                    let provided = dict
+                        .get_item("id")
+                        .ok()
+                        .flatten()
+                        .and_then(|id_item| id_item.extract::<String>().ok());
+
+                    // Read before the record takes a generated id, so a record
+                    // refused for its metadata takes none.
+                    let metadata = match record_dict_metadata(dict) {
+                        Ok(metadata) => metadata,
+                        Err(e) => {
+                            let label = provided.unwrap_or_else(|| "single_object".to_string());
+                            errors.push(format!("Vector {}: {}", label, e));
+                            return Ok(());
+                        }
                     };
 
-                    let metadata = match dict.get_item("metadata") {
-                        Ok(Some(meta_item)) => {
-                            if let Ok(meta_dict) = meta_item.cast::<PyDict>() {
-                                python_dict_to_value_map(meta_dict).unwrap_or_default()
-                            } else {
-                                HashMap::new()
-                            }
-                        }
-                        _ => HashMap::new(),
-                    };
+                    let id = provided.unwrap_or_else(|| self.inner.generate_id());
 
                     match sparse_input_of_record(dict) {
                         Ok(sparse) => parsed_vectors.push(Parsed {
@@ -294,50 +452,65 @@ impl HNSWIndex {
                 }
             }
         } else {
-            // Batch format. The parallel arrays are checked against the vector
-            // count before anything is parsed, and a disagreement raises rather
-            // than being collected. Everything else the batch can get wrong is
-            // a property of one record and is still reported per record.
-            self.check_batch_lengths(dict)?;
-            if let Err(e) = self.parse_batch_format(dict, parsed_vectors, errors) {
-                errors.push(format!("Batch parsing error: {}", e));
+            // Batch format. The vector field and the parallel arrays are held
+            // to their rules before any record is parsed, and a breach raises
+            // rather than being collected. Everything else the batch can get
+            // wrong is a property of one record and is reported per record.
+            let (vector_field, vectors) = Self::batch_vectors(dict)?;
+            self.check_batch_lengths(dict, vector_field, vectors.count())?;
+            match vectors {
+                BatchVectors::List(list) => {
+                    self.process_vector_list(&list, dict, parsed_vectors, errors)?
+                }
+                BatchVectors::Rows(rows) => {
+                    self.parse_numpy_with_context(&rows, dict, parsed_vectors, errors)?
+                }
             }
         }
 
         Ok(())
     }
 
-    /// How many vectors a batch dict carries, or `None` if it carries no
-    /// recognised vector field.
+    /// The field a batch dict carries its vectors under, and the vectors.
     ///
-    /// Mirrors `parse_batch_format`'s dispatch exactly, key for key and cast
-    /// for cast, so the count checked here is the count that loop will run to.
-    /// An unrecognised or wrongly typed vector field returns `None` and is left
-    /// for `parse_batch_format` to report in its own words.
-    fn batch_vector_count(dict: &Bound<PyDict>) -> PyResult<Option<usize>> {
-        for key in ["vectors", "embeddings"] {
-            if let Some(item) = dict.get_item(key)? {
-                if let Ok(list) = item.cast::<PyList>() {
-                    return Ok(Some(list.len()));
-                } else if let Ok(np_array) = item.cast::<PyArray2<f32>>() {
-                    let count = np_array.readonly().shape().first().copied();
-                    return Ok(count);
-                }
-                return Ok(None);
-            }
-        }
-
-        if let Some(item) = dict.get_item("values")? {
+    /// The first of `vectors`, `embeddings` and `values` the dict holds is the
+    /// field. Under `vectors` or `embeddings` it is a list of vectors or a two
+    /// dimensional array of `f32` or `f64`, and under `values` a list. A dict
+    /// holding none of the three raises `ValueError`, a field of any other
+    /// type under the first two raises `TypeError` naming the field, and one
+    /// under `values` raises `ValueError`.
+    fn batch_vectors<'py>(
+        dict: &Bound<'py, PyDict>,
+    ) -> PyResult<(&'static str, BatchVectors<'py>)> {
+        for field in ["vectors", "embeddings", "values"] {
+            let Some(item) = dict.get_item(field)? else {
+                continue;
+            };
             if let Ok(list) = item.cast::<PyList>() {
-                return Ok(Some(list.len()));
+                return Ok((field, BatchVectors::List(list.clone())));
             }
-            return Ok(None);
+            if field == "values" {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "values field must be a list in batch format",
+                ));
+            }
+            if let Some(rows) = Rows::of(&item) {
+                return Ok((field, BatchVectors::Rows(rows)));
+            }
+            return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                "add expected '{}' to be a list of vectors or a two dimensional array of \
+                 float32 or float64, got {}",
+                field,
+                type_name(&item)
+            )));
         }
-
-        Ok(None)
+        Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Missing vector data. Expected one of: 'vectors', 'embeddings', or 'values' key",
+        ))
     }
 
-    /// The one rule that raises rather than counting an error
+    /// The rule on a batch's parallel arrays, which raises rather than
+    /// counting an error
     ///
     /// A batch dict pairs its arrays by position, so `ids[i]` names `vectors[i]`
     /// and `metadatas[i]` describes it. Nothing in the shape says how long each
@@ -353,21 +526,17 @@ impl HNSWIndex {
     /// have to guess. Every other mistake `add` reports is a property of one
     /// record, and the surrounding records are still what the caller asked for.
     ///
-    /// A parallel array that is not a list is the same loss by another route.
-    /// The NumPy branch resolved `ids` with `cast::<PyList>().ok()`, so a tuple
-    /// or an `ndarray` of ids was discarded whole and every record took a
-    /// generated id, while the list branch raised on the same input. Both now
-    /// say so.
-    fn check_batch_lengths(&self, dict: &Bound<PyDict>) -> PyResult<()> {
-        let Some(vector_count) = Self::batch_vector_count(dict)? else {
-            return Ok(());
-        };
-
-        let vector_field = ["vectors", "embeddings", "values"]
-            .into_iter()
-            .find(|key| dict.contains(key).unwrap_or(false))
-            .unwrap_or("vectors");
-
+    /// A parallel array that is not a list is the same loss by another route,
+    /// and raises `TypeError` naming the field, under every field. Only a list
+    /// keeps the pairing by position, so a tuple or an `ndarray` under any
+    /// field is refused whole, before any record takes an id or loses its
+    /// metadata.
+    fn check_batch_lengths(
+        &self,
+        dict: &Bound<PyDict>,
+        vector_field: &str,
+        vector_count: usize,
+    ) -> PyResult<()> {
         // 'metadata' is read as a spelling of 'metadatas' by both batch parsers,
         // and only where 'metadatas' is absent, so it is checked under the same
         // rule and only in the same case.
@@ -378,8 +547,7 @@ impl HNSWIndex {
         };
 
         // `sparse` and `texts` are the sparse half's parallel arrays, held to
-        // the same rule, and a non-list under either raises as one under
-        // `ids` does, since neither has a spelling an earlier release read.
+        // the same rule.
         for (field, singular) in [
             ("ids", "id"),
             (metadata_field, "metadata mapping"),
@@ -390,30 +558,22 @@ impl HNSWIndex {
                 continue;
             };
             let Ok(list) = item.cast::<PyList>() else {
-                if field == metadata_field {
-                    // A non-list under a metadata key is ignored by both
-                    // parsers today and carries no id, so it is left alone.
-                    continue;
-                }
-                if field == "ids" {
-                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
-                        "add expected '{}' to be a list, got {}. A batch pairs '{}' with \
-                         '{}' by position and reads only a list that way, so any other type \
-                         is discarded whole and every record takes a generated id.",
-                        field,
-                        item.get_type().name()?,
-                        field,
-                        vector_field
-                    )));
-                }
+                let tail = if field == "ids" {
+                    "so any other type is discarded whole and every record takes a generated id"
+                        .to_string()
+                } else if field == metadata_field {
+                    "with None for a record that carries no metadata".to_string()
+                } else {
+                    "with None for a record that fills the dense space alone".to_string()
+                };
                 return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
                     "add expected '{}' to be a list, got {}. A batch pairs '{}' with '{}' \
-                     by position and reads only a list that way, with None for a record \
-                     that fills the dense space alone.",
+                     by position and reads only a list that way, {}.",
                     field,
                     item.get_type().name()?,
                     field,
-                    vector_field
+                    vector_field,
+                    tail
                 )));
             };
             if list.len() != vector_count {
@@ -440,63 +600,44 @@ impl HNSWIndex {
         Ok(())
     }
 
-    /// Handle Format 3 & 5: Batch format - WORKING SOLUTION
-    fn parse_batch_format(
-        &self,
-        dict: &Bound<PyDict>,
-        parsed_vectors: &mut Vec<Parsed>,
-        errors: &mut Vec<String>,
-    ) -> PyResult<()> {
-        // Process each key path immediately without storing references
-
-        // Try "vectors" key
-        if let Some(vectors_item) = dict.get_item("vectors")? {
-            if let Ok(list) = vectors_item.cast::<PyList>() {
-                return self.process_vector_list(list, dict, parsed_vectors, errors);
-            } else if let Ok(np_array) = vectors_item.cast::<PyArray2<f32>>() {
-                // FIX: Handle NumPy with IDs and metadata
-                return Ok(self.parse_numpy_with_context(
-                    np_array,
-                    dict,
-                    parsed_vectors,
-                    errors,
-                )?);
-            }
-        }
-
-        // Try "embeddings" key
-        if let Some(embeddings_item) = dict.get_item("embeddings")? {
-            if let Ok(list) = embeddings_item.cast::<PyList>() {
-                return self.process_vector_list(list, dict, parsed_vectors, errors);
-            } else if let Ok(np_array) = embeddings_item.cast::<PyArray2<f32>>() {
-                // FIX: Handle NumPy with IDs and metadata
-                return Ok(self.parse_numpy_with_context(
-                    np_array,
-                    dict,
-                    parsed_vectors,
-                    errors,
-                )?);
-            }
-        }
-
-        // Try "values" key
-        if let Some(values_item) = dict.get_item("values")? {
-            if let Ok(list) = values_item.cast::<PyList>() {
-                return self.process_vector_list(list, dict, parsed_vectors, errors);
-            } else {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "values field must be a list in batch format",
-                ));
-            }
-        }
-
-        // No valid vector data found
-        Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "Missing vector data. Expected one of: 'vectors', 'embeddings', or 'values' key",
-        ))
+    /// The id a batch's `ids` give the record at position `i`, where they hold
+    /// a string there. A record whose entry is not a string takes a
+    /// generated id, as a record dict whose `id` is not a string does.
+    fn provided_id(ids: Option<&Bound<PyList>>, i: usize) -> PyResult<Option<String>> {
+        Ok(match ids {
+            Some(ids) if i < ids.len() => ids.get_item(i)?.extract::<String>().ok(),
+            _ => None,
+        })
     }
 
-    /// Helper method to process vector list (extracted to avoid code duplication)
+    /// The batch's metadata list, under `metadatas` or else `metadata`, a
+    /// list by the time this runs, since `check_batch_lengths` refused any
+    /// other type.
+    fn batch_metadatas<'py>(dict: &Bound<'py, PyDict>) -> PyResult<Option<Bound<'py, PyList>>> {
+        Ok(dict
+            .get_item("metadatas")?
+            .or_else(|| dict.get_item("metadata").ok().flatten())
+            .and_then(|item| item.cast::<PyList>().ok().cloned()))
+    }
+
+    /// The metadata a batch gives the record at position `i`, under its list
+    /// of vectors or its array alike: its entry as `metadata_entry` reads it,
+    /// and none for a record past the list.
+    fn batch_metadata(
+        metadatas: Option<&Bound<PyList>>,
+        i: usize,
+    ) -> Result<HashMap<String, Value>, String> {
+        let Some(metadatas) = metadatas.filter(|metadatas| i < metadatas.len()) else {
+            return Ok(HashMap::new());
+        };
+        metadata_entry(&metadatas.get_item(i).map_err(metadata_error)?)
+    }
+
+    /// Every record of a batch whose vectors are a list, each parsed on its
+    /// own, so a refused record is named, by its id or by its position as
+    /// `item_N`, and the records after it are parsed as the records before
+    /// it were. A record takes a generated id once every check on it has
+    /// passed.
     fn process_vector_list(
         &self,
         vectors: &Bound<PyList>,
@@ -504,112 +645,66 @@ impl HNSWIndex {
         parsed_vectors: &mut Vec<Parsed>,
         errors: &mut Vec<String>,
     ) -> PyResult<()> {
+        let ids_list = parallel_list(dict, "ids");
+        let metadatas_list = Self::batch_metadatas(dict)?;
         let sparse_list = parallel_list(dict, "sparse");
         let texts_list = parallel_list(dict, "texts");
 
-        // Process each vector in the batch
         for (i, vector_item) in vectors.iter().enumerate() {
-            let vector = self.extract_single_vector(&vector_item)?;
-
-            // Extract ID from "ids" array
-            let id = match dict.get_item("ids")? {
-                Some(item) => {
-                    let ids_list = item.cast::<PyList>()?;
-                    if i < ids_list.len() {
-                        ids_list.get_item(i)?.extract::<String>()?
-                    } else {
-                        self.inner.generate_id()
-                    }
+            let provided = Self::provided_id(ids_list.as_ref(), i)?;
+            let label = || provided.clone().unwrap_or_else(|| format!("item_{}", i));
+            let vector = match self.extract_single_vector_safe(&vector_item) {
+                Ok(vector) => vector,
+                Err(e) => {
+                    errors.push(format!("Vector {}: {}", label(), e));
+                    continue;
                 }
+            };
+            let metadata = match Self::batch_metadata(metadatas_list.as_ref(), i) {
+                Ok(metadata) => metadata,
+                Err(e) => {
+                    errors.push(format!("Vector {}: {}", label(), e));
+                    continue;
+                }
+            };
+            let sparse = match sparse_input_at(sparse_list.as_ref(), texts_list.as_ref(), i) {
+                Ok(sparse) => sparse,
+                Err(e) => {
+                    errors.push(format!("Vector {}: {}", label(), e));
+                    continue;
+                }
+            };
+            let id = match provided {
+                Some(id) => id,
                 None => self.inner.generate_id(),
             };
-
-            // Extract metadata from "metadatas" or "metadata" arrays
-            let meta = match dict
-                .get_item("metadatas")?
-                .or_else(|| dict.get_item("metadata").ok().flatten())
-            {
-                Some(item) => {
-                    if let Ok(meta_list) = item.cast::<PyList>() {
-                        if i < meta_list.len() {
-                            let metadata_item = meta_list.get_item(i)?;
-                            if let Ok(meta_dict) = metadata_item.cast::<PyDict>() {
-                                python_dict_to_value_map(meta_dict)?
-                            } else if metadata_item.is_none() {
-                                HashMap::new()
-                            } else {
-                                let mut map = HashMap::new();
-                                let value = python_object_to_value(&metadata_item)?;
-                                let key = if value.is_string() { "text" } else { "value" };
-                                map.insert(key.to_string(), value);
-                                map
-                            }
-                        } else {
-                            HashMap::new()
-                        }
-                    } else {
-                        HashMap::new()
-                    }
-                }
-                None => HashMap::new(),
-            };
-
-            match sparse_input_at(sparse_list.as_ref(), texts_list.as_ref(), i) {
-                Ok(sparse) => parsed_vectors.push(Parsed {
-                    id,
-                    vector,
-                    metadata: meta,
-                    sparse,
-                }),
-                Err(e) => errors.push(format!("Vector {}: {}", id, e)),
-            }
+            parsed_vectors.push(Parsed {
+                id,
+                vector,
+                metadata,
+                sparse,
+            });
         }
 
         Ok(())
     }
 
-    /// Parse NumPy array with context (IDs and metadata from dict)
+    /// Every record of a batch whose vectors are a two dimensional array,
+    /// with the ids, the metadata and the sparse half from the dict, each
+    /// parsed on its own as a list batch's record is.
     fn parse_numpy_with_context(
         &self,
-        np_array: &Bound<PyArray2<f32>>,
+        rows: &Rows<'_>,
         dict: &Bound<PyDict>,
         parsed_vectors: &mut Vec<Parsed>,
         errors: &mut Vec<String>,
     ) -> Result<(), PyEngineError> {
-        let readonly = np_array.readonly();
-        let shape = readonly.shape();
+        let dim = self.inner.dim();
+        let flat = rows.flat(dim)?;
+        let num_vectors = rows.shape()[0];
 
-        trace!(operation = "parse_numpy_context", shape = ?shape, "Processing NumPy array with context");
-
-        if shape.len() != 2 || shape[1] != self.inner.dim() {
-            error!(
-                operation = "parse_numpy_context",
-                error = "shape_mismatch",
-                expected_shape = format!("(N, {})", self.inner.dim()),
-                actual_shape = format!("{:?}", shape),
-                "NumPy array shape validation failed"
-            );
-            return Err(Error::BatchArrayShape {
-                dim: self.inner.dim(),
-                shape: shape.to_vec(),
-            }
-            .into());
-        }
-
-        let flat = readonly.as_slice()?;
-        let num_vectors = shape[0];
-
-        // Extract IDs array
-        let ids_list = dict
-            .get_item("ids")?
-            .and_then(|item| item.cast::<PyList>().ok().cloned());
-
-        // Extract metadata array
-        let metadatas_list = dict
-            .get_item("metadatas")?
-            .or_else(|| dict.get_item("metadata").ok().flatten())
-            .and_then(|item| item.cast::<PyList>().ok().cloned());
-
+        let ids_list = parallel_list(dict, "ids");
+        let metadatas_list = Self::batch_metadatas(dict)?;
         // The sparse half's parallel arrays, where the batch carries them.
         let sparse_list = parallel_list(dict, "sparse");
         let texts_list = parallel_list(dict, "texts");
@@ -624,36 +719,41 @@ impl HNSWIndex {
 
         let mut rejected = 0usize;
 
-        for i in 0..num_vectors {
-            let start_idx = i * self.inner.dim();
-            let end_idx = start_idx + self.inner.dim();
-            let raw_vector = &flat[start_idx..end_idx];
-
+        for (i, raw_vector) in flat.chunks(dim).enumerate() {
             // Resolve the caller's id before validating, so a rejected row can
-            // be named without advancing the internal id counter for a record
+            // be named without advancing the generated id counter for a record
             // that is never stored.
-            let provided_id = match &ids_list {
-                Some(ids) if i < ids.len() => ids.get_item(i)?.extract::<String>().ok(),
-                _ => None,
-            };
+            let provided_id = Self::provided_id(ids_list.as_ref(), i)?;
+            let label = || provided_id.clone().unwrap_or_else(|| format!("row_{}", i));
 
             if let Some((component, value)) = Self::first_non_finite(raw_vector) {
-                let label = provided_id.clone().unwrap_or_else(|| format!("row_{}", i));
                 error!(
                     operation = "parse_numpy_context",
                     error = "invalid_value",
-                    vector_id = %label,
+                    vector_id = %label(),
                     index = component,
                     value = value,
                     "NumPy row contains a non-finite value"
                 );
                 errors.push(format!(
                     "Vector {}: contains invalid value at index {}: {} (must be finite)",
-                    label, component, value
+                    label(),
+                    component,
+                    value
                 ));
                 rejected += 1;
                 continue;
             }
+
+            // The record's metadata, read as a list batch reads it.
+            let metadata = match Self::batch_metadata(metadatas_list.as_ref(), i) {
+                Ok(metadata) => metadata,
+                Err(e) => {
+                    errors.push(format!("Vector {}: {}", label(), e));
+                    rejected += 1;
+                    continue;
+                }
+            };
 
             let processed_vector = self.inner.process_vector_for_space(raw_vector.to_vec());
 
@@ -661,22 +761,6 @@ impl HNSWIndex {
             let id = match provided_id {
                 Some(id) => id,
                 None => self.inner.generate_id(),
-            };
-
-            // Get metadata from provided metadata or use empty
-            let metadata = if let Some(metas) = &metadatas_list {
-                if i < metas.len() {
-                    let meta_item = metas.get_item(i)?;
-                    if let Ok(meta_dict) = meta_item.cast::<PyDict>() {
-                        python_dict_to_value_map(meta_dict)?
-                    } else {
-                        HashMap::new()
-                    }
-                } else {
-                    HashMap::new()
-                }
-            } else {
-                HashMap::new()
             };
 
             trace!(
@@ -711,12 +795,26 @@ impl HNSWIndex {
     }
 
     /// Safe list parsing that collects errors instead of failing immediately
+    ///
+    /// Each item is a record dict or a vector. An item of any other shape
+    /// raises `TypeError` naming its position, before any item is parsed or
+    /// takes a generated id.
     fn parse_list_input_safe(
         &self,
         list: &Bound<PyList>,
         parsed_vectors: &mut Vec<Parsed>,
         errors: &mut Vec<String>,
-    ) {
+    ) -> PyResult<()> {
+        for (item_index, item) in list.iter().enumerate() {
+            if item.cast::<PyDict>().is_err() && !shaped_as_a_vector(&item) {
+                return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                    "add() takes a list whose items are record dicts or vectors, and item {} \
+                     is {}",
+                    item_index,
+                    type_name(&item)
+                )));
+            }
+        }
         for (item_index, item) in list.iter().enumerate() {
             if let Ok(item_dict) = item.cast::<PyDict>() {
                 // Extract vector safely
@@ -730,31 +828,25 @@ impl HNSWIndex {
 
                 match vector_result {
                     Ok(vector) => {
-                        // Extract ID
-                        let id = match item_dict.get_item("id") {
-                            Ok(Some(id_item)) => id_item
-                                .extract::<String>()
-                                .unwrap_or_else(|_| self.inner.generate_id()),
-                            _ => self.inner.generate_id(),
+                        let provided = item_dict
+                            .get_item("id")
+                            .ok()
+                            .flatten()
+                            .and_then(|id_item| id_item.extract::<String>().ok());
+
+                        // Read before the record takes a generated id, so a
+                        // record refused for its metadata takes none.
+                        let metadata = match record_dict_metadata(item_dict) {
+                            Ok(metadata) => metadata,
+                            Err(e) => {
+                                let label =
+                                    provided.unwrap_or_else(|| format!("item_{}", item_index));
+                                errors.push(format!("Vector {}: {}", label, e));
+                                continue;
+                            }
                         };
 
-                        // Extract metadata
-                        let metadata = match item_dict.get_item("metadata") {
-                            Ok(Some(meta_item)) => {
-                                if let Ok(meta_dict) = meta_item.cast::<PyDict>() {
-                                    python_dict_to_value_map(meta_dict).unwrap_or_default()
-                                } else {
-                                    // Handle non-dict metadata
-                                    let mut map = HashMap::new();
-                                    if let Ok(value) = python_object_to_value(&meta_item) {
-                                        let key = if value.is_string() { "text" } else { "value" };
-                                        map.insert(key.to_string(), value);
-                                    }
-                                    map
-                                }
-                            }
-                            _ => HashMap::new(),
-                        };
+                        let id = provided.unwrap_or_else(|| self.inner.generate_id());
 
                         match sparse_input_of_record(item_dict) {
                             Ok(sparse) => parsed_vectors.push(Parsed {
@@ -791,37 +883,22 @@ impl HNSWIndex {
                 }
             }
         }
+        Ok(())
     }
 
-    /// Safe NumPy parsing for error collection
+    /// A bare two dimensional array, one record a row, each under a generated
+    /// id. A row holding a value that is not finite is that row's error,
+    /// named by its position, and takes no id.
     fn parse_numpy_input_safe(
         &self,
-        np_array: &Bound<PyArray2<f32>>,
+        rows: &Rows<'_>,
         parsed_vectors: &mut Vec<Parsed>,
         errors: &mut Vec<String>,
-    ) -> Result<(), String> {
-        // This is the same as your current parse_numpy_input but returns Result<(), String>
-        let readonly = np_array.readonly();
-        let shape = readonly.shape();
+    ) -> Result<(), PyEngineError> {
+        let dim = self.inner.dim();
+        let flat = rows.flat(dim)?;
 
-        if shape.len() != 2 || shape[1] != self.inner.dim() {
-            return Err(format!(
-                "NumPy array must have shape (N, {}), got {:?}",
-                self.inner.dim(),
-                shape
-            ));
-        }
-
-        let flat = readonly
-            .as_slice()
-            .map_err(|e| format!("NumPy access error: {}", e))?;
-        let num_vectors = shape[0];
-
-        for i in 0..num_vectors {
-            let start_idx = i * self.inner.dim();
-            let end_idx = start_idx + self.inner.dim();
-            let raw_vector = &flat[start_idx..end_idx];
-
+        for (i, raw_vector) in flat.chunks(dim).enumerate() {
             // A bare array carries no ids, so a rejected row is named by its
             // position and no id is generated for it.
             if let Some((component, value)) = Self::first_non_finite(raw_vector) {
@@ -851,9 +928,9 @@ impl HNSWIndex {
     /// Report the first non-finite component of a vector, if there is one
     ///
     /// The two NumPy branches read their rows straight out of the buffer, so
-    /// they skip the per-value check that `extract_single_vector` runs. A NaN
-    /// that reaches the graph degrades every later query rather than only the
-    /// one that carried it, so both branches route through this.
+    /// they skip the per-value check that `extract_single_vector_safe` runs.
+    /// A NaN that reaches the graph degrades every later query rather than
+    /// only the one that carried it, so both branches route through this.
     fn first_non_finite(vector: &[f32]) -> Option<(usize, f32)> {
         vector
             .iter()
@@ -862,50 +939,8 @@ impl HNSWIndex {
             .map(|(index, value)| (index, *value))
     }
 
-    /// Extract a single vector from various Python types (enhanced)
-    fn extract_single_vector(&self, data: &Bound<PyAny>) -> Result<Vec<f32>, PyEngineError> {
-        let vector = if let Ok(array1d) = data.cast::<PyArray1<f32>>() {
-            // NumPy 1D array
-            array1d.readonly().as_slice()?.to_vec()
-        } else if let Ok(list) = data.cast::<PyList>() {
-            // Python list
-            list.iter()
-                .map(|item| item.extract::<f32>())
-                .collect::<PyResult<Vec<f32>>>()?
-        } else {
-            // Direct extraction (e.g., from other numeric arrays)
-            data.extract::<Vec<f32>>()?
-        };
-
-        // Comprehensive validation
-        if vector.is_empty() {
-            return Err(Error::VectorEmpty.into());
-        }
-
-        if vector.len() != self.inner.dim() {
-            return Err(Error::VectorDimension {
-                expected: self.inner.dim(),
-                got: vector.len(),
-            }
-            .into());
-        }
-
-        // Check for invalid values
-        for (i, &val) in vector.iter().enumerate() {
-            if !val.is_finite() {
-                return Err(Error::VectorNotFinite {
-                    index: i,
-                    value: val,
-                }
-                .into());
-            }
-        }
-
-        // ✅ Apply space-specific processing
-        Ok(self.inner.process_vector_for_space(vector))
-    }
-
-    /// Safe version of extract_single_vector that returns String errors instead of PyErr
+    /// One record's vector, checked and processed for the space, with a
+    /// failure returned as words `add` reports against the record.
     fn extract_single_vector_safe(&self, data: &Bound<PyAny>) -> Result<Vec<f32>, String> {
         let vector = if let Ok(array1d) = data.cast::<PyArray1<f32>>() {
             array1d
@@ -925,7 +960,6 @@ impl HNSWIndex {
                 .map_err(|e| format!("Vector extraction error: {}", e))?
         };
 
-        // Same validation as extract_single_vector, but with String errors
         if vector.is_empty() {
             return Err("Vector cannot be empty".to_string());
         }

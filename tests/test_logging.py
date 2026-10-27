@@ -603,3 +603,72 @@ def test_shutdown_logging_drains_on_demand_and_is_idempotent(tmp_path):
     messages = [entry["fields"]["message"] for entry in entries]
     assert any("HNSW index created successfully" in m for m in messages)
     assert any("Vector addition completed" in m for m in messages)
+
+
+# ------------------------------------------------------------
+# The logging functions take their arguments' defaults
+# ------------------------------------------------------------
+def test_the_logging_functions_take_their_defaults(tmp_path):
+    """`init_logging()` and `init_file_logging(log_dir)` are callable with the
+    arguments they treat as optional left out, as the README calls them, and
+    each signature shows the defaults."""
+    import inspect
+
+    assert str(inspect.signature(zdb_signature("init_logging"))) == "(level=None)"
+    assert (str(inspect.signature(zdb_signature("init_file_logging")))
+            == "(log_dir, level=None, file_prefix=None)")
+    for call in ("zdb.init_logging()",
+                 f"zdb.init_file_logging({str(tmp_path / 'logs')!r})"):
+        script = (
+            "import zeusdb_vector_database as zdb\n"
+            f"print({call})\n"
+        )
+        out, err = _run_script_with_logging_env(script, ZEUSDB_DISABLE_AUTO_LOGGING="1")
+        assert out.strip().splitlines()[-1] == "True", (call, out, err)
+
+
+def zdb_signature(name):
+    import zeusdb_vector_database
+    return getattr(zeusdb_vector_database, name)
+
+
+# ------------------------------------------------------------
+# An unrecognised level runs both layers at the default
+# ------------------------------------------------------------
+def test_an_unrecognised_level_runs_both_layers_at_the_default():
+    """The Python layer falls back to the environment's default for a level
+    it does not recognise, and writes that default where the Rust layer reads
+    it, so the Rust layer runs at it too rather than at its own fallback of
+    warn. In production the default is ERROR, so a warning the engine emits
+    is not written."""
+    script = r"""
+import os
+import zeusdb_vector_database as zdb
+print("level", os.environ.get("ZEUSDB_LOG_LEVEL"))
+index = zdb.VectorDatabase().create("hnsw", dim=2, indexed_fields=["cat"])
+index.add({"ids": ["a"], "vectors": [[0.1, 0.2]], "metadatas": [{"cat": 1, "other": 2}]})
+# A filter naming a field the index did not declare, which the engine warns
+# of once.
+index.search([0.1, 0.2], filter={"cat": 1, "other": 2})
+"""
+    out, err = _run_script_with_logging_env(
+        script,
+        ENVIRONMENT="production",
+        ZEUSDB_LOG_LEVEL="loud",
+        ZEUSDB_LOG_FORMAT="json",
+        ZEUSDB_LOG_TARGET="stderr",
+    )
+    assert "level ERROR" in out
+    warnings = [entry for entry in _json_lines(err) if entry.get("level") == "WARN"]
+    assert warnings == [], warnings
+
+    # The same script at a level both layers know writes the warning, so the
+    # silence above is the level's and not the workload's.
+    out, err = _run_script_with_logging_env(
+        script,
+        ENVIRONMENT="production",
+        ZEUSDB_LOG_LEVEL="warning",
+        ZEUSDB_LOG_FORMAT="json",
+        ZEUSDB_LOG_TARGET="stderr",
+    )
+    assert any(entry.get("level") == "WARN" for entry in _json_lines(err)), err

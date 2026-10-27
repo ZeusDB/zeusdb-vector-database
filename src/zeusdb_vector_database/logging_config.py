@@ -283,6 +283,14 @@ def _configure_rust_logging(config: Dict[str, Any]) -> None:
     # function is idempotent only if what it writes is what it would read back,
     # and `critical` written back as `error` reads back as ERROR rather than
     # CRITICAL.
+    #
+    # A level the user set that this module does not recognise is the one
+    # value replaced. The Python side has fallen back to the default it
+    # chose, and the Rust side falls back to warn on its own, so the default
+    # is written in its Python spelling, which both sides read as the same
+    # level and which reads back unchanged.
+    if '_invalid_log_level' in config:
+        os.environ["ZEUSDB_LOG_LEVEL"] = config['level']
     os.environ.setdefault("ZEUSDB_LOG_LEVEL", rust_level)
     os.environ.setdefault("ZEUSDB_LOG_FORMAT", config['format'])
     

@@ -96,12 +96,8 @@ def test_add_format_3_separate_arrays_lists():
     assert add_result.vector_shape == (2, 2)
     assert len(add_result.errors) == 0
     
-    # Verify repr format matches expected (adjust for actual format)
-    repr_str = repr(add_result)
-    # The actual format might be "Some((2, 2))" instead of "(2, 2)"
-    assert "inserted=2" in repr_str
-    assert "errors=0" in repr_str
-    assert "(2, 2)" in repr_str
+    # The repr writes the shape as Python writes the tuple it is.
+    assert repr(add_result) == "AddResult(inserted=2, errors=0, shape=(2, 2))"
     
     # Verify records were added correctly
     records = index.get_records(["doc1", "doc2"])
@@ -727,13 +723,12 @@ def test_add_batch_length_rule_leaves_valid_input_alone():
     assert empty.total_inserted == 0
     assert empty.total_errors == 0
 
-    # A batch carrying no recognised vector field is still reported through
-    # AddResult rather than raised, because it names no records to lose.
+    # A batch carrying no recognised vector field is a malformed call, and
+    # raises before anything is inserted.
     index = vdb.create("hnsw", dim=4, expected_size=10)
-    missing = index.add({"ids": ["a"], "junk": 1})
-    assert missing.total_inserted == 0
-    assert missing.total_errors == 1
-    assert "Missing vector data" in missing.errors[0]
+    with pytest.raises(ValueError, match="Missing vector data"):
+        index.add({"ids": ["a"], "junk": 1})
+    assert len(index) == 0
 
     # The four shapes with no parallel arrays are untouched, including the
     # per-record rejection a bad vector still gets inside a list batch.
@@ -750,3 +745,278 @@ def test_add_batch_length_rule_leaves_valid_input_alone():
     mixed = index.add([{"id": "ok", "values": rows3[0]}, {"id": "bad", "values": [1.0, 2.0]}])
     assert mixed.total_inserted == 1
     assert mixed.total_errors == 1
+
+
+# ------------------------------------------------------------
+# An input of no format, a batch with no vectors and a batch of the wrong
+# width raise before anything is inserted
+# ------------------------------------------------------------
+@pytest.mark.parametrize("data,type_name", [
+    (123, "int"),
+    ("not a vector", "str"),
+    (b"bytes", "bytes"),
+    (object(), "object"),
+    ({1, 2, 3}, "set"),
+])
+def test_an_input_of_no_format_raises_type_error(data, type_name):
+    """Every input `add` cannot read as one of its formats is refused whole,
+    before anything is inserted, rather than reported as a record error."""
+    index = VectorDatabase().create("hnsw", dim=4)
+    with pytest.raises(TypeError) as raised:
+        index.add(data)
+    assert str(raised.value) == (
+        "add() takes a record dict, a list of records, a dict of parallel arrays, a "
+        f"two dimensional array or one vector, and got {type_name}"
+    )
+    assert len(index) == 0
+
+
+def test_a_list_holding_an_item_that_is_no_record_raises_type_error():
+    """A list of numbers is not a list of records or of vectors, and nothing in
+    it is parsed, so no record takes a generated id."""
+    index = VectorDatabase().create("hnsw", dim=4)
+    for data, position, type_name in (
+        ([0.1, 0.2, 0.3, 0.4], 0, "float"),
+        ([[0.1, 0.2, 0.3, 0.4], None], 1, "NoneType"),
+        ([{"id": "a", "values": [0.1, 0.2, 0.3, 0.4]}, "text"], 1, "str"),
+    ):
+        with pytest.raises(TypeError) as raised:
+            index.add(data)
+        assert str(raised.value) == (
+            "add() takes a list whose items are record dicts or vectors, and item "
+            f"{position} is {type_name}"
+        )
+    assert len(index) == 0
+    assert index.add([[0.1, 0.2, 0.3, 0.4]]).ids == ["vec_1"]
+
+
+def test_a_batch_dict_with_no_vectors_raises_value_error():
+    index = VectorDatabase().create("hnsw", dim=4)
+    with pytest.raises(ValueError) as raised:
+        index.add({"ids": ["a", "b"], "metadatas": [{}, {}]})
+    assert str(raised.value) == (
+        "Missing vector data. Expected one of: 'vectors', 'embeddings', or 'values' key"
+    )
+    assert len(index) == 0
+
+
+def test_a_two_dimensional_array_of_the_wrong_width_raises_value_error():
+    """A whole array of the wrong width is a malformed batch, bare and under a
+    batch key alike, of either float type."""
+    index = VectorDatabase().create("hnsw", dim=2)
+    for dtype in (np.float32, np.float64):
+        with pytest.raises(ValueError) as raised:
+            index.add(np.zeros((5, 3), dtype=dtype))
+        assert str(raised.value) == "NumPy array must have shape (N, 2), got [5, 3]"
+        with pytest.raises(ValueError) as raised:
+            index.add({"ids": ["a", "b"], "embeddings": np.zeros((2, 4), dtype=dtype)})
+        assert str(raised.value) == "NumPy array must have shape (N, 2), got [2, 4]"
+    assert len(index) == 0
+
+
+def test_a_batch_vector_field_of_the_wrong_type_raises():
+    index = VectorDatabase().create("hnsw", dim=2)
+    with pytest.raises(TypeError) as raised:
+        index.add({"ids": ["a"], "vectors": ([0.1, 0.2],)})
+    assert str(raised.value) == (
+        "add expected 'vectors' to be a list of vectors or a two dimensional array of "
+        "float32 or float64, got tuple"
+    )
+    with pytest.raises(ValueError, match="^values field must be a list in batch format$"):
+        index.add({"ids": ["a"], "values": ([0.1, 0.2],)})
+    assert len(index) == 0
+
+
+# ------------------------------------------------------------
+# A parallel array that is not a list raises under every key
+# ------------------------------------------------------------
+def test_a_tuple_of_metadata_raises_rather_than_dropping_it():
+    """A tuple of metadata mappings raises under either spelling of the key,
+    before any record goes in, and a list of the same mappings goes in."""
+    index = VectorDatabase().create("hnsw", dim=2)
+    for key in ("metadatas", "metadata"):
+        with pytest.raises(TypeError) as raised:
+            index.add({"ids": ["a", "b"], "vectors": [[0.1, 0.2], [0.3, 0.4]],
+                       key: ({"k": 1}, {"k": 2})})
+        assert str(raised.value) == (
+            f"add expected '{key}' to be a list, got tuple. A batch pairs '{key}' with "
+            "'vectors' by position and reads only a list that way, with None for a "
+            "record that carries no metadata."
+        )
+    assert len(index) == 0
+    added = index.add({"ids": ["a", "b"], "vectors": [[0.1, 0.2], [0.3, 0.4]],
+                       "metadatas": [{"k": 1}, {"k": 2}]})
+    assert added.is_success()
+    assert [r["metadata"] for r in index.get_records(["a", "b"], return_vector=False)] == [
+        {"k": 1}, {"k": 2}]
+
+
+# ------------------------------------------------------------
+# Every record of a batch is parsed on its own
+# ------------------------------------------------------------
+def test_a_list_batch_parses_each_record_on_its_own():
+    """A bad record in a list batch is its own error, named by its id or its
+    position, and the records after it are parsed as the records before it."""
+    index = VectorDatabase().create("hnsw", dim=4)
+    added = index.add({
+        "ids": ["a", "bad", "c", "d"],
+        "vectors": [[0.1, 0.2, 0.3, 0.4], [0.1], [0.5, 0.6, 0.7, 0.8], [0.9, 0.1, 0.2, 0.3]],
+    })
+    assert added.ids == ["a", "c", "d"]
+    assert (added.total_inserted, added.total_errors) == (3, 1)
+    assert added.errors == ["Vector bad: Vector dimension mismatch: expected 4, got 1"]
+    assert added.vector_shape == (4, 4)
+    assert sorted(record_id for record_id, _ in index.list(10)) == ["a", "c", "d"]
+
+    # A record with no id given is named by its position, and takes no id.
+    index = VectorDatabase().create("hnsw", dim=4)
+    added = index.add({"vectors": [[0.1, 0.2, 0.3, 0.4], [float("nan"), 0.2, 0.3, 0.4],
+                                   [0.5, 0.6, 0.7, 0.8]]})
+    assert added.ids == ["vec_1", "vec_2"]
+    assert added.errors == ["Vector item_1: Vector contains invalid value at index 0: NaN"]
+    assert added.vector_shape == (3, 4)
+
+    # Metadata that does not convert is its record's error and no other's.
+    index = VectorDatabase().create("hnsw", dim=2)
+    added = index.add({"ids": ["a", "b", "c"], "vectors": [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+                       "metadatas": [{"k": 1}, {7: "a key that is not a string"}, {"k": 3}]})
+    assert added.ids == ["a", "c"]
+    assert len(added.errors) == 1 and added.errors[0].startswith("Vector b: ")
+
+
+def test_a_numpy_batch_parses_each_record_on_its_own():
+    """Metadata that does not convert is its row's error in a NumPy batch,
+    and the rows after it go in."""
+    index = VectorDatabase().create("hnsw", dim=2)
+    added = index.add({"ids": ["a", "b", "c"],
+                       "embeddings": np.array([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+                                              dtype=np.float32),
+                       "metadatas": [{"k": 1}, {7: "a key that is not a string"}, {"k": 3}]})
+    assert added.ids == ["a", "c"]
+    assert len(added.errors) == 1 and added.errors[0].startswith("Vector b: ")
+    assert added.vector_shape == (3, 2)
+
+
+# ------------------------------------------------------------
+# Metadata that does not convert is its record's error in every shape
+# ------------------------------------------------------------
+def _nested(levels):
+    """A mapping nested `levels` deep, past the 128 levels a value may nest
+    where `levels` is 128 or more."""
+    value = 1
+    for _ in range(levels):
+        value = {"k": value}
+    return value
+
+
+KEY_WORDS = "Metadata error: TypeError: 'int' object is not an instance of 'str'"
+DEPTH_WORDS = ("Metadata error: ValueError: Nested value is deeper than 128 levels, "
+               "which is as far as mappings and lists nest.")
+
+
+@pytest.mark.parametrize("metadata,words", [
+    ({7: "a key that is not a string"}, KEY_WORDS),
+    ({"outer": {7: "a nested key that is not a string"}}, KEY_WORDS),
+    (_nested(200), DEPTH_WORDS),
+])
+def test_metadata_that_does_not_convert_is_refused_in_every_shape(metadata, words):
+    """A record whose metadata does not convert is refused and named in
+    `errors` in each of the four shapes, and the records around it go in."""
+    vectors = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]
+    metadatas = [{"k": 1}, metadata, {"k": 3}]
+    shapes = {
+        "single object": {"id": "b", "values": vectors[1], "metadata": metadata},
+        "list of records": [{"id": record_id, "values": vector, "metadata": entry}
+                            for record_id, vector, entry in zip("abc", vectors, metadatas)],
+        "list batch": {"ids": list("abc"), "vectors": vectors, "metadatas": metadatas},
+        "array batch": {"ids": list("abc"), "vectors": np.array(vectors, dtype=np.float32),
+                        "metadatas": metadatas},
+    }
+    for shape, data in shapes.items():
+        index = VectorDatabase().create("hnsw", dim=2)
+        added = index.add(data)
+        assert added.errors == [f"Vector b: {words}"], shape
+        assert "b" not in index, shape
+        assert sorted(record_id for record_id, _ in index.list(10)) == (
+            [] if shape == "single object" else ["a", "c"]), shape
+
+
+def test_a_record_refused_for_its_metadata_takes_no_generated_id():
+    """A record given no id is named by its position and leaves the id it
+    would have taken to the next record."""
+    index = VectorDatabase().create("hnsw", dim=2)
+    added = index.add([{"values": [0.1, 0.2], "metadata": {7: "x"}},
+                       {"values": [0.3, 0.4], "metadata": {"k": 1}}])
+    assert added.errors == [f"Vector item_0: {KEY_WORDS}"]
+    assert added.ids == ["vec_1"]
+    added = index.add({"vectors": [[0.1, 0.2], [0.3, 0.4]], "metadatas": [{7: "x"}, {"k": 1}]})
+    assert added.errors == [f"Vector item_0: {KEY_WORDS}"]
+    assert added.ids == ["vec_2"]
+    added = index.add({"vectors": np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+                       "metadatas": [{7: "x"}, {"k": 1}]})
+    assert added.errors == [f"Vector row_0: {KEY_WORDS}"]
+    assert added.ids == ["vec_3"]
+
+
+def test_every_shape_reads_a_metadata_entry_the_same_way():
+    """A mapping is the record's metadata, a string is kept under `text`, any
+    other value under `value`, and `None` is no metadata, in each of the four
+    shapes that carry metadata."""
+    entries = [{"k": 1}, "plain words", 42, [1, 2], None]
+    expected = [{"k": 1}, {"text": "plain words"}, {"value": 42}, {"value": [1, 2]}, {}]
+    ids = [f"r{i}" for i in range(len(entries))]
+    vectors = [[0.1 * (i + 1), 0.2] for i in range(len(entries))]
+    records = [{"id": record_id, "values": vector, "metadata": entry}
+               for record_id, vector, entry in zip(ids, vectors, entries)]
+    calls = {
+        "single object": records,
+        "list of records": [records],
+        "list batch": [{"ids": ids, "vectors": vectors, "metadatas": entries}],
+        "array batch": [{"ids": ids, "vectors": np.array(vectors, dtype=np.float32),
+                         "metadatas": entries}],
+    }
+    for shape, payloads in calls.items():
+        index = VectorDatabase().create("hnsw", dim=2)
+        for payload in payloads:
+            assert index.add(payload).is_success(), shape
+        stored = {record["id"]: record["metadata"]
+                  for record in index.get_records(ids, return_vector=False)}
+        assert stored == dict(zip(ids, expected)), shape
+
+
+# ------------------------------------------------------------
+# A float64 array is read as search reads it
+# ------------------------------------------------------------
+def test_a_float64_array_is_read_as_its_float32_narrowing():
+    """NumPy's default float type, bare and under a batch key, goes in as the
+    float32 array it narrows to, as `search` reads it."""
+    rows = np.random.default_rng(5).random((3, 4))
+    for payload in (rows, {"ids": ["a", "b", "c"], "embeddings": rows},
+                    {"ids": ["a", "b", "c"], "vectors": rows}):
+        wide = VectorDatabase().create("hnsw", dim=4, space="l2")
+        narrow = VectorDatabase().create("hnsw", dim=4, space="l2")
+        narrow_payload = (rows.astype(np.float32) if isinstance(payload, np.ndarray)
+                          else {**payload, next(k for k in payload if k != "ids"):
+                                rows.astype(np.float32)})
+        added = wide.add(payload)
+        assert added.is_success() and added.vector_shape == (3, 4)
+        assert narrow.add(narrow_payload).is_success()
+        ids = [record_id for record_id, _ in wide.list(10)]
+        assert ids == [record_id for record_id, _ in narrow.list(10)]
+        for record_id in ids:
+            assert (wide.get_records(record_id)[0]["vector"]
+                    == narrow.get_records(record_id)[0]["vector"])
+
+
+# ------------------------------------------------------------
+# vector_shape is the records the input holds
+# ------------------------------------------------------------
+def test_vector_shape_counts_the_records_the_input_holds():
+    index = VectorDatabase().create("hnsw", dim=2)
+    assert index.add([]).vector_shape == (0, 2)
+    assert index.add({"ids": ["a", "b", "c"],
+                      "vectors": [[0.1, 0.2], [0.3], [0.5, 0.6]]}).vector_shape == (3, 2)
+    assert index.add([{"id": "d", "values": [0.1, 0.2]},
+                      {"id": "e", "values": [0.1]}]).vector_shape == (2, 2)
+    assert index.add(np.array([[0.1, 0.2], [np.nan, 0.2]],
+                              dtype=np.float32)).vector_shape == (2, 2)

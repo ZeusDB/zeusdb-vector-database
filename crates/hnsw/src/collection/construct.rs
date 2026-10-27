@@ -940,6 +940,7 @@ impl Collection {
             training_threshold_reached: AtomicBool::new(false),
             created_at: RwLockAt::new(order::CREATED_AT, Utc::now().to_rfc3339()),
             overgrowth_warned: AtomicBool::new(false),
+            stopped: OnceLock::new(),
         }
     }
 }

@@ -193,6 +193,12 @@ impl PQ {
         *self.is_trained.read().unwrap()
     }
 
+    /// [`PQ::is_trained`] where its lock is free now, read without waiting,
+    /// and `None` where a writer holds the lock or a panic poisoned it.
+    pub fn try_is_trained(&self) -> Option<bool> {
+        self.is_trained.try_read().ok().map(|trained| *trained)
+    }
+
     /// Serve the codebook to a caller that must not own the guard
     ///
     /// The save writes the codebook to pq_centroids.bin and used to take this
@@ -486,6 +492,18 @@ impl PQ {
     /// Bytes held by the centroid norm table
     pub fn centroid_norm_memory_bytes(&self) -> usize {
         self.derived.read().unwrap().norms.len() * std::mem::size_of::<f32>()
+    }
+
+    /// [`PQ::sdc_memory_bytes`] and [`PQ::centroid_norm_memory_bytes`], in
+    /// that order, where the lock over the two tables is free now, read
+    /// without waiting, and `None` where a writer holds the lock or a panic
+    /// poisoned it.
+    pub fn try_table_bytes(&self) -> Option<(usize, usize)> {
+        let derived = self.derived.try_read().ok()?;
+        Some((
+            derived.sdc.len() * std::mem::size_of::<f32>(),
+            derived.norms.len() * std::mem::size_of::<f32>(),
+        ))
     }
 
     /// Train the PQ codebook using k-means clustering, and install it.

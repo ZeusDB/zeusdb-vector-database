@@ -602,13 +602,12 @@ def test_search_single_query_wrong_dimension():
 def test_search_empty_list_query():
     index = build_validation_index()
 
-    # Current behaviour, asserted rather than expected. An empty list extracts
-    # as an empty batch before the single vector path is reached, so a caller
-    # who passed one empty query vector is told the batch is empty. The
-    # expectation this violates is that the message describes what was passed,
-    # which here would be an empty search vector.
-    with pytest.raises(ValueError, match="Batch cannot be empty"):
-        index.search([])
+    # An empty list, an empty tuple and an empty one dimensional array are
+    # each one empty query, and the message says so. A two dimensional array
+    # with no rows is the empty batch of test 64.
+    for empty in ([], (), np.array([], dtype=np.float32), np.array([], dtype=np.float64)):
+        with pytest.raises(ValueError, match="^Search vector cannot be empty$"):
+            index.search(empty)
 
 # ------------------------------------------------------------
 # Test 63: None as a query
@@ -640,15 +639,11 @@ def test_search_none_query():
 def test_search_empty_batch():
     index = build_validation_index()
 
-    # A batch with no queries in it is the same object as the empty single
-    # query of test 62, and the two are indistinguishable to the index.
-    empty_batch = []
-    with pytest.raises(ValueError, match="Batch cannot be empty"):
-        index.search(empty_batch)
-
-    # A NumPy array with no rows is rejected the same way.
-    with pytest.raises(ValueError, match="Batch cannot be empty"):
-        index.search(np.zeros((0, 4), dtype=np.float32))
+    # A batch with no queries in it is a two dimensional array with no rows,
+    # of any dtype. An empty list is the empty query of test 62.
+    for dtype in (np.float32, np.float64, np.int64):
+        with pytest.raises(ValueError, match="^Batch cannot be empty$"):
+            index.search(np.zeros((0, 4), dtype=dtype))
 
 # ------------------------------------------------------------
 # Test 65: A batch containing an empty vector
@@ -912,7 +907,7 @@ def test_dot_is_accepted_and_reported_the_way_the_other_three_are():
 
 
 def test_an_unsupported_space_names_dot_among_the_four():
-    with pytest.raises(RuntimeError, match=r"'cosine', 'l2', 'l1', 'dot'"):
+    with pytest.raises(ValueError, match=r"'cosine', 'l2', 'l1', 'dot'"):
         VectorDatabase().create("hnsw", dim=4, space="inner_product")
 
 
@@ -1002,7 +997,7 @@ def test_dot_cannot_be_quantized():
     every vector is a unit vector. For an inner product it does not, because the
     stored vector's own length enters the L2 and not the inner product.
     """
-    with pytest.raises(RuntimeError, match=r"space='dot' cannot be product quantized"):
+    with pytest.raises(ValueError, match=r"space='dot' cannot be product quantized"):
         VectorDatabase().create(
             "hnsw", dim=16, space="dot", expected_size=20000,
             quantization_config={"type": "pq", "subvectors": 4, "bits": 8,
@@ -1056,7 +1051,7 @@ def test_l1_cannot_be_quantized():
     the pair stays refused. `validate_space_supports_quantization` records the
     figures.
     """
-    with pytest.raises(RuntimeError, match=r"space='l1' cannot be product quantized"):
+    with pytest.raises(ValueError, match=r"space='l1' cannot be product quantized"):
         VectorDatabase().create(
             "hnsw", dim=16, space="l1", expected_size=20000,
             quantization_config={"type": "pq", "subvectors": 4, "bits": 8,

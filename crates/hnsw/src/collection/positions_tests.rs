@@ -686,7 +686,12 @@ fn check(
     assert_eq!(views.len(), names.len(), "{step}");
     for view in &views {
         let held = &model.held[&view.id];
-        assert_eq!(view.metadata, held.fields, "{step}: {}'s fields", view.id);
+        assert_eq!(
+            view.metadata,
+            held.fields.clone().into_iter().collect::<BTreeMap<_, _>>(),
+            "{step}: {}'s fields",
+            view.id
+        );
         let want = expected_vector(collection, kind, held);
         let got = view.vector.as_ref().unwrap();
         assert!(
@@ -743,12 +748,12 @@ fn check(
 
     // `list`, in windows and after a cursor.
     let ordered = model.by_internal();
-    let window = |from: usize, number: usize| -> Vec<(String, HashMap<String, Value>)> {
+    let window = |from: usize, number: usize| -> Vec<(String, BTreeMap<String, Value>)> {
         ordered
             .iter()
             .skip(from)
             .take(number)
-            .map(|(name, held)| (name.to_string(), held.fields.clone()))
+            .map(|(name, held)| (name.to_string(), held.fields.clone().into_iter().collect()))
             .collect()
     };
     for (number, offset) in [
@@ -1849,7 +1854,7 @@ fn put(collection: &Collection, records: impl Iterator<Item = usize>) {
 struct Slot {
     name: Option<String>,
     node: Option<u32>,
-    fields: Option<HashMap<String, Value>>,
+    fields: Option<BTreeMap<String, Value>>,
     column: bool,
     sparse: Option<f32>,
 }
@@ -2049,7 +2054,11 @@ fn a_close_up_moves_every_structure_and_keeps_order() {
             );
             assert_eq!(
                 metadata.get(at).unwrap().to_map(),
-                record.metadata,
+                record
+                    .metadata
+                    .clone()
+                    .into_iter()
+                    .collect::<BTreeMap<_, _>>(),
                 "{label}"
             );
             assert!(columns.agrees_with(at, &record.metadata), "{label}");

@@ -17,7 +17,7 @@
 //! for it.
 
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use zeusdb_vector_core::RecordFields;
 
@@ -239,8 +239,9 @@ impl<'a> HitRef<'a> {
             })
     }
 
-    /// The record's metadata as the mapping it was inserted as.
-    pub fn metadata(self) -> HashMap<String, Value> {
+    /// The record's metadata as the mapping it was inserted as, its names in
+    /// code point order.
+    pub fn metadata(self) -> BTreeMap<String, Value> {
         let page = self.page;
         self.fields()
             .map(|(name, value)| {
@@ -276,6 +277,7 @@ pub enum FieldRef<'a> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashMap;
     use zeusdb_vector_core::MetadataStore;
 
     fn mapping(pairs: &[(&str, Value)]) -> HashMap<String, Value> {

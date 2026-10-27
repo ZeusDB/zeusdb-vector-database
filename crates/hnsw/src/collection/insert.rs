@@ -667,6 +667,7 @@ impl Collection {
             let slot = ids.extent();
             let at = Position::from_slot(slot);
             ids.insert_admitted(slot, external_id);
+            zeusdb_vector_core::panic_at(zeusdb_vector_core::PanicPoint::InsertAfterName);
             if let Err(refused) = index.insert(at, id, vector, prepared) {
                 ids.retract(slot);
                 return Err(refused);
@@ -2278,6 +2279,7 @@ impl Collection {
                     "Completed removal phase for overwrite"
                 );
             }
+            zeusdb_vector_core::panic_at(zeusdb_vector_core::PanicPoint::AddBeforeInstalls);
 
             for outcome in segment {
                 let admitted = match outcome {
@@ -2632,6 +2634,7 @@ impl Collection {
         // install can set off, runs after the record's last write, so the
         // position is the one the record still holds.
         if let Some(sparse) = sparse {
+            zeusdb_vector_core::panic_at(zeusdb_vector_core::PanicPoint::InstallBeforeSparse);
             self.insert_sparse(at, internal_id, &sparse)?;
         }
 

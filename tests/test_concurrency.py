@@ -1661,3 +1661,53 @@ def test_a_filtered_search_never_deadlocks_against_a_writer(tmp_path, probe_mode
         f"no filtered search overlapped a write, so the interleaving under test "
         f"never occurred. {seen}"
     )
+
+
+
+# ------------------------------------------------------------
+# get_stats releases the interpreter
+# ------------------------------------------------------------
+def test_get_stats_lets_another_python_thread_run():
+    """`get_stats` walks every record's metadata, the code map and the training
+    buffer, and does it with the interpreter released, so another Python thread
+    runs during the call.
+
+    The switch interval is set long enough that no switch is pending inside a
+    measured call, so a counting thread advances during a call only where the
+    call releases the interpreter. A call that releases it hands it to the
+    counting thread at once where the thread wins the race, and does in most
+    rounds, so the loop stops at the first such round; one that holds it never
+    does, in any number of rounds.
+    """
+    n = 2_000
+    index = VectorDatabase().create("hnsw", dim=8, expected_size=n, m=8, ef_construction=40)
+    rng = np.random.default_rng(7)
+    index.add({"ids": [f"g{i}" for i in range(n)],
+               "vectors": rng.random((n, 8), dtype=np.float32),
+               "metadatas": [{"k": i % 13, "s": f"v{i % 101}"} for i in range(n)]})
+    counter = [0]
+    stop = [False]
+
+    def spin():
+        while not stop[0]:
+            counter[0] += 1
+
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(0.2)
+    spinner = threading.Thread(target=spin, daemon=True)
+    try:
+        spinner.start()
+        while counter[0] == 0:
+            time.sleep(0.001)
+        moved = False
+        for _ in range(50):
+            before = counter[0]
+            index.get_stats()
+            if counter[0] != before:
+                moved = True
+                break
+    finally:
+        stop[0] = True
+        spinner.join()
+        sys.setswitchinterval(previous)
+    assert moved, "no other thread ran during any of 50 get_stats() calls"

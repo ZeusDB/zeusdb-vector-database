@@ -245,3 +245,99 @@ def test_add_metadata_merges_on_a_second_call():
     snapshot = index.get_all_metadata()
     snapshot["injected"] = "no"
     assert index.get_metadata("injected") is None
+
+
+# ------------------------------------------------------------
+# Metadata keys come back in code point order
+# ------------------------------------------------------------
+_ORDER_NAMES = ["zeta", "Alpha", "mid", "été", "beta", "_under"]
+
+
+def _order_index(n=60):
+    """An index whose records each name their fields in a rotated order, so
+    no one order is the order the store first saw the names in."""
+    index = VectorDatabase().create("hnsw", dim=4, expected_size=n)
+    rng = np.random.default_rng(222)
+    vectors = rng.random((n, 4), dtype=np.float32)
+    records = []
+    for i in range(n):
+        shift = i % len(_ORDER_NAMES)
+        rotated = _ORDER_NAMES[shift:] + _ORDER_NAMES[:shift]
+        metadata = {name: i for name in rotated}
+        metadata["nested"] = {"z": 1, "a": 2}
+        records.append({"id": f"r{i:03d}", "vector": vectors[i].tolist(), "metadata": metadata})
+    assert index.add(records).is_success()
+    return index, vectors
+
+
+def _orders(index, vectors, n=60):
+    """The key order of every record's metadata, by the call that handed it."""
+    ids = [f"r{i:03d}" for i in range(n)]
+    query = vectors[0].tolist()
+    pages = {
+        "search": [h["metadata"] for h in index.search(query, top_k=n)],
+        "search of a batch": [h["metadata"] for h in index.search([query], top_k=n)[0]],
+        "query": [h["metadata"] for h in index.query([{"vector": query}], top_k=n)],
+        "get_records": [r["metadata"] for r in index.get_records(ids, return_vector=False)],
+        "list": [metadata for _, metadata in index.list(number=n)],
+    }
+    return {call: [list(metadata) for metadata in dicts] for call, dicts in pages.items()}
+
+
+def test_every_call_hands_metadata_keys_over_in_code_point_order():
+    """`search`, `query`, `get_records` and `list` hand every record's keys over
+    in one order, being code point order, which is the order a nested mapping's
+    keys come in, whatever order the store first saw the names in."""
+    index, vectors = _order_index()
+    expected = sorted(_ORDER_NAMES + ["nested"])
+    assert expected == ["Alpha", "_under", "beta", "mid", "nested", "zeta", "été"]
+    for call, orders in _orders(index, vectors).items():
+        assert len(orders) == 60, call
+        assert all(order == expected for order in orders), call
+    record = index.get_records("r000", return_vector=False)[0]
+    assert list(record["metadata"]["nested"]) == ["a", "z"]
+
+
+def test_the_reports_hand_their_keys_over_in_code_point_order():
+    index, _ = _order_index(20)
+    index.add_metadata({"zulu": "1", "alpha": "2", "Mike": "3"})
+    stats = index.get_stats()
+    assert list(stats) == sorted(stats)
+    assert list(index.get_all_metadata()) == ["Mike", "alpha", "zulu"]
+    performance = index.get_performance_info()
+    assert list(performance) == sorted(performance)
+    benchmark = index.benchmark_concurrent_reads(4, max_threads=1)
+    assert list(benchmark) == sorted(benchmark)
+
+
+def test_the_key_order_is_the_same_in_another_process():
+    """A second process, whose hash maps are seeded afresh and whose store sees
+    the names first in another order, hands the keys over in the same order."""
+    import json
+    import subprocess
+    import sys
+
+    script = r"""
+import json
+import numpy as np
+from zeusdb_vector_database import VectorDatabase
+names = ["mid", "_under", "zeta", "été", "Alpha", "beta"]
+index = VectorDatabase().create("hnsw", dim=4)
+vectors = np.random.default_rng(7).random((5, 4), dtype=np.float32)
+index.add([{"id": f"p{i}", "vector": vectors[i].tolist(),
+            "metadata": {name: i for name in names[i:] + names[:i]}} for i in range(5)])
+print(json.dumps({
+    "search": [list(h["metadata"]) for h in index.search(vectors[0].tolist(), top_k=5)],
+    "get_records": [list(r["metadata"]) for r in index.get_records([f"p{i}" for i in range(5)])],
+    "list": [list(m) for _, m in index.list(5)],
+    "stats": list(index.get_stats())[:6],
+}))
+"""
+    out = subprocess.run([sys.executable, "-c", script], check=True,
+                         capture_output=True, text=True, encoding="utf-8").stdout
+    seen = json.loads(out.strip().splitlines()[-1])
+    expected = sorted(_ORDER_NAMES)
+    for call in ("search", "get_records", "list"):
+        assert all(order == expected for order in seen[call]), call
+    index, _ = _order_index(5)
+    assert seen["stats"] == list(index.get_stats())[:6]

@@ -36,7 +36,7 @@
 
 use crate::filter::FieldLookup;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// The most entries the store reserves at creation, whatever the declaration.
 ///
@@ -553,8 +553,10 @@ impl<'a> RecordFields<'a> {
             .map(move |field| (field.key, names[field.key as usize].as_str(), &field.value))
     }
 
-    /// The mapping the record was inserted with.
-    pub fn to_map(&self) -> HashMap<String, Value> {
+    /// The mapping the record was inserted with, its names in code point
+    /// order, which is one order for every record whatever order the store
+    /// first saw the names in.
+    pub fn to_map(&self) -> BTreeMap<String, Value> {
         self.iter()
             .map(|(name, value)| (name.to_string(), value.clone()))
             .collect()
@@ -584,8 +586,14 @@ mod tests {
             .collect()
     }
 
+    /// A mapping as `to_map` returns it.
+    fn sorted(mapping: HashMap<String, Value>) -> BTreeMap<String, Value> {
+        mapping.into_iter().collect()
+    }
+
     /// What goes in comes back, field for field, whatever order the names
-    /// were first seen in.
+    /// were first seen in, and every record hands its names over in code
+    /// point order.
     #[test]
     fn a_record_reads_back_as_the_mapping_it_was_inserted_with() {
         let mut store = MetadataStore::new(4);
@@ -593,8 +601,10 @@ mod tests {
         let second = record(&[("category", json!("c4")), ("flag", json!(true))]);
         store.insert(0, first.clone());
         store.insert(2, second.clone());
-        assert_eq!(store.get(0).unwrap().to_map(), first);
-        assert_eq!(store.get(2).unwrap().to_map(), second);
+        assert_eq!(store.get(0).unwrap().to_map(), sorted(first));
+        assert_eq!(store.get(2).unwrap().to_map(), sorted(second));
+        let names: Vec<String> = store.get(0).unwrap().to_map().into_keys().collect();
+        assert_eq!(names, ["category", "year"]);
         assert_eq!(store.get(2).unwrap().field("category"), Some(&json!("c4")));
         assert_eq!(store.get(2).unwrap().field("year"), None);
         assert_eq!(store.get(2).unwrap().field("absent"), None);
@@ -614,7 +624,7 @@ mod tests {
         assert!(store.get(0).is_none());
         let fields = store.get(1).expect("an empty mapping is an entry");
         assert!(fields.is_empty());
-        assert_eq!(fields.to_map(), HashMap::new());
+        assert_eq!(fields.to_map(), BTreeMap::new());
         assert_eq!(store.len(), 1);
         assert!(store.remove(1));
         assert!(!store.remove(1));
@@ -629,7 +639,10 @@ mod tests {
         let mut store = MetadataStore::new(1);
         store.insert(0, record(&[("a", json!(1)), ("b", json!(2))]));
         store.insert(0, record(&[("b", json!(3))]));
-        assert_eq!(store.get(0).unwrap().to_map(), record(&[("b", json!(3))]));
+        assert_eq!(
+            store.get(0).unwrap().to_map(),
+            sorted(record(&[("b", json!(3))]))
+        );
         assert_eq!(store.len(), 1);
     }
 
@@ -786,7 +799,7 @@ mod tests {
             store
         };
         let kept: Vec<u32> = (0..90u32).filter(|slot| slot % 3 == 1).collect();
-        let held = |store: &MetadataStore| -> Vec<(usize, HashMap<String, Value>)> {
+        let held = |store: &MetadataStore| -> Vec<(usize, BTreeMap<String, Value>)> {
             store
                 .iter()
                 .map(|(slot, fields)| (slot, fields.to_map()))
@@ -833,7 +846,7 @@ mod tests {
             parts.records.iter().all(Option::is_none),
             "the old entries are handed back empty"
         );
-        let after: Vec<(usize, HashMap<String, Value>)> = before
+        let after: Vec<(usize, BTreeMap<String, Value>)> = before
             .iter()
             .enumerate()
             .map(|(k, (_, fields))| (k, fields.clone()))
@@ -909,7 +922,7 @@ mod tests {
             for slot in 0..records {
                 assert_eq!(
                     store.get(slot).unwrap().to_map(),
-                    fields(slot),
+                    sorted(fields(slot)),
                     "{declared}: {slot}"
                 );
             }

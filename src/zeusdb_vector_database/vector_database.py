@@ -146,13 +146,14 @@ class VectorDatabase:
 
     @staticmethod
     def _validate_indexed_fields(fields: Any) -> list:
-        """Every rule a declared field list has to satisfy, checked here first.
+        """The shape of a declared field list, checked here first.
 
-        The Rust constructor enforces the same rules and raises the same kind of
-        error, because a directory loaded from disk has to be held to them too.
-        This exists so that a mistake in a create() call is reported against the
-        argument the caller wrote rather than wrapped in the RuntimeError
-        create() raises for a backend failure.
+        A single string, a value that is not iterable and a name that is not
+        a string are refused here with ValueError, against the argument
+        the caller wrote. The count of fields, the names themselves and a
+        name given twice are held to their rules by the Rust constructor
+        alone, which holds a directory loaded from disk to the same rules and
+        raises ValueError too.
         """
         if isinstance(fields, str):
             raise ValueError(
@@ -405,8 +406,11 @@ class VectorDatabase:
             )
 
         Raises:
-            ValueError: If index_type is not supported or quantization config is invalid.
-            RuntimeError: If index creation fails due to backend validation.
+            TypeError: If dim is missing, a parameter is of the wrong type, or a
+                keyword is not one the index type takes.
+            ValueError: If index_type is not supported, a parameter breaks the
+                rules above, or the quantization config is invalid.
+            RuntimeError: If the call fails inside the engine.
         """
         index_type = (index_type or "").strip().lower()
 
@@ -477,17 +481,17 @@ class VectorDatabase:
                 quantization_config, dim, kwargs.get("expected_size")
             )
 
-        try:
-            # Always pass quantization_config parameter
-            if quantization_config is not None:
-                # Remove keys with None values and internal keys
-                clean_config = {k: v for k, v in quantization_config.items() if not k.startswith('_') and v is not None}
-            else:
-                clean_config = None
+        # Always pass quantization_config parameter
+        if quantization_config is not None:
+            # Remove keys with None values and internal keys
+            clean_config = {k: v for k, v in quantization_config.items() if not k.startswith('_') and v is not None}
+        else:
+            clean_config = None
 
-            return self._build_index(index_type, quantization_config=clean_config, **kwargs)
-        except Exception as e:
-            raise RuntimeError(f"Failed to create {index_type.upper()} index: {e}") from e
+        # What the builder raises reaches the caller as it is: ValueError for a
+        # value its rules refuse and TypeError for a value of the wrong type or
+        # a keyword it does not take, in the engine's words.
+        return self._build_index(index_type, quantization_config=clean_config, **kwargs)
 
 
     def load(self, path: str, tokenizer: Any = None, durability: Optional[str] = None,

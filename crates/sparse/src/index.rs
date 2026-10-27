@@ -214,7 +214,8 @@ pub(crate) struct Posting {
 pub(crate) struct PostingList {
     pub(crate) postings: Vec<Posting>,
     /// Postings whose record has been removed and not yet rewritten out.
-    /// Maintained under `Unlink::Lazy` alone.
+    /// Maintained under `Unlink::Strand` and `Unlink::Lazy`. `Unlink::Eager`
+    /// takes a removed record's postings out, so it stays at zero there.
     pub(crate) dead: u32,
 }
 
@@ -507,17 +508,27 @@ impl PostingsIndex {
 
     /// Whether every posting is keyed by a position the record table holds a
     /// record at, live or dead, each list in strictly increasing key order,
-    /// the dead set lies inside the records held, the length table is the
-    /// record table's length, and the slot count reaches past every record.
-    /// Every write keeps it true.
+    /// each list's dead count is the postings on it whose position is in the
+    /// dead set, the dead postings are the sum of those counts, the dead set
+    /// lies inside the records held, the length table is the record table's
+    /// length, and the slot count reaches past every record. Every write
+    /// keeps it true.
     pub fn keys_agree(&self) -> bool {
         let held = |key: usize| self.records.get(key).is_some_and(Slot::held);
+        let mut counted_dead = 0usize;
         let lists = self.lists.iter().all(|list| {
+            let dead_keys = list
+                .postings
+                .iter()
+                .filter(|p| self.dead.contains(p.key as usize))
+                .count();
+            counted_dead += list.dead as usize;
             list.postings.iter().all(|p| held(p.key as usize))
                 && list
                     .postings
                     .windows(2)
                     .all(|pair| pair[0].key < pair[1].key)
+                && dead_keys == list.dead as usize
         });
         let mut dead = 0usize;
         let mut dead_within = true;
@@ -529,6 +540,7 @@ impl PostingsIndex {
             .filter(|&at| held(at) && !self.dead.contains(at))
             .count();
         lists
+            && counted_dead == self.dead_postings
             && dead_within
             && dead == self.dead_records
             && live == self.live
@@ -900,8 +912,9 @@ impl PostingsIndex {
         self.slot_count = self.slot_count.max(id.slot() + 1);
     }
 
-    /// Insert one record at its position `at`, with the check every caller
-    /// wants and the forward arena's ceiling, both before anything is
+    /// Insert one record at its position `at`, with the checks every caller
+    /// wants, being the record's own rules, the forward arena's ceiling and
+    /// a position the index holds live or removed, all before anything is
     /// written. The caller raises the slot count by the record's internal id
     /// once the record is in, through [`PostingsIndex::count_slot`].
     pub(crate) fn insert_record(
@@ -921,12 +934,12 @@ impl PostingsIndex {
             return Err(Error::RecordAlreadyHeld { id: at.0 });
         }
         if self.dead.contains(slot_index) {
-            // A removed position being re-inserted. The engine never does
-            // this, since it never reuses a position, but the structure stays
-            // correct if a caller does: the old span and its postings are
-            // already counted dead, and the record starts again.
-            self.dead.remove(slot_index);
-            self.dead_records -= 1;
+            // A removed position keeps its postings on their lists under the
+            // strand and lazy policies, keyed by the position, until a
+            // compaction or a close-up drops them, so a record taken at it
+            // would read them as its own. The collection files every record
+            // at a new position and never takes one.
+            return Err(Error::RecordRemoved { id: at.0 });
         }
         let start = u32::try_from(self.fwd_dims.len())
             .expect("the forward arena is held within its ceiling, which no u32 offset passes");
@@ -1292,6 +1305,102 @@ pub(crate) mod tests {
             Err(Error::RecordNotHeld { id: 1 })
         ));
         assert!(index.vector(Position(1)).is_none());
+    }
+
+    /// A position the index holds as removed is refused under every policy,
+    /// before anything is written, so the removed record's postings stay
+    /// counted dead and no search reads them as a new record's. A
+    /// compaction then takes them back cleanly.
+    #[test]
+    fn a_removed_position_is_refused_with_nothing_written() {
+        for unlink in [Unlink::Strand, Unlink::Lazy, Unlink::Eager] {
+            let mut index = PostingsIndex::new(SparseConfig {
+                unlink,
+                ..SparseConfig::default()
+            });
+            // Twenty records share dimension 1, so one removal leaves that
+            // list below the lazy rewrite's ten percent and its dead posting
+            // on it.
+            for id in 0..20u32 {
+                let v = sparse(&[1, 100 + id], &[1.0, 1.0]);
+                index
+                    .insert(Position(id), RecordId(id + 1), v.as_ref(), Prepared::none())
+                    .unwrap();
+            }
+            index.remove(Position(5)).unwrap();
+            let before = index.layout();
+            let refused = index.insert(
+                Position(5),
+                RecordId(21),
+                sparse(&[7], &[2.0]).as_ref(),
+                Prepared::none(),
+            );
+            assert!(
+                matches!(refused, Err(Error::RecordRemoved { id: 5 })),
+                "{unlink:?}: {refused:?}"
+            );
+            assert_eq!(index.layout(), before, "{unlink:?}: nothing is written");
+            assert!(index.keys_agree(), "{unlink:?}");
+            assert!(!index.holds(Position(5)), "{unlink:?}");
+            assert_eq!(index.df(1), 19, "{unlink:?}");
+            for dim in [1, 105, 7] {
+                let found = index
+                    .search(
+                        sparse(&[dim], &[1.0]).as_ref(),
+                        25,
+                        &Candidates::All,
+                        &Budget::default(),
+                    )
+                    .unwrap();
+                assert!(
+                    found.items.iter().all(|hit| hit.position != Position(5)),
+                    "{unlink:?}: dimension {dim} finds the removed position"
+                );
+            }
+            index.compact();
+            assert_eq!(index.dead_postings(), 0, "{unlink:?}");
+            assert!(index.keys_agree(), "{unlink:?}: compacted");
+        }
+    }
+
+    /// The structure's own check holds each list's dead count to the
+    /// postings on it whose position is removed, and the dead postings to
+    /// the sum of the counts, so a position dropped from the dead set while
+    /// its postings stay counted, or a count that drifts, fails it.
+    #[test]
+    fn the_keys_check_holds_the_dead_counts_to_the_lists() {
+        for unlink in [Unlink::Strand, Unlink::Lazy] {
+            let fresh = || {
+                let mut index = PostingsIndex::new(SparseConfig {
+                    unlink,
+                    ..SparseConfig::default()
+                });
+                for id in 0..20u32 {
+                    let v = sparse(&[1, 100 + id], &[1.0, 1.0]);
+                    index
+                        .insert(Position(id), RecordId(id + 1), v.as_ref(), Prepared::none())
+                        .unwrap();
+                }
+                index.remove(Position(5)).unwrap();
+                assert!(index.keys_agree(), "{unlink:?}");
+                index
+            };
+
+            let mut revived = fresh();
+            revived.dead.remove(5);
+            revived.dead_records -= 1;
+            assert!(!revived.keys_agree(), "{unlink:?}: a revived position");
+
+            let mut drifted = fresh();
+            let slot = drifted.slots_by_dim[&1] as usize;
+            drifted.lists[slot].dead += 1;
+            drifted.dead_postings += 1;
+            assert!(!drifted.keys_agree(), "{unlink:?}: a list's count");
+
+            let mut total = fresh();
+            total.dead_postings += 1;
+            assert!(!total.keys_agree(), "{unlink:?}: the total");
+        }
     }
 
     /// Stranding leaves the postings and counts them, and a compaction takes

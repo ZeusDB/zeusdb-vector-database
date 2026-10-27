@@ -683,6 +683,27 @@ pub enum Error {
     },
     /// A term longer than a text space stores for one term
     TermTooLong { bytes: usize, ceiling: usize },
+
+    // ------------------------------------------------------------------
+    // A call that panicked, a removed record inserted again and a negative
+    // count. Appended after every variant above, and none wider than the
+    // widest above.
+    // ------------------------------------------------------------------
+    /// A call that panicked inside the engine. `operation` names the call as
+    /// a caller writes it and `cause` is what the panic said. `stopped` is
+    /// set where the call was made on an index, which then refuses every
+    /// call with this refusal, naming the first call that panicked; a load
+    /// and the creation of an index have no index to stop
+    Panicked {
+        operation: &'static str,
+        cause: String,
+        stopped: bool,
+    },
+    /// An insert under an internal id the index holds as removed, which it
+    /// holds until a compaction or a close-up drops the removed records
+    RecordRemoved { id: u32 },
+    /// A count or a size a call takes, given below zero
+    ArgumentNegative { name: &'static str, value: i64 },
 }
 
 impl Error {
@@ -763,7 +784,9 @@ impl Error {
             | QueryArmsEmpty
             | QueryArmsTooMany { .. }
             | FetchTooLarge { .. }
-            | FusionConstantInvalid { .. } => Exception::Value,
+            | FusionConstantInvalid { .. }
+            | UnsupportedSpace { .. }
+            | ArgumentNegative { .. } => Exception::Value,
 
             RecordsAbsent { .. }
             | ListCursorMissing { .. }
@@ -792,8 +815,7 @@ impl Error {
             | IndexDirectoryNotFound { .. }
             | JournalMissing { .. } => Exception::FileNotFound,
 
-            UnsupportedSpace { .. }
-            | NoQuantizer
+            NoQuantizer
             | CompactRefused { .. }
             | ReinsertCodesFailed(_)
             | AdoptRawFailed(_)
@@ -855,7 +877,9 @@ impl Error {
             | FeatureJournalUnreadable { .. }
             | GraphFull { .. }
             | SparseForwardFull { .. }
-            | TermTooLong { .. } => Exception::Runtime,
+            | TermTooLong { .. }
+            | Panicked { .. }
+            | RecordRemoved { .. } => Exception::Runtime,
         }
     }
 
@@ -2102,6 +2126,37 @@ impl fmt::Display for Error {
                  term.",
                 bytes, ceiling
             ),
+            Panicked {
+                operation,
+                cause,
+                stopped: true,
+            } => write!(
+                f,
+                "This index stopped when {} failed inside the engine: {}. It refuses every \
+                 call from then on, since the failed call may have left a change part made. \
+                 Drop it, and load() opens the directory it was saved or journaled to.",
+                operation,
+                cause.trim_end_matches('.')
+            ),
+            Panicked {
+                operation,
+                cause,
+                stopped: false,
+            } => write!(
+                f,
+                "{} failed inside the engine: {}.",
+                operation,
+                cause.trim_end_matches('.')
+            ),
+            RecordRemoved { id } => write!(
+                f,
+                "Record {} was removed from this space and cannot be added again. An internal \
+                 id is never reused.",
+                id
+            ),
+            ArgumentNegative { name, value } => {
+                write!(f, "{} cannot be negative, got {}", name, value)
+            }
         }
     }
 }

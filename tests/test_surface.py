@@ -1190,3 +1190,82 @@ def test_a_save_and_a_load_write_nothing_to_stdout(tmp_path, capfd):
     VectorDatabase().load(str(path))
     captured = capfd.readouterr()
     assert captured.out == "", captured.out[:400]
+
+
+# ------------------------------------------------------------
+# A negative count is refused with ValueError naming it
+# ------------------------------------------------------------
+_QUERY = [0.1, 0.2, 0.3, 0.4]
+
+
+@pytest.mark.parametrize("name,call", [
+    ("top_k", lambda index: index.search(_QUERY, top_k=-1)),
+    ("ef_search", lambda index: index.search(_QUERY, ef_search=-1)),
+    ("rerank", lambda index: index.search(_QUERY, rerank=-1)),
+    ("top_k", lambda index: index.query([{"vector": _QUERY}], top_k=-1)),
+    ("fetch", lambda index: index.query([{"vector": _QUERY}], fetch=-1)),
+    ("ef_search", lambda index: index.query([{"vector": _QUERY, "ef_search": -1}])),
+    ("rerank", lambda index: index.query([{"vector": _QUERY, "rerank": -1}])),
+    ("top_k", lambda index: index.explain([{"vector": _QUERY}], top_k=-1)),
+    ("fetch", lambda index: index.explain([{"vector": _QUERY}], fetch=-1)),
+    ("number", lambda index: index.list(number=-1)),
+    ("offset", lambda index: index.list(offset=-1)),
+    ("m", lambda index: index.rebuild(m=-1)),
+    ("expected_size", lambda index: index.rebuild(expected_size=-1)),
+    ("ef_construction", lambda index: index.rebuild(ef_construction=-1)),
+    ("query_count", lambda index: index.benchmark_concurrent_reads(-1)),
+    ("max_threads", lambda index: index.benchmark_concurrent_reads(2, max_threads=-1)),
+])
+def test_a_negative_count_raises_value_error_naming_it(name, call):
+    """Each count a call takes is read as a Python integer, and a negative one
+    is a value outside its range, refused as every other such value is, with
+    ValueError naming the argument."""
+    index = build(3)
+    with pytest.raises(ValueError) as raised:
+        call(index)
+    assert str(raised.value) == f"{name} cannot be negative, got -1"
+    assert len(index) == 3
+
+
+def test_a_negative_interval_raises_value_error_naming_it(tmp_path):
+    index = build(3)
+    path = str(tmp_path / "journaled.zdb")
+    with pytest.raises(ValueError, match="^interval_ms cannot be negative, got -2$"):
+        index.journal_to(path, durability="interval", interval_ms=-2)
+    index.save(path)
+    with pytest.raises(ValueError, match="^interval_ms cannot be negative, got -2$"):
+        VectorDatabase().load(path, durability="interval", interval_ms=-2)
+
+
+# ------------------------------------------------------------
+# The docstrings say what the code does
+# ------------------------------------------------------------
+def _doc(name):
+    from zeusdb_vector_database import AddResult, HNSWIndex
+    owner, _, attribute = name.partition(".")
+    return getattr({"HNSWIndex": HNSWIndex, "AddResult": AddResult}[owner], attribute).__doc__
+
+
+@pytest.mark.parametrize("name,says,no_longer_says", [
+    ("HNSWIndex.search", "is the larger of twice `top_k` and 150 under `l1`",
+     "Hnsw::search_filter"),
+    ("HNSWIndex.search", "held to the live records where fewer", "default `ef_search` is 100"),
+    ("HNSWIndex.count", "counts the bits of the columns' selection", "scan_candidates"),
+    ("HNSWIndex.count", "reads no metadata", "validate_filter_conditions"),
+    ("HNSWIndex.list", "`clear()` starts them again from 1",
+     "Internal\n    /// ids are unique and are never reissued"),
+    ("HNSWIndex.list", "with an `offset` other than 0 raises", "passing\n    /// both raises"),
+    ("HNSWIndex.get_quantization_info", "0.0 until training fits the", "and once trained"),
+    ("HNSWIndex.shrink_to_fit", "This gives it back without the rebuild",
+     "`compact()` does not reclaim it"),
+    ("HNSWIndex.compact", "is compacted first whatever the graph holds",
+     "Nothing outside the graph is touched"),
+    ("HNSWIndex.backup", "(FeatureReadOnly)", "on one opened read only."),
+    ("HNSWIndex.query", "refused on a query of one arm too",
+     "It is read where there is more than one arm"),
+    ("AddResult.ids", "may take a generated id", "because none was ever"),
+])
+def test_a_docstring_says_what_the_code_does(name, says, no_longer_says):
+    doc = " ".join(_doc(name).split())
+    assert " ".join(says.split()) in doc
+    assert " ".join(no_longer_says.replace("///", "").split()) not in doc

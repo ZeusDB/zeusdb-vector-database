@@ -7,12 +7,13 @@
 //! stays here.
 
 use super::{Collection, QuantizationScheme, StorageMode};
+use crate::journal::Durability;
 use crate::{
     default_rerank_fetch, requested_rerank_fetch, rerank_fetch_ceiling, RERANK_CALIBRATION_PAGES,
     RERANK_CALIBRATION_TOP_K,
 };
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, info};
@@ -92,7 +93,7 @@ impl Collection {
     /// consistency check. Nothing here re-enters a helper that locks; the
     /// storage mode, the training progress and the vectors still needed are
     /// derived from the captured values by the same rules the helpers apply.
-    pub fn stats(&self) -> HashMap<String, String> {
+    pub fn stats(&self) -> BTreeMap<String, String> {
         // With the holes unbounded, since this takes no `writers` and can
         // land between a removal batch and its close-up.
         debug_assert!(
@@ -255,7 +256,7 @@ impl Collection {
         // What `is_quantized` answers, from the captured flag.
         let quantization_active = trained && graph_quantized;
 
-        let mut stats = HashMap::new();
+        let mut stats = BTreeMap::new();
 
         // Basic stats
         stats.insert("total_vectors".to_string(), vector_count.to_string());
@@ -913,6 +914,45 @@ impl Collection {
     /// `vectors=` is the live record count in every storage mode.
     pub fn info(&self) -> String {
         let record_count = self.ids.read().unwrap().len();
+        let durability = self.journal_status().map(|journal| journal.durability);
+        self.info_line(
+            record_count,
+            durability,
+            self.dense().can_use_quantization(),
+            self.is_quantized(),
+        )
+    }
+
+    /// [`Collection::info`] without waiting; see [`Collection::try_len`].
+    pub fn try_info(&self) -> Option<String> {
+        let record_count = self.ids.try_read()?.len();
+        // The durability `journal_status` reports, which it reports where the
+        // sink has a journal's path and a durability both.
+        let durability = {
+            let slot = self.sink.try_lock()?;
+            slot.attached.as_ref().and_then(|sink| {
+                sink.journal_path()?;
+                sink.durability()
+            })
+        };
+        Some(self.info_line(
+            record_count,
+            durability,
+            self.dense().try_can_use_quantization()?,
+            self.dense().try_is_quantized()?,
+        ))
+    }
+
+    /// The line `info` returns, from the live record count, the journal's
+    /// durability where the collection has a journal, whether the quantizer
+    /// is fitted and whether the graph scores against codes.
+    fn info_line(
+        &self,
+        record_count: usize,
+        durability: Option<Durability>,
+        fitted: bool,
+        active: bool,
+    ) -> String {
         // The name Python sees. The class is `HNSWIndex` there whatever the
         // engine type is called, and the README and the examples print this
         // line.
@@ -927,23 +967,15 @@ impl Collection {
         );
         // The journal's policy, on a journaled collection alone, so the line
         // an unjournaled index prints is the line it always printed.
-        let base_info = match self.journal_status() {
-            Some(journal) => format!("{}, journal={}", base_info, journal.durability.name()),
+        let base_info = match durability {
+            Some(durability) => format!("{}, journal={}", base_info, durability.name()),
             None => base_info,
         };
 
         if let Some(config) = &self.dense().quantization_config {
-            let trained_status = if self.dense().can_use_quantization() {
-                "trained"
-            } else {
-                "untrained"
-            };
+            let trained_status = if fitted { "trained" } else { "untrained" };
 
-            let active_status = if self.is_quantized() {
-                "active"
-            } else {
-                "inactive"
-            };
+            let active_status = if active { "active" } else { "inactive" };
 
             match &config.scheme {
                 QuantizationScheme::Pq { subvectors, bits } => {
@@ -993,6 +1025,32 @@ impl Collection {
     /// Owned values rather than a mapping, so the binding builds the dict
     /// Python receives with the keys in the order it always had them.
     pub fn quantization_report(&self) -> Option<QuantizationReport> {
+        let quantizer = self.dense().pq.as_ref().map(|pq| {
+            (
+                pq.is_trained(),
+                (pq.sdc_memory_bytes(), pq.centroid_norm_memory_bytes()),
+            )
+        });
+        self.quantization_report_from(quantizer)
+    }
+
+    /// [`Collection::quantization_report`] without waiting; see
+    /// [`Collection::try_len`].
+    pub fn try_quantization_report(&self) -> Option<Option<QuantizationReport>> {
+        let quantizer = match self.dense().pq.as_ref() {
+            Some(pq) => Some((pq.try_is_trained()?, pq.try_table_bytes()?)),
+            None => None,
+        };
+        Some(self.quantization_report_from(quantizer))
+    }
+
+    /// The report, from what the product quantizer's locks hold where the
+    /// space has one: whether it is fitted, and the bytes of its symmetric
+    /// distance table and of its centroid norm table.
+    fn quantization_report_from(
+        &self,
+        quantizer: Option<(bool, (usize, usize))>,
+    ) -> Option<QuantizationReport> {
         let config = self.dense().quantization_config.as_ref()?;
         if config.is_int8() {
             // The scales are the whole of what a scalar quantizer holds, and
@@ -1014,31 +1072,31 @@ impl Collection {
                 }),
             });
         }
-        let quantizer = self.dense().pq.as_ref().map(|pq| {
-            // Use enhanced PQ methods
-            let (memory_mb, total_centroids) = pq.get_memory_stats();
+        let quantizer = self.dense().pq.as_ref().zip(quantizer).map(
+            |(pq, (is_trained, (sdc_bytes, norm_bytes)))| {
+                // Use enhanced PQ methods
+                let (memory_mb, total_centroids) = pq.get_memory_stats();
 
-            // Calculate compression ratio using cached values
-            let original_bytes = pq.dim() * 4; // f32
-            let compressed_bytes = pq.subvectors(); // u8 per subvector
-            QuantizerReport {
-                is_trained: pq.is_trained(),
-                memory_mb,
-                total_centroids: Some(total_centroids),
-                // The symmetric distance table graph construction reads.
-                // Reported separately because it is derived from the
-                // codebook rather than part of it, and because it scales
-                // with subvectors and bits alone while memory_mb scales
-                // with the dimension too.
-                sdc_memory_mb: Some(pq.sdc_memory_bytes() as f64 / (1024.0 * 1024.0)),
-                // The centroid norm table the cosine scorer reads, on the
-                // same footing and for the same reason.
-                centroid_norm_memory_mb: Some(
-                    pq.centroid_norm_memory_bytes() as f64 / (1024.0 * 1024.0),
-                ),
-                compression_ratio: original_bytes as f64 / compressed_bytes as f64,
-            }
-        });
+                // Calculate compression ratio using cached values
+                let original_bytes = pq.dim() * 4; // f32
+                let compressed_bytes = pq.subvectors(); // u8 per subvector
+                QuantizerReport {
+                    is_trained,
+                    memory_mb,
+                    total_centroids: Some(total_centroids),
+                    // The symmetric distance table graph construction reads.
+                    // Reported separately because it is derived from the
+                    // codebook rather than part of it, and because it scales
+                    // with subvectors and bits alone while memory_mb scales
+                    // with the dimension too.
+                    sdc_memory_mb: Some(sdc_bytes as f64 / (1024.0 * 1024.0)),
+                    // The centroid norm table the cosine scorer reads, on the
+                    // same footing and for the same reason.
+                    centroid_norm_memory_mb: Some(norm_bytes as f64 / (1024.0 * 1024.0)),
+                    compression_ratio: original_bytes as f64 / compressed_bytes as f64,
+                }
+            },
+        );
         Some(QuantizationReport {
             scheme: config.scheme.clone(),
             training_size: config.training_size,
@@ -1058,8 +1116,8 @@ impl Collection {
     /// widths. The keys stay, because the langchain adapter forwards the map
     /// verbatim; the values used to describe a mutex the index no longer
     /// has.
-    pub fn performance_info(&self) -> HashMap<String, String> {
-        let mut info = HashMap::new();
+    pub fn performance_info(&self) -> BTreeMap<String, String> {
+        let mut info = BTreeMap::new();
         info.insert(
             "search_speedup_expected".to_string(),
             "linear_in_readers_while_the_index_fits_in_cache".to_string(),
@@ -1140,7 +1198,7 @@ impl Collection {
         &self,
         query_count: usize,
         max_threads: Option<usize>,
-    ) -> Result<HashMap<String, f64>, Error> {
+    ) -> Result<BTreeMap<String, f64>, Error> {
         use rand::random; // Import for random number generation
 
         let start_time = Instant::now();
@@ -1166,7 +1224,7 @@ impl Collection {
             })
             .collect();
 
-        let mut results = HashMap::new();
+        let mut results = BTreeMap::new();
 
         // Sequential benchmark
         let start = Instant::now();

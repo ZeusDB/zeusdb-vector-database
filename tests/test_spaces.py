@@ -212,15 +212,14 @@ def test_create_with_a_tokenizer_weights_by_term_frequency_by_default(tmp_path):
     ({"tokenizer": 3}, TypeError, "must be 'simple' or a callable"),
 ])
 def test_create_refuses_a_bad_sparse_declaration(sparse, klass, fragment):
-    """Through the engine's own door the class is the binding's; through
-    create() every backend refusal is wrapped in a RuntimeError, as every
-    other backend validation has always been."""
+    """Through the engine's own door and through create() alike, the class is
+    the binding's and the words are the engine's."""
     with pytest.raises(klass) as raised:
         CREATE(dim=DIM, space="l2", m=8, ef_construction=50, expected_size=50, sparse=sparse)
     assert fragment in str(raised.value)
-    with pytest.raises(RuntimeError, match="Failed to create HNSW index") as wrapped:
+    with pytest.raises(klass) as created:
         VectorDatabase().create("hnsw", dim=DIM, space="l2", expected_size=50, sparse=sparse)
-    assert fragment in str(wrapped.value)
+    assert str(created.value) == str(raised.value)
 
 
 def test_create_refuses_a_sparse_declaration_that_is_not_a_mapping():
