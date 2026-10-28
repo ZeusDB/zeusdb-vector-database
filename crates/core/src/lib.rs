@@ -9,7 +9,8 @@
 //! pages into one, the write-ahead journal's format with its reader and
 //! the operations it records, the storage a saved collection is kept in
 //! with its one implementation over the filesystem, the abort hook a crash
-//! test kills a process at, and the hook a test panics at inside a mutation.
+//! test kills a process at, and the hook a test panics or pauses at inside a
+//! mutation.
 //! The binding takes this crate as a path
 //! dependency and reaches it through the re-exports below, so the crate's
 //! surface is this file's `pub use` list and nothing else.
@@ -33,7 +34,10 @@
 //! `cargo test -p zeusdb-vector-core` compiles this crate and its
 //! dependencies alone. The `test-support` feature exposes [`test_support`]
 //! for a test in another crate that measures against the same data, and
-//! nothing but a test target turns it on.
+//! nothing but a test target turns it on. The `pause-points` feature, which
+//! `test-support` turns on, exposes the points a test panics or pauses at;
+//! the binding's own `test-support` feature turns it on for the extension
+//! the interpreter checks run against. See `panic_point`.
 #![warn(unreachable_pub)]
 
 mod admit;
@@ -113,10 +117,14 @@ pub use metadata::{MetadataParts, MetadataStore, RecordFields};
 pub use operation::{
     AbortReason, Fitted, FittedRef, InsertParts, Operation, Values, STAMP_CEILING,
 };
-// The hook a test panics at inside a mutation. An empty function in every
-// build without the `test-support` feature; see `panic_point`.
-#[cfg(any(test, feature = "test-support"))]
-pub use panic_point::{arm as panic_arm, disarm as panic_disarm};
+// The hook a test panics or pauses at inside a mutation, and the pause it
+// waits on. An empty function in every build without the `pause-points`
+// feature; see `panic_point`.
+#[cfg(any(test, feature = "pause-points"))]
+pub use panic_point::{
+    arm as panic_arm, disarm as panic_disarm, pause_arm, pause_call, pause_disarm, Pause, PauseAt,
+    PauseState,
+};
 pub use panic_point::{at as panic_at, PanicPoint};
 pub use pq::PQ;
 pub use rng::SeededRng;

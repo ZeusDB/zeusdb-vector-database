@@ -287,7 +287,7 @@ impl HNSWIndex {
         call: impl FnOnce(&Collection) -> Result<T, Error> + Send,
     ) -> Result<T, PyEngineError> {
         let inner = &self.inner;
-        Ok(py.detach(|| inner.run(operation, || call(inner)))?)
+        run_released!(py, inner, operation, call(inner))
     }
 
     /// A read of an engine guard or two through the rule a panic keeps, with
@@ -306,7 +306,7 @@ impl HNSWIndex {
         if let Some(value) = inner.run(operation, || Ok::<_, Error>(now(inner)))? {
             return Ok(value);
         }
-        Ok(py.detach(|| inner.run(operation, || Ok::<_, Error>(wait(inner))))?)
+        run_released!(py, inner, operation, Ok::<_, Error>(wait(inner)))
     }
 
     /// What `read` gives where the index is not stopped and every guard it

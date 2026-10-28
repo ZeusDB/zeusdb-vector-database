@@ -41,6 +41,9 @@
 # Every build job records a SHA-256 for each artefact as the first step after
 # the build and uploads the artefacts and their digests straight after that,
 # so the install checks and the audit run once the files have left the job.
+# Every install check, the sdist's among them, imports the package and fails
+# where `_engine` holds `_Pause`, the class only the binding's test-support
+# feature compiles.
 # The publish job verifies every file in dist against those digests before
 # attestation and before upload. It requires the six wheels and the sdist and
 # no other file, and fails if one disagrees or is missing. That catches the
@@ -373,13 +376,14 @@ jobs:
         # Two interpreters rather than one, because an abi3 wheel claims to
         # load on every CPython from 3.10 up and one install proves only the
         # version it was installed on. The floor and the newest release
-        # bracket the claim.
+        # bracket the claim. The import fails where `_engine` holds `_Pause`;
+        # see the header.
         run: |
           for image in "$FLOOR_IMAGE" "$NEWEST_IMAGE"; do
             docker run --rm --platform ${{ matrix.platform.docker-platform }} \
               --volume "${{ github.workspace }}/dist:/dist:ro" \
               "$image" \
-              sh -c 'python -m pip install --no-index --no-deps --find-links /dist zeusdb-vector-database && python -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__)"'
+              sh -c 'python -m pip install --no-index --no-deps --find-links /dist zeusdb-vector-database && python -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__); sys.exit(\"_engine holds _Pause, which only the test-support feature compiles\" if hasattr(zvd._engine, \"_Pause\") else 0)"'
           done
 
   musllinux:
@@ -476,13 +480,14 @@ jobs:
       - name: Install and import the built wheel on two interpreters
         # Runs in a musl container, because a musllinux wheel does not install
         # on the glibc runner that builds it. The floor and the newest release
-        # bracket the abi3 claim.
+        # bracket the abi3 claim. The import fails where `_engine` holds
+        # `_Pause`; see the header.
         run: |
           for image in "$FLOOR_IMAGE" "$NEWEST_IMAGE"; do
             docker run --rm --platform ${{ matrix.platform.docker-platform }} \
               --volume "${{ github.workspace }}/dist:/dist:ro" \
               "$image" \
-              sh -c 'python -m pip install --no-index --no-deps --find-links /dist zeusdb-vector-database && python -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__)"'
+              sh -c 'python -m pip install --no-index --no-deps --find-links /dist zeusdb-vector-database && python -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__); sys.exit(\"_engine holds _Pause, which only the test-support feature compiles\" if hasattr(zvd._engine, \"_Pause\") else 0)"'
           done
 
   windows:
@@ -556,7 +561,8 @@ jobs:
       - name: Install and import the built wheel on two interpreters
         # One install proves only the version it ran on, so the floor and the
         # newest release are both exercised. Each native call is checked,
-        # because the runner only inspects the exit code of the last one.
+        # because the runner only inspects the exit code of the last one. The
+        # import fails where `_engine` holds `_Pause`; see the header.
         shell: pwsh
         run: |
           $interpreters = [ordered]@{
@@ -570,7 +576,7 @@ jobs:
             uv pip install --python $venv --no-index --no-deps --find-links dist zeusdb-vector-database
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $py = Join-Path $venv 'Scripts\python.exe'
-            & $py -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__)"
+            & $py -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__); sys.exit('_engine holds _Pause, which only the test-support feature compiles' if hasattr(zvd._engine, '_Pause') else 0)"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
@@ -638,13 +644,14 @@ jobs:
           path: digests
       - name: Install and import the built wheel on two interpreters
         # One install proves only the version it ran on, so the floor and the
-        # newest release are both exercised.
+        # newest release are both exercised. The import fails where `_engine`
+        # holds `_Pause`; see the header.
         run: |
           check() {
             venv="$RUNNER_TEMP/wheel-check-$2"
             uv venv "$venv" --python "$1"
             uv pip install --python "$venv" --no-index --no-deps --find-links dist zeusdb-vector-database
-            "$venv/bin/python" -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__)"
+            "$venv/bin/python" -c "import sys, zeusdb_vector_database as zvd; print(sys.version.split()[0], zvd.__version__); sys.exit('_engine holds _Pause, which only the test-support feature compiles' if hasattr(zvd._engine, '_Pause') else 0)"
           }
           check "$FLOOR_CPYTHON_MACOS" floor
           check "$NEWEST_CPYTHON_MACOS" newest
@@ -708,7 +715,8 @@ jobs:
         # backend and the hash-locked numpy as the one runtime dependency, and
         # fetches no other package. The archive carries no
         # rust-toolchain.toml, so RUSTUP_TOOLCHAIN names the toolchain that
-        # file names, and MATURIN_PEP517_ARGS passes --locked to cargo.
+        # file names, and MATURIN_PEP517_ARGS passes --locked to cargo. The
+        # import fails where `_engine` holds `_Pause`; see the header.
         env:
           MATURIN_PEP517_ARGS: --locked
         run: |
@@ -720,7 +728,7 @@ jobs:
           RUSTUP_TOOLCHAIN=$(sed -n 's/^channel *= *"\([^"]*\)".*$/\1/p' rust-toolchain.toml)
           export RUSTUP_TOOLCHAIN
           uv pip install --python "$RUNNER_TEMP/sdist-check" --no-build-isolation --no-deps --no-index dist/*.tar.gz
-          "$RUNNER_TEMP/sdist-check/bin/python" -c "import zeusdb_vector_database as zvd; print(zvd.__version__)"
+          "$RUNNER_TEMP/sdist-check/bin/python" -c "import sys, zeusdb_vector_database as zvd; print(zvd.__version__); sys.exit('_engine holds _Pause, which only the test-support feature compiles' if hasattr(zvd._engine, '_Pause') else 0)"
 
   audit:
     name: Audit the wheels against the stable ABI

@@ -40,7 +40,10 @@
 # exact build that uv installs and checks against the SHA-256 in its own list.
 # uv itself is pinned by version and by the SHA-256 of its archive. Both jobs
 # build the extension with the maturin uv.lock names, and lint checks that
-# .github/requirements/maturin.txt names the same one for the release.
+# .github/requirements/maturin.txt names the same one for the release. Each
+# job runs the suite on the release build without tests/test_interpreter.py,
+# then builds again with the binding's test-support feature and runs that
+# module alone, since its checks arm pauses the wheel does not carry.
 # test-rust links its test executables against the libpython of the newest
 # build, which uv installs the same way.
 #
@@ -132,6 +135,10 @@ jobs:
       - name: Run clippy
         if: steps.scope.outputs.documentation-only != 'true'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run clippy with the binding's test-support feature
+        if: steps.scope.outputs.documentation-only != 'true'
+        # The code that feature compiles, which no other step here builds.
+        run: cargo clippy --workspace --all-targets --locked --features zeusdb-vector-python/test-support -- -D warnings
       # The three steps below hold the workspace's shape, and each guards
       # against something a member manifest could undo without a warning.
       # Clippy reads the clippy.toml nearest each crate's manifest and
@@ -271,12 +278,22 @@ jobs:
         # The release profile, which is what the wheel is, built by the maturin
         # uv.lock names. It builds on every run, so no cached build can stand in
         # for the source the job checked out.
-        run: uv run --no-sync maturin develop --release
+        run: uv run --no-sync maturin develop --release --locked
       - name: Run the Python test suite
         if: steps.scope.outputs.documentation-only != 'true'
         # Scoped to the tests directory, as testpaths in pyproject.toml is, and
-        # spread over four workers, as addopts there is.
-        run: uv run --no-sync pytest tests
+        # spread over four workers, as addopts there is. The interpreter checks
+        # run after the next build, which they need.
+        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py
+      - name: Build the extension with the test-support feature
+        if: steps.scope.outputs.documentation-only != 'true'
+        # The same release build with the pauses the interpreter checks arm,
+        # which the wheel does not carry. See the feature in
+        # bindings/python/Cargo.toml.
+        run: uv run --no-sync maturin develop --release --locked --features test-support
+      - name: Run the interpreter checks
+        if: steps.scope.outputs.documentation-only != 'true'
+        run: uv run --no-sync pytest tests/test_interpreter.py
 
   test-python-floor:
     runs-on: ubuntu-24.04
@@ -326,10 +343,18 @@ jobs:
       - name: Build the extension and install the project
         if: steps.scope.outputs.documentation-only != 'true'
         # See test-python.
-        run: uv run --no-sync maturin develop --release
+        run: uv run --no-sync maturin develop --release --locked
       - name: Run the Python test suite
         if: steps.scope.outputs.documentation-only != 'true'
-        run: uv run --no-sync pytest tests
+        # See test-python.
+        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py
+      - name: Build the extension with the test-support feature
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv run --no-sync maturin develop --release --locked --features test-support
+      - name: Run the interpreter checks
+        if: steps.scope.outputs.documentation-only != 'true'
+        run: uv run --no-sync pytest tests/test_interpreter.py
 
   test-rust:
     runs-on: ubuntu-24.04

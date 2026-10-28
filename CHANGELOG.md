@@ -181,6 +181,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Each call into the engine runs inside one function that catches a panic and stops the index. Four points of an insert and a training can inject a panic under the `test-support` feature, which the wheel does not enable.
 
+- The binding's `test-support` feature compiles a pause at the start of the part of each call that runs with the interpreter released and at the four points of an insert and a training, and the private class `_engine._Pause` that arms it. The wheel does not enable it. `tests/test_interpreter.py` uses the pause to check that `get_stats()` and `add()` release the interpreter for their work and that each read of a guard releases it only to wait for a writer. CI and the lock order workflow run that module on a build with the feature after the rest of the suite, and each install check of the release workflow fails a wheel whose `_engine` holds `_Pause`.
+
 - The lock wrappers take a lock without waiting, for the reads made with the interpreter held.
 
 - The sparse index refuses a record at a position it holds as removed, before it writes anything, and its consistency check holds each posting list's count of removed postings to the postings on it whose record is removed.

@@ -1,16 +1,11 @@
 """Concurrent search, and search running alongside a write.
 
-Three separate defects sat on this path. Search held an exclusive lock on the
-graph, so two searches never ran at once. Above that, the mutating methods took
-`&mut self`, which PyO3 enforces as an exclusive borrow of the whole object, so a
-write arriving while a search held its shared borrow across `allow_threads`
-raised `RuntimeError: Already borrowed` before any lock was reached. Below both,
-`add` held the interpreter lock for its entire duration, so a write in flight
-stopped every Python thread in the process rather than only the ones touching the
-index. These tests hold the line on all three, which is that concurrent searches
-return exactly what the same queries return alone, that a write in flight never
-makes a search raise, and that searches keep running at a real rate while an
-insert is underway.
+Every method of the index takes `&self`, so a write that arrives while a
+search is in flight takes no exclusive borrow of the object. These tests hold
+that concurrent searches return exactly what the same queries return alone,
+and that a write in flight never makes a search raise. That a call releases
+the interpreter for its work, so other Python threads run beside it, is held
+in `tests/test_interpreter.py`.
 
 Every test here is built to fail for a reason rather than on timing.
 
@@ -50,37 +45,6 @@ PQ_CONFIG = {"type": "pq", "subvectors": 8, "bits": 8, "training_size": 1000}
 # Wide enough to contend on a developer machine, small enough to stay quick.
 THREADS = 8
 ROUNDS = 6
-
-# The interpreter lock test below. The insert is split into rounds so that
-# each one can be timed against a control window of its own length, and the
-# rounds together insert what one call used to.
-GIL_DIM = 32
-GIL_BASE = 1500
-GIL_ROUNDS = 9
-GIL_BATCH = 700
-MIN_ADD_WINDOW_S = 0.10
-
-# The search rate during an insert, as a share of the rate the same thread
-# reaches over a window of the same length with a second search thread beside
-# it in place of the insert. A share rather than a count, so the bound is a
-# fraction of what this machine actually does rather than a number tuned to
-# one machine.
-#
-# Both halves of "same length" and "in place of" are load bearing, and neither
-# held before. The control window was a fixed 0.30 seconds against an insert
-# lasting seconds, and a 0.30 second sample on a loaded machine lands anywhere
-# across a factor of four. The control also ran with the reader alone in the
-# process while the insert's window held two threads, so the share measured
-# how many cores the machine has as much as what the lock does. On four cores
-# the old form read 0.164 and 0.194 against this bound with nothing wrong.
-# Matched in length, matched in threads and reduced by a median over the
-# rounds, the same contention reads 0.61 to 1.79.
-#
-# A build where `add` never released the lock was measured at 2.2 to 2.4
-# percent of the reader's rate. Releasing it puts the two threads in ordinary
-# competition for the CPU. A fifth sits an order of magnitude above the first
-# and well below what a matched pair reads.
-MIN_SEARCH_SHARE = 0.20
 
 # The sustained mixed workload. Its assertions are counts and known answers
 # rather than durations, and the writer is bounded by batches rather than by a
@@ -474,153 +438,6 @@ def test_concurrent_searches_during_add_stay_correct(build):
 
 
 # ------------------------------------------------------------
-# The interpreter lock during a write
-# ------------------------------------------------------------
-
-
-class SearchCounter:
-    """One thread issuing single queries in a loop, counting completed calls.
-
-    Single queries rather than batches, because a batch releases the lock once
-    for the whole batch and would hide the thing being measured.
-    """
-
-    def __init__(self, index, queries):
-        self.index = index
-        self.queries = queries
-        self.count = 0
-        self.error = None
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run)
-
-    def _run(self):
-        cursor = 0
-        size = len(self.queries)
-        try:
-            while not self._stop.is_set():
-                self.index.search(self.queries[cursor], top_k=TOP_K)
-                cursor = cursor + 1 if cursor + 1 < size else 0
-                self.count += 1
-        except BaseException as exc:  # noqa: BLE001 - surfaced by the caller
-            self.error = exc
-
-    def __enter__(self):
-        self._thread.start()
-        # Do not sample until the thread has actually issued a search, so the
-        # first window is a steady state rather than thread start-up. The bound
-        # is a stuck thread detector and not a race bound, as `ReadLoad`'s is.
-        deadline = time.monotonic() + 30.0
-        while self.count == 0 and self.error is None and time.monotonic() < deadline:
-            time.sleep(0.001)
-        if self.error is not None:
-            raise self.error
-        assert self.count > 0, "the search thread completed no search in thirty seconds"
-        return self
-
-    def __exit__(self, *_):
-        self._stop.set()
-        self._thread.join(timeout=120)
-        return False
-
-
-def test_search_keeps_its_rate_while_one_insert_runs():
-    """A search thread keeps running at a real rate through a long insert.
-
-    `add` used to hold the interpreter lock for its whole duration, so no other
-    Python thread could start a search at all while one ran. That collapse was
-    measured at 97.6 to 98.4 percent of the reader's rate, and the cause was the
-    interpreter lock rather than any lock inside the index.
-
-    The bound is a share of the rate this same thread reaches over a window of
-    the same length with a second search thread beside it in place of the
-    insert. Both windows therefore hold two threads working the index, and both
-    are the same length, so neither the machine's speed nor its core count sits
-    in the comparison. The arms alternate round by round and the rounds are
-    reduced by a median, which is the only form a timing claim takes here.
-
-    Each round's insert is one call, so the window measured is exactly one `add`
-    and there are no gaps between calls to hide in. The rounds together are
-    asserted to be long enough to sample, so a machine that finished them too
-    fast to measure fails rather than passing on a handful of samples.
-    """
-    index, _ = build_raw(n=GIL_BASE, dim=GIL_DIM, seed=17)
-    queries = query_set(GIL_DIM, 64, seed=808)
-    batches = [
-        {
-            "ids": [f"bulk_{round_}_{i}" for i in range(GIL_BATCH)],
-            "embeddings": clustered(GIL_BATCH, GIL_DIM, seed=909 + round_),
-        }
-        for round_ in range(GIL_ROUNDS)
-    ]
-
-    # The control arm's thread. It searches only while the gate is open, so an
-    # insert's window holds the reader and the insert, a control window holds
-    # the reader and this, and neither holds three.
-    gate = threading.Event()
-    stop = threading.Event()
-    control_error = []
-
-    def control():
-        cursor = 0
-        try:
-            while not stop.is_set():
-                if not gate.wait(timeout=0.05):
-                    continue
-                index.search(queries[cursor], top_k=TOP_K)
-                cursor = cursor + 1 if cursor + 1 < len(queries) else 0
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
-            control_error.append(exc)
-
-    control_thread = threading.Thread(target=control)
-    control_thread.start()
-    shares = []
-    inserted = 0
-    insert_seconds = 0.0
-    try:
-        with SearchCounter(index, queries) as reader:
-            for batch in batches:
-                before = reader.count
-                started = time.monotonic()
-                result = index.add(batch)
-                window = time.monotonic() - started
-                during_rate = (reader.count - before) / window
-                inserted += result.total_inserted
-                insert_seconds += window
-
-                gate.set()
-                before = reader.count
-                started = time.monotonic()
-                time.sleep(window)
-                control_window = time.monotonic() - started
-                control_rate = (reader.count - before) / control_window
-                gate.clear()
-
-                shares.append(
-                    during_rate / control_rate if control_rate else float("inf")
-                )
-    finally:
-        stop.set()
-        gate.set()
-        control_thread.join(timeout=120)
-
-    assert not control_thread.is_alive(), "the control thread hung"
-    assert not control_error, control_error[0]
-    assert reader.error is None, reader.error
-    assert inserted == GIL_ROUNDS * GIL_BATCH
-    assert insert_seconds >= MIN_ADD_WINDOW_S, (
-        f"the inserts took {insert_seconds:.3f}s together, too short to sample "
-        f"a rate against"
-    )
-    shares.sort()
-    share = shares[len(shares) // 2]
-    assert share >= MIN_SEARCH_SHARE, (
-        f"the reader ran at a paired median {share:.3f} of its own rate during "
-        f"an insert, against a bound of {MIN_SEARCH_SHARE}. Rounds: "
-        f"{[round(s, 3) for s in shares]}"
-    )
-
-
-# ------------------------------------------------------------
 # A sustained mixed workload
 # ------------------------------------------------------------
 
@@ -766,21 +583,16 @@ def test_sustained_mixed_workload_leaves_the_index_exact():
 def test_training_completes_under_a_concurrent_search_load():
     """Product quantization training fires mid-workload without breaking it.
 
-    Training is the longest thing an insert can do. It runs k-means over the
-    collected vectors and then rebuilds the whole graph from quantized codes, and
-    all of it now happens with the interpreter lock released. This checks that
-    the transition is safe while searches are in flight, and that searches keep
-    completing through it.
+    Training runs k-means over the collected vectors and then rebuilds the
+    whole graph from quantized codes. Four threads search the index through
+    every batch, the one that trains among them, and a search that raises
+    fails the test. That the training runs with the interpreter released is
+    held in `tests/test_interpreter.py`.
 
     Nothing here depends on a duration. Training fires on a record count, so the
     test asserts the index was not quantized before the crossing batch and is
     quantized after it. A run where training did not fire fails on that pair
     rather than passing without exercising anything.
-
-    The overlap is proved by counting. The reader pool's completed reads are
-    sampled either side of the batch that crosses the threshold, and the test
-    asserts reads landed inside that window. A build that held the interpreter
-    lock through training records none.
     """
     vectors = clustered(TRAIN_PRELOAD, TRAIN_DIM, seed=31)
     index = VectorDatabase().create(
@@ -801,13 +613,11 @@ def test_training_completes_under_a_concurrent_search_load():
 
     read_batch = query_set(TRAIN_DIM, READ_BATCH, seed=707)
     total = TRAIN_PRELOAD
-    crossing_reads = 0
     quantized_before_crossing = None
 
     with ReadLoad(index, read_batch) as load:
         for round_ in range(TRAIN_BATCHES):
             quantized_before = index.is_quantized()
-            before = load.reads
             index.add(
                 {
                     "ids": [f"t_{round_}_{i}" for i in range(TRAIN_BATCH)],
@@ -818,14 +628,12 @@ def test_training_completes_under_a_concurrent_search_load():
             load.check()
             if not quantized_before and index.is_quantized():
                 quantized_before_crossing = quantized_before
-                crossing_reads = load.reads - before
         load.check()
 
     assert quantized_before_crossing is False, (
         "training never completed, so the transition was not exercised"
     )
     assert index.is_quantized()
-    assert crossing_reads > 0, "no search completed while training ran"
     assert index.get_vector_count() == total
 
     # The index still answers after the rebuild the training triggered.
@@ -1661,53 +1469,3 @@ def test_a_filtered_search_never_deadlocks_against_a_writer(tmp_path, probe_mode
         f"no filtered search overlapped a write, so the interleaving under test "
         f"never occurred. {seen}"
     )
-
-
-
-# ------------------------------------------------------------
-# get_stats releases the interpreter
-# ------------------------------------------------------------
-def test_get_stats_lets_another_python_thread_run():
-    """`get_stats` walks every record's metadata, the code map and the training
-    buffer, and does it with the interpreter released, so another Python thread
-    runs during the call.
-
-    The switch interval is set long enough that no switch is pending inside a
-    measured call, so a counting thread advances during a call only where the
-    call releases the interpreter. A call that releases it hands it to the
-    counting thread at once where the thread wins the race, and does in most
-    rounds, so the loop stops at the first such round; one that holds it never
-    does, in any number of rounds.
-    """
-    n = 2_000
-    index = VectorDatabase().create("hnsw", dim=8, expected_size=n, m=8, ef_construction=40)
-    rng = np.random.default_rng(7)
-    index.add({"ids": [f"g{i}" for i in range(n)],
-               "vectors": rng.random((n, 8), dtype=np.float32),
-               "metadatas": [{"k": i % 13, "s": f"v{i % 101}"} for i in range(n)]})
-    counter = [0]
-    stop = [False]
-
-    def spin():
-        while not stop[0]:
-            counter[0] += 1
-
-    previous = sys.getswitchinterval()
-    sys.setswitchinterval(0.2)
-    spinner = threading.Thread(target=spin, daemon=True)
-    try:
-        spinner.start()
-        while counter[0] == 0:
-            time.sleep(0.001)
-        moved = False
-        for _ in range(50):
-            before = counter[0]
-            index.get_stats()
-            if counter[0] != before:
-                moved = True
-                break
-    finally:
-        stop[0] = True
-        spinner.join()
-        sys.setswitchinterval(previous)
-    assert moved, "no other thread ran during any of 50 get_stats() calls"

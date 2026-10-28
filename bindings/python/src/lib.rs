@@ -7,10 +7,35 @@
 // every method here parses, calls one operation on the collection through the
 // rule a panic keeps, and converts what comes back, releasing the interpreter
 // lock around any call that may wait for an engine guard.
+
+/// The part of a call that runs with the interpreter released: `$body`
+/// inside `Collection::run` on `$inner` as `$operation`, under `$py.detach`,
+/// with the result converted for the method that returns it.
+///
+/// Under the `test-support` feature the released part starts at the pause a
+/// test of the interpreter rule arms for its next call; see `test_support`.
+/// Without the feature the expansion is the release alone.
+///
+/// It is a macro defined here, ahead of `hnsw_index`, so that each of its
+/// two uses there is one line and adds no line to that module. Every log
+/// record carries its file and line, so a line added above a tracing call
+/// site changes what the log prints and what the wheel holds.
+macro_rules! run_released {
+    ($py:expr, $inner:expr, $operation:expr, $body:expr) => {
+        Ok($py.detach(|| {
+            #[cfg(feature = "test-support")]
+            crate::test_support::pause_here($operation);
+            $inner.run($operation, || $body)
+        })?)
+    };
+}
+
 mod conversion;
 mod durability;
 mod hnsw_index;
 mod logging;
+#[cfg(feature = "test-support")]
+mod test_support;
 mod tokenizer;
 
 use pyo3::prelude::*;
@@ -319,6 +344,12 @@ fn engine(py: Python, m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
         )?;
         os.call_method("register_at_fork", (), Some(&hooks))?;
     }
+
+    // The pause a test of the interpreter rule arms, registered after every
+    // other name and under the `test-support` feature alone; see
+    // `test_support`.
+    #[cfg(feature = "test-support")]
+    m.add_class::<test_support::PyPause>()?;
 
     Ok(())
 }

@@ -15,10 +15,16 @@ publish = false
 
 [features]
 # The test data and the small test graph, for a test in another crate that
-# measures against them. Off in every build that is not a test, so the wheel
-# carries neither. The binding turns it on through its dev-dependency on this
-# crate, which cargo applies to that crate's test targets and to nothing else.
-test-support = []
+# measures against them, and the points of `pause-points`. Off in every build
+# that is not a test, so the wheel carries none of them. The index crate and
+# the sparse crate turn it on through their dev-dependencies on this crate,
+# which cargo applies to their test targets and to nothing else.
+test-support = ["pause-points"]
+# The points a test panics or pauses at inside a mutation, and nothing else of
+# this crate; see src/panic_point.rs. Off in every build that does not name
+# it. The binding's `test-support` feature turns it on, and no other feature
+# of this crate, for the extension the interpreter checks run against.
+pause-points = []
 
 # Every version is the workspace's, declared once in the root Cargo.toml with
 # the reason for each pin.

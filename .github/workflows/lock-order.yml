@@ -25,6 +25,10 @@
 # guard twice on one thread, and that none inverts the declared order. The
 # assertion fires on the acquisition itself, with no writer and no scheduling.
 #
+# The suite runs on the checked build without tests/test_interpreter.py, and
+# that module then runs alone on the checked build with the binding's
+# test-support feature, since its checks arm pauses the wheel does not carry.
+#
 # The suite runs on the newest CPython release, the exact build test-python in
 # ci.yml runs, which uv installs and checks against the SHA-256 in its own
 # list. uv itself is pinned by version and by the SHA-256 of its archive.
@@ -106,7 +110,7 @@ jobs:
         # extension for it to overwrite.
         run: uv sync --locked --extra dev --no-install-project
       - name: Build the extension with debug assertions on
-        run: uv run --no-sync maturin develop --profile checked
+        run: uv run --no-sync maturin develop --profile checked --locked
       - name: Confirm the registry is actually in the built module
         # A suite that passes looks the same whether or not the profile still
         # carries the assertions. The assertion text is in the binary or it is
@@ -120,4 +124,10 @@ jobs:
         # Four workers, from addopts in pyproject.toml. The registry is per
         # thread and each worker is its own process, so a worker sees only the
         # guards its own threads take, which is what the rule is about.
-        run: uv run --no-sync pytest tests
+        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py
+      - name: Build the extension with debug assertions and the test-support feature
+        # The checked build with the pauses the interpreter checks arm. See the
+        # feature in bindings/python/Cargo.toml.
+        run: uv run --no-sync maturin develop --profile checked --locked --features test-support
+      - name: Run the interpreter checks
+        run: uv run --no-sync pytest tests/test_interpreter.py
