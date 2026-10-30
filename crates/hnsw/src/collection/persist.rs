@@ -360,7 +360,9 @@ impl Collection {
     /// given, and the sequence it has reached is written onto the collection
     /// so that phase three records it in the manifest. A sync that fails is
     /// logged and passed, since the directory is written from memory and
-    /// holds every record whatever reached the device.
+    /// holds every record whatever reached the device. A save that fails
+    /// puts back the sequence the collection named before the sync, which
+    /// the directory it last committed holds.
     ///
     /// Then the four phases, under the one hold this already has, so the
     /// directory that is committed holds exactly the mutations at or below
@@ -434,6 +436,7 @@ impl Collection {
         };
         // Every record handed over is synced before the directory that will
         // claim them is written, where the device allows.
+        let in_place = self.journal_sequence();
         if let Some(reached) = self.sync_sink_locked(false)? {
             self.set_journal_sequence(reached);
             debug!(target: LOG_TARGET, operation = "checkpoint_sync",
@@ -442,7 +445,12 @@ impl Collection {
             );
         }
         zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::CheckpointBeforeSave);
-        self.save_phases(&storage, path)?;
+        if let Err(error) = self.save_phases(&storage, path) {
+            // This save put no directory in place, so the collection names
+            // again the sequence of the directory it last committed.
+            self.set_journal_sequence(in_place);
+            return Err(error);
+        }
         zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::CheckpointAfterSaveBeforeRoll);
         if kind == CheckpointKind::Upgrade {
             zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::UpgradeAfterCommit);

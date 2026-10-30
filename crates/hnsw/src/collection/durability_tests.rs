@@ -5,8 +5,9 @@
 //! rest of the contract a caller acts on: that the interval policy's thread
 //! lives exactly as long as the collection and does nothing while the
 //! journal is clean, that a failed commit is withdrawn from the journal and
-//! refuses everything after it until a checkpoint, and that a recovery takes
-//! the tokenizer a text layer was declared with.
+//! refuses everything after it until a checkpoint commits, which alone
+//! clears a failed sync of that thread, and that a recovery takes the
+//! tokenizer a text layer was declared with.
 //!
 //! A device fault cannot be produced on demand, so a failure is injected
 //! through a journal directory that fails a chosen write, sync or cut; see
@@ -30,6 +31,7 @@ use super::journal_support::{
 };
 use super::{Added, Collection, Declaration, ParsedRecord, SparseHalf};
 use crate::journal::{journal_path, CheckpointTaken, Durability};
+use crate::Watch;
 
 // ============================================================================
 // FIXTURES
@@ -528,8 +530,340 @@ fn a_failed_sync_of_the_interval_thread_withdraws_the_next_call() {
 }
 
 // ============================================================================
+// A FAILED SYNC OF THE INTERVAL THREAD AND WHAT CLEARS IT
+// ============================================================================
+
+/// A collection journaled at `path` under the interval policy at five
+/// milliseconds whose thread holds a failed sync that no call has met: the
+/// thread synced the first call, and its sync of the second failed.
+fn holding_a_failure(path: &Path) -> (Collection, Arc<Faults>, Watch) {
+    let (collection, faults) = faulty(path, Durability::PerInterval(Duration::from_millis(5)));
+    let watch = collection.flusher_watch().unwrap();
+    add(&collection, 0..2);
+    assert!(
+        faults.thread_syncs.wait_ended(0).is_some(),
+        "the thread synced no commit within {SYNC_LIMIT:?}, so it hung"
+    );
+    faults.syncs.arm(0, 1);
+    add(&collection, 2..3);
+    assert!(
+        wait_for(SYNC_LIMIT, || watch.holds_failure() == Some(true)),
+        "the thread recorded no failed sync within {SYNC_LIMIT:?}, so it hung"
+    );
+    (collection, faults, watch)
+}
+
+/// A checkpoint that commits while the thread is inside a sync of the
+/// segment the checkpoint replaces discards that sync's failure, since the
+/// directory it wrote holds every record the segment held, so the next call
+/// is taken.
+///
+/// The thread's second sync is held at the gate. The checkpoint runs on a
+/// thread of its own, and once it is past its own sync, by returning or by
+/// waiting at its roll for the held sync to end, one failed sync is armed
+/// and the gate is opened, so the held sync is the one that fails. The
+/// thread has dealt with that sync once the checkpoint has waited for it,
+/// or once the thread holds its failure.
+#[test]
+fn a_failed_sync_of_a_segment_the_checkpoint_replaced_refuses_nothing() {
+    let temp = TempDir::new("durability-tests");
+    let path = temp.at("replaced.zdb");
+    let (collection, faults) = faulty(&path, Durability::PerInterval(Duration::from_millis(5)));
+    let watch = collection.flusher_watch().unwrap();
+    let syncs = &faults.thread_syncs;
+    add(&collection, 0..2);
+    assert!(
+        syncs.wait_ended(0).is_some(),
+        "the thread synced no commit within {SYNC_LIMIT:?}, so it hung"
+    );
+    syncs.close();
+    add(&collection, 2..3);
+    assert!(
+        syncs.wait_begun(1).is_some(),
+        "the thread began no sync of the second call within {SYNC_LIMIT:?}, so it hung"
+    );
+    let waited = std::thread::scope(|scope| {
+        let checkpoint = scope.spawn(|| collection.checkpoint());
+        let past_its_sync = wait_for(SYNC_LIMIT, || {
+            checkpoint.is_finished() || watch.roll_waits() == Some(true)
+        });
+        let waited = watch.roll_waits() == Some(true);
+        faults.syncs.arm(0, 1);
+        syncs.open();
+        assert!(
+            past_its_sync,
+            "the checkpoint neither returned nor waited for the held sync within \
+             {SYNC_LIMIT:?}, so it hung"
+        );
+        checkpoint.join().unwrap().expect("the checkpoint commits");
+        waited
+    });
+    assert!(
+        waited || wait_for(SYNC_LIMIT, || watch.holds_failure() == Some(true)),
+        "the thread recorded nothing of the held sync within {SYNC_LIMIT:?}, so it hung"
+    );
+    assert!(faults.syncs.spent(), "the held sync is the one that failed");
+    assert_eq!(
+        collection.journal_sequence(),
+        5,
+        "the checkpoint holds both calls, so every record of the segment the held sync was of"
+    );
+    let added = try_add(&collection, 3..5);
+    assert_eq!(
+        added.total_errors, 0,
+        "a failed sync of a segment the checkpoint replaced refuses nothing: {:?}",
+        added.errors
+    );
+    assert!(
+        !syncs.timed_out(),
+        "no sync waited at the gate for its whole limit"
+    );
+    let before = ids(&collection);
+    drop(collection);
+    let (recovered, report) = recover(&path, Durability::PerCall);
+    assert_eq!(report.replayed, 2);
+    assert_eq!(ids(&recovered), before);
+}
+
+/// A backup's own sync clears nothing. With a failed sync of the thread
+/// held, a backup writes its copy, which holds every record the collection
+/// holds, and the next call is refused and withdrawn as it is without the
+/// backup, since only a checkpoint that commits clears a failed sync. The
+/// checkpoint after it clears the failure, and the call after that is taken.
+#[test]
+fn a_backup_writes_its_copy_and_leaves_a_failed_sync_of_the_thread_held() {
+    let temp = TempDir::new("durability-tests");
+    let path = temp.at("backup-held.zdb");
+    let (collection, _faults, watch) = holding_a_failure(&path);
+    let target = temp.at("backup-held-copy.zdb");
+    collection
+        .backup(target.to_str().unwrap())
+        .expect("a backup is not a mutation, and writes its copy");
+    let refused = try_add(&collection, 3..4);
+    assert_eq!(
+        refused.total_errors, 1,
+        "the call after the backup is refused: {:?}",
+        refused.errors
+    );
+    assert!(
+        refused.errors[0].contains("withdrawn by an abort record"),
+        "{}",
+        refused.errors[0]
+    );
+    let copy = Collection::load(target.to_str().unwrap()).unwrap();
+    assert_eq!(
+        ids(&copy),
+        ["r0", "r1", "r2"],
+        "the copy holds every record the collection holds"
+    );
+    collection.checkpoint().unwrap();
+    assert_eq!(watch.holds_failure(), Some(false));
+    add(&collection, 4..5);
+    assert_eq!(ids(&collection), ["r0", "r1", "r2", "r4"]);
+}
+
+/// A checkpoint whose own sync succeeds and whose save then fails commits
+/// nothing, so a failed sync of the thread it found held stays held and the
+/// next call is refused. A file where the save stages its directory fails
+/// the save once the journal is synced. With the file gone, the checkpoint
+/// commits and the call after it is taken.
+#[test]
+fn a_checkpoint_whose_save_fails_leaves_a_failed_sync_of_the_thread_held() {
+    let temp = TempDir::new("durability-tests");
+    let path = temp.at("unsaved.zdb");
+    let (collection, _faults, watch) = holding_a_failure(&path);
+    let staging = temp.at("unsaved.zdb.zdbtmp");
+    std::fs::write(&staging, b"a file where the staging directory goes").unwrap();
+    match collection.checkpoint() {
+        Err(Error::RemoveTreeFailed { .. }) => {}
+        other => panic!("expected the save to fail at its staging directory, got {other:?}"),
+    }
+    let refused = try_add(&collection, 3..4);
+    assert_eq!(
+        refused.total_errors, 1,
+        "the call after a checkpoint whose save failed is refused: {:?}",
+        refused.errors
+    );
+    std::fs::remove_file(&staging).unwrap();
+    collection.checkpoint().unwrap();
+    assert_eq!(watch.holds_failure(), Some(false));
+    add(&collection, 4..5);
+    assert_eq!(ids(&collection), ["r0", "r1", "r2", "r4"]);
+}
+
+/// A checkpoint that commits after the thread recorded a failed sync clears
+/// it, since the directory it wrote holds every record the collection
+/// holds, and the calls after it are taken. A recovery holds every record of
+/// every call that was taken.
+#[test]
+fn a_checkpoint_that_commits_clears_a_failed_sync_of_the_thread() {
+    let temp = TempDir::new("durability-tests");
+    let path = temp.at("cleared.zdb");
+    let (collection, _faults, watch) = holding_a_failure(&path);
+    collection.checkpoint().unwrap();
+    assert_eq!(
+        watch.holds_failure(),
+        Some(false),
+        "the checkpoint that committed cleared the failed sync"
+    );
+    add(&collection, 3..5);
+    let before = ids(&collection);
+    drop(collection);
+    let (recovered, report) = recover(&path, Durability::PerCall);
+    assert_eq!(report.replayed, 2);
+    assert_eq!(ids(&recovered), before);
+}
+
+/// A failed sync of the thread refuses the next call in the words of that
+/// sync, followed by what the withdrawal achieved, and every later mutation
+/// in the words of the fault the refused call left, which name the sequence
+/// that call reached and `checkpoint()`.
+#[test]
+fn a_failed_sync_of_the_thread_refuses_in_the_words_of_the_sync() {
+    let temp = TempDir::new("durability-tests");
+    let path = temp.at("words.zdb");
+    let (collection, _faults, _watch) = holding_a_failure(&path);
+    let sync = format!(
+        "Failed to sync the journal {}: injected: the device refused it. The call's records \
+         were withdrawn by an abort record, so they never come back after a crash.",
+        journal_path(&path).unwrap().display()
+    );
+    let first = try_add(&collection, 3..4);
+    assert_eq!(first.errors, [format!("Vector r3: RuntimeError: {sync}")]);
+    // Two inserts and a commit, an insert and a commit, and the refused
+    // call's insert and its abort reach sequence 7.
+    let fault = format!(
+        "The journal's commit failed at sequence 7: {sync} A failed sync may also have lost \
+         records of earlier calls that the device had not yet written, so nothing more is \
+         recorded until a checkpoint writes the collection from memory. Call checkpoint()."
+    );
+    let later = try_add(&collection, 4..5);
+    assert_eq!(later.errors, [format!("Vector r4: RuntimeError: {fault}")]);
+    match collection.remove_points(&["r0".to_string()]) {
+        Err(error) => assert_eq!(error.to_string(), fault),
+        Ok(removed) => panic!("the removal was taken: {removed:?}"),
+    }
+}
+
+/// A backup whose sync fails writes its copy and leaves the fault, so every
+/// later mutation is refused in the words of that sync, one full stop, and
+/// the fault's own sentences, which name the sequence the journal reached
+/// and `checkpoint()`.
+#[test]
+fn a_backup_whose_sync_fails_refuses_with_one_full_stop_after_the_sync() {
+    let temp = TempDir::new("durability-tests");
+    let path = temp.at("backup-sync.zdb");
+    let (collection, faults) = faulty(&path, Durability::PerCall);
+    add(&collection, 0..1);
+    faults.syncs.arm(0, 1);
+    collection
+        .backup(temp.at("backup-sync-copy.zdb").to_str().unwrap())
+        .expect("a backup whose sync fails writes its copy");
+    // An insert and a commit reach sequence 2.
+    let fault = format!(
+        "The journal's commit failed at sequence 2: Failed to sync the journal {}: injected: \
+         the device refused it. A failed sync may also have lost records of earlier calls \
+         that the device had not yet written, so nothing more is recorded until a checkpoint \
+         writes the collection from memory. Call checkpoint().",
+        journal_path(&path).unwrap().display()
+    );
+    let refused = try_add(&collection, 1..2);
+    assert_eq!(
+        refused.errors,
+        [format!("Vector r1: RuntimeError: {fault}")]
+    );
+    match collection.remove_points(&["r0".to_string()]) {
+        Err(error) => assert_eq!(error.to_string(), fault),
+        Ok(removed) => panic!("the removal was taken: {removed:?}"),
+    }
+}
+
+/// A wakeup that is not the stop's does not end the thread's interval, so
+/// the thread syncs once an interval however it is woken, and the stop ends
+/// the interval at once.
+///
+/// The interval is an hour, so none ends inside the test. Once one call has
+/// dirtied the file, the thread holds the state at its wait for the
+/// interval, which the watch counts. The test wakes it with nothing changed,
+/// and once the thread has held the state again the file is still dirty and
+/// no sync has begun. The drop then stops the thread, which syncs what the
+/// call left before it exits.
+#[test]
+fn a_wakeup_that_is_not_the_stops_keeps_the_thread_to_its_interval() {
+    let temp = TempDir::new("durability-tests");
+    let (collection, faults) = faulty(
+        &temp.at("woken.zdb"),
+        Durability::PerInterval(Duration::from_secs(3600)),
+    );
+    let watch = collection.flusher_watch().unwrap();
+    let syncs = &faults.thread_syncs;
+    add(&collection, 0..1);
+    assert!(
+        wait_for(SYNC_LIMIT, || watch.interval_checks() >= Some(1)),
+        "the thread began no interval within {SYNC_LIMIT:?}, so it hung"
+    );
+    watch.wake();
+    assert!(
+        wait_for(SYNC_LIMIT, || watch.interval_checks() >= Some(2)),
+        "the thread did not wake within {SYNC_LIMIT:?}, so it hung"
+    );
+    assert_eq!(
+        watch.is_dirty(),
+        Some(true),
+        "a wakeup that is not the stop's leaves the interval running"
+    );
+    assert_eq!(syncs.begun(), 0, "no sync begins inside the interval");
+    drop(collection);
+    assert_eq!(
+        (syncs.begun(), syncs.ended()),
+        (1, 1),
+        "the stop ended the interval, and the thread synced what the call left"
+    );
+}
+
+// ============================================================================
 // THE CHECKPOINT AND THE STATUS
 // ============================================================================
+
+/// A checkpoint whose save fails puts no directory of its own in place, so
+/// its status and the stats name the sequence the directory in place holds.
+/// A file where the save stages its directory fails the save once the
+/// journal is synced. With the file gone, the checkpoint commits and names
+/// the sequence its directory holds.
+#[test]
+fn a_checkpoint_whose_save_fails_names_the_sequence_the_directory_holds() {
+    let temp = TempDir::new("durability-tests");
+    let path = temp.at("unsaved-status.zdb");
+    let (collection, _faults) = faulty(&path, Durability::PerCall);
+    add(&collection, 0..2);
+    let staging = temp.at("unsaved-status.zdb.zdbtmp");
+    std::fs::write(&staging, b"a file where the staging directory goes").unwrap();
+    match collection.checkpoint() {
+        Err(Error::RemoveTreeFailed { .. }) => {}
+        other => panic!("expected the save to fail at its staging directory, got {other:?}"),
+    }
+    assert_eq!(manifest(&path)["journal"]["sequence"], json!(0));
+    assert_eq!(manifest(&path)["identity"]["sequence"], json!(0));
+    let status = collection.journal_status().unwrap();
+    assert_eq!(
+        status.checkpoint_sequence, 0,
+        "the status names the sequence the directory in place holds"
+    );
+    assert_eq!(status.sequence_reached, 3, "two records and a commit");
+    assert_eq!(status.records_since_checkpoint(), 2);
+    assert_eq!(
+        collection
+            .stats()
+            .get("journal_sequence")
+            .map(String::as_str),
+        Some("0"),
+        "the stats name the sequence the directory in place holds"
+    );
+    std::fs::remove_file(&staging).unwrap();
+    collection.checkpoint().unwrap();
+    assert_eq!(collection.journal_status().unwrap().checkpoint_sequence, 3);
+    assert_eq!(manifest(&path)["journal"]["sequence"], json!(3));
+}
 
 /// `checkpoint` is a save into the journal's own directory, and needs one.
 /// The status reports the journal's directory, the operation records a

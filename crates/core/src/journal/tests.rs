@@ -1785,7 +1785,7 @@ fn a_failed_cut_stops_the_writer_until_a_checkpoint_rolls() {
     assert!(failed.contains("could not be cut back"), "{failed}");
     let refused = message(writer.append(OperationKind::Insert, b"r2").unwrap_err());
     assert!(
-        refused.contains("takes nothing more until a checkpoint"),
+        refused.ends_with("so the journal takes nothing more until checkpoint() succeeds."),
         "{refused}"
     );
     let reached = writer.sequence_reached();
@@ -1806,6 +1806,30 @@ fn a_failed_cut_stops_the_writer_until_a_checkpoint_rolls() {
     assert_eq!(
         states(&contents),
         vec![(reached + 1, RecordState::Committed)]
+    );
+}
+
+/// A commit record whose write fails and whose cut fails too is withdrawn
+/// by the cut of the whole call back to the last commit. The error holds
+/// the refusal, which ends its sentence, and then what the withdrawal
+/// achieved, with one full stop between the two.
+#[test]
+fn a_withdrawal_follows_a_refusal_after_one_full_stop() {
+    let (_tmp, storage) = journal_storage();
+    let (dir, faults) = faulty(&storage);
+    let mut writer = started(dir);
+    writer.append(OperationKind::Insert, b"r0").unwrap();
+    faults.writes.arm(0, 1);
+    faults.cuts.arm(0, 1);
+    let failed = message(writer.commit(CommitMode::Sync).unwrap_err());
+    assert!(
+        failed.ends_with(
+            "an earlier append failed with injected: the device refused it and the bytes it \
+             left could not be cut back (injected: the device refused it), so the journal \
+             takes nothing more until checkpoint() succeeds. The call's records were cut from \
+             the journal, so they never come back after a crash."
+        ),
+        "{failed}"
     );
 }
 
@@ -1914,7 +1938,7 @@ fn a_failed_abort_and_cut_leave_neither() {
     );
     assert!(
         message(writer.append(OperationKind::Insert, b"x").unwrap_err())
-            .contains("takes nothing more until a checkpoint")
+            .ends_with("so the journal takes nothing more until checkpoint() succeeds.")
     );
     drop(writer);
     let loaded = load(&storage);
@@ -1968,8 +1992,9 @@ fn a_full_segment_rolls_at_a_commit_and_the_sync_handle_follows() {
     assert_eq!(contents.next_sequence, 19);
 }
 
-/// A roll that fails leaves the writer on the full segment, whose records
-/// are committed, and the next commit rolls.
+/// A next segment that cannot be created after the seal leaves the writer
+/// on the full segment, whose records are committed, and the next commit
+/// rolls.
 #[test]
 fn a_failed_roll_leaves_the_writer_on_the_full_segment() {
     set_segment_roll_bytes(200);
@@ -1987,6 +2012,68 @@ fn a_failed_roll_leaves_the_writer_on_the_full_segment() {
     drop(writer);
     let loaded = load(&storage);
     assert_eq!(loaded.read(&expected_at(0)).unwrap().committed(), 2);
+}
+
+/// A seal that fails, being the sync of the full segment before the next
+/// one starts, stops the writer until a checkpoint, since a later sync does
+/// not show that the records the seal covered reached the device. The
+/// commit that filled the segment returns with its call committed and
+/// starts no segment, every append after it is refused in words that name
+/// the seal and the checkpoint, and the roll of a checkpoint lets the
+/// writer append again. The seal is the commit's second sync under the
+/// synced mode and its first under the deferred one.
+#[test]
+fn a_failed_seal_stops_the_writer_until_a_checkpoint() {
+    for (mode, before_the_seal) in [(CommitMode::Sync, 1), (CommitMode::Deferred, 0)] {
+        set_segment_roll_bytes(200);
+        let (_tmp, storage) = journal_storage();
+        let (dir, faults) = faulty(&storage);
+        let mut writer = started(dir);
+        set_segment_roll_bytes(0);
+        faults.syncs.arm(before_the_seal, 1);
+        writer.append(OperationKind::Insert, &[1; 100]).unwrap();
+        writer.commit(mode).unwrap();
+        assert_eq!(
+            faults.syncs.fail.load(Ordering::SeqCst),
+            0,
+            "{mode:?}: the seal's sync failed"
+        );
+        assert_eq!(
+            writer.segments(),
+            1,
+            "{mode:?}: the failed seal started no segment"
+        );
+        let refused = match writer.append(OperationKind::Insert, &[2; 100]) {
+            Err(error) => message(error),
+            Ok(sequence) => panic!(
+                "{mode:?}: the append after a failed seal is refused, and it took sequence \
+                 {sequence}"
+            ),
+        };
+        assert!(
+            refused.ends_with(
+                "the full segment could not be synced before the next one was started \
+                 (injected: the device refused it), so the journal takes nothing more until \
+                 checkpoint() succeeds."
+            ),
+            "{mode:?}: {refused}"
+        );
+        let reached = writer.sequence_reached();
+        writer.roll_to(base(LIVE + 1, reached)).unwrap();
+        writer.append(OperationKind::Insert, &[3; 100]).unwrap();
+        writer.commit(mode).unwrap();
+        drop(writer);
+        let loaded = load(&storage);
+        let expected = Expected {
+            collection_id: COLLECTION,
+            base: base(LIVE + 1, reached),
+        };
+        assert_eq!(
+            states(&loaded.read(&expected).unwrap()),
+            vec![(reached + 1, RecordState::Committed)],
+            "{mode:?}: the checkpoint's segment holds the call after it"
+        );
+    }
 }
 
 /// A checkpoint rolls onto a segment naming it, at the sequence after the
@@ -2053,7 +2140,7 @@ fn a_failed_checkpoint_roll_stops_the_writer() {
     assert!(writer.roll_to(base(LIVE + 1, reached)).is_err());
     assert!(
         message(writer.append(OperationKind::Insert, b"r1").unwrap_err())
-            .contains("takes nothing more until a checkpoint")
+            .ends_with("so the journal takes nothing more until checkpoint() succeeds.")
     );
     writer.roll_to(base(LIVE + 1, reached)).unwrap();
     writer.append(OperationKind::Insert, b"r1").unwrap();

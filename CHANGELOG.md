@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Every call that changes a journaled index ends its records with a commit record.** A recovery replays the records of committed calls, and cuts the records that no commit follows as a torn tail.
 
-- **A commit whose sync fails withdraws its call.** The journal writes an abort record after the call's records, or cuts the segment back to the last commit where the abort cannot be written. `add()` reports every record of the call as an error, and any other mutation raises `RuntimeError`. Every mutation after it is refused the same way, naming `checkpoint()`, until a checkpoint commits, and the checkpoint runs even where the old segment does not sync. Under `"interval"`, a failed sync of the policy's thread withdraws and refuses the next call. A `load()` whose journal holds an abort takes a checkpoint before it records anything.
+- **A commit whose sync fails withdraws its call.** The journal writes an abort record after the call's records, or cuts the segment back to the last commit where the abort cannot be written. `add()` reports every record of the call as an error, and any other mutation raises `RuntimeError`. Every mutation after it is refused the same way, naming `checkpoint()`, until a checkpoint commits, and the checkpoint runs even where the old segment does not sync. Under `"interval"`, a failed sync of the policy's thread withdraws and refuses the next call, and neither a `backup()` nor a `checkpoint()` whose save fails clears it. The journal syncs a full segment before it starts the next one, and where that sync fails, every later mutation is refused until a checkpoint commits. A `load()` whose journal holds an abort takes a checkpoint before it records anything.
 
 - **A journaled directory saved by 0.13.0 or earlier is written again at 5.0.0 when it opens.** `load()` replays its journal file, saves the directory with a journal of segments that carries the sequence on, and deletes `<path>.zdbwal`. `checkpoint_only=True` opens the directory as it stood at its last save and changes neither it nor its journal.
 
@@ -117,6 +117,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **An append that fails part way leaves no bytes in the journal.** The writer cuts the segment back to where the record began, and where the cut fails it records nothing more until a checkpoint. A text index interns a term only after the term's `Intern` record is appended, so a failed append leaves the dictionary as it was.
 
+- **A failed sync of the `"interval"` policy's thread refuses nothing once a checkpoint that replaced its segment commits.** A checkpoint waits for a sync of the thread that is under way before it starts the new segment, and the thread starts none until the new segment is in place.
+
+- **The refusal a failed sync of the `"interval"` policy's thread gives names the journal once.**
+
+- **The `"interval"` policy's thread syncs once an interval however the system wakes it**, and at once when the index is dropped.
+
+- **A `checkpoint()` whose save fails leaves `get_stats()["journal_sequence"]` at the sequence the directory holds.**
+
 - **A thread that the interpreter ends during shutdown, while the thread takes the interpreter back after a long call, does not crash the process.** Long calls into the engine, such as a search, a save or a load, release the interpreter while they run and take it back at the end. The binding is built with PyO3 0.29.3, which handles a thread that is ended at that point.
 
 - **An overwrite keeps every record that it replaces when its commit fails**, live and after a crash, and when the process stops between its removal record and its records.
@@ -188,6 +196,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Under the core crate's `pause-points` feature, each point a crash test aborts at can also hold the thread a test arms there. `zeusdb-vector-hnsw` has a `pause-points` feature of its own, which adds the point between the two phases of an insert, and the binding's `test-support` feature turns on both.
 
 - The concurrency checks of the Python suite run until each thread reaches its count, and each wait in them ends at a limit that only a hung run reaches. The Rust tests hold an insert, a save, a backup, a clear and each close-up at a pause or a hook while other threads run. A hook in the lock wrappers, compiled in the tests alone, shows that a thread waits at a guard the held write holds, and once the write lets go the test reads the thread's answer past any later wait. The interval thread's syncs are counted through the test storage once the thread has stopped.
+
+- The tests of the `"interval"` policy's thread read, through marks compiled in the tests alone, the thread's holds of its state at its wait for the interval and whether a checkpoint's roll waits for the thread's sync, and wake the thread with nothing changed.
 
 - The lock wrappers take a lock without waiting, for the reads made with the interpreter held.
 

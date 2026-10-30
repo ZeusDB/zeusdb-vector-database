@@ -1703,11 +1703,12 @@ impl fmt::Display for Error {
             ),
             JournalCommitFailed { sequence, error } => write!(
                 f,
-                "The journal's commit failed at sequence {}: {} A failed sync may also have \
+                "The journal's commit failed at sequence {}: {}. A failed sync may also have \
                  lost records of earlier calls that the device had not yet written, so nothing \
                  more is recorded until a checkpoint writes the collection from memory. Call \
                  checkpoint().",
-                sequence, error
+                sequence,
+                error.strip_suffix('.').unwrap_or(error)
             ),
             NotJournaled => f.write_str(
                 "This index has no journal, so there is no directory for a checkpoint to \

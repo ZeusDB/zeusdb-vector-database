@@ -4,8 +4,8 @@
 //! tests set low through the override debug builds carry, so a journal of
 //! several segments is reached with a few records. A write that fails part
 //! way is cut back, and one whose cut fails too stops the sink until a
-//! checkpoint. A sink in a process other than the one that opened it
-//! refuses everything.
+//! checkpoint, as a failed seal of a full segment does. A sink in a process
+//! other than the one that opened it refuses everything.
 
 #![allow(clippy::disallowed_types)]
 
@@ -14,7 +14,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde_json::json;
-use zeusdb_vector_core::{set_segment_roll_bytes, Error, FsStorage, SEGMENT_HEADER_BYTES};
+use zeusdb_vector_core::{
+    set_segment_roll_bytes, Error, FsStorage, InsertParts, Operation,
+    JOURNAL_RECORD_OVERHEAD_BYTES, SEGMENT_HEADER_BYTES,
+};
 
 use super::journal_support::{
     copy_journaled, expected_of, sink_over, FaultyStorage, Segments, TempDir, SYNC_LIMIT,
@@ -242,13 +245,16 @@ fn a_failed_cut_stops_the_sink_until_a_checkpoint() {
         added.errors[0]
     );
     assert!(
-        added.errors[1].contains("takes nothing more until a checkpoint"),
+        added.errors[1].ends_with("so the journal takes nothing more until checkpoint() succeeds."),
         "{}",
         added.errors[1]
     );
     match collection.remove_points(&["r0".to_string()]) {
         Err(Error::JournalIoFailed { error, .. }) => {
-            assert!(error.contains("takes nothing more"), "{error}")
+            assert!(
+                error.ends_with("so the journal takes nothing more until checkpoint() succeeds."),
+                "{error}"
+            )
         }
         other => panic!("expected the refusal, got {other:?}"),
     }
@@ -259,6 +265,73 @@ fn a_failed_cut_stops_the_sink_until_a_checkpoint() {
     let (recovered, report) = recover(&path);
     assert_eq!(report.replayed, 2);
     assert_eq!(ids(&recovered), before);
+}
+
+/// The bytes a call of one record adds to a segment, being its insert and
+/// its commit. Every record from `record(1)` to `record(9)` encodes to the
+/// same length.
+fn call_bytes() -> u64 {
+    let probe = record(1);
+    let mut payload = Vec::new();
+    Operation::encode_insert(
+        &InsertParts {
+            id: &probe.id,
+            vector: &probe.vector,
+            metadata: &probe.metadata,
+            sparse: None,
+        },
+        &mut payload,
+    );
+    (payload.len() + 8 + 2 * JOURNAL_RECORD_OVERHEAD_BYTES) as u64
+}
+
+/// A failed sync of the full segment, which a roll makes before it starts
+/// the next one, stops the sink until a checkpoint commits, since a later
+/// sync does not show that the records it covered reached the device. The
+/// call whose commit rolled returns with its records committed, and every
+/// call after it is refused until a checkpoint commits. The segment rolls at
+/// the third call, whose seal is its second sync under the per-call policy
+/// and its first under the policy that never syncs.
+#[test]
+fn a_failed_seal_stops_the_sink_until_a_checkpoint() {
+    for (durability, before_the_seal) in [(Durability::PerCall, 1), (Durability::NoSync, 0)] {
+        let temp = TempDir::new("segment-tests");
+        let path = temp.at("sealed.zdb");
+        let collection = Collection::build(declaration(), None);
+        let storage = FaultyStorage::at(&path);
+        let faults = storage.faults.clone();
+        set_segment_roll_bytes(SEGMENT_HEADER_BYTES as u64 + 2 * call_bytes() + 1);
+        let sink = sink_over(&storage, &path, collection.collection_id(), durability);
+        set_segment_roll_bytes(0);
+        collection.attach_sink(Box::new(sink));
+        collection.save(path.to_str().unwrap()).unwrap();
+        add(&collection, 1..2);
+        add(&collection, 2..3);
+        faults.syncs.arm(before_the_seal, 1);
+        add(&collection, 3..4);
+        assert!(
+            faults.syncs.spent(),
+            "{durability:?}: the seal's sync failed"
+        );
+        assert_eq!(
+            Segments::of(&path).numbers.len(),
+            1,
+            "{durability:?}: the failed seal started no segment"
+        );
+        let refused = collection.add_records(vec![record(4)], vec![], false);
+        assert_eq!(
+            refused.total_errors, 1,
+            "{durability:?}: the call after a failed seal is refused: {:?}",
+            refused.errors
+        );
+        collection.checkpoint().unwrap();
+        add(&collection, 5..6);
+        let before = ids(&collection);
+        assert_eq!(before, ["r1", "r2", "r3", "r5"]);
+        drop(collection);
+        let (recovered, _) = recover(&path);
+        assert_eq!(ids(&recovered), before);
+    }
 }
 
 /// A sink in a process other than the one that opened it, which is what a

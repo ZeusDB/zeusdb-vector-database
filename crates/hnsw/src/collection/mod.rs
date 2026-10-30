@@ -1332,7 +1332,8 @@ pub struct Collection {
     /// journal has had no record appended. A checkpoint syncs the sink,
     /// writes the sequence the sink had reached here, and the manifest
     /// records it, so a recovery replays every record above it and skips
-    /// every record at or below it.
+    /// every record at or below it. A checkpoint whose save fails puts back
+    /// the sequence it replaced.
     journal_sequence: MutexAt<u64>,
 
     /// The generation, snapshot and parent of the directory this collection
@@ -1793,7 +1794,8 @@ impl Collection {
     /// that opened the journal is refused, since its save would race the
     /// parent's. `backup` says the sync is a backup's, whose commit leaves
     /// the fault, since a backup does not write the collection's own
-    /// directory.
+    /// directory. A sync that succeeds clears no fault, and leaves a failed
+    /// sync the interval policy's thread holds where it is.
     pub(crate) fn sync_sink_locked(&self, backup: bool) -> Result<Option<u64>, Error> {
         let mut slot = self.sink.lock().unwrap();
         let Some(sink) = slot.attached.as_mut() else {
@@ -1839,7 +1841,9 @@ impl Collection {
     /// Roll the sink onto the checkpoint `base`, whose directory has just
     /// committed and holds every record the sink holds, and clear the fault
     /// a failed commit left, since that directory holds the collection as
-    /// this process has it. Does nothing where no sink is attached. The
+    /// this process has it. The sink's roll discards a failed sync the
+    /// interval policy's thread holds, for the same reason. Does nothing
+    /// where no sink is attached. The
     /// mutation guard is the caller's. A roll that fails leaves the fault,
     /// and the sink takes nothing more until a later checkpoint rolls it.
     pub(crate) fn roll_sink_locked(&self, base: SegmentBase) -> Result<(), Error> {

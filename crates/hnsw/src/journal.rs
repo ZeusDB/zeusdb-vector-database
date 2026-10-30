@@ -506,10 +506,9 @@ impl OperationSink for JournalSink {
     /// Under the per-call policy, the commit record and the flush, and a
     /// flush that fails withdraws the call. Under the other two, the commit
     /// record with nothing on the device: the interval policy's thread is
-    /// told the journal is dirty, and a sync that thread could not complete
-    /// since the last commit withdraws this call and is its failure, so a
-    /// device that will not flush is reported at the next call rather than
-    /// never.
+    /// told the journal is dirty, and a failed sync the thread holds
+    /// withdraws this call and is its failure, so a device that will not
+    /// flush is reported at the next call rather than never.
     fn commit(&mut self) -> Result<(), Error> {
         match self.durability.commit_mode() {
             CommitMode::Sync => self.writer.commit(CommitMode::Sync),
@@ -533,6 +532,9 @@ impl OperationSink for JournalSink {
         self.writer.withdraw(AbortReason::WriteFailed)
     }
 
+    /// Sync the active segment, which leaves the interval policy's thread
+    /// nothing to sync until the next commit. A failed sync the thread holds
+    /// stays held, whatever this sync says.
     fn sync(&mut self) -> Result<(), Error> {
         self.writer.sync()?;
         if let Some(flusher) = &self.flusher {
@@ -545,10 +547,22 @@ impl OperationSink for JournalSink {
         self.writer.sequence_reached()
     }
 
+    /// The roll waits for a sync the interval policy's thread has begun to
+    /// end and keeps the thread from beginning another until the active
+    /// segment is replaced, so every sync of the thread is of a segment
+    /// wholly before the roll or wholly after it. A roll that lands discards
+    /// a failure the thread holds, since the checkpoint holds every record
+    /// the replaced segments held. A child forked from the process that
+    /// opened the journal has no copy of the thread, so its roll leaves the
+    /// thread's state alone, and the writer refuses it.
     fn roll(&mut self, base: SegmentBase) -> Result<(), Error> {
+        let rolling = match &self.flusher {
+            Some(flusher) if self.writer.in_its_own_process() => Some(flusher.roll()),
+            _ => None,
+        };
         self.writer.roll_to(base)?;
-        if let Some(flusher) = &self.flusher {
-            flusher.mark_clean();
+        if let Some(rolling) = rolling {
+            rolling.committed();
         }
         Ok(())
     }

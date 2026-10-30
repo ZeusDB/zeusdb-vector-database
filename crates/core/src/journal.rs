@@ -1952,13 +1952,17 @@ impl Withdrawal {
     }
 
     /// `error`, the failure that made the call withdraw, with what the
-    /// withdrawal achieved said after it.
+    /// withdrawal achieved said after it and one full stop between them.
     pub fn attach_to(self, error: Error) -> Error {
         match error {
             Error::JournalIoFailed { path, what, error } => Error::JournalIoFailed {
                 path,
                 what,
-                error: format!("{error}. {}", self.sentence()),
+                error: format!(
+                    "{}. {}",
+                    error.strip_suffix('.').unwrap_or(&error),
+                    self.sentence()
+                ),
             },
             other => other,
         }
@@ -2386,8 +2390,8 @@ impl JournalWriter {
                 Err(cut) => {
                     let reason = format!(
                         "an earlier append failed with {error} and the bytes it left could not \
-                         be cut back ({cut}), so the journal takes nothing more until a \
-                         checkpoint"
+                         be cut back ({cut}), so the journal takes nothing more until \
+                         checkpoint() succeeds."
                     );
                     self.poisoned = Some(reason.clone());
                     Error::JournalIoFailed {
@@ -2528,7 +2532,7 @@ impl JournalWriter {
             Err(error) => {
                 self.poisoned = Some(format!(
                     "a call whose commit failed could be neither withdrawn nor cut back ({error}), \
-                     so the journal takes nothing more until a checkpoint"
+                     so the journal takes nothing more until checkpoint() succeeds."
                 ));
                 Withdrawal::Neither
             }
@@ -2536,9 +2540,15 @@ impl JournalWriter {
     }
 
     /// Seal the active segment and start the next where the active one has
-    /// passed the roll length. A roll that fails leaves the writer on the
-    /// full segment, whose records are already committed, and is tried again
-    /// at the next commit.
+    /// passed the roll length.
+    ///
+    /// The seal is a sync of every record the full segment holds. A seal
+    /// that fails stops the writer taking anything more until a checkpoint,
+    /// since a later sync does not show that those records reached the
+    /// device. A next segment that cannot be created after a seal that
+    /// landed leaves the writer on the full segment, whose records are
+    /// committed and on the device, and the roll is tried again at the next
+    /// commit.
     fn roll_if_full(&mut self) {
         let Some(active) = &self.active else {
             return;
@@ -2546,25 +2556,32 @@ impl JournalWriter {
         if active.length < self.roll_bytes {
             return;
         }
+        if let Err(error) = active.file.sync_data() {
+            warn!(target: LOG_TARGET, operation = "journal_seal_failed",
+                journal = %self.path.display(),
+                error = %error,
+                "The journal's full segment could not be synced before the next one was \
+                 started; the journal takes nothing more until a checkpoint"
+            );
+            self.poisoned = Some(format!(
+                "the full segment could not be synced before the next one was started \
+                 ({error}), so the journal takes nothing more until checkpoint() succeeds."
+            ));
+            return;
+        }
+        crate::kill_at(crate::KillPoint::RollAfterSeal);
         if let Err(error) = self.roll_by_size() {
             warn!(target: LOG_TARGET, operation = "journal_roll_failed",
                 journal = %self.path.display(),
                 error = %error,
-                "The journal's active segment could not be sealed and the next one started; \
-                 records go on into the full segment and the roll is tried at the next commit"
+                "The journal's next segment could not be started; records go on into the \
+                 full segment and the roll is tried at the next commit"
             );
         }
     }
 
+    /// Start the next segment after a seal that landed.
     fn roll_by_size(&mut self) -> Result<(), Error> {
-        let Some(active) = &self.active else {
-            return Ok(());
-        };
-        active
-            .file
-            .sync_data()
-            .map_err(Self::io(&self.path, "seal"))?;
-        crate::kill_at(crate::KillPoint::RollAfterSeal);
         let number = self.next_sequence;
         let file = self.create_segment(number, self.base).map_err(|e| e.0)?;
         crate::kill_at(crate::KillPoint::RollAfterCreate);
@@ -2614,7 +2631,7 @@ impl JournalWriter {
             if let Err(error) = self.dir.remove_segment(number) {
                 let reason = format!(
                     "the empty segment numbered {number} could not give way to the checkpoint's \
-                     ({error}), so the journal takes nothing more until a checkpoint"
+                     ({error}), so the journal takes nothing more until checkpoint() succeeds."
                 );
                 self.poisoned = Some(reason.clone());
                 return Err(Error::JournalIoFailed {
@@ -2629,7 +2646,7 @@ impl JournalWriter {
             Err((error, _)) => {
                 self.poisoned = Some(format!(
                     "the segment naming the checkpoint at sequence {} could not be created \
-                     ({error}), so the journal takes nothing more until a checkpoint",
+                     ({error}), so the journal takes nothing more until checkpoint() succeeds.",
                     base.sequence
                 ));
                 return Err(error);
