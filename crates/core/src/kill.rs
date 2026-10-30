@@ -15,6 +15,14 @@
 //! `checked` profile leave them on, which is where the matrix runs. See the
 //! `[profile]` tables in the workspace manifest.
 //!
+//! # A pause at a point
+//!
+//! A test that holds a write between two of its steps arms a pause at one of
+//! these points instead, under the `pause-points` feature and in this crate's
+//! own tests, and `at` holds the armed thread there before it reads whether
+//! the process is armed to abort; see `panic_point`. A build without the
+//! feature compiles none of it.
+//!
 //! # Why the points are an enum
 //!
 //! Every point is declared once in [`KillPoint`], and a process is armed by
@@ -259,8 +267,11 @@ mod live {
     ///
     /// `std::process::abort` rather than `panic!` or `exit`, so no destructor
     /// runs, no buffer is flushed and no file is closed, which is what a
-    /// killed process leaves.
+    /// killed process leaves. A thread armed to pause at `point` pauses
+    /// first.
     pub fn at(point: KillPoint) {
+        #[cfg(any(test, feature = "pause-points"))]
+        crate::panic_point::pause_at_kill(point);
         if !armed_at(point) {
             return;
         }
@@ -291,8 +302,13 @@ mod live {
         false
     }
 
+    /// Pause where this thread is armed to pause at `_point`, under the
+    /// `pause-points` feature, and do nothing else.
     #[inline(always)]
-    pub fn at(_point: KillPoint) {}
+    pub fn at(_point: KillPoint) {
+        #[cfg(any(test, feature = "pause-points"))]
+        crate::panic_point::pause_at_kill(_point);
+    }
 }
 
 pub use live::{arm, armed_at, at, disarm};

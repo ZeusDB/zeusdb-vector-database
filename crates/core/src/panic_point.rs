@@ -13,6 +13,11 @@
 //! holds the interpreter shows that the paused call did not hold it at the
 //! pause. See `Pause`.
 //!
+//! A test that holds a write between two of its steps pauses its thread at a
+//! point a crash test aborts at, which `kill_at` reaches; see `KillPoint`. The
+//! pause is taken there before the abort is, so a thread armed for both
+//! pauses first.
+//!
 //! # What it costs a build that ships
 //!
 //! Nothing. The checks, the pause and the arming exist under the
@@ -30,13 +35,18 @@
 //! thread that makes the call, so the tests running beside it on other
 //! threads reach the same point unharmed, and a point disarms itself as it
 //! fires, so the calls after it run as they would. A pause is armed the same
-//! way, at one of these points or at the thread's next `pause_call`, and a
-//! thread holds one armed panic and one armed pause at most.
+//! way, at one of these points, at a kill point or at the thread's next
+//! `pause_call`, and a thread holds one armed panic and one armed pause at
+//! most.
 
 /// Every point a test can panic or pause at, each named for the step it
 /// follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanicPoint {
+    /// After an insertion's first phase has planned the record against the
+    /// graph and let the index's read guard go, and before its second phase
+    /// takes its four write guards, with no guard held.
+    InsertAfterPlan,
     /// Inside an insertion's second phase, under its four write guards,
     /// after the record is named in the id store and before the graph takes
     /// it.
@@ -57,6 +67,7 @@ impl PanicPoint {
     /// What the panic says, being the point's name.
     pub fn name(self) -> &'static str {
         match self {
+            PanicPoint::InsertAfterPlan => "insert:after_plan",
             PanicPoint::InsertAfterName => "insert:after_name",
             PanicPoint::InstallBeforeSparse => "install:before_sparse",
             PanicPoint::AddBeforeInstalls => "add:before_installs",
@@ -68,7 +79,8 @@ impl PanicPoint {
 #[cfg(any(test, feature = "pause-points"))]
 impl PanicPoint {
     /// Every point, in the order the enum declares them.
-    pub const ALL: [PanicPoint; 4] = [
+    pub const ALL: [PanicPoint; 5] = [
+        PanicPoint::InsertAfterPlan,
         PanicPoint::InsertAfterName,
         PanicPoint::InstallBeforeSparse,
         PanicPoint::AddBeforeInstalls,
@@ -86,6 +98,7 @@ impl PanicPoint {
 #[cfg(any(test, feature = "pause-points"))]
 mod live {
     use super::PanicPoint;
+    use crate::kill::KillPoint;
     use std::cell::{Cell, RefCell};
     use std::sync::{Arc, Condvar, MutexGuard, PoisonError};
     use std::time::{Duration, Instant};
@@ -137,6 +150,8 @@ mod live {
         NextCall,
         /// The named point inside a mutation.
         Point(PanicPoint),
+        /// The point a crash test aborts at, which `kill_at` reaches.
+        Kill(KillPoint),
     }
 
     /// What a pause has seen. Every state after the first carries the name
@@ -301,6 +316,16 @@ mod live {
         }
     }
 
+    /// The point a crash test aborts at, which `kill_at` reaches before it
+    /// reads whether the process is armed to abort. Pause here, under the
+    /// point's name, where this thread is armed at `point`, disarming it
+    /// first, and do nothing where it is not.
+    pub(crate) fn pause_at_kill(point: KillPoint) {
+        if let Some(pause) = take_pause(PauseAt::Kill(point)) {
+            pause.hold(point.name());
+        }
+    }
+
     /// The pause this thread is armed with at `at`, taken off the thread,
     /// where the thread is armed at `at`.
     fn take_pause(at: PauseAt) -> Option<Arc<Pause>> {
@@ -330,6 +355,8 @@ mod live {
 }
 
 pub use live::at;
+#[cfg(any(test, feature = "pause-points"))]
+pub(crate) use live::pause_at_kill;
 #[cfg(any(test, feature = "pause-points"))]
 pub use live::{arm, disarm, pause_arm, pause_call, pause_disarm, Pause, PauseAt, PauseState};
 
@@ -442,6 +469,28 @@ mod tests {
         pause_call("call()");
         at(PanicPoint::AddBeforeInstalls);
         assert_eq!(disarmed.state(), PauseState::Armed);
+    }
+
+    /// A pause armed at a kill point fires where `kill_at` reaches that
+    /// point, under the point's name, and disarms its thread as it fires. It
+    /// passes every call, every panic point and every other kill point.
+    #[test]
+    fn a_pause_at_a_kill_point_fires_there_and_nowhere_else() {
+        use crate::kill::KillPoint;
+
+        let pause = Arc::new(Pause::new(Duration::ZERO));
+        let armed_at = PauseAt::Kill(KillPoint::SaveAfterArtefacts);
+        pause_arm(armed_at, Arc::clone(&pause));
+        pause_call("call()");
+        at(PanicPoint::AddBeforeInstalls);
+        crate::kill_at(KillPoint::SaveAfterDump);
+        assert_eq!(pause.state(), PauseState::Armed);
+        assert_eq!(live::pause_armed_at(), Some(armed_at));
+        crate::kill_at(KillPoint::SaveAfterArtefacts);
+        assert_eq!(live::pause_armed_at(), None);
+        assert_eq!(pause.state(), PauseState::TimedOut("save:after_artefacts"));
+        crate::kill_at(KillPoint::SaveAfterArtefacts);
+        assert_eq!(pause.state(), PauseState::TimedOut("save:after_artefacts"));
     }
 
     /// Every point is found by its own name, and no other name finds one.

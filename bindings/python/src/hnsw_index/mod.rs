@@ -955,7 +955,7 @@ impl HNSWIndex {
                 Queries::One(processed_query)
             };
 
-            let pages = py.detach(|| -> Result<Pages, Error> {
+            let pages = detach_paused!(py, "search()", || -> Result<Pages, Error> {
                 let params = inner.search_params(top_k, ef_search, return_vector, rerank)?;
                 Ok(match &queries {
                     Queries::One(query) => {

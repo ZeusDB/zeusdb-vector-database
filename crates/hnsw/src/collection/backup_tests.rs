@@ -8,17 +8,27 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 use serde_json::{json, Value};
-use zeusdb_vector_core::{Error, FsStorage, LockMode, Locked, RecordState, Storage};
+use zeusdb_vector_core::{
+    pause_arm, pause_disarm, Error, FsStorage, KillPoint, LockMode, Locked, Pause, PauseAt,
+    RecordState, Storage,
+};
 
 use super::journal_support::{
-    copy_fixture, copy_journaled, expected_of, files_under, manifest, sink_over, FaultyStorage,
-    RefusingStorage, Segments, TempDir,
+    copy_fixture, copy_journaled, expected_of, files_under, manifest, say_waits, sink_over,
+    waited_among, FaultyStorage, RefusingStorage, Said, Segments, TempDir,
 };
 use super::{Collection, Declaration, IdentityRecord, ParsedRecord};
 use crate::journal::{journal_path, Durability, JournalPolicy};
+use crate::locks::lock_name;
 use crate::SearchParams;
+
+/// How long a check waits for a thread beside it, and the longest the
+/// pause holds the backup, which is the tests' own bound on a hang.
+const LIMIT: Duration = Duration::from_secs(20);
 
 const DIM: usize = 4;
 
@@ -159,9 +169,14 @@ fn a_backup_is_a_standalone_copy_that_moves_nothing() {
     assert_eq!(after.identity.generation, copy.identity.generation);
 }
 
-/// A backup taken while one thread adds and another searches holds exactly
-/// what a replay of the journal to the backup's sequence holds, record for
-/// record and internal id for internal id.
+/// A backup taken between adds, with searches beside it, holds exactly what
+/// a replay of the journal to the backup's sequence holds, record for
+/// record and internal id for internal id. The backup holds the mutation
+/// guard from its sync of the journal to its last write and no guard a
+/// reader waits for. Held at `backup:after_sync`, with the journal synced
+/// and its sequence read, it lets searches answer from this thread while an
+/// add made on another thread reaches its wait at `writers` before it can
+/// return, so no add lands between the sequence and the copy.
 #[test]
 fn a_backup_during_adds_and_searches_equals_a_replay_to_its_sequence() {
     let tmp = TempDir::new("backup-concurrent");
@@ -171,30 +186,67 @@ fn a_backup_during_adds_and_searches_equals_a_replay_to_its_sequence() {
     collection
         .journal_to(path.to_str().unwrap(), Durability::PerCall)
         .unwrap();
-    add(&collection, 0..50);
+    for batch in 0..10 {
+        add(&collection, batch * 5..batch * 5 + 5);
+    }
+    let pause = Arc::new(Pause::new(LIMIT));
     let copy = std::thread::scope(|scope| {
-        let adding = scope.spawn(|| {
-            for batch in 0..40 {
-                add(&collection, 50 + batch * 5..55 + batch * 5);
-            }
-        });
-        let searching = scope.spawn(|| {
-            for i in 0..200 {
-                let params = SearchParams {
-                    top_k: 5,
-                    ef: 50,
-                    return_vector: false,
-                    rerank: None,
-                };
-                collection
-                    .search_one(&record(i % 50).vector, None, params)
-                    .unwrap();
-            }
-        });
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let copy = collection.backup(target.to_str().unwrap()).unwrap();
+        let backer = {
+            let (collection, pause, target) = (&collection, Arc::clone(&pause), &target);
+            scope.spawn(move || {
+                pause_arm(PauseAt::Kill(KillPoint::BackupAfterSync), pause);
+                let copy = collection.backup(target.to_str().unwrap());
+                pause_disarm();
+                copy
+            })
+        };
+        assert_eq!(
+            pause.wait_reached(LIMIT).reached(),
+            Some("backup:after_sync"),
+            "the backup never reached backup:after_sync"
+        );
+        let params = SearchParams {
+            top_k: 5,
+            ef: 50,
+            return_vector: false,
+            rerank: None,
+        };
+        for i in 0..20 {
+            let page = collection
+                .search_one(&record(i % 50).vector, None, params)
+                .unwrap();
+            assert_eq!(page.len(), 5);
+        }
+        let (said_tx, said) = mpsc::channel::<Said<()>>();
+        let adding = {
+            let collection = &collection;
+            scope.spawn(move || {
+                say_waits(&said_tx);
+                for batch in 10..50 {
+                    add(collection, batch * 5..batch * 5 + 5);
+                }
+                let _ = said_tx.send(Said::Done(()));
+            })
+        };
+        // The backup holds `writers` alone at its pause, by the rule this
+        // test holds, so that is the guard the add waits at.
+        waited_among(
+            &said,
+            LIMIT,
+            &[lock_name("writers")],
+            "an add waits at the mutation guard the backup holds",
+        );
+        assert!(
+            pause.release(),
+            "the backup was not waiting once the searches had answered, so a search waited for it"
+        );
+        let copy = backer.join().unwrap().unwrap();
         adding.join().unwrap();
-        searching.join().unwrap();
+        assert_eq!(
+            said.try_iter().last(),
+            Some(Said::Done(())),
+            "the adds returned"
+        );
         copy
     });
     assert_eq!(collection.len(), 250);
@@ -221,7 +273,11 @@ fn a_backup_during_adds_and_searches_equals_a_replay_to_its_sequence() {
     }
     let (backup, _) =
         Collection::recover(target.to_str().unwrap(), None, Durability::PerCall).unwrap();
-    assert!(backup.len() >= 50 && backup.len() <= 250);
+    assert_eq!(
+        backup.len(),
+        50,
+        "the copy holds the records the collection held as the backup began"
+    );
     assert_eq!(contents(&backup), contents(&replayed));
 }
 

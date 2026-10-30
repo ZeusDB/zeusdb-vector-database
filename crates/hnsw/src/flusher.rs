@@ -70,8 +70,8 @@ pub(crate) struct Flusher {
 struct Shared {
     state: Mutex<State>,
     wake: Condvar,
-    /// Syncs the thread has completed. Read by the tests that hold the
-    /// thread to costing nothing on a clean file.
+    /// Syncs the thread has completed, which the log record of its stop
+    /// reports.
     syncs: AtomicU64,
 }
 
@@ -241,10 +241,19 @@ impl Watch {
         self.0.strong_count() > 0
     }
 
-    /// Syncs completed, while the state is alive.
-    pub(crate) fn syncs(&self) -> Option<u64> {
+    /// Whether the thread holds a failed sync that no commit has taken,
+    /// while the state is alive.
+    pub(crate) fn holds_failure(&self) -> Option<bool> {
         self.0
             .upgrade()
-            .map(|shared| shared.syncs.load(Ordering::Acquire))
+            .map(|shared| shared.state.lock().unwrap().failed.is_some())
+    }
+
+    /// Whether the file is marked dirty, so the thread has a sync to make,
+    /// while the state is alive.
+    pub(crate) fn is_dirty(&self) -> Option<bool> {
+        self.0
+            .upgrade()
+            .map(|shared| shared.state.lock().unwrap().dirty)
     }
 }

@@ -17,7 +17,7 @@ use serde_json::json;
 use zeusdb_vector_core::{set_segment_roll_bytes, Error, FsStorage, SEGMENT_HEADER_BYTES};
 
 use super::journal_support::{
-    copy_journaled, expected_of, sink_over, FaultyStorage, Segments, TempDir,
+    copy_journaled, expected_of, sink_over, FaultyStorage, Segments, TempDir, SYNC_LIMIT,
 };
 use super::{Collection, Declaration, OperationSink, ParsedRecord};
 use crate::journal::Durability;
@@ -120,23 +120,44 @@ fn a_journal_of_several_segments_reads_back_as_one() {
 
 /// The interval policy's thread follows the active segment through every
 /// roll, so what it syncs is the segment records land in, and a recovery
-/// holds every record the calls returned from.
+/// holds every record the calls returned from. After each add the thread's
+/// next sync is of the segment active once the add returned. Where the add
+/// rolled the journal that is the new segment, since the roll sealed the
+/// full one with a sync of its own.
 #[test]
 fn the_interval_thread_follows_the_active_segment() {
     let temp = TempDir::new("segment-tests");
     let path = temp.at("interval.zdb");
-    let collection = rolling(
+    let collection = Collection::build(declaration(), None);
+    let storage = FaultyStorage::at(&path);
+    let faults = storage.faults.clone();
+    set_segment_roll_bytes(300);
+    let sink = sink_over(
+        &storage,
         &path,
-        300,
+        collection.collection_id(),
         Durability::PerInterval(Duration::from_millis(2)),
     );
+    set_segment_roll_bytes(0);
+    collection.attach_sink(Box::new(sink));
+    collection.save(path.to_str().unwrap()).unwrap();
+    let syncs = &faults.thread_syncs;
     for i in 0..10 {
+        let from = syncs.begun();
         add(&collection, i..i + 1);
-        std::thread::sleep(Duration::from_millis(5));
+        let active = *Segments::of(&path).numbers.iter().max().unwrap();
+        let synced = syncs.wait_ended(from).unwrap_or_else(|| {
+            panic!("the thread made no sync within {SYNC_LIMIT:?} of add {i}, so it hung")
+        });
+        assert_eq!(
+            synced, active,
+            "after add {i} the thread synced segment {synced} while segment {active} is active"
+        );
     }
-    let watch = collection.flusher_watch().unwrap();
-    assert!(watch.syncs().unwrap() > 0);
-    assert!(Segments::of(&path).numbers.len() > 2);
+    assert!(
+        Segments::of(&path).numbers.len() > 2,
+        "the adds rolled the journal"
+    );
     let before = ids(&collection);
     drop(collection);
     let (recovered, report) = recover(&path);

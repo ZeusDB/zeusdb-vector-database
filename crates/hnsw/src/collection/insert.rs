@@ -652,10 +652,10 @@ impl Collection {
         level: usize,
     ) -> Result<(Position, Option<Vec<u8>>), Error> {
         let id = RecordId::from_slot(internal_id);
-        let prepared = {
+        let prepared = after_plan!({
             let index = self.dense().index.read().unwrap();
             index.prepare_at_level(id, vector, level)?
-        };
+        });
         let (at, codes, due) = {
             let mut ids = self.ids.write().unwrap();
             let mut index = self.dense().index.write().unwrap();

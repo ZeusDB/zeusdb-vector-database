@@ -8,18 +8,27 @@
 //! query's ids being counted and its postings being searched either.
 //! `add_metadata` takes the guard as every other durable mutation does. And
 //! the stamp training records is a parameter, read from the clock at the
-//! trigger and handed down.
+//! trigger and handed down. A reader that takes no mutation guard finds the
+//! two live sets agree wherever an insertion lets its guards go.
+//!
+//! A thread that must wait for a guard another thread holds is shown to
+//! reach that wait by the registry's wait hook, which hears the wait only
+//! where the guard is held, and the first of the wait and the call's return
+//! decides each check.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use zeusdb_vector_core::{IdfScope, PQ};
+use zeusdb_vector_core::{
+    pause_arm, pause_disarm, IdfScope, KillPoint, PanicPoint, Pause, PauseAt, PQ,
+};
 use zeusdb_vector_sparse::{SparseConfig, Weighting};
 use zeusdb_vector_text::SimpleTokenizer;
 
@@ -27,6 +36,7 @@ use zeusdb_vector_text::SimpleTokenizer;
 use crate::locks::held_now;
 
 use super::insert::{ClearPoint, CLEAR_HOOK};
+use super::journal_support::{say_waits, wait_among, waited_among, Said};
 use super::query::AFTER_RESOLVE;
 use super::{Collection, Declaration, ParsedRecord, SparseHalf, StorageMode};
 
@@ -37,6 +47,10 @@ use super::{Collection, Declaration, ParsedRecord, SparseHalf, StorageMode};
 fn held_now() -> Vec<String> {
     Vec::new()
 }
+
+/// How long a check waits for a thread beside it, which is the tests' own
+/// bound on a hang.
+const LIMIT: Duration = Duration::from_secs(20);
 
 fn text_collection() -> Collection {
     let declaration = Declaration::validate(2, "l2", 4, 50, 100, vec![])
@@ -206,17 +220,19 @@ fn a_search_never_returns_a_record_that_never_held_the_term_under_concurrent_cle
 /// counted "zebra" into id 0 and released the dictionary, `clear` emptied
 /// it, the next text "apple" took id 0, and the query then searched the
 /// postings over id 0 and returned the record that never held "zebra".
-/// The interleaving is arranged rather than raced for: the mutation is
-/// started from the hook the query runs once its ids are counted, and the
-/// hook waits for it, up to a bound. Where the mutation can land inside
-/// the window it does so within milliseconds, and where the query's guards
-/// hold it out the wait ends with it still pending.
+/// The interleaving is arranged rather than raced for. The mutation is
+/// started from the hook the query runs once its ids are counted, with
+/// every guard the query holds still held, and the hook waits for the
+/// first of two events: the clear reaching its wait at a guard the query
+/// holds, as the registry names them, or the mutation finishing. The first
+/// is the rule. The second is a clear that landed inside the window.
 #[test]
 fn clear_between_a_querys_counting_and_its_search_cannot_reissue_its_terms() {
-    /// What the hook saw: whether the mutation it started had landed by the
-    /// time the hook returned, and the thread to join.
+    /// What the hook saw first, being the guard the query holds that the
+    /// clear waited at, or the words of a clear that did not wait there,
+    /// and the thread to join.
     struct Held {
-        landed_in_window: bool,
+        first: Result<String, String>,
         mutation: thread::JoinHandle<()>,
     }
 
@@ -233,23 +249,29 @@ fn clear_between_a_querys_counting_and_its_search_cannot_reissue_its_terms() {
         let collection = collection.clone();
         let outcome = outcome.clone();
         let run: Box<dyn FnOnce()> = Box::new(move || {
+            let query_held = held_now();
+            let (heard_tx, heard) = mpsc::channel::<Said<()>>();
             let mutation = {
                 let collection = collection.clone();
                 thread::spawn(move || {
+                    say_waits(&heard_tx);
                     assert_eq!(collection.clear().unwrap(), 1);
                     let b = text_record(&collection, "B", [0.0, 1.0], "apple");
                     assert_eq!(
                         collection.add_records(vec![b], vec![], false).total_errors,
                         0
                     );
+                    let _ = heard_tx.send(Said::Done(()));
                 })
             };
-            let deadline = Instant::now() + Duration::from_millis(500);
-            while !mutation.is_finished() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(5));
-            }
             *outcome.borrow_mut() = Some(Held {
-                landed_in_window: mutation.is_finished(),
+                first: wait_among(
+                    &heard,
+                    LIMIT,
+                    &query_held,
+                    "the clear waits at a guard the query holds, so the clear and the insert \
+                     land only once the page is made",
+                ),
                 mutation,
             });
         });
@@ -259,19 +281,15 @@ fn clear_between_a_querys_counting_and_its_search_cannot_reissue_its_terms() {
     let page = collection
         .search_text("zebra", None, 5, IdfScope::Corpus)
         .unwrap();
-    let Held {
-        landed_in_window,
-        mutation,
-    } = outcome.borrow_mut().take().expect("the hook ran");
+    let Held { first, mutation } = outcome.borrow_mut().take().expect("the hook ran");
     assert_eq!(
         ids_of(&page),
         ["A"],
         "the page holds the record that carried the term when it was counted"
     );
-    assert!(
-        !landed_in_window,
-        "the clear and the insert landed between the count and the search"
-    );
+    if let Err(words) = first {
+        panic!("{words}");
+    }
     mutation.join().unwrap();
 
     // The clear and the insert landed once the page was made.
@@ -433,11 +451,95 @@ fn a_reader_beside_a_clear_finds_every_structure_cleared_at_once() {
     assert_eq!(read(&collection), cleared, "after the clear");
 }
 
+/// A reader that takes no mutation guard finds the collection's live set
+/// and the dense index's agree wherever an insertion lets its guards go.
+/// An add of three records is held at each such place in turn: before the
+/// batch is installed, once its first record is planned and before its
+/// second phase, once that record's dense half is in and before its sparse
+/// half, and once the whole batch is in. At each the reader's `stats()`
+/// passes every check a build with debug assertions makes, the positions
+/// agree, and the first record is named in the record set exactly where
+/// the index holds it.
+#[test]
+fn a_reader_finds_the_live_sets_agree_wherever_an_insertion_lets_its_guards_go() {
+    let collection = Arc::new(text_collection());
+    let seed: Vec<ParsedRecord> = (0..20)
+        .map(|i| text_record(&collection, &format!("s{i}"), [i as f32, 1.0], "seed"))
+        .collect();
+    assert_eq!(collection.add_records(seed, vec![], false).total_errors, 0);
+    // Each place, the point it is named by, and whether the batch's first
+    // record is in by then.
+    let places = [
+        (
+            PauseAt::Point(PanicPoint::AddBeforeInstalls),
+            "add:before_installs",
+            false,
+        ),
+        (
+            PauseAt::Point(PanicPoint::InsertAfterPlan),
+            "insert:after_plan",
+            false,
+        ),
+        (
+            PauseAt::Point(PanicPoint::InstallBeforeSparse),
+            "install:before_sparse",
+            true,
+        ),
+        (
+            PauseAt::Kill(KillPoint::AddAfterApply),
+            "add:after_apply",
+            true,
+        ),
+    ];
+    for (round, (at, name, first_in)) in places.into_iter().enumerate() {
+        let first = format!("b{round}_0");
+        let batch: Vec<ParsedRecord> = (0..3)
+            .map(|i| {
+                let id = format!("b{round}_{i}");
+                text_record(&collection, &id, [i as f32, 2.0 + round as f32], "batch")
+            })
+            .collect();
+        let pause = Arc::new(Pause::new(LIMIT));
+        let adder = {
+            let (collection, pause) = (Arc::clone(&collection), Arc::clone(&pause));
+            thread::spawn(move || {
+                pause_arm(at, pause);
+                let added = collection.add_records(batch, vec![], false);
+                pause_disarm();
+                added
+            })
+        };
+        let reached = pause.wait_reached(LIMIT).reached();
+        // The reader, on this thread, while the add waits at the place. A
+        // build with debug assertions checks the two live sets inside
+        // `stats()`.
+        let _ = collection.stats();
+        let agree = collection.positions_agree_any_holes();
+        let named = collection.contains(&first);
+        let released = pause.release();
+        let added = adder.join().unwrap();
+        assert_eq!(reached, Some(name), "the add never reached {name}");
+        assert!(
+            released,
+            "the add was not waiting at {name} once the reader had read"
+        );
+        assert!(agree, "the reader found the live sets disagree at {name}");
+        assert_eq!(
+            named, first_in,
+            "at {name} the record set names the first record where it should not"
+        );
+        assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    }
+    assert_eq!(collection.len(), 20 + 3 * 4);
+    assert!(collection.positions_agree());
+}
+
 /// What a clear traded out is dropped once `writers` is let go, with no
 /// guard held. While its drop is held open, the dropping thread holds no
 /// guard by the lock registry's own count, a second writer adds a record
-/// and returns, and a search answers it. The clear returns only once the
-/// drop is done.
+/// and returns, and a search answers it. The drop runs on the thread that
+/// called `clear`, which waits in the drop's hook, so the clear returns
+/// only once the drop is done.
 #[test]
 fn a_second_writer_goes_while_a_clears_old_structures_drop() {
     let collection = text_collection();
@@ -448,19 +550,19 @@ fn a_second_writer_goes_while_a_clears_old_structures_drop() {
         collection.add_records(records, vec![], false).total_errors,
         0
     );
-    let wait = Duration::from_secs(20);
+    let wait = LIMIT;
     thread::scope(|scope| {
-        let (dropping_tx, dropping) = std::sync::mpsc::channel::<Vec<String>>();
-        let (dropped_tx, dropped) = std::sync::mpsc::channel::<Vec<String>>();
-        let (go, go_rx) = std::sync::mpsc::channel::<()>();
-        let (returned_tx, returned) = std::sync::mpsc::channel::<Instant>();
+        let (dropping_tx, dropping) = mpsc::channel::<(Vec<String>, thread::ThreadId)>();
+        let (dropped_tx, dropped) = mpsc::channel::<Vec<String>>();
+        let (go, go_rx) = mpsc::channel::<()>();
+        let (returned_tx, returned) = mpsc::channel::<Instant>();
         let clearer = {
             let collection = &collection;
             scope.spawn(move || {
                 CLEAR_HOOK.with(|hook| {
                     *hook.borrow_mut() = Some(Box::new(move |point| match point {
                         ClearPoint::Dropping => {
-                            let _ = dropping_tx.send(held_now());
+                            let _ = dropping_tx.send((held_now(), thread::current().id()));
                             let _ = go_rx.recv();
                         }
                         ClearPoint::Dropped => {
@@ -476,7 +578,7 @@ fn a_second_writer_goes_while_a_clears_old_structures_drop() {
             })
         };
 
-        let held = dropping
+        let (held, dropper) = dropping
             .recv_timeout(wait)
             .expect("the clear drops what it traded out");
         assert_eq!(
@@ -484,10 +586,15 @@ fn a_second_writer_goes_while_a_clears_old_structures_drop() {
             Vec::<String>::new(),
             "no guard is held as the drop begins"
         );
+        assert_eq!(
+            dropper,
+            clearer.thread().id(),
+            "the clear drops what it traded out on its own thread, which the drop's hook holds"
+        );
         assert_eq!(collection.len(), 0, "the trade ran before the drop");
 
         // A second writer goes and returns, and a search answers its record.
-        let (wrote_tx, wrote) = std::sync::mpsc::channel::<usize>();
+        let (wrote_tx, wrote) = mpsc::channel::<usize>();
         {
             let collection = &collection;
             scope.spawn(move || {
@@ -507,8 +614,8 @@ fn a_second_writer_goes_while_a_clears_old_structures_drop() {
             .unwrap();
         assert_eq!(ids_of(&page), ["later"]);
         assert!(
-            returned.recv_timeout(Duration::from_millis(50)).is_err(),
-            "the clear waits for its drop"
+            returned.try_recv().is_err(),
+            "the clear returned while its own thread was held in the drop's hook"
         );
 
         let released = Instant::now();
@@ -529,8 +636,9 @@ fn a_second_writer_goes_while_a_clears_old_structures_drop() {
 }
 
 /// `add_metadata` takes the mutation guard, as every durable mutation does,
-/// so a caller holding the guard sees it wait, and it merges once the guard
-/// is free.
+/// so a call made while another thread holds the guard reaches its wait at
+/// `writers` and writes nothing, and it merges once the guard is free. The
+/// first of the call's wait and its return decides the check.
 #[test]
 fn add_metadata_waits_for_the_mutation_guard() {
     let collection = Arc::new(Collection::build(
@@ -538,16 +646,23 @@ fn add_metadata_waits_for_the_mutation_guard() {
         None,
     ));
     let held = collection.writers.lock().unwrap();
+    let held_here = held_now();
+    let (heard_tx, heard) = mpsc::channel::<Said<()>>();
     let writer = {
         let collection = collection.clone();
         thread::spawn(move || {
-            collection.add_metadata(HashMap::from([("owner".to_string(), "held".to_string())]))
+            say_waits(&heard_tx);
+            let merged =
+                collection.add_metadata(HashMap::from([("owner".to_string(), "held".to_string())]));
+            let _ = heard_tx.send(Said::Done(()));
+            merged
         })
     };
-    thread::sleep(Duration::from_millis(200));
-    assert!(
-        !writer.is_finished(),
-        "add_metadata wrote while the mutation guard was held"
+    waited_among(
+        &heard,
+        LIMIT,
+        &held_here,
+        "add_metadata waits at the mutation guard another thread holds",
     );
     assert_eq!(collection.metadata("owner"), None);
     drop(held);

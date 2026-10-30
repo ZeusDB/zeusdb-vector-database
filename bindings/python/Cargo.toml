@@ -49,16 +49,17 @@ crate-type = ["cdylib"]
 [features]
 default = ["extension-module"]
 extension-module = ["pyo3/extension-module"]
-# The pause a test of the interpreter rule arms: the engine's pause points,
-# the pause at the start of every released part of a call, and the private
-# class `_engine._Pause`; see src/test_support.rs. Off in the wheel and in
-# every build that does not name it, so `_engine` has no `_Pause` there. The
-# checks in tests/test_interpreter.py run on an extension built with it,
+# The pause a test arms: the engine's pause points and the index's, the pause
+# at the start of every released part of a call and of a search, and the
+# private class `_engine._Pause`; see src/test_support.rs. Off in the wheel
+# and in every build that does not name it, so `_engine` has no `_Pause`
+# there. The checks in tests/test_interpreter.py and tests/test_overlap.py
+# run on an extension built with it,
 #
 #   maturin develop --release --features test-support
 #
 # and the rest of the suite runs on the build without it.
-test-support = ["zeusdb-vector-core/pause-points"]
+test-support = ["zeusdb-vector-core/pause-points", "zeusdb-vector-hnsw/pause-points"]
 
 # Every version is the workspace's, declared once in the root Cargo.toml with
 # the reason for each pin. The index is zeusdb-vector-hnsw, taken by path,

@@ -30,6 +30,32 @@ macro_rules! run_released {
     };
 }
 
+/// `$py.detach` of a closure with its return type written out, for a method
+/// that releases the interpreter for its work by itself, being `search()`.
+///
+/// Under the `test-support` feature the closure's body starts at the pause a
+/// test arms for its next call, under `$operation`; see `test_support`.
+/// Without the feature the expansion is the call of `$py.detach` on the
+/// closure as written, token for token.
+///
+/// It is a macro defined here for the reason `run_released!` is one: its use
+/// in `hnsw_index` replaces one line and adds none.
+#[cfg(feature = "test-support")]
+macro_rules! detach_paused {
+    ($py:expr, $operation:expr, || -> $ret:ty { $($body:tt)* }) => {
+        $py.detach(|| -> $ret {
+            crate::test_support::pause_here($operation);
+            $($body)*
+        })
+    };
+}
+#[cfg(not(feature = "test-support"))]
+macro_rules! detach_paused {
+    ($py:expr, $operation:expr, || -> $ret:ty { $($body:tt)* }) => {
+        $py.detach(|| -> $ret { $($body)* })
+    };
+}
+
 mod conversion;
 mod durability;
 mod hnsw_index;

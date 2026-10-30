@@ -1,7 +1,8 @@
 //! What the journal's tests share: a temporary folder, a journal read back
 //! by hand, a journal damaged for a repair, a graph dump whose topology is
-//! damaged, faults armed on a journal's directory, and a storage on a medium
-//! that refuses every write.
+//! damaged, faults armed on a journal's directory, a record of the interval
+//! thread's syncs through that directory, a storage on a medium that
+//! refuses every write, and what a thread says while a test holds a write.
 //!
 //! A device fault cannot be produced on demand, so a failure is injected
 //! through a journal directory that fails a chosen write, sync, cut or
@@ -14,7 +15,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use zeusdb_vector_core::{
@@ -26,6 +28,7 @@ use zeusdb_vector_core::{
 
 use super::{Collection, Declaration, ParsedRecord};
 use crate::journal::{Durability, JournalSink};
+use crate::locks::{on_wait, Wait, WAIT_HOOK};
 
 // ============================================================================
 // A GRAPH DUMP DAMAGED
@@ -603,10 +606,144 @@ pub(super) struct Faults {
     pub(super) creates: Arm,
     pub(super) quarantines: Arm,
     pub(super) quarantines_denied: Arm,
+    /// Every sync the interval thread made through this directory.
+    pub(super) thread_syncs: ThreadSyncs,
 }
 
 fn injected() -> io::Error {
     io::Error::other("injected: the device refused it")
+}
+
+/// The name `Flusher::start` gives the interval policy's thread, by which a
+/// faulty directory tells that thread's syncs from every other.
+const INTERVAL_THREAD: &str = "zeusdb-journal-sync";
+
+/// The longest a closed gate holds the interval thread, and the longest a
+/// test waits for one of its syncs.
+pub(super) const SYNC_LIMIT: Duration = Duration::from_secs(20);
+
+/// Every sync the interval thread made through a faulty directory, in the
+/// order they began, each with the segment it synced and whether it has
+/// ended, and a gate that holds the thread's syncs while a test keeps it
+/// closed.
+///
+/// A sync is recorded as it begins, before the gate and before any armed
+/// fault is read, and again as it ends, failed or not. A test that reads
+/// the record once the collection is dropped, which joins the thread, reads
+/// every sync the thread made.
+#[derive(Debug, Default)]
+pub(super) struct ThreadSyncs {
+    state: Mutex<SyncRecord>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct SyncRecord {
+    /// The segment of each sync, in the order they began, and whether it
+    /// has ended.
+    syncs: Vec<(u64, bool)>,
+    /// The gate is closed.
+    closed: bool,
+    /// A sync waited at the gate for the whole limit and went on.
+    timed_out: bool,
+}
+
+impl ThreadSyncs {
+    /// Record a sync of `segment` beginning, and hold it while the gate is
+    /// closed, for [`SYNC_LIMIT`] at most. Gives the sync's place.
+    fn begin(&self, segment: u64) -> usize {
+        let mut record = self.lock();
+        let at = record.syncs.len();
+        record.syncs.push((segment, false));
+        self.changed.notify_all();
+        let deadline = Instant::now() + SYNC_LIMIT;
+        while record.closed {
+            let now = Instant::now();
+            if now >= deadline {
+                record.timed_out = true;
+                break;
+            }
+            record = self
+                .changed
+                .wait_timeout(record, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        at
+    }
+
+    /// Record the sync at place `at` ending.
+    fn end(&self, at: usize) {
+        self.lock().syncs[at].1 = true;
+        self.changed.notify_all();
+    }
+
+    /// The syncs begun so far.
+    pub(super) fn begun(&self) -> usize {
+        self.lock().syncs.len()
+    }
+
+    /// The syncs ended so far.
+    pub(super) fn ended(&self) -> usize {
+        self.lock().syncs.iter().filter(|(_, ended)| *ended).count()
+    }
+
+    /// Hold the thread's syncs from here on.
+    pub(super) fn close(&self) {
+        self.lock().closed = true;
+    }
+
+    /// Let the thread's syncs go.
+    pub(super) fn open(&self) {
+        self.lock().closed = false;
+        self.changed.notify_all();
+    }
+
+    /// Whether a sync waited at the gate for the whole limit.
+    pub(super) fn timed_out(&self) -> bool {
+        self.lock().timed_out
+    }
+
+    /// The segment of the sync at place `at`, once it has begun, or `None`
+    /// where none begins there within [`SYNC_LIMIT`].
+    pub(super) fn wait_begun(&self, at: usize) -> Option<u64> {
+        self.wait(|record| record.syncs.get(at).map(|(segment, _)| *segment))
+    }
+
+    /// The segment of the first sync at place `from` or after it to end, or
+    /// `None` where none ends within [`SYNC_LIMIT`].
+    pub(super) fn wait_ended(&self, from: usize) -> Option<u64> {
+        self.wait(|record| {
+            record
+                .syncs
+                .get(from..)
+                .and_then(|later| later.iter().find(|(_, ended)| *ended))
+                .map(|(segment, _)| *segment)
+        })
+    }
+
+    fn wait<T>(&self, found: impl Fn(&SyncRecord) -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + SYNC_LIMIT;
+        let mut record = self.lock();
+        loop {
+            if let Some(found) = found(&record) {
+                return Some(found);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            record = self
+                .changed
+                .wait_timeout(record, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, SyncRecord> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 #[derive(Debug)]
@@ -619,6 +756,8 @@ struct FaultyDir {
 struct FaultyFile {
     inner: Box<dyn JournalFile>,
     faults: Arc<Faults>,
+    /// The segment this file is.
+    number: u64,
 }
 
 impl JournalDir for FaultyDir {
@@ -638,12 +777,14 @@ impl JournalDir for FaultyDir {
         Ok(Box::new(FaultyFile {
             inner: self.inner.create_segment(number)?,
             faults: self.faults.clone(),
+            number,
         }))
     }
     fn open_segment(&self, number: u64) -> io::Result<Box<dyn JournalFile>> {
         Ok(Box::new(FaultyFile {
             inner: self.inner.open_segment(number)?,
             faults: self.faults.clone(),
+            number,
         }))
     }
     fn remove_segment(&self, number: u64) -> io::Result<()> {
@@ -696,10 +837,17 @@ impl JournalFile for FaultyFile {
         self.inner.set_len(len)
     }
     fn sync_data(&self) -> io::Result<()> {
-        if self.faults.syncs.trips() {
-            return Err(injected());
+        let thread = (std::thread::current().name() == Some(INTERVAL_THREAD))
+            .then(|| self.faults.thread_syncs.begin(self.number));
+        let synced = if self.faults.syncs.trips() {
+            Err(injected())
+        } else {
+            self.inner.sync_data()
+        };
+        if let Some(at) = thread {
+            self.faults.thread_syncs.end(at);
         }
-        self.inner.sync_data()
+        synced
     }
     fn sync_all(&self) -> io::Result<()> {
         self.inner.sync_all()
@@ -955,5 +1103,143 @@ impl Storage for RefusingStorage {
             }),
             Err(error) => Err(LockFailure::Failed(error)),
         }
+    }
+}
+
+// ============================================================================
+// WHAT A THREAD SAYS WHILE A WRITE IS HELD
+// ============================================================================
+
+/// What a thread beside a held write says, in the order it says it: each
+/// guard it begins to wait at, as the registry's wait hook hears it, and
+/// what its call gave once it returned.
+#[derive(Debug, PartialEq)]
+pub(super) enum Said<T> {
+    Waits(String),
+    Done(T),
+}
+
+/// Say each guard this thread begins to wait at through `said`, from now on.
+pub(super) fn say_waits<T: Send + 'static>(said: &mpsc::Sender<Said<T>>) {
+    let waits = said.clone();
+    on_wait(move |name| {
+        let _ = waits.send(Said::Waits(name.to_string()));
+    });
+}
+
+/// Whether `name`, the guard a wait was heard at, is one of `guards`, the
+/// guards a held phase names. A build that keeps no ranks hears every wait
+/// with an empty name and names no guard held, so there every wait is at
+/// one of them.
+pub(super) fn among(guards: &[String], name: &str) -> bool {
+    !cfg!(debug_assertions) || guards.iter().any(|guard| guard == name)
+}
+
+/// The guard a thread waits at among `guards`, the guards a held phase
+/// holds, read from what it says past any wait at another guard. A thread
+/// that answers first went on without waiting for the phase, and one that
+/// says nothing more within `limit` hung, and either fails the check with
+/// `expected`, the words of what the check needs.
+pub(super) fn waited_among<T>(
+    said: &mpsc::Receiver<Said<T>>,
+    limit: Duration,
+    guards: &[String],
+    expected: &str,
+) -> String {
+    wait_among(said, limit, guards, expected).unwrap_or_else(|words| panic!("{words}"))
+}
+
+/// [`waited_among`] with the failure given as its words rather than
+/// raised, for a check read inside a hook, where a panic would unwind
+/// under the guards the hooked call holds.
+pub(super) fn wait_among<T>(
+    said: &mpsc::Receiver<Said<T>>,
+    limit: Duration,
+    guards: &[String],
+    expected: &str,
+) -> Result<String, String> {
+    let deadline = Instant::now() + limit;
+    loop {
+        match said.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Said::Waits(name)) if among(guards, &name) => return Ok(name),
+            Ok(Said::Waits(_)) => {}
+            Ok(Said::Done(_)) => {
+                return Err(format!(
+                    "{expected}, and it returned without waiting at any of {guards:?}"
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "{expected}, and it said nothing within {limit:?}, so it hung"
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(format!("{expected}, and its thread ended without a word"))
+            }
+        }
+    }
+}
+
+/// What a thread beside a held write gives once the hold is let go. The
+/// write lets its guards go one at a time, so the thread can wait again
+/// first, at a guard the write has yet to let go or one another thread
+/// holds, and every wait it reports is read past until its answer. A thread
+/// that gives no answer within `limit` hung, and one whose channel closes
+/// without one ended first, and either fails the check with `expected`.
+pub(super) fn answer_after<T>(
+    said: &mpsc::Receiver<Said<T>>,
+    limit: Duration,
+    expected: &str,
+) -> T {
+    let deadline = Instant::now() + limit;
+    loop {
+        match said.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Said::Waits(_)) => {}
+            Ok(Said::Done(answer)) => return answer,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("{expected}, and it gave no answer within {limit:?}, so it hung")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("{expected}, and its thread ended without an answer")
+            }
+        }
+    }
+}
+
+/// The guards the threads that listen wait at now, one entry for each wait
+/// in progress, for a phase held until one of them waits at a guard the
+/// phase holds.
+#[derive(Debug, Default)]
+pub(super) struct Heard {
+    waiting: Mutex<Vec<String>>,
+}
+
+impl Heard {
+    /// Hear this thread's waits from now on, each from its beginning to its
+    /// end, through the registry's wait hook.
+    pub(super) fn listen(self: &Arc<Self>) {
+        let heard = Arc::clone(self);
+        WAIT_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |name, wait| {
+                let mut waiting = heard.lock();
+                match wait {
+                    Wait::Begins => waiting.push(name.to_string()),
+                    Wait::Ends => {
+                        if let Some(at) = waiting.iter().position(|guard| guard == name) {
+                            waiting.swap_remove(at);
+                        }
+                    }
+                }
+            }));
+        });
+    }
+
+    /// Whether a thread that listens waits now at one of `guards`.
+    pub(super) fn at_any(&self, guards: &[String]) -> bool {
+        self.lock().iter().any(|name| among(guards, name))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<String>> {
+        self.waiting.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }

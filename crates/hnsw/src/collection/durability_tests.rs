@@ -26,6 +26,7 @@ use zeusdb_vector_text::Tokenizer;
 
 use super::journal_support::{
     copy_journaled, expected_of, manifest, sink_over, Faults, FaultyStorage, Segments, TempDir,
+    SYNC_LIMIT,
 };
 use super::{Added, Collection, Declaration, ParsedRecord, SparseHalf};
 use crate::journal::{journal_path, CheckpointTaken, Durability};
@@ -153,70 +154,85 @@ fn the_interval_threads_lifetime_is_the_collections() {
 }
 
 /// A clean journal costs no sync. The thread sleeps until a commit dirties
-/// it, syncs once an interval while it is dirty, and goes back to sleep; a
-/// checkpoint that syncs the journal itself leaves it nothing to do.
+/// it, syncs once an interval while it is dirty, and goes back to sleep, and
+/// a checkpoint that syncs the journal itself leaves it nothing to do.
+///
+/// The syncs counted are the thread's, through the faulty storage, and the
+/// count is read once the collection is dropped, which joins the thread, so
+/// it holds every sync the thread made. One commit costs one sync. The
+/// thread clears the mark before it syncs, so commits made while its sync is
+/// held at the gate cost one sync more between them, however many they are.
+/// On a collection whose interval is an hour the thread is still waiting it
+/// out when the checkpoint runs, and the checkpoint leaves the mark clean.
 #[test]
 fn the_interval_thread_syncs_nothing_while_the_file_is_clean() {
     let temp = TempDir::new("durability-tests");
-    let path = temp.at("clean.zdb");
-    let collection = Collection::build(declaration(), None);
-    let interval = Duration::from_millis(200);
-    collection
-        .journal_to(path.to_str().unwrap(), Durability::PerInterval(interval))
-        .unwrap();
-    let watch = collection.flusher_watch().unwrap();
+    let (collection, faults) = faulty(
+        &temp.at("clean.zdb"),
+        Durability::PerInterval(Duration::from_millis(5)),
+    );
+    let syncs = &faults.thread_syncs;
+    assert_eq!(
+        syncs.begun(),
+        0,
+        "a collection no call has written syncs nothing"
+    );
 
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(watch.syncs(), Some(0), "an idle collection syncs nothing");
-
+    // One commit, one sync.
     add(&collection, 0..1);
     assert!(
-        wait_for(Duration::from_secs(5), || watch.syncs() == Some(1)),
-        "one commit is synced within the interval"
+        syncs.wait_ended(0).is_some(),
+        "the thread synced no commit within {SYNC_LIMIT:?}, so it hung"
     );
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(watch.syncs(), Some(1), "and nothing is synced after it");
 
-    // A burst gathers behind the interval rather than behind the commits.
-    // The count is held against the intervals the burst spanned rather than
-    // against the number two, because whether five commits fit inside one
-    // interval is a statement about the machine while one sync an interval
-    // is the policy. A sink that synced per commit reads five here.
-    let before = watch.syncs().expect("the interval policy counts its syncs");
-    let started = Instant::now();
-    for i in 1..6 {
+    // A sync held at the gate, and four commits made while it is held.
+    syncs.close();
+    add(&collection, 1..2);
+    assert!(
+        syncs.wait_begun(1).is_some(),
+        "the thread began no sync of the second commit within {SYNC_LIMIT:?}, so it hung"
+    );
+    for i in 2..6 {
         add(&collection, i..i + 1);
     }
+    syncs.open();
     assert!(
-        wait_for(Duration::from_secs(5), || watch.syncs() > Some(before)),
-        "the burst was synced"
-    );
-    std::thread::sleep(Duration::from_millis(300));
-    let spanned = started.elapsed().as_millis() / interval.as_millis() + 1;
-    let synced = u128::from(watch.syncs().unwrap() - before);
-    assert!(
-        synced <= spanned,
-        "five commits cost {synced} syncs over {spanned} intervals"
+        syncs.wait_ended(2).is_some(),
+        "the thread synced nothing the four commits left within {SYNC_LIMIT:?}, so it hung"
     );
 
-    // A checkpoint syncs the journal itself, so the thread finds it clean.
-    // Read the count as the checkpoint returns rather than before the
-    // commit, since whether the thread fired between the two is the
-    // machine's business and what the checkpoint promises is that nothing
-    // is left to sync after it.
-    add(&collection, 6..7);
+    // Nothing is left dirty, so the checkpoint leaves the thread nothing to
+    // do, and the drop finds nothing to sync.
     collection.checkpoint().unwrap();
-    let after_checkpoint = watch.syncs();
-    std::thread::sleep(Duration::from_millis(600));
-    assert_eq!(
-        watch.syncs(),
-        after_checkpoint,
-        "the checkpoint left the thread nothing to sync"
-    );
     assert_eq!(
         collection.journal_sequence(),
-        14,
-        "seven calls of one record, each with its commit"
+        12,
+        "six calls of one record, each with its commit"
+    );
+    drop(collection);
+    assert_eq!(
+        (syncs.begun(), syncs.ended()),
+        (3, 3),
+        "the thread syncs once for each commit that finds the file clean"
+    );
+    assert!(
+        !syncs.timed_out(),
+        "no sync waited at the gate for its whole limit"
+    );
+
+    // An interval of an hour, so the thread is waiting it out when the
+    // checkpoint marks the file clean.
+    let (collection, _faults) = faulty(
+        &temp.at("checkpoint.zdb"),
+        Durability::PerInterval(Duration::from_secs(3600)),
+    );
+    let watch = collection.flusher_watch().unwrap();
+    add(&collection, 0..1);
+    collection.checkpoint().unwrap();
+    assert_eq!(
+        watch.is_dirty(),
+        Some(false),
+        "the checkpoint left the thread nothing to sync"
     );
 }
 
@@ -468,18 +484,26 @@ fn a_checkpoint_runs_through_a_failed_sync_and_clears_the_fault() {
 /// Under the interval policy, a sync the thread could not complete refuses
 /// and withdraws the next call, by an abort with no commit before it, and
 /// the fault stands until `checkpoint()`. The call before it was committed
-/// and acknowledged, so a process that stops keeps it.
+/// and acknowledged, so a process that stops keeps it. The fault is armed
+/// once the thread has synced the first call, so the failing sync is the
+/// one of the second, and the third call is made once the thread holds the
+/// failure.
 #[test]
 fn a_failed_sync_of_the_interval_thread_withdraws_the_next_call() {
     let temp = TempDir::new("durability-tests");
     let path = temp.at("interval-fault.zdb");
     let (collection, faults) = faulty(&path, Durability::PerInterval(Duration::from_millis(5)));
+    let watch = collection.flusher_watch().unwrap();
     add(&collection, 0..2);
+    assert!(
+        faults.thread_syncs.wait_ended(0).is_some(),
+        "the thread synced no commit within {SYNC_LIMIT:?}, so it hung"
+    );
     faults.syncs.arm(0, 1);
     add(&collection, 2..3);
     assert!(
-        wait_for(Duration::from_secs(10), || faults.syncs.spent()),
-        "the thread reached its failing sync"
+        wait_for(SYNC_LIMIT, || watch.holds_failure() == Some(true)),
+        "the thread recorded no failed sync within {SYNC_LIMIT:?}, so it hung"
     );
     let failed = try_add(&collection, 3..4);
     assert_eq!(failed.total_errors, 1);

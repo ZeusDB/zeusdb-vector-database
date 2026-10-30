@@ -41,9 +41,10 @@
 # uv itself is pinned by version and by the SHA-256 of its archive. Both jobs
 # build the extension with the maturin uv.lock names, and lint checks that
 # .github/requirements/maturin.txt names the same one for the release. Each
-# job runs the suite on the release build without tests/test_interpreter.py,
-# then builds again with the binding's test-support feature and runs that
-# module alone, since its checks arm pauses the wheel does not carry.
+# job runs the suite on the release build without tests/test_interpreter.py
+# and tests/test_overlap.py, then builds again with the binding's
+# test-support feature and runs those two modules alone, since their checks
+# arm pauses the wheel does not carry.
 # test-rust links its test executables against the libpython of the newest
 # build, which uv installs the same way.
 #
@@ -282,18 +283,18 @@ jobs:
       - name: Run the Python test suite
         if: steps.scope.outputs.documentation-only != 'true'
         # Scoped to the tests directory, as testpaths in pyproject.toml is, and
-        # spread over four workers, as addopts there is. The interpreter checks
-        # run after the next build, which they need.
-        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py
+        # spread over four workers, as addopts there is. The checks that arm
+        # pauses run after the next build, which they need.
+        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py --ignore=tests/test_overlap.py
       - name: Build the extension with the test-support feature
         if: steps.scope.outputs.documentation-only != 'true'
-        # The same release build with the pauses the interpreter checks arm,
-        # which the wheel does not carry. See the feature in
+        # The same release build with the pauses the checks of the next step
+        # arm, which the wheel does not carry. See the feature in
         # bindings/python/Cargo.toml.
         run: uv run --no-sync maturin develop --release --locked --features test-support
-      - name: Run the interpreter checks
+      - name: Run the checks that need the test-support feature
         if: steps.scope.outputs.documentation-only != 'true'
-        run: uv run --no-sync pytest tests/test_interpreter.py
+        run: uv run --no-sync pytest tests/test_interpreter.py tests/test_overlap.py
 
   test-python-floor:
     runs-on: ubuntu-24.04
@@ -347,14 +348,14 @@ jobs:
       - name: Run the Python test suite
         if: steps.scope.outputs.documentation-only != 'true'
         # See test-python.
-        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py
+        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py --ignore=tests/test_overlap.py
       - name: Build the extension with the test-support feature
         if: steps.scope.outputs.documentation-only != 'true'
         # See test-python.
         run: uv run --no-sync maturin develop --release --locked --features test-support
-      - name: Run the interpreter checks
+      - name: Run the checks that need the test-support feature
         if: steps.scope.outputs.documentation-only != 'true'
-        run: uv run --no-sync pytest tests/test_interpreter.py
+        run: uv run --no-sync pytest tests/test_interpreter.py tests/test_overlap.py
 
   test-rust:
     runs-on: ubuntu-24.04

@@ -42,6 +42,31 @@
 //! and their dependencies alone.
 #![warn(unreachable_pub)]
 
+/// The block that plans an insertion's record, and then the point a test
+/// panics or pauses at once the plan is made and the index's read guard is
+/// let go, `insert:after_plan`, under `cfg(test)` or the `pause-points`
+/// feature. Without either, the expansion is the block alone, token for
+/// token, so the build that ships compiles the block as it is written.
+///
+/// It is a macro defined here, ahead of `collection`, so that its one use in
+/// `Collection::insert_one` changes two lines in place and adds none. Every
+/// log record and every panic location carries its line, so a line added
+/// above one changes what the wheel holds.
+#[cfg(any(test, feature = "pause-points"))]
+macro_rules! after_plan {
+    ($plan:block) => {{
+        let planned = $plan;
+        zeusdb_vector_core::panic_at(zeusdb_vector_core::PanicPoint::InsertAfterPlan);
+        planned
+    }};
+}
+#[cfg(not(any(test, feature = "pause-points")))]
+macro_rules! after_plan {
+    ($plan:block) => {
+        $plan
+    };
+}
+
 mod collection;
 mod flusher;
 mod journal;

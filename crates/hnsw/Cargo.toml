@@ -17,6 +17,14 @@ license.workspace = true
 # artefact.
 publish = false
 
+[features]
+# The points a test panics or pauses at inside a mutation, this crate's among
+# them, being the point after an insertion plans its record; see src/lib.rs.
+# Turns on the engine's own `pause-points` and nothing else of it. Off in
+# every build that does not name it. The binding's `test-support` feature
+# turns it on for the extension the interpreter checks run against.
+pause-points = ["zeusdb-vector-core/pause-points"]
+
 # Every version is the workspace's, declared once in the root Cargo.toml with
 # the reason for each pin.
 [dependencies]

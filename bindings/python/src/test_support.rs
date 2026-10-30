@@ -1,6 +1,7 @@
-//! What a test of the interpreter rule reaches the engine through. Compiled
-//! under this crate's `test-support` feature alone, so the wheel and every
-//! other build have none of it.
+//! What a test that stops a thread at a pause reaches the engine through,
+//! being the checks of the interpreter rule and of a write made while a
+//! search is held. Compiled under this crate's `test-support` feature alone,
+//! so the wheel and every other build have none of it.
 //!
 //! `_Pause` is a private class of `_engine`. A test arms a thread on one,
 //! either at the start of the released part of the thread's next call or at
@@ -22,7 +23,8 @@ use zeusdb_vector_core::{
 /// Pause here where this thread is armed for its next call, under the
 /// call's name. `run_released!` reaches it at the start of every released
 /// part of a call made through `HNSWIndex::released` or the wait of
-/// `HNSWIndex::cheap`.
+/// `HNSWIndex::cheap`, and `detach_paused!` at the start of the released
+/// part of a search.
 pub(crate) fn pause_here(call: &'static str) {
     pause_call(call);
 }

@@ -4,22 +4,27 @@
 //! same page: a dense space alone, a dense and a sparse space, and both with
 //! a text layer. What the directory holds, what the manifest declares, what
 //! an older reader would meet, and what a tokenizer the engine cannot write
-//! down does to a load.
+//! down does to a load. And what runs beside a save held between two of its
+//! phases.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use zeusdb_vector_core::{
-    compile_filter, Error, FsDir, IdfScope, Operation, Position, SparseVector, VectorGraph,
-    VectorIndex, DUMP_FILENAME, NB_LAYER_MAX,
+    compile_filter, pause_arm, pause_disarm, Error, FsDir, IdfScope, KillPoint, Operation, Pause,
+    PauseAt, PauseState, Position, SparseVector, VectorGraph, VectorIndex, DUMP_FILENAME,
+    NB_LAYER_MAX,
 };
 use zeusdb_vector_sparse::{SparseConfig, Weighting};
 use zeusdb_vector_text::{SimpleTokenizer, Tokenizer, TokenizerConfig};
 
-use super::{Collection, Declaration, ParsedRecord, SpaceConfig, SparseHalf};
+use super::journal_support::{answer_after, say_waits, waited_among, Said};
+use super::{Collection, Declaration, ParsedRecord, SpaceConfig, SparseHalf, StorageMode};
 use crate::journal::Durability;
+use crate::locks::lock_name;
 
 /// A directory under the system's temporary directory, removed on drop.
 struct TempDir(std::path::PathBuf);
@@ -1322,4 +1327,141 @@ fn a_directory_whose_counter_is_above_its_largest_id_reads_its_dump_and_writes_i
         0
     );
     assert!(ids_of(&loaded).contains(&("late".to_string(), 301)));
+}
+
+// ============================================================================
+// WHAT RUNS BESIDE A SAVE
+// ============================================================================
+
+/// How long a check waits for a thread beside it, and the longest the
+/// pause holds the save, which is the tests' own bound on a hang.
+const LIMIT: Duration = Duration::from_secs(20);
+
+/// A vector of width eight for record `i`, the same every time.
+fn wide(i: usize) -> Vec<f32> {
+    (0..8)
+        .map(|d| ((i * 7 + d * 13) % 29) as f32 * 0.25 - 3.5)
+        .collect()
+}
+
+/// Run `write` on a thread of `scope`, and give what that thread says in
+/// order: each guard it begins to wait at, then its return.
+fn spawn_writer<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    write: impl FnOnce() + Send + 'scope,
+) -> mpsc::Receiver<Said<()>> {
+    let (said_tx, said) = mpsc::channel::<Said<()>>();
+    scope.spawn(move || {
+        say_waits(&said_tx);
+        write();
+        let _ = said_tx.send(Said::Done(()));
+    });
+    said
+}
+
+/// A save holds the mutation guard from its first phase to its last and no
+/// guard a reader waits for. Held between its artefacts and its graph dump,
+/// at `save:after_artefacts`, it lets a search, a count and a page of `list`
+/// answer from this thread while the pause still holds it. A removal and an
+/// add made on two more threads each reach their wait at `writers` before
+/// they can return. Once the save is let go, the directory it wrote loads
+/// with exactly the records the collection held as the save began, and the
+/// removal and the add land after it. On a raw declaration and on a product
+/// quantized one.
+#[test]
+fn a_save_held_between_its_phases_answers_searches_and_holds_writers_back() {
+    for quantized in [false, true] {
+        let declaration =
+            Declaration::validate(8, "l2", 8, 50, 4000, vec!["cat".to_string()]).unwrap();
+        let quantization = quantized.then(|| {
+            declaration
+                .quantization(4, 4, 1000, None, StorageMode::QuantizedWithRaw)
+                .unwrap()
+        });
+        let collection = Collection::build(declaration, quantization);
+        let records: Vec<ParsedRecord> = (0..1200)
+            .map(|i| {
+                let cat = if i % 2 == 0 { "a" } else { "b" };
+                record(&format!("r{i}"), &wide(i), None, cat)
+            })
+            .collect();
+        let added = collection.add_records(records, vec![], false);
+        assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+        assert_eq!(collection.is_quantized(), quantized);
+        let cat_a = compile_filter(&HashMap::from([("cat".to_string(), json!("a"))])).unwrap();
+        let temp = TempDir::new();
+        let dir = temp.path().join("held.zdb");
+        let pause = Arc::new(Pause::new(LIMIT));
+
+        std::thread::scope(|scope| {
+            let saver = {
+                let (collection, pause, dir) = (&collection, Arc::clone(&pause), &dir);
+                scope.spawn(move || {
+                    pause_arm(PauseAt::Kill(KillPoint::SaveAfterArtefacts), pause);
+                    let saved = collection.save(dir.to_str().unwrap());
+                    pause_disarm();
+                    saved
+                })
+            };
+            assert_eq!(
+                pause.wait_reached(LIMIT).reached(),
+                Some("save:after_artefacts"),
+                "the save never reached save:after_artefacts"
+            );
+
+            // The readers, on this thread, while the save waits.
+            let params = collection.search_params(5, None, false, None).unwrap();
+            let page = collection.search_one(&wide(7), None, params).unwrap();
+            let count = collection.count(Some(&cat_a));
+            let listed = collection.list(10, 0, None).unwrap();
+            assert_eq!(
+                pause.state(),
+                PauseState::Waiting("save:after_artefacts"),
+                "a reader waited for the save"
+            );
+
+            // The writers, each on a thread of its own, reach their wait.
+            let removal = spawn_writer(scope, || {
+                assert!(collection.remove_point("r0".to_string()).unwrap());
+            });
+            let addition = spawn_writer(scope, || {
+                let late = record("late", &wide(5_000), None, "a");
+                let added = collection.add_records(vec![late], vec![], false);
+                assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+            });
+            // The save holds `writers` alone at its pause, by the rule this
+            // test holds, so that is the guard each writer waits at.
+            let save_held = [lock_name("writers")];
+            for (name, said) in [("removal", &removal), ("add", &addition)] {
+                waited_among(
+                    said,
+                    LIMIT,
+                    &save_held,
+                    &format!("the {name} waits at the mutation guard the save holds"),
+                );
+            }
+            assert!(pause.release(), "the save was not waiting at its pause");
+            saver.join().unwrap().unwrap();
+            for (name, said) in [("removal", &removal), ("add", &addition)] {
+                answer_after(
+                    said,
+                    LIMIT,
+                    &format!("the {name} returns once the save is done"),
+                );
+            }
+            assert_eq!(page.len(), 5);
+            assert_eq!(count, 600);
+            assert_eq!(listed.len(), 10);
+        });
+
+        let loaded = Collection::load(dir.to_str().unwrap()).unwrap();
+        assert_eq!(
+            loaded.len(),
+            1200,
+            "the directory holds the records the collection held as the save began"
+        );
+        assert!(loaded.contains("r0") && !loaded.contains("late"));
+        assert!(!collection.contains("r0") && collection.contains("late"));
+        assert_eq!(loaded.is_quantized(), quantized);
+    }
 }

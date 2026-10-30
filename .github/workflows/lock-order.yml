@@ -25,9 +25,10 @@
 # guard twice on one thread, and that none inverts the declared order. The
 # assertion fires on the acquisition itself, with no writer and no scheduling.
 #
-# The suite runs on the checked build without tests/test_interpreter.py, and
-# that module then runs alone on the checked build with the binding's
-# test-support feature, since its checks arm pauses the wheel does not carry.
+# The suite runs on the checked build without tests/test_interpreter.py and
+# tests/test_overlap.py, and those two modules then run alone on the checked
+# build with the binding's test-support feature, since their checks arm pauses
+# the wheel does not carry.
 #
 # The suite runs on the newest CPython release, the exact build test-python in
 # ci.yml runs, which uv installs and checks against the SHA-256 in its own
@@ -124,10 +125,10 @@ jobs:
         # Four workers, from addopts in pyproject.toml. The registry is per
         # thread and each worker is its own process, so a worker sees only the
         # guards its own threads take, which is what the rule is about.
-        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py
+        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py --ignore=tests/test_overlap.py
       - name: Build the extension with debug assertions and the test-support feature
-        # The checked build with the pauses the interpreter checks arm. See the
-        # feature in bindings/python/Cargo.toml.
+        # The checked build with the pauses the checks of the next step arm.
+        # See the feature in bindings/python/Cargo.toml.
         run: uv run --no-sync maturin develop --profile checked --locked --features test-support
-      - name: Run the interpreter checks
-        run: uv run --no-sync pytest tests/test_interpreter.py
+      - name: Run the checks that need the test-support feature
+        run: uv run --no-sync pytest tests/test_interpreter.py tests/test_overlap.py

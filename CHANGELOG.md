@@ -179,9 +179,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Every offset into the graph's upper list arenas, a sparse space's forward store and a text space's dictionary is converted with `try_from`, and a value past its width stops the call.
 
-- Each call into the engine runs inside one function that catches a panic and stops the index. Four points of an insert and a training can inject a panic under the `test-support` feature, which the wheel does not enable.
+- Each call into the engine runs inside one function that catches a panic and stops the index. Five points of an insert and a training can inject a panic under the `test-support` feature, which the wheel does not enable.
 
-- The binding's `test-support` feature compiles a pause at the start of the part of each call that runs with the interpreter released and at the four points of an insert and a training, and the private class `_engine._Pause` that arms it. The wheel does not enable it. `tests/test_interpreter.py` uses the pause to check that `get_stats()` and `add()` release the interpreter for their work and that each read of a guard releases it only to wait for a writer. CI and the lock order workflow run that module on a build with the feature after the rest of the suite, and each install check of the release workflow fails a wheel whose `_engine` holds `_Pause`.
+- The binding's `test-support` feature compiles a pause at the start of the part of each call that runs with the interpreter released and at the five points of an insert and a training, and the private class `_engine._Pause` that arms it. The wheel does not enable it. `tests/test_interpreter.py` uses the pause to check that `get_stats()` and `add()` release the interpreter for their work and that each read of a guard releases it only to wait for a writer. CI and the lock order workflow run that module and `tests/test_overlap.py` on a build with the feature after the rest of the suite, and each install check of the release workflow fails a wheel whose `_engine` holds `_Pause`.
+
+- `tests/test_overlap.py` holds a search at the start of the part it runs with the interpreter released, and checks that an add, a `remove_point()`, an `add_metadata()` and a `compact()` made while the search is held complete without an error and that the search then answers.
+
+- Under the core crate's `pause-points` feature, each point a crash test aborts at can also hold the thread a test arms there. `zeusdb-vector-hnsw` has a `pause-points` feature of its own, which adds the point between the two phases of an insert, and the binding's `test-support` feature turns on both.
+
+- The concurrency checks of the Python suite run until each thread reaches its count, and each wait in them ends at a limit that only a hung run reaches. The Rust tests hold an insert, a save, a backup, a clear and each close-up at a pause or a hook while other threads run. A hook in the lock wrappers, compiled in the tests alone, shows that a thread waits at a guard the held write holds, and once the write lets go the test reads the thread's answer past any later wait. The interval thread's syncs are counted through the test storage once the thread has stopped.
 
 - The lock wrappers take a lock without waiting, for the reads made with the interpreter held.
 
