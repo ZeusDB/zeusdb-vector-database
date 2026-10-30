@@ -217,21 +217,30 @@ impl ArtefactWriter for FsArtefact {
 ///
 /// So a commit over an existing directory does this:
 ///
-/// 1. rename the target aside to `<name>.zdbold`
-/// 2. rename the staging directory to the target
-/// 3. remove `<name>.zdbold`
+/// 1. sync every directory the save wrote, deepest first
+/// 2. rename the target aside to `<name>.zdbold`
+/// 3. rename the staging directory to the target
+/// 4. sync the folder the target sits in
+/// 5. remove `<name>.zdbold`
 ///
-/// Steps 1 and 2 are each atomic on both platforms. Between them the target
+/// A file's sync does not make its name durable, so each directory's own
+/// entries are synced, and a sync that fails fails the commit; see
+/// [`sync_directory`]. Step 4 comes before step 5, so a power loss leaves
+/// the new directory or the whole previous one.
+///
+/// Steps 2 and 3 are each atomic on both platforms. Between them the target
 /// does not exist, which is a window of two filesystem calls with no I/O
 /// between them. **A reader in that window sees no directory rather than a
 /// partial one**, which is the property that matters, and a process killed
 /// in it leaves the whole previous index at `<name>.zdbold`.
 /// [`Storage::recover`] puts that back, and both a load and the next save run
-/// it first. A save to a path that holds nothing yet is step 2 alone, which
-/// is atomic outright.
+/// it first. A save to a path that holds nothing yet is step 3 alone between
+/// its two syncs, which is atomic outright.
 ///
-/// If step 2 fails the target is renamed back from `<name>.zdbold`, so a
-/// failed save leaves the previous directory where it was.
+/// If step 3 fails the target is renamed back from `<name>.zdbold`, so a
+/// failed save leaves the previous directory where it was. If step 4 fails
+/// the new directory is in place and the previous one stays at
+/// `<name>.zdbold`, which the next save removes.
 ///
 /// A rename is only cheap, and only atomic, within one volume, which is why
 /// the staging directory is a sibling of the target rather than a directory
@@ -348,9 +357,18 @@ impl Storage for FsStorage {
     ///
     /// `<name>.zdbold` still present after the recovery is the previous index
     /// after a save that finished, so it is removed, and so is a staging
-    /// directory an interrupted save left.
+    /// directory an interrupted save left. The save that left it may not
+    /// have synced the folder after its move, so the folder is synced first,
+    /// and a power loss then leaves the directory that moved in rather than
+    /// a previous one part removed.
     fn stage(&self) -> Result<Box<dyn Staged>, Error> {
         if !self.recover()? && self.replaced.exists() {
+            let folder = folder_of(&self.target);
+            sync_directory(folder).map_err(|error| Error::SaveSyncFailed {
+                directory: folder.to_path_buf(),
+                target: self.target.clone(),
+                error: error.to_string(),
+            })?;
             remove_tree(
                 &self.replaced,
                 "the previous index a finished save left aside",
@@ -362,10 +380,12 @@ impl Storage for FsStorage {
                 "a staging directory an interrupted save left behind",
             )?;
         }
-        fs::create_dir_all(&self.staging).map_err(|e| Error::StagingCreateFailed {
-            staging: self.staging.clone(),
-            error: e.to_string(),
-        })?;
+        create_folders(folder_of(&self.staging))
+            .and_then(|()| fs::create_dir_all(&self.staging))
+            .map_err(|e| Error::StagingCreateFailed {
+                staging: self.staging.clone(),
+                error: e.to_string(),
+            })?;
         Ok(Box::new(FsStaged {
             target: self.target.clone(),
             dir: FsDir::new(&self.staging),
@@ -424,6 +444,9 @@ impl Storage for FsStorage {
         self.journal.is_dir()
     }
 
+    /// The journal's directory is synced once it is emptied, and the folder
+    /// it sits in once it is there, so neither a segment of the journal it
+    /// replaces nor the loss of its own name can meet a later load.
     fn create_journal(&self) -> io::Result<()> {
         fs::create_dir_all(&self.journal)?;
         let dir = FsJournalDir {
@@ -432,11 +455,8 @@ impl Storage for FsStorage {
         for number in dir.segments()? {
             dir.remove_segment(number)?;
         }
-        dir.sync();
-        if let Some(parent) = self.journal.parent() {
-            sync_directory(parent);
-        }
-        Ok(())
+        dir.sync()?;
+        sync_directory(folder_of(&self.journal))
     }
 
     fn journal_dir(&self) -> Box<dyn JournalDir> {
@@ -458,11 +478,16 @@ impl Storage for FsStorage {
     }
 
     fn remove_legacy_journal(&self) -> io::Result<()> {
-        fs::remove_file(&self.legacy_journal)?;
-        if let Some(parent) = self.legacy_journal.parent() {
-            sync_directory(parent);
-        }
-        Ok(())
+        fs::remove_file(&self.legacy_journal)
+    }
+
+    fn sync_in_place(&self) -> io::Result<()> {
+        sync_tree(&self.target).map_err(|(directory, error)| {
+            io::Error::new(error.kind(), format!("{}: {error}", directory.display()))
+        })?;
+        let folder = folder_of(&self.target);
+        sync_directory(folder)
+            .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", folder.display())))
     }
 
     fn cut_legacy_journal(&self, len: u64) -> io::Result<()> {
@@ -512,7 +537,7 @@ impl FsStorage {
                     .parent()
                     .filter(|parent| !parent.as_os_str().is_empty())
                 {
-                    Some(parent) => fs::create_dir_all(parent).and_then(|()| open()),
+                    Some(parent) => create_folders(parent).and_then(|()| open()),
                     None => Err(error),
                 }
             }
@@ -822,8 +847,8 @@ impl JournalDir for FsJournalDir {
         fs::remove_file(self.segment_path(number))
     }
 
-    fn sync(&self) {
-        sync_directory(&self.path);
+    fn sync(&self) -> io::Result<()> {
+        sync_directory(&self.path)
     }
 
     fn segment_path(&self, number: u64) -> PathBuf {
@@ -854,11 +879,11 @@ impl JournalDir for FsJournalDir {
         Ok(folders)
     }
 
-    fn sync_quarantine(&self, folder: &str) {
+    fn sync_quarantine(&self, folder: &str) -> io::Result<()> {
         let root = self.path.join(QUARANTINE);
-        sync_directory(&root.join(folder));
-        sync_directory(&root);
-        sync_directory(&self.path);
+        sync_directory(&root.join(folder))?;
+        sync_directory(&root)?;
+        sync_directory(&self.path)
     }
 }
 
@@ -881,8 +906,22 @@ impl Staged for FsStaged {
         &self.dir
     }
 
+    /// Every directory the save wrote is synced before the first move, so a
+    /// directory moves into place only once every name in it is durable.
+    /// The folder is synced after the moves and before the directory they
+    /// replaced is removed, so a power loss leaves one of the two whole. A
+    /// sync that fails fails the commit. One after the moves leaves the
+    /// directory in place and the one it replaced at `<name>.zdbold`, which
+    /// the next save removes.
     fn commit(mut self: Box<Self>, between: crate::KillPoint) -> Result<(), Error> {
-        sync_directory(&self.staging);
+        if let Err((directory, error)) = sync_tree(&self.staging) {
+            return Err(Error::SaveSyncFailed {
+                directory,
+                target: self.target.clone(),
+                error: error.to_string(),
+            });
+        }
+        let folder = folder_of(&self.target).to_path_buf();
 
         if self.target.exists() {
             fs::rename(&self.target, &self.replaced).map_err(|e| Error::MoveAsideFailed {
@@ -903,17 +942,27 @@ impl Staged for FsStaged {
                     restored,
                 });
             }
+            self.committed = true;
 
+            sync_directory(&folder).map_err(|error| Error::SaveMoveNotDurable {
+                target: self.target.clone(),
+                error: error.to_string(),
+                kept: Some(self.replaced.clone()),
+            })?;
             remove_tree(&self.replaced, "the index this save replaced").ok();
         } else {
             fs::rename(&self.staging, &self.target).map_err(|e| Error::MoveIntoPlaceFailed {
                 target: self.target.clone(),
                 error: e.to_string(),
             })?;
-        }
+            self.committed = true;
 
-        sync_directory(self.target.parent().unwrap_or_else(|| Path::new(".")));
-        self.committed = true;
+            sync_directory(&folder).map_err(|error| Error::SaveMoveNotDurable {
+                target: self.target.clone(),
+                error: error.to_string(),
+                kept: None,
+            })?;
+        }
         Ok(())
     }
 }
@@ -937,30 +986,217 @@ fn remove_tree(path: &Path, what: &'static str) -> Result<(), Error> {
     })
 }
 
-/// Persist a directory's own entries, where the platform has a call for it
+/// Make a directory's own entries durable, and return the failure of the
+/// open or of the sync for the caller to hold.
 ///
 /// A file's bytes reaching the disk does not put its name in its directory.
-/// On POSIX that needs the directory's own descriptor fsynced, which is what
-/// this does, and without it a power loss can leave the renamed directory
-/// holding entries that were never recorded.
+/// The directory's own handle has to be synced as well, and without it a
+/// power loss can lose a name whose file was synced, with nothing for a load
+/// to find. A caller is told nothing is durable while a name it rests on may
+/// not be, so a failure here is never passed over.
 ///
-/// **Windows has no equivalent through the standard library.** `File::open`
-/// refuses a directory there, so this is a no-op, and the durability claim on
-/// Windows rests on NTFS journalling the rename rather than on anything this
-/// crate does. That difference is not observable from a gate that runs on
-/// Windows.
-///
-/// Best effort on both. A filesystem that refuses the fsync is not a reason
-/// to fail a save whose bytes are already written.
+/// On Linux and macOS the directory is opened to read, and `sync_all` is
+/// `fsync` on Linux and `fcntl(F_FULLFSYNC)` on macOS. On Windows the
+/// standard library's `File::open` refuses a directory, so it is opened with
+/// write access and `FILE_FLAG_BACKUP_SEMANTICS`, which a directory handle
+/// needs and which `FlushFileBuffers` needs to flush it. NTFS persists the
+/// directory's structure at that flush, and other filesystems there return
+/// success and persist nothing more.
+#[cfg(any(unix, windows))]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    directory_sync_faults::asked(path)?;
+    open_directory(path)?.sync_all()?;
+    #[cfg(any(test, feature = "test-support"))]
+    directory_sync_faults::completed(path);
+    Ok(())
+}
+
+/// A target with neither system has no wheel and no call that syncs a
+/// directory, so there is nothing to make durable and nothing to fail.
+#[cfg(not(any(unix, windows)))]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    directory_sync_faults::asked(path)?;
+    let _ = path;
+    Ok(())
+}
+
+/// A directory opened for its sync, to read as Linux and macOS take it.
 #[cfg(unix)]
-fn sync_directory(path: &Path) {
-    if let Ok(dir) = File::open(path) {
-        let _ = dir.sync_all();
+fn open_directory(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+/// A directory opened for its sync, with write access and
+/// `FILE_FLAG_BACKUP_SEMANTICS`, whose value is `0x0200_0000`.
+#[cfg(windows)]
+fn open_directory(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(0x0200_0000)
+        .open(path)
+}
+
+/// The folder `path` sits in, being `.` where `path` is a bare name, whose
+/// parent is the empty path.
+fn folder_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
     }
 }
 
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) {}
+/// Sync every directory under `root`, deepest first, and then `root`, so
+/// every name written anywhere inside it is durable. A failure names the
+/// directory it was for.
+fn sync_tree(root: &Path) -> Result<(), (PathBuf, io::Error)> {
+    let listed = |error| (root.to_path_buf(), error);
+    for entry in fs::read_dir(root).map_err(listed)? {
+        let entry = entry.map_err(listed)?;
+        if entry.file_type().map_err(listed)?.is_dir() {
+            sync_tree(&entry.path())?;
+        }
+    }
+    sync_directory(root).map_err(listed)
+}
+
+/// Create the folder `path` and every folder above it that is missing, and
+/// sync each folder created in the folder above it, so the path to whatever
+/// goes in it survives a power loss. A folder that exists already is left
+/// as it is and costs no sync.
+///
+/// A sync that fails names the folder it was for, and the folders created
+/// are removed again, deepest first, so the next call creates them and
+/// syncs them once more rather than finding them and syncing nothing. The
+/// error says where one of them could not be removed.
+fn create_folders(path: &Path) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut at = path;
+    while !at.as_os_str().is_empty() && !at.exists() {
+        missing.push(at.to_path_buf());
+        match at.parent() {
+            Some(parent) => at = parent,
+            None => break,
+        }
+    }
+    fs::create_dir_all(path)?;
+    for created in missing.iter().rev() {
+        if let Err(error) = sync_directory(folder_of(created)) {
+            let removed = missing.iter().all(|folder| fs::remove_dir(folder).is_ok());
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "the folder {} was created and the folder above it could not be synced \
+                     ({error}), {}",
+                    created.display(),
+                    if removed {
+                        "so the folders created were removed"
+                    } else {
+                        "and the folders created could not all be removed"
+                    }
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Directory syncs a test makes fail, each armed for one directory by its
+/// path, and the syncs of it the system's call completed. Present under the
+/// `test-support` feature and in this crate's own tests, and absent from
+/// every other build.
+#[cfg(any(test, feature = "test-support"))]
+pub mod directory_sync_faults {
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::PoisonError;
+
+    #[allow(clippy::disallowed_types)]
+    static ARMED: std::sync::Mutex<Vec<Armed>> = std::sync::Mutex::new(Vec::new());
+
+    struct Armed {
+        path: PathBuf,
+        pass: usize,
+        fail: usize,
+        asked: usize,
+        completed: usize,
+    }
+
+    #[allow(clippy::disallowed_types)]
+    fn armed() -> std::sync::MutexGuard<'static, Vec<Armed>> {
+        ARMED.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Let the next `pass` syncs of the directory `path` through and fail
+    /// the `fail` after them. Arming a path again replaces its arm.
+    pub fn arm(path: &Path, pass: usize, fail: usize) {
+        let mut armed = armed();
+        armed.retain(|a| a.path != path);
+        armed.push(Armed {
+            path: path.to_path_buf(),
+            pass,
+            fail,
+            asked: 0,
+            completed: 0,
+        });
+    }
+
+    /// The syncs of `path` asked since it was armed.
+    pub fn asked_of(path: &Path) -> usize {
+        armed()
+            .iter()
+            .find(|a| a.path == path)
+            .map_or(0, |a| a.asked)
+    }
+
+    /// The syncs of `path` the system's call completed since it was armed.
+    pub fn completed_of(path: &Path) -> usize {
+        armed()
+            .iter()
+            .find(|a| a.path == path)
+            .map_or(0, |a| a.completed)
+    }
+
+    /// Whether every failure armed for `path` has been spent.
+    pub fn spent(path: &Path) -> bool {
+        armed()
+            .iter()
+            .find(|a| a.path == path)
+            .is_none_or(|a| a.fail == 0)
+    }
+
+    /// Take the arm of `path` away.
+    pub fn disarm(path: &Path) {
+        armed().retain(|a| a.path != path);
+    }
+
+    /// Count a sync of `path` as asked, and fail it where it is armed to.
+    pub(super) fn asked(path: &Path) -> io::Result<()> {
+        let mut armed = armed();
+        let Some(a) = armed.iter_mut().find(|a| a.path == path) else {
+            return Ok(());
+        };
+        a.asked += 1;
+        if a.pass > 0 {
+            a.pass -= 1;
+            return Ok(());
+        }
+        if a.fail > 0 {
+            a.fail -= 1;
+            return Err(io::Error::other("injected: the device refused it"));
+        }
+        Ok(())
+    }
+
+    /// Count a sync of `path` the system's call completed.
+    pub(super) fn completed(path: &Path) {
+        if let Some(a) = armed().iter_mut().find(|a| a.path == path) {
+            a.completed += 1;
+        }
+    }
+}
 
 // ============================================================================
 // THE JOURNAL
@@ -1289,7 +1525,7 @@ mod tests {
             .quarantine()
             .write("a-3/00000000000000000003.zdbseg", b"bytes")
             .unwrap();
-        journal.sync_quarantine("a-3");
+        journal.sync_quarantine("a-3").unwrap();
         assert_eq!(journal.quarantine_folders().unwrap(), ["a-3", "b-9"]);
         assert_eq!(
             journal
@@ -1305,6 +1541,273 @@ mod tests {
             journal.quarantine_folders().unwrap(),
             ["a-3", "b-9"],
             "emptying the journal of segments leaves the quarantine"
+        );
+    }
+
+    /// A sync of the journal's directory that fails after it is created or
+    /// emptied fails the creation, and so does a sync of the folder it sits
+    /// in, since a segment written there may lose its name on a power loss.
+    #[test]
+    fn a_failed_directory_sync_fails_the_journals_creation() {
+        for which in ["the journal's directory", "the folder it sits in"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+            let synced = if which == "the folder it sits in" {
+                tmp.path().to_path_buf()
+            } else {
+                storage.journal_path().to_path_buf()
+            };
+            directory_sync_faults::arm(&synced, 0, 1);
+            let created = storage.create_journal();
+            let spent = directory_sync_faults::spent(&synced);
+            directory_sync_faults::disarm(&synced);
+            assert!(spent, "{which}: the sync was asked");
+            assert_eq!(
+                created.map_err(|error| error.to_string()),
+                Err("injected: the device refused it".to_string()),
+                "{which}"
+            );
+        }
+    }
+
+    /// The directory in place is synced with every directory under it and
+    /// the folder it sits in, and a sync of any of them that fails is
+    /// returned naming the directory.
+    #[test]
+    fn a_failed_sync_of_the_directory_in_place_is_returned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("index.zdb");
+        let storage = FsStorage::at(&target).unwrap();
+        let staged = storage.stage().unwrap();
+        staged
+            .dir()
+            .write("spaces/s/postings.zdbsparse", b"p")
+            .unwrap();
+        staged.commit(crate::KillPoint::SaveBetweenRenames).unwrap();
+        let space = target.join("spaces").join("s");
+        for synced in [space.clone(), target.clone(), tmp.path().to_path_buf()] {
+            directory_sync_faults::arm(&synced, 0, 1);
+            let result = storage.sync_in_place();
+            let spent = directory_sync_faults::spent(&synced);
+            directory_sync_faults::disarm(&synced);
+            assert!(spent, "{}: the sync was asked", synced.display());
+            assert_eq!(
+                result.map_err(|error| error.to_string()),
+                Err(format!(
+                    "{}: injected: the device refused it",
+                    synced.display()
+                ))
+            );
+        }
+        storage.sync_in_place().unwrap();
+    }
+
+    /// A sync of the staging directory that fails fails the commit before
+    /// anything moves, so the directory in place is the one that was there,
+    /// and the staging directory is removed.
+    #[test]
+    fn a_failed_sync_of_the_staging_directory_fails_the_commit_before_anything_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("index.zdb");
+        let storage = FsStorage::at(&target).unwrap();
+        let staged = storage.stage().unwrap();
+        staged.dir().write("a.bin", b"first").unwrap();
+        staged.commit(crate::KillPoint::SaveBetweenRenames).unwrap();
+        let staging = tmp.path().join("index.zdb.zdbtmp");
+        let staged = storage.stage().unwrap();
+        staged.dir().write("b.bin", b"second").unwrap();
+        directory_sync_faults::arm(&staging, 0, 1);
+        let committed = staged.commit(crate::KillPoint::SaveBetweenRenames);
+        let spent = directory_sync_faults::spent(&staging);
+        directory_sync_faults::disarm(&staging);
+        assert!(spent, "the sync was asked");
+        assert_eq!(
+            committed.map_err(|error| error.to_string()),
+            Err(format!(
+                "Failed to sync {} before the saved index moved into place: injected: the \
+                 device refused it. Nothing was moved, and the directory at {} is as it was.",
+                staging.display(),
+                target.display()
+            ))
+        );
+        assert_eq!(entries(&target), vec!["a.bin"]);
+        assert_eq!(entries(tmp.path()), vec!["index.zdb"]);
+    }
+
+    /// A sync of the folder the directory sits in that fails once the
+    /// directory has moved into place fails the commit, and the directory it
+    /// replaced is kept beside it, since the move may not survive a power
+    /// loss. The next save removes it. A first save meets the same failure
+    /// with nothing to keep.
+    #[test]
+    fn a_failed_sync_of_the_folder_fails_the_commit_and_keeps_the_directory_it_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("index.zdb");
+        let storage = FsStorage::at(&target).unwrap();
+        let staged = storage.stage().unwrap();
+        staged.dir().write("a.bin", b"first").unwrap();
+        directory_sync_faults::arm(tmp.path(), 0, 1);
+        let first = staged.commit(crate::KillPoint::SaveBetweenRenames);
+        directory_sync_faults::disarm(tmp.path());
+        assert_eq!(
+            first.map_err(|error| error.to_string()),
+            Err(format!(
+                "The saved index is in place at {}, and the folder it sits in could not be \
+                 synced: injected: the device refused it. The move may not survive a power loss.",
+                target.display()
+            ))
+        );
+        let staged = storage.stage().unwrap();
+        staged.dir().write("b.bin", b"second").unwrap();
+        directory_sync_faults::arm(tmp.path(), 0, 1);
+        let second = staged.commit(crate::KillPoint::SaveBetweenRenames);
+        let spent = directory_sync_faults::spent(tmp.path());
+        directory_sync_faults::disarm(tmp.path());
+        assert!(spent, "the sync was asked");
+        assert_eq!(
+            second.map_err(|error| error.to_string()),
+            Err(format!(
+                "The saved index is in place at {}, and the folder it sits in could not be \
+                 synced: injected: the device refused it. The move may not survive a power \
+                 loss, so the index it replaced is kept at {} until the next save.",
+                target.display(),
+                tmp.path().join("index.zdb.zdbold").display()
+            ))
+        );
+        assert_eq!(
+            entries(tmp.path()),
+            vec!["index.zdb", "index.zdb.zdbold"],
+            "the directory replaced is kept"
+        );
+        assert_eq!(entries(&target), vec!["b.bin"]);
+        directory_sync_faults::arm(tmp.path(), 0, 1);
+        let staged = storage.stage().map(|_| ());
+        directory_sync_faults::disarm(tmp.path());
+        assert_eq!(
+            staged.map_err(|error| error.to_string()),
+            Err(format!(
+                "Failed to sync {} before the saved index moved into place: injected: the \
+                 device refused it. Nothing was moved, and the directory at {} is as it was.",
+                tmp.path().display(),
+                target.display()
+            )),
+            "the next save syncs the folder before it removes the directory kept"
+        );
+        assert_eq!(entries(tmp.path()), vec!["index.zdb", "index.zdb.zdbold"]);
+        drop(storage.stage().unwrap());
+        assert_eq!(entries(tmp.path()), vec!["index.zdb"]);
+    }
+
+    /// A commit syncs every directory the save wrote inside the staging
+    /// directory, deepest first, and a sync of one of them that fails fails
+    /// the commit before anything moves.
+    #[test]
+    fn a_commit_syncs_every_directory_the_save_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        let staging = tmp.path().join("index.zdb.zdbtmp");
+        let space = staging.join("spaces").join("s");
+        for synced in [space.clone(), staging.join("spaces")] {
+            let staged = storage.stage().unwrap();
+            staged.dir().write("config.json", b"{}").unwrap();
+            staged
+                .dir()
+                .write("spaces/s/postings.zdbsparse", &[7u8; 30])
+                .unwrap();
+            directory_sync_faults::arm(&synced, 0, 1);
+            let committed = staged.commit(crate::KillPoint::SaveBetweenRenames);
+            let asked = directory_sync_faults::asked_of(&synced);
+            directory_sync_faults::disarm(&synced);
+            assert!(
+                matches!(committed, Err(Error::SaveSyncFailed { .. })),
+                "{}: a commit whose directory does not sync is refused, and it asked {asked} \
+                 syncs of it",
+                synced.display()
+            );
+            assert!(!storage.exists(), "nothing moved");
+        }
+    }
+
+    /// A staging directory under folders the save created syncs each folder
+    /// it created in the folder above it, so the directory's path survives a
+    /// power loss. A sync that fails refuses the staging and removes the
+    /// folders created, so the next save creates and syncs them again.
+    #[test]
+    fn a_save_syncs_the_folders_it_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("new").join("index.zdb")).unwrap();
+        directory_sync_faults::arm(tmp.path(), 0, 1);
+        let staged = storage.stage();
+        let asked = directory_sync_faults::asked_of(tmp.path());
+        match staged {
+            Err(error) => assert_eq!(
+                error.to_string(),
+                format!(
+                    "Failed to create the staging directory {}: the folder {} was created and \
+                     the folder above it could not be synced (injected: the device refused it), \
+                     so the folders created were removed",
+                    tmp.path().join("new").join("index.zdb.zdbtmp").display(),
+                    tmp.path().join("new").display()
+                )
+            ),
+            Ok(_) => panic!(
+                "a staging whose new folder's entry does not sync is refused, and it asked \
+                 {asked} syncs of the folder above it"
+            ),
+        }
+        assert!(
+            entries(tmp.path()).is_empty(),
+            "the folder created is removed"
+        );
+        let staged = storage.stage().unwrap();
+        let asked = directory_sync_faults::asked_of(tmp.path());
+        directory_sync_faults::disarm(tmp.path());
+        assert_eq!(asked, 2, "the next save syncs the folder above it again");
+        staged.dir().write("a.bin", b"first").unwrap();
+        staged.commit(crate::KillPoint::SaveBetweenRenames).unwrap();
+    }
+
+    /// A bare name sits in the current folder, which is the folder synced
+    /// for it.
+    #[test]
+    fn a_bare_name_sits_in_the_current_folder() {
+        assert_eq!(folder_of(Path::new("index.zdb")), Path::new("."));
+        assert_eq!(folder_of(Path::new("a/index.zdb")), Path::new("a"));
+    }
+
+    /// On a system that opens a directory to read, a directory this process
+    /// may write and may not read refuses the open its sync makes, which is
+    /// a refusal the filesystem itself gives, so the creation of a journal
+    /// beside it and a save into it each fail. Root reads every directory,
+    /// so the test runs as any other user.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_this_process_cannot_read_fails_its_directory_sync() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("write-only");
+        fs::create_dir(&folder).unwrap();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o300)).unwrap();
+        if File::open(&folder).is_ok() {
+            fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipped: this user reads a folder whose mode refuses reads");
+            return;
+        }
+        let storage = FsStorage::at(&folder.join("index.zdb")).unwrap();
+        let created = storage.create_journal();
+        let saved = storage.stage().and_then(|staged| {
+            staged.dir().write("a.bin", b"first")?;
+            staged.commit(crate::KillPoint::SaveBetweenRenames)
+        });
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            created.map_err(|error| error.kind()),
+            Err(io::ErrorKind::PermissionDenied),
+            "the journal beside a folder its sync cannot open is not created"
+        );
+        assert!(
+            matches!(saved, Err(Error::SaveMoveNotDurable { .. })),
+            "a save into a folder its sync cannot open is refused: {saved:?}"
         );
     }
 

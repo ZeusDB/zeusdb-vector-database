@@ -597,7 +597,10 @@ impl Arm {
 /// its bytes first, which is what a device that fills part way leaves.
 /// `quarantines` fails the creation of a repair's quarantine folder, and
 /// `quarantines_denied` fails it with the system's refusal of a missing
-/// permission.
+/// permission. `dir_syncs` fails a sync of the journal directory's own
+/// entries, `quarantine_syncs` a sync of a quarantine folder's, and
+/// `in_place_denied` the sync of the directory in place with the system's
+/// refusal of a missing permission.
 #[derive(Debug, Default)]
 pub(super) struct Faults {
     pub(super) writes: Arm,
@@ -606,6 +609,9 @@ pub(super) struct Faults {
     pub(super) creates: Arm,
     pub(super) quarantines: Arm,
     pub(super) quarantines_denied: Arm,
+    pub(super) dir_syncs: Arm,
+    pub(super) quarantine_syncs: Arm,
+    pub(super) in_place_denied: Arm,
     /// Every sync the interval thread made through this directory.
     pub(super) thread_syncs: ThreadSyncs,
 }
@@ -790,7 +796,10 @@ impl JournalDir for FaultyDir {
     fn remove_segment(&self, number: u64) -> io::Result<()> {
         self.inner.remove_segment(number)
     }
-    fn sync(&self) {
+    fn sync(&self) -> io::Result<()> {
+        if self.faults.dir_syncs.trips() {
+            return Err(injected());
+        }
         self.inner.sync()
     }
     fn segment_path(&self, number: u64) -> PathBuf {
@@ -814,7 +823,10 @@ impl JournalDir for FaultyDir {
     fn quarantine_folders(&self) -> io::Result<Vec<String>> {
         self.inner.quarantine_folders()
     }
-    fn sync_quarantine(&self, folder: &str) {
+    fn sync_quarantine(&self, folder: &str) -> io::Result<()> {
+        if self.faults.quarantine_syncs.trips() {
+            return Err(injected());
+        }
         self.inner.sync_quarantine(folder)
     }
 }
@@ -926,6 +938,15 @@ impl Storage for FaultyStorage {
     fn remove_legacy_journal(&self) -> io::Result<()> {
         self.inner.remove_legacy_journal()
     }
+    fn sync_in_place(&self) -> io::Result<()> {
+        if self.faults.in_place_denied.trips() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected: the folder may not be written",
+            ));
+        }
+        self.inner.sync_in_place()
+    }
     fn cut_legacy_journal(&self, len: u64) -> io::Result<()> {
         self.inner.cut_legacy_journal(len)
     }
@@ -1001,7 +1022,10 @@ impl JournalDir for RefusingDir {
     fn remove_segment(&self, _number: u64) -> io::Result<()> {
         Err(io::Error::new(self.kind, "the medium refuses writes"))
     }
-    fn sync(&self) {}
+    /// A medium that refuses every write has nothing of its own to sync.
+    fn sync(&self) -> io::Result<()> {
+        Ok(())
+    }
     fn segment_path(&self, number: u64) -> PathBuf {
         self.inner.segment_path(number)
     }
@@ -1014,7 +1038,9 @@ impl JournalDir for RefusingDir {
     fn quarantine_folders(&self) -> io::Result<Vec<String>> {
         self.inner.quarantine_folders()
     }
-    fn sync_quarantine(&self, _folder: &str) {}
+    fn sync_quarantine(&self, _folder: &str) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Storage for RefusingStorage {
@@ -1078,6 +1104,10 @@ impl Storage for RefusingStorage {
     }
     fn remove_legacy_journal(&self) -> io::Result<()> {
         Err(self.refusal())
+    }
+    /// A medium that refuses every write has nothing of its own to sync.
+    fn sync_in_place(&self) -> io::Result<()> {
+        Ok(())
     }
     fn cut_legacy_journal(&self, _len: u64) -> io::Result<()> {
         Err(self.refusal())

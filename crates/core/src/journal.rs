@@ -176,11 +176,14 @@
 //! withdraws a call whose commit failed. Rolls onto a new segment when the
 //! active one passes [`SEGMENT_ROLL_BYTES`] at a commit, and onto a segment
 //! naming a new checkpoint when a checkpoint asks, deleting every segment
-//! that checkpoint holds. It refuses every operation in a process other than
-//! the one that opened it, which is a child forked from it, since the child
-//! shares the parent's open file. It takes no index type, holds no index lock
-//! and knows nothing of a collection, and it reaches its directory through
-//! the [`JournalDir`] it is handed.
+//! that checkpoint holds. A segment's own sync does not make its name
+//! durable, so the journal's directory is synced before a segment takes a
+//! record and after segments are deleted, and a sync that fails stops the
+//! writer until a checkpoint's roll lands. It refuses every operation in a
+//! process other than the one that opened it, which is a child forked from
+//! it, since the child shares the parent's open file. It takes no index
+//! type, holds no index lock and knows nothing of a collection, and it
+//! reaches its directory through the [`JournalDir`] it is handed.
 
 use crate::checksum::checksum_of;
 use crate::error::Error;
@@ -2117,7 +2120,11 @@ impl JournalWriter {
     /// creation a crash interrupted, or opening the active segment, or
     /// creating it where no segment names the checkpoint. The failure
     /// returned then carries the system's error whole, for the caller to
-    /// classify. The torn tail is cut next and synced. Stale segments stay
+    /// classify. The torn tail is cut next and synced. An active segment
+    /// that was opened has the journal's directory synced before the writer
+    /// is returned, since the process that created it may have stopped
+    /// before its directory sync, or met one that failed, and no record goes
+    /// into a segment whose name may not be durable. Stale segments stay
     /// until [`JournalWriter::remove_stale`].
     pub fn resume(
         dir: Box<dyn JournalDir>,
@@ -2152,6 +2159,11 @@ impl JournalWriter {
                     .and_then(|()| file.sync_all())
                     .and_then(|()| file.seek_end())
                     .map_err(failure(&path, "cut"))?;
+                let journal = writer.path.clone();
+                writer
+                    .dir
+                    .sync()
+                    .map_err(failure(&journal, "sync the entries of"))?;
                 Active {
                     number,
                     file: Arc::from(file),
@@ -2181,12 +2193,17 @@ impl JournalWriter {
                         .remove_segment(number)
                         .map_err(failure(&path, "remove"))?;
                 }
-                let file = writer
-                    .create_segment(number, base)
-                    .map_err(|error| ResumeFailure {
-                        refuses_writes: error.1,
-                        error: error.0,
-                    })?;
+                let file = writer.create_segment(number, base).map_err(|not_created| {
+                    let NotCreated {
+                        error,
+                        refuses_writes,
+                        ..
+                    } = *not_created;
+                    ResumeFailure {
+                        refuses_writes,
+                        error,
+                    }
+                })?;
                 Active {
                     number,
                     file,
@@ -2216,29 +2233,32 @@ impl JournalWriter {
     }
 
     /// Create the segment `number` naming `base`, with its header written and
-    /// synced and the directory's entries synced. A segment whose header
-    /// could not be made durable is removed again. The second value of the
-    /// failure says whether the medium refused the write.
+    /// synced and the directory's entries synced, so that its name is
+    /// durable before it takes a record. A segment whose header could not be
+    /// made durable is removed again and the directory synced, since one
+    /// that came back would name sequences the writer goes on to give out.
+    /// The failure says what the segment left; see [`Left`].
     fn create_segment(
         &self,
         number: u64,
         base: SegmentBase,
-    ) -> Result<Arc<dyn JournalFile>, (Error, bool)> {
+    ) -> Result<Arc<dyn JournalFile>, Box<NotCreated>> {
         let path = self.dir.segment_path(number);
-        let fail = |what: &'static str, error: std::io::Error| {
-            (
-                Error::JournalIoFailed {
+        let fail = |what: &'static str, error: std::io::Error, left: Left| {
+            Box::new(NotCreated {
+                refuses_writes: crate::storage::refuses_writes(&error),
+                error: Error::JournalIoFailed {
                     path: path.clone(),
                     what,
                     error: error.to_string(),
                 },
-                crate::storage::refuses_writes(&error),
-            )
+                left,
+            })
         };
         let file = self
             .dir
             .create_segment(number)
-            .map_err(|error| fail("create", error))?;
+            .map_err(|error| fail("create", error, Left::Nothing))?;
         let header = encode_segment_header(&SegmentHeader {
             collection_id: self.collection_id,
             base,
@@ -2246,11 +2266,53 @@ impl JournalWriter {
         });
         if let Err(error) = file.write_all(&header).and_then(|()| file.sync_all()) {
             drop(file);
-            let _ = self.dir.remove_segment(number);
-            return Err(fail("write the header of", error));
+            let left = match self
+                .dir
+                .remove_segment(number)
+                .and_then(|()| self.dir.sync())
+            {
+                Ok(()) => Left::Nothing,
+                Err(cause) => Left::Abandoned {
+                    cause: cause.to_string(),
+                },
+            };
+            return Err(fail("write the header of", error, left));
         }
-        self.dir.sync();
-        Ok(Arc::from(file))
+        let file: Arc<dyn JournalFile> = Arc::from(file);
+        if let Err(error) = self.dir.sync() {
+            return Err(Box::new(NotCreated {
+                refuses_writes: crate::storage::refuses_writes(&error),
+                error: Error::JournalIoFailed {
+                    path: self.path.clone(),
+                    what: "sync the entries of",
+                    error: error.to_string(),
+                },
+                left: Left::Unnamed {
+                    cause: error.to_string(),
+                    file,
+                },
+            }));
+        }
+        Ok(file)
+    }
+
+    /// Make the segment `number` the active one, keeping the one it replaces
+    /// among the others.
+    fn switch_to(&mut self, number: u64, file: Arc<dyn JournalFile>) {
+        let old = self.active.replace(Active {
+            number,
+            file: file.clone(),
+            length: SEGMENT_HEADER_BYTES as u64,
+        });
+        *self.lock_slot() = Some(file);
+        if let Some(old) = old {
+            self.others.push(Other {
+                number: old.number,
+                bytes: old.length,
+                stale: false,
+            });
+        }
+        self.boundary_offset = SEGMENT_HEADER_BYTES as u64;
     }
 
     /// Where the journal is, being its directory.
@@ -2549,6 +2611,14 @@ impl JournalWriter {
     /// landed leaves the writer on the full segment, whose records are
     /// committed and on the device, and the roll is tried again at the next
     /// commit.
+    ///
+    /// Two failures of the next segment stop the writer until a checkpoint
+    /// instead. One is a sync of the journal's directory that fails once the
+    /// segment is created, after which the writer moves onto the segment,
+    /// which holds no record, so that the checkpoint's roll gives way to it.
+    /// The other is a segment whose header failed and whose removal could
+    /// not be made durable, which may come back after a power loss naming
+    /// sequences the full segment would go on to hold.
     fn roll_if_full(&mut self) {
         let Some(active) = &self.active else {
             return;
@@ -2570,35 +2640,57 @@ impl JournalWriter {
             return;
         }
         crate::kill_at(crate::KillPoint::RollAfterSeal);
-        if let Err(error) = self.roll_by_size() {
-            warn!(target: LOG_TARGET, operation = "journal_roll_failed",
-                journal = %self.path.display(),
-                error = %error,
-                "The journal's next segment could not be started; records go on into the \
-                 full segment and the roll is tried at the next commit"
-            );
+        let number = self.next_sequence;
+        let Err(not_created) = self.roll_by_size() else {
+            return;
+        };
+        let NotCreated { error, left, .. } = *not_created;
+        match left {
+            Left::Nothing => {
+                warn!(target: LOG_TARGET, operation = "journal_roll_failed",
+                    journal = %self.path.display(),
+                    error = %error,
+                    "The journal's next segment could not be started; records go on into the \
+                     full segment and the roll is tried at the next commit"
+                );
+            }
+            Left::Unnamed { file, cause } => {
+                self.switch_to(number, file);
+                warn!(target: LOG_TARGET, operation = "journal_directory_sync_failed",
+                    journal = %self.path.display(),
+                    error = %error,
+                    "The journal's directory could not be synced once its next segment was \
+                     created; the journal takes nothing more until a checkpoint"
+                );
+                self.poisoned = Some(format!(
+                    "the journal's directory could not be synced once the segment numbered \
+                     {number} was created ({cause}), so the journal takes nothing more until \
+                     checkpoint() succeeds."
+                ));
+            }
+            Left::Abandoned { cause } => {
+                warn!(target: LOG_TARGET, operation = "journal_segment_abandoned",
+                    journal = %self.path.display(),
+                    error = %error,
+                    removal = %cause,
+                    "The journal's next segment could not be started and its removal could not \
+                     be made durable; the journal takes nothing more until a checkpoint"
+                );
+                self.poisoned = Some(format!(
+                    "the segment numbered {number} could not be started, and its removal could \
+                     not be made durable ({cause}), so the journal takes nothing more until \
+                     checkpoint() succeeds."
+                ));
+            }
         }
     }
 
     /// Start the next segment after a seal that landed.
-    fn roll_by_size(&mut self) -> Result<(), Error> {
+    fn roll_by_size(&mut self) -> Result<(), Box<NotCreated>> {
         let number = self.next_sequence;
-        let file = self.create_segment(number, self.base).map_err(|e| e.0)?;
+        let file = self.create_segment(number, self.base)?;
         crate::kill_at(crate::KillPoint::RollAfterCreate);
-        let old = self.active.replace(Active {
-            number,
-            file: file.clone(),
-            length: SEGMENT_HEADER_BYTES as u64,
-        });
-        *self.lock_slot() = Some(file);
-        if let Some(old) = old {
-            self.others.push(Other {
-                number: old.number,
-                bytes: old.length,
-                stale: false,
-            });
-        }
-        self.boundary_offset = SEGMENT_HEADER_BYTES as u64;
+        self.switch_to(number, file);
         Ok(())
     }
 
@@ -2607,12 +2699,20 @@ impl JournalWriter {
     ///
     /// The checkpoint names the sequence the writer has reached, so the new
     /// segment begins at the next one. An empty active segment named for
-    /// the same sequence gives way first. The new segment's header is synced
-    /// before anything is deleted, and the directory's entries after. A
-    /// segment that will not be deleted is left, since a later open deletes
-    /// it, and logged. Where the new segment cannot be created the writer
-    /// takes nothing more, since records appended under the old checkpoint
-    /// would be refused by the next open, and a later checkpoint tries again.
+    /// the same sequence gives way first. The new segment's header and the
+    /// directory's entries are synced before anything is deleted, and the
+    /// directory's entries again after. A segment that will not be deleted
+    /// is left, since a later open deletes it, and logged. Where the new
+    /// segment cannot be created the writer takes nothing more, since
+    /// records appended under the old checkpoint would be refused by the
+    /// next open, and a later checkpoint tries again.
+    ///
+    /// A sync of the directory that fails stops the writer until a later
+    /// checkpoint's roll lands, and the roll returns the failure. One after
+    /// the creation moves the writer onto the new segment, which holds no
+    /// record, and keeps the segments it replaces, so the later roll gives
+    /// way to that segment and creates it again. One after the deletions
+    /// leaves the roll made, with the new segment's name already durable.
     pub fn roll_to(&mut self, base: SegmentBase) -> Result<(), Error> {
         self.check_process()?;
         let number = self.next_sequence;
@@ -2641,9 +2741,28 @@ impl JournalWriter {
                 });
             }
         }
-        let file = match self.create_segment(number, base) {
+        let file = match self.create_segment(number, base).map_err(|boxed| *boxed) {
             Ok(file) => file,
-            Err((error, _)) => {
+            Err(NotCreated {
+                left: Left::Unnamed { file, cause },
+                ..
+            }) => {
+                self.switch_to(number, file);
+                self.follow(number, base);
+                let reason = format!(
+                    "the journal's directory could not be synced once the segment naming the \
+                     checkpoint at sequence {} was created ({cause}), so the journal takes \
+                     nothing more until checkpoint() succeeds.",
+                    base.sequence
+                );
+                self.poisoned = Some(reason.clone());
+                return Err(Error::JournalIoFailed {
+                    path: self.path.clone(),
+                    what: "roll",
+                    error: reason,
+                });
+            }
+            Err(NotCreated { error, .. }) => {
                 self.poisoned = Some(format!(
                     "the segment naming the checkpoint at sequence {} could not be created \
                      ({error}), so the journal takes nothing more until checkpoint() succeeds.",
@@ -2663,11 +2782,8 @@ impl JournalWriter {
         if let Some(old) = old {
             doomed.push(old.number);
         }
-        self.base = base;
-        self.boundary = number - 1;
         self.boundary_offset = SEGMENT_HEADER_BYTES as u64;
-        self.pending = 0;
-        self.committed = 0;
+        self.follow(number, base);
         self.poisoned = None;
         doomed.sort_unstable();
         for (n, segment) in doomed.into_iter().enumerate() {
@@ -2688,15 +2804,38 @@ impl JournalWriter {
                 crate::kill_at(crate::KillPoint::CheckpointMidDelete);
             }
         }
-        self.dir.sync();
+        if let Err(cause) = self.dir.sync() {
+            let reason = format!(
+                "the journal's directory could not be synced once the checkpoint at sequence {} \
+                 deleted the segments it holds ({cause}), so the journal takes nothing more \
+                 until checkpoint() succeeds.",
+                base.sequence
+            );
+            self.poisoned = Some(reason.clone());
+            return Err(Error::JournalIoFailed {
+                path: self.path.clone(),
+                what: "roll",
+                error: reason,
+            });
+        }
         crate::kill_at(crate::KillPoint::CheckpointAfterDelete);
         Ok(())
     }
 
+    /// Follow the checkpoint `base` from the active segment `number`, which
+    /// names it and holds no record.
+    fn follow(&mut self, number: u64, base: SegmentBase) {
+        self.base = base;
+        self.boundary = number - 1;
+        self.pending = 0;
+        self.committed = 0;
+    }
+
     /// Delete the stale segments a resumed journal holds, which the
-    /// directory's checkpoint holds every record of. A segment that will not
-    /// be deleted is left and logged.
-    pub fn remove_stale(&mut self) {
+    /// directory's checkpoint holds every record of, and sync the journal's
+    /// directory, whose failure is returned. A segment that will not be
+    /// deleted is left and logged.
+    pub fn remove_stale(&mut self) -> Result<(), Error> {
         let mut kept = Vec::with_capacity(self.others.len());
         let mut removed = false;
         for other in self.others.drain(..) {
@@ -2719,8 +2858,11 @@ impl JournalWriter {
         }
         self.others = kept;
         if removed {
-            self.dir.sync();
+            self.dir
+                .sync()
+                .map_err(Self::io(&self.path, "sync the entries of"))?;
         }
+        Ok(())
     }
 
     /// Sync the active segment's data to the device whatever the policy,
@@ -2750,6 +2892,31 @@ impl JournalWriter {
 pub struct ResumeFailure {
     pub error: Error,
     pub refuses_writes: bool,
+}
+
+/// Why a segment was not made ready to take records, whether the medium
+/// refused the write, and what the segment left in the journal's directory.
+struct NotCreated {
+    error: Error,
+    refuses_writes: bool,
+    left: Left,
+}
+
+/// What a segment that was not made ready leaves in the journal's directory.
+enum Left {
+    /// Nothing a power loss can bring back, since the segment was never
+    /// created, or was removed and the removal synced.
+    Nothing,
+    /// The segment, whole and synced and holding no record, whose name the
+    /// directory's sync did not make durable, with that sync's error.
+    Unnamed {
+        file: Arc<dyn JournalFile>,
+        cause: String,
+    },
+    /// The segment, whose header did not reach the device and whose removal
+    /// could not be made durable, with that error. It may stand, or come
+    /// back after a power loss.
+    Abandoned { cause: String },
 }
 
 // ============================================================================

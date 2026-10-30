@@ -445,9 +445,10 @@ impl JournalSink {
     }
 
     /// Delete the stale segments a resumed journal holds, which the
-    /// directory's checkpoint holds every record of.
-    pub fn remove_stale(&mut self) {
-        self.writer.remove_stale();
+    /// directory's checkpoint holds every record of, and return a failed
+    /// sync of the journal's directory after it.
+    pub fn remove_stale(&mut self) -> Result<(), Error> {
+        self.writer.remove_stale()
     }
 
     /// The writer as a test that has to reach the fork check without forking
@@ -1198,10 +1199,16 @@ pub(crate) fn check_legacy_contents(
 /// Deleted where it names the directory's collection, reads without a
 /// corrupt middle and holds no whole record above the directory's sequence,
 /// since the directory then holds every record it holds. Otherwise it is
-/// logged and left, and so is one the system will not delete.
-pub(crate) fn remove_covered_legacy(storage: &dyn Storage, directory_id: u128, sequence: u64) {
+/// logged and left, and so is one the system will not delete. A deletion is
+/// made durable through [`Storage::sync_in_place`], and a failed sync there
+/// is returned.
+pub(crate) fn remove_covered_legacy(
+    storage: &dyn Storage,
+    directory_id: u128,
+    sequence: u64,
+) -> Result<(), Error> {
     if !storage.legacy_journal_exists() {
-        return;
+        return Ok(());
     }
     let path = storage.legacy_journal_path().display().to_string();
     let covered = storage.read_legacy_journal().ok().is_some_and(|bytes| {
@@ -1221,20 +1228,37 @@ pub(crate) fn remove_covered_legacy(storage: &dyn Storage, directory_id: u128, s
              of segments, and the directory does not hold every record in it; it was left where \
              it is"
         );
-        return;
+        return Ok(());
     }
     match storage.remove_legacy_journal() {
-        Ok(()) => info!(target: LOG_TARGET, operation = "journal_legacy_removed",
-            journal = path.as_str(),
-            "A journal of format version 1 whose records the directory holds was deleted"
-        ),
-        Err(error) => warn!(target: LOG_TARGET, operation = "journal_legacy_kept",
-            journal = path.as_str(),
-            error = %error,
-            "A journal of format version 1 whose records the directory holds could not be \
-             deleted; the next load tries again"
-        ),
+        Ok(()) => {
+            info!(target: LOG_TARGET, operation = "journal_legacy_removed",
+                journal = path.as_str(),
+                "A journal of format version 1 whose records the directory holds was deleted"
+            );
+            sync_in_place(storage)
+        }
+        Err(error) => {
+            warn!(target: LOG_TARGET, operation = "journal_legacy_kept",
+                journal = path.as_str(),
+                error = %error,
+                "A journal of format version 1 whose records the directory holds could not be \
+                 deleted; the next load tries again"
+            );
+            Ok(())
+        }
     }
+}
+
+/// Make the directory `storage` keeps durable, its entries and its name,
+/// with a failure in the words a load raises it in.
+pub(crate) fn sync_in_place(storage: &dyn Storage) -> Result<(), Error> {
+    storage
+        .sync_in_place()
+        .map_err(|error| Error::DirectoryNotDurable {
+            directory: storage.dir().locate(""),
+            error: error.to_string(),
+        })
 }
 
 /// Whether `a` and `b` name one directory, compared as absolute paths, since

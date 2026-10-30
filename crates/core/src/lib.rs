@@ -134,6 +134,10 @@ pub use space::{
     Restore, ScoreKind, Selectivity, SpaceKind, SpaceName, Sparse, SparseRef, SparseVector,
     VectorIndex,
 };
+// The directory syncs a test makes fail. Present under the `test-support`
+// feature and in this crate's own tests; see `storage`.
+#[cfg(any(test, feature = "test-support"))]
+pub use storage::directory_sync_faults;
 pub use storage::{
     close_lock_files_in_forked_child, hold_lock_files_for_fork, refuses_writes,
     release_lock_files_after_fork, ArtefactWriter, Dir, FsDir, FsStorage, JournalDir, JournalFile,

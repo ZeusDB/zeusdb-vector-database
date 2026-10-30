@@ -1499,12 +1499,17 @@ impl Arm {
 
 /// Failures a test arms on a journal directory. A failing write lands half
 /// its bytes first, which is what a device that fills part way leaves.
+/// `dir_syncs` fails a sync of the directory's own entries, and `full_syncs`
+/// a sync of a file's data and length together, which a segment's header
+/// takes.
 #[derive(Debug, Default)]
 struct Faults {
     writes: Arm,
     syncs: Arm,
     cuts: Arm,
     creates: Arm,
+    dir_syncs: Arm,
+    full_syncs: Arm,
     /// The segment the last sync reached, by its number.
     last_synced: AtomicUsize,
 }
@@ -1556,7 +1561,10 @@ impl JournalDir for FaultyDir {
     fn remove_segment(&self, number: u64) -> std::io::Result<()> {
         self.inner.remove_segment(number)
     }
-    fn sync(&self) {
+    fn sync(&self) -> std::io::Result<()> {
+        if self.faults.dir_syncs.trips() {
+            return Err(injected());
+        }
         self.inner.sync()
     }
     fn segment_path(&self, number: u64) -> PathBuf {
@@ -1571,7 +1579,7 @@ impl JournalDir for FaultyDir {
     fn quarantine_folders(&self) -> std::io::Result<Vec<String>> {
         self.inner.quarantine_folders()
     }
-    fn sync_quarantine(&self, folder: &str) {
+    fn sync_quarantine(&self, folder: &str) -> std::io::Result<()> {
         self.inner.sync_quarantine(folder)
     }
 }
@@ -1603,6 +1611,9 @@ impl JournalFile for FaultyFile {
         self.inner.sync_data()
     }
     fn sync_all(&self) -> std::io::Result<()> {
+        if self.faults.full_syncs.trips() {
+            return Err(injected());
+        }
         self.inner.sync_all()
     }
     fn length(&self) -> std::io::Result<u64> {
@@ -2147,6 +2158,302 @@ fn a_failed_checkpoint_roll_stops_the_writer() {
     writer.commit(CommitMode::Sync).unwrap();
 }
 
+/// The words of the refusal of an append, or the panic of a test that names
+/// what it expected where the append was taken.
+fn refused_append(writer: &mut JournalWriter, what: &str) -> String {
+    match writer.append(OperationKind::Insert, &[2; 100]) {
+        Err(error) => message(error),
+        Ok(sequence) => panic!("{what} is refused, and it took sequence {sequence}"),
+    }
+}
+
+/// The words a writer refuses every append with once it takes nothing more,
+/// for the journal at `storage` and the reason `reason`.
+fn append_refusal(storage: &FsStorage, reason: &str) -> String {
+    format!(
+        "Failed to append to the journal {}: {reason}",
+        storage.journal_path().display()
+    )
+}
+
+/// A sync of the journal's directory that fails once a roll by size has
+/// created the next segment stops the writer until a checkpoint, since a
+/// record in that segment may lose its name on a power loss. The commit that
+/// filled the segment returns with its call committed in the full segment,
+/// the writer moves onto the new segment, which holds no record, every
+/// append after it is refused in words that name the directory's sync and
+/// the checkpoint, and the roll of a checkpoint gives way to the empty
+/// segment and lets the writer append again.
+#[test]
+fn a_failed_directory_sync_at_a_roll_by_size_stops_the_writer_until_a_checkpoint() {
+    for mode in [CommitMode::Sync, CommitMode::Deferred] {
+        set_segment_roll_bytes(200);
+        let (_tmp, storage) = journal_storage();
+        let (dir, faults) = faulty(&storage);
+        let mut writer = started(dir);
+        set_segment_roll_bytes(0);
+        faults.dir_syncs.arm(0, 1);
+        writer.append(OperationKind::Insert, &[1; 100]).unwrap();
+        writer.commit(mode).unwrap();
+        assert_eq!(
+            faults.dir_syncs.fail.load(Ordering::SeqCst),
+            0,
+            "{mode:?}: the directory's sync failed"
+        );
+        assert_eq!(
+            writer.segments(),
+            2,
+            "{mode:?}: the writer moved onto the new segment"
+        );
+        let refused = refused_append(
+            &mut writer,
+            &format!("{mode:?}: the append after a failed directory sync"),
+        );
+        assert_eq!(
+            refused,
+            append_refusal(
+                &storage,
+                "the journal's directory could not be synced once the segment numbered 3 was \
+                 created (injected: the device refused it), so the journal takes nothing more \
+                 until checkpoint() succeeds."
+            ),
+            "{mode:?}"
+        );
+        let reached = writer.sequence_reached();
+        writer.roll_to(base(LIVE + 1, reached)).unwrap();
+        writer.append(OperationKind::Insert, &[3; 100]).unwrap();
+        writer.commit(mode).unwrap();
+        drop(writer);
+        let loaded = load(&storage);
+        let expected = Expected {
+            collection_id: COLLECTION,
+            base: base(LIVE + 1, reached),
+        };
+        assert_eq!(
+            states(&loaded.read(&expected).unwrap()),
+            vec![(reached + 1, RecordState::Committed)],
+            "{mode:?}: the checkpoint's segment holds the call after it"
+        );
+    }
+}
+
+/// A sync of the journal's directory that fails once a checkpoint has
+/// created the segment naming it fails the roll and stops the writer, since
+/// a record in that segment may lose its name on a power loss, and the
+/// writer moves onto that segment, which holds no record. A sync that fails
+/// once the checkpoint has deleted the segments it holds fails the roll and
+/// stops the writer the same way. In each case a later checkpoint's roll
+/// lands and the writer appends again.
+#[test]
+fn a_failed_directory_sync_in_a_checkpoints_roll_stops_the_writer() {
+    for (passed, what) in [(0, "its segment's creation"), (1, "its deletions")] {
+        let (_tmp, storage) = journal_storage();
+        let (dir, faults) = faulty(&storage);
+        let mut writer = started(dir);
+        writer.append(OperationKind::Insert, b"r0").unwrap();
+        writer.commit(CommitMode::Sync).unwrap();
+        faults.dir_syncs.arm(passed, 1);
+        let reached = writer.sequence_reached();
+        let reason = if passed == 0 {
+            format!(
+                "the journal's directory could not be synced once the segment naming the \
+                 checkpoint at sequence {reached} was created (injected: the device refused it), \
+                 so the journal takes nothing more until checkpoint() succeeds."
+            )
+        } else {
+            format!(
+                "the journal's directory could not be synced once the checkpoint at sequence \
+                 {reached} deleted the segments it holds (injected: the device refused it), so \
+                 the journal takes nothing more until checkpoint() succeeds."
+            )
+        };
+        match writer.roll_to(base(LIVE + 1, reached)) {
+            Err(error) => assert_eq!(
+                message(error),
+                format!(
+                    "Failed to roll the journal {}: {reason}",
+                    storage.journal_path().display()
+                ),
+                "{what}"
+            ),
+            Ok(()) => panic!(
+                "{what}: the roll whose directory sync failed is refused, and it landed with \
+                 the directory's sync spent {}",
+                faults.dir_syncs.fail.load(Ordering::SeqCst) == 0
+            ),
+        }
+        let refused = refused_append(&mut writer, &format!("{what}: the append after it"));
+        assert_eq!(refused, append_refusal(&storage, &reason), "{what}");
+        writer.roll_to(base(LIVE + 2, reached)).unwrap();
+        writer.append(OperationKind::Insert, b"r1").unwrap();
+        writer.commit(CommitMode::Sync).unwrap();
+        drop(writer);
+        let loaded = load(&storage);
+        assert_eq!(loaded.numbers, vec![reached + 1], "{what}");
+        let expected = Expected {
+            collection_id: COLLECTION,
+            base: base(LIVE + 2, reached),
+        };
+        assert_eq!(
+            states(&loaded.read(&expected).unwrap()),
+            vec![(reached + 1, RecordState::Committed)],
+            "{what}"
+        );
+    }
+}
+
+/// A roll by size whose next segment's header does not reach the device
+/// removes that segment and syncs the journal's directory, and the writer
+/// goes on in the full segment and rolls at the next commit, with nothing of
+/// the removed segment on disk. Where the sync after the removal fails, the
+/// writer takes nothing more until a checkpoint, since that segment coming
+/// back after a power loss would name sequences the full segment goes on to
+/// hold.
+#[test]
+fn an_abandoned_segment_whose_removal_does_not_sync_stops_the_writer() {
+    for removal_syncs in [true, false] {
+        set_segment_roll_bytes(200);
+        let (_tmp, storage) = journal_storage();
+        let (dir, faults) = faulty(&storage);
+        let mut writer = started(dir);
+        set_segment_roll_bytes(0);
+        faults.full_syncs.arm(0, 1);
+        if !removal_syncs {
+            faults.dir_syncs.arm(0, 1);
+        }
+        writer.append(OperationKind::Insert, &[1; 100]).unwrap();
+        writer.commit(CommitMode::Sync).unwrap();
+        assert_eq!(
+            faults.full_syncs.fail.load(Ordering::SeqCst),
+            0,
+            "removal syncs {removal_syncs}: the next segment's header did not sync"
+        );
+        assert_eq!(
+            writer.segments(),
+            1,
+            "removal syncs {removal_syncs}: the writer stays on the full segment"
+        );
+        assert_eq!(
+            load(&storage).numbers,
+            vec![1],
+            "removal syncs {removal_syncs}"
+        );
+        if removal_syncs {
+            writer.append(OperationKind::Insert, &[2; 100]).unwrap();
+            writer.commit(CommitMode::Sync).unwrap();
+            assert_eq!(writer.segments(), 2, "the next commit rolls");
+            continue;
+        }
+        assert_eq!(
+            faults.dir_syncs.fail.load(Ordering::SeqCst),
+            0,
+            "the removal's sync failed"
+        );
+        let refused = refused_append(
+            &mut writer,
+            "the append after an abandoned segment whose removal did not sync",
+        );
+        assert_eq!(
+            refused,
+            append_refusal(
+                &storage,
+                "the segment numbered 3 could not be started, and its removal could not be made \
+                 durable (injected: the device refused it), so the journal takes nothing more \
+                 until checkpoint() succeeds."
+            )
+        );
+        let reached = writer.sequence_reached();
+        writer.roll_to(base(LIVE + 1, reached)).unwrap();
+        writer.append(OperationKind::Insert, &[3; 100]).unwrap();
+        writer.commit(CommitMode::Sync).unwrap();
+    }
+}
+
+/// A resumed writer syncs the journal's directory before it returns, so a
+/// segment an earlier process created has a durable name before a record is
+/// appended to it, whether that process's sync failed or never ran. A sync
+/// that fails refuses the resume in the same words where the writer opened
+/// the active segment and where it created it.
+#[test]
+fn a_resumed_writer_syncs_the_journals_directory_before_it_appends() {
+    for created in [false, true] {
+        let (_tmp, storage) = journal_storage();
+        let mut writer = started(storage.journal_dir());
+        writer.append(OperationKind::Insert, b"r0").unwrap();
+        writer.commit(CommitMode::Sync).unwrap();
+        let reached = writer.sequence_reached();
+        drop(writer);
+        let follows = if created {
+            base(LIVE + 1, reached)
+        } else {
+            base(LIVE, 0)
+        };
+        let loaded = load(&storage);
+        let contents = loaded
+            .read(&Expected {
+                collection_id: COLLECTION,
+                base: follows,
+            })
+            .unwrap();
+        assert_eq!(contents.active.is_none(), created);
+        let (dir, faults) = faulty(&storage);
+        faults.dir_syncs.arm(0, 1);
+        match JournalWriter::resume(dir, COLLECTION, follows, &contents) {
+            Err(failure) => {
+                assert!(!failure.refuses_writes, "created {created}");
+                assert_eq!(
+                    message(failure.error),
+                    format!(
+                        "Failed to sync the entries of the journal {}: injected: the device \
+                         refused it",
+                        storage.journal_path().display()
+                    ),
+                    "created {created}"
+                );
+            }
+            Ok(_) => panic!(
+                "created {created}: a resume whose directory sync fails is refused, and it was \
+                 taken with the directory's sync spent {}",
+                faults.dir_syncs.fail.load(Ordering::SeqCst) == 0
+            ),
+        }
+    }
+}
+
+/// The removal of the stale segments a resumed journal holds syncs the
+/// journal's directory and returns a sync that fails.
+#[test]
+fn a_failed_directory_sync_after_stale_segments_go_is_returned() {
+    let (_tmp, storage) = journal_storage();
+    let mut writer = started(storage.journal_dir());
+    writer.append(OperationKind::Insert, b"r0").unwrap();
+    writer.commit(CommitMode::Sync).unwrap();
+    let reached = writer.sequence_reached();
+    drop(writer);
+    let follows = base(LIVE + 1, reached);
+    let loaded = load(&storage);
+    let contents = loaded
+        .read(&Expected {
+            collection_id: COLLECTION,
+            base: follows,
+        })
+        .unwrap();
+    let (dir, faults) = faulty(&storage);
+    let mut writer = JournalWriter::resume(dir, COLLECTION, follows, &contents).unwrap();
+    faults.dir_syncs.arm(0, 1);
+    match writer.remove_stale() {
+        Err(error) => assert_eq!(
+            message(error),
+            format!(
+                "Failed to sync the entries of the journal {}: injected: the device refused it",
+                storage.journal_path().display()
+            )
+        ),
+        Ok(()) => panic!("a removal of stale segments whose directory sync fails is refused"),
+    }
+    assert_eq!(load(&storage).numbers, vec![reached + 1]);
+}
+
 /// A resumed writer cuts the torn tail the reader found, records after the
 /// last commit among it, and carries on at the sequence the reader gave.
 #[test]
@@ -2209,7 +2516,7 @@ fn a_resumed_writer_creates_the_segment_a_crash_left_missing() {
         let mut writer =
             JournalWriter::resume(storage.journal_dir(), COLLECTION, checkpoint, &contents)
                 .unwrap();
-        writer.remove_stale();
+        writer.remove_stale().unwrap();
         assert_eq!(writer.segments(), 1, "{left}");
         writer.append(OperationKind::Insert, b"r1").unwrap();
         writer.commit(CommitMode::Sync).unwrap();

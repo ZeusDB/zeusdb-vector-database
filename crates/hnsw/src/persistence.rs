@@ -4415,6 +4415,23 @@ impl Opened<'_> {
             recovery.repair = plan.as_ref().map(|plan| plan.report(None));
             return Ok(read_only(index, self.path, cause, reached, recovery));
         }
+        // The stale segments this load deletes and the records it takes rest
+        // on the directory it read, which a save in an earlier process may
+        // have moved into place without its sync landing, so the directory
+        // is made durable before the journal changes. A medium that refuses
+        // the sync as it refuses a write opens read only, as the load's
+        // first write does, since nothing is then written that rests on it.
+        if let Err(error) = storage.sync_in_place() {
+            if refuses_writes(&error) {
+                recovery.repair = plan.as_ref().map(|plan| plan.report(None));
+                let cause = ReadOnlyCause::Medium(error.to_string());
+                return Ok(read_only(index, self.path, cause, reached, recovery));
+            }
+            return Err(Error::DirectoryNotDurable {
+                directory: storage.dir().locate(""),
+                error: error.to_string(),
+            });
+        }
         let mut sealed: Vec<String> = Vec::new();
         let writer = match &plan {
             None => JournalWriter::resume(dir, self.directory_id, base, &contents),
@@ -4467,8 +4484,12 @@ impl Opened<'_> {
                 .iter()
                 .any(|(_, snapshot)| *snapshot == self.snapshot);
         if !repaired {
-            sink.remove_stale();
-            crate::journal::remove_covered_legacy(storage, self.directory_id, self.record.sequence);
+            sink.remove_stale()?;
+            crate::journal::remove_covered_legacy(
+                storage,
+                self.directory_id,
+                self.record.sequence,
+            )?;
         }
         index.attach_sink(Box::new(sink));
         // The fault a failed commit left lived in memory alone, so a process
@@ -4491,10 +4512,10 @@ impl Opened<'_> {
                 storage,
                 self.directory_id,
                 index.journal_sequence(),
-            );
+            )?;
         }
         sealed.extend(unfinished.into_iter().map(|(folder, _)| folder));
-        repair::seal(&*storage.journal_dir(), &sealed);
+        repair::seal(&*storage.journal_dir(), &sealed)?;
         recovery.report(self.path);
         Ok((index, recovery))
     }
@@ -4700,13 +4721,14 @@ impl Opened<'_> {
         )?;
         index.attach_sink(Box::new(sink));
         index.upgrade_checkpoint(self.path)?;
-        if let Err(error) = storage.remove_legacy_journal() {
-            warn!(target: LOG_TARGET, operation = "upgrade_old_journal_kept",
+        match storage.remove_legacy_journal() {
+            Ok(()) => crate::journal::sync_in_place(storage)?,
+            Err(error) => warn!(target: LOG_TARGET, operation = "upgrade_old_journal_kept",
                 journal = file.as_str(),
                 error = %error,
                 "The directory was upgraded and its journal of format version 1 could not be \
                  deleted; the directory holds every record in it, and the next load deletes it"
-            );
+            ),
         }
         zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::UpgradeAfterOldRemoved);
         recovery.upgraded_from = Some(recovery.format_version.clone());
@@ -4725,7 +4747,7 @@ impl Opened<'_> {
             zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::RepairAfterCheckpoint);
         }
         sealed.extend(unfinished.into_iter().map(|(folder, _)| folder));
-        repair::seal(&*storage.journal_dir(), &sealed);
+        repair::seal(&*storage.journal_dir(), &sealed)?;
         recovery.report(self.path);
         Ok((index, recovery))
     }

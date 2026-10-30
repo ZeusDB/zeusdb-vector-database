@@ -410,7 +410,13 @@ pub(super) fn set_aside(journal: &dyn JournalDir, plan: &Plan<'_>) -> Result<Str
     quarantine
         .write(&format!("{folder}/{UNSEALED}"), b"")
         .map_err(SetAside::Write)?;
-    journal.sync_quarantine(&folder);
+    journal.sync_quarantine(&folder).map_err(|error| {
+        SetAside::Write(Error::JournalIoFailed {
+            path: journal.path().to_path_buf(),
+            what: "sync the quarantine of",
+            error: error.to_string(),
+        })
+    })?;
     Ok(folder)
 }
 
@@ -472,9 +478,10 @@ pub(super) fn unfinished(journal: &dyn JournalDir) -> Vec<(String, Option<u128>)
 }
 
 /// Remove the marker from each of `folders`, once the checkpoint that seals
-/// their repair has landed. A marker that will not go is logged and left,
-/// and the next repair removes it.
-pub(super) fn seal(journal: &dyn JournalDir, folders: &[String]) {
+/// their repair has landed, and sync each folder. A marker that will not go
+/// is logged and left, and the next repair removes it. A sync that fails is
+/// returned, and the load fails with it.
+pub(super) fn seal(journal: &dyn JournalDir, folders: &[String]) -> Result<(), Error> {
     let quarantine = journal.quarantine();
     for folder in folders {
         if let Err(error) = quarantine.remove(&format!("{folder}/{UNSEALED}")) {
@@ -487,8 +494,15 @@ pub(super) fn seal(journal: &dyn JournalDir, folders: &[String]) {
                 );
             }
         }
-        journal.sync_quarantine(folder);
+        journal
+            .sync_quarantine(folder)
+            .map_err(|error| Error::JournalIoFailed {
+                path: journal.path().to_path_buf(),
+                what: "sync the quarantine of",
+                error: error.to_string(),
+            })?;
     }
+    Ok(())
 }
 
 /// Cut the journal of segments at the byte `at` of the segment `segment`,
@@ -512,8 +526,7 @@ pub(super) fn cut_segments(
         file.set_len(at)?;
         file.sync_all()?;
     }
-    journal.sync();
-    Ok(())
+    journal.sync()
 }
 
 /// Remove the stale segments `numbers` a repair set aside whole, and sync
@@ -526,6 +539,5 @@ pub(super) fn remove_stale(journal: &dyn JournalDir, numbers: &[u64]) -> io::Res
     for &number in numbers {
         journal.remove_segment(number)?;
     }
-    journal.sync();
-    Ok(())
+    journal.sync()
 }

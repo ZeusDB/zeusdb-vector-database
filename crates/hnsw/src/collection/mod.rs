@@ -84,6 +84,8 @@ mod construct;
 mod crash_tests;
 mod dense;
 #[cfg(test)]
+mod directory_sync_tests;
+#[cfg(test)]
 mod directory_tests;
 #[cfg(test)]
 mod durability_tests;
@@ -427,18 +429,27 @@ pub(crate) struct SinkSlot {
 }
 
 /// What the commit that failed said, and the sequence it had reached.
+/// `moved` names the directory a checkpoint moved into place when the fault
+/// is that checkpoint's, whose folder did not sync after the move.
 #[derive(Clone, Debug)]
 struct SinkFault {
     sequence: u64,
     error: String,
+    moved: Option<String>,
 }
 
 impl SinkFault {
     /// The refusal every record meets while the fault stands.
     fn refusal(&self) -> Error {
-        Error::JournalCommitFailed {
-            sequence: self.sequence,
-            error: self.error.clone(),
+        match &self.moved {
+            Some(target) => Error::CheckpointNotDurable {
+                target: target.clone(),
+                error: self.error.clone(),
+            },
+            None => Error::JournalCommitFailed {
+                sequence: self.sequence,
+                error: self.error.clone(),
+            },
         }
     }
 }
@@ -1831,6 +1842,7 @@ impl Collection {
                     slot.fault = Some(SinkFault {
                         sequence: reached,
                         error: message,
+                        moved: None,
                     });
                 }
             }
@@ -2004,6 +2016,7 @@ impl Collection {
                 slot.fault = Some(SinkFault {
                     sequence,
                     error: message,
+                    moved: None,
                 });
                 Err(error)
             }
@@ -2031,6 +2044,7 @@ impl Collection {
         if matches!(
             error,
             Error::JournalCommitFailed { .. }
+                | Error::CheckpointNotDurable { .. }
                 | Error::JournalForked { .. }
                 | Error::CollectionReadOnly { .. }
                 | Error::FeatureReadOnly { .. }
@@ -2055,6 +2069,7 @@ impl Collection {
         slot.fault = Some(SinkFault {
             sequence,
             error: message,
+            moved: None,
         });
         error
     }
@@ -2079,6 +2094,35 @@ impl Collection {
         slot.fault = Some(SinkFault {
             sequence,
             error: error.to_string(),
+            moved: None,
+        });
+    }
+
+    /// Leave the fault of a checkpoint that moved its directory `target`
+    /// into place and could not sync the folder it sits in, where `error`
+    /// is the sync's. A record taken under the checkpoint the journal still
+    /// follows would not replay over the directory now in place, so nothing
+    /// is recorded until a checkpoint commits. The fault replaces one that
+    /// stands, since this refusal is the one the next checkpoint clears.
+    /// Does nothing where no sink is attached.
+    pub(crate) fn fault_after_move(&self, target: &str, error: &str) {
+        let mut slot = self.sink.lock().unwrap();
+        let Some(sink) = slot.attached.as_ref() else {
+            return;
+        };
+        let sequence = sink.sequence_reached();
+        tracing::error!(target: "zeusdb_vector_database::journal",
+            operation = "checkpoint_not_durable",
+            sequence = sequence,
+            directory = target,
+            error = %error,
+            "A checkpoint moved its directory into place and the folder it sits in could not be \
+             synced; nothing is recorded until a checkpoint commits"
+        );
+        slot.fault = Some(SinkFault {
+            sequence,
+            error: error.to_string(),
+            moved: Some(target.to_string()),
         });
     }
 

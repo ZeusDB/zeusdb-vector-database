@@ -362,7 +362,10 @@ impl Collection {
     /// logged and passed, since the directory is written from memory and
     /// holds every record whatever reached the device. A save that fails
     /// puts back the sequence the collection named before the sync, which
-    /// the directory it last committed holds.
+    /// the directory it last committed holds and the journal still follows.
+    /// A save that moved its directory into place and could not sync the
+    /// folder leaves the collection refusing every record until a checkpoint
+    /// commits, since either directory may be in place after a power loss.
     ///
     /// Then the four phases, under the one hold this already has, so the
     /// directory that is committed holds exactly the mutations at or below
@@ -446,9 +449,24 @@ impl Collection {
         }
         zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::CheckpointBeforeSave);
         if let Err(error) = self.save_phases(&storage, path) {
-            // This save put no directory in place, so the collection names
-            // again the sequence of the directory it last committed.
+            // The journal still follows the checkpoint the collection last
+            // committed, so the collection names that checkpoint's sequence
+            // again. A save that moved its directory into place and could
+            // not sync the folder leaves either directory there after a
+            // power loss, so the collection takes no record until a
+            // checkpoint commits, since a record under the old checkpoint
+            // would not replay over the new directory.
             self.set_journal_sequence(in_place);
+            if let Error::SaveMoveNotDurable {
+                target,
+                error: cause,
+                ..
+            } = &error
+            {
+                if journal.is_some() {
+                    self.fault_after_move(&target.display().to_string(), cause);
+                }
+            }
             return Err(error);
         }
         zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::CheckpointAfterSaveBeforeRoll);

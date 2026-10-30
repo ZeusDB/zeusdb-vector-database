@@ -48,6 +48,8 @@
 
 mod fs;
 
+#[cfg(any(test, feature = "test-support"))]
+pub use fs::directory_sync_faults;
 pub use fs::{
     close_lock_files_in_forked_child, hold_lock_files_for_fork, release_lock_files_after_fork,
     FsDir, FsStorage, JOURNAL_SUFFIX, LEGACY_JOURNAL_SUFFIX, LOCK_SUFFIX, SEGMENT_SUFFIX,
@@ -170,8 +172,18 @@ pub trait Storage {
     fn read_legacy_journal(&self) -> io::Result<Vec<u8>>;
 
     /// Remove the journal of format version 1, which an upgrade does once
-    /// its checkpoint holds every record the file held.
+    /// its checkpoint holds every record the file held. The removal is made
+    /// durable by [`Storage::sync_in_place`], which the caller runs after
+    /// it, so a failed removal is told apart from a failed sync.
     fn remove_legacy_journal(&self) -> io::Result<()>;
+
+    /// Make the directory in place durable, being the entries of every
+    /// directory under it, deepest first, its own, and those of the folder
+    /// it sits in, which also names the journal and the lock. A load runs
+    /// this before it changes the journal or takes a record, since a save in
+    /// an earlier process may have moved the directory into place without
+    /// its sync landing, and the journal's past is in that directory alone.
+    fn sync_in_place(&self) -> io::Result<()>;
 
     /// Cut the journal of format version 1 to its first `len` bytes and make
     /// the cut durable, which a repair does once its quarantine holds every
@@ -235,8 +247,10 @@ pub trait JournalDir: Send + Sync + std::fmt::Debug {
     fn remove_segment(&self, number: u64) -> io::Result<()>;
 
     /// Make the directory's own entries durable, after a segment is created
-    /// or removed, where the system has a call for it. Best effort.
-    fn sync(&self);
+    /// or removed. A segment's own sync does not make its name durable, so
+    /// no record goes into a segment until this has succeeded after its
+    /// creation. The error is the system's.
+    fn sync(&self) -> io::Result<()>;
 
     /// Where the segment `number` is, which a message names.
     fn segment_path(&self, number: u64) -> std::path::PathBuf;
@@ -257,9 +271,9 @@ pub trait JournalDir: Send + Sync + std::fmt::Debug {
     fn quarantine_folders(&self) -> io::Result<Vec<String>>;
 
     /// Make the entries of the folder `folder` under `quarantine`, of
-    /// `quarantine` and of the journal's directory durable, where the
-    /// system has a call for it. Best effort.
-    fn sync_quarantine(&self, folder: &str);
+    /// `quarantine` and of the journal's directory durable, and return the
+    /// first failure. The error is the system's.
+    fn sync_quarantine(&self, folder: &str) -> io::Result<()>;
 }
 
 /// One segment of the journal, open to read and write.

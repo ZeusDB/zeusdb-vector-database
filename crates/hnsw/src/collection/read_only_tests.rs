@@ -319,7 +319,7 @@ impl JournalDir for OpenFails {
     fn remove_segment(&self, number: u64) -> io::Result<()> {
         self.inner.remove_segment(number)
     }
-    fn sync(&self) {
+    fn sync(&self) -> io::Result<()> {
         self.inner.sync()
     }
     fn segment_path(&self, number: u64) -> PathBuf {
@@ -334,7 +334,7 @@ impl JournalDir for OpenFails {
     fn quarantine_folders(&self) -> io::Result<Vec<String>> {
         self.inner.quarantine_folders()
     }
-    fn sync_quarantine(&self, folder: &str) {
+    fn sync_quarantine(&self, folder: &str) -> io::Result<()> {
         self.inner.sync_quarantine(folder)
     }
 }
@@ -402,6 +402,9 @@ impl Storage for Fails {
             FailAt::RemoveLegacy(kind) => Err(failure(kind)),
             _ => self.inner.remove_legacy_journal(),
         }
+    }
+    fn sync_in_place(&self) -> io::Result<()> {
+        self.inner.sync_in_place()
     }
     fn cut_legacy_journal(&self, len: u64) -> io::Result<()> {
         self.inner.cut_legacy_journal(len)

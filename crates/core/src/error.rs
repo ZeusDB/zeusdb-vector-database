@@ -441,6 +441,13 @@ pub enum Error {
     /// withdrawn where the journal allowed, and nothing more is recorded
     /// until a checkpoint commits
     JournalCommitFailed { sequence: u64, error: String },
+    /// A checkpoint moved its directory into place and the folder it sits
+    /// in could not be synced, so nothing more is recorded until a
+    /// checkpoint commits
+    CheckpointNotDurable { target: String, error: String },
+    /// A load could not make the directory it read durable, its entries
+    /// and its name, before it changed the journal beside it
+    DirectoryNotDurable { directory: String, error: String },
     /// A checkpoint was asked of a collection that has no journal
     NotJournaled,
 
@@ -472,6 +479,19 @@ pub enum Error {
     },
     /// The staged index could not be moved into an empty place
     MoveIntoPlaceFailed { target: PathBuf, error: String },
+    /// A directory a save wrote could not be synced, so nothing moved
+    SaveSyncFailed {
+        directory: PathBuf,
+        target: PathBuf,
+        error: String,
+    },
+    /// The saved directory moved into place and the folder it sits in could
+    /// not be synced. `kept` names the directory it replaced, kept aside
+    SaveMoveNotDurable {
+        target: PathBuf,
+        error: String,
+        kept: Option<PathBuf>,
+    },
     /// A directory tree could not be removed
     RemoveTreeFailed {
         path: PathBuf,
@@ -833,6 +853,8 @@ impl Error {
             | MoveAsideFailed { .. }
             | MoveIntoPlaceFailedAfterAside { .. }
             | MoveIntoPlaceFailed { .. }
+            | SaveSyncFailed { .. }
+            | SaveMoveNotDurable { .. }
             | RemoveTreeFailed { .. }
             | ArtefactCreateFailed { .. }
             | ArtefactWriteFailed { .. }
@@ -861,6 +883,8 @@ impl Error {
             | JournalStartsAfterCheckpoint { .. }
             | JournalReplayFailed { .. }
             | JournalCommitFailed { .. }
+            | CheckpointNotDurable { .. }
+            | DirectoryNotDurable { .. }
             | NotJournaled
             | JournalSegmentsInvalid { .. }
             | JournalNotThisCheckpoint { .. }
@@ -1619,6 +1643,43 @@ impl fmt::Display for Error {
                 target.display(),
                 error
             ),
+            SaveSyncFailed {
+                directory,
+                target,
+                error,
+            } => write!(
+                f,
+                "Failed to sync {} before the saved index moved into place: {}. Nothing was \
+                 moved, and the directory at {} is as it was.",
+                directory.display(),
+                error.strip_suffix('.').unwrap_or(error),
+                target.display()
+            ),
+            SaveMoveNotDurable {
+                target,
+                error,
+                kept,
+            } => {
+                let error = error.strip_suffix('.').unwrap_or(error);
+                match kept {
+                    Some(kept) => write!(
+                        f,
+                        "The saved index is in place at {}, and the folder it sits in could not \
+                         be synced: {}. The move may not survive a power loss, so the index it \
+                         replaced is kept at {} until the next save.",
+                        target.display(),
+                        error,
+                        kept.display()
+                    ),
+                    None => write!(
+                        f,
+                        "The saved index is in place at {}, and the folder it sits in could not \
+                         be synced: {}. The move may not survive a power loss.",
+                        target.display(),
+                        error
+                    ),
+                }
+            }
             RemoveTreeFailed { path, what, error } => write!(
                 f,
                 "Failed to remove {}, which is {}: {}",
@@ -1709,6 +1770,18 @@ impl fmt::Display for Error {
                  checkpoint().",
                 sequence,
                 error.strip_suffix('.').unwrap_or(error)
+            ),
+            CheckpointNotDurable { target, error } => write!(
+                f,
+                "The checkpoint moved its directory into place at {} and the folder it sits in \
+                 could not be synced ({}), so nothing more is recorded until checkpoint() \
+                 succeeds.",
+                target, error
+            ),
+            DirectoryNotDurable { directory, error } => write!(
+                f,
+                "Failed to sync the index directory {} and the folder it sits in: {}",
+                directory, error
             ),
             NotJournaled => f.write_str(
                 "This index has no journal, so there is no directory for a checkpoint to \
