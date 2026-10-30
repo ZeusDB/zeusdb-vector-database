@@ -112,7 +112,7 @@ jobs:
       - name: Install the pinned toolchain
         if: steps.scope.outputs.documentation-only != 'true'
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: steps.scope.outputs.documentation-only != 'true'
         with:
           # One workspace root per line, as `root -> target`. The action
@@ -246,7 +246,7 @@ jobs:
       - name: Install the pinned toolchain
         if: steps.scope.outputs.documentation-only != 'true'
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: steps.scope.outputs.documentation-only != 'true'
         with:
           workspaces: ". -> target"
@@ -259,7 +259,7 @@ jobs:
           # See the lint job.
           env-vars: ImageOS ImageVersion
           cache-on-failure: true
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         if: steps.scope.outputs.documentation-only != 'true'
         with:
           version: ${{ env.PINNED_UV_VERSION }}
@@ -316,7 +316,7 @@ jobs:
       - name: Install the pinned toolchain
         if: steps.scope.outputs.documentation-only != 'true'
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: steps.scope.outputs.documentation-only != 'true'
         with:
           workspaces: ". -> target"
@@ -327,7 +327,7 @@ jobs:
           # See the lint job.
           env-vars: ImageOS ImageVersion
           cache-on-failure: true
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         if: steps.scope.outputs.documentation-only != 'true'
         with:
           version: ${{ env.PINNED_UV_VERSION }}
@@ -377,7 +377,7 @@ jobs:
       - name: Install the pinned toolchain
         if: steps.scope.outputs.documentation-only != 'true'
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: steps.scope.outputs.documentation-only != 'true'
         with:
           workspaces: ". -> target"
@@ -385,7 +385,7 @@ jobs:
           # See the lint job.
           env-vars: ImageOS ImageVersion
           cache-on-failure: true
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         if: steps.scope.outputs.documentation-only != 'true'
         with:
           version: ${{ env.PINNED_UV_VERSION }}
