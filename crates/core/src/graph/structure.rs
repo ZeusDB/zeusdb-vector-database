@@ -28,7 +28,7 @@ use super::traverse::LAYERS;
 use super::{
     restore_graph, restore_int8_graph, Distance, DumpBounds, Record, Restored, VectorGraph,
 };
-use crate::distance::{CosineDist, L1Dist, L2Dist};
+use crate::distance::{CosineDist, DotDist, L1Dist, L2Dist};
 use crate::distance::{DistPQ, Int8Dist, Int8Metric, PqMetric};
 use crate::int8::Int8Codec;
 use crate::pq::PQ;
@@ -81,7 +81,7 @@ fn build<T, D>(
     dist: D,
 ) -> (MutableGraph<T, D>, VectorStore<T>)
 where
-    T: Clone + Send + Sync,
+    T: Clone + Send + Sync + PartialEq,
     D: Distance<T> + Send + Sync,
 {
     let dim = data.first().map_or(1, Vec::len);
@@ -1357,4 +1357,681 @@ fn a_graph_reserved_after_it_is_built_holds_what_new_reserves() {
             declared
         );
     }
+}
+
+// ============================================================================
+// THE STOP RULE AND THE TWIN
+// ============================================================================
+
+/// The node a graph built by [`build`] gave the point inserted as `id`.
+fn node_of_id<T, D>(graph: &MutableGraph<T, D>, id: usize) -> u32
+where
+    T: Clone + Send + Sync,
+    D: Distance<T> + Send + Sync,
+{
+    (0..graph.nb_points() as u32)
+        .find(|&node| graph.origin_id_of(node) == id)
+        .expect("every inserted id has a node")
+}
+
+/// Whether every node reaches every other through the base layer's lists,
+/// which holds where a walk over the lists and a walk over them backwards
+/// from one node each reach every node.
+fn base_layer_strongly_connected<T, D>(graph: &MutableGraph<T, D>) -> bool
+where
+    T: Clone + Send + Sync,
+    D: Distance<T> + Send + Sync,
+{
+    let n = graph.nb_points();
+    let mut backward: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for node in 0..n as u32 {
+        for &target in graph.neighbours_at(node, 0) {
+            backward[target as usize].push(node);
+        }
+    }
+    let reaches_all = |next: &dyn Fn(u32) -> Vec<u32>| {
+        let mut seen = vec![false; n];
+        let mut stack = vec![0u32];
+        seen[0] = true;
+        while let Some(node) = stack.pop() {
+            for target in next(node) {
+                if !seen[target as usize] {
+                    seen[target as usize] = true;
+                    stack.push(target);
+                }
+            }
+        }
+        seen.iter().all(|&s| s)
+    };
+    reaches_all(&|node| graph.neighbours_at(node, 0).to_vec())
+        && reaches_all(&|node| backward[node as usize].clone())
+}
+
+/// A traversal under a predicate admitting fewer points than its width
+/// reaches every admitted point the base layer connects to its start, and
+/// returns the nearest `knbn` of them at every width at or above the
+/// admitted count. At a width below it the page is still `knbn` long.
+///
+/// One point in fifty is admitted, and each query is an admitted point's own
+/// vector, so the first point admitted lies at distance zero and every
+/// candidate after it lies farther. The page holds the ten admitted points an
+/// exact scan ranks first, positions and score bits both, and asked for all
+/// twenty at each width at or above twenty, every admitted point in the
+/// scan's order.
+///
+/// A second graph, built at `m` 2 and `ef_construction` 16 over clustered
+/// points in two dimensions with one point in twenty admitted, is asked for
+/// ten at widths of forty and four hundred from every point not admitted.
+/// Many of those traversals hold ten admitted points before they reach one
+/// of the nearest ten, so the page is the scan's only where the traversal
+/// goes on until its heap holds the width.
+#[test]
+fn a_traversal_under_a_sparse_predicate_returns_the_nearest_admitted_points() {
+    let data = sample_vectors(1_000, 8, 0x0223);
+    let (graph, store) = build(&data, 16, 64, L2Dist {});
+    assert!(
+        base_layer_strongly_connected(&graph),
+        "every admitted point is reachable from any start"
+    );
+    let admits = |id: &usize| id % 50 == 3;
+    let admitted: Vec<usize> = (0..data.len()).filter(admits).collect();
+    assert_eq!(admitted.len(), 20);
+    for &at in &admitted {
+        let query = &data[at];
+        for ef in [20, 40, 400] {
+            assert_eq!(
+                admitted_page(&graph, &store, query, 10, ef, &admits),
+                nearest_admitted(&data, &admitted, query, 10),
+                "query {at} at width {ef}"
+            );
+            assert_eq!(
+                admitted_page(&graph, &store, query, 20, ef, &admits),
+                nearest_admitted(&data, &admitted, query, 20),
+                "query {at} at width {ef}, every admitted point"
+            );
+        }
+        let page = graph.search(&store, query, 10, 10, Some(&admits));
+        assert_eq!(page.len(), 10, "query {at} at width 10");
+        assert!(page.iter().all(|hit| admits(&hit.position)));
+    }
+
+    let sparse = crate::test_vectors::clustered(400, 2, 0x0223);
+    let (graph, store) = build(&sparse, 2, 16, L2Dist {});
+    assert!(
+        base_layer_strongly_connected(&graph),
+        "every admitted point of the sparse graph is reachable from any start"
+    );
+    let admits = |id: &usize| id % 20 == 3;
+    let admitted: Vec<usize> = (0..sparse.len()).filter(admits).collect();
+    assert_eq!(admitted.len(), 20);
+    for at in (0..sparse.len()).filter(|id| !admits(id)) {
+        let query = &sparse[at];
+        for ef in [40, 400] {
+            assert_eq!(
+                admitted_page(&graph, &store, query, 10, ef, &admits),
+                nearest_admitted(&sparse, &admitted, query, 10),
+                "sparse graph, query {at} at width {ef}"
+            );
+        }
+    }
+}
+
+/// The `n` points of `admitted` nearest `query` under the l2 kernel, by
+/// distance and then by id, as ids and score bits.
+fn nearest_admitted(
+    data: &[Vec<f32>],
+    admitted: &[usize],
+    query: &[f32],
+    n: usize,
+) -> Vec<(usize, u32)> {
+    let mut ranked: Vec<(f32, usize)> = admitted
+        .iter()
+        .map(|&id| (L2Dist {}.eval(query, &data[id]), id))
+        .collect();
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    ranked[..n]
+        .iter()
+        .map(|&(distance, id)| (id, distance.to_bits()))
+        .collect()
+}
+
+/// The page a traversal of `graph` under `admits` returns, as ids and score
+/// bits.
+fn admitted_page<D>(
+    graph: &MutableGraph<f32, D>,
+    store: &VectorStore<f32>,
+    query: &[f32],
+    n: usize,
+    ef: usize,
+    admits: &impl Fn(&usize) -> bool,
+) -> Vec<(usize, u32)>
+where
+    D: Distance<f32> + Send + Sync,
+{
+    graph
+        .search(store, query, n, ef, Some(admits))
+        .iter()
+        .map(|hit| (hit.position, hit.distance.to_bits()))
+        .collect()
+}
+
+/// With no predicate the size test ends no traversal: a graph searched
+/// with a predicate admitting every point returns the page the search with
+/// none returns, at widths below, at and above the point count.
+///
+/// The sparse graph of the stop rule's test, built at `m` 2 over clustered
+/// points in two dimensions, is searched the same two ways from every point
+/// at widths of ten and forty, and the two pages agree there as well. Its
+/// searches with no predicate end before they visit every node, so a
+/// traversal under the predicate that went on past its distance test would
+/// return pages they do not.
+#[test]
+fn a_predicate_admitting_every_point_returns_the_unfiltered_page() {
+    let data = sample_vectors(300, 8, 0x0227);
+    let (graph, store) = build(&data, 8, 32, L2Dist {});
+    let every = |_: &usize| true;
+    for q in [0usize, 77, 299] {
+        for ef in [1, 10, 300, 600] {
+            let bare = graph.search(&store, &data[q], 10, ef, None::<&BoxedFilter>);
+            let admitted = graph.search(&store, &data[q], 10, ef, Some(&every));
+            let bits = |page: &[super::GraphHit]| -> Vec<(usize, u32)> {
+                page.iter()
+                    .map(|hit| (hit.position, hit.distance.to_bits()))
+                    .collect()
+            };
+            assert_eq!(bits(&bare), bits(&admitted), "query {q} at width {ef}");
+        }
+    }
+
+    let sparse = crate::test_vectors::clustered(400, 2, 0x0223);
+    let (graph, store) = build(&sparse, 2, 16, L2Dist {});
+    let bits = |page: &[super::GraphHit]| -> Vec<(usize, u32)> {
+        page.iter()
+            .map(|hit| (hit.position, hit.distance.to_bits()))
+            .collect()
+    };
+    for (q, query) in sparse.iter().enumerate() {
+        for ef in [10, 40] {
+            let bare = graph.search(&store, query, 10, ef, None::<&BoxedFilter>);
+            let admitted = graph.search(&store, query, 10, ef, Some(&every));
+            assert_eq!(
+                bits(&bare),
+                bits(&admitted),
+                "sparse graph, query {q} at width {ef}"
+            );
+        }
+    }
+}
+
+/// A point inserted with the row of a point already held keeps that twin
+/// and the neighbours the rule selects from the candidates after it.
+///
+/// The twin is the first candidate the selection pops, at distance zero, and
+/// every other candidate is exactly as far from it as from the new point.
+/// The new point's base list holds the twin and more, within its budget of
+/// `2 * m`, and among the rest no neighbour lies closer to an earlier one in
+/// the list than to the new point, which is the rule with the twin left out.
+#[test]
+fn a_twin_keeps_the_neighbours_the_rule_selects_past_it() {
+    for m in [2usize, 8] {
+        let mut data = sample_vectors(400, 8, 0x0224);
+        let original = 123;
+        data.push(data[original].clone());
+        let (graph, store) = build(&data, m, 64, L2Dist {});
+        let twin = node_of_id(&graph, 400);
+        let original_node = node_of_id(&graph, original);
+        let list = graph.neighbours_at(twin, 0);
+        assert!(
+            list.contains(&original_node),
+            "m {m}: the twin keeps the point it copies"
+        );
+        assert!(
+            list.len() > 1,
+            "m {m}: the twin holds a list of {} where the rule selects past its copy",
+            list.len()
+        );
+        assert!(
+            list.len() <= 2 * m,
+            "m {m}: the twin holds a list of {} over its budget of {}",
+            list.len(),
+            2 * m
+        );
+        let rest: Vec<u32> = list
+            .iter()
+            .copied()
+            .filter(|&node| node != original_node)
+            .collect();
+        let dist = L2Dist {};
+        for (k, &e) in rest.iter().enumerate() {
+            let to_new = dist.eval(&data[400], store.get(e));
+            for &r in &rest[..k] {
+                assert!(
+                    dist.eval(store.get(e), store.get(r)) >= to_new,
+                    "m {m}: node {e} is kept behind node {r}, which prunes it"
+                );
+            }
+        }
+    }
+}
+
+/// What the base list of the last point of `data` breaks of the rule, where
+/// the point at `head` is the candidate its selection pops first: the head
+/// missing from the list, a list of one, a list over its budget of `2 * m`,
+/// or a kept neighbour that an earlier one in the list prunes, being closer
+/// to it than the new point is. Each fault is named with `label`.
+///
+/// Holds first that `head` lies nearer the new point than every other point
+/// does, and that every other point lies exactly as far from `head` as from
+/// the new point, bit for bit, so the case reaches the tie it is named for.
+fn faults_past_the_head<T, D>(
+    label: &str,
+    data: &[Vec<T>],
+    head: usize,
+    m: usize,
+    dist: impl Fn() -> D,
+) -> Vec<String>
+where
+    T: Clone + Send + Sync + PartialEq,
+    D: Distance<T> + Send + Sync,
+{
+    let new = data.len() - 1;
+    let kernel = dist();
+    let to_head = kernel.eval(&data[new], &data[head]);
+    for (at, row) in data[..new].iter().enumerate() {
+        if at == head {
+            continue;
+        }
+        assert!(
+            to_head < kernel.eval(&data[new], row),
+            "{label}: point {at} lies no farther from the new point than the head"
+        );
+        assert_eq!(
+            kernel.eval(row, &data[head]).to_bits(),
+            kernel.eval(row, &data[new]).to_bits(),
+            "{label}: point {at} does not tie the head with the new point"
+        );
+    }
+    let (graph, store) = build(data, m, 64, dist());
+    let node = node_of_id(&graph, new);
+    let head_node = node_of_id(&graph, head);
+    let list = graph.neighbours_at(node, 0);
+    let mut faults = Vec::new();
+    if !list.contains(&head_node) {
+        faults.push(format!("{label}: the list does not hold the head"));
+    }
+    if list.len() < 2 {
+        faults.push(format!(
+            "{label}: a list of {} where the rule selects past the head",
+            list.len()
+        ));
+    }
+    if list.len() > 2 * m {
+        faults.push(format!(
+            "{label}: a list of {} over its budget of {}",
+            list.len(),
+            2 * m
+        ));
+    }
+    let rest: Vec<u32> = list.iter().copied().filter(|&n| n != head_node).collect();
+    for (k, &e) in rest.iter().enumerate() {
+        let to_new = kernel.eval(&data[new], store.get(e));
+        for &r in &rest[..k] {
+            if kernel.eval(store.get(e), store.get(r)) < to_new {
+                faults.push(format!(
+                    "{label}: node {e} is kept behind node {r}, which prunes it"
+                ));
+            }
+        }
+    }
+    faults
+}
+
+/// Every graph kind on every metric it serves keeps a full list past a head
+/// that ties with the new point against every other point.
+///
+/// The head is the candidate the selection pops first, and each case makes it
+/// tie with the new point bit for bit against every other point the graph
+/// holds. On every raw, product quantized and scalar graph the head holds the
+/// new point's row, the quantized rows coming from two different raw rows
+/// with equal codes, and a cosine graph holding rows of lengths other than
+/// one is among them. On the scalar cosine graph of width 5 fitted where four
+/// dimensions hold zeros, the head's codes are the new point's halved. On
+/// every raw and scalar metric, the head differs from the new point only in
+/// the sign of a dimension every other point holds at zero, and on the raw
+/// l2 graph only in the last place of such a dimension. The new point's base
+/// list holds the head and more, within its budget, and no neighbour in it
+/// lies closer to an earlier one than to the new point. A group of copies of
+/// one row leaves the last copy one copy and the rest from the rule. Every
+/// case is checked and every fault named before the test fails.
+#[test]
+fn a_twin_keeps_its_neighbours_on_every_graph_kind() {
+    const M: usize = 8;
+    const N: usize = 400;
+    const HEAD: usize = 123;
+    let mut faults = Vec::new();
+    let with_copy = |rows: &[Vec<f32>]| -> Vec<Vec<f32>> {
+        let mut data = rows.to_vec();
+        data.push(rows[HEAD].clone());
+        data
+    };
+
+    // Raw rows, each metric over a row equal to the head's. A cosine graph
+    // scores the rows it is given, so one holds rows of lengths from a half to
+    // eight tenths with the head the longest, at nine tenths. Under the inner
+    // product the head is three times its length, so it is the nearest.
+    let plain = sample_vectors(N, 8, 0x0229);
+    let unit = unit_sample_vectors(N, 8, 0x022b);
+    let scaled: Vec<Vec<f32>> = unit
+        .iter()
+        .enumerate()
+        .map(|(at, v)| {
+            let length = if at == HEAD {
+                0.9
+            } else {
+                0.5 + 0.05 * (at % 7) as f32
+            };
+            v.iter().map(|x| x * length).collect()
+        })
+        .collect();
+    let mut long = plain.clone();
+    long[HEAD] = long[HEAD].iter().map(|x| x * 3.0).collect();
+    faults.extend(faults_past_the_head(
+        "raw l2, an equal row",
+        &with_copy(&plain),
+        HEAD,
+        M,
+        || L2Dist {},
+    ));
+    faults.extend(faults_past_the_head(
+        "raw l1, an equal row",
+        &with_copy(&plain),
+        HEAD,
+        M,
+        || L1Dist {},
+    ));
+    faults.extend(faults_past_the_head(
+        "raw dot, an equal row",
+        &with_copy(&long),
+        HEAD,
+        M,
+        || DotDist {},
+    ));
+    faults.extend(faults_past_the_head(
+        "raw cosine, an equal row",
+        &with_copy(&unit),
+        HEAD,
+        M,
+        || CosineDist {},
+    ));
+    faults.extend(faults_past_the_head(
+        "raw cosine, an equal row of length nine tenths",
+        &with_copy(&scaled),
+        HEAD,
+        M,
+        || CosineDist {},
+    ));
+
+    // Two different raw rows with equal product quantized codes, on each
+    // quantized graph, the l1 graph scored by the squared distance as it is.
+    let equal_codes = |pq: &PQ, rows: &[Vec<f32>]| -> Vec<Vec<u8>> {
+        let mut near = rows[HEAD].clone();
+        near[0] += 1.0e-4;
+        let mut codes: Vec<Vec<u8>> = rows.iter().map(|v| pq.quantize(v).unwrap()).collect();
+        let near_codes = pq.quantize(&near).unwrap();
+        assert_ne!(near, rows[HEAD]);
+        assert_eq!(near_codes, codes[HEAD], "the two raw rows quantize alike");
+        codes.push(near_codes);
+        codes
+    };
+    let pq_plain = Arc::new(PQ::new(8, 4, 4, N, None));
+    pq_plain.train(&plain).unwrap();
+    let plain_codes = equal_codes(&pq_plain, &plain);
+    faults.extend(faults_past_the_head(
+        "product quantized l2, two raw rows with equal codes",
+        &plain_codes,
+        HEAD,
+        M,
+        || DistPQ::new(pq_plain.clone(), PqMetric::SquaredL2),
+    ));
+    faults.extend(faults_past_the_head(
+        "product quantized l1, two raw rows with equal codes",
+        &plain_codes,
+        HEAD,
+        M,
+        || DistPQ::new(pq_plain.clone(), PqMetric::SquaredL2),
+    ));
+    let pq_unit = Arc::new(PQ::new(8, 4, 4, N, None));
+    pq_unit.train(&unit).unwrap();
+    faults.extend(faults_past_the_head(
+        "product quantized cosine, two raw rows with equal codes",
+        &equal_codes(&pq_unit, &unit),
+        HEAD,
+        M,
+        || DistPQ::new(pq_unit.clone(), PqMetric::Cosine),
+    ));
+
+    // Two different raw rows with equal scalar codes, on each scalar graph.
+    for (label, metric, rows) in [
+        (
+            "scalar l2, two raw rows with equal codes",
+            Int8Metric::L2,
+            &plain,
+        ),
+        (
+            "scalar l1, two raw rows with equal codes",
+            Int8Metric::L1,
+            &plain,
+        ),
+        (
+            "scalar dot, two raw rows with equal codes",
+            Int8Metric::Dot,
+            &long,
+        ),
+        (
+            "scalar cosine, two raw rows with equal codes",
+            Int8Metric::Cosine,
+            &unit,
+        ),
+    ] {
+        let codec = Arc::new(Int8Codec::fit(8, rows).unwrap());
+        let kernel = Int8Dist::new(codec.clone(), metric);
+        let mut coded: Vec<Vec<i8>> = rows.iter().map(|v| kernel.encode(v).unwrap()).collect();
+        let mut near = rows[HEAD].clone();
+        near[0] += 1.0e-5;
+        let near_row = kernel.encode(&near).unwrap();
+        assert_ne!(near, rows[HEAD]);
+        assert_eq!(
+            near_row, coded[HEAD],
+            "{label}: the two raw rows encode alike"
+        );
+        coded.push(near_row);
+        faults.extend(faults_past_the_head(label, &coded, HEAD, M, || {
+            Int8Dist::new(codec.clone(), metric)
+        }));
+    }
+
+    // On the scalar cosine graph of width 5 fitted where dimensions 0 to 3
+    // hold zeros, the head's codes are the new point's halved. Every other
+    // row holds one to three of the first four dimensions at one or minus
+    // one, so its codes there are not zero.
+    let fitted = Arc::new(Int8Codec::fit(5, &[vec![0.0, 0.0, 0.0, 0.0, 1.0]]).unwrap());
+    let cosine5 = Int8Dist::new(fitted.clone(), Int8Metric::Cosine);
+    let mut rows5: Vec<Vec<i8>> = sample_vectors(N, 5, 0x022d)
+        .iter()
+        .enumerate()
+        .map(|(at, s)| {
+            let mut v: Vec<f32> = s[..4]
+                .iter()
+                .map(|&x| {
+                    if x > 0.15 {
+                        1.0
+                    } else if x < -0.15 {
+                        -1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let held = v.iter().filter(|&&x| x != 0.0).count();
+            if held == 0 {
+                v[at % 4] = 1.0;
+            } else if held == 4 {
+                v[at % 4] = 0.0;
+            }
+            v.push(s[4] * 1.8);
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let unit: Vec<f32> = v.iter().map(|x| x / norm).collect();
+            cosine5.encode(&unit).unwrap()
+        })
+        .collect();
+    let head5 = cosine5
+        .encode(&[0.47697, 0.47697, 0.47697, 0.47697, 0.3])
+        .unwrap();
+    let new5 = cosine5.encode(&[0.4, 0.4, 0.4, 0.4, 0.6]).unwrap();
+    assert_eq!(cosine5.codes_of_row(&head5), &[0, 0, 0, 0, 38]);
+    assert_eq!(cosine5.codes_of_row(&new5), &[0, 0, 0, 0, 76]);
+    rows5.push(head5);
+    rows5.push(new5);
+    faults.extend(faults_past_the_head(
+        "scalar cosine of width 5, codes in a power-of-two ratio",
+        &rows5,
+        N,
+        M,
+        || Int8Dist::new(fitted.clone(), Int8Metric::Cosine),
+    ));
+
+    // On every raw and scalar metric, the head differs from the new point
+    // only in the sign of dimension 7, which every other point holds at
+    // zero. The pair lies about a point none of the others holds, at three
+    // times its length under the inner product.
+    let flat: Vec<Vec<f32>> = sample_vectors(N, 8, 0x022f)
+        .into_iter()
+        .map(|mut v| {
+            v[7] = 0.0;
+            v
+        })
+        .collect();
+    let centre = sample_vectors(1, 8, 0x0231)[0].clone();
+    let pair = |rows: &[Vec<f32>], centre: &[f32], a: f32| -> Vec<Vec<f32>> {
+        let mut data = rows.to_vec();
+        for sign in [1.0f32, -1.0] {
+            let mut v = centre.to_vec();
+            v[7] = sign * a;
+            data.push(v);
+        }
+        data
+    };
+    let unit_rows = |rows: Vec<Vec<f32>>| -> Vec<Vec<f32>> {
+        rows.into_iter()
+            .map(|v| {
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                v.iter().map(|x| x / norm).collect()
+            })
+            .collect()
+    };
+    let long_centre: Vec<f32> = centre.iter().map(|x| x * 3.0).collect();
+    let signs = pair(&flat, &centre, 0.01);
+    let unit_signs = unit_rows(signs.clone());
+    let long_signs = pair(&flat, &long_centre, 0.01);
+    faults.extend(faults_past_the_head(
+        "raw l2, rows differing in one sign",
+        &signs,
+        N,
+        M,
+        || L2Dist {},
+    ));
+    faults.extend(faults_past_the_head(
+        "raw l1, rows differing in one sign",
+        &signs,
+        N,
+        M,
+        || L1Dist {},
+    ));
+    faults.extend(faults_past_the_head(
+        "raw dot, rows differing in one sign",
+        &long_signs,
+        N,
+        M,
+        || DotDist {},
+    ));
+    faults.extend(faults_past_the_head(
+        "raw cosine, rows differing in one sign",
+        &unit_signs,
+        N,
+        M,
+        || CosineDist {},
+    ));
+    for (label, metric, rows) in [
+        (
+            "scalar l2, rows differing in one sign",
+            Int8Metric::L2,
+            &signs,
+        ),
+        (
+            "scalar l1, rows differing in one sign",
+            Int8Metric::L1,
+            &signs,
+        ),
+        (
+            "scalar dot, rows differing in one sign",
+            Int8Metric::Dot,
+            &long_signs,
+        ),
+        (
+            "scalar cosine, rows differing in one sign",
+            Int8Metric::Cosine,
+            &unit_signs,
+        ),
+    ] {
+        let codec = Arc::new(Int8Codec::fit(8, rows).unwrap());
+        let kernel = Int8Dist::new(codec.clone(), metric);
+        let coded: Vec<Vec<i8>> = rows.iter().map(|v| kernel.encode(v).unwrap()).collect();
+        faults.extend(faults_past_the_head(label, &coded, N, M, || {
+            Int8Dist::new(codec.clone(), metric)
+        }));
+    }
+
+    // On the raw l2 graph, the head differs from the new point only in the
+    // last place of dimension 7, which every other point holds at zero.
+    let a = 1.0e-6f32;
+    let mut last_place = flat.clone();
+    let mut head_row = centre.clone();
+    head_row[7] = a;
+    let mut new_row = centre.clone();
+    new_row[7] = f32::from_bits(a.to_bits() + 1);
+    last_place.push(head_row);
+    last_place.push(new_row);
+    faults.extend(faults_past_the_head(
+        "raw l2, rows differing in the last place of one value",
+        &last_place,
+        N,
+        M,
+        || L2Dist {},
+    ));
+
+    // Copies of one row fill no list: the last of 3 m copies keeps one copy
+    // and the neighbours the rule selects past them.
+    let row = sample_vectors(1, 8, 0x0233)[0].clone();
+    let mut copies = plain.clone();
+    copies.extend((0..3 * M).map(|_| row.clone()));
+    let (graph, _) = build(&copies, M, 64, L2Dist {});
+    let list = graph.neighbours_at(node_of_id(&graph, copies.len() - 1), 0);
+    let held = list
+        .iter()
+        .filter(|&&node| graph.origin_id_of(node) >= N)
+        .count();
+    if held != 1 || list.len() < 2 {
+        faults.push(format!(
+            "raw l2, {} copies of one row: the last keeps {held} copies in a list of {}",
+            3 * M,
+            list.len()
+        ));
+    }
+
+    assert!(
+        faults.is_empty(),
+        "{} faults:\n{}",
+        faults.len(),
+        faults.join("\n")
+    );
 }

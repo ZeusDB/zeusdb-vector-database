@@ -96,7 +96,7 @@ fn insert_within_the_room<T, D>(
     mut level: impl FnMut(usize) -> usize,
     label: &str,
 ) where
-    T: Clone + Send + Sync,
+    T: Clone + Send + Sync + PartialEq,
     D: Distance<T> + Send + Sync,
 {
     for (k, row) in rows.iter().enumerate() {

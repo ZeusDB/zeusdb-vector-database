@@ -526,7 +526,12 @@ impl Collection {
                         space: self.spaces[0].name.clone(),
                         kind: SpaceKind::Dense,
                         fetch: fetch_k,
-                        cost: index.cost(vector, fetch_k, selectivity.as_ref()),
+                        cost: index.cost_under(
+                            vector,
+                            fetch_k,
+                            &shape,
+                            &Self::dense_budget(params),
+                        ),
                     }
                 }
                 Resolved::Sparse { vector, .. } => {

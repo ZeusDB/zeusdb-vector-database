@@ -136,6 +136,8 @@ mod stop;
 mod stop_tests;
 mod training;
 #[cfg(test)]
+mod traversal_tests;
+#[cfg(test)]
 mod upgrade_tests;
 
 // The declaration rules, so that `persistence::load_config` applies the same

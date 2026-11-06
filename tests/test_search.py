@@ -1249,3 +1249,49 @@ def test_a_hit_carries_the_metadata_its_record_was_added_with(quantization):
         hit["metadata"]["added"] = 1
     for hit in index.search(queries[0], top_k=10):
         assert _same(hit["metadata"], expected[hit["id"]])
+
+
+# ------------------------------------------------------------
+# A search through removed records' stranded nodes
+# ------------------------------------------------------------
+def test_a_search_through_removed_records_returns_the_live_records_nearest_the_query():
+    """Removals leave twenty live records among a thousand nodes, one in
+    each of twenty clusters. A search for a live record's own vector returns
+    ten live records at the default width and at a wider one, and the page
+    is the one the exact scan gives under a filter admitting exactly the
+    live records, ids and scores both. A batch and a query's dense arm
+    return the same pages."""
+    rng = np.random.default_rng(223)
+    centres = rng.standard_normal((50, 8)).astype(np.float32)
+    noise = rng.standard_normal((1000, 8)).astype(np.float32)
+    vectors = (centres[np.arange(1000) % 50] + np.float32(0.15) * noise).astype(np.float32)
+    ids = [f"r{i:04d}" for i in range(1000)]
+    live = [i for i in range(1000) if i % 51 == 2]
+    index = VectorDatabase().create(
+        "hnsw", dim=8, space="l2", m=8, ef_construction=60, expected_size=4000,
+        indexed_fields=["keep"],
+    )
+    added = index.add({
+        "ids": ids,
+        "embeddings": vectors,
+        "metadatas": [{"keep": "y" if i % 51 == 2 else "n"} for i in range(1000)],
+    })
+    assert added.is_success()
+    assert index.remove_points([ids[i] for i in range(1000) if i % 51 != 2]) == []
+    assert len(index) == len(live) == 20
+
+    def page(hits):
+        return [(hit["id"], hit["score"]) for hit in hits]
+
+    queries = [vectors[i] for i in live]
+    for ef_search in (None, 400):
+        exact = [page(index.search(q, top_k=10, filter={"keep": "y"})) for q in queries]
+        assert all(len(p) == 10 for p in exact)
+        single = [page(index.search(q, top_k=10, ef_search=ef_search)) for q in queries]
+        assert single == exact, ef_search
+        batch = [page(hits) for hits in index.search(np.stack(queries), top_k=10, ef_search=ef_search)]
+        assert batch == exact, ef_search
+        arm = {"vector": None} if ef_search is None else {"vector": None, "ef_search": ef_search}
+        arms = [[{**arm, "vector": q}] for q in queries]
+        queried = [page(index.query(a, top_k=10)) for a in arms]
+        assert queried == exact, ef_search

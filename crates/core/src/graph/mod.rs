@@ -240,7 +240,7 @@ pub(crate) struct Backend<T, D> {
 
 impl<T, D> Backend<T, D>
 where
-    T: Clone + Send + Sync,
+    T: Clone + Send + Sync + PartialEq,
     D: Distance<T> + Send + Sync,
 {
     /// An empty graph at the default scale for its degree, with the reservation
@@ -705,7 +705,32 @@ impl VectorGraph {
     ///
     /// It is taken by generic reference rather than as a trait object so the
     /// closure the caller passes is monomorphised into the traversal.
+    ///
+    /// A search under a predicate runs the traversal with the size test, and
+    /// a search with none runs it without, as `traverse::search_layer` sets
+    /// out. Each is an instance of [`Self::search_with`].
     pub fn search<F>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        filter: Option<&F>,
+    ) -> Result<Vec<GraphHit>, String>
+    where
+        F: Fn(&usize) -> bool,
+    {
+        match filter {
+            None => self.search_with::<fn(&usize) -> bool, false>(query, k, ef, None),
+            Some(admits) => self.search_with::<F, true>(query, k, ef, Some(admits)),
+        }
+    }
+
+    /// The search in the traversal's instance that `UNTIL_FULL` names.
+    ///
+    /// Never inlined, so each instance is compiled alone, and the two share
+    /// no registers and no stack frame.
+    #[inline(never)]
+    fn search_with<F, const UNTIL_FULL: bool>(
         &self,
         query: &[f32],
         k: usize,
@@ -719,11 +744,18 @@ impl VectorGraph {
             // Raw vector search
             VectorGraph::Cosine(b) => {
                 assert_unit_for_cosine(query, "search");
-                Ok(b.graph.search(&b.store, query, k, ef, filter))
+                Ok(b.graph
+                    .search_with::<F, UNTIL_FULL>(&b.store, query, k, ef, filter))
             }
-            VectorGraph::L2(b) => Ok(b.graph.search(&b.store, query, k, ef, filter)),
-            VectorGraph::L1(b) => Ok(b.graph.search(&b.store, query, k, ef, filter)),
-            VectorGraph::Dot(b) => Ok(b.graph.search(&b.store, query, k, ef, filter)),
+            VectorGraph::L2(b) => Ok(b
+                .graph
+                .search_with::<F, UNTIL_FULL>(&b.store, query, k, ef, filter)),
+            VectorGraph::L1(b) => Ok(b
+                .graph
+                .search_with::<F, UNTIL_FULL>(&b.store, query, k, ef, filter)),
+            VectorGraph::Dot(b) => Ok(b
+                .graph
+                .search_with::<F, UNTIL_FULL>(&b.store, query, k, ef, filter)),
 
             // PQ-based search with ADC
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
@@ -736,7 +768,8 @@ impl VectorGraph {
                 // Create dummy query vector for HNSW traversal (flat u8 codes)
                 let dummy_query = vec![0u8; b.graph.distance().subvectors()];
 
-                Ok(b.graph.search(&b.store, &dummy_query, k, ef, filter))
+                Ok(b.graph
+                    .search_with::<F, UNTIL_FULL>(&b.store, &dummy_query, k, ef, filter))
             }
 
             // Scalar codes. The query is installed on this thread at full
@@ -748,7 +781,8 @@ impl VectorGraph {
                 }
                 let _query = b.graph.distance().install_query(query)?;
                 let dummy_query = vec![0i8; b.graph.distance().dim()];
-                Ok(b.graph.search(&b.store, &dummy_query, k, ef, filter))
+                Ok(b.graph
+                    .search_with::<F, UNTIL_FULL>(&b.store, &dummy_query, k, ef, filter))
             }
         }
     }
@@ -1226,10 +1260,11 @@ impl VectorGraph {
     }
 
     /// Time one whole search on this graph, in nanoseconds, as the median of
-    /// `rounds` searches at `k` and `ef` under `admits`, each asked with a
-    /// query built from two of the graph's own points. `admits` is asked what
-    /// a search's predicate is asked, being the position each candidate's
-    /// node holds its record at.
+    /// `rounds` searches at `k` and `ef` under `filter`, each asked with a
+    /// query built from two of the graph's own points. `filter` is handed to
+    /// [`VectorGraph::search`] as a search's predicate is, so the traversal
+    /// timed is the one a search under the same predicate runs, and it is
+    /// asked about the position each candidate's node holds its record at.
     ///
     /// What a traversal costs is not what a distance evaluation costs
     /// multiplied by a count. A traversal's time is the memory it touches,
@@ -1244,22 +1279,19 @@ impl VectorGraph {
     /// The query is the midpoint of two points scattered across the store,
     /// normalised on a cosine graph, rather than a stored point itself, so
     /// the search is for a vector the graph does not hold, which is what a
-    /// query is. The predicate is in place because a filtered search and a
-    /// search over a graph holding a removed record's node carry one, and
-    /// the test is paid once per candidate. Measured at width 100 over 50,000
-    /// points, this figure sits within 3 percent of a search the collection
-    /// runs on the same graph; a stored point as the query, with no
-    /// predicate, sat within 10 percent of it, so the two changes are for
-    /// the search's shape rather than for a gap they close. On a quantized
-    /// graph the two points are reconstructed from their codes, so the
-    /// table the query installs is one a real query would.
-    pub fn time_search_ns(
+    /// query is. On a quantized graph the two points are reconstructed from
+    /// their codes, so the table the query installs is one a real query
+    /// would.
+    pub fn time_search_ns<F>(
         &self,
         k: usize,
         ef: usize,
         rounds: usize,
-        admits: &dyn Fn(usize) -> bool,
-    ) -> Option<f64> {
+        filter: Option<&F>,
+    ) -> Option<f64>
+    where
+        F: Fn(&usize) -> bool,
+    {
         let n = self.nb_points();
         if n < 2 || rounds == 0 {
             return None;
@@ -1297,9 +1329,8 @@ impl VectorGraph {
                     query.iter_mut().for_each(|v| *v /= norm);
                 }
             }
-            let predicate = |at: &usize| admits(*at);
             let started = std::time::Instant::now();
-            let hits = self.search(&query, k, ef, Some(&predicate)).ok()?;
+            let hits = self.search(&query, k, ef, filter).ok()?;
             let elapsed = started.elapsed();
             std::hint::black_box(hits);
             samples.push(elapsed.as_secs_f64() * 1e9);

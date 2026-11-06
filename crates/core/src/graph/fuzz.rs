@@ -698,7 +698,7 @@ fn entry<T, D>(
     value: impl Fn(f32) -> T,
 ) -> Entry
 where
-    T: DumpElement + Clone + Send + Sync,
+    T: DumpElement + Clone + Send + Sync + PartialEq,
     D: Distance<T> + Send + Sync,
 {
     let scale = LevelGenerator::default_scale(m);

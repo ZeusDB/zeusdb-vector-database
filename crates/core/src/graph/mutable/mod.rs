@@ -2220,14 +2220,35 @@ where
         total
     }
 
-    /// Search the graph, which is [`traverse::search`] over this layout.
+    /// Search the graph, which is [`traverse::search`] over this layout, under
+    /// a predicate with the size test and with no predicate without it. See
+    /// [`traverse::search_layer`].
+    pub(super) fn search<F>(
+        &self,
+        store: &VectorStore<T>,
+        data: &[T],
+        knbn: usize,
+        ef_arg: usize,
+        filter: Option<&F>,
+    ) -> Vec<GraphHit>
+    where
+        F: Fn(&usize) -> bool,
+    {
+        match filter {
+            None => self.search_with::<fn(&usize) -> bool, false>(store, data, knbn, ef_arg, None),
+            Some(admits) => self.search_with::<F, true>(store, data, knbn, ef_arg, Some(admits)),
+        }
+    }
+
+    /// Search the graph, which is [`traverse::search`] over this layout, in
+    /// the instance `UNTIL_FULL` names.
     ///
     /// The empty case is answered here rather than in the traversal, which has
     /// no early return for it because neither loading constructor accepts a
     /// graph of no points. [`Self::new`] does, since a graph being built by
     /// insertion starts empty, and the vendored `search_filter` answers the same
     /// question the same way.
-    pub(super) fn search<F>(
+    pub(super) fn search_with<F, const UNTIL_FULL: bool>(
         &self,
         store: &VectorStore<T>,
         data: &[T],
@@ -2241,7 +2262,7 @@ where
         if self.origin_ids.is_empty() {
             return Vec::new();
         }
-        traverse::search(&self.bound(store), data, knbn, ef_arg, filter)
+        traverse::search::<_, F, UNTIL_FULL>(&self.bound(store), data, knbn, ef_arg, filter)
     }
 
     /// This graph with its store, which is what a traversal reads.

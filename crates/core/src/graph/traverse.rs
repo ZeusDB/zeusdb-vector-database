@@ -253,7 +253,7 @@ where
 /// page exactly as the vendored function does, although patch 4 made that
 /// re-test a no-op by keeping only admitted points in the heap.
 ///
-/// Four deliberate differences, none of which moves a result.
+/// Four deliberate differences move no result.
 ///
 /// A neighbour is a `u32` read from the graph's own arena, so the traversal
 /// allocates nothing per edge where the vendored one allocates an `Arc` per
@@ -264,12 +264,17 @@ where
 /// a graph of no points, and `search_layer`'s negative-rank check, since a node
 /// index is unsigned.
 ///
+/// One more moves a page under a predicate and nowhere else. Every caller with
+/// a predicate passes `UNTIL_FULL`, and the bottom search then ends only once
+/// its result heap holds `ef` entries or no candidate is left. See
+/// [`search_layer`].
+///
 /// A non-finite query is rejected by every ZeusDB entry point before the seam.
 /// One that reaches the traversal anyway behaves as it does on the vendored
 /// path: a NaN distance panics with the vendored message the moment it enters a
 /// heap comparison, and an infinite distance traverses normally and scores the
 /// page it returns.
-pub(super) fn search<G, F>(
+pub(super) fn search<G, F, const UNTIL_FULL: bool>(
     graph: &G,
     data: &[G::Elem],
     knbn: usize,
@@ -306,7 +311,8 @@ where
         .find(|&layer| graph.layer_len(layer) > 0)
         .expect("a built graph holds at least one point");
 
-    let neighbours_heap = search_layer(graph, data, pivot, ef, layer_to_search, filter);
+    let neighbours_heap =
+        search_layer::<G, F, UNTIL_FULL>(graph, data, pivot, ef, layer_to_search, filter);
     let neighbours = neighbours_heap.into_sorted_vec();
     let last = knbn.min(ef).min(neighbours.len());
 
@@ -344,7 +350,22 @@ where
 /// candidate pushed before the filter is consulted, and the result heap trimmed
 /// above `ef`. The two vendored assertions are kept, because they are
 /// behaviour.
-pub(super) fn search_layer<G, F>(
+///
+/// The loop ends when the nearest candidate lies farther than the farthest
+/// result, with `UNTIL_FULL` only once the result heap also holds `ef`
+/// entries, or when no candidate is left.
+///
+/// Every traversal under a predicate runs with `UNTIL_FULL`. The heap then
+/// holds admitted points alone, so while fewer than `ef` are admitted the
+/// traversal goes on past the farthest of them, and it reaches every admitted
+/// point the layer connects to the entry before it ends with fewer. A
+/// traversal with no predicate runs without it, being the unfiltered search
+/// and the insertion's. Every candidate there stays in the heap until a trim
+/// removes it, and a trim leaves `ef` entries, so the nearest candidate lies
+/// past the farthest result only once the heap is full and the size test
+/// would end no traversal the distance test alone does not. That instance
+/// compiles to the vendored loop with no size test in it.
+pub(super) fn search_layer<G, F, const UNTIL_FULL: bool>(
     graph: &G,
     point: &[G::Elem],
     entry: u32,
@@ -356,6 +377,10 @@ where
     G: Topology + ?Sized,
     F: Fn(&usize) -> bool,
 {
+    debug_assert!(
+        UNTIL_FULL || filter.is_none(),
+        "a traversal under a predicate runs with UNTIL_FULL"
+    );
     let dist_f = graph.distance();
     let skiplist_size = ef.max(2);
     // Patch 4: one slot is the smallest width that terminates under a filter;
@@ -411,7 +436,9 @@ where
             }
             None => f32::INFINITY,
         };
-        if -(c.dist_to_ref) > f_dist_to_ref {
+        // With `UNTIL_FULL` the farthest result bounds the traversal only
+        // once the result heap holds `ef` entries.
+        if -(c.dist_to_ref) > f_dist_to_ref && (!UNTIL_FULL || return_points.len() >= ef) {
             return return_points;
         }
         // The vectors this list is about to be scored against, hinted before

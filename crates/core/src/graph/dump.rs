@@ -257,7 +257,7 @@ impl GraphKind {
 /// header and checked on the way back, so a dump of one element type handed
 /// to a reader of another is refused on the header rather than misread.
 pub(crate) trait DumpElement:
-    Copy + Clone + Send + Sync + std::fmt::Debug + 'static
+    Copy + Clone + Send + Sync + PartialEq + std::fmt::Debug + 'static
 {
     /// The number the header records for this element type.
     const KIND: u8;

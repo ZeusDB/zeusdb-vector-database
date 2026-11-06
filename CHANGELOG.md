@@ -107,6 +107,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The docstrings of `add()`, `search()`, `count()`, `list()`, `get_quantization_info()`, `shrink_to_fit()`, `compact()`, `backup()`, `query()`, `add_metadata()`, `save()`, `create()` and `is_logging_initialized()`, and of `AddResult.ids`, describe what each does**, among them each space's default `ef_search` and the fetch of `search()`, the cost of `count()`, how `add()` reads metadata, and the calls that release the interpreter.
 
+- **A search with no filter, on an index that holds fewer records than its search width and a graph node that a removal left, scores every record the index holds**, one distance a record, and returns the nearest `top_k` of them wherever they lie in the graph. `query()` and `explain()` report that arm as exact.
+
+- **The graph keeps a candidate neighbour that lies exactly as far from a kept neighbour as from the new record.** On vectors whose distances tie, as integer vectors' often do, the graph and the pages a search returns differ from those 0.13.0 builds.
+
 ### Fixed
 
 - **`load()` refuses a journal whose segments follow another checkpoint of the same index**, with a `RuntimeError` naming both checkpoints, and replays none of it. A segment from another checkpoint that holds nothing past the directory's sequence is passed over, and deleted by a load that can write.
@@ -162,6 +166,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An unrecognised `ZEUSDB_LOG_LEVEL` runs the Python and Rust layers at the same default level.**
 
 - **A call that waits for a writer lets other Python threads run.** `get_stats()` and every call that does more than a constant amount of work release the interpreter while they run, and `len()`, `contains()` and the property getters release it only to wait for a writer.
+
+- **A search under a filter returns `top_k` records wherever the graph reaches as many that the filter admits, at every `ef_search`.** Its traversal goes on until it holds `ef_search` records the filter admits or has visited every candidate it reaches. A search with no filter on an index that holds removed records runs the same way.
+
+- **A record whose vector or product quantized codes equal those of a record the index holds keeps the neighbours the selection picks past that copy**, and so does a record that scores alike with one the index holds against every other record, such as a scalar quantized cosine record whose codes are another's doubled. The copies of one vector or of one set of codes take one place in a list.
+
+- **`query()` and `explain()` price a dense arm with no filter, on an index whose every graph node holds a record, from the traversal that arm runs.**
 
 ### Internal
 

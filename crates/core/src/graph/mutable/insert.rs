@@ -192,7 +192,7 @@ where
 
 impl<T, D> MutableGraph<T, D>
 where
-    T: Clone + Send + Sync,
+    T: Clone + Send + Sync + PartialEq,
     D: Distance<T> + Send + Sync,
 {
     /// Insert one point, drawing its level from `levels`.
@@ -306,7 +306,8 @@ where
         // one, at width one, taking the first strict improvement.
         let mut residue: Vec<(u8, u32)> = Vec::new();
         for l in ((level + 1)..=max_level_observed).rev() {
-            let mut sorted_points = traverse::search_layer(&view, data, pivot, 1, l, NO_FILTER);
+            let mut sorted_points =
+                traverse::search_layer::<_, _, false>(&view, data, pivot, 1, l, NO_FILTER);
             // The vendored panic, kept because it is behaviour. A width of one
             // trims the result heap to one entry, so it cannot fire.
             assert!(
@@ -339,15 +340,21 @@ where
         let mut lists: Vec<(usize, Vec<Entry>)> = Vec::with_capacity(level + 1);
         let mut neighbours: Vec<Entry> = Vec::new();
         for l in (0..=level).rev() {
-            let sorted_points =
-                traverse::search_layer(&view, data, pivot, self.ef_construction(), l, NO_FILTER);
+            let sorted_points = traverse::search_layer::<_, _, false>(
+                &view,
+                data,
+                pivot,
+                self.ef_construction(),
+                l,
+                NO_FILTER,
+            );
             if sorted_points.is_empty() {
                 continue;
             }
             let mut candidates = negated(&sorted_points);
             let nb_conn = if l == 0 { 2 * self.m() } else { self.m() };
             neighbours.reserve(nb_conn);
-            self.select_neighbours(store, &mut candidates, nb_conn, &mut neighbours);
+            self.select_neighbours(store, data, &mut candidates, nb_conn, &mut neighbours);
             neighbours.sort_by(by_distance);
             // The nearest chosen neighbour carries the descent into the next
             // layer down. The vendored insert reads it after installing the
@@ -366,10 +373,18 @@ where
         }
     }
 
-    /// Navarro's rule, as the vendored `select_neighbours` implements it.
+    /// Navarro's rule, as the vendored `select_neighbours` implements it,
+    /// except that a tie keeps the candidate.
     ///
     /// Pop candidates nearest first and keep one only if no already kept
-    /// neighbour is at least as close to it as it is to the query.
+    /// neighbour is closer to it than it is to the query. A kept neighbour
+    /// exactly as far from a candidate as the query is prunes nothing. A
+    /// neighbour can score alike with the query against every candidate
+    /// without holding the query's row: a scalar cosine row whose codes are
+    /// the query's times a power of two, or a row that differs from the
+    /// query's only where every candidate lies equally far from both. Pruning
+    /// on a tie, such a neighbour would prune every candidate after it and
+    /// leave the query a list of one.
     ///
     /// The early transfer branch above is live behaviour rather than a corner.
     /// With `extend_candidates` false, a candidate list no longer than the
@@ -384,14 +399,23 @@ where
     /// either setter. The branches they guard are not ported, rather than ported
     /// behind a flag nothing can set.
     ///
-    /// The query is not a parameter for the same reason. The vendored signature
-    /// takes it, and the only line that reads it is inside the
-    /// `extend_candidates` branch. Every distance this rule evaluates is
-    /// between two stored points, and the distances to the query arrive already
-    /// computed on the candidate heap.
+    /// Every distance this rule evaluates is between two stored points, and
+    /// the distances to the query arrive already computed on the candidate
+    /// heap. The query's own row, `data`, is read for one thing: whether the
+    /// candidates at the head of the heap are its twins, a twin being a
+    /// candidate whose stored row equals `data`.
+    ///
+    /// **Twins take one place.** A twin ties with the query against every
+    /// other candidate, so with a tie kept every twin at the head of the heap
+    /// would be kept in turn, and enough copies of one row would fill the
+    /// list with copies alone. The first twin popped is set aside instead,
+    /// takes one place of the budget and joins the list at the end, every
+    /// further twin at the head is pruned, and the rule runs over the
+    /// candidates after them.
     fn select_neighbours(
         &self,
         store: &VectorStore<T>,
+        data: &[T],
         candidates: &mut BinaryHeap<OrderedNode>,
         nb_neighbours_asked: usize,
         neighbours_vec: &mut Vec<Entry>,
@@ -412,23 +436,49 @@ where
             return;
         }
 
-        while !candidates.is_empty() && neighbours_vec.len() < nb_neighbours_asked {
-            if let Some(e_p) = candidates.pop() {
-                let mut e_to_insert = true;
-                let e_point_v = store.get(e_p.node);
-                assert!(!e_p.dist_to_ref.is_nan());
-                if !neighbours_vec.is_empty() {
-                    e_to_insert = !neighbours_vec
-                        .iter()
-                        .any(|d| dist_f.eval(e_point_v, store.get(d.target)) <= -e_p.dist_to_ref);
-                }
-                if e_to_insert {
-                    neighbours_vec.push(Entry {
-                        dist: -e_p.dist_to_ref,
-                        target: e_p.node,
-                    });
-                }
+        // The twins at the head of the candidates, the first set aside and
+        // the rest pruned, before the rule runs over the candidates after
+        // them. See "Twins take one place" above.
+        let mut twin = None;
+        let mut asked = nb_neighbours_asked;
+        while let Some(first) = candidates.peek() {
+            if store.get(first.node) != data {
+                break;
             }
+            assert!(!first.dist_to_ref.is_nan());
+            if twin.is_none() {
+                twin = Some(Entry {
+                    dist: -first.dist_to_ref,
+                    target: first.node,
+                });
+                asked -= 1;
+            }
+            candidates.pop();
+        }
+
+        // The pop answers whether a candidate is left, so the loop asks no
+        // second time.
+        while neighbours_vec.len() < asked {
+            let Some(e_p) = candidates.pop() else {
+                break;
+            };
+            let mut e_to_insert = true;
+            let e_point_v = store.get(e_p.node);
+            assert!(!e_p.dist_to_ref.is_nan());
+            if !neighbours_vec.is_empty() {
+                e_to_insert = !neighbours_vec
+                    .iter()
+                    .any(|d| dist_f.eval(e_point_v, store.get(d.target)) < -e_p.dist_to_ref);
+            }
+            if e_to_insert {
+                neighbours_vec.push(Entry {
+                    dist: -e_p.dist_to_ref,
+                    target: e_p.node,
+                });
+            }
+        }
+        if let Some(twin) = twin {
+            neighbours_vec.push(twin);
         }
     }
 
